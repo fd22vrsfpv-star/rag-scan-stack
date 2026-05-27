@@ -1,0 +1,72 @@
+{
+  "data": [
+    {
+      "kind": "users",
+      "id": "user-uuid-001",
+      "properties": {
+        "id": "user-uuid-001",
+        "displayName": "John Admin",
+        "userPrincipalName": "john.admin@contoso.com",
+        "mail": "john.admin@contoso.com",
+        "tenantId": "tenant-abc-123",
+        "accountEnabled": true
+      }
+    },
+    {
+      "kind": "users",
+      "id": "user-uuid-002",
+      "properties": {
+        "id": "user-uuid-002",
+        "displayName": "Service Account",
+        "userPrincipalName": "svc-deploy@contoso.com",
+        "tenantId": "tenant-abc-123",
+        "accountEnabled": true
+      }
+    },
+    {
+      "kind": "roleAssignments",
+      "id": "ra-uuid-001",
+      "properties": {
+        "id": "ra-uuid-001",
+        "roleDefinitionName": "Owner",
+        "scope": "/subscriptions/sub-prod-001",
+        "principalType": "User",
+        "displayName": "John Admin",
+        "tenantId": "tenant-abc-123"
+      }
+    },
+    {
+      "kind": "roleAssignments",
+      "id": "ra-uuid-002",
+      "properties": {
+        "id": "ra-uuid-002",
+        "roleDefinitionName": "Reader",
+        "scope": "/subscriptions/sub-prod-001",
+        "principalType": "ServicePrincipal",
+        "displayName": "Monitoring App",
+        "tenantId": "tenant-abc-123"
+      }
+    },
+    {
+      "kind": "apps",
+      "id": "app-uuid-001",
+      "properties": {
+        "id": "app-uuid-001",
+        "displayName": "Legacy API App",
+        "appId": "app-client-id-001",
+        "signInAudience": "AzureADMultipleOrgs",
+        "tenantId": "tenant-abc-123"
+      }
+    },
+    {
+      "kind": "servicePrincipals",
+      "id": "sp-uuid-001",
+      "properties": {
+        "id": "sp-uuid-001",
+        "displayName": "Deploy Pipeline SP",
+        "appId": "app-client-id-002",
+        "tenantId": "tenant-abc-123"
+      }
+    }
+  ]
+}

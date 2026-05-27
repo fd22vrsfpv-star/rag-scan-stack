@@ -1,0 +1,56 @@
+FROM python:3.11-slim
+
+# Install curl for healthcheck + node/npm for npx third-party MCP packages + git for github sources
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl git \
+        nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy all MCP server scripts
+COPY autogen-streamable-http-mcp-server.py .
+COPY mcp-sessions.py .
+COPY mcp-scanning.py .
+COPY mcp-recon.py .
+COPY mcp-exploit.py .
+COPY mcp-credentials.py .
+COPY mcp-pipelines.py .
+COPY mcp-burp.py .
+COPY mcp-zap.py .
+COPY launch-mcp-servers.sh .
+RUN chmod +x launch-mcp-servers.sh
+
+# Stdio-to-HTTP bridge for third-party MCP servers
+COPY stdio_bridge.py .
+
+# Third-party server registry
+COPY third_party/ ./third_party/
+
+# Copy Agent Skills directories (SKILL.md + references)
+COPY pentest-sessions/ ./skills/pentest-sessions/
+COPY pentest-scanning/ ./skills/pentest-scanning/
+COPY pentest-recon/ ./skills/pentest-recon/
+COPY pentest-exploit/ ./skills/pentest-exploit/
+COPY pentest-credentials/ ./skills/pentest-credentials/
+COPY scan-pipelines/ ./skills/scan-pipelines/
+COPY burp-integration/ ./skills/burp-integration/
+COPY zap-integration/ ./skills/zap-integration/
+
+# Expose ports: built-in=9016-9023, third-party=9030-9039
+EXPOSE 9016 9017 9018 9019 9020 9021 9022 9023 9030 9031 9032 9033 9034 9035 9036 9037 9038 9039
+
+# Health check against sessions server (primary)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -sf -X POST http://localhost:9016/mcp \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json, text/event-stream" \
+        -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1.0.0"}}}' \
+        | grep -q '"protocolVersion"' || exit 1
+
+# Launch all category MCP servers
+CMD ["bash", "launch-mcp-servers.sh"]

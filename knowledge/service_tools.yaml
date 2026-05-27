@@ -1,0 +1,934 @@
+# Service Tool Recommendations Knowledge Base
+# Maps services/ports to recommended penetration testing tools
+# Used by scan-recommender to provide AI agents with tool recommendations
+
+services:
+  ssh:
+    ports: [22, 2222, 22222]
+    description: "Secure Shell - remote access protocol"
+    tools:
+      - name: nmap
+        purpose: banner grab & version detection
+        command: "nmap -sV -sC -p {port} {target}"
+      - name: ssh-audit
+        purpose: configuration and algorithm audit
+        command: "ssh-audit --no-colors {target}:{port}"
+      - name: hydra
+        purpose: brute force credentials
+        command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt ssh://{target}:{port}"
+      - name: medusa
+        purpose: parallel brute force
+        command: "medusa -h {target} -U /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt -M ssh"
+      - name: ncrack
+        purpose: network authentication cracker
+        command: "ncrack -p {port} --user root -P /usr/share/wordlists/rockyou.txt {target}"
+      - name: vulnx
+        purpose: CVE lookup by product and version
+        command: "vulnx search \"{product} {version}\" --json"
+    metasploit:
+      - module: auxiliary/scanner/ssh/ssh_version
+        purpose: SSH version detection
+      - module: auxiliary/scanner/ssh/ssh_login
+        purpose: SSH login brute force
+      - module: auxiliary/scanner/ssh/ssh_enumusers
+        purpose: SSH user enumeration
+      - module: auxiliary/scanner/ssh/ssh_login_pubkey
+        purpose: SSH public key authentication test
+    nuclei_tags: ["ssh", "network", "default-login", "cve"]
+    common_vulns:
+      - "CVE-2018-15473: OpenSSH User Enumeration (< 7.7)"
+      - "CVE-2016-0777: OpenSSH Roaming Bug"
+      - "CVE-2016-0778: OpenSSH Buffer Overflow"
+      - "Weak key exchange algorithms"
+      - "Weak ciphers (arcfour, 3des-cbc)"
+      - "Default/weak credentials"
+
+  http:
+    ports: [80, 8080, 8000, 8008, 3000, 5000, 8888, 9000]
+    description: "HTTP - Web server (unencrypted)"
+    tools:
+      - name: nikto
+        purpose: web vulnerability scanner
+        command: "nikto -h http://{target}:{port}"
+      - name: gobuster
+        purpose: directory and file bruteforce
+        command: "gobuster dir -u http://{target}:{port} -w /usr/share/wordlists/dirb/common.txt"
+      - name: feroxbuster
+        purpose: fast recursive content discovery
+        command: "feroxbuster -u http://{target}:{port} -w /usr/share/wordlists/dirb/common.txt"
+      - name: dirsearch
+        purpose: web path scanner
+        command: "dirsearch -u http://{target}:{port}"
+      - name: nuclei
+        purpose: template-based vulnerability scanning
+        command: "nuclei -u http://{target}:{port} -tags cve,misconfig,exposure"
+      - name: whatweb
+        purpose: technology fingerprinting
+        command: "whatweb http://{target}:{port}"
+      - name: wappalyzer
+        purpose: technology detection
+        command: "wappalyzer http://{target}:{port}"
+      - name: sqlmap
+        purpose: SQL injection testing
+        command: "sqlmap -u 'http://{target}:{port}/?id=1' --batch"
+      - name: wfuzz
+        purpose: web fuzzing
+        command: "wfuzz -c -z file,wordlist.txt http://{target}:{port}/FUZZ"
+      - name: ffuf
+        purpose: fast web fuzzer
+        command: "ffuf -u http://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/common.txt"
+      - name: curl
+        purpose: manual HTTP requests
+        command: "curl -v http://{target}:{port}/"
+      - name: vulnx
+        purpose: CVE lookup by product and version
+        command: "vulnx search \"{product} {version}\" --json"
+    metasploit:
+      - module: auxiliary/scanner/http/http_version
+        purpose: HTTP version detection
+      - module: auxiliary/scanner/http/dir_scanner
+        purpose: directory enumeration
+      - module: auxiliary/scanner/http/files_dir
+        purpose: interesting file scanner
+      - module: auxiliary/scanner/http/http_login
+        purpose: HTTP login brute force
+      - module: auxiliary/scanner/http/robots_txt
+        purpose: robots.txt parser
+    nuclei_tags: ["http", "cve", "misconfig", "exposure", "default-login", "tech", "xss", "sqli", "lfi", "rfi", "ssrf"]
+    common_vulns:
+      - "Directory traversal / LFI"
+      - "SQL injection"
+      - "Cross-site scripting (XSS)"
+      - "Server-side request forgery (SSRF)"
+      - "Remote code execution"
+      - "Default credentials"
+      - "Information disclosure"
+
+  https:
+    ports: [443, 8443, 4443, 9443]
+    description: "HTTPS - Web server (TLS encrypted)"
+    tools:
+      - name: sslscan
+        purpose: SSL/TLS cipher enumeration
+        command: "sslscan {target}:{port}"
+      - name: testssl
+        purpose: comprehensive SSL/TLS testing
+        command: "testssl.sh {target}:{port}"
+      - name: sslyze
+        purpose: SSL configuration analyzer
+        command: "sslyze {target}:{port}"
+      - name: nikto
+        purpose: web vulnerability scanner
+        command: "nikto -h https://{target}:{port}"
+      - name: gobuster
+        purpose: directory bruteforce
+        command: "gobuster dir -u https://{target}:{port} -w /usr/share/wordlists/dirb/common.txt -k"
+      - name: nuclei
+        purpose: template-based vulnerability scanning
+        command: "nuclei -u https://{target}:{port} -tags cve,misconfig,exposure,ssl"
+      - name: vulnx
+        purpose: CVE lookup by product and version
+        command: "vulnx search \"{product} {version}\" --json"
+    metasploit:
+      - module: auxiliary/scanner/http/http_version
+        purpose: HTTPS version detection
+      - module: auxiliary/scanner/http/ssl_version
+        purpose: SSL/TLS version detection
+      - module: auxiliary/scanner/http/cert
+        purpose: SSL certificate information
+    nuclei_tags: ["ssl", "tls", "https", "cve", "misconfig", "certificate"]
+    common_vulns:
+      - "Heartbleed (CVE-2014-0160)"
+      - "POODLE (CVE-2014-3566)"
+      - "BEAST attack"
+      - "CRIME attack"
+      - "Weak ciphers"
+      - "Expired certificates"
+      - "Self-signed certificates"
+
+  ftp:
+    ports: [21, 2121]
+    description: "FTP - File Transfer Protocol"
+    tools:
+      - name: nmap
+        purpose: FTP enumeration scripts
+        command: "nmap -sV -sC -p {port} --script=ftp-* {target}"
+      - name: hydra
+        purpose: brute force FTP credentials
+        command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt ftp://{target}:{port}"
+      - name: ftp
+        purpose: manual connection test
+        command: "ftp {target} {port}"
+      - name: lftp
+        purpose: advanced FTP client
+        command: "lftp -u anonymous, ftp://{target}:{port}"
+      - name: vulnx
+        purpose: CVE lookup by product and version
+        command: "vulnx search \"{product} {version}\" --json"
+    metasploit:
+      - module: auxiliary/scanner/ftp/ftp_version
+        purpose: FTP version detection
+      - module: auxiliary/scanner/ftp/ftp_login
+        purpose: FTP login brute force
+      - module: auxiliary/scanner/ftp/anonymous
+        purpose: anonymous FTP access check
+      - module: exploit/unix/ftp/vsftpd_234_backdoor
+        purpose: vsftpd 2.3.4 backdoor
+      - module: exploit/unix/ftp/proftpd_133c_backdoor
+        purpose: ProFTPD 1.3.3c backdoor
+    nuclei_tags: ["ftp", "network", "default-login", "cve"]
+    common_vulns:
+      - "Anonymous FTP access"
+      - "vsftpd 2.3.4 backdoor"
+      - "ProFTPD vulnerabilities"
+      - "Cleartext credentials"
+      - "Directory traversal"
+
+  mysql:
+    ports: [3306, 33060]
+    description: "MySQL/MariaDB - Database server"
+    tools:
+      - name: nmap
+        purpose: MySQL enumeration
+        command: "nmap -sV -sC -p {port} --script=mysql-* {target}"
+      - name: mysql
+        purpose: direct connection
+        command: "mysql -h {target} -P {port} -u root"
+      - name: hydra
+        purpose: brute force credentials
+        command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt mysql://{target}:{port}"
+      - name: mysqltuner
+        purpose: security audit
+        command: "mysqltuner --host {target} --port {port}"
+      - name: vulnx
+        purpose: CVE lookup by product and version
+        command: "vulnx search \"{product} {version}\" --json"
+    metasploit:
+      - module: auxiliary/scanner/mysql/mysql_version
+        purpose: MySQL version detection
+      - module: auxiliary/scanner/mysql/mysql_login
+        purpose: MySQL login brute force
+      - module: auxiliary/admin/mysql/mysql_enum
+        purpose: MySQL enumeration
+      - module: auxiliary/scanner/mysql/mysql_hashdump
+        purpose: MySQL hash dump
+      - module: exploit/multi/mysql/mysql_udf_payload
+        purpose: MySQL UDF code execution
+    nuclei_tags: ["mysql", "database", "default-login", "cve"]
+    common_vulns:
+      - "Empty root password"
+      - "Remote root login"
+      - "UDF privilege escalation"
+      - "SQL injection"
+      - "CVE-2012-2122: Authentication bypass"
+
+  postgresql:
+    ports: [5432, 5433]
+    description: "PostgreSQL - Database server"
+    tools:
+      - name: nmap
+        purpose: PostgreSQL enumeration
+        command: "nmap -sV -sC -p {port} --script=pgsql-* {target}"
+      - name: psql
+        purpose: direct connection
+        command: "psql -h {target} -p {port} -U postgres"
+      - name: hydra
+        purpose: brute force credentials
+        command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt postgres://{target}:{port}"
+      - name: vulnx
+        purpose: CVE lookup by product and version
+        command: "vulnx search \"{product} {version}\" --json"
+    metasploit:
+      - module: auxiliary/scanner/postgres/postgres_version
+        purpose: PostgreSQL version detection
+      - module: auxiliary/scanner/postgres/postgres_login
+        purpose: PostgreSQL login brute force
+      - module: auxiliary/admin/postgres/postgres_sql
+        purpose: PostgreSQL SQL execution
+      - module: exploit/linux/postgres/postgres_payload
+        purpose: PostgreSQL code execution
+    nuclei_tags: ["postgresql", "postgres", "database", "default-login", "cve"]
+    common_vulns:
+      - "Trust authentication"
+      - "Default postgres user"
+      - "COPY TO/FROM PROGRAM RCE"
+      - "Large object abuse"
+
+  mssql:
+    ports: [1433, 1434]
+    description: "Microsoft SQL Server - Database"
+    tools:
+      - name: nmap
+        purpose: MSSQL enumeration
+        command: "nmap -sV -sC -p {port} --script=ms-sql-* {target}"
+      - name: sqsh
+        purpose: SQL client
+        command: "sqsh -S {target}:{port} -U sa"
+      - name: impacket-mssqlclient
+        purpose: Python MSSQL client
+        command: "impacket-mssqlclient sa@{target} -port {port}"
+      - name: hydra
+        purpose: brute force credentials
+        command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt mssql://{target}:{port}"
+    metasploit:
+      - module: auxiliary/scanner/mssql/mssql_ping
+        purpose: MSSQL discovery
+      - module: auxiliary/scanner/mssql/mssql_login
+        purpose: MSSQL login brute force
+      - module: auxiliary/admin/mssql/mssql_enum
+        purpose: MSSQL enumeration
+      - module: exploit/windows/mssql/mssql_payload
+        purpose: MSSQL code execution
+      - module: auxiliary/admin/mssql/mssql_exec
+        purpose: xp_cmdshell execution
+    nuclei_tags: ["mssql", "database", "default-login", "cve"]
+    common_vulns:
+      - "xp_cmdshell enabled"
+      - "Weak sa password"
+      - "SQL injection"
+      - "Linked server abuse"
+
+  smb:
+    ports: [445, 139]
+    description: "SMB/CIFS - Windows/Linux file sharing and Samba"
+    tools:
+      - name: nmap
+        purpose: SMB enumeration
+        command: "nmap -sV -sC -p {port} --script=smb-* {target}"
+      - name: nmap-smb-vuln
+        purpose: SMB vulnerability scan (includes CVE-2007-2447)
+        command: "nmap -p 139,445 --script=smb-vuln-*,smb-enum-shares,smb-enum-users {target}"
+      - name: smbclient
+        purpose: SMB client
+        command: "smbclient -L //{target}/ -N"
+      - name: smbmap
+        purpose: SMB share enumeration
+        command: "smbmap -H {target}"
+      - name: enum4linux
+        purpose: SMB/NetBIOS enumeration
+        command: "enum4linux -a {target}"
+      - name: enum4linux-ng
+        purpose: modern SMB enumeration
+        command: "enum4linux-ng -A {target}"
+      - name: crackmapexec
+        purpose: SMB authentication and enumeration
+        command: "crackmapexec smb {target} -u '' -p '' --shares"
+      - name: impacket-smbclient
+        purpose: Python SMB client
+        command: "impacket-smbclient {target}"
+      - name: vulnx
+        purpose: CVE lookup by product and version
+        command: "vulnx search \"{product} {version}\" --json"
+    metasploit:
+      - module: auxiliary/scanner/smb/smb_version
+        purpose: SMB version detection
+      - module: auxiliary/scanner/smb/smb_enumshares
+        purpose: SMB share enumeration
+      - module: auxiliary/scanner/smb/smb_enumusers
+        purpose: SMB user enumeration
+      - module: auxiliary/scanner/smb/smb_login
+        purpose: SMB login brute force
+      - module: exploit/multi/samba/usermap_script
+        purpose: "Samba username map script RCE (CVE-2007-2447) - CRITICAL for Samba 3.0.20-3.0.25rc3"
+      - module: exploit/windows/smb/ms17_010_eternalblue
+        purpose: EternalBlue (MS17-010)
+      - module: exploit/windows/smb/ms08_067_netapi
+        purpose: MS08-067 NetAPI
+      - module: exploit/linux/samba/is_known_pipename
+        purpose: Samba CVE-2017-7494 SambaCry
+    nuclei_tags: ["smb", "cifs", "network", "cve", "default-login", "samba"]
+    common_vulns:
+      - "CVE-2007-2447: Samba username map script command injection (Samba 3.0.20-3.0.25rc3)"
+      - "MS17-010 EternalBlue"
+      - "MS08-067 NetAPI"
+      - "CVE-2017-7494 SambaCry"
+      - "Null session"
+      - "Anonymous access"
+      - "Writable shares"
+      - "SMB signing disabled"
+
+  rdp:
+    ports: [3389]
+    description: "RDP - Remote Desktop Protocol"
+    tools:
+      - name: nmap
+        purpose: RDP enumeration
+        command: "nmap -sV -sC -p {port} --script=rdp-* {target}"
+      - name: xfreerdp
+        purpose: RDP client
+        command: "xfreerdp /v:{target}:{port} /u:administrator"
+      - name: rdesktop
+        purpose: RDP client
+        command: "rdesktop {target}:{port}"
+      - name: hydra
+        purpose: brute force credentials
+        command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt rdp://{target}:{port}"
+      - name: crowbar
+        purpose: RDP brute force
+        command: "crowbar -b rdp -s {target}/32 -u admin -C /usr/share/wordlists/rockyou.txt"
+      - name: vulnx
+        purpose: CVE lookup by product and version
+        command: "vulnx search \"{product} {version}\" --json"
+    metasploit:
+      - module: auxiliary/scanner/rdp/rdp_scanner
+        purpose: RDP service detection
+      - module: auxiliary/scanner/rdp/cve_2019_0708_bluekeep
+        purpose: BlueKeep vulnerability check
+      - module: exploit/windows/rdp/cve_2019_0708_bluekeep_rce
+        purpose: BlueKeep RCE
+    nuclei_tags: ["rdp", "network", "cve", "windows"]
+    common_vulns:
+      - "CVE-2019-0708 BlueKeep"
+      - "CVE-2019-1181/1182 DejaBlue"
+      - "Weak credentials"
+      - "NLA disabled"
+
+  telnet:
+    ports: [23, 2323]
+    description: "Telnet - Unencrypted remote access"
+    tools:
+      - name: nmap
+        purpose: Telnet enumeration
+        command: "nmap -sV -sC -p {port} --script=telnet-* {target}"
+      - name: telnet
+        purpose: manual connection
+        command: "telnet {target} {port}"
+      - name: hydra
+        purpose: brute force credentials
+        command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt telnet://{target}:{port}"
+      - name: vulnx
+        purpose: CVE lookup by product and version
+        command: "vulnx search \"{product} {version}\" --json"
+    metasploit:
+      - module: auxiliary/scanner/telnet/telnet_version
+        purpose: Telnet version detection
+      - module: auxiliary/scanner/telnet/telnet_login
+        purpose: Telnet login brute force
+    nuclei_tags: ["telnet", "network", "default-login"]
+    common_vulns:
+      - "Cleartext credentials"
+      - "Default credentials"
+      - "Banner information disclosure"
+
+  smtp:
+    ports: [25, 465, 587]
+    description: "SMTP - Email server"
+    tools:
+      - name: nmap
+        purpose: SMTP enumeration
+        command: "nmap -sV -sC -p {port} --script=smtp-* {target}"
+      - name: smtp-user-enum
+        purpose: user enumeration
+        command: "smtp-user-enum -M VRFY -U /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -t {target} -p {port}"
+      - name: swaks
+        purpose: SMTP testing tool
+        command: "swaks --to test@{target} --server {target}:{port}"
+      - name: vulnx
+        purpose: CVE lookup by product and version
+        command: "vulnx search \"{product} {version}\" --json"
+    metasploit:
+      - module: auxiliary/scanner/smtp/smtp_version
+        purpose: SMTP version detection
+      - module: auxiliary/scanner/smtp/smtp_enum
+        purpose: SMTP user enumeration
+      - module: auxiliary/scanner/smtp/smtp_relay
+        purpose: SMTP relay check
+    nuclei_tags: ["smtp", "mail", "network", "cve"]
+    common_vulns:
+      - "Open relay"
+      - "User enumeration via VRFY/EXPN"
+      - "STARTTLS downgrade"
+
+  dns:
+    ports: [53]
+    description: "DNS - Domain Name System"
+    tools:
+      - name: nmap
+        purpose: DNS enumeration
+        command: "nmap -sV -sC -p {port} --script=dns-* {target}"
+      - name: dig
+        purpose: DNS queries
+        command: "dig @{target} -p {port} ANY example.com"
+      - name: dnsrecon
+        purpose: DNS reconnaissance
+        command: "dnsrecon -d example.com -n {target}"
+      - name: dnsenum
+        purpose: DNS enumeration
+        command: "dnsenum --dnsserver {target} example.com"
+    metasploit:
+      - module: auxiliary/scanner/dns/dns_amp
+        purpose: DNS amplification check
+      - module: auxiliary/gather/dns_bruteforce
+        purpose: DNS subdomain brute force
+      - module: auxiliary/gather/dns_info
+        purpose: DNS information gathering
+    nuclei_tags: ["dns", "network", "cve"]
+    common_vulns:
+      - "Zone transfer allowed"
+      - "DNS cache poisoning"
+      - "DNS amplification"
+      - "BIND vulnerabilities"
+
+  subdomain_enum:
+    ports: []
+    description: "Subdomain Enumeration - passive and active subdomain discovery"
+    tools:
+      - name: subfinder
+        purpose: passive subdomain enumeration
+        command: "subfinder -d {target} -silent"
+      - name: dnsx
+        purpose: DNS resolution and enrichment
+        command: "dnsx -d {target} -a -aaaa -cname -mx -ns -silent"
+      - name: alterx
+        purpose: subdomain permutation wordlist generation
+        command: "alterx -d {target} -silent"
+    metasploit:
+      - module: auxiliary/gather/dns_bruteforce
+        purpose: DNS subdomain brute force
+    nuclei_tags: ["dns", "subdomain", "takeover"]
+    common_vulns:
+      - "Subdomain takeover (dangling CNAME)"
+      - "Exposed internal services on subdomains"
+      - "Information disclosure via DNS records"
+
+  ldap:
+    ports: [389, 636, 3268, 3269]
+    description: "LDAP - Lightweight Directory Access Protocol"
+    tools:
+      - name: nmap
+        purpose: LDAP enumeration
+        command: "nmap -sV -sC -p {port} --script=ldap-* {target}"
+      - name: ldapsearch
+        purpose: LDAP queries
+        command: "ldapsearch -x -H ldap://{target}:{port} -b 'dc=example,dc=com'"
+      - name: ldapdomaindump
+        purpose: domain dump
+        command: "ldapdomaindump -u 'domain\\user' -p password {target}"
+    metasploit:
+      - module: auxiliary/gather/ldap_query
+        purpose: LDAP queries
+      - module: auxiliary/scanner/ldap/ldap_search
+        purpose: LDAP enumeration
+    nuclei_tags: ["ldap", "network", "cve", "active-directory"]
+    common_vulns:
+      - "Anonymous bind allowed"
+      - "LDAP injection"
+      - "Information disclosure"
+
+  vnc:
+    ports: [5900, 5901, 5902, 5903]
+    description: "VNC - Virtual Network Computing"
+    tools:
+      - name: nmap
+        purpose: VNC enumeration
+        command: "nmap -sV -sC -p {port} --script=vnc-* {target}"
+      - name: vncviewer
+        purpose: VNC client
+        command: "vncviewer {target}:{port}"
+      - name: hydra
+        purpose: brute force credentials
+        command: "hydra -P /usr/share/wordlists/rockyou.txt vnc://{target}:{port}"
+    metasploit:
+      - module: auxiliary/scanner/vnc/vnc_none_auth
+        purpose: VNC no auth check
+      - module: auxiliary/scanner/vnc/vnc_login
+        purpose: VNC login brute force
+    nuclei_tags: ["vnc", "network", "default-login"]
+    common_vulns:
+      - "No authentication"
+      - "Weak passwords"
+      - "Authentication bypass"
+
+  redis:
+    ports: [6379]
+    description: "Redis - In-memory data store"
+    tools:
+      - name: nmap
+        purpose: Redis enumeration
+        command: "nmap -sV -sC -p {port} --script=redis-* {target}"
+      - name: redis-cli
+        purpose: Redis client
+        command: "redis-cli -h {target} -p {port}"
+    metasploit:
+      - module: auxiliary/scanner/redis/redis_server
+        purpose: Redis detection
+      - module: auxiliary/scanner/redis/file_upload
+        purpose: Redis file upload
+      - module: exploit/linux/redis/redis_replication_cmd_exec
+        purpose: Redis RCE via replication
+    nuclei_tags: ["redis", "database", "cve", "misconfig"]
+    common_vulns:
+      - "No authentication"
+      - "Arbitrary file write"
+      - "RCE via replication"
+      - "CONFIG command abuse"
+
+  mongodb:
+    ports: [27017, 27018, 27019]
+    description: "MongoDB - NoSQL database"
+    tools:
+      - name: nmap
+        purpose: MongoDB enumeration
+        command: "nmap -sV -sC -p {port} --script=mongodb-* {target}"
+      - name: mongosh
+        purpose: MongoDB shell
+        command: "mongosh --host {target} --port {port}"
+    metasploit:
+      - module: auxiliary/scanner/mongodb/mongodb_login
+        purpose: MongoDB authentication
+      - module: auxiliary/gather/mongodb_js_inject_collection_enum
+        purpose: MongoDB enumeration
+    nuclei_tags: ["mongodb", "database", "cve", "misconfig"]
+    common_vulns:
+      - "No authentication"
+      - "Default credentials"
+      - "JavaScript injection"
+      - "Exposed management interface"
+
+  snmp:
+    ports: [161, 162]
+    description: "SNMP - Simple Network Management Protocol"
+    tools:
+      - name: nmap
+        purpose: SNMP enumeration
+        command: "nmap -sU -sV -p {port} --script=snmp-* {target}"
+      - name: snmpwalk
+        purpose: SNMP enumeration
+        command: "snmpwalk -v2c -c public {target}"
+      - name: onesixtyone
+        purpose: SNMP scanner
+        command: "onesixtyone -c community.txt {target}"
+      - name: snmp-check
+        purpose: SNMP enumeration
+        command: "snmp-check {target}"
+    metasploit:
+      - module: auxiliary/scanner/snmp/snmp_enum
+        purpose: SNMP enumeration
+      - module: auxiliary/scanner/snmp/snmp_login
+        purpose: SNMP community string brute force
+    nuclei_tags: ["snmp", "network", "udp", "misconfig"]
+    common_vulns:
+      - "Default community strings"
+      - "SNMPv1/v2c (no encryption)"
+      - "Write community string"
+      - "Information disclosure"
+
+  nfs:
+    ports: [2049, 111]
+    description: "NFS - Network File System"
+    tools:
+      - name: nmap
+        purpose: NFS enumeration
+        command: "nmap -sV -sC -p {port} --script=nfs-* {target}"
+      - name: showmount
+        purpose: list NFS exports
+        command: "showmount -e {target}"
+      - name: rpcinfo
+        purpose: RPC enumeration
+        command: "rpcinfo -p {target}"
+    metasploit:
+      - module: auxiliary/scanner/nfs/nfsmount
+        purpose: NFS mount enumeration
+    nuclei_tags: ["nfs", "network", "misconfig"]
+    common_vulns:
+      - "World-readable exports"
+      - "No root squash"
+      - "Writable shares"
+
+  kerberos:
+    ports: [88]
+    description: "Kerberos - Authentication protocol"
+    tools:
+      - name: nmap
+        purpose: Kerberos enumeration
+        command: "nmap -sV -sC -p {port} --script=krb5-* {target}"
+      - name: kerbrute
+        purpose: Kerberos user enumeration
+        command: "kerbrute userenum -d domain.local /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt --dc {target}"
+      - name: impacket-GetNPUsers
+        purpose: AS-REP roasting
+        command: "impacket-GetNPUsers domain.local/ -usersfile /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -dc-ip {target}"
+      - name: impacket-GetUserSPNs
+        purpose: Kerberoasting
+        command: "impacket-GetUserSPNs domain.local/user:pass -dc-ip {target}"
+    metasploit:
+      - module: auxiliary/gather/kerberos_enumusers
+        purpose: Kerberos user enumeration
+    nuclei_tags: ["kerberos", "active-directory", "network"]
+    common_vulns:
+      - "AS-REP roasting"
+      - "Kerberoasting"
+      - "Pass-the-ticket"
+      - "Golden ticket"
+
+  winrm:
+    ports: [5985, 5986]
+    description: "WinRM - Windows Remote Management"
+    tools:
+      - name: nmap
+        purpose: WinRM detection
+        command: "nmap -sV -sC -p {port} {target}"
+      - name: evil-winrm
+        purpose: WinRM shell
+        command: "evil-winrm -i {target} -u user -p password"
+      - name: crackmapexec
+        purpose: WinRM enumeration
+        command: "crackmapexec winrm {target} -u user -p password"
+    metasploit:
+      - module: auxiliary/scanner/winrm/winrm_login
+        purpose: WinRM login
+      - module: auxiliary/scanner/winrm/winrm_auth_methods
+        purpose: WinRM auth methods
+    nuclei_tags: ["winrm", "windows", "network"]
+    common_vulns:
+      - "Weak credentials"
+      - "HTTP (not HTTPS)"
+      - "Certificate issues"
+
+  docker:
+    ports: [2375, 2376]
+    description: "Docker - Container management API"
+    tools:
+      - name: nmap
+        purpose: Docker API detection
+        command: "nmap -sV -p {port} {target}"
+      - name: docker
+        purpose: Docker client
+        command: "docker -H tcp://{target}:{port} ps"
+      - name: curl
+        purpose: Docker API
+        command: "curl http://{target}:{port}/containers/json"
+    metasploit:
+      - module: exploit/linux/http/docker_daemon_tcp
+        purpose: Docker daemon exploit
+    nuclei_tags: ["docker", "api", "misconfig"]
+    common_vulns:
+      - "Unauthenticated API"
+      - "Container escape"
+      - "Privileged containers"
+
+  kubernetes:
+    ports: [6443, 8443, 10250, 10255]
+    description: "Kubernetes - Container orchestration"
+    tools:
+      - name: kubectl
+        purpose: Kubernetes client
+        command: "kubectl --server=https://{target}:{port} get pods"
+      - name: kube-hunter
+        purpose: Kubernetes security scanner
+        command: "kube-hunter --remote {target}"
+      - name: curl
+        purpose: API access
+        command: "curl -k https://{target}:{port}/api"
+    nuclei_tags: ["kubernetes", "k8s", "api", "misconfig"]
+    common_vulns:
+      - "Anonymous authentication"
+      - "Exposed kubelet"
+      - "RBAC misconfig"
+      - "etcd exposure"
+
+  # High-value ports often missed by 1-1000 scans
+  java-rmi:
+    ports: [1099]
+    description: "Java RMI Registry - Remote Method Invocation"
+    tools:
+      - name: nmap
+        purpose: RMI enumeration
+        command: "nmap -sV -p {port} --script=rmi-* {target}"
+      - name: rmg
+        purpose: Java RMI enumeration
+        command: "rmg enum {target} {port}"
+    metasploit:
+      - module: exploit/multi/misc/java_rmi_server
+        purpose: "Java RMI Server Insecure Default Configuration RCE"
+      - module: auxiliary/scanner/misc/java_rmi_server
+        purpose: Java RMI server detection
+      - module: auxiliary/gather/java_rmi_registry
+        purpose: Java RMI registry enumeration
+    nuclei_tags: ["rmi", "java", "network", "cve"]
+    common_vulns:
+      - "CVE-2011-3556: Java RMI Registry RCE"
+      - "Insecure deserialization"
+      - "Remote code execution"
+
+  distcc:
+    ports: [3632]
+    description: "DISTCC - Distributed Compiler Service"
+    tools:
+      - name: nmap
+        purpose: DISTCC enumeration
+        command: "nmap -sV -p {port} --script=distcc-* {target}"
+    metasploit:
+      - module: exploit/unix/misc/distcc_exec
+        purpose: "DISTCC Daemon Command Execution (CVE-2004-2687)"
+    nuclei_tags: ["distcc", "network", "cve"]
+    common_vulns:
+      - "CVE-2004-2687: DISTCC Daemon unauthenticated RCE"
+
+  irc:
+    ports: [6667, 6697, 6660, 6661, 6662, 6663, 6664, 6665, 6666, 6668, 6669]
+    description: "IRC - Internet Relay Chat"
+    tools:
+      - name: nmap
+        purpose: IRC enumeration
+        command: "nmap -sV -p {port} --script=irc-* {target}"
+      - name: irssi
+        purpose: IRC client connection
+        command: "irssi -c {target} -p {port}"
+    metasploit:
+      - module: exploit/unix/irc/unreal_ircd_3281_backdoor
+        purpose: "UnrealIRCd 3.2.8.1 Backdoor (CVE-2010-2075)"
+    nuclei_tags: ["irc", "network", "cve", "backdoor"]
+    common_vulns:
+      - "CVE-2010-2075: UnrealIRCd 3.2.8.1 backdoor command execution"
+      - "Information disclosure via WHOIS/VERSION"
+
+  tomcat:
+    ports: [8180, 8080, 8443, 8009]
+    description: "Apache Tomcat - Java application server"
+    tools:
+      - name: nmap
+        purpose: Tomcat enumeration
+        command: "nmap -sV -p {port} --script=http-tomcat-* {target}"
+      - name: curl
+        purpose: Test manager access
+        command: "curl -u tomcat:tomcat http://{target}:{port}/manager/html"
+      - name: nuclei
+        purpose: Tomcat vulnerability scan
+        command: "nuclei -u http://{target}:{port} -tags tomcat"
+    metasploit:
+      - module: exploit/multi/http/tomcat_mgr_deploy
+        purpose: "Tomcat Manager Application Deploy RCE"
+      - module: exploit/multi/http/tomcat_mgr_upload
+        purpose: "Tomcat Manager Application Upload RCE"
+      - module: auxiliary/scanner/http/tomcat_mgr_login
+        purpose: Tomcat manager credential brute force
+      - module: auxiliary/admin/http/tomcat_ghostcat
+        purpose: "Ghostcat AJP file read (CVE-2020-1938)"
+    nuclei_tags: ["tomcat", "java", "cve", "default-login"]
+    common_vulns:
+      - "CVE-2009-3548: Tomcat manager default credentials"
+      - "CVE-2020-1938: Ghostcat AJP file read/RCE"
+      - "Default credentials (tomcat:tomcat, admin:admin)"
+      - "WAR file upload RCE"
+
+  bindshell:
+    ports: [1524, 4444, 5555, 6666]
+    description: "Bind Shell / Backdoor - Direct shell access"
+    tools:
+      - name: netcat
+        purpose: Connect to bindshell
+        command: "nc -v {target} {port}"
+      - name: nmap
+        purpose: Banner grab
+        command: "nmap -sV -p {port} {target}"
+    metasploit: []
+    nuclei_tags: ["backdoor", "network"]
+    common_vulns:
+      - "Direct root/system shell access"
+      - "Backdoor installed by previous compromise"
+      - "Ingreslock backdoor (port 1524)"
+
+  rservices:
+    ports: [512, 513, 514]
+    description: "R-Services - rexec, rlogin, rsh (legacy remote access)"
+    tools:
+      - name: nmap
+        purpose: R-services enumeration
+        command: "nmap -sV -p 512,513,514 {target}"
+      - name: rlogin
+        purpose: Remote login
+        command: "rlogin -l root {target}"
+      - name: rsh
+        purpose: Remote shell
+        command: "rsh {target}"
+    metasploit:
+      - module: auxiliary/scanner/rservices/rexec_login
+        purpose: rexec login brute force
+      - module: auxiliary/scanner/rservices/rlogin_login
+        purpose: rlogin login brute force
+      - module: auxiliary/scanner/rservices/rsh_login
+        purpose: rsh login check
+    nuclei_tags: ["rservices", "network", "legacy"]
+    common_vulns:
+      - "Cleartext authentication"
+      - "Trust-based authentication (.rhosts)"
+      - "Default/weak credentials"
+
+  drb:
+    ports: [8787]
+    description: "DRb - Distributed Ruby"
+    tools:
+      - name: nmap
+        purpose: DRb detection
+        command: "nmap -sV -p {port} {target}"
+    metasploit:
+      - module: exploit/linux/misc/drb_remote_codeexec
+        purpose: "DRb Remote Code Execution"
+    nuclei_tags: ["ruby", "drb", "network"]
+    common_vulns:
+      - "Remote code execution via insecure DRb service"
+
+  ajp:
+    ports: [8009]
+    description: "AJP - Apache JServ Protocol (Tomcat connector)"
+    tools:
+      - name: nmap
+        purpose: AJP detection
+        command: "nmap -sV -p {port} {target}"
+      - name: ajpycat
+        purpose: AJP exploitation tool
+        command: "python3 ajpycat.py {target} {port}"
+    metasploit:
+      - module: auxiliary/admin/http/tomcat_ghostcat
+        purpose: "Ghostcat file read/RCE (CVE-2020-1938)"
+    nuclei_tags: ["ajp", "tomcat", "cve"]
+    common_vulns:
+      - "CVE-2020-1938: Ghostcat - arbitrary file read, potential RCE"
+
+# Port-only mappings for common ports where service is unknown
+port_hints:
+  22: ssh
+  23: telnet
+  25: smtp
+  53: dns
+  80: http
+  110: pop3
+  111: rpc
+  135: msrpc
+  139: netbios
+  143: imap
+  161: snmp
+  389: ldap
+  443: https
+  445: smb
+  465: smtp
+  512: rservices
+  513: rservices
+  514: rservices
+  587: smtp
+  636: ldap
+  993: imap
+  995: pop3
+  1099: java-rmi
+  1433: mssql
+  1434: mssql
+  1524: bindshell
+  2049: nfs
+  3306: mysql
+  3389: rdp
+  3632: distcc
+  5432: postgresql
+  5900: vnc
+  5901: vnc
+  5985: winrm
+  5986: winrm
+  6379: redis
+  6667: irc
+  6697: irc
+  8009: ajp
+  8080: http
+  8180: tomcat
+  8443: https
+  8787: drb
+  27017: mongodb

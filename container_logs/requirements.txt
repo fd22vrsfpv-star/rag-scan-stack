@@ -1,0 +1,4 @@
+fastapi
+uvicorn
+docker
+psycopg2-binary

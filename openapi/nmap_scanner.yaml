@@ -1,0 +1,21 @@
+openapi: 3.0.3
+info:
+  title: Nmap Scanner
+  version: "0.0.1"
+servers:
+  - url: http://localhost:7080/nmap
+  - url: https://localhost:7443/nmap
+tags:
+  - name: Health
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: nmapHealth
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example: { status: "ok" }

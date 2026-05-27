@@ -1,0 +1,120 @@
+<?xml version="1.0" ?>
+<NessusClientData_v2>
+  <Report name="Test Scan" xmlns:cm="http://www.nessus.org/cm">
+    <ReportHost name="192.168.1.100">
+      <HostProperties>
+        <tag name="host-ip">192.168.1.100</tag>
+        <tag name="host-fqdn">web01.example.com</tag>
+        <tag name="operating-system">Linux Kernel 5.4 on Ubuntu 20.04</tag>
+        <tag name="HOST_START">Mon Mar 10 12:00:00 2025</tag>
+        <tag name="HOST_END">Mon Mar 10 12:15:00 2025</tag>
+      </HostProperties>
+
+      <!-- Critical: MS17-010 EternalBlue -->
+      <ReportItem port="445" svc_name="cifs" protocol="tcp"
+                  pluginID="97833" pluginName="MS17-010: Security Update for Microsoft SMB Server (4013389)"
+                  pluginFamily="Windows" severity="4">
+        <synopsis>The remote Windows host is affected by a remote code execution vulnerability.</synopsis>
+        <description>The remote Windows host is missing a security update. It is therefore affected by multiple remote code execution vulnerabilities in Microsoft SMB Server due to improper handling of certain requests.</description>
+        <solution>Apply the security update from Microsoft Security Bulletin MS17-010.</solution>
+        <plugin_output>
+The following SMB-related security updates are missing:
+  - KB4013389
+        </plugin_output>
+        <risk_factor>Critical</risk_factor>
+        <cvss3_base_score>9.8</cvss3_base_score>
+        <cvss_base_score>9.3</cvss_base_score>
+        <cve>CVE-2017-0143</cve>
+        <cve>CVE-2017-0144</cve>
+        <cwe>20</cwe>
+        <xref>MSFT:MS17-010</xref>
+        <see_also>https://docs.microsoft.com/en-us/security-updates/SecurityBulletins/2017/ms17-010</see_also>
+      </ReportItem>
+
+      <!-- High: Apache Struts RCE -->
+      <ReportItem port="8080" svc_name="www" protocol="tcp"
+                  pluginID="100895" pluginName="Apache Struts 2.x Remote Code Execution"
+                  pluginFamily="Web Servers" severity="3">
+        <synopsis>The remote web server hosts an application that is affected by a remote code execution vulnerability.</synopsis>
+        <description>The Apache Struts application on the remote host is affected by a remote code execution vulnerability due to improper handling of OGNL expressions.</description>
+        <solution>Upgrade Apache Struts to version 2.5.13 or later.</solution>
+        <plugin_output>
+Path: /struts2-showcase/
+Installed version: 2.5.10
+Fixed version: 2.5.13
+        </plugin_output>
+        <risk_factor>High</risk_factor>
+        <cvss3_base_score>7.5</cvss3_base_score>
+        <cvss_base_score>7.5</cvss_base_score>
+        <cve>CVE-2017-9805</cve>
+        <cwe>20</cwe>
+      </ReportItem>
+
+      <!-- Medium: SSL weak cipher -->
+      <ReportItem port="443" svc_name="www" protocol="tcp"
+                  pluginID="26928" pluginName="SSL Weak Cipher Suites Supported"
+                  pluginFamily="General" severity="2">
+        <synopsis>The remote service supports the use of weak SSL ciphers.</synopsis>
+        <description>The remote host supports the use of SSL ciphers that offer weak encryption. An attacker can exploit this to conduct man-in-the-middle attacks.</description>
+        <solution>Reconfigure the affected application to avoid use of weak ciphers.</solution>
+        <plugin_output>
+Here is the list of weak SSL ciphers supported:
+  Low Strength Ciphers (&lt; 56-bit key)
+    TLS_RSA_WITH_DES_CBC_SHA
+        </plugin_output>
+        <risk_factor>Medium</risk_factor>
+        <cvss3_base_score>5.3</cvss3_base_score>
+        <cvss_base_score>5.0</cvss_base_score>
+      </ReportItem>
+
+      <!-- Low: SSH weak algorithms -->
+      <ReportItem port="22" svc_name="ssh" protocol="tcp"
+                  pluginID="70658" pluginName="SSH Weak Algorithms Supported"
+                  pluginFamily="Misc." severity="1">
+        <synopsis>The remote SSH server supports weak encryption algorithms.</synopsis>
+        <description>The remote SSH server supports arcfour and other weak encryption algorithms.</description>
+        <solution>Disable weak encryption algorithms in the SSH server configuration.</solution>
+        <risk_factor>Low</risk_factor>
+        <cvss_base_score>2.6</cvss_base_score>
+      </ReportItem>
+
+      <!-- Info: OS identification (port 0) -->
+      <ReportItem port="0" svc_name="general" protocol="tcp"
+                  pluginID="11936" pluginName="OS Identification"
+                  pluginFamily="General" severity="0">
+        <synopsis>It was possible to identify the remote operating system.</synopsis>
+        <description>Using a combination of remote probes the remote operating system was identified.</description>
+        <solution>n/a</solution>
+        <plugin_output>
+Remote operating system : Linux Kernel 5.4 on Ubuntu 20.04
+Confidence Level : 95
+Method : SSH
+        </plugin_output>
+        <risk_factor>None</risk_factor>
+      </ReportItem>
+    </ReportHost>
+
+    <ReportHost name="192.168.1.200">
+      <HostProperties>
+        <tag name="host-ip">192.168.1.200</tag>
+        <tag name="host-fqdn">db01.example.com</tag>
+        <tag name="operating-system">Microsoft Windows Server 2019</tag>
+      </HostProperties>
+
+      <!-- High: SQL Server default creds -->
+      <ReportItem port="1433" svc_name="mssql" protocol="tcp"
+                  pluginID="10862" pluginName="Microsoft SQL Server Default Credentials"
+                  pluginFamily="Databases" severity="3">
+        <synopsis>The remote database server uses default credentials.</synopsis>
+        <description>It was possible to log into the remote MS SQL server with the 'sa' account using a default or empty password.</description>
+        <solution>Set a strong password for the 'sa' account.</solution>
+        <plugin_output>
+It was possible to login as 'sa' with an empty password.
+        </plugin_output>
+        <risk_factor>High</risk_factor>
+        <cvss3_base_score>8.1</cvss3_base_score>
+        <cvss_base_score>7.5</cvss_base_score>
+      </ReportItem>
+    </ReportHost>
+  </Report>
+</NessusClientData_v2>

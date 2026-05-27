@@ -1,0 +1,232 @@
+_format_version: "3.0"
+_transform: true
+
+services:
+  # -------- Swagger UI at / and /docs (no plugin) --------
+  - name: svc-swagger-ui
+    url: http://swagger-ui:8080
+    routes:
+      - name: r-swagger-docs
+        paths: ["/docs"]      # keep /docs working too
+        strip_path: false
+
+  # -------- Raw OpenAPI specs at /specs/* --------
+  - name: svc-specs
+    url: http://specs:80
+    routes:
+      - name: r-specs
+        paths: ["/specs"]
+        strip_path: false
+    plugins:
+      - name: cors
+        config:
+          origins: ["*"]
+          methods: ["GET","OPTIONS"]
+          headers: ["*"]
+          exposed_headers: ["*"]
+          max_age: 3600
+          credentials: false
+
+
+  # -------- Backends (inject x-api-key) --------
+  - name: svc-rag-api
+    url: https://rag-api:8000
+    routes:
+      - name: r-rag-api
+        paths: ["/rag-api"]
+        strip_path: true
+    plugins:
+      - name: request-transformer
+        config:
+          replace:
+            headers:
+              - "x-api-key: change-me"
+
+  - name: svc-llm-query
+    url: https://llm_query:8002
+    routes:
+      - name: r-llm-query
+        paths: ["/llm"]
+        strip_path: true
+    plugins:
+      - name: request-transformer
+        config:
+          replace:
+            headers:
+              - "x-api-key: change-me"
+
+  - name: svc-web-scanner
+    url: https://web-scanner:8010
+    routes:
+      - name: r-web-scanner
+        paths: ["/web"]
+        strip_path: true
+    plugins:
+      - name: request-transformer
+        config:
+          replace:
+            headers:
+              - "x-api-key: change-me"
+
+  - name: svc-nuclei-runner
+    url: https://nuclei-runner:8011
+    routes:
+      - name: r-nuclei-runner
+        paths: ["/nuclei"]
+        strip_path: true
+    plugins:
+      - name: request-transformer
+        config:
+          replace:
+            headers:
+              - "x-api-key: change-me"
+
+  - name: svc-nmap-scanner
+    url: https://nmap_scanner:8012
+    routes:
+      - name: r-nmap-scanner
+        paths: ["/nmap"]
+        strip_path: true
+    plugins:
+      - name: request-transformer
+        config:
+          replace:
+            headers:
+              - "x-api-key: change-me"
+
+  - name: svc-scan-recommender
+    url: https://scan-recommender:8013
+    routes:
+      - name: r-scan-recommender
+        paths: ["/scan"]
+        strip_path: true
+    plugins:
+      - name: request-transformer
+        config:
+          replace:
+            headers:
+              - "x-api-key: change-me"
+
+  - name: svc-playwright-scanner
+    url: https://playwright-scanner:8014
+    routes:
+      - name: r-playwright-scanner
+        paths: ["/playwright"]
+        strip_path: true
+    plugins:
+      - name: request-transformer
+        config:
+          replace:
+            headers:
+              - "x-api-key: change-me"
+
+  - name: svc-autogen-agents
+    url: https://autogen-agents:8015
+    routes:
+      - name: r-autogen-agents
+        paths: ["/agents"]
+        strip_path: true
+    plugins:
+      - name: request-transformer
+        config:
+          replace:
+            headers:
+              - "x-api-key: change-me"
+
+  # -------- Logs UI (direct pass-through, no strip) --------
+  - name: svc-logs-ui
+    url: https://autogen-agents:8015
+    routes:
+      - name: r-logs-ui
+        paths: ["/logs"]
+        strip_path: false
+
+  - name: svc-zap
+    url: http://zap:8090
+    routes:
+      - name: r-zap
+        paths: ["/zap"]
+        strip_path: true
+    plugins:
+      - name: request-transformer
+        config:
+          replace:
+            headers:
+              - "x-api-key: change-me"
+
+  - name: svc-ollama
+    url: http://ollama:11434
+    routes:
+      - name: r-ollama
+        paths: ["/ollama"]
+        strip_path: true
+    plugins:
+      - name: request-transformer
+        config:
+          replace:
+            headers:
+              - "x-api-key: change-me"
+
+  - name: svc-osint-runner
+    url: https://osint-runner:8024
+    routes:
+      - name: r-osint-runner
+        paths: ["/osint"]
+        strip_path: true
+    plugins:
+      - name: request-transformer
+        config:
+          replace:
+            headers:
+              - "x-api-key: change-me"
+
+  - name: svc-pd-runner
+    url: https://pd-runner:8023
+    routes:
+      - name: r-pd-runner
+        paths: ["/pd"]
+        strip_path: true
+    plugins:
+      - name: request-transformer
+        config:
+          replace:
+            headers:
+              - "x-api-key: change-me"
+
+  - name: svc-brutus-runner
+    url: https://brutus-runner:8025
+    routes:
+      - name: r-brutus-runner
+        paths: ["/brutus"]
+        strip_path: true
+    plugins:
+      - name: request-transformer
+        config:
+          replace:
+            headers:
+              - "x-api-key: change-me"
+
+  # ---- Root redirect to Open WebUI ----
+  - name: svc-root-redirect
+    url: http://127.0.0.1:9     # dummy; never used
+    routes:
+      - name: r-root
+        paths: [ "/" ]
+        strip_path: false
+    plugins:
+      - name: pre-function
+        config:
+          access:
+            - |
+              local target = "http://localhost:3000/"
+              kong.response.set_header("Location", target)
+              return kong.response.exit(302)
+
+  - name: svc-n8n
+    url: http://n8n:5678
+    routes:
+        - name: r-n8n
+          paths: ["/n8n"]
+          strip_path: true
+
+

@@ -1,0 +1,43 @@
+services:
+  n8n:
+    image: n8nio/n8n:1.82.1
+    container_name: agent-n8n
+      #user: "${UID}:${GID}"
+    ports:
+      - "5678:5678"
+    environment:
+      TZ: America/New_York
+      # auth / security
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: "admin"
+      N8N_BASIC_AUTH_PASSWORD: "change-me"
+      N8N_ENCRYPTION_KEY: "1234567890abcdef1234567890abcdef"  # ← keep the exact same key you used before
+
+      # postgres (now external)
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: rag-postgres          # ← was "postgres"; use the DB container name on agents_net
+      DB_POSTGRESDB_PORT: "5432"
+      DB_POSTGRESDB_DATABASE: n8n               # or n8n_db (match whatever you created)
+      DB_POSTGRESDB_USER: n8n                   # or n8n_user
+      DB_POSTGRESDB_PASSWORD: pgpass            # or your new password
+
+      # misc (same as before)
+      N8N_DEFAULT_BINARY_DATA_MODE: filesystem
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+      N8N_HIRING_BANNER_ENABLED: "false"
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+
+    volumes:
+      - ./.n8n:/home/node/.n8n
+
+    networks:
+      - agents_net
+    # Do NOT include depends_on here (DB is in another project).
+    # Also do NOT set custom command/entrypoint; use image defaults.
+
+networks:
+  agents_net:
+    external: true
+

@@ -1,0 +1,30 @@
+# FastAPI and server
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# Playwright for browser automation
+playwright==1.40.0
+
+# Database
+psycopg2-binary==2.9.9
+
+# HTTP client for ZAP API
+requests==2.31.0
+httpx>=0.25.0
+python-owasp-zap-v2.4==0.0.21
+
+# Utilities
+python-dateutil==2.8.2
+pydantic==2.5.0
+
+# Image processing for screenshots
+Pillow==10.1.0
+
+# HTML parsing
+beautifulsoup4==4.12.2
+lxml==4.9.3
+
+# Security analysis
+tld==0.13
+validators==0.22.0

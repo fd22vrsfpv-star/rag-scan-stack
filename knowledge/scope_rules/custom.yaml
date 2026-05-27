@@ -1,0 +1,30 @@
+# Custom scope classification rules
+#
+# Replace the examples below with your engagement's actual scope rules.
+# Two rule_types are supported:
+#   - domain_pattern: matches hostnames against a glob (e.g. "*.example.com")
+#   - whois_org:     matches the whois_org field with an operator
+#
+# Set auto_apply: true to let recon assign matches without operator review.
+
+- id: example_primary
+  name: "Example customer primary domains"
+  scope_name: customer_general
+  rule_type: domain_pattern
+  priority: 5
+  enabled: false
+  auto_apply: false
+  conditions:
+    pattern: "*.example.com"
+
+- id: example_whois
+  name: "Example customer WHOIS org"
+  scope_name: customer_general
+  rule_type: whois_org
+  priority: 10
+  enabled: false
+  auto_apply: false
+  conditions:
+    field: whois_org
+    op: contains
+    value: "Example Corp"

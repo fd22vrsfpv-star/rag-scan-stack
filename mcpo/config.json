@@ -1,0 +1,40 @@
+{
+  "mcpServers": {
+    "sessions": {
+      "type": "streamable-http",
+      "url": "https://mcp-streamable:9016/mcp"
+    },
+    "scanning": {
+      "type": "streamable-http",
+      "url": "https://mcp-streamable:9017/mcp"
+    },
+    "recon": {
+      "type": "streamable-http",
+      "url": "https://mcp-streamable:9018/mcp"
+    },
+    "exploit": {
+      "type": "streamable-http",
+      "url": "https://mcp-streamable:9019/mcp"
+    },
+    "credentials": {
+      "type": "streamable-http",
+      "url": "https://mcp-streamable:9020/mcp"
+    },
+    "pipelines": {
+      "type": "streamable-http",
+      "url": "https://mcp-streamable:9021/mcp"
+    },
+    "burp": {
+      "type": "streamable-http",
+      "url": "https://mcp-streamable:9022/mcp"
+    },
+    "zap": {
+      "type": "streamable-http",
+      "url": "https://mcp-streamable:9023/mcp"
+    },
+    "mcp-everything": {
+      "type": "streamable-http",
+      "url": "https://mcp-streamable:9030/mcp"
+    }
+  }
+}

@@ -1,0 +1,42 @@
+[Unit]
+Description=Tunnel Manager - SSH and WireGuard tunnel management
+Documentation=https://github.com/your-org/rag-scan-stack
+After=network-online.target postgresql.service
+Wants=network-online.target
+ConditionPathExists=/etc/tunnel-manager/config.yaml
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/bin/tunnel-manager --config=/etc/tunnel-manager/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+StartLimitInterval=0
+
+# Resource limits
+MemoryMax=256M
+CPUQuota=50%
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/etc/tunnel-manager /var/lib/tunnel-manager /tmp /var/log
+
+# Network capabilities for tunnel management
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+
+# Environment
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+Environment=HOME=/var/lib/tunnel-manager
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tunnel-manager
+
+[Install]
+WantedBy=multi-user.target

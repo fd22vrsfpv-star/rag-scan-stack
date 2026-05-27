@@ -1,0 +1,425 @@
+{
+  "name": "Import & Duplicate Prompt Instructions + Burp Export",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [200, 340]
+    },
+    {
+      "parameters": {
+        "path": "prompts",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-in",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [200, 540],
+      "webhookId": "prompt-mgmt"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://autogen-agents:8015/config/prompts/active",
+        "options": {
+          "response": {
+            "responseFormat": "json"
+          }
+        }
+      },
+      "id": "fetch-active",
+      "name": "Fetch Active Prompts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 340]
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={{ JSON.stringify({ name: 'imported-' + new Date().toISOString().slice(0,10) + '-' + Math.random().toString(36).slice(2,6), description: 'Imported from ' + ($json.source || 'defaults') + ' — ' + ($json.name || 'built-in') + ' on ' + new Date().toISOString(), prompts: $json.prompts }) }}",
+        "options": {}
+      },
+      "id": "build-create",
+      "name": "Build Create Body",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [700, 340]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://autogen-agents:8015/config/prompts",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ name: $json.name, description: $json.description, prompts: $json.prompts, is_active: false }) }}",
+        "options": {
+          "response": {
+            "responseFormat": "json"
+          }
+        }
+      },
+      "id": "save-copy",
+      "name": "Save as New Config",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [940, 240]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'http://autogen-agents:8015/config/prompts/' + $json.id + '/duplicate' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ new_name: $json.name + '-copy-' + Math.random().toString(36).slice(2,6) }) }}",
+        "options": {
+          "response": {
+            "responseFormat": "json"
+          }
+        }
+      },
+      "id": "duplicate",
+      "name": "Duplicate Config",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [940, 440]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://autogen-agents:8015/config/prompts",
+        "options": {
+          "response": {
+            "responseFormat": "json"
+          }
+        }
+      },
+      "id": "list-all",
+      "name": "List All Configs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1180, 340]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://rag-api:8000/export/burp",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "changeme"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "responseFormat": "text"
+          },
+          "fullResponse": true
+        }
+      },
+      "id": "burp-export",
+      "name": "Export Burp Sitemap",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1180, 600]
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={{ JSON.stringify({ burp_xml_length: ($json.body || '').length, content_type: 'application/xml', filename: 'burp_sitemap_export.xml', xml_preview: ($json.body || '').substring(0, 500) }) }}",
+        "options": {}
+      },
+      "id": "parse-burp",
+      "name": "Parse Burp Response",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1420, 600]
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={{ JSON.stringify({ status: 'ok', saved: $('Save as New Config').first().json, duplicated: $('Duplicate Config').first().json, all_configs: $('List All Configs').first().json.configs, burp_export: { xml_length: $('Parse Burp Response').first().json.burp_xml_length, filename: 'burp_sitemap_export.xml' } }) }}",
+        "options": {}
+      },
+      "id": "merge-results",
+      "name": "Merge Results",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1660, 340]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'ok', saved: $('Save as New Config').first().json, duplicated: $('Duplicate Config').first().json, all_configs: $('List All Configs').first().json.configs, burp_export: { xml_length: $('Parse Burp Response').first().json.burp_xml_length, filename: 'burp_sitemap_export.xml' } }) }}"
+      },
+      "id": "respond-webhook",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1660, 540]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://rag-api:8000/export/burp",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "changeme"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "responseFormat": "file"
+          },
+          "fullResponse": false
+        }
+      },
+      "id": "burp-download",
+      "name": "Download Burp XML File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1660, 760]
+    },
+    {
+      "parameters": {
+        "path": "burp-export",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-burp",
+      "name": "Burp Export Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [200, 760],
+      "webhookId": "burp-export"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={{ JSON.stringify({ severity: ($json.query && $json.query.severity) || null, source: ($json.query && $json.query.source) || null, ip: ($json.query && $json.query.ip) || null, limit: ($json.query && $json.query.limit) || '1000' }) }}",
+        "options": {}
+      },
+      "id": "burp-params",
+      "name": "Build Burp Query Params",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [460, 760]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'http://rag-api:8000/export/burp' + (($json.severity || $json.ip || $json.source) ? '?' + [($json.severity ? 'severity=' + $json.severity : ''), ($json.ip ? 'ip=' + $json.ip : ''), ($json.source ? 'source=' + $json.source : ''), 'limit=' + ($json.limit || '1000')].filter(x => x).join('&') : '?limit=' + ($json.limit || '1000')) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "changeme"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "responseFormat": "text"
+          }
+        }
+      },
+      "id": "burp-fetch-filtered",
+      "name": "Fetch Burp Export (Filtered)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [700, 760]
+    },
+    {
+      "parameters": {
+        "respondWith": "binary",
+        "responseBody": "={{ $json.data }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/xml"
+              },
+              {
+                "name": "Content-Disposition",
+                "value": "attachment; filename=\"burp_sitemap_export.xml\""
+              }
+            ]
+          }
+        }
+      },
+      "id": "respond-burp",
+      "name": "Respond with Burp XML",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [940, 760]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Active Prompts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Active Prompts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Active Prompts": {
+      "main": [
+        [
+          {
+            "node": "Build Create Body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Create Body": {
+      "main": [
+        [
+          {
+            "node": "Save as New Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save as New Config": {
+      "main": [
+        [
+          {
+            "node": "Duplicate Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Duplicate Config": {
+      "main": [
+        [
+          {
+            "node": "List All Configs",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Export Burp Sitemap",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List All Configs": {
+      "main": [
+        [
+          {
+            "node": "Merge Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Export Burp Sitemap": {
+      "main": [
+        [
+          {
+            "node": "Parse Burp Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Burp Response": {
+      "main": [
+        [
+          {
+            "node": "Merge Results",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Burp Export Webhook": {
+      "main": [
+        [
+          {
+            "node": "Build Burp Query Params",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Burp Query Params": {
+      "main": [
+        [
+          {
+            "node": "Fetch Burp Export (Filtered)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Burp Export (Filtered)": {
+      "main": [
+        [
+          {
+            "node": "Respond with Burp XML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    {
+      "name": "prompt-management"
+    },
+    {
+      "name": "burp-export"
+    }
+  ]
+}

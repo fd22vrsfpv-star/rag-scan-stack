@@ -1,0 +1,1 @@
+docker exec -it rag-postgres psql -U app -d scans -c "SELECT host(a.ip) AS ip, p.proto, p.port, p.service, p.product, p.version, p.banner, p.last_seen FROM ports p JOIN assets a ON a.id=p.asset_id WHERE host(a.ip)='${IP}' AND COALESCE(p.is_open,true) ORDER BY p.port;"

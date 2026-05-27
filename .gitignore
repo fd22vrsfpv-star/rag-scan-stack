@@ -1,0 +1,182 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+
+# Environment & Secrets
+.env
+.venv
+.env.local
+
+# Prompt logs (local-only — may contain sensitive operator context)
+PROMPT_LOG.md
+Docs/PROMPT_LOG.md
+
+# Logs
+*.log
+autogen_logs/
+autogen_cache/
+
+# Scan Outputs
+nmap_out/
+web_reports/
+nuclei_reports/
+playwright_screenshots/
+playwright_reports/
+brutus_reports/
+pd_reports/
+scan_sessions/
+scan_results/
+
+# Ollama Models (large files - transfer separately)
+ollama-data/
+ollama-models*.tar.gz
+
+# Database
+*.sqlite
+*.sqlite-*
+n8n/.n8n/
+n8n/database.sqlite
+
+# IDE & Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude Code & MCP
+.claude/
+.mcp.json
+claude_desktop_config*.json
+
+# Windows WSL metadata
+*:Zone.Identifier
+
+# IDE artifacts
+*.iml
+
+# Temp & Test files
+*.tmp
+*.bak
+*.backup
+bs.out
+test_*.sh
+pytest.ini
+
+# Development
+requirements-dev.txt
+scripts/bs.sh
+scripts/run_me.sh
+scripts/runme.sh
+scripts/tables_dumped.txt
+
+# Import data (usually one-time use)
+imports/*.json
+
+# Exploit databases (cloned separately)
+exploitdb/
+
+# Metasploit data directory
+msf_data/
+
+# vLLM cache
+vllm-cache/
+
+# GRPO training artifacts
+grpo_trainer/datasets/
+grpo_trainer/checkpoints/
+reports/
+
+# Windows NUL device artifact
+Docs/NUL
+
+# Frontend build artifacts & dependencies
+dashboard/frontend/dist/
+dashboard/frontend/node_modules/
+dashboard/frontend/package-lock.json
+dashboard/frontend/tsconfig.tsbuildinfo
+
+# OSINT output & runner binaries
+osint_reports/
+osint_runner/bin/
+osint_runner/bin-*/
+pd_runner/bin/
+pd_runner/bin-*/
+pd_runner/tlsx
+
+# SSH keys (secrets)
+ssh-keys/
+
+# WireGuard keys and configs (secrets)
+wireguard/*.conf
+wireguard/*.key
+wireguard/wg_confs/
+wireguard/templates/
+wireguard/coredns/
+wireguard/db-config.json
+db-config.json
+!wireguard/.gitkeep
+
+# DB migration backups
+backups/
+
+# Swagger/OpenAPI imports (user-provided specs)
+import/swagger/
+
+# Presentation materials (conference-specific, not for distribution)
+Docs/presentation/
+Docs/eval-deck/
+Docs/screenshots/
+
+# Images anywhere under Docs/ — keep generated artifacts and dashboard
+# screenshots out of the repo. Diagrams that need to ship live in /assets/
+# or are referenced by absolute external URL.
+Docs/**/*.png
+Docs/**/*.jpg
+Docs/**/*.jpeg
+Docs/**/*.gif
+
+# Any directory literally named screenshots/ — catches future captures from
+# capture-screenshots.py / build-deck.py wherever they land.
+**/screenshots/
+
+# Root node_modules (from ad-hoc scripts)
+node_modules/
+package-lock.json
+
+# PEM keys
+*.pem
+
+# Vault data + init secrets (NEVER commit)
+vault/data/
+vault/logs/
+vault/init/init.json
+
+# ── Pre-public hardening ──────────────────────────────────────────────
+# These were committed before the pre-public review; keep them locally
+# but never let them reach a shared remote.
+
+# Backup variants of scan-output dirs (companion to osint_reports/, reports/)
+osint_reports_backup/
+reports_backup/
+screenshots_backup/
+
+# Audit log data — keep audit_writer.py tracked
+scan_audit/*.jsonl
+
+# TLS material — regenerate per-install via generate-credentials.sh
+certs/server.key
+certs/server.crt
+
+# WireGuard server install state (keys, peer confs, coredns)
+wireguard/server/
+
+# Operator notes / decision log — accumulates sensitive context
+Docs/Memories.md
+Docs/CHANGES_MADE.md

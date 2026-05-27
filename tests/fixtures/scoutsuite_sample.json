@@ -1,0 +1,53 @@
+{
+  "provider_name": "aws",
+  "services": {
+    "iam": {
+      "findings": {
+        "iam-root-account-no-mfa": {
+          "level": "danger",
+          "description": "Root account does not have MFA enabled",
+          "items": [
+            {"arn": "arn:aws:iam::123456789012:root", "id": "root", "name": "root"}
+          ]
+        },
+        "iam-user-no-mfa": {
+          "level": "warning",
+          "description": "IAM users without MFA",
+          "items": [
+            {"arn": "arn:aws:iam::123456789012:user/deploy-bot", "id": "deploy-bot", "name": "deploy-bot"},
+            {"arn": "arn:aws:iam::123456789012:user/dev-user", "id": "dev-user", "name": "dev-user"}
+          ]
+        }
+      }
+    },
+    "s3": {
+      "findings": {
+        "s3-bucket-public-read": {
+          "level": "danger",
+          "description": "S3 bucket allows public read access",
+          "items": [
+            {"arn": "arn:aws:s3:::public-assets-bucket", "name": "public-assets-bucket"}
+          ]
+        }
+      }
+    },
+    "ec2": {
+      "findings": {
+        "ec2-security-group-opens-all-ports": {
+          "level": "danger",
+          "description": "Security group opens all ports to 0.0.0.0/0",
+          "items": [
+            {"id": "sg-0abc123", "name": "launch-wizard-1"}
+          ]
+        },
+        "ec2-instance-in-public-subnet": {
+          "level": "info",
+          "description": "EC2 instance is in a public subnet",
+          "items": [
+            "i-0def456"
+          ]
+        }
+      }
+    }
+  }
+}

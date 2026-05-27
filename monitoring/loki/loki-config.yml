@@ -1,0 +1,180 @@
+# Loki Configuration
+# Log aggregation system for RAG Scan Stack
+#
+# This configuration sets up Loki for efficient log storage and querying.
+# Optimized for small to medium deployments (< 10GB/day of logs).
+#
+# Documentation: https://grafana.com/docs/loki/latest/configuration/
+# Version: 1.0
+# Last Updated: 2025-11-19
+
+# Disable authentication (protected by network)
+auth_enabled: false
+
+# Server configuration
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: info
+
+# Common configuration
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: inmemory
+
+# Query range configuration
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100
+
+# Schema configuration
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: boltdb-shipper
+      object_store: filesystem
+      schema: v11
+      index:
+        prefix: index_
+        period: 24h
+
+# Storage configuration
+storage_config:
+  boltdb_shipper:
+    active_index_directory: /loki/boltdb-shipper-active
+    cache_location: /loki/boltdb-shipper-cache
+    cache_ttl: 24h
+    shared_store: filesystem
+  filesystem:
+    directory: /loki/chunks
+
+# Compactor configuration (runs in same process)
+compactor:
+  working_directory: /loki/compactor
+  shared_store: filesystem
+  compaction_interval: 10m
+  retention_enabled: true
+  retention_delete_delay: 2h
+  retention_delete_worker_count: 150
+
+# Limits configuration
+limits_config:
+  # Retention period (30 days)
+  retention_period: 720h
+
+  # Reject old samples
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h  # 7 days
+
+  # Ingestion rate limits (per-tenant)
+  ingestion_rate_mb: 15
+  ingestion_burst_size_mb: 30
+
+  # Query limits
+  max_query_length: 721h  # Slightly more than retention
+  max_query_lookback: 0  # No limit
+  max_query_series: 500
+  max_streams_per_user: 0  # No limit
+  max_global_streams_per_user: 5000
+
+  # Per-query limits
+  max_entries_limit_per_query: 5000
+  max_chunks_per_query: 2000000
+
+  # Label limits
+  max_label_name_length: 1024
+  max_label_value_length: 2048
+  max_label_names_per_series: 30
+
+  # Line size limits
+  max_line_size: 256kb
+  max_line_size_truncate: false
+
+# Ruler configuration (for alerting)
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+  rule_path: /loki/rules-temp
+  alertmanager_url: http://alertmanager:9093
+  ring:
+    kvstore:
+      store: inmemory
+  enable_api: true
+  enable_alertmanager_v2: true
+
+# Table manager configuration
+table_manager:
+  retention_deletes_enabled: true
+  retention_period: 720h  # 30 days
+
+# Chunk store configuration
+chunk_store_config:
+  max_look_back_period: 0
+
+# Analytics (disable for privacy)
+analytics:
+  reporting_enabled: false
+
+# Notes:
+#
+# 1. Retention:
+#    - Default: 30 days (720 hours)
+#    - Adjust retention_period based on compliance requirements
+#    - Compactor automatically deletes old data
+#
+# 2. Performance Tuning:
+#    - ingestion_rate_mb: Increase for high log volume
+#    - max_query_series: Increase if queries return "too many series" errors
+#    - Adjust cache sizes based on available RAM
+#
+# 3. Storage:
+#    - Uses local filesystem storage
+#    - For production, consider S3-compatible object storage
+#    - Monitor disk space: /loki/chunks grows with log volume
+#
+# 4. Queries:
+#    - LogQL queries can filter by labels and regex
+#    - Example: {service="rag-api"} |= "error" | json
+#
+# 5. Labels:
+#    - Keep label cardinality low (< 100 unique values per label)
+#    - Good labels: service, environment, level
+#    - Bad labels: request_id, user_id, timestamp
+#
+# 6. Monitoring Loki:
+#    - Metrics: http://localhost:3100/metrics
+#    - Ready check: http://localhost:3100/ready
+#    - Health: http://localhost:3100/loki/api/v1/status/buildinfo
+#
+# 7. Troubleshooting:
+#    - Check logs: docker logs loki
+#    - Verify ingestion: curl http://localhost:3100/loki/api/v1/label
+#    - Query test: curl -G http://localhost:3100/loki/api/v1/query --data-urlencode 'query={job="docker"}'
+#
+# 8. Scaling Considerations:
+#    - Single node good for < 10GB/day
+#    - For more, use multiple ingesters and queriers
+#    - Use object storage (S3, GCS, Azure) for better durability
+#
+# 9. Security:
+#    - auth_enabled=false assumes network-level security
+#    - Enable auth in production with X-Scope-OrgID header
+#    - Use HTTPS with reverse proxy
+#
+# 10. Backup:
+#     - Backup /loki/boltdb-shipper-active for indices
+#     - Backup /loki/chunks for log data
+#     - Consider retention period vs backup frequency

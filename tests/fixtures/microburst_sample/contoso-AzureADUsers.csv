@@ -1,0 +1,4 @@
+DisplayName,UserPrincipalName,Mail,Id,AccountEnabled,UserType
+John Admin,john.admin@contoso.com,john.admin@contoso.com,11111111-aaaa-bbbb-cccc-222222222222,True,Member
+Jane Dev,jane.dev@contoso.com,jane.dev@contoso.com,33333333-aaaa-bbbb-cccc-444444444444,True,Member
+Guest User,guest_external.com#EXT#@contoso.onmicrosoft.com,,55555555-aaaa-bbbb-cccc-666666666666,False,Guest

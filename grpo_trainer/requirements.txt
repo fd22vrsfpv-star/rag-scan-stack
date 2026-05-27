@@ -1,0 +1,14 @@
+torch>=2.1.0
+transformers>=4.38.0
+trl>=0.8.0
+peft>=0.9.0
+bitsandbytes>=0.42.0
+accelerate>=0.27.0
+datasets>=2.17.0
+fastapi>=0.109.0
+uvicorn>=0.27.0
+psycopg2-binary>=2.9.9
+wandb>=0.16.0
+huggingface-hub>=0.21.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0

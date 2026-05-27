@@ -1,0 +1,21 @@
+  Recommended IAM policy — create a dedicated user with only EC2 permissions:
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": [
+          "ec2:RunInstances",
+          "ec2:TerminateInstances",
+          "ec2:DescribeInstances",
+          "ec2:DescribeKeyPairs",
+          "ec2:ImportKeyPair",
+          "ec2:CreateSecurityGroup",
+          "ec2:DescribeSecurityGroups",
+          "ec2:AuthorizeSecurityGroupIngress",
+          "ec2:CreateTags"
+        ],
+        "Resource": "*"
+      }
+    ]
+  }
