@@ -872,6 +872,24 @@ fi
 
 record_phase "Infrastructure: OK"
 
+# ── TLS certificates for inter-service communication ──────────────────────
+# Every uvicorn-based service mounts ./certs:/certs:ro and starts with
+# --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt. Without
+# these files the containers crash-loop on FileNotFoundError. Generate them
+# here (idempotent — generate-certs.sh skips if they already exist).
+if [ -f "scripts/generate-certs.sh" ]; then
+    log_info "Generating TLS certificates (certs/server.crt, certs/server.key)"
+    if bash scripts/generate-certs.sh >/dev/null 2>&1; then
+        log_ok "TLS certificates ready in certs/"
+    else
+        log_err "TLS certificate generation failed — services using /certs will crash-loop"
+        record_phase "TLS Certs: FAILED"
+        exit 1
+    fi
+else
+    log_warn "scripts/generate-certs.sh not found — skipping TLS cert generation"
+fi
+
 # ══════════════════════════════════════════════════════════════════════════
 #  PHASE 5 — Docker Build
 # ══════════════════════════════════════════════════════════════════════════
