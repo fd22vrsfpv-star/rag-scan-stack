@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  librechat:
+    image: ghcr.io/danny-avila/librechat:latest
+    container_name: librechat
+    ports:
+      - "3001:3080"
+    env_file:
+      - .env
+    volumes:
+      - librechat-data:/app/client/public/images
+      - librechat-logs:/app/api/logs
+      - ./librechat.yaml:/app/librechat.yaml:ro
+    depends_on:
+      - mongodb
+    networks:
+      - agents_net
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:7
+    container_name: librechat-mongodb
+    volumes:
+      - mongodb-data:/data/db
+    networks:
+      - agents_net
+    restart: unless-stopped
+
+volumes:
+  librechat-data:
+  librechat-logs:
+  mongodb-data:
+
+networks:
+  agents_net:
+    external: true

@@ -1,0 +1,37 @@
+# ZAP Add-ons to pre-install at build time
+# One add-on ID per line. Lines starting with # are comments.
+# Find IDs at: https://www.zaproxy.org/addons/
+
+# Active Scan Rules
+ascanrulesBeta
+ascanrulesAlpha
+
+# Passive Scan Rules
+pscanrulesBeta
+pscanrulesAlpha
+
+# Technology Detection
+wappalyzer
+
+# Vulnerable JS Libraries
+retire
+
+# DOM XSS Scanner
+domxss
+
+# API Testing
+openapi
+graphql
+soap
+
+# Authentication Helper
+authhelper
+
+# Ajax Spider (JS-heavy apps)
+spiderAjax
+
+# Automation Framework
+automation
+
+# Fuzzing
+fuzz

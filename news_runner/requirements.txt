@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+psycopg2-binary
+requests
+pydantic
+httpx
+feedparser>=6.0
+beautifulsoup4>=4.12

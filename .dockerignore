@@ -1,0 +1,52 @@
+# Large data directories
+ollama-data/
+vllm-cache/
+grpo_trainer/
+exploitdb/
+msf_data/
+nmap_out/
+nuclei_reports/
+web_reports/
+playwright_screenshots/
+playwright_reports/
+autogen_logs/
+autogen_cache/
+pd_reports/
+n8n/
+
+# Git
+.git/
+.github/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+venv/
+.venv/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Documentation (not needed in containers)
+*.md
+docs/
+
+# Test files
+tests/
+
+# Misc
+.dockerignore
+*.log
+*.bak

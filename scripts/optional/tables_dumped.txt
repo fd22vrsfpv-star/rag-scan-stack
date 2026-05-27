@@ -1,0 +1,6106 @@
+########################     app ####################
+--
+-- PostgreSQL database cluster dump
+--
+
+\restrict FAj3W02MqzRHecHsbokFGzPmsL8yZKXbFQclwrE5HVxJtLmg0Xq9whtUaMlkU4H
+
+SET default_transaction_read_only = off;
+
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+
+--
+-- Roles
+--
+
+CREATE ROLE app;
+ALTER ROLE app WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN REPLICATION BYPASSRLS PASSWORD 'SCRAM-SHA-256$4096:q2VM1dQPbMNB/M0HImvbJg==$3wrVRRUzxF4soa43LAKod4Szu+JH282MVZpbffoMNIs=:+DCf+cF0or2GVaCqYsuyimhpj4ycDFNhP5i2HpSuZvE=';
+CREATE ROLE edb_owner;
+ALTER ROLE edb_owner WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS PASSWORD 'SCRAM-SHA-256$4096:h1fCnZpaTX9Z22TlaSVVEQ==$a8DoboSHji6L5TF3w6JWB3qNpNDFyPZxODOVlmaN5ak=:NKiEiMeWwlSkcWgDpU4e5WjJRUCYVuasy+VGWXiq03A=';
+CREATE ROLE edb_ro;
+ALTER ROLE edb_ro WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS PASSWORD 'SCRAM-SHA-256$4096:tQeaxIGJ9f3XBSBazrzshg==$fEoAwsEgRivYZx59IO/OFEa8aUUxwhCmOjJUdtsCUX4=:ludz7bl5L3MpjF++nnVvvtNHcxWXXaG1hJQ6NoZVRpA=';
+CREATE ROLE edb_rw;
+ALTER ROLE edb_rw WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS PASSWORD 'SCRAM-SHA-256$4096:gWLdIO9xN5ENcePH3pcK6A==$1swQxwIbnnFHrPGwbYagJ2m1boFL/vatM4T7bOow0NU=:IWWRu92i60SzABkumRm5IWD0HlgiKM5Y3BfKOsg02ms=';
+CREATE ROLE exploit;
+ALTER ROLE exploit WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN NOREPLICATION NOBYPASSRLS PASSWORD 'SCRAM-SHA-256$4096:zP7+EouRiyY181W3NsbmRg==$uzR3r7tcO9jsb0gsufZpSeKi2FHmxD/jgnTktTJHkWA=:uPGiTwaIuTbEwCgFVIlZri8sp4yrkJlAxr6TETCl2uc=';
+CREATE ROLE n8n;
+ALTER ROLE n8n WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS PASSWORD 'SCRAM-SHA-256$4096:zUus23ed+hX2qpthAQBtPg==$Lln4+MCSpIhoxS6P7iszRl9M/MsrWDp1fvZ1UIZ4Mck=:nxDN/66Wy/wwy/HI7B+zM2OjXGrWX4a0RgYID7Qh/no=';
+
+--
+-- User Configurations
+--
+
+--
+-- User Config "n8n"
+--
+
+ALTER ROLE n8n SET search_path TO 'n8n', 'public';
+
+
+
+
+
+
+\unrestrict FAj3W02MqzRHecHsbokFGzPmsL8yZKXbFQclwrE5HVxJtLmg0Xq9whtUaMlkU4H
+
+--
+-- Databases
+--
+
+--
+-- Database "template1" dump
+--
+
+\connect template1
+
+--
+-- PostgreSQL database dump
+--
+
+\restrict wlMy0NeDXQ6ifdmeO89Yu7hEztsgZP3pSjrkE10TuXkLnA33Fs7DnYjFayiEEYm
+
+-- Dumped from database version 16.10 (Debian 16.10-1.pgdg12+1)
+-- Dumped by pg_dump version 16.10 (Ubuntu 16.10-0ubuntu0.24.04.1)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- PostgreSQL database dump complete
+--
+
+\unrestrict wlMy0NeDXQ6ifdmeO89Yu7hEztsgZP3pSjrkE10TuXkLnA33Fs7DnYjFayiEEYm
+
+--
+-- Database "exploitdb" dump
+--
+
+--
+-- PostgreSQL database dump
+--
+
+\restrict aDJEQ7kZ66bp6uNKpP6Zm3d1sN52mq6pjehtdbgr8INgmVlZUo7MG4yUAHBSXKf
+
+-- Dumped from database version 16.10 (Debian 16.10-1.pgdg12+1)
+-- Dumped by pg_dump version 16.10 (Ubuntu 16.10-0ubuntu0.24.04.1)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: exploitdb; Type: DATABASE; Schema: -; Owner: -
+--
+
+CREATE DATABASE exploitdb WITH TEMPLATE = template0 ENCODING = 'UTF8' LOCALE_PROVIDER = libc LOCALE = 'en_US.utf8';
+
+
+\unrestrict aDJEQ7kZ66bp6uNKpP6Zm3d1sN52mq6pjehtdbgr8INgmVlZUo7MG4yUAHBSXKf
+\connect exploitdb
+\restrict aDJEQ7kZ66bp6uNKpP6Zm3d1sN52mq6pjehtdbgr8INgmVlZUo7MG4yUAHBSXKf
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- PostgreSQL database dump complete
+--
+
+\unrestrict aDJEQ7kZ66bp6uNKpP6Zm3d1sN52mq6pjehtdbgr8INgmVlZUo7MG4yUAHBSXKf
+
+--
+-- Database "n8n" dump
+--
+
+--
+-- PostgreSQL database dump
+--
+
+\restrict wwvkcFX9ody0TX4G7Fdfv8nOzowejWxEVkhkPc8SAzziF0DUmUopfhW7Gk4ArH1
+
+-- Dumped from database version 16.10 (Debian 16.10-1.pgdg12+1)
+-- Dumped by pg_dump version 16.10 (Ubuntu 16.10-0ubuntu0.24.04.1)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: n8n; Type: DATABASE; Schema: -; Owner: -
+--
+
+CREATE DATABASE n8n WITH TEMPLATE = template0 ENCODING = 'UTF8' LOCALE_PROVIDER = libc LOCALE = 'en_US.utf8';
+
+
+\unrestrict wwvkcFX9ody0TX4G7Fdfv8nOzowejWxEVkhkPc8SAzziF0DUmUopfhW7Gk4ArH1
+\connect n8n
+\restrict wwvkcFX9ody0TX4G7Fdfv8nOzowejWxEVkhkPc8SAzziF0DUmUopfhW7Gk4ArH1
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: n8n; Type: DATABASE PROPERTIES; Schema: -; Owner: -
+--
+
+ALTER DATABASE n8n SET search_path TO 'public';
+
+
+\unrestrict wwvkcFX9ody0TX4G7Fdfv8nOzowejWxEVkhkPc8SAzziF0DUmUopfhW7Gk4ArH1
+\connect n8n
+\restrict wwvkcFX9ody0TX4G7Fdfv8nOzowejWxEVkhkPc8SAzziF0DUmUopfhW7Gk4ArH1
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: n8n; Type: SCHEMA; Schema: -; Owner: -
+--
+
+CREATE SCHEMA n8n;
+
+
+--
+-- Name: public; Type: SCHEMA; Schema: -; Owner: -
+--
+
+-- *not* creating schema, since initdb creates it
+
+
+--
+-- Name: uuid-ossp; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION "uuid-ossp"; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION "uuid-ossp" IS 'generate universally unique identifiers (UUIDs)';
+
+
+--
+-- Name: vector; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION vector; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION vector IS 'vector data type and ivfflat and hnsw access methods';
+
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: analytics_by_period; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.analytics_by_period (
+    id integer NOT NULL,
+    "metaId" integer NOT NULL,
+    type integer NOT NULL,
+    value integer NOT NULL,
+    "periodUnit" integer NOT NULL,
+    "periodStart" timestamp(0) without time zone
+);
+
+
+--
+-- Name: COLUMN analytics_by_period.type; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.analytics_by_period.type IS '0: time_saved_minutes, 1: runtime_milliseconds, 2: success, 3: failure';
+
+
+--
+-- Name: COLUMN analytics_by_period."periodUnit"; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.analytics_by_period."periodUnit" IS '0: hour, 1: day, 2: week';
+
+
+--
+-- Name: analytics_by_period_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.analytics_by_period ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME public.analytics_by_period_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
+-- Name: analytics_metadata; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.analytics_metadata (
+    "metaId" integer NOT NULL,
+    "workflowId" character varying(16),
+    "projectId" character varying(36),
+    "workflowName" character varying(128) NOT NULL,
+    "projectName" character varying(255) NOT NULL
+);
+
+
+--
+-- Name: analytics_metadata_metaId_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.analytics_metadata ALTER COLUMN "metaId" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME public."analytics_metadata_metaId_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
+-- Name: analytics_raw; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.analytics_raw (
+    id integer NOT NULL,
+    "metaId" integer NOT NULL,
+    type integer NOT NULL,
+    value integer NOT NULL,
+    "timestamp" timestamp(0) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+
+--
+-- Name: COLUMN analytics_raw.type; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.analytics_raw.type IS '0: time_saved_minutes, 1: runtime_milliseconds, 2: success, 3: failure';
+
+
+--
+-- Name: analytics_raw_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.analytics_raw ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME public.analytics_raw_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
+-- Name: annotation_tag_entity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.annotation_tag_entity (
+    id character varying(16) NOT NULL,
+    name character varying(24) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: assets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.assets (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    ip inet,
+    hostname text,
+    env text,
+    tags text[] DEFAULT '{}'::text[],
+    first_seen timestamp with time zone DEFAULT now(),
+    last_seen timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: auth_identity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.auth_identity (
+    "userId" uuid,
+    "providerId" character varying(64) NOT NULL,
+    "providerType" character varying(32) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: auth_provider_sync_history; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.auth_provider_sync_history (
+    id integer NOT NULL,
+    "providerType" character varying(32) NOT NULL,
+    "runMode" text NOT NULL,
+    status text NOT NULL,
+    "startedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    "endedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    scanned integer NOT NULL,
+    created integer NOT NULL,
+    updated integer NOT NULL,
+    disabled integer NOT NULL,
+    error text
+);
+
+
+--
+-- Name: auth_provider_sync_history_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.auth_provider_sync_history_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: auth_provider_sync_history_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.auth_provider_sync_history_id_seq OWNED BY public.auth_provider_sync_history.id;
+
+
+--
+-- Name: credentials_entity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.credentials_entity (
+    name character varying(128) NOT NULL,
+    data text NOT NULL,
+    type character varying(128) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    id character varying(36) NOT NULL,
+    "isManaged" boolean DEFAULT false NOT NULL
+);
+
+
+--
+-- Name: event_destinations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.event_destinations (
+    id uuid NOT NULL,
+    destination jsonb NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: execution_annotation_tags; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.execution_annotation_tags (
+    "annotationId" integer NOT NULL,
+    "tagId" character varying(24) NOT NULL
+);
+
+
+--
+-- Name: execution_annotations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.execution_annotations (
+    id integer NOT NULL,
+    "executionId" integer NOT NULL,
+    vote character varying(6),
+    note text,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: execution_annotations_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.execution_annotations_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: execution_annotations_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.execution_annotations_id_seq OWNED BY public.execution_annotations.id;
+
+
+--
+-- Name: execution_data; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.execution_data (
+    "executionId" integer NOT NULL,
+    "workflowData" json NOT NULL,
+    data text NOT NULL
+);
+
+
+--
+-- Name: execution_entity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.execution_entity (
+    id integer NOT NULL,
+    finished boolean NOT NULL,
+    mode character varying NOT NULL,
+    "retryOf" character varying,
+    "retrySuccessId" character varying,
+    "startedAt" timestamp(3) with time zone,
+    "stoppedAt" timestamp(3) with time zone,
+    "waitTill" timestamp(3) with time zone,
+    status character varying NOT NULL,
+    "workflowId" character varying(36) NOT NULL,
+    "deletedAt" timestamp(3) with time zone,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: execution_entity_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.execution_entity_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: execution_entity_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.execution_entity_id_seq OWNED BY public.execution_entity.id;
+
+
+--
+-- Name: execution_metadata; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.execution_metadata (
+    id integer NOT NULL,
+    "executionId" integer NOT NULL,
+    key character varying(255) NOT NULL,
+    value text NOT NULL
+);
+
+
+--
+-- Name: execution_metadata_temp_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.execution_metadata_temp_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: execution_metadata_temp_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.execution_metadata_temp_id_seq OWNED BY public.execution_metadata.id;
+
+
+--
+-- Name: findings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.findings (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    asset_id uuid,
+    port_id uuid,
+    source_tool text,
+    rule_id text,
+    title text,
+    description text,
+    evidence jsonb DEFAULT '{}'::jsonb,
+    cve text[],
+    cvss numeric,
+    severity text,
+    observed_at timestamp with time zone DEFAULT now(),
+    status text DEFAULT 'open'::text,
+    CONSTRAINT findings_severity_check CHECK ((severity = ANY (ARRAY['info'::text, 'low'::text, 'medium'::text, 'high'::text, 'critical'::text]))),
+    CONSTRAINT findings_status_check CHECK ((status = ANY (ARRAY['open'::text, 'accepted'::text, 'fixed'::text, 'retest-passed'::text, 'retest-failed'::text])))
+);
+
+
+--
+-- Name: folder; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.folder (
+    id character varying(36) NOT NULL,
+    name character varying(128) NOT NULL,
+    "parentFolderId" character varying(36),
+    "projectId" character varying(36) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: folder_tag; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.folder_tag (
+    "folderId" character varying(36) NOT NULL,
+    "tagId" character varying(36) NOT NULL
+);
+
+
+--
+-- Name: installed_nodes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.installed_nodes (
+    name character varying(200) NOT NULL,
+    type character varying(200) NOT NULL,
+    "latestVersion" integer DEFAULT 1 NOT NULL,
+    package character varying(241) NOT NULL
+);
+
+
+--
+-- Name: installed_packages; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.installed_packages (
+    "packageName" character varying(214) NOT NULL,
+    "installedVersion" character varying(50) NOT NULL,
+    "authorName" character varying(70),
+    "authorEmail" character varying(70),
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: invalid_auth_token; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.invalid_auth_token (
+    token character varying(512) NOT NULL,
+    "expiresAt" timestamp(3) with time zone NOT NULL
+);
+
+
+--
+-- Name: migrations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.migrations (
+    id integer NOT NULL,
+    "timestamp" bigint NOT NULL,
+    name character varying NOT NULL
+);
+
+
+--
+-- Name: migrations_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.migrations_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: migrations_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.migrations_id_seq OWNED BY public.migrations.id;
+
+
+--
+-- Name: ports; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ports (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    asset_id uuid NOT NULL,
+    proto text,
+    port integer NOT NULL,
+    service text,
+    product text,
+    version text,
+    banner text,
+    first_seen timestamp with time zone DEFAULT now(),
+    last_seen timestamp with time zone DEFAULT now(),
+    is_open boolean DEFAULT true NOT NULL,
+    CONSTRAINT ports_port_check CHECK (((port >= 1) AND (port <= 65535))),
+    CONSTRAINT ports_proto_check CHECK ((proto = ANY (ARRAY['tcp'::text, 'udp'::text])))
+);
+
+
+--
+-- Name: processed_data; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.processed_data (
+    "workflowId" character varying(36) NOT NULL,
+    context character varying(255) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    value text NOT NULL
+);
+
+
+--
+-- Name: project; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.project (
+    id character varying(36) NOT NULL,
+    name character varying(255) NOT NULL,
+    type character varying(36) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    icon json
+);
+
+
+--
+-- Name: project_relation; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.project_relation (
+    "projectId" character varying(36) NOT NULL,
+    "userId" uuid NOT NULL,
+    role character varying NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: rag_documents; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.rag_documents (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    asset_id uuid,
+    finding_id uuid,
+    port_id uuid,
+    scan_id uuid,
+    title text,
+    text_chunk text NOT NULL,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    embedding public.vector(384),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    fts tsvector GENERATED ALWAYS AS (to_tsvector('english'::regconfig, ((COALESCE(title, ''::text) || ' '::text) || text_chunk))) STORED
+);
+
+
+--
+-- Name: rag_recent_high; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.rag_recent_high AS
+ SELECT title,
+    text_chunk,
+    metadata,
+    created_at
+   FROM public.rag_documents
+  WHERE (((metadata ->> 'severity'::text) = ANY (ARRAY['high'::text, 'critical'::text])) AND (created_at >= (now() - '30 days'::interval)));
+
+
+--
+-- Name: role; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.role (
+    id integer NOT NULL,
+    name character varying(32) NOT NULL,
+    scope character varying(255) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: role_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.role_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: role_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.role_id_seq OWNED BY public.role.id;
+
+
+--
+-- Name: scan_ports; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.scan_ports (
+    scan_id uuid NOT NULL,
+    port_id uuid NOT NULL
+);
+
+
+--
+-- Name: scans; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.scans (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    tool text,
+    profile text,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    finished_at timestamp with time zone,
+    args text,
+    source_path text,
+    metadata jsonb DEFAULT '{}'::jsonb
+);
+
+
+--
+-- Name: settings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.settings (
+    key character varying(255) NOT NULL,
+    value text NOT NULL,
+    "loadOnStartup" boolean DEFAULT false NOT NULL
+);
+
+
+--
+-- Name: shared_credentials; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.shared_credentials (
+    "credentialsId" character varying(36) NOT NULL,
+    "projectId" character varying(36) NOT NULL,
+    role text NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: shared_workflow; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.shared_workflow (
+    "workflowId" character varying(36) NOT NULL,
+    "projectId" character varying(36) NOT NULL,
+    role text NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: tag_entity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tag_entity (
+    name character varying(24) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    id character varying(36) NOT NULL
+);
+
+
+--
+-- Name: test_case_execution; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.test_case_execution (
+    id character varying(36) NOT NULL,
+    "testRunId" character varying(36) NOT NULL,
+    "pastExecutionId" integer,
+    "executionId" integer,
+    "evaluationExecutionId" integer,
+    status character varying NOT NULL,
+    "runAt" timestamp(3) with time zone,
+    "completedAt" timestamp(3) with time zone,
+    "errorCode" character varying,
+    "errorDetails" json,
+    metrics json,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: test_definition; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.test_definition (
+    name character varying(255) NOT NULL,
+    "workflowId" character varying(36) NOT NULL,
+    "evaluationWorkflowId" character varying(36),
+    "annotationTagId" character varying(16),
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    description text,
+    id character varying(36) NOT NULL,
+    "mockedNodes" json DEFAULT '[]'::json NOT NULL
+);
+
+
+--
+-- Name: test_metric; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.test_metric (
+    id character varying(36) NOT NULL,
+    name character varying(255) NOT NULL,
+    "testDefinitionId" character varying(36) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: test_run; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.test_run (
+    id character varying(36) NOT NULL,
+    "testDefinitionId" character varying(36) NOT NULL,
+    status character varying NOT NULL,
+    "runAt" timestamp(3) with time zone,
+    "completedAt" timestamp(3) with time zone,
+    metrics json,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "totalCases" integer,
+    "passedCases" integer,
+    "failedCases" integer,
+    "errorCode" character varying(255),
+    "errorDetails" text,
+    CONSTRAINT test_run_check CHECK (
+CASE
+    WHEN ((status)::text = 'new'::text) THEN ("totalCases" IS NULL)
+    WHEN ((status)::text = ANY ((ARRAY['cancelled'::character varying, 'error'::character varying])::text[])) THEN (("totalCases" IS NULL) OR ("totalCases" >= 0))
+    ELSE ("totalCases" >= 0)
+END),
+    CONSTRAINT test_run_check1 CHECK (
+CASE
+    WHEN ((status)::text = 'new'::text) THEN ("passedCases" IS NULL)
+    WHEN ((status)::text = ANY ((ARRAY['cancelled'::character varying, 'error'::character varying])::text[])) THEN (("passedCases" IS NULL) OR ("passedCases" >= 0))
+    ELSE ("passedCases" >= 0)
+END),
+    CONSTRAINT test_run_check2 CHECK (
+CASE
+    WHEN ((status)::text = 'new'::text) THEN ("failedCases" IS NULL)
+    WHEN ((status)::text = ANY ((ARRAY['cancelled'::character varying, 'error'::character varying])::text[])) THEN (("failedCases" IS NULL) OR ("failedCases" >= 0))
+    ELSE ("failedCases" >= 0)
+END)
+);
+
+
+--
+-- Name: user; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public."user" (
+    id uuid DEFAULT uuid_in((OVERLAY(OVERLAY(md5((((random())::text || ':'::text) || (clock_timestamp())::text)) PLACING '4'::text FROM 13) PLACING to_hex((floor(((random() * (((11 - 8) + 1))::double precision) + (8)::double precision)))::integer) FROM 17))::cstring) NOT NULL,
+    email character varying(255),
+    "firstName" character varying(32),
+    "lastName" character varying(32),
+    password character varying(255),
+    "personalizationAnswers" json,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    settings json,
+    disabled boolean DEFAULT false NOT NULL,
+    "mfaEnabled" boolean DEFAULT false NOT NULL,
+    "mfaSecret" text,
+    "mfaRecoveryCodes" text,
+    role text NOT NULL
+);
+
+
+--
+-- Name: user_api_keys; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_api_keys (
+    id character varying(36) NOT NULL,
+    "userId" uuid NOT NULL,
+    label character varying(100) NOT NULL,
+    "apiKey" character varying NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: variables; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.variables (
+    key character varying(50) NOT NULL,
+    type character varying(50) DEFAULT 'string'::character varying NOT NULL,
+    value character varying(255),
+    id character varying(36) NOT NULL
+);
+
+
+--
+-- Name: web_findings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.web_findings (
+    id uuid NOT NULL,
+    asset_id uuid,
+    url text NOT NULL,
+    source text NOT NULL,
+    issue_type text,
+    name text,
+    severity text,
+    evidence text,
+    status_code integer,
+    first_seen timestamp with time zone DEFAULT now(),
+    last_seen timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: webhook_entity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.webhook_entity (
+    "webhookPath" character varying NOT NULL,
+    method character varying NOT NULL,
+    node character varying NOT NULL,
+    "webhookId" character varying,
+    "pathLength" integer,
+    "workflowId" character varying(36) NOT NULL
+);
+
+
+--
+-- Name: workflow_entity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.workflow_entity (
+    name character varying(128) NOT NULL,
+    active boolean NOT NULL,
+    nodes json NOT NULL,
+    connections json NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    settings json,
+    "staticData" json,
+    "pinData" json,
+    "versionId" character(36),
+    "triggerCount" integer DEFAULT 0 NOT NULL,
+    id character varying(36) NOT NULL,
+    meta json,
+    "parentFolderId" character varying(36) DEFAULT NULL::character varying
+);
+
+
+--
+-- Name: workflow_history; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.workflow_history (
+    "versionId" character varying(36) NOT NULL,
+    "workflowId" character varying(36) NOT NULL,
+    authors character varying(255) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    nodes json NOT NULL,
+    connections json NOT NULL
+);
+
+
+--
+-- Name: workflow_statistics; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.workflow_statistics (
+    count integer DEFAULT 0,
+    "latestEvent" timestamp(3) with time zone,
+    name character varying(128) NOT NULL,
+    "workflowId" character varying(36) NOT NULL
+);
+
+
+--
+-- Name: workflows_tags; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.workflows_tags (
+    "workflowId" character varying(36) NOT NULL,
+    "tagId" character varying(36) NOT NULL
+);
+
+
+--
+-- Name: auth_provider_sync_history id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_provider_sync_history ALTER COLUMN id SET DEFAULT nextval('public.auth_provider_sync_history_id_seq'::regclass);
+
+
+--
+-- Name: execution_annotations id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_annotations ALTER COLUMN id SET DEFAULT nextval('public.execution_annotations_id_seq'::regclass);
+
+
+--
+-- Name: execution_entity id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_entity ALTER COLUMN id SET DEFAULT nextval('public.execution_entity_id_seq'::regclass);
+
+
+--
+-- Name: execution_metadata id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_metadata ALTER COLUMN id SET DEFAULT nextval('public.execution_metadata_temp_id_seq'::regclass);
+
+
+--
+-- Name: migrations id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.migrations ALTER COLUMN id SET DEFAULT nextval('public.migrations_id_seq'::regclass);
+
+
+--
+-- Name: role id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role ALTER COLUMN id SET DEFAULT nextval('public.role_id_seq'::regclass);
+
+
+--
+-- Name: test_run PK_011c050f566e9db509a0fadb9b9; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_run
+    ADD CONSTRAINT "PK_011c050f566e9db509a0fadb9b9" PRIMARY KEY (id);
+
+
+--
+-- Name: installed_packages PK_08cc9197c39b028c1e9beca225940576fd1a5804; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.installed_packages
+    ADD CONSTRAINT "PK_08cc9197c39b028c1e9beca225940576fd1a5804" PRIMARY KEY ("packageName");
+
+
+--
+-- Name: analytics_by_period PK_13d19771a5725bf911493e2b4c9; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.analytics_by_period
+    ADD CONSTRAINT "PK_13d19771a5725bf911493e2b4c9" PRIMARY KEY (id);
+
+
+--
+-- Name: execution_metadata PK_17a0b6284f8d626aae88e1c16e4; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_metadata
+    ADD CONSTRAINT "PK_17a0b6284f8d626aae88e1c16e4" PRIMARY KEY (id);
+
+
+--
+-- Name: project_relation PK_1caaa312a5d7184a003be0f0cb6; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_relation
+    ADD CONSTRAINT "PK_1caaa312a5d7184a003be0f0cb6" PRIMARY KEY ("projectId", "userId");
+
+
+--
+-- Name: analytics_raw PK_2660b1d980e526ebfad550b3b7e; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.analytics_raw
+    ADD CONSTRAINT "PK_2660b1d980e526ebfad550b3b7e" PRIMARY KEY (id);
+
+
+--
+-- Name: folder_tag PK_27e4e00852f6b06a925a4d83a3e; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.folder_tag
+    ADD CONSTRAINT "PK_27e4e00852f6b06a925a4d83a3e" PRIMARY KEY ("folderId", "tagId");
+
+
+--
+-- Name: test_metric PK_3e98b8e20acc19c5030a8644142; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_metric
+    ADD CONSTRAINT "PK_3e98b8e20acc19c5030a8644142" PRIMARY KEY (id);
+
+
+--
+-- Name: project PK_4d68b1358bb5b766d3e78f32f57; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project
+    ADD CONSTRAINT "PK_4d68b1358bb5b766d3e78f32f57" PRIMARY KEY (id);
+
+
+--
+-- Name: invalid_auth_token PK_5779069b7235b256d91f7af1a15; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invalid_auth_token
+    ADD CONSTRAINT "PK_5779069b7235b256d91f7af1a15" PRIMARY KEY (token);
+
+
+--
+-- Name: shared_workflow PK_5ba87620386b847201c9531c58f; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_workflow
+    ADD CONSTRAINT "PK_5ba87620386b847201c9531c58f" PRIMARY KEY ("workflowId", "projectId");
+
+
+--
+-- Name: folder PK_6278a41a706740c94c02e288df8; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.folder
+    ADD CONSTRAINT "PK_6278a41a706740c94c02e288df8" PRIMARY KEY (id);
+
+
+--
+-- Name: annotation_tag_entity PK_69dfa041592c30bbc0d4b84aa00; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.annotation_tag_entity
+    ADD CONSTRAINT "PK_69dfa041592c30bbc0d4b84aa00" PRIMARY KEY (id);
+
+
+--
+-- Name: execution_annotations PK_7afcf93ffa20c4252869a7c6a23; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_annotations
+    ADD CONSTRAINT "PK_7afcf93ffa20c4252869a7c6a23" PRIMARY KEY (id);
+
+
+--
+-- Name: migrations PK_8c82d7f526340ab734260ea46be; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.migrations
+    ADD CONSTRAINT "PK_8c82d7f526340ab734260ea46be" PRIMARY KEY (id);
+
+
+--
+-- Name: installed_nodes PK_8ebd28194e4f792f96b5933423fc439df97d9689; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.installed_nodes
+    ADD CONSTRAINT "PK_8ebd28194e4f792f96b5933423fc439df97d9689" PRIMARY KEY (name);
+
+
+--
+-- Name: shared_credentials PK_8ef3a59796a228913f251779cff; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_credentials
+    ADD CONSTRAINT "PK_8ef3a59796a228913f251779cff" PRIMARY KEY ("credentialsId", "projectId");
+
+
+--
+-- Name: test_case_execution PK_90c121f77a78a6580e94b794bce; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_case_execution
+    ADD CONSTRAINT "PK_90c121f77a78a6580e94b794bce" PRIMARY KEY (id);
+
+
+--
+-- Name: user_api_keys PK_978fa5caa3468f463dac9d92e69; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_api_keys
+    ADD CONSTRAINT "PK_978fa5caa3468f463dac9d92e69" PRIMARY KEY (id);
+
+
+--
+-- Name: execution_annotation_tags PK_979ec03d31294cca484be65d11f; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_annotation_tags
+    ADD CONSTRAINT "PK_979ec03d31294cca484be65d11f" PRIMARY KEY ("annotationId", "tagId");
+
+
+--
+-- Name: webhook_entity PK_b21ace2e13596ccd87dc9bf4ea6; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.webhook_entity
+    ADD CONSTRAINT "PK_b21ace2e13596ccd87dc9bf4ea6" PRIMARY KEY ("webhookPath", method);
+
+
+--
+-- Name: workflow_history PK_b6572dd6173e4cd06fe79937b58; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflow_history
+    ADD CONSTRAINT "PK_b6572dd6173e4cd06fe79937b58" PRIMARY KEY ("versionId");
+
+
+--
+-- Name: processed_data PK_ca04b9d8dc72de268fe07a65773; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.processed_data
+    ADD CONSTRAINT "PK_ca04b9d8dc72de268fe07a65773" PRIMARY KEY ("workflowId", context);
+
+
+--
+-- Name: settings PK_dc0fe14e6d9943f268e7b119f69ab8bd; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.settings
+    ADD CONSTRAINT "PK_dc0fe14e6d9943f268e7b119f69ab8bd" PRIMARY KEY (key);
+
+
+--
+-- Name: role PK_e853ce24e8200abe5721d2c6ac552b73; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role
+    ADD CONSTRAINT "PK_e853ce24e8200abe5721d2c6ac552b73" PRIMARY KEY (id);
+
+
+--
+-- Name: user PK_ea8f538c94b6e352418254ed6474a81f; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public."user"
+    ADD CONSTRAINT "PK_ea8f538c94b6e352418254ed6474a81f" PRIMARY KEY (id);
+
+
+--
+-- Name: analytics_metadata PK_ee291a42a64743a29bbde1280d3; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.analytics_metadata
+    ADD CONSTRAINT "PK_ee291a42a64743a29bbde1280d3" PRIMARY KEY ("metaId");
+
+
+--
+-- Name: role UQ_5b49d0f504f7ef31045a1fb2eb8; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role
+    ADD CONSTRAINT "UQ_5b49d0f504f7ef31045a1fb2eb8" UNIQUE (scope, name);
+
+
+--
+-- Name: user UQ_e12875dfb3b1d92d7d7c5377e2; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public."user"
+    ADD CONSTRAINT "UQ_e12875dfb3b1d92d7d7c5377e2" UNIQUE (email);
+
+
+--
+-- Name: assets assets_ip_hostname_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.assets
+    ADD CONSTRAINT assets_ip_hostname_key UNIQUE (ip, hostname);
+
+
+--
+-- Name: assets assets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.assets
+    ADD CONSTRAINT assets_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: auth_identity auth_identity_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_identity
+    ADD CONSTRAINT auth_identity_pkey PRIMARY KEY ("providerId", "providerType");
+
+
+--
+-- Name: auth_provider_sync_history auth_provider_sync_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_provider_sync_history
+    ADD CONSTRAINT auth_provider_sync_history_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: credentials_entity credentials_entity_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credentials_entity
+    ADD CONSTRAINT credentials_entity_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: event_destinations event_destinations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_destinations
+    ADD CONSTRAINT event_destinations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: execution_data execution_data_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_data
+    ADD CONSTRAINT execution_data_pkey PRIMARY KEY ("executionId");
+
+
+--
+-- Name: findings findings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.findings
+    ADD CONSTRAINT findings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: execution_entity pk_e3e63bbf986767844bbe1166d4e; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_entity
+    ADD CONSTRAINT pk_e3e63bbf986767844bbe1166d4e PRIMARY KEY (id);
+
+
+--
+-- Name: workflow_statistics pk_workflow_statistics; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflow_statistics
+    ADD CONSTRAINT pk_workflow_statistics PRIMARY KEY ("workflowId", name);
+
+
+--
+-- Name: workflows_tags pk_workflows_tags; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflows_tags
+    ADD CONSTRAINT pk_workflows_tags PRIMARY KEY ("workflowId", "tagId");
+
+
+--
+-- Name: ports ports_asset_id_proto_port_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ports
+    ADD CONSTRAINT ports_asset_id_proto_port_key UNIQUE (asset_id, proto, port);
+
+
+--
+-- Name: ports ports_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ports
+    ADD CONSTRAINT ports_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: rag_documents rag_documents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rag_documents
+    ADD CONSTRAINT rag_documents_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: scan_ports scan_ports_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scan_ports
+    ADD CONSTRAINT scan_ports_pkey PRIMARY KEY (scan_id, port_id);
+
+
+--
+-- Name: scans scans_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scans
+    ADD CONSTRAINT scans_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tag_entity tag_entity_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tag_entity
+    ADD CONSTRAINT tag_entity_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: test_definition test_definition_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_definition
+    ADD CONSTRAINT test_definition_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: variables variables_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.variables
+    ADD CONSTRAINT variables_key_key UNIQUE (key);
+
+
+--
+-- Name: variables variables_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.variables
+    ADD CONSTRAINT variables_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: web_findings web_findings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.web_findings
+    ADD CONSTRAINT web_findings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: workflow_entity workflow_entity_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflow_entity
+    ADD CONSTRAINT workflow_entity_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: IDX_14f68deffaf858465715995508; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX "IDX_14f68deffaf858465715995508" ON public.folder USING btree ("projectId", id);
+
+
+--
+-- Name: IDX_1e31657f5fe46816c34be7c1b4; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_1e31657f5fe46816c34be7c1b4" ON public.workflow_history USING btree ("workflowId");
+
+
+--
+-- Name: IDX_1ef35bac35d20bdae979d917a3; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX "IDX_1ef35bac35d20bdae979d917a3" ON public.user_api_keys USING btree ("apiKey");
+
+
+--
+-- Name: IDX_20714d890d77beba8e3065367d; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX "IDX_20714d890d77beba8e3065367d" ON public.analytics_by_period USING btree ("periodStart", type, "periodUnit", "metaId");
+
+
+--
+-- Name: IDX_3a4e9cf37111ac3270e2469b47; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_3a4e9cf37111ac3270e2469b47" ON public.test_metric USING btree ("testDefinitionId");
+
+
+--
+-- Name: IDX_3a81713a76f2295b12b46cdfca; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_3a81713a76f2295b12b46cdfca" ON public.test_run USING btree ("testDefinitionId");
+
+
+--
+-- Name: IDX_5f0643f6717905a05164090dde; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_5f0643f6717905a05164090dde" ON public.project_relation USING btree ("userId");
+
+
+--
+-- Name: IDX_61448d56d61802b5dfde5cdb00; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_61448d56d61802b5dfde5cdb00" ON public.project_relation USING btree ("projectId");
+
+
+--
+-- Name: IDX_63d7bbae72c767cf162d459fcc; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX "IDX_63d7bbae72c767cf162d459fcc" ON public.user_api_keys USING btree ("userId", label);
+
+
+--
+-- Name: IDX_8e4b4774db42f1e6dda3452b2a; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_8e4b4774db42f1e6dda3452b2a" ON public.test_case_execution USING btree ("testRunId");
+
+
+--
+-- Name: IDX_97f863fa83c4786f1956508496; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX "IDX_97f863fa83c4786f1956508496" ON public.execution_annotations USING btree ("executionId");
+
+
+--
+-- Name: IDX_9ec1ce6fbf82305f489adb971d; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_9ec1ce6fbf82305f489adb971d" ON public.test_definition USING btree ("evaluationWorkflowId");
+
+
+--
+-- Name: IDX_a3697779b366e131b2bbdae297; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_a3697779b366e131b2bbdae297" ON public.execution_annotation_tags USING btree ("tagId");
+
+
+--
+-- Name: IDX_ae51b54c4bb430cf92f48b623f; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX "IDX_ae51b54c4bb430cf92f48b623f" ON public.annotation_tag_entity USING btree (name);
+
+
+--
+-- Name: IDX_b0dd0087fe3da02b0ffa4b9c5b; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_b0dd0087fe3da02b0ffa4b9c5b" ON public.test_definition USING btree ("workflowId");
+
+
+--
+-- Name: IDX_c1519757391996eb06064f0e7c; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_c1519757391996eb06064f0e7c" ON public.execution_annotation_tags USING btree ("annotationId");
+
+
+--
+-- Name: IDX_cec8eea3bf49551482ccb4933e; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX "IDX_cec8eea3bf49551482ccb4933e" ON public.execution_metadata USING btree ("executionId", key);
+
+
+--
+-- Name: IDX_execution_entity_deletedAt; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_execution_entity_deletedAt" ON public.execution_entity USING btree ("deletedAt");
+
+
+--
+-- Name: IDX_workflow_entity_name; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_workflow_entity_name" ON public.workflow_entity USING btree (name);
+
+
+--
+-- Name: findings_asset_sev_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX findings_asset_sev_idx ON public.findings USING btree (asset_id, severity);
+
+
+--
+-- Name: findings_cve_gin; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX findings_cve_gin ON public.findings USING gin (cve);
+
+
+--
+-- Name: idx_07fde106c0b471d8cc80a64fc8; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_07fde106c0b471d8cc80a64fc8 ON public.credentials_entity USING btree (type);
+
+
+--
+-- Name: idx_16f4436789e804e3e1c9eeb240; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_16f4436789e804e3e1c9eeb240 ON public.webhook_entity USING btree ("webhookId", method, "pathLength");
+
+
+--
+-- Name: idx_812eb05f7451ca757fb98444ce; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_812eb05f7451ca757fb98444ce ON public.tag_entity USING btree (name);
+
+
+--
+-- Name: idx_execution_entity_stopped_at_status_deleted_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_execution_entity_stopped_at_status_deleted_at ON public.execution_entity USING btree ("stoppedAt", status, "deletedAt") WHERE (("stoppedAt" IS NOT NULL) AND ("deletedAt" IS NULL));
+
+
+--
+-- Name: idx_execution_entity_wait_till_status_deleted_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_execution_entity_wait_till_status_deleted_at ON public.execution_entity USING btree ("waitTill", status, "deletedAt") WHERE (("waitTill" IS NOT NULL) AND ("deletedAt" IS NULL));
+
+
+--
+-- Name: idx_execution_entity_workflow_id_started_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_execution_entity_workflow_id_started_at ON public.execution_entity USING btree ("workflowId", "startedAt") WHERE (("startedAt" IS NOT NULL) AND ("deletedAt" IS NULL));
+
+
+--
+-- Name: idx_workflows_tags_workflow_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_workflows_tags_workflow_id ON public.workflows_tags USING btree ("workflowId");
+
+
+--
+-- Name: ix_assets_ip; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_assets_ip ON public.assets USING btree (ip);
+
+
+--
+-- Name: ix_web_findings_asset; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_web_findings_asset ON public.web_findings USING btree (asset_id);
+
+
+--
+-- Name: ix_web_findings_url; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_web_findings_url ON public.web_findings USING btree (url);
+
+
+--
+-- Name: pk_credentials_entity_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pk_credentials_entity_id ON public.credentials_entity USING btree (id);
+
+
+--
+-- Name: pk_tag_entity_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pk_tag_entity_id ON public.tag_entity USING btree (id);
+
+
+--
+-- Name: pk_test_definition_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pk_test_definition_id ON public.test_definition USING btree (id);
+
+
+--
+-- Name: pk_variables_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pk_variables_id ON public.variables USING btree (id);
+
+
+--
+-- Name: pk_workflow_entity_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pk_workflow_entity_id ON public.workflow_entity USING btree (id);
+
+
+--
+-- Name: ports_asset_port_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ports_asset_port_idx ON public.ports USING btree (asset_id, proto, port);
+
+
+--
+-- Name: rag_docs_embedding_ivfflat; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX rag_docs_embedding_ivfflat ON public.rag_documents USING ivfflat (embedding) WITH (lists='200');
+
+
+--
+-- Name: rag_docs_fts_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX rag_docs_fts_idx ON public.rag_documents USING gin (fts);
+
+
+--
+-- Name: rag_docs_meta_gin; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX rag_docs_meta_gin ON public.rag_documents USING gin (metadata);
+
+
+--
+-- Name: scans_started_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX scans_started_idx ON public.scans USING btree (started_at);
+
+
+--
+-- Name: ux_ports_asset_proto_port; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_ports_asset_proto_port ON public.ports USING btree (asset_id, proto, port);
+
+
+--
+-- Name: processed_data FK_06a69a7032c97a763c2c7599464; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.processed_data
+    ADD CONSTRAINT "FK_06a69a7032c97a763c2c7599464" FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: workflow_history FK_1e31657f5fe46816c34be7c1b4b; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflow_history
+    ADD CONSTRAINT "FK_1e31657f5fe46816c34be7c1b4b" FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: test_case_execution FK_258d954733841d51edd826a562b; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_case_execution
+    ADD CONSTRAINT "FK_258d954733841d51edd826a562b" FOREIGN KEY ("pastExecutionId") REFERENCES public.execution_entity(id) ON DELETE SET NULL;
+
+
+--
+-- Name: execution_metadata FK_31d0b4c93fb85ced26f6005cda3; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_metadata
+    ADD CONSTRAINT "FK_31d0b4c93fb85ced26f6005cda3" FOREIGN KEY ("executionId") REFERENCES public.execution_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: test_metric FK_3a4e9cf37111ac3270e2469b475; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_metric
+    ADD CONSTRAINT "FK_3a4e9cf37111ac3270e2469b475" FOREIGN KEY ("testDefinitionId") REFERENCES public.test_definition(id) ON DELETE CASCADE;
+
+
+--
+-- Name: test_run FK_3a81713a76f2295b12b46cdfcab; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_run
+    ADD CONSTRAINT "FK_3a81713a76f2295b12b46cdfcab" FOREIGN KEY ("testDefinitionId") REFERENCES public.test_definition(id) ON DELETE CASCADE;
+
+
+--
+-- Name: shared_credentials FK_416f66fc846c7c442970c094ccf; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_credentials
+    ADD CONSTRAINT "FK_416f66fc846c7c442970c094ccf" FOREIGN KEY ("credentialsId") REFERENCES public.credentials_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_relation FK_5f0643f6717905a05164090dde7; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_relation
+    ADD CONSTRAINT "FK_5f0643f6717905a05164090dde7" FOREIGN KEY ("userId") REFERENCES public."user"(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_relation FK_61448d56d61802b5dfde5cdb002; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_relation
+    ADD CONSTRAINT "FK_61448d56d61802b5dfde5cdb002" FOREIGN KEY ("projectId") REFERENCES public.project(id) ON DELETE CASCADE;
+
+
+--
+-- Name: installed_nodes FK_73f857fc5dce682cef8a99c11dbddbc969618951; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.installed_nodes
+    ADD CONSTRAINT "FK_73f857fc5dce682cef8a99c11dbddbc969618951" FOREIGN KEY (package) REFERENCES public.installed_packages("packageName") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: folder FK_804ea52f6729e3940498bd54d78; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.folder
+    ADD CONSTRAINT "FK_804ea52f6729e3940498bd54d78" FOREIGN KEY ("parentFolderId") REFERENCES public.folder(id) ON DELETE CASCADE;
+
+
+--
+-- Name: shared_credentials FK_812c2852270da1247756e77f5a4; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_credentials
+    ADD CONSTRAINT "FK_812c2852270da1247756e77f5a4" FOREIGN KEY ("projectId") REFERENCES public.project(id) ON DELETE CASCADE;
+
+
+--
+-- Name: analytics_by_period FK_83eea8e9024d109d055721dfb40; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.analytics_by_period
+    ADD CONSTRAINT "FK_83eea8e9024d109d055721dfb40" FOREIGN KEY ("metaId") REFERENCES public.analytics_metadata("metaId") ON DELETE CASCADE;
+
+
+--
+-- Name: test_case_execution FK_8e4b4774db42f1e6dda3452b2af; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_case_execution
+    ADD CONSTRAINT "FK_8e4b4774db42f1e6dda3452b2af" FOREIGN KEY ("testRunId") REFERENCES public.test_run(id) ON DELETE CASCADE;
+
+
+--
+-- Name: folder_tag FK_94a60854e06f2897b2e0d39edba; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.folder_tag
+    ADD CONSTRAINT "FK_94a60854e06f2897b2e0d39edba" FOREIGN KEY ("folderId") REFERENCES public.folder(id) ON DELETE CASCADE;
+
+
+--
+-- Name: execution_annotations FK_97f863fa83c4786f19565084960; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_annotations
+    ADD CONSTRAINT "FK_97f863fa83c4786f19565084960" FOREIGN KEY ("executionId") REFERENCES public.execution_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: test_definition FK_9ec1ce6fbf82305f489adb971d3; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_definition
+    ADD CONSTRAINT "FK_9ec1ce6fbf82305f489adb971d3" FOREIGN KEY ("evaluationWorkflowId") REFERENCES public.workflow_entity(id) ON DELETE SET NULL;
+
+
+--
+-- Name: execution_annotation_tags FK_a3697779b366e131b2bbdae2976; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_annotation_tags
+    ADD CONSTRAINT "FK_a3697779b366e131b2bbdae2976" FOREIGN KEY ("tagId") REFERENCES public.annotation_tag_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: shared_workflow FK_a45ea5f27bcfdc21af9b4188560; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_workflow
+    ADD CONSTRAINT "FK_a45ea5f27bcfdc21af9b4188560" FOREIGN KEY ("projectId") REFERENCES public.project(id) ON DELETE CASCADE;
+
+
+--
+-- Name: folder FK_a8260b0b36939c6247f385b8221; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.folder
+    ADD CONSTRAINT "FK_a8260b0b36939c6247f385b8221" FOREIGN KEY ("projectId") REFERENCES public.project(id) ON DELETE CASCADE;
+
+
+--
+-- Name: analytics_metadata FK_b06b8962721cf6ef7a508d52a66; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.analytics_metadata
+    ADD CONSTRAINT "FK_b06b8962721cf6ef7a508d52a66" FOREIGN KEY ("projectId") REFERENCES public.project(id) ON DELETE SET NULL;
+
+
+--
+-- Name: test_definition FK_b0dd0087fe3da02b0ffa4b9c5bb; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_definition
+    ADD CONSTRAINT "FK_b0dd0087fe3da02b0ffa4b9c5bb" FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: analytics_metadata FK_b14a2a0105c036afaa293b1c57e; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.analytics_metadata
+    ADD CONSTRAINT "FK_b14a2a0105c036afaa293b1c57e" FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE SET NULL;
+
+
+--
+-- Name: execution_annotation_tags FK_c1519757391996eb06064f0e7c8; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_annotation_tags
+    ADD CONSTRAINT "FK_c1519757391996eb06064f0e7c8" FOREIGN KEY ("annotationId") REFERENCES public.execution_annotations(id) ON DELETE CASCADE;
+
+
+--
+-- Name: test_definition FK_d5d7ea64662dbc62f5e266fbeb0; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_definition
+    ADD CONSTRAINT "FK_d5d7ea64662dbc62f5e266fbeb0" FOREIGN KEY ("annotationTagId") REFERENCES public.annotation_tag_entity(id) ON DELETE SET NULL;
+
+
+--
+-- Name: shared_workflow FK_daa206a04983d47d0a9c34649ce; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_workflow
+    ADD CONSTRAINT "FK_daa206a04983d47d0a9c34649ce" FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: folder_tag FK_dc88164176283de80af47621746; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.folder_tag
+    ADD CONSTRAINT "FK_dc88164176283de80af47621746" FOREIGN KEY ("tagId") REFERENCES public.tag_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: test_case_execution FK_dfbe194e3ebdfe49a87bc4692ca; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_case_execution
+    ADD CONSTRAINT "FK_dfbe194e3ebdfe49a87bc4692ca" FOREIGN KEY ("evaluationExecutionId") REFERENCES public.execution_entity(id) ON DELETE SET NULL;
+
+
+--
+-- Name: user_api_keys FK_e131705cbbc8fb589889b02d457; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_api_keys
+    ADD CONSTRAINT "FK_e131705cbbc8fb589889b02d457" FOREIGN KEY ("userId") REFERENCES public."user"(id) ON DELETE CASCADE;
+
+
+--
+-- Name: test_case_execution FK_e48965fac35d0f5b9e7f51d8c44; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_case_execution
+    ADD CONSTRAINT "FK_e48965fac35d0f5b9e7f51d8c44" FOREIGN KEY ("executionId") REFERENCES public.execution_entity(id) ON DELETE SET NULL;
+
+
+--
+-- Name: analytics_raw FK_e4cdf6fe2f1d8a494da5569ed13; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.analytics_raw
+    ADD CONSTRAINT "FK_e4cdf6fe2f1d8a494da5569ed13" FOREIGN KEY ("metaId") REFERENCES public.analytics_metadata("metaId") ON DELETE CASCADE;
+
+
+--
+-- Name: auth_identity auth_identity_userId_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_identity
+    ADD CONSTRAINT "auth_identity_userId_fkey" FOREIGN KEY ("userId") REFERENCES public."user"(id);
+
+
+--
+-- Name: execution_data execution_data_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_data
+    ADD CONSTRAINT execution_data_fk FOREIGN KEY ("executionId") REFERENCES public.execution_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: findings findings_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.findings
+    ADD CONSTRAINT findings_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id) ON DELETE CASCADE;
+
+
+--
+-- Name: findings findings_port_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.findings
+    ADD CONSTRAINT findings_port_id_fkey FOREIGN KEY (port_id) REFERENCES public.ports(id) ON DELETE SET NULL;
+
+
+--
+-- Name: execution_entity fk_execution_entity_workflow_id; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_entity
+    ADD CONSTRAINT fk_execution_entity_workflow_id FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: webhook_entity fk_webhook_entity_workflow_id; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.webhook_entity
+    ADD CONSTRAINT fk_webhook_entity_workflow_id FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: workflow_entity fk_workflow_parent_folder; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflow_entity
+    ADD CONSTRAINT fk_workflow_parent_folder FOREIGN KEY ("parentFolderId") REFERENCES public.folder(id) ON DELETE CASCADE;
+
+
+--
+-- Name: workflow_statistics fk_workflow_statistics_workflow_id; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflow_statistics
+    ADD CONSTRAINT fk_workflow_statistics_workflow_id FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: workflows_tags fk_workflows_tags_tag_id; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflows_tags
+    ADD CONSTRAINT fk_workflows_tags_tag_id FOREIGN KEY ("tagId") REFERENCES public.tag_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: workflows_tags fk_workflows_tags_workflow_id; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflows_tags
+    ADD CONSTRAINT fk_workflows_tags_workflow_id FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: ports ports_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ports
+    ADD CONSTRAINT ports_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id) ON DELETE CASCADE;
+
+
+--
+-- Name: rag_documents rag_documents_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rag_documents
+    ADD CONSTRAINT rag_documents_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id) ON DELETE SET NULL;
+
+
+--
+-- Name: rag_documents rag_documents_finding_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rag_documents
+    ADD CONSTRAINT rag_documents_finding_id_fkey FOREIGN KEY (finding_id) REFERENCES public.findings(id) ON DELETE SET NULL;
+
+
+--
+-- Name: rag_documents rag_documents_port_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rag_documents
+    ADD CONSTRAINT rag_documents_port_id_fkey FOREIGN KEY (port_id) REFERENCES public.ports(id) ON DELETE SET NULL;
+
+
+--
+-- Name: rag_documents rag_documents_scan_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rag_documents
+    ADD CONSTRAINT rag_documents_scan_id_fkey FOREIGN KEY (scan_id) REFERENCES public.scans(id) ON DELETE SET NULL;
+
+
+--
+-- Name: scan_ports scan_ports_port_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scan_ports
+    ADD CONSTRAINT scan_ports_port_id_fkey FOREIGN KEY (port_id) REFERENCES public.ports(id) ON DELETE CASCADE;
+
+
+--
+-- Name: scan_ports scan_ports_scan_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scan_ports
+    ADD CONSTRAINT scan_ports_scan_id_fkey FOREIGN KEY (scan_id) REFERENCES public.scans(id) ON DELETE CASCADE;
+
+
+--
+-- Name: web_findings web_findings_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.web_findings
+    ADD CONSTRAINT web_findings_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id) ON DELETE CASCADE;
+
+
+--
+-- PostgreSQL database dump complete
+--
+
+\unrestrict wwvkcFX9ody0TX4G7Fdfv8nOzowejWxEVkhkPc8SAzziF0DUmUopfhW7Gk4ArH1
+
+--
+-- Database "postgres" dump
+--
+
+\connect postgres
+
+--
+-- PostgreSQL database dump
+--
+
+\restrict S98oKNkWX1xwq4kAhcTJJmoryrvM3nxdIFGIZ9GQM13lLoNHznICliiGY7CPx6Z
+
+-- Dumped from database version 16.10 (Debian 16.10-1.pgdg12+1)
+-- Dumped by pg_dump version 16.10 (Ubuntu 16.10-0ubuntu0.24.04.1)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: dblink; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS dblink WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION dblink; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION dblink IS 'connect to other PostgreSQL databases from within a database';
+
+
+--
+-- Name: pg_trgm; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION pg_trgm; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION pg_trgm IS 'text similarity measurement and index searching based on trigrams';
+
+
+--
+-- Name: unaccent; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS unaccent WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION unaccent; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION unaccent IS 'text search dictionary that removes accents';
+
+
+--
+-- Name: vector; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION vector; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION vector IS 'vector data type and ivfflat and hnsw access methods';
+
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: edb_exploits; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.edb_exploits (
+    edb_id integer NOT NULL,
+    file_path text NOT NULL,
+    title text,
+    date_published date,
+    author text,
+    type text,
+    platform text,
+    port text,
+    cves text[],
+    description text,
+    fts tsvector GENERATED ALWAYS AS ((((setweight(to_tsvector('simple'::regconfig, COALESCE(title, ''::text)), 'A'::"char") || setweight(to_tsvector('simple'::regconfig, COALESCE(description, ''::text)), 'B'::"char")) || to_tsvector('simple'::regconfig, COALESCE(platform, ''::text))) || to_tsvector('simple'::regconfig, COALESCE(type, ''::text)))) STORED
+);
+
+
+--
+-- Name: exploit_chunks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.exploit_chunks (
+    id bigint NOT NULL,
+    edb_id integer,
+    title text,
+    path text,
+    platform text,
+    type text,
+    source_repo text,
+    published date,
+    chunk_id integer,
+    chunk text,
+    embedding public.vector(768),
+    sha256 text
+);
+
+
+--
+-- Name: exploit_chunks_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.exploit_chunks_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: exploit_chunks_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.exploit_chunks_id_seq OWNED BY public.exploit_chunks.id;
+
+
+--
+-- Name: exploit_chunks id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.exploit_chunks ALTER COLUMN id SET DEFAULT nextval('public.exploit_chunks_id_seq'::regclass);
+
+
+--
+-- Name: edb_exploits edb_exploits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.edb_exploits
+    ADD CONSTRAINT edb_exploits_pkey PRIMARY KEY (edb_id);
+
+
+--
+-- Name: exploit_chunks exploit_chunks_edb_id_chunk_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.exploit_chunks
+    ADD CONSTRAINT exploit_chunks_edb_id_chunk_id_key UNIQUE (edb_id, chunk_id);
+
+
+--
+-- Name: exploit_chunks exploit_chunks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.exploit_chunks
+    ADD CONSTRAINT exploit_chunks_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: exploit_chunks_edb_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX exploit_chunks_edb_idx ON public.exploit_chunks USING btree (edb_id);
+
+
+--
+-- Name: exploit_chunks_embedding_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX exploit_chunks_embedding_idx ON public.exploit_chunks USING ivfflat (embedding) WITH (lists='100');
+
+
+--
+-- Name: idx_edb_exploits_cves; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_edb_exploits_cves ON public.edb_exploits USING gin (cves);
+
+
+--
+-- Name: idx_edb_exploits_fts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_edb_exploits_fts ON public.edb_exploits USING gin (fts);
+
+
+--
+-- Name: idx_edb_exploits_title_trgm; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_edb_exploits_title_trgm ON public.edb_exploits USING gin (title public.gin_trgm_ops);
+
+
+--
+-- PostgreSQL database dump complete
+--
+
+\unrestrict S98oKNkWX1xwq4kAhcTJJmoryrvM3nxdIFGIZ9GQM13lLoNHznICliiGY7CPx6Z
+
+--
+-- Database "scans" dump
+--
+
+--
+-- PostgreSQL database dump
+--
+
+\restrict GohMmch58t7NKKAehSMaYjmSREiNZtbuRfEDNJ8fKgGoQdInCwD7SCYB5PhbJ3J
+
+-- Dumped from database version 16.10 (Debian 16.10-1.pgdg12+1)
+-- Dumped by pg_dump version 16.10 (Ubuntu 16.10-0ubuntu0.24.04.1)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: scans; Type: DATABASE; Schema: -; Owner: -
+--
+
+CREATE DATABASE scans WITH TEMPLATE = template0 ENCODING = 'UTF8' LOCALE_PROVIDER = libc LOCALE = 'en_US.utf8';
+
+
+\unrestrict GohMmch58t7NKKAehSMaYjmSREiNZtbuRfEDNJ8fKgGoQdInCwD7SCYB5PhbJ3J
+\connect scans
+\restrict GohMmch58t7NKKAehSMaYjmSREiNZtbuRfEDNJ8fKgGoQdInCwD7SCYB5PhbJ3J
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: pgcrypto; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION pgcrypto; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION pgcrypto IS 'cryptographic functions';
+
+
+--
+-- Name: uuid-ossp; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION "uuid-ossp"; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION "uuid-ossp" IS 'generate universally unique identifiers (UUIDs)';
+
+
+--
+-- Name: vector; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION vector; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION vector IS 'vector data type and ivfflat and hnsw access methods';
+
+
+--
+-- Name: _touch_updated_at(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public._touch_updated_at() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$;
+
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: assets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.assets (
+    id uuid NOT NULL,
+    ip inet NOT NULL,
+    hostname text,
+    env text,
+    tags text[],
+    first_seen timestamp with time zone DEFAULT now(),
+    last_seen timestamp with time zone DEFAULT now(),
+    os text
+);
+
+
+--
+-- Name: findings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.findings (
+    id uuid NOT NULL,
+    title text,
+    severity text,
+    asset_id uuid,
+    port integer,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    details jsonb
+);
+
+
+--
+-- Name: jobs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.jobs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    type text NOT NULL,
+    status text DEFAULT 'queued'::text NOT NULL,
+    params jsonb DEFAULT '{}'::jsonb NOT NULL,
+    total_tasks integer DEFAULT 0 NOT NULL,
+    finished_tasks integer DEFAULT 0 NOT NULL,
+    error text,
+    idempotency_key text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    started_at timestamp with time zone,
+    finished_at timestamp with time zone,
+    CONSTRAINT jobs_status_check CHECK ((status = ANY (ARRAY['queued'::text, 'running'::text, 'finished'::text, 'failed'::text, 'canceled'::text]))),
+    CONSTRAINT jobs_type_check CHECK ((type = 'masscan-nmap'::text))
+);
+
+
+--
+-- Name: ports; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ports (
+    id uuid NOT NULL,
+    asset_id uuid,
+    proto text NOT NULL,
+    port integer NOT NULL,
+    service text,
+    product text,
+    version text,
+    banner text,
+    first_seen timestamp with time zone DEFAULT now(),
+    last_seen timestamp with time zone DEFAULT now(),
+    is_open boolean DEFAULT true,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+);
+
+
+--
+-- Name: rag_documents; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.rag_documents (
+    id uuid NOT NULL,
+    content text,
+    embedding public.vector(384),
+    metadata jsonb
+);
+
+
+--
+-- Name: scan_ports; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.scan_ports (
+    scan_id uuid NOT NULL,
+    port_id uuid NOT NULL
+);
+
+
+--
+-- Name: scans; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.scans (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    tool text,
+    profile text,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    finished_at timestamp with time zone,
+    args text,
+    source_path text,
+    metadata jsonb DEFAULT '{}'::jsonb
+);
+
+
+--
+-- Name: tasks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tasks (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    job_id uuid NOT NULL,
+    type text NOT NULL,
+    target_host inet,
+    target_port integer,
+    proto text,
+    status text DEFAULT 'queued'::text NOT NULL,
+    attempt integer DEFAULT 0 NOT NULL,
+    last_error text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    started_at timestamp with time zone,
+    finished_at timestamp with time zone,
+    CONSTRAINT tasks_status_check CHECK ((status = ANY (ARRAY['queued'::text, 'running'::text, 'finished'::text, 'failed'::text, 'canceled'::text]))),
+    CONSTRAINT tasks_type_check CHECK ((type = ANY (ARRAY['pipeline'::text, 'masscan'::text, 'nmap'::text, 'followup'::text])))
+);
+
+
+--
+-- Name: vulns; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vulns (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    port_id uuid NOT NULL,
+    script text NOT NULL,
+    output text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: web_findings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.web_findings (
+    id uuid NOT NULL,
+    asset_id uuid,
+    url text NOT NULL,
+    source text NOT NULL,
+    issue_type text,
+    name text,
+    severity text,
+    evidence text,
+    status_code integer,
+    first_seen timestamp with time zone DEFAULT now(),
+    last_seen timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: assets assets_ip_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.assets
+    ADD CONSTRAINT assets_ip_key UNIQUE (ip);
+
+
+--
+-- Name: assets assets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.assets
+    ADD CONSTRAINT assets_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: findings findings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.findings
+    ADD CONSTRAINT findings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: jobs jobs_idempotency_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.jobs
+    ADD CONSTRAINT jobs_idempotency_key_key UNIQUE (idempotency_key);
+
+
+--
+-- Name: jobs jobs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.jobs
+    ADD CONSTRAINT jobs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: ports ports_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ports
+    ADD CONSTRAINT ports_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: rag_documents rag_documents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rag_documents
+    ADD CONSTRAINT rag_documents_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: scan_ports scan_ports_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scan_ports
+    ADD CONSTRAINT scan_ports_pkey PRIMARY KEY (scan_id, port_id);
+
+
+--
+-- Name: scans scans_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scans
+    ADD CONSTRAINT scans_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tasks tasks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tasks
+    ADD CONSTRAINT tasks_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: vulns vulns_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vulns
+    ADD CONSTRAINT vulns_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: web_findings web_findings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.web_findings
+    ADD CONSTRAINT web_findings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: findings_asset_sev_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX findings_asset_sev_idx ON public.findings USING btree (asset_id, severity);
+
+
+--
+-- Name: idx_jobs_created_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_jobs_created_at ON public.jobs USING btree (created_at DESC);
+
+
+--
+-- Name: idx_jobs_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_jobs_status ON public.jobs USING btree (status);
+
+
+--
+-- Name: idx_ports_asset_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ports_asset_id ON public.ports USING btree (asset_id);
+
+
+--
+-- Name: idx_tasks_job; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tasks_job ON public.tasks USING btree (job_id);
+
+
+--
+-- Name: idx_tasks_job_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tasks_job_status ON public.tasks USING btree (job_id, status);
+
+
+--
+-- Name: idx_tasks_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tasks_status ON public.tasks USING btree (status);
+
+
+--
+-- Name: ix_assets_ip; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_assets_ip ON public.assets USING btree (ip);
+
+
+--
+-- Name: ix_ports_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_ports_open ON public.ports USING btree (is_open);
+
+
+--
+-- Name: ix_rag_documents_embedding; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_rag_documents_embedding ON public.rag_documents USING ivfflat (embedding) WITH (lists='100');
+
+
+--
+-- Name: ix_web_findings_asset; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_web_findings_asset ON public.web_findings USING btree (asset_id);
+
+
+--
+-- Name: ix_web_findings_url; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_web_findings_url ON public.web_findings USING btree (url);
+
+
+--
+-- Name: ports_asset_port_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ports_asset_port_idx ON public.ports USING btree (asset_id, proto, port);
+
+
+--
+-- Name: rag_docs_embedding_ivfflat; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX rag_docs_embedding_ivfflat ON public.rag_documents USING ivfflat (embedding) WITH (lists='200');
+
+
+--
+-- Name: rag_docs_meta_gin; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX rag_docs_meta_gin ON public.rag_documents USING gin (metadata);
+
+
+--
+-- Name: scans_started_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX scans_started_idx ON public.scans USING btree (started_at);
+
+
+--
+-- Name: ux_ports_asset_proto_port; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_ports_asset_proto_port ON public.ports USING btree (asset_id, proto, port);
+
+
+--
+-- Name: ux_tasks_job_target; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_tasks_job_target ON public.tasks USING btree (job_id, type, target_host, target_port, COALESCE(proto, ''::text));
+
+
+--
+-- Name: findings trg_findings_touch_updated; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_findings_touch_updated BEFORE UPDATE ON public.findings FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+
+
+--
+-- Name: findings findings_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.findings
+    ADD CONSTRAINT findings_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id);
+
+
+--
+-- Name: ports ports_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ports
+    ADD CONSTRAINT ports_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id) ON DELETE CASCADE;
+
+
+--
+-- Name: scan_ports scan_ports_port_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scan_ports
+    ADD CONSTRAINT scan_ports_port_id_fkey FOREIGN KEY (port_id) REFERENCES public.ports(id) ON DELETE CASCADE;
+
+
+--
+-- Name: scan_ports scan_ports_scan_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scan_ports
+    ADD CONSTRAINT scan_ports_scan_id_fkey FOREIGN KEY (scan_id) REFERENCES public.scans(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tasks tasks_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tasks
+    ADD CONSTRAINT tasks_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: vulns vulns_port_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vulns
+    ADD CONSTRAINT vulns_port_id_fkey FOREIGN KEY (port_id) REFERENCES public.ports(id) ON DELETE CASCADE;
+
+
+--
+-- Name: web_findings web_findings_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.web_findings
+    ADD CONSTRAINT web_findings_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id) ON DELETE CASCADE;
+
+
+--
+-- PostgreSQL database dump complete
+--
+
+\unrestrict GohMmch58t7NKKAehSMaYjmSREiNZtbuRfEDNJ8fKgGoQdInCwD7SCYB5PhbJ3J
+
+--
+-- PostgreSQL database cluster dump complete
+--
+
+########################     scans ####################
+--
+-- PostgreSQL database cluster dump
+--
+
+\restrict EgULziOgDcDs6vs4V95mMrewC8rtD8rKyB4iCbAKEunbpGTjl67ck5r3WQewEFz
+
+SET default_transaction_read_only = off;
+
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+
+--
+-- Roles
+--
+
+CREATE ROLE app;
+ALTER ROLE app WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN REPLICATION BYPASSRLS PASSWORD 'SCRAM-SHA-256$4096:q2VM1dQPbMNB/M0HImvbJg==$3wrVRRUzxF4soa43LAKod4Szu+JH282MVZpbffoMNIs=:+DCf+cF0or2GVaCqYsuyimhpj4ycDFNhP5i2HpSuZvE=';
+CREATE ROLE edb_owner;
+ALTER ROLE edb_owner WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS PASSWORD 'SCRAM-SHA-256$4096:h1fCnZpaTX9Z22TlaSVVEQ==$a8DoboSHji6L5TF3w6JWB3qNpNDFyPZxODOVlmaN5ak=:NKiEiMeWwlSkcWgDpU4e5WjJRUCYVuasy+VGWXiq03A=';
+CREATE ROLE edb_ro;
+ALTER ROLE edb_ro WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS PASSWORD 'SCRAM-SHA-256$4096:tQeaxIGJ9f3XBSBazrzshg==$fEoAwsEgRivYZx59IO/OFEa8aUUxwhCmOjJUdtsCUX4=:ludz7bl5L3MpjF++nnVvvtNHcxWXXaG1hJQ6NoZVRpA=';
+CREATE ROLE edb_rw;
+ALTER ROLE edb_rw WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS PASSWORD 'SCRAM-SHA-256$4096:gWLdIO9xN5ENcePH3pcK6A==$1swQxwIbnnFHrPGwbYagJ2m1boFL/vatM4T7bOow0NU=:IWWRu92i60SzABkumRm5IWD0HlgiKM5Y3BfKOsg02ms=';
+CREATE ROLE exploit;
+ALTER ROLE exploit WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN NOREPLICATION NOBYPASSRLS PASSWORD 'SCRAM-SHA-256$4096:zP7+EouRiyY181W3NsbmRg==$uzR3r7tcO9jsb0gsufZpSeKi2FHmxD/jgnTktTJHkWA=:uPGiTwaIuTbEwCgFVIlZri8sp4yrkJlAxr6TETCl2uc=';
+CREATE ROLE n8n;
+ALTER ROLE n8n WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS PASSWORD 'SCRAM-SHA-256$4096:zUus23ed+hX2qpthAQBtPg==$Lln4+MCSpIhoxS6P7iszRl9M/MsrWDp1fvZ1UIZ4Mck=:nxDN/66Wy/wwy/HI7B+zM2OjXGrWX4a0RgYID7Qh/no=';
+
+--
+-- User Configurations
+--
+
+--
+-- User Config "n8n"
+--
+
+ALTER ROLE n8n SET search_path TO 'n8n', 'public';
+
+
+
+
+
+
+\unrestrict EgULziOgDcDs6vs4V95mMrewC8rtD8rKyB4iCbAKEunbpGTjl67ck5r3WQewEFz
+
+--
+-- Databases
+--
+
+--
+-- Database "template1" dump
+--
+
+\connect template1
+
+--
+-- PostgreSQL database dump
+--
+
+\restrict X4nxx6qMKMnfElhkECp7AWgpXPf9hso0t5WavTmbydT5rf5YJXMDTSlADseFlgv
+
+-- Dumped from database version 16.10 (Debian 16.10-1.pgdg12+1)
+-- Dumped by pg_dump version 16.10 (Ubuntu 16.10-0ubuntu0.24.04.1)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- PostgreSQL database dump complete
+--
+
+\unrestrict X4nxx6qMKMnfElhkECp7AWgpXPf9hso0t5WavTmbydT5rf5YJXMDTSlADseFlgv
+
+--
+-- Database "exploitdb" dump
+--
+
+--
+-- PostgreSQL database dump
+--
+
+\restrict 4BDgmkxzQlhx6VdjnTcsWudPaCNtt0FDaGbIgnRtqG5kUiViYIlkpDwjkaB0zvl
+
+-- Dumped from database version 16.10 (Debian 16.10-1.pgdg12+1)
+-- Dumped by pg_dump version 16.10 (Ubuntu 16.10-0ubuntu0.24.04.1)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: exploitdb; Type: DATABASE; Schema: -; Owner: -
+--
+
+CREATE DATABASE exploitdb WITH TEMPLATE = template0 ENCODING = 'UTF8' LOCALE_PROVIDER = libc LOCALE = 'en_US.utf8';
+
+
+\unrestrict 4BDgmkxzQlhx6VdjnTcsWudPaCNtt0FDaGbIgnRtqG5kUiViYIlkpDwjkaB0zvl
+\connect exploitdb
+\restrict 4BDgmkxzQlhx6VdjnTcsWudPaCNtt0FDaGbIgnRtqG5kUiViYIlkpDwjkaB0zvl
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- PostgreSQL database dump complete
+--
+
+\unrestrict 4BDgmkxzQlhx6VdjnTcsWudPaCNtt0FDaGbIgnRtqG5kUiViYIlkpDwjkaB0zvl
+
+--
+-- Database "n8n" dump
+--
+
+--
+-- PostgreSQL database dump
+--
+
+\restrict pcS9FggsrwAqWJWWLPRfHWM5dVvQgVQn0Nc6Q5Fzuu4NC1scjB8PvBHWMPxOzZD
+
+-- Dumped from database version 16.10 (Debian 16.10-1.pgdg12+1)
+-- Dumped by pg_dump version 16.10 (Ubuntu 16.10-0ubuntu0.24.04.1)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: n8n; Type: DATABASE; Schema: -; Owner: -
+--
+
+CREATE DATABASE n8n WITH TEMPLATE = template0 ENCODING = 'UTF8' LOCALE_PROVIDER = libc LOCALE = 'en_US.utf8';
+
+
+\unrestrict pcS9FggsrwAqWJWWLPRfHWM5dVvQgVQn0Nc6Q5Fzuu4NC1scjB8PvBHWMPxOzZD
+\connect n8n
+\restrict pcS9FggsrwAqWJWWLPRfHWM5dVvQgVQn0Nc6Q5Fzuu4NC1scjB8PvBHWMPxOzZD
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: n8n; Type: DATABASE PROPERTIES; Schema: -; Owner: -
+--
+
+ALTER DATABASE n8n SET search_path TO 'public';
+
+
+\unrestrict pcS9FggsrwAqWJWWLPRfHWM5dVvQgVQn0Nc6Q5Fzuu4NC1scjB8PvBHWMPxOzZD
+\connect n8n
+\restrict pcS9FggsrwAqWJWWLPRfHWM5dVvQgVQn0Nc6Q5Fzuu4NC1scjB8PvBHWMPxOzZD
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: n8n; Type: SCHEMA; Schema: -; Owner: -
+--
+
+CREATE SCHEMA n8n;
+
+
+--
+-- Name: public; Type: SCHEMA; Schema: -; Owner: -
+--
+
+-- *not* creating schema, since initdb creates it
+
+
+--
+-- Name: uuid-ossp; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION "uuid-ossp"; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION "uuid-ossp" IS 'generate universally unique identifiers (UUIDs)';
+
+
+--
+-- Name: vector; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION vector; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION vector IS 'vector data type and ivfflat and hnsw access methods';
+
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: analytics_by_period; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.analytics_by_period (
+    id integer NOT NULL,
+    "metaId" integer NOT NULL,
+    type integer NOT NULL,
+    value integer NOT NULL,
+    "periodUnit" integer NOT NULL,
+    "periodStart" timestamp(0) without time zone
+);
+
+
+--
+-- Name: COLUMN analytics_by_period.type; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.analytics_by_period.type IS '0: time_saved_minutes, 1: runtime_milliseconds, 2: success, 3: failure';
+
+
+--
+-- Name: COLUMN analytics_by_period."periodUnit"; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.analytics_by_period."periodUnit" IS '0: hour, 1: day, 2: week';
+
+
+--
+-- Name: analytics_by_period_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.analytics_by_period ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME public.analytics_by_period_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
+-- Name: analytics_metadata; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.analytics_metadata (
+    "metaId" integer NOT NULL,
+    "workflowId" character varying(16),
+    "projectId" character varying(36),
+    "workflowName" character varying(128) NOT NULL,
+    "projectName" character varying(255) NOT NULL
+);
+
+
+--
+-- Name: analytics_metadata_metaId_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.analytics_metadata ALTER COLUMN "metaId" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME public."analytics_metadata_metaId_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
+-- Name: analytics_raw; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.analytics_raw (
+    id integer NOT NULL,
+    "metaId" integer NOT NULL,
+    type integer NOT NULL,
+    value integer NOT NULL,
+    "timestamp" timestamp(0) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+
+--
+-- Name: COLUMN analytics_raw.type; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.analytics_raw.type IS '0: time_saved_minutes, 1: runtime_milliseconds, 2: success, 3: failure';
+
+
+--
+-- Name: analytics_raw_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.analytics_raw ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME public.analytics_raw_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
+-- Name: annotation_tag_entity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.annotation_tag_entity (
+    id character varying(16) NOT NULL,
+    name character varying(24) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: assets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.assets (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    ip inet,
+    hostname text,
+    env text,
+    tags text[] DEFAULT '{}'::text[],
+    first_seen timestamp with time zone DEFAULT now(),
+    last_seen timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: auth_identity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.auth_identity (
+    "userId" uuid,
+    "providerId" character varying(64) NOT NULL,
+    "providerType" character varying(32) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: auth_provider_sync_history; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.auth_provider_sync_history (
+    id integer NOT NULL,
+    "providerType" character varying(32) NOT NULL,
+    "runMode" text NOT NULL,
+    status text NOT NULL,
+    "startedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    "endedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    scanned integer NOT NULL,
+    created integer NOT NULL,
+    updated integer NOT NULL,
+    disabled integer NOT NULL,
+    error text
+);
+
+
+--
+-- Name: auth_provider_sync_history_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.auth_provider_sync_history_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: auth_provider_sync_history_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.auth_provider_sync_history_id_seq OWNED BY public.auth_provider_sync_history.id;
+
+
+--
+-- Name: credentials_entity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.credentials_entity (
+    name character varying(128) NOT NULL,
+    data text NOT NULL,
+    type character varying(128) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    id character varying(36) NOT NULL,
+    "isManaged" boolean DEFAULT false NOT NULL
+);
+
+
+--
+-- Name: event_destinations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.event_destinations (
+    id uuid NOT NULL,
+    destination jsonb NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: execution_annotation_tags; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.execution_annotation_tags (
+    "annotationId" integer NOT NULL,
+    "tagId" character varying(24) NOT NULL
+);
+
+
+--
+-- Name: execution_annotations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.execution_annotations (
+    id integer NOT NULL,
+    "executionId" integer NOT NULL,
+    vote character varying(6),
+    note text,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: execution_annotations_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.execution_annotations_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: execution_annotations_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.execution_annotations_id_seq OWNED BY public.execution_annotations.id;
+
+
+--
+-- Name: execution_data; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.execution_data (
+    "executionId" integer NOT NULL,
+    "workflowData" json NOT NULL,
+    data text NOT NULL
+);
+
+
+--
+-- Name: execution_entity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.execution_entity (
+    id integer NOT NULL,
+    finished boolean NOT NULL,
+    mode character varying NOT NULL,
+    "retryOf" character varying,
+    "retrySuccessId" character varying,
+    "startedAt" timestamp(3) with time zone,
+    "stoppedAt" timestamp(3) with time zone,
+    "waitTill" timestamp(3) with time zone,
+    status character varying NOT NULL,
+    "workflowId" character varying(36) NOT NULL,
+    "deletedAt" timestamp(3) with time zone,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: execution_entity_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.execution_entity_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: execution_entity_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.execution_entity_id_seq OWNED BY public.execution_entity.id;
+
+
+--
+-- Name: execution_metadata; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.execution_metadata (
+    id integer NOT NULL,
+    "executionId" integer NOT NULL,
+    key character varying(255) NOT NULL,
+    value text NOT NULL
+);
+
+
+--
+-- Name: execution_metadata_temp_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.execution_metadata_temp_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: execution_metadata_temp_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.execution_metadata_temp_id_seq OWNED BY public.execution_metadata.id;
+
+
+--
+-- Name: findings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.findings (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    asset_id uuid,
+    port_id uuid,
+    source_tool text,
+    rule_id text,
+    title text,
+    description text,
+    evidence jsonb DEFAULT '{}'::jsonb,
+    cve text[],
+    cvss numeric,
+    severity text,
+    observed_at timestamp with time zone DEFAULT now(),
+    status text DEFAULT 'open'::text,
+    CONSTRAINT findings_severity_check CHECK ((severity = ANY (ARRAY['info'::text, 'low'::text, 'medium'::text, 'high'::text, 'critical'::text]))),
+    CONSTRAINT findings_status_check CHECK ((status = ANY (ARRAY['open'::text, 'accepted'::text, 'fixed'::text, 'retest-passed'::text, 'retest-failed'::text])))
+);
+
+
+--
+-- Name: folder; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.folder (
+    id character varying(36) NOT NULL,
+    name character varying(128) NOT NULL,
+    "parentFolderId" character varying(36),
+    "projectId" character varying(36) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: folder_tag; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.folder_tag (
+    "folderId" character varying(36) NOT NULL,
+    "tagId" character varying(36) NOT NULL
+);
+
+
+--
+-- Name: installed_nodes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.installed_nodes (
+    name character varying(200) NOT NULL,
+    type character varying(200) NOT NULL,
+    "latestVersion" integer DEFAULT 1 NOT NULL,
+    package character varying(241) NOT NULL
+);
+
+
+--
+-- Name: installed_packages; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.installed_packages (
+    "packageName" character varying(214) NOT NULL,
+    "installedVersion" character varying(50) NOT NULL,
+    "authorName" character varying(70),
+    "authorEmail" character varying(70),
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: invalid_auth_token; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.invalid_auth_token (
+    token character varying(512) NOT NULL,
+    "expiresAt" timestamp(3) with time zone NOT NULL
+);
+
+
+--
+-- Name: migrations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.migrations (
+    id integer NOT NULL,
+    "timestamp" bigint NOT NULL,
+    name character varying NOT NULL
+);
+
+
+--
+-- Name: migrations_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.migrations_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: migrations_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.migrations_id_seq OWNED BY public.migrations.id;
+
+
+--
+-- Name: ports; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ports (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    asset_id uuid NOT NULL,
+    proto text,
+    port integer NOT NULL,
+    service text,
+    product text,
+    version text,
+    banner text,
+    first_seen timestamp with time zone DEFAULT now(),
+    last_seen timestamp with time zone DEFAULT now(),
+    is_open boolean DEFAULT true NOT NULL,
+    CONSTRAINT ports_port_check CHECK (((port >= 1) AND (port <= 65535))),
+    CONSTRAINT ports_proto_check CHECK ((proto = ANY (ARRAY['tcp'::text, 'udp'::text])))
+);
+
+
+--
+-- Name: processed_data; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.processed_data (
+    "workflowId" character varying(36) NOT NULL,
+    context character varying(255) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    value text NOT NULL
+);
+
+
+--
+-- Name: project; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.project (
+    id character varying(36) NOT NULL,
+    name character varying(255) NOT NULL,
+    type character varying(36) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    icon json
+);
+
+
+--
+-- Name: project_relation; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.project_relation (
+    "projectId" character varying(36) NOT NULL,
+    "userId" uuid NOT NULL,
+    role character varying NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: rag_documents; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.rag_documents (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    asset_id uuid,
+    finding_id uuid,
+    port_id uuid,
+    scan_id uuid,
+    title text,
+    text_chunk text NOT NULL,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    embedding public.vector(384),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    fts tsvector GENERATED ALWAYS AS (to_tsvector('english'::regconfig, ((COALESCE(title, ''::text) || ' '::text) || text_chunk))) STORED
+);
+
+
+--
+-- Name: rag_recent_high; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.rag_recent_high AS
+ SELECT title,
+    text_chunk,
+    metadata,
+    created_at
+   FROM public.rag_documents
+  WHERE (((metadata ->> 'severity'::text) = ANY (ARRAY['high'::text, 'critical'::text])) AND (created_at >= (now() - '30 days'::interval)));
+
+
+--
+-- Name: role; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.role (
+    id integer NOT NULL,
+    name character varying(32) NOT NULL,
+    scope character varying(255) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: role_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.role_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: role_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.role_id_seq OWNED BY public.role.id;
+
+
+--
+-- Name: scan_ports; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.scan_ports (
+    scan_id uuid NOT NULL,
+    port_id uuid NOT NULL
+);
+
+
+--
+-- Name: scans; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.scans (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    tool text,
+    profile text,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    finished_at timestamp with time zone,
+    args text,
+    source_path text,
+    metadata jsonb DEFAULT '{}'::jsonb
+);
+
+
+--
+-- Name: settings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.settings (
+    key character varying(255) NOT NULL,
+    value text NOT NULL,
+    "loadOnStartup" boolean DEFAULT false NOT NULL
+);
+
+
+--
+-- Name: shared_credentials; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.shared_credentials (
+    "credentialsId" character varying(36) NOT NULL,
+    "projectId" character varying(36) NOT NULL,
+    role text NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: shared_workflow; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.shared_workflow (
+    "workflowId" character varying(36) NOT NULL,
+    "projectId" character varying(36) NOT NULL,
+    role text NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: tag_entity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tag_entity (
+    name character varying(24) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    id character varying(36) NOT NULL
+);
+
+
+--
+-- Name: test_case_execution; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.test_case_execution (
+    id character varying(36) NOT NULL,
+    "testRunId" character varying(36) NOT NULL,
+    "pastExecutionId" integer,
+    "executionId" integer,
+    "evaluationExecutionId" integer,
+    status character varying NOT NULL,
+    "runAt" timestamp(3) with time zone,
+    "completedAt" timestamp(3) with time zone,
+    "errorCode" character varying,
+    "errorDetails" json,
+    metrics json,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: test_definition; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.test_definition (
+    name character varying(255) NOT NULL,
+    "workflowId" character varying(36) NOT NULL,
+    "evaluationWorkflowId" character varying(36),
+    "annotationTagId" character varying(16),
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    description text,
+    id character varying(36) NOT NULL,
+    "mockedNodes" json DEFAULT '[]'::json NOT NULL
+);
+
+
+--
+-- Name: test_metric; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.test_metric (
+    id character varying(36) NOT NULL,
+    name character varying(255) NOT NULL,
+    "testDefinitionId" character varying(36) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: test_run; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.test_run (
+    id character varying(36) NOT NULL,
+    "testDefinitionId" character varying(36) NOT NULL,
+    status character varying NOT NULL,
+    "runAt" timestamp(3) with time zone,
+    "completedAt" timestamp(3) with time zone,
+    metrics json,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "totalCases" integer,
+    "passedCases" integer,
+    "failedCases" integer,
+    "errorCode" character varying(255),
+    "errorDetails" text,
+    CONSTRAINT test_run_check CHECK (
+CASE
+    WHEN ((status)::text = 'new'::text) THEN ("totalCases" IS NULL)
+    WHEN ((status)::text = ANY ((ARRAY['cancelled'::character varying, 'error'::character varying])::text[])) THEN (("totalCases" IS NULL) OR ("totalCases" >= 0))
+    ELSE ("totalCases" >= 0)
+END),
+    CONSTRAINT test_run_check1 CHECK (
+CASE
+    WHEN ((status)::text = 'new'::text) THEN ("passedCases" IS NULL)
+    WHEN ((status)::text = ANY ((ARRAY['cancelled'::character varying, 'error'::character varying])::text[])) THEN (("passedCases" IS NULL) OR ("passedCases" >= 0))
+    ELSE ("passedCases" >= 0)
+END),
+    CONSTRAINT test_run_check2 CHECK (
+CASE
+    WHEN ((status)::text = 'new'::text) THEN ("failedCases" IS NULL)
+    WHEN ((status)::text = ANY ((ARRAY['cancelled'::character varying, 'error'::character varying])::text[])) THEN (("failedCases" IS NULL) OR ("failedCases" >= 0))
+    ELSE ("failedCases" >= 0)
+END)
+);
+
+
+--
+-- Name: user; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public."user" (
+    id uuid DEFAULT uuid_in((OVERLAY(OVERLAY(md5((((random())::text || ':'::text) || (clock_timestamp())::text)) PLACING '4'::text FROM 13) PLACING to_hex((floor(((random() * (((11 - 8) + 1))::double precision) + (8)::double precision)))::integer) FROM 17))::cstring) NOT NULL,
+    email character varying(255),
+    "firstName" character varying(32),
+    "lastName" character varying(32),
+    password character varying(255),
+    "personalizationAnswers" json,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    settings json,
+    disabled boolean DEFAULT false NOT NULL,
+    "mfaEnabled" boolean DEFAULT false NOT NULL,
+    "mfaSecret" text,
+    "mfaRecoveryCodes" text,
+    role text NOT NULL
+);
+
+
+--
+-- Name: user_api_keys; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_api_keys (
+    id character varying(36) NOT NULL,
+    "userId" uuid NOT NULL,
+    label character varying(100) NOT NULL,
+    "apiKey" character varying NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL
+);
+
+
+--
+-- Name: variables; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.variables (
+    key character varying(50) NOT NULL,
+    type character varying(50) DEFAULT 'string'::character varying NOT NULL,
+    value character varying(255),
+    id character varying(36) NOT NULL
+);
+
+
+--
+-- Name: web_findings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.web_findings (
+    id uuid NOT NULL,
+    asset_id uuid,
+    url text NOT NULL,
+    source text NOT NULL,
+    issue_type text,
+    name text,
+    severity text,
+    evidence text,
+    status_code integer,
+    first_seen timestamp with time zone DEFAULT now(),
+    last_seen timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: webhook_entity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.webhook_entity (
+    "webhookPath" character varying NOT NULL,
+    method character varying NOT NULL,
+    node character varying NOT NULL,
+    "webhookId" character varying,
+    "pathLength" integer,
+    "workflowId" character varying(36) NOT NULL
+);
+
+
+--
+-- Name: workflow_entity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.workflow_entity (
+    name character varying(128) NOT NULL,
+    active boolean NOT NULL,
+    nodes json NOT NULL,
+    connections json NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    settings json,
+    "staticData" json,
+    "pinData" json,
+    "versionId" character(36),
+    "triggerCount" integer DEFAULT 0 NOT NULL,
+    id character varying(36) NOT NULL,
+    meta json,
+    "parentFolderId" character varying(36) DEFAULT NULL::character varying
+);
+
+
+--
+-- Name: workflow_history; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.workflow_history (
+    "versionId" character varying(36) NOT NULL,
+    "workflowId" character varying(36) NOT NULL,
+    authors character varying(255) NOT NULL,
+    "createdAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    "updatedAt" timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    nodes json NOT NULL,
+    connections json NOT NULL
+);
+
+
+--
+-- Name: workflow_statistics; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.workflow_statistics (
+    count integer DEFAULT 0,
+    "latestEvent" timestamp(3) with time zone,
+    name character varying(128) NOT NULL,
+    "workflowId" character varying(36) NOT NULL
+);
+
+
+--
+-- Name: workflows_tags; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.workflows_tags (
+    "workflowId" character varying(36) NOT NULL,
+    "tagId" character varying(36) NOT NULL
+);
+
+
+--
+-- Name: auth_provider_sync_history id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_provider_sync_history ALTER COLUMN id SET DEFAULT nextval('public.auth_provider_sync_history_id_seq'::regclass);
+
+
+--
+-- Name: execution_annotations id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_annotations ALTER COLUMN id SET DEFAULT nextval('public.execution_annotations_id_seq'::regclass);
+
+
+--
+-- Name: execution_entity id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_entity ALTER COLUMN id SET DEFAULT nextval('public.execution_entity_id_seq'::regclass);
+
+
+--
+-- Name: execution_metadata id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_metadata ALTER COLUMN id SET DEFAULT nextval('public.execution_metadata_temp_id_seq'::regclass);
+
+
+--
+-- Name: migrations id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.migrations ALTER COLUMN id SET DEFAULT nextval('public.migrations_id_seq'::regclass);
+
+
+--
+-- Name: role id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role ALTER COLUMN id SET DEFAULT nextval('public.role_id_seq'::regclass);
+
+
+--
+-- Name: test_run PK_011c050f566e9db509a0fadb9b9; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_run
+    ADD CONSTRAINT "PK_011c050f566e9db509a0fadb9b9" PRIMARY KEY (id);
+
+
+--
+-- Name: installed_packages PK_08cc9197c39b028c1e9beca225940576fd1a5804; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.installed_packages
+    ADD CONSTRAINT "PK_08cc9197c39b028c1e9beca225940576fd1a5804" PRIMARY KEY ("packageName");
+
+
+--
+-- Name: analytics_by_period PK_13d19771a5725bf911493e2b4c9; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.analytics_by_period
+    ADD CONSTRAINT "PK_13d19771a5725bf911493e2b4c9" PRIMARY KEY (id);
+
+
+--
+-- Name: execution_metadata PK_17a0b6284f8d626aae88e1c16e4; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_metadata
+    ADD CONSTRAINT "PK_17a0b6284f8d626aae88e1c16e4" PRIMARY KEY (id);
+
+
+--
+-- Name: project_relation PK_1caaa312a5d7184a003be0f0cb6; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_relation
+    ADD CONSTRAINT "PK_1caaa312a5d7184a003be0f0cb6" PRIMARY KEY ("projectId", "userId");
+
+
+--
+-- Name: analytics_raw PK_2660b1d980e526ebfad550b3b7e; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.analytics_raw
+    ADD CONSTRAINT "PK_2660b1d980e526ebfad550b3b7e" PRIMARY KEY (id);
+
+
+--
+-- Name: folder_tag PK_27e4e00852f6b06a925a4d83a3e; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.folder_tag
+    ADD CONSTRAINT "PK_27e4e00852f6b06a925a4d83a3e" PRIMARY KEY ("folderId", "tagId");
+
+
+--
+-- Name: test_metric PK_3e98b8e20acc19c5030a8644142; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_metric
+    ADD CONSTRAINT "PK_3e98b8e20acc19c5030a8644142" PRIMARY KEY (id);
+
+
+--
+-- Name: project PK_4d68b1358bb5b766d3e78f32f57; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project
+    ADD CONSTRAINT "PK_4d68b1358bb5b766d3e78f32f57" PRIMARY KEY (id);
+
+
+--
+-- Name: invalid_auth_token PK_5779069b7235b256d91f7af1a15; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invalid_auth_token
+    ADD CONSTRAINT "PK_5779069b7235b256d91f7af1a15" PRIMARY KEY (token);
+
+
+--
+-- Name: shared_workflow PK_5ba87620386b847201c9531c58f; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_workflow
+    ADD CONSTRAINT "PK_5ba87620386b847201c9531c58f" PRIMARY KEY ("workflowId", "projectId");
+
+
+--
+-- Name: folder PK_6278a41a706740c94c02e288df8; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.folder
+    ADD CONSTRAINT "PK_6278a41a706740c94c02e288df8" PRIMARY KEY (id);
+
+
+--
+-- Name: annotation_tag_entity PK_69dfa041592c30bbc0d4b84aa00; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.annotation_tag_entity
+    ADD CONSTRAINT "PK_69dfa041592c30bbc0d4b84aa00" PRIMARY KEY (id);
+
+
+--
+-- Name: execution_annotations PK_7afcf93ffa20c4252869a7c6a23; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_annotations
+    ADD CONSTRAINT "PK_7afcf93ffa20c4252869a7c6a23" PRIMARY KEY (id);
+
+
+--
+-- Name: migrations PK_8c82d7f526340ab734260ea46be; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.migrations
+    ADD CONSTRAINT "PK_8c82d7f526340ab734260ea46be" PRIMARY KEY (id);
+
+
+--
+-- Name: installed_nodes PK_8ebd28194e4f792f96b5933423fc439df97d9689; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.installed_nodes
+    ADD CONSTRAINT "PK_8ebd28194e4f792f96b5933423fc439df97d9689" PRIMARY KEY (name);
+
+
+--
+-- Name: shared_credentials PK_8ef3a59796a228913f251779cff; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_credentials
+    ADD CONSTRAINT "PK_8ef3a59796a228913f251779cff" PRIMARY KEY ("credentialsId", "projectId");
+
+
+--
+-- Name: test_case_execution PK_90c121f77a78a6580e94b794bce; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_case_execution
+    ADD CONSTRAINT "PK_90c121f77a78a6580e94b794bce" PRIMARY KEY (id);
+
+
+--
+-- Name: user_api_keys PK_978fa5caa3468f463dac9d92e69; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_api_keys
+    ADD CONSTRAINT "PK_978fa5caa3468f463dac9d92e69" PRIMARY KEY (id);
+
+
+--
+-- Name: execution_annotation_tags PK_979ec03d31294cca484be65d11f; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_annotation_tags
+    ADD CONSTRAINT "PK_979ec03d31294cca484be65d11f" PRIMARY KEY ("annotationId", "tagId");
+
+
+--
+-- Name: webhook_entity PK_b21ace2e13596ccd87dc9bf4ea6; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.webhook_entity
+    ADD CONSTRAINT "PK_b21ace2e13596ccd87dc9bf4ea6" PRIMARY KEY ("webhookPath", method);
+
+
+--
+-- Name: workflow_history PK_b6572dd6173e4cd06fe79937b58; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflow_history
+    ADD CONSTRAINT "PK_b6572dd6173e4cd06fe79937b58" PRIMARY KEY ("versionId");
+
+
+--
+-- Name: processed_data PK_ca04b9d8dc72de268fe07a65773; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.processed_data
+    ADD CONSTRAINT "PK_ca04b9d8dc72de268fe07a65773" PRIMARY KEY ("workflowId", context);
+
+
+--
+-- Name: settings PK_dc0fe14e6d9943f268e7b119f69ab8bd; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.settings
+    ADD CONSTRAINT "PK_dc0fe14e6d9943f268e7b119f69ab8bd" PRIMARY KEY (key);
+
+
+--
+-- Name: role PK_e853ce24e8200abe5721d2c6ac552b73; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role
+    ADD CONSTRAINT "PK_e853ce24e8200abe5721d2c6ac552b73" PRIMARY KEY (id);
+
+
+--
+-- Name: user PK_ea8f538c94b6e352418254ed6474a81f; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public."user"
+    ADD CONSTRAINT "PK_ea8f538c94b6e352418254ed6474a81f" PRIMARY KEY (id);
+
+
+--
+-- Name: analytics_metadata PK_ee291a42a64743a29bbde1280d3; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.analytics_metadata
+    ADD CONSTRAINT "PK_ee291a42a64743a29bbde1280d3" PRIMARY KEY ("metaId");
+
+
+--
+-- Name: role UQ_5b49d0f504f7ef31045a1fb2eb8; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role
+    ADD CONSTRAINT "UQ_5b49d0f504f7ef31045a1fb2eb8" UNIQUE (scope, name);
+
+
+--
+-- Name: user UQ_e12875dfb3b1d92d7d7c5377e2; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public."user"
+    ADD CONSTRAINT "UQ_e12875dfb3b1d92d7d7c5377e2" UNIQUE (email);
+
+
+--
+-- Name: assets assets_ip_hostname_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.assets
+    ADD CONSTRAINT assets_ip_hostname_key UNIQUE (ip, hostname);
+
+
+--
+-- Name: assets assets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.assets
+    ADD CONSTRAINT assets_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: auth_identity auth_identity_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_identity
+    ADD CONSTRAINT auth_identity_pkey PRIMARY KEY ("providerId", "providerType");
+
+
+--
+-- Name: auth_provider_sync_history auth_provider_sync_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_provider_sync_history
+    ADD CONSTRAINT auth_provider_sync_history_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: credentials_entity credentials_entity_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credentials_entity
+    ADD CONSTRAINT credentials_entity_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: event_destinations event_destinations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_destinations
+    ADD CONSTRAINT event_destinations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: execution_data execution_data_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_data
+    ADD CONSTRAINT execution_data_pkey PRIMARY KEY ("executionId");
+
+
+--
+-- Name: findings findings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.findings
+    ADD CONSTRAINT findings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: execution_entity pk_e3e63bbf986767844bbe1166d4e; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_entity
+    ADD CONSTRAINT pk_e3e63bbf986767844bbe1166d4e PRIMARY KEY (id);
+
+
+--
+-- Name: workflow_statistics pk_workflow_statistics; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflow_statistics
+    ADD CONSTRAINT pk_workflow_statistics PRIMARY KEY ("workflowId", name);
+
+
+--
+-- Name: workflows_tags pk_workflows_tags; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflows_tags
+    ADD CONSTRAINT pk_workflows_tags PRIMARY KEY ("workflowId", "tagId");
+
+
+--
+-- Name: ports ports_asset_id_proto_port_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ports
+    ADD CONSTRAINT ports_asset_id_proto_port_key UNIQUE (asset_id, proto, port);
+
+
+--
+-- Name: ports ports_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ports
+    ADD CONSTRAINT ports_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: rag_documents rag_documents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rag_documents
+    ADD CONSTRAINT rag_documents_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: scan_ports scan_ports_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scan_ports
+    ADD CONSTRAINT scan_ports_pkey PRIMARY KEY (scan_id, port_id);
+
+
+--
+-- Name: scans scans_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scans
+    ADD CONSTRAINT scans_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tag_entity tag_entity_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tag_entity
+    ADD CONSTRAINT tag_entity_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: test_definition test_definition_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_definition
+    ADD CONSTRAINT test_definition_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: variables variables_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.variables
+    ADD CONSTRAINT variables_key_key UNIQUE (key);
+
+
+--
+-- Name: variables variables_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.variables
+    ADD CONSTRAINT variables_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: web_findings web_findings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.web_findings
+    ADD CONSTRAINT web_findings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: workflow_entity workflow_entity_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflow_entity
+    ADD CONSTRAINT workflow_entity_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: IDX_14f68deffaf858465715995508; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX "IDX_14f68deffaf858465715995508" ON public.folder USING btree ("projectId", id);
+
+
+--
+-- Name: IDX_1e31657f5fe46816c34be7c1b4; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_1e31657f5fe46816c34be7c1b4" ON public.workflow_history USING btree ("workflowId");
+
+
+--
+-- Name: IDX_1ef35bac35d20bdae979d917a3; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX "IDX_1ef35bac35d20bdae979d917a3" ON public.user_api_keys USING btree ("apiKey");
+
+
+--
+-- Name: IDX_20714d890d77beba8e3065367d; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX "IDX_20714d890d77beba8e3065367d" ON public.analytics_by_period USING btree ("periodStart", type, "periodUnit", "metaId");
+
+
+--
+-- Name: IDX_3a4e9cf37111ac3270e2469b47; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_3a4e9cf37111ac3270e2469b47" ON public.test_metric USING btree ("testDefinitionId");
+
+
+--
+-- Name: IDX_3a81713a76f2295b12b46cdfca; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_3a81713a76f2295b12b46cdfca" ON public.test_run USING btree ("testDefinitionId");
+
+
+--
+-- Name: IDX_5f0643f6717905a05164090dde; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_5f0643f6717905a05164090dde" ON public.project_relation USING btree ("userId");
+
+
+--
+-- Name: IDX_61448d56d61802b5dfde5cdb00; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_61448d56d61802b5dfde5cdb00" ON public.project_relation USING btree ("projectId");
+
+
+--
+-- Name: IDX_63d7bbae72c767cf162d459fcc; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX "IDX_63d7bbae72c767cf162d459fcc" ON public.user_api_keys USING btree ("userId", label);
+
+
+--
+-- Name: IDX_8e4b4774db42f1e6dda3452b2a; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_8e4b4774db42f1e6dda3452b2a" ON public.test_case_execution USING btree ("testRunId");
+
+
+--
+-- Name: IDX_97f863fa83c4786f1956508496; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX "IDX_97f863fa83c4786f1956508496" ON public.execution_annotations USING btree ("executionId");
+
+
+--
+-- Name: IDX_9ec1ce6fbf82305f489adb971d; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_9ec1ce6fbf82305f489adb971d" ON public.test_definition USING btree ("evaluationWorkflowId");
+
+
+--
+-- Name: IDX_a3697779b366e131b2bbdae297; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_a3697779b366e131b2bbdae297" ON public.execution_annotation_tags USING btree ("tagId");
+
+
+--
+-- Name: IDX_ae51b54c4bb430cf92f48b623f; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX "IDX_ae51b54c4bb430cf92f48b623f" ON public.annotation_tag_entity USING btree (name);
+
+
+--
+-- Name: IDX_b0dd0087fe3da02b0ffa4b9c5b; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_b0dd0087fe3da02b0ffa4b9c5b" ON public.test_definition USING btree ("workflowId");
+
+
+--
+-- Name: IDX_c1519757391996eb06064f0e7c; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_c1519757391996eb06064f0e7c" ON public.execution_annotation_tags USING btree ("annotationId");
+
+
+--
+-- Name: IDX_cec8eea3bf49551482ccb4933e; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX "IDX_cec8eea3bf49551482ccb4933e" ON public.execution_metadata USING btree ("executionId", key);
+
+
+--
+-- Name: IDX_execution_entity_deletedAt; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_execution_entity_deletedAt" ON public.execution_entity USING btree ("deletedAt");
+
+
+--
+-- Name: IDX_workflow_entity_name; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IDX_workflow_entity_name" ON public.workflow_entity USING btree (name);
+
+
+--
+-- Name: findings_asset_sev_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX findings_asset_sev_idx ON public.findings USING btree (asset_id, severity);
+
+
+--
+-- Name: findings_cve_gin; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX findings_cve_gin ON public.findings USING gin (cve);
+
+
+--
+-- Name: idx_07fde106c0b471d8cc80a64fc8; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_07fde106c0b471d8cc80a64fc8 ON public.credentials_entity USING btree (type);
+
+
+--
+-- Name: idx_16f4436789e804e3e1c9eeb240; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_16f4436789e804e3e1c9eeb240 ON public.webhook_entity USING btree ("webhookId", method, "pathLength");
+
+
+--
+-- Name: idx_812eb05f7451ca757fb98444ce; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_812eb05f7451ca757fb98444ce ON public.tag_entity USING btree (name);
+
+
+--
+-- Name: idx_execution_entity_stopped_at_status_deleted_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_execution_entity_stopped_at_status_deleted_at ON public.execution_entity USING btree ("stoppedAt", status, "deletedAt") WHERE (("stoppedAt" IS NOT NULL) AND ("deletedAt" IS NULL));
+
+
+--
+-- Name: idx_execution_entity_wait_till_status_deleted_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_execution_entity_wait_till_status_deleted_at ON public.execution_entity USING btree ("waitTill", status, "deletedAt") WHERE (("waitTill" IS NOT NULL) AND ("deletedAt" IS NULL));
+
+
+--
+-- Name: idx_execution_entity_workflow_id_started_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_execution_entity_workflow_id_started_at ON public.execution_entity USING btree ("workflowId", "startedAt") WHERE (("startedAt" IS NOT NULL) AND ("deletedAt" IS NULL));
+
+
+--
+-- Name: idx_workflows_tags_workflow_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_workflows_tags_workflow_id ON public.workflows_tags USING btree ("workflowId");
+
+
+--
+-- Name: ix_assets_ip; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_assets_ip ON public.assets USING btree (ip);
+
+
+--
+-- Name: ix_web_findings_asset; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_web_findings_asset ON public.web_findings USING btree (asset_id);
+
+
+--
+-- Name: ix_web_findings_url; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_web_findings_url ON public.web_findings USING btree (url);
+
+
+--
+-- Name: pk_credentials_entity_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pk_credentials_entity_id ON public.credentials_entity USING btree (id);
+
+
+--
+-- Name: pk_tag_entity_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pk_tag_entity_id ON public.tag_entity USING btree (id);
+
+
+--
+-- Name: pk_test_definition_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pk_test_definition_id ON public.test_definition USING btree (id);
+
+
+--
+-- Name: pk_variables_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pk_variables_id ON public.variables USING btree (id);
+
+
+--
+-- Name: pk_workflow_entity_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pk_workflow_entity_id ON public.workflow_entity USING btree (id);
+
+
+--
+-- Name: ports_asset_port_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ports_asset_port_idx ON public.ports USING btree (asset_id, proto, port);
+
+
+--
+-- Name: rag_docs_embedding_ivfflat; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX rag_docs_embedding_ivfflat ON public.rag_documents USING ivfflat (embedding) WITH (lists='200');
+
+
+--
+-- Name: rag_docs_fts_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX rag_docs_fts_idx ON public.rag_documents USING gin (fts);
+
+
+--
+-- Name: rag_docs_meta_gin; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX rag_docs_meta_gin ON public.rag_documents USING gin (metadata);
+
+
+--
+-- Name: scans_started_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX scans_started_idx ON public.scans USING btree (started_at);
+
+
+--
+-- Name: ux_ports_asset_proto_port; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_ports_asset_proto_port ON public.ports USING btree (asset_id, proto, port);
+
+
+--
+-- Name: processed_data FK_06a69a7032c97a763c2c7599464; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.processed_data
+    ADD CONSTRAINT "FK_06a69a7032c97a763c2c7599464" FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: workflow_history FK_1e31657f5fe46816c34be7c1b4b; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflow_history
+    ADD CONSTRAINT "FK_1e31657f5fe46816c34be7c1b4b" FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: test_case_execution FK_258d954733841d51edd826a562b; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_case_execution
+    ADD CONSTRAINT "FK_258d954733841d51edd826a562b" FOREIGN KEY ("pastExecutionId") REFERENCES public.execution_entity(id) ON DELETE SET NULL;
+
+
+--
+-- Name: execution_metadata FK_31d0b4c93fb85ced26f6005cda3; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_metadata
+    ADD CONSTRAINT "FK_31d0b4c93fb85ced26f6005cda3" FOREIGN KEY ("executionId") REFERENCES public.execution_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: test_metric FK_3a4e9cf37111ac3270e2469b475; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_metric
+    ADD CONSTRAINT "FK_3a4e9cf37111ac3270e2469b475" FOREIGN KEY ("testDefinitionId") REFERENCES public.test_definition(id) ON DELETE CASCADE;
+
+
+--
+-- Name: test_run FK_3a81713a76f2295b12b46cdfcab; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_run
+    ADD CONSTRAINT "FK_3a81713a76f2295b12b46cdfcab" FOREIGN KEY ("testDefinitionId") REFERENCES public.test_definition(id) ON DELETE CASCADE;
+
+
+--
+-- Name: shared_credentials FK_416f66fc846c7c442970c094ccf; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_credentials
+    ADD CONSTRAINT "FK_416f66fc846c7c442970c094ccf" FOREIGN KEY ("credentialsId") REFERENCES public.credentials_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_relation FK_5f0643f6717905a05164090dde7; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_relation
+    ADD CONSTRAINT "FK_5f0643f6717905a05164090dde7" FOREIGN KEY ("userId") REFERENCES public."user"(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_relation FK_61448d56d61802b5dfde5cdb002; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_relation
+    ADD CONSTRAINT "FK_61448d56d61802b5dfde5cdb002" FOREIGN KEY ("projectId") REFERENCES public.project(id) ON DELETE CASCADE;
+
+
+--
+-- Name: installed_nodes FK_73f857fc5dce682cef8a99c11dbddbc969618951; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.installed_nodes
+    ADD CONSTRAINT "FK_73f857fc5dce682cef8a99c11dbddbc969618951" FOREIGN KEY (package) REFERENCES public.installed_packages("packageName") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: folder FK_804ea52f6729e3940498bd54d78; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.folder
+    ADD CONSTRAINT "FK_804ea52f6729e3940498bd54d78" FOREIGN KEY ("parentFolderId") REFERENCES public.folder(id) ON DELETE CASCADE;
+
+
+--
+-- Name: shared_credentials FK_812c2852270da1247756e77f5a4; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_credentials
+    ADD CONSTRAINT "FK_812c2852270da1247756e77f5a4" FOREIGN KEY ("projectId") REFERENCES public.project(id) ON DELETE CASCADE;
+
+
+--
+-- Name: analytics_by_period FK_83eea8e9024d109d055721dfb40; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.analytics_by_period
+    ADD CONSTRAINT "FK_83eea8e9024d109d055721dfb40" FOREIGN KEY ("metaId") REFERENCES public.analytics_metadata("metaId") ON DELETE CASCADE;
+
+
+--
+-- Name: test_case_execution FK_8e4b4774db42f1e6dda3452b2af; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_case_execution
+    ADD CONSTRAINT "FK_8e4b4774db42f1e6dda3452b2af" FOREIGN KEY ("testRunId") REFERENCES public.test_run(id) ON DELETE CASCADE;
+
+
+--
+-- Name: folder_tag FK_94a60854e06f2897b2e0d39edba; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.folder_tag
+    ADD CONSTRAINT "FK_94a60854e06f2897b2e0d39edba" FOREIGN KEY ("folderId") REFERENCES public.folder(id) ON DELETE CASCADE;
+
+
+--
+-- Name: execution_annotations FK_97f863fa83c4786f19565084960; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_annotations
+    ADD CONSTRAINT "FK_97f863fa83c4786f19565084960" FOREIGN KEY ("executionId") REFERENCES public.execution_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: test_definition FK_9ec1ce6fbf82305f489adb971d3; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_definition
+    ADD CONSTRAINT "FK_9ec1ce6fbf82305f489adb971d3" FOREIGN KEY ("evaluationWorkflowId") REFERENCES public.workflow_entity(id) ON DELETE SET NULL;
+
+
+--
+-- Name: execution_annotation_tags FK_a3697779b366e131b2bbdae2976; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_annotation_tags
+    ADD CONSTRAINT "FK_a3697779b366e131b2bbdae2976" FOREIGN KEY ("tagId") REFERENCES public.annotation_tag_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: shared_workflow FK_a45ea5f27bcfdc21af9b4188560; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_workflow
+    ADD CONSTRAINT "FK_a45ea5f27bcfdc21af9b4188560" FOREIGN KEY ("projectId") REFERENCES public.project(id) ON DELETE CASCADE;
+
+
+--
+-- Name: folder FK_a8260b0b36939c6247f385b8221; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.folder
+    ADD CONSTRAINT "FK_a8260b0b36939c6247f385b8221" FOREIGN KEY ("projectId") REFERENCES public.project(id) ON DELETE CASCADE;
+
+
+--
+-- Name: analytics_metadata FK_b06b8962721cf6ef7a508d52a66; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.analytics_metadata
+    ADD CONSTRAINT "FK_b06b8962721cf6ef7a508d52a66" FOREIGN KEY ("projectId") REFERENCES public.project(id) ON DELETE SET NULL;
+
+
+--
+-- Name: test_definition FK_b0dd0087fe3da02b0ffa4b9c5bb; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_definition
+    ADD CONSTRAINT "FK_b0dd0087fe3da02b0ffa4b9c5bb" FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: analytics_metadata FK_b14a2a0105c036afaa293b1c57e; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.analytics_metadata
+    ADD CONSTRAINT "FK_b14a2a0105c036afaa293b1c57e" FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE SET NULL;
+
+
+--
+-- Name: execution_annotation_tags FK_c1519757391996eb06064f0e7c8; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_annotation_tags
+    ADD CONSTRAINT "FK_c1519757391996eb06064f0e7c8" FOREIGN KEY ("annotationId") REFERENCES public.execution_annotations(id) ON DELETE CASCADE;
+
+
+--
+-- Name: test_definition FK_d5d7ea64662dbc62f5e266fbeb0; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_definition
+    ADD CONSTRAINT "FK_d5d7ea64662dbc62f5e266fbeb0" FOREIGN KEY ("annotationTagId") REFERENCES public.annotation_tag_entity(id) ON DELETE SET NULL;
+
+
+--
+-- Name: shared_workflow FK_daa206a04983d47d0a9c34649ce; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shared_workflow
+    ADD CONSTRAINT "FK_daa206a04983d47d0a9c34649ce" FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: folder_tag FK_dc88164176283de80af47621746; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.folder_tag
+    ADD CONSTRAINT "FK_dc88164176283de80af47621746" FOREIGN KEY ("tagId") REFERENCES public.tag_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: test_case_execution FK_dfbe194e3ebdfe49a87bc4692ca; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_case_execution
+    ADD CONSTRAINT "FK_dfbe194e3ebdfe49a87bc4692ca" FOREIGN KEY ("evaluationExecutionId") REFERENCES public.execution_entity(id) ON DELETE SET NULL;
+
+
+--
+-- Name: user_api_keys FK_e131705cbbc8fb589889b02d457; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_api_keys
+    ADD CONSTRAINT "FK_e131705cbbc8fb589889b02d457" FOREIGN KEY ("userId") REFERENCES public."user"(id) ON DELETE CASCADE;
+
+
+--
+-- Name: test_case_execution FK_e48965fac35d0f5b9e7f51d8c44; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_case_execution
+    ADD CONSTRAINT "FK_e48965fac35d0f5b9e7f51d8c44" FOREIGN KEY ("executionId") REFERENCES public.execution_entity(id) ON DELETE SET NULL;
+
+
+--
+-- Name: analytics_raw FK_e4cdf6fe2f1d8a494da5569ed13; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.analytics_raw
+    ADD CONSTRAINT "FK_e4cdf6fe2f1d8a494da5569ed13" FOREIGN KEY ("metaId") REFERENCES public.analytics_metadata("metaId") ON DELETE CASCADE;
+
+
+--
+-- Name: auth_identity auth_identity_userId_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_identity
+    ADD CONSTRAINT "auth_identity_userId_fkey" FOREIGN KEY ("userId") REFERENCES public."user"(id);
+
+
+--
+-- Name: execution_data execution_data_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_data
+    ADD CONSTRAINT execution_data_fk FOREIGN KEY ("executionId") REFERENCES public.execution_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: findings findings_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.findings
+    ADD CONSTRAINT findings_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id) ON DELETE CASCADE;
+
+
+--
+-- Name: findings findings_port_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.findings
+    ADD CONSTRAINT findings_port_id_fkey FOREIGN KEY (port_id) REFERENCES public.ports(id) ON DELETE SET NULL;
+
+
+--
+-- Name: execution_entity fk_execution_entity_workflow_id; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_entity
+    ADD CONSTRAINT fk_execution_entity_workflow_id FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: webhook_entity fk_webhook_entity_workflow_id; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.webhook_entity
+    ADD CONSTRAINT fk_webhook_entity_workflow_id FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: workflow_entity fk_workflow_parent_folder; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflow_entity
+    ADD CONSTRAINT fk_workflow_parent_folder FOREIGN KEY ("parentFolderId") REFERENCES public.folder(id) ON DELETE CASCADE;
+
+
+--
+-- Name: workflow_statistics fk_workflow_statistics_workflow_id; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflow_statistics
+    ADD CONSTRAINT fk_workflow_statistics_workflow_id FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: workflows_tags fk_workflows_tags_tag_id; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflows_tags
+    ADD CONSTRAINT fk_workflows_tags_tag_id FOREIGN KEY ("tagId") REFERENCES public.tag_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: workflows_tags fk_workflows_tags_workflow_id; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflows_tags
+    ADD CONSTRAINT fk_workflows_tags_workflow_id FOREIGN KEY ("workflowId") REFERENCES public.workflow_entity(id) ON DELETE CASCADE;
+
+
+--
+-- Name: ports ports_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ports
+    ADD CONSTRAINT ports_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id) ON DELETE CASCADE;
+
+
+--
+-- Name: rag_documents rag_documents_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rag_documents
+    ADD CONSTRAINT rag_documents_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id) ON DELETE SET NULL;
+
+
+--
+-- Name: rag_documents rag_documents_finding_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rag_documents
+    ADD CONSTRAINT rag_documents_finding_id_fkey FOREIGN KEY (finding_id) REFERENCES public.findings(id) ON DELETE SET NULL;
+
+
+--
+-- Name: rag_documents rag_documents_port_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rag_documents
+    ADD CONSTRAINT rag_documents_port_id_fkey FOREIGN KEY (port_id) REFERENCES public.ports(id) ON DELETE SET NULL;
+
+
+--
+-- Name: rag_documents rag_documents_scan_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rag_documents
+    ADD CONSTRAINT rag_documents_scan_id_fkey FOREIGN KEY (scan_id) REFERENCES public.scans(id) ON DELETE SET NULL;
+
+
+--
+-- Name: scan_ports scan_ports_port_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scan_ports
+    ADD CONSTRAINT scan_ports_port_id_fkey FOREIGN KEY (port_id) REFERENCES public.ports(id) ON DELETE CASCADE;
+
+
+--
+-- Name: scan_ports scan_ports_scan_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scan_ports
+    ADD CONSTRAINT scan_ports_scan_id_fkey FOREIGN KEY (scan_id) REFERENCES public.scans(id) ON DELETE CASCADE;
+
+
+--
+-- Name: web_findings web_findings_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.web_findings
+    ADD CONSTRAINT web_findings_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id) ON DELETE CASCADE;
+
+
+--
+-- PostgreSQL database dump complete
+--
+
+\unrestrict pcS9FggsrwAqWJWWLPRfHWM5dVvQgVQn0Nc6Q5Fzuu4NC1scjB8PvBHWMPxOzZD
+
+--
+-- Database "postgres" dump
+--
+
+\connect postgres
+
+--
+-- PostgreSQL database dump
+--
+
+\restrict j5c7rzkIWmvBeE0XNnjyhhCok0mxpOBaklUtbFAMExb4jnHYixfchp2smza70o5
+
+-- Dumped from database version 16.10 (Debian 16.10-1.pgdg12+1)
+-- Dumped by pg_dump version 16.10 (Ubuntu 16.10-0ubuntu0.24.04.1)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: dblink; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS dblink WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION dblink; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION dblink IS 'connect to other PostgreSQL databases from within a database';
+
+
+--
+-- Name: pg_trgm; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION pg_trgm; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION pg_trgm IS 'text similarity measurement and index searching based on trigrams';
+
+
+--
+-- Name: unaccent; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS unaccent WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION unaccent; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION unaccent IS 'text search dictionary that removes accents';
+
+
+--
+-- Name: vector; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION vector; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION vector IS 'vector data type and ivfflat and hnsw access methods';
+
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: edb_exploits; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.edb_exploits (
+    edb_id integer NOT NULL,
+    file_path text NOT NULL,
+    title text,
+    date_published date,
+    author text,
+    type text,
+    platform text,
+    port text,
+    cves text[],
+    description text,
+    fts tsvector GENERATED ALWAYS AS ((((setweight(to_tsvector('simple'::regconfig, COALESCE(title, ''::text)), 'A'::"char") || setweight(to_tsvector('simple'::regconfig, COALESCE(description, ''::text)), 'B'::"char")) || to_tsvector('simple'::regconfig, COALESCE(platform, ''::text))) || to_tsvector('simple'::regconfig, COALESCE(type, ''::text)))) STORED
+);
+
+
+--
+-- Name: exploit_chunks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.exploit_chunks (
+    id bigint NOT NULL,
+    edb_id integer,
+    title text,
+    path text,
+    platform text,
+    type text,
+    source_repo text,
+    published date,
+    chunk_id integer,
+    chunk text,
+    embedding public.vector(768),
+    sha256 text
+);
+
+
+--
+-- Name: exploit_chunks_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.exploit_chunks_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: exploit_chunks_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.exploit_chunks_id_seq OWNED BY public.exploit_chunks.id;
+
+
+--
+-- Name: exploit_chunks id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.exploit_chunks ALTER COLUMN id SET DEFAULT nextval('public.exploit_chunks_id_seq'::regclass);
+
+
+--
+-- Name: edb_exploits edb_exploits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.edb_exploits
+    ADD CONSTRAINT edb_exploits_pkey PRIMARY KEY (edb_id);
+
+
+--
+-- Name: exploit_chunks exploit_chunks_edb_id_chunk_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.exploit_chunks
+    ADD CONSTRAINT exploit_chunks_edb_id_chunk_id_key UNIQUE (edb_id, chunk_id);
+
+
+--
+-- Name: exploit_chunks exploit_chunks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.exploit_chunks
+    ADD CONSTRAINT exploit_chunks_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: exploit_chunks_edb_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX exploit_chunks_edb_idx ON public.exploit_chunks USING btree (edb_id);
+
+
+--
+-- Name: exploit_chunks_embedding_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX exploit_chunks_embedding_idx ON public.exploit_chunks USING ivfflat (embedding) WITH (lists='100');
+
+
+--
+-- Name: idx_edb_exploits_cves; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_edb_exploits_cves ON public.edb_exploits USING gin (cves);
+
+
+--
+-- Name: idx_edb_exploits_fts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_edb_exploits_fts ON public.edb_exploits USING gin (fts);
+
+
+--
+-- Name: idx_edb_exploits_title_trgm; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_edb_exploits_title_trgm ON public.edb_exploits USING gin (title public.gin_trgm_ops);
+
+
+--
+-- PostgreSQL database dump complete
+--
+
+\unrestrict j5c7rzkIWmvBeE0XNnjyhhCok0mxpOBaklUtbFAMExb4jnHYixfchp2smza70o5
+
+--
+-- Database "scans" dump
+--
+
+--
+-- PostgreSQL database dump
+--
+
+\restrict yZh2h2VtqAR1ThVieoveb7OxTHxrrBp45fIsxE3gXaeAARJ8KtLphiaRG9CIo31
+
+-- Dumped from database version 16.10 (Debian 16.10-1.pgdg12+1)
+-- Dumped by pg_dump version 16.10 (Ubuntu 16.10-0ubuntu0.24.04.1)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: scans; Type: DATABASE; Schema: -; Owner: -
+--
+
+CREATE DATABASE scans WITH TEMPLATE = template0 ENCODING = 'UTF8' LOCALE_PROVIDER = libc LOCALE = 'en_US.utf8';
+
+
+\unrestrict yZh2h2VtqAR1ThVieoveb7OxTHxrrBp45fIsxE3gXaeAARJ8KtLphiaRG9CIo31
+\connect scans
+\restrict yZh2h2VtqAR1ThVieoveb7OxTHxrrBp45fIsxE3gXaeAARJ8KtLphiaRG9CIo31
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: pgcrypto; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION pgcrypto; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION pgcrypto IS 'cryptographic functions';
+
+
+--
+-- Name: uuid-ossp; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION "uuid-ossp"; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION "uuid-ossp" IS 'generate universally unique identifiers (UUIDs)';
+
+
+--
+-- Name: vector; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION vector; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION vector IS 'vector data type and ivfflat and hnsw access methods';
+
+
+--
+-- Name: _touch_updated_at(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public._touch_updated_at() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$;
+
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: assets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.assets (
+    id uuid NOT NULL,
+    ip inet NOT NULL,
+    hostname text,
+    env text,
+    tags text[],
+    first_seen timestamp with time zone DEFAULT now(),
+    last_seen timestamp with time zone DEFAULT now(),
+    os text
+);
+
+
+--
+-- Name: findings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.findings (
+    id uuid NOT NULL,
+    title text,
+    severity text,
+    asset_id uuid,
+    port integer,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    details jsonb
+);
+
+
+--
+-- Name: jobs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.jobs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    type text NOT NULL,
+    status text DEFAULT 'queued'::text NOT NULL,
+    params jsonb DEFAULT '{}'::jsonb NOT NULL,
+    total_tasks integer DEFAULT 0 NOT NULL,
+    finished_tasks integer DEFAULT 0 NOT NULL,
+    error text,
+    idempotency_key text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    started_at timestamp with time zone,
+    finished_at timestamp with time zone,
+    CONSTRAINT jobs_status_check CHECK ((status = ANY (ARRAY['queued'::text, 'running'::text, 'finished'::text, 'failed'::text, 'canceled'::text]))),
+    CONSTRAINT jobs_type_check CHECK ((type = 'masscan-nmap'::text))
+);
+
+
+--
+-- Name: ports; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ports (
+    id uuid NOT NULL,
+    asset_id uuid,
+    proto text NOT NULL,
+    port integer NOT NULL,
+    service text,
+    product text,
+    version text,
+    banner text,
+    first_seen timestamp with time zone DEFAULT now(),
+    last_seen timestamp with time zone DEFAULT now(),
+    is_open boolean DEFAULT true,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+);
+
+
+--
+-- Name: rag_documents; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.rag_documents (
+    id uuid NOT NULL,
+    content text,
+    embedding public.vector(384),
+    metadata jsonb
+);
+
+
+--
+-- Name: scan_ports; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.scan_ports (
+    scan_id uuid NOT NULL,
+    port_id uuid NOT NULL
+);
+
+
+--
+-- Name: scans; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.scans (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    tool text,
+    profile text,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    finished_at timestamp with time zone,
+    args text,
+    source_path text,
+    metadata jsonb DEFAULT '{}'::jsonb
+);
+
+
+--
+-- Name: tasks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tasks (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    job_id uuid NOT NULL,
+    type text NOT NULL,
+    target_host inet,
+    target_port integer,
+    proto text,
+    status text DEFAULT 'queued'::text NOT NULL,
+    attempt integer DEFAULT 0 NOT NULL,
+    last_error text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    started_at timestamp with time zone,
+    finished_at timestamp with time zone,
+    CONSTRAINT tasks_status_check CHECK ((status = ANY (ARRAY['queued'::text, 'running'::text, 'finished'::text, 'failed'::text, 'canceled'::text]))),
+    CONSTRAINT tasks_type_check CHECK ((type = ANY (ARRAY['pipeline'::text, 'masscan'::text, 'nmap'::text, 'followup'::text])))
+);
+
+
+--
+-- Name: vulns; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vulns (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    port_id uuid NOT NULL,
+    script text NOT NULL,
+    output text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: web_findings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.web_findings (
+    id uuid NOT NULL,
+    asset_id uuid,
+    url text NOT NULL,
+    source text NOT NULL,
+    issue_type text,
+    name text,
+    severity text,
+    evidence text,
+    status_code integer,
+    first_seen timestamp with time zone DEFAULT now(),
+    last_seen timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: assets assets_ip_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.assets
+    ADD CONSTRAINT assets_ip_key UNIQUE (ip);
+
+
+--
+-- Name: assets assets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.assets
+    ADD CONSTRAINT assets_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: findings findings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.findings
+    ADD CONSTRAINT findings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: jobs jobs_idempotency_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.jobs
+    ADD CONSTRAINT jobs_idempotency_key_key UNIQUE (idempotency_key);
+
+
+--
+-- Name: jobs jobs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.jobs
+    ADD CONSTRAINT jobs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: ports ports_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ports
+    ADD CONSTRAINT ports_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: rag_documents rag_documents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rag_documents
+    ADD CONSTRAINT rag_documents_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: scan_ports scan_ports_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scan_ports
+    ADD CONSTRAINT scan_ports_pkey PRIMARY KEY (scan_id, port_id);
+
+
+--
+-- Name: scans scans_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scans
+    ADD CONSTRAINT scans_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tasks tasks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tasks
+    ADD CONSTRAINT tasks_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: vulns vulns_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vulns
+    ADD CONSTRAINT vulns_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: web_findings web_findings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.web_findings
+    ADD CONSTRAINT web_findings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: findings_asset_sev_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX findings_asset_sev_idx ON public.findings USING btree (asset_id, severity);
+
+
+--
+-- Name: idx_jobs_created_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_jobs_created_at ON public.jobs USING btree (created_at DESC);
+
+
+--
+-- Name: idx_jobs_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_jobs_status ON public.jobs USING btree (status);
+
+
+--
+-- Name: idx_ports_asset_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ports_asset_id ON public.ports USING btree (asset_id);
+
+
+--
+-- Name: idx_tasks_job; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tasks_job ON public.tasks USING btree (job_id);
+
+
+--
+-- Name: idx_tasks_job_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tasks_job_status ON public.tasks USING btree (job_id, status);
+
+
+--
+-- Name: idx_tasks_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tasks_status ON public.tasks USING btree (status);
+
+
+--
+-- Name: ix_assets_ip; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_assets_ip ON public.assets USING btree (ip);
+
+
+--
+-- Name: ix_ports_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_ports_open ON public.ports USING btree (is_open);
+
+
+--
+-- Name: ix_rag_documents_embedding; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_rag_documents_embedding ON public.rag_documents USING ivfflat (embedding) WITH (lists='100');
+
+
+--
+-- Name: ix_web_findings_asset; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_web_findings_asset ON public.web_findings USING btree (asset_id);
+
+
+--
+-- Name: ix_web_findings_url; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_web_findings_url ON public.web_findings USING btree (url);
+
+
+--
+-- Name: ports_asset_port_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ports_asset_port_idx ON public.ports USING btree (asset_id, proto, port);
+
+
+--
+-- Name: rag_docs_embedding_ivfflat; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX rag_docs_embedding_ivfflat ON public.rag_documents USING ivfflat (embedding) WITH (lists='200');
+
+
+--
+-- Name: rag_docs_meta_gin; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX rag_docs_meta_gin ON public.rag_documents USING gin (metadata);
+
+
+--
+-- Name: scans_started_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX scans_started_idx ON public.scans USING btree (started_at);
+
+
+--
+-- Name: ux_ports_asset_proto_port; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_ports_asset_proto_port ON public.ports USING btree (asset_id, proto, port);
+
+
+--
+-- Name: ux_tasks_job_target; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_tasks_job_target ON public.tasks USING btree (job_id, type, target_host, target_port, COALESCE(proto, ''::text));
+
+
+--
+-- Name: findings trg_findings_touch_updated; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_findings_touch_updated BEFORE UPDATE ON public.findings FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+
+
+--
+-- Name: findings findings_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.findings
+    ADD CONSTRAINT findings_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id);
+
+
+--
+-- Name: ports ports_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ports
+    ADD CONSTRAINT ports_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id) ON DELETE CASCADE;
+
+
+--
+-- Name: scan_ports scan_ports_port_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scan_ports
+    ADD CONSTRAINT scan_ports_port_id_fkey FOREIGN KEY (port_id) REFERENCES public.ports(id) ON DELETE CASCADE;
+
+
+--
+-- Name: scan_ports scan_ports_scan_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scan_ports
+    ADD CONSTRAINT scan_ports_scan_id_fkey FOREIGN KEY (scan_id) REFERENCES public.scans(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tasks tasks_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tasks
+    ADD CONSTRAINT tasks_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: vulns vulns_port_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vulns
+    ADD CONSTRAINT vulns_port_id_fkey FOREIGN KEY (port_id) REFERENCES public.ports(id) ON DELETE CASCADE;
+
+
+--
+-- Name: web_findings web_findings_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.web_findings
+    ADD CONSTRAINT web_findings_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id) ON DELETE CASCADE;
+
+
+--
+-- PostgreSQL database dump complete
+--
+
+\unrestrict yZh2h2VtqAR1ThVieoveb7OxTHxrrBp45fIsxE3gXaeAARJ8KtLphiaRG9CIo31
+
+--
+-- PostgreSQL database cluster dump complete
+--
+

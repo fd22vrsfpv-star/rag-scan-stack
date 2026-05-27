@@ -1,0 +1,61 @@
+# Remote Database Overlay — SSH tunnel to VPS Postgres
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.remote-db.yml up -d
+#
+# Prerequisites:
+#   1. VPS provisioned with scripts/vps/setup-remote-db.sh
+#   2. SSH key in ssh-keys/ (set REMOTE_DB_SSH_KEY in .env)
+#   3. .env populated with REMOTE_DB_HOST, REMOTE_DB_SSH_USER, REMOTE_DB_PORT
+#
+# How it works:
+#   - Local rag-postgres is disabled (profiles: ["local-db-only"])
+#   - db-tunnel container SSH-forwards local :5432 → VPS Postgres
+#   - db-tunnel gets network alias "rag-postgres" on agents_net
+#   - All 25+ services resolve rag-postgres:5432 → SSH tunnel → VPS Postgres
+#   - Zero code changes required in any service
+
+networks:
+  agents_net:
+    external: true
+
+services:
+  # ── Disable the local Postgres ──────────────────────────────────────
+  rag-postgres:
+    profiles: ["local-db-only"]
+
+  # ── SSH tunnel to VPS Postgres ─────────────────────────────────────
+  db-tunnel:
+    image: alpine:3.20
+    container_name: rag-db-tunnel
+    restart: unless-stopped
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        apk add --no-cache openssh-client
+        cp /ssh-keys/${SSH_KEY_FILE:-remote_db.pem} /tmp/ssh_key && chmod 600 /tmp/ssh_key
+        exec ssh -N -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
+          -i /tmp/ssh_key \
+          -L 0.0.0.0:5432:localhost:${REMOTE_DB_PORT:-5432} \
+          ${REMOTE_DB_SSH_USER:-azureuser}@${REMOTE_DB_HOST:?REMOTE_DB_HOST must be set}
+    environment:
+      SSH_KEY_FILE: ${REMOTE_DB_SSH_KEY:-remote_db.pem}
+    volumes:
+      - ./ssh-keys:/ssh-keys:ro
+    networks:
+      agents_net:
+        aliases:
+          - rag-postgres
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 5432 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  # ── Override wait-for-db to probe via tunnel alias ─────────────────
+  wait-for-db:
+    depends_on:
+      db-tunnel:
+        condition: service_healthy

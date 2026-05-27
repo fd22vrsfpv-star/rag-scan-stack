@@ -1,0 +1,69 @@
+openapi: 3.0.3
+info:
+  title: Playwright Scanner
+  version: "1.0.0"
+servers:
+  - url: http://localhost:7080/playwright
+  - url: https://localhost:7443/playwright
+tags:
+  - name: Health
+  - name: Scan
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: playwrightHealth
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example: { ok: true, service: "playwright-scanner" }
+  /scan:
+    post:
+      tags: [Scan]
+      operationId: startScan
+      summary: Start a browser-based security scan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  format: uri
+                browser:
+                  type: string
+                  enum: [chromium, firefox, webkit]
+                  default: chromium
+                use_zap_proxy:
+                  type: boolean
+                  default: true
+      responses:
+        "200":
+          description: Scan started
+          content:
+            application/json:
+              example: { scan_id: "uuid", status: "running" }
+  /scan/{scan_id}:
+    get:
+      tags: [Scan]
+      operationId: getScanStatus
+      summary: Get scan status and results
+      parameters:
+        - name: scan_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Scan status
+          content:
+            application/json:
+              example: { scan_id: "uuid", status: "completed", findings_count: 0 }

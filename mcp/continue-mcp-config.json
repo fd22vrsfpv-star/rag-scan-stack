@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "autogen-pentest": {
+      "command": "C:\\Windows\\System32\\wsl.exe",
+      "args": [
+        "-d",
+        "Ubuntu-22.04",
+        "--",
+        "/usr/bin/python3",
+        "/opt/rag-scan-stack/mcp/autogen-http-mcp.py"
+      ],
+      "description": "AI-powered autonomous penetration testing agents"
+    },
+    "rag-scan-stack-health": {
+      "command": "C:\\Windows\\System32\\wsl.exe",
+      "args": [
+        "-d",
+        "Ubuntu-22.04",
+        "--",
+        "/usr/bin/python3",
+        "/opt/rag-scan-stack/mcp/health-check-server.py"
+      ],
+      "description": "RAG Scan Stack health monitoring"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  sanity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install linters
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8
+      - name: Lint python
+        run: |
+          flake8 etl app scanner nuclei || true
+      - name: Byte-compile python
+        run: |
+          python -m compileall -q etl app scanner nuclei

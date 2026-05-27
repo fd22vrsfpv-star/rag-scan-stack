@@ -1,0 +1,22 @@
+# security_controls.yaml — Detect security appliances and network controls
+
+- id: tcpwrapped_security_control
+  name: "Security Control Detected (tcpwrapped mass-open)"
+  type: simple
+  enabled: true
+  severity: low
+  confidence: 0.9
+  description: "Host has many ports reporting tcpwrapped — likely a WAF, load balancer, or transparent proxy intercepting all TCP connections. These are not real services."
+  title_template: "Security appliance detected — {port_count} tcpwrapped ports on {ip}"
+  reason_template: "Host has {port_count} ports responding as tcpwrapped, indicating a security control (WAF/LB/IPS) is intercepting connections. Individual port results for this host should be treated as false positives."
+  finding_source: vuln
+  query:
+    table: ports
+    columns: [id, asset_id, port, service]
+    where:
+      is_open: true
+      service: tcpwrapped
+    time_column: created_at
+  match:
+    type: python
+    function: check_tcpwrapped_security_control

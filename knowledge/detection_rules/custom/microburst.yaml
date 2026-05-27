@@ -1,0 +1,238 @@
+# microburst.yaml — Detection rules for MicroBurst (NetSPI) Azure AD enumeration data.
+# Pass 1: the parser now emits granular finding_type values so rules are
+# schema-aware `simple` matches instead of regex over the stringified jsonb.
+# Refined finding_type values and their severities (set at ingest in parse_microburst.py):
+#   azure_secret_exposure         critical   (any KeyVault/AppService/Storage/Automation cred dump)
+#   azure_role_global_admin       critical   (Global / Privileged Role / Privileged Auth Admin)
+#   azure_user_dirsync            critical   (AAD Connect / on-prem sync identity)
+#   azure_role_app_admin          high       (App / Cloud App / Hybrid Identity Admin)
+#   azure_role_service_principal  high       (SP holding any role)
+#   azure_app_with_secret         high       (App registration with stored cred)
+#   azure_ca_disabled             high       (Conditional Access policy in disabled state)
+#   azure_domain_federated        high       (federated authentication — AD FS hijack risk)
+#   azure_role_assignment         medium     (other roles; bumped to high if priv keyword)
+#   azure_device_unmanaged        medium     (no MDM enrollment)
+#   azure_user_guest              info       (cross-rule with role catches privileged guest)
+#   azure_user / azure_group      info
+
+# ── Tier 1 — Critical ────────────────────────────────────────────────────────
+
+- id: microburst_secret_exposed
+  name: "Azure secret exposed via MicroBurst"
+  type: simple
+  enabled: true
+  severity: critical
+  confidence: 1.0
+  description: "MicroBurst dumped a credential from KeyVault / AppService / Storage / Automation"
+  title_template: "Exposed Azure secret — {target}"
+  reason_template: "MicroBurst surfaced a credential during enumeration — import to vault and rotate"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data, severity]
+    where:
+      source: microburst
+      finding_type: azure_secret_exposure
+    time_column: created_at
+
+- id: microburst_global_admin
+  name: "Global / Privileged Role Administrator (MicroBurst)"
+  type: simple
+  enabled: true
+  severity: critical
+  confidence: 0.98
+  description: "MicroBurst found a Global Administrator or Privileged Role Administrator assignment"
+  title_template: "Global/Privileged-Role Admin — {target}"
+  reason_template: "Holds a tier-0 Entra role — full tenant takeover risk; verify ownership and MFA"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: microburst
+      finding_type: azure_role_global_admin
+    time_column: created_at
+
+- id: microburst_dirsync_account
+  name: "Directory-sync service account (MicroBurst)"
+  type: simple
+  enabled: true
+  severity: critical
+  confidence: 0.95
+  description: "Account name matches Azure AD Connect / on-prem dirsync naming convention"
+  title_template: "Dirsync service account — {target}"
+  reason_template: "On-prem→cloud sync identity — compromise enables hybrid AD takeover"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: microburst
+      finding_type: azure_user_dirsync
+    time_column: created_at
+
+# ── Tier 2 — High ────────────────────────────────────────────────────────────
+
+- id: microburst_app_with_credentials
+  name: "App registration with stored credentials (MicroBurst)"
+  type: simple
+  enabled: true
+  severity: high
+  confidence: 0.95
+  description: "App registration carries a non-empty PasswordCredentials or KeyCredentials"
+  title_template: "App with credentials — {target}"
+  reason_template: "App registration carries a client secret or certificate — privesc surface"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: microburst
+      finding_type: azure_app_with_secret
+    time_column: created_at
+
+- id: microburst_application_admin
+  name: "Application / Cloud Application Administrator (MicroBurst)"
+  type: simple
+  enabled: true
+  severity: high
+  confidence: 0.95
+  description: "Holds Application / Cloud Application / Hybrid Identity Administrator — can add credentials to ANY app"
+  title_template: "Application Admin — {target}"
+  reason_template: "Application Admin can pivot via secret-injection on any app registration in the tenant"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: microburst
+      finding_type: azure_role_app_admin
+    time_column: created_at
+
+- id: microburst_disabled_ca_policy
+  name: "Disabled Conditional Access policy (MicroBurst)"
+  type: simple
+  enabled: true
+  severity: high
+  confidence: 0.95
+  description: "A Conditional Access policy is in disabled state — likely an MFA / location gap"
+  title_template: "Disabled CA policy — {target}"
+  reason_template: "Disabled CA policy may leave authentication paths unprotected — verify intent"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: microburst
+      finding_type: azure_ca_disabled
+    time_column: created_at
+
+- id: microburst_privileged_service_principal
+  name: "Service principal with role (MicroBurst)"
+  type: simple
+  enabled: true
+  severity: high
+  confidence: 0.95
+  description: "Role assignment whose principal is a ServicePrincipal — SPs lack MFA and are common abuse path"
+  title_template: "Privileged service principal — {target}"
+  reason_template: "Service principals authenticate via secrets/certs (no MFA); privileged SPs are a top abuse path"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: microburst
+      finding_type: azure_role_service_principal
+    time_column: created_at
+
+- id: microburst_federated_domain
+  name: "Federated Azure AD domain (MicroBurst)"
+  type: simple
+  enabled: true
+  severity: high
+  confidence: 0.95
+  description: "Tenant has federated domain — on-prem AD FS hijack maps directly to cloud takeover"
+  title_template: "Federated domain — {target}"
+  reason_template: "Federated authentication delegates trust to on-prem AD FS — verify ADFS posture"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: microburst
+      finding_type: azure_domain_federated
+    time_column: created_at
+
+# ── Tier 3 — Medium ─────────────────────────────────────────────────────────
+
+- id: microburst_guest_with_role
+  name: "Guest user with role assignment (MicroBurst)"
+  type: cross_source
+  enabled: true
+  severity: medium
+  confidence: 0.9
+  description: "External guest account holds a role assignment — weak auth surface with privilege"
+  title_template: "Guest with role — {target}"
+  reason_template: "External guest holds an Entra role; guest auth flow is the weakest path to that privilege"
+  finding_source: recon
+  sources:
+    primary:
+      table: recon_findings
+      columns: [id, target, data]
+      where:
+        source: microburst
+        finding_type: azure_user_guest
+    secondary:
+      table: recon_findings
+      columns: [id, target, data]
+      where:
+        source: microburst
+        finding_type: azure_role_assignment
+  join_key: target
+  condition: primary_with_secondary
+
+- id: microburst_unmanaged_device
+  name: "Unmanaged Azure AD device (MicroBurst)"
+  type: simple
+  enabled: true
+  severity: medium
+  confidence: 0.85
+  description: "Device joined to tenant without MDM enrollment / management"
+  title_template: "Unmanaged device — {target}"
+  reason_template: "Device lacks MDM enrollment — compliance posture unenforced"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: microburst
+      finding_type: azure_device_unmanaged
+    time_column: created_at
+
+# ── Tier 4 — Cross-source corroboration ─────────────────────────────────────
+
+- id: microburst_azurehound_owner_match
+  name: "Same principal flagged by both MicroBurst and AzureHound"
+  type: cross_source
+  enabled: true
+  severity: high
+  confidence: 0.97
+  description: "Two independent tools observed a privileged role assignment for the same principal"
+  title_template: "Privileged principal (corroborated) — {target}"
+  reason_template: "MicroBurst and AzureHound both report a privileged role for this principal — high-confidence target"
+  finding_source: recon
+  sources:
+    primary:
+      table: recon_findings
+      columns: [id, target, data, severity]
+      where:
+        source: microburst
+        finding_type: azure_role_global_admin
+    secondary:
+      table: recon_findings
+      columns: [id, target, data]
+      where:
+        source: azurehound
+        finding_type: azure_role_assignment
+  join_key: target
+  condition: primary_with_secondary

@@ -1,0 +1,50 @@
+# Grafana Dashboard Provisioning
+#
+# This file tells Grafana where to find dashboard JSON files.
+# Dashboards in the specified path will be automatically loaded.
+#
+# Documentation: https://grafana.com/docs/grafana/latest/administration/provisioning/
+# Version: 1.0
+# Last Updated: 2025-11-19
+
+apiVersion: 1
+
+providers:
+  - name: 'RAG Scan Stack Logs'
+    orgId: 1
+    folder: 'Logs'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false
+
+# Notes:
+#
+# 1. Provider Configuration:
+#    - name: Display name in Grafana
+#    - folder: Grafana folder to organize dashboards
+#    - path: Where to find dashboard JSON files
+#
+# 2. Update Behavior:
+#    - updateIntervalSeconds: How often to check for changes
+#    - allowUiUpdates: Users can modify dashboards in UI
+#    - disableDeletion: Users can delete dashboards
+#
+# 3. Adding Dashboards:
+#    - Place dashboard JSON in monitoring/grafana/dashboards/
+#    - Will be automatically loaded
+#    - Filename doesn't matter (all *.json files loaded)
+#
+# 4. Dashboard Updates:
+#    - Changes to JSON files trigger reload
+#    - UI changes are preserved if allowUiUpdates: true
+#    - Set allowUiUpdates: false in production
+#
+# 5. Multiple Providers:
+#    Can add more providers for different dashboard sets:
+#    - name: 'Monitoring'
+#      folder: 'Monitoring'
+#      path: /etc/grafana/provisioning/monitoring-dashboards

@@ -1,0 +1,23 @@
+# Continue MCP Configuration Examples
+# Copy the relevant section to your ~/.continue/config.yaml
+
+# Option 1: HTTP Transport (Recommended when using Docker)
+# Works with Claude Desktop and Continue
+# Requires: docker-compose up mcp-server
+mcpServers:
+  - name: autogen-pentest
+    type: streamable-http
+    url: http://localhost:8016/mcp
+
+# Option 2: STDIO Transport (Traditional)
+# Works when running MCP server locally via WSL
+# mcpServers:
+#   - name: autogen-pentest
+#     type: stdio
+#     command: wsl
+#     args:
+#       - "-d"
+#       - "Ubuntu-22.04"
+#       - "--"
+#       - "/usr/bin/python3"
+#       - "/opt/rag-scan-stack/mcp/autogen-http-mcp.py"

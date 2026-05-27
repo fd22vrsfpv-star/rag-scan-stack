@@ -1,0 +1,60 @@
+# RAG Scan Stack - VPN Testing Overlay
+#
+# Usage:
+#   1. Connect to TryHackMe/HackTheBox VPN on your host machine:
+#      sudo openvpn your-config.ovpn
+#
+#   2. Start the stack with this overlay:
+#      docker-compose -f docker-compose.yml -f docker-compose.vpn.yml up -d
+#
+#   3. Verify VPN connectivity from scanner:
+#      docker exec nmap_scanner ping -c 3 10.10.10.1
+#
+# Note: host network mode gives containers direct access to host's VPN tunnel
+
+networks:
+  agents_net:
+    external: true
+
+services:
+  # Nmap scanner - uses host network for VPN access
+  nmap_scanner:
+    network_mode: "host"
+    extra_hosts:
+      - "rag-postgres:127.0.0.1"
+      - "ollama:127.0.0.1"
+    environment:
+      - DB_HOST=127.0.0.1
+      - OLLAMA_HOST=http://127.0.0.1:11434
+
+  # Nuclei runner - uses host network for VPN access
+  nuclei-runner:
+    network_mode: "host"
+    extra_hosts:
+      - "rag-postgres:127.0.0.1"
+    environment:
+      - DB_HOST=127.0.0.1
+
+  # Web scanner (ZAP proxy) - uses host network for VPN access
+  web-scanner:
+    network_mode: "host"
+    extra_hosts:
+      - "rag-postgres:127.0.0.1"
+      - "zap:127.0.0.1"
+    environment:
+      - DB_HOST=127.0.0.1
+      - ZAP_API_URL=http://127.0.0.1:8080
+
+  # Exploit runner - uses host network for VPN access
+  exploit-runner:
+    network_mode: "host"
+    extra_hosts:
+      - "rag-postgres:127.0.0.1"
+      - "metasploit:127.0.0.1"
+    environment:
+      - DB_HOST=127.0.0.1
+      - MSF_HOST=127.0.0.1
+
+  # Metasploit - uses host network to reach external targets
+  metasploit:
+    network_mode: "host"

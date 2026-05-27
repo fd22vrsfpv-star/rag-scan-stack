@@ -1,0 +1,5 @@
+Role,Principal,TrustedService,IsAdmin,CanPrivEsc
+arn:aws:iam::123456789012:role/AdminRole,arn:aws:iam::123456789012:user/deploy-bot,,"Yes","Yes"
+arn:aws:iam::123456789012:role/LambdaExecRole,arn:aws:iam::123456789012:root,lambda.amazonaws.com,"No","No"
+arn:aws:iam::123456789012:role/EC2ReadOnly,arn:aws:iam::123456789012:user/dev-user,ec2.amazonaws.com,"No","Yes"
+arn:aws:iam::123456789012:role/CrossAccountRole,arn:aws:iam::987654321098:root,,"No","No"

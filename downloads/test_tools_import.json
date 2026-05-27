@@ -1,0 +1,16 @@
+[
+  {
+    "id": "rag_scan_stack_test_tools",
+    "name": "RAG-Scan-Stack Test Tools",
+    "content": "\"\"\"\ntitle: Test Tools\nauthor: RAG-Scan-Stack\nversion: 1.0.0\ndescription: Simple test tools to verify tool calling works\n\"\"\"\n\nimport json\nimport requests\nfrom datetime import datetime\nfrom pydantic import BaseModel, Field\n\n\nclass Tools:\n    class Valves(BaseModel):\n        MCP_TEST_URL: str = Field(\n            default=\"http://mcp-test:8020\",\n            description=\"URL of the MCP test server\"\n        )\n\n    def __init__(self):\n        self.valves = self.Valves()\n\n    def echo_message(self, message: str) -> str:\n        \"\"\"\n        Echo back the input message. Test basic tool calling.\n\n        :param message: Message to echo back\n        :return: The echoed message\n        \"\"\"\n        return f\"Echo: {message}\"\n\n    def get_current_time(self) -> str:\n        \"\"\"\n        Get the current server time.\n\n        :return: Current date and time\n        \"\"\"\n        return f\"Current time: {datetime.now().isoformat()}\"\n\n    def add_numbers(self, a: float, b: float) -> str:\n        \"\"\"\n        Add two numbers together.\n\n        :param a: First number\n        :param b: Second number\n        :return: Sum of the two numbers\n        \"\"\"\n        result = a + b\n        return f\"{a} + {b} = {result}\"\n\n    def greet_person(self, name: str) -> str:\n        \"\"\"\n        Generate a greeting for a person.\n\n        :param name: Name of the person to greet\n        :return: A greeting message\n        \"\"\"\n        return f\"Hello, {name}! Welcome to RAG-Scan-Stack.\"\n\n    def check_mcp_test_server(self) -> str:\n        \"\"\"\n        Check if the MCP test server is running.\n\n        :return: Health status\n        \"\"\"\n        try:\n            r = requests.get(f\"{self.valves.MCP_TEST_URL}/health\", timeout=10)\n            return json.dumps(r.json(), indent=2)\n        except Exception as e:\n            return f\"Error: {e}\"\n\n    def check_all_services(self) -> str:\n        \"\"\"\n        Check health of all RAG-Scan-Stack services.\n\n        :return: Service health status\n        \"\"\"\n        services = {\n            \"mcp_server\": \"http://mcp-server:8016/health\",\n            \"mcp_test\": \"http://mcp-test:8020/health\",\n            \"autogen_agents\": \"http://autogen-agents:8015/health\",\n            \"rag_api\": \"http://rag-api:8000/health\",\n            \"nmap_scanner\": \"http://nmap_scanner:8012/health\",\n        }\n        results = {}\n        for name, url in services.items():\n            try:\n                r = requests.get(url, timeout=5)\n                results[name] = \"healthy\" if r.status_code == 200 else \"unhealthy\"\n            except:\n                results[name] = \"unreachable\"\n        return json.dumps(results, indent=2)\n",
+    "meta": {
+      "description": "Simple test tools to verify tool calling works",
+      "manifest": {
+        "title": "RAG-Scan-Stack Test Tools",
+        "author": "RAG-Scan-Stack",
+        "version": "1.0.0"
+      }
+    },
+    "access_control": null
+  }
+]

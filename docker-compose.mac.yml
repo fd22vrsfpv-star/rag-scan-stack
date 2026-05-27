@@ -1,0 +1,67 @@
+# Mac-specific overrides - use with:
+# docker compose -f docker-compose.yml -f docker-compose.mac.yml up -d
+
+services:
+  # Don't run Ollama in Docker on Mac - run it natively instead
+  ollama:
+    profiles: ["disabled"]
+
+  ollama-init:
+    profiles: ["disabled"]
+
+  # Override depends_on to remove ollama dependency (must run Ollama natively)
+  # Note: Using !override to replace the entire depends_on block
+  autogen-agents:
+    depends_on: !override
+      wait-for-db:
+        condition: service_completed_successfully
+      rag-api:
+        condition: service_started
+      web-scanner:
+        condition: service_started
+      nuclei-runner:
+        condition: service_started
+      nmap_scanner:
+        condition: service_started
+      playwright-scanner:
+        condition: service_started
+      scan-recommender:
+        condition: service_started
+    environment:
+      OLLAMA_URL: "http://host.docker.internal:11434"
+
+  scan-recommender:
+    depends_on: !override
+      wait-for-db:
+        condition: service_completed_successfully
+    environment:
+      OLLAMA_URL: "http://host.docker.internal:11434"
+      OLLAMA_HOST: "http://host.docker.internal:11434"
+
+  llm_query:
+    depends_on: !override
+      wait-for-db:
+        condition: service_completed_successfully
+    environment:
+      OLLAMA_URL: "http://host.docker.internal:11434"
+
+  # Port 5000 is used by macOS AirPlay Receiver – shift listener range to 5001+
+  kali-listener:
+    ports: !override
+      - "8019:8019"
+      - "5001-5100:5001-5100"
+    environment:
+      LISTENER_PORT_START: "5001"
+
+  # Port 8021 is used by macOS launchd (Intuit service) – remap mcpo
+  mcpo:
+    ports: !override
+      - "8022:8080"
+
+  # Playwright base image has no ARM64 variant; run under Rosetta 2
+  playwright-scanner:
+    platform: linux/amd64
+
+  open-webui:
+    environment:
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434"

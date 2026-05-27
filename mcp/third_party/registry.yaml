@@ -1,0 +1,14 @@
+servers:
+- name: mcp-everything
+  description: "Official MCP test server \u2014 tools, resources, prompts"
+  source: npm
+  package: '@modelcontextprotocol/server-everything'
+  transport: stdio
+  port: 9030
+  enabled: true
+- name: burpsuite-pro
+  description: "Burp Suite Professional MCP \u2014 scan, crawl, audit, site map, issues"
+  source: external
+  transport: sse
+  url: http://burp-mcp-proxy:9876/
+  enabled: false

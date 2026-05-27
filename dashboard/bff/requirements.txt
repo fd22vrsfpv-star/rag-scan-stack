@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+websockets==14.1
+python-multipart==0.0.20
+weasyprint==63.1
+jinja2==3.1.5
+pydantic==2.10.4
+pydantic-settings==2.7.1
+sse-starlette==2.2.1
+pyyaml>=6.0
+httpx-sse>=0.4.0

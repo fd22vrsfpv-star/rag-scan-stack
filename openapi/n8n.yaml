@@ -1,0 +1,17 @@
+openapi: 3.0.3
+info:
+  title: n8n
+  version: "0.0.1"
+servers:
+  - url: http://localhost:7080/n8n
+  - url: https://localhost:7443/n8n
+tags:
+  - name: UI
+paths:
+  /:
+    get:
+      tags: [UI]
+      summary: n8n UI root (proxied via Kong)
+      responses:
+        "200":
+          description: OK

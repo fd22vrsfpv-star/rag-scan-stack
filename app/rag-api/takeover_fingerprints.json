@@ -1,0 +1,166 @@
+{
+  "_comment": "Subdomain takeover detector signatures. Each entry: cname_patterns (substrings that indicate the resource type), http_status (status codes consistent with a dangling resource), body_regex (case-insensitive regex that confirms claim-availability), nx_only (true => match on NXDOMAIN with no HTTP probe needed), vulnerable (always true here; informational), claim_hint (operator-facing note).",
+  "_source": "Curated from EdOverflow/can-i-take-over-xyz + Hacker0x01 disclosures. Last reviewed 2026-04-26.",
+  "detectors": [
+    {
+      "id": "aws_s3",
+      "cname_patterns": ["s3.amazonaws.com", "s3-website", "s3-ap-", "s3-eu-", "s3-us-", "s3-sa-"],
+      "http_status": [404],
+      "body_regex": "NoSuchBucket|The specified bucket does not exist",
+      "vulnerable": true,
+      "claim_hint": "Register the bucket name in the same AWS region. Verify region from CNAME path."
+    },
+    {
+      "id": "github_pages",
+      "cname_patterns": ["github.io", "githubusercontent.com"],
+      "http_status": [404],
+      "body_regex": "There isn't a GitHub Pages site here",
+      "vulnerable": true,
+      "claim_hint": "Create a GitHub repo named <username>.github.io or configure Pages on a repo and add a CNAME file."
+    },
+    {
+      "id": "heroku",
+      "cname_patterns": ["herokuapp.com", "herokussl.com", "herokudns.com"],
+      "http_status": [404],
+      "body_regex": "no-such-app|There's nothing here, yet|herokucdn\\.com/error-pages/no-such-app",
+      "vulnerable": true,
+      "claim_hint": "Create a Heroku app with the matching name; add the custom domain."
+    },
+    {
+      "id": "azure_websites",
+      "cname_patterns": ["azurewebsites.net"],
+      "http_status": [],
+      "nx_only": true,
+      "vulnerable": true,
+      "claim_hint": "Create an Azure App Service with the same name. Confirm region match if the app uses a regional CNAME."
+    },
+    {
+      "id": "azure_cloudapp",
+      "cname_patterns": ["cloudapp.net", "cloudapp.azure.com"],
+      "http_status": [],
+      "nx_only": true,
+      "vulnerable": true,
+      "claim_hint": "Provision an Azure Cloud Service / VM with the matching DNS name."
+    },
+    {
+      "id": "azure_trafficmanager",
+      "cname_patterns": ["trafficmanager.net"],
+      "http_status": [],
+      "nx_only": true,
+      "vulnerable": true,
+      "claim_hint": "Create a Traffic Manager profile with the matching prefix."
+    },
+    {
+      "id": "azure_blob",
+      "cname_patterns": ["blob.core.windows.net"],
+      "http_status": [400, 404],
+      "body_regex": "BlobNotFound|The specified blob does not exist|InvalidUri|The specifed resource name contains invalid characters",
+      "vulnerable": true,
+      "claim_hint": "Create a storage account with the matching name and a blob container of the same path."
+    },
+    {
+      "id": "shopify",
+      "cname_patterns": ["myshopify.com"],
+      "http_status": [404],
+      "body_regex": "Sorry, this shop is currently unavailable|Only one step left",
+      "vulnerable": true,
+      "claim_hint": "Register a Shopify store with the same name; requires payment method on file."
+    },
+    {
+      "id": "fastly",
+      "cname_patterns": ["fastly.net"],
+      "http_status": [],
+      "body_regex": "Fastly error: unknown domain",
+      "vulnerable": true,
+      "claim_hint": "Add the domain to your Fastly service configuration. Requires the original Fastly account to have lapsed."
+    },
+    {
+      "id": "tumblr",
+      "cname_patterns": ["domains.tumblr.com", "tumblr.com"],
+      "http_status": [404],
+      "body_regex": "Whatever you were looking for doesn't currently exist at this address",
+      "vulnerable": true,
+      "claim_hint": "Create a Tumblr blog and add the custom domain."
+    },
+    {
+      "id": "unbounce",
+      "cname_patterns": ["unbouncepages.com"],
+      "http_status": [404],
+      "body_regex": "The requested URL was not found on this server",
+      "vulnerable": false,
+      "claim_hint": "Unbounce now requires SSL verification — confirm before claiming."
+    },
+    {
+      "id": "ghost",
+      "cname_patterns": ["ghost.io"],
+      "http_status": [],
+      "body_regex": "The thing you were looking for is no longer here, or never was",
+      "vulnerable": true,
+      "claim_hint": "Sign up for a Ghost(Pro) account and add the custom domain."
+    },
+    {
+      "id": "pantheon",
+      "cname_patterns": ["pantheonsite.io"],
+      "http_status": [],
+      "body_regex": "The gods are wise, but do not know of the site which you seek",
+      "vulnerable": true,
+      "claim_hint": "Create a Pantheon site and connect the domain."
+    },
+    {
+      "id": "bitbucket",
+      "cname_patterns": ["bitbucket.io"],
+      "http_status": [404],
+      "body_regex": "Repository not found",
+      "vulnerable": true,
+      "claim_hint": "Create a Bitbucket repo and enable Pages with the matching URL."
+    },
+    {
+      "id": "wordpress",
+      "cname_patterns": ["wordpress.com"],
+      "http_status": [],
+      "body_regex": "Do you want to register .*\\.wordpress\\.com",
+      "vulnerable": false,
+      "claim_hint": "WordPress.com may require domain ownership verification — confirm manually."
+    },
+    {
+      "id": "readme_io",
+      "cname_patterns": ["readme.io"],
+      "http_status": [],
+      "body_regex": "Project doesnt exist... yet!",
+      "vulnerable": true,
+      "claim_hint": "Sign up for a ReadMe project with the matching subdomain."
+    },
+    {
+      "id": "gcp_storage",
+      "cname_patterns": ["storage.googleapis.com"],
+      "http_status": [404],
+      "body_regex": "NoSuchBucket|The specified bucket does not exist",
+      "vulnerable": true,
+      "claim_hint": "Create a GCS bucket with the matching name (subject to global GCS namespace)."
+    },
+    {
+      "id": "netlify",
+      "cname_patterns": ["netlify.com", "netlify.app"],
+      "http_status": [404],
+      "body_regex": "Not found - Request ID:",
+      "vulnerable": false,
+      "claim_hint": "Netlify uses random subdomain tokens; confirm before claiming."
+    },
+    {
+      "id": "vercel",
+      "cname_patterns": ["vercel.app", "now.sh"],
+      "http_status": [404],
+      "body_regex": "DEPLOYMENT_NOT_FOUND",
+      "vulnerable": false,
+      "claim_hint": "Vercel deployments use ephemeral subdomains — verify ownership manually."
+    },
+    {
+      "id": "azure_apim",
+      "cname_patterns": ["azure-api.net"],
+      "http_status": [],
+      "nx_only": true,
+      "vulnerable": true,
+      "claim_hint": "Provision an Azure API Management instance with the matching name."
+    }
+  ]
+}

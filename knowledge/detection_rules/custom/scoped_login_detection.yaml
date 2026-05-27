@@ -1,0 +1,52 @@
+# scoped_login_detection.yaml — Enhanced scope handling for login page detection
+# Uses automatic unknown_scope engagement assignment for out-of-scope discoveries.
+
+# Re-enable the builtin rule now that we have unknown_scope engagement handling
+- id: login_page
+  enabled: true
+  comment: "Re-enabled with unknown_scope engagement auto-assignment for out-of-scope items"
+
+# Enhanced rule for comprehensive login detection with scope awareness
+- id: enhanced_login_page
+  name: "Login Page Discovered (Enhanced)"
+  type: pattern
+  enabled: false  # DISABLED - replaced by unified_login_page
+  severity: medium
+  confidence: 0.9
+  description: "Login page discovered — automatic scope assignment to appropriate engagement"
+  title_template: "Login page — {url}"
+  reason_template: "Login page discovered — credential testing candidate. Auto-assigned based on scope analysis."
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, name, evidence, asset_id]
+    time_column: created_at
+  match:
+    type: regex
+    fields: [url, name, evidence]
+    pattern: "(login|signin|sign-in|auth|logon|log-on|sso|oauth|session|wp-login|admin/login|user/login|account/login|authentication)"
+    case_insensitive: true
+  tags: [login, credentials, authentication]
+
+# Rule to flag high-value out-of-scope login pages for potential scope expansion
+- id: valuable_external_login
+  name: "High-Value External Login Page"
+  type: pattern
+  enabled: false  # DISABLED - replaced by unified_login_page
+  severity: low
+  confidence: 0.8
+  description: "Login page on external domain that may be worth adding to scope"
+  title_template: "External login — {domain}"
+  reason_template: "Login page found on external domain {domain}. Consider if this should be added to engagement scope."
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, name, evidence]
+    where:
+      asset_id_null: true
+    time_column: created_at
+  match:
+    type: python
+    function: check_valuable_external_login
+  tags: [external, scope-expansion, login]
+  priority: low

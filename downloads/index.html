@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>RAG-Scan-Stack Downloads</title>
+    <style>
+        body { font-family: monospace; background: #1a1a2e; color: #eee; padding: 40px; max-width: 900px; margin: 0 auto; }
+        h1 { color: #0f0; border-bottom: 1px solid #0f0; padding-bottom: 10px; }
+        h2 { color: #0ff; margin-top: 30px; }
+        a { color: #0f0; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .file { margin: 10px 0; padding: 10px; background: #16213e; border-radius: 5px; display: flex; justify-content: space-between; align-items: center; }
+        .file-info { flex: 1; }
+        .desc { color: #888; font-size: 0.9em; margin-top: 5px; }
+        .badge { background: #0f0; color: #000; padding: 2px 8px; border-radius: 3px; font-size: 0.8em; margin-left: 10px; }
+        .badge-json { background: #f0f; }
+        .badge-py { background: #0ff; }
+        code { background: #0d1b2a; padding: 2px 6px; border-radius: 3px; }
+        .section { background: #0d1b2a; padding: 15px; border-radius: 5px; margin: 20px 0; }
+        table { width: 100%; border-collapse: collapse; margin: 10px 0; }
+        th, td { text-align: left; padding: 8px; border-bottom: 1px solid #333; }
+        th { color: #0ff; }
+    </style>
+</head>
+<body>
+    <h1>RAG-Scan-Stack Downloads</h1>
+    <p>Build Date: 2026-02-16 | Version: 1.1.0 | Total Tools: 50</p>
+
+    <h2>Open WebUI Import Files (JSON)</h2>
+    <p>Download and import via: <code>Workspace → Tools → Import</code></p>
+
+    <div class="file">
+        <div class="file-info">
+            <a href="all_tools_import.json">all_tools_import.json</a>
+            <span class="badge badge-json">JSON</span>
+            <div class="desc">Complete toolkit - 50 tools (RECOMMENDED)</div>
+        </div>
+    </div>
+
+    <div class="file">
+        <div class="file-info">
+            <a href="test_tools_import.json">test_tools_import.json</a>
+            <span class="badge badge-json">JSON</span>
+            <div class="desc">Simple test tools (echo, time, add) - for testing</div>
+        </div>
+    </div>
+
+    <div class="file">
+        <div class="file-info">
+            <a href="pentest_tools_import.json">pentest_tools_import.json</a>
+            <span class="badge badge-json">JSON</span>
+            <div class="desc">Core pentest tools only</div>
+        </div>
+    </div>
+
+    <h2>Raw Python Files</h2>
+    <p>For manual copy/paste: <code>Workspace → Tools → + → Paste → Save</code></p>
+
+    <div class="file">
+        <div class="file-info">
+            <a href="all_tools.py">all_tools.py</a>
+            <span class="badge badge-py">Python</span>
+            <div class="desc">Complete toolkit source code</div>
+        </div>
+    </div>
+
+    <div class="file">
+        <div class="file-info">
+            <a href="test_tools.py">test_tools.py</a>
+            <span class="badge badge-py">Python</span>
+            <div class="desc">Test tools source code</div>
+        </div>
+    </div>
+
+    <div class="file">
+        <div class="file-info">
+            <a href="pentest_tools.py">pentest_tools.py</a>
+            <span class="badge badge-py">Python</span>
+            <div class="desc">Pentest tools source code</div>
+        </div>
+    </div>
+
+    <h2>Documentation</h2>
+
+    <div class="file">
+        <div class="file-info">
+            <a href="system_prompt.txt">system_prompt.txt</a>
+            <span class="badge">TXT</span>
+            <div class="desc">Recommended system prompt for Open WebUI (copy to model settings)</div>
+        </div>
+    </div>
+
+    <div class="file">
+        <div class="file-info">
+            <a href="open-webui-setup.md">open-webui-setup.md</a>
+            <span class="badge">MD</span>
+            <div class="desc">Complete setup guide for Open WebUI</div>
+        </div>
+    </div>
+
+    <h2>Tool Summary</h2>
+    <div class="section">
+        <table>
+            <tr><th>Category</th><th>Count</th><th>Tools</th></tr>
+            <tr><td>Utilities</td><td>4</td><td>echo, get_time, add, check_health</td></tr>
+            <tr><td>OSINT</td><td>8</td><td>start_subfinder, start_dnsx, start_asnmap, start_uncover, start_cloudlist, start_alterx, start_mapcidr, get_osint_job_status</td></tr>
+            <tr><td>Port Discovery</td><td>7</td><td>start_masscan, start_naabu, start_nmap_scan, start_udp_scan, start_httpx_probe, start_tlsx, get_pd_job_status</td></tr>
+            <tr><td>Web Scanning</td><td>5</td><td>start_web_scan, start_katana, start_playwright_scan, start_nuclei_scan, get_web_scan_job_status</td></tr>
+            <tr><td>Credential Testing</td><td>2</td><td>start_brutus, get_brutus_job_status</td></tr>
+            <tr><td>Scan Status</td><td>5</td><td>get_nmap_job_status, get_nuclei_job_status, get_playwright_scan_status, get_all_active_jobs, get_all_scanner_status</td></tr>
+            <tr><td>Database</td><td>3</td><td>query_assets, query_open_ports, query_findings</td></tr>
+            <tr><td>Exploits</td><td>2</td><td>search_exploits, search_exploits_enhanced</td></tr>
+            <tr><td>Metasploit</td><td>6</td><td>run_msf_module, run_edb_script, list_msf_sessions, run_session_command, list_msf_jobs, get_msf_status</td></tr>
+            <tr><td>AI Sessions</td><td>7</td><td>start_pentest_session, resume_pentest_session, get_session_status, get_session_scans, get_session_messages, list_sessions, stop_session</td></tr>
+            <tr><td>Reports &amp; Cleanup</td><td>4</td><td>get_osint_report, get_next_scan_recommendation, cleanup_findings, cleanup_old_sessions</td></tr>
+        </table>
+    </div>
+
+    <h2>Service URLs</h2>
+    <div class="section">
+        <table>
+            <tr><th>Service</th><th>URL</th><th>Description</th></tr>
+            <tr><td>Open WebUI</td><td><a href="http://localhost:3000">localhost:3000</a></td><td>Chat Interface</td></tr>
+            <tr><td>LibreChat</td><td><a href="http://localhost:3001">localhost:3001</a></td><td>Chat Interface (Alternative UI)</td></tr>
+            <tr><td>Kong Gateway</td><td><a href="http://localhost:7080/docs">localhost:7080</a></td><td>API Gateway + Swagger UI</td></tr>
+            <tr><td>MCP Streamable</td><td><a href="http://localhost:9016/mcp">localhost:9016</a></td><td>50 MCP Tools (Streamable HTTP)</td></tr>
+            <tr><td>MCP OpenAPI (mcpo)</td><td><a href="http://localhost:8022/pentest/openapi.json">localhost:8022</a></td><td>OpenAPI Proxy for MCP</td></tr>
+            <tr><td>Autogen Agents</td><td><a href="http://localhost:8015/health">localhost:8015</a></td><td>AI Pentest Sessions</td></tr>
+            <tr><td>Logs UI</td><td><a href="http://localhost:8015/logs/ui">localhost:8015/logs/ui</a></td><td>Diagnostic Logs Dashboard</td></tr>
+            <tr><td>RAG API</td><td><a href="http://localhost:8000/health">localhost:8000</a></td><td>Assets, Ports, Findings DB</td></tr>
+            <tr><td>Nmap Scanner</td><td><a href="http://localhost:8012/health">localhost:8012</a></td><td>Nmap + Masscan</td></tr>
+            <tr><td>Web Scanner</td><td><a href="http://localhost:8010/health">localhost:8010</a></td><td>Gobuster + ZAP</td></tr>
+            <tr><td>Nuclei Runner</td><td><a href="http://localhost:8011/health">localhost:8011</a></td><td>Nuclei Vulnerability Scanner</td></tr>
+            <tr><td>Playwright Scanner</td><td><a href="http://localhost:8014/health">localhost:8014</a></td><td>Browser-based Security Scan</td></tr>
+            <tr><td>Scan Recommender</td><td><a href="http://localhost:8013/health">localhost:8013</a></td><td>AI Scan Recommendations + RAG</td></tr>
+            <tr><td>Exploit Runner</td><td><a href="http://localhost:8017/health">localhost:8017</a></td><td>Metasploit + ExploitDB</td></tr>
+            <tr><td>OSINT Runner</td><td><a href="http://localhost:8024/health">localhost:8024</a></td><td>Subfinder, dnsx, asnmap, uncover, cloudlist, alterx, mapcidr</td></tr>
+            <tr><td>PD Runner</td><td><a href="http://localhost:8023/health">localhost:8023</a></td><td>Naabu, httpx, katana, tlsx</td></tr>
+            <tr><td>Brutus Runner</td><td><a href="http://localhost:8025/health">localhost:8025</a></td><td>Multi-protocol Credential Testing</td></tr>
+        </table>
+    </div>
+
+    <h2>Quick Start</h2>
+    <div class="section">
+        <ol>
+            <li>Download <a href="all_tools_import.json">all_tools_import.json</a></li>
+            <li>Open <a href="http://localhost:3000">Open WebUI</a></li>
+            <li>Go to <code>Workspace → Tools → Import</code></li>
+            <li>Select the downloaded JSON file</li>
+            <li>Start chatting with tools enabled!</li>
+        </ol>
+    </div>
+</body>
+</html>

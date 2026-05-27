@@ -1,0 +1,155 @@
+# Scope Classification Rules
+# These rules auto-suggest which scope a discovered target belongs to.
+# Rules are evaluated in priority order (lower = higher priority).
+# Set auto_apply: true to automatically move targets without user review.
+
+# ── Third-party CDN/Infrastructure ─────────────────────────────────────────
+
+- id: cloudflare_cdn
+  name: "Cloudflare CDN/WAF"
+  scope_name: third_party_infrastructure
+  rule_type: asn
+  priority: 10
+  enabled: true
+  auto_apply: false
+  conditions:
+    field: asn_name
+    op: contains
+    value: "Cloudflare"
+
+- id: akamai_cdn
+  name: "Akamai CDN"
+  scope_name: third_party_infrastructure
+  rule_type: asn
+  priority: 10
+  enabled: true
+  auto_apply: false
+  conditions:
+    field: asn_name
+    op: contains
+    value: "Akamai"
+
+- id: fastly_cdn
+  name: "Fastly CDN"
+  scope_name: third_party_infrastructure
+  rule_type: asn
+  priority: 10
+  enabled: true
+  auto_apply: false
+  conditions:
+    field: asn_name
+    op: contains
+    value: "Fastly"
+
+# ── Cloud Hosting (may or may not be customer) ─────────────────────────────
+
+- id: aws_hosting
+  name: "AWS-hosted asset"
+  scope_name: cloud_hosted
+  rule_type: asn
+  priority: 50
+  enabled: true
+  auto_apply: false
+  conditions:
+    field: asn_name
+    op: contains
+    value: "Amazon"
+
+- id: azure_hosting
+  name: "Azure-hosted asset"
+  scope_name: cloud_hosted
+  rule_type: asn
+  priority: 50
+  enabled: true
+  auto_apply: false
+  conditions:
+    field: asn_name
+    op: contains
+    value: "Microsoft"
+
+# ── SaaS Platforms (usually third-party) ───────────────────────────────────
+
+- id: salesforce_saas
+  name: "Salesforce domain"
+  scope_name: customer_or_third_party
+  rule_type: domain_pattern
+  priority: 20
+  enabled: true
+  auto_apply: false
+  conditions:
+    pattern: "*.salesforce.com"
+
+- id: hubspot_saas
+  name: "HubSpot domain"
+  scope_name: customer_or_third_party
+  rule_type: domain_pattern
+  priority: 20
+  enabled: true
+  auto_apply: false
+  conditions:
+    pattern: "*.hubspot.com"
+
+- id: zendesk_saas
+  name: "Zendesk domain"
+  scope_name: customer_or_third_party
+  rule_type: domain_pattern
+  priority: 20
+  enabled: true
+  auto_apply: false
+  conditions:
+    pattern: "*.zendesk.com"
+
+- id: google_workspace
+  name: "Google Workspace"
+  scope_name: customer_or_third_party
+  rule_type: domain_pattern
+  priority: 20
+  enabled: true
+  auto_apply: false
+  conditions:
+    pattern: "*.google.com"
+
+# ── Let's Encrypt / Self-signed (informational) ───────────────────────────
+
+- id: letsencrypt_cert
+  name: "Let's Encrypt certificate"
+  scope_name: standard_hosting
+  rule_type: tls_issuer
+  priority: 80
+  enabled: false
+  auto_apply: false
+  conditions:
+    op: contains
+    value: "Let's Encrypt"
+
+# ── Private IP ranges (internal network) ───────────────────────────────────
+
+- id: private_10
+  name: "Private 10.0.0.0/8"
+  scope_name: internal_network
+  rule_type: ip_cidr
+  priority: 5
+  enabled: true
+  auto_apply: false
+  conditions:
+    cidr: "10.0.0.0/8"
+
+- id: private_172
+  name: "Private 172.16.0.0/12"
+  scope_name: internal_network
+  rule_type: ip_cidr
+  priority: 5
+  enabled: true
+  auto_apply: false
+  conditions:
+    cidr: "172.16.0.0/12"
+
+- id: private_192
+  name: "Private 192.168.0.0/16"
+  scope_name: internal_network
+  rule_type: ip_cidr
+  priority: 5
+  enabled: true
+  auto_apply: false
+  conditions:
+    cidr: "192.168.0.0/16"

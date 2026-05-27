@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Sample Source B</title>
+    <link>https://example.invalid/b</link>
+    <description>Sample test feed B</description>
+    <item>
+      <title>WidgetCorp Acme RCE actively exploited - CVE-2099-12345</title>
+      <link>https://example.invalid/b/widgetcorp-itw</link>
+      <pubDate>Mon, 28 Apr 2026 12:00:00 GMT</pubDate>
+      <description>Researchers report active in-the-wild exploitation of CVE-2099-12345 in WidgetCorp Acme Server. Operators should patch immediately.</description>
+    </item>
+  </channel>
+</rss>

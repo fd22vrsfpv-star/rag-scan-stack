@@ -1,0 +1,55 @@
+{
+  "account_id": "123456789012",
+  "session_name": "pentest-2026",
+  "modules": {
+    "iam__enum_users_roles_policies_groups": {
+      "results": {
+        "users": ["admin", "deploy-bot", "dev-user"],
+        "roles": ["AdminRole", "LambdaExecRole", "EC2ReadOnly"],
+        "policies": ["AdministratorAccess", "PowerUserAccess"]
+      }
+    },
+    "iam__privesc_scan": {
+      "results": {
+        "privesc_methods": [
+          {
+            "method": "CreateNewPolicyVersion",
+            "target": "arn:aws:iam::123456789012:user/deploy-bot",
+            "description": "User can create a new policy version to escalate privileges"
+          },
+          {
+            "method": "AttachUserPolicy",
+            "target": "arn:aws:iam::123456789012:user/dev-user",
+            "description": "User can attach AdministratorAccess to themselves"
+          }
+        ]
+      }
+    },
+    "lambda__enum": {
+      "results": {
+        "functions": [
+          {"name": "auth-handler", "runtime": "python3.9", "role": "arn:aws:iam::123456789012:role/LambdaExecRole"},
+          {"name": "data-processor", "runtime": "nodejs18.x", "role": "arn:aws:iam::123456789012:role/LambdaExecRole"}
+        ]
+      }
+    },
+    "s3__enum_buckets": {
+      "results": {
+        "buckets": ["company-data", "company-logs", "company-backups"]
+      }
+    }
+  },
+  "credentials": [
+    {
+      "access_key_id": "AKIAIOSFODNN7EXAMPLE",
+      "secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      "user_name": "deploy-bot"
+    },
+    {
+      "access_key_id": "ASIAIOSFODNN7EXAMPLE",
+      "secret_access_key": "tempSecretKey123",
+      "session_token": "FwoGZXIvYXdzEBYaDK...",
+      "user_name": "sts-assumed-role"
+    }
+  ]
+}

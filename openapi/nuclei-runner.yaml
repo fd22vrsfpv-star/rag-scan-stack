@@ -1,0 +1,21 @@
+openapi: 3.0.3
+info:
+  title: Nuclei Runner
+  version: "0.0.1"
+servers:
+  - url: http://localhost:7080/nuclei
+  - url: https://localhost:7443/nuclei
+tags:
+  - name: Health
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: nucleiHealth
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example: { status: "ok" }

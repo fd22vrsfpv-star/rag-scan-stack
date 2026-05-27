@@ -1,0 +1,21 @@
+openapi: 3.0.3
+info:
+  title: Scan Recommender
+  version: "0.0.1"
+servers:
+  - url: http://localhost:7080/scan
+  - url: https://localhost:7443/scan
+tags:
+  - name: Health
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: scanRecHealth
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example: { status: "ok" }

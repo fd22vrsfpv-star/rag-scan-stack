@@ -1,0 +1,181 @@
+# cloud.yaml — Cloud security detection rules for OSINT agent
+# These rules flag common cloud misconfigurations found by Prowler, ScoutSuite, CloudFox, etc.
+
+# ──────────────────────────────────────────────────────────────
+# Type: simple — Query one table, check field conditions
+# ──────────────────────────────────────────────────────────────
+
+- id: public_s3_bucket
+  name: "Public S3 Bucket"
+  type: simple
+  enabled: true
+  severity: critical
+  confidence: 0.95
+  description: "S3 bucket or cloud storage with public access detected"
+  title_template: "Public storage — {target}"
+  reason_template: "Cloud storage resource has public access enabled — data exposure risk"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: prowler
+      finding_type: cloud_misconfiguration
+    json_conditions:
+      - column: data
+        key: service
+        op: in
+        value: ["s3", "storage"]
+    time_column: created_at
+
+- id: overprivileged_iam
+  name: "Overprivileged IAM Role"
+  type: simple
+  enabled: true
+  severity: high
+  confidence: 0.85
+  description: "IAM role or user with admin-level permissions detected"
+  title_template: "Overprivileged IAM — {target}"
+  reason_template: "IAM entity has excessive permissions (admin/*) — privilege escalation risk"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: cloudfox
+      finding_type: privesc_path
+    time_column: created_at
+
+- id: missing_mfa_admin
+  name: "Admin Account Without MFA"
+  type: simple
+  enabled: true
+  severity: high
+  confidence: 0.9
+  description: "Administrative account without MFA — credential theft risk"
+  title_template: "No MFA on admin — {target}"
+  reason_template: "Admin account lacks MFA — compromised credentials grant full access"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: scoutsuite
+    json_conditions:
+      - column: data
+        key: rule
+        op: contains
+        value: "mfa"
+    time_column: created_at
+
+- id: stale_access_key
+  name: "Stale AWS Access Key"
+  type: simple
+  enabled: true
+  severity: medium
+  confidence: 0.8
+  description: "AWS access key older than 90 days — rotation recommended"
+  title_template: "Stale access key — {target}"
+  reason_template: "AWS access key not rotated in >90 days"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: prowler
+    json_conditions:
+      - column: data
+        key: check_id
+        op: contains
+        value: "access_key"
+    time_column: created_at
+
+- id: exposed_key_vault
+  name: "Exposed Azure Key Vault"
+  type: simple
+  enabled: true
+  severity: high
+  confidence: 0.85
+  description: "Azure Key Vault with permissive network access"
+  title_template: "Exposed Key Vault — {target}"
+  reason_template: "Azure Key Vault allows broad network access — secrets at risk"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: azurehound
+      finding_type: azure_key_vault
+    time_column: created_at
+
+- id: expired_cloud_credential
+  name: "Expired Cloud Credential"
+  type: simple
+  enabled: true
+  severity: medium
+  confidence: 1.0
+  description: "Cloud credential (STS/OAuth token) past its expiry time"
+  title_template: "Expired credential — {username}"
+  reason_template: "Cloud credential has expired — refresh or rotate"
+  finding_source: credential
+  query:
+    table: credential_vault
+    columns: [id, username, credential_type, expires_at, cloud_metadata]
+    where_raw: "expires_at IS NOT NULL AND expires_at < now() AND status NOT IN ('revoked','expired')"
+    time_column: created_at
+
+- id: lambda_public_url
+  name: "Lambda Function URL Without Auth"
+  type: simple
+  enabled: true
+  severity: high
+  confidence: 0.85
+  description: "Lambda function URL configured without authentication"
+  title_template: "Unauthenticated Lambda URL — {target}"
+  reason_template: "Lambda function URL is publicly accessible without IAM auth"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: prowler
+    json_conditions:
+      - column: data
+        key: check_id
+        op: contains
+        value: "lambda"
+    time_column: created_at
+
+- id: public_resource_no_waf
+  name: "Public Resource Without WAF"
+  type: cross_source
+  enabled: true
+  severity: medium
+  confidence: 0.7
+  description: "Public-facing cloud resource without WAF or Shield protection"
+  title_template: "No WAF on public resource — {target}"
+  reason_template: "Public cloud resource detected without WAF/Shield — direct attack surface"
+  finding_source: recon
+  sources:
+    primary:
+      table: recon_findings
+      columns: [id, target, data]
+      where:
+        source: prowler
+      json_conditions:
+        - column: data
+          key: service
+          op: in
+          value: ["ec2", "elbv2", "cloudfront"]
+    secondary:
+      table: recon_findings
+      columns: [id, target, data]
+      where:
+        source: prowler
+      json_conditions:
+        - column: data
+          key: check_id
+          op: contains
+          value: "waf"
+  join_key: target
+  condition: primary_without_secondary

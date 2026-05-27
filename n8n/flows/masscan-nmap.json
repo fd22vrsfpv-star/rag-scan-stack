@@ -1,0 +1,84 @@
+{
+  "name": "Masscan then Nmap",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "scan",
+        "options": {}
+      },
+      "id": "webhook-in",
+      "name": "Webhook In",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "masscan-scan"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://nmap_scanner:8012/jobs/masscan-then-nmap",
+        "options": {
+          "bodyContentType": "json",
+          "response": {
+            "responseFormat": "json"
+          }
+        },
+        "sendBody": true
+      },
+      "id": "http-req",
+      "name": "Call Scanner",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 2,
+      "position": [520, 300]
+    },
+    {
+      "parameters": {
+        "fields": {
+          "string": [
+            {
+              "name": "targets",
+              "value": "={{$json[\"targets\"] || [\"192.168.1.5\"]}}"
+            },
+            {
+              "name": "ports",
+              "value": "={{$json[\"ports\"] || \"1-65535\"}}"
+            },
+            {
+              "name": "rate",
+              "value": "={{$json[\"rate\"] || 1000}}"
+            }
+          ]
+        }
+      },
+      "id": "set",
+      "name": "Build Body",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [380, 300]
+    }
+  ],
+  "connections": {
+    "Webhook In": {
+      "main": [
+        [
+          {
+            "node": "Build Body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Body": {
+      "main": [
+        [
+          {
+            "node": "Call Scanner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

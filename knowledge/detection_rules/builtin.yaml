@@ -1,0 +1,400 @@
+# builtin.yaml — Default OSINT agent detection rules
+# These match the 10 original hardcoded rules in osint_agent.py
+# Edit or add custom rules in the custom/ directory.
+
+# ──────────────────────────────────────────────────────────────
+# Type: simple — Query one table, check field conditions
+# ──────────────────────────────────────────────────────────────
+
+- id: no_waf
+  name: "No WAF Detected"
+  type: simple
+  enabled: true
+  severity: medium
+  confidence: 0.9
+  description: "No WAF detected — target may be directly exposed"
+  title_template: "No WAF — {target}"
+  reason_template: "No WAF detected — target may be directly exposed"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: wafw00f
+    json_conditions:
+      - column: data
+        key: detected
+        op: is_not_true
+    time_column: created_at
+
+- id: self_signed_cert
+  name: "Self-Signed Certificate"
+  type: simple
+  enabled: true
+  severity: medium
+  confidence: 0.9
+  description: "Self-signed certificate — possible dev/staging environment"
+  title_template: "Self-signed cert — {target}"
+  reason_template: "Self-signed certificate — possible dev/staging environment"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: tlsx
+    time_column: created_at
+  match:
+    type: python
+    function: check_self_signed
+
+- id: expired_cert
+  name: "Expired TLS Certificate"
+  type: simple
+  enabled: true
+  severity: low
+  confidence: 0.9
+  description: "Expired TLS certificate"
+  title_template: "Expired cert — {target}"
+  reason_template: "TLS certificate expired on {not_after}"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: tlsx
+    time_column: created_at
+  match:
+    type: python
+    function: check_expired_cert
+
+- id: default_install
+  name: "Default Installation"
+  type: simple
+  enabled: true
+  severity: medium
+  confidence: 0.9
+  description: "Default installation detected"
+  title_template: "Default install — {name}"
+  reason_template: "Default installation detected"
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, name]
+    where:
+      array_contains:
+        column: user_tags
+        value: default-install
+    time_column: created_at
+
+- id: exposed_bucket
+  name: "Exposed Cloud Storage"
+  type: simple
+  enabled: true
+  severity: medium
+  confidence: 0.9
+  description: "Publicly exposed cloud storage"
+  title_template: "Exposed bucket — {bucket}"
+  reason_template: "Publicly exposed cloud storage: {bucket}"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data, finding_type]
+    where:
+      source: greyhatwarfare
+    time_column: created_at
+
+# ──────────────────────────────────────────────────────────────
+# Type: pattern — Query + regex/set match in Python
+# ──────────────────────────────────────────────────────────────
+
+- id: login_page
+  name: "Login Page Discovered"
+  type: pattern
+  enabled: false  # DISABLED - replaced by unified_login_page
+  severity: medium
+  confidence: 0.9
+  description: "Login page discovered — credential testing candidate"
+  title_template: "Login page — {url}"
+  reason_template: "Login page discovered — credential testing candidate"
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, name, evidence]
+    time_column: created_at
+  match:
+    type: regex
+    fields: [url, name, evidence]
+    pattern: "(login|signin|sign-in|auth|logon|log-on|sso|oauth|session|wp-login|admin/login|user/login|account/login)"
+    case_insensitive: true
+
+- id: weak_creds
+  name: "Weak/Default Credentials"
+  type: pattern
+  enabled: true
+  severity: high
+  confidence: 0.9
+  description: "Weak/default credentials found"
+  title_template: "Weak credentials — {username}@{domain}"
+  reason_template: "Weak/default password found for user '{username}'"
+  finding_source: credential
+  query:
+    table: credential_vault
+    columns: [id, username, domain, credential_value, cracked_value, credential_type]
+    where:
+      status: active
+    time_column: created_at
+  match:
+    type: python
+    function: check_weak_creds
+
+# ──────────────────────────────────────────────────────────────
+# Type: cross_source — Join findings from two tables
+# ──────────────────────────────────────────────────────────────
+
+- id: no_waf_plus_login
+  name: "Login Without WAF"
+  type: cross_source
+  enabled: true
+  severity: high
+  confidence: 0.95
+  description: "Login page without WAF protection — priority target"
+  title_template: "Login without WAF — {host}"
+  reason_template: "Login page without WAF protection — priority target"
+  finding_source: web
+  sources:
+    - name: no_waf_hosts
+      table: recon_findings
+      columns: [target]
+      where:
+        source: wafw00f
+      json_conditions:
+        - column: data
+          key: detected
+          op: is_not_true
+      distinct: target
+    - name: login_urls
+      table: web_findings
+      columns: [id, url]
+      time_column: created_at
+      extract_host_from: url
+  join:
+    left: login_urls.host
+    right: no_waf_hosts.target
+  post_filter:
+    type: regex
+    fields: [url]
+    pattern: "(login|signin|sign-in|auth|logon|log-on|sso|oauth|session|wp-login|admin/login|user/login|account/login)"
+    case_insensitive: true
+
+- id: self_signed_plus_service
+  name: "Self-Signed Cert on HTTPS"
+  type: simple
+  enabled: true
+  severity: medium
+  confidence: 0.9
+  description: "Self-signed cert on HTTPS service — possible internal/dev exposure"
+  title_template: "Self-signed HTTPS — {target}:{port}"
+  reason_template: "Self-signed cert on HTTPS service port {port} — possible internal/dev exposure"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: tlsx
+    time_column: created_at
+  match:
+    type: python
+    function: check_self_signed_plus_service
+
+# ──────────────────────────────────────────────────────────────
+# Type: multi_pass — Same rule checks multiple tables independently
+# ──────────────────────────────────────────────────────────────
+
+- id: open_redirect
+  name: "Open Redirect"
+  type: multi_pass
+  enabled: true
+  severity: medium
+  description: "Potential open redirect — phishing/token theft vector"
+  finding_source: multi
+  passes:
+    # Pass 1: vulns table — Nuclei/ZAP findings mentioning redirects
+    - finding_source: vuln
+      confidence: 0.95
+      title_template: "Open redirect — {script}"
+      reason_template: "Open redirect vulnerability detected by scanner: {script}"
+      query:
+        table: vulns
+        columns: [id, script, output, severity, asset_id]
+        time_column: created_at
+        extra_select: "(SELECT ip::text FROM assets WHERE id = v.asset_id LIMIT 1) AS target_ip"
+        table_alias: v
+      match:
+        type: regex
+        fields: [script, output]
+        pattern: "(open.?redirect|url.?redirect|unvalidated.?redirect|redirect.?vulnerab|CWE-601|external.?redirect|arbitrary.?redirect|redirect.?injection)"
+        case_insensitive: true
+
+    # Pass 2: web_findings — redirect in name/evidence or URL params
+    - finding_source: web
+      confidence: 0.9
+      title_template: "Open redirect — {url}"
+      reason_template: "Open redirect found: {name}"
+      query:
+        table: web_findings
+        columns: [id, url, name, evidence, source]
+        time_column: created_at
+      match:
+        type: python
+        function: check_open_redirect_web
+
+    # Pass 3: recon_findings — crawled URLs with redirect params
+    - finding_source: recon
+      confidence: 0.6
+      title_template: "Redirect param in crawled URL — {url}"
+      reason_template: "Crawled URL contains redirect parameter — candidate for open redirect testing"
+      tags: [open-redirect]
+      query:
+        table: recon_findings
+        columns: [id, target, data]
+        where:
+          source_in: [katana, gau, waybackurls]
+        time_column: created_at
+      match:
+        type: python
+        function: check_open_redirect_recon
+
+# ──────────────────────────────────────────────────────────────
+# Scope Intelligence Rules — flag findings from recon/content data
+# ──────────────────────────────────────────────────────────────
+
+- id: interesting_http_service
+  name: "Interesting HTTP Service"
+  type: simple
+  enabled: true
+  severity: medium
+  confidence: 0.85
+  description: "HTTP service with admin/management title or non-standard port"
+  title_template: "Interesting service — {url}"
+  reason_template: "{_reason_override}"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      finding_type: web_service
+    time_column: created_at
+  match:
+    type: python
+    function: check_interesting_http_service
+
+- id: exposed_api_endpoint
+  name: "Exposed API Endpoints"
+  type: simple
+  enabled: true
+  severity: medium
+  confidence: 0.8
+  description: "API endpoints discovered via content extraction — enumerate and test"
+  title_template: "API endpoints on {url} ({endpoint_count} found)"
+  reason_template: "Content extraction found {endpoint_count} API endpoint(s) — enumerate for auth bypass, IDOR, data exposure"
+  finding_source: web
+  query:
+    table: content_extractions
+    columns: [id, url, api_endpoints]
+    time_column: created_at
+  match:
+    type: python
+    function: check_exposed_api_endpoints
+
+- id: exposed_keys_secrets
+  name: "Exposed Keys/Secrets"
+  type: simple
+  enabled: true
+  severity: high
+  confidence: 0.9
+  description: "API keys, tokens, or secrets found in page content"
+  title_template: "Exposed secret on {url}"
+  reason_template: "Content extraction found {key_count} exposed key(s)/secret(s): {sample}"
+  finding_source: web
+  query:
+    table: content_extractions
+    columns: [id, url, exposed_keys]
+    time_column: created_at
+  match:
+    type: python
+    function: check_exposed_keys
+
+- id: sensitive_parameter
+  name: "Sensitive Parameter Discovered"
+  type: simple
+  enabled: true
+  severity: low
+  confidence: 0.7
+  description: "Parameter with security-sensitive name — fuzz for injection/bypass"
+  title_template: "Sensitive param '{param_name}' on {url_pattern}"
+  reason_template: "Parameter '{param_name}' ({http_method} {param_location}) may accept auth tokens, secrets, or redirect URLs"
+  finding_source: web
+  query:
+    table: discovered_params
+    columns: [id, url_pattern, param_name, http_method, param_location]
+    time_column: first_seen
+  match:
+    type: python
+    function: check_sensitive_params
+
+- id: missing_security_headers
+  name: "Missing Security Headers"
+  type: simple
+  enabled: true
+  severity: low
+  confidence: 0.8
+  description: "Page missing CSP, X-Frame-Options, or HSTS headers"
+  title_template: "Missing headers on {url}"
+  reason_template: "Missing security headers: {missing_headers}"
+  finding_source: web
+  query:
+    table: dom_analysis
+    columns: [id, url, security_headers]
+    time_column: created_at
+  match:
+    type: python
+    function: check_missing_security_headers
+
+- id: subdomain_wildcard
+  name: "Wildcard Subdomain / Large Cluster"
+  type: simple
+  enabled: false
+  severity: info
+  confidence: 0.7
+  description: "New subdomains discovered — disabled by default (high volume)"
+  title_template: "Subdomain — {target}"
+  reason_template: "Subdomain discovered — verify if wildcard or shared hosting before testing"
+  finding_source: recon
+  query:
+    table: recon_findings
+    columns: [id, target, data, source]
+    where:
+      finding_type: subdomain
+    time_column: created_at
+
+# ──────────────────────────────────────────────────────────────
+# Software version / CVE detection
+# ──────────────────────────────────────────────────────────────
+
+- id: software_known_cve
+  name: "Software with Known CVE"
+  type: pattern
+  enabled: true
+  severity: high
+  confidence: 0.85
+  description: "Detected software version matches known CVE entries"
+  title_template: "Vulnerable: {product} {version} on {ip} — {cve_list}"
+  reason_template: "{product} v{version} on {ip} ({hostname}) has {cve_count} known CVE(s) (max CVSS {max_cvss}): {cve_list}. Detected by {source}."
+  finding_source: recon
+  tags: [cve, software-version, vulnerability]
+  query:
+    table: detected_software
+    columns: [asset_id, ip, hostname, product, version, source, detection_type]
+  match:
+    type: python
+    function: check_software_cve

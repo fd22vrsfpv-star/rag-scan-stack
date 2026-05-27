@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+psycopg2-binary
+requests
+fastapi
+uvicorn
+psycopg2-binary
+requests
+fastapi
+uvicorn
+psycopg2-binary
+requests
+fastapi
+uvicorn
+psycopg2-binary
+requests

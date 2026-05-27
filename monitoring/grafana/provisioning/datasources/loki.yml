@@ -1,0 +1,77 @@
+# Grafana Datasource Provisioning - Loki
+#
+# This file automatically configures Loki as a datasource in Grafana.
+# No manual configuration needed - datasource will be available on Grafana startup.
+#
+# Documentation: https://grafana.com/docs/grafana/latest/administration/provisioning/
+# Version: 1.0
+# Last Updated: 2025-11-19
+
+apiVersion: 1
+
+datasources:
+  - name: Loki
+    type: loki
+    access: proxy
+    uid: loki-main
+    url: http://loki:3100
+    isDefault: true
+    editable: true
+    jsonData:
+      # Loki-specific configuration
+      maxLines: 1000
+      derivedFields:
+        # Extract request_id and make it clickable
+        - datasourceUid: loki-main
+          matcherRegex: '"request_id":"([^"]+)"'
+          name: request_id
+          url: $${__value.raw}
+
+        # Extract scan_id and make it clickable
+        - datasourceUid: loki-main
+          matcherRegex: '"scan_id":"([^"]+)"'
+          name: scan_id
+          url: $${__value.raw}
+
+      # Alert configuration
+      alertmanagerUid: alertmanager
+
+    # Query timeout
+    timeout: 60s
+
+# Notes:
+#
+# 1. Default Datasource:
+#    - isDefault: true makes Loki the default for Explore
+#    - Can be changed later in Grafana UI
+#
+# 2. Access Mode:
+#    - proxy: Grafana proxies requests to Loki
+#    - Better for security (client doesn't need direct access)
+#
+# 3. Derived Fields:
+#    - Automatically extracts fields from logs
+#    - Makes request_id and scan_id clickable
+#    - Click to filter logs by that field
+#
+# 4. UID:
+#    - Stable identifier for datasource
+#    - Used in dashboard provisioning
+#
+# 5. Editable:
+#    - Users can modify datasource settings in UI
+#    - Set to false in production for stability
+#
+# 6. URL:
+#    - http://loki:3100 uses Docker service name
+#    - Accessible within Docker network
+#
+# 7. MaxLines:
+#    - Default number of log lines to return
+#    - Can be overridden in queries
+#
+# 8. Additional Datasources:
+#    To add more Loki instances:
+#    - name: Loki-Production
+#      uid: loki-prod
+#      url: http://loki-prod:3100

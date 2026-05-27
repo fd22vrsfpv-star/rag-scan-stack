@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+psycopg2-binary
+python-multipart
+requests
+aiohttp
+censys
+wafw00f
+dnsdumpster
+dnspython>=2.4.0

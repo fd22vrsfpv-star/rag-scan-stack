@@ -1,0 +1,20 @@
+[Unit]
+Description=AutoSSH tunnel for %i
+After=network.target
+Wants=network.target
+StartLimitInterval=0
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/autossh -M 0 -N -T -D 0.0.0.0:%i -o "StrictHostKeyChecking=no" -o "UserKnownHostsFile=/dev/null" -o "ServerAliveInterval=15" -o "ServerAliveCountMax=5" -o "TCPKeepAlive=yes" -o "ConnectTimeout=15" -o "ConnectionAttempts=3" -o "ExitOnForwardFailure=yes" ${SSH_DESTINATION}
+Environment=AUTOSSH_PORT=0
+Environment=SSH_DESTINATION=root@example.com
+EnvironmentFile=-/opt/rag-scan-stack/systemd/autossh@%i.conf
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

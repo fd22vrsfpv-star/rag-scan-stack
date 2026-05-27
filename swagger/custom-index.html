@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>API Portal</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="./swagger-ui.css" />
+  <style>
+    /* -------- Theme tokens -------- */
+    :root{
+      --ui-fg:#111827;--ui-fg-muted:#374151;--ui-bg:#ffffff;--ui-border:#d1d5db;
+      --ui-bg-hover:#f3f4f6;--ui-accent:#2563eb;--ui-topbar-fg:#ffffff;--ui-topbar-border:rgba(255,255,255,.6)
+    }
+    @media (prefers-color-scheme:dark){
+      :root{
+        --ui-fg:#e5e7eb;--ui-fg-muted:#d1d5db;--ui-bg:#111827;--ui-border:#374151;
+        --ui-bg-hover:#1f2937;--ui-accent:#60a5fa;--ui-topbar-fg:#ffffff;--ui-topbar-border:rgba(255,255,255,.55)
+      }
+    }
+
+    /* Keep Swagger header tidy */
+    .topbar .wrapper .topbar-wrapper{display:flex;align-items:center;gap:8px}
+
+    /* Buttons that sit on the purple topbar */
+    .n8n-btn,.direct-toggle{
+      display:inline-block;padding:8px 12px;border-radius:8px;background:transparent;
+      color:var(--ui-topbar-fg);border:1px solid var(--ui-topbar-border);text-decoration:none;
+      font:14px/1.2 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif
+    }
+    .n8n-btn:hover,.n8n-btn:focus,.direct-toggle:hover,.direct-toggle:focus{
+      background:rgba(255,255,255,.08);outline:none
+    }
+
+    /* Portal dropdown rendered under <body> (isolated from topbar styles) */
+    .direct-portal{position:absolute;min-width:260px;background:#ffffff;border:1px solid #d1d5db;border-radius:10px;
+      box-shadow:0 10px 28px rgba(0,0,0,.18);padding:8px;z-index:99999;display:none;isolation:isolate}
+    .direct-portal a{display:block;padding:8px 10px;border-radius:8px;text-decoration:none;
+      color:#111827 !important;font:14px/1.2 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif}
+    .direct-portal a:hover,.direct-portal a:focus{background:#f3f4f6;color:#2563eb !important;outline:none}
+    .direct-portal hr{border:none;border-top:1px solid #e5e7eb;margin:6px 0}
+    .direct-portal .hint{color:#6b7280;font-size:12px;padding:4px 10px}
+
+    /* Belt-and-suspenders: force readable text inside the portal */
+    .direct-portal, .direct-portal *, .direct-portal a:link, .direct-portal a:visited{
+      color:#111827 !important;-webkit-text-fill-color:#111827 !important;text-shadow:none !important;mix-blend-mode:normal !important
+    }
+  </style>
+</head>
+<body>
+<div id="swagger-ui"></div>
+
+<!-- Stock bundles -->
+<script src="./swagger-ui-bundle.js"></script>
+<script src="./swagger-ui-standalone-preset.js"></script>
+
+<script>
+  /* Build Swagger UI with MULTI-URL list (forces the dropdown in all browsers) */
+  window.ui = SwaggerUIBundle({
+    urls: [
+      { name: "RAG API",          url: "/specs/rag-api.yaml" },
+      { name: "LLM Query",        url: "/specs/llm-query.yaml" },
+      { name: "Web Scanner",      url: "/specs/web-scanner.yaml" },
+      { name: "Nuclei Runner",    url: "/specs/nuclei-runner.yaml" },
+      { name: "Nmap Scanner",     url: "/specs/nmap_scanner.yaml" },
+      { name: "Scan Recommender", url: "/specs/scan-recommender.yaml" },
+      { name: "Playwright Scanner", url: "/specs/playwright-scanner.yaml" },
+      { name: "ZAP",              url: "/specs/zap.yaml" }
+    ],
+    dom_id: '#swagger-ui',
+    deepLinking: true,
+    presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+    layout: "StandaloneLayout"
+  });
+
+  /* Direct Access dropdown rendered as a body-level portal (readable colors) */
+  (function setupDirectAccess(){
+    const proto = window.location.protocol || 'http:';   // use current scheme
+    const host  = window.location.hostname || 'localhost';
+
+    // NOTE: per your request, each direct URL ends with "/doc"
+    const links = [
+      { label: 'Open WebUI (3000)',      href: `${proto}//${host}:3000` },
+      { label: 'LibreChat (3001)',       href: `${proto}//${host}:3001` },
+      { label: 'n8n (UI)',               href: `${proto}//${host}:5678/docs` },
+      { label: 'RAG API (8000)',         href: `${proto}//${host}:8000/docs` },
+      { label: 'LLM Query (8002)',       href: `${proto}//${host}:8002/docs` },
+      { label: 'Web Scanner (8010)',     href: `${proto}//${host}:8010/docs` },
+      { label: 'Nuclei Runner (8011)',   href: `${proto}//${host}:8011/docs` },
+      { label: 'Nmap Scanner (8012)',    href: `${proto}//${host}:8012/docs` },
+      { label: 'Scan Recommender (8013)',href: `${proto}//${host}:8013/docs` },
+      { label: 'Playwright Scanner (8014)', href: `${proto}//${host}:8014/docs` },
+      { label: 'Autogen Agents (8015)',  href: `${proto}//${host}:8015/docs` },
+      { label: 'Exploit Runner (8017)',  href: `${proto}//${host}:8017/docs` },
+      { label: 'ZAP (8090)',             href: `${proto}//${host}:8090/docs` },
+      { label: '---', href: '#', separator: true },
+      { label: 'Webhooks Dashboard',     href: `${proto}//${host}:8000/webhooks/ui` },
+      { label: 'Web Scanner Logs',       href: `${proto}//${host}:8010/logs/ui` },
+      { label: 'Nuclei Runner Logs',     href: `${proto}//${host}:8011/logs/ui` },
+      { label: 'Nmap Scanner Logs',      href: `${proto}//${host}:8012/logs/ui` },
+      { label: 'Scan Recommender Logs',  href: `${proto}//${host}:8013/logs/ui` },
+      { label: 'Playwright Scanner Logs', href: `${proto}//${host}:8014/logs/ui` },
+      { label: 'Autogen Agents Logs',    href: `${proto}//${host}:8015/logs/ui` },
+      { label: 'Exploit Runner Logs',    href: `${proto}//${host}:8017/logs/ui` },
+      { label: 'Container Logs (ZAP/MSF)', href: `${proto}//${host}:8018/` }
+    ];
+
+    function render(){
+      const header =
+        document.querySelector('.topbar .wrapper .download-url-wrapper') ||
+        document.querySelector('.topbar .wrapper .topbar-wrapper') ||
+        document.querySelector('.topbar .wrapper');
+      if(!header) return false;
+
+      if(!document.querySelector('.direct-toggle')){
+        // Buttons in topbar
+        const btn=document.createElement('button');
+        btn.className='direct-toggle'; btn.type='button'; btn.textContent='Direct Access ▾';
+        header.appendChild(btn);
+
+        const n8n=document.createElement('a');
+        n8n.className='n8n-btn'; n8n.href=`${proto}//${host}:5678/`; n8n.target='_blank'; n8n.rel='noopener';
+        n8n.textContent='Open n8n ↗'; header.appendChild(n8n);
+
+        // Create the portal panel under <body>
+        const panel=document.createElement('div');
+        panel.className='direct-portal';
+        links.forEach(({label,href,separator})=>{
+          if(separator){
+            panel.appendChild(Object.assign(document.createElement('hr'),{}));
+            const secLabel=document.createElement('div');
+            secLabel.className='hint'; secLabel.style.fontWeight='600'; secLabel.style.color='#374151';
+            secLabel.textContent='Service Logs'; panel.appendChild(secLabel);
+          } else {
+            const a=document.createElement('a');
+            a.href=href; a.target='_blank'; a.rel='noopener'; a.textContent=label;
+            panel.appendChild(a);
+          }
+        });
+        panel.appendChild(Object.assign(document.createElement('hr'),{}));
+        const hint=document.createElement('div');
+        hint.className='hint';
+        hint.textContent='These links open each service directly on its host port (bypassing Kong).';
+        panel.appendChild(hint);
+        document.body.appendChild(panel);
+
+        // Toggle & position the portal under the button
+        function place(){
+          const r=btn.getBoundingClientRect();
+          panel.style.left = Math.round(r.left + window.scrollX) + 'px';
+          panel.style.top  = Math.round(r.bottom + window.scrollY + 6) + 'px';
+        }
+        function show(){ place(); panel.style.display='block'; }
+        function hide(){ panel.style.display='none'; }
+        btn.addEventListener('click', (e)=>{ e.stopPropagation(); panel.style.display==='block'?hide():show(); });
+        window.addEventListener('scroll', ()=>panel.style.display==='block'&&place());
+        window.addEventListener('resize', ()=>panel.style.display==='block'&&place());
+        document.addEventListener('click', hide, true);
+      }
+      return true;
+    }
+
+    // Firefox-safe: wait for header
+    if(!render()){
+      const obs=new MutationObserver(()=>{ if(render()) obs.disconnect(); });
+      obs.observe(document.body,{childList:true,subtree:true});
+      setTimeout(render,500);
+    }
+  })();
+</script>
+</body>
+</html>
+
+

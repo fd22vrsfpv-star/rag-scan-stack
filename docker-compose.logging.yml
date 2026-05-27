@@ -1,0 +1,176 @@
+# RAG Scan Stack - Log Aggregation Stack
+#
+# This Docker Compose file deploys the log aggregation infrastructure:
+# - Loki: Log aggregation system (like Prometheus for logs)
+# - Promtail: Log collector that ships logs to Loki
+# - Grafana: Visualization and querying interface (shares with monitoring stack)
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.logging.yml up -d
+#
+# Or to run separately:
+#   docker-compose -f docker-compose.logging.yml up -d
+#
+# Author: RAG Scan Stack Operations Team
+# Version: 1.0
+# Last Updated: 2025-11-19
+
+networks:
+  agents_net:
+    external: true
+
+volumes:
+  loki-data:
+    driver: local
+  grafana-data:
+    driver: local
+
+services:
+  # Loki - Log aggregation system
+  loki:
+    image: grafana/loki:2.9.3
+    container_name: loki
+    hostname: loki
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./monitoring/loki:/etc/loki:ro
+      - loki-data:/loki
+    environment:
+      TZ: America/New_York
+    command: -config.file=/etc/loki/loki-config.yml
+    networks:
+      - agents_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3100/ready || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - "com.rag-scan-stack.service=logging"
+      - "com.rag-scan-stack.component=loki"
+
+  # Promtail - Log collector
+  promtail:
+    image: grafana/promtail:2.9.3
+    container_name: promtail
+    hostname: promtail
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/promtail:/etc/promtail:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/log:/var/log:ro
+    environment:
+      TZ: America/New_York
+    command: -config.file=/etc/promtail/promtail-config.yml
+    networks:
+      - agents_net
+    depends_on:
+      - loki
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - "com.rag-scan-stack.service=logging"
+      - "com.rag-scan-stack.component=promtail"
+
+  # Grafana - Visualization (shared with monitoring stack)
+  # Note: If you're also using docker-compose.monitoring.yml,
+  # Grafana is defined there. This is for standalone logging setup.
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: grafana
+    hostname: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    environment:
+      - TZ=America/New_York
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-changeme}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+      - GF_INSTALL_PLUGINS=
+      - GF_LOG_LEVEL=info
+      - GF_PATHS_PROVISIONING=/etc/grafana/provisioning
+    networks:
+      - agents_net
+    depends_on:
+      - loki
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - "com.rag-scan-stack.service=logging"
+      - "com.rag-scan-stack.component=grafana"
+
+# Notes:
+#
+# 1. Network Configuration:
+#    - Uses external 'agents_net' network to communicate with main stack
+#    - If network doesn't exist, create it: docker network create agents_net
+#
+# 2. Data Persistence:
+#    - loki-data: Stores log indices and chunks
+#    - grafana-data: Stores dashboards, users, and settings
+#
+# 3. Log Collection:
+#    - Promtail collects logs from Docker containers via /var/lib/docker/containers
+#    - Also collects system logs from /var/log
+#    - Sends all logs to Loki for aggregation
+#
+# 4. Access:
+#    - Loki API: http://localhost:3100
+#    - Grafana UI: http://localhost:3000 (admin/changeme)
+#
+# 5. Security:
+#    - Change GRAFANA_ADMIN_PASSWORD in .env file
+#    - Restrict port access via firewall
+#    - Use read-only mounts for configuration
+#
+# 6. Resource Usage:
+#    - Loki: ~200-500MB RAM (depends on log volume)
+#    - Promtail: ~50-100MB RAM
+#    - Grafana: ~100-200MB RAM
+#    - Total: ~350-800MB RAM baseline
+#
+# 7. Log Retention:
+#    - Configured in loki-config.yml (default: 30 days)
+#    - Adjust based on disk space and compliance requirements
+#
+# 8. Troubleshooting:
+#    - Check Loki: curl http://localhost:3100/ready
+#    - Check Promtail: docker logs promtail
+#    - Check Grafana: curl http://localhost:3000/api/health
+#    - View logs: docker-compose -f docker-compose.logging.yml logs -f
+#
+# 9. Integration with Main Stack:
+#    - Services should output JSON logs to stdout
+#    - Use structured_logger.py module for consistent formatting
+#    - Promtail automatically discovers and collects Docker logs
+#
+# 10. Scaling:
+#     - For high log volume (>10GB/day), consider:
+#       * Multiple Loki instances with shared storage
+#       * S3-compatible object storage for chunks
+#       * Separate Promtail instances per host

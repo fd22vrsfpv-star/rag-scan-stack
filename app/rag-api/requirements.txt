@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+psycopg2-binary
+requests
+pydantic
+python-multipart
+ipaddress
+pyyaml
+httpx
+slowapi
+

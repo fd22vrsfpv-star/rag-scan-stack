@@ -1,0 +1,35 @@
+# Tunnel Manager Configuration
+# Copy this file to /etc/tunnel-manager/config.yaml and customize
+
+# API server settings
+listen_addr: "0.0.0.0:8027"
+
+# Database connection (will also check DB_DSN environment variable)
+database_url: "postgresql://app:app@localhost:5432/scans"
+
+# SSH configuration
+ssh_keys_dir: "/etc/tunnel-manager/ssh-keys"
+
+# WireGuard configuration
+wireguard_config: "/etc/tunnel-manager/wireguard"
+
+# Port allocation ranges
+ssh_port_start: 10120
+ssh_port_end: 10149
+wireguard_port_start: 10150
+wireguard_port_end: 10199
+
+# Health monitoring
+health_check_interval: 60   # seconds
+reconnect_attempts: 3
+backoff_threshold: 5
+
+# WireGuard settings
+wireguard_network: "10.66.0.0/24"
+wireguard_server_port: 51820
+
+# WSL2 integration (auto/force/disable)
+windows_wireguard_integration: "auto"
+
+# Logging (debug/info/warn/error)
+log_level: "info"

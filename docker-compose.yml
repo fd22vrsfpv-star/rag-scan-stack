@@ -1,0 +1,1883 @@
+networks:
+  agents_net:
+    external: true
+
+volumes:
+  rag-pgdata:
+  nuclei-templates:
+  searchsploit-data:
+  open-webui-data:
+  zap-plugins:
+  sliver-data:
+  sliver-configs:
+
+
+services:
+  exploitdb-etl:
+    image: python:3.12-slim
+    depends_on:
+      wait-for-db:
+        condition: service_completed_successfully
+        required: false
+      searchsploit-updater:
+        condition: service_started
+    networks: [ agents_net ]
+    environment:
+      - TZ=${TZ:-America/New_York}
+      - PG_DSN=postgres://edb_rw:${EDB_RW_PASSWORD:-ChangeMe_RW_#1}@rag-postgres:5432/exploits
+      - SEARCHSPLOIT_JSON=/var/lib/searchsploit/searchsploit.json
+    volumes:
+      - searchsploit-data:/var/lib/searchsploit     # read the JSON
+      - ./etl:/etl                                   # where edb_ingest_json.py lives
+    command: >
+      sh -lc '
+        pip install --no-cache-dir psycopg2-binary &&
+        python /etl/edb_ingest_json.py
+      '
+    restart: "no"
+  searchsploit-updater:
+    image: kalilinux/kali-rolling
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+    command: >
+      sh -lc '
+        apt-get update && apt-get install -y exploitdb jq git &&
+        mkdir -p /var/lib/searchsploit &&
+        searchsploit -o -j -w > /var/lib/searchsploit/searchsploit.json &&
+        sleep infinity
+      '
+    volumes:
+      - searchsploit-data:/var/lib/searchsploit
+    networks: [ agents_net ]
+  rag-postgres:
+    image: pgvector/pgvector:pg16
+    container_name: rag-postgres
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    profiles: ["local-db"]
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      POSTGRES_DB: ${POSTGRES_DB:-scans}
+    # ports: ["5432:5432"]  # Disabled external port - access via other services only
+    networks: [agents_net]
+    command:
+      - "postgres"
+      - "-c"
+      - "log_min_duration_statement=1000"   # log queries >1s
+      - "-c"
+      - "log_lock_waits=on"
+      - "-c"
+      - "log_temp_files=10240"               # log temp files >10MB
+    volumes:
+      - rag-pgdata:/var/lib/postgresql/data
+      - ./db_init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-scans}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── HashiCorp Vault — secrets store ─────────────────────────────
+  # Opt-in via profile "vault". App services read secrets via VAULT_ADDR/VAULT_TOKEN
+  # (see app/rag-api/secrets.py). Falls back to env vars when VAULT_ADDR unset.
+  vault:
+    image: hashicorp/vault:1.17
+    container_name: vault
+    profiles: ["vault"]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${VAULT_MEM_LIMIT:-512m}
+    cpus: ${VAULT_CPUS:-1.0}
+    cap_add: ["IPC_LOCK"]
+    environment:
+      VAULT_ADDR: https://127.0.0.1:8200
+      VAULT_API_ADDR: https://vault:8200
+      VAULT_SKIP_VERIFY: "true"
+    ports:
+      - "${VAULT_PORT:-8200}:8200"
+    volumes:
+      - ./vault/config:/vault/config:ro
+      - ./vault/data:/vault/file
+      - ./vault/logs:/vault/logs
+      - ./certs:/certs:ro
+    networks: [agents_net]
+    command: ["server", "-config=/vault/config/vault.hcl"]
+    healthcheck:
+      # 200=initialized+unsealed+active; 429=standby; 501=uninit; 503=sealed.
+      # Treat all of those as "process alive" so init/unseal sidecar can do its job.
+      test: ["CMD-SHELL", "wget -q --no-check-certificate -O- https://127.0.0.1:8200/v1/sys/health?standbyok=true&sealedcode=200&uninitcode=200 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  vault-init:
+    image: hashicorp/vault:1.17
+    container_name: vault-init
+    profiles: ["vault"]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    depends_on:
+      vault:
+        condition: service_started
+    environment:
+      VAULT_ADDR: https://vault:8200
+      VAULT_SKIP_VERIFY: "true"
+    volumes:
+      - ./vault/init-unseal.sh:/init-unseal.sh:ro
+      - ./vault/init:/vault/init   # holds init.json (root token + unseal key)
+    networks: [agents_net]
+    entrypoint: ["/bin/sh", "/init-unseal.sh"]
+
+  wait-for-db:
+    image: bash:5.2
+    container_name: rag-wait-for-db
+    profiles: ["local-db"]  # only needed when local postgres is running
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+    command: >
+      bash -lc "until (echo > /dev/tcp/rag-postgres/5432) 2>/dev/null; do echo 'waiting for db'; sleep 2; done"
+    networks: [agents_net]
+
+  rag-api:
+    build:
+      context: .
+      dockerfile: app/rag-api/Dockerfile
+    container_name: rag-api
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${RAG_API_MEM_LIMIT:-6g}
+    cpus: ${RAG_API_CPUS:-4.0}
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-2026.04.17-1}
+      TZ: ${TZ:-America/New_York}
+      API_KEY: ${API_KEY:-changeme}
+      DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      EMBEDDER_URL: ${EMBEDDER_URL:-https://embedder:8030}
+      # Vault (optional). When VAULT_ADDR is set, secrets.get_secret() prefers
+      # vault values over env. Token is read from VAULT_TOKEN or
+      # /vault/init/init.json (mounted read-only below when vault profile up).
+      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_TOKEN: ${VAULT_TOKEN:-}
+      VAULT_KV_MOUNT: ${VAULT_KV_MOUNT:-secret}
+      VAULT_SKIP_VERIFY: ${VAULT_SKIP_VERIFY:-true}
+      NMAP_PORT_BATCH: ${NMAP_PORT_BATCH:-100}
+      PYTHONPATH: /app
+      NMAP_OUT_DIR: /app/nmap_out
+      NMAP_SERVICE_DETECTION: ${NMAP_SERVICE_DETECTION:-1}
+      NMAP_VERSION_INTENSITY: ${NMAP_VERSION_INTENSITY:-9}
+      NMAP_SCRIPTS: ${NMAP_SCRIPTS:-banner,http-title,ssl-cert,ssl-enum-ciphers,ssh2-enum-algos}
+      NMAP_SCANNER_URL: ${NMAP_SCANNER_URL:-https://nmap_scanner:8012}
+      SCAN_RECOMMENDER_URL: ${SCAN_RECOMMENDER_URL:-https://scan-recommender:8013}
+      DETECTION_RULES_DIR: /knowledge/detection_rules
+      SCOPE_RULES_DIR: /knowledge/scope_rules
+      EXPLOITDB_CSV: /exploitdb/files_exploits.csv
+      NEWS_RUNNER_URL: ${NEWS_RUNNER_URL:-http://news-runner:8028}
+      # Ollama — used by cloud_triage_agent, takeover_hunter, vault_import_agent.
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_BASE_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:26b}
+    command: uvicorn api:app --host 0.0.0.0 --port 8000 --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
+    # depends_on: [wait-for-db]  # removed — wait-for-db is local-db profile only
+    ports: ["8000:8000"]
+    volumes:
+      - ./nmap_out:/app/nmap_out
+      - ./etl:/app/etl:ro
+      - ${WORDLISTS_DIR:-./wordlists}:/wordlists
+      - ./knowledge:/knowledge:ro
+      - ${SWAGGER_DIR:-./import/swagger}:/app/swagger_files
+      - ./scan_audit:/scan_audit:ro
+      - ./exploitdb:/exploitdb
+      - ./certs:/certs:ro
+      - ./vault/init:/vault/init:ro   # secrets.py reads root_token from init.json
+    networks: [agents_net]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    cap_add: [NET_RAW, NET_ADMIN]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8000/health || curl -f http://127.0.0.1:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  embedder:
+    build:
+      context: .
+      dockerfile: app/embedder/Dockerfile
+    container_name: embedder
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      EMBED_MODEL: ${EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+    ports: ["8030:8030"]
+    networks: [agents_net]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8030/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  # GPU-accelerated embedder — use with: docker compose --profile gpu up -d
+  # Stop CPU embedder first: docker compose stop embedder
+  embedder-gpu:
+    build:
+      context: .
+      dockerfile: app/embedder/Dockerfile.gpu
+    container_name: embedder-gpu
+    profiles: ["gpu"]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${EMBEDDER_MEM_LIMIT:-8g}
+    cpus: ${EMBEDDER_CPUS:-4.0}
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      EMBED_MODEL: ${EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+    ports: ["8031:8030"]
+    networks:
+      agents_net:
+        aliases:
+          - embedder
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8030/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  zap:
+    # profiles: ["scan"]  # starts by default
+    build:
+      context: ./zap
+    container_name: zap
+    networks: [agents_net]
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+    ports: ["8090:8090"]
+    volumes:
+      - zap-plugins:/home/zap/.ZAP/plugin
+    command: ["zap.sh","-daemon","-host","0.0.0.0","-port","8090",
+              "-config","api.key=${ZAP_API_KEY:-changeme}",
+              "-config","api.addrs.addr.name=.*",
+              "-config","api.addrs.addr.regex=true"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8090/JSON/core/view/version/?apikey=${ZAP_API_KEY:-changeme} || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  web-scanner:
+    # profiles: ["scan"]  # starts by default
+    build:
+      context: .
+      dockerfile: web_scanner/Dockerfile
+    container_name: web-scanner
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      SSL_CERTFILE: /certs/server.crt
+      PYTHONHTTPSVERIFY: "0"
+      SSL_KEYFILE: /certs/server.key
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      WORDLIST: ${WORDLIST:-/opt/seclists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-medium.txt}
+      WEB_PORTS: ${WEB_PORTS:-80,443,8080,8443,8000,8888,3000,5000}
+      ZAP_API_KEY: ${ZAP_API_KEY:-changeme}
+      ZAP_ADDR: ${ZAP_ADDR:-zap}
+      ZAP_PORT: ${ZAP_PORT:-8090}
+      SCHEME_HINT: ${SCHEME_HINT:-auto}
+      REPORT_DIR: /reports
+      PD_RUNNER_URL: "https://pd-runner:8023"
+    depends_on: [zap]
+    networks: [agents_net]
+    ports: ["8010:8010"]
+    volumes:
+      - ./web_reports:/reports
+      - ./etl:/scanner/etl
+      - ./scan_results:/scan_results
+      - ./scan_audit:/scan_audit
+      - ./scan_audit/audit_writer.py:/scanner/audit_writer.py:ro
+      - ./certs:/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8010/health || curl -f http://127.0.0.1:8010/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+
+  nuclei-runner:
+    # profiles: ["scan"]  # starts by default
+    build:
+      context: .
+      dockerfile: ./nuclei/Dockerfile
+    container_name: nuclei-runner
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      SSL_CERTFILE: /certs/server.crt
+      PYTHONHTTPSVERIFY: "0"
+      SSL_KEYFILE: /certs/server.key
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      API_BASE: https://rag-api:8000
+      API_KEY: ${API_KEY:-changeme}
+      WEB_PORTS: ${WEB_PORTS:-80,443,8080,8443,8000,8888,3000,5000}
+      SCHEME_HINT: ${SCHEME_HINT:-auto}
+      NUCLEI_TEMPLATES: /opt/nuclei-templates
+      NUCLEI_SEVERITY: ${NUCLEI_SEVERITY:-medium,high,critical}
+      NUCLEI_CONCURRENCY: ${NUCLEI_CONCURRENCY:-50}
+      NUCLEI_RATELIMIT: ${NUCLEI_RATELIMIT:-150}
+      NUCLEI_TIMEOUT: ${NUCLEI_TIMEOUT:-10}
+      NUCLEI_RETRIES: ${NUCLEI_RETRIES:-1}
+      NUCLEI_AUTO_UPDATE: ${NUCLEI_AUTO_UPDATE:-1}
+      REPORT_DIR: /reports
+    depends_on: [rag-api]
+    networks: [agents_net]
+    ports: ["8011:8011"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8011/health || curl -f http://127.0.0.1:8011/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - nuclei-templates:/opt/nuclei-templates
+      - ./nuclei_reports:/reports
+      - ./scan_results:/scan_results
+      - ./scan_audit:/scan_audit
+      - ./scan_audit/audit_writer.py:/runner/audit_writer.py:ro
+
+
+      - ./certs:/certs:ro
+  osint-runner:
+    # profiles: ["scan"]  # starts by default
+    build:
+      context: .
+      dockerfile: osint_runner/Dockerfile
+    container_name: osint-runner
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      SSL_CERTFILE: /certs/server.crt
+      PYTHONHTTPSVERIFY: "0"
+      SSL_KEYFILE: /certs/server.key
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      API_BASE: https://rag-api:8000
+      API_KEY: ${API_KEY:-changeme}
+      REPORT_DIR: /reports
+      SHODAN_API_KEY: ${SHODAN_API_KEY:-}
+      CENSYS_API_ID: ${CENSYS_API_ID:-}
+      CENSYS_API_SECRET: ${CENSYS_API_SECRET:-}
+      PDCP_API_KEY: ${PDCP_API_KEY:-}
+    depends_on: [rag-api]
+    networks: [agents_net]
+    ports: ["8024:8024"]
+    volumes:
+      - ./osint_reports:/reports
+      - ./etl:/runner/etl:ro
+      - ./scan_results:/scan_results
+      - ./scan_audit:/scan_audit
+      - ./scan_audit/audit_writer.py:/runner/audit_writer.py:ro
+    # SHM size needed for Chromium (gowitness screenshots) to avoid crashes
+      - ./certs:/certs:ro
+    shm_size: '1gb'
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8024/health || curl -f http://127.0.0.1:8024/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+
+  pd-runner:
+    # profiles: ["scan"]  # starts by default
+    build:
+      context: .
+      dockerfile: pd_runner/Dockerfile
+    container_name: pd-runner
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      SSL_CERTFILE: /certs/server.crt
+      PYTHONHTTPSVERIFY: "0"
+      SSL_KEYFILE: /certs/server.key
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      API_BASE: https://rag-api:8000
+      API_KEY: ${API_KEY:-changeme}
+      WEB_PORTS: ${WEB_PORTS:-80,443,8080,8443,8000,8888,3000,5000}
+      REPORT_DIR: /reports
+    depends_on: [rag-api]
+    networks: [agents_net]
+    ports: ["8023:8023"]
+    volumes:
+      - ./pd_reports:/reports
+      - ./etl:/runner/etl:ro
+      - ./scan_results:/scan_results
+      - ./scan_audit:/scan_audit
+      - ./scan_audit/audit_writer.py:/runner/audit_writer.py:ro
+      - ./certs:/certs:ro
+    cap_add: [NET_RAW]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8023/health || curl -f http://127.0.0.1:8023/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+
+  news-runner:
+    # Pulls 16 security feeds, dedupes by CVE/topic, LLM-enriches, runs daily.
+    # Lives in its own container so feed scraping + LLM enrichment can't take
+    # down rag-api. Communicates with rag-api over HTTP only for webhook emit.
+    build:
+      context: .
+      dockerfile: news_runner/Dockerfile
+    container_name: news-runner
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${NEWS_RUNNER_MEM_LIMIT:-2g}
+    cpus: ${NEWS_RUNNER_CPUS:-1.0}
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      RAG_API_URL: ${RAG_API_URL:-https://rag-api:8000}
+      API_KEY: ${API_KEY:-changeme}
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_BASE_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:26b}
+      NEWS_AGENT_MODEL: ${NEWS_AGENT_MODEL:-gemma4:26b}
+      NEWS_AUTO_FETCH: ${NEWS_AUTO_FETCH:-1}
+      NEWS_FETCH_INTERVAL_HOURS: ${NEWS_FETCH_INTERVAL_HOURS:-24}
+      NEWS_FETCH_HOUR_LOCAL: ${NEWS_FETCH_HOUR_LOCAL:-6}
+      GITHUB_PAT: ${GITHUB_PAT:-}
+    depends_on: [rag-api]
+    networks: [agents_net]
+    ports: ["8028:8028"]
+
+  brutus-runner:
+    # profiles: ["scan"]  # starts by default
+    build:
+      context: .
+      dockerfile: brutus_runner/Dockerfile
+    container_name: brutus-runner
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      SSL_CERTFILE: /certs/server.crt
+      PYTHONHTTPSVERIFY: "0"
+      SSL_KEYFILE: /certs/server.key
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      API_BASE: https://rag-api:8000
+      API_KEY: ${API_KEY:-changeme}
+      REPORT_DIR: /reports
+    depends_on: [rag-api]
+    networks: [agents_net]
+    ports: ["8026:8025"]
+    volumes:
+      - ./brutus_reports:/reports
+      - ./etl:/runner/etl:ro
+      - ./scan_results:/scan_results
+      - ${WORDLISTS_DIR:-./wordlists}:/wordlists:ro
+      - ./scan_audit:/scan_audit
+      - ./scan_audit/audit_writer.py:/runner/audit_writer.py:ro
+      - ./certs:/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8025/health || curl -f http://127.0.0.1:8025/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+
+  nmap_scanner:
+    # profiles: ["scan"]  # starts by default
+    build:
+      context: .
+      dockerfile: nmap_scanner/Dockerfile
+    container_name: nmap_scanner
+    command: uvicorn nmap-api:app --host 0.0.0.0 --port 8012 --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      SSL_CERTFILE: /certs/server.crt
+      PYTHONHTTPSVERIFY: "0"
+      SSL_KEYFILE: /certs/server.key
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      NMAP_OUT_DIR: /app/nmap_out
+      NMAP_SERVICE_DETECTION: ${NMAP_SERVICE_DETECTION:-1}
+      NMAP_VERSION_INTENSITY: ${NMAP_VERSION_INTENSITY:-9}
+      NMAP_SCRIPTS: ${NMAP_SCRIPTS:-banner,http-title,ssl-cert,ssl-enum-ciphers,ssh2-enum-algos,vulscan/vulscan.nse,vulners}
+      NMAP_PORT_BATCH: ${NMAP_PORT_BATCH:-100}
+      WEB_PORTS: ${WEB_PORTS:-80,443,8080,8443,8000,8888,3000,5000}
+      DEEP_SCAN_PORTS: ${DEEP_SCAN_PORTS:-1001-65535}
+      PYTHONPATH: /app
+      API_BASE: ${API_BASE:-https://rag-api:8000}
+      API_KEY: ${API_KEY:-changeme}
+      SCAN_RECOMMENDER_URL: ${SCAN_RECOMMENDER_URL:-https://scan-recommender:8013}
+      NUCLEI_URL: ${NUCLEI_URL:-https://nuclei-runner:8011}
+      OSINT_RUNNER_URL: ${OSINT_RUNNER_URL:-https://osint-runner:8024}
+    # depends_on: [wait-for-db]  # removed — wait-for-db is local-db profile only
+    networks: [agents_net]
+    ports: ["8012:8012"]
+    volumes:
+      - ./nmap_out:/app/nmap_out
+      - ./etl:/app/etl:ro
+      - ./app:/app/app:ro
+      - ./scan_results:/scan_results
+      - ./scan_audit:/scan_audit
+      - ./scan_audit/audit_writer.py:/app/audit_writer.py:ro
+      - ./certs:/certs:ro
+    cap_add: [NET_RAW, NET_ADMIN]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8012/health || curl -f http://127.0.0.1:8012/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+
+  scan-recommender:
+    # profiles: ["scan"]  # starts by default
+    build:
+      context: ./scan_recommender
+      dockerfile: Dockerfile
+    container_name: scan-recommender
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      SSL_CERTFILE: /certs/server.crt
+      PYTHONHTTPSVERIFY: "0"
+      SSL_KEYFILE: /certs/server.key
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      PG_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_HOST: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_BASE_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:14b}
+      CHAT_MODEL: ${OLLAMA_MODEL:-qwen2.5:14b}
+      TOOL_KB_PATH: "/knowledge/service_tools.yaml"
+      PLAYBOOK_DIR: "/knowledge/playbooks"
+      KALI_LISTENER_URL: "https://kali-listener:8019"
+      AUTO_EXECUTE_SAFE: ${AUTO_EXECUTE_SAFE:-1}
+      # LLM Backend + Azure/OpenAI/Anthropic settings
+      LLM_BACKEND: ${LLM_BACKEND:-ollama}
+      AZURE_API_KEY: ${AZURE_API_KEY:-}
+      AZURE_ENDPOINT: ${AZURE_ENDPOINT:-}
+      AZURE_MODEL: ${AZURE_MODEL:-gpt-4o}
+      AZURE_API_VERSION: ${AZURE_API_VERSION:-2024-08-01-preview}
+      AZURE_EMBED_MODEL: ${AZURE_EMBED_MODEL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-https://api.openai.com}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}
+    depends_on:
+      ollama:
+        condition: service_healthy
+        required: false  # macOS: native Ollama, no Docker container
+      wait-for-db:
+        condition: service_completed_successfully
+        required: false
+    networks:
+      - agents_net
+    volumes:
+      - searchsploit-data:/var/lib/searchsploit
+      - ./knowledge:/knowledge:ro
+      - ./certs:/certs:ro
+    ports:
+      - "8013:8013"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8013/health || curl -f http://127.0.0.1:8013/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+
+  playwright-scanner:
+    # profiles: ["scan"]  # starts by default
+    build:
+      context: ./playwright_scanner
+      dockerfile: Dockerfile
+    container_name: playwright-scanner
+    command: uvicorn playwright_scanner:app --host 0.0.0.0 --port 8014 --log-level info --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      SSL_CERTFILE: /certs/server.crt
+      PYTHONHTTPSVERIFY: "0"
+      SSL_KEYFILE: /certs/server.key
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      BROWSER_TYPE: ${BROWSER_TYPE:-chromium}  # chromium, firefox, or webkit
+      VIEWPORT_WIDTH: ${VIEWPORT_WIDTH:-1920}
+      VIEWPORT_HEIGHT: ${VIEWPORT_HEIGHT:-1080}
+      USER_AGENT: ${USER_AGENT:-Mozilla/5.0 (Playwright Security Scanner)}
+      USE_ZAP: ${USE_ZAP:-true}
+      ZAP_ADDR: ${ZAP_ADDR:-zap}
+      ZAP_PORT: ${ZAP_PORT:-8090}
+      ZAP_API_KEY: ${ZAP_API_KEY:-changeme}
+      HEADLESS: ${HEADLESS:-true}
+      SCREENSHOT_FORMAT: ${SCREENSHOT_FORMAT:-png}
+    depends_on:
+      wait-for-db:
+        condition: service_completed_successfully
+        required: false
+      zap:
+        condition: service_started
+    networks:
+      - agents_net
+    ports:
+      - "8014:8014"
+    volumes:
+      - ./playwright_screenshots:/screenshots
+      - ./playwright_reports:/reports
+    # SHM size needed for Chromium to avoid crashes
+      - ./certs:/certs:ro
+    shm_size: '2gb'
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8014/health || curl -f http://127.0.0.1:8014/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
+
+  autogen-agents:
+    # profiles: ["ai"]  # starts by default
+    build:
+      context: ./autogen_agents
+      dockerfile: Dockerfile
+    container_name: autogen-agents
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${AUTOGEN_MEM_LIMIT:-6g}
+    cpus: ${AUTOGEN_CPUS:-3.0}
+    environment:
+      SSL_CERTFILE: /certs/server.crt
+      PYTHONHTTPSVERIFY: "0"
+      SSL_KEYFILE: /certs/server.key
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      API_KEY: ${API_KEY:-changeme}
+      # LLM Backend: "ollama", "vllm", "azure", "openai", or "anthropic"
+      LLM_BACKEND: ${LLM_BACKEND:-ollama}
+      # Ollama settings (default)
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:32b}
+      # vLLM settings (when LLM_BACKEND=vllm)
+      VLLM_URL: ${VLLM_URL:-http://vllm:8000}
+      VLLM_MODEL: ${VLLM_MODEL:-mistralai/Mistral-7B-Instruct-v0.3}
+      VLLM_API_KEY: ${VLLM_API_KEY:-dummy}
+      # Azure settings (when LLM_BACKEND=azure)
+      AZURE_API_KEY: ${AZURE_API_KEY:-}
+      AZURE_ENDPOINT: ${AZURE_ENDPOINT:-}
+      AZURE_MODEL: ${AZURE_MODEL:-gpt-4o}
+      AZURE_API_VERSION: ${AZURE_API_VERSION:-2024-08-01-preview}
+      # OpenAI settings (when LLM_BACKEND=openai)
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-https://api.openai.com}
+      # Anthropic settings (when LLM_BACKEND=anthropic)
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}
+      RAG_API_URL: "https://rag-api:8000"
+      WEB_SCANNER_URL: "https://web-scanner:8010"
+      NUCLEI_URL: "https://nuclei-runner:8011"
+      NMAP_URL: "https://nmap_scanner:8012"
+      PLAYWRIGHT_URL: "https://playwright-scanner:8014"
+      SCAN_RECOMMENDER_URL: "https://scan-recommender:8013"
+      EXPLOIT_RUNNER_URL: "https://exploit-runner:8017"
+      PD_RUNNER_URL: "https://pd-runner:8023"
+      OSINT_RUNNER_URL: "https://osint-runner:8024"
+      BRUTUS_RUNNER_URL: "https://brutus-runner:8025"
+      WEB_PORTS: ${WEB_PORTS:-80,443,8080,8443,8000,8888,3000,5000}
+      DEEP_SCAN_PORTS: ${DEEP_SCAN_PORTS:-1001-65535}
+      SCAN_DEBUG: "false"
+      LLM_TIMEOUT: "900"
+      SESSION_STALL_TIMEOUT: "3600"
+      MCP_STREAMABLE_HOST: "mcp-streamable"
+      MCP_REGISTRY_PATH: "/app/third_party/registry.yaml"
+    depends_on:
+      wait-for-db:
+        condition: service_completed_successfully
+        required: false
+      ollama:
+        condition: service_healthy
+        required: false
+      rag-api:
+        condition: service_started
+      web-scanner:
+        condition: service_started
+      nuclei-runner:
+        condition: service_started
+      nmap_scanner:
+        condition: service_started
+      playwright-scanner:
+        condition: service_started
+      scan-recommender:
+        condition: service_started
+      pd-runner:
+        condition: service_started
+      osint-runner:
+        condition: service_started
+      brutus-runner:
+        condition: service_started
+    networks:
+      - agents_net
+    ports:
+      - "8015:8015"
+    volumes:
+      - ./autogen_logs:/app/logs
+      - ./autogen_cache:/app/cache
+      - ./scan_sessions:/app/scan_sessions
+      - ./nmap_out:/app/scanner_data/nmap_out:ro
+      - ./nuclei_reports:/app/scanner_data/nuclei_reports:ro
+      - ./web_reports:/app/scanner_data/web_reports:ro
+      - ./playwright_reports:/app/scanner_data/playwright_reports:ro
+      - ./playwright_screenshots:/app/scanner_data/playwright_screenshots:ro
+      - ./brutus_reports:/app/scanner_data/brutus_reports:ro
+      - ./osint_reports:/app/scanner_data/osint_reports:ro
+      - ./pd_reports:/app/scanner_data/pd_reports:ro
+      - ./mcp/third_party:/app/third_party:ro
+      - ./certs:/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8015/health || curl -f http://127.0.0.1:8015/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+
+  mcp-server:
+    # profiles: ["ai"]  # starts by default
+    build:
+      context: ./mcp
+      dockerfile: Dockerfile
+    container_name: mcp-server
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      API_URL: "https://autogen-agents:8015"
+      RAG_API_URL: "https://rag-api:8000"
+      NMAP_URL: "https://nmap_scanner:8012"
+      PLAYWRIGHT_URL: "https://playwright-scanner:8014"
+      EXPLOIT_RUNNER_URL: "https://exploit-runner:8017"
+      WEB_SCANNER_URL: "https://web-scanner:8010"
+      NUCLEI_URL: "https://nuclei-runner:8011"
+      SCAN_RECOMMENDER_URL: "https://scan-recommender:8013"
+      PD_RUNNER_URL: "https://pd-runner:8023"
+      OSINT_RUNNER_URL: "https://osint-runner:8024"
+      BRUTUS_RUNNER_URL: "https://brutus-runner:8025"
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8016"
+    depends_on:
+      - autogen-agents
+      - rag-api
+    networks:
+      - agents_net
+    ports:
+      - "8016:8016"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8016/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+
+  # Simple MCP test server for debugging tool execution
+  mcp-test:
+    # profiles: ["ai"]  # starts by default
+    build:
+      context: ./mcp
+      dockerfile: Dockerfile.test
+    container_name: mcp-test
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8020"
+    networks:
+      - agents_net
+    ports:
+      - "8020:8020"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8020/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  # Streamable HTTP MCP server - Native support for Open WebUI
+  mcp-streamable:
+    # profiles: ["ai"]  # starts by default
+    build:
+      context: ./mcp
+      dockerfile: Dockerfile.streamable
+    container_name: mcp-streamable
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      API_URL: "https://autogen-agents:8015"
+      RAG_API_URL: "https://rag-api:8000"
+      API_KEY: ${API_KEY:-changeme}
+      NMAP_URL: "https://nmap_scanner:8012"
+      PLAYWRIGHT_URL: "https://playwright-scanner:8014"
+      EXPLOIT_RUNNER_URL: "https://exploit-runner:8017"
+      WEB_SCANNER_URL: "https://web-scanner:8010"
+      NUCLEI_URL: "https://nuclei-runner:8011"
+      SCAN_RECOMMENDER_URL: "https://scan-recommender:8013"
+      PD_RUNNER_URL: "https://pd-runner:8023"
+      OSINT_RUNNER_URL: "https://osint-runner:8024"
+      BRUTUS_RUNNER_URL: "https://brutus-runner:8025"
+      OSINT_URL: "https://osint-runner:8024"
+      BRUTUS_URL: "https://brutus-runner:8025"
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "9016"
+    depends_on:
+      - autogen-agents
+      - rag-api
+    networks:
+      - agents_net
+    volumes:
+      - ./mcp/third_party:/app/third_party
+    ports:
+      - "9016:9016"
+      - "9017:9017"
+      - "9018:9018"
+      - "9019:9019"
+      - "9020:9020"
+      - "9021:9021"
+      - "9022:9022"
+      - "9023:9023"
+      - "9030:9030"
+      - "9031:9031"
+      - "9032:9032"
+      - "9033:9033"
+      - "9034:9034"
+
+  # Burp Suite MCP proxy — forwards requests to host Burp with correct Host header
+  burp-mcp-proxy:
+    image: nginx:alpine
+    container_name: burp-mcp-proxy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./mcp/burp-proxy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - agents_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9876/ >/dev/null 2>&1 || exit 0"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # MCPO - MCP to OpenAPI proxy for Open WebUI compatibility
+  mcpo:
+    # profiles: ["ai"]  # starts by default
+    image: ghcr.io/open-webui/mcpo:latest
+    container_name: mcpo
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+    command: --port 8080 --host 0.0.0.0 --config /config/config.json
+    volumes:
+      - ./mcpo:/config:ro
+    depends_on:
+      - mcp-streamable
+    networks:
+      - agents_net
+    ports:
+      - "8022:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/openapi.json || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Host Helper — systemd SSH tunnel manager for host-level persistence
+  host-helper:
+    profiles: ["optional"]
+    build:
+      context: .
+      dockerfile: host-helper/Dockerfile
+    container_name: host-helper
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+    network_mode: host
+    volumes:
+      - /etc/systemd/system:/etc/systemd/system
+      - /run/systemd:/run/systemd
+      - ./systemd:/opt/rag-scan-stack/systemd
+      - ./ssh-keys:/opt/rag-scan-stack/ssh-keys:ro
+    privileged: true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8029/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  exploit-runner:
+    # profiles: ["offensive"]  # starts by default
+    build:
+      context: .
+      dockerfile: exploit_runner/Dockerfile
+    container_name: exploit-runner
+    command: uvicorn exploit_runner:app --host 0.0.0.0 --port 8017 --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      SSL_CERTFILE: /certs/server.crt
+      PYTHONHTTPSVERIFY: "0"
+      SSL_KEYFILE: /certs/server.key
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      MSF_RPC_HOST: ${MSF_RPC_HOST:-metasploit}
+      MSF_RPC_PORT: ${MSF_RPC_PORT:-55553}
+      MSF_RPC_USER: ${MSF_RPC_USER:-msf}
+      MSF_RPC_PASS: ${MSF_RPC_PASS:-msf}
+      MSF_LHOST: ${MSF_LHOST:-}
+      MSF_LPORT: ${MSF_LPORT:-4444}
+      EXPLOITDB_PATH: /opt/exploitdb
+      MODIFIED_EXPLOITS_DIR: /app/modified_exploits
+    depends_on:
+      wait-for-db:
+        condition: service_completed_successfully
+        required: false
+    networks:
+      - agents_net
+    ports:
+      - "8017:8017"
+    volumes:
+      - ./exploitdb:/opt/exploitdb:ro
+      - ./modified_exploits:/app/modified_exploits
+    # Minimal capabilities for network access
+      - ./certs:/certs:ro
+    cap_add:
+      - NET_RAW
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8017/health || curl -f http://127.0.0.1:8017/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+
+  container-logs:
+    build:
+      context: .
+      dockerfile: container_logs/Dockerfile
+    container_name: container-logs
+    command: uvicorn container_logs:app --host 0.0.0.0 --port 8018 --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      SSL_CERTFILE: /certs/server.crt
+      PYTHONHTTPSVERIFY: "0"
+      SSL_KEYFILE: /certs/server.key
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      PROJECT_DIR: /project
+    networks:
+      - agents_net
+    ports:
+      - "8018:8018"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/project
+      - ./certs:/certs:ro
+      - ./db-config.json:/app/db-config.json:rw
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8018/health || curl -f http://127.0.0.1:8018/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  kali-listener:
+    # profiles: ["offensive"]  # starts by default
+    build:
+      context: ./kali_listener
+      dockerfile: Dockerfile
+    container_name: kali-listener
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      SSL_CERTFILE: /certs/server.crt
+      PYTHONHTTPSVERIFY: "0"
+      SSL_KEYFILE: /certs/server.key
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      LISTENER_PORT_START: 9080
+      LISTENER_PORT_END: 9180
+      API_PORT: 8019
+    networks:
+      - agents_net
+    ports:
+      - "8019:8019"
+      - "9080-9180:9080-9180"
+    volumes:
+      - ./certs:/certs:ro
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    depends_on:
+      wait-for-db:
+        condition: service_completed_successfully
+        required: false
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import ssl,urllib.request; ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE; urllib.request.urlopen('https://127.0.0.1:8019/health',context=ctx)\" || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+
+  # Ollama Debug Proxy - intercepts Open WebUI → Ollama traffic
+  # Run on host: OLLAMA_URL=http://localhost:11435 PROXY_PORT=11435 python mcp/ollama-debug-proxy.py
+  # Then point Open WebUI Ollama URL to http://host.docker.internal:11435
+  # Log viewer at http://localhost:11435/logs
+
+  metasploit:
+    # profiles: ["offensive"]  # starts by default
+    image: metasploitframework/metasploit-framework:latest
+    container_name: metasploit
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      MSF_RPC_HOST: "0.0.0.0"
+      MSF_RPC_PORT: "55553"
+      MSF_RPC_USER: ${MSF_RPC_USER:-msf}
+      MSF_RPC_PASS: ${MSF_RPC_PASS:-msf}
+    # Start msfrpcd daemon (keeps running)
+    command: >
+      /bin/bash -c "
+        ./msfrpcd -U msf -P msf -S -a 0.0.0.0 -p 55553 -f
+      "
+    networks:
+      - agents_net
+    ports:
+      - "55553:55553"
+      - "4444:4444"
+    volumes:
+      - ./msf_data:/root/.msf4
+    # Metasploit needs these capabilities for exploits
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    # Larger SHM for Metasploit
+    shm_size: '1gb'
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    profiles: ["gpu"]  # Windows WSL2: docker compose --profile gpu up -d
+    ports:
+      - "11435:11434"
+    environment:
+      - TZ=${TZ:-America/New_York}
+      - OLLAMA_HOST=0.0.0.0:11434
+    volumes:
+      - ./ollama-data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - agents_net
+  ollama-init:
+    image: ollama/ollama:latest
+    profiles: ["gpu"]  # Only runs with Docker ollama container
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+    # Share the same network namespace so localhost:11434 works
+    network_mode: "service:ollama"
+    volumes:
+      - ./ollama-data:/root/.ollama
+    entrypoint: >
+      sh -lc '
+        set -e
+        MODELS="nomic-embed-text qwen2.5:32b"
+        for m in $$MODELS; do
+          echo "=== Ensuring $$m ==="
+          # retry loop in case of network hiccups
+          i=0; until ollama pull "$$m"; do
+            i=$$((i+1)); [ "$$i" -ge 6 ] && echo "Failed to pull $$m after retries" && exit 1
+            echo "Retry $$i for $$m in 10s..."; sleep 10
+          done
+          # verify it actually exists/loaded
+          ollama show "$$m" >/dev/null 2>&1 || { echo "Verification failed for $$m"; exit 1; }
+          echo "OK: $$m ready."
+        done
+        echo "All models ensured."
+      '
+    restart: "no"
+
+  # vLLM - High-performance LLM inference server (OpenAI-compatible API)
+  # Use instead of Ollama for faster inference with large models
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm
+    profiles: ["optional"]  # docker compose --profile optional up -d
+    ports:
+      - "8100:8000"
+    environment:
+      - TZ=${TZ:-America/New_York}
+      - HF_HOME=/root/.cache/huggingface
+      - VLLM_API_KEY=${VLLM_API_KEY:-}
+    volumes:
+      - ./vllm-cache:/root/.cache/huggingface
+    command: >
+      --model ${VLLM_MODEL:-mistralai/Mistral-7B-Instruct-v0.3}
+      --host 0.0.0.0
+      --port 8000
+      --max-model-len ${VLLM_MAX_MODEL_LEN:-32768}
+      --gpu-memory-utilization ${VLLM_GPU_MEM:-0.9}
+      --dtype ${VLLM_DTYPE:-auto}
+      --enable-auto-tool-choice
+      --tool-call-parser mistral
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/v1/models || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s  # Model loading takes time
+    networks:
+      - agents_net
+    shm_size: '4gb'
+
+  # GRPO Training Service - Fine-tune pentest models with human feedback
+  # Only starts with: docker compose --profile training up grpo-trainer
+  grpo-trainer:
+    build:
+      context: ./grpo_trainer
+      dockerfile: Dockerfile
+    container_name: grpo-trainer
+    profiles: ["optional"]
+    restart: "no"
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      OLLAMA_URL: http://ollama:11434
+      HF_HOME: /root/.cache/huggingface
+      WANDB_API_KEY: ${WANDB_API_KEY:-}
+      WANDB_PROJECT: rag-scan-grpo
+    ports:
+      - "8025:8025"
+    volumes:
+      - ./grpo_trainer/datasets:/app/datasets
+      - ./grpo_trainer/checkpoints:/app/checkpoints
+      - ./vllm-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      wait-for-db:
+        condition: service_completed_successfully
+        required: false
+    networks:
+      - agents_net
+    shm_size: '4gb'
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8025/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  llm_query:
+      # profiles: ["ai"]  # starts by default
+      build:
+        context: ./llm_query
+        dockerfile: Dockerfile
+      container_name: llm_query
+      restart: unless-stopped
+      logging:
+        driver: json-file
+        options:
+          max-size: "50m"
+          max-file: "5"
+      environment:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
+        TZ: ${TZ:-America/New_York}
+        OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+        OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:32b}
+        OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-300}
+        # LLM Backend + Azure/OpenAI/Anthropic settings
+        LLM_BACKEND: ${LLM_BACKEND:-ollama}
+        AZURE_API_KEY: ${AZURE_API_KEY:-}
+        AZURE_ENDPOINT: ${AZURE_ENDPOINT:-}
+        AZURE_MODEL: ${AZURE_MODEL:-gpt-4o}
+        AZURE_API_VERSION: ${AZURE_API_VERSION:-2024-08-01-preview}
+        OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+        OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+        OPENAI_API_BASE: ${OPENAI_API_BASE:-https://api.openai.com}
+        ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+        ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}
+      depends_on:
+        ollama:
+          condition: service_healthy
+          required: false
+        wait-for-db:
+          condition: service_completed_successfully
+          required: false
+      networks:
+        - agents_net
+      ports:
+        - "8002:8002"  # Expose on port 8002 locally
+      healthcheck:
+        test: [ "CMD-SHELL", "curl -f http://127.0.0.1:8002/healthz || exit 1" ]
+        interval: 20s
+        timeout: 5s
+        retries: 15
+
+  kong:
+      build:
+        context: ./kong        # folder with your Dockerfile
+        dockerfile: Dockerfile
+      container_name: kong
+      profiles: ["optional"]
+      depends_on:
+        wait-for-db:
+          condition: service_completed_successfully
+          required: false
+        rag-api:
+          condition: service_started
+        llm_query:
+          condition: service_started
+        scan-recommender:
+          condition: service_started
+      networks:
+        - agents_net
+
+      # Use mapping style to avoid YAML list pitfalls
+      environment:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
+        TZ: ${TZ:-America/New_York}
+        KONG_DATABASE: "off"
+        KONG_DECLARATIVE_CONFIG: "/kong/declarative/kong.yml"
+        #KONG_PROXY_LISTEN: "0.0.0.0:7080, 0.0.0.0:7443 ssl"
+        KONG_PROXY_LISTEN: "0.0.0.0:7080"
+        KONG_ADMIN_LISTEN: "127.0.0.1:7081"
+        KONG_LOG_LEVEL: "notice"
+
+      # Mount ONLY the file you need (safer than mounting the whole dir)
+      volumes:
+        - ./kong/kong.yml:/kong/declarative/kong.yml:ro
+
+      ports:
+        - "7080:7080"            # Public HTTP
+        #- "7443:7443"            # Public HTTPS
+        - "127.0.0.1:7081:7081"  # Admin API (host-local only)
+      healthcheck:
+        test: ["CMD", "kong", "health"]
+        interval: 30s
+        timeout: 5s
+        retries: 5
+  swagger-ui:
+    image: swaggerapi/swagger-ui:latest
+    profiles: ["optional"]
+    networks: [ agents_net ]
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      BASE_URL: /docs
+    expose: [ "8080" ]
+    volumes:
+      - ./swagger/custom-index.html:/usr/share/nginx/html/index.html:ro
+    depends_on:
+      - specs
+  specs:
+    image: nginx:alpine
+    container_name: specs
+    profiles: ["optional"]
+    networks: [ agents_net ]
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+    volumes:
+      - ./openapi:/usr/share/nginx/html/specs:ro
+    expose:
+      - "80"
+
+  # WireGuard server — future migration target for SSH SOCKS tunnels.
+  # Stays OFF by default (optional profile). To bring online:
+  #   docker compose --profile optional up -d wg-server
+  # Then follow Docs/WIREGUARD_MIGRATION.md to generate per-node peers.
+  # Existing autossh tunnels keep working untouched while this is dormant.
+  wg-server:
+    profiles: ["optional"]
+    image: lscr.io/linuxserver/wireguard:latest
+    container_name: wg-server
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+      - net.ipv4.ip_forward=1
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: ${TZ:-America/New_York}
+      # Pre-allocate 0 peers — we manage peers via the dashboard / Docs/WIREGUARD_MIGRATION.md
+      # so the lscr image doesn't auto-generate clients we don't want.
+      PEERS: "0"
+      INTERNAL_SUBNET: ${WG_SUBNET:-10.66.0.0/24}
+      SERVERPORT: ${WG_LISTEN_PORT:-51820}
+      # SERVERURL must be reachable from remote nodes (not "auto") for valid client configs.
+      SERVERURL: ${WG_SERVERURL:-auto}
+      LOG_CONFS: "true"
+    volumes:
+      - ./wireguard/server:/config
+      - /lib/modules:/lib/modules:ro
+    ports:
+      - "${WG_LISTEN_PORT:-51820}:51820/udp"
+    networks:
+      - agents_net
+    restart: unless-stopped
+
+  # Open WebUI - Web interface for Ollama with tool/function support
+  open-webui:
+    profiles: ["optional"]
+    image: ghcr.io/open-webui/open-webui:dev
+    container_name: open-webui
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    networks: [ agents_net ]
+    ports:
+      - "3000:8080"
+    environment:
+      - TZ=${TZ:-America/New_York}
+      # Ollama connection - use container name since both are on same network
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
+      # OpenAI-compatible API (optional)
+      - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # Disable auth for local use
+      - WEBUI_AUTH=false
+      - ENABLE_SIGNUP=true
+      # Enable features
+      - ENABLE_OLLAMA_API=true
+      - ENABLE_OPENAI_API=true
+      # Default model - llama3.1:8b has excellent tool calling support
+      - DEFAULT_MODELS=${DEFAULT_MODELS:-llama3.1:8b}
+      # Tool/Function configuration
+      - ENABLE_TOOLS=true
+      # Use native tool calling for Ollama (empty = native, not prompt-based)
+      - TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE=
+      # Pre-configured tool servers (auto-initialized on startup)
+      - TOOL_SERVER_CONNECTIONS=[{"type":"openapi","url":"http://mcpo:8080/sessions","auth_type":"","key":"","config":{"enable":true},"info":{"id":"mcp-sessions","name":"Pentest Sessions","description":"Sessions, data queries, utilities, health checks (17 tools)"}},{"type":"openapi","url":"http://mcpo:8080/scanning","auth_type":"","key":"","config":{"enable":true},"info":{"id":"mcp-scanning","name":"Scanning Tools","description":"Masscan, Nmap, Naabu, Nuclei, Web, httpx, Katana, Playwright, TLS, job status (16 tools)"}},{"type":"openapi","url":"http://mcpo:8080/recon","auth_type":"","key":"","config":{"enable":true},"info":{"id":"mcp-recon","name":"Recon Tools","description":"Subfinder, dnsx, asnmap, uncover, cloudlist, alterx, mapcidr (9 tools)"}},{"type":"openapi","url":"http://mcpo:8080/exploit","auth_type":"","key":"","config":{"enable":true},"info":{"id":"mcp-exploit","name":"Exploit Tools","description":"Exploit search, Metasploit modules/sessions/jobs, ExploitDB scripts (8 tools)"}},{"type":"openapi","url":"http://mcpo:8080/credentials","auth_type":"","key":"","config":{"enable":true},"info":{"id":"mcp-credentials","name":"Credential Testing","description":"Brutus credential testing + identity/group queries (6 tools)"}},{"type":"openapi","url":"http://mcpo:8080/pipelines","auth_type":"","key":"","config":{"enable":true},"info":{"id":"mcp-pipelines","name":"Scan Pipelines","description":"One-click full port scan, web pipeline, pipeline status (3 tools)"}}]
+    volumes:
+      - open-webui-data:/app/backend/data
+      - ./open-webui/tools:/app/backend/data/tools:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - mcp-streamable
+      - mcpo
+
+  # ---------------------------------------------------------------------------
+  # Sliver C2 Server — implant management + SOCKS proxies for remote nodes
+  # ---------------------------------------------------------------------------
+  sliver-server:
+    # profiles: ["offensive"]  # starts by default
+    build:
+      context: ./sliver
+    container_name: sliver-server
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+    ports:
+      - "31337:31337"           # C2 listener (HTTPS + gRPC mux)
+      - "10000-10099:10000-10099"  # SOCKS proxy ports (one per Sliver node)
+    volumes:
+      - sliver-data:/root/.sliver
+      - sliver-configs:/root/.sliver-client
+    networks: [agents_net]
+    healthcheck:
+      test: ["CMD-SHELL", "sliver-server version || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Chisel Server — lightweight HTTPS tunnels for remote nodes
+  # ---------------------------------------------------------------------------
+  chisel-server:
+    # profiles: ["offensive"]  # starts by default
+    image: jpillora/chisel:latest
+    container_name: chisel-server
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+    command: server --reverse --port 10443 --auth ${CHISEL_USER:-pentest}:${CHISEL_PASSWORD:-changeme}
+    ports:
+      - "10443:10443"             # Chisel listener
+      - "10100-10119:10100-10119" # SOCKS proxy ports (one per Chisel node)
+    networks: [agents_net]
+
+  # ---------------------------------------------------------------------------
+  # SSH Tunnel — outbound SSH tunnel to remote VPS/jumpbox via autossh
+  #   Modes: dynamic (SOCKS5), reverse (-R), local (-L)
+  #   Start: docker compose --profile ssh-tunnel up -d ssh-tunnel
+  # ---------------------------------------------------------------------------
+  ssh-tunnel:
+    image: alpine:3.19
+    container_name: ssh-tunnel
+    # profiles: ["ssh-tunnel"]  # starts by default
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      # --- required ---
+      SSH_REMOTE_HOST: ${SSH_REMOTE_HOST:-}
+      SSH_REMOTE_USER: ${SSH_REMOTE_USER:-root}
+      SSH_REMOTE_PORT: ${SSH_REMOTE_PORT:-22}
+      # --- tunnel mode: dynamic | reverse | local ---
+      SSH_MODE: ${SSH_MODE:-dynamic}
+      # dynamic mode
+      SSH_SOCKS_PORT: ${SSH_SOCKS_PORT:-1080}
+      # reverse mode  (-R remote_bind -> local_target)
+      SSH_REVERSE_BIND: ${SSH_REVERSE_BIND:-0.0.0.0:9999}
+      SSH_REVERSE_TARGET: ${SSH_REVERSE_TARGET:-pentest-dashboard:80}
+      # local mode  (-L local_port -> remote_target)
+      SSH_LOCAL_PORT: ${SSH_LOCAL_PORT:-3389}
+      SSH_LOCAL_TARGET: ${SSH_LOCAL_TARGET:-127.0.0.1:3389}
+      # extra flags passed verbatim to ssh
+      SSH_EXTRA_OPTS: ${SSH_EXTRA_OPTS:-}
+      # autossh monitoring port (0 = rely on ServerAlive)
+      AUTOSSH_PORT: "0"
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        if [ -z "$${SSH_REMOTE_HOST}" ]; then
+          echo "[ssh-tunnel] ERROR: SSH_REMOTE_HOST is not set in .env — cannot start tunnel." >&2
+          echo "[ssh-tunnel] Sleeping to avoid restart loop. Set SSH_REMOTE_HOST and restart." >&2
+          exec sleep infinity
+        fi
+        apk add --no-cache openssh-client autossh >/dev/null 2>&1
+        chmod 600 /root/.ssh/id_rsa 2>/dev/null || true
+        # Build SSH options common to every mode
+        SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -o ConnectionAttempts=3 -i /root/.ssh/id_rsa -p $${SSH_REMOTE_PORT} $${SSH_EXTRA_OPTS}"
+        DEST="$${SSH_REMOTE_USER}@$${SSH_REMOTE_HOST}"
+        case "$${SSH_MODE}" in
+          dynamic)
+            echo "[ssh-tunnel] SOCKS5 proxy on 0.0.0.0:$${SSH_SOCKS_PORT} via $${DEST}"
+            exec autossh -M 0 -N -T -D 0.0.0.0:$${SSH_SOCKS_PORT} $${SSH_OPTS} $${DEST}
+            ;;
+          reverse)
+            echo "[ssh-tunnel] Reverse tunnel -R $${SSH_REVERSE_BIND} -> $${SSH_REVERSE_TARGET} via $${DEST}"
+            exec autossh -M 0 -N -T -R $${SSH_REVERSE_BIND}:$${SSH_REVERSE_TARGET} $${SSH_OPTS} $${DEST}
+            ;;
+          local)
+            echo "[ssh-tunnel] Local forward -L 0.0.0.0:$${SSH_LOCAL_PORT} -> $${SSH_LOCAL_TARGET} via $${DEST}"
+            exec autossh -M 0 -N -T -L 0.0.0.0:$${SSH_LOCAL_PORT}:$${SSH_LOCAL_TARGET} $${SSH_OPTS} $${DEST}
+            ;;
+          *)
+            echo "[ssh-tunnel] ERROR: unknown SSH_MODE='$${SSH_MODE}'. Use dynamic|reverse|local." >&2
+            exit 1
+            ;;
+        esac
+    ports:
+      - "${SSH_SOCKS_PORT:-1080}:${SSH_SOCKS_PORT:-1080}"   # SOCKS5 / local-forward port
+    volumes:
+      - ${SSH_KEY_PATH:-./ssh-keys}/${SSH_KEY_NAME:-id_rsa}:/root/.ssh/id_rsa:ro
+    networks: [agents_net]
+
+  # ---------------------------------------------------------------------------
+  # Node Manager — REPLACED by native tunnel manager (see tunnel-manager/)
+  # Use: ./scripts/build-tunnel-manager.sh to build and install native service
+  # ---------------------------------------------------------------------------
+  node-manager:
+    # profiles: ["offensive"]  # starts by default
+    build:
+      context: .
+      dockerfile: node_manager/Dockerfile
+    container_name: node-manager
+    command: uvicorn node_manager:app --host 0.0.0.0 --port 8027 --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      SSL_CERTFILE: /certs/server.crt
+      SSL_KEYFILE: /certs/server.key
+      PYTHONHTTPSVERIFY: "0"
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      # Remote database configuration
+      REMOTE_DB_HOST: ${REMOTE_DB_HOST:-}
+      REMOTE_DB_PORT: ${REMOTE_DB_PORT:-5432}
+      REMOTE_DB_USER: ${REMOTE_DB_USER:-app}
+      REMOTE_DB_PASSWORD: ${REMOTE_DB_PASSWORD:-}
+      REMOTE_DB_NAME: ${REMOTE_DB_NAME:-scans}
+      SLIVER_CONFIG: /root/.sliver-client/configs/node-manager.cfg
+      CHISEL_URL: http://chisel-server:10443
+      CHISEL_USER: ${CHISEL_USER:-pentest}
+      CHISEL_PASSWORD: ${CHISEL_PASSWORD:-changeme}
+      SLIVER_C2_HOST: ${SLIVER_C2_HOST:-}
+      SLIVER_C2_PORT: "31337"
+      SSH_REMOTE_HOST: ${SSH_REMOTE_HOST:-}
+      SSH_REMOTE_USER: ${SSH_REMOTE_USER:-root}
+      SSH_REMOTE_PORT: ${SSH_REMOTE_PORT:-22}
+      SSH_KEY_NAME: ${SSH_KEY_NAME:-id_rsa}
+      SSH_TUNNEL_NAME: ${SSH_TUNNEL_NAME:-ssh-tunnel}
+      API_BASE: https://rag-api:8000
+      API_KEY: ${API_KEY:-changeme}
+    volumes:
+      - ${SSH_KEY_PATH:-./ssh-keys}:/ssh-keys:ro
+      - ./node_manager:/app/node_manager:ro
+      - ./certs:/certs:ro
+      - ./wireguard:/opt/rag-scan-stack/wireguard:rw
+      - /tmp:/tmp
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD-SHELL", "curl -k -f https://127.0.0.1:8027/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks: [agents_net]
+    ports: ["8027:8027"]
+    depends_on:
+      wait-for-db:
+        condition: service_completed_successfully
+        required: false
+  #     # SSH auto-connect from .env (creates tunnel on startup)
+  #     SSH_REMOTE_HOST: ${SSH_REMOTE_HOST:-}
+  #     SSH_REMOTE_USER: ${SSH_REMOTE_USER:-root}
+  #     SSH_REMOTE_PORT: ${SSH_REMOTE_PORT:-22}
+  #     SSH_KEY_NAME: ${SSH_KEY_NAME:-id_rsa}
+  #     SSH_TUNNEL_NAME: ${SSH_TUNNEL_NAME:-ssh-tunnel}
+  #     # For remote scan ingestion
+  #     API_BASE: https://rag-api:8000
+  #     API_KEY: ${API_KEY:-changeme}
+  #   depends_on:
+  #     wait-for-db:
+  #       condition: service_completed_successfully
+  #       required: false
+  #     sliver-server:
+  #       condition: service_started
+  #   networks: [agents_net]
+  #   ports:
+  #     - "8027:8027"
+  #     - "10120-10149:10120-10149"  # SSH tunnel SOCKS proxy ports
+  #   volumes:
+  #     - sliver-configs:/root/.sliver-client:ro
+  #     - ./ssh-keys:/ssh-keys:ro
+  #     - ./scan_audit:/scan_audit
+  #     - ./scan_audit/audit_writer.py:/app/audit_writer.py:ro
+  #     - ./osint_runner/bin:/tool-bins/osint:ro
+  #     - ./pd_runner/bin:/tool-bins/pd:ro
+  #     - ./certs:/certs:ro
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8027/health || curl -f http://127.0.0.1:8027/health || exit 1"]
+  #     interval: 20s
+  #     timeout: 5s
+  #     retries: 15
+
+  pentest-dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: pentest-dashboard
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
+    cpus: ${DEFAULT_CPUS:-2.0}
+    environment:
+      BUILD_VERSION: ${BUILD_VERSION:-dev}
+      TZ: ${TZ:-America/New_York}
+      RAG_API_URL: https://rag-api:8000
+      NMAP_SCANNER_URL: https://nmap_scanner:8012
+      WEB_SCANNER_URL: https://web-scanner:8010
+      NUCLEI_URL: https://nuclei-runner:8011
+      PD_RUNNER_URL: https://pd-runner:8023
+      OSINT_RUNNER_URL: https://osint-runner:8024
+      EXPLOIT_RUNNER_URL: https://exploit-runner:8017
+      SCAN_RECOMMENDER_URL: https://scan-recommender:8013
+      AUTOGEN_URL: https://autogen-agents:8015
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      BRUTUS_RUNNER_URL: https://brutus-runner:8025
+      PLAYWRIGHT_SCANNER_URL: https://playwright-scanner:8014
+      ZAP_URL: http://zap:8090
+      ZAP_API_KEY: ${ZAP_API_KEY:-changeme}
+      API_KEY: ${API_KEY:-changeme}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:14b}
+      TUNNEL_MANAGER_URL: https://node-manager:8027
+      GPU_NAME: ${GPU_NAME:-}
+      GPU_TOTAL_MEMORY_GB: ${GPU_TOTAL_MEMORY_GB:-0}
+      # LLM Backend
+      LLM_BACKEND: ${LLM_BACKEND:-ollama}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-https://api.openai.com}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}
+      AZURE_API_KEY: ${AZURE_API_KEY:-}
+      AZURE_ENDPOINT: ${AZURE_ENDPOINT:-}
+      AZURE_MODEL: ${AZURE_MODEL:-gpt-4o}
+      AZURE_API_VERSION: ${AZURE_API_VERSION:-2024-08-01-preview}
+    depends_on:
+      rag-api:
+        condition: service_started
+      nmap_scanner:
+        condition: service_started
+      web-scanner:
+        condition: service_started
+      nuclei-runner:
+        condition: service_started
+      autogen-agents:
+        condition: service_started
+    volumes:
+      - ./scan_results:/scan_results
+      - ./scan_audit:/scan_audit
+      - ./osint_reports:/osint_reports:ro
+      - ./Docs:/docs:ro
+      - ./mcp:/mcp:ro
+      - ./mcp/third_party:/mcp/third_party
+      - ./mcpo/config.json:/mcpo/config.json
+      - ./db-config.json:/app/db-config.json:rw
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # Enable docker exec for WireGuard status querying
+    networks:
+      - agents_net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "3002:443"
+      - "3001:80"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:443/api/health || curl -f http://127.0.0.1:80/api/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 10

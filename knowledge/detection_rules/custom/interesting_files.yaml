@@ -1,0 +1,205 @@
+# interesting_files.yaml — Detect exposed sensitive/interesting files from crawl data
+# Searches web_findings URLs (katana, gobuster, httpx) for file extensions and paths
+# that indicate exposed configs, backups, source code, API specs, or data files.
+
+# ── Sensitive config/data files ──────────────────────────────────────────────
+
+- id: exposed_json_files
+  name: "Exposed JSON Files"
+  type: pattern
+  enabled: true
+  severity: medium
+  confidence: 0.8
+  description: "JSON files found — may contain API responses, config, or data exports"
+  title_template: "Exposed JSON — {url}"
+  reason_template: "JSON file accessible: {url}"
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, source, status_code, evidence]
+    time_column: created_at
+  match:
+    type: regex
+    fields: [url]
+    pattern: "\\.(json|jsonl)($|\\?)"
+    case_insensitive: true
+
+- id: exposed_xml_files
+  name: "Exposed XML Files"
+  type: pattern
+  enabled: true
+  severity: low
+  confidence: 0.8
+  description: "XML files found — may contain sitemaps, configs, SOAP endpoints, or data"
+  title_template: "Exposed XML — {url}"
+  reason_template: "XML file accessible: {url}"
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, source, status_code, evidence]
+    time_column: created_at
+  match:
+    type: regex
+    fields: [url]
+    pattern: "\\.(xml|xsd|wsdl|dtd)($|\\?)"
+    case_insensitive: true
+
+- id: exposed_config_files
+  name: "Exposed Config Files"
+  type: pattern
+  enabled: true
+  severity: high
+  confidence: 0.9
+  description: "Configuration files found — may contain credentials, DB strings, API keys"
+  title_template: "Exposed config — {url}"
+  reason_template: "Config file accessible: {url}"
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, source, status_code, evidence]
+    time_column: created_at
+  match:
+    type: regex
+    fields: [url]
+    pattern: "(\\.(env|ini|cfg|conf|config|properties|toml|yaml|yml)|/config\\.js|/settings\\.py|/application\\.properties|/web\\.config|/\\.htaccess|/wp-config)"
+    case_insensitive: true
+
+- id: exposed_backup_files
+  name: "Exposed Backup/Archive Files"
+  type: pattern
+  enabled: true
+  severity: high
+  confidence: 0.9
+  description: "Backup or archive files found — may contain source code or database dumps"
+  title_template: "Exposed backup — {url}"
+  reason_template: "Backup/archive file accessible: {url}"
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, source, status_code, evidence]
+    time_column: created_at
+  match:
+    type: regex
+    fields: [url]
+    pattern: "\\.(bak|backup|old|orig|save|swp|sql|db|sqlite|dump|tar|gz|zip|rar|7z)($|\\?)"
+    case_insensitive: true
+
+- id: exposed_source_code
+  name: "Exposed Source Code"
+  type: pattern
+  enabled: true
+  severity: high
+  confidence: 0.8
+  description: "Source code files found — may reveal application logic, credentials, or vulnerabilities"
+  title_template: "Exposed source — {url}"
+  reason_template: "Source code file accessible: {url}"
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, source, status_code, evidence]
+    time_column: created_at
+  match:
+    type: regex
+    fields: [url]
+    pattern: "\\.(py|rb|java|cs|go|rs|pl|sh|ps1|bat|asp|aspx|jsp)($|\\?)"
+    case_insensitive: true
+
+- id: exposed_api_docs
+  name: "API Documentation/Specs"
+  type: pattern
+  enabled: true
+  severity: medium
+  confidence: 0.9
+  description: "API documentation or OpenAPI/Swagger specs found — reveals API surface"
+  title_template: "API docs — {url}"
+  reason_template: "API documentation found: {url}"
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, source, status_code, evidence]
+    time_column: created_at
+  match:
+    type: regex
+    fields: [url]
+    pattern: "(swagger|openapi|api-docs|graphql|/api/v[0-9]|/rest/|/_api/|/odata/|wp-json)"
+    case_insensitive: true
+
+- id: exposed_git_svn
+  name: "Exposed Version Control"
+  type: pattern
+  enabled: true
+  severity: critical
+  confidence: 0.95
+  description: "Version control metadata exposed — may allow full source code download"
+  title_template: "Exposed VCS — {url}"
+  reason_template: "Version control metadata accessible: {url}"
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, source, status_code, evidence]
+    time_column: created_at
+  match:
+    type: regex
+    fields: [url]
+    pattern: "(/\\.git/|/\\.svn/|/\\.hg/|/\\.bzr/|/CVS/|/\\.gitignore|/\\.env)"
+    case_insensitive: true
+
+- id: exposed_debug_admin
+  name: "Debug/Admin Endpoints"
+  type: pattern
+  enabled: true
+  severity: high
+  confidence: 0.85
+  description: "Debug or admin endpoints found — may allow unauthorized access"
+  title_template: "Debug/admin endpoint — {url}"
+  reason_template: "Debug or admin endpoint accessible: {url}"
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, source, status_code, evidence]
+    time_column: created_at
+  match:
+    type: regex
+    fields: [url]
+    pattern: "(/debug|/trace|/actuator|/healthcheck|/metrics|/status|/info|/phpinfo|/server-status|/server-info|/elmah|/adminer|/phpmyadmin|/console|/__debug__)"
+    case_insensitive: true
+
+- id: exposed_data_files
+  name: "Exposed Data Files"
+  type: pattern
+  enabled: true
+  severity: medium
+  confidence: 0.85
+  description: "Data export files found — may contain PII, credentials, or business data"
+  title_template: "Exposed data file — {url}"
+  reason_template: "Data file accessible: {url}"
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, source, status_code, evidence]
+    time_column: created_at
+  match:
+    type: regex
+    fields: [url]
+    pattern: "\\.(csv|tsv|xls|xlsx|doc|docx|pdf|log|txt)($|\\?)"
+    case_insensitive: true
+
+- id: exposed_certs_keys
+  name: "Exposed Certificates/Keys"
+  type: pattern
+  enabled: true
+  severity: critical
+  confidence: 0.95
+  description: "Private keys or certificates found — immediate credential compromise risk"
+  title_template: "Exposed key/cert — {url}"
+  reason_template: "Private key or certificate accessible: {url}"
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, source, status_code, evidence]
+    time_column: created_at
+  match:
+    type: regex
+    fields: [url]
+    pattern: "\\.(pem|key|crt|cer|p12|pfx|jks|keystore)($|\\?)"
+    case_insensitive: true
