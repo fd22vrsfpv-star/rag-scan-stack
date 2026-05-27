@@ -73,7 +73,7 @@ cd /utils/agents
 git status
 
 # Commit changes
-git add docker-compose.yml .env.production.example kong/kong.yml.production.example scripts/deploy.sh
+git add docker-compose.yml .env.production.example kong/kong.yml.template scripts/deploy.sh
 git commit -m "Prepare for production deployment"
 
 # Push to repository
@@ -229,8 +229,8 @@ nano .env
 #### Step 7: Configure Kong
 
 ```bash
-# Copy Kong template
-cp kong/kong.yml.production.example kong/kong.yml
+# Copy Kong template (kong/kong.yml is generated and gitignored)
+cp kong/kong.yml.template kong/kong.yml
 
 # Replace API key (use the same API_KEY from .env)
 sed -i "s/REPLACE_WITH_YOUR_API_KEY/${API_KEY}/g" kong/kong.yml

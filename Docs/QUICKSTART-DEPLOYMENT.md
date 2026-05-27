@@ -154,7 +154,7 @@ tar -xzf /media/usb/rag-stack-complete.tar.gz -C /opt/rag-scan-stack/
 | File | Purpose | Action Required |
 |------|---------|----------------|
 | `.env` | Environment variables | Copy from `.env.production.example`, update credentials |
-| `kong/kong.yml` | API gateway config | Copy from `kong/kong.yml.production.example`, update API keys |
+| `kong/kong.yml` | API gateway config (generated, gitignored) | Copy from `kong/kong.yml.template`, update API keys |
 | `docker-compose.yml` | Service definitions | Already updated with portable paths |
 
 ### Key Configuration Changes
@@ -188,7 +188,7 @@ mkdir -p nmap_out web_reports nuclei_reports \
 
 # 3. Configure
 cp .env.production.example .env
-cp kong/kong.yml.production.example kong/kong.yml
+cp kong/kong.yml.template kong/kong.yml
 # Edit both files with your credentials
 
 # 4. Start
@@ -271,7 +271,7 @@ docker compose restart
 ## Key Changes Made for Portability
 
 1. **Ollama volume path**: Changed from `/mnt/c/Users/rapto/.ollama` to `./ollama-data`
-2. **Production templates**: Created `.env.production.example` and `kong/kong.yml.production.example`
+2. **Production templates**: Created `.env.production.example` and `kong/kong.yml.template`
 3. **Deployment script**: Automated setup at `scripts/deploy.sh`
 4. **Documentation**: Complete deployment guide in `DEPLOYMENT.md`
 

@@ -844,17 +844,13 @@ fi
 # Kong configuration
 if [ -d "kong" ]; then
     # kong/kong.yml is a generated, gitignored file (it ends up holding the real
-    # API key). Generate it from kong.yml.template; fall back to the older
-    # production example only if the template is missing.
+    # API key). Generate it from the committed kong.yml.template.
     if [ ! -f "kong/kong.yml" ]; then
         if [ -f "kong/kong.yml.template" ]; then
             cp kong/kong.yml.template kong/kong.yml
             log_ok "Created kong/kong.yml from kong.yml.template"
-        elif [ -f "kong/kong.yml.production.example" ]; then
-            cp kong/kong.yml.production.example kong/kong.yml
-            log_ok "Created kong/kong.yml from production template"
         else
-            log_warn "No kong.yml.template or kong.yml.production.example — skipping Kong setup"
+            log_warn "kong/kong.yml.template not found — skipping Kong setup"
         fi
     else
         log_skip "kong/kong.yml already exists"
