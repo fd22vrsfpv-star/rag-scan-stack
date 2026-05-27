@@ -1,508 +1,138 @@
-# Deployment & Sync Scripts
+# `scripts/` — Build, Operate & Maintain
 
-This directory contains scripts for deploying and syncing your RAG Scan Stack between development and production machines.
-
-## Quick Start
-
-### 1. Initial Configuration (One-Time Setup)
-
-Configure your production machine details:
-
-```bash
-./scripts/configure-sync.sh
-```
-
-This will prompt you for:
-- Production machine username
-- Production machine IP/hostname
-- Production machine path (default: `/opt/rag-scan-stack`)
-
-It will test the SSH connection and update all sync scripts automatically.
-
-### 2. Choose Your Workflow
-
-#### Option A: Manual Sync (Most Control)
-
-```bash
-# Just sync files
-./scripts/sync-to-prod.sh
-
-# Sync and restart services
-./scripts/sync-to-prod.sh --restart
-
-# Sync, rebuild, and restart
-./scripts/sync-to-prod.sh --restart --build
-```
-
-#### Option B: Quick Deploy (One Command)
-
-```bash
-# Deploy everything (sync + build + restart)
-./scripts/quick-deploy.sh
-
-# Deploy only a specific service
-./scripts/quick-deploy.sh autogen-agents
-```
-
-#### Option C: Auto-Sync (Watch Mode)
-
-```bash
-# Watch for changes and auto-sync
-./scripts/watch-and-sync.sh
-
-# Watch and auto-restart services
-./scripts/watch-and-sync.sh --restart
-
-# Run in background
-./scripts/watch-and-sync.sh &
-
-# Stop background process
-pkill -f watch-and-sync
-```
+This directory holds the install/build scripts, plus operational tooling for
+databases, TLS, versioning, remote nodes, and dev↔prod sync. Run everything
+from the **project root** (e.g. `./scripts/setup.sh`), not from inside `scripts/`.
 
 ---
 
-## Script Reference
+## Quick Build (the short list)
 
-### `configure-sync.sh`
+For a fresh clone on Linux/macOS, one command does everything:
 
-**Purpose**: One-time configuration of production machine details
-
-**Usage**:
 ```bash
-./scripts/configure-sync.sh
+./scripts/setup.sh          # Windows: ./scripts/setup.ps1
 ```
 
-**What it does**:
-- Prompts for production machine details
-- Tests SSH connection
-- Updates all sync scripts with your configuration
-- Creates backups of original scripts
+`setup.sh` runs these phases in order — each is also a standalone script you can
+re-run individually if a phase fails:
+
+| # | Phase | What runs | Standalone script |
+|---|-------|-----------|-------------------|
+| 1 | Check dependencies | Docker, Compose, Go, unzip, … | — |
+| 2 | Build Go security tools | Compiles httpx/naabu/katana/subfinder/… into `*/bin/` | `./scripts/build-go-tools.sh` |
+| 3 | Generate `.env` | Secure random credentials + API key | — |
+| 4 | Infrastructure | Kong API key wiring + **TLS certs** | `./scripts/generate-certs.sh` |
+| 5 | Docker build | `docker compose build` | — |
+| 6 | Start services | `docker compose up -d` | — |
+| 7 | Apply DB schema | Creates all required tables | `./scripts/ensure_db_schema.sh` |
+| 8 | Health check | Quick smoke test | — |
+
+Then verify the whole stack end-to-end:
+
+```bash
+./scripts/post-install-check.sh     # tables + Go binaries + container health + API endpoints
+```
+
+To pull updates and rebuild later:
+
+```bash
+./scripts/update.sh                 # git pull → rebuild → re-apply schema → restart
+```
+
+> **TLS note:** every uvicorn service mounts `./certs:/certs:ro` and starts with
+> `--ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt`. If those
+> files are missing the containers crash-loop on `FileNotFoundError`.
+> `setup.sh` (phase 4) generates them automatically; run
+> `./scripts/generate-certs.sh` by hand if you ever wipe `certs/`.
 
 ---
 
-### `sync-to-prod.sh`
+## Detailed Script Reference
 
-**Purpose**: Sync code from development to production
+### Build & Install
 
-**Usage**:
-```bash
-./scripts/sync-to-prod.sh [OPTIONS]
-```
+| Script | Purpose |
+|--------|---------|
+| `setup.sh` | **Unified installer** for Linux/macOS — runs the 8-phase build above from a fresh clone to a running stack. |
+| `setup.ps1` | Same unified installer for **Windows** (PowerShell). |
+| `build-go-tools.sh` | Compiles all Go security tools for both `arm64` and `amd64`. Outputs to `osint_runner/bin/`, `pd_runner/bin/` (local arch) plus `bin-amd64/`/`bin-arm64/` for remote nodes. |
+| `generate-certs.sh` | Generates the self-signed TLS cert/key pair in `certs/` used for inter-service HTTPS. Idempotent — skips if certs already exist. |
+| `post-install-check.sh` | End-to-end health audit: verifies all DB tables, Go tool binaries, container health, and API endpoints (RAG API + dashboard BFF). Run this to diagnose a failed build. |
+| `deploy.sh` | First-time deployment on a new machine / ongoing deploys: checks prerequisites, creates the Docker network and directories, sets up config, optionally starts services. |
+| `update.sh` | Pull latest code, rebuild containers, re-apply DB schema, and restart services. |
+| `fix-etl-imports.sh` | One-off repair of ETL import paths across services (web_scanner, osint_runner, …). |
 
-**Options**:
-- `--restart` - Restart Docker services after sync
-- `--build` - Rebuild Docker images before restart
-- `--help` - Show help message
+### Database
 
-**Examples**:
-```bash
-# Just sync files (fastest)
-./scripts/sync-to-prod.sh
+| Script | Purpose |
+|--------|---------|
+| `ensure_db_schema.sh` | Ensures every required database table exists; safe to re-run. Called by `setup.sh` phase 7. |
+| `check-remote-db-status.sh` | Reports whether the `.env` is pointed at the local or remote (WireGuard) database. |
+| `toggle-remote-db.sh` | `on` / `off` / `status` — switch between local and remote Postgres while preserving the configured remote IP. |
+| `cleanup_out_of_scope.sql` | SQL to purge findings/assets that fall outside engagement scope. |
+| `fix_scope_detection.sql` | SQL fix-up for scope-detection data. |
 
-# Sync and restart services
-./scripts/sync-to-prod.sh --restart
+### TLS & Secrets
 
-# Full deployment: sync, rebuild, restart
-./scripts/sync-to-prod.sh --restart --build
-```
+| Script | Purpose |
+|--------|---------|
+| `generate-certs.sh` | (see Build & Install) self-signed certs for inter-service TLS. |
+| `vault-seed.sh` | One-time helper to seed HashiCorp Vault with secrets read from `.env` (only needed with the `vault` compose profile). |
 
-**What gets synced**:
-- All Python code
-- Configuration files
-- Dockerfiles
-- Database init scripts
-- Documentation
+### Versioning & Maintenance
 
-**What's excluded**:
-- `.git/` - Git repository data
-- `ollama-data/` - Large model files
-- `*_reports/`, `*_logs/` - Output directories
-- `*.pyc`, `__pycache__/` - Python cache
-- `.env` - Environment secrets
+| Script | Purpose |
+|--------|---------|
+| `update-version.sh` | Bumps the build version string in all three required locations (`.env`, `dashboard/frontend/package.json`, `dashboard/frontend/src/lib/constants.ts`). Usage: `./scripts/update-version.sh 2026.05.27-01`. |
+| `cleanup-old-files.sh` | Deletes scan-output files older than `RETENTION_DAYS` to prevent disk exhaustion. |
+| `setup-cleanup-cron.sh` | Installs a daily (3 AM) cron job that runs `cleanup-old-files.sh`. |
 
----
+### Remote Nodes, WireGuard & Tunnels
 
-### `watch-and-sync.sh`
+| Script | Purpose |
+|--------|---------|
+| `provision-standard-node.sh` | Full provisioning of a new remote scan node. |
+| `provision-standard-node-safe.sh` | Same, with auto-recovery + SSH safeguards to prevent lockouts. |
+| `wireguard-node-setup.sh` | Pre-installs WireGuard and dependencies on a remote node. |
+| `wireguard-node-setup-safe.sh` | Same, with SSH-lockout safeguards and auto-recovery. |
+| `create-wg-peer.sh` | Creates a new WireGuard peer (allocates the next free IP). |
+| `reset-wireguard-installation.py` | Resets stuck WireGuard peer installs back to `not_attempted`. |
+| `auto-ip-detection.py` | Detects current reachable node IPs and updates node metadata to avoid stale addresses. |
+| `build-tunnel-manager.sh` | Builds the Go tunnel-manager binary. |
+| `test-tunnel-manager.sh` | Checks the tunnel-manager service + systemd unit. |
+| `test-wg-connection.sh` | Tests WireGuard peer reachability and the SOCKS proxy. |
 
-**Purpose**: Automatically sync files when changes are detected
+### Testing & Diagnostics
 
-**Usage**:
-```bash
-./scripts/watch-and-sync.sh [OPTIONS]
-```
+| Script | Purpose |
+|--------|---------|
+| `post-install-check.sh` | (see Build & Install) full-stack audit. |
+| `test-assets-filtering.sh` | Exercises the assets API endpoint and its filters (uses `-k` for self-signed TLS). |
+| `capture-screenshots.py` | Captures screenshots of key dashboard pages (needs `playwright`). |
 
-**Options**:
-- `--restart` - Auto-restart services after each sync
-- `--help` - Show help message
+### `optional/` — Dev↔Prod Sync & Extras
 
-**Examples**:
-```bash
-# Watch and sync only
-./scripts/watch-and-sync.sh
+These are convenience scripts not part of the core build. Highlights:
 
-# Watch, sync, and auto-restart
-./scripts/watch-and-sync.sh --restart
+| Script | Purpose |
+|--------|---------|
+| `configure-sync.sh` | One-time: configure target prod host/user/path; tests SSH and updates the sync scripts. |
+| `sync-to-prod.sh` | rsync code dev→prod. Flags: `--restart`, `--build`. Excludes `.env`, `.git/`, caches, large model/output dirs. |
+| `watch-and-sync.sh` | Watches for file changes and auto-syncs (optionally `--restart`). Needs `inotify-tools`. |
+| `quick-deploy.sh` | One-command sync + build + restart, optionally for a single service. |
+| `sync-push.sh` / `sync-pull.sh` | Push/pull DB changes to/from the remote DB via the sync API. |
+| `migrate-db-to-remote.sh` | Dump local Postgres and restore it to a remote VPS. |
+| `test-remote-db.sh` | Verify the WireGuard tunnel + remote Postgres connectivity. |
+| `check_system_health.sh` | Comprehensive system health check. |
+| `init_db.sh`, `db_tables.sh`, `create_software_view.py` | DB bootstrap / table-dump / `detected_software` view helpers. |
+| `dev_up.sh`, `bootstrap_repo.sh` | Dev bring-up and repo bootstrap helpers. |
+| `basic_scan.sh`, `chk_open_ports.sh`, `chkresults.sh`, `masscan_load_file.sh`, `masscanNmapJobRequest.sh`, `runme.sh`, `run_me.sh` | Example/ad-hoc scan-driver scripts. |
+| `zap_mcp_bridge.py` | Bridge between ZAP and the MCP layer. |
 
-# Run in background
-nohup ./scripts/watch-and-sync.sh > /tmp/watch-sync.log 2>&1 &
-
-# Stop watching
-pkill -f watch-and-sync
-```
-
-**Features**:
-- Monitors file changes in real-time
-- Debounces rapid changes (waits 3 seconds)
-- Ignores temporary files and cache
-- Shows which files changed
-
-**Requirements**:
-- `inotify-tools` (auto-installed if missing)
-
----
-
-### `quick-deploy.sh`
-
-**Purpose**: Full deployment in one command (sync + build + restart)
-
-**Usage**:
-```bash
-./scripts/quick-deploy.sh [service-name]
-```
-
-**Examples**:
-```bash
-# Deploy everything
-./scripts/quick-deploy.sh
-
-# Deploy only autogen-agents service
-./scripts/quick-deploy.sh autogen-agents
-
-# Deploy only web-scanner
-./scripts/quick-deploy.sh web-scanner
-```
-
-**What it does**:
-1. Syncs all files to production
-2. Builds Docker images
-3. Restarts services
-4. Shows service status
+See the git history of `optional/` for the older dev↔prod sync workflow notes
+(SSH key setup, IntelliJ run configs, troubleshooting).
 
 ---
 
-### `deploy.sh`
-
-**Purpose**: Initial deployment setup on a new machine
-
-**Usage**:
-```bash
-./scripts/deploy.sh
-```
-
-**What it does**:
-- Checks prerequisites (Docker, GPU, etc.)
-- Creates Docker network
-- Creates required directories
-- Sets up configuration files
-- Optionally starts services
-
-**When to use**:
-- First-time deployment on a new machine
-- Setting up a fresh environment
-
----
-
-## Typical Workflows
-
-### Development Workflow
-
-**In IntelliJ:**
-1. Make code changes
-2. Save files (Ctrl+S)
-3. From terminal, sync to production
-
-**Terminal:**
-```bash
-# Option 1: Manual sync when ready
-./scripts/sync-to-prod.sh --restart
-
-# Option 2: Auto-sync as you work
-./scripts/watch-and-sync.sh
-```
-
-### Quick Fix Deployment
-
-```bash
-# Edit files in IntelliJ
-# Then deploy specific service:
-./scripts/quick-deploy.sh web-scanner
-```
-
-### Full Deployment
-
-```bash
-# Complete deployment with rebuild
-./scripts/sync-to-prod.sh --restart --build
-
-# Or use quick-deploy
-./scripts/quick-deploy.sh
-```
-
-### Testing Before Commit
-
-```bash
-# Sync to production for testing
-./scripts/sync-to-prod.sh --restart
-
-# Test on production
-ssh user@prod 'cd /opt/rag-scan-stack && docker compose logs -f service-name'
-
-# If works well, commit and push to git
-git add .
-git commit -m "Feature: description"
-git push origin master
-```
-
----
-
-## SSH Setup
-
-For passwordless sync, set up SSH key authentication:
-
-### On Development Machine:
-
-```bash
-# Generate SSH key
-ssh-keygen -t ed25519 -C "your_email@example.com"
-
-# Copy to production machine
-ssh-copy-id user@production-ip
-```
-
-### Test Connection:
-
-```bash
-# Should connect without password
-ssh user@production-ip
-
-# Should work without password
-./scripts/sync-to-prod.sh
-```
-
----
-
-## Troubleshooting
-
-### "Cannot connect to production machine"
-
-**Problem**: SSH connection fails
-
-**Solution**:
-```bash
-# Test SSH manually
-ssh user@production-ip
-
-# If fails, check:
-# 1. Is SSH server running on production?
-ssh user@production-ip 'sudo service ssh status'
-
-# 2. Can you ping the machine?
-ping production-ip
-
-# 3. Is firewall blocking SSH?
-ssh user@production-ip 'sudo ufw status'
-```
-
-### "Sync is slow"
-
-**Problem**: Syncing takes a long time
-
-**Solution**:
-```bash
-# Check what's being synced
-rsync -avn --stats source/ dest/
-
-# Ensure large files are excluded
-# Check .gitignore patterns in sync-to-prod.sh
-```
-
-### "Services won't restart"
-
-**Problem**: Services fail after sync
-
-**Solution**:
-```bash
-# Check service logs on production
-ssh user@prod 'cd /opt/rag-scan-stack && docker compose logs -f'
-
-# Check if files were synced correctly
-ssh user@prod 'ls -la /opt/rag-scan-stack'
-
-# Try manual restart
-ssh user@prod 'cd /opt/rag-scan-stack && docker compose down && docker compose up -d --build'
-```
-
-### "Watch script not working"
-
-**Problem**: Changes aren't being detected
-
-**Solution**:
-```bash
-# Install inotify-tools
-sudo apt install inotify-tools
-
-# Test inotify manually
-inotifywait -m /utils/agents
-
-# Check system limits
-cat /proc/sys/fs/inotify/max_user_watches
-
-# Increase if needed
-echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf
-sudo sysctl -p
-```
-
----
-
-## Best Practices
-
-### 1. Use Git for Important Changes
-
-Sync scripts are great for rapid testing, but use git for production deployments:
-
-```bash
-# Development cycle:
-./scripts/sync-to-prod.sh --restart  # Test changes
-
-# When tested and working:
-git add .
-git commit -m "Description"
-git push origin master
-
-# On production:
-git pull origin master
-docker compose up -d --build
-```
-
-### 2. Sync Before Rebuilding
-
-```bash
-# More efficient: sync first, then rebuild
-./scripts/sync-to-prod.sh
-ssh user@prod 'cd /opt/rag-scan-stack && docker compose build changed-service'
-ssh user@prod 'cd /opt/rag-scan-stack && docker compose up -d --no-deps changed-service'
-```
-
-### 3. Test Locally First
-
-```bash
-# Test on dev machine before syncing
-docker compose up -d --build service-name
-docker compose logs -f service-name
-
-# If works, then sync
-./scripts/sync-to-prod.sh --restart
-```
-
-### 4. Use Watch Mode During Active Development
-
-```bash
-# Start watch mode in a separate terminal
-./scripts/watch-and-sync.sh
-
-# Now edit in IntelliJ - changes sync automatically
-# Stop with Ctrl+C when done
-```
-
----
-
-## Environment Variables
-
-You can override default settings with environment variables:
-
-```bash
-# Override target details
-TARGET_USER=admin TARGET_HOST=10.0.0.50 ./scripts/sync-to-prod.sh
-
-# Use different path
-TARGET_PATH=/home/user/rag-stack ./scripts/sync-to-prod.sh
-```
-
----
-
-## Integration with IntelliJ
-
-### Create Run Configurations
-
-**Run → Edit Configurations → Shell Script**
-
-**Sync to Production:**
-- Name: "Sync to Prod"
-- Script: `/utils/agents/scripts/sync-to-prod.sh`
-- Arguments: `--restart`
-
-**Quick Deploy:**
-- Name: "Quick Deploy"
-- Script: `/utils/agents/scripts/quick-deploy.sh`
-
-**Start Watch Mode:**
-- Name: "Watch and Sync"
-- Script: `/utils/agents/scripts/watch-and-sync.sh`
-
-Now you can deploy with one click in IntelliJ!
-
----
-
-## Performance Tips
-
-### 1. Exclude Unnecessary Files
-
-Edit the `--exclude` patterns in `sync-to-prod.sh` to skip files you don't need.
-
-### 2. Use Compression for Large Files
-
-```bash
-# Enable compression (slower but less bandwidth)
-rsync -avz --compress-level=9 ...
-```
-
-### 3. Sync Only Changed Files
-
-rsync automatically only transfers changed files - no need to sync everything each time.
-
-### 4. Use Local Network
-
-Ensure both machines are on the same local network for fastest transfer speeds.
-
----
-
-## Security Notes
-
-### SSH Key Authentication
-
-Always use SSH keys instead of passwords for automated scripts.
-
-### Don't Sync Secrets
-
-The scripts exclude `.env` files by default. Never sync:
-- `.env` files
-- SSH keys
-- Database credentials
-- API keys
-
-### Review Excludes
-
-Check the `--exclude` patterns in scripts to ensure sensitive files aren't synced.
-
----
-
-## Additional Resources
-
-- **Main Deployment Guide**: See `/utils/agents/DEPLOYMENT.md`
-- **Quick Start Guide**: See `/utils/agents/QUICKSTART-DEPLOYMENT.md`
-- **Docker Compose**: See `/utils/agents/docker-compose.yml`
-
----
-
-**Last Updated**: 2025-11-04
+**Last updated:** 2026-05-27
