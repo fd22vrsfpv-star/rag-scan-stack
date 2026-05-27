@@ -68,7 +68,9 @@ EXPECTED_TABLES=(
   # TIER 20: Cloud Tenant Discovery
   cloud_tenants
   # TIER 21: News Intelligence
-  news_sources news_items news_runs news_asset_matches
+  # NB: asset matches are stored in the news_items.asset_matches JSONB column,
+  # not a separate news_asset_matches table (see news_runner/news_agent.py).
+  news_sources news_items news_runs
   # TIER 22: Chat presets
   chat_presets
 )
@@ -238,6 +240,11 @@ done
 echo ""
 echo "=== API Endpoints ==="
 
+# Prefer an explicit env override, else read the generated key from .env so the
+# authenticated RAG API endpoints return 200 instead of 401.
+if [ -z "${API_KEY:-}" ] && [ -f ".env" ]; then
+  API_KEY=$(grep '^API_KEY=' .env | head -1 | cut -d= -f2-)
+fi
 API_KEY="${API_KEY:-changeme}"
 
 endpoints=(
@@ -266,21 +273,28 @@ for entry in "${endpoints[@]}"; do
 done
 
 # BFF endpoints
-# Detect BFF port from container mapping
-BFF_PORT=$(docker port pentest-dashboard 80 2>/dev/null | head -1 | sed 's/.*://')
+# The dashboard serves over HTTPS (container port 443) and 301-redirects plain
+# HTTP to HTTPS, so hit the HTTPS-mapped port directly with -k. Fall back to the
+# HTTP port only if no 443 mapping is published.
+BFF_PORT=$(docker port pentest-dashboard 443 2>/dev/null | head -1 | sed 's/.*://')
+BFF_SCHEME="https"
+if [ -z "$BFF_PORT" ]; then
+  BFF_PORT=$(docker port pentest-dashboard 80 2>/dev/null | head -1 | sed 's/.*://')
+  BFF_SCHEME="http"
+fi
 BFF_PORT="${BFF_PORT:-3002}"
 
 bff_endpoints=(
-  "GET|http://localhost:${BFF_PORT}/api/health|BFF health"
-  "GET|http://localhost:${BFF_PORT}/api/content-extractions?limit=1|BFF content extractions"
-  "GET|http://localhost:${BFF_PORT}/api/content-intel/patterns|BFF content patterns"
-  "GET|http://localhost:${BFF_PORT}/api/software|BFF software inventory"
-  "GET|http://localhost:${BFF_PORT}/api/followups?limit=1|BFF follow-ups"
+  "GET|${BFF_SCHEME}://localhost:${BFF_PORT}/api/health|BFF health"
+  "GET|${BFF_SCHEME}://localhost:${BFF_PORT}/api/content-extractions?limit=1|BFF content extractions"
+  "GET|${BFF_SCHEME}://localhost:${BFF_PORT}/api/content-intel/patterns|BFF content patterns"
+  "GET|${BFF_SCHEME}://localhost:${BFF_PORT}/api/software|BFF software inventory"
+  "GET|${BFF_SCHEME}://localhost:${BFF_PORT}/api/follow-ups?limit=1|BFF follow-ups"
 )
 
 for entry in "${bff_endpoints[@]}"; do
   IFS='|' read -r method url label <<< "$entry"
-  code=$(curl -s -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)
+  code=$(curl -sk -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)
   if [[ "$code" == "200" ]]; then
     pass "$label ($code)"
   else
