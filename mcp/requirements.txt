@@ -1,0 +1,11 @@
+# MCP Server Requirements
+mcp>=1.0.0
+httpx>=0.27.0
+
+# HTTP transport dependencies
+uvicorn>=0.30.0
+starlette>=0.37.0
+fastapi>=0.110.0
+
+# Third-party server registry + stdio bridge
+pyyaml>=6.0

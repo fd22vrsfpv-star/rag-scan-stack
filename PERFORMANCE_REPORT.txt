@@ -1,0 +1,136 @@
+════════════════════════════════════════════════════════════════
+                  PERFORMANCE SUMMARY REPORT
+════════════════════════════════════════════════════════════════
+
+🖥️  SYSTEM SPECIFICATIONS
+────────────────────────────────────────────────────────────────
+CPU:        AMD Ryzen AI 9 HX 370 w/ Radeon 890M
+Cores:      6 cores / 12 threads
+Memory:     12.36 GiB total (6.6 GiB available)
+Swap:       15 GiB (1.2 GiB used)
+GPU:        NVIDIA GeForce RTX 5070 Ti Laptop GPU
+GPU Memory: 12 GB GDDR7
+OS:         Ubuntu 24.04.3 LTS (WSL2)
+Disk:       1 TB NVMe (11% used)
+
+════════════════════════════════════════════════════════════════
+
+⚡ CPU PERFORMANCE
+────────────────────────────────────────────────────────────────
+Single Thread:     ✓ Good (10s math test completed in 9s)
+Multi-Core:        12 logical cores available
+Rating:            ⭐⭐⭐⭐ Excellent for multi-threaded workloads
+
+════════════════════════════════════════════════════════════════
+
+💾 MEMORY PERFORMANCE
+────────────────────────────────────────────────────────────────
+Sequential Write:  2.4 GB/s
+Rating:            ⭐⭐⭐ Good for general workloads
+Note:              WSL2 memory management may affect performance
+
+════════════════════════════════════════════════════════════════
+
+💿 DISK I/O PERFORMANCE
+────────────────────────────────────────────────────────────────
+Sequential Write:  5.1 GB/s ⚡
+Sequential Read:   6.4 GB/s ⚡⚡
+Rating:            ⭐⭐⭐⭐⭐ Excellent NVMe performance
+
+════════════════════════════════════════════════════════════════
+
+🎮 GPU PERFORMANCE
+────────────────────────────────────────────────────────────────
+Model:             NVIDIA RTX 5070 Ti Laptop GPU (Ada Lovelace)
+Memory:            12 GB GDDR7
+Compute:           12.0 (supports latest CUDA features)
+Utilization:       1-7% (idle to light load)
+Temperature:       67-68°C (excellent cooling)
+Power Draw:        15-18W (efficient)
+Rating:            ⭐⭐⭐⭐⭐ Excellent for AI/ML workloads
+
+════════════════════════════════════════════════════════════════
+
+🤖 AI INFERENCE PERFORMANCE
+────────────────────────────────────────────────────────────────
+
+MODEL: qwen2.5:32b (19 GB) - FLAGSHIP MODEL
+  • Model size:      19 GB
+  • GPU memory fit:  ⚠️  Tight (uses ~11.3 GB / 12 GB available)
+  • Load time:       31.6 seconds (large model)
+  • Generation:      4.76 - 5.22 tokens/sec
+  • Rating:          ⭐⭐ Limited by VRAM - swapping to system RAM
+  • Recommendation:  Use for quality over speed
+
+MODEL: qwen2.5:14b (9 GB) - RECOMMENDED MODEL ⭐
+  • Model size:      9 GB
+  • GPU memory fit:  ✅ Excellent (uses ~11.3 GB / 12 GB)
+  • Load time:       12.6 seconds
+  • Generation:      30.61 tokens/sec ⚡⚡⚡
+  • Rating:          ⭐⭐⭐⭐⭐ Optimal for this GPU
+  • Recommendation:  BEST BALANCE of speed and quality
+
+PERFORMANCE COMPARISON:
+  • 14b is 6.4x FASTER than 32b model
+  • 14b loads 2.5x FASTER than 32b model
+  • 14b leaves 583 MB VRAM free vs 595 MB with 32b
+
+════════════════════════════════════════════════════════════════
+
+🐳 DOCKER PERFORMANCE
+────────────────────────────────────────────────────────────────
+Active containers: 23
+Top Memory Users:
+  • ollama:          4.2 GB (model loaded in memory)
+  • open-webui:      615 MB (web interface)
+  • mcp-streamable:  178 MB (tool servers)
+  • mcpo:            63 MB (proxy)
+  • mcp-server:      35 MB (MCP server)
+
+Total Docker:      ~5.3 GB / 12.36 GB (43% of system RAM)
+Rating:            ⭐⭐⭐⭐ Good resource management
+
+════════════════════════════════════════════════════════════════
+
+📊 OVERALL SYSTEM ASSESSMENT
+────────────────────────────────────────────════════════════════
+
+STRENGTHS:
+  ✓ Excellent GPU (RTX 5070 Ti - 12GB VRAM)
+  ✓ Fast NVMe storage (5-6 GB/s)
+  ✓ Modern CPU with good multi-core performance
+  ✓ Efficient power/thermal management
+
+BOTTLENECKS:
+  ⚠ Limited system RAM (12 GB shared with many containers)
+  ⚠ 32b model too large for available VRAM (causes swapping)
+  ⚠ WSL2 overhead affects memory performance slightly
+
+RECOMMENDATIONS:
+  1. Use qwen2.5:14b as default model for best performance
+  2. Keep 32b model for high-quality tasks (accept slower speed)
+  3. Consider closing unused containers when running 32b model
+  4. Monitor VRAM usage - 12GB is the hard limit
+  5. System RAM (12GB) is adequate but not generous for 23 containers
+
+OPTIMAL CONFIGURATION:
+  • Default model:   qwen2.5:14b
+  • Quality model:   qwen2.5:32b (when speed isn't critical)
+  • Embedding:       nomic-embed-text (274 MB - perfect)
+
+════════════════════════════════════════════════════════════════
+
+🎯 PERFORMANCE RATING: ⭐⭐⭐⭐ (4/5)
+
+Your machine is WELL-SUITED for:
+  ✓ AI development and testing
+  ✓ Running multiple pentest tools simultaneously
+  ✓ Local LLM inference (with 14b models)
+  ✓ Docker-based development environments
+  ✓ Web application development and testing
+
+Consider upgrading:
+  • System RAM to 32 GB for heavy multi-tasking
+  • Keep current GPU - it's excellent for AI workloads
+
+════════════════════════════════════════════════════════════════

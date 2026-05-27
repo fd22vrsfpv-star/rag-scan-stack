@@ -1,0 +1,235 @@
+# Cloud Scan Recommendation Rules
+# Maps cloud finding patterns to suggested next actions for pentesters.
+# Three categories: bootstrap (no data yet), finding-triggered, credential-triggered.
+
+# ──────────────────────────────────────────────────────────────
+# Bootstrap rules — suggest initial tools when data is missing
+# ──────────────────────────────────────────────────────────────
+bootstrap_rules:
+  - id: no_cloud_data
+    name: "No cloud data imported"
+    description: "No cloud tool output has been imported yet"
+    priority: high
+    provider: any
+    recommendations:
+      - tool: prowler
+        action: "Run Prowler against your AWS/Azure/GCP accounts for baseline posture assessment"
+        command_hint: "prowler aws --output-formats json"
+        import_as: prowler-import
+      - tool: scoutsuite
+        action: "Run ScoutSuite for multi-cloud audit"
+        command_hint: "scout aws --report-dir /tmp/scout"
+        import_as: scoutsuite-import
+
+  - id: aws_no_privesc_check
+    name: "AWS data but no CloudFox"
+    description: "Prowler or ScoutSuite data imported but no CloudFox privesc enumeration"
+    requires_sources: [prowler, scoutsuite]
+    missing_sources: [cloudfox]
+    provider: aws
+    priority: high
+    recommendations:
+      - tool: cloudfox
+        action: "Run CloudFox to enumerate privilege escalation paths and access mapping"
+        command_hint: "cloudfox aws --profile target all-checks -o json"
+        import_as: cloudfox-import
+
+  - id: azure_no_identity_recon
+    name: "Azure data but no identity recon"
+    description: "Prowler Azure data imported but no AzureHound or MicroBurst identity recon"
+    requires_sources: [prowler]
+    requires_provider: azure
+    missing_sources: [azurehound, microburst]
+    provider: azure
+    priority: high
+    recommendations:
+      - tool: azurehound
+        action: "Run AzureHound to map Azure AD attack paths and role assignments"
+        command_hint: "azurehound list -o azurehound_output.json"
+        import_as: azurehound-import
+      - tool: microburst
+        action: "Or run MicroBurst (NetSPI) for Azure AD enumeration; zip the output folder and import"
+        command_hint: "Import-Module ./MicroBurst.psm1; Get-AzDomainInfo -folder ./mb-out"
+        import_as: microburst-import
+
+  - id: have_creds_no_access_map
+    name: "Cloud credentials without access mapping"
+    description: "Cloud credentials exist in vault but no CloudFox access mapping performed"
+    requires_cloud_creds: true
+    missing_sources: [cloudfox]
+    provider: aws
+    priority: critical
+    recommendations:
+      - tool: cloudfox
+        action: "Map what these credentials can access using CloudFox"
+        command_hint: "cloudfox aws --profile stolen-creds permissions -o json"
+        import_as: cloudfox-import
+
+# ──────────────────────────────────────────────────────────────
+# Finding-triggered rules — specific finding → specific next step
+# ──────────────────────────────────────────────────────────────
+finding_rules:
+  - id: public_s3_suggest_cloudfox
+    name: "Public S3 bucket found"
+    description: "Prowler flagged a public S3 bucket — enumerate with CloudFox and Pacu"
+    source: prowler
+    finding_type_pattern: "s3|bucket|public"
+    severity_min: medium
+    provider: aws
+    priority: critical
+    recommendations:
+      - tool: cloudfox
+        action: "Enumerate S3 bucket permissions and content"
+        command_hint: "cloudfox aws s3 -o json"
+        import_as: cloudfox-import
+      - tool: pacu
+        action: "Run Pacu s3__bucket_finder for deeper enumeration"
+        command_hint: "pacu --module s3__bucket_finder"
+        import_as: pacu-import
+
+  - id: iam_no_mfa_suggest_privesc
+    name: "IAM user without MFA"
+    description: "ScoutSuite found IAM user without MFA — check for privilege escalation"
+    source: scoutsuite
+    finding_type_pattern: "mfa|multi.factor"
+    provider: aws
+    priority: high
+    recommendations:
+      - tool: pacu
+        action: "Run IAM privilege escalation scan on the account"
+        command_hint: "pacu --module iam__privesc_scan"
+        import_as: pacu-import
+
+  - id: azure_owner_suggest_prowler
+    name: "Azure Owner role detected"
+    description: "AzureHound found Owner role assignment — deep check with Prowler"
+    source: azurehound
+    finding_type_pattern: "owner|admin|global"
+    provider: azure
+    priority: high
+    recommendations:
+      - tool: prowler
+        action: "Run targeted Prowler checks on the Azure subscription"
+        command_hint: "prowler azure --subscription-ids SUB_ID --output-formats json"
+        import_as: prowler-import
+
+  - id: microburst_priv_role_suggest_prowler
+    name: "Privileged Azure role found by MicroBurst"
+    description: "MicroBurst flagged a privileged Entra role assignment — deep check with Prowler"
+    source: microburst
+    finding_type_pattern: "role_assignment|directory_role|owner|admin|global"
+    provider: azure
+    priority: high
+    recommendations:
+      - tool: prowler
+        action: "Run targeted Prowler checks on the Azure subscription/tenant"
+        command_hint: "prowler azure --subscription-ids SUB_ID --output-formats json"
+        import_as: prowler-import
+
+  - id: microburst_secret_suggest_vault
+    name: "Azure secret exposed via MicroBurst"
+    description: "MicroBurst dumped Key Vault / app-service / storage credentials — import to credential vault"
+    source: microburst
+    finding_type_pattern: "secret_exposure|secret|password|key"
+    provider: azure
+    priority: critical
+    recommendations:
+      - tool: credential_vault
+        action: "Import discovered Azure secrets to credential vault for tracking"
+        command_hint: "Navigate to Credentials tab and add each secret from the MicroBurst output"
+        import_as: null
+
+  - id: cloudfox_privesc_suggest_pacu
+    name: "CloudFox privesc path found"
+    description: "CloudFox identified privilege escalation path — exploit with Pacu"
+    source: cloudfox
+    finding_type_pattern: "privesc|escalat|permissions"
+    provider: aws
+    priority: critical
+    recommendations:
+      - tool: pacu
+        action: "Attempt privilege escalation via Pacu"
+        command_hint: "pacu --module iam__escalate"
+        import_as: pacu-import
+
+  - id: lambda_enum_suggest_exploitation
+    name: "Lambda functions enumerated"
+    description: "Pacu found Lambda functions — check for code injection or env secrets"
+    source: pacu
+    finding_type_pattern: "lambda"
+    provider: aws
+    priority: medium
+    recommendations:
+      - tool: cloudfox
+        action: "Enumerate Lambda environment variables for secrets"
+        command_hint: "cloudfox aws lambda -o json"
+        import_as: cloudfox-import
+
+  - id: secret_found_suggest_vault
+    name: "Cloud secret discovered"
+    description: "CloudFox found exposed secrets — import to credential vault"
+    source: cloudfox
+    finding_type_pattern: "secret|key|token|credential"
+    provider: aws
+    priority: critical
+    recommendations:
+      - tool: credential_vault
+        action: "Import discovered secrets to credential vault for tracking"
+        command_hint: "Navigate to Credentials tab and add the discovered key"
+        import_as: null
+
+  - id: open_sg_suggest_nmap
+    name: "Open security group found"
+    description: "Prowler found overly permissive security group — scan exposed ports"
+    source: prowler
+    finding_type_pattern: "security.group|sg|ingress|0.0.0.0"
+    provider: aws
+    priority: high
+    recommendations:
+      - tool: nmap
+        action: "Scan the exposed IP ranges from the open security group"
+        command_hint: "Use Port Scanning tab with the exposed CIDR"
+        import_as: null
+
+  - id: cross_account_trust_suggest_enum
+    name: "Cross-account trust relationship"
+    description: "CloudFox found cross-account trust — enumerate target account"
+    source: cloudfox
+    finding_type_pattern: "trust|cross.account|assume.role"
+    provider: aws
+    priority: high
+    recommendations:
+      - tool: cloudfox
+        action: "Enumerate the trusted account for further attack paths"
+        command_hint: "cloudfox aws --profile target-account all-checks -o json"
+        import_as: cloudfox-import
+
+# ──────────────────────────────────────────────────────────────
+# Credential-triggered rules — based on credential vault state
+# ──────────────────────────────────────────────────────────────
+credential_rules:
+  - id: credential_expiring_soon
+    name: "Cloud credential expiring soon"
+    description: "STS or OAuth token expires within 30 minutes"
+    credential_type_pattern: "sts|oauth|token"
+    expires_within_minutes: 30
+    provider: any
+    priority: critical
+    recommendations:
+      - tool: credential_vault
+        action: "Refresh expiring token before it becomes invalid — run remaining checks now"
+        command_hint: "aws sts get-session-token / az account get-access-token"
+        import_as: null
+
+  - id: stale_key_suggest_rotation
+    name: "Stale access key detected"
+    description: "Cloud access key is older than 90 days — flag for rotation awareness"
+    credential_type_pattern: "aws_key|aws_access|azure_key|gcp_sa"
+    stale_days: 90
+    provider: any
+    priority: medium
+    recommendations:
+      - tool: credential_vault
+        action: "Flag this key age for reporting — may indicate poor hygiene (attack surface)"
+        command_hint: "Check key creation date in cloud console"
+        import_as: null

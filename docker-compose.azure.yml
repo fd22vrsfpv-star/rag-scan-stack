@@ -1,0 +1,38 @@
+# Azure-specific overrides - use with:
+# docker compose -f docker-compose.yml -f docker-compose.azure.yml up -d
+
+services:
+  # Don't run Ollama in Docker when using Azure backend
+  ollama:
+    profiles: ["disabled"]
+
+  ollama-init:
+    profiles: ["disabled"]
+
+  # Override depends_on to remove ollama dependency
+  autogen-agents:
+    depends_on: !override
+      wait-for-db:
+        condition: service_completed_successfully
+      rag-api:
+        condition: service_started
+      web-scanner:
+        condition: service_started
+      nuclei-runner:
+        condition: service_started
+      nmap_scanner:
+        condition: service_started
+      playwright-scanner:
+        condition: service_started
+      scan-recommender:
+        condition: service_started
+
+  scan-recommender:
+    depends_on: !override
+      wait-for-db:
+        condition: service_completed_successfully
+
+  llm_query:
+    depends_on: !override
+      wait-for-db:
+        condition: service_completed_successfully

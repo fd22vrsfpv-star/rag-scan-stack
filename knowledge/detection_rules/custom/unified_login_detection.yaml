@@ -1,0 +1,69 @@
+# unified_login_detection.yaml — Single comprehensive login page detection
+# Replaces: login_page (builtin), enhanced_login_page, valuable_external_login
+# Handles both in-scope and out-of-scope login pages with smart scope assignment
+
+- id: unified_login_page
+  name: "Login Page Discovered"
+  type: pattern
+  enabled: true
+  severity: medium
+  confidence: 0.9
+  description: "Login page discovered — credential testing candidate"
+  title_template: "Login page — {url}"
+  reason_template: "Login page discovered — credential testing candidate"
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, name, evidence, asset_id, status_code]
+    time_column: created_at
+  match:
+    type: regex
+    fields: [url, name, evidence]
+    # Comprehensive pattern combining all previous detection patterns
+    pattern: "(login|signin|sign-in|auth|authentication|logon|log-on|sso|oauth|oidc|saml|session|wp-login|wp-admin|admin/login|user/login|account/login|portal/login|secure/login|member/login|client/login|employee/login|staff/login|dashboard/login|console/login|management/login|cpanel|plesk|webmail|roundcube|squirrelmail|zimbra|exchange/owa|adfs|okta|ping|forgerock|keycloak|cognito|auth0)"
+    case_insensitive: true
+  tags: [login, credentials, authentication]
+
+# Multi-factor Authentication (MFA) detection - often co-located with logins
+- id: mfa_endpoints
+  name: "MFA/2FA Endpoints"
+  type: pattern
+  enabled: true
+  severity: low
+  confidence: 0.8
+  description: "Multi-factor authentication endpoints discovered"
+  title_template: "MFA endpoint — {url}"
+  reason_template: "MFA/2FA endpoint discovered — test for bypass opportunities"
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, name, evidence]
+    time_column: created_at
+  match:
+    type: regex
+    fields: [url, name, evidence]
+    pattern: "(mfa|2fa|totp|otp|verify|verification|token|duo|authenticator|yubikey|fido|webauthn|sms-code|email-code)"
+    case_insensitive: true
+  tags: [mfa, 2fa, authentication, security-bypass]
+
+# Password reset/recovery endpoints - common attack vectors
+- id: password_reset_endpoints
+  name: "Password Reset Endpoints"
+  type: pattern
+  enabled: true
+  severity: medium
+  confidence: 0.85
+  description: "Password reset/recovery endpoints discovered"
+  title_template: "Password reset — {url}"
+  reason_template: "Password reset endpoint discovered — test for enumeration and bypass"
+  finding_source: web
+  query:
+    table: web_findings
+    columns: [id, url, name, evidence]
+    time_column: created_at
+  match:
+    type: regex
+    fields: [url, name, evidence]
+    pattern: "(reset|recover|recovery|forgot|forgotten|password|passwd|pwd|changepassword|newpassword|resetpassword|forgotpassword)"
+    case_insensitive: true
+  tags: [password-reset, enumeration, authentication]

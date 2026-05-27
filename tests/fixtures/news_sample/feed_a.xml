@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Sample Source A</title>
+    <link>https://example.invalid/a</link>
+    <description>Sample test feed A</description>
+    <item>
+      <title>Critical RCE in WidgetCorp Acme Server CVE-2099-12345</title>
+      <link>https://example.invalid/a/widgetcorp-rce</link>
+      <pubDate>Mon, 28 Apr 2026 10:00:00 GMT</pubDate>
+      <description>A critical remote-code-execution vulnerability tracked as CVE-2099-12345 was disclosed today affecting WidgetCorp Acme Server. Patches are available.</description>
+    </item>
+    <item>
+      <title>BleepingExample reports new ransomware crew</title>
+      <link>https://example.invalid/a/ransomware-crew</link>
+      <pubDate>Mon, 28 Apr 2026 09:00:00 GMT</pubDate>
+      <description>A new ransomware operation has been observed targeting healthcare organizations.</description>
+    </item>
+  </channel>
+</rss>

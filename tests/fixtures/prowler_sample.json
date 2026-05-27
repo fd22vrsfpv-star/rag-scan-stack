@@ -1,0 +1,93 @@
+[
+  {
+    "check_id": "s3_bucket_public_access",
+    "check_title": "S3 Bucket Public Access",
+    "status_code": "FAIL",
+    "severity": "critical",
+    "service_name": "s3",
+    "provider": "aws",
+    "account_id": "123456789012",
+    "resource_arn": "arn:aws:s3:::company-public-data",
+    "description": "S3 bucket has public access enabled",
+    "risk": "Data exposure — bucket contents accessible to anyone on the internet",
+    "status_extended": "S3 Bucket company-public-data has public access block disabled",
+    "remediation": {
+      "recommendation": {
+        "text": "Enable S3 Block Public Access",
+        "url": "https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html"
+      }
+    },
+    "compliance": {
+      "CIS-AWS": ["2.1.5"],
+      "SOC2": ["CC6.1"]
+    },
+    "cloud": {
+      "provider": "aws",
+      "account": {"uid": "123456789012", "name": "prod-account"},
+      "region": "us-east-1"
+    },
+    "resources": [
+      {"uid": "arn:aws:s3:::company-public-data", "type": "AWS::S3::Bucket", "region": "us-east-1"}
+    ],
+    "finding_info": {
+      "uid": "s3_bucket_public_access",
+      "title": "S3 Bucket Public Access",
+      "desc": "S3 bucket has public access enabled"
+    }
+  },
+  {
+    "check_id": "iam_root_mfa_enabled",
+    "check_title": "Root account MFA",
+    "status_code": "PASS",
+    "severity": "critical",
+    "service_name": "iam",
+    "provider": "aws",
+    "account_id": "123456789012",
+    "resource_arn": "arn:aws:iam::123456789012:root",
+    "description": "Root account has MFA enabled",
+    "cloud": {
+      "provider": "aws",
+      "account": {"uid": "123456789012"}
+    },
+    "resources": [{"uid": "arn:aws:iam::123456789012:root", "type": "AWS::IAM::User"}]
+  },
+  {
+    "check_id": "ec2_security_group_open_to_world",
+    "check_title": "Security Group Open to 0.0.0.0/0",
+    "status_code": "FAIL",
+    "severity": "high",
+    "service_name": "ec2",
+    "provider": "aws",
+    "account_id": "123456789012",
+    "resource_arn": "arn:aws:ec2:us-east-1:123456789012:security-group/sg-12345",
+    "description": "Security group allows unrestricted inbound access on port 22",
+    "risk": "SSH exposed to the internet",
+    "cloud": {
+      "provider": "aws",
+      "account": {"uid": "123456789012"},
+      "region": "us-east-1"
+    },
+    "resources": [
+      {"uid": "arn:aws:ec2:us-east-1:123456789012:security-group/sg-12345", "type": "AWS::EC2::SecurityGroup", "region": "us-east-1"}
+    ]
+  },
+  {
+    "check_id": "azure_storage_public_access",
+    "check_title": "Azure Storage Public Access",
+    "status_code": "FAIL",
+    "severity": "medium",
+    "service_name": "storage",
+    "provider": "azure",
+    "account_id": "tenant-abc-123",
+    "resource_arn": "/subscriptions/sub-1/resourceGroups/rg-prod/providers/Microsoft.Storage/storageAccounts/publicstore",
+    "description": "Azure storage account allows public blob access",
+    "cloud": {
+      "provider": "azure",
+      "account": {"uid": "tenant-abc-123"},
+      "region": "eastus"
+    },
+    "resources": [
+      {"uid": "/subscriptions/sub-1/resourceGroups/rg-prod/providers/Microsoft.Storage/storageAccounts/publicstore", "type": "Microsoft.Storage/storageAccounts", "region": "eastus"}
+    ]
+  }
+]

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" args="nmap -sV -sC -oX output.xml 192.168.1.50" start="1710000000" startstr="Sun Mar 10 12:00:00 2025" version="7.94" xmloutputversion="1.05">
+  <scaninfo type="syn" protocol="tcp" numservices="1000" services="1-1000"/>
+  <host starttime="1710000000" endtime="1710000060">
+    <status state="up" reason="syn-ack" reason_ttl="64"/>
+    <address addr="192.168.1.50" addrtype="ipv4"/>
+    <hostnames>
+      <hostname name="testhost.example.com" type="PTR"/>
+    </hostnames>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open" reason="syn-ack" reason_ttl="64"/>
+        <service name="ssh" product="OpenSSH" version="8.9p1" extrainfo="Ubuntu" method="probed" conf="10"/>
+        <script id="banner" output="SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6"/>
+      </port>
+      <port protocol="tcp" portid="80">
+        <state state="open" reason="syn-ack" reason_ttl="64"/>
+        <service name="http" product="Apache httpd" version="2.4.52" method="probed" conf="10"/>
+        <script id="http-title" output="Test Page"/>
+      </port>
+      <port protocol="tcp" portid="443">
+        <state state="open" reason="syn-ack" reason_ttl="64"/>
+        <service name="https" product="nginx" version="1.22.0" method="probed" conf="10"/>
+        <script id="ssl-heartbleed" output="VULNERABLE: The Heartbleed Bug (CVE-2014-0160)\n  State: VULNERABLE\n  Risk factor: High\n  CVSS: 7.5">
+        </script>
+      </port>
+      <port protocol="tcp" portid="445">
+        <state state="open" reason="syn-ack" reason_ttl="64"/>
+        <service name="microsoft-ds" method="probed" conf="10"/>
+        <script id="smb-vuln-ms17-010" output="VULNERABLE:\n  Remote Code Execution vulnerability in Microsoft SMBv1 servers (ms17-010)\n  State: VULNERABLE\n  IDs: CVE:CVE-2017-0144\n  Risk factor: HIGH\n  CVSS: 9.3"/>
+      </port>
+      <port protocol="tcp" portid="8080">
+        <state state="closed" reason="reset" reason_ttl="64"/>
+        <service name="http-proxy" method="table" conf="3"/>
+      </port>
+    </ports>
+  </host>
+  <host starttime="1710000000" endtime="1710000030">
+    <status state="down" reason="no-response" reason_ttl="0"/>
+    <address addr="192.168.1.51" addrtype="ipv4"/>
+  </host>
+  <runstats>
+    <finished time="1710000060" timestr="Sun Mar 10 12:01:00 2025" elapsed="60"/>
+    <hosts up="1" down="1" total="2"/>
+  </runstats>
+</nmaprun>

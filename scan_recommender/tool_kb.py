@@ -1,0 +1,546 @@
+"""
+Tool Knowledge Base Loader
+Loads and queries the service-to-tools YAML mappings for penetration testing recommendations.
+"""
+
+import os
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+
+import yaml
+
+logger = logging.getLogger("tool_kb")
+
+
+# =============================================================================
+# High-Value Port Knowledge Base
+# =============================================================================
+
+# Ports commonly missed by 1-1000 scans but critical for exploitation
+HIGH_VALUE_PORTS = {
+    1099: {
+        "service": "java-rmi",
+        "vulns": ["CVE-2011-3556"],
+        "msf": "exploit/multi/misc/java_rmi_server",
+        "note": "Java RMI registry - common RCE vector"
+    },
+    1524: {
+        "service": "bindshell",
+        "vulns": ["backdoor"],
+        "msf": None,
+        "note": "Instant root shell - nc target 1524"
+    },
+    3306: {
+        "service": "mysql",
+        "vulns": ["weak-creds", "CVE-2012-2122"],
+        "msf": "auxiliary/scanner/mysql/mysql_login",
+        "note": "MySQL - test root with empty password"
+    },
+    3632: {
+        "service": "distcc",
+        "vulns": ["CVE-2004-2687"],
+        "msf": "exploit/unix/misc/distcc_exec",
+        "note": "DISTCC - unauthenticated RCE"
+    },
+    5432: {
+        "service": "postgresql",
+        "vulns": ["weak-creds"],
+        "msf": "auxiliary/scanner/postgres/postgres_login",
+        "note": "PostgreSQL - test postgres:postgres"
+    },
+    5900: {
+        "service": "vnc",
+        "vulns": ["weak-creds", "CVE-2006-2369"],
+        "msf": "auxiliary/scanner/vnc/vnc_login",
+        "note": "VNC - often password-only auth"
+    },
+    6667: {
+        "service": "irc",
+        "vulns": ["CVE-2010-2075"],
+        "msf": "exploit/unix/irc/unreal_ircd_3281_backdoor",
+        "note": "UnrealIRCd backdoor"
+    },
+    6697: {
+        "service": "irc-ssl",
+        "vulns": ["CVE-2010-2075"],
+        "msf": "exploit/unix/irc/unreal_ircd_3281_backdoor",
+        "note": "UnrealIRCd backdoor (SSL)"
+    },
+    8009: {
+        "service": "ajp13",
+        "vulns": ["CVE-2020-1938"],
+        "msf": "auxiliary/admin/http/tomcat_ghostcat",
+        "note": "Ghostcat - Tomcat AJP file read/RCE"
+    },
+    8180: {
+        "service": "tomcat",
+        "vulns": ["CVE-2009-3548", "weak-creds"],
+        "msf": "exploit/multi/http/tomcat_mgr_deploy",
+        "note": "Tomcat manager - test tomcat:tomcat"
+    },
+    8787: {
+        "service": "drb",
+        "vulns": ["CVE-2013-0156"],
+        "msf": "exploit/linux/misc/drb_remote_codeexec",
+        "note": "Ruby DRb RCE"
+    },
+}
+
+
+# Known vulnerabilities for Metasploitable2 target
+METASPLOITABLE2_VULNS = {
+    "vsftpd": {
+        "port": 21,
+        "cve": "CVE-2011-2523",
+        "msf": "exploit/unix/ftp/vsftpd_234_backdoor",
+        "severity": "critical",
+        "note": "Backdoor triggered by :) in username"
+    },
+    "samba_usermap": {
+        "port": 445,
+        "cve": "CVE-2007-2447",
+        "msf": "exploit/multi/samba/usermap_script",
+        "severity": "critical",
+        "note": "Samba 3.0.20-3.0.25rc3 - username map script RCE"
+    },
+    "distcc": {
+        "port": 3632,
+        "cve": "CVE-2004-2687",
+        "msf": "exploit/unix/misc/distcc_exec",
+        "severity": "critical",
+        "note": "Unauthenticated remote code execution"
+    },
+    "java_rmi": {
+        "port": 1099,
+        "cve": "CVE-2011-3556",
+        "msf": "exploit/multi/misc/java_rmi_server",
+        "severity": "critical",
+        "note": "Java RMI Registry RCE"
+    },
+    "postgres": {
+        "port": 5432,
+        "cve": None,
+        "default_creds": "postgres:postgres",
+        "msf": "auxiliary/scanner/postgres/postgres_login",
+        "severity": "high",
+        "note": "Default credentials"
+    },
+    "mysql": {
+        "port": 3306,
+        "cve": None,
+        "default_creds": "root:",
+        "msf": "auxiliary/scanner/mysql/mysql_login",
+        "severity": "high",
+        "note": "Root with empty password"
+    },
+    "vnc": {
+        "port": 5900,
+        "cve": None,
+        "default_creds": "password",
+        "msf": "auxiliary/scanner/vnc/vnc_login",
+        "severity": "high",
+        "note": "Password-only auth, common passwords"
+    },
+    "tomcat": {
+        "port": 8180,
+        "cve": None,
+        "default_creds": "tomcat:tomcat",
+        "msf": "exploit/multi/http/tomcat_mgr_deploy",
+        "severity": "high",
+        "note": "Default manager credentials"
+    },
+    "bindshell": {
+        "port": 1524,
+        "cve": None,
+        "msf": None,
+        "severity": "critical",
+        "note": "Instant root shell: nc target 1524"
+    },
+    "ircd_backdoor": {
+        "port": 6667,
+        "cve": "CVE-2010-2075",
+        "msf": "exploit/unix/irc/unreal_ircd_3281_backdoor",
+        "severity": "critical",
+        "note": "UnrealIRCd 3.2.8.1 backdoor"
+    },
+    "php_cgi": {
+        "port": 80,
+        "cve": "CVE-2012-1823",
+        "msf": "exploit/multi/http/php_cgi_arg_injection",
+        "severity": "critical",
+        "note": "PHP CGI argument injection RCE"
+    },
+    "ssh_msfadmin": {
+        "port": 22,
+        "cve": None,
+        "default_creds": "msfadmin:msfadmin",
+        "msf": "auxiliary/scanner/ssh/ssh_login",
+        "severity": "high",
+        "note": "Default msfadmin credentials"
+    },
+    "telnet_msfadmin": {
+        "port": 23,
+        "cve": None,
+        "default_creds": "msfadmin:msfadmin",
+        "msf": "auxiliary/scanner/telnet/telnet_login",
+        "severity": "high",
+        "note": "Default msfadmin credentials"
+    },
+    "nfs_no_root_squash": {
+        "port": 2049,
+        "cve": None,
+        "msf": None,
+        "severity": "high",
+        "note": "NFS share with no_root_squash - privesc via SUID"
+    },
+    "rexec": {
+        "port": 512,
+        "cve": None,
+        "default_creds": "msfadmin:msfadmin",
+        "msf": "auxiliary/scanner/rservices/rexec_login",
+        "severity": "medium",
+        "note": "Remote exec with default credentials"
+    },
+    "rlogin": {
+        "port": 513,
+        "cve": None,
+        "default_creds": "msfadmin:msfadmin",
+        "msf": "auxiliary/scanner/rservices/rlogin_login",
+        "severity": "medium",
+        "note": "Remote login with default credentials"
+    },
+    "rsh": {
+        "port": 514,
+        "cve": None,
+        "msf": "auxiliary/scanner/rservices/rsh_login",
+        "severity": "medium",
+        "note": "Remote shell - may allow passwordless access"
+    },
+    "drb": {
+        "port": 8787,
+        "cve": None,
+        "msf": "exploit/linux/misc/drb_remote_codeexec",
+        "severity": "critical",
+        "note": "Ruby DRb service RCE"
+    },
+}
+
+
+def get_high_value_port_info(port: int) -> Optional[Dict[str, Any]]:
+    """Get vulnerability information for a high-value port."""
+    return HIGH_VALUE_PORTS.get(port)
+
+
+def get_msf2_vuln_info(vuln_name: str) -> Optional[Dict[str, Any]]:
+    """Get Metasploitable2 vulnerability information by name."""
+    return METASPLOITABLE2_VULNS.get(vuln_name)
+
+
+def get_all_high_value_ports() -> List[int]:
+    """Get list of all high-value ports that should be scanned."""
+    return list(HIGH_VALUE_PORTS.keys())
+
+
+def get_msf2_vulns_by_port(port: int) -> List[Dict[str, Any]]:
+    """Get all known Metasploitable2 vulnerabilities for a given port."""
+    results = []
+    for name, info in METASPLOITABLE2_VULNS.items():
+        if info.get("port") == port:
+            results.append({"name": name, **info})
+    return results
+
+
+def get_critical_msf2_vulns() -> List[Dict[str, Any]]:
+    """Get all critical severity Metasploitable2 vulnerabilities."""
+    results = []
+    for name, info in METASPLOITABLE2_VULNS.items():
+        if info.get("severity") == "critical":
+            results.append({"name": name, **info})
+    return results
+
+# Default path to the knowledge base
+DEFAULT_KB_PATH = os.getenv("TOOL_KB_PATH", "/knowledge/service_tools.yaml")
+
+
+class ToolKnowledgeBase:
+    """
+    Loads and queries the service-to-tools knowledge base.
+    Provides fast lookups by service name or port number.
+    """
+
+    def __init__(self, kb_path: str = DEFAULT_KB_PATH):
+        self.kb_path = kb_path
+        self._data: Dict[str, Any] = {}
+        self._port_to_service: Dict[int, str] = {}
+        self._loaded = False
+        self._load()
+
+    def _load(self) -> bool:
+        """Load the YAML knowledge base file."""
+        try:
+            path = Path(self.kb_path)
+            if not path.is_file():
+                logger.warning(f"[tool_kb] Knowledge base not found: {self.kb_path}")
+                return False
+
+            with open(path, "r", encoding="utf-8") as f:
+                self._data = yaml.safe_load(f) or {}
+
+            # Build port-to-service index
+            self._build_port_index()
+            self._loaded = True
+
+            services_count = len(self._data.get("services", {}))
+            ports_count = len(self._port_to_service)
+            logger.info(f"[tool_kb] Loaded {services_count} services, {ports_count} port mappings")
+            return True
+
+        except Exception as e:
+            logger.error(f"[tool_kb] Failed to load knowledge base: {e}")
+            return False
+
+    def _build_port_index(self):
+        """Build reverse index from port to service name."""
+        self._port_to_service = {}
+
+        # From services section
+        services = self._data.get("services", {})
+        for service_name, service_data in services.items():
+            ports = service_data.get("ports", [])
+            for port in ports:
+                self._port_to_service[int(port)] = service_name
+
+        # From port_hints section (fallback mappings)
+        port_hints = self._data.get("port_hints", {})
+        for port, service_name in port_hints.items():
+            # Don't override if already mapped from services
+            if int(port) not in self._port_to_service:
+                self._port_to_service[int(port)] = service_name
+
+    def reload(self) -> bool:
+        """Reload the knowledge base from disk."""
+        return self._load()
+
+    def is_loaded(self) -> bool:
+        """Check if knowledge base is loaded."""
+        return self._loaded
+
+    def get_service_by_port(self, port: int) -> Optional[str]:
+        """
+        Get service name for a given port number.
+
+        Args:
+            port: Port number
+
+        Returns:
+            Service name or None if not found
+        """
+        return self._port_to_service.get(port)
+
+    def get_service_info(self, service_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Get full service information by name.
+
+        Args:
+            service_name: Service name (e.g., 'ssh', 'http', 'smb')
+
+        Returns:
+            Service info dict or None if not found
+        """
+        services = self._data.get("services", {})
+        # Case-insensitive lookup
+        service_name_lower = service_name.lower()
+
+        if service_name_lower in services:
+            return services[service_name_lower]
+
+        # Try to find by alias/partial match
+        for name, data in services.items():
+            if service_name_lower in name or name in service_name_lower:
+                return data
+
+        return None
+
+    def get_tools_for_service(
+        self,
+        service: str = None,
+        port: int = None,
+        include_msf: bool = True,
+        include_nuclei: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Get tool recommendations for a service or port.
+
+        Args:
+            service: Service name (e.g., 'ssh', 'http')
+            port: Port number (used to infer service if service not provided)
+            include_msf: Include Metasploit modules
+            include_nuclei: Include Nuclei tags
+
+        Returns:
+            Dictionary with tool recommendations
+        """
+        # Resolve service name from port if not provided
+        if not service and port:
+            service = self.get_service_by_port(port)
+
+        if not service:
+            return {
+                "error": "Service not specified and could not be inferred from port",
+                "port": port,
+                "tools": [],
+                "metasploit": [],
+                "nuclei_tags": []
+            }
+
+        service_info = self.get_service_info(service)
+
+        if not service_info:
+            return {
+                "error": f"Unknown service: {service}",
+                "service": service,
+                "port": port,
+                "tools": [],
+                "metasploit": [],
+                "nuclei_tags": []
+            }
+
+        result = {
+            "service": service.lower(),
+            "description": service_info.get("description", ""),
+            "common_ports": service_info.get("ports", []),
+            "tools": service_info.get("tools", []),
+            "common_vulns": service_info.get("common_vulns", [])
+        }
+
+        if include_msf:
+            result["metasploit"] = service_info.get("metasploit", [])
+
+        if include_nuclei:
+            result["nuclei_tags"] = service_info.get("nuclei_tags", [])
+
+        # Fill in target/port placeholders in commands
+        if port:
+            result["port_used"] = port
+            result["tools"] = self._format_commands(result["tools"], port=port)
+
+        return result
+
+    def _format_commands(
+        self,
+        tools: List[Dict[str, Any]],
+        target: str = "{target}",
+        port: int = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Format command templates with actual values.
+
+        Args:
+            tools: List of tool dictionaries
+            target: Target IP/hostname
+            port: Port number
+
+        Returns:
+            Tools list with formatted commands
+        """
+        formatted = []
+        for tool in tools:
+            tool_copy = dict(tool)
+            if "command" in tool_copy and port:
+                tool_copy["command"] = tool_copy["command"].replace("{port}", str(port))
+            formatted.append(tool_copy)
+        return formatted
+
+    def get_all_services(self) -> List[str]:
+        """Get list of all known service names."""
+        return list(self._data.get("services", {}).keys())
+
+    def get_all_port_mappings(self) -> Dict[int, str]:
+        """Get all port-to-service mappings."""
+        return dict(self._port_to_service)
+
+    def search_tools(
+        self,
+        query: str,
+        tool_type: str = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for tools by name or purpose.
+
+        Args:
+            query: Search query
+            tool_type: Filter by type ('tools', 'metasploit', or None for all)
+
+        Returns:
+            List of matching tools with service context
+        """
+        results = []
+        query_lower = query.lower()
+
+        services = self._data.get("services", {})
+        for service_name, service_data in services.items():
+            # Search in tools
+            if tool_type in (None, "tools"):
+                for tool in service_data.get("tools", []):
+                    name = tool.get("name", "").lower()
+                    purpose = tool.get("purpose", "").lower()
+                    if query_lower in name or query_lower in purpose:
+                        results.append({
+                            "service": service_name,
+                            "type": "tool",
+                            **tool
+                        })
+
+            # Search in Metasploit modules
+            if tool_type in (None, "metasploit"):
+                for msf in service_data.get("metasploit", []):
+                    module = msf.get("module", "").lower()
+                    purpose = msf.get("purpose", "").lower()
+                    if query_lower in module or query_lower in purpose:
+                        results.append({
+                            "service": service_name,
+                            "type": "metasploit",
+                            **msf
+                        })
+
+        return results
+
+
+# Global instance
+_kb_instance: Optional[ToolKnowledgeBase] = None
+
+
+def get_tool_kb() -> ToolKnowledgeBase:
+    """Get or create the global ToolKnowledgeBase instance."""
+    global _kb_instance
+    if _kb_instance is None:
+        _kb_instance = ToolKnowledgeBase()
+    return _kb_instance
+
+
+def recommend_tools(
+    service: str = None,
+    port: int = None,
+    include_msf: bool = True,
+    include_nuclei: bool = True
+) -> Dict[str, Any]:
+    """
+    Convenience function to get tool recommendations.
+
+    Args:
+        service: Service name (e.g., 'ssh', 'http')
+        port: Port number
+        include_msf: Include Metasploit modules
+        include_nuclei: Include Nuclei tags
+
+    Returns:
+        Tool recommendations dictionary
+    """
+    kb = get_tool_kb()
+    return kb.get_tools_for_service(
+        service=service,
+        port=port,
+        include_msf=include_msf,
+        include_nuclei=include_nuclei
+    )

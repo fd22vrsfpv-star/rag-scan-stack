@@ -1,0 +1,166 @@
+{
+  "name": "Targets File -> Masscan -> Nmap -> WebScan",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "masscan-webscan",
+        "httpMethod": "POST",
+        "responseMode": "responseNode"
+      },
+      "name": "Webhook In",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "notes": "Intended for n8n 1.82.1+. Upload field name: file."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://rag-api:8000/jobs/masscan-nmap/upload",
+        "sendBinaryData": true,
+        "binaryPropertyName": "file",
+        "headerParametersUi": {
+          "parameter": [
+            { "name": "x-api-key", "value": "changeme" }
+          ]
+        }
+      },
+      "name": "Submit Job",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 2,
+      "position": [520, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{'http://rag-api:8000/jobs/' + $node['Submit Job'].json.id}}",
+        "headerParametersUi": {
+          "parameter": [
+            { "name": "x-api-key", "value": "changeme" }
+          ]
+        }
+      },
+      "name": "Get Job",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 2,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            { "value1": "={{$json.status}}", "operation": "equal", "value2": "finished" }
+          ]
+        }
+      },
+      "name": "If Finished",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [920, 240]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            { "value1": "={{$json.status}}", "operation": "equal", "value2": "failed" }
+          ]
+        }
+      },
+      "name": "If Failed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 360]
+    },
+    {
+      "parameters": { "amount": 10, "unit": "seconds" },
+      "name": "Wait 10s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [920, 420]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://web-scanner:8010/jobs/web-scan",
+        "jsonParameters": true,
+        "bodyParametersJson": "{\"do_gobuster\": true, \"do_zap\": true}"
+      },
+      "name": "Web Scan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 2,
+      "position": [1120, 200]
+    },
+    {
+      "parameters": {
+        "keepOnlySet": true,
+        "values": {
+          "string": [
+            { "name": "job_id", "value": "={{$node['Submit Job'].json.id}}" },
+            { "name": "job_status", "value": "={{$json.status}}" }
+          ],
+          "json": [
+            { "name": "job", "value": "={{$json}}" },
+            { "name": "web_scan", "value": "={{$node['Web Scan'].json}}" }
+          ]
+        }
+      },
+      "name": "Build Success Response",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [1320, 200]
+    },
+    {
+      "parameters": {
+        "keepOnlySet": true,
+        "values": {
+          "string": [
+            { "name": "job_id", "value": "={{$node['Submit Job'].json.id}}" },
+            { "name": "job_status", "value": "={{$json.status}}" },
+            { "name": "error", "value": "={{$json.error || 'failed'}}" }
+          ],
+          "json": [
+            { "name": "job", "value": "={{$json}}" }
+          ]
+        }
+      },
+      "name": "Build Failure Response",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [1320, 360]
+    },
+    {
+      "parameters": {
+        "responseBody": "={{$json}}",
+        "responseCode": 200
+      },
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1520, 280]
+    }
+  ],
+  "connections": {
+    "Webhook In": { "main": [[{ "node": "Submit Job", "type": "main", "index": 0 }]] },
+    "Submit Job": { "main": [[{ "node": "Get Job", "type": "main", "index": 0 }]] },
+    "Get Job": { "main": [[{ "node": "If Finished", "type": "main", "index": 0 }]] },
+    "If Finished": {
+      "main": [
+        [{ "node": "Web Scan", "type": "main", "index": 0 }],
+        [{ "node": "If Failed", "type": "main", "index": 0 }]
+      ]
+    },
+    "If Failed": {
+      "main": [
+        [{ "node": "Build Failure Response", "type": "main", "index": 0 }],
+        [{ "node": "Wait 10s", "type": "main", "index": 0 }]
+      ]
+    },
+    "Wait 10s": { "main": [[{ "node": "Get Job", "type": "main", "index": 0 }]] },
+    "Web Scan": { "main": [[{ "node": "Build Success Response", "type": "main", "index": 0 }]] },
+    "Build Success Response": { "main": [[{ "node": "Respond", "type": "main", "index": 0 }]] },
+    "Build Failure Response": { "main": [[{ "node": "Respond", "type": "main", "index": 0 }]] }
+  },
+  "version": 2,
+  "active": false,
+  "settings": {}
+}

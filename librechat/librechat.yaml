@@ -1,0 +1,76 @@
+version: 1.1.7
+cache: true
+
+endpoints:
+  # Google Gemini - API key entered from UI (user_provided in .env)
+  # Free tier: Gemini 2.5 Flash (15 req/min), Gemini 2.5 Pro (5 req/min)
+  google:
+    models:
+      default: ["gemini-2.5-flash", "gemini-2.5-pro"]
+      fetch: false
+  custom:
+    - name: "Ollama"
+      apiKey: "ollama"
+      baseURL: "http://ollama:11434/v1"
+      models:
+        default: ["qwen2.5:14b", "llama3.1:8b", "qwen2.5:32b"]
+        fetch: false
+      titleConvo: true
+      titleModel: "qwen2.5:14b"
+      summarize: false
+      summaryModel: "llama3.1:8b"
+      forcePrompt: false
+      modelDisplayLabel: "Ollama"
+      iconURL: ""
+      addParams:
+        max_tokens: 4000
+        temperature: 0.7
+
+# Tool/Action Configuration
+# These are OpenAPI specs from MCPO
+fileConfig:
+  endpoints:
+    assistants:
+      fileLimit: 5
+      fileSizeLimit: 10
+      totalSizeLimit: 50
+      supportedMimeTypes:
+        - "image/.*"
+        - "application/pdf"
+
+# Actions Configuration - Allow access to MCPO and MCP streamable servers
+# These are internal services, so we must explicitly allow them
+actions:
+  allowedDomains:
+    - "http://mcpo:8080"
+    - "mcpo:8080"
+    - "mcpo"
+    - "https://mcp-streamable:9016"
+    - "https://mcp-streamable:9017"
+    - "https://mcp-streamable:9018"
+    - "https://mcp-streamable:9019"
+    - "https://mcp-streamable:9020"
+    - "https://mcp-streamable:9021"
+    - "mcp-streamable:9016"
+    - "mcp-streamable:9017"
+    - "mcp-streamable:9018"
+    - "mcp-streamable:9019"
+    - "mcp-streamable:9020"
+    - "mcp-streamable:9021"
+    - "mcp-streamable"
+
+# MCP Settings - allow access to internal MCP servers
+mcpSettings:
+  allowedDomains:
+    - "https://mcp-streamable:9016"
+    - "https://mcp-streamable:9017"
+    - "https://mcp-streamable:9018"
+    - "https://mcp-streamable:9019"
+    - "https://mcp-streamable:9020"
+    - "https://mcp-streamable:9021"
+
+# MCP Servers Configuration - only pipelines (3 tools) for 14b reliability
+mcpServers:
+  pipelines:
+    type: streamable-http
+    url: https://mcp-streamable:9021/mcp

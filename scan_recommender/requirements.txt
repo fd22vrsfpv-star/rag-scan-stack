@@ -1,0 +1,6 @@
+# requirements.txt
+fastapi[all]
+psycopg2-binary
+requests
+uvicorn
+pyyaml

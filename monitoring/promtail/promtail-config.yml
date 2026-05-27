@@ -1,0 +1,262 @@
+# Promtail Configuration
+# Log collector for RAG Scan Stack
+#
+# Promtail discovers and ships logs to Loki from:
+# - Docker containers (via Docker socket)
+# - System logs (/var/log)
+# - Application logs
+#
+# Documentation: https://grafana.com/docs/loki/latest/clients/promtail/configuration/
+# Version: 1.0
+# Last Updated: 2025-11-19
+
+# Server configuration
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: info
+
+# Position file (tracks what's been read)
+positions:
+  filename: /tmp/positions.yaml
+
+# Loki client configuration
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    batchwait: 1s
+    batchsize: 1048576  # 1MB
+    timeout: 10s
+    backoff_config:
+      min_period: 500ms
+      max_period: 5m
+      max_retries: 10
+
+# Scrape configurations
+scrape_configs:
+  # Docker container logs
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+        filters:
+          - name: label
+            values: ["com.docker.compose.project=agents"]
+
+    relabel_configs:
+      # Container name
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'container'
+
+      # Service name from Docker Compose
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: 'service'
+
+      # Project name
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_project']
+        target_label: 'project'
+
+      # Container ID (short)
+      - source_labels: ['__meta_docker_container_id']
+        regex: '([a-f0-9]{12}).*'
+        target_label: 'container_id'
+
+      # Image name
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_image']
+        target_label: 'image'
+
+      # Log stream (stdout/stderr)
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: 'stream'
+
+    pipeline_stages:
+      # Parse JSON logs if possible
+      - json:
+          expressions:
+            timestamp: timestamp
+            level: level
+            logger: logger
+            message: message
+            request_id: request_id
+            scan_id: scan_id
+            target: target
+            duration: duration
+            status: status
+            error: error
+          source: message
+
+      # Extract timestamp
+      - timestamp:
+          source: timestamp
+          format: RFC3339
+
+      # Extract log level
+      - labels:
+          level:
+          logger:
+          service:
+          request_id:
+          scan_id:
+
+      # Drop healthcheck logs (too noisy)
+      - drop:
+          source: message
+          expression: ".*healthcheck.*"
+
+      # Drop prometheus scrape logs
+      - drop:
+          source: message
+          expression: ".*GET /metrics.*"
+
+  # System logs
+  - job_name: system
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: system
+          __path__: /var/log/*.log
+
+    pipeline_stages:
+      # Parse syslog format
+      - regex:
+          expression: '^(?P<timestamp>\S+\s+\S+\s+\S+) (?P<hostname>\S+) (?P<application>\S+?)(\[(?P<pid>\d+)\])?: (?P<message>.*)$'
+
+      # Extract labels
+      - labels:
+          application:
+          hostname:
+
+      # Parse timestamp
+      - timestamp:
+          source: timestamp
+          format: 'Jan _2 15:04:05'
+
+  # Docker daemon logs
+  - job_name: docker-daemon
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: docker-daemon
+          __path__: /var/log/docker.log
+
+    pipeline_stages:
+      - json:
+          expressions:
+            level: level
+            msg: msg
+            time: time
+
+      - labels:
+          level:
+
+      - timestamp:
+          source: time
+          format: RFC3339
+
+  # RAG Scan Stack specific logs
+  - job_name: rag-api
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: rag-api
+          service: rag-api
+          __path__: /var/log/rag-api/*.log
+
+    pipeline_stages:
+      - json:
+          expressions:
+            timestamp: timestamp
+            level: level
+            message: message
+            request_id: request_id
+            endpoint: endpoint
+            method: method
+            status_code: status_code
+            duration: duration
+
+      - labels:
+          level:
+          request_id:
+          endpoint:
+          method:
+
+      - timestamp:
+          source: timestamp
+          format: RFC3339
+
+# Notes:
+#
+# 1. Log Discovery:
+#    - Automatically discovers Docker containers with label filter
+#    - Collects stdout/stderr from all matching containers
+#    - Filters by project=agents to only collect RAG stack logs
+#
+# 2. Label Strategy:
+#    - Low cardinality labels: service, level, stream
+#    - High cardinality extracted but not labeled: request_id, scan_id
+#    - Use extracted fields in queries: {service="rag-api"} | json | request_id="abc123"
+#
+# 3. Pipeline Stages:
+#    - json: Parse JSON log lines
+#    - timestamp: Extract timestamp from logs
+#    - labels: Add labels for filtering
+#    - drop: Skip noisy logs (healthchecks, metrics)
+#
+# 4. Performance:
+#    - batchwait: Time to wait before sending batch (lower = more real-time)
+#    - batchsize: Max size of batch (higher = more efficient)
+#    - Adjust based on log volume and latency requirements
+#
+# 5. JSON Log Format:
+#    Expected format from services:
+#    {
+#      "timestamp": "2025-11-19T10:00:00Z",
+#      "level": "INFO",
+#      "logger": "rag-api",
+#      "message": "Scan started",
+#      "request_id": "req-123",
+#      "scan_id": "scan-456"
+#    }
+#
+# 6. Dropped Logs:
+#    - Healthcheck endpoints (too frequent, low value)
+#    - Prometheus /metrics scrapes
+#    - Add more drop rules as needed
+#
+# 7. Troubleshooting:
+#    - Check Promtail logs: docker logs promtail
+#    - Verify targets: curl http://localhost:9080/targets
+#    - Check metrics: curl http://localhost:9080/metrics
+#    - Test log push: echo '{"message":"test"}' | docker exec -i promtail sh -c 'cat > /tmp/test.log'
+#
+# 8. Position File:
+#    - Tracks read positions for each log file
+#    - Prevents duplicate log ingestion
+#    - Located at /tmp/positions.yaml inside container
+#
+# 9. Relabel Configs:
+#    - Extract metadata from Docker labels
+#    - Transform into Loki labels
+#    - Keep cardinality low (< 100 unique values per label)
+#
+# 10. Adding New Services:
+#     - Logs automatically collected if container has project=agents label
+#     - Ensure service outputs JSON to stdout/stderr
+#     - Use structured_logger.py for consistent format
+#
+# 11. Custom Log Paths:
+#     To add custom application logs:
+#     - job_name: my-app
+#       static_configs:
+#         - targets: [localhost]
+#           labels:
+#             job: my-app
+#             __path__: /app/logs/*.log
+#
+# 12. Filtering:
+#     - Remove filters to collect ALL Docker logs
+#     - Add more specific filters for namespace/label matching
+#     - Balance between coverage and noise
