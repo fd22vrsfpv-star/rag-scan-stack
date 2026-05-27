@@ -268,11 +268,11 @@ fi
 if [ -f "kong/kong.yml" ]; then
     log_info "kong/kong.yml already exists"
 else
-    if [ -f "kong/kong.yml.production.example" ]; then
-        cp kong/kong.yml.production.example kong/kong.yml
-        log_success "Created kong/kong.yml from template"
+    if [ -f "kong/kong.yml.template" ]; then
+        cp kong/kong.yml.template kong/kong.yml
+        log_success "Created kong/kong.yml from kong.yml.template"
     else
-        log_warning "kong/kong.yml.production.example not found, using existing kong/kong.yml"
+        log_warning "kong/kong.yml.template not found, using existing kong/kong.yml"
     fi
 fi
 
