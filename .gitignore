@@ -180,3 +180,6 @@ wireguard/server/
 # Operator notes / decision log — accumulates sensitive context
 Docs/Memories.md
 Docs/CHANGES_MADE.md
+
+# Generated Kong config — holds the real injected API key. Edit kong.yml.template instead.
+kong/kong.yml
