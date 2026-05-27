@@ -1564,7 +1564,7 @@ def sync_push_to_remote():
 
     config = _read_db_config()
     db_user = config.get("remote_db_user") or "app"
-    db_password = config.get("remote_db_password") or "app"
+    db_password = config.get("remote_db_password") or ""
     remote_host = config.get("remote_db_host") or ""
     if not remote_host:
         return {"ok": False, "error": "No remote_db_host configured"}
@@ -1743,7 +1743,7 @@ def sync_schema_to_remote():
 
     config = _read_db_config()
     db_user = config.get("remote_db_user") or "app"
-    db_password = config.get("remote_db_password") or "app"
+    db_password = config.get("remote_db_password") or ""
 
     # Find remote DB via tunnel
     remote_dsn_host = None
@@ -1820,7 +1820,7 @@ def compare_databases():
 
     config = _read_db_config()
     db_user = config.get("remote_db_user") or "app"
-    db_password = config.get("remote_db_password") or "app"
+    db_password = config.get("remote_db_password") or ""
     mode = _detect_db_mode()
 
     # ── Get local DB stats ─────────────────────────────────────────

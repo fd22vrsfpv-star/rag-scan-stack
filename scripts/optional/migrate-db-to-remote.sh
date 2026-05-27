@@ -17,7 +17,7 @@
 #   POSTGRES_USER         (default: app)
 #   POSTGRES_PASSWORD     (default: app)
 #   REMOTE_DB_USER        (default: app)
-#   REMOTE_DB_PASSWORD    (default: app)
+#   REMOTE_DB_PASSWORD    (required — no default; export or set in .env)
 #   REMOTE_DB_HOST        (required — VPS IP/hostname)
 #   REMOTE_DB_SSH_USER    (default: azureuser)
 #   REMOTE_DB_SSH_KEY     (default: remote_db.pem)
@@ -41,7 +41,7 @@ LOCAL_PASS="${POSTGRES_PASSWORD:-app}"
 LOCAL_DB="${POSTGRES_DB:-scans}"
 
 REMOTE_USER="${REMOTE_DB_USER:-app}"
-REMOTE_PASS="${REMOTE_DB_PASSWORD:-app}"
+REMOTE_PASS="${REMOTE_DB_PASSWORD:?REMOTE_DB_PASSWORD must be set}"
 REMOTE_HOST="${REMOTE_DB_HOST:?Set REMOTE_DB_HOST in .env}"
 REMOTE_SSH_USER="${REMOTE_DB_SSH_USER:-azureuser}"
 REMOTE_SSH_KEY="${REMOTE_DB_SSH_KEY:-remote_db.pem}"
