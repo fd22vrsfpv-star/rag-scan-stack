@@ -1,3 +1,13 @@
+# Kong API Gateway Configuration — TEMPLATE
+#
+# This is the source of truth for kong/kong.yml, which is a GENERATED file
+# (gitignored — it ends up holding your real API key). scripts/setup.sh copies
+# this template to kong/kong.yml and substitutes the API-key placeholders below
+# with the API_KEY from your .env. To regenerate by hand:
+#   cp kong/kong.yml.template kong/kong.yml
+#   KEY=$(grep ^API_KEY= .env | cut -d= -f2); sed -i "s/PLACEHOLDER/$KEY/g" kong/kong.yml
+# (where PLACEHOLDER is the api-key value used below)
+#
 _format_version: "3.0"
 _transform: true
 
