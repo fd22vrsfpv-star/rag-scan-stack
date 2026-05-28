@@ -985,6 +985,56 @@ async def apply_schema():
             END IF; RETURN NEW; END; $t$""",
             "DROP TRIGGER IF EXISTS trg_followups_engagement ON follow_up_items",
             "CREATE TRIGGER trg_followups_engagement BEFORE INSERT ON follow_up_items FOR EACH ROW EXECUTE FUNCTION propagate_engagement_to_followups()",
+            # ── Scan-execution tables: engagement_id self-heal (Phase 1/3) ──
+            # ALTER TABLE entries here so a stale DB picks up the columns on
+            # rag-api startup even if the operator hasn't run ensure_all_tables.sql.
+            "ALTER TABLE public.jobs                 ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id) ON DELETE SET NULL",
+            "ALTER TABLE public.tasks                ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id) ON DELETE SET NULL",
+            "ALTER TABLE public.scan_recommendations ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id) ON DELETE SET NULL",
+            "ALTER TABLE public.pending_exploits     ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id) ON DELETE SET NULL",
+            "ALTER TABLE public.exploit_results      ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id) ON DELETE SET NULL",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_engagement                 ON public.jobs(engagement_id)                 WHERE engagement_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_engagement                ON public.tasks(engagement_id)                WHERE engagement_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_scan_recommendations_engagement ON public.scan_recommendations(engagement_id) WHERE engagement_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_pending_exploits_engagement     ON public.pending_exploits(engagement_id)     WHERE engagement_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_exploit_results_engagement      ON public.exploit_results(engagement_id)      WHERE engagement_id IS NOT NULL",
+            # Propagation triggers: if a caller forgets to set engagement_id on
+            # INSERT, fill it from the natural parent (job → tasks, asset by ip
+            # → scan_recommendations, job/finding → pending_exploits, pending
+            # → exploit_results).  Matches the pattern used for vulns/findings/
+            # follow_up_items above.
+            """CREATE OR REPLACE FUNCTION propagate_engagement_to_tasks() RETURNS TRIGGER LANGUAGE plpgsql AS $t$
+            BEGIN IF NEW.engagement_id IS NULL AND NEW.job_id IS NOT NULL THEN
+                SELECT engagement_id INTO NEW.engagement_id FROM jobs WHERE id = NEW.job_id;
+            END IF; RETURN NEW; END; $t$""",
+            "DROP TRIGGER IF EXISTS trg_tasks_engagement ON tasks",
+            "CREATE TRIGGER trg_tasks_engagement BEFORE INSERT ON tasks FOR EACH ROW EXECUTE FUNCTION propagate_engagement_to_tasks()",
+            """CREATE OR REPLACE FUNCTION propagate_engagement_to_scan_recs() RETURNS TRIGGER LANGUAGE plpgsql AS $t$
+            BEGIN IF NEW.engagement_id IS NULL THEN
+                IF NEW.asset_id IS NOT NULL THEN
+                    SELECT engagement_id INTO NEW.engagement_id FROM assets WHERE id = NEW.asset_id;
+                ELSIF NEW.ip IS NOT NULL THEN
+                    SELECT engagement_id INTO NEW.engagement_id FROM assets WHERE ip = NEW.ip LIMIT 1;
+                END IF;
+            END IF; RETURN NEW; END; $t$""",
+            "DROP TRIGGER IF EXISTS trg_scan_recs_engagement ON scan_recommendations",
+            "CREATE TRIGGER trg_scan_recs_engagement BEFORE INSERT ON scan_recommendations FOR EACH ROW EXECUTE FUNCTION propagate_engagement_to_scan_recs()",
+            """CREATE OR REPLACE FUNCTION propagate_engagement_to_pending_exploits() RETURNS TRIGGER LANGUAGE plpgsql AS $t$
+            BEGIN IF NEW.engagement_id IS NULL THEN
+                IF NEW.asset_id IS NOT NULL THEN
+                    SELECT engagement_id INTO NEW.engagement_id FROM assets WHERE id = NEW.asset_id;
+                ELSIF NEW.target_ip IS NOT NULL THEN
+                    SELECT engagement_id INTO NEW.engagement_id FROM assets WHERE ip = NEW.target_ip LIMIT 1;
+                END IF;
+            END IF; RETURN NEW; END; $t$""",
+            "DROP TRIGGER IF EXISTS trg_pending_exploits_engagement ON pending_exploits",
+            "CREATE TRIGGER trg_pending_exploits_engagement BEFORE INSERT ON pending_exploits FOR EACH ROW EXECUTE FUNCTION propagate_engagement_to_pending_exploits()",
+            """CREATE OR REPLACE FUNCTION propagate_engagement_to_exploit_results() RETURNS TRIGGER LANGUAGE plpgsql AS $t$
+            BEGIN IF NEW.engagement_id IS NULL AND NEW.pending_exploit_id IS NOT NULL THEN
+                SELECT engagement_id INTO NEW.engagement_id FROM pending_exploits WHERE id = NEW.pending_exploit_id;
+            END IF; RETURN NEW; END; $t$""",
+            "DROP TRIGGER IF EXISTS trg_exploit_results_engagement ON exploit_results",
+            "CREATE TRIGGER trg_exploit_results_engagement BEFORE INSERT ON exploit_results FOR EACH ROW EXECUTE FUNCTION propagate_engagement_to_exploit_results()",
             # Engagement-scoped scopes
             "ALTER TABLE scope_targets ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES engagements(id) ON DELETE CASCADE",
             "CREATE INDEX IF NOT EXISTS idx_scope_targets_engagement ON scope_targets(engagement_id)",
