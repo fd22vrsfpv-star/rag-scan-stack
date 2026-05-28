@@ -13,6 +13,7 @@ from typing import Optional
 from utils import safe_json
 
 from config import get_settings
+from engagement import engagement_headers
 
 log = logging.getLogger("targeted_recon")
 router = APIRouter()
@@ -73,7 +74,7 @@ async def _load_wordlist_paths(s) -> dict[str, str]:
                 try:
                     resp = await c.get(
                         f"{s.rag_api_url}/settings/config/{key}",
-                        headers={"x-api-key": s.api_key},
+                        headers={"x-api-key": s.api_key, **engagement_headers()},
                     )
                     if resp.status_code == 200:
                         user_val = resp.json().get("value", "").strip()
@@ -410,7 +411,7 @@ async def targeted_recon_execute(req: ReconExecuteRequest):
                     # Ingest the file via rag-api
                     ingest_resp = await c.post(
                         f"{s.rag_api_url}/ingest/{ingest_type}",
-                        headers={"x-api-key": s.api_key},
+                        headers={"x-api-key": s.api_key, **engagement_headers()},
                         files={"file": (f"tr_{req.tool_name}.out",
                                         dl_resp.content, mime)},
                         params={"job_id": f"tr-{req.node_id[:8]}"},
@@ -430,7 +431,7 @@ async def targeted_recon_execute(req: ReconExecuteRequest):
             async with httpx.AsyncClient(verify=False, timeout=30) as c:
                 struct_resp = await c.post(
                     f"{s.rag_api_url}/ingest/tool-output",
-                    headers={"x-api-key": s.api_key},
+                    headers={"x-api-key": s.api_key, **engagement_headers()},
                     json={
                         "stdout": stdout,
                         "tool_name": req.tool_name,

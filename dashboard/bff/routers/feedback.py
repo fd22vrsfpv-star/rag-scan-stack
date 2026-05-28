@@ -3,6 +3,7 @@ import httpx
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter()
@@ -23,7 +24,7 @@ async def create_feedback(req: FeedbackCreate):
         resp = await c.post(
             f"{s.autogen_url}/feedback",
             json=req.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -42,7 +43,7 @@ async def list_feedback(
         resp = await c.get(
             f"{s.autogen_url}/feedback",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -59,7 +60,7 @@ async def update_feedback(feedback_id: str, req: FeedbackUpdate):
         resp = await c.put(
             f"{s.autogen_url}/feedback/{feedback_id}",
             json=req.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -70,6 +71,6 @@ async def export_feedback():
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.get(
             f"{s.autogen_url}/feedback/export",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)

@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional, List
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter()
@@ -26,7 +27,7 @@ async def list_content_extractions(asset_id: str = None, scan_id: str = None, se
         resp = await c.get(
             f"{s.rag_api_url}/content-extractions",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -45,7 +46,7 @@ async def content_extraction_summary(asset_id: str = None, search: str = None):
         resp = await c.get(
             f"{s.rag_api_url}/content-extractions/summary",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -60,7 +61,7 @@ async def update_extraction(extraction_id: str, request: Request):
         resp = await c.patch(
             f"{s.rag_api_url}/content-extractions/{extraction_id}",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -73,7 +74,7 @@ async def delete_extraction(extraction_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/content-extractions/{extraction_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -92,7 +93,7 @@ async def list_patterns(category: str = None):
         resp = await c.get(
             f"{s.rag_api_url}/content-intel/patterns",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -107,7 +108,7 @@ async def create_pattern(request: Request):
         resp = await c.post(
             f"{s.rag_api_url}/content-intel/patterns",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -122,7 +123,7 @@ async def update_pattern(pattern_id: str, request: Request):
         resp = await c.put(
             f"{s.rag_api_url}/content-intel/patterns/{pattern_id}",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -135,7 +136,7 @@ async def delete_pattern(pattern_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/content-intel/patterns/{pattern_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -156,7 +157,7 @@ async def get_sitemap(domain: str = None, asset_id: str = None):
         resp = await c.get(
             f"{s.rag_api_url}/content-intel/sitemap",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -173,7 +174,7 @@ async def export_sitemap_urls(domain: str = None, asset_id: str = None):
         resp = await c.get(
             f"{s.rag_api_url}/content-intel/sitemap/export/urls",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -193,7 +194,7 @@ async def generate_wordlist(request: Request):
         resp = await c.post(
             f"{s.rag_api_url}/wordlists/generate",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -229,7 +230,7 @@ async def generate_credential_guesses(req: CredentialGuessReq):
         resp = await c.get(
             f"{s.rag_api_url}/content-extractions",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -309,7 +310,7 @@ Respond ONLY with valid JSON in this exact format:
             async with httpx.AsyncClient(verify=False, timeout=5) as c:
                 r = await c.get(
                     f"{s.rag_api_url}/settings/ollama_active_model",
-                    headers={"x-api-key": s.api_key},
+                    headers={"x-api-key": s.api_key, **engagement_headers()},
                 )
                 if r.status_code == 200:
                     m = r.json().get("value")

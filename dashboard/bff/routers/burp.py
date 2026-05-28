@@ -3,6 +3,7 @@
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter()
@@ -155,7 +156,7 @@ async def import_burp_results(task_id: str):
         async with httpx.AsyncClient(verify=False, timeout=60) as c:
             for finding in findings:
                 try:
-                    resp = await c.post(f"{s.rag_api_url}/findings/web", json=finding, headers={"x-api-key": s.api_key})
+                    resp = await c.post(f"{s.rag_api_url}/findings/web", json=finding, headers={"x-api-key": s.api_key, **engagement_headers()})
                     if resp.status_code < 300:
                         imported += 1
                 except Exception:
@@ -172,7 +173,7 @@ async def _get_burp_proxy_url() -> str:
     s = get_settings()
     try:
         async with httpx.AsyncClient(verify=False, timeout=3) as c:
-            resp = await c.get(f"{s.rag_api_url}/settings/config/burp_proxy_url", headers={"x-api-key": s.api_key})
+            resp = await c.get(f"{s.rag_api_url}/settings/config/burp_proxy_url", headers={"x-api-key": s.api_key, **engagement_headers()})
             if resp.status_code == 200:
                 return safe_json(resp).get("value") or s.burp_proxy_url
     except Exception:
@@ -231,7 +232,7 @@ async def configure_burp_proxy(request: Request):
     if node_id:
         try:
             async with httpx.AsyncClient(verify=False, timeout=5) as c:
-                resp = await c.get(f"{s.tunnel_manager_url}/nodes/{node_id}", headers={"x-api-key": s.api_key})
+                resp = await c.get(f"{s.tunnel_manager_url}/nodes/{node_id}", headers={"x-api-key": s.api_key, **engagement_headers()})
                 if resp.status_code == 200:
                     node = resp.json()
                     # For external Burp: use docker_host_ip from request or DB setting
@@ -240,7 +241,7 @@ async def configure_burp_proxy(request: Request):
                     if not docker_host_ip:
                         try:
                             async with httpx.AsyncClient(verify=False, timeout=3) as c2:
-                                r2 = await c2.get(f"{s.rag_api_url}/settings/config/docker_host_ip", headers={"x-api-key": s.api_key})
+                                r2 = await c2.get(f"{s.rag_api_url}/settings/config/docker_host_ip", headers={"x-api-key": s.api_key, **engagement_headers()})
                                 if r2.status_code == 200:
                                     docker_host_ip = r2.json().get("value")
                         except Exception:
@@ -296,7 +297,7 @@ async def add_to_burp_queue(request: Request):
         resp = await c.post(
             f"{s.rag_api_url}/burp-queue",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -311,7 +312,7 @@ async def list_burp_queue(
         resp = await c.get(
             f"{s.rag_api_url}/burp-queue",
             params={"status": status, "limit": limit},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -322,7 +323,7 @@ async def burp_queue_stats():
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.get(
             f"{s.rag_api_url}/burp-queue/stats",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -334,7 +335,7 @@ async def update_burp_queue_item(item_id: str, status: str = Query(...)):
         resp = await c.patch(
             f"{s.rag_api_url}/burp-queue/{item_id}",
             params={"status": status},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -347,7 +348,7 @@ async def bulk_mark_imported(request: Request):
         resp = await c.post(
             f"{s.rag_api_url}/burp-queue/mark-imported",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -358,6 +359,6 @@ async def delete_burp_queue_item(item_id: str):
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/burp-queue/{item_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)

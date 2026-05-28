@@ -3,6 +3,7 @@ import httpx
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter()
@@ -20,7 +21,7 @@ async def list_engagements(status: Optional[str] = Query(None)):
         resp = await c.get(
             f"{s.rag_api_url}/engagements",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -31,7 +32,7 @@ async def get_engagement(eid: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/engagements/{eid}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -56,7 +57,7 @@ async def create_engagement(body: EngagementBody):
         resp = await c.post(
             f"{s.rag_api_url}/engagements",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -81,7 +82,7 @@ async def update_engagement(eid: str, body: EngagementUpdateBody):
         resp = await c.put(
             f"{s.rag_api_url}/engagements/{eid}",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -92,7 +93,7 @@ async def delete_engagement(eid: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/engagements/{eid}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -122,7 +123,7 @@ async def create_campaign_event(eid: str, body: CampaignEventBody):
         resp = await c.post(
             f"{s.rag_api_url}/engagements/{eid}/campaign-events",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -137,7 +138,7 @@ async def list_campaign_events(eid: str, kill_chain_phase: Optional[str] = Query
         resp = await c.get(
             f"{s.rag_api_url}/engagements/{eid}/campaign-events",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -161,7 +162,7 @@ async def update_campaign_event(event_id: str, body: CampaignEventUpdateBody):
         resp = await c.put(
             f"{s.rag_api_url}/campaign-events/{event_id}",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -172,7 +173,7 @@ async def delete_campaign_event(event_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/campaign-events/{event_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -183,7 +184,7 @@ async def campaign_summary(eid: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/engagements/{eid}/campaign-summary",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -195,7 +196,7 @@ async def list_engagement_scopes(eid: str):
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/engagements/{eid}/scopes",
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -205,7 +206,7 @@ async def get_engagement_scope(eid: str, scope_name: str, limit: int = Query(500
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/engagements/{eid}/scopes/{scope_name}",
                            params={"limit": limit},
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -220,7 +221,7 @@ async def add_scope_targets(eid: str, scope_name: str, body: ScopeTargetsBody):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.post(f"{s.rag_api_url}/engagements/{eid}/scopes/{scope_name}/targets",
                             json=body.dict(),
-                            headers={"x-api-key": s.api_key})
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -229,7 +230,7 @@ async def delete_scope(eid: str, scope_name: str):
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.delete(f"{s.rag_api_url}/engagements/{eid}/scopes/{scope_name}",
-                              headers={"x-api-key": s.api_key})
+                              headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -243,7 +244,7 @@ async def rename_scope(eid: str, scope_name: str, body: ScopeRenameBody):
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.put(f"{s.rag_api_url}/engagements/{eid}/scopes/{scope_name}",
                            json=body.dict(),
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -259,7 +260,7 @@ async def move_scope_targets(eid: str, scope_name: str, body: MoveTargetsBody):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.post(f"{s.rag_api_url}/engagements/{eid}/scopes/{scope_name}/move",
                             json=body.dict(),
-                            headers={"x-api-key": s.api_key})
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -273,5 +274,5 @@ async def move_entire_scope(eid: str, scope_name: str, body: MoveScopeBody):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.post(f"{s.rag_api_url}/engagements/{eid}/scopes/{scope_name}/move-all",
                             json=body.dict(),
-                            headers={"x-api-key": s.api_key})
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
