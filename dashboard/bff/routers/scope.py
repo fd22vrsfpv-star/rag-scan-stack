@@ -3,6 +3,7 @@ import httpx
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter()
@@ -14,7 +15,7 @@ async def list_scope_names():
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/scope/names",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -29,7 +30,7 @@ async def get_scope(
         resp = await c.get(
             f"{s.rag_api_url}/scope",
             params={"name": name, "limit": limit},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -46,7 +47,7 @@ async def add_to_scope(body: AddToScopeBody):
         resp = await c.post(
             f"{s.rag_api_url}/scope/add",
             json=body.model_dump(),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -64,7 +65,7 @@ async def remove_from_scope(body: RemoveFromScopeBody):
             "DELETE",
             f"{s.rag_api_url}/scope/targets",
             json=body.model_dump(),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -77,7 +78,7 @@ async def move_scope_targets(request: Request):
         resp = await c.post(
             f"{s.rag_api_url}/scope/move",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -88,7 +89,7 @@ async def cleanup_unknown_scope():
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.post(
             f"{s.rag_api_url}/scope/cleanup-unknown",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -99,7 +100,7 @@ async def auto_assign_unknown():
     async with httpx.AsyncClient(verify=False, timeout=120) as c:
         resp = await c.post(
             f"{s.rag_api_url}/scope/auto-assign-unknown",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -116,7 +117,7 @@ async def exclude_from_scope(body: ExcludeBody):
         resp = await c.post(
             f"{s.rag_api_url}/scope/exclude",
             json=body.model_dump(),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -129,7 +130,7 @@ async def remove_exclusion(body: RemoveFromScopeBody):
             "DELETE",
             f"{s.rag_api_url}/scope/exclude",
             json={"targets": body.targets},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -140,6 +141,6 @@ async def list_excluded():
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/scope/excluded",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)

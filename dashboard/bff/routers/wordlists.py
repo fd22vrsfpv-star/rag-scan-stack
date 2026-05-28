@@ -1,6 +1,7 @@
 import httpx
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter()
@@ -12,7 +13,7 @@ async def list_wordlists():
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/wordlists",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -32,7 +33,7 @@ async def upload_wordlist(file: UploadFile = File(...), list_type: str = "passwo
             f"{s.rag_api_url}/wordlists/upload",
             files=files,
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -45,7 +46,7 @@ async def delete_wordlist(wordlist_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/wordlists/{wordlist_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)

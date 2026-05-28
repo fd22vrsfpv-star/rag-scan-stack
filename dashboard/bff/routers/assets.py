@@ -5,6 +5,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Query, Request, HTTPException
 from pydantic import BaseModel
 from config import get_settings
+from engagement import engagement_headers
 from polling import register_job
 from utils import safe_json
 
@@ -21,7 +22,7 @@ async def create_credential(request: Request):
         resp = await c.post(
             f"{s.rag_api_url}/credentials",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -32,7 +33,7 @@ async def delete_credential(cid: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/credentials/{cid}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -53,7 +54,7 @@ async def list_all_credentials(
         resp = await c.get(
             f"{s.rag_api_url}/credentials",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -65,7 +66,7 @@ async def list_assets(limit: int = Query(100, le=5000)):
         resp = await c.get(
             f"{s.rag_api_url}/assets",
             params={"limit": limit},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -79,7 +80,7 @@ async def purge_by_pattern(request: Request):
             "DELETE",
             f"{s.rag_api_url}/purge/pattern",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -93,7 +94,7 @@ async def delete_assets(request: Request):
             "DELETE",
             f"{s.rag_api_url}/assets",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -105,7 +106,7 @@ async def purge_target_domain(domain: str, dry_run: bool = Query(False)):
         resp = await c.delete(
             f"{s.rag_api_url}/targets/{domain}",
             params={"dry_run": str(dry_run).lower()},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             from fastapi import HTTPException
@@ -120,7 +121,7 @@ async def asset_ports(ip: str, limit: int = Query(200, le=5000)):
         resp = await c.get(
             f"{s.rag_api_url}/ports/open",
             params={"ip": ip, "limit": limit},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -132,7 +133,7 @@ async def asset_vulns(ip: str, limit: int = Query(200, le=5000)):
         resp = await c.get(
             f"{s.rag_api_url}/vulns",
             params={"ip": ip, "limit": limit},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -147,7 +148,7 @@ async def recon_subdomains(domain: str = Query(None), limit: int = Query(500, le
         resp = await c.get(
             f"{s.rag_api_url}/recon/subdomains",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -161,7 +162,7 @@ async def delete_subdomains(request: Request):
             "DELETE",
             f"{s.rag_api_url}/recon/subdomains",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -172,7 +173,7 @@ async def asset_credentials(ip: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/assets/{ip}/credentials",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -185,7 +186,7 @@ async def update_credential_status(cid: str, request: Request):
         resp = await c.patch(
             f"{s.rag_api_url}/credential-findings/{cid}/status",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -208,7 +209,7 @@ async def detected_software(
         resp = await c.get(
             f"{s.rag_api_url}/software",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -217,7 +218,7 @@ async def detected_software(
 async def get_cve_tuning():
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
-        resp = await c.get(f"{s.rag_api_url}/software/cve-tuning", headers={"x-api-key": s.api_key})
+        resp = await c.get(f"{s.rag_api_url}/software/cve-tuning", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -226,7 +227,7 @@ async def update_cve_tuning(request: Request):
     s = get_settings()
     body = await request.json()
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
-        resp = await c.put(f"{s.rag_api_url}/software/cve-tuning", json=body, headers={"x-api-key": s.api_key})
+        resp = await c.put(f"{s.rag_api_url}/software/cve-tuning", json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -238,7 +239,7 @@ async def bulk_dismiss_software(request: Request):
         resp = await c.post(
             f"{s.rag_api_url}/software/bulk-dismiss",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             from fastapi import HTTPException
@@ -254,7 +255,7 @@ async def software_searchsploit(product: str, version: str = "", target_version:
         resp = await c.get(
             f"{s.rag_api_url}/software/searchsploit",
             params={"product": product, "version": version, "target_version": target_version, "analyze": str(analyze).lower(), "limit": limit},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -266,7 +267,7 @@ async def software_research_cache(product: str, version: str = ""):
         resp = await c.get(
             f"{s.rag_api_url}/software/research-cache",
             params={"product": product, "version": version},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -280,7 +281,7 @@ async def software_bulk_check(request: Request):
         body = {}
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.post(f"{s.rag_api_url}/software/bulk-check",
-                            json=body, headers={"x-api-key": s.api_key})
+                            json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text[:500])
         try:
@@ -313,7 +314,7 @@ async def software_bulk_check_status():
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/bulk-check/status",
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
         data = resp.json()
 
     # Sync BFF job status with rag-api bulk check status
@@ -338,7 +339,7 @@ async def software_bulk_check_cancel():
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.post(f"{s.rag_api_url}/software/bulk-check/cancel",
-                            headers={"x-api-key": s.api_key})
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -348,7 +349,7 @@ async def software_cve_decision(request: Request):
     body = await request.json()
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.post(f"{s.rag_api_url}/software/cve-decision",
-                            json=body, headers={"x-api-key": s.api_key})
+                            json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -358,7 +359,7 @@ async def get_cve_decisions(product: str, version: str):
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/cve-decisions",
                            params={"product": product, "version": version},
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -368,7 +369,7 @@ async def clear_research_cache(product: str, version: str = ""):
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.delete(f"{s.rag_api_url}/software/research-cache",
                               params={"product": product, "version": version},
-                              headers={"x-api-key": s.api_key})
+                              headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -377,7 +378,7 @@ async def backfill_followup_refs():
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.post(f"{s.rag_api_url}/software/backfill-refs",
-                            headers={"x-api-key": s.api_key})
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -396,7 +397,7 @@ async def software_llm_debug(product: str, version: str = ""):
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/llm-debug",
                            params={"product": product, "version": version},
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -406,7 +407,7 @@ async def get_release_date(product: str, version: str):
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/release-date",
                            params={"product": product, "version": version},
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -416,7 +417,7 @@ async def set_release_date(request: Request):
     body = await request.json()
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.put(f"{s.rag_api_url}/software/release-date",
-                           json=body, headers={"x-api-key": s.api_key})
+                           json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -425,7 +426,7 @@ async def list_ddg_jobs():
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/ddg-jobs",
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -433,7 +434,7 @@ async def list_ddg_jobs():
 async def list_vendor_pages():
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
-        resp = await c.get(f"{s.rag_api_url}/software/vendor-pages", headers={"x-api-key": s.api_key})
+        resp = await c.get(f"{s.rag_api_url}/software/vendor-pages", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -442,7 +443,7 @@ async def save_vendor_page(request: Request):
     s = get_settings()
     body = await request.json()
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
-        resp = await c.put(f"{s.rag_api_url}/software/vendor-pages", json=body, headers={"x-api-key": s.api_key})
+        resp = await c.put(f"{s.rag_api_url}/software/vendor-pages", json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -450,7 +451,7 @@ async def save_vendor_page(request: Request):
 async def delete_vendor_page(keyword: str):
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
-        resp = await c.delete(f"{s.rag_api_url}/software/vendor-pages/{keyword}", headers={"x-api-key": s.api_key})
+        resp = await c.delete(f"{s.rag_api_url}/software/vendor-pages/{keyword}", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -460,7 +461,7 @@ async def scan_manual_urls(request: Request):
     body = await request.json()
     async with httpx.AsyncClient(verify=False, timeout=120) as c:
         resp = await c.post(f"{s.rag_api_url}/software/scan-urls",
-                            json=body, headers={"x-api-key": s.api_key})
+                            json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -470,7 +471,7 @@ async def get_deep_search_cache(product: str, version: str):
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/deep-search-cache",
                            params={"product": product, "version": version},
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -480,7 +481,7 @@ async def cve_deep_search(request: Request):
     body = await request.json()
     async with httpx.AsyncClient(verify=False, timeout=120) as c:
         resp = await c.post(f"{s.rag_api_url}/software/cve-deep-search",
-                            json=body, headers={"x-api-key": s.api_key})
+                            json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -489,7 +490,7 @@ async def get_cve_prompt():
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/cve-prompt",
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -499,7 +500,7 @@ async def update_cve_prompt(request: Request):
     body = await request.json()
     async with httpx.AsyncClient(verify=False, timeout=10) as c:
         resp = await c.put(f"{s.rag_api_url}/software/cve-prompt",
-                           json=body, headers={"x-api-key": s.api_key})
+                           json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -511,7 +512,7 @@ async def software_ddg_search_raw(query: str = Query(...), max_results: int = Qu
         resp = await c.get(
             f"{s.rag_api_url}/software/ddg-search-raw",
             params={"query": query, "max_results": max_results},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -523,7 +524,7 @@ async def software_ddg_search(product: str, version: str = "", force: bool = Fal
         resp = await c.get(
             f"{s.rag_api_url}/software/ddg-search",
             params={"product": product, "version": version, "force": str(force).lower()},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text[:500])
@@ -539,7 +540,7 @@ async def software_ddg_search_status(job_id: str):
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/software/ddg-search/{job_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text[:500])
@@ -564,7 +565,7 @@ async def list_scan_recommendations(
             resp = await c.get(
                 f"{s.rag_api_url}/scan-recommendations",
                 params=params,
-                headers={"x-api-key": s.api_key},
+                headers={"x-api-key": s.api_key, **engagement_headers()},
             )
             if resp.status_code == 200:
                 return safe_json(resp)
@@ -572,7 +573,7 @@ async def list_scan_recommendations(
             resp2 = await c.get(
                 f"{s.scan_recommender_url}/recommendations",
                 params=params,
-                headers={"x-api-key": s.api_key},
+                headers={"x-api-key": s.api_key, **engagement_headers()},
             )
             if resp2.status_code == 200:
                 return resp2.json()
@@ -595,7 +596,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
     Updates recommendation status to 'running' then 'completed' or 'failed'.
     """
     s = get_settings()
-    headers = {"x-api-key": s.api_key, "Content-Type": "application/json"}
+    headers = {"x-api-key": s.api_key, "Content-Type": "application/json", **engagement_headers()}
     results = []
 
     # Fetch the full recommendation details
@@ -924,7 +925,7 @@ TOOL_INSTALL_MAP = {
 async def check_tools_on_node(body: ToolCheckRequest):
     """Check which tools are installed on Kali container or remote node."""
     s = get_settings()
-    headers = {"x-api-key": s.api_key, "Content-Type": "application/json"}
+    headers = {"x-api-key": s.api_key, "Content-Type": "application/json", **engagement_headers()}
 
     # Internal Kali container — use /tools/allowed endpoint
     if body.node_id in ("kali-local", "kali", "internal"):
@@ -980,7 +981,7 @@ async def check_tools_on_node(body: ToolCheckRequest):
 async def install_tools_on_node(body: ToolInstallRequest):
     """Install missing tools on a remote node via SSH."""
     s = get_settings()
-    headers = {"x-api-key": s.api_key, "Content-Type": "application/json"}
+    headers = {"x-api-key": s.api_key, "Content-Type": "application/json", **engagement_headers()}
     results = []
 
     async with httpx.AsyncClient(verify=False, timeout=120) as client:
@@ -1039,7 +1040,7 @@ async def port_recommendations(
         resp = await c.get(
             f"{s.scan_recommender_url}/next_scan",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -1060,6 +1061,6 @@ async def get_vulnx_findings(
         resp = await c.get(
             f"{s.rag_api_url}/software/vulnx-findings",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)

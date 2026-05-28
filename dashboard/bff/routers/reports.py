@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from config import get_settings
+from engagement import engagement_headers
 from services.report_renderer import render_pdf
 import io
 from utils import safe_json
@@ -21,7 +22,7 @@ async def report_summary(session_id: Optional[str] = None):
         resp = await c.get(
             f"{s.autogen_url}/reports/summary",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -49,7 +50,7 @@ async def report_full(
             resp = await c.get(
                 f"{s.autogen_url}/reports/full",
                 params=params,
-                headers={"x-api-key": s.api_key},
+                headers={"x-api-key": s.api_key, **engagement_headers()},
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -68,7 +69,7 @@ async def report_full(
         resp2 = await c.get(
             f"{s.rag_api_url}/findings/search",
             params=findings_params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp2.status_code == 200:
             findings_data = resp2.json()
@@ -208,7 +209,7 @@ async def export_pdf(req: ExportRequest):
         resp = await c.get(
             f"{s.rag_api_url}/findings/search",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code == 200:
             findings_data = resp.json()
@@ -221,7 +222,7 @@ async def export_pdf(req: ExportRequest):
             resp2 = await c.get(
                 f"{s.autogen_url}/reports/summary",
                 params=summary_params,
-                headers={"x-api-key": s.api_key},
+                headers={"x-api-key": s.api_key, **engagement_headers()},
             )
             if resp2.status_code == 200:
                 summary_data = resp2.json()
@@ -272,7 +273,7 @@ async def export_burp(req: ExportRequest):
         resp = await c.get(
             f"{s.rag_api_url}/export/burp",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -303,7 +304,7 @@ async def export_har(request: Request):
         resp = await c.get(
             f"{s.rag_api_url}/export/har",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -320,7 +321,7 @@ async def proxy_replay_status():
     """Get proxy replay progress."""
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=5) as c:
-        resp = await c.get(f"{s.rag_api_url}/export/proxy-replay/status", headers={"x-api-key": s.api_key})
+        resp = await c.get(f"{s.rag_api_url}/export/proxy-replay/status", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -333,7 +334,7 @@ async def proxy_replay(request: Request):
         resp = await c.post(
             f"{s.rag_api_url}/export/proxy-replay",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -357,7 +358,7 @@ async def export_zap_report(request: Request):
         resp = await c.get(
             f"{s.rag_api_url}/export/zap-report",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -386,7 +387,7 @@ async def sarif_export(
         resp = await c.get(
             f"{s.rag_api_url}/export/sarif",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)

@@ -10,6 +10,7 @@ import tempfile
 import logging
 from pathlib import Path
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter()
@@ -61,7 +62,7 @@ async def maintenance_stats():
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/maintenance/stats",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -232,7 +233,7 @@ async def cleanup_category(
         resp = await c.post(
             f"{s.rag_api_url}/cleanup/{category}",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -248,7 +249,7 @@ async def followups_bulk_update(body: dict):
         resp = await c.post(
             f"{s.rag_api_url}/followups/bulk-update",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -389,7 +390,7 @@ async def export_data(
             resp = await c.get(
                 f"{s.rag_api_url}/export/data",
                 params={"format": format, "categories": categories},
-                headers={"x-api-key": s.api_key},
+                headers={"x-api-key": s.api_key, **engagement_headers()},
             )
             if resp.status_code >= 400:
                 raise HTTPException(resp.status_code, resp.text)
@@ -407,7 +408,7 @@ async def export_data(
         resp = await c.get(
             f"{s.rag_api_url}/export/data",
             params={"format": "json", "categories": categories},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -480,7 +481,7 @@ async def import_data(file: UploadFile = File(...)):
             resp = await c.post(
                 f"{s.rag_api_url}/import/data",
                 files={"file": (file.filename or "import.json", content, "application/json")},
-                headers={"x-api-key": s.api_key},
+                headers={"x-api-key": s.api_key, **engagement_headers()},
             )
             if resp.status_code >= 400:
                 raise HTTPException(resp.status_code, resp.text)
@@ -509,7 +510,7 @@ async def import_data(file: UploadFile = File(...)):
             resp = await c.post(
                 f"{s.rag_api_url}/import/data",
                 files={"file": ("data.json", data_bytes, "application/json")},
-                headers={"x-api-key": s.api_key},
+                headers={"x-api-key": s.api_key, **engagement_headers()},
             )
             if resp.status_code < 400:
                 result["db_import"] = resp.json()

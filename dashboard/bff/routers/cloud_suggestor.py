@@ -3,6 +3,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter()
@@ -14,7 +15,7 @@ async def cloud_posture():
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/cloud/posture",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -39,7 +40,7 @@ async def cloud_recommendations(
         resp = await c.get(
             f"{s.rag_api_url}/cloud/recommendations",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -50,7 +51,7 @@ async def cloud_refresh():
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.post(
             f"{s.rag_api_url}/cloud/recommendations/refresh",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -66,7 +67,7 @@ async def cloud_recommendation_update(rec_id: str, body: RecStatusUpdate):
         resp = await c.patch(
             f"{s.rag_api_url}/cloud/recommendations/{rec_id}",
             params={"status": body.status},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -98,7 +99,7 @@ async def cloud_triage_run(
         resp = await c.post(
             f"{s.rag_api_url}/cloud/triage/run",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -120,7 +121,7 @@ async def cloud_triage_latest(
         resp = await c.get(
             f"{s.rag_api_url}/cloud/triage/latest",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -143,7 +144,7 @@ async def cloud_tenants(
         resp = await c.get(
             f"{s.rag_api_url}/cloud-tenants",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)

@@ -4,8 +4,29 @@ Scan Audit Writer — thread-safe JSONL audit log for Splunk ingestion.
 Every scan event (start, complete, fail) is appended as a single JSON line
 to AUDIT_FILE (default /scan_audit/audit.jsonl).  The file is safe to tail,
 ship via Splunk Universal Forwarder, or parse with jq.
+
+Cross-engagement isolation (Option B / Phase 5):
+    Each scanner runner should register an HTTP middleware that captures
+    `X-Engagement-Id` from incoming scan-launch requests and sets the
+    `current_engagement_id` ContextVar exported by this module.  Then every
+    `write_audit()` inside that request's call stack will pick the
+    engagement up automatically -- no per-call-site change required.
+
+    Example (one of the scanner runners)::
+
+        from audit_writer import current_engagement_id
+
+        @app.middleware("http")
+        async def _capture_engagement(request, call_next):
+            eid = request.headers.get("x-engagement-id")
+            token = current_engagement_id.set(eid or None)
+            try:
+                return await call_next(request)
+            finally:
+                current_engagement_id.reset(token)
 """
 
+import contextvars
 import json
 import os
 import socket
@@ -15,6 +36,13 @@ from datetime import datetime, timezone
 
 _lock = threading.Lock()
 AUDIT_FILE = os.environ.get("AUDIT_FILE", "/scan_audit/audit.jsonl")
+
+# Per-request engagement context.  Set by a middleware in each scanner
+# runner (see module docstring); read here as the last-resort fallback
+# inside write_audit().  Default None = unscoped / legacy entry.
+current_engagement_id: contextvars.ContextVar = contextvars.ContextVar(
+    "current_engagement_id", default=None,
+)
 
 _external_ip_cache: dict = {"ip": None, "ts": 0}
 
@@ -62,8 +90,16 @@ def write_audit(
         parameter so existing call sites that already include it keep
         working unchanged.
     """
-    # Resolve the canonical engagement_id from either input.
+    # Resolve the canonical engagement_id with explicit precedence:
+    #   1) data["engagement_id"]          (legacy explicit, highest)
+    #   2) engagement_id parameter        (new explicit)
+    #   3) current_engagement_id contextvar (per-request middleware capture)
     eid = data.get("engagement_id", engagement_id)
+    if eid is None:
+        try:
+            eid = current_engagement_id.get()
+        except LookupError:
+            eid = None
 
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),

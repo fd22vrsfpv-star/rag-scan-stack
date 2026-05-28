@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter()
@@ -48,7 +49,7 @@ class RenderBody(BaseModel):
 
 def _headers() -> dict:
     s = get_settings()
-    return {"x-api-key": s.api_key} if s.api_key else {}
+    return {"x-api-key": s.api_key, **engagement_headers()} if s.api_key else engagement_headers()
 
 
 @router.get("/api/chat-presets")

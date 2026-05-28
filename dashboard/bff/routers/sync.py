@@ -3,6 +3,7 @@ import httpx
 import logging
 from fastapi import APIRouter, Query, Request
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter(prefix="/api/sync", tags=["sync"])
@@ -15,7 +16,7 @@ def _api(path: str) -> str:
 
 
 def _headers() -> dict:
-    return {"x-api-key": get_settings().api_key}
+    return {"x-api-key": get_settings().api_key, **engagement_headers()}
 
 
 @router.post("/register-node")

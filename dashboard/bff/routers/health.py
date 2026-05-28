@@ -5,6 +5,7 @@ from typing import Optional
 import httpx
 from fastapi import APIRouter, Query
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 TCP_SERVICES = {
@@ -69,7 +70,7 @@ async def health(bust: bool = False):
         url = getattr(settings, attr) + path
         try:
             async with httpx.AsyncClient(verify=False, timeout=2) as client:
-                resp = await client.get(url, headers={"x-api-key": settings.api_key})
+                resp = await client.get(url, headers={"x-api-key": settings.api_key, **engagement_headers()})
                 if name in RESPOND_ONLY:
                     results[name] = {"status": "healthy", "code": resp.status_code}
                 else:
@@ -180,7 +181,7 @@ async def health(bust: bool = False):
             async with httpx.AsyncClient(verify=False, timeout=3) as client:
                 resp = await client.get(
                     f"{settings.rag_api_url}/health/db-pool",
-                    headers={"x-api-key": settings.api_key},
+                    headers={"x-api-key": settings.api_key, **engagement_headers()},
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -274,7 +275,7 @@ async def db_pool_status():
         async with httpx.AsyncClient(verify=False, timeout=10) as c:
             resp = await c.get(
                 f"{s.rag_api_url}/health/db-pool",
-                headers={"x-api-key": s.api_key},
+                headers={"x-api-key": s.api_key, **engagement_headers()},
             )
             return safe_json(resp)
     except Exception as e:
@@ -291,7 +292,7 @@ async def llm_metrics(limit: int = 50, caller: str = None, model: str = None):
     if model: params["model"] = model
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(f"{s.rag_api_url}/metrics/models/requests",
-                           params=params, headers={"x-api-key": s.api_key})
+                           params=params, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -300,7 +301,7 @@ async def llm_summary(days: int = 7):
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(f"{s.rag_api_url}/metrics/llm/summary",
-                           params={"days": days}, headers={"x-api-key": s.api_key})
+                           params={"days": days}, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -469,7 +470,7 @@ async def diagnostics_recent_sessions(hours: int = Query(8, ge=1, le=72)):
         async with httpx.AsyncClient(verify=False, timeout=10) as client:
             resp = await client.get(
                 f"{settings.autogen_url}/pentest/sessions",
-                headers={"x-api-key": settings.api_key},
+                headers={"x-api-key": settings.api_key, **engagement_headers()},
             )
             if resp.status_code != 200:
                 log.warning(f"diagnostics_recent_sessions: autogen returned {resp.status_code}")
@@ -514,7 +515,7 @@ async def diagnostics_session_bundle(session_id: Optional[str] = None, hours: in
     If session_id is omitted, auto-selects the most recent session.
     """
     settings = get_settings()
-    req_headers = {"x-api-key": settings.api_key}
+    req_headers = {"x-api-key": settings.api_key, **engagement_headers()}
 
     # Auto-select most recent session if none specified
     if not session_id:
@@ -786,7 +787,7 @@ async def system_check():
             # Get table list from rag-api
             resp = await client.get(
                 f"{settings.rag_api_url}/health/database",
-                headers={"x-api-key": settings.api_key},
+                headers={"x-api-key": settings.api_key, **engagement_headers()},
             )
             if resp.status_code == 200:
                 db_data = resp.json()
@@ -839,7 +840,7 @@ async def system_check():
         async with httpx.AsyncClient(verify=False, timeout=10) as client:
             resp = await client.post(
                 f"{settings.rag_api_url}/health/sql/check-schema",
-                headers={"x-api-key": settings.api_key},
+                headers={"x-api-key": settings.api_key, **engagement_headers()},
                 json={
                     "tables": CRITICAL_TABLES,
                     "views": CRITICAL_VIEWS,
@@ -899,7 +900,7 @@ async def system_check():
         url = getattr(settings, attr, "") + path
         try:
             async with httpx.AsyncClient(verify=False, timeout=5) as client:
-                resp = await client.get(url, headers={"x-api-key": settings.api_key})
+                resp = await client.get(url, headers={"x-api-key": settings.api_key, **engagement_headers()})
                 svc_results[name] = {
                     "status": "pass" if resp.status_code == 200 else "warning",
                     "code": resp.status_code,
@@ -936,19 +937,19 @@ async def system_check():
     async def test_db_query():
         async with httpx.AsyncClient(verify=False, timeout=10) as c:
             r = await c.get(f"{settings.rag_api_url}/assets?limit=1",
-                            headers={"x-api-key": settings.api_key})
+                            headers={"x-api-key": settings.api_key, **engagement_headers()})
             return {"detail": f"Query returned {r.status_code}"}
 
     async def test_scan_recommender():
         async with httpx.AsyncClient(verify=False, timeout=10) as c:
             r = await c.get(f"{settings.scan_recommender_url}/recommendations?limit=1",
-                            headers={"x-api-key": settings.api_key})
+                            headers={"x-api-key": settings.api_key, **engagement_headers()})
             return {"detail": f"Recommendations endpoint: {r.status_code}"}
 
     async def test_webhook_delivery():
         async with httpx.AsyncClient(verify=False, timeout=10) as c:
             r = await c.get(f"{settings.rag_api_url}/webhooks",
-                            headers={"x-api-key": settings.api_key})
+                            headers={"x-api-key": settings.api_key, **engagement_headers()})
             count = len(r.json()) if r.status_code == 200 and isinstance(r.json(), list) else 0
             return {"detail": f"{count} webhooks registered"}
 
@@ -956,7 +957,7 @@ async def system_check():
         async with httpx.AsyncClient(verify=False, timeout=15) as c:
             r = await c.get(f"{settings.scan_recommender_url}/rag/search/enhanced",
                             params={"query": "test", "service": "http"},
-                            headers={"x-api-key": settings.api_key})
+                            headers={"x-api-key": settings.api_key, **engagement_headers()})
             return {"detail": f"Exploit search: {r.status_code}"}
 
     async def test_ollama():
@@ -1102,7 +1103,7 @@ async def system_check():
             # Check if running in WSL by probing kernel version
             try:
                 resp2 = await client.get(f"{settings.rag_api_url}/health/quick",
-                                         headers={"x-api-key": settings.api_key})
+                                         headers={"x-api-key": settings.api_key, **engagement_headers()})
             except Exception:
                 pass
 
@@ -1112,7 +1113,7 @@ async def system_check():
             async with httpx.AsyncClient(verify=False, timeout=5) as client:
                 r = await client.get(f"{settings.nmap_scanner_url}/logs",
                                      params={"search": "fallback", "limit": 5},
-                                     headers={"x-api-key": settings.api_key})
+                                     headers={"x-api-key": settings.api_key, **engagement_headers()})
                 if r.status_code == 200:
                     logs = r.json().get("logs", [])
                     if any("fallback" in (l.get("message", "")).lower() for l in logs):
@@ -1202,7 +1203,7 @@ async def system_check():
                 if r.status_code == 200:
                     # Try to detect WSL from uname
                     r2 = await client.get(f"{settings.rag_api_url}/health/quick",
-                                          headers={"x-api-key": settings.api_key})
+                                          headers={"x-api-key": settings.api_key, **engagement_headers()})
         except Exception:
             pass
 
@@ -1277,7 +1278,7 @@ async def system_fix():
             # Ask rag-api to apply schema (it has DB access)
             resp = await client.post(
                 f"{settings.rag_api_url}/health/sql/apply-schema",
-                headers={"x-api-key": settings.api_key},
+                headers={"x-api-key": settings.api_key, **engagement_headers()},
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -1483,7 +1484,7 @@ async def get_active_model():
         async with httpx.AsyncClient(verify=False, timeout=5) as client:
             resp = await client.get(
                 f"{settings.rag_api_url}/settings/config/ollama_active_model",
-                headers={"x-api-key": settings.api_key},
+                headers={"x-api-key": settings.api_key, **engagement_headers()},
             )
             if resp.status_code == 200:
                 return {"ok": True, "model": resp.json().get("value")}
@@ -1501,7 +1502,7 @@ async def set_active_model(body: ModelAction):
         async with httpx.AsyncClient(verify=False, timeout=5) as client:
             resp = await client.put(
                 f"{settings.rag_api_url}/settings/config/ollama_active_model",
-                headers={"x-api-key": settings.api_key, "Content-Type": "application/json"},
+                headers={"x-api-key": settings.api_key, "Content-Type": "application/json", **engagement_headers()},
                 json={"value": body.name},
             )
             if resp.status_code == 200:

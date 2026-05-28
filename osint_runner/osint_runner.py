@@ -485,6 +485,21 @@ def _run_tool_job(job_id: str, tool: str, cmd: list, targets_file: str, output_f
 
 app = FastAPI(title="OSINT Runner")
 
+# ── Engagement context (Option B / Phase 5) — see nmap_scanner for docs. ──
+try:
+    from audit_writer import current_engagement_id  # type: ignore
+
+    @app.middleware("http")
+    async def _capture_engagement_for_audit(request, call_next):
+        eid = request.headers.get("x-engagement-id") or request.headers.get("X-Engagement-Id")
+        token = current_engagement_id.set(eid or None)
+        try:
+            return await call_next(request)
+        finally:
+            current_engagement_id.reset(token)
+except ImportError:
+    pass
+
 
 @app.on_event("startup")
 async def startup_event():
