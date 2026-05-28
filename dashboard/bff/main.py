@@ -68,6 +68,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Pentest Dashboard BFF", lifespan=lifespan)
 
+# ── Engagement context (Option B / Phase 7 audit fix) ──
+# Captures `X-Engagement-Id` from every incoming request into a
+# request-scoped contextvar.  BFF routes that proxy to rag-api must spread
+# `engagement_headers()` into their outgoing httpx `headers={...}` so the
+# rag-api middleware sees the header and stamps INSERTs with the active
+# engagement.  Without this, scans launched via the dashboard would fall
+# through unstamped (engagement_id = NULL) -- exactly the gap caught in
+# the audit.
+from engagement import engagement_middleware  # noqa: E402
+app.middleware("http")(engagement_middleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

@@ -290,8 +290,16 @@ async def audit_log(
     scan_type: Optional[str] = Query(default=None),
     event: Optional[str] = Query(default=None),
     job_id: Optional[str] = Query(default=None),
+    engagement_id: Optional[str] = Query(default=None),
 ):
-    """Read and return scan audit log entries."""
+    """Read and return scan audit log entries.
+
+    When ``engagement_id`` is provided, only entries that explicitly carry
+    that engagement_id are returned -- legacy entries written before Phase 2
+    (no engagement_id field) are treated as unscoped and hidden when an
+    engagement is active.  This enforces the cross-engagement isolation
+    guarantee at the audit-log read path.
+    """
     if not AUDIT_LOG_PATH.exists():
         return {"entries": [], "total": 0}
     entries = []
@@ -310,6 +318,11 @@ async def audit_log(
                 if event and entry.get("event") != event:
                     continue
                 if job_id and entry.get("job_id") != job_id:
+                    continue
+                # Cross-engagement isolation filter (Phase 6).  Strict
+                # equality means legacy NULL entries are excluded when an
+                # engagement is active -- the safer default.
+                if engagement_id and entry.get("engagement_id") != engagement_id:
                     continue
                 entries.append(entry)
     except Exception as e:
