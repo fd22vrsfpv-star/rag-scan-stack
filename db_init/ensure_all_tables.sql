@@ -2998,15 +2998,31 @@ CREATE INDEX IF NOT EXISTS idx_news_items_all_cves_gin
 CREATE INDEX IF NOT EXISTS idx_news_items_kev
     ON public.news_items(kev_listed) WHERE kev_listed = true;
 
--- Insert default news sources (idempotent)
+-- Default news sources seeded on fresh install.  ON CONFLICT (url) DO
+-- NOTHING means existing installs aren't disturbed: only sources whose
+-- URLs aren't already in the DB get inserted on subsequent runs.
 INSERT INTO public.news_sources (name, url, parser, enabled)
 VALUES
-    ('CyberSecurityNews', 'https://www.cybersecuritynews.com/feed/', 'rss', true),
-    ('Bleeping Computer', 'https://www.bleepingcomputer.com/feed/', 'rss', true),
-    ('KrebsOnSecurity', 'https://krebsonsecurity.com/feed/', 'rss', true),
-    ('The Hacker News', 'https://thehackernews.com/feeds/posts/default', 'rss', true),
-    ('Dark Reading', 'https://www.darkreading.com/rss/all.xml', 'rss', true),
-    ('Security Week', 'https://www.securityweek.com/feed/', 'rss', true)
+    -- Tier 1: major news outlets
+    ('BleepingComputer',            'https://www.bleepingcomputer.com/feed/',                       'rss',  true),
+    ('Krebs on Security',           'https://krebsonsecurity.com/feed/',                            'rss',  true),
+    ('The Hacker News',             'https://feeds.feedburner.com/TheHackersNews',                  'rss',  true),
+    ('Dark Reading',                'https://www.darkreading.com/rss.xml',                          'rss',  true),
+    ('SecurityWeek',                'https://www.securityweek.com/feed/',                           'rss',  true),
+    ('CyberScoop',                  'https://cyberscoop.com/feed/',                                 'rss',  true),
+    ('CSO Online',                  'https://www.csoonline.com/index.rss',                          'rss',  true),
+    ('Cybersecurity Dive',          'https://www.cybersecuritydive.com/feeds/news/',                'rss',  true),
+    ('Help Net Security',           'https://www.helpnetsecurity.com/feed/',                        'rss',  true),
+    ('TechCrunch Security',         'https://techcrunch.com/category/security/feed/',               'rss',  true),
+    -- Tier 2: vendor / official advisories
+    ('CISA Alerts',                 'https://www.cisa.gov/cybersecurity-advisories/all.xml',        'rss',  true),
+    ('Microsoft MSRC',              'https://msrc.microsoft.com/blog/feed',                         'rss',  true),
+    ('GitHub Security Advisories',  'https://github.com/advisories.atom',                           'atom', true),
+    -- Tier 3: high-signal research / disclosures
+    ('Google Project Zero',         'https://googleprojectzero.blogspot.com/feeds/posts/default',   'atom', true),
+    ('PortSwigger Research',        'https://portswigger.net/research/rss',                         'rss',  true),
+    ('Assetnote Research',          'https://www.assetnote.io/feed.xml',                            'rss',  true),
+    ('watchTowr Labs',              'https://labs.watchtowr.com/rss/',                              'rss',  true)
 ON CONFLICT (url) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS public.news_runs (
