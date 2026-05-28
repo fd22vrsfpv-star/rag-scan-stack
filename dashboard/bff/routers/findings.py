@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter()
@@ -57,7 +58,7 @@ async def search_findings(
         resp = await c.get(
             f"{s.rag_api_url}/findings/search",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -68,7 +69,7 @@ async def delete_findings_bulk(request: Request):
     body = await request.json()
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.request("DELETE", f"{s.rag_api_url}/findings/bulk",
-                               json=body, headers={"x-api-key": s.api_key})
+                               json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -78,7 +79,7 @@ async def delete_recon_findings_bulk(request: Request):
     body = await request.json()
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.request("DELETE", f"{s.rag_api_url}/recon/findings/bulk",
-                               json=body, headers={"x-api-key": s.api_key})
+                               json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -121,7 +122,7 @@ async def search_recon(
         resp = await c.get(
             f"{s.rag_api_url}/recon/search",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -146,7 +147,7 @@ async def list_recon_domains(
         resp = await c.get(
             f"{s.rag_api_url}/recon/domains",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -157,7 +158,7 @@ async def get_domain_overview(domain: str):
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/recon/domains/{domain}/overview",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -166,7 +167,7 @@ async def get_domain_overview(domain: str):
 async def ports_summary():
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
-        resp = await c.get(f"{s.rag_api_url}/ports/summary", headers={"x-api-key": s.api_key})
+        resp = await c.get(f"{s.rag_api_url}/ports/summary", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -177,7 +178,7 @@ async def get_domain_sitemap(domain: str, limit: int = 2000):
         resp = await c.get(
             f"{s.rag_api_url}/recon/domains/{domain}/sitemap",
             params={"limit": limit},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -206,7 +207,7 @@ async def search_params(
         resp = await c.get(
             f"{s.rag_api_url}/params",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -225,7 +226,7 @@ async def params_summary(
         resp = await c.get(
             f"{s.rag_api_url}/params/summary",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -243,7 +244,7 @@ async def list_vulns(
         resp = await c.get(
             f"{s.rag_api_url}/vulns",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -254,7 +255,7 @@ async def get_recommendations():
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.get(
             f"{s.scan_recommender_url}/get_next_recommendations",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -277,7 +278,7 @@ async def update_finding_workflow(source: str, fid: str, body: WorkflowBody):
         resp = await c.patch(
             f"{s.rag_api_url}/findings/{source}/{fid}/workflow",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -296,7 +297,7 @@ async def add_comment(source: str, fid: str, body: CommentBody):
         resp = await c.post(
             f"{s.rag_api_url}/findings/{source}/{fid}/comments",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -307,7 +308,7 @@ async def get_activity(source: str, fid: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/findings/{source}/{fid}/activity",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -320,7 +321,7 @@ async def get_exploit_matches(source: str, fid: str):
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/findings/{source}/{fid}/exploit-matches",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -333,7 +334,7 @@ async def scope_intelligence(scope_name: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/scope/{scope_name}/intelligence",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -344,7 +345,7 @@ async def scope_analysis(scope_name: str):
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/scope/{scope_name}/analysis",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -388,7 +389,7 @@ async def update_finding_tags(source: str, fid: str, body: TagBody):
         resp = await c.patch(
             f"{s.rag_api_url}/findings/{source}/{fid}/tags",
             json=body.model_dump(),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -399,7 +400,7 @@ async def get_tag_suggestions():
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/tags/suggestions",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -430,7 +431,7 @@ async def get_screenshot_metadata(
         resp = await c.get(
             f"{s.rag_api_url}/screenshots/metadata",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -442,6 +443,6 @@ async def upsert_screenshot_metadata(body: ScreenshotMetaBody):
         resp = await c.patch(
             f"{s.rag_api_url}/screenshots/metadata",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)

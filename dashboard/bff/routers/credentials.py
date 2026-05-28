@@ -3,6 +3,7 @@ import httpx
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter()
@@ -34,7 +35,7 @@ async def create_credential(body: CredentialBody):
         resp = await c.post(
             f"{s.rag_api_url}/credential-vault",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -62,7 +63,7 @@ async def list_credentials(
         resp = await c.get(
             f"{s.rag_api_url}/credential-vault",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -85,7 +86,7 @@ async def update_credential(cid: str, body: CredentialUpdateBody):
         resp = await c.patch(
             f"{s.rag_api_url}/credential-vault/{cid}",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -96,7 +97,7 @@ async def delete_credential_vault(cid: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/credential-vault/{cid}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -108,7 +109,7 @@ async def credentials_expiring(minutes: int = Query(30)):
         resp = await c.get(
             f"{s.rag_api_url}/credential-vault/expiring",
             params={"minutes": minutes},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -138,7 +139,7 @@ async def vault_import_from_recon(body: VaultImportBody):
         resp = await c.post(
             f"{s.rag_api_url}/vault/import-from-recon",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -152,7 +153,7 @@ async def refresh_credential_expiry(cid: str, body: dict):
         resp = await c.patch(
             f"{s.rag_api_url}/credential-vault/{cid}/refresh-expiry",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -163,7 +164,7 @@ async def credential_cloud_summary():
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/credential-vault/cloud-summary",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -174,7 +175,7 @@ async def list_access_map(credential_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/credential-access-map/{credential_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -196,7 +197,7 @@ async def create_access_map(body: AccessMapBody):
         resp = await c.post(
             f"{s.rag_api_url}/credential-access-map",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -207,6 +208,6 @@ async def delete_access_map(map_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/credential-access-map/{map_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)

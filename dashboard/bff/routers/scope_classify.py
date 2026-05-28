@@ -4,6 +4,7 @@ from typing import Optional
 from fastapi import APIRouter, Request, Query
 import httpx
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter()
@@ -13,7 +14,7 @@ router = APIRouter()
 async def classify_target(target: str):
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
-        resp = await c.get(f"{s.rag_api_url}/scope/classify/{target}", headers={"x-api-key": s.api_key})
+        resp = await c.get(f"{s.rag_api_url}/scope/classify/{target}", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -26,7 +27,7 @@ async def classify_unknown(request: Request):
     except Exception:
         pass
     async with httpx.AsyncClient(verify=False, timeout=120) as c:
-        resp = await c.post(f"{s.rag_api_url}/scope/classify-unknown", json=body, headers={"x-api-key": s.api_key})
+        resp = await c.post(f"{s.rag_api_url}/scope/classify-unknown", json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -34,7 +35,7 @@ async def classify_unknown(request: Request):
 async def list_suggestions(status: str = Query("pending"), limit: int = Query(100)):
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
-        resp = await c.get(f"{s.rag_api_url}/scope/suggestions", params={"status": status, "limit": limit}, headers={"x-api-key": s.api_key})
+        resp = await c.get(f"{s.rag_api_url}/scope/suggestions", params={"status": status, "limit": limit}, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -42,7 +43,7 @@ async def list_suggestions(status: str = Query("pending"), limit: int = Query(10
 async def accept_suggestion(suggestion_id: str):
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
-        resp = await c.post(f"{s.rag_api_url}/scope/suggestions/{suggestion_id}/accept", headers={"x-api-key": s.api_key})
+        resp = await c.post(f"{s.rag_api_url}/scope/suggestions/{suggestion_id}/accept", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -55,7 +56,7 @@ async def reject_suggestion(suggestion_id: str, request: Request):
     except Exception:
         pass
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
-        resp = await c.post(f"{s.rag_api_url}/scope/suggestions/{suggestion_id}/reject", json=body, headers={"x-api-key": s.api_key})
+        resp = await c.post(f"{s.rag_api_url}/scope/suggestions/{suggestion_id}/reject", json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -64,7 +65,7 @@ async def bulk_accept(request: Request):
     s = get_settings()
     body = await request.json()
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
-        resp = await c.post(f"{s.rag_api_url}/scope/suggestions/bulk-accept", json=body, headers={"x-api-key": s.api_key})
+        resp = await c.post(f"{s.rag_api_url}/scope/suggestions/bulk-accept", json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -72,7 +73,7 @@ async def bulk_accept(request: Request):
 async def list_rules():
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
-        resp = await c.get(f"{s.rag_api_url}/scope/classification-rules", headers={"x-api-key": s.api_key})
+        resp = await c.get(f"{s.rag_api_url}/scope/classification-rules", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -81,7 +82,7 @@ async def create_rule(request: Request):
     s = get_settings()
     body = await request.json()
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
-        resp = await c.post(f"{s.rag_api_url}/scope/classification-rules", json=body, headers={"x-api-key": s.api_key})
+        resp = await c.post(f"{s.rag_api_url}/scope/classification-rules", json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -89,7 +90,7 @@ async def create_rule(request: Request):
 async def delete_rule(rule_id: str):
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
-        resp = await c.request("DELETE", f"{s.rag_api_url}/scope/classification-rules/{rule_id}", headers={"x-api-key": s.api_key})
+        resp = await c.request("DELETE", f"{s.rag_api_url}/scope/classification-rules/{rule_id}", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -97,7 +98,7 @@ async def delete_rule(rule_id: str):
 async def learn_rules():
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
-        resp = await c.post(f"{s.rag_api_url}/scope/rules/learn", headers={"x-api-key": s.api_key})
+        resp = await c.post(f"{s.rag_api_url}/scope/rules/learn", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -105,5 +106,5 @@ async def learn_rules():
 async def list_decisions(limit: int = Query(50)):
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
-        resp = await c.get(f"{s.rag_api_url}/scope/decisions", params={"limit": limit}, headers={"x-api-key": s.api_key})
+        resp = await c.get(f"{s.rag_api_url}/scope/decisions", params={"limit": limit}, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)

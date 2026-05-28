@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 from services.ollama_chat import stream_chat
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 log = logging.getLogger("chat")
@@ -36,7 +37,7 @@ async def _resolve_llm_backend(settings) -> str:
     try:
         async with httpx.AsyncClient(verify=False, timeout=5) as c:
             resp = await c.get(f"{settings.rag_api_url}/settings/config/llm.backend",
-                               headers={"x-api-key": settings.api_key})
+                               headers={"x-api-key": settings.api_key, **engagement_headers()})
             if resp.status_code == 200:
                 val = resp.json().get("value", "").strip()
                 if val:
@@ -61,7 +62,7 @@ async def _resolve_llm_keys(settings, backend: str) -> dict:
         async with httpx.AsyncClient(verify=False, timeout=5) as c:
             for k in db_keys:
                 resp = await c.get(f"{settings.rag_api_url}/settings/config/{k}",
-                                   headers={"x-api-key": settings.api_key})
+                                   headers={"x-api-key": settings.api_key, **engagement_headers()})
                 if resp.status_code == 200:
                     val = resp.json().get("value", "")
                     if val:
