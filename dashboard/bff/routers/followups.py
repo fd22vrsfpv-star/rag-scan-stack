@@ -3,6 +3,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter()
@@ -55,7 +56,7 @@ async def follow_up_stats(engagement_id: Optional[str] = Query(None)):
         resp = await c.get(
             f"{s.rag_api_url}/follow-ups/stats",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -76,7 +77,7 @@ async def follow_up_group_ids(
     if engagement_id: params["engagement_id"] = engagement_id
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(f"{s.rag_api_url}/follow-ups/group-ids", params=params,
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -99,7 +100,7 @@ async def follow_ups_grouped(
         resp = await c.get(
             f"{s.rag_api_url}/follow-ups/grouped",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -139,7 +140,7 @@ async def list_follow_ups(
         resp = await c.get(
             f"{s.rag_api_url}/follow-ups",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -151,7 +152,7 @@ async def create_follow_up(body: FollowUpCreate):
         resp = await c.post(
             f"{s.rag_api_url}/follow-ups",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -165,7 +166,7 @@ async def update_follow_up(item_id: str, body: FollowUpUpdate):
         resp = await c.patch(
             f"{s.rag_api_url}/follow-ups/{item_id}",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -178,7 +179,7 @@ async def delete_follow_up(item_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/follow-ups/{item_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -192,7 +193,7 @@ async def submit_feedback(item_id: str, body: FeedbackBody):
         resp = await c.post(
             f"{s.rag_api_url}/follow-ups/{item_id}/feedback",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -209,7 +210,7 @@ async def bulk_update_followups(request: Request):
         resp = await c.post(
             f"{s.rag_api_url}/followups/bulk-update",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -229,7 +230,7 @@ async def trigger_agent_scan(body: AgentScanBody = AgentScanBody()):
         resp = await c.post(
             f"{s.rag_api_url}/agent/scan",
             json=body.model_dump(),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -240,7 +241,7 @@ async def list_agent_rules():
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/agent/rules",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -251,7 +252,7 @@ async def get_agent_rule(rule_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/agent/rules/{rule_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -265,7 +266,7 @@ async def toggle_agent_rule(rule_id: str, enabled: bool = Query(True)):
         resp = await c.patch(
             f"{s.rag_api_url}/agent/rules/{rule_id}",
             params={"enabled": enabled},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -276,7 +277,7 @@ async def reload_agent_rules():
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/agent/rules/reload",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -294,7 +295,7 @@ async def test_agent_rule(body: RuleTestBody):
         resp = await c.post(
             f"{s.rag_api_url}/agent/rules/test",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -311,7 +312,7 @@ async def create_adhoc_rule(body: AdhocRuleBody):
         resp = await c.post(
             f"{s.rag_api_url}/agent/rules/adhoc",
             json=body.model_dump(),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -324,7 +325,7 @@ async def delete_agent_rule(rule_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/agent/rules/{rule_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -337,6 +338,6 @@ async def agent_stats():
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/agent/stats",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)

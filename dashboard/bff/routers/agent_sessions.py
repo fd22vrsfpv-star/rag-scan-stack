@@ -3,6 +3,7 @@ import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter()
@@ -29,7 +30,7 @@ async def list_sessions():
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.get(
             f"{s.autogen_url}/pentest/sessions",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -43,7 +44,7 @@ async def start_session(req: StartSessionRequest):
         resp = await c.post(
             f"{s.autogen_url}/pentest",
             json=req.model_dump(),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -56,7 +57,7 @@ async def get_session(session_id: str):
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.get(
             f"{s.autogen_url}/pentest/{session_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -69,7 +70,7 @@ async def get_messages(session_id: str):
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.get(
             f"{s.autogen_url}/pentest/{session_id}/messages",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -82,7 +83,7 @@ async def stop_session(session_id: str):
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.post(
             f"{s.autogen_url}/pentest/{session_id}/stop",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -96,7 +97,7 @@ async def resume_session(session_id: str, req: ResumeRequest):
         resp = await c.post(
             f"{s.autogen_url}/pentest/{session_id}/resume",
             json=req.model_dump(),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -109,7 +110,7 @@ async def get_session_scans(session_id: str):
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.get(
             f"{s.autogen_url}/pentest/{session_id}/scans",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -123,7 +124,7 @@ async def delete_session(session_id: str):
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.delete(
             f"{s.autogen_url}/pentest/{session_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -137,7 +138,7 @@ async def clear_session_history():
     async with httpx.AsyncClient(verify=False, timeout=60) as c:
         resp = await c.post(
             f"{s.rag_api_url}/cleanup/sessions",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -152,7 +153,7 @@ async def list_agent_mcp_tools():
         async with httpx.AsyncClient(verify=False, timeout=15) as c:
             resp = await c.get(
                 f"{s.autogen_url}/pentest/mcp-tools",
-                headers={"x-api-key": s.api_key},
+                headers={"x-api-key": s.api_key, **engagement_headers()},
             )
             if resp.status_code >= 400:
                 return {"error": resp.text, "total_discovered": 0}

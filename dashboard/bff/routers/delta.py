@@ -2,6 +2,7 @@
 import httpx
 from fastapi import APIRouter, Query
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter(prefix="/api/delta", tags=["delta"])
@@ -13,7 +14,7 @@ def _api(path: str) -> str:
 
 
 def _headers() -> dict:
-    return {"x-api-key": get_settings().api_key}
+    return {"x-api-key": get_settings().api_key, **engagement_headers()}
 
 
 @router.get("/scan-runs")
