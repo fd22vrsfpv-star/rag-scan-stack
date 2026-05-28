@@ -320,6 +320,32 @@ def _resolve_engagement_id(explicit: Optional[str] = None) -> Optional[str]:
         return None
 
 
+def _outgoing_runner_headers(
+    extra: Optional[Dict[str, str]] = None,
+    engagement_id: Optional[str] = None,
+) -> Dict[str, str]:
+    """Build the headers dict for a rag-api → scanner_runner / scan_recommender
+    outgoing HTTP call.
+
+    Always includes ``x-api-key`` for inter-service auth.  Forwards
+    ``X-Engagement-Id`` from either the explicit ``engagement_id`` arg or the
+    request-scoped contextvar -- without this, the runner-side middleware
+    (added in Option B / Phase 5) sees no engagement header and the audit.jsonl
+    lines it writes come out with ``engagement_id: null``.
+
+    Pass ``extra`` for additional headers (e.g. ``Content-Type``).  Pass
+    ``engagement_id`` explicitly when calling from a context where the
+    contextvar may not be set reliably (e.g. some background-task chains).
+    """
+    headers: Dict[str, str] = {"x-api-key": API_KEY}
+    eid = _resolve_engagement_id(engagement_id)
+    if eid:
+        headers["X-Engagement-Id"] = eid
+    if extra:
+        headers.update(extra)
+    return headers
+
+
 # ── Rate limiting (per-IP) ──────────────────────────────────────
 # Default: 120 req/min global, configurable via RATE_LIMIT env (e.g. "60/minute").
 # Endpoints exempted: /health, /metrics. Set RATE_LIMIT="" to disable.
@@ -925,7 +951,14 @@ def masscan_nmap_upload(
         payload: Dict[str, Any] = {"targets": targets, "ports": ports, "rate": rate}
         if interface:
             payload["interface"] = interface
-        r = requests.post(f"{base}/jobs/masscan-then-nmap", json=payload, verify=False, timeout=3600)
+        # Synchronous handler: the request's contextvar is reliably set, so
+        # _outgoing_runner_headers() picks engagement_id up automatically.
+        r = requests.post(
+            f"{base}/jobs/masscan-then-nmap",
+            json=payload,
+            headers=_outgoing_runner_headers(),
+            verify=False, timeout=3600,
+        )
         r.raise_for_status()
         resp = r.json() if r.headers.get("content-type", "").startswith("application/json") else {"ok": True}
         ok = bool(resp.get("ok", True))
@@ -976,7 +1009,21 @@ def nmap_from_masscan(authorized: bool = Depends(auth), job_id: Optional[str] = 
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"failed to init job lifecycle: {type(e).__name__}: {e}")
     try:
-        r = requests.post(f"{base}/jobs/nmap-from-masscan", verify=False, timeout=600)
+        # Resolve engagement_id from the jobs row to forward to the runner.
+        _eid = None
+        try:
+            with get_db() as conn, conn.cursor() as cur:
+                cur.execute("SELECT engagement_id FROM jobs WHERE id=%s::uuid", (job_id,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    _eid = str(row[0])
+        except Exception:
+            pass
+        r = requests.post(
+            f"{base}/jobs/nmap-from-masscan",
+            headers=_outgoing_runner_headers(engagement_id=_eid),
+            verify=False, timeout=600,
+        )
         r.raise_for_status()
         payload = r.json() if r.headers.get("content-type","").startswith("application/json") else {"ok": True}
         ok = bool(payload.get("ok", True))
@@ -1575,8 +1622,21 @@ def _parse_targets_text(content: str, whitelist: Optional[List[str]], blacklist:
 
 def _create_nmap_tasks_from_recent(job_id: str, since_ts: datetime) -> int:
     base = os.environ.get("NMAP_SCANNER_URL", "https://nmap_scanner:8012")
+    _eid = None
     try:
-        r = requests.post(f"{base}/jobs/masscan-results-since/{since_ts.isoformat()}", verify=False)
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT engagement_id FROM jobs WHERE id=%s::uuid", (job_id,))
+            row = cur.fetchone()
+            if row and row[0]:
+                _eid = str(row[0])
+    except Exception:
+        pass
+    try:
+        r = requests.post(
+            f"{base}/jobs/masscan-results-since/{since_ts.isoformat()}",
+            headers=_outgoing_runner_headers(engagement_id=_eid),
+            verify=False,
+        )
         r.raise_for_status()
         results = r.json().get("results", [])
         with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -1603,6 +1663,17 @@ def _create_nmap_tasks_from_recent(job_id: str, since_ts: datetime) -> int:
 def _background_run_masscan_nmap(job_id: str, targets: List[str], ports: str, rate: int, interface: Optional[str]) -> None:
     base = os.environ.get("NMAP_SCANNER_URL", "https://nmap_scanner:8012")
     since_ts = datetime.now(timezone.utc)
+    # Resolve engagement_id from the jobs row we already stamped at launch.
+    # The contextvar isn't reliable in background tasks; DB lookup is.
+    _bg_eid: Optional[str] = None
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT engagement_id FROM jobs WHERE id=%s::uuid", (job_id,))
+            row = cur.fetchone()
+            if row and row[0]:
+                _bg_eid = str(row[0])
+    except Exception:
+        pass
     # transition job/tasks to running if queued
     try:
         with get_db() as conn, conn.cursor() as cur:
@@ -1626,7 +1697,12 @@ def _background_run_masscan_nmap(job_id: str, targets: List[str], ports: str, ra
         payload: Dict[str, Any] = {"targets": targets, "ports": ports, "rate": rate}
         if interface:
             payload["interface"] = interface
-        r = requests.post(f"{base}/jobs/masscan-then-nmap", json=payload, verify=False, timeout=3600)
+        r = requests.post(
+            f"{base}/jobs/masscan-then-nmap",
+            json=payload,
+            headers=_outgoing_runner_headers(engagement_id=_bg_eid),
+            verify=False, timeout=3600,
+        )
         r.raise_for_status()
         resp = r.json() if r.headers.get("content-type","").startswith("application/json") else {"ok": True}
         ok = bool(resp.get("ok", True))
@@ -1736,10 +1812,13 @@ def _trigger_recommendations_for(source: str, stats: dict = None):
                 if row.get("banner"):
                     params["banner"] = row["banner"]
                 try:
+                    # Worker runs inside copy_context() (see Thread spawn
+                    # below), so _outgoing_runner_headers() resolves the
+                    # engagement_id from the captured contextvar.
                     requests.get(
                         f"{scan_rec_url}/next_scan",
                         params=params,
-                        headers={"x-api-key": api_key},
+                        headers=_outgoing_runner_headers(),
                         timeout=60,
                         verify=False,
                     )
@@ -16815,7 +16894,7 @@ def send_to_pipeline(body: SendToPipelineRequest, _: bool = Depends(auth)):
             resp = requests.post(
                 f"{web_scanner_url}/scan",
                 json={"urls": urls, "source": "api-tester"},
-                headers={"x-api-key": API_KEY},
+                headers=_outgoing_runner_headers(),
                 timeout=15,
             )
             return {
