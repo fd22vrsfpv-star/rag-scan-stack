@@ -7,9 +7,10 @@ import os
 import re
 import json
 import logging
+import threading
 import uuid
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -44,6 +45,8 @@ ZAP_API_KEY = os.environ.get("ZAP_API_KEY", "changeme")
 ZAP_BASE_URL = f"http://{ZAP_ADDR}:{ZAP_PORT}"
 API_BASE = os.environ.get("API_BASE", "https://rag-api:8000")
 API_KEY = os.environ.get("API_KEY", "changeme")
+SCAN_RECOMMENDER_URL = os.environ.get("SCAN_RECOMMENDER_URL",
+                                      "https://scan-recommender:8013")
 WEBHOOK_ENABLED = os.environ.get("WEBHOOK_ENABLED", "true").lower() == "true"
 
 
@@ -191,6 +194,88 @@ def get_zap_alert_count(base_url: Optional[str] = None) -> int:
     return 0
 
 
+def _trigger_recommendations_from_zap(
+    unique_services: Set[Tuple[str, str, int]],
+) -> None:
+    """Fire-and-forget: call the local-LLM scan_recommender's /next_scan for
+    each unique (ip, scheme, port) ZAP just touched, skipping any service
+    that already has a recommendation persisted.
+
+    Runs in a daemon thread so it never blocks parse_zap_alerts' return.
+    Mirrors the central trigger in app/rag-api/api.py:_trigger_recommendations_for
+    -- ZAP findings are parsed in-process by web_scanner (not via an
+    /ingest/* endpoint), so this is the only point at which the recommender
+    can be triggered reactively for ZAP."""
+    if not unique_services:
+        return
+
+    def _worker() -> None:
+        ips = list({ip for (ip, _, _) in unique_services})
+        already_done: Set[Tuple[str, str]] = set()
+        try:
+            conn = psycopg2.connect(DB_DSN)
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("""
+                        SELECT host(ip)::text AS ip,
+                               COALESCE(service, '') AS service
+                        FROM public.scan_recommendations
+                        WHERE host(ip)::text = ANY(%s)
+                    """, (ips,))
+                    already_done = {
+                        (row["ip"], row["service"]) for row in cur.fetchall()
+                    }
+            finally:
+                conn.close()
+        except Exception as e:
+            # Non-fatal: worst case we make extra /next_scan calls and the
+            # recommender's ON CONFLICT DO NOTHING absorbs the duplicate.
+            logger.debug(f"[zap] dedup lookup failed, falling through: {e}")
+
+        dispatched = 0
+        for ip, scheme, port in unique_services:
+            if (ip, scheme) in already_done:
+                continue
+            try:
+                requests.get(
+                    f"{SCAN_RECOMMENDER_URL}/next_scan",
+                    params={
+                        "ip": ip,
+                        "service": scheme,
+                        "port": str(port),
+                        "persist": "true",
+                    },
+                    headers={"x-api-key": API_KEY},
+                    timeout=60,
+                    verify=False,
+                )
+                dispatched += 1
+            except Exception as e:
+                logger.debug(
+                    f"[zap] recommender call failed for {ip}:{port}/{scheme}: {e}"
+                )
+
+        if dispatched:
+            logger.info(
+                f"[zap] scan_recommender dispatched: {dispatched} new probe "
+                f"recommendation(s) from {len(unique_services)} unique service(s)"
+            )
+            # Surface this on the webhook bus so the OPSEC timeline and any
+            # external listeners see the reactive trigger as part of ingest.
+            try:
+                emit_webhook_event("recommendations_generated", "zap", {
+                    "source": "zap",
+                    "dispatched": dispatched,
+                    "unique_services_seen": len(unique_services),
+                })
+            except Exception:
+                pass
+
+    threading.Thread(
+        target=_worker, daemon=True, name="zap-reco-trigger",
+    ).start()
+
+
 def parse_zap_alerts(
     base_url: Optional[str] = None,
     batch_size: int = 100,
@@ -223,6 +308,9 @@ def parse_zap_alerts(
         "by_risk": {},
         "errors": []
     }
+    # (ip, scheme, port) tuples for every service ZAP touched. Used after the
+    # parse completes to trigger the local-LLM scan_recommender reactively.
+    unique_services: Set[Tuple[str, str, int]] = set()
 
     # Get total count
     total_count = get_zap_alert_count(base_url)
@@ -314,6 +402,16 @@ def parse_zap_alerts(
                     if ip:
                         # Try IP first
                         asset_id = get_asset_id_for_ip(cur, ip)
+                        # Track the (ip, scheme, port) this alert touched so we
+                        # can trigger the scan_recommender reactively at the
+                        # end of the parse run.
+                        try:
+                            parsed = urlparse(alert_url)
+                            scheme = (parsed.scheme or "http").lower()
+                            port = parsed.port or (443 if scheme == "https" else 80)
+                            unique_services.add((ip, scheme, port))
+                        except Exception:
+                            pass
                     else:
                         # Extract hostname if no IP found
                         from urllib.parse import urlparse
@@ -426,9 +524,17 @@ def parse_zap_alerts(
     logger.info(f"  Skipped (duplicate): {stats['skipped_duplicate']}")
     logger.info(f"  Skipped (false positive): {stats['skipped_false_positive']}")
     logger.info(f"  By Severity: {stats['by_severity']}")
+    logger.info(f"  Unique services touched: {len(unique_services)}")
     if stats["errors"]:
         logger.warning(f"  Errors: {len(stats['errors'])}")
     logger.info(f"{'=' * 60}\n")
+
+    # Fire the scan_recommender reactively for each service ZAP just touched.
+    # Fire-and-forget — does not block this function's return.
+    try:
+        _trigger_recommendations_from_zap(unique_services)
+    except Exception as e:
+        logger.warning(f"[zap] failed to spawn recommender trigger: {e}")
 
     return stats
 

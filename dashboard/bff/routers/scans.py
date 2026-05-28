@@ -11,8 +11,55 @@ log = logging.getLogger("scans")
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Query
 from pydantic import BaseModel
 from config import get_settings
+from engagement import engagement_headers
 from polling import register_job, active_jobs, _persist, pending_queue
 from timeouts import TIMEOUT_NORMAL, TIMEOUT_SCAN
+
+
+# ── "Cleared scans" deny-list (Bug 2 fix) ─────────────────────────────────
+# The original "Clear History" complaint: clicking it appeared to do
+# nothing because the BFF deletes from `active_jobs` but the audit.jsonl
+# merge re-injects the same job_ids on the next GET (audit log is
+# immutable by design).  Fix: maintain a persistent set of job_ids the
+# user has explicitly cleared, keyed by engagement.  list_scans filters
+# the audit-merge step by it; the audit log itself stays intact.
+_CLEARED_JOBS_PATH = pathlib.Path("/scan_results/.bff_cleared_jobs.json")
+
+
+def _cleared_key(engagement_id: Optional[str]) -> str:
+    """Storage key for the cleared-set dict.  None / empty → "_unscoped"."""
+    return engagement_id if engagement_id else "_unscoped"
+
+
+def _load_cleared_jobs() -> dict:
+    """Return the on-disk cleared dict as {key: set(job_id)}.  Returns
+    an empty dict if the file is missing or unreadable; never raises."""
+    if not _CLEARED_JOBS_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(_CLEARED_JOBS_PATH.read_text())
+        return {k: set(v) for k, v in raw.items() if isinstance(v, list)}
+    except Exception as e:
+        log.warning(f"Failed to load cleared-jobs file: {e}")
+        return {}
+
+
+def _save_cleared_jobs(data: dict) -> None:
+    """Persist the cleared-set dict atomically.  Sets are serialized as
+    sorted lists for deterministic on-disk format."""
+    serializable = {k: sorted(list(v)) for k, v in data.items()}
+    try:
+        _CLEARED_JOBS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CLEARED_JOBS_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(serializable, indent=2))
+        os.replace(tmp, _CLEARED_JOBS_PATH)
+    except Exception as e:
+        log.warning(f"Failed to persist cleared-jobs file: {e}")
+
+
+def _cleared_set_for(engagement_id: Optional[str]) -> set:
+    """Convenience: cleared job_ids for one engagement (or "_unscoped")."""
+    return _load_cleared_jobs().get(_cleared_key(engagement_id), set())
 
 router = APIRouter()
 
@@ -53,7 +100,7 @@ def _is_local_blocked() -> bool:
         import httpx as _hx
         s = get_settings()
         r = _hx.get(f"{s.rag_api_url}/settings/config/block_local_scans",
-                     headers={"x-api-key": s.api_key}, verify=False, timeout=3)
+                     headers={"x-api-key": s.api_key, **engagement_headers()}, verify=False, timeout=3)
         val = r.json().get("value", "") if r.status_code == 200 else ""
         _block_local_cache["val"] = val.lower() in ("1", "true", "yes")
         _block_local_cache["ts"] = now
@@ -583,7 +630,7 @@ async def launch_pipeline(req: PipelineRequest):
         resp = await c.post(
             f"{s.rag_api_url}/pipelines",
             json=req.dict(),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
@@ -597,7 +644,7 @@ async def launch_pipeline(req: PipelineRequest):
     if config.get("use_tunnels"):
         try:
             async with httpx.AsyncClient(verify=False, timeout=5) as c:
-                nr = await c.get(f"{s.tunnel_manager_url}/nodes", headers={"x-api-key": s.api_key})
+                nr = await c.get(f"{s.tunnel_manager_url}/nodes", headers={"x-api-key": s.api_key, **engagement_headers()})
                 if nr.status_code == 200:
                     for node in (nr.json().get("nodes") or []):
                         if node.get("status") == "online" and node.get("proxy_port"):
@@ -635,7 +682,7 @@ async def list_pipelines(engagement_id: Optional[str] = None, status: Optional[s
         params["status"] = status
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/pipelines", params=params,
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
     return safe_json(resp)
 
 
@@ -644,7 +691,7 @@ async def get_pipeline(pipeline_id: str):
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/pipelines/{pipeline_id}",
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
     return safe_json(resp)
@@ -660,7 +707,7 @@ async def list_pipeline_jobs(pipeline_id: str, stage: Optional[int] = None, host
         params["host"] = host
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/pipelines/{pipeline_id}/jobs",
-                           params=params, headers={"x-api-key": s.api_key})
+                           params=params, headers={"x-api-key": s.api_key, **engagement_headers()})
     return safe_json(resp)
 
 
@@ -674,7 +721,7 @@ async def stop_pipeline(pipeline_id: str):
     # Mark in DB
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(f"{s.rag_api_url}/pipelines/{pipeline_id}/stop",
-                            headers={"x-api-key": s.api_key})
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
     return safe_json(resp)
@@ -716,7 +763,7 @@ async def scan_limits():
         async with httpx.AsyncClient(verify=False, timeout=5) as client:
             resp = await client.get(
                 f"{settings.autogen_url}/pentest/sessions",
-                headers={"x-api-key": settings.api_key},
+                headers={"x-api-key": settings.api_key, **engagement_headers()},
             )
             if resp.status_code == 200:
                 sessions = resp.json().get("sessions", [])
@@ -726,7 +773,7 @@ async def scan_limits():
                         try:
                             r = await client.get(
                                 f"{settings.autogen_url}/pentest/{sid}/scans",
-                                headers={"x-api-key": settings.api_key},
+                                headers={"x-api-key": settings.api_key, **engagement_headers()},
                                 timeout=3,
                             )
                             if r.status_code == 200:
@@ -771,7 +818,7 @@ async def _detect_scope_for_target(target: str, api_key: str, rag_api_url: str) 
         async with httpx.AsyncClient(verify=False, timeout=5) as c:
             resp = await c.get(
                 f"{rag_api_url}/scope/classify/{hostname}",
-                headers={"x-api-key": api_key},
+                headers={"x-api-key": api_key, **engagement_headers()},
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -791,7 +838,7 @@ async def _resolve_scope_targets(scope_name: str, api_key: str, rag_api_url: str
             resp = await c.get(
                 f"{rag_api_url}/scope",
                 params={"name": scope_name, "limit": 2000},
-                headers={"x-api-key": api_key},
+                headers={"x-api-key": api_key, **engagement_headers()},
             )
             if resp.status_code != 200:
                 return []
@@ -831,7 +878,7 @@ async def nmap_resume(req: NmapResumeReq):
         resp = await c.post(
             f"{service_url}/jobs/nmap-resume",
             json=payload,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
@@ -911,7 +958,7 @@ async def launch_scan(scan_type: str, req: ScanRequest):
                 try:
                     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_SCAN) as c:
                         resp = await c.post(f"{service_url}{path}", json=payload,
-                                            headers={"x-api-key": s.api_key})
+                                            headers={"x-api-key": s.api_key, **engagement_headers()})
                         if resp.status_code < 400:
                             data = resp.json()
                             jid = data.get("job_id")
@@ -975,7 +1022,7 @@ async def launch_scan(scan_type: str, req: ScanRequest):
         resp = await c.post(
             f"{service_url}{path}",
             json=payload,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -1014,7 +1061,7 @@ async def launch_scan(scan_type: str, req: ScanRequest):
                         "severity": "info",
                         "evidence": ", ".join(evidence_parts),
                     },
-                    headers={"x-api-key": s.api_key},
+                    headers={"x-api-key": s.api_key, **engagement_headers()},
                 )
         except Exception:
             pass  # never block scan launch
@@ -1023,11 +1070,39 @@ async def launch_scan(scan_type: str, req: ScanRequest):
 
 
 @router.get("/api/scans")
-async def list_scans():
-    """Return all tracked jobs, merged with autogen agent scans and recent audit log entries."""
+async def list_scans(engagement_id: Optional[str] = None):
+    """Return all tracked jobs, merged with autogen agent scans and recent audit log entries.
+
+    When ``engagement_id`` is provided, only scans belonging to that engagement
+    are returned -- legacy / unscoped scans (engagement_id IS NULL) are hidden
+    to prevent cross-engagement leakage.  This is the BFF-side enforcement of
+    the engagement-isolation guarantee added in Option B / Phase 6.
+
+    Resolution rules per source:
+      * active_jobs: filter by info.get("engagement_id") == engagement_id
+      * autogen sessions: passed through with the same engagement_id query
+      * audit.jsonl: filter by entry.get("engagement_id") == engagement_id
+        for entries that have it; for legacy entries without engagement_id,
+        join through the rag-api's jobs.engagement_id by job_id (resolved
+        lazily on demand).
+    """
     from datetime import datetime, timezone, timedelta
-    jobs = [{"job_id": jid, **info} for jid, info in active_jobs.items()]
-    tracked_ids = set(active_jobs.keys())
+
+    # Filter active_jobs by engagement_id if requested.  active_jobs entries
+    # carry an "engagement_id" key when the launch site captured one
+    # (Phase 4 / rag-api middleware).  Old / legacy entries without the key
+    # are treated as unscoped and hidden when an engagement is active.
+    if engagement_id:
+        jobs = [
+            {"job_id": jid, **info}
+            for jid, info in active_jobs.items()
+            if info.get("engagement_id") == engagement_id
+        ]
+        tracked_ids = {jid for jid, info in active_jobs.items()
+                       if info.get("engagement_id") == engagement_id}
+    else:
+        jobs = [{"job_id": jid, **info} for jid, info in active_jobs.items()]
+        tracked_ids = set(active_jobs.keys())
 
     # Merge in scans from active autogen agent sessions
     try:
@@ -1035,7 +1110,7 @@ async def list_scans():
         async with httpx.AsyncClient(verify=False, timeout=5) as client:
             resp = await client.get(
                 f"{settings.autogen_url}/pentest/sessions",
-                headers={"x-api-key": settings.api_key},
+                headers={"x-api-key": settings.api_key, **engagement_headers()},
             )
             if resp.status_code == 200:
                 sessions = resp.json().get("sessions", [])
@@ -1047,7 +1122,7 @@ async def list_scans():
                     try:
                         r = await client.get(
                             f"{settings.autogen_url}/pentest/{sid}/scans",
-                            headers={"x-api-key": settings.api_key},
+                            headers={"x-api-key": settings.api_key, **engagement_headers()},
                             timeout=5,
                         )
                         if r.status_code == 200:
@@ -1083,6 +1158,10 @@ async def list_scans():
     # Merge in scans from audit log that aren't tracked by BFF or autogen (last 48h only)
     audit_path = pathlib.Path("/scan_audit/audit.jsonl")
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+    # Bug 2 fix: skip job_ids the user has explicitly cleared.  The audit
+    # log is immutable, but the user's intent to dismiss those rows from
+    # the active view must persist across reloads -- so we filter here.
+    cleared_set = _cleared_set_for(engagement_id)
     if audit_path.exists():
         try:
             audit_jobs: dict = {}
@@ -1098,6 +1177,21 @@ async def list_scans():
                 # Skip entries older than 48h
                 if ts and ts < cutoff:
                     continue
+                # User explicitly cleared this scan -- don't re-show it
+                # from the audit log.
+                if jid in cleared_set:
+                    continue
+                # Cross-engagement isolation: when filtering by engagement_id,
+                # only include audit entries that explicitly carry the same
+                # engagement_id.  Entries written before Phase 2 (no
+                # engagement_id field) are treated as legacy / unscoped and
+                # hidden when an engagement is active.  Stricter than the
+                # job_id-join approach but safer: a NULL audit entry whose
+                # job_id maps to a different engagement is correctly excluded.
+                if engagement_id:
+                    entry_eid = entry.get("engagement_id")
+                    if entry_eid != engagement_id:
+                        continue
                 event = entry.get("event", "")
                 if jid not in audit_jobs:
                     # Extract proxy from audit entry or from command string
@@ -1183,12 +1277,43 @@ async def delete_scan(job_id: str):
 
 
 @router.delete("/api/scans")
-async def clear_scan_history():
-    """Delete all completed/failed/stopped/lost scans from history."""
-    to_delete = [
-        jid for jid, info in active_jobs.items()
-        if info.get("status") in ("completed", "failed", "stopped", "lost")
-    ]
+async def clear_scan_history(engagement_id: Optional[str] = None):
+    """Delete all completed/failed/stopped/lost scans from BFF-tracked history.
+
+    When ``engagement_id`` is provided, only scans tagged to that engagement
+    are removed -- preventing the case where one engagement's "Clear History"
+    accidentally wipes another engagement's tracked scans.  When omitted
+    (admin / unscoped view), clears all completed/failed/stopped/lost scans.
+
+    Note: this clears BFF-tracked active_jobs and its on-disk persistence
+    only.  The rag-api jobs table and scan_audit/audit.jsonl are unchanged
+    (audit log is immutable by design; jobs table is cleaned via the
+    Maintenance page's "Jobs & Tasks" cleanup action).  GET /api/scans now
+    also filters audit-derived rows by engagement_id, so cleared scans
+    don't reappear from the audit-merge path.
+    """
+    if engagement_id:
+        to_delete = [
+            jid for jid, info in active_jobs.items()
+            if info.get("status") in ("completed", "failed", "stopped", "lost")
+            and info.get("engagement_id") == engagement_id
+        ]
+    else:
+        to_delete = [
+            jid for jid, info in active_jobs.items()
+            if info.get("status") in ("completed", "failed", "stopped", "lost")
+        ]
+
+    # Record the cleared job_ids in the persistent deny-list BEFORE
+    # touching active_jobs.  list_scans filters the audit.jsonl merge by
+    # this set so audit entries for cleared jobs don't ghost back into
+    # the view -- which was the original Clear-History bug.
+    if to_delete:
+        cleared = _load_cleared_jobs()
+        key = _cleared_key(engagement_id)
+        cleared.setdefault(key, set()).update(to_delete)
+        _save_cleared_jobs(cleared)
+
     persist_dir = pathlib.Path("/scan_results/.bff_jobs")
     for jid in to_delete:
         del active_jobs[jid]
@@ -1227,7 +1352,7 @@ async def get_scan(job_id: str):
             try:
                 url = getattr(s, attr)
                 async with httpx.AsyncClient(verify=False, timeout=5) as c:
-                    resp = await c.get(f"{url}/jobs/{job_id}", headers={"x-api-key": s.api_key})
+                    resp = await c.get(f"{url}/jobs/{job_id}", headers={"x-api-key": s.api_key, **engagement_headers()})
                     if resp.status_code == 200:
                         return safe_json(resp)
             except Exception:
@@ -1237,7 +1362,7 @@ async def get_scan(job_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{service_url}/jobs/{job_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code == 200:
             merged = resp.json()
@@ -1268,7 +1393,7 @@ async def stop_scan(job_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.post(
             f"{info['service_url']}/jobs/{job_id}/stop",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code < 400:
             info["status"] = "stopped"
@@ -1286,7 +1411,7 @@ async def resume_scan(job_id: str):
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(
             f"{info['service_url']}/jobs/{job_id}/resume",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -1310,7 +1435,7 @@ async def nmap_resume_info(job_id: str):
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(
             f"{info['service_url']}/jobs/{job_id}/nmap-resume-info",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
@@ -1348,7 +1473,7 @@ async def cloud_import(
             f"{s.rag_api_url}/ingest/{ingest_path}",
             files={"file": (file.filename, content, file.content_type or "application/octet-stream")},
             data=data,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             # Pass through structured upstream errors so the frontend gets a
@@ -1392,7 +1517,7 @@ async def cloud_import_status(job_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/jobs/{job_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
