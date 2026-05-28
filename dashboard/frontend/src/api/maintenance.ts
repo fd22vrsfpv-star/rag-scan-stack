@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch, apiUrl } from './client'
+import { useUIStore } from '@/stores/ui'
 import { POLL } from '@/lib/polling'
 
 export type MaintenanceStats = Record<string, number>
@@ -107,10 +108,15 @@ export interface AuditLogResponse {
 }
 
 export function useAuditLog(filters?: { limit?: number; scan_type?: string; event?: string }) {
+  // Engagement-isolation: when an engagement is active, only return audit
+  // entries explicitly tagged to it.  Legacy / unscoped rows are hidden by
+  // the BFF filter (Phase 6), so this matches the rest of the UI.
+  const eid = useUIStore(s => s.selectedEngagementId)
   const qs = new URLSearchParams()
   if (filters?.limit) qs.set('limit', String(filters.limit))
   if (filters?.scan_type) qs.set('scan_type', filters.scan_type)
   if (filters?.event) qs.set('event', filters.event)
+  if (eid) qs.set('engagement_id', eid)
   const query = qs.toString()
   return useQuery({
     queryKey: ['audit-log', query],
