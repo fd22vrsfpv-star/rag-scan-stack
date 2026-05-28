@@ -66,6 +66,26 @@ from validation import (
 
 app = FastAPI(title="Nmap Scanner", version="1.0.0")
 
+# ── Engagement context (Option B / Phase 5) ──
+# Capture X-Engagement-Id from incoming scan-launch requests into the
+# audit_writer's ContextVar so write_audit() calls inside the request's
+# call stack automatically carry the engagement_id field.  Without this,
+# audit lines written by this runner land with engagement_id=null and are
+# hidden from any active-engagement view in the dashboard.
+try:
+    from audit_writer import current_engagement_id  # type: ignore
+
+    @app.middleware("http")
+    async def _capture_engagement_for_audit(request, call_next):
+        eid = request.headers.get("x-engagement-id") or request.headers.get("X-Engagement-Id")
+        token = current_engagement_id.set(eid or None)
+        try:
+            return await call_next(request)
+        finally:
+            current_engagement_id.reset(token)
+except ImportError:
+    pass  # audit_writer not on path — runner runs without engagement scoping
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize log capture on startup"""

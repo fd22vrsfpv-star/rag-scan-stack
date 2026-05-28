@@ -3,6 +3,7 @@ import httpx
 from fastapi import APIRouter, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
 from config import get_settings
+from engagement import engagement_headers
 import io
 from utils import safe_json
 
@@ -35,7 +36,7 @@ async def upload_evidence(
             f"{s.rag_api_url}/evidence/upload",
             params=params,
             files={"file": (file.filename, content, file.content_type)},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -58,7 +59,7 @@ async def list_evidence(
         resp = await c.get(
             f"{s.rag_api_url}/evidence",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -69,7 +70,7 @@ async def get_evidence(eid: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/evidence/{eid}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -80,7 +81,7 @@ async def get_evidence_content(eid: str):
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/evidence/{eid}/content",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return StreamingResponse(
             io.BytesIO(resp.content),
@@ -94,7 +95,7 @@ async def get_evidence_thumbnail(eid: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/evidence/{eid}/thumbnail",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return StreamingResponse(
             io.BytesIO(resp.content),
@@ -113,7 +114,7 @@ async def link_evidence(
         resp = await c.post(
             f"{s.rag_api_url}/evidence/{eid}/link",
             params={"entity_type": entity_type, "entity_id": entity_id},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -124,7 +125,7 @@ async def get_finding_evidence(source: str, fid: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/findings/{source}/{fid}/evidence",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -135,6 +136,6 @@ async def delete_evidence(eid: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/evidence/{eid}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)

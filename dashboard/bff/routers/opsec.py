@@ -2,6 +2,7 @@ from typing import Optional
 import httpx
 from fastapi import APIRouter, Query
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter()
@@ -14,7 +15,7 @@ async def opsec_timeline(hours: int = Query(24)):
         resp = await c.get(
             f"{s.rag_api_url}/opsec/timeline",
             params={"hours": hours},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -26,7 +27,7 @@ async def opsec_alerts(threshold: int = Query(20)):
         resp = await c.get(
             f"{s.rag_api_url}/opsec/alerts",
             params={"threshold": threshold},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -41,7 +42,7 @@ async def list_scheduled_scans(status: Optional[str] = Query(None)):
         resp = await c.get(
             f"{s.rag_api_url}/scheduled-scans",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -53,7 +54,7 @@ async def create_scheduled_scan(body: dict):
         resp = await c.post(
             f"{s.rag_api_url}/scheduled-scans",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -64,6 +65,6 @@ async def cancel_scheduled_scan(sid: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/scheduled-scans/{sid}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
