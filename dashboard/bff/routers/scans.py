@@ -11,6 +11,7 @@ log = logging.getLogger("scans")
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Query
 from pydantic import BaseModel
 from config import get_settings
+from engagement import engagement_headers
 from polling import register_job, active_jobs, _persist, pending_queue
 from timeouts import TIMEOUT_NORMAL, TIMEOUT_SCAN
 
@@ -53,7 +54,7 @@ def _is_local_blocked() -> bool:
         import httpx as _hx
         s = get_settings()
         r = _hx.get(f"{s.rag_api_url}/settings/config/block_local_scans",
-                     headers={"x-api-key": s.api_key}, verify=False, timeout=3)
+                     headers={"x-api-key": s.api_key, **engagement_headers()}, verify=False, timeout=3)
         val = r.json().get("value", "") if r.status_code == 200 else ""
         _block_local_cache["val"] = val.lower() in ("1", "true", "yes")
         _block_local_cache["ts"] = now
@@ -583,7 +584,7 @@ async def launch_pipeline(req: PipelineRequest):
         resp = await c.post(
             f"{s.rag_api_url}/pipelines",
             json=req.dict(),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
@@ -597,7 +598,7 @@ async def launch_pipeline(req: PipelineRequest):
     if config.get("use_tunnels"):
         try:
             async with httpx.AsyncClient(verify=False, timeout=5) as c:
-                nr = await c.get(f"{s.tunnel_manager_url}/nodes", headers={"x-api-key": s.api_key})
+                nr = await c.get(f"{s.tunnel_manager_url}/nodes", headers={"x-api-key": s.api_key, **engagement_headers()})
                 if nr.status_code == 200:
                     for node in (nr.json().get("nodes") or []):
                         if node.get("status") == "online" and node.get("proxy_port"):
@@ -635,7 +636,7 @@ async def list_pipelines(engagement_id: Optional[str] = None, status: Optional[s
         params["status"] = status
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/pipelines", params=params,
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
     return safe_json(resp)
 
 
@@ -644,7 +645,7 @@ async def get_pipeline(pipeline_id: str):
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/pipelines/{pipeline_id}",
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
     return safe_json(resp)
@@ -660,7 +661,7 @@ async def list_pipeline_jobs(pipeline_id: str, stage: Optional[int] = None, host
         params["host"] = host
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/pipelines/{pipeline_id}/jobs",
-                           params=params, headers={"x-api-key": s.api_key})
+                           params=params, headers={"x-api-key": s.api_key, **engagement_headers()})
     return safe_json(resp)
 
 
@@ -674,7 +675,7 @@ async def stop_pipeline(pipeline_id: str):
     # Mark in DB
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(f"{s.rag_api_url}/pipelines/{pipeline_id}/stop",
-                            headers={"x-api-key": s.api_key})
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
     return safe_json(resp)
@@ -716,7 +717,7 @@ async def scan_limits():
         async with httpx.AsyncClient(verify=False, timeout=5) as client:
             resp = await client.get(
                 f"{settings.autogen_url}/pentest/sessions",
-                headers={"x-api-key": settings.api_key},
+                headers={"x-api-key": settings.api_key, **engagement_headers()},
             )
             if resp.status_code == 200:
                 sessions = resp.json().get("sessions", [])
@@ -726,7 +727,7 @@ async def scan_limits():
                         try:
                             r = await client.get(
                                 f"{settings.autogen_url}/pentest/{sid}/scans",
-                                headers={"x-api-key": settings.api_key},
+                                headers={"x-api-key": settings.api_key, **engagement_headers()},
                                 timeout=3,
                             )
                             if r.status_code == 200:
@@ -771,7 +772,7 @@ async def _detect_scope_for_target(target: str, api_key: str, rag_api_url: str) 
         async with httpx.AsyncClient(verify=False, timeout=5) as c:
             resp = await c.get(
                 f"{rag_api_url}/scope/classify/{hostname}",
-                headers={"x-api-key": api_key},
+                headers={"x-api-key": api_key, **engagement_headers()},
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -791,7 +792,7 @@ async def _resolve_scope_targets(scope_name: str, api_key: str, rag_api_url: str
             resp = await c.get(
                 f"{rag_api_url}/scope",
                 params={"name": scope_name, "limit": 2000},
-                headers={"x-api-key": api_key},
+                headers={"x-api-key": api_key, **engagement_headers()},
             )
             if resp.status_code != 200:
                 return []
@@ -831,7 +832,7 @@ async def nmap_resume(req: NmapResumeReq):
         resp = await c.post(
             f"{service_url}/jobs/nmap-resume",
             json=payload,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
@@ -911,7 +912,7 @@ async def launch_scan(scan_type: str, req: ScanRequest):
                 try:
                     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_SCAN) as c:
                         resp = await c.post(f"{service_url}{path}", json=payload,
-                                            headers={"x-api-key": s.api_key})
+                                            headers={"x-api-key": s.api_key, **engagement_headers()})
                         if resp.status_code < 400:
                             data = resp.json()
                             jid = data.get("job_id")
@@ -975,7 +976,7 @@ async def launch_scan(scan_type: str, req: ScanRequest):
         resp = await c.post(
             f"{service_url}{path}",
             json=payload,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -1014,7 +1015,7 @@ async def launch_scan(scan_type: str, req: ScanRequest):
                         "severity": "info",
                         "evidence": ", ".join(evidence_parts),
                     },
-                    headers={"x-api-key": s.api_key},
+                    headers={"x-api-key": s.api_key, **engagement_headers()},
                 )
         except Exception:
             pass  # never block scan launch
@@ -1063,7 +1064,7 @@ async def list_scans(engagement_id: Optional[str] = None):
         async with httpx.AsyncClient(verify=False, timeout=5) as client:
             resp = await client.get(
                 f"{settings.autogen_url}/pentest/sessions",
-                headers={"x-api-key": settings.api_key},
+                headers={"x-api-key": settings.api_key, **engagement_headers()},
             )
             if resp.status_code == 200:
                 sessions = resp.json().get("sessions", [])
@@ -1075,7 +1076,7 @@ async def list_scans(engagement_id: Optional[str] = None):
                     try:
                         r = await client.get(
                             f"{settings.autogen_url}/pentest/{sid}/scans",
-                            headers={"x-api-key": settings.api_key},
+                            headers={"x-api-key": settings.api_key, **engagement_headers()},
                             timeout=5,
                         )
                         if r.status_code == 200:
@@ -1286,7 +1287,7 @@ async def get_scan(job_id: str):
             try:
                 url = getattr(s, attr)
                 async with httpx.AsyncClient(verify=False, timeout=5) as c:
-                    resp = await c.get(f"{url}/jobs/{job_id}", headers={"x-api-key": s.api_key})
+                    resp = await c.get(f"{url}/jobs/{job_id}", headers={"x-api-key": s.api_key, **engagement_headers()})
                     if resp.status_code == 200:
                         return safe_json(resp)
             except Exception:
@@ -1296,7 +1297,7 @@ async def get_scan(job_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{service_url}/jobs/{job_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code == 200:
             merged = resp.json()
@@ -1327,7 +1328,7 @@ async def stop_scan(job_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.post(
             f"{info['service_url']}/jobs/{job_id}/stop",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code < 400:
             info["status"] = "stopped"
@@ -1345,7 +1346,7 @@ async def resume_scan(job_id: str):
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(
             f"{info['service_url']}/jobs/{job_id}/resume",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -1369,7 +1370,7 @@ async def nmap_resume_info(job_id: str):
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(
             f"{info['service_url']}/jobs/{job_id}/nmap-resume-info",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
@@ -1407,7 +1408,7 @@ async def cloud_import(
             f"{s.rag_api_url}/ingest/{ingest_path}",
             files={"file": (file.filename, content, file.content_type or "application/octet-stream")},
             data=data,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             # Pass through structured upstream errors so the frontend gets a
@@ -1451,7 +1452,7 @@ async def cloud_import_status(job_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/jobs/{job_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
