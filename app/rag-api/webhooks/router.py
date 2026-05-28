@@ -155,29 +155,28 @@ def list_webhooks(
     authorized: bool = Depends(auth)
 ):
     """List all webhook configurations."""
+    # Static, fully parameterized SQL. The optional `enabled` filter is bound
+    # via the `(%s IS NULL OR col = %s)` idiom so user input never enters the
+    # SQL string itself — every value travels through psycopg2 parameter binding.
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        where_clauses = []
-        params = []
-
-        if enabled is not None:
-            where_clauses.append("enabled = %s")
-            params.append(enabled)
-
-        where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
-
-        # Get total count
-        cur.execute(f"SELECT COUNT(*) as total FROM webhooks {where_sql}", params)
+        cur.execute(
+            "SELECT COUNT(*) as total FROM webhooks "
+            "WHERE (%s::boolean IS NULL OR enabled = %s::boolean)",
+            [enabled, enabled],
+        )
         total = cur.fetchone()["total"]
 
-        # Get webhooks
-        cur.execute(f"""
+        cur.execute(
+            """
             SELECT id, name, url, enabled, event_types, sources, severities, max_retries, timeout_ms,
                    created_at, updated_at, last_success, failure_count
             FROM webhooks
-            {where_sql}
+            WHERE (%s::boolean IS NULL OR enabled = %s::boolean)
             ORDER BY created_at DESC
             LIMIT %s OFFSET %s
-        """, params + [limit, offset])
+            """,
+            [enabled, enabled, limit, offset],
+        )
         rows = cur.fetchall()
 
     webhooks = [
@@ -266,35 +265,41 @@ def list_webhook_events(
     authorized: bool = Depends(auth)
 ):
     """List webhook delivery events."""
+    # Static, fully parameterized SQL (see list_webhooks). Optional filters
+    # are bound via the `(%s IS NULL OR col = %s)` idiom; the WHERE clause is
+    # inlined into each query as a pure string literal — no concatenation, no
+    # f-string interpolation — so no user input can reach the SQL text.
+    filter_params = [
+        webhook_id, webhook_id,
+        status, status,
+        event_type, event_type,
+    ]
+
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        where_clauses = []
-        params = []
-
-        if webhook_id:
-            where_clauses.append("webhook_id = %s")
-            params.append(webhook_id)
-        if status:
-            where_clauses.append("status = %s")
-            params.append(status)
-        if event_type:
-            where_clauses.append("event_type = %s")
-            params.append(event_type)
-
-        where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
-
-        # Get total count
-        cur.execute(f"SELECT COUNT(*) as total FROM webhook_events {where_sql}", params)
+        cur.execute(
+            """
+            SELECT COUNT(*) as total FROM webhook_events
+            WHERE (%s::text IS NULL OR webhook_id = %s::uuid)
+              AND (%s::text IS NULL OR status = %s::text)
+              AND (%s::text IS NULL OR event_type = %s::text)
+            """,
+            filter_params,
+        )
         total = cur.fetchone()["total"]
 
-        # Get events
-        cur.execute(f"""
+        cur.execute(
+            """
             SELECT id, webhook_id, event_type, payload, status, attempt, response_code,
                    error_message, created_at, delivered_at, next_retry
             FROM webhook_events
-            {where_sql}
+            WHERE (%s::text IS NULL OR webhook_id = %s::uuid)
+              AND (%s::text IS NULL OR status = %s::text)
+              AND (%s::text IS NULL OR event_type = %s::text)
             ORDER BY created_at DESC
             LIMIT %s OFFSET %s
-        """, params + [limit, offset])
+            """,
+            filter_params + [limit, offset],
+        )
         rows = cur.fetchall()
 
     events = [
@@ -380,51 +385,42 @@ def get_webhook(webhook_id: str, authorized: bool = Depends(auth)):
 @router.put("/{webhook_id}", response_model=WebhookResponse)
 def update_webhook(webhook_id: str, webhook: WebhookUpdate, authorized: bool = Depends(auth)):
     """Update a webhook configuration."""
-    # Build update query dynamically based on provided fields
-    updates = []
-    params = []
-
-    if webhook.name is not None:
-        updates.append("name = %s")
-        params.append(webhook.name)
-    if webhook.url is not None:
-        updates.append("url = %s")
-        params.append(webhook.url)
-    if webhook.secret is not None:
-        updates.append("secret = %s")
-        params.append(webhook.secret)
-    if webhook.enabled is not None:
-        updates.append("enabled = %s")
-        params.append(webhook.enabled)
-    if webhook.event_types is not None:
-        updates.append("event_types = %s")
-        params.append(webhook.event_types)
-    if webhook.sources is not None:
-        updates.append("sources = %s")
-        params.append(webhook.sources)
-    if webhook.severities is not None:
-        updates.append("severities = %s")
-        params.append(webhook.severities)
-    if webhook.max_retries is not None:
-        updates.append("max_retries = %s")
-        params.append(webhook.max_retries)
-    if webhook.timeout_ms is not None:
-        updates.append("timeout_ms = %s")
-        params.append(webhook.timeout_ms)
-
-    if not updates:
+    # Static, fully parameterized SQL. Each field is COALESCE(%s, col) so
+    # passing None leaves the existing value untouched — the PATCH-like
+    # "only fields the client provided" semantics, expressed without any
+    # dynamic SQL construction.
+    if all(v is None for v in (
+        webhook.name, webhook.url, webhook.secret, webhook.enabled,
+        webhook.event_types, webhook.sources, webhook.severities,
+        webhook.max_retries, webhook.timeout_ms,
+    )):
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    params.append(webhook_id)
-
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(f"""
-            UPDATE webhooks
-            SET {", ".join(updates)}, updated_at = now()
+        cur.execute(
+            """
+            UPDATE webhooks SET
+                name         = COALESCE(%s, name),
+                url          = COALESCE(%s, url),
+                secret       = COALESCE(%s, secret),
+                enabled      = COALESCE(%s, enabled),
+                event_types  = COALESCE(%s, event_types),
+                sources      = COALESCE(%s, sources),
+                severities   = COALESCE(%s, severities),
+                max_retries  = COALESCE(%s, max_retries),
+                timeout_ms   = COALESCE(%s, timeout_ms),
+                updated_at   = now()
             WHERE id = %s
             RETURNING id, name, url, enabled, event_types, sources, severities, max_retries, timeout_ms,
                       created_at, updated_at, last_success, failure_count
-        """, params)
+            """,
+            [
+                webhook.name, webhook.url, webhook.secret, webhook.enabled,
+                webhook.event_types, webhook.sources, webhook.severities,
+                webhook.max_retries, webhook.timeout_ms,
+                webhook_id,
+            ],
+        )
         row = cur.fetchone()
         conn.commit()
 

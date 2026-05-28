@@ -241,16 +241,10 @@ def get_aggregate_metrics(
     """
     from psycopg2.extras import RealDictCursor
 
-    where_clauses = ["started_at >= now() - interval '%s days'"]
-    params: list = [days]
-
-    if scan_type:
-        where_clauses.append("scan_type = %s")
-        params.append(scan_type)
-
-    where_sql = "WHERE " + " AND ".join(where_clauses)
-
-    sql = f"""
+    # Static, fully parameterized SQL. Optional filters use the
+    # `(%s IS NULL OR col = %s)` idiom so user input never enters the SQL
+    # string itself; every value travels through psycopg2 parameter binding.
+    sql = """
         SELECT
             scan_type,
             COUNT(*) AS count,
@@ -262,11 +256,13 @@ def get_aggregate_metrics(
             SUM(CASE WHEN status IN ('finished', 'completed') THEN 1 ELSE 0 END) AS success_count,
             SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failure_count
         FROM pipeline_performance
-        {where_sql}
+        WHERE started_at >= now() - %s::interval
+          AND (%s::text IS NULL OR scan_type = %s::text)
           AND duration_seconds IS NOT NULL
         GROUP BY scan_type
         ORDER BY count DESC
     """
+    params: list = [f"{days} days", scan_type, scan_type]
 
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, params)
@@ -308,24 +304,17 @@ def get_recent_metrics(
     """
     from psycopg2.extras import RealDictCursor
 
-    where_clauses = ["duration_seconds IS NOT NULL"]
-    params: list = []
-
-    if scan_type:
-        where_clauses.append("scan_type = %s")
-        params.append(scan_type)
-
-    where_sql = "WHERE " + " AND ".join(where_clauses)
-
-    sql = f"""
+    # Static, fully parameterized SQL (see get_aggregate_metrics).
+    sql = """
         SELECT metric_source, entity_id, session_id,
                scan_type, status, started_at, finished_at, duration_seconds
         FROM pipeline_performance
-        {where_sql}
+        WHERE duration_seconds IS NOT NULL
+          AND (%s::text IS NULL OR scan_type = %s::text)
         ORDER BY started_at DESC NULLS LAST
         LIMIT %s
     """
-    params.append(limit)
+    params: list = [scan_type, scan_type, limit]
 
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, params)
@@ -364,16 +353,8 @@ def get_model_comparison(
     """
     from psycopg2.extras import RealDictCursor
 
-    where_clauses = ["created_at >= now() - interval '%s days'"]
-    params: list = [days]
-
-    if session_id:
-        where_clauses.append("session_id = %s::uuid")
-        params.append(session_id)
-
-    where_sql = "WHERE " + " AND ".join(where_clauses)
-
-    sql = f"""
+    # Static, fully parameterized SQL (see get_aggregate_metrics).
+    sql = """
         SELECT
             model_name,
             COUNT(*) AS total_requests,
@@ -387,10 +368,12 @@ def get_model_comparison(
             ROUND(SUM(CASE WHEN is_error THEN 1 ELSE 0 END)::numeric / NULLIF(COUNT(*), 0) * 100, 1) AS error_rate_pct,
             COUNT(DISTINCT session_id) AS session_count
         FROM llm_request_metrics
-        {where_sql}
+        WHERE created_at >= now() - %s::interval
+          AND (%s::text IS NULL OR session_id = %s::uuid)
         GROUP BY model_name
         ORDER BY total_requests DESC
     """
+    params: list = [f"{days} days", session_id, session_id]
 
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, params)
@@ -433,34 +416,29 @@ def get_llm_requests(
     """
     from psycopg2.extras import RealDictCursor
 
-    where_clauses = []
-    params: list = []
+    # Static, fully parameterized SQL (see get_aggregate_metrics).
+    # `caller_pattern` is None when the user supplied no caller filter, so
+    # the IS-NULL branch short-circuits and the ILIKE never runs.
+    caller_pattern = f"%{caller}%" if caller else None
 
-    if session_id:
-        where_clauses.append("session_id = %s::uuid")
-        params.append(session_id)
-
-    if model:
-        where_clauses.append("model_name = %s")
-        params.append(model)
-
-    if caller:
-        where_clauses.append("caller ILIKE %s")
-        params.append(f"%{caller}%")
-
-    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
-
-    sql = f"""
+    sql = """
         SELECT id, session_id, agent_name, caller, model_name,
                prompt_tokens, completion_tokens, total_tokens, tokens_per_sec,
                latency_ms, has_tool_calls, tool_call_count, tool_names,
                is_error, error_message, request_params, created_at
         FROM llm_request_metrics
-        {where_sql}
+        WHERE (%s::text IS NULL OR session_id = %s::uuid)
+          AND (%s::text IS NULL OR model_name = %s::text)
+          AND (%s::text IS NULL OR caller ILIKE %s::text)
         ORDER BY created_at DESC
         LIMIT %s
     """
-    params.append(limit)
+    params: list = [
+        session_id, session_id,
+        model, model,
+        caller_pattern, caller_pattern,
+        limit,
+    ]
 
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, params)
@@ -516,9 +494,9 @@ def get_llm_summary(
                    MIN(created_at) as first_call,
                    MAX(created_at) as last_call
             FROM llm_request_metrics
-            WHERE created_at > now() - interval '%s days'
+            WHERE created_at > now() - %s::interval
             GROUP BY COALESCE(caller, agent_name, 'unknown'), model_name
             ORDER BY total_calls DESC
-        """, (days,))
+        """, (f"{days} days",))
         rows = cur.fetchall()
     return {"days": days, "callers": [dict(r) for r in rows]}
