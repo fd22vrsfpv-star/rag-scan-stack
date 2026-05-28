@@ -5,6 +5,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel
 from config import get_settings
+from engagement import engagement_headers
 from utils import safe_json
 
 router = APIRouter()
@@ -76,7 +77,7 @@ async def import_swagger_url(body: ImportUrl):
         resp = await c.post(
             f"{s.rag_api_url}/api-collections/import-url",
             json=body.model_dump(),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -90,7 +91,7 @@ async def import_swagger_file(file: UploadFile = File(...)):
         resp = await c.post(
             f"{s.rag_api_url}/api-collections/import",
             files={"file": (file.filename, await file.read(), file.content_type or "application/json")},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -103,7 +104,7 @@ async def import_swagger_dir():
     async with httpx.AsyncClient(verify=False, timeout=60) as c:
         resp = await c.post(
             f"{s.rag_api_url}/api-collections/import-dir",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -116,7 +117,7 @@ async def list_collections():
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/api-collections",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -127,7 +128,7 @@ async def get_collection(collection_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/api-collections/{collection_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -140,7 +141,7 @@ async def delete_collection(collection_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/api-collections/{collection_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -166,7 +167,7 @@ async def list_endpoints(
         resp = await c.get(
             f"{s.rag_api_url}/api-collections/{collection_id}/endpoints",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -180,7 +181,7 @@ async def create_session(body: TestSessionCreate):
         resp = await c.post(
             f"{s.rag_api_url}/api-test/sessions",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -193,7 +194,7 @@ async def list_sessions():
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/api-test/sessions",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -205,7 +206,7 @@ async def update_session(session_id: str, body: TestSessionUpdate):
         resp = await c.patch(
             f"{s.rag_api_url}/api-test/sessions/{session_id}",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -218,7 +219,7 @@ async def delete_session(session_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/api-test/sessions/{session_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -232,7 +233,7 @@ async def execute_test(body: TestExecute):
         resp = await c.post(
             f"{s.rag_api_url}/api-test/execute",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -253,7 +254,7 @@ async def get_history(
         resp = await c.get(
             f"{s.rag_api_url}/api-test/sessions/{session_id}/history",
             params=params,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -265,7 +266,7 @@ async def send_to_pipeline(body: SendToPipeline):
         resp = await c.post(
             f"{s.rag_api_url}/api-test/send-to-pipeline",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -295,7 +296,7 @@ async def clear_session_history(session_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/api-test/sessions/{session_id}/history",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -308,7 +309,7 @@ async def get_common_params(collection_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/api-collections/{collection_id}/common-params",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -327,7 +328,7 @@ async def list_param_configs(collection_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/api-collections/{collection_id}/param-configs",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
 
@@ -339,7 +340,7 @@ async def create_param_config(collection_id: str, body: ParamConfigBody):
         resp = await c.post(
             f"{s.rag_api_url}/api-collections/{collection_id}/param-configs",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -353,7 +354,7 @@ async def update_param_config(config_id: str, body: ParamConfigBody):
         resp = await c.put(
             f"{s.rag_api_url}/api-param-configs/{config_id}",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -366,7 +367,7 @@ async def delete_param_config(config_id: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/api-param-configs/{config_id}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -380,7 +381,7 @@ async def import_param_configs(collection_id: str, body: dict):
         resp = await c.post(
             f"{s.rag_api_url}/api-collections/{collection_id}/param-configs/import",
             json=body,
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -396,7 +397,7 @@ async def collection_to_scope(collection_id: str, body: CollectionToScope):
         resp = await c.post(
             f"{s.rag_api_url}/api-collections/{collection_id}/to-scope",
             json=body.model_dump(),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -412,7 +413,7 @@ async def run_all_endpoints(body: RunAll):
         resp = await c.post(
             f"{s.rag_api_url}/api-test/run-all",
             json=body.model_dump(exclude_none=True),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)

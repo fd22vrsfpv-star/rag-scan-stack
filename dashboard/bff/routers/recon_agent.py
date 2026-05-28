@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
 from config import get_settings
+from engagement import engagement_headers
 from timeouts import TIMEOUT_NORMAL
 from utils import safe_json
 
@@ -15,7 +16,7 @@ async def get_agent_state(eid: str):
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/recon-agent/{eid}",
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
     return safe_json(resp)
 
 
@@ -31,7 +32,7 @@ async def enable_agent(eid: str, body: EnableBody = EnableBody()):
         resp = await c.post(
             f"{s.rag_api_url}/recon-agent/{eid}/enable",
             json=body.dict(),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
@@ -43,7 +44,7 @@ async def disable_agent(eid: str):
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(f"{s.rag_api_url}/recon-agent/{eid}/disable",
-                            headers={"x-api-key": s.api_key})
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
     return safe_json(resp)
 
 
@@ -53,7 +54,7 @@ async def pause_agent(eid: str, minutes: int = Query(60)):
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(f"{s.rag_api_url}/recon-agent/{eid}/pause",
                             params={"minutes": minutes},
-                            headers={"x-api-key": s.api_key})
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
     return safe_json(resp)
 
 
@@ -63,7 +64,7 @@ async def get_coverage(eid: str, target: Optional[str] = None):
     params = {"target": target} if target else {}
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/recon-agent/{eid}/coverage",
-                           params=params, headers={"x-api-key": s.api_key})
+                           params=params, headers={"x-api-key": s.api_key, **engagement_headers()})
     return safe_json(resp)
 
 
@@ -75,7 +76,7 @@ async def get_agent_log(eid: str, limit: int = Query(20)):
         resp = await c.get(
             f"{s.rag_api_url}/engagements/{eid}/campaign-events",
             params={"operator": "recon_agent", "limit": limit},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
     if resp.status_code >= 400:
         return {"events": []}
@@ -95,7 +96,7 @@ async def run_now(eid: str):
         await c.patch(
             f"{s.rag_api_url}/recon-agent/{eid}",
             json={"last_run_at": "2000-01-01T00:00:00Z"},
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
     return {"ok": True, "message": f"Next cycle will run within {int(30)}s"}
 
@@ -106,7 +107,7 @@ async def github_search(product: str, version: str = "", cve: str = "", force: b
     params = {"product": product, "version": version, "cve": cve, "force": str(force).lower()}
     async with httpx.AsyncClient(verify=False, timeout=30) as c:
         resp = await c.get(f"{s.rag_api_url}/software/github-search",
-                           params=params, headers={"x-api-key": s.api_key})
+                           params=params, headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
     return safe_json(resp)

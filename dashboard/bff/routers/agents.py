@@ -4,6 +4,7 @@ from fastapi import APIRouter, Query, Request, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from config import get_settings
+from engagement import engagement_headers
 from timeouts import TIMEOUT_NORMAL, TIMEOUT_LONG
 from utils import safe_json
 
@@ -18,7 +19,7 @@ async def agents_status():
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/agents/status",
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -30,7 +31,7 @@ async def trigger_gap_analysis(eid: str):
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(f"{s.rag_api_url}/agent/gap-analysis/{eid}",
-                            headers={"x-api-key": s.api_key})
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -41,7 +42,7 @@ async def get_gap_report(eid: str, all: bool = Query(False)):
     params = {"all": str(all).lower()} if all else {}
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/agent/gap-analysis/{eid}",
-                           params=params, headers={"x-api-key": s.api_key})
+                           params=params, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -54,7 +55,7 @@ async def auto_fill_gaps(eid: str, report_id: Optional[str] = Query(None)):
         params["report_id"] = report_id
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_LONG) as c:
         resp = await c.post(f"{s.rag_api_url}/agent/gap-analysis/{eid}/auto-fill",
-                            params=params, headers={"x-api-key": s.api_key})
+                            params=params, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -64,7 +65,7 @@ async def get_gap_schedule(eid: str):
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/agent/gap-analysis/{eid}/schedule",
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -75,7 +76,7 @@ async def set_gap_schedule(eid: str, request: Request):
     body = await request.json()
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(f"{s.rag_api_url}/agent/gap-analysis/{eid}/schedule",
-                            json=body, headers={"x-api-key": s.api_key})
+                            json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
 
@@ -100,7 +101,7 @@ async def takeover_hunter_run(body: TakeoverRunBody):
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_LONG) as c:
         resp = await c.post(f"{s.rag_api_url}/agents/takeover-hunter/run",
                             json=body.model_dump(exclude_none=True),
-                            headers={"x-api-key": s.api_key})
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
         return resp.json()
