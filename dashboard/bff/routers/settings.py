@@ -4,6 +4,7 @@ import os
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from config import get_settings
+from engagement import engagement_headers
 from typing import Optional, Dict
 from timeouts import TIMEOUT_NORMAL
 import time
@@ -22,7 +23,7 @@ async def list_api_keys():
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/settings/keys",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code != 200:
             raise HTTPException(resp.status_code, resp.text)
@@ -36,7 +37,7 @@ async def upsert_api_key(key_name: str, body: ApiKeyBody):
         resp = await c.put(
             f"{s.rag_api_url}/settings/keys/{key_name}",
             json=body.model_dump(),
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code != 200:
             raise HTTPException(resp.status_code, resp.text)
@@ -52,7 +53,7 @@ async def get_config_setting(key_name: str):
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/settings/config/{key_name}",
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code == 404:
         return {"key": key_name, "value": ""}
     if resp.status_code >= 400:
@@ -66,7 +67,7 @@ async def put_config_setting(key_name: str, body: ConfigBody):
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.put(f"{s.rag_api_url}/settings/config/{key_name}",
                            json={"value": body.value},
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
     return safe_json(resp)
@@ -91,7 +92,7 @@ async def get_exploit_watcher_settings():
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/settings/exploit-watcher",
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code == 404:
         # Return defaults if not configured
         return ExploitWatcherSettings().model_dump()
@@ -107,7 +108,7 @@ async def update_exploit_watcher_settings(settings: ExploitWatcherSettings):
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.put(f"{s.rag_api_url}/settings/exploit-watcher",
                            json=settings.model_dump(),
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
     return safe_json(resp)
@@ -164,7 +165,7 @@ async def delete_api_key(key_name: str):
     async with httpx.AsyncClient(verify=False, timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/settings/keys/{key_name}",
-            headers={"x-api-key": s.api_key},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code != 200:
             raise HTTPException(resp.status_code, resp.text)
@@ -348,7 +349,7 @@ async def toggle_remote_db(body: RemoteDbToggleBody):
                 resp = await c.post(
                     f"{s.rag_api_url}/webhooks/emit",
                     json=payload,
-                    headers={"x-api-key": s.api_key}
+                    headers={"x-api-key": s.api_key, **engagement_headers()}
                 )
                 webhook_success = resp.status_code < 400
 
@@ -689,7 +690,7 @@ async def list_updatable_tools():
         # Get version info
         try:
             url = getattr(s, info["service_attr"])
-            headers = {"x-api-key": s.api_key} if info["service_attr"] == "rag_api_url" else {}
+            headers = {"x-api-key": s.api_key, **engagement_headers()} if info["service_attr"] == "rag_api_url" else {}
             async with httpx.AsyncClient(verify=False, timeout=10) as c:
                 resp = await c.get(f"{url}{info['version_path']}", headers=headers)
                 if resp.status_code == 200:
@@ -708,7 +709,7 @@ async def update_tool(tool_id: str):
     info = UPDATABLE_TOOLS[tool_id]
     s = get_settings()
     url = getattr(s, info["service_attr"])
-    headers = {"x-api-key": s.api_key} if info["service_attr"] == "rag_api_url" else {}
+    headers = {"x-api-key": s.api_key, **engagement_headers()} if info["service_attr"] == "rag_api_url" else {}
     try:
         async with httpx.AsyncClient(verify=False, timeout=180) as c:
             resp = await c.post(f"{url}{info['update_path']}", headers=headers, timeout=120)
@@ -738,7 +739,7 @@ async def get_llm_settings():
         for key in _LLM_KEYS:
             try:
                 resp = await c.get(f"{s.rag_api_url}/settings/config/{key}",
-                                   headers={"x-api-key": s.api_key})
+                                   headers={"x-api-key": s.api_key, **engagement_headers()})
                 if resp.status_code == 200:
                     val = resp.json().get("value", "")
                     if key in _MASKED_KEYS and val:
@@ -778,7 +779,7 @@ async def save_llm_settings(body: LlmSettingsBody):
             val = getattr(body, field, None)
             if val is not None:
                 resp = await c.put(f"{s.rag_api_url}/settings/config/{key}",
-                                   headers={"x-api-key": s.api_key}, json={"value": val})
+                                   headers={"x-api-key": s.api_key, **engagement_headers()}, json={"value": val})
                 if resp.status_code < 400:
                     updates[field] = True
     return {"ok": True, "updated": updates}
@@ -796,7 +797,7 @@ async def test_llm_backend(body: dict):
         for key in _LLM_KEYS:
             try:
                 resp = await c.get(f"{s.rag_api_url}/settings/config/{key}",
-                                   headers={"x-api-key": s.api_key})
+                                   headers={"x-api-key": s.api_key, **engagement_headers()})
                 if resp.status_code == 200:
                     keys[key.replace("llm.", "")] = resp.json().get("value", "")
             except Exception:
@@ -898,7 +899,7 @@ async def get_scan_timeouts():
             try:
                 resp = await c.get(
                     f"{s.rag_api_url}/settings/config/{key}",
-                    headers={"x-api-key": s.api_key},
+                    headers={"x-api-key": s.api_key, **engagement_headers()},
                 )
                 if resp.status_code == 200:
                     val = resp.json().get("value", "")
@@ -933,7 +934,7 @@ async def put_scan_timeouts(body: ScanTimeoutsBody):
             resp = await c.put(
                 f"{s.rag_api_url}/settings/config/{key}",
                 json={"value": str(seconds)},
-                headers={"x-api-key": s.api_key},
+                headers={"x-api-key": s.api_key, **engagement_headers()},
             )
             if resp.status_code >= 400:
                 raise HTTPException(resp.status_code,
@@ -973,7 +974,7 @@ async def get_llm_tuning():
             entry.pop("type", None)
             try:
                 resp = await c.get(f"{s.rag_api_url}/settings/config/{key}",
-                                   headers={"x-api-key": s.api_key})
+                                   headers={"x-api-key": s.api_key, **engagement_headers()})
                 if resp.status_code == 200:
                     raw = resp.json().get("value", "")
                     if raw:
@@ -1005,7 +1006,7 @@ async def put_llm_tuning(body: LLMTuningBody):
         for k, v in body.tuning.items():
             resp = await c.put(f"{s.rag_api_url}/settings/config/{k}",
                                json={"value": str(v)},
-                               headers={"x-api-key": s.api_key})
+                               headers={"x-api-key": s.api_key, **engagement_headers()})
             if resp.status_code >= 400:
                 raise HTTPException(resp.status_code, f"Failed to write {k}: {resp.text}")
     return {"ok": True, "updated": list(body.tuning.keys())}
@@ -1021,7 +1022,7 @@ async def get_agent_models():
     s = get_settings()
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/settings/agent-models",
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
         return resp.json()
@@ -1038,7 +1039,7 @@ async def put_agent_model(agent_id: str, body: AgentModelBody):
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.put(f"{s.rag_api_url}/settings/agent-models/{agent_id}",
                            json={"model": body.model},
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
         return resp.json()
@@ -1057,7 +1058,7 @@ async def put_agent_auto(agent_id: str, body: AgentAutoBody):
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
         resp = await c.put(f"{s.rag_api_url}/settings/agent-models/{agent_id}/auto",
                            json={"enabled": body.enabled},
-                           headers={"x-api-key": s.api_key})
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
         return resp.json()
