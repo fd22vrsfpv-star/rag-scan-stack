@@ -133,6 +133,7 @@ import/swagger/
 Docs/presentation/
 Docs/eval-deck/
 Docs/screenshots/
+presentation-materials/defcon-creator-stage/
 
 # Images anywhere under Docs/ — keep generated artifacts and dashboard
 # screenshots out of the repo. Diagrams that need to ship live in /assets/
