@@ -277,6 +277,49 @@ from webhooks import webhook_router, start_retry_worker, stop_retry_worker, ensu
 
 app = FastAPI(title="Pentest RAG API", version="1.0.0")
 
+
+# ── Engagement context (cross-engagement isolation, Option B / Phase 4) ──
+# Frontend sends the active engagement as the `X-Engagement-Id` request
+# header on every API call.  An HTTP middleware captures it into a
+# contextvar so scan-launch / INSERT sites deep in the call stack can read
+# it without threading the value through every function signature.
+#
+# Endpoints/INSERT sites should prefer an explicit `engagement_id`
+# parameter where present, and fall back to `current_engagement_id.get()`
+# otherwise — see `_resolve_engagement_id()` below.
+import contextvars
+
+current_engagement_id: contextvars.ContextVar = contextvars.ContextVar(
+    "current_engagement_id", default=None,
+)
+
+
+@app.middleware("http")
+async def _capture_engagement_header(request, call_next):
+    """Bind X-Engagement-Id from the request to the current contextvar so
+    any code in this request's call stack can read the active engagement.
+    Resets on response so it doesn't leak between requests."""
+    eid = request.headers.get("x-engagement-id") or request.headers.get("X-Engagement-Id")
+    token = current_engagement_id.set(eid or None)
+    try:
+        return await call_next(request)
+    finally:
+        current_engagement_id.reset(token)
+
+
+def _resolve_engagement_id(explicit: Optional[str] = None) -> Optional[str]:
+    """Return the engagement_id to attach to a scan-launch / job INSERT.
+    Prefers an explicitly-passed value (from query param or request body),
+    falling back to the contextvar captured from the `X-Engagement-Id`
+    header.  Returns None when no engagement is active (legacy / unscoped)."""
+    if explicit:
+        return explicit
+    try:
+        return current_engagement_id.get()
+    except LookupError:
+        return None
+
+
 # ── Rate limiting (per-IP) ──────────────────────────────────────
 # Default: 120 req/min global, configurable via RATE_LIMIT env (e.g. "60/minute").
 # Endpoints exempted: /health, /metrics. Set RATE_LIMIT="" to disable.
@@ -810,9 +853,11 @@ def run_masscan_nmap(
             "whitelist": whitelist or [],
             "blacklist": blacklist or [],
         }
+        eid = _resolve_engagement_id()
         cur.execute(
-            "INSERT INTO jobs (type, params, idempotency_key, status) VALUES (%s,%s,%s,'queued') RETURNING id",
-            ("masscan-nmap", Json(params), idempotency_key),
+            "INSERT INTO jobs (type, params, idempotency_key, status, engagement_id) "
+            "VALUES (%s,%s,%s,'queued',%s::uuid) RETURNING id",
+            ("masscan-nmap", Json(params), idempotency_key, eid),
         )
         job_id = str(cur.fetchone()["id"])
         cur.execute("INSERT INTO tasks (job_id, type, status) VALUES (%s::uuid,'pipeline','queued')", (job_id,))
@@ -862,9 +907,11 @@ def masscan_nmap_upload(
             "whitelist": whitelist or [],
             "blacklist": blacklist or [],
         }
+        eid = _resolve_engagement_id()
         cur.execute(
-            "INSERT INTO jobs (type, params, idempotency_key, status, started_at) VALUES (%s,%s,%s,'running',now()) RETURNING id",
-            ("masscan-nmap", Json(params), idempotency_key),
+            "INSERT INTO jobs (type, params, idempotency_key, status, started_at, engagement_id) "
+            "VALUES (%s,%s,%s,'running',now(),%s::uuid) RETURNING id",
+            ("masscan-nmap", Json(params), idempotency_key, eid),
         )
         job_id = str(cur.fetchone()["id"])
         cur.execute("INSERT INTO tasks (job_id, type, status, started_at) VALUES (%s::uuid,'pipeline','running',now())", (job_id,))
@@ -2964,12 +3011,15 @@ def ingest_microburst(
 
     path = _save_upload_to_tmp(file)
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        eid = _resolve_engagement_id(engagement_id)
         cur.execute(
-            "INSERT INTO jobs (type, params, status) VALUES (%s, %s, 'queued') RETURNING id",
-            ("microburst-ingest", Json({
-                "filename": filename,
-                "engagement_id": engagement_id,
-            })),
+            "INSERT INTO jobs (type, params, status, engagement_id) "
+            "VALUES (%s, %s, 'queued', %s::uuid) RETURNING id",
+            (
+                "microburst-ingest",
+                Json({"filename": filename, "engagement_id": eid}),
+                eid,
+            ),
         )
         job_id = str(cur.fetchone()["id"])
         conn.commit()
@@ -8547,12 +8597,15 @@ def _do_ddg_search(product: str, version: str, _ddg_start, _ddg_time, _job_id: s
                             _template_paths.append(t.get("template_path", ""))
                         _tags_str = ",".join(sorted(_all_tags)[:15])
                         _action = f"Nuclei scan: {len(nuclei_templates)} templates matching {_product_short}"
+                        # engagement_id is auto-filled by the propagate trigger
+                        # (assets-by-ip lookup) when the active engagement context
+                        # is available, so the INSERT itself stays minimal.
                         cur.execute("""
                             INSERT INTO scan_recommendations
-                                (id, ip, scanner, action, template, source, confidence, priority, status)
-                            VALUES (gen_random_uuid(), %s::inet, 'nuclei', %s, %s, 'ai_check', 0.8, 70, 'pending')
+                                (id, ip, scanner, action, template, source, confidence, priority, status, engagement_id)
+                            VALUES (gen_random_uuid(), %s::inet, 'nuclei', %s, %s, 'ai_check', 0.8, 70, 'pending', %s::uuid)
                             ON CONFLICT (fingerprint) DO NOTHING
-                        """, (_host_ip, _action, _tags_str))
+                        """, (_host_ip, _action, _tags_str, _resolve_engagement_id()))
                         if cur.rowcount > 0:
                             nuclei_recs_created += 1
                     conn.commit()
