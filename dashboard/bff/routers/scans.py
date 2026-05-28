@@ -15,6 +15,52 @@ from engagement import engagement_headers
 from polling import register_job, active_jobs, _persist, pending_queue
 from timeouts import TIMEOUT_NORMAL, TIMEOUT_SCAN
 
+
+# ── "Cleared scans" deny-list (Bug 2 fix) ─────────────────────────────────
+# The original "Clear History" complaint: clicking it appeared to do
+# nothing because the BFF deletes from `active_jobs` but the audit.jsonl
+# merge re-injects the same job_ids on the next GET (audit log is
+# immutable by design).  Fix: maintain a persistent set of job_ids the
+# user has explicitly cleared, keyed by engagement.  list_scans filters
+# the audit-merge step by it; the audit log itself stays intact.
+_CLEARED_JOBS_PATH = pathlib.Path("/scan_results/.bff_cleared_jobs.json")
+
+
+def _cleared_key(engagement_id: Optional[str]) -> str:
+    """Storage key for the cleared-set dict.  None / empty → "_unscoped"."""
+    return engagement_id if engagement_id else "_unscoped"
+
+
+def _load_cleared_jobs() -> dict:
+    """Return the on-disk cleared dict as {key: set(job_id)}.  Returns
+    an empty dict if the file is missing or unreadable; never raises."""
+    if not _CLEARED_JOBS_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(_CLEARED_JOBS_PATH.read_text())
+        return {k: set(v) for k, v in raw.items() if isinstance(v, list)}
+    except Exception as e:
+        log.warning(f"Failed to load cleared-jobs file: {e}")
+        return {}
+
+
+def _save_cleared_jobs(data: dict) -> None:
+    """Persist the cleared-set dict atomically.  Sets are serialized as
+    sorted lists for deterministic on-disk format."""
+    serializable = {k: sorted(list(v)) for k, v in data.items()}
+    try:
+        _CLEARED_JOBS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CLEARED_JOBS_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(serializable, indent=2))
+        os.replace(tmp, _CLEARED_JOBS_PATH)
+    except Exception as e:
+        log.warning(f"Failed to persist cleared-jobs file: {e}")
+
+
+def _cleared_set_for(engagement_id: Optional[str]) -> set:
+    """Convenience: cleared job_ids for one engagement (or "_unscoped")."""
+    return _load_cleared_jobs().get(_cleared_key(engagement_id), set())
+
 router = APIRouter()
 
 # Max concurrent scans — prevents overwhelming scanners when batching
@@ -1112,6 +1158,10 @@ async def list_scans(engagement_id: Optional[str] = None):
     # Merge in scans from audit log that aren't tracked by BFF or autogen (last 48h only)
     audit_path = pathlib.Path("/scan_audit/audit.jsonl")
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+    # Bug 2 fix: skip job_ids the user has explicitly cleared.  The audit
+    # log is immutable, but the user's intent to dismiss those rows from
+    # the active view must persist across reloads -- so we filter here.
+    cleared_set = _cleared_set_for(engagement_id)
     if audit_path.exists():
         try:
             audit_jobs: dict = {}
@@ -1126,6 +1176,10 @@ async def list_scans(engagement_id: Optional[str] = None):
                     continue
                 # Skip entries older than 48h
                 if ts and ts < cutoff:
+                    continue
+                # User explicitly cleared this scan -- don't re-show it
+                # from the audit log.
+                if jid in cleared_set:
                     continue
                 # Cross-engagement isolation: when filtering by engagement_id,
                 # only include audit entries that explicitly carry the same
@@ -1249,6 +1303,17 @@ async def clear_scan_history(engagement_id: Optional[str] = None):
             jid for jid, info in active_jobs.items()
             if info.get("status") in ("completed", "failed", "stopped", "lost")
         ]
+
+    # Record the cleared job_ids in the persistent deny-list BEFORE
+    # touching active_jobs.  list_scans filters the audit.jsonl merge by
+    # this set so audit entries for cleared jobs don't ghost back into
+    # the view -- which was the original Clear-History bug.
+    if to_delete:
+        cleared = _load_cleared_jobs()
+        key = _cleared_key(engagement_id)
+        cleared.setdefault(key, set()).update(to_delete)
+        _save_cleared_jobs(cleared)
+
     persist_dir = pathlib.Path("/scan_results/.bff_jobs")
     for jid in to_delete:
         del active_jobs[jid]
