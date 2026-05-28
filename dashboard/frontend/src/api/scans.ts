@@ -1,21 +1,38 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './client'
+import { useUIStore } from '@/stores/ui'
 import type { ScanJob } from '@/lib/types'
 import { POLL } from '@/lib/polling'
 
+/**
+ * Build a `?engagement_id=...` query suffix for endpoints that filter by
+ * the active engagement.  The X-Engagement-Id header is already sent on
+ * every request by `apiFetch`, but BFF endpoints that filter results
+ * (scans list, audit log, recommendations) take an explicit query param
+ * for ergonomic CORS-friendly access from curl / external tools too.
+ *
+ * Returned suffix includes the leading `?` (or '' when no engagement is
+ * active, so calls fall through to the unscoped admin view).
+ */
+function engagementQS(eid: string | null): string {
+  return eid ? `?engagement_id=${encodeURIComponent(eid)}` : ''
+}
+
 export function useScans() {
+  const eid = useUIStore(s => s.selectedEngagementId)
   return useQuery({
-    queryKey: ['scans'],
-    queryFn: () => apiFetch<{ jobs: ScanJob[] }>('/scans'),
+    queryKey: ['scans', eid],
+    queryFn: () => apiFetch<{ jobs: ScanJob[] }>(`/scans${engagementQS(eid)}`),
     refetchInterval: POLL.REALTIME,
   })
 }
 
 /** Lightweight scan count for global badges (TopBar). Polls slowly. */
 export function useScanCount() {
+  const eid = useUIStore(s => s.selectedEngagementId)
   return useQuery({
-    queryKey: ['scan-count'],
-    queryFn: () => apiFetch<{ jobs: ScanJob[] }>('/scans'),
+    queryKey: ['scan-count', eid],
+    queryFn: () => apiFetch<{ jobs: ScanJob[] }>(`/scans${engagementQS(eid)}`),
     refetchInterval: POLL.SLOW,
     select: (data) => data.jobs?.filter(j => j.status === 'running' || j.status === 'queued').length ?? 0,
   })
@@ -189,9 +206,13 @@ export function usePipelineJobs(pipelineId: string | undefined) {
 
 export function useClearScanHistory() {
   const qc = useQueryClient()
+  const eid = useUIStore(s => s.selectedEngagementId)
   return useMutation({
     mutationFn: () =>
-      apiFetch<{ ok: boolean; deleted_count: number }>('/scans', { method: 'DELETE' }),
+      apiFetch<{ ok: boolean; deleted_count: number }>(
+        `/scans${engagementQS(eid)}`,
+        { method: 'DELETE' },
+      ),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['scans'] }),
   })
 }
@@ -206,9 +227,12 @@ export interface AuditEntry {
 }
 
 export function useScanAudit(jobId: string) {
+  const eid = useUIStore(s => s.selectedEngagementId)
   return useQuery({
-    queryKey: ['scan-audit', jobId],
-    queryFn: () => apiFetch<{ entries: AuditEntry[]; total: number }>(`/maintenance/audit-log?job_id=${jobId}`),
+    queryKey: ['scan-audit', jobId, eid],
+    queryFn: () => apiFetch<{ entries: AuditEntry[]; total: number }>(
+      `/maintenance/audit-log?job_id=${encodeURIComponent(jobId)}${eid ? `&engagement_id=${encodeURIComponent(eid)}` : ''}`,
+    ),
     enabled: !!jobId,
   })
 }
