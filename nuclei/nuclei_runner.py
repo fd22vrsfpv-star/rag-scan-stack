@@ -378,6 +378,24 @@ def ingest_results(path: pathlib.Path, job_id: str = None, target: str = None) -
 
 app = FastAPI(title="Nuclei Runner")
 
+# ── Engagement context (Option B / Phase 5) ──
+# See nmap_scanner/nmap-api.py for full docs.  Same pattern across all
+# scanner runners: capture X-Engagement-Id into audit_writer's ContextVar
+# so write_audit() picks it up automatically.
+try:
+    from audit_writer import current_engagement_id  # type: ignore
+
+    @app.middleware("http")
+    async def _capture_engagement_for_audit(request, call_next):
+        eid = request.headers.get("x-engagement-id") or request.headers.get("X-Engagement-Id")
+        token = current_engagement_id.set(eid or None)
+        try:
+            return await call_next(request)
+        finally:
+            current_engagement_id.reset(token)
+except ImportError:
+    pass
+
 @app.on_event("startup")
 async def startup_event():
     setup_log_capture()

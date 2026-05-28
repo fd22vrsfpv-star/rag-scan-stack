@@ -90,6 +90,21 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# ── Engagement context (Option B / Phase 5) — see nmap_scanner for docs. ──
+try:
+    from audit_writer import current_engagement_id  # type: ignore
+
+    @app.middleware("http")
+    async def _capture_engagement_for_audit(request, call_next):
+        eid = request.headers.get("x-engagement-id") or request.headers.get("X-Engagement-Id")
+        token = current_engagement_id.set(eid or None)
+        try:
+            return await call_next(request)
+        finally:
+            current_engagement_id.reset(token)
+except ImportError:
+    pass
+
 # Initialize handlers
 screenshot_handler = ScreenshotHandler()
 zap_bridge = ZAPBridge() if USE_ZAP else None
