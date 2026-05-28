@@ -1608,13 +1608,126 @@ def _background_run_masscan_nmap(job_id: str, targets: List[str], ports: str, ra
             cur.execute("UPDATE jobs SET status='failed', finished_at=now(), error=%s WHERE id=%s::uuid", (err, job_id))
         conn.commit()
 
+# Service-discovery sources whose ingest produces new (ip, service, banner)
+# tuples that the local-LLM scan_recommender can usefully reason about.
+# Sources NOT in this set (burp, subfinder, dnsx, tlsx, crtsh, brutus,
+# trufflehog, amass, gau, waybackurls, …) don't produce service-centric
+# output, so calling /next_scan for them would be a no-op or wasted call —
+# exploit_watcher's existing periodic poll picks up findings from them.
+_RECOMMENDER_TRIGGER_SOURCES = {
+    "nmap", "masscan", "naabu", "nessus", "nuclei",
+    "whatweb", "wafw00f", "httpx", "zap",
+}
+
+
 def _emit_ingest_event(source: str, stats: dict = None):
-    """Emit ingest_completed webhook so dashboard updates immediately."""
+    """Emit ingest_completed webhook, and — for service-discovery sources —
+    fire the local-LLM scan recommender for every freshly-touched open port
+    that doesn't yet have a recommendation.  Together these make prioritized
+    follow-ups appear as soon as scan results land, instead of waiting for the
+    exploit_watcher's polling cycle."""
     try:
         from webhooks import emit_webhook
         emit_webhook("ingest_completed", source, {"stats": stats or {}})
     except Exception:
         pass  # Non-critical — dashboard will still poll
+    try:
+        _trigger_recommendations_for(source, stats)
+    except Exception as e:
+        logger.warning("recommender trigger failed for source=%s: %s", source, e)
+
+
+def _trigger_recommendations_for(source: str, stats: dict = None):
+    """Fire-and-forget: ask the local-LLM scan_recommender to recommend next
+    probes for every recently-touched open port without a recommendation yet.
+
+    Runs in a daemon thread so the ingest response isn't blocked by LLM
+    inference.  Only fires for sources in `_RECOMMENDER_TRIGGER_SOURCES`;
+    everything else is a no-op (no shape match, no value)."""
+    if source not in _RECOMMENDER_TRIGGER_SOURCES:
+        return
+
+    def _worker():
+        scan_rec_url = os.environ.get("SCAN_RECOMMENDER_URL",
+                                      "https://scan-recommender:8013")
+        api_key = os.environ.get("API_KEY", "changeme")
+        try:
+            # Pull the most-recently-touched open ports that haven't been
+            # recommended on yet.  LEFT JOIN + IS NULL keeps this idempotent:
+            # running again over the same data is a no-op because rows
+            # already-recommended are filtered out.
+            with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT host(a.ip)::text AS ip,
+                           p.port,
+                           p.service,
+                           COALESCE(NULLIF(p.banner, ''),
+                                    NULLIF(CONCAT_WS(' ', p.product, p.version), '')
+                           ) AS banner
+                    FROM public.ports p
+                    JOIN public.assets a ON a.id = p.asset_id
+                    LEFT JOIN public.scan_recommendations sr
+                      ON sr.ip = a.ip
+                     AND COALESCE(sr.service, '') = COALESCE(p.service, '')
+                    WHERE COALESCE(p.is_open, true)
+                      AND p.last_seen >= now() - interval '10 minutes'
+                      AND sr.id IS NULL
+                    ORDER BY p.last_seen DESC
+                    LIMIT 100
+                """)
+                rows = cur.fetchall()
+
+            dispatched = 0
+            for row in rows:
+                params = {
+                    "ip": row["ip"],
+                    "port": str(row["port"]),
+                    "persist": "true",
+                }
+                if row.get("service"):
+                    params["service"] = row["service"]
+                if row.get("banner"):
+                    params["banner"] = row["banner"]
+                try:
+                    requests.get(
+                        f"{scan_rec_url}/next_scan",
+                        params=params,
+                        headers={"x-api-key": api_key},
+                        timeout=60,
+                        verify=False,
+                    )
+                    dispatched += 1
+                except Exception as e:
+                    logger.debug(
+                        "recommender call failed for %s:%s — %s",
+                        row["ip"], row["port"], e,
+                    )
+
+            if dispatched:
+                logger.info(
+                    "scan_recommender dispatched: source=%s dispatched=%d",
+                    source, dispatched,
+                )
+                # Surface this on the webhook bus so external tools / the
+                # OPSEC timeline can see that follow-ups were generated
+                # reactively in response to this ingest.
+                try:
+                    from webhooks import emit_webhook
+                    emit_webhook("recommendations_generated", source, {
+                        "source": source,
+                        "dispatched": dispatched,
+                    })
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(
+                "recommender trigger worker failed: source=%s err=%s",
+                source, e,
+            )
+
+    threading.Thread(
+        target=_worker, daemon=True, name=f"reco-trigger-{source}",
+    ).start()
 
 @app.post("/ingest/nmap")
 def ingest_nmap(
