@@ -1772,8 +1772,16 @@ def _trigger_recommendations_for(source: str, stats: dict = None):
                 source, e,
             )
 
+    # Propagate the request's contextvars (including current_engagement_id)
+    # into the worker thread.  `threading.Thread` does NOT inherit contextvars
+    # by default -- without this the worker runs with default (None) values
+    # for any contextvar set by the HTTP middleware, which would silently
+    # break engagement-scoped lookups added in future worker code paths.
+    # See: https://docs.python.org/3/library/contextvars.html#contextvars.copy_context
+    ctx = contextvars.copy_context()
     threading.Thread(
-        target=_worker, daemon=True, name=f"reco-trigger-{source}",
+        target=ctx.run, args=(_worker,),
+        daemon=True, name=f"reco-trigger-{source}",
     ).start()
 
 @app.post("/ingest/nmap")
