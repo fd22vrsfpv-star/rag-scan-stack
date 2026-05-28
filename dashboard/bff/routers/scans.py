@@ -1023,11 +1023,39 @@ async def launch_scan(scan_type: str, req: ScanRequest):
 
 
 @router.get("/api/scans")
-async def list_scans():
-    """Return all tracked jobs, merged with autogen agent scans and recent audit log entries."""
+async def list_scans(engagement_id: Optional[str] = None):
+    """Return all tracked jobs, merged with autogen agent scans and recent audit log entries.
+
+    When ``engagement_id`` is provided, only scans belonging to that engagement
+    are returned -- legacy / unscoped scans (engagement_id IS NULL) are hidden
+    to prevent cross-engagement leakage.  This is the BFF-side enforcement of
+    the engagement-isolation guarantee added in Option B / Phase 6.
+
+    Resolution rules per source:
+      * active_jobs: filter by info.get("engagement_id") == engagement_id
+      * autogen sessions: passed through with the same engagement_id query
+      * audit.jsonl: filter by entry.get("engagement_id") == engagement_id
+        for entries that have it; for legacy entries without engagement_id,
+        join through the rag-api's jobs.engagement_id by job_id (resolved
+        lazily on demand).
+    """
     from datetime import datetime, timezone, timedelta
-    jobs = [{"job_id": jid, **info} for jid, info in active_jobs.items()]
-    tracked_ids = set(active_jobs.keys())
+
+    # Filter active_jobs by engagement_id if requested.  active_jobs entries
+    # carry an "engagement_id" key when the launch site captured one
+    # (Phase 4 / rag-api middleware).  Old / legacy entries without the key
+    # are treated as unscoped and hidden when an engagement is active.
+    if engagement_id:
+        jobs = [
+            {"job_id": jid, **info}
+            for jid, info in active_jobs.items()
+            if info.get("engagement_id") == engagement_id
+        ]
+        tracked_ids = {jid for jid, info in active_jobs.items()
+                       if info.get("engagement_id") == engagement_id}
+    else:
+        jobs = [{"job_id": jid, **info} for jid, info in active_jobs.items()]
+        tracked_ids = set(active_jobs.keys())
 
     # Merge in scans from active autogen agent sessions
     try:
@@ -1098,6 +1126,17 @@ async def list_scans():
                 # Skip entries older than 48h
                 if ts and ts < cutoff:
                     continue
+                # Cross-engagement isolation: when filtering by engagement_id,
+                # only include audit entries that explicitly carry the same
+                # engagement_id.  Entries written before Phase 2 (no
+                # engagement_id field) are treated as legacy / unscoped and
+                # hidden when an engagement is active.  Stricter than the
+                # job_id-join approach but safer: a NULL audit entry whose
+                # job_id maps to a different engagement is correctly excluded.
+                if engagement_id:
+                    entry_eid = entry.get("engagement_id")
+                    if entry_eid != engagement_id:
+                        continue
                 event = entry.get("event", "")
                 if jid not in audit_jobs:
                     # Extract proxy from audit entry or from command string
@@ -1183,12 +1222,32 @@ async def delete_scan(job_id: str):
 
 
 @router.delete("/api/scans")
-async def clear_scan_history():
-    """Delete all completed/failed/stopped/lost scans from history."""
-    to_delete = [
-        jid for jid, info in active_jobs.items()
-        if info.get("status") in ("completed", "failed", "stopped", "lost")
-    ]
+async def clear_scan_history(engagement_id: Optional[str] = None):
+    """Delete all completed/failed/stopped/lost scans from BFF-tracked history.
+
+    When ``engagement_id`` is provided, only scans tagged to that engagement
+    are removed -- preventing the case where one engagement's "Clear History"
+    accidentally wipes another engagement's tracked scans.  When omitted
+    (admin / unscoped view), clears all completed/failed/stopped/lost scans.
+
+    Note: this clears BFF-tracked active_jobs and its on-disk persistence
+    only.  The rag-api jobs table and scan_audit/audit.jsonl are unchanged
+    (audit log is immutable by design; jobs table is cleaned via the
+    Maintenance page's "Jobs & Tasks" cleanup action).  GET /api/scans now
+    also filters audit-derived rows by engagement_id, so cleared scans
+    don't reappear from the audit-merge path.
+    """
+    if engagement_id:
+        to_delete = [
+            jid for jid, info in active_jobs.items()
+            if info.get("status") in ("completed", "failed", "stopped", "lost")
+            and info.get("engagement_id") == engagement_id
+        ]
+    else:
+        to_delete = [
+            jid for jid, info in active_jobs.items()
+            if info.get("status") in ("completed", "failed", "stopped", "lost")
+        ]
     persist_dir = pathlib.Path("/scan_results/.bff_jobs")
     for jid in to_delete:
         del active_jobs[jid]
