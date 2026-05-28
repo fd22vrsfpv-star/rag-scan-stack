@@ -1852,6 +1852,25 @@ ALTER TABLE public.credential_findings ADD COLUMN IF NOT EXISTS engagement_id uu
 ALTER TABLE public.assets             ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id);
 ALTER TABLE public.playwright_findings ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id);
 
+-- Scan-execution tables: engagement_id for cross-engagement isolation.
+-- ON DELETE SET NULL keeps scan history intact when an engagement is deleted
+-- (the history loses its engagement context, but isn't destroyed).
+-- NULL = legacy / unscoped — views must hide NULL rows when an engagement
+-- is active (see dashboard/bff list_scans + audit-log filtering).
+ALTER TABLE public.jobs                 ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id) ON DELETE SET NULL;
+ALTER TABLE public.tasks                ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id) ON DELETE SET NULL;
+ALTER TABLE public.scan_recommendations ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id) ON DELETE SET NULL;
+ALTER TABLE public.pending_exploits     ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id) ON DELETE SET NULL;
+ALTER TABLE public.exploit_results      ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id) ON DELETE SET NULL;
+
+-- Partial indexes (engagement_id IS NOT NULL) for the dominant query
+-- pattern: "show scans / tasks / recs / exploits for engagement X".
+CREATE INDEX IF NOT EXISTS idx_jobs_engagement                  ON public.jobs(engagement_id)                 WHERE engagement_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_engagement                 ON public.tasks(engagement_id)                WHERE engagement_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_scan_recommendations_engagement  ON public.scan_recommendations(engagement_id) WHERE engagement_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_pending_exploits_engagement      ON public.pending_exploits(engagement_id)     WHERE engagement_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_exploit_results_engagement       ON public.exploit_results(engagement_id)      WHERE engagement_id IS NOT NULL;
+
 -- Finding workflow columns (C1)
 ALTER TABLE public.vulns ADD COLUMN IF NOT EXISTS workflow_status text DEFAULT 'new'
     CHECK (workflow_status IN ('new','triaging','confirmed','false_positive','accepted_risk','in_report','deferred'));
