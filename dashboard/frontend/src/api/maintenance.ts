@@ -125,6 +125,30 @@ export function useAuditLog(filters?: { limit?: number; scan_type?: string; even
   })
 }
 
+export interface AuditLogRotateResponse {
+  ok: boolean
+  rotated: boolean
+  archive_name?: string
+  archived_lines?: number
+  archived_bytes?: number
+  reason?: string
+}
+
+/** Archive the active audit.jsonl into a timestamped file and start a fresh
+ * empty active log.  Export-then-rotate -- never destructively deletes
+ * audit data.  Invalidates the audit-log query so the table re-fetches. */
+export function useRotateAuditLog() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () =>
+      apiFetch<AuditLogRotateResponse>('/maintenance/audit-log/rotate', { method: 'POST' }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['audit-log'] })
+      qc.invalidateQueries({ queryKey: ['maintenance-stats'] })
+    },
+  })
+}
+
 // ---- Export ----
 
 interface ExportParams {
