@@ -6,6 +6,7 @@ import {
   useDataImport,
   useExportEstimate,
   useAuditLog,
+  useRotateAuditLog,
   useFollowupBulkUpdate,
   ImportResult,
 } from '@/api/maintenance'
@@ -138,6 +139,8 @@ export default function Maintenance() {
   // Audit log state
   const [auditLimit, setAuditLimit] = useState(100)
   const { data: auditData, isLoading: auditLoading } = useAuditLog({ limit: auditLimit })
+  const rotateAuditLog = useRotateAuditLog()
+  const [rotateMsg, setRotateMsg] = useState<string>('')
 
   const setAge = (key: string, val: string) =>
     setAges(prev => ({ ...prev, [key]: val }))
@@ -483,8 +486,10 @@ export default function Maintenance() {
         <h3 className="text-sm font-semibold mb-3">Scan Audit Log</h3>
         <p className="text-xs text-muted-foreground mb-3">
           Timestamped record of all scans executed — useful for post-engagement audit reports.
+          Use <strong>Rotate</strong> to archive the current log to a timestamped file and start a fresh one;
+          archived files stay on disk in <code className="font-mono">/scan_audit/</code> and can be exported.
         </p>
-        <div className="flex items-center gap-2 mb-3">
+        <div className="flex items-center gap-2 mb-3 flex-wrap">
           <span className="text-xs text-muted-foreground">Show:</span>
           {[50, 100, 500].map(n => (
             <button
@@ -499,6 +504,35 @@ export default function Maintenance() {
               {n}
             </button>
           ))}
+          <div className="ml-auto flex items-center gap-2">
+            {rotateMsg && (
+              <span className="text-xs font-mono text-primary">{rotateMsg}</span>
+            )}
+            <button
+              onClick={async () => {
+                if (!window.confirm(
+                  'Archive the active audit log to a timestamped file and start a fresh one?\n\n' +
+                  'The archive is preserved on disk in /scan_audit/ (not deleted).'
+                )) return
+                setRotateMsg('Rotating…')
+                try {
+                  const res = await rotateAuditLog.mutateAsync()
+                  if (res.rotated) {
+                    setRotateMsg(`Archived to ${res.archive_name} (${res.archived_lines} lines)`)
+                  } else {
+                    setRotateMsg(res.reason ?? 'No active log to rotate')
+                  }
+                } catch (err: unknown) {
+                  setRotateMsg(`Error: ${err instanceof Error ? err.message : 'Unknown'}`)
+                }
+              }}
+              disabled={rotateAuditLog.isPending}
+              className="h-6 px-3 text-xs rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-50"
+              title="Archive active audit log and start a fresh one"
+            >
+              {rotateAuditLog.isPending ? 'Rotating…' : 'Rotate'}
+            </button>
+          </div>
         </div>
         {auditLoading ? (
           <p className="text-xs text-muted-foreground">Loading audit log...</p>
