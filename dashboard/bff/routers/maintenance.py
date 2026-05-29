@@ -318,9 +318,20 @@ async def audit_log_rotate():
     except Exception:
         pass
 
-    ts = _dt.now().strftime("%Y%m%d-%H%M%S")
+    # Millisecond granularity so two rotations in the same second produce
+    # different archive filenames -- without this, a double-click would
+    # have the second `os.replace` silently overwrite the first archive.
+    ts = _dt.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]  # YYYYMMDD-HHMMSS-mmm
     archive_name = f"audit-{ts}.jsonl"
     archive_path = AUDIT_LOG_PATH.parent / archive_name
+    # Defense-in-depth: if the path still somehow exists (clock skew,
+    # filesystem oddity), append a numeric suffix instead of clobbering.
+    if archive_path.exists():
+        n = 2
+        while (AUDIT_LOG_PATH.parent / f"audit-{ts}-{n}.jsonl").exists():
+            n += 1
+        archive_name = f"audit-{ts}-{n}.jsonl"
+        archive_path = AUDIT_LOG_PATH.parent / archive_name
 
     try:
         # os.replace is atomic on POSIX -- callers concurrently opening the
