@@ -285,6 +285,84 @@ async def export_estimate():
 
 # ---- Audit log ----
 
+
+@router.post("/api/maintenance/audit-log/rotate")
+async def audit_log_rotate():
+    """Archive-and-reset the active audit log.
+
+    Renames the current ``/scan_audit/audit.jsonl`` to
+    ``/scan_audit/audit-YYYYMMDD-HHMMSS.jsonl`` (preserved as an immutable
+    archive for post-engagement reporting) and creates a fresh empty active
+    log.  This is the export-then-rotate pattern -- we never destructively
+    delete audit data, we just start a new active file.
+
+    audit_writer.write_audit() opens the file fresh per-call (`open(..., "a")`),
+    so the rename is safe: in-flight scans don't need to be paused, and
+    the next write reopens the new (empty) audit.jsonl at the canonical path.
+
+    Returns the archive filename, line count, and byte size so the UI can
+    confirm the operation.
+
+    Fires a `audit_log_rotated` webhook event via the rag-api so external
+    listeners (Slack, n8n, SIEM) and the OPSEC timeline see the rotation.
+    """
+    from datetime import datetime as _dt
+    if not AUDIT_LOG_PATH.exists():
+        return {"ok": True, "rotated": False, "reason": "no active audit log"}
+
+    archived_lines = 0
+    archived_bytes = AUDIT_LOG_PATH.stat().st_size
+    try:
+        with open(AUDIT_LOG_PATH) as f:
+            archived_lines = sum(1 for _ in f)
+    except Exception:
+        pass
+
+    ts = _dt.now().strftime("%Y%m%d-%H%M%S")
+    archive_name = f"audit-{ts}.jsonl"
+    archive_path = AUDIT_LOG_PATH.parent / archive_name
+
+    try:
+        # os.replace is atomic on POSIX -- callers concurrently opening the
+        # canonical path land in either the old file (now renamed) or the
+        # new empty one, never an in-between state.
+        os.replace(str(AUDIT_LOG_PATH), str(archive_path))
+        # Touch a new empty active log at the canonical path.
+        AUDIT_LOG_PATH.touch()
+    except Exception as e:
+        raise HTTPException(500, f"audit-log rotation failed: {e}")
+
+    # Fire-and-forget webhook event so the OPSEC timeline records the
+    # rotation.  Non-critical -- the rotation itself has already succeeded.
+    try:
+        import asyncio
+        s = get_settings()
+        async with httpx.AsyncClient(verify=False, timeout=5) as c:
+            await c.post(
+                f"{s.rag_api_url}/webhooks/emit",
+                json={
+                    "event_type": "audit_log_rotated",
+                    "source": "maintenance",
+                    "data": {
+                        "archive_name": archive_name,
+                        "archived_lines": archived_lines,
+                        "archived_bytes": archived_bytes,
+                    },
+                },
+                headers={"x-api-key": s.api_key, **engagement_headers()},
+            )
+    except Exception as e:
+        log.debug(f"audit_log_rotated webhook emit failed: {e}")
+
+    return {
+        "ok": True,
+        "rotated": True,
+        "archive_name": archive_name,
+        "archived_lines": archived_lines,
+        "archived_bytes": archived_bytes,
+    }
+
+
 @router.get("/api/maintenance/audit-log")
 async def audit_log(
     limit: int = Query(500, ge=1, le=10000),
