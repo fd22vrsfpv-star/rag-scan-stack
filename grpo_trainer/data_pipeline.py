@@ -519,12 +519,17 @@ def build_dataset(
         for entry in all_entries:
             f.write(json.dumps(entry, default=str) + "\n")
 
+    # Audit fix: previously `synthetic_entries` subtracted
+    # `len(rag_summary and [rag_summary] or [])` which evaluates to 0 or 1
+    # regardless of how many RAG rows actually landed in all_entries.
+    # The correct subtraction is the count of RAG GRPO rows folded in.
+    rag_entries_count = rag_summary.get("grpo_rows", 0) if rag_summary else 0
     stats = {
         "version": version,
         "total_entries": len(all_entries),
         "feedback_entries": len(feedback_data),
-        "synthetic_entries": len(all_entries) - len(feedback_data) - len(rag_summary and [rag_summary] or []),
-        "rag_entries": rag_summary.get("grpo_rows", 0) if rag_summary else 0,
+        "synthetic_entries": len(all_entries) - len(feedback_data) - rag_entries_count,
+        "rag_entries": rag_entries_count,
         "rag_triplets": rag_summary.get("triplets", 0) if rag_summary else 0,
         "rag_reranker_rows": rag_summary.get("reranker_rows", 0) if rag_summary else 0,
         "output_path": train_path,

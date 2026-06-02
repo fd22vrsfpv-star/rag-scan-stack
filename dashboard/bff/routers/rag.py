@@ -143,6 +143,7 @@ async def rag_training_preview(
 class RagTrainingExportRequest(BaseModel):
     days: int = 90
     min_rating: Optional[int] = None
+    subdir_prefix: Optional[str] = None  # scan_recommender sanitises this
 
 
 @router.post("/api/rag/training/export")
