@@ -674,6 +674,10 @@ services:
       - searchsploit-data:/var/lib/searchsploit
       - ./knowledge:/knowledge:ro
       - ./certs:/certs:ro
+      # RAG training-data export target (Layer 3).  /rag/training/export
+      # writes JSONL bundles here; bind-mounted so grpo_trainer (when
+      # deployed) and operators can pick them up off the host.
+      - ./datasets:/datasets
     ports:
       - "8013:8013"
     healthcheck:
