@@ -55,6 +55,142 @@ class TestRAGUtils:
             # Some overlap expected (not exact due to boundary handling)
             assert len(chunks[i]) <= 3000
 
+    # ---- Markdown-aware chunker tests ----
+
+    def test_chunk_markdown_keeps_header_with_command(self):
+        """A section whose ### header, prose, fenced command, and trailing
+        usage notes fit inside max_chars must come back as ONE tuple --
+        otherwise the LLM gets the command without "when to use" or vice
+        versa, which is the bug we're fixing."""
+        md = (
+            "### Brute Force\n\n"
+            "Use when default creds didn't work and you have a wordlist.\n\n"
+            "```bash\n"
+            "hydra -L users.txt -P passwords.txt ssh://target\n"
+            "```\n\n"
+            "Check for:\n"
+            "- Successful logins in hydra output\n"
+            "- Lockout indicators in target logs\n"
+        )
+
+        chunks = exploits_rag._chunk_markdown(md)
+
+        assert len(chunks) == 1, f"Expected single chunk, got {len(chunks)}"
+        section, body = chunks[0]
+        assert section == "Brute Force"
+        # Every part of the atomic unit must be present in the chunk
+        assert "hydra -L users.txt -P passwords.txt ssh://target" in body
+        assert "Use when default creds didn't work" in body
+        assert "Successful logins in hydra output" in body
+
+    def test_chunk_markdown_preserves_fenced_block(self):
+        """A section containing a fenced code block that pushes the section
+        over max_chars must NEVER split the fence -- both ``` markers must
+        live in the same chunk."""
+        big_code = "echo 'line {}'\n".format("x" * 30) * 100  # ~3.3k chars of code
+        md = (
+            "### Big Section\n\n"
+            "Preamble paragraph.\n\n"
+            "```bash\n"
+            f"{big_code}"
+            "```\n\n"
+            "Trailing paragraph.\n"
+        )
+
+        chunks = exploits_rag._chunk_markdown(md, max_chars=3500)
+
+        # The fence must be intact: find the chunk containing the opening
+        # ``` and assert it also contains the closing ```.
+        fence_chunks = [body for _h, body in chunks if "```bash" in body]
+        assert len(fence_chunks) == 1, (
+            "Opening ```bash should appear in exactly one chunk"
+        )
+        body = fence_chunks[0]
+        # An even number of fence markers means every open has a close
+        # within the same chunk.
+        assert body.count("```") % 2 == 0, (
+            f"Found uneven fence count in chunk -- fence was split.\n"
+            f"chunk head: {body[:120]!r}\nchunk tail: {body[-120:]!r}"
+        )
+
+    def test_chunk_markdown_splits_oversized_section_at_paragraphs(self):
+        """A single section bigger than max_chars should split at blank-line
+        paragraph boundaries, with every sub-chunk carrying the same
+        section_header.  Fences must stay whole."""
+        paragraphs = "\n\n".join(
+            [f"Paragraph {i}: " + ("p" * 400) for i in range(20)]
+        )
+        md = f"### Huge Section\n\n{paragraphs}\n"
+
+        chunks = exploits_rag._chunk_markdown(md, max_chars=1500)
+
+        assert len(chunks) > 1, "Oversized section should have split"
+        # Every chunk should carry the same section header
+        headers = {h for h, _b in chunks}
+        assert headers == {"Huge Section"}, (
+            f"All sub-chunks should share header; got {headers}"
+        )
+        # No mid-paragraph splits: every chunk should either start the file
+        # or start with "Paragraph N:" at its first non-empty line.
+        for _h, body in chunks[1:]:
+            first_meaningful = next(
+                (ln for ln in body.splitlines() if ln.strip()), ""
+            )
+            assert first_meaningful.startswith("Paragraph "), (
+                f"Sub-chunk started mid-paragraph: {first_meaningful!r}"
+            )
+
+    def test_chunk_markdown_merges_tiny_sections(self):
+        """Single-line subsections shouldn't become orphan chunks -- they
+        should merge forward under the previous header."""
+        md = (
+            "### Main Step\n\n"
+            "A full paragraph of context that easily clears min_chars. "
+            * 30
+            + "\n\n"
+            "### Tiny\n\n"
+            "one line only\n"
+        )
+
+        chunks = exploits_rag._chunk_markdown(md, min_chars=400)
+
+        # The tiny section should have merged into the previous one.
+        # Either we get a single chunk (merged), or two chunks where the
+        # tiny header doesn't appear standalone -- both are acceptable.
+        all_text = "".join(body for _h, body in chunks)
+        assert "one line only" in all_text
+        # The "Tiny" header should NOT be the section_header of a separate
+        # chunk -- its content merges back under "Main Step".
+        tiny_chunks = [c for h, c in chunks if h == "Tiny"]
+        assert len(tiny_chunks) == 0, (
+            "Tiny section should have merged into the previous section"
+        )
+
+    def test_embed_batch_falls_back_on_failure(self, monkeypatch):
+        """When the batch endpoint errors, _embed_batch must fall back to
+        per-text _embed() and preserve input ordering."""
+        # Simulate batch endpoint failure: make requests.post raise on the
+        # batch path, but make _embed succeed and return a deterministic
+        # vector so we can verify ordering.
+        def fake_post(*args, **kwargs):
+            raise RuntimeError("simulated batch endpoint failure")
+
+        def fake_embed(text):
+            # Encode the text length so we can verify ordering.
+            return [float(len(text)), 0.0, 0.0]
+
+        monkeypatch.setattr(exploits_rag.requests, "post", fake_post)
+        monkeypatch.setattr(exploits_rag, "_embed", fake_embed)
+
+        texts = ["short", "a bit longer text", "x"]
+        result = exploits_rag._embed_batch(texts)
+
+        # Order preserved + correct fallback values
+        assert len(result) == 3
+        assert result[0][0] == float(len("short"))
+        assert result[1][0] == float(len("a bit longer text"))
+        assert result[2][0] == float(len("x"))
+
     def test_parse_date_valid(self):
         """Test parsing valid ISO date."""
         date_str = "2024-01-15"
