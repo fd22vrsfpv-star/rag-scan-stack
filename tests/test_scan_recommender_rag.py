@@ -191,6 +191,112 @@ class TestRAGUtils:
         assert result[1][0] == float(len("a bit longer text"))
         assert result[2][0] == float(len("x"))
 
+    # ---- _stable_playbook_id tests ----
+
+    def test_stable_playbook_id_is_deterministic(self):
+        """Same filename -> same id, always.  This is the property that
+        Python's hash() lacks (PYTHONHASHSEED makes it non-deterministic)
+        and that the atomic-replace ingest depends on."""
+        a = exploits_rag._stable_playbook_id("ssh_methodology.md")
+        b = exploits_rag._stable_playbook_id("ssh_methodology.md")
+        c = exploits_rag._stable_playbook_id("ssh_methodology.md")
+        assert a == b == c, f"non-deterministic: {a}, {b}, {c}"
+
+    def test_stable_playbook_id_is_negative(self):
+        """All playbook ids must be strictly negative (in the range
+        [-1_000_000_001, -1]) so they can never collide with positive
+        ExploitDB ids -- including the boundary cases of the old buggy
+        code (-abs(x) % N which returned 0..N-1 i.e. positive)."""
+        for name in [
+            "ssh_methodology.md",
+            "web_methodology.md",
+            "smb_methodology.md",
+            "database_methodology.md",
+            "x.md",  # short
+            "extremely_long_filename_for_a_playbook.md",
+            "",      # empty -- still must be in the negative range
+        ]:
+            pid = exploits_rag._stable_playbook_id(name)
+            assert pid < 0, f"{name!r} -> {pid}, expected negative"
+            assert pid >= -1_000_000_001, f"{name!r} -> {pid}, out of range"
+
+    def test_stable_playbook_id_is_unique_across_filenames(self):
+        """Reasonable spread of distinct filenames must produce distinct
+        ids.  32-bit hash space with a billion-modulo means actual
+        collisions are vanishingly unlikely for ~11 playbook files."""
+        names = [
+            f"{prefix}_methodology.md"
+            for prefix in [
+                "ssh", "web", "smb", "database", "active_directory",
+                "credential", "lateral", "persistence", "defense",
+                "code_injection", "network",
+            ]
+        ]
+        ids = [exploits_rag._stable_playbook_id(n) for n in names]
+        assert len(set(ids)) == len(ids), (
+            f"collision among {len(names)} playbook ids: {ids}"
+        )
+
+    # ---- _embed_batch_cached tests ----
+
+    def test_embed_batch_cached_reuses_existing(self, monkeypatch):
+        """When a text's sha256 is already in the DB, _embed_batch_cached
+        reuses the stored embedding and skips the embedder.  Tests this
+        without a real DB by stubbing _conn() to return a fake cursor
+        that yields a known sha256 -> embedding mapping."""
+        # The two cached vectors.
+        known_text = "this is content we have seen before"
+        known_emb = [9.9, 8.8, 7.7]
+        new_text = "fresh content the embedder must process"
+        # _embed_batch's fallback path returns whatever fake we wire in.
+
+        # Stub _conn().__enter__().cursor() -> fake cursor that returns
+        # exactly one row for our known sha256.
+        known_digest = exploits_rag._sha256(known_text.encode("utf-8"))
+
+        class _FakeCursor:
+            def __init__(self):
+                self._rows = []
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def execute(self, sql, params=None):
+                # The cached lookup query selects sha256, embedding.
+                if "FROM exploit_chunks WHERE sha256" in sql:
+                    # params is (list_of_digests,)
+                    requested = set(params[0]) if params else set()
+                    self._rows = [
+                        (known_digest, json.dumps(known_emb))
+                    ] if known_digest in requested else []
+                else:
+                    self._rows = []
+            def fetchall(self): return self._rows
+
+        class _FakeConn:
+            def cursor(self): return _FakeCursor()
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        import json
+        monkeypatch.setattr(exploits_rag, "_conn", lambda: _FakeConn())
+
+        # Stub _embed_batch so we can verify ONLY the new text was sent.
+        sent_to_embedder = []
+        def fake_embed_batch(texts, batch_size=32):
+            sent_to_embedder.extend(texts)
+            return [[1.1, 2.2, 3.3] for _ in texts]
+        monkeypatch.setattr(exploits_rag, "_embed_batch", fake_embed_batch)
+
+        result = exploits_rag._embed_batch_cached([known_text, new_text])
+
+        # 1. Order preserved
+        assert len(result) == 2
+        # 2. Known text reused its stored embedding (not the fake fresh one)
+        assert result[0] == known_emb, f"expected cached, got {result[0]}"
+        # 3. Only the new text actually went to the embedder
+        assert sent_to_embedder == [new_text], (
+            f"embedder was called with: {sent_to_embedder}"
+        )
+
     def test_parse_date_valid(self):
         """Test parsing valid ISO date."""
         date_str = "2024-01-15"
