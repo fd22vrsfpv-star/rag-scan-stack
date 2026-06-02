@@ -188,3 +188,6 @@ kong/kong.yml
 # agentic-security scanner artifacts (per-directory cache)
 .agentic-security/
 **/.agentic-security/
+
+# RAG training-data exports (per-host, mirrored from container /datasets)
+datasets/
