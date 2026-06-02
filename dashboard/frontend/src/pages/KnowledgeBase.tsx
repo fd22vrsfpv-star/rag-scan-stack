@@ -6,6 +6,13 @@ import {
   useDeleteKBOverride,
   type KBServiceSummary,
 } from '@/api/kb'
+import {
+  useRagAsk,
+  useRagFeedback,
+  useRagFeedbackStats,
+  type RagAskResponse,
+  type RagRetrievedChunk,
+} from '@/api/rag'
 
 function SourceBadge({ source }: { source: string }) {
   const colors: Record<string, string> = {
@@ -17,6 +24,293 @@ function SourceBadge({ source }: { source: string }) {
     <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${colors[source] || 'bg-muted text-muted-foreground'}`}>
       {source}
     </span>
+  )
+}
+
+
+/**
+ * "Ask the Knowledge Base" — interactive RAG querying with operator
+ * feedback (Layer 1: every call writes a rag_query_log row; Layer 2:
+ * per-chunk thumbs up/down + overall rating + comment write rag_feedback
+ * rows).  Hard-negative signal (chunks marked unhelpful despite high
+ * similarity) is the most valuable training data this surface produces.
+ */
+function AskKnowledgeBase() {
+  const [question, setQuestion] = useState('')
+  const [topK, setTopK] = useState(6)
+  const [response, setResponse] = useState<RagAskResponse | null>(null)
+  // Per-chunk feedback state, keyed by chunk_id.  +1 = thumbs up,
+  // -1 = thumbs down, undefined = no opinion yet.
+  const [chunkRatings, setChunkRatings] = useState<Record<number, 1 | -1>>({})
+  const [overallRating, setOverallRating] = useState<-1 | 0 | 1>(0)
+  const [comment, setComment] = useState('')
+  const [submittedFeedbackFor, setSubmittedFeedbackFor] = useState<string | null>(null)
+
+  const ask = useRagAsk()
+  const submitFeedback = useRagFeedback()
+  const { data: stats } = useRagFeedbackStats(30)
+
+  const handleAsk = async () => {
+    if (!question.trim()) return
+    setResponse(null)
+    setChunkRatings({})
+    setOverallRating(0)
+    setComment('')
+    setSubmittedFeedbackFor(null)
+    try {
+      const r = await ask.mutateAsync({ q: question, top_k: topK })
+      setResponse(r)
+    } catch {
+      // Surfaced via ask.error below
+    }
+  }
+
+  const handleSubmitFeedback = async () => {
+    if (!response?.query_log_id) return
+    const helpful = Object.entries(chunkRatings)
+      .filter(([, r]) => r === 1)
+      .map(([id]) => Number(id))
+    const unhelpful = Object.entries(chunkRatings)
+      .filter(([, r]) => r === -1)
+      .map(([id]) => Number(id))
+    try {
+      await submitFeedback.mutateAsync({
+        query_log_id: response.query_log_id,
+        rating: overallRating,
+        helpful_chunk_ids: helpful,
+        unhelpful_chunk_ids: unhelpful,
+        comment: comment.trim() || undefined,
+      })
+      setSubmittedFeedbackFor(response.query_log_id)
+    } catch {
+      // Error surfaced via submitFeedback.error
+    }
+  }
+
+  return (
+    <div className="bg-card border border-border rounded-lg p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-sm font-semibold">Ask the Knowledge Base</h3>
+          <p className="text-xs text-muted-foreground">
+            Natural-language RAG query over playbooks + ExploitDB.  Rate the
+            answer + mark individual chunks helpful/unhelpful to feed the
+            training pipeline.
+          </p>
+        </div>
+        {stats?.summary && (
+          <div className="text-[10px] text-muted-foreground text-right">
+            <div>
+              <strong className="text-foreground">{stats.summary.queries}</strong>{' '}
+              queries · last {stats.days}d
+            </div>
+            <div>
+              👍 {stats.summary.thumbs_up} · 👎 {stats.summary.thumbs_down}
+              {stats.summary.queries > 0 && (
+                <>
+                  {' '}·{' '}
+                  {Math.round(
+                    (stats.summary.feedback_rows / stats.summary.queries) * 100,
+                  )}
+                  % rated
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="flex items-start gap-2">
+        <textarea
+          value={question}
+          onChange={e => setQuestion(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleAsk()
+          }}
+          placeholder="e.g. how do I brute force ssh?  (Ctrl/Cmd+Enter to submit)"
+          rows={2}
+          className="flex-1 rounded-md border border-border bg-background px-2 py-1.5 text-xs font-mono resize-none"
+        />
+        <div className="flex flex-col gap-1">
+          <label className="text-[10px] text-muted-foreground">top_k</label>
+          <input
+            type="number"
+            min={1}
+            max={25}
+            value={topK}
+            onChange={e => setTopK(Math.max(1, Math.min(25, Number(e.target.value) || 6)))}
+            className="w-14 rounded-md border border-border bg-background px-2 py-1 text-xs"
+          />
+          <button
+            onClick={handleAsk}
+            disabled={ask.isPending || !question.trim()}
+            className="px-3 py-1.5 text-xs rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {ask.isPending ? 'Asking…' : 'Ask'}
+          </button>
+        </div>
+      </div>
+
+      {ask.error && (
+        <p className="text-xs text-red-400 font-mono">
+          Error: {ask.error instanceof Error ? ask.error.message : String(ask.error)}
+        </p>
+      )}
+
+      {response && (
+        <div className="space-y-3 border-t border-border pt-3">
+          {/* Answer */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <h4 className="text-xs font-semibold">Answer</h4>
+              <span className="text-[10px] text-muted-foreground">
+                {response.duration_ms}ms · log id:{' '}
+                <code className="font-mono">
+                  {response.query_log_id?.slice(0, 8) ?? '—'}
+                </code>
+              </span>
+            </div>
+            <pre className="text-xs whitespace-pre-wrap font-sans bg-muted/30 rounded p-2 border border-border">
+              {response.answer || '(empty response from LLM)'}
+            </pre>
+          </div>
+
+          {/* Retrieved chunks with per-chunk feedback */}
+          {response.retrieved && response.retrieved.length > 0 && (
+            <div>
+              <h4 className="text-xs font-semibold mb-2">
+                Retrieved chunks ({response.retrieved.length})
+              </h4>
+              <div className="space-y-2">
+                {response.retrieved.map((c: RagRetrievedChunk, i: number) => {
+                  const rating = chunkRatings[c.chunk_id]
+                  return (
+                    <div
+                      key={c.chunk_id}
+                      className="flex items-start gap-2 p-2 rounded border border-border bg-muted/10"
+                    >
+                      <div className="flex flex-col gap-1 shrink-0">
+                        <button
+                          onClick={() =>
+                            setChunkRatings(prev => ({
+                              ...prev,
+                              [c.chunk_id]: rating === 1 ? (undefined as unknown as 1) : 1,
+                            }))
+                          }
+                          title="Helpful"
+                          className={`w-6 h-6 rounded text-xs ${
+                            rating === 1
+                              ? 'bg-green-500/30 border border-green-500/50 text-green-400'
+                              : 'bg-background border border-border hover:bg-muted'
+                          }`}
+                        >
+                          👍
+                        </button>
+                        <button
+                          onClick={() =>
+                            setChunkRatings(prev => ({
+                              ...prev,
+                              [c.chunk_id]: rating === -1 ? (undefined as unknown as -1) : -1,
+                            }))
+                          }
+                          title="Not helpful (despite high similarity — hard negative)"
+                          className={`w-6 h-6 rounded text-xs ${
+                            rating === -1
+                              ? 'bg-red-500/30 border border-red-500/50 text-red-400'
+                              : 'bg-background border border-border hover:bg-muted'
+                          }`}
+                        >
+                          👎
+                        </button>
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-[10px] text-muted-foreground flex items-center gap-2">
+                          <span className="font-mono">#{i + 1}</span>
+                          <span>
+                            <strong className="text-foreground">{c.title}</strong>
+                            {c.section_header && (
+                              <>
+                                {' > '}
+                                <span className="text-blue-400">{c.section_header}</span>
+                              </>
+                            )}
+                          </span>
+                          <span className="ml-auto font-mono">
+                            sim={c.similarity.toFixed(3)}
+                          </span>
+                        </div>
+                        <div className="text-[10px] text-muted-foreground font-mono truncate">
+                          {c.path}
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Overall rating + comment + submit */}
+          <div className="space-y-2 border-t border-border pt-2">
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-muted-foreground">Overall:</span>
+              <button
+                onClick={() => setOverallRating(overallRating === 1 ? 0 : 1)}
+                className={`px-2 py-1 text-xs rounded ${
+                  overallRating === 1
+                    ? 'bg-green-500/30 border border-green-500/50 text-green-400'
+                    : 'bg-background border border-border hover:bg-muted'
+                }`}
+              >
+                👍 Useful
+              </button>
+              <button
+                onClick={() => setOverallRating(overallRating === -1 ? 0 : -1)}
+                className={`px-2 py-1 text-xs rounded ${
+                  overallRating === -1
+                    ? 'bg-red-500/30 border border-red-500/50 text-red-400'
+                    : 'bg-background border border-border hover:bg-muted'
+                }`}
+              >
+                👎 Not useful
+              </button>
+            </div>
+            <textarea
+              value={comment}
+              onChange={e => setComment(e.target.value)}
+              placeholder="Optional comment — what was missing, wrong, or could be improved?"
+              rows={2}
+              className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-xs resize-none"
+            />
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleSubmitFeedback}
+                disabled={
+                  submitFeedback.isPending ||
+                  !response.query_log_id ||
+                  (overallRating === 0 &&
+                    Object.keys(chunkRatings).length === 0 &&
+                    !comment.trim())
+                }
+                className="h-7 px-3 text-xs rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              >
+                {submitFeedback.isPending ? 'Submitting…' : 'Submit feedback'}
+              </button>
+              {submittedFeedbackFor === response.query_log_id && (
+                <span className="text-xs text-green-400">✓ feedback recorded</span>
+              )}
+              {submitFeedback.error && (
+                <span className="text-xs text-red-400 font-mono">
+                  {submitFeedback.error instanceof Error
+                    ? submitFeedback.error.message
+                    : String(submitFeedback.error)}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -259,6 +553,8 @@ export default function KnowledgeBase() {
 
       {showAdd && <AddServiceForm onDone={() => setShowAdd(false)} />}
       {selected && <ServiceDetail name={selected} onClose={() => setSelected(null)} />}
+
+      <AskKnowledgeBase />
 
       <div className="bg-card border border-border rounded-lg overflow-hidden">
         {isLoading ? (
