@@ -10,6 +10,7 @@ from webhook_receiver import router as webhook_router
 from routers.health import router as health_router
 from routers.assets import router as assets_router
 from routers.findings import router as findings_router
+from routers.rag import router as rag_router
 from routers.scans import router as scans_router
 from routers.exploits import router as exploits_router
 from routers.reports import router as reports_router
@@ -91,6 +92,7 @@ app.include_router(health_router)
 app.include_router(assets_router)
 app.include_router(findings_router)
 app.include_router(scans_router)
+app.include_router(rag_router)
 app.include_router(exploits_router)
 app.include_router(reports_router)
 app.include_router(chat_router)
