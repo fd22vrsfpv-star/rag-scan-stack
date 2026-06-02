@@ -111,3 +111,59 @@ async def rag_feedback_stats(days: int = Query(30, ge=1, le=365)):
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
     return safe_json(resp)
+
+
+@router.get("/api/rag/training/preview")
+async def rag_training_preview(
+    days: int = Query(90, ge=1, le=365),
+    min_rating: Optional[int] = Query(None, ge=-1, le=5),
+):
+    """Counts-only preview of what /rag/training/export would produce
+    right now: how many embedding triplets, reranker rows, GRPO rows
+    can we extract from the current rag_query_log + rag_feedback tables.
+    Cheap to call; safe to poll from the dashboard."""
+    s = get_settings()
+    params: dict = {"days": days}
+    if min_rating is not None:
+        params["min_rating"] = min_rating
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=30) as c:
+            resp = await c.get(
+                f"{s.scan_recommender_url}/rag/training/preview",
+                params=params,
+                headers={"x-api-key": s.api_key, **engagement_headers()},
+            )
+    except Exception as e:
+        raise HTTPException(502, f"scan_recommender unreachable: {e}")
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, resp.text)
+    return safe_json(resp)
+
+
+class RagTrainingExportRequest(BaseModel):
+    days: int = 90
+    min_rating: Optional[int] = None
+
+
+@router.post("/api/rag/training/export")
+async def rag_training_export(req: RagTrainingExportRequest):
+    """Materialise the three RAG training datasets (embedding triplets,
+    reranker rows, GRPO RLHF rows) as JSONL on the host filesystem.
+    Returns the manifest of files written + counts.
+
+    Files land in /datasets/rag-YYYYMMDD-HHMMSS/ on the host (bind-
+    mounted from scan-recommender's /datasets).  The grpo_trainer
+    service can pick them up directly when it's deployed."""
+    s = get_settings()
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=300) as c:
+            resp = await c.post(
+                f"{s.scan_recommender_url}/rag/training/export",
+                json=req.dict(),
+                headers={"x-api-key": s.api_key, **engagement_headers()},
+            )
+    except Exception as e:
+        raise HTTPException(502, f"scan_recommender unreachable: {e}")
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, resp.text)
+    return safe_json(resp)

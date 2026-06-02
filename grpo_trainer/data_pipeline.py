@@ -287,12 +287,165 @@ def extract_feedback_dataset(
     ]
 
 
+def extract_rag_dataset(
+    days: int = 90,
+    min_rating: Optional[int] = None,
+) -> Dict:
+    """Extract RAG training data: embedding triplets, reranker rows,
+    and GRPO RLHF rows -- all derived from the rag_query_log x
+    rag_feedback join populated by the live scan_recommender service.
+
+    Mirror of ``_build_rag_training_datasets`` in scan_recommender so
+    the offline GRPO pipeline can produce the same dataset the live
+    dashboard surfaces.  Each row carries a ``source_query_log_id`` so
+    the offline dataset can be re-joined with the runtime tables for
+    ablation studies.
+
+    Returns ``{"summary": {...}, "triplets": [...], "reranker": [...],
+    "grpo": [...]}`` -- the GRPO list is what ``build_dataset`` folds
+    into the unified train.jsonl under ``task_type='rag_answer'``;
+    the other two are emitted as separate side-car files (since their
+    schemas differ from the per-row prompt/response format).
+    """
+    conds = ["f.created_at >= now() - %s::interval"]
+    params: list = [f"{days} days"]
+    if min_rating is not None:
+        conds.append("f.rating >= %s")
+        params.append(min_rating)
+    where = " AND ".join(conds)
+
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            SELECT q.id AS query_log_id, q.query, q.top_k_chunk_ids,
+                   q.top_k_sims, q.llm_answer, q.engagement_id,
+                   f.rating, f.helpful_chunk_ids, f.unhelpful_chunk_ids,
+                   f.comment, f.created_at AS feedback_at
+              FROM rag_feedback f
+              JOIN rag_query_log q ON q.id = f.query_log_id
+             WHERE {where}
+             ORDER BY f.created_at ASC
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+
+        all_ids: set = set()
+        for r in rows:
+            for ids in (r.get("top_k_chunk_ids") or [],
+                        r.get("helpful_chunk_ids") or [],
+                        r.get("unhelpful_chunk_ids") or []):
+                for cid in ids:
+                    if cid is not None:
+                        all_ids.add(int(cid))
+        chunks: Dict[int, dict] = {}
+        if all_ids:
+            cur.execute(
+                "SELECT id, edb_id, title, path, section_header, chunk, source_repo "
+                "FROM exploit_chunks WHERE id = ANY(%s)",
+                (list(all_ids),),
+            )
+            chunks = {int(c["id"]): dict(c) for c in cur.fetchall()}
+
+    triplets: List[dict] = []
+    reranker: List[dict] = []
+    grpo: List[dict] = []
+
+    for r in rows:
+        query = r["query"]
+        rating = r.get("rating")
+        helpful = [int(c) for c in (r.get("helpful_chunk_ids") or [])]
+        unhelpful = [int(c) for c in (r.get("unhelpful_chunk_ids") or [])]
+        top_k = [int(c) for c in (r.get("top_k_chunk_ids") or [])]
+        top_k_sims = list(r.get("top_k_sims") or [])
+
+        for pid in helpful:
+            p = chunks.get(pid)
+            if not p:
+                continue
+            for nid in unhelpful:
+                n = chunks.get(nid)
+                if not n:
+                    continue
+                triplets.append({
+                    "query": query,
+                    "positive": p["chunk"],
+                    "negative": n["chunk"],
+                    "positive_meta": {
+                        "chunk_id": pid,
+                        "title": p["title"],
+                        "section_header": p.get("section_header"),
+                    },
+                    "negative_meta": {
+                        "chunk_id": nid,
+                        "title": n["title"],
+                        "section_header": n.get("section_header"),
+                    },
+                    "source_query_log_id": str(r["query_log_id"]),
+                })
+
+        labeled = []
+        for idx, cid in enumerate(top_k):
+            ch = chunks.get(cid)
+            if not ch:
+                continue
+            label = 1 if cid in helpful else (-1 if cid in unhelpful else 0)
+            labeled.append({
+                "chunk_id": cid,
+                "chunk": ch["chunk"],
+                "title": ch["title"],
+                "section_header": ch.get("section_header"),
+                "similarity": top_k_sims[idx] if idx < len(top_k_sims) else None,
+                "label": label,
+            })
+        if labeled:
+            reranker.append({
+                "query": query,
+                "chunks": labeled,
+                "overall_rating": rating,
+                "source_query_log_id": str(r["query_log_id"]),
+            })
+
+        llm = r.get("llm_answer") or ""
+        if llm and not llm.startswith("[LLM_ERROR]") and rating is not None:
+            grpo.append({
+                "task_type": "rag_answer",
+                "user_prompt": query,
+                "model_response": llm,
+                "system_prompt": None,
+                "context": {
+                    "top_k_chunk_ids": top_k,
+                    "helpful_chunk_ids": helpful,
+                    "unhelpful_chunk_ids": unhelpful,
+                    "engagement_id": str(r["engagement_id"]) if r.get("engagement_id") else None,
+                },
+                "rating": rating,
+                "source_query_log_id": str(r["query_log_id"]),
+            })
+
+    return {
+        "summary": {
+            "days": days,
+            "min_rating": min_rating,
+            "raw_feedback_rows": len(rows),
+            "triplets": len(triplets),
+            "reranker_rows": len(reranker),
+            "grpo_rows": len(grpo),
+        },
+        "triplets": triplets,
+        "reranker": reranker,
+        "grpo": grpo,
+    }
+
+
 def build_dataset(
     version: str,
     task_types: Optional[List[str]] = None,
     min_rating: int = 1,
     include_synthetic: bool = True,
     output_dir: str = "/app/datasets",
+    include_rag: bool = True,
+    rag_days: int = 90,
 ) -> Dict:
     """
     Build a versioned JSONL training dataset.
@@ -340,16 +493,40 @@ def build_dataset(
             for entry in extract_agent_decision_prompts(limit=200):
                 all_entries.append({"source": "synthetic", **entry})
 
+    # 3. RAG feedback dataset (Layer 3): GRPO rows fold into the
+    # unified train.jsonl; triplets + reranker rows are emitted as
+    # separate side-car files because their schemas differ.
+    rag_summary: Dict = {}
+    if include_rag:
+        rag = extract_rag_dataset(days=rag_days)
+        rag_summary = rag["summary"]
+        for entry in rag["grpo"]:
+            all_entries.append({"source": "rag_feedback", **entry})
+
+        # Side-car files
+        triplets_path = os.path.join(output_dir, version, "rag_triplets.jsonl")
+        with open(triplets_path, "w") as f:
+            for entry in rag["triplets"]:
+                f.write(json.dumps(entry, default=str) + "\n")
+
+        reranker_path = os.path.join(output_dir, version, "rag_reranker.jsonl")
+        with open(reranker_path, "w") as f:
+            for entry in rag["reranker"]:
+                f.write(json.dumps(entry, default=str) + "\n")
+
     # Write JSONL
     with open(train_path, "w") as f:
         for entry in all_entries:
-            f.write(json.dumps(entry) + "\n")
+            f.write(json.dumps(entry, default=str) + "\n")
 
     stats = {
         "version": version,
         "total_entries": len(all_entries),
         "feedback_entries": len(feedback_data),
-        "synthetic_entries": len(all_entries) - len(feedback_data),
+        "synthetic_entries": len(all_entries) - len(feedback_data) - len(rag_summary and [rag_summary] or []),
+        "rag_entries": rag_summary.get("grpo_rows", 0) if rag_summary else 0,
+        "rag_triplets": rag_summary.get("triplets", 0) if rag_summary else 0,
+        "rag_reranker_rows": rag_summary.get("reranker_rows", 0) if rag_summary else 0,
         "output_path": train_path,
         "by_task_type": {},
     }
@@ -360,6 +537,6 @@ def build_dataset(
     # Write stats
     stats_path = os.path.join(output_dir, version, "stats.json")
     with open(stats_path, "w") as f:
-        json.dump(stats, f, indent=2)
+        json.dump(stats, f, indent=2, default=str)
 
     return stats

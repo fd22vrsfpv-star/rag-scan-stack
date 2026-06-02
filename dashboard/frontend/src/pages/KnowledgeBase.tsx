@@ -10,9 +10,132 @@ import {
   useRagAsk,
   useRagFeedback,
   useRagFeedbackStats,
+  useRagTrainingPreview,
+  useRagTrainingExport,
   type RagAskResponse,
   type RagRetrievedChunk,
+  type RagTrainingExportResult,
 } from '@/api/rag'
+
+/**
+ * "Training data" panel — Layer 3 of the RAG feedback loop.
+ *
+ * Shows how many rows the current rag_query_log + rag_feedback would
+ * produce in each training dataset format (embedding triplets,
+ * reranker rows, GRPO RLHF rows), and offers a one-click export that
+ * writes them as JSONL to `/datasets/rag-<timestamp>/` on the host
+ * (bind-mounted from the scan-recommender container).  The
+ * grpo_trainer service, when deployed, picks the same files up.
+ */
+function TrainingDataPanel() {
+  const [days, setDays] = useState(90)
+  const { data: preview } = useRagTrainingPreview(days)
+  const exportMut = useRagTrainingExport()
+  const [lastResult, setLastResult] = useState<RagTrainingExportResult | null>(null)
+
+  const handleExport = async () => {
+    setLastResult(null)
+    try {
+      const res = await exportMut.mutateAsync({ days })
+      setLastResult(res)
+    } catch {
+      // surfaced via exportMut.error
+    }
+  }
+
+  const ready = (preview?.triplets ?? 0) + (preview?.reranker_rows ?? 0) + (preview?.grpo_rows ?? 0)
+  const haveData = ready > 0
+
+  return (
+    <div className="bg-card border border-border rounded-lg p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-sm font-semibold">Training data (Layer 3)</h3>
+          <p className="text-xs text-muted-foreground">
+            Convert operator feedback into fine-tuning datasets.  Exports
+            three JSONL files: embedding triplets (hard negatives),
+            reranker rows (top-K with per-chunk labels), and GRPO RLHF
+            rows for LLM training.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <label className="text-[10px] text-muted-foreground">window</label>
+          <select
+            value={days}
+            onChange={e => setDays(Number(e.target.value))}
+            className="h-7 rounded-md border border-border bg-background px-2 text-xs"
+          >
+            <option value={7}>7d</option>
+            <option value={30}>30d</option>
+            <option value={90}>90d</option>
+            <option value={365}>365d</option>
+          </select>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-3 gap-2">
+        <div className="rounded border border-border bg-muted/10 p-2 text-center">
+          <div className="text-lg font-mono font-semibold">
+            {preview?.triplets ?? '—'}
+          </div>
+          <div className="text-[10px] text-muted-foreground">
+            embedding triplets<br />
+            <span className="text-[9px]">(query, +ve, hard −ve)</span>
+          </div>
+        </div>
+        <div className="rounded border border-border bg-muted/10 p-2 text-center">
+          <div className="text-lg font-mono font-semibold">
+            {preview?.reranker_rows ?? '—'}
+          </div>
+          <div className="text-[10px] text-muted-foreground">
+            reranker rows<br />
+            <span className="text-[9px]">(query, top-K labeled)</span>
+          </div>
+        </div>
+        <div className="rounded border border-border bg-muted/10 p-2 text-center">
+          <div className="text-lg font-mono font-semibold">
+            {preview?.grpo_rows ?? '—'}
+          </div>
+          <div className="text-[10px] text-muted-foreground">
+            GRPO rows<br />
+            <span className="text-[9px]">(RLHF prompt/response)</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-2">
+        <button
+          onClick={handleExport}
+          disabled={exportMut.isPending || !haveData}
+          className="h-7 px-3 text-xs rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          title={haveData ? 'Export to /datasets/' : 'No feedback rows in the selected window'}
+        >
+          {exportMut.isPending ? 'Exporting…' : 'Export training data'}
+        </button>
+        {!haveData && preview && (
+          <span className="text-[10px] text-muted-foreground">
+            Rate some answers above to generate training data.
+          </span>
+        )}
+        {lastResult?.exported && (
+          <span className="text-xs text-green-400 font-mono truncate">
+            ✓ wrote {Object.values(lastResult.files ?? {}).reduce((a, b) => a + b, 0)} rows
+            to <code>{lastResult.output_dir}</code>
+          </span>
+        )}
+        {lastResult && !lastResult.exported && lastResult.reason && (
+          <span className="text-xs text-amber-400">{lastResult.reason}</span>
+        )}
+        {exportMut.error && (
+          <span className="text-xs text-red-400 font-mono">
+            {exportMut.error instanceof Error ? exportMut.error.message : String(exportMut.error)}
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
 
 function SourceBadge({ source }: { source: string }) {
   const colors: Record<string, string> = {
@@ -555,6 +678,7 @@ export default function KnowledgeBase() {
       {selected && <ServiceDetail name={selected} onClose={() => setSelected(null)} />}
 
       <AskKnowledgeBase />
+      <TrainingDataPanel />
 
       <div className="bg-card border border-border rounded-lg overflow-hidden">
         {isLoading ? (

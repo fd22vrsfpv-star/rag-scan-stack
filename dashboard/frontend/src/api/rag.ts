@@ -97,3 +97,55 @@ export function useRagFeedbackStats(days: number = 30) {
     staleTime: 60_000,
   })
 }
+
+// ---- Layer 3: training-data extraction ----
+
+export interface RagTrainingPreview {
+  days: number
+  min_rating: number | null
+  raw_feedback_rows: number
+  triplets: number
+  reranker_rows: number
+  grpo_rows: number
+}
+
+export interface RagTrainingExportResult {
+  ok: boolean
+  exported: boolean
+  reason?: string
+  output_dir?: string
+  exported_at?: string
+  days?: number
+  raw_feedback_rows?: number
+  triplets?: number
+  reranker_rows?: number
+  grpo_rows?: number
+  files?: Record<string, number>
+}
+
+/** Preview of how many training rows the current feedback would extract
+ * (embedding triplets, reranker rows, GRPO RLHF rows).  Cheap; safe to
+ * poll. */
+export function useRagTrainingPreview(days: number = 90) {
+  return useQuery({
+    queryKey: ['rag-training-preview', days],
+    queryFn: () =>
+      apiFetch<RagTrainingPreview>(`/rag/training/preview?days=${days}`),
+    staleTime: 60_000,
+  })
+}
+
+/** Materialise the three training datasets as JSONL on the host
+ * (bind-mounted to /datasets/rag-YYYYMMDD-HHMMSS/). */
+export function useRagTrainingExport() {
+  return useMutation({
+    mutationFn: (req: { days?: number; min_rating?: number | null }) =>
+      apiFetch<RagTrainingExportResult>('/rag/training/export', {
+        method: 'POST',
+        body: JSON.stringify({
+          days: req.days ?? 90,
+          min_rating: req.min_rating ?? null,
+        }),
+      }),
+  })
+}
