@@ -149,3 +149,73 @@ export function useRagTrainingExport() {
       }),
   })
 }
+
+// ---- Layer 4 / Phase A: retrieval evaluation ----
+
+export interface RagEvalRun {
+  id: string
+  model_label: string
+  embed_model: string | null
+  eval_set_size: number
+  ndcg_at_3: number | null
+  ndcg_at_5: number | null
+  ndcg_at_10: number | null
+  mrr: number | null
+  recall_at_3: number | null
+  recall_at_5: number | null
+  recall_at_10: number | null
+  precision_at_3: number | null
+  precision_at_5: number | null
+  notes: string | null
+  created_at: string
+}
+
+export interface RagEvalRunResult {
+  ok: boolean
+  ran: boolean
+  reason?: string
+  id?: string
+  created_at?: string
+  model_label?: string
+  embed_model?: string
+  eval_set_size: number
+  ndcg_at_3?: number
+  ndcg_at_5?: number
+  ndcg_at_10?: number
+  mrr?: number
+  recall_at_3?: number
+  recall_at_5?: number
+  recall_at_10?: number
+  precision_at_3?: number
+  precision_at_5?: number
+}
+
+/** Trigger a fresh evaluation pass: replay every feedback-rated query
+ * through the current retrieval pipeline, score against operator labels,
+ * persist a row into rag_eval_runs. */
+export function useRagEvalRun() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (req: { model_label?: string; top_k?: number; days?: number; notes?: string | null }) =>
+      apiFetch<RagEvalRunResult>('/rag/eval/run', {
+        method: 'POST',
+        body: JSON.stringify({
+          model_label: req.model_label ?? 'baseline',
+          top_k: req.top_k ?? 10,
+          days: req.days ?? 365,
+          notes: req.notes ?? null,
+        }),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['rag-eval-history'] }),
+  })
+}
+
+/** Recent eval runs, most recent first.  Used by the dashboard widget. */
+export function useRagEvalHistory(limit: number = 10) {
+  return useQuery({
+    queryKey: ['rag-eval-history', limit],
+    queryFn: () =>
+      apiFetch<{ runs: RagEvalRun[] }>(`/rag/eval/history?limit=${limit}`),
+    staleTime: 30_000,
+  })
+}
