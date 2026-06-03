@@ -419,9 +419,15 @@ function AskKnowledgeBase() {
           value={question}
           onChange={e => setQuestion(e.target.value)}
           onKeyDown={e => {
-            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleAsk()
+            // Enter submits; Shift+Enter inserts a newline (standard
+            // chat-style affordance).  Operators expected this to be
+            // the default after the first round of feedback.
+            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+              e.preventDefault()
+              handleAsk()
+            }
           }}
-          placeholder="e.g. how do I brute force ssh?  (Ctrl/Cmd+Enter to submit)"
+          placeholder="e.g. how do I brute force ssh?  (Enter to submit, Shift+Enter for newline)"
           rows={2}
           className="flex-1 rounded-md border border-border bg-background px-2 py-1.5 text-xs font-mono resize-none"
         />
