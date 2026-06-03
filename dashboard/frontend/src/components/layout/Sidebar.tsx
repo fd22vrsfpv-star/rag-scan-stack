@@ -85,6 +85,7 @@ const NAV_GROUPS: NavEntry[] = [
     children: [
       { to: '/maintenance', icon: Wrench, label: 'Maintenance' },
       { to: '/knowledge', icon: BookOpen, label: 'Knowledge Base' },
+      { to: '/settings/kb-overrides', icon: Wrench, label: 'KB Overrides' },
       { to: '/settings', icon: Settings, label: 'Settings' },
       { to: '/sync', icon: RefreshCw, label: 'Sync' },
       { to: '/about', icon: Info, label: 'About' },
