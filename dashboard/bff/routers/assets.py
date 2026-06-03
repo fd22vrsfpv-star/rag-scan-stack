@@ -583,6 +583,139 @@ async def list_scan_recommendations(
         return {"recommendations": [], "error": str(e)}
 
 
+class AddScanRecommendationRequest(BaseModel):
+    """Payload for POST /api/scan-recommendations.
+
+    Used by the per-port "Suggest from KB" modal: operator picks a tool
+    from the KB suggestions list, we materialize it as a scan_recommendations
+    row with source='kb_manual' so it flows through the same dispatch +
+    status-loop machinery as auto-generated recs.
+    """
+    ip: str
+    port: Optional[int] = None
+    service: Optional[str] = None
+    scanner: str
+    action: Optional[str] = None
+    script: Optional[str] = None
+    template: Optional[str] = None
+    priority: int = 50
+    extra: Optional[dict] = None
+
+
+@router.post("/api/scan-recommendations")
+async def add_scan_recommendation(body: AddScanRecommendationRequest):
+    """Insert a manual KB-driven scan recommendation.
+
+    Dedupes against the table's generated `fingerprint` column
+    (md5 of ip|service|scanner|action|script|template) so adding the
+    same KB tool twice for the same port returns the existing row
+    instead of creating a duplicate.
+    """
+    extra = dict(body.extra or {})
+    if body.port is not None:
+        extra.setdefault("port", body.port)
+
+    def _do_insert():
+        from db import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            # INSERT ... ON CONFLICT DO NOTHING ... RETURNING returns no rows
+            # on a conflict, so we fall back to SELECT-by-fingerprint for the
+            # existing row.  Fingerprint is a generated column, so we let PG
+            # compute it -- this matches scan_recommender's persist path.
+            cur.execute(
+                """
+                INSERT INTO scan_recommendations (
+                    ip, service, scanner, action, script, template,
+                    source, priority, extra, status
+                )
+                VALUES (
+                    %s::inet, %s, %s, %s, %s, %s,
+                    'kb_manual', %s, %s::jsonb, 'pending'
+                )
+                ON CONFLICT (fingerprint) DO NOTHING
+                RETURNING id, status, created_at
+                """,
+                (
+                    body.ip,
+                    body.service,
+                    body.scanner,
+                    body.action,
+                    body.script,
+                    body.template,
+                    body.priority,
+                    Json(extra),
+                ),
+            )
+            row = cur.fetchone()
+            if row is None:
+                # Conflict on fingerprint -- find the existing row.
+                cur.execute(
+                    """
+                    SELECT id, status, created_at
+                      FROM scan_recommendations
+                     WHERE ip = %s::inet
+                       AND COALESCE(service,'') = COALESCE(%s,'')
+                       AND scanner = %s
+                       AND COALESCE(action,'') = COALESCE(%s,'')
+                       AND COALESCE(script,'') = COALESCE(%s,'')
+                       AND COALESCE(template,'') = COALESCE(%s,'')
+                     LIMIT 1
+                    """,
+                    (body.ip, body.service, body.scanner,
+                     body.action, body.script, body.template),
+                )
+                row = cur.fetchone()
+                conn.commit()
+                return {"created": False, "row": row}
+            conn.commit()
+            return {"created": True, "row": row}
+
+    try:
+        result = await asyncio.to_thread(_do_insert)
+    except Exception as e:
+        log.warning("manual rec insert failed: %s", e)
+        raise HTTPException(500, f"insert failed: {e}")
+
+    row = result["row"]
+    if row is None:
+        # Theoretical race: conflict happened but the row also vanished.
+        raise HTTPException(500, "insert raced with concurrent delete")
+    rec_id, status, created_at = row
+
+    # Best-effort webhook so external subscribers see operator-driven adds
+    # alongside the auto-generated rule firings.
+    s = get_settings()
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=5) as c:
+            await c.post(
+                f"{s.rag_api_url}/webhooks/emit",
+                json={
+                    "event_type": "scan_recommendation_manual_added",
+                    "source": "bff",
+                    "data": {
+                        "rec_id": str(rec_id),
+                        "ip": body.ip,
+                        "port": body.port,
+                        "service": body.service,
+                        "scanner": body.scanner,
+                        "action": body.action,
+                        "deduplicated": not result["created"],
+                    },
+                },
+                headers={"x-api-key": s.api_key, **engagement_headers()},
+            )
+    except Exception as e:
+        log.debug(f"scan_recommendation_manual_added webhook failed: {e}")
+
+    return {
+        "ok": True,
+        "created": result["created"],
+        "id": str(rec_id),
+        "status": status,
+        "created_at": created_at.isoformat() if created_at else None,
+    }
+
+
 class RunRecommendationsRequest(BaseModel):
     ids: List[str]
     proxy: Optional[str] = None  # SOCKS proxy URL, e.g. socks5://node-manager:10001

@@ -95,6 +95,92 @@ export function useScanRecommendations(status = 'pending') {
   })
 }
 
+// ---- KB tool-recommend (per-port "Suggest from KB" modal) ----
+//
+// Backed by the BFF proxy GET /api/rag/tools/recommend which forwards to
+// scan_recommender's /rag/tools/recommend.  Returns structured tool
+// suggestions plus an optional RAG playbook excerpt for the service.
+
+export interface KbToolSuggestion {
+  name: string
+  purpose: string
+  command?: string | null
+}
+export interface KbMetasploitModule {
+  module: string
+  purpose?: string | null
+}
+export interface KbToolRecommendation {
+  service: string
+  description?: string | null
+  common_ports: number[]
+  port_used?: number | null
+  tools: KbToolSuggestion[]
+  metasploit: KbMetasploitModule[]
+  nuclei_tags: string[]
+  common_vulns: string[]
+  rag_context?: string | null
+  error?: string | null
+}
+
+export function useKbToolRecommend(
+  service: string | undefined,
+  port: number | undefined,
+  enabled: boolean = true,
+) {
+  const params = new URLSearchParams()
+  if (service) params.set('service', service)
+  if (port !== undefined) params.set('port', String(port))
+  return useQuery({
+    queryKey: ['rag-tools-recommend', service ?? '', port ?? ''],
+    queryFn: () => apiFetch<KbToolRecommendation>(
+      `/rag/tools/recommend?${params.toString()}`
+    ),
+    enabled: enabled && (!!service || port !== undefined),
+    staleTime: 30_000,
+  })
+}
+
+// ---- POST /api/scan-recommendations (KB-driven manual add) ----
+//
+// Materializes one of the KbToolRecommendation suggestions as a stored
+// scan_recommendations row with source='kb_manual'.  Dedupes via the
+// fingerprint column on the BFF side -- a second add of the same target
+// + tool returns the existing row instead of creating a duplicate.
+
+export interface AddScanRecommendationPayload {
+  ip: string
+  port?: number
+  service?: string
+  scanner: string
+  action?: string
+  script?: string
+  template?: string
+  priority?: number
+  extra?: Record<string, unknown>
+}
+export interface AddScanRecommendationResponse {
+  ok: boolean
+  created: boolean   // false when fingerprint dedup hit an existing row
+  id: string
+  status: string
+  created_at: string | null
+}
+
+export function useAddScanRecommendation() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: AddScanRecommendationPayload) =>
+      apiFetch<AddScanRecommendationResponse>('/scan-recommendations', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['scan-recommendations'] })
+    },
+  })
+}
+
 export function useDeleteAssets() {
   const qc = useQueryClient()
   return useMutation({
