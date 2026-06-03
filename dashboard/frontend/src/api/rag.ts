@@ -10,6 +10,7 @@ export interface RagRetrievedChunk {
   path: string
   similarity: number
   edb_id: number | null
+  chunk: string
 }
 
 export interface RagAskResponse {
