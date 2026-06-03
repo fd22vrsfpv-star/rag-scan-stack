@@ -297,6 +297,128 @@ class TestRAGUtils:
             f"embedder was called with: {sent_to_embedder}"
         )
 
+    def test_playbook_reingest_removes_orphans(self, tmp_path, monkeypatch):
+        """Re-ingesting a playbook that shrunk MUST issue a DELETE for that
+        file's existing chunks before INSERTing the new ones, all in the same
+        transaction.
+
+        The atomic-replace contract: if the playbook drops from 5 chunks to
+        2, post-ingest DB state for that ``edb_id`` is exactly 2 rows with
+        ``chunk_id`` 0 and 1 -- the prior chunks 2..4 do not survive as
+        orphans poisoning future RAG retrieval.
+
+        We can't run real Postgres in unit tests, so we instead verify the
+        invariant by structure: capture every SQL statement the endpoint
+        executes per file, and assert (1) exactly one DELETE precedes any
+        INSERTs, (2) the DELETE filters on this file's edb_id, and (3) the
+        INSERT chunk_ids run contiguously from 0 and never reach the
+        previous-run count.
+        """
+        # ---- Build a fake DB that records every (sql, params) per cursor ----
+        executed: list[tuple[str, tuple]] = []
+
+        class _RecCursor:
+            rowcount = 1  # every insert "succeeds" for inserted-count math
+
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+            def execute(self, sql, params=None):
+                executed.append((sql, params))
+
+            def fetchall(self):  # _embed_batch_cached path may call this
+                return []
+
+        class _RecConn:
+            def cursor(self): return _RecCursor()
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def commit(self): pass
+            def rollback(self): pass
+
+        monkeypatch.setattr(exploits_rag, "_conn", lambda: _RecConn())
+        monkeypatch.setattr(exploits_rag, "_dim", lambda: 3)
+        monkeypatch.setattr(exploits_rag, "_ensure_schema", lambda dim: None)
+        # Skip the cache lookup; return one 3-vec per input text.
+        monkeypatch.setattr(
+            exploits_rag,
+            "_embed_batch_cached",
+            lambda texts: [[0.1, 0.2, 0.3] for _ in texts],
+        )
+
+        playbook = tmp_path / "ssh_methodology.md"
+        file_id = exploits_rag._stable_playbook_id(playbook.name)
+
+        # Each section MUST be ≥ _chunk_markdown's default min_chars (400) or
+        # they'd merge into one chunk and the orphan-shrink scenario would be
+        # vacuous.  500-char filler per section is comfortably above the floor.
+        def _section(letter: str, n: int) -> str:
+            filler = (
+                f"Section {letter}: this is body content for the playbook "
+                f"section, padded to clear the merge-tiny floor. "
+            ) * 6
+            return f"### Section {letter} step {n}\n\n{filler}\n\n"
+
+        # ---- First ingest: 5 distinct sections ----
+        playbook.write_text(
+            "".join(_section(c, i) for i, c in enumerate("ABCDE")),
+            encoding="utf-8",
+        )
+
+        executed.clear()
+        exploits_rag.ingest_playbooks_endpoint(playbook_dir=str(tmp_path))
+
+        first_run = list(executed)
+        deletes_1 = [(s, p) for s, p in first_run if s.lstrip().startswith("DELETE")]
+        inserts_1 = [(s, p) for s, p in first_run if "INSERT INTO exploit_chunks" in s]
+
+        assert len(deletes_1) == 1, (
+            f"expected exactly one DELETE on first ingest, got {len(deletes_1)}"
+        )
+        # DELETE precedes every INSERT.
+        first_delete_idx = next(i for i, (s, _) in enumerate(first_run) if s.lstrip().startswith("DELETE"))
+        first_insert_idx = next(i for i, (s, _) in enumerate(first_run) if "INSERT INTO exploit_chunks" in s)
+        assert first_delete_idx < first_insert_idx, (
+            "DELETE must run BEFORE any INSERTs (atomic-replace invariant)"
+        )
+        # DELETE targets this file's edb_id with the knowledge_base source_repo.
+        del_sql, del_params = deletes_1[0]
+        assert "source_repo = 'knowledge_base'" in del_sql
+        assert "edb_id = %s" in del_sql
+        assert del_params == (file_id,)
+        # First-run INSERT count == _chunk_markdown's section count.
+        chunks_first = exploits_rag._chunk_markdown(playbook.read_text())
+        assert len(inserts_1) == len(chunks_first)
+        # chunk_id column (index 7 in the INSERT param tuple) runs 0..N-1.
+        first_chunk_ids = [p[7] for _s, p in inserts_1]
+        assert first_chunk_ids == list(range(len(chunks_first)))
+
+        # ---- Second ingest: shrunk to 2 sections ----
+        playbook.write_text(
+            "".join(_section(c, i) for i, c in enumerate("AB")),
+            encoding="utf-8",
+        )
+
+        executed.clear()
+        exploits_rag.ingest_playbooks_endpoint(playbook_dir=str(tmp_path))
+
+        second_run = list(executed)
+        deletes_2 = [(s, p) for s, p in second_run if s.lstrip().startswith("DELETE")]
+        inserts_2 = [(s, p) for s, p in second_run if "INSERT INTO exploit_chunks" in s]
+
+        assert len(deletes_2) == 1, "shrink reingest must still issue one DELETE"
+        chunks_second = exploits_rag._chunk_markdown(playbook.read_text())
+        assert len(inserts_2) == len(chunks_second)
+        # The orphan property: post-shrink chunk_ids never reach the prior
+        # max.  Real DB state = exactly len(chunks_second) rows for this
+        # edb_id because DELETE wiped everything first.
+        second_chunk_ids = [p[7] for _s, p in inserts_2]
+        assert second_chunk_ids == list(range(len(chunks_second)))
+        assert max(second_chunk_ids) < max(first_chunk_ids), (
+            "post-shrink chunk_ids must be strictly less than pre-shrink max "
+            "-- combined with the DELETE this proves no orphans remain"
+        )
+
     def test_parse_date_valid(self):
         """Test parsing valid ISO date."""
         date_str = "2024-01-15"
