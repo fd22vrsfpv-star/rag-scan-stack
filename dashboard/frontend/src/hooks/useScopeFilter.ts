@@ -18,7 +18,15 @@ export function useScopeFilter(scopeName: string) {
   }, [scopeName, scopeData])
 
   const matchesScope = useCallback((val: string): boolean => {
-    if (!targetsList) return true
+    // No scope selected → no filter, everything matches.
+    if (!scopeName) return true
+    // A scope IS selected but its target list hasn't arrived yet (React Query
+    // is mid-fetch after the user picked a new scope from the dropdown).
+    // Return false so the table briefly shows empty rather than flashing the
+    // entire unfiltered asset list -- the latter looked like "the scope change
+    // didn't take" to operators.  Once targetsList lands, this re-runs and
+    // applies the real filter.
+    if (!targetsList) return false
     if (!val) return false
     const v = val.toLowerCase().trim()
     const targets = new Set(targetsList)
@@ -40,7 +48,10 @@ export function useScopeFilter(scopeName: string) {
       if (v.endsWith('.' + t)) return true
     }
     return false
-  }, [targetsList])
+  }, [scopeName, targetsList])
 
-  return { matchesScope, isFiltering: !!targetsList }
+  // isFiltering reflects user intent (a scope is selected), not load state.
+  // This keeps the count chip ("N in <scope>") accurate the instant the user
+  // changes the dropdown, rather than blinking off during the targets refetch.
+  return { matchesScope, isFiltering: !!scopeName }
 }

@@ -634,7 +634,10 @@ export default function AssetBrowser() {
     }
 
     return filtered
-  }, [allAssets, isScopeFiltering, matchesScope, search, portsFilter, providerFilter, assetKindFilter])
+    // scopeFilter is included for parity with the `subdomains` memo below and
+    // to guarantee invalidation when the local scope dropdown changes, even
+    // though matchesScope identity would normally cover it.
+  }, [allAssets, isScopeFiltering, matchesScope, search, portsFilter, providerFilter, assetKindFilter, scopeFilter])
 
   // Available provider chips derived from the current asset set, sorted by
   // count desc — operators see what tags exist without us hardcoding the list.
