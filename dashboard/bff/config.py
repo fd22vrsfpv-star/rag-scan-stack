@@ -46,6 +46,15 @@ class Settings(BaseSettings):
     burp_api_key: str = ""
     burp_proxy_url: str = "http://192.168.1.181:8080"
 
+    # Direct Postgres access -- matches scan_recommender's env var names so a
+    # single shared .env block in docker-compose feeds both services.  See
+    # db.py for the connection helper.
+    db_host: str = "rag-postgres"
+    db_port: int = 5432
+    db_name: str = "scans"
+    db_user: str = "app"
+    db_password: str = "app"
+
     model_config = {"env_prefix": "", "case_sensitive": False}
 
 

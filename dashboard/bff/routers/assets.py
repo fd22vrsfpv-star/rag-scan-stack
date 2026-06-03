@@ -4,6 +4,7 @@ import httpx
 from typing import List, Optional
 from fastapi import APIRouter, Query, Request, HTTPException
 from pydantic import BaseModel
+from psycopg2.extras import Json
 from config import get_settings
 from engagement import engagement_headers
 from polling import register_job
@@ -614,6 +615,28 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
     if not selected:
         return {"ok": False, "error": "No matching recommendations found", "results": []}
 
+    # Idempotency guard: a rec that's already 'queued' / 'running' / 'completed'
+    # MUST NOT be re-dispatched -- doing so spawns a second runner job for the
+    # same target and leaves the old job_id orphaned in the rec's extra.jsonb.
+    # We split selected[] into dispatchable + already_active and emit a
+    # 'skipped' result for the latter so the UI surfaces "already running".
+    _ACTIVE_REC_STATES = {"queued", "running", "completed"}
+    dispatchable = []
+    already_active_results = []
+    for rec in selected:
+        cur_status = (rec.get("status") or "pending").lower()
+        if cur_status in _ACTIVE_REC_STATES:
+            already_active_results.append({
+                "id": rec["id"],
+                "scanner": rec.get("scanner"),
+                "ip": rec.get("ip"),
+                "status": "skipped",
+                "detail": f"already {cur_status} -- skipped to prevent double-dispatch",
+            })
+        else:
+            dispatchable.append(rec)
+    selected = dispatchable
+
     # Map scanner → service URL
     SCANNER_URLS = {
         "nmap": s.nmap_scanner_url,
@@ -758,7 +781,11 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                     result["status"] = "dispatched"
                     result["job_id"] = job_id
                     result["detail"] = f"Scan started: {job_id[:8]}"
-                    # Register with BFF job tracker so it shows in Scan Monitor
+                    # Register with BFF job tracker so it shows in Scan Monitor.
+                    # source_rec_id links the runner job back to the
+                    # scan_recommendations row -- the polling loop uses this
+                    # to backfill the rec's terminal status when the job
+                    # finishes (see polling.py _backfill_recommendation_status).
                     if job_id and service_url:
                         try:
                             register_job(
@@ -767,9 +794,23 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                                 scan_type=scanner,
                                 target=ip,
                                 proxy=proxy_url,
+                                source_rec_id=rec["id"],
                             )
                         except Exception:
                             pass
+                        # Close the first half of the rec lifecycle loop:
+                        # mark queued + persist job_id + emit dispatched
+                        # webhook.  Best-effort; the run itself has already
+                        # been accepted by the scanner.
+                        await _mark_rec_dispatched(
+                            rec_id=rec["id"],
+                            job_id=job_id,
+                            ip=ip,
+                            port=rec.get("port"),
+                            service=rec.get("service"),
+                            scanner=scanner,
+                            node_id=node_id,
+                        )
                 else:
                     result["status"] = "failed"
                     result["detail"] = f"HTTP {r.status_code}: {r.text[:100]}"
@@ -833,6 +874,77 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             result["detail"] = f"Kali: {type(e).__name__}: {str(e)[:60]}"
         return result
 
+    async def _mark_rec_dispatched(
+        rec_id: str, job_id: str, ip: str, port, service, scanner: str,
+        node_id: Optional[str],
+    ):
+        """Close the first half of the rec → job lifecycle loop.
+
+        Called immediately after a successful register_job().  Two side
+        effects, both best-effort (a failure here must not roll back the
+        scanner job that was already accepted):
+          1. Direct UPDATE on scan_recommendations: status -> 'queued',
+             executed_at = now(), and merge job_id (+ optional node_id)
+             into the row's `extra` jsonb so the polling backfill can
+             correlate completion events back to the rec.
+          2. Emit a 'scan_recommendation_dispatched' webhook event so
+             external subscribers (Slack, n8n) see the dispatch.
+
+        psycopg2 is synchronous; we run the UPDATE in a worker thread via
+        asyncio.to_thread so this coroutine doesn't block the event loop.
+        """
+        # Step 1: status writeback via direct DB (no HTTP hop -- the BFF
+        # owns the trigger and has psycopg2 access via dashboard/bff/db.py).
+        def _do_update():
+            from db import get_db
+            extra_merge = {"job_id": job_id}
+            if node_id:
+                extra_merge["node_id"] = node_id
+            with get_db() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE scan_recommendations
+                       SET status = 'queued',
+                           executed_at = COALESCE(executed_at, now()),
+                           updated_at = now(),
+                           extra = COALESCE(extra, '{}'::jsonb) || %s::jsonb
+                     WHERE id = %s::uuid
+                    """,
+                    (Json(extra_merge), rec_id),
+                )
+                conn.commit()
+                return cur.rowcount
+
+        try:
+            rows = await asyncio.to_thread(_do_update)
+            if rows == 0:
+                log.warning("rec dispatch writeback: rec_id=%s not found in DB", rec_id)
+        except Exception as e:
+            log.warning(f"failed to UPDATE rec {rec_id} to queued: {e}")
+
+        # Step 2: fire-and-forget webhook.
+        try:
+            async with httpx.AsyncClient(verify=False, timeout=5) as c:
+                await c.post(
+                    f"{s.rag_api_url}/webhooks/emit",
+                    json={
+                        "event_type": "scan_recommendation_dispatched",
+                        "source": "bff",
+                        "data": {
+                            "rec_id": rec_id,
+                            "job_id": job_id,
+                            "ip": ip,
+                            "port": port,
+                            "service": service,
+                            "scanner": scanner,
+                            "node_id": node_id,
+                        },
+                    },
+                    headers={"x-api-key": s.api_key, **engagement_headers()},
+                )
+        except Exception as e:
+            log.debug(f"scan_recommendation_dispatched webhook failed: {e}")
+
     async def _dispatch_via_node(rec, scanner, ip, nid, result):
         """Route tool execution to a remote node via SSH."""
         command = rec.get("script") or f"{scanner} {ip}"
@@ -859,7 +971,10 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             result["detail"] = f"Node: {type(e).__name__}"
         return result
 
-    results = await asyncio.gather(*[dispatch_rec(r) for r in selected])
+    dispatched_results = await asyncio.gather(*[dispatch_rec(r) for r in selected])
+    # Combine fresh dispatches with the idempotency-guard skips so the UI
+    # sees one consistent list -- "already queued" recs surface as skipped.
+    results = list(dispatched_results) + already_active_results
 
     dispatched = sum(1 for r in results if r.get("status") == "dispatched")
     failed = sum(1 for r in results if r.get("status") == "failed")
