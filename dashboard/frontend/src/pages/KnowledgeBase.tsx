@@ -12,9 +12,12 @@ import {
   useRagFeedbackStats,
   useRagTrainingPreview,
   useRagTrainingExport,
+  useRagEvalRun,
+  useRagEvalHistory,
   type RagAskResponse,
   type RagRetrievedChunk,
   type RagTrainingExportResult,
+  type RagEvalRun,
 } from '@/api/rag'
 
 /**
@@ -132,6 +135,172 @@ function TrainingDataPanel() {
           </span>
         )}
       </div>
+    </div>
+  )
+}
+
+
+/**
+ * "Retrieval quality" panel — Layer 4 Phase A.
+ *
+ * Re-runs the feedback-rated queries through the live retrieval
+ * pipeline, scores them against operator-labeled helpful chunks,
+ * persists the result.  Lets us prove whether a future model swap
+ * (embedding fine-tune, reranker, etc.) actually improves retrieval
+ * vs. just claiming it does.
+ */
+function RetrievalQualityPanel() {
+  const [modelLabel, setModelLabel] = useState('baseline')
+  const [notes, setNotes] = useState('')
+  const runMut = useRagEvalRun()
+  const { data: history } = useRagEvalHistory(10)
+  const latest = history?.runs?.[0]
+
+  const fmt = (v: number | null | undefined) =>
+    v == null ? '—' : v.toFixed(3)
+
+  const handleRun = async () => {
+    try {
+      await runMut.mutateAsync({
+        model_label: modelLabel || 'baseline',
+        notes: notes.trim() || null,
+      })
+      setNotes('')
+    } catch {
+      // surfaced via runMut.error
+    }
+  }
+
+  return (
+    <div className="bg-card border border-border rounded-lg p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-sm font-semibold">Retrieval quality (Phase A)</h3>
+          <p className="text-xs text-muted-foreground">
+            Replay every feedback-rated query through the current retrieval
+            pipeline and score against operator labels.  The score is the
+            only honest answer to "did fine-tuning actually help?" — track
+            it before and after every model swap.
+          </p>
+        </div>
+        <div className="flex flex-col items-end gap-1 text-[10px] text-muted-foreground">
+          {latest ? (
+            <>
+              <span>
+                last run: <strong className="text-foreground">{latest.model_label}</strong>
+                {' '}· n={latest.eval_set_size}
+              </span>
+              <span>
+                {new Date(latest.created_at).toLocaleString()}
+              </span>
+            </>
+          ) : (
+            <span>no eval runs yet</span>
+          )}
+        </div>
+      </div>
+
+      {/* Metric grid */}
+      <div className="grid grid-cols-4 gap-2">
+        <MetricCell label="NDCG@3" value={fmt(latest?.ndcg_at_3)} />
+        <MetricCell label="NDCG@5" value={fmt(latest?.ndcg_at_5)} />
+        <MetricCell label="MRR" value={fmt(latest?.mrr)} />
+        <MetricCell label="Recall@5" value={fmt(latest?.recall_at_5)} />
+      </div>
+
+      {/* Run controls */}
+      <div className="flex items-end gap-2 flex-wrap">
+        <div className="flex flex-col gap-1">
+          <label className="text-[10px] text-muted-foreground">model_label</label>
+          <input
+            value={modelLabel}
+            onChange={e => setModelLabel(e.target.value)}
+            placeholder="baseline"
+            className="h-7 w-32 rounded-md border border-border bg-background px-2 text-xs"
+          />
+        </div>
+        <div className="flex flex-col gap-1 flex-1 min-w-[200px]">
+          <label className="text-[10px] text-muted-foreground">notes (optional)</label>
+          <input
+            value={notes}
+            onChange={e => setNotes(e.target.value)}
+            placeholder='e.g. "after re-ingest with markdown chunker"'
+            className="h-7 rounded-md border border-border bg-background px-2 text-xs"
+          />
+        </div>
+        <button
+          onClick={handleRun}
+          disabled={runMut.isPending}
+          className="h-7 px-3 text-xs rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+        >
+          {runMut.isPending ? 'Running…' : 'Run evaluation'}
+        </button>
+      </div>
+
+      {runMut.data && !runMut.data.ran && (
+        <p className="text-xs text-amber-400">
+          {runMut.data.reason ?? 'No rated queries to evaluate yet.'}
+        </p>
+      )}
+      {runMut.error && (
+        <p className="text-xs text-red-400 font-mono">
+          {runMut.error instanceof Error ? runMut.error.message : String(runMut.error)}
+        </p>
+      )}
+
+      {/* History table */}
+      {history?.runs && history.runs.length > 1 && (
+        <div>
+          <h4 className="text-xs font-semibold mb-1">Recent runs</h4>
+          <div className="overflow-x-auto">
+            <table className="w-full text-[11px]">
+              <thead>
+                <tr className="border-b border-border text-left text-muted-foreground">
+                  <th className="py-1 px-1.5">When</th>
+                  <th className="py-1 px-1.5">Model</th>
+                  <th className="py-1 px-1.5 text-right">n</th>
+                  <th className="py-1 px-1.5 text-right">NDCG@3</th>
+                  <th className="py-1 px-1.5 text-right">NDCG@5</th>
+                  <th className="py-1 px-1.5 text-right">MRR</th>
+                  <th className="py-1 px-1.5 text-right">R@5</th>
+                  <th className="py-1 px-1.5">Notes</th>
+                </tr>
+              </thead>
+              <tbody>
+                {history.runs.map((r: RagEvalRun) => (
+                  <tr key={r.id} className="border-b border-border/50 hover:bg-muted/20">
+                    <td className="py-1 px-1.5 text-muted-foreground whitespace-nowrap">
+                      {new Date(r.created_at).toLocaleString(undefined, {
+                        month: 'short', day: 'numeric',
+                        hour: '2-digit', minute: '2-digit',
+                      })}
+                    </td>
+                    <td className="py-1 px-1.5 font-mono">{r.model_label}</td>
+                    <td className="py-1 px-1.5 text-right">{r.eval_set_size}</td>
+                    <td className="py-1 px-1.5 text-right font-mono">{fmt(r.ndcg_at_3)}</td>
+                    <td className="py-1 px-1.5 text-right font-mono">{fmt(r.ndcg_at_5)}</td>
+                    <td className="py-1 px-1.5 text-right font-mono">{fmt(r.mrr)}</td>
+                    <td className="py-1 px-1.5 text-right font-mono">{fmt(r.recall_at_5)}</td>
+                    <td className="py-1 px-1.5 text-muted-foreground truncate max-w-[180px]">
+                      {r.notes ?? '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+function MetricCell({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded border border-border bg-muted/10 p-2 text-center">
+      <div className="text-base font-mono font-semibold">{value}</div>
+      <div className="text-[10px] text-muted-foreground">{label}</div>
     </div>
   )
 }
@@ -679,6 +848,7 @@ export default function KnowledgeBase() {
 
       <AskKnowledgeBase />
       <TrainingDataPanel />
+      <RetrievalQualityPanel />
 
       <div className="bg-card border border-border rounded-lg overflow-hidden">
         {isLoading ? (
