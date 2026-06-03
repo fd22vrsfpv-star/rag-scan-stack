@@ -337,6 +337,8 @@ function AskKnowledgeBase() {
   const [overallRating, setOverallRating] = useState<-1 | 0 | 1>(0)
   const [comment, setComment] = useState('')
   const [submittedFeedbackFor, setSubmittedFeedbackFor] = useState<string | null>(null)
+  // Per-chunk "show full content" toggle, keyed by chunk_id.
+  const [expandedChunks, setExpandedChunks] = useState<Set<number>>(new Set())
 
   const ask = useRagAsk()
   const submitFeedback = useRagFeedback()
@@ -476,6 +478,13 @@ function AskKnowledgeBase() {
               <div className="space-y-2">
                 {response.retrieved.map((c: RagRetrievedChunk, i: number) => {
                   const rating = chunkRatings[c.chunk_id]
+                  const isExpanded = expandedChunks.has(c.chunk_id)
+                  const chunkText = c.chunk ?? ''
+                  const PREVIEW_CHARS = 240
+                  const needsExpand = chunkText.length > PREVIEW_CHARS
+                  const preview = needsExpand
+                    ? chunkText.slice(0, PREVIEW_CHARS).trimEnd() + '…'
+                    : chunkText
                   return (
                     <div
                       key={c.chunk_id}
@@ -534,6 +543,30 @@ function AskKnowledgeBase() {
                         <div className="text-[10px] text-muted-foreground font-mono truncate">
                           {c.path}
                         </div>
+                        {/* Chunk content -- collapsed preview by default,
+                            click to expand to the full retrieved text. */}
+                        {chunkText && (
+                          <div className="mt-1.5">
+                            <pre className="text-[11px] whitespace-pre-wrap font-mono bg-background/60 border border-border/60 rounded px-2 py-1.5 leading-snug">
+                              {isExpanded ? chunkText : preview}
+                            </pre>
+                            {needsExpand && (
+                              <button
+                                onClick={() => {
+                                  setExpandedChunks(prev => {
+                                    const next = new Set(prev)
+                                    if (next.has(c.chunk_id)) next.delete(c.chunk_id)
+                                    else next.add(c.chunk_id)
+                                    return next
+                                  })
+                                }}
+                                className="mt-1 text-[10px] text-blue-400 hover:underline"
+                              >
+                                {isExpanded ? `Show less` : `Show full chunk (${chunkText.length} chars)`}
+                              </button>
+                            )}
+                          </div>
+                        )}
                       </div>
                     </div>
                   )
