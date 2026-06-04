@@ -215,3 +215,41 @@ async def rag_training_export(req: RagTrainingExportRequest):
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
     return safe_json(resp)
+
+
+@router.get("/api/rag/tools/recommend")
+async def rag_tools_recommend(
+    service: Optional[str] = Query(None, description="Service name (e.g., ssh, http, smb)"),
+    port: Optional[int] = Query(None, description="Port number to infer service from"),
+    include_msf: bool = Query(True),
+    include_nuclei: bool = Query(True),
+    include_rag: bool = Query(True),
+    top_k: int = Query(3, ge=1, le=10),
+):
+    """Proxy GET /rag/tools/recommend on scan_recommender so the dashboard's
+    per-port "Suggest from KB" modal can fetch structured tool suggestions
+    plus RAG playbook context for a given service/port.  Engagement-scoped
+    via the X-Engagement-Id header (apiFetch attaches it client-side)."""
+    s = get_settings()
+    params: dict = {
+        "include_msf": include_msf,
+        "include_nuclei": include_nuclei,
+        "include_rag": include_rag,
+        "top_k": top_k,
+    }
+    if service:
+        params["service"] = service
+    if port is not None:
+        params["port"] = port
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=30) as c:
+            resp = await c.get(
+                f"{s.scan_recommender_url}/rag/tools/recommend",
+                params=params,
+                headers={"x-api-key": s.api_key, **engagement_headers()},
+            )
+    except Exception as e:
+        raise HTTPException(502, f"scan_recommender unreachable: {e}")
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, resp.text)
+    return safe_json(resp)

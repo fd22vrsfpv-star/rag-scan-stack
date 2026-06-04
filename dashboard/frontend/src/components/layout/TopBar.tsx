@@ -14,6 +14,8 @@ const ROUTE_TITLES: Record<string, string> = {
   '/scans': 'Scan Monitor',
   '/assets': 'Assets',
   '/findings': 'Findings Explorer',
+  '/recommendations': 'Recommendations',
+  '/settings/kb-overrides': 'KB Overrides',
   '/recon': 'Recon & Scope Intelligence',
   '/exploits': 'Exploit Manager',
   '/reports': 'Reports',
