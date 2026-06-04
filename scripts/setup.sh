@@ -32,6 +32,7 @@ FORCE_GO_TOOLS=false
 NO_START=false
 NON_INTERACTIVE=false
 GPU_OVERRIDE=auto   # auto | force | skip — Phase 1 sets GPU_AVAILABLE; Phase 6 honors this
+SKIP_DEP_INSTALL=false   # Phase 1 auto-installs missing host deps (Docker, CLIs); --no-install disables
 
 for arg in "$@"; do
     case "$arg" in
@@ -41,6 +42,7 @@ for arg in "$@"; do
         --non-interactive) NON_INTERACTIVE=true ;;
         --gpu)            GPU_OVERRIDE=force ;;
         --no-gpu)         GPU_OVERRIDE=skip ;;
+        --no-install)     SKIP_DEP_INSTALL=true ;;
         -h|--help)
             echo "Usage: ./scripts/setup.sh [OPTIONS]"
             echo ""
@@ -51,6 +53,7 @@ for arg in "$@"; do
             echo "  --non-interactive  No prompts, use defaults everywhere"
             echo "  --gpu              Force-enable the gpu compose profile (ollama + embedder-gpu)"
             echo "  --no-gpu           Skip the gpu profile even if a GPU is detected"
+            echo "  --no-install       Do NOT auto-install missing host deps (Docker, CLIs, GPU toolkit)"
             echo "  -h, --help         Show this help"
             exit 0
             ;;
@@ -146,6 +149,174 @@ detect_platform() {
 detect_platform
 
 # ══════════════════════════════════════════════════════════════════════════
+#  Host dependency provisioning
+# ──────────────────────────────────────────────────────────────────────────
+#  Makes setup.sh a single entry point: it installs everything the host needs
+#  to BUILD and RUN the stack, then verifies it below. Scoped to genuine host
+#  prerequisites only — Docker + Docker Compose, a handful of CLIs, and the
+#  optional NVIDIA toolkit. The language toolchains (Go, Node, Python) and the
+#  per-tool security binaries are deliberately NOT installed here: every build
+#  runs inside containers, so the host never needs them.
+# ══════════════════════════════════════════════════════════════════════════
+_sudo() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
+
+PKG_MGR=""
+_detect_pkg_mgr() {
+    local m
+    for m in apt-get dnf yum apk brew; do
+        if command -v "$m" &>/dev/null; then PKG_MGR="$m"; return 0; fi
+    done
+    return 1
+}
+
+# Generic package install across the supported managers.
+_pm_install() {
+    [ $# -eq 0 ] && return 0
+    case "$PKG_MGR" in
+        apt-get) _sudo apt-get install -y -qq "$@" ;;
+        dnf)     _sudo dnf install -y "$@" ;;
+        yum)     _sudo yum install -y "$@" ;;
+        apk)     _sudo apk add --no-cache "$@" ;;
+        brew)    brew install "$@" ;;
+        *)       return 1 ;;
+    esac
+}
+
+# Install Docker Engine + Compose v2 plugin when absent. On WSL the daemon
+# normally comes from Docker Desktop integration, so we don't fight that.
+_install_docker() {
+    if command -v docker &>/dev/null && docker compose version &>/dev/null; then
+        return 0
+    fi
+    if [ "$IS_WSL" = true ] && [ -f /proc/sys/fs/binfmt_misc/WSLInterop ]; then
+        log_warn "Docker not found under WSL — enable Docker Desktop's WSL integration"
+        log_warn "  (Docker Desktop → Settings → Resources → WSL Integration), then re-run."
+        return 1
+    fi
+    case "$PKG_MGR" in
+        apt-get)
+            log_info "Installing Docker Engine + Compose plugin (apt)..."
+            _sudo install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+                | _sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+            _sudo chmod a+r /etc/apt/keyrings/docker.gpg
+            # download.docker.com lags new Ubuntu releases; pin a known-good
+            # codename for very recent / non-LTS versions.
+            local codename arch
+            codename=$(. /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-}")
+            case "$codename" in
+                focal|jammy|noble|bookworm|bullseye) ;;          # supported as-is
+                *) log_info "No Docker repo for '$codename' — falling back to noble (24.04)"; codename="noble" ;;
+            esac
+            arch=$(dpkg --print-architecture)
+            echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${codename} stable" \
+                | _sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+            _sudo apt-get update -qq
+            _sudo apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+            ;;
+        dnf|yum)
+            log_info "Installing Docker Engine + Compose plugin ($PKG_MGR)..."
+            _sudo "$PKG_MGR" install -y dnf-plugins-core || true
+            _sudo "$PKG_MGR" config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo 2>/dev/null || true
+            _sudo "$PKG_MGR" install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+            ;;
+        *)
+            log_warn "Cannot auto-install Docker with '$PKG_MGR' — install it manually: https://docs.docker.com/engine/install/"
+            return 1
+            ;;
+    esac
+    # Start + enable the daemon (systemd hosts) and grant the user docker access.
+    if command -v systemctl &>/dev/null; then
+        _sudo systemctl enable --now docker 2>/dev/null || true
+    fi
+    if [ "$(id -u)" -ne 0 ] && ! groups 2>/dev/null | grep -qw docker; then
+        _sudo usermod -aG docker "${USER:-$(id -un)}" 2>/dev/null || true
+        log_warn "Added ${USER:-$(id -un)} to the 'docker' group — log out/in for it to take effect."
+    fi
+}
+
+# Install the NVIDIA Container Toolkit so containers can use the GPU. Mirrors
+# the upstream install guide; configures the docker runtime and restarts it.
+_install_nvidia_toolkit() {
+    case "$PKG_MGR" in
+        apt-get)
+            curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+                | _sudo gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+            curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+                | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+                | _sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+            _sudo apt-get update -qq
+            _sudo apt-get install -y -qq nvidia-container-toolkit
+            ;;
+        dnf|yum)
+            curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
+                | _sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo >/dev/null
+            _sudo "$PKG_MGR" install -y nvidia-container-toolkit
+            ;;
+        *) return 1 ;;
+    esac
+    _sudo nvidia-ctk runtime configure --runtime=docker 2>/dev/null || true
+    if command -v systemctl &>/dev/null; then
+        _sudo systemctl restart docker 2>/dev/null || true
+    fi
+}
+
+# Provision the base host dependencies. Best-effort: per-package failures warn
+# rather than abort, so the Phase 1 checks below remain the source of truth.
+_install_host_deps() {
+    if [ "$SKIP_DEP_INSTALL" = true ]; then
+        log_skip "Host dependency install disabled (--no-install)"
+        return 0
+    fi
+    if ! _detect_pkg_mgr; then
+        log_warn "No supported package manager found — skipping auto-install (checks below still run)"
+        return 0
+    fi
+    log_info "Provisioning host dependencies via ${PKG_MGR} (use --no-install to skip)"
+
+    # Base CLIs the build/run actually uses. ssh-keygen ← openssh-client;
+    # gnupg/ca-certificates are needed to add the Docker apt repo.
+    local base
+    case "$PKG_MGR" in
+        apt-get) base="curl wget git unzip jq openssl ca-certificates gnupg lsb-release software-properties-common openssh-client" ;;
+        apk)     base="curl wget git unzip jq openssl ca-certificates gnupg openssh" ;;
+        *)       base="curl wget git unzip jq openssl ca-certificates gnupg openssh-clients" ;;
+    esac
+
+    # Install only what's missing to keep re-runs fast and quiet. On apt the
+    # authoritative installed-check is `dpkg -s`; elsewhere fall back to probing
+    # for the relevant binary (some packages ship no same-named command).
+    local want=() pkg bin
+    for pkg in $base; do
+        if [ "$PKG_MGR" = "apt-get" ]; then
+            dpkg -s "$pkg" &>/dev/null && continue
+        else
+            case "$pkg" in
+                openssh-client|openssh|openssh-clients)                    bin="ssh-keygen" ;;
+                gnupg)                                                     bin="gpg" ;;
+                ca-certificates|lsb-release|apt-transport-https|software-properties-common) bin="" ;;
+                *)                                                         bin="$pkg" ;;
+            esac
+            if [ -n "$bin" ] && command -v "$bin" &>/dev/null; then continue; fi
+        fi
+        want+=("$pkg")
+    done
+    # Refresh apt metadata only when we actually have something to install.
+    [ "$PKG_MGR" = "apt-get" ] && [ ${#want[@]} -gt 0 ] && { _sudo apt-get update -qq || true; }
+    if [ ${#want[@]} -gt 0 ]; then
+        log_info "Installing base packages: ${want[*]}"
+        _pm_install "${want[@]}" || log_warn "Some base packages failed to install — see checks below"
+    else
+        log_ok "Base CLI packages already present"
+    fi
+
+    # Docker Engine + Compose
+    _install_docker || true
+}
+
+_install_host_deps
+
+# ══════════════════════════════════════════════════════════════════════════
 #  PHASE 1 — Dependency Check
 # ══════════════════════════════════════════════════════════════════════════
 banner 1 "Checking dependencies"
@@ -154,9 +325,12 @@ DEP_PASS=0
 DEP_WARN=0
 DEP_FAIL=0
 INSTALL_HINTS=()
+# CLI tools that were missing AND are auto-installable via a package manager
+# (small userspace utils — not docker/compose, which need their own installers).
+MISSING_PKGS=()
 
 check_required() {
-    local name="$1" cmd="$2" install_hint="$3"
+    local name="$1" cmd="$2" install_hint="$3" pkg="${4:-$2}"
     if command -v "$cmd" &>/dev/null; then
         local ver
         ver=$("$cmd" --version 2>/dev/null | head -1 | head -c 60 || echo "installed")
@@ -165,7 +339,43 @@ check_required() {
     else
         echo -e "  ${RED}✗${NC} $name: NOT FOUND"
         INSTALL_HINTS+=("  $name: $install_hint")
+        [ -n "$pkg" ] && MISSING_PKGS+=("$pkg")
         DEP_FAIL=$((DEP_FAIL + 1))
+    fi
+}
+
+# Try to install missing userspace packages via the host package manager.
+# Returns 0 if an install was attempted, 1 if no usable package manager.
+attempt_pkg_install() {
+    local pkgs=("$@")
+    [ ${#pkgs[@]} -eq 0 ] && return 0
+
+    local SUDO=""
+    if [ "$(id -u)" -ne 0 ]; then
+        command -v sudo &>/dev/null && SUDO="sudo" || {
+            log_warn "Not root and sudo not available — cannot auto-install: ${pkgs[*]}"
+            return 1
+        }
+    fi
+
+    if command -v apt-get &>/dev/null; then
+        log_info "Installing missing packages via apt-get: ${pkgs[*]}"
+        $SUDO apt-get update -qq && $SUDO apt-get install -y -qq "${pkgs[@]}"
+    elif command -v dnf &>/dev/null; then
+        log_info "Installing missing packages via dnf: ${pkgs[*]}"
+        $SUDO dnf install -y "${pkgs[@]}"
+    elif command -v yum &>/dev/null; then
+        log_info "Installing missing packages via yum: ${pkgs[*]}"
+        $SUDO yum install -y "${pkgs[@]}"
+    elif command -v apk &>/dev/null; then
+        log_info "Installing missing packages via apk: ${pkgs[*]}"
+        $SUDO apk add --no-cache "${pkgs[@]}"
+    elif command -v brew &>/dev/null; then
+        log_info "Installing missing packages via brew: ${pkgs[*]}"
+        brew install "${pkgs[@]}"
+    else
+        log_warn "No supported package manager found — cannot auto-install: ${pkgs[*]}"
+        return 1
     fi
 }
 
@@ -259,6 +469,27 @@ echo ""
 echo -e "  ────────────────────────────────────"
 echo -e "  ${GREEN}Pass: $DEP_PASS${NC}  ${YELLOW}Warn: $DEP_WARN${NC}  ${RED}Fail: $DEP_FAIL${NC}"
 
+# Auto-install any missing userspace packages (unzip, jq, curl, git, openssl)
+# before failing. Docker/Compose are excluded — they need dedicated installers.
+if [ $DEP_FAIL -gt 0 ] && [ ${#MISSING_PKGS[@]} -gt 0 ]; then
+    echo ""
+    log_info "Attempting to auto-install missing packages: ${MISSING_PKGS[*]}"
+    if attempt_pkg_install "${MISSING_PKGS[@]}"; then
+        # Re-verify the tools we just tried to install; clear the ones now present.
+        STILL_MISSING=()
+        for pkg in "${MISSING_PKGS[@]}"; do
+            if command -v "$pkg" &>/dev/null; then
+                log_ok "$pkg now installed"
+                DEP_FAIL=$((DEP_FAIL - 1))
+                DEP_PASS=$((DEP_PASS + 1))
+            else
+                STILL_MISSING+=("$pkg")
+            fi
+        done
+        MISSING_PKGS=("${STILL_MISSING[@]}")
+    fi
+fi
+
 if [ $DEP_FAIL -gt 0 ]; then
     echo ""
     echo -e "  ${RED}Missing required dependencies:${NC}"
@@ -323,6 +554,15 @@ elif [ -n "$NVIDIA_SMI" ]; then
     if docker info 2>/dev/null | grep -q "Runtimes.*nvidia"; then
         log_ok "nvidia-container-toolkit installed"
         GPU_AVAILABLE=true
+    elif [ "$SKIP_DEP_INSTALL" = false ] && _detect_pkg_mgr && [ "$PKG_MGR" != "brew" ]; then
+        log_info "Installing NVIDIA Container Toolkit (GPU detected)..."
+        if _install_nvidia_toolkit && docker info 2>/dev/null | grep -q "Runtimes.*nvidia"; then
+            log_ok "nvidia-container-toolkit installed"
+            GPU_AVAILABLE=true
+        else
+            log_warn "nvidia-container-toolkit install incomplete — Ollama will use CPU only"
+            log_warn "  Manual: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html"
+        fi
     else
         log_warn "nvidia-container-toolkit not found — Ollama will use CPU only"
         log_warn "  Install: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html"
@@ -473,6 +713,65 @@ OLLAMA_BASE_URL=http://host.docker.internal:11434' .env
     log_ok "GPU → ${MAC_CHIP_NAME} / ${MAC_TOTAL_RAM_GB}GB unified memory"
 }
 
+# ── Env secret helpers ─────────────────────────────────────────────────────
+# Read a value from .env ("" if the key is missing).
+_get_env_val() { grep -E "^$1=" .env | head -1 | cut -d= -f2- || true; }
+
+# Set (replace or append) a key in .env. Values are hex/alnum, never contain '|'.
+_set_env_val() {
+    local var="$1" val="$2"
+    if grep -qE "^${var}=" .env; then
+        sed -i.bak "s|^${var}=.*|${var}=${val}|" .env && rm -f .env.bak
+    else
+        echo "${var}=${val}" >> .env
+    fi
+}
+
+_gen_alnum() { openssl rand -base64 "${1:-32}" | tr -d "=+/" | cut -c1-"${2:-32}"; }
+
+# Backfill any critical secret that is blank/missing in an existing .env. Guards
+# against a hand-edited or partial .env that would otherwise start Postgres (and
+# others) with an empty password. Mirrors the generators used for a fresh .env.
+_backfill_env_secrets() {
+    local filled=()
+    # Hex API-key style secrets
+    local hex_secrets="API_KEY ZAP_API_KEY KONG_ADMIN_TOKEN VLLM_API_KEY"
+    for v in $hex_secrets; do
+        if [ -z "$(_get_env_val "$v")" ]; then
+            _set_env_val "$v" "$(openssl rand -hex 32)"; filled+=("$v")
+        fi
+    done
+    # Alphanumeric password style secrets
+    local pw_secrets="POSTGRES_PASSWORD N8N_PASSWORD EXPLOITDB_PASSWORD SCANS_PASSWORD CHISEL_PASSWORD MSF_RPC_PASS"
+    for v in $pw_secrets; do
+        if [ -z "$(_get_env_val "$v")" ]; then
+            _set_env_val "$v" "$(_gen_alnum 32 32)"; filled+=("$v")
+        fi
+    done
+
+    # Rebuild credential strings that embed a regenerated password.
+    if printf '%s\n' "${filled[@]}" | grep -qx "POSTGRES_PASSWORD"; then
+        local u h p d pw
+        u="$(_get_env_val POSTGRES_USER)"; u="${u:-app}"
+        h="$(_get_env_val POSTGRES_HOST)"; h="${h:-rag-postgres}"
+        p="$(_get_env_val POSTGRES_PORT)"; p="${p:-5432}"
+        d="$(_get_env_val POSTGRES_DB)";   d="${d:-scans}"
+        pw="$(_get_env_val POSTGRES_PASSWORD)"
+        _set_env_val DB_DSN "postgresql://${u}:${pw}@${h}:${p}/${d}"
+    fi
+    if printf '%s\n' "${filled[@]}" | grep -qx "EXPLOITDB_PASSWORD"; then
+        local epw; epw="$(_get_env_val EXPLOITDB_PASSWORD)"
+        _set_env_val EDB_RW_PASSWORD "$epw"
+        _set_env_val PG_DSN "postgres://edb_rw:${epw}@rag-postgres:5432/exploits"
+    fi
+
+    if [ ${#filled[@]} -gt 0 ]; then
+        log_ok "Backfilled blank/missing secrets: ${filled[*]}"
+    else
+        log_skip "All critical secrets already set"
+    fi
+}
+
 # ══════════════════════════════════════════════════════════════════════════
 #  PHASE 3 — Environment (.env)
 # ══════════════════════════════════════════════════════════════════════════
@@ -480,6 +779,9 @@ banner 3 "Generating environment configuration"
 
 if [ -f ".env" ]; then
     log_skip ".env already exists — keeping current credentials"
+    # Even when keeping an existing .env, fill any blank critical secret with a
+    # secure random value so we never boot Postgres with an empty password.
+    _backfill_env_secrets
     # Still apply Mac config to existing .env if needed
     if [ "$IS_APPLE_SILICON" = true ]; then
         if grep -q "^OLLAMA_URL=http://ollama:11434" .env || ! grep -q "^GPU_NAME=" .env; then
@@ -694,7 +996,7 @@ PG_DSN=postgres://edb_rw:${EXPLOITDB_PASSWORD}@rag-postgres:5432/exploits
 SEARCHSPLOIT_JSON=/var/lib/searchsploit/searchsploit.json
 
 # ==========================================
-# HASHICORP VAULT (optional — `vault` compose profile)
+# HASHICORP VAULT (optional — \`vault\` compose profile)
 # ==========================================
 # Leave VAULT_ADDR empty to keep using plaintext .env. Set to https://vault:8200
 # AFTER running:
@@ -1123,8 +1425,10 @@ else
     log_info "Waiting 10s for services to initialize..."
     sleep 10
 
+    # rag-api now serves over TLS (https) on :8000; the dashboard BFF is http on
+    # :3001. Use -k for the self-signed cert. Wrong scheme = false negative.
     HEALTH_ENDPOINTS=(
-        "RAG API|http://localhost:8000/health"
+        "RAG API|https://localhost:8000/health"
         "Dashboard BFF|http://localhost:3001/health"
     )
 
@@ -1134,7 +1438,7 @@ else
     for entry in "${HEALTH_ENDPOINTS[@]}"; do
         NAME="${entry%%|*}"
         URL="${entry##*|}"
-        if curl -sf --max-time 5 "$URL" >/dev/null 2>&1; then
+        if curl -sfk --max-time 5 "$URL" >/dev/null 2>&1; then
             log_ok "$NAME — healthy"
             HEALTHY=$((HEALTHY + 1))
         else
