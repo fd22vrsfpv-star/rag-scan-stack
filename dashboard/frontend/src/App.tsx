@@ -26,6 +26,8 @@ const Engagements = lazy(() => import('@/pages/Engagements'))
 const ScopeIntelligence = lazy(() => import('@/pages/ScopeIntelligence'))
 const OpSec = lazy(() => import('@/pages/OpSec'))
 const FollowUps = lazy(() => import('@/pages/FollowUps'))
+const Recommendations = lazy(() => import('@/pages/Recommendations'))
+const KbOverrides = lazy(() => import('@/pages/KbOverrides'))
 const ApiTester = lazy(() => import('@/pages/ApiTester'))
 const DeltaCompare = lazy(() => import('@/pages/DeltaCompare'))
 const About = lazy(() => import('@/pages/About'))
@@ -158,6 +160,8 @@ export default function App() {
             <Route path="assets" element={<Suspense fallback={<Loading />}><AssetBrowser /></Suspense>} />
             <Route path="findings" element={<Suspense fallback={<Loading />}><FindingsExplorer /></Suspense>} />
             <Route path="follow-ups" element={<Suspense fallback={<Loading />}><FollowUps /></Suspense>} />
+            <Route path="recommendations" element={<Suspense fallback={<Loading />}><Recommendations /></Suspense>} />
+            <Route path="settings/kb-overrides" element={<Suspense fallback={<Loading />}><KbOverrides /></Suspense>} />
             <Route path="recon" element={<Suspense fallback={<Loading />}><ReconExplorer /></Suspense>} />
             <Route path="users" element={<Suspense fallback={<Loading />}><Users /></Suspense>} />
             <Route path="exploits" element={<Suspense fallback={<Loading />}><ExploitManager /></Suspense>} />

@@ -1852,6 +1852,14 @@ services:
       AZURE_ENDPOINT: ${AZURE_ENDPOINT:-}
       AZURE_MODEL: ${AZURE_MODEL:-gpt-4o}
       AZURE_API_VERSION: ${AZURE_API_VERSION:-2024-08-01-preview}
+      # Direct Postgres access for the BFF (scan_recommendations status
+      # writeback path -- see dashboard/bff/db.py).  Matches the env-var
+      # names scan_recommender uses so the same .env feeds both services.
+      DB_HOST: ${DB_HOST:-rag-postgres}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${POSTGRES_DB:-scans}
+      DB_USER: ${POSTGRES_USER:-app}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-app}
     depends_on:
       rag-api:
         condition: service_started

@@ -14,6 +14,7 @@ import type { Asset, Port, Vuln, ScanRecommendation } from '@/lib/types'
 import { X, Trash2, Key, Plus, ShieldCheck, ShieldX, ShieldQuestion, ShieldOff, AlertTriangle, Globe, Camera, Cpu, Settings2, Search, ExternalLink, Cloud, Server } from 'lucide-react'
 import { ScopeAssignModal } from '@/components/common/ScopeAssignModal'
 import { ScopeFilter } from '@/components/common/ScopeFilter'
+import { KbSuggestionsModal } from '@/components/recommendations/KbSuggestionsModal'
 import { useScopeFilter } from '@/hooks/useScopeFilter'
 import { useUIStore } from '@/stores/ui'
 import { useScreenshots, useReconDomainOverview } from '@/api/recon'
@@ -379,6 +380,10 @@ function PortDetailDialog({
   const reconExecute = useTargetedReconExecute()
   const [selectedNode, setSelectedNode] = useState('')
   const [execResults, setExecResults] = useState<Record<string, { ok: boolean; stdout: string; stderr: string }>>({})
+  // "Suggest from KB" modal -- queries the knowledge base for tool ideas
+  // beyond the auto-rec rules and lets the operator promote any of them
+  // into a stored scan_recommendations row (source='kb_manual').
+  const [showKbModal, setShowKbModal] = useState(false)
 
   const commands = reconData?.commands ?? []
   const nodes = reconData?.nodes ?? []
@@ -449,13 +454,23 @@ function PortDetailDialog({
               <h4 className="text-xs font-medium text-muted-foreground">
                 Recommended Scans ({commands.length})
               </h4>
-              {nodes.length > 0 && (
-                <select value={selectedNode} onChange={e => setSelectedNode(e.target.value)}
-                  className="bg-muted rounded px-2 py-0.5 text-[10px] border border-border w-36">
-                  <option value="">Run on node...</option>
-                  {nodes.map(n => <option key={n.id} value={n.id}>{n.name}</option>)}
-                </select>
-              )}
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowKbModal(true)}
+                  title="Browse KB tool suggestions for this service/port and add any to the recommendations queue"
+                  className="px-2 py-0.5 text-[10px] rounded border border-border bg-muted/40 hover:bg-muted text-foreground"
+                >
+                  Suggest from KB
+                </button>
+                {nodes.length > 0 && (
+                  <select value={selectedNode} onChange={e => setSelectedNode(e.target.value)}
+                    className="bg-muted rounded px-2 py-0.5 text-[10px] border border-border w-36">
+                    <option value="">Run on node...</option>
+                    {nodes.map(n => <option key={n.id} value={n.id}>{n.name}</option>)}
+                  </select>
+                )}
+              </div>
             </div>
             {reconLoading ? (
               <p className="text-xs text-muted-foreground">Loading recommendations...</p>
@@ -503,6 +518,14 @@ function PortDetailDialog({
           </div>
         </Dialog.Content>
       </Dialog.Portal>
+      {showKbModal && (
+        <KbSuggestionsModal
+          ip={ip}
+          port={port.port}
+          service={port.service || undefined}
+          onClose={() => setShowKbModal(false)}
+        />
+      )}
     </Dialog.Root>
   )
 }

@@ -4,6 +4,7 @@ import httpx
 from typing import List, Optional
 from fastapi import APIRouter, Query, Request, HTTPException
 from pydantic import BaseModel
+from psycopg2.extras import Json
 from config import get_settings
 from engagement import engagement_headers
 from polling import register_job
@@ -582,6 +583,139 @@ async def list_scan_recommendations(
         return {"recommendations": [], "error": str(e)}
 
 
+class AddScanRecommendationRequest(BaseModel):
+    """Payload for POST /api/scan-recommendations.
+
+    Used by the per-port "Suggest from KB" modal: operator picks a tool
+    from the KB suggestions list, we materialize it as a scan_recommendations
+    row with source='kb_manual' so it flows through the same dispatch +
+    status-loop machinery as auto-generated recs.
+    """
+    ip: str
+    port: Optional[int] = None
+    service: Optional[str] = None
+    scanner: str
+    action: Optional[str] = None
+    script: Optional[str] = None
+    template: Optional[str] = None
+    priority: int = 50
+    extra: Optional[dict] = None
+
+
+@router.post("/api/scan-recommendations")
+async def add_scan_recommendation(body: AddScanRecommendationRequest):
+    """Insert a manual KB-driven scan recommendation.
+
+    Dedupes against the table's generated `fingerprint` column
+    (md5 of ip|service|scanner|action|script|template) so adding the
+    same KB tool twice for the same port returns the existing row
+    instead of creating a duplicate.
+    """
+    extra = dict(body.extra or {})
+    if body.port is not None:
+        extra.setdefault("port", body.port)
+
+    def _do_insert():
+        from db import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            # INSERT ... ON CONFLICT DO NOTHING ... RETURNING returns no rows
+            # on a conflict, so we fall back to SELECT-by-fingerprint for the
+            # existing row.  Fingerprint is a generated column, so we let PG
+            # compute it -- this matches scan_recommender's persist path.
+            cur.execute(
+                """
+                INSERT INTO scan_recommendations (
+                    ip, service, scanner, action, script, template,
+                    source, priority, extra, status
+                )
+                VALUES (
+                    %s::inet, %s, %s, %s, %s, %s,
+                    'kb_manual', %s, %s::jsonb, 'pending'
+                )
+                ON CONFLICT (fingerprint) DO NOTHING
+                RETURNING id, status, created_at
+                """,
+                (
+                    body.ip,
+                    body.service,
+                    body.scanner,
+                    body.action,
+                    body.script,
+                    body.template,
+                    body.priority,
+                    Json(extra),
+                ),
+            )
+            row = cur.fetchone()
+            if row is None:
+                # Conflict on fingerprint -- find the existing row.
+                cur.execute(
+                    """
+                    SELECT id, status, created_at
+                      FROM scan_recommendations
+                     WHERE ip = %s::inet
+                       AND COALESCE(service,'') = COALESCE(%s,'')
+                       AND scanner = %s
+                       AND COALESCE(action,'') = COALESCE(%s,'')
+                       AND COALESCE(script,'') = COALESCE(%s,'')
+                       AND COALESCE(template,'') = COALESCE(%s,'')
+                     LIMIT 1
+                    """,
+                    (body.ip, body.service, body.scanner,
+                     body.action, body.script, body.template),
+                )
+                row = cur.fetchone()
+                conn.commit()
+                return {"created": False, "row": row}
+            conn.commit()
+            return {"created": True, "row": row}
+
+    try:
+        result = await asyncio.to_thread(_do_insert)
+    except Exception as e:
+        log.warning("manual rec insert failed: %s", e)
+        raise HTTPException(500, f"insert failed: {e}")
+
+    row = result["row"]
+    if row is None:
+        # Theoretical race: conflict happened but the row also vanished.
+        raise HTTPException(500, "insert raced with concurrent delete")
+    rec_id, status, created_at = row
+
+    # Best-effort webhook so external subscribers see operator-driven adds
+    # alongside the auto-generated rule firings.
+    s = get_settings()
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=5) as c:
+            await c.post(
+                f"{s.rag_api_url}/webhooks/emit",
+                json={
+                    "event_type": "scan_recommendation_manual_added",
+                    "source": "bff",
+                    "data": {
+                        "rec_id": str(rec_id),
+                        "ip": body.ip,
+                        "port": body.port,
+                        "service": body.service,
+                        "scanner": body.scanner,
+                        "action": body.action,
+                        "deduplicated": not result["created"],
+                    },
+                },
+                headers={"x-api-key": s.api_key, **engagement_headers()},
+            )
+    except Exception as e:
+        log.debug(f"scan_recommendation_manual_added webhook failed: {e}")
+
+    return {
+        "ok": True,
+        "created": result["created"],
+        "id": str(rec_id),
+        "status": status,
+        "created_at": created_at.isoformat() if created_at else None,
+    }
+
+
 class RunRecommendationsRequest(BaseModel):
     ids: List[str]
     proxy: Optional[str] = None  # SOCKS proxy URL, e.g. socks5://node-manager:10001
@@ -613,6 +747,28 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
 
     if not selected:
         return {"ok": False, "error": "No matching recommendations found", "results": []}
+
+    # Idempotency guard: a rec that's already 'queued' / 'running' / 'completed'
+    # MUST NOT be re-dispatched -- doing so spawns a second runner job for the
+    # same target and leaves the old job_id orphaned in the rec's extra.jsonb.
+    # We split selected[] into dispatchable + already_active and emit a
+    # 'skipped' result for the latter so the UI surfaces "already running".
+    _ACTIVE_REC_STATES = {"queued", "running", "completed"}
+    dispatchable = []
+    already_active_results = []
+    for rec in selected:
+        cur_status = (rec.get("status") or "pending").lower()
+        if cur_status in _ACTIVE_REC_STATES:
+            already_active_results.append({
+                "id": rec["id"],
+                "scanner": rec.get("scanner"),
+                "ip": rec.get("ip"),
+                "status": "skipped",
+                "detail": f"already {cur_status} -- skipped to prevent double-dispatch",
+            })
+        else:
+            dispatchable.append(rec)
+    selected = dispatchable
 
     # Map scanner → service URL
     SCANNER_URLS = {
@@ -758,7 +914,11 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                     result["status"] = "dispatched"
                     result["job_id"] = job_id
                     result["detail"] = f"Scan started: {job_id[:8]}"
-                    # Register with BFF job tracker so it shows in Scan Monitor
+                    # Register with BFF job tracker so it shows in Scan Monitor.
+                    # source_rec_id links the runner job back to the
+                    # scan_recommendations row -- the polling loop uses this
+                    # to backfill the rec's terminal status when the job
+                    # finishes (see polling.py _backfill_recommendation_status).
                     if job_id and service_url:
                         try:
                             register_job(
@@ -767,9 +927,23 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                                 scan_type=scanner,
                                 target=ip,
                                 proxy=proxy_url,
+                                source_rec_id=rec["id"],
                             )
                         except Exception:
                             pass
+                        # Close the first half of the rec lifecycle loop:
+                        # mark queued + persist job_id + emit dispatched
+                        # webhook.  Best-effort; the run itself has already
+                        # been accepted by the scanner.
+                        await _mark_rec_dispatched(
+                            rec_id=rec["id"],
+                            job_id=job_id,
+                            ip=ip,
+                            port=rec.get("port"),
+                            service=rec.get("service"),
+                            scanner=scanner,
+                            node_id=node_id,
+                        )
                 else:
                     result["status"] = "failed"
                     result["detail"] = f"HTTP {r.status_code}: {r.text[:100]}"
@@ -833,6 +1007,77 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             result["detail"] = f"Kali: {type(e).__name__}: {str(e)[:60]}"
         return result
 
+    async def _mark_rec_dispatched(
+        rec_id: str, job_id: str, ip: str, port, service, scanner: str,
+        node_id: Optional[str],
+    ):
+        """Close the first half of the rec → job lifecycle loop.
+
+        Called immediately after a successful register_job().  Two side
+        effects, both best-effort (a failure here must not roll back the
+        scanner job that was already accepted):
+          1. Direct UPDATE on scan_recommendations: status -> 'queued',
+             executed_at = now(), and merge job_id (+ optional node_id)
+             into the row's `extra` jsonb so the polling backfill can
+             correlate completion events back to the rec.
+          2. Emit a 'scan_recommendation_dispatched' webhook event so
+             external subscribers (Slack, n8n) see the dispatch.
+
+        psycopg2 is synchronous; we run the UPDATE in a worker thread via
+        asyncio.to_thread so this coroutine doesn't block the event loop.
+        """
+        # Step 1: status writeback via direct DB (no HTTP hop -- the BFF
+        # owns the trigger and has psycopg2 access via dashboard/bff/db.py).
+        def _do_update():
+            from db import get_db
+            extra_merge = {"job_id": job_id}
+            if node_id:
+                extra_merge["node_id"] = node_id
+            with get_db() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE scan_recommendations
+                       SET status = 'queued',
+                           executed_at = COALESCE(executed_at, now()),
+                           updated_at = now(),
+                           extra = COALESCE(extra, '{}'::jsonb) || %s::jsonb
+                     WHERE id = %s::uuid
+                    """,
+                    (Json(extra_merge), rec_id),
+                )
+                conn.commit()
+                return cur.rowcount
+
+        try:
+            rows = await asyncio.to_thread(_do_update)
+            if rows == 0:
+                log.warning("rec dispatch writeback: rec_id=%s not found in DB", rec_id)
+        except Exception as e:
+            log.warning(f"failed to UPDATE rec {rec_id} to queued: {e}")
+
+        # Step 2: fire-and-forget webhook.
+        try:
+            async with httpx.AsyncClient(verify=False, timeout=5) as c:
+                await c.post(
+                    f"{s.rag_api_url}/webhooks/emit",
+                    json={
+                        "event_type": "scan_recommendation_dispatched",
+                        "source": "bff",
+                        "data": {
+                            "rec_id": rec_id,
+                            "job_id": job_id,
+                            "ip": ip,
+                            "port": port,
+                            "service": service,
+                            "scanner": scanner,
+                            "node_id": node_id,
+                        },
+                    },
+                    headers={"x-api-key": s.api_key, **engagement_headers()},
+                )
+        except Exception as e:
+            log.debug(f"scan_recommendation_dispatched webhook failed: {e}")
+
     async def _dispatch_via_node(rec, scanner, ip, nid, result):
         """Route tool execution to a remote node via SSH."""
         command = rec.get("script") or f"{scanner} {ip}"
@@ -859,7 +1104,10 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             result["detail"] = f"Node: {type(e).__name__}"
         return result
 
-    results = await asyncio.gather(*[dispatch_rec(r) for r in selected])
+    dispatched_results = await asyncio.gather(*[dispatch_rec(r) for r in selected])
+    # Combine fresh dispatches with the idempotency-guard skips so the UI
+    # sees one consistent list -- "already queued" recs surface as skipped.
+    results = list(dispatched_results) + already_active_results
 
     dispatched = sum(1 for r in results if r.get("status") == "dispatched")
     failed = sum(1 for r in results if r.get("status") == "failed")
