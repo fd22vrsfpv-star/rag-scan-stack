@@ -56,6 +56,7 @@ const NAV_GROUPS: NavEntry[] = [
       { to: '/assets', icon: Server, label: 'Assets' },
       { to: '/findings', icon: Search, label: 'Findings' },
       { to: '/follow-ups', icon: Flag, label: 'Follow-Ups' },
+      { to: '/recommendations', icon: Crosshair, label: 'Recommendations' },
       { to: '/recon', icon: Globe2, label: 'Recon' },
       { to: '/users', icon: Users, label: 'Users' },
       { to: '/delta', icon: GitCompare, label: 'Delta Compare' },
@@ -84,6 +85,7 @@ const NAV_GROUPS: NavEntry[] = [
     children: [
       { to: '/maintenance', icon: Wrench, label: 'Maintenance' },
       { to: '/knowledge', icon: BookOpen, label: 'Knowledge Base' },
+      { to: '/settings/kb-overrides', icon: Wrench, label: 'KB Overrides' },
       { to: '/settings', icon: Settings, label: 'Settings' },
       { to: '/sync', icon: RefreshCw, label: 'Sync' },
       { to: '/about', icon: Info, label: 'About' },

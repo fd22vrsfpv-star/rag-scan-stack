@@ -79,7 +79,15 @@ _load_persisted()
 
 def register_job(job_id: str, service_url: str, scan_type: str,
                   proxy: str | None = None, engagement_id: str | None = None,
-                  scope_name: str | None = None, target: str | None = None):
+                  scope_name: str | None = None, target: str | None = None,
+                  source_rec_id: str | None = None):
+    """Track an in-flight scan job.
+
+    ``source_rec_id`` is the ``scan_recommendations.id`` that spawned this
+    run, when applicable.  Persisted in active_jobs so the polling loop can
+    backfill the recommendation row's status when the job reaches a
+    terminal state (closes the dispatch→ingest UX loop).
+    """
     now = datetime.now(timezone.utc).isoformat()
     active_jobs[job_id] = {
         "service_url": service_url,
@@ -92,6 +100,7 @@ def register_job(job_id: str, service_url: str, scan_type: str,
         "engagement_id": engagement_id,
         "scope_name": scope_name,
         "target": target,
+        "source_rec_id": source_rec_id,
     }
     _persist(job_id)
     # Auto-create a campaign event for engagement-linked scans
@@ -129,6 +138,103 @@ async def _post_scan_campaign_event(
             )
     except Exception:
         log.debug("Failed to post scan campaign event for job %s", job_id)
+
+
+# Map BFF job-poll terminal states to scan_recommendations.status enum
+# values.  'partial' is treated as completed for the rec lifecycle because
+# the run did produce results that ingested -- the operator wants the rec
+# off the pending list, just with a note that some targets failed.
+_REC_TERMINAL_MAP = {
+    "completed": "completed",
+    "finished": "completed",
+    "partial":   "completed",
+    "failed":    "failed",
+    "stopped":   "failed",
+    "cancelled": "failed",
+    "canceled":  "failed",
+    "error":     "failed",
+    "lost":      "failed",
+}
+
+
+async def _backfill_recommendation_status(
+    rec_id: str, job_status: str, job_id: str, engagement_id: str | None,
+):
+    """Close the scan_recommendations lifecycle loop on a terminal job event.
+
+    Called from _poll_once() when a job linked to a recommendation reaches
+    a terminal state.  Two side effects:
+      1. Direct UPDATE on scan_recommendations so the row's status moves
+         from 'queued'/'running' to 'completed' or 'failed' (no HTTP hop
+         through scan_recommender -- the BFF owns the trigger and has DB
+         access via dashboard/bff/db.py).
+      2. Emit a webhook event so external subscribers (Slack, n8n) see the
+         recommendation lifecycle close.  Best-effort -- a webhook delivery
+         failure must NOT prevent the DB status update.
+
+    The UPDATE runs in a worker thread via asyncio.to_thread so the polling
+    event loop doesn't block on psycopg2's synchronous network I/O.
+    """
+    settings = get_settings()
+    final_status = _REC_TERMINAL_MAP.get(job_status, "failed")
+
+    def _do_update():
+        # Lazy import keeps polling.py importable in test environments that
+        # don't have psycopg2 installed (e.g. host-side test discovery).
+        from db import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE scan_recommendations
+                   SET status = %s,
+                       executed_at = COALESCE(executed_at, now()),
+                       updated_at = now(),
+                       extra = COALESCE(extra, '{}'::jsonb)
+                               || jsonb_build_object(
+                                    'job_id', %s::text,
+                                    'final_job_status', %s::text
+                                  )
+                 WHERE id = %s::uuid
+                """,
+                (final_status, job_id, job_status, rec_id),
+            )
+            conn.commit()
+            return cur.rowcount
+
+    try:
+        rows = await asyncio.to_thread(_do_update)
+        if rows == 0:
+            log.warning("rec backfill: rec_id=%s not found in DB", rec_id)
+            return
+    except Exception as e:
+        log.warning("rec backfill UPDATE failed for %s: %s", rec_id, e)
+        return
+
+    # Fire-and-forget webhook so external subscribers see the lifecycle close.
+    event_type = (
+        "scan_recommendation_completed"
+        if final_status == "completed"
+        else "scan_recommendation_failed"
+    )
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_FAST) as c:
+            await c.post(
+                f"{settings.rag_api_url}/webhooks/emit",
+                json={
+                    "event_type": event_type,
+                    "source": "bff_polling",
+                    "data": {
+                        "rec_id": rec_id,
+                        "job_id": job_id,
+                        "final_status": final_status,
+                        "raw_job_status": job_status,
+                        "engagement_id": engagement_id,
+                    },
+                },
+                headers={"x-api-key": settings.api_key},
+            )
+    except Exception as e:
+        log.debug("Failed to emit %s webhook for rec %s: %s", event_type, rec_id, e)
 
 
 def _count_active() -> int:
@@ -299,6 +405,19 @@ async def _poll_once(client: httpx.AsyncClient):
                             await _post_scan_campaign_event(
                                 info["engagement_id"], info["type"], job_id,
                                 new_status, info.get("completed_at", datetime.now(timezone.utc).isoformat()),
+                            )
+                        # Close the recommendation lifecycle loop: if this
+                        # job was spawned by a scan_recommendations row,
+                        # backfill that row's status (+ emit webhook) so
+                        # the FollowUps / Recommendations UI shows the
+                        # terminal state instead of stale 'queued'.
+                        src_rec_id = info.get("source_rec_id")
+                        if src_rec_id:
+                            await _backfill_recommendation_status(
+                                rec_id=src_rec_id,
+                                job_status=new_status,
+                                job_id=job_id,
+                                engagement_id=info.get("engagement_id"),
                             )
             elif resp.status_code == 404:
                 # Service lost track of the job (container restart, etc.)
