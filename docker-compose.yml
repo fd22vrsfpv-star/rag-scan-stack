@@ -640,6 +640,20 @@ services:
       TZ: ${TZ:-America/New_York}
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       PG_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      # Individual DB_* vars for scan_recommender's _conn() helper.  The
+      # service has two DB code paths: psycopg2.connect(DB_DSN) and
+      # _conn() which reads DB_HOST/PORT/NAME/USER/PASSWORD individually
+      # with weak "app" defaults.  Passing only DB_DSN above left
+      # _conn() falling back to password='app' against a strong-password
+      # Postgres -- the failure mode is "FATAL: password authentication
+      # failed for user app" on every /recommendations list call.
+      # Matches the env-var block we added to pentest-dashboard so the
+      # same .env credentials feed both services.
+      DB_HOST: ${POSTGRES_HOST:-rag-postgres}
+      DB_PORT: ${POSTGRES_PORT:-5432}
+      DB_NAME: ${POSTGRES_DB:-scans}
+      DB_USER: ${POSTGRES_USER:-app}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-app}
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       OLLAMA_HOST: ${OLLAMA_URL:-http://ollama:11434}
       OLLAMA_BASE_URL: ${OLLAMA_URL:-http://ollama:11434}
