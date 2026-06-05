@@ -657,8 +657,8 @@ services:
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       OLLAMA_HOST: ${OLLAMA_URL:-http://ollama:11434}
       OLLAMA_BASE_URL: ${OLLAMA_URL:-http://ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:14b}
-      CHAT_MODEL: ${OLLAMA_MODEL:-qwen2.5:14b}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
+      CHAT_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
       TOOL_KB_PATH: "/knowledge/service_tools.yaml"
       PLAYBOOK_DIR: "/knowledge/playbooks"
       KALI_LISTENER_URL: "https://kali-listener:8019"
@@ -780,7 +780,7 @@ services:
       LLM_BACKEND: ${LLM_BACKEND:-ollama}
       # Ollama settings (default)
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:32b}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
       # vLLM settings (when LLM_BACKEND=vllm)
       VLLM_URL: ${VLLM_URL:-http://vllm:8000}
       VLLM_MODEL: ${VLLM_MODEL:-mistralai/Mistral-7B-Instruct-v0.3}
@@ -1293,7 +1293,7 @@ services:
     entrypoint: >
       sh -lc '
         set -e
-        MODELS="nomic-embed-text qwen2.5:32b"
+        MODELS="nomic-embed-text gemma4:31b"
         for m in $$MODELS; do
           echo "=== Ensuring $$m ==="
           # retry loop in case of network hiccups
@@ -1409,7 +1409,7 @@ services:
         BUILD_VERSION: ${BUILD_VERSION:-dev}
         TZ: ${TZ:-America/New_York}
         OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
-        OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:32b}
+        OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
         OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-300}
         # LLM Backend + Azure/OpenAI/Anthropic settings
         LLM_BACKEND: ${LLM_BACKEND:-ollama}
@@ -1851,7 +1851,7 @@ services:
       ZAP_URL: http://zap:8090
       ZAP_API_KEY: ${ZAP_API_KEY:-changeme}
       API_KEY: ${API_KEY:-changeme}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:14b}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
       TUNNEL_MANAGER_URL: https://node-manager:8027
       GPU_NAME: ${GPU_NAME:-}
       GPU_TOTAL_MEMORY_GB: ${GPU_TOTAL_MEMORY_GB:-0}
