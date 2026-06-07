@@ -47,8 +47,22 @@ def parse_brutus(path: str, profile: str = "upload", job_id: str = None, secret_
                         cur.execute("SELECT id FROM ports WHERE asset_id=%s AND port=%s", (asset_id, int(port)))
                         prow = cur.fetchone()
                         if prow: port_id = str(prow["id"])
-                    # Insert - do NOT store password
-                    meta = {"job_id": job_id} if job_id else {}
+                    # Insert - do NOT store password.
+                    # Metadata captures the audit trail when present:
+                    #   - job_id : ties row back to the scan
+                    #   - audit  : per-attempt list (users tried, passwords
+                    #              masked, failure modes, KEX-legacy detection,
+                    #              summary).  Populated by the credential-check
+                    #              path (nmap_scanner/cred_checker.py).
+                    #              Optional -- the brutus runner JSONL omits
+                    #              it, in which case the row just has no
+                    #              audit panel in the UI.
+                    meta = {}
+                    if job_id:
+                        meta["job_id"] = job_id
+                    rec_audit = rec.get("audit")
+                    if rec_audit:
+                        meta["audit"] = rec_audit
                     cur.execute("""
                         INSERT INTO credential_findings (id, asset_id, port_id, ip, port, protocol, username, valid_cred, auth_type, secret_type, source, metadata, discovered_at, status)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, true, %s, %s, 'brutus', %s, now(), 'valid')
