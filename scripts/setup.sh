@@ -26,6 +26,22 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 PROJECT_ROOT="$(pwd)"
 
+# ── Install log (single file, timestamped) ────────────────────────────────
+# Everything from this point is tee'd to logs/setup-<ts>.log so a failing
+# run leaves behind a complete transcript that's easy to attach to a bug
+# report.  The log path is printed at the start and end of the run.
+#
+# logs/ is .gitignore'd; we create it lazily here in case fresh clones
+# don't have the directory yet.
+mkdir -p "$PROJECT_ROOT/logs"
+LOG_FILE="$PROJECT_ROOT/logs/setup-$(date +%Y%m%d-%H%M%S).log"
+# Use process substitution so both stdout and stderr land in the log while
+# still being visible on the operator's terminal.  Works in bash 4+ which
+# is the floor for macOS (via brew) and every supported Linux/WSL distro.
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "Full setup log: $LOG_FILE"
+echo ""
+
 # ── Flags ──────────────────────────────────────────────────────────────────
 SKIP_GO_TOOLS=false
 FORCE_GO_TOOLS=false
@@ -149,6 +165,34 @@ detect_platform() {
 detect_platform
 
 # ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+#  Preflight: strict host gates + (on supported hosts) Docker auto-install
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Two-stage preflight before Phase 1:
+#
+#   1. OS gate (strict): macOS any, or WSL2 Ubuntu 22.04/24.04 only.
+#      Refuses bare-metal Linux, WSL1, non-Ubuntu WSL distros, other
+#      Ubuntu versions.  Set first so the auto-installer (step 2) never
+#      runs on hosts where the stack isn't validated.
+#
+#   2. Host dependency provisioning: when the OS gate passes, auto-install
+#      Docker Engine + Compose v2 plugin if absent (Ubuntu/WSL2 + RHEL
+#      family).  Scoped to genuine host prerequisites only -- the
+#      language toolchains (Go, Node, Python) and per-tool security
+#      binaries are deliberately NOT installed here: every build runs
+#      inside containers, so the host never needs them.
+#
+#   3. Remaining gates (Docker daemon, Compose v2 >= 2.20, resource
+#      floors RAM/CPU/disk, BuildKit/buildx).  If any of these still
+#      fail after the auto-installer ran, exit with a summary so the
+#      operator can fix the root cause and re-run -- no half-installed
+#      stack.
+#
+# All output (including the gate transcript) is tee'd to logs/setup-
+# <ts>.log via the exec redirection at the top of this script.
+
+# ── Host dependency provisioning (#17/#26) ─────────────────────────────────
 #  Host dependency provisioning
 # ──────────────────────────────────────────────────────────────────────────
 #  Makes setup.sh a single entry point: it installs everything the host needs
@@ -314,7 +358,206 @@ _install_host_deps() {
     _install_docker || true
 }
 
-_install_host_deps
+
+
+# ── Preflight gate definitions ─────────────────────────────────────────────
+PREFLIGHT_BLOCKERS=()
+preflight_block() { PREFLIGHT_BLOCKERS+=("$1"); }
+
+# ── Gate 1: supported host (macOS any, or WSL2 Ubuntu 22.04/24.04) ───────
+gate_os_supported() {
+    if [ "$IS_MAC" = true ]; then
+        log_ok "Host: macOS (${MAC_CHIP_NAME:-Intel/unknown}, ${MAC_TOTAL_RAM_GB}GB RAM)"
+        return
+    fi
+
+    if [ "$IS_WSL" != true ]; then
+        log_err "Host is bare-metal Linux -- only macOS or WSL2 Ubuntu are supported by this installer."
+        log_err "  Bare-metal Linux installs work but aren't validated; if you want to proceed anyway,"
+        log_err "  comment out the gate_os_supported call in scripts/setup.sh and re-run."
+        preflight_block "Unsupported host (bare-metal Linux)"
+        return
+    fi
+
+    # Distinguish WSL1 from WSL2 -- WSL2 kernel string contains "WSL2"
+    if ! /usr/bin/uname -r 2>/dev/null | /usr/bin/grep -qiE "WSL2|microsoft-standard-WSL"; then
+        log_err "Host is WSL1 -- only WSL2 is supported (WSL1 lacks docker integration)."
+        log_err "  Upgrade with: wsl --set-version <distro> 2"
+        preflight_block "WSL1 detected (need WSL2)"
+        return
+    fi
+
+    # Distinguish Ubuntu version (22.04 or 24.04 only)
+    local distro="" version=""
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        distro="${ID:-}"
+        version="${VERSION_ID:-}"
+    fi
+    if [ "$distro" != "ubuntu" ]; then
+        log_err "WSL distro is '${distro:-unknown}' -- only Ubuntu is supported."
+        log_err "  Install Ubuntu 22.04 LTS or 24.04 LTS from the Microsoft Store, then re-run."
+        preflight_block "WSL distro is not Ubuntu (got '${distro:-unknown}')"
+        return
+    fi
+    case "$version" in
+        22.04|24.04)
+            log_ok "Host: WSL2 Ubuntu $version"
+            ;;
+        *)
+            log_err "WSL Ubuntu version $version is not supported -- need 22.04 or 24.04 (LTS only)."
+            log_err "  20.04 is past mainstream support; non-LTS versions are not validated."
+            preflight_block "Unsupported Ubuntu version ($version)"
+            ;;
+    esac
+}
+
+# ── Gate 2: Docker daemon reachable ──────────────────────────────────────
+gate_docker_daemon() {
+    if ! command -v docker &>/dev/null; then
+        log_err "Docker CLI not installed."
+        log_err "  macOS:        brew install --cask docker  (then launch Docker.app)"
+        log_err "  WSL2 Ubuntu:  install Docker Desktop on Windows host with WSL integration enabled"
+        preflight_block "Docker CLI missing"
+        return
+    fi
+    if ! docker info >/dev/null 2>&1; then
+        log_err "Docker daemon is not reachable -- the CLI is installed but \`docker info\` fails."
+        log_err "  macOS:        launch Docker Desktop (or run: open -a Docker)"
+        log_err "  WSL2:         start Docker Desktop on Windows + enable WSL integration"
+        log_err "  Linux:        sudo systemctl start docker"
+        preflight_block "Docker daemon not reachable"
+        return
+    fi
+    log_ok "Docker daemon reachable"
+}
+
+# ── Gate 3: Compose v2 + version >= 2.20 ─────────────────────────────────
+gate_compose_v2() {
+    if ! docker compose version >/dev/null 2>&1; then
+        log_err "Docker Compose v2 (the \`docker compose\` subcommand) is not available."
+        log_err "  This repo requires Compose v2.  The standalone \`docker-compose\` (with hyphen)"
+        log_err "  is Compose v1 and is NOT compatible -- it lacks features used by this stack."
+        preflight_block "Compose v2 subcommand missing"
+        return
+    fi
+    # Parse version (e.g. "Docker Compose version v2.27.0" -> 2.27.0)
+    local raw major minor
+    raw=$(docker compose version 2>/dev/null | /usr/bin/awk '{for(i=1;i<=NF;i++) if ($i ~ /^v?[0-9]+\.[0-9]+/) {print $i; exit}}' | /usr/bin/tr -d 'v')
+    major=$(echo "$raw" | /usr/bin/awk -F. '{print $1+0}')
+    minor=$(echo "$raw" | /usr/bin/awk -F. '{print $2+0}')
+    if [ -z "$raw" ] || [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 20 ]; }; then
+        log_err "Docker Compose version is '$raw' -- need >= 2.20."
+        log_err "  Upgrade Docker Desktop, or apt-get install --only-upgrade docker-compose-plugin"
+        preflight_block "Compose version too old (have $raw, need >=2.20)"
+        return
+    fi
+    log_ok "Docker Compose v$raw"
+}
+
+# ── Gate 4: resource floors (RAM, CPU, disk available to Docker) ─────────
+gate_docker_resources() {
+    # `docker info --format` returns the limits Docker actually has, which
+    # matters more than the host's bare metal (Docker Desktop on macOS
+    # caps memory + CPU per its own settings).
+    local d_ncpu d_mem_bytes d_mem_gb avail_gb
+    d_ncpu=$(docker info --format '{{.NCPU}}' 2>/dev/null || echo 0)
+    d_mem_bytes=$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)
+    d_mem_gb=$((d_mem_bytes / 1073741824))
+
+    if [ "$d_ncpu" -lt 4 ]; then
+        log_err "Docker has only $d_ncpu CPU(s) allocated -- need >= 4."
+        log_err "  macOS:  Docker Desktop -> Settings -> Resources -> CPUs"
+        log_err "  WSL2:   adjust .wslconfig: [wsl2] processors=4"
+        preflight_block "Docker CPU allocation $d_ncpu (need >=4)"
+    else
+        log_ok "Docker CPUs: $d_ncpu"
+    fi
+
+    if [ "$d_mem_gb" -lt 16 ]; then
+        log_err "Docker has only ${d_mem_gb}GB RAM allocated -- need >= 16GB."
+        log_err "  macOS:  Docker Desktop -> Settings -> Resources -> Memory"
+        log_err "  WSL2:   adjust .wslconfig: [wsl2] memory=16GB"
+        preflight_block "Docker RAM allocation ${d_mem_gb}GB (need >=16GB)"
+    else
+        log_ok "Docker RAM: ${d_mem_gb}GB"
+    fi
+
+    # Available disk under the project root.  df -k is portable; the
+    # fourth column is "available" in 1K blocks.
+    avail_gb=$(/bin/df -k "$PROJECT_ROOT" 2>/dev/null | /usr/bin/awk 'NR==2 {print int($4/1048576)}')
+    if [ -z "$avail_gb" ] || [ "$avail_gb" -lt 50 ]; then
+        log_err "Disk available under $PROJECT_ROOT: ${avail_gb:-0}GB -- need >= 50GB."
+        log_err "  Free up disk or move the checkout to a larger filesystem before re-running."
+        preflight_block "Insufficient disk (${avail_gb:-0}GB free, need >=50GB)"
+    else
+        log_ok "Disk available: ${avail_gb}GB"
+    fi
+}
+
+# ── Gate 5: BuildKit + buildx ────────────────────────────────────────────
+gate_buildkit() {
+    if ! docker buildx version >/dev/null 2>&1; then
+        log_err "docker buildx not available -- this repo's Dockerfiles use multi-stage builds"
+        log_err "that need BuildKit.  Upgrade Docker Desktop, or install docker-buildx-plugin."
+        preflight_block "buildx missing"
+        return
+    fi
+    log_ok "docker buildx available"
+}
+
+
+# ── Preflight execution ────────────────────────────────────────────────────
+echo ""
+echo -e "${BOLD}${BLUE}══════════════════════════════════════════════════════════════${NC}"
+echo -e "${BOLD}${BLUE}  Preflight: host + Docker checks                              ${NC}"
+echo -e "${BOLD}${BLUE}══════════════════════════════════════════════════════════════${NC}"
+echo ""
+
+# Stage 1: OS gate FIRST.  If the host isn't supported, refuse before
+# touching anything else -- the auto-installer below would otherwise
+# try to apt-get install on the wrong distro.
+gate_os_supported
+
+# Stage 2: on supported hosts, auto-install Docker + Compose if missing.
+# Skip entirely if the OS gate already failed.
+if [ ${#PREFLIGHT_BLOCKERS[@]} -eq 0 ]; then
+    if [ "$IS_LINUX" = true ] || [ "$IS_WSL" = true ]; then
+        # Only the Linux/WSL path actually invokes _install_host_deps --
+        # on macOS, Docker Desktop is a GUI .app that we can't apt-install,
+        # so we just verify it via gate_docker_daemon below.
+        _install_host_deps || log_warn "Host dependency provisioning hit warnings (see above)"
+    fi
+fi
+
+# Stage 3: remaining Docker-side gates.  These verify that whatever the
+# auto-installer did (or didn't do) actually produced a working Docker.
+gate_docker_daemon
+if [ ${#PREFLIGHT_BLOCKERS[@]} -eq 0 ] || \
+   ! printf '%s\n' "${PREFLIGHT_BLOCKERS[@]}" | grep -q "Docker daemon"; then
+    gate_compose_v2
+    gate_docker_resources
+    gate_buildkit
+fi
+
+echo ""
+if [ ${#PREFLIGHT_BLOCKERS[@]} -gt 0 ]; then
+    echo -e "${BOLD}${RED}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${RED}  Preflight FAILED -- ${#PREFLIGHT_BLOCKERS[@]} blocker(s); not proceeding   ${NC}"
+    echo -e "${BOLD}${RED}══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    for b in "${PREFLIGHT_BLOCKERS[@]}"; do
+        echo -e "  ${RED}✗${NC} $b"
+    done
+    echo ""
+    echo "  Fix the blockers above and re-run: ./scripts/setup.sh"
+    echo "  Full log of this attempt: $LOG_FILE"
+    echo ""
+    exit 2
+fi
+echo -e "${BOLD}${GREEN}  Preflight passed -- proceeding with install${NC}"
+echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
 #  PHASE 1 — Dependency Check
@@ -1532,6 +1775,9 @@ elif [ "$IS_MAC" = true ]; then
 fi
 echo ""
 echo -e "  ${BOLD}Stuck?${NC}  ${BLUE}./scripts/post-install-check.sh${NC}  runs an end-to-end health audit."
+echo ""
+echo -e "  ${BOLD}Full transcript of this run:${NC}  ${BLUE}${LOG_FILE}${NC}"
+echo -e "             (attach to bug reports; gitignored under logs/)"
 echo ""
 echo -e "${BOLD}${YELLOW}══════════════════════════════════════════════════════════════${NC}"
 echo ""

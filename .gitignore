@@ -191,3 +191,6 @@ kong/kong.yml
 
 # RAG training-data exports (per-host, mirrored from container /datasets)
 datasets/
+
+# Setup script transcripts (timestamped)
+logs/
