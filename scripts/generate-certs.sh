@@ -22,7 +22,12 @@ openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
     -addext "subjectAltName=DNS:rag-api,DNS:pentest-dashboard,DNS:nmap_scanner,DNS:web-scanner,DNS:nuclei-runner,DNS:pd-runner,DNS:osint-runner,DNS:brutus-runner,DNS:node-manager,DNS:playwright-scanner,DNS:autogen-agents,DNS:scan-recommender,DNS:exploit-runner,DNS:container-logs,DNS:embedder,DNS:kali-listener,DNS:localhost,IP:127.0.0.1"
 
 chmod 644 "$CERT_DIR/server.crt"
-chmod 600 "$CERT_DIR/server.key"
+# 644 (not 600): several services run as a dedicated non-root user (e.g.
+# exploit-runner's "exploitrunner") and mount ./certs read-only. A 600 root-owned
+# key is unreadable by those users and uvicorn crashes with PermissionError on
+# load_cert_chain. This is an internal, self-signed, per-install cert on an
+# isolated docker network — world-readable is acceptable here.
+chmod 644 "$CERT_DIR/server.key"
 
 echo "Certificate generated:"
 openssl x509 -in "$CERT_DIR/server.crt" -noout -subject -dates -ext subjectAltName
