@@ -1092,6 +1092,7 @@ const API_KEY_SERVICES = [
   { key: 'censys_api_secret', label: 'Censys API Secret', description: 'Censys search API secret' },
   { key: 'pdcp_api_key', label: 'Chaos / PDCP', description: 'ProjectDiscovery Cloud Platform' },
   { key: 'nvd_api_key', label: 'NVD (NIST)', description: 'National Vulnerability Database API key — increases rate limit from 5 to 50 req/30s. Get one free at https://nvd.nist.gov/developers/request-an-api-key' },
+  { key: 'certspotter_api_key', label: 'Certspotter (Sectigo)', description: 'Fallback CT log source used when crt.sh is degraded. Works without a key (100 issuances/day, 1 req/s); a free Sectigo account key raises the quota to 5000/day. Sign up at https://sslmate.com/account/api_credentials' },
 ] as const
 
 function ApiKeyRow({ keyName, label, description, storedMasked, updatedAt }: {
