@@ -600,7 +600,13 @@ services:
       WEB_PORTS: ${WEB_PORTS:-80,443,8080,8443,8000,8888,3000,5000}
       DEEP_SCAN_PORTS: ${DEEP_SCAN_PORTS:-1001-65535}
       PYTHONPATH: /app
-      API_BASE: ${API_BASE:-https://rag-api:8000}
+      # API_BASE hardcoded to https:// rather than ${API_BASE:-...} -- the
+      # other 5 runners (brutus, node-manager, nuclei, osint, pd) all
+      # hardcode https://rag-api:8000.  An earlier substitution here was
+      # silently overridden by a stale .env that set API_BASE=http://...,
+      # breaking every /ingest/* call from this container (rag-api serves
+      # HTTPS only on :8000).
+      API_BASE: https://rag-api:8000
       API_KEY: ${API_KEY:-changeme}
       SCAN_RECOMMENDER_URL: ${SCAN_RECOMMENDER_URL:-https://scan-recommender:8013}
       NUCLEI_URL: ${NUCLEI_URL:-https://nuclei-runner:8011}
