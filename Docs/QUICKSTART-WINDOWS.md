@@ -125,8 +125,11 @@ API_KEY=your-secure-api-key
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=your-secure-password
 
-# Ollama model (adjust based on your RAM)
-OLLAMA_MODEL=qwen2.5:14b   # Use qwen2.5:7b for less RAM
+# Ollama model (adjust based on your RAM).
+# Default: gemma4:31b -- matches docker-compose.yml's :- default so
+# every service in the stack picks up the same model.  Switch to a
+# smaller model (gemma4:9b or qwen3:4b) on machines with < 32 GB.
+OLLAMA_MODEL=gemma4:31b
 ```
 
 ---
@@ -218,12 +221,16 @@ wsl --shutdown
 
 ### Out of memory errors
 
-Edit `.wslconfig` to allocate more memory, or use a smaller Ollama model:
+Edit `.wslconfig` to allocate more memory, or use a smaller Ollama
+model.  The stack's default is `gemma4:31b` (~20 GB).  On 16 GB hosts:
 
 ```bash
-# Edit .env and change:
-OLLAMA_MODEL=qwen2.5:7b
+# Edit .env and change to a smaller variant:
+OLLAMA_MODEL=gemma4:9b        # ~6 GB, gemma family
+# or
+OLLAMA_MODEL=qwen3:4b         # ~3 GB, lighter still
 ```
+Remember to also `ollama pull <model>` so the daemon has it.
 
 ### Port already in use
 
