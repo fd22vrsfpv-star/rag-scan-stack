@@ -3007,6 +3007,15 @@ def _run_credential_check_async(
                             continue
                         port_n = chk.get("port")
                         service = chk.get("service") or "unknown"
+                        # The per-check audit (cred_checker.check_default_
+                        # credentials adds this) tells the operator which
+                        # users/passwords were tried, how each attempt
+                        # failed, whether legacy-SSH KEX was detected and
+                        # whether an nmap fallback ran.  Attach it to every
+                        # JSONL row so parse_brutus.py can stash it in
+                        # credential_findings.metadata.audit -- the
+                        # AssetBrowser → Credentials expander reads it.
+                        chk_audit = chk.get("audit") or {}
                         for cred in chk.get("valid_credentials", []) or []:
                             lines.append(json.dumps({
                                 "host":     target_ip,
@@ -3014,6 +3023,7 @@ def _run_credential_check_async(
                                 "protocol": service,
                                 "username": cred.get("username", ""),
                                 "success":  True,
+                                "audit":    chk_audit,
                             }))
                 if lines:
                     # Write to /scan_results so the path is consistent with
