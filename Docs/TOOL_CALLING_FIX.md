@@ -1,212 +1,140 @@
-# Tool Calling Issue - FIXED ✅
+# Tool Calling & Model Selection Guide
 
-## Problem Identified
+The stack's Open WebUI surface (port 3000) lets you invoke pentest tools through natural-language chat — but that only works when the model you've selected actually supports **native tool / function calling** (returning a `tool_calls` field on the response) and when Open WebUI is configured to use that native path rather than prompt-based fallback.
 
-**qwen2.5:14b does NOT support tool/function calling properly**
+This guide documents the working configuration and the model-selection trade-offs that matter for tool calling. It supersedes the original "qwen2.5 doesn't tool-call" narrative — the stack's default model is now `gemma4:31b`, and the surrounding Open WebUI configuration described here is what wires it to the tool servers.
 
-Symptoms:
-- Model responds in Thai language instead of English
-- Model explains tools instead of calling them
-- Warning: "50 tools provided but model returned text only!"
-- No tools are actually executed
+## Current default
 
-## Root Causes
+`docker-compose.yml` defaults `OLLAMA_MODEL` to **`gemma4:31b`** in six places (scan-recommender, autogen-agents, ollama-init pull list, llm_query, pentest-dashboard, and the default for unset env). The `./scripts/setup.sh` Phase 8 step auto-pulls it on first run.
 
-1. **Model Incompatibility**: The Qwen 2.5 models have limited or no function calling support. They treat tool definitions as conversation context and explain them instead of calling them.
+To override: set `OLLAMA_MODEL=<your-choice>` in `.env`. Every service in the stack reads the same variable, so a single change cascades.
 
-2. **Open WebUI Configuration**: The `TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE=auto` setting was causing Open WebUI to use prompt-based tool calling (instructing models to output JSON) instead of native tool calling (using the proper tool_calls API).
+## Open WebUI configuration
 
-## Solution
-
-**Switch to llama3.1:8b** - Excellent tool calling support from Meta
-
-### What We Did:
-
-1. ✅ Installed llama3.1:8b (4.9 GB)
-2. ✅ Updated default model in docker-compose.yml to llama3.1:8b
-3. ✅ Fixed TOOL_SERVER_CONNECTIONS - removed separate "path" field, included full path in "url"
-   - Before: `"url":"http://mcpo:8080","path":"/sessions"`
-   - After: `"url":"http://mcpo:8080/sessions"`
-4. ✅ Changed TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE from "auto" to empty (enables native tool calling)
-5. ✅ Cleared Open WebUI data volume to force re-initialization
-6. ✅ Recreated Open WebUI - Successfully loaded 5 tool servers!
-
-### How to Use Tool Calling in Open WebUI:
-
-#### Step 1: Start a New Chat
-Open http://localhost:3000 and create a new chat
-
-#### Step 2: Select llama3.1:8b Model
-- Click the model dropdown at the top
-- Select **llama3.1:8b**
-
-#### Step 3: Enable Tools
-- Click the **🔧 Tools** icon in the chat interface
-- Toggle on the tools you want to use:
-  - ✅ Pentest Sessions (17 tools)
-  - ✅ Scanning Tools (16 tools)
-  - ✅ Recon Tools (9 tools)
-  - ✅ Exploit Tools (8 tools)
-  - ✅ Scan Pipelines (3 tools)
-
-#### Step 4: Set Tool Calling Mode
-- In the tools panel, ensure mode is set to **"Auto"**
-- This allows the AI to automatically decide when to call tools
-
-#### Step 5: Test Tool Calling
-Try these commands:
-```
-check_health
-list sessions
-start pentest session on 192.168.1.100 named test1
-scan 192.168.1.100 ports 1-1000
-what ports are open on 192.168.1.100?
-```
-
-## Model Comparison
-
-| Model | Tool Calling | Speed | VRAM | Recommendation |
-|-------|--------------|-------|------|----------------|
-| **llama3.1:8b** ⭐ | ✅ Excellent | Fast | 5 GB | **USE THIS** |
-| qwen2.5:14b | ❌ Poor | Very Fast | 9 GB | Text only |
-| qwen2.5:32b | ⚠️ Limited | Slow | 19 GB | Text only |
-| llama3.2:3b | ✅ Good | Very Fast | 2 GB | Alternative |
-| mistral:7b | ✅ Good | Fast | 4 GB | Alternative |
-
-## Configuration Updated
-
-File: `/opt/rag_scan_stack/docker-compose.yml`
+Tool calling only works end-to-end when these three are correct:
 
 ```yaml
-# Default model - llama3.1:8b has excellent tool calling support
-- DEFAULT_MODELS=${DEFAULT_MODELS:-llama3.1:8b}
+# docker-compose.yml (or .env-driven)
 
-# Enable native tool calling (not prompt-based)
+# 1. Pick a model that actually supports tool calling natively
+- OLLAMA_MODEL=${OLLAMA_MODEL:-gemma4:31b}
+
+# 2. Disable prompt-based fallback so Open WebUI uses the model's
+#    native tool_calls API rather than instructing it to emit JSON
+#    in the chat body.  Empty string = native path.
 - TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE=
 
-# Tool servers with full URL (no separate path field needed)
-- TOOL_SERVER_CONNECTIONS=[{"type":"openapi","url":"http://mcpo:8080/sessions",...},...]
+# 3. Tool server connections include the FULL path on the URL
+#    field; there is no separate `path` key.
+- TOOL_SERVER_CONNECTIONS=[
+    {"type":"openapi","url":"http://mcpo:8080/sessions"},
+    {"type":"openapi","url":"http://mcpo:8080/scanning"},
+    {"type":"openapi","url":"http://mcpo:8080/recon"},
+    {"type":"openapi","url":"http://mcpo:8080/exploit"},
+    {"type":"openapi","url":"http://mcpo:8080/pipelines"}
+  ]
 ```
 
-**Important**: Each tool server URL must include the full path (e.g., `/sessions`, `/scanning`) where MCPO exposes the OpenAPI spec at `{url}/openapi.json`.
+The `url` field must include the segment where MCPO exposes the OpenAPI spec at `{url}/openapi.json` (e.g. `http://mcpo:8080/sessions/openapi.json`). Splitting URL + path across two keys was a previous source of confusion; it does not work.
+
+## Model comparison
+
+Tool-calling support varies by model family. Updated for the current Ollama library:
+
+| Model | Tool calling | Approx size | Notes |
+|---|---|---|---|
+| **`gemma4:31b`** ⭐ | ✅ Native, reliable | ~20 GB | Current stack default. Strong general-purpose; tool calls return cleanly. |
+| `gemma4:9b` | ✅ Native, reliable | ~6 GB | Smaller gemma4; recommended on 16 GB hosts. |
+| `llama3.3:70b` | ✅ Native, reliable | ~40 GB | Higher quality for hosts with ≥ 64 GB RAM. |
+| `llama3.1:8b` | ✅ Native, reliable | ~5 GB | Was the prior default; still works. |
+| `mistral:7b` | ✅ Native, reliable | ~4 GB | Fast and competent for smaller hosts. |
+| `qwen3:4b` | ✅ Native, reliable | ~3 GB | Lightest practical option. |
+| `qwen2.5:14b` | ❌ Poor | ~9 GB | **Avoid for tool calling.** Treats tool definitions as prose. Was the source of the prior "Thai-language response / explains the tool instead of calling it" bug. |
+| `qwen2.5:32b` | ⚠️ Limited | ~19 GB | Same family limitations as 14b at larger scale. Text generation only. |
+| `qwen3-vl:30b` | ✅ Native, reliable | ~18 GB | Newer Qwen 3 series VL; works for text + tool calls. |
+| `deepseek-v4-flash:cloud` | ✅ Routed | n/a | Cloud-routed; check account quota before relying on it. |
+
+The cutoff between "works" and "doesn't work" tends to be the model family's release vintage, not the parameter count — Qwen 2.5 had broken tool-call support across the family; Qwen 3.x fixed it. Gemma 3 introduced native tool calls; Gemma 4 carries that forward.
+
+## Using tool calling in Open WebUI
+
+1. Open the dashboard at `http://localhost:3000`.
+2. New chat → model dropdown → select `gemma4:31b` (or another model from the ✅ rows above).
+3. Click the 🔧 **Tools** icon in the chat input.
+4. Toggle on the tool servers you want available:
+   - Pentest Sessions (17 tools)
+   - Scanning Tools (16 tools)
+   - Recon Tools (9 tools)
+   - Exploit Tools (8 tools)
+   - Scan Pipelines (3 tools)
+5. Tool-calling **mode** should be `Auto` so the model decides when to call.
+6. Try an explicit command:
+   ```
+   check_health
+   list sessions
+   start pentest session on 192.168.1.100 named demo
+   scan 192.168.1.100 ports 1-1000
+   ```
 
 ## Troubleshooting
 
-### Tools Still Not Being Called?
+**Model is explaining the tool instead of calling it** — you've selected one of the ❌ models above. Switch to a ✅ row.
 
-1. **Check Model Selection**
-   - Ensure you're using llama3.1:8b, not qwen2.5:14b
-   - Model selector is at the top of the chat
+**Open WebUI says "N tools provided but model returned text only"** — usually means `TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE` is set to `auto` (prompt-based fallback). Fix:
 
-2. **Check Tools Are Enabled**
-   - Click 🔧 icon
-   - Verify tools are toggled ON (green)
-
-3. **Check Tool Calling Mode**
-   - Mode should be "Auto" not "Manual"
-
-4. **Verify Native Tool Calling is Enabled**
-   ```bash
-   docker exec open-webui env | grep TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
-   ```
-   - Should show: `TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE=` (empty)
-   - If it shows "auto", recreate the container: `docker-compose up -d --force-recreate open-webui`
-
-5. **Use Explicit Commands**
-   - Instead of: "Can you check health?"
-   - Try: "check_health" or "Use check_health tool"
-
-6. **Check Open WebUI Logs**
-   ```bash
-   docker logs open-webui | tail -50
-   ```
-
-## Available Models
-
-Check currently loaded models:
 ```bash
-docker exec ollama ollama list
+docker exec open-webui env | grep TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
+# Should be empty.  If it shows 'auto':
+docker compose up -d --force-recreate open-webui
 ```
 
-Output should show:
-- llama3.1:8b (NEW - for tool calling)
-- qwen2.5:14b (for general chat)
-- qwen2.5:32b (for high-quality text generation)
-- nomic-embed-text (for embeddings)
-
-## Performance
-
-llama3.1:8b Performance:
-- Load time: ~5-8 seconds
-- Generation: 15-25 tokens/sec (on your GPU)
-- VRAM usage: ~5 GB / 12 GB available
-- Perfect fit for your RTX 5070 Ti!
-
-## Next Steps
-
-1. Refresh your Open WebUI browser: http://localhost:3000
-2. Start a new chat
-3. Select llama3.1:8b from the model dropdown
-4. Enable tools (🔧 icon)
-5. Test with: "check_health"
-
-## Verification Test Results
-
-Tested tool calling via Ollama API `/api/chat` endpoint:
+**Tools tab is empty / no tool servers** — MCPO didn't start, OR the URLs in `TOOL_SERVER_CONNECTIONS` are wrong. Check:
 
 ```bash
-curl -s http://localhost:11435/api/chat -d '{
-  "model": "llama3.1:8b",
+docker logs mcpo --tail 50          # MCPO startup
+docker exec open-webui curl -s http://mcpo:8080/sessions/openapi.json | head -5   # reachable from inside open-webui
+```
+
+**Tool calls hang / time out** — verify the underlying tool runner is responding:
+
+```bash
+docker logs nmap_scanner --tail 50  # scan tool calls
+docker logs scan-recommender --tail 50   # KB-driven recs
+```
+
+**Need to verify native tool calling end-to-end** — bypass Open WebUI and hit Ollama directly:
+
+```bash
+curl -s http://localhost:11434/api/chat -d '{
+  "model": "gemma4:31b",
   "messages": [{"role": "user", "content": "Use the check_health tool"}],
   "tools": [{"type": "function", "function": {"name": "check_health"}}]
-}'
+}' | jq .message.tool_calls
 ```
 
-**Result**: ✅ SUCCESS
-```json
-{
-  "message": {
-    "role": "assistant",
-    "tool_calls": [{
-      "id": "call_l2yens58",
-      "function": {"name": "check_health", "arguments": {}}
-    }]
-  }
-}
-```
+A non-null `tool_calls` array means native tool calling is working. A response with the tool name as prose means the model doesn't support it.
 
-llama3.1:8b properly returns `tool_calls` instead of explaining the tool!
+## Available models on your host
 
-## Summary
+List what's actually pulled:
 
-✅ **llama3.1:8b is now your default model**
-✅ **Native tool calling enabled** (TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE empty)
-✅ **Tool server connections fixed** (full URL without separate path field)
-✅ **All 5 tool servers successfully loaded** (55+ pentest tools)
-✅ **Configuration persists across restarts**
-✅ **Tool calling verified working via Ollama API**
-✅ **Open WebUI healthy on port 3000**
-
-The Thai language responses and tool calling issues should now be resolved!
-
-**Key Fixes**:
-1. Changed from prompt-based tool calling (`auto`) to native tool calling (empty string)
-2. Fixed TOOL_SERVER_CONNECTIONS format - use full URL like `http://mcpo:8080/sessions` (no separate path field)
-3. Cleared Open WebUI data volume to force configuration re-initialization
-
-**Tool Servers Loaded**:
-- ✅ Pentest Sessions (17 tools)
-- ✅ Scanning Tools (16 tools)
-- ✅ Recon Tools (9 tools)
-- ✅ Exploit Tools (8 tools)
-- ✅ Scan Pipelines (3 tools)
-- ⚠️ Credentials (2 tools - disabled by default)
-
-═══════════════════════════════════════════════════════════════
-
-For questions or issues, check the Open WebUI logs:
 ```bash
-docker logs open-webui -f
+ollama list
 ```
 
-═══════════════════════════════════════════════════════════════
+Pull a different one:
+
+```bash
+ollama pull gemma4:9b           # smaller alternative
+ollama pull qwen3:4b            # smallest viable
+ollama pull llama3.3:70b        # high-end, needs ≥ 64 GB RAM
+```
+
+`nomic-embed-text` should always be in the list — it's the embedding model used by the RAG pipeline (KB search, exploit chunks, playbook lookup). Without it, `/rag/ask` and the recon agent's KB lookups fail.
+
+## Related stack components
+
+- The **scan-recommender** uses the same `OLLAMA_MODEL` env for its `/tools/recommend` and `/rag/ask` endpoints — model changes apply uniformly.
+- **CT log scans** were migrated from crt.sh to Certspotter (no model dependency; called out here only because operators sometimes ask whether changing the model affects passive recon — it doesn't).
+- **Setup script** Phase 8 (`./scripts/setup.sh`) auto-pulls the configured model + `nomic-embed-text` on first install and verifies they're reachable from inside the containers.
