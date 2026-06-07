@@ -64,7 +64,7 @@ brew install wireguard-tools
 
 ```bash
 # From your LOCAL machine, copy files to VPS
-scp scripts/vps/setup-remote-db.sh root@<VPS_IP>:/tmp/
+scp scripts/optional/vps/setup-remote-db.sh root@<VPS_IP>:/tmp/
 scp db_init/ensure_all_tables.sql root@<VPS_IP>:/tmp/
 
 # SSH to VPS and run setup
@@ -83,7 +83,7 @@ The script installs WireGuard, PostgreSQL 16, pgvector, PgBouncer, and configure
 ```bash
 # Install wireguard-tools if not already installed (see Prerequisites above)
 # Then generate keys for your machine:
-./scripts/vps/wg-genkeys.sh alice 10.13.13.2
+./scripts/optional/vps/wg-genkeys.sh alice 10.13.13.2
 ```
 
 This creates:
@@ -154,7 +154,7 @@ docker compose -f docker-compose.yml -f docker-compose.remote-db.yml up -d
 **Run on: YOUR HOST MACHINE** (your laptop/desktop terminal, NOT inside a Docker container)
 
 ```bash
-./scripts/test-remote-db.sh
+./scripts/optional/test-remote-db.sh
 ```
 
 This checks: WireGuard container health, tunnel ping, TCP connectivity, database access, and pgvector extension.
@@ -171,7 +171,7 @@ docker compose up -d rag-postgres
 docker compose -f docker-compose.yml -f docker-compose.remote-db.yml up -d wireguard db-proxy
 
 # Run migration
-./scripts/migrate-db-to-remote.sh
+./scripts/optional/migrate-db-to-remote.sh
 ```
 
 Dumps are saved in `backups/` for safety.
@@ -185,8 +185,8 @@ Each team member needs their own WireGuard keypair with a unique IP:
 
 ```bash
 # On team member's machine (requires wireguard-tools installed):
-./scripts/vps/wg-genkeys.sh bob 10.13.13.3
-./scripts/vps/wg-genkeys.sh charlie 10.13.13.4
+./scripts/optional/vps/wg-genkeys.sh bob 10.13.13.3
+./scripts/optional/vps/wg-genkeys.sh charlie 10.13.13.4
 ```
 
 Then on the VPS, add each member's `[Peer]` block and reload:
@@ -205,8 +205,8 @@ Once remote DB is set up, team members can work offline and sync:
 2. **Switch to local mode**: `docker compose up -d` (stops using remote)
 3. **Work offline** — all changes tracked in `sync_log` via triggers
 4. **Reconnect**: switch back to remote mode
-5. **Push changes**: `./scripts/sync-push.sh my-node`
-6. **Pull teammates' changes**: `./scripts/sync-pull.sh my-node`
+5. **Push changes**: `./scripts/optional/sync-push.sh my-node`
+6. **Pull teammates' changes**: `./scripts/optional/sync-pull.sh my-node`
 7. **Resolve conflicts**: Sync Dashboard > Conflicts tab
 
 See the Sync Dashboard in the UI under System > Sync for visual management.
@@ -236,10 +236,10 @@ See the Sync Dashboard in the UI under System > Sync for visual management.
 | File | Run Where | Purpose |
 |------|-----------|---------|
 | `docker-compose.remote-db.yml` | Local | Compose overlay: disables local PG, adds WG + socat |
-| `scripts/vps/setup-remote-db.sh` | VPS | Provisions WG + PG16 + pgvector + PgBouncer + UFW |
-| `scripts/vps/wg-genkeys.sh` | Local | Generates WireGuard client keypair + config template |
-| `scripts/migrate-db-to-remote.sh` | Local | pg_dump local → pg_restore to remote via WG tunnel |
-| `scripts/test-remote-db.sh` | Local | Connectivity verification |
-| `scripts/sync-push.sh` | Local | Push local changes to remote DB |
-| `scripts/sync-pull.sh` | Local | Pull remote changes to local DB |
+| `scripts/optional/vps/setup-remote-db.sh` | VPS | Provisions WG + PG16 + pgvector + PgBouncer + UFW |
+| `scripts/optional/vps/wg-genkeys.sh` | Local | Generates WireGuard client keypair + config template |
+| `scripts/optional/migrate-db-to-remote.sh` | Local | pg_dump local → pg_restore to remote via WG tunnel |
+| `scripts/optional/test-remote-db.sh` | Local | Connectivity verification |
+| `scripts/optional/sync-push.sh` | Local | Push local changes to remote DB |
+| `scripts/optional/sync-pull.sh` | Local | Pull remote changes to local DB |
 | `wireguard/wg0.conf` | Local | WireGuard client config (gitignored) |
