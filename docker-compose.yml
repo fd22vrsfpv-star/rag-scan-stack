@@ -430,6 +430,11 @@ services:
       CENSYS_API_ID: ${CENSYS_API_ID:-}
       CENSYS_API_SECRET: ${CENSYS_API_SECRET:-}
       PDCP_API_KEY: ${PDCP_API_KEY:-}
+      # Optional Certspotter API key (raises CT-log fallback quota
+      # from 100/day to 5000/day).  Operators normally set this via
+      # Settings → API Keys; this env var is the bootstrap path for
+      # fresh installs that haven't visited Settings yet.
+      CERTSPOTTER_API_KEY: ${CERTSPOTTER_API_KEY:-}
     depends_on: [rag-api]
     networks: [agents_net]
     ports: ["8024:8024"]
