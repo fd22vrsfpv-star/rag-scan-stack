@@ -144,8 +144,11 @@ API_KEY=your-secure-api-key
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=your-secure-password
 
-# Ollama model (adjust based on your RAM)
-OLLAMA_MODEL=qwen2.5:14b   # Use qwen2.5:7b for less RAM
+# Ollama model (adjust based on your RAM).
+# Default: gemma4:31b -- matches docker-compose.yml's :- default so
+# every service in the stack picks up the same model.  Switch to a
+# smaller model on machines with < 32 GB free RAM.
+OLLAMA_MODEL=gemma4:31b
 ```
 
 ---
@@ -164,9 +167,11 @@ brew services start ollama
 # Or run manually in a terminal
 ollama serve
 
-# Pull the required models
-ollama pull qwen2.5:14b       # Main LLM (use qwen2.5:7b for less RAM)
-ollama pull nomic-embed-text  # Embedding model
+# Pull the required models.  `./scripts/setup.sh` will also pull these
+# automatically (Phase 8) if you run setup first; this section is for
+# manual operators who want explicit control.
+ollama pull gemma4:31b        # Main LLM (matches docker-compose default)
+ollama pull nomic-embed-text  # Embedding model (also matches default)
 ```
 
 ### Verify Ollama is running:
@@ -308,10 +313,14 @@ colima stop
 colima start --cpu 4 --memory 12
 ```
 
-Or use a smaller Ollama model in `.env`:
+Or use a smaller Ollama model in `.env`.  The stack's default is
+`gemma4:31b` (~20 GB).  On 16 GB hosts try a smaller model:
 ```bash
-OLLAMA_MODEL=qwen2.5:7b
+OLLAMA_MODEL=gemma4:9b        # ~6 GB, gemma family
+# or
+OLLAMA_MODEL=qwen3:4b         # ~3 GB, lighter still
 ```
+Remember to also `ollama pull <model>` on the host so the daemon has it.
 
 ### Port already in use
 

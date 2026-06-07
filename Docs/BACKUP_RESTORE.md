@@ -726,8 +726,6 @@ A: 1) Backup on old server, 2) Copy backup files to new server, 3) Restore on ne
 
 ## Additional Resources
 
-- **Disaster Recovery Plan:** `Docs/disaster-recovery/DISASTER_RECOVERY_PLAN.md`
-- **Database Failure Runbook:** `Docs/disaster-recovery/RUNBOOK_DATABASE_FAILURE.md`
 - **Security Setup:** `SECURITY_SETUP.md`
 - **Deployment Guide:** `DEPLOYMENT.md`
 
