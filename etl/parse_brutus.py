@@ -28,11 +28,45 @@ def parse_brutus(path: str, profile: str = "upload", job_id: str = None, secret_
             for rec in records:
                 try:
                     cur.execute("SAVEPOINT rec_sp")
+                    # Field-name compatibility across brutus + credential-check
+                    # producers.  Two schemas show up here:
+                    #
+                    # Legacy brutus / nmap-api credential-check JSONL:
+                    #   {"host":"1.2.3.4","port":22,"protocol":"ssh",
+                    #    "username":"x","success":true}
+                    #
+                    # Current brutus (multi-subcommand v9+) only emits rows
+                    # for SUCCESSFUL attempts, with no `success` field and
+                    # a combined target string:
+                    #   {"target":"1.2.3.4:22","protocol":"ssh",
+                    #    "username":"x","password":"y","duration":"..."}
+                    #
+                    # Treat absence-of-success-field-with-password-present as
+                    # implicit success (matches current brutus semantics), and
+                    # fall back to splitting `target` when host/port aren't
+                    # provided separately.
                     ip = rec.get("host") or rec.get("ip")
                     port = rec.get("port")
+                    if (not ip or not port) and rec.get("target"):
+                        tgt = rec["target"]
+                        if ":" in tgt:
+                            tgt_host, _, tgt_port = tgt.rpartition(":")
+                            ip = ip or tgt_host
+                            try:
+                                port = port or int(tgt_port)
+                            except ValueError:
+                                pass
+                        else:
+                            ip = ip or tgt
                     protocol = rec.get("protocol", "unknown")
                     username = rec.get("username", "")
-                    success = rec.get("success", False)
+                    # success: honour explicit value; otherwise infer from
+                    # the row's presence + a password being captured (the
+                    # current-brutus contract).
+                    if "success" in rec:
+                        success = bool(rec["success"])
+                    else:
+                        success = bool(rec.get("password") or rec.get("username"))
                     if not ip or not port or not success:
                         stats["skipped"] += 1
                         cur.execute("RELEASE SAVEPOINT rec_sp")
