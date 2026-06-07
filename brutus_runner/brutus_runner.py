@@ -304,7 +304,17 @@ def run_brutus(req: BrutusReq, background_tasks: BackgroundTasks):
     output_file = str(REPORT_DIR / f"brutus_{job_id[:8]}.jsonl")
     stdin_data = _build_fingerprintx_input(req.targets, req.protocols)
 
-    cmd = ["brutus", "--nerva", "-o", output_file, "-q"]
+    # Brutus is multi-subcommand now ("creds", "web", "snmp", "badkeys",
+    # "logon" -- see `brutus --help`).  We always want the `creds` family
+    # (default credentials on SSH/DB/SMB/etc.); without the subcommand
+    # brutus walks positional args looking for one and errors out with
+    # `unknown command "/reports/..."` on the output file path.
+    #
+    # The old `--nerva` flag is gone -- pipeline mode auto-detects Nerva
+    # JSON on stdin now.  Targets like {"ip":..,"port":..,"protocol":..}
+    # piped via _build_fingerprintx_input() still work; brutus identifies
+    # them by shape.
+    cmd = ["brutus", "creds", "-o", output_file, "-q"]
 
     # Usernames — inline list or wordlist file
     if req.username_wordlist_path:
