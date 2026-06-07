@@ -134,15 +134,100 @@ def get_service_from_port(port: int) -> Optional[str]:
     return None
 
 
+def _mask_password(password: str) -> str:
+    """Operator-friendly password masking for audit logs.
+
+    Goal: enough information that an operator scanning the audit recognises
+    which password from their wordlist was tried (length + leading chars),
+    without preserving the secret in plaintext if the audit ends up in logs
+    or DB rows that get exfiltrated.  Successful credentials' full passwords
+    remain in the in-memory job record + on-disk JSON, NOT here.
+
+      ""        -> "(empty)"
+      "a"       -> "*"
+      "ab"      -> "**"
+      "abc"     -> "***"
+      "abcd"    -> "ab**"          (first 2 + asterisks for the rest)
+      "msfadmin"-> "msf*****"       (first 3 + asterisks for the rest)
+    """
+    if not password:
+        return "(empty)"
+    n = len(password)
+    if n <= 3:
+        return "*" * n
+    keep = 2 if n == 4 else 3
+    return password[:keep] + ("*" * (n - keep))
+
+
+def _classify_hydra_failure(output: str) -> Tuple[str, Optional[str]]:
+    """Inspect hydra stdout+stderr to label why a single attempt failed.
+
+    Returns ``(failure_mode, error_excerpt)``.  failure_mode is one of:
+      - "kex_mismatch": SSH key-exchange / host-key-algorithm negotiation
+        failed; typically legacy SSH servers (Metasploitable2, OpenSSH < 7.0)
+        offering ssh-rsa/dss while modern hydra/libssh only offers ed25519
+        and rsa-sha2-*.  No password was actually tested.
+      - "connection_error": couldn't reach the service at all (closed port,
+        timeout at TCP/SSL layer, host unreachable).
+      - "auth_failed": connected + completed protocol negotiation, but the
+        credential was rejected.  This is the "normal" failure for wrong
+        credentials.
+      - "unknown": hydra returned 0 valid passwords but the output didn't
+        match any of the above patterns.
+    """
+    low = output.lower()
+    # SSH KEX / host-key-algo mismatch -- exact strings that hydra/libssh emit
+    if ("kex error" in low) or ("no match for method" in low) or \
+       ("could not connect" in low and "ssh://" in low) or \
+       ("no kex algorithm" in low):
+        # Pull just the kex-error line so the audit shows it cleanly
+        for line in output.splitlines():
+            if "kex" in line.lower() or "no match for method" in line.lower():
+                return "kex_mismatch", line.strip()[:180]
+        return "kex_mismatch", "key exchange failed (legacy SSH algorithms)"
+    if "could not connect" in low or "no route to host" in low or \
+       "connection refused" in low or "timed out" in low:
+        for line in output.splitlines():
+            if any(kw in line.lower() for kw in
+                   ("could not connect", "no route", "refused", "timed out")):
+                return "connection_error", line.strip()[:180]
+        return "connection_error", None
+    if "0 valid passwords" in low or "0 valid pairs" in low or \
+       "login fail" in low:
+        return "auth_failed", None
+    return "unknown", output.strip()[:180] if output.strip() else None
+
+
+# Tuple type alias for the rich return shape -- (results, audit_dict).
+# Existing callers within this module are updated below; cred_checker.py
+# has no external callers (confirmed via repo-wide grep).
+HydraResult = Tuple[List["CredentialResult"], Dict[str, Any]]
+
+
 def check_credentials_hydra(
     target: str,
     port: int,
     service: str,
     credentials: List[Tuple[str, str]],
     timeout: int = 60
-) -> List[CredentialResult]:
+) -> HydraResult:
     """
-    Test credentials using Hydra.
+    Test credentials using Hydra.  Returns BOTH the successful credential
+    list AND a rich per-attempt audit dict so the operator can see exactly
+    which (username, password-masked) pairs were tried, which failed and
+    why, and whether a legacy-SSH key-exchange mismatch suppressed real
+    auth attempts (the Metasploitable2 case).
+
+    Audit dict shape:
+      {
+        "method": "hydra",
+        "attempts": [
+            {"username": "...", "password_masked": "...",
+             "success": bool, "failure_mode": "...", "error_excerpt": "..."},
+            ...
+        ],
+        "kex_legacy_detected": bool,     # true if any attempt got kex_mismatch
+      }
 
     Args:
         target: Target IP address
@@ -152,9 +237,11 @@ def check_credentials_hydra(
         timeout: Timeout in seconds
 
     Returns:
-        List of successful credential results
+        Tuple of (successful credential results, audit dict).
     """
-    results = []
+    results: List[CredentialResult] = []
+    audit_attempts: List[Dict[str, Any]] = []
+    kex_legacy_detected = False
 
     # Map our service names to Hydra service names
     hydra_service_map = {
@@ -171,9 +258,21 @@ def check_credentials_hydra(
     hydra_svc = hydra_service_map.get(service)
     if not hydra_svc:
         logger.warning(f"Hydra does not support service: {service}")
-        return results
+        return results, {
+            "method": "hydra",
+            "attempts": [],
+            "kex_legacy_detected": False,
+            "unsupported_service": service,
+        }
 
     for username, password in credentials:
+        attempt: Dict[str, Any] = {
+            "username": username,
+            "password_masked": _mask_password(password),
+            "success": False,
+            "failure_mode": None,
+            "error_excerpt": None,
+        }
         try:
             # Build hydra command
             # -l: single username, -p: single password, -s: port, -t: tasks
@@ -215,14 +314,33 @@ def check_credentials_hydra(
                     details=output.strip()[:200]
                 )
                 results.append(result)
+                attempt["success"] = True
                 logger.info(f"[+] Valid credentials found: {username}:{password} on {target}:{port} ({service})")
+            else:
+                # Classify the failure so the operator can distinguish
+                # "wrong password" from "couldn't even handshake".
+                mode, excerpt = _classify_hydra_failure(output)
+                attempt["failure_mode"] = mode
+                attempt["error_excerpt"] = excerpt
+                if mode == "kex_mismatch":
+                    kex_legacy_detected = True
 
         except subprocess.TimeoutExpired:
             logger.warning(f"Hydra timeout for {username}@{target}:{port}")
+            attempt["failure_mode"] = "timeout"
         except Exception as e:
             logger.error(f"Hydra error: {e}")
+            attempt["failure_mode"] = "unknown"
+            attempt["error_excerpt"] = f"{type(e).__name__}: {str(e)[:120]}"
 
-    return results
+        audit_attempts.append(attempt)
+
+    audit = {
+        "method": "hydra",
+        "attempts": audit_attempts,
+        "kex_legacy_detected": kex_legacy_detected,
+    }
+    return results, audit
 
 
 def check_credentials_nmap(
@@ -231,21 +349,33 @@ def check_credentials_nmap(
     service: str,
     credentials: List[Tuple[str, str]],
     timeout: int = 120
-) -> List[CredentialResult]:
+) -> Tuple[List[CredentialResult], Dict[str, Any]]:
     """
-    Test credentials using nmap scripts.
+    Test credentials using nmap NSE brute scripts.  Returns BOTH the
+    successful credential list AND a per-attempt audit dict, matching
+    the shape returned by check_credentials_hydra so the upstream caller
+    can present one consistent audit panel regardless of which method
+    succeeded.
 
-    Args:
-        target: Target IP address
-        port: Target port
-        service: Service type
-        credentials: List of (username, password) tuples
-        timeout: Timeout in seconds
+    Audit dict shape:
+      {
+        "method": "nmap",
+        "script": "ssh-brute",       # which NSE script was run
+        "attempts": [                # ALL (user, pass) pairs that went into
+            ...                      # the temp userdb/passdb -- nmap doesn't
+        ],                           # report per-attempt outcome so most
+                                     # rows have success=false and the
+                                     # successful ones get success=true
+                                     # after parsing nmap's output.
+      }
 
-    Returns:
-        List of successful credential results
+    nmap's brute scripts don't emit per-attempt logs by default, so we
+    can't classify individual failures as kex/connection/auth like hydra.
+    The audit instead captures the full Cartesian product that was
+    submitted plus the parsed successes.
     """
-    results = []
+    results: List[CredentialResult] = []
+    audit_attempts: List[Dict[str, Any]] = []
 
     # Map services to nmap scripts
     nmap_script_map = {
@@ -260,7 +390,11 @@ def check_credentials_nmap(
 
     script = nmap_script_map.get(service)
     if not script:
-        return results
+        return results, {
+            "method": "nmap",
+            "attempts": [],
+            "unsupported_service": service,
+        }
 
     # Create temporary credential files
     import tempfile
@@ -290,22 +424,21 @@ def check_credentials_nmap(
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         output = proc.stdout
 
-        # Parse output for valid credentials
-        # Look for patterns like "Valid credentials" or service-specific success messages
+        # Build the audit's attempts list -- one entry per (user, pass) tested.
+        # Default all to failure; flip to success below for matches found in
+        # nmap's output.
+        successful_pairs: List[Tuple[str, str]] = []
         if "Valid credentials" in output or "Accounts:" in output:
-            # Extract credentials from output
             import re
-
-            # Common patterns in nmap brute output
             patterns = [
                 r"(\S+):(\S*)\s+-\s+Valid",  # user:pass - Valid
                 r"Accounts:.*?(\S+):(\S*)",   # Accounts: user:pass
             ]
-
             for pattern in patterns:
                 matches = re.findall(pattern, output, re.IGNORECASE | re.DOTALL)
                 for match in matches:
                     username, password = match
+                    successful_pairs.append((username, password))
                     result = CredentialResult(
                         service=service,
                         target=target,
@@ -319,19 +452,53 @@ def check_credentials_nmap(
                     results.append(result)
                     logger.info(f"[+] Valid credentials found: {username}:{password} on {target}:{port}")
 
+        # Now build the per-attempt audit list: every (user, pass) tested,
+        # marking the ones that nmap's parser flagged as Valid.
+        success_set = {(u, p) for u, p in successful_pairs}
+        for username, password in credentials:
+            is_success = (username, password) in success_set
+            audit_attempts.append({
+                "username": username,
+                "password_masked": _mask_password(password),
+                "success": is_success,
+                # nmap doesn't tell us *why* an attempt failed -- mark as
+                # auth_failed unless something at the script level errored.
+                "failure_mode": None if is_success else "auth_failed",
+                "error_excerpt": None,
+            })
+
     except subprocess.TimeoutExpired:
         logger.warning(f"Nmap brute timeout for {target}:{port}")
+        audit_attempts = [{
+            "username": u,
+            "password_masked": _mask_password(p),
+            "success": False,
+            "failure_mode": "timeout",
+            "error_excerpt": None,
+        } for u, p in credentials]
     except Exception as e:
         logger.error(f"Nmap brute error: {e}")
+        audit_attempts = [{
+            "username": u,
+            "password_masked": _mask_password(p),
+            "success": False,
+            "failure_mode": "unknown",
+            "error_excerpt": f"{type(e).__name__}: {str(e)[:120]}",
+        } for u, p in credentials]
     finally:
         # Cleanup temp files
         try:
             os.unlink(users_path)
             os.unlink(pass_path)
-        except:
+        except Exception:
             pass
 
-    return results
+    audit = {
+        "method": "nmap",
+        "script": script,
+        "attempts": audit_attempts,
+    }
+    return results, audit
 
 
 def check_vnc_password(target: str, port: int = 5900, passwords: List[str] = None) -> List[CredentialResult]:
@@ -485,17 +652,83 @@ def check_default_credentials(
             "success": False
         }
 
-    results = []
+    results: List[CredentialResult] = []
+    # Merged audit across whichever method(s) ran.  Built up as the
+    # method choices fan out (hydra-then-nmap-on-kex-fallback etc.).
+    audit: Dict[str, Any] = {
+        "credential_source": "cred_checker:default_credentials_dict",
+        "users_tried":            sorted({u for u, _ in credentials if u}),
+        "passwords_tried_masked": sorted({_mask_password(p) for _, p in credentials}),
+        "credentials_tested":     len(credentials),
+        "methods_used":           [],
+        "method_audits":          [],   # list of per-method audit dicts
+        "kex_legacy_detected":    False,
+        "fell_back_to_nmap":      False,
+    }
 
     if method == "hydra":
-        results = check_credentials_hydra(target, port, service, credentials)
+        results, m_audit = check_credentials_hydra(target, port, service, credentials)
+        audit["methods_used"].append("hydra")
+        audit["method_audits"].append(m_audit)
+        audit["kex_legacy_detected"] = bool(m_audit.get("kex_legacy_detected"))
     elif method == "nmap":
-        results = check_credentials_nmap(target, port, service, credentials)
+        results, m_audit = check_credentials_nmap(target, port, service, credentials)
+        audit["methods_used"].append("nmap")
+        audit["method_audits"].append(m_audit)
     else:
-        # Try hydra first, fall back to nmap
-        results = check_credentials_hydra(target, port, service, credentials)
-        if not results:
-            results = check_credentials_nmap(target, port, service, credentials)
+        # Default behaviour: try hydra first, fall back to nmap.  Also auto-
+        # fall back to nmap when hydra detected SSH KEX-mismatch on every
+        # attempt (the Metasploitable2 / legacy-OpenSSH case) -- nmap's
+        # NSE brute scripts handle legacy KEX correctly where hydra/libssh
+        # can't negotiate.  Record the fallback in the audit so operators
+        # see *why* nmap was invoked.
+        results, h_audit = check_credentials_hydra(target, port, service, credentials)
+        audit["methods_used"].append("hydra")
+        audit["method_audits"].append(h_audit)
+        audit["kex_legacy_detected"] = bool(h_audit.get("kex_legacy_detected"))
+
+        should_fallback = (
+            not results
+            and (h_audit.get("kex_legacy_detected") or
+                 all((a.get("failure_mode") == "kex_mismatch")
+                     for a in h_audit.get("attempts", [])
+                     if not a.get("success")))
+        )
+        if not results and not should_fallback:
+            # Plain "nothing worked" case -- still try nmap once
+            should_fallback = True
+
+        if should_fallback:
+            logger.info(
+                f"[cred_checker] {service}://{target}:{port} hydra returned "
+                f"0 valid creds (kex_legacy_detected="
+                f"{h_audit.get('kex_legacy_detected')}); falling back to nmap"
+            )
+            n_results, n_audit = check_credentials_nmap(target, port, service, credentials)
+            audit["methods_used"].append("nmap")
+            audit["method_audits"].append(n_audit)
+            audit["fell_back_to_nmap"] = True
+            if n_results:
+                results = n_results
+
+    # Human-readable summary for the audit panel.
+    total_attempts = sum(
+        len(ma.get("attempts", [])) for ma in audit["method_audits"]
+    )
+    if results:
+        summary = f"{len(results)} valid / {total_attempts} attempts"
+        if audit["fell_back_to_nmap"]:
+            summary += " (hydra→nmap fallback)"
+    elif audit["kex_legacy_detected"]:
+        summary = (
+            f"0 valid / {total_attempts} attempts — every hydra attempt "
+            f"failed at SSH key exchange (target uses legacy ssh-rsa/dss)"
+        )
+        if audit["fell_back_to_nmap"]:
+            summary += "; nmap fallback also found no valid creds"
+    else:
+        summary = f"0 valid / {total_attempts} attempts"
+    audit["summary"] = summary
 
     return {
         "service": service,
@@ -511,6 +744,7 @@ def check_default_credentials(
             }
             for r in results
         ],
+        "audit": audit,
         "success": len(results) > 0
     }
 
