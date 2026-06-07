@@ -1,7 +1,12 @@
 # Stage 1: Build Brutus binary (static so it runs on any Linux base)
-FROM golang:1.24-alpine AS builder
+# brutus@latest currently requires Go >= 1.26. The official golang images pin
+# GOTOOLCHAIN=local, so we both bump the base and allow toolchain auto-upgrade
+# to stay ahead of future Go-version bumps in upstream brutus.
+FROM golang:1.26-alpine AS builder
 
 RUN apk add --no-cache git
+
+ENV GOTOOLCHAIN=auto
 
 RUN CGO_ENABLED=0 go install github.com/praetorian-inc/brutus/cmd/brutus@latest
 
