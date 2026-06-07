@@ -209,8 +209,16 @@ TOOL_ROUTES: dict[str, tuple[str, callable, callable]] = {
         None,
     ),
     "get_recommendations": (
+        # scan_recommender exposes /recommendations (list, optional
+        # status/ip/limit) and /next_scan (per-port, requires ip).
+        # The tool-definition for the LLM is "Get AI-generated scan
+        # recommendations based on current findings and asset state"
+        # with no required parameters -- that matches /recommendations
+        # (defaults to status=pending, limit=100, no ip filter).
+        # The previous URL `/get_next_recommendations` did not exist and
+        # silently 404'd whenever an LLM invoked this tool.
         "GET",
-        lambda s, a: f"{s.scan_recommender_url}/get_next_recommendations",
+        lambda s, a: f"{s.scan_recommender_url}/recommendations",
         lambda a: {},
     ),
     "search_exploits": (
