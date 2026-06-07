@@ -72,7 +72,7 @@ NC='\033[0m'
 banner() {
     echo ""
     echo -e "${BOLD}${BLUE}══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${BLUE}  [$1/8] $2${NC}"
+    echo -e "${BOLD}${BLUE}  [$1/9] $2${NC}"
     echo -e "${BOLD}${BLUE}══════════════════════════════════════════════════════════════${NC}"
     echo ""
 }
@@ -451,17 +451,16 @@ OLLAMA_BASE_URL=http://host.docker.internal:11434' .env
         echo "GPU_TOTAL_MEMORY_GB=${MAC_TOTAL_RAM_GB}" >> .env
     fi
 
-    # Recommend model size based on available RAM
+    # Recommend model size based on available RAM.  Defaults track the
+    # OLLAMA_MODEL baked into docker-compose.yml (gemma4:31b) so the
+    # message matches what the stack will actually pull.
     if [ "$MAC_TOTAL_RAM_GB" -ge 96 ] 2>/dev/null; then
-        # 96GB+ → can run 70B models
-        if grep -q "^OLLAMA_MODEL=qwen2.5:32b" .env; then
-            log_info "With ${MAC_TOTAL_RAM_GB}GB RAM you can run 70B models"
-            log_info "Current model: qwen2.5:32b (change to llama3.3:70b or qwen2.5:72b if desired)"
-        fi
+        log_info "With ${MAC_TOTAL_RAM_GB}GB RAM you can comfortably run 70B models"
+        log_info "Current default: gemma4:31b (upgrade to llama3.3:70b or qwen2.5:72b if desired)"
     elif [ "$MAC_TOTAL_RAM_GB" -ge 48 ] 2>/dev/null; then
-        log_info "With ${MAC_TOTAL_RAM_GB}GB RAM, qwen2.5:32b is a good fit"
+        log_info "With ${MAC_TOTAL_RAM_GB}GB RAM, gemma4:31b is a good fit"
     elif [ "$MAC_TOTAL_RAM_GB" -ge 16 ] 2>/dev/null; then
-        log_info "With ${MAC_TOTAL_RAM_GB}GB RAM, consider smaller models (qwen2.5:14b or 7b)"
+        log_info "With ${MAC_TOTAL_RAM_GB}GB RAM, consider smaller models (gemma4:latest or qwen3:4b)"
     fi
 
     # Open WebUI Ollama base URL
@@ -572,7 +571,7 @@ MSF_LPORT=4444
 
 EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
 LLM_BACKEND=ollama
-OLLAMA_MODEL=qwen2.5:32b
+OLLAMA_MODEL=gemma4:31b
 OLLAMA_URL=http://ollama:11434
 OLLAMA_TIMEOUT=300
 GPU_NAME=
@@ -1006,9 +1005,115 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-#  PHASE 8 — Health Check
+#  PHASE 8 — Ollama models + macOS connection check
 # ══════════════════════════════════════════════════════════════════════════
-banner 8 "Health check"
+#
+# Setup historically stopped at "the daemon is listening" without ever
+# checking that the configured chat model actually exists on the Ollama
+# instance.  Symptom: every RAG / agent completion fails with a model-
+# not-found error that some error handlers report as a connection
+# failure -- exactly the macOS confusion we keep hitting.
+#
+# This phase:
+#   1. Reads OLLAMA_MODEL from .env (falls back to the docker-compose
+#      default if unset).
+#   2. Pulls OLLAMA_MODEL + nomic-embed-text on the host's native Ollama
+#      (macOS path) or via the ollama-init container (Linux/WSL GPU path).
+#   3. On macOS, additionally confirms that `host.docker.internal:11434`
+#      resolves and responds from inside scan-recommender -- this is the
+#      mac-specific failure mode (host networking misconfigured) that
+#      doesn't show up in the Phase 1 host-side check.
+banner 8 "Ollama models + connection check"
+
+if [ "$NO_START" = true ]; then
+    log_skip "Ollama setup skipped (services not started)"
+    record_phase "Ollama: SKIPPED"
+else
+    # Resolve OLLAMA_MODEL from .env (fall back to the compose default).
+    OLLAMA_MODEL_VAL="$(grep -E '^OLLAMA_MODEL=' .env 2>/dev/null | head -1 | cut -d= -f2- || true)"
+    OLLAMA_MODEL_VAL="${OLLAMA_MODEL_VAL:-gemma4:31b}"
+    REQUIRED_MODELS=("$OLLAMA_MODEL_VAL" "nomic-embed-text")
+
+    if [ "$IS_MAC" = true ]; then
+        # ── macOS: native Ollama on the host ─────────────────────────
+        if ! command -v ollama &>/dev/null; then
+            log_warn "Ollama CLI not installed on host — install with: brew install ollama"
+            log_warn "Then re-run: ./scripts/setup.sh"
+            record_phase "Ollama: NOT INSTALLED"
+        elif ! curl -sf --max-time 3 http://localhost:11434/api/version >/dev/null 2>&1; then
+            log_warn "Ollama daemon not running — start with: ollama serve  (or open the Ollama.app)"
+            record_phase "Ollama: NOT RUNNING"
+        else
+            log_ok "Ollama daemon reachable at localhost:11434"
+            INSTALLED_MODELS=$(curl -sf --max-time 5 http://localhost:11434/api/tags 2>/dev/null \
+                | grep -oE '"name":"[^"]+"' | cut -d'"' -f4 || true)
+
+            for m in "${REQUIRED_MODELS[@]}"; do
+                if echo "$INSTALLED_MODELS" | grep -qxF "$m" \
+                   || echo "$INSTALLED_MODELS" | grep -qxF "${m}:latest"; then
+                    log_ok "Model present: $m"
+                else
+                    log_info "Pulling $m (this may take several minutes)..."
+                    if ollama pull "$m"; then
+                        log_ok "Pulled: $m"
+                    else
+                        log_warn "Failed to pull $m -- LLM ops against this model will fail until resolved"
+                        log_warn "  Retry manually: ollama pull $m"
+                    fi
+                fi
+            done
+
+            # macOS-specific: confirm host.docker.internal resolves and
+            # answers from inside a stack container.  This catches the
+            # "everything works from the host, nothing works from
+            # containers" failure mode that the Phase 1 host-side check
+            # cannot see.
+            if docker ps --format '{{.Names}}' | grep -q "^scan-recommender$"; then
+                if docker exec scan-recommender curl -sf --max-time 5 \
+                   http://host.docker.internal:11434/api/version >/dev/null 2>&1; then
+                    log_ok "Containers can reach Ollama via host.docker.internal:11434"
+                else
+                    log_warn "Containers CANNOT reach host.docker.internal:11434"
+                    log_warn "  In Docker Desktop → Settings → Resources → Network, ensure"
+                    log_warn "  host networking is enabled.  Then: docker compose restart scan-recommender"
+                fi
+            fi
+
+            # Smoke test: round-trip a one-token completion through the
+            # configured chat model.  Failures here are usually OOM or
+            # the model not being warmable on this hardware.
+            if echo "$INSTALLED_MODELS" | grep -qxF "$OLLAMA_MODEL_VAL"; then
+                log_info "Smoke-testing completion through $OLLAMA_MODEL_VAL..."
+                if curl -sf --max-time 60 http://localhost:11434/api/generate \
+                     -d "{\"model\":\"$OLLAMA_MODEL_VAL\",\"prompt\":\"hi\",\"stream\":false}" \
+                     >/dev/null 2>&1; then
+                    log_ok "Completion smoke test passed for $OLLAMA_MODEL_VAL"
+                else
+                    log_warn "Smoke test failed -- model may be too large for this hardware"
+                fi
+            fi
+
+            record_phase "Ollama: OK (model: $OLLAMA_MODEL_VAL)"
+        fi
+    else
+        # ── Linux / WSL2: ollama-init container handles the pull when ──
+        # ── the gpu profile is active.  Without --gpu, this phase is a no-op.
+        if [ "$ENABLE_GPU" = true ]; then
+            log_info "Linux/WSL2 with --gpu: ollama-init container handles model pulls"
+            log_info "  Watch progress with: docker logs -f ollama-init"
+            record_phase "Ollama: HANDLED BY ollama-init"
+        else
+            log_skip "GPU profile not enabled -- Ollama not started in this stack"
+            log_info "  Re-run with --gpu to start ollama + ollama-init, or point at an external Ollama"
+            record_phase "Ollama: SKIPPED (no GPU profile)"
+        fi
+    fi
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PHASE 9 — Health Check
+# ══════════════════════════════════════════════════════════════════════════
+banner 9 "Health check"
 
 if [ "$NO_START" = true ]; then
     log_skip "Health check skipped (services not started)"
