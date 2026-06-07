@@ -2985,6 +2985,72 @@ def _run_credential_check_async(
             ]
         }
 
+        # Persist valid credentials into the credential_findings table so
+        # they show up in AssetBrowser → Credentials.  Previously this
+        # handler only stored results in the in-memory job tracker and on
+        # disk (/scan_results/.jobs/<job_id>.json) -- they were findable
+        # via the /jobs/{id} API but invisible to the credentials UI.
+        #
+        # Mirror the brutus runner's pattern: write a JSONL file in the
+        # shape parse_brutus.py reads (host/port/protocol/username/success)
+        # and POST it to the rag-api /ingest/brutus endpoint.  Best-effort
+        # -- a failure here must NOT roll back the job's success status;
+        # the credentials are still on disk and retrievable manually.
+        ingest_summary = None
+        if total_valid > 0:
+            try:
+                lines = []
+                for r in all_results:
+                    target_ip = r.get("target")
+                    for chk in r.get("checks", []):
+                        if not chk.get("success"):
+                            continue
+                        port_n = chk.get("port")
+                        service = chk.get("service") or "unknown"
+                        for cred in chk.get("valid_credentials", []) or []:
+                            lines.append(json.dumps({
+                                "host":     target_ip,
+                                "port":     int(port_n) if port_n is not None else 0,
+                                "protocol": service,
+                                "username": cred.get("username", ""),
+                                "success":  True,
+                            }))
+                if lines:
+                    # Write to /scan_results so the path is consistent with
+                    # how other /ingest/* calls in this module work.
+                    ingest_path = f"/scan_results/.jobs/credcheck_{job_id}.jsonl"
+                    with open(ingest_path, "w") as fh:
+                        fh.write("\n".join(lines) + "\n")
+                    with open(ingest_path, "rb") as fh:
+                        resp = requests.post(
+                            f"{API_BASE}/ingest/brutus",
+                            headers={"x-api-key": API_KEY},
+                            files={"file": ("credcheck.jsonl", fh, "application/x-ndjson")},
+                            params={"job_id": job_id, "secret_type": "password"},
+                            timeout=INGEST_TIMEOUT,
+                            verify=False,
+                        )
+                    try:
+                        ingest_summary = resp.json()
+                    except Exception:
+                        ingest_summary = {"status_code": resp.status_code,
+                                          "body": resp.text[:200]}
+                    logging.info(
+                        f"[{job_id}] credential-check ingested {len(lines)} "
+                        f"credentials → credential_findings: {ingest_summary}"
+                    )
+            except Exception as ingest_err:
+                logging.warning(
+                    f"[{job_id}] credential-check ingest failed (job result still "
+                    f"on disk): {type(ingest_err).__name__}: {ingest_err}"
+                )
+                ingest_summary = {"error": f"{type(ingest_err).__name__}: {ingest_err}"}
+
+        # Attach the ingest outcome to final_result so the UI / API can
+        # surface "credentials persisted" alongside the in-memory list.
+        if ingest_summary is not None:
+            final_result["ingest"] = ingest_summary
+
         update_job_status(job_id, "completed", "done",
                          f"Credential check complete. Found {total_valid} valid credentials.",
                          result=final_result)
