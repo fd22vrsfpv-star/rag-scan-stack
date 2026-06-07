@@ -421,5 +421,5 @@ done
 For issues or questions:
 1. Check the Swagger UI at http://localhost:8000/docs
 2. Review logs: `docker compose logs rag-api`
-3. Run manual health check: `./scripts/check_system_health.sh`
+3. Run manual health check: `./scripts/optional/check_system_health.sh`
 4. Open an issue on GitHub

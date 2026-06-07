@@ -116,7 +116,7 @@ Credentials and scan data transmitted in plaintext within container network.
 **Implementation Steps:**
 ```bash
 # 1. Generate certificates
-./scripts/generate-internal-certs.sh
+./scripts/generate-certs.sh
 
 # 2. Mount certificates in docker-compose.yml
 volumes:

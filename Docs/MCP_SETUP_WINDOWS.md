@@ -172,7 +172,7 @@ wsl -d Ubuntu-22.04 -- bash -c "cd /opt/rag-scan-stack/mcp && pip install -r req
 
 ```powershell
 # Test the health check script works
-wsl -d Ubuntu-22.04 -- /opt/rag-scan-stack/scripts/check_system_health.sh
+wsl -d Ubuntu-22.04 -- /opt/rag-scan-stack/scripts/optional/check_system_health.sh
 
 # Test the MCP server can start (Ctrl+C to exit)
 wsl -d Ubuntu-22.04 -- python3 /opt/rag-scan-stack/mcp/health-check-server.py
@@ -271,7 +271,7 @@ wsl -d Ubuntu-22.04 -- bash -c "cd /opt/rag-scan-stack && docker compose up -d a
 ```powershell
 # Make script executable in WSL
 wsl -d Ubuntu-22.04 -- chmod +x /opt/rag-scan-stack/mcp/health-check-server.py
-wsl -d Ubuntu-22.04 -- chmod +x /opt/rag-scan-stack/scripts/check_system_health.sh
+wsl -d Ubuntu-22.04 -- chmod +x /opt/rag-scan-stack/scripts/optional/check_system_health.sh
 ```
 
 ## Testing Individual Components

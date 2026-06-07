@@ -10,16 +10,16 @@ The RAG Scan Stack now includes a comprehensive health check system that verifie
 
 ```bash
 # Run complete health check
-./scripts/check_system_health.sh
+./scripts/optional/check_system_health.sh
 
 # Get JSON output
-./scripts/check_system_health.sh --json
+./scripts/optional/check_system_health.sh --json
 
 # Get MCP-formatted output
-./scripts/check_system_health.sh --mcp
+./scripts/optional/check_system_health.sh --mcp
 
 # Verbose mode (show all checks)
-./scripts/check_system_health.sh --verbose
+./scripts/optional/check_system_health.sh --verbose
 ```
 
 ### MCP Tool (via Claude Desktop/Code)
@@ -257,10 +257,10 @@ See [MCP README](../mcp/README.md) for detailed documentation.
 crontab -e
 
 # Check every 15 minutes, log results
-*/15 * * * * /opt/rag-scan-stack/scripts/check_system_health.sh >> /var/log/rag-health.log 2>&1
+*/15 * * * * /opt/rag-scan-stack/scripts/optional/check_system_health.sh >> /var/log/rag-health.log 2>&1
 
 # Email alerts on failure
-*/15 * * * * /opt/rag-scan-stack/scripts/check_system_health.sh || echo "Health check failed" | mail -s "Alert" admin@example.com
+*/15 * * * * /opt/rag-scan-stack/scripts/optional/check_system_health.sh || echo "Health check failed" | mail -s "Alert" admin@example.com
 ```
 
 ### Systemd Timer (Linux)
@@ -273,13 +273,13 @@ See [MCP README - Automation section](../mcp/README.md#automation) for systemd s
 # GitHub Actions example
 - name: Health Check
   run: |
-    ./scripts/check_system_health.sh
+    ./scripts/optional/check_system_health.sh
   timeout-minutes: 2
 
 # GitLab CI example
 health_check:
   script:
-    - ./scripts/check_system_health.sh
+    - ./scripts/optional/check_system_health.sh
   timeout: 2m
 ```
 
@@ -291,7 +291,7 @@ Export health check metrics:
 
 ```bash
 # Add to prometheus exporter
-./scripts/check_system_health.sh --json | \
+./scripts/optional/check_system_health.sh --json | \
   jq -r '.summary | "rag_health_score \(.health_percentage)"'
 ```
 
@@ -308,7 +308,7 @@ rag_health_score > 90  # Alert if below 90%
 
 ### Adding New Checks
 
-Edit `scripts/check_system_health.sh`:
+Edit `scripts/optional/check_system_health.sh`:
 
 ```bash
 check_my_service() {
@@ -333,15 +333,15 @@ check_my_service
 
 ```bash
 # Test the script
-./scripts/check_system_health.sh --verbose
+./scripts/optional/check_system_health.sh --verbose
 
 # Test with failures (stop a service)
 docker compose stop nuclei-runner
-./scripts/check_system_health.sh
+./scripts/optional/check_system_health.sh
 
 # Restart and retest
 docker compose start nuclei-runner
-./scripts/check_system_health.sh
+./scripts/optional/check_system_health.sh
 ```
 
 ## Best Practices
@@ -350,7 +350,7 @@ docker compose start nuclei-runner
    ```bash
    docker compose up -d --build
    sleep 30  # Wait for services to start
-   ./scripts/check_system_health.sh
+   ./scripts/optional/check_system_health.sh
    ```
 
 2. **Include in startup scripts**
@@ -360,7 +360,7 @@ docker compose start nuclei-runner
    echo "Waiting for services..."
    sleep 30
 
-   if ./scripts/check_system_health.sh; then
+   if ./scripts/optional/check_system_health.sh; then
        echo "System ready!"
    else
        echo "Health check failed, review logs"
@@ -376,7 +376,7 @@ docker compose start nuclei-runner
 4. **Before running scans**
    ```bash
    # Always verify system is ready
-   if ! ./scripts/check_system_health.sh; then
+   if ! ./scripts/optional/check_system_health.sh; then
        echo "System not ready, aborting scan"
        exit 1
    fi
