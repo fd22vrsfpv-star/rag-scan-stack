@@ -68,10 +68,14 @@ def _save_session_results(job_id, job_type, scanner, files, metadata=None):
 
 
 # Optional API keys for uncover/cloudlist/chaos (env var fallbacks)
-_ENV_SHODAN_API_KEY    = os.environ.get("SHODAN_API_KEY", "")
-_ENV_CENSYS_API_ID     = os.environ.get("CENSYS_API_ID", "")
-_ENV_CENSYS_API_SECRET = os.environ.get("CENSYS_API_SECRET", "")
-_ENV_PDCP_API_KEY      = os.environ.get("PDCP_API_KEY", "")
+_ENV_SHODAN_API_KEY      = os.environ.get("SHODAN_API_KEY", "")
+_ENV_CENSYS_API_ID       = os.environ.get("CENSYS_API_ID", "")
+_ENV_CENSYS_API_SECRET   = os.environ.get("CENSYS_API_SECRET", "")
+_ENV_PDCP_API_KEY        = os.environ.get("PDCP_API_KEY", "")
+# Certspotter is the crt.sh fallback for CT log lookups -- works without a
+# key (100 issuances/day, 1 req/s) but a free Sectigo account key raises
+# the quota to 5000/day.  See https://sslmate.com/certspotter/api
+_ENV_CERTSPOTTER_API_KEY = os.environ.get("CERTSPOTTER_API_KEY", "")
 
 
 def _fetch_db_api_keys() -> dict:
@@ -94,18 +98,20 @@ def _fetch_db_api_keys() -> dict:
 def _get_api_keys() -> dict:
     """Return merged API keys: DB values take precedence over env vars."""
     keys = {
-        "SHODAN_API_KEY": _ENV_SHODAN_API_KEY,
-        "CENSYS_API_ID": _ENV_CENSYS_API_ID,
-        "CENSYS_API_SECRET": _ENV_CENSYS_API_SECRET,
-        "PDCP_API_KEY": _ENV_PDCP_API_KEY,
+        "SHODAN_API_KEY":      _ENV_SHODAN_API_KEY,
+        "CENSYS_API_ID":       _ENV_CENSYS_API_ID,
+        "CENSYS_API_SECRET":   _ENV_CENSYS_API_SECRET,
+        "PDCP_API_KEY":        _ENV_PDCP_API_KEY,
+        "CERTSPOTTER_API_KEY": _ENV_CERTSPOTTER_API_KEY,
     }
     db_keys = _fetch_db_api_keys()
     # DB keys are lowercase, env vars are uppercase — map accordingly
     db_to_env = {
-        "shodan_api_key": "SHODAN_API_KEY",
-        "censys_api_id": "CENSYS_API_ID",
-        "censys_api_secret": "CENSYS_API_SECRET",
-        "pdcp_api_key": "PDCP_API_KEY",
+        "shodan_api_key":      "SHODAN_API_KEY",
+        "censys_api_id":       "CENSYS_API_ID",
+        "censys_api_secret":   "CENSYS_API_SECRET",
+        "pdcp_api_key":        "PDCP_API_KEY",
+        "certspotter_api_key": "CERTSPOTTER_API_KEY",
     }
     for db_name, env_name in db_to_env.items():
         val = db_keys.get(db_name, "")
@@ -234,52 +240,128 @@ def _read_jsonl(path: str) -> list:
 
 def _query_crtsh(domain: str, proxy: str = None, timeout: int = 60,
                   max_retries: int = 3, output: str = "json") -> list:
-    """Query crt.sh with retry logic and error handling.
+    """CT log lookup -- now backed by Certspotter, not crt.sh.
 
-    crt.sh frequently returns 502/503 or times out. This helper retries
-    with exponential backoff and returns an empty list on persistent failure
-    instead of crashing the entire scan.
+    crt.sh has been chronically flaky (frequent 502/503/timeouts; entire-
+    site outages lasting hours) which made every CT-log-dependent scan
+    unreliable.  We dropped direct crt.sh queries in favour of Certspotter
+    (https://sslmate.com/certspotter), a Sectigo-operated independent CT
+    log monitor that returns the same data with much better availability.
 
-    Args:
-        domain: Domain to query (e.g. 'example.com')
-        proxy: Optional SOCKS/HTTP proxy URL
-        timeout: Request timeout in seconds
-        max_retries: Number of retry attempts
-        output: crt.sh output format ('json')
+    Function name + signature preserved so the three existing callers
+    (the /jobs/crtsh handler, the passive-recon pipeline, and the cert-
+    chain expander) don't have to change.  ``max_retries`` and ``output``
+    are accepted but ignored -- Certspotter is JSON-only and has its own
+    retry budget inside _query_certspotter.
+
+    See _query_certspotter for the upstream details, API key support,
+    and the (common_name, not_after) normalization that matches the shape
+    the downstream consumers already expect.
+    """
+    return _query_certspotter(domain, proxy=proxy, timeout=timeout)
+
+
+def _query_certspotter(domain: str, proxy: str = None, timeout: int = 60,
+                        max_retries: int = 3) -> list:
+    """CT log lookup via Certspotter -- the public Sectigo-run alternative to
+    crt.sh.  Used as a fallback when crt.sh is degraded (it 502s frequently).
+
+    The response shape is normalized to match crt.sh's per-cert dict so the
+    crtsh-job consumer at /jobs/crtsh and the other two callers don't need
+    to change.  Specifically: each Certspotter issuance lists every SAN
+    under ``dns_names``, so one issuance becomes N synthetic crt.sh-style
+    rows (one per dns_name), each with ``common_name``, ``not_after``,
+    ``not_before``, and ``issuer_name`` populated.
+
+    API key (optional): if ``certspotter_api_key`` is set in app_settings
+    (Settings page in the dashboard) or CERTSPOTTER_API_KEY is in the
+    container's env, it's sent as ``Authorization: Bearer <token>`` -- the
+    free tier without a key allows 100 issuances/day and 1 req/sec; with
+    a free Sectigo account key it's 5000/day.
 
     Returns:
-        List of certificate dicts from crt.sh, or empty list on failure
+        List of normalized cert dicts, or a single-element error sentinel
+        list on persistent failure (matches _query_crtsh's contract so the
+        wrapper's "did the fallback work?" check is uniform).
     """
     import time as _time
 
-    url = f"https://crt.sh/?q=%.{domain}&output={output}"
-    proxies = {"https": proxy, "http": proxy} if proxy else None
+    # Certspotter expects the *base* domain; subdomain expansion is on by
+    # default via include_subdomains=true.  expand= controls which fields
+    # the response includes -- dns_names + issuer is enough for our schema.
+    url = (
+        f"https://api.certspotter.com/v1/issuances?"
+        f"domain={domain}"
+        f"&include_subdomains=true"
+        f"&expand=dns_names&expand=issuer"
+    )
+
+    # Pull the optional API key from app_settings (preferred) or env var.
+    api_key = ""
+    try:
+        all_keys = _get_api_keys()  # already merges DB → env precedence
+        api_key = all_keys.get("CERTSPOTTER_API_KEY", "")
+    except Exception:
+        api_key = os.environ.get("CERTSPOTTER_API_KEY", "")
+
     headers = {"User-Agent": "Mozilla/5.0 (recon-scanner)"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    proxies = {"https": proxy, "http": proxy} if proxy else None
 
     for attempt in range(max_retries):
         try:
             resp = requests.get(url, timeout=timeout, proxies=proxies, headers=headers)
             if resp.status_code == 200:
                 try:
-                    return resp.json()
+                    issuances = resp.json()
                 except (json.JSONDecodeError, ValueError) as e:
-                    logging.warning("crt.sh returned invalid JSON for %s: %s", domain, e)
+                    logging.warning("Certspotter invalid JSON for %s: %s", domain, e)
                     return []
-            elif resp.status_code in (502, 503, 504, 429):
-                wait = (2 ** attempt) * 5  # 5s, 10s, 20s
+                # Normalize each issuance into N crt.sh-style rows, one
+                # per dns_name SAN.  Skip wildcard-only entries that have
+                # no concrete dns_names (rare).
+                out = []
+                for iss in issuances or []:
+                    dns_names = iss.get("dns_names") or []
+                    issuer = (iss.get("issuer") or {}).get("name") or ""
+                    not_before = iss.get("not_before") or ""
+                    not_after = iss.get("not_after") or ""
+                    for name in dns_names:
+                        out.append({
+                            "common_name":  name,
+                            "name_value":   name,
+                            "not_before":   not_before,
+                            "not_after":    not_after,
+                            "issuer_name":  issuer,
+                            "_source":      "certspotter",
+                        })
+                return out
+            elif resp.status_code == 429:
+                wait = (2 ** attempt) * 10  # 10s, 20s, 40s -- Certspotter is rate-sensitive
                 logging.warning(
-                    "crt.sh returned %d for %s (attempt %d/%d), retrying in %ds",
+                    "Certspotter 429 (rate-limited) for %s (attempt %d/%d), retrying in %ds",
+                    domain, attempt + 1, max_retries, wait,
+                )
+                _time.sleep(wait)
+                continue
+            elif resp.status_code in (502, 503, 504):
+                wait = (2 ** attempt) * 5
+                logging.warning(
+                    "Certspotter %d for %s (attempt %d/%d), retrying in %ds",
                     resp.status_code, domain, attempt + 1, max_retries, wait,
                 )
                 _time.sleep(wait)
                 continue
             else:
-                logging.warning("crt.sh returned %d for %s: %s", resp.status_code, domain, resp.text[:200])
+                logging.warning("Certspotter %d for %s: %s",
+                                resp.status_code, domain, resp.text[:200])
                 return []
         except requests.exceptions.Timeout:
             wait = (2 ** attempt) * 5
             logging.warning(
-                "crt.sh timeout for %s (attempt %d/%d), retrying in %ds",
+                "Certspotter timeout for %s (attempt %d/%d), retrying in %ds",
                 domain, attempt + 1, max_retries, wait,
             )
             _time.sleep(wait)
@@ -287,18 +369,17 @@ def _query_crtsh(domain: str, proxy: str = None, timeout: int = 60,
         except requests.exceptions.ConnectionError as e:
             wait = (2 ** attempt) * 5
             logging.warning(
-                "crt.sh connection error for %s (attempt %d/%d): %s, retrying in %ds",
+                "Certspotter connection error for %s (attempt %d/%d): %s, retrying in %ds",
                 domain, attempt + 1, max_retries, e, wait,
             )
             _time.sleep(wait)
             continue
         except Exception as e:
-            logging.error("crt.sh unexpected error for %s: %s", domain, e)
+            logging.error("Certspotter unexpected error for %s: %s", domain, e)
             return []
 
-    logging.error("crt.sh failed after %d attempts for %s", max_retries, domain)
-    # Return a sentinel error entry so callers know it failed vs. genuinely 0 results
-    return [{"_error": f"crt.sh unavailable after {max_retries} attempts"}]
+    logging.error("Certspotter failed after %d attempts for %s", max_retries, domain)
+    return [{"_error": f"Certspotter unavailable after {max_retries} attempts"}]
 
 
 def _query_crtsh_serial(serial: str, timeout: int = 30, max_retries: int = 2) -> list:
