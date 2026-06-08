@@ -305,6 +305,44 @@ def _append_proactive_vulnx_recs(recs: List[Dict], ip: str):
 
 
 # ---- Rules ----
+# Ports that look like HTTP even when nmap can't fingerprint the service.
+# When the port row has service=null/unknown AND port is in this set, the
+# generator appends an httpx rec so the recon agent's KB-drain phase probes
+# the port.  httpx confirms whether it's HTTP, fills banner+title, and on
+# the NEXT ingest the KB lookup picks up the full web toolchain.  Without
+# this fallback an `nmap tcpwrapped`/`unknown` finding on 8443 would emit
+# only a generic nmap banner rec and the agent would never reach the port
+# with web tooling.
+COMMON_WEB_PORTS = {80, 443, 8080, 8443, 8000, 8008, 8888, 3000, 5000, 9000, 9090, 4443, 9443}
+COMMON_HTTPS_PORTS = {443, 8443, 4443, 9443}
+
+
+def _append_common_web_fallback(recs: List[Dict], port: Optional[int]):
+    """Append an httpx rec for HTTP-likely ports when no httpx rec exists.
+
+    Idempotent: if a KB lookup already emitted httpx (e.g. service was
+    fingerprinted as http/https), do nothing.  Otherwise append a
+    minimal httpx command that does fingerprint + tech detect + status
+    code, so the recon agent's KB-drain phase has something to dispatch
+    against unfingerprinted web ports.
+    """
+    if port is None or port not in COMMON_WEB_PORTS:
+        return
+    if any((r.get("scanner") or "").lower() == "httpx" for r in recs):
+        return
+    scheme = "https" if port in COMMON_HTTPS_PORTS else "http"
+    recs.append({
+        "scanner": "httpx",
+        "action": "fingerprint + tech detect (port-based fallback)",
+        "script": (
+            f"httpx -u {scheme}://{{target}}:{{port}} -title -tech-detect "
+            "-status-code -web-server -follow-redirects"
+            + (" -tls-probe" if scheme == "https" else "")
+        ),
+        "template": None,
+    })
+
+
 def generate_recommendations(row: Dict, port: Optional[int] = None, ip: Optional[str] = None) -> List[Dict]:
     service = (row.get("service") or "").lower()
     kb = get_tool_kb()
@@ -321,6 +359,7 @@ def generate_recommendations(row: Dict, port: Optional[int] = None, ip: Optional
         recs = _kb_result_to_recommendations(kb_result)
         if recs:
             _append_vulnx_rec(recs, row)
+            _append_common_web_fallback(recs, port)
             # Add proactive vulnx recommendations if IP is provided
             if ip:
                 _append_proactive_vulnx_recs(recs, ip)
@@ -332,6 +371,7 @@ def generate_recommendations(row: Dict, port: Optional[int] = None, ip: Optional
         recs = _kb_result_to_recommendations(kb_result)
         if recs:
             _append_vulnx_rec(recs, row)
+            _append_common_web_fallback(recs, port)
             # Add proactive vulnx recommendations if IP is provided
             if ip:
                 _append_proactive_vulnx_recs(recs, ip)
@@ -347,6 +387,7 @@ def generate_recommendations(row: Dict, port: Optional[int] = None, ip: Optional
     else:
         recs.append({"scanner": "nmap", "action": None, "script": "banner", "template": None})
     _append_vulnx_rec(recs, row)
+    _append_common_web_fallback(recs, port)
 
     # Add proactive vulnx recommendations if IP is provided
     if ip:

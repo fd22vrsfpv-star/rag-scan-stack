@@ -47,6 +47,9 @@ services:
     ports: [80, 8080, 8000, 8008, 3000, 5000, 8888, 9000]
     description: "HTTP - Web server (unencrypted)"
     tools:
+      - name: httpx
+        purpose: HTTP fingerprint, tech detect, title, status code
+        command: "httpx -u http://{target}:{port} -title -tech-detect -status-code -web-server -follow-redirects"
       - name: nikto
         purpose: web vulnerability scanner
         command: "nikto -h http://{target}:{port}"
@@ -108,6 +111,9 @@ services:
     ports: [443, 8443, 4443, 9443]
     description: "HTTPS - Web server (TLS encrypted)"
     tools:
+      - name: httpx
+        purpose: HTTPS fingerprint, tech detect, TLS probe, title
+        command: "httpx -u https://{target}:{port} -title -tech-detect -status-code -tls-probe -web-server -follow-redirects"
       - name: sslscan
         purpose: SSL/TLS cipher enumeration
         command: "sslscan {target}:{port}"
@@ -692,6 +698,9 @@ services:
       - name: nmap
         purpose: Docker API detection
         command: "nmap -sV -p {port} {target}"
+      - name: httpx
+        purpose: HTTP probe / version banner on Docker daemon socket
+        command: "httpx -u http://{target}:{port}/version -title -tech-detect -status-code -web-server"
       - name: docker
         purpose: Docker client
         command: "docker -H tcp://{target}:{port} ps"
@@ -711,6 +720,9 @@ services:
     ports: [6443, 8443, 10250, 10255]
     description: "Kubernetes - Container orchestration"
     tools:
+      - name: httpx
+        purpose: HTTPS probe / API server fingerprint
+        command: "httpx -u https://{target}:{port}/ -title -tech-detect -status-code -tls-probe -web-server"
       - name: kubectl
         purpose: Kubernetes client
         command: "kubectl --server=https://{target}:{port} get pods"
