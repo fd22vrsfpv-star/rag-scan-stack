@@ -753,10 +753,52 @@ async def cleanup_stale_scans(max_age_hours: int = Query(24, ge=1)):
 
 @router.get("/api/scans/limits")
 async def scan_limits():
-    """Return current scan concurrency status, including agent-launched scans."""
+    """Return current scan concurrency status, including agent-launched scans.
+
+    Counts reconciled against multiple sources of truth:
+      * `bff_active`   — in-memory active_jobs (BFF-dispatched scans)
+      * `agent_active` — autogen agent sessions reporting `status='running'`
+        BUT cross-checked against the audit log and stale-detected, so a
+        stale autogen session that never updated its status doesn't inflate
+        the count forever.
+      * `pending_recommendations` — scan_recommendations.status='pending',
+        scoped to the current engagement via header.  Surfaces the
+        recon-agent / KB-driven queue depth so operators can see how much
+        work is waiting to be dispatched.
+    """
     bff_active = _count_active_scans()
 
-    # Also count running scans from agent sessions
+    # Build the set of job_ids that have terminal events in the audit log.
+    # The audit log is append-only; if a job emitted completed/failed/stopped
+    # there at any point in the last 48h, it isn't actually "running" anymore
+    # even if autogen's session response still says so.
+    terminal_ids: set[str] = set()
+    audit_path = pathlib.Path("/scan_audit/audit.jsonl")
+    if audit_path.exists():
+        try:
+            for line in audit_path.read_text().splitlines()[-1000:]:
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+                jid = entry.get("job_id")
+                event = entry.get("event", "")
+                if jid and event in (
+                    "scan_completed", "scan_failed", "scan_stopped",
+                    "scan_lost", "scan_error", "scan_partial",
+                ):
+                    terminal_ids.add(jid)
+        except Exception:
+            pass
+
+    # Stale-detect threshold: an autogen-reported "running" scan whose
+    # started_at is older than this is almost certainly a session that
+    # never closed cleanly.  10 minutes is generous (most scans finish in
+    # 1-5 min; nmap with --top-ports 1000 against an LAN target is ~2 min).
+    from datetime import datetime, timezone, timedelta
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
+
+    # Also count running scans from agent sessions, reconciled.
     agent_active = 0
     try:
         settings = get_settings()
@@ -778,12 +820,60 @@ async def scan_limits():
                             )
                             if r.status_code == 200:
                                 for scan in r.json().get("scans", []):
-                                    if scan.get("status") == "running" and scan.get("job_id") not in active_jobs:
-                                        agent_active += 1
+                                    if scan.get("status") != "running":
+                                        continue
+                                    jid = scan.get("job_id")
+                                    if not jid or jid in active_jobs:
+                                        # Either no id, or already counted in
+                                        # bff_active -- don't double-count.
+                                        continue
+                                    # Skip if audit log shows the job is done.
+                                    if jid in terminal_ids:
+                                        continue
+                                    # Skip if started_at is older than 10 min
+                                    # (stale autogen session, never closed).
+                                    started_at_str = scan.get("started_at") or ""
+                                    if started_at_str:
+                                        try:
+                                            started_at = datetime.fromisoformat(
+                                                started_at_str.replace("Z", "+00:00")
+                                            )
+                                            if started_at < stale_cutoff:
+                                                continue
+                                        except Exception:
+                                            pass
+                                    agent_active += 1
                         except Exception:
                             pass
     except Exception:
         pass
+
+    # Count pending scan_recommendations for the current engagement (header
+    # supplies engagement_id).  Returns the depth of the recon-agent's
+    # KB-driven queue.  Cheap one-shot count query.
+    pending_recommendations = 0
+    try:
+        eid = engagement_headers().get("X-Engagement-Id") \
+            or engagement_headers().get("x-engagement-id")
+        if eid:
+            from db import get_db
+            with get_db() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                      FROM scan_recommendations sr
+                     WHERE sr.status = 'pending'
+                       AND sr.ip IN (
+                             SELECT a.ip FROM assets a
+                              WHERE a.engagement_id = %s::uuid
+                                AND a.ip IS NOT NULL
+                           )
+                    """,
+                    (eid,),
+                )
+                pending_recommendations = int(cur.fetchone()[0] or 0)
+    except Exception as e:
+        log.debug(f"pending_recommendations count failed: {e}")
 
     total_active = bff_active + agent_active
     return {
@@ -791,6 +881,7 @@ async def scan_limits():
         "max": MAX_CONCURRENT_SCANS,
         "available": max(0, MAX_CONCURRENT_SCANS - total_active),
         "pending_queue": len(pending_queue),
+        "pending_recommendations": pending_recommendations,
     }
 
 
@@ -1132,15 +1223,49 @@ async def list_scans(engagement_id: Optional[str] = None):
                     return sid, session, []
 
                 results = await asyncio.gather(*[_get_session_scans(s) for s in active_sessions])
+                # Build terminal-id set from audit log so we can downgrade
+                # stale "running" status reports from autogen.  Same logic as
+                # /scans/limits — keeps the two endpoints consistent.
+                _terminal_ids: set[str] = set()
+                _audit_path = pathlib.Path("/scan_audit/audit.jsonl")
+                if _audit_path.exists():
+                    try:
+                        for _line in _audit_path.read_text().splitlines()[-1000:]:
+                            try:
+                                _entry = json.loads(_line)
+                            except Exception:
+                                continue
+                            _jid = _entry.get("job_id")
+                            _event = _entry.get("event", "")
+                            if _jid and _event in (
+                                "scan_completed", "scan_failed", "scan_stopped",
+                                "scan_lost", "scan_error", "scan_partial",
+                            ):
+                                _terminal_ids.add(_jid)
+                    except Exception:
+                        pass
+                _stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
                 for sid, session, scans in results:
                     for scan in scans:
                         jid = scan.get("job_id", "")
                         if jid and jid not in tracked_ids:
                             tracked_ids.add(jid)
+                            # Reconcile autogen-reported status against
+                            # audit log + stale detection.  Without this,
+                            # a session autogen never closed shows up as
+                            # "running" forever.
+                            scan_status = scan.get("status", "running")
+                            if scan_status == "running":
+                                if jid in _terminal_ids:
+                                    scan_status = "completed"  # audit said so
+                                else:
+                                    _started = scan.get("started_at") or ""
+                                    if _started and _started < _stale_cutoff:
+                                        scan_status = "lost"  # stale autogen
                             jobs.append({
                                 "job_id": jid,
                                 "type": scan.get("type", "unknown"),
-                                "status": scan.get("status", "running"),
+                                "status": scan_status,
                                 "created_at": scan.get("started_at", ""),
                                 "completed_at": scan.get("completed_at"),
                                 "duration_s": scan.get("duration_seconds"),
@@ -1257,6 +1382,19 @@ async def list_scans(engagement_id: Optional[str] = None):
                 elif "stopped" in event or "cancelled" in event:
                     audit_jobs[jid]["status"] = "stopped"
                     audit_jobs[jid]["completed_at"] = ts
+            # Stale-detect: a scan_started event with no terminal counterpart
+            # leaves the audit_jobs entry at "running" forever.  Cap that --
+            # if the entry is still "running" after 10 min, treat as lost
+            # (matches the autogen-merge stale logic above).  Keeps the
+            # active-scans count honest even when a runner crashes mid-scan
+            # without writing a completion event.
+            stale_iso = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+            for _aj in audit_jobs.values():
+                if _aj.get("status") == "running":
+                    _created = _aj.get("created_at") or ""
+                    if _created and _created < stale_iso:
+                        _aj["status"] = "lost"
+                        _aj["error"] = "no completion event logged within 10 min"
             jobs.extend(audit_jobs.values())
         except Exception:
             pass
