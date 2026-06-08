@@ -198,12 +198,22 @@ export default function ScanMonitor() {
 
   const { data: limitsData } = useQuery({
     queryKey: ['scan-limits'],
-    queryFn: () => apiFetch<{ active: number; max: number; available: number; pending_queue: number }>('/scans/limits'),
+    queryFn: () => apiFetch<{
+      active: number
+      max: number
+      available: number
+      pending_queue: number
+      pending_recommendations: number
+    }>('/scans/limits'),
     refetchInterval: 5000,
   })
   const limActive = limitsData?.active ?? 0
   const limMax = limitsData?.max ?? 5
   const limPending = limitsData?.pending_queue ?? 0
+  // Recon-agent / KB-driven queue depth, distinct from `limPending`
+  // (BFF dispatch-queue) — operators want to see how many KB-
+  // recommended scans are awaiting auto-dispatch by the recon agent.
+  const limPendingRecs = limitsData?.pending_recommendations ?? 0
 
   const sessions = sessionsData?.sessions ?? []
   const activeSessions = sessions.filter(s => s.status === 'active')
@@ -230,6 +240,14 @@ export default function ScanMonitor() {
             {limPending > 0 && (
               <span className="text-xs text-amber-500 font-medium" title={`${limPending} scans queued, auto-dispatching as slots open`}>
                 +{limPending} queued
+              </span>
+            )}
+            {limPendingRecs > 0 && (
+              <span
+                className="text-xs text-purple-400 font-medium"
+                title={`${limPendingRecs} KB-recommended scans pending — the recon agent will dispatch them across cycles`}
+              >
+                +{limPendingRecs} pending recs
               </span>
             )}
           </div>
