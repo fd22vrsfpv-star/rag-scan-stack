@@ -19,6 +19,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /go/bin/brutus /usr/local/bin/brutus
 
+# Kali-style wordlist path compatibility.
+#
+# docker-compose bind-mounts the host's ./wordlists/ at /wordlists:ro
+# (read-only) -- that's where SecLists/rockyou/etc. live, populated by
+# ./scripts/install-wordlists.sh.  The KB commands reference Kali's
+# canonical /usr/share/wordlists/... paths.  Symlinking the two
+# directories means an operator pasting `hydra ... -P
+# /usr/share/wordlists/rockyou.txt` from the KB resolves to the same
+# file as `/wordlists/rockyou.txt`, and brutus_runner.py's
+# `_validate_wordlist_path` accepts both prefixes (see brutus_runner.py).
+RUN mkdir -p /usr/share && ln -s /wordlists /usr/share/wordlists
+
 WORKDIR /runner
 ENV PYTHONUNBUFFERED=1
 
