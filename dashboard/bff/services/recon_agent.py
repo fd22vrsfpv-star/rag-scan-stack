@@ -28,14 +28,31 @@ log = logging.getLogger("recon_agent")
 
 BASE_INTERVAL = float(os.environ.get("RECON_AGENT_BASE_INTERVAL", "30"))
 
-# Stage → default scan type mapping
+# Seed-stage discovery pipeline.
+#
+# Stages 0-2 (whois → dnsx → nmap) are the discovery seed that produces the
+# port/service data the KB-driven dispatcher (Phase 4 in _agent_cycle) needs.
+# Once nmap (stage 2) ingests, the post-ingest auto-recommender in rag-api
+# (`_trigger_recommendations_for` at app/rag-api/api.py:1763) writes
+# `scan_recommendations` rows per discovered port; Phase 4 then drains that
+# queue, dispatching whichever tool the KB picked for each (ip, port, service)
+# tuple.  This replaces the old hardcoded "stage 3 = httpx, stage 4 = nuclei"
+# chain with KB-informed selection that adapts to what's actually on the wire.
+#
+# Stages 3 and 4 are retained as a LEGACY FALLBACK: operators can flip
+# `config.kb_driven_recon=false` on the agent state to restore the old chain
+# (useful when scan-recommender or its KB store is offline).
 STAGE_TO_SCAN = {
     0: "whois",     # passive — WHOIS registration/ownership (no target contact)
     1: "dnsx",      # passive — DNS resolution (no target contact)
     2: "nmap",      # discovery (masscan-then-nmap, touches target)
-    3: "httpx",     # fingerprint / HTTP probing (touches target)
-    4: "nuclei",    # exploit / vuln detection (touches target)
+    3: "httpx",     # legacy-only — replaced by KB dispatch when kb_driven_recon=true
+    4: "nuclei",    # legacy-only — replaced by KB dispatch when kb_driven_recon=true
 }
+
+# Stages that always run regardless of kb_driven_recon — they produce the
+# port data the KB needs.  Stages NOT in this set are legacy-only.
+SEED_STAGES = {0, 1, 2}
 
 STAGE_NAMES = {0: "passive-whois", 1: "passive-dns", 2: "discovery", 3: "fingerprint", 4: "exploit"}
 
@@ -49,6 +66,11 @@ SCAN_TARGET_TYPES: dict[str, set[str]] = {
     "httpx": {"ip", "domain", "url"},
     "nuclei": {"ip", "domain", "url"},
 }
+
+# Default for whether a cycle should drain the KB recommendation queue
+# (Phase 4 below) or fall back to the legacy hardcoded stage 3/4 dispatches.
+# Operators can override per-engagement via `config.kb_driven_recon=false`.
+KB_DRIVEN_RECON_DEFAULT = True
 
 import re as _re
 _IP_RE = _re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
@@ -171,6 +193,12 @@ class ReconAgent:
         interval = agent_state.get("interval_sec", 300)
         max_dispatches = config.get("max_dispatches_per_cycle", 5 if profile == "pentest" else 2)
         dispatched = 0
+        # KB-driven recon: skip the legacy hardcoded stage 3 (httpx) / stage 4
+        # (nuclei) dispatches and instead drain the scan_recommendations queue
+        # in Phase 4 below.  The queue is populated by rag-api's post-ingest
+        # auto-recommender after each nmap/discovery scan ingests, so the KB
+        # picks the right tool per discovered (ip, port, service).
+        kb_driven_recon = bool(config.get("kb_driven_recon", KB_DRIVEN_RECON_DEFAULT))
 
         # Resolve proxy / tunnel config
         proxy_single = config.get("proxy")  # explicit single proxy URL
@@ -341,6 +369,11 @@ class ReconAgent:
         custom_scan_types = config.get("scan_target_types", {})
         for stage, scan_type in sorted(STAGE_TO_SCAN.items()):
             if stage in skip_stages:
+                continue
+            # KB-driven mode: post-discovery stages (httpx, nuclei) are owned
+            # by Phase 4's KB-queue drain.  Skip them here so the agent doesn't
+            # double-dispatch on top of whatever the KB recommended.
+            if kb_driven_recon and stage not in SEED_STAGES:
                 continue
 
             # Filter targets to those compatible with this scan type
@@ -531,6 +564,169 @@ class ReconAgent:
                 if dispatched >= max_dispatches:
                     break
 
+        # 4b. Phase 4 — drain the KB recommendation queue (kb_driven_recon=true)
+        #
+        # After the seed pipeline (stages 0-2) runs nmap, the post-ingest auto-
+        # recommender in rag-api (`_trigger_recommendations_for` at
+        # app/rag-api/api.py:1763) writes scan_recommendations rows per
+        # discovered (ip, port, service) tuple.  Phase 4 dispatches those recs
+        # via the existing /api/scan-recommendations/run endpoint, which
+        # already handles SCANNER_URLS routing, the Piece-1 status writeback
+        # loop, idempotency against in-flight jobs, and per-scanner manual-
+        # tool fallback (kali/node).  We just pick a proxy (matching the
+        # legacy dispatcher's policy) and submit the batch.
+        #
+        # Scoping: scan_recommendations has no engagement_id column; recs
+        # link to assets.id which has engagement_id.  Query through the join
+        # so we only drain THIS engagement's pending recs.
+        kb_drained = 0
+        kb_skipped_pending = 0
+        if kb_driven_recon and dispatched < max_dispatches:
+            pending_recs: list[dict] = []
+            try:
+                from db import get_db
+                budget = max_dispatches - dispatched
+                # Pull priority-ordered pending recs scoped to this engagement.
+                # Fetch slightly more than budget so we have something to
+                # report under kb_skipped_pending when the queue's deeper
+                # than this cycle can drain.
+                with get_db() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT sr.id::text, sr.ip::text, sr.service,
+                               sr.scanner, sr.action, sr.script, sr.template,
+                               sr.priority
+                          FROM scan_recommendations sr
+                          JOIN assets a ON sr.asset_id = a.id
+                         WHERE a.engagement_id = %s::uuid
+                           AND sr.status = 'pending'
+                         ORDER BY sr.priority ASC, sr.created_at DESC
+                         LIMIT %s
+                        """,
+                        (eid, max(budget * 3, 10)),
+                    )
+                    pending_recs = [
+                        {"id": r[0], "ip": r[1], "service": r[2],
+                         "scanner": r[3], "action": r[4], "script": r[5],
+                         "template": r[6], "priority": r[7]}
+                        for r in cur.fetchall()
+                    ]
+            except Exception as e:
+                log.warning("[recon:%s] KB queue fetch failed: %s",
+                            eid[:8], e)
+
+            if pending_recs:
+                # Respect both budgets: per-cycle (max_dispatches) AND the
+                # global concurrent-scan cap.
+                current_running = sum(
+                    1 for j in active_jobs.values()
+                    if j.get("status") in ("running", "queued")
+                )
+                kb_budget = max(0, min(
+                    max_dispatches - dispatched,
+                    MAX_CONCURRENT_RECON_SCANS - current_running,
+                ))
+                recs_to_dispatch = pending_recs[:kb_budget]
+                kb_skipped_pending = max(
+                    0, len(pending_recs) - len(recs_to_dispatch)
+                )
+
+                if recs_to_dispatch:
+                    # Pick proxy with the same round-robin / single-proxy
+                    # policy the legacy seed loop uses above.  All recs in
+                    # this batch share the same proxy — keeps the runner
+                    # behavior consistent within a cycle.
+                    kb_proxy = None
+                    if tunnel_proxies:
+                        kb_proxy = tunnel_proxies[
+                            self._tunnel_idx % len(tunnel_proxies)
+                        ]
+                        self._tunnel_idx += 1
+                    elif proxy_single:
+                        kb_proxy = proxy_single
+
+                    bff_port = os.environ.get("BFF_PORT", "443")
+                    payload = {"ids": [r["id"] for r in recs_to_dispatch]}
+                    if kb_proxy:
+                        payload["proxy"] = kb_proxy
+
+                    try:
+                        # Self-call into the BFF dispatch endpoint — same
+                        # pattern the legacy loop uses (cf. /api/scans/<type>
+                        # invocation above).  Pass engagement explicitly so
+                        # the downstream handler's engagement_headers()
+                        # resolves correctly regardless of middleware state
+                        # on this background task.
+                        async with httpx.AsyncClient(verify=False, timeout=120) as c:
+                            resp = await c.post(
+                                f"https://127.0.0.1:{bff_port}/api/scan-recommendations/run",
+                                json=payload,
+                                headers={
+                                    **headers,
+                                    "Content-Type": "application/json",
+                                    "x-engagement-id": eid,
+                                },
+                            )
+                        if resp.status_code < 400:
+                            body = resp.json() or {}
+                            for r in (body.get("results") or []):
+                                if (r.get("status") or "").lower() in (
+                                    "ok", "queued", "running", "dispatched"
+                                ):
+                                    kb_drained += 1
+                                    dispatched += 1
+                                    log.info(
+                                        "[recon:%s] KB dispatched %s for %s → %s",
+                                        eid[:8], r.get("scanner"),
+                                        r.get("ip"),
+                                        (r.get("job_id") or "?")[:8],
+                                    )
+                                    await self._emit_webhook(
+                                        eid, "recon_agent_kb_dispatched",
+                                        headers,
+                                        {
+                                            "engagement_id": eid,
+                                            "rec_id": r.get("id"),
+                                            "ip": r.get("ip"),
+                                            "scanner": r.get("scanner"),
+                                            "job_id": r.get("job_id"),
+                                            "proxy": kb_proxy,
+                                            "source": "kb_recon",
+                                        },
+                                    )
+                        else:
+                            log.warning(
+                                "[recon:%s] KB dispatch failed: %d %s",
+                                eid[:8], resp.status_code, resp.text[:200],
+                            )
+                            await self._emit_webhook(
+                                eid, "recon_agent_blocked", headers,
+                                {
+                                    "engagement_id": eid,
+                                    "phase": "kb_drain",
+                                    "reason": resp.text[:300],
+                                    "status_code": resp.status_code,
+                                },
+                                severity="warning",
+                            )
+                    except Exception as e:
+                        log.warning(
+                            "[recon:%s] KB dispatch error: %s", eid[:8], e
+                        )
+
+            # Emit drained signal only when we actually moved recs AND no
+            # backlog remains — operators / Slack get a clean "agent caught
+            # up" ping rather than a noisy per-cycle heartbeat.
+            if kb_drained > 0 and kb_skipped_pending == 0:
+                await self._emit_webhook(
+                    eid, "recon_agent_kb_queue_drained", headers,
+                    {
+                        "engagement_id": eid,
+                        "drained": kb_drained,
+                        "remaining_pending": 0,
+                    },
+                )
+
         # 5. Log to campaign events
         try:
             async with httpx.AsyncClient(verify=False, timeout=10) as c:
@@ -539,13 +735,20 @@ class ReconAgent:
                     json={
                         "kill_chain_phase": "reconnaissance",
                         "title": f"Recon agent cycle: {dispatched} scans dispatched",
-                        "description": (f"Checked {len(open_followups)} open follow-ups, "
-                                       f"{len(targets)} scope targets, "
-                                       f"dispatched {dispatched} scans"),
+                        "description": (
+                            f"Checked {len(open_followups)} open follow-ups, "
+                            f"{len(targets)} scope targets, "
+                            f"dispatched {dispatched} scans "
+                            f"({kb_drained} from KB queue, "
+                            f"{kb_skipped_pending} KB recs deferred)"
+                        ),
                         "operator": "recon_agent",
                         "detected": False,
                         "metadata": {
                             "dispatched": dispatched,
+                            "kb_dispatched": kb_drained,
+                            "kb_remaining_pending": kb_skipped_pending,
+                            "kb_driven_recon": kb_driven_recon,
                             "targets_checked": len(targets),
                             "followups_open": len(open_followups),
                             "profile": profile,
