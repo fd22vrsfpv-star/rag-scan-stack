@@ -1368,6 +1368,19 @@ for dir in "${DIRS[@]}"; do
 done
 log_ok "Directories verified ($CREATED created, $((${#DIRS[@]} - CREATED)) already existed)"
 
+# Credential-testing wordlists for brutus-runner.
+# install-wordlists.sh is idempotent -- it skips files already present
+# and only downloads what's missing.  brutus-runner expects wordlists
+# at /wordlists/{rockyou.txt,seclists/Passwords,seclists/Usernames}.
+if [ -x "scripts/install-wordlists.sh" ]; then
+    log_info "Provisioning credential-testing wordlists (rockyou + sparse SecLists, ~170MB)..."
+    if scripts/install-wordlists.sh 2>&1 | sed 's/^/  /'; then
+        log_ok "Wordlists provisioned"
+    else
+        log_warn "Wordlist provisioning failed — brutus credential attacks may fall back to built-in defaults"
+    fi
+fi
+
 # ExploitDB CSV (searchsploit data for software vulnerability matching)
 if [ ! -f "exploitdb/files_exploits.csv" ]; then
     log_info "Downloading ExploitDB CSV for searchsploit..."

@@ -1904,32 +1904,125 @@ function DatabaseTab() {
       </div>
 
       {/* Setup Guide Card */}
-      <div className="bg-card border border-border rounded-lg p-4">
-        <h3 className="text-sm font-semibold mb-2">Setup Guide</h3>
-        <div className="text-xs text-muted-foreground space-y-2">
-          <div className="flex gap-2">
-            <span className="text-primary font-mono font-bold">1.</span>
-            <span>Provision VPS: Run <code className="px-1 py-0.5 bg-muted rounded text-[10px]">scripts/vps/setup-remote-db.sh</code> on the remote server</span>
+      <div className="bg-card border border-border rounded-lg p-4 space-y-5">
+        <h3 className="text-sm font-semibold">Setup Guide</h3>
+
+        {/* SSH Tunnel Mode (default for VPS instances behind a firewall) */}
+        <div>
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-300 border border-blue-500/30 font-semibold">SSH Tunnel</span>
+            <span className="text-[11px] text-muted-foreground">
+              VPS behind a firewall, only SSH (port 22) reachable. Port 5432 stays private.
+            </span>
           </div>
-          <div className="flex gap-2">
-            <span className="text-primary font-mono font-bold">2.</span>
-            <span>Place your SSH key (e.g. <code className="px-1 py-0.5 bg-muted rounded text-[10px]">remote_db.pem</code>) in the <code className="px-1 py-0.5 bg-muted rounded text-[10px]">ssh-keys/</code> directory</span>
+          <div className="text-xs text-muted-foreground space-y-2">
+            <div className="flex gap-2">
+              <span className="text-primary font-mono font-bold">1.</span>
+              <span>Provision VPS: Run <code className="px-1 py-0.5 bg-muted rounded text-[10px]">scripts/vps/setup-remote-db.sh</code> on the remote server</span>
+            </div>
+            <div className="flex gap-2">
+              <span className="text-primary font-mono font-bold">2.</span>
+              <span>Place your SSH key (e.g. <code className="px-1 py-0.5 bg-muted rounded text-[10px]">remote_db.pem</code>) in the <code className="px-1 py-0.5 bg-muted rounded text-[10px]">ssh-keys/</code> directory</span>
+            </div>
+            <div className="flex gap-2">
+              <span className="text-primary font-mono font-bold">3.</span>
+              <span>Fill in the form above: <strong>VPS Host</strong>, <strong>SSH User</strong>, <strong>SSH Key File</strong>, <strong>DB Port</strong> (5432), <strong>DB User</strong>, <strong>DB Password</strong>, then click Save</span>
+            </div>
+            <div className="flex gap-2">
+              <span className="text-primary font-mono font-bold">4.</span>
+              <span>Click "Test SSH Tunnel" to verify connectivity</span>
+            </div>
+            <div className="flex gap-2">
+              <span className="text-primary font-mono font-bold">5.</span>
+              <span>Click "Switch to Remote" to activate the SSH tunnel</span>
+            </div>
+            <div className="flex gap-2">
+              <span className="text-primary font-mono font-bold">6.</span>
+              <span>Optional: Run <code className="px-1 py-0.5 bg-muted rounded text-[10px]">scripts/migrate-db-to-remote.sh</code> to copy local data to remote</span>
+            </div>
           </div>
-          <div className="flex gap-2">
-            <span className="text-primary font-mono font-bold">3.</span>
-            <span>Fill in the VPS host, SSH user, key filename, and DB credentials above, then click Save</span>
+        </div>
+
+        {/* Direct SSL Mode (cloud-managed Postgres, RDS, Aurora, etc.) */}
+        <div className="pt-4 border-t border-border/50">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-300 border border-purple-500/30 font-semibold">Direct SSL</span>
+            <span className="text-[11px] text-muted-foreground">
+              Postgres reachable on port 5432 with TLS (cloud-managed, RDS, Aurora, Supabase, self-hosted with cert).
+            </span>
           </div>
-          <div className="flex gap-2">
-            <span className="text-primary font-mono font-bold">4.</span>
-            <span>Click "Test SSH Tunnel" to verify connectivity</span>
-          </div>
-          <div className="flex gap-2">
-            <span className="text-primary font-mono font-bold">5.</span>
-            <span>Click "Switch to Remote" to activate the SSH tunnel</span>
-          </div>
-          <div className="flex gap-2">
-            <span className="text-primary font-mono font-bold">6.</span>
-            <span>Optional: Run <code className="px-1 py-0.5 bg-muted rounded text-[10px]">scripts/migrate-db-to-remote.sh</code> to copy local data to remote</span>
+          <div className="text-xs text-muted-foreground space-y-2">
+            <div className="flex gap-2">
+              <span className="text-primary font-mono font-bold">1.</span>
+              <span>
+                Confirm port <code className="px-1 py-0.5 bg-muted rounded text-[10px]">5432</code> is reachable from this host
+                {' '}and the server has SSL enabled (<code className="px-1 py-0.5 bg-muted rounded text-[10px]">ssl = on</code> in <code className="px-1 py-0.5 bg-muted rounded text-[10px]">postgresql.conf</code> for self-hosted; managed services have SSL on by default).
+              </span>
+            </div>
+            <div className="flex gap-2">
+              <span className="text-primary font-mono font-bold">2.</span>
+              <span>
+                Form fields above — fill these in, <strong>leave SSH fields blank</strong> (Direct SSL doesn't tunnel):
+                <ul className="ml-5 mt-1 list-disc text-[11px]">
+                  <li><strong>VPS Host / IP</strong>: the Postgres server's hostname or IP (e.g. <code className="px-1 py-0.5 bg-muted rounded text-[10px]">db.example.com</code> or <code className="px-1 py-0.5 bg-muted rounded text-[10px]">my-cluster.cluster-xyz.us-east-1.rds.amazonaws.com</code>)</li>
+                  <li><strong>SSH User / SSH Key File</strong>: leave blank or default</li>
+                  <li><strong>DB Port</strong>: <code className="px-1 py-0.5 bg-muted rounded text-[10px]">5432</code> (or your custom port)</li>
+                  <li><strong>DB User</strong>: usually <code className="px-1 py-0.5 bg-muted rounded text-[10px]">app</code></li>
+                  <li><strong>DB Password</strong>: the password set on the remote DB</li>
+                </ul>
+              </span>
+            </div>
+            <div className="flex gap-2">
+              <span className="text-primary font-mono font-bold">3.</span>
+              <span>
+                Click <strong>Save</strong> to persist the connection config.
+              </span>
+            </div>
+            <div className="flex gap-2">
+              <span className="text-primary font-mono font-bold">4.</span>
+              <div className="flex-1">
+                Edit <code className="px-1 py-0.5 bg-muted rounded text-[10px]">.env</code> at the repo root so the rag-api container points at the remote DB instead of the local container:
+                <pre className="mt-1 p-2 bg-muted/60 rounded text-[10.5px] font-mono leading-snug overflow-x-auto">{`# Comment out the local Postgres profile so docker-compose doesn't
+# start rag-postgres locally:
+COMPOSE_PROFILES=         # was: local-db
+
+POSTGRES_HOST=db.example.com      # the same VPS Host you entered above
+POSTGRES_PORT=5432
+POSTGRES_USER=app
+POSTGRES_PASSWORD=<the DB password>
+POSTGRES_DB=scans
+
+# DSN with sslmode=require so the driver rejects unencrypted fallback.
+# Use sslmode=verify-full if you have the server cert in /certs/.
+DB_DSN=postgresql://app:<PASSWORD>@db.example.com:5432/scans?sslmode=require`}</pre>
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <span className="text-primary font-mono font-bold">5.</span>
+              <span>
+                Recreate the affected containers so they read the new <code className="px-1 py-0.5 bg-muted rounded text-[10px]">.env</code>:{' '}
+                <code className="px-1 py-0.5 bg-muted rounded text-[10px]">docker compose up -d --force-recreate rag-api pentest-dashboard</code>
+                {' '}(<code className="px-1 py-0.5 bg-muted rounded text-[10px]">restart</code> alone won't pick up env_file changes).
+              </span>
+            </div>
+            <div className="flex gap-2">
+              <span className="text-primary font-mono font-bold">6.</span>
+              <span>Click <strong>"Test DB Connection"</strong> above to verify SSL handshake + auth succeed. Green checkmark = ready.</span>
+            </div>
+            <div className="flex gap-2">
+              <span className="text-primary font-mono font-bold">7.</span>
+              <span>Click <strong>"Switch to Direct"</strong> to mark Direct SSL as the active mode.</span>
+            </div>
+            <div className="flex gap-2">
+              <span className="text-primary font-mono font-bold">8.</span>
+              <span>Optional: run <code className="px-1 py-0.5 bg-muted rounded text-[10px]">scripts/migrate-db-to-remote.sh</code> to seed the remote DB from your local data.</span>
+            </div>
+            <div className="mt-3 px-3 py-2 rounded border border-amber-500/30 bg-amber-500/5">
+              <div className="text-[11px] text-amber-300 font-medium mb-0.5">Heads-up</div>
+              <div className="text-[11px] text-amber-200/80">
+                Direct SSL exposes port 5432 to the network. Use IP allowlisting on the DB server's firewall + a strong <code className="px-1 py-0.5 bg-muted rounded text-[10px]">scram-sha-256</code> password (the rag-postgres image enforces this by default). Prefer SSH Tunnel mode when only a single operator workstation needs access.
+              </div>
+            </div>
           </div>
         </div>
       </div>
