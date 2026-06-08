@@ -1310,7 +1310,13 @@ function DatabaseTab() {
   const [switching, setSwitching] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; message?: string; error?: string; target?: string; mode?: string } | null>(null)
-  const [switchResult, setSwitchResult] = useState<{ ok: boolean; error?: string } | null>(null)
+  const [switchResult, setSwitchResult] = useState<{
+    ok: boolean
+    error?: string
+    mode?: string
+    pruning?: string[]
+    pruning_status?: string
+  } | null>(null)
   const [preflighting, setPreflighting] = useState(false)
   const [preflightResult, setPreflightResult] = useState<{ ok: boolean; checks: Record<string, { status: string; detail: string }> } | null>(null)
   const [showPassword, setShowPassword] = useState(false)
@@ -1384,14 +1390,26 @@ function DatabaseTab() {
     setSwitching(true)
     setSwitchResult(null)
     try {
-      const res = await apiFetch<{ ok: boolean; error?: string; mode?: string }>(
+      const res = await apiFetch<{
+        ok: boolean
+        error?: string
+        mode?: string
+        pruning?: string[]
+        pruning_status?: string
+      }>(
         `/settings/database/switch/${mode}`,
         { method: 'POST' }
       )
       setSwitchResult(res)
       if (res.ok) {
-        // Wait for containers to settle
-        setTimeout(() => fetchStatus(), 3000)
+        // The backend force-recreates DB-consumer containers async (rag-api,
+        // BFF, scan-recommender, scanners) to flush stale psycopg2 pools.
+        // pentest-dashboard itself is in that list, so the fetch below
+        // races the restart -- poll a few times so we catch the new
+        // status once the BFF is back up.  Errors are swallowed; the
+        // last successful poll wins.
+        const pollTimes = [8000, 15000, 25000]
+        pollTimes.forEach(t => setTimeout(() => fetchStatus().catch(() => {}), t))
       }
     } catch (e: any) {
       setSwitchResult({ ok: false, error: e.message })
@@ -1606,9 +1624,21 @@ function DatabaseTab() {
         )}
 
         {switchResult && (
-          <div className={cn('mt-3 text-xs flex items-center gap-1.5', switchResult.ok ? 'text-green-400' : 'text-red-400')}>
-            {switchResult.ok ? <CheckCircle2 className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />}
-            {switchResult.ok ? 'Mode switched successfully. Services are restarting.' : switchResult.error}
+          <div className={cn('mt-3 text-xs flex flex-col gap-1', switchResult.ok ? 'text-green-400' : 'text-red-400')}>
+            <div className="flex items-center gap-1.5">
+              {switchResult.ok ? <CheckCircle2 className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />}
+              {switchResult.ok ? 'Mode switched successfully. Services are restarting.' : switchResult.error}
+            </div>
+            {switchResult.ok && switchResult.pruning && switchResult.pruning.length > 0 && (
+              <div className="ml-5 text-[10.5px] text-yellow-300/90 flex items-start gap-1.5">
+                <Loader2 className="w-3 h-3 mt-0.5 animate-spin shrink-0" />
+                <span>
+                  Pruning {switchResult.pruning.length} DB-consumer container(s) so connection pools reconnect cleanly:{' '}
+                  <span className="font-mono text-yellow-200/80">{switchResult.pruning.join(', ')}</span>.
+                  This page may briefly fail to load while pentest-dashboard restarts.
+                </span>
+              </div>
+            )}
           </div>
         )}
 
