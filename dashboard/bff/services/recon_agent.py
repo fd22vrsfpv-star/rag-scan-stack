@@ -679,8 +679,10 @@ class ReconAgent:
                             )
                         if resp.status_code < 400:
                             body = resp.json() or {}
+                            skipped_rec_ids: list[str] = []
                             for r in (body.get("results") or []):
-                                if (r.get("status") or "").lower() in (
+                                r_status = (r.get("status") or "").lower()
+                                if r_status in (
                                     "ok", "queued", "running", "dispatched"
                                 ):
                                     kb_drained += 1
@@ -703,6 +705,43 @@ class ReconAgent:
                                             "proxy": kb_proxy,
                                             "source": "kb_recon",
                                         },
+                                    )
+                                elif r_status == "skipped":
+                                    # Dispatcher decided this rec doesn't
+                                    # warrant a fresh run (e.g. trivial nmap
+                                    # NSE script already covered by service
+                                    # detection, manual-only tool with no
+                                    # kali/node, in-flight duplicate).  Mark
+                                    # the rec status='skipped' in the DB so
+                                    # the next cycle's queue scan doesn't
+                                    # pick it back up and burn budget on the
+                                    # same dead rec forever.
+                                    rid = r.get("id")
+                                    if rid:
+                                        skipped_rec_ids.append(rid)
+                                        log.info(
+                                            "[recon:%s] KB rec skipped (%s) — marking 'skipped' in DB: %s",
+                                            eid[:8], r.get("scanner"),
+                                            (r.get("detail") or "")[:80],
+                                        )
+                            # Bulk-update skipped rec IDs so they leave the
+                            # pending queue.  One UPDATE per cycle keeps the
+                            # txn small even if many recs were rejected.
+                            if skipped_rec_ids:
+                                try:
+                                    with get_db() as conn, conn.cursor() as cur:
+                                        cur.execute(
+                                            "UPDATE scan_recommendations "
+                                            "   SET status = 'skipped', "
+                                            "       updated_at = now() "
+                                            " WHERE id = ANY(%s::uuid[])",
+                                            (skipped_rec_ids,),
+                                        )
+                                        conn.commit()
+                                except Exception as e:
+                                    log.warning(
+                                        "[recon:%s] failed to mark %d recs as skipped: %s",
+                                        eid[:8], len(skipped_rec_ids), e,
                                     )
                         else:
                             log.warning(
