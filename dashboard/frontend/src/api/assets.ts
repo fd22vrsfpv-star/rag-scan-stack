@@ -196,6 +196,52 @@ export function useDeleteAssets() {
   })
 }
 
+// ── credential_findings.metadata.audit shape ──────────────────────────────
+//
+// Populated by the credential-check path
+// (nmap_scanner/cred_checker.check_default_credentials).  Captures the
+// per-attempt audit trail so AssetBrowser → Credentials can show
+// "here's what we tried, what failed, and why" alongside each row.
+//
+// Brutus-runner rows do NOT have this field (brutus is a Go binary
+// that doesn't expose per-attempt detail).  The expander handles
+// absent audit gracefully.
+
+export interface CredentialAttempt {
+  username: string
+  password_masked: string  // e.g. "msf*****"; full password lives only in the in-memory job record
+  success: boolean
+  failure_mode: string | null  // "kex_mismatch" | "connection_error" | "auth_failed" | "timeout" | "unknown"
+  error_excerpt: string | null
+}
+
+export interface CredentialMethodAudit {
+  method: string                       // "hydra" | "nmap"
+  script?: string | null               // populated when method=="nmap" with the NSE script used
+  attempts: CredentialAttempt[]
+  kex_legacy_detected?: boolean        // hydra-only signal
+  unsupported_service?: string | null  // populated when the service had no module map
+}
+
+export interface CredentialAudit {
+  credential_source: string                 // e.g. "cred_checker:default_credentials_dict"
+  users_tried: string[]
+  passwords_tried_masked: string[]
+  credentials_tested: number
+  methods_used: string[]                    // ordered, e.g. ["hydra"] or ["hydra","nmap"]
+  method_audits: CredentialMethodAudit[]
+  kex_legacy_detected: boolean              // OR of per-method signals
+  fell_back_to_nmap: boolean
+  summary: string                           // human-readable
+}
+
+export interface CredentialMetadata {
+  job_id?: string
+  audit?: CredentialAudit
+  // Other keys (e.g. node_id from manual KB-driven dispatch) may appear too.
+  [key: string]: unknown
+}
+
 export interface CredentialFinding {
   id: string
   ip: string
@@ -212,7 +258,7 @@ export interface CredentialFinding {
   discovered_at: string | null
   last_verified_at: string | null
   duration_ms: number | null
-  metadata: Record<string, unknown>
+  metadata: CredentialMetadata
   created_at: string
 }
 
