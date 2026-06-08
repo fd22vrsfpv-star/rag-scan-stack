@@ -1161,6 +1161,10 @@ services:
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
       PROJECT_DIR: /project
+      # Lets the DB-mode-switch handler emit webhook events
+      # (db_mode_switched / db_consumers_recreated) to rag-api.
+      API_BASE: https://rag-api:8000
+      API_KEY: ${API_KEY:-changeme}
     networks:
       - agents_net
     ports:

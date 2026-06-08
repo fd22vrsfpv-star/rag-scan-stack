@@ -549,7 +549,38 @@ import json as json_module
 from pydantic import BaseModel as PydanticBaseModel
 
 PROJECT_DIR = os.environ.get("PROJECT_DIR", "/project")
-COMPOSE_PROJECT = os.environ.get("COMPOSE_PROJECT_NAME", "rag-scan-stack")
+
+
+def _resolve_compose_project() -> str:
+    """Resolve the docker-compose project name this stack runs under.
+
+    Order of precedence:
+      1. COMPOSE_PROJECT_NAME env var (explicit operator override).
+      2. This container's own `com.docker.compose.project` label, read
+         back via the docker socket -- works regardless of how the stack
+         was named (default is the repo directory name, e.g.
+         "rag-scan-stack-public", NOT the historical "rag-scan-stack").
+      3. Hardcoded "rag-scan-stack" fallback.
+
+    Using the wrong project name here is dangerous: a `docker compose -p
+    <wrong>` would spawn a DUPLICATE stack instead of recreating the
+    running containers, so we go out of our way to detect it correctly.
+    """
+    env_name = os.environ.get("COMPOSE_PROJECT_NAME")
+    if env_name:
+        return env_name
+    try:
+        import socket as _socket
+        me = docker_client.containers.get(_socket.gethostname())
+        label = me.labels.get("com.docker.compose.project")
+        if label:
+            return label
+    except Exception:
+        pass
+    return "rag-scan-stack"
+
+
+COMPOSE_PROJECT = _resolve_compose_project()
 ENV_FILE = os.path.join(PROJECT_DIR, ".env")
 DB_CONFIG_FILE = os.path.join(PROJECT_DIR, "db-config.json")
 
@@ -1133,6 +1164,173 @@ def _remove_container(name: str, stop: bool = True):
         return False
 
 
+# ─────────────────────────────────────────────────────────────────────
+# DB-mode-switch pruning
+# ─────────────────────────────────────────────────────────────────────
+# Containers that hold psycopg2 connection pools (or otherwise cache
+# `rag-postgres` socket state) and need to be force-recreated after a
+# DB mode switch.  `docker compose restart` only sends SIGTERM/SIGKILL
+# and reuses the container -- existing connection pools survive and
+# continue talking to the previously-resolved IP.  Recreate forces a
+# fresh DNS resolution + reconnect against the new path (local socket,
+# SSH tunnel sidecar, or direct-SSL proxy sidecar).
+#
+# Listed in roughly the order operators care about first.  pentest-
+# dashboard is included even though it's the BFF this request flowed
+# through -- the recreate is fired async with a small delay so the
+# /db/switch response can land in the operator's browser before the
+# dashboard container restarts.
+_DB_CONSUMER_SERVICES = (
+    "rag-api",
+    "pentest-dashboard",
+    "scan-recommender",
+    "autogen-agents",
+    "node-manager",
+    "nmap_scanner",
+    "nuclei-runner",
+    "web-scanner",
+    "osint-runner",
+    "pd-runner",
+    "brutus-runner",
+    "playwright-scanner",
+    "exploit-runner",
+    "kali-listener",
+    "news-runner",
+)
+
+
+def _emit_db_event(event_type: str, data: dict = None):
+    """Fire-and-forget webhook event for DB-mode-switch actions.
+
+    Mirrors the node_manager emit pattern so external subscribers
+    (Slack, n8n, etc.) can react to a DB mode switch / consumer
+    recreate.  Best-effort: never raises into the caller.
+    """
+    try:
+        import requests as _req
+        api_base = os.environ.get("API_BASE", "https://rag-api:8000")
+        api_key = os.environ.get("API_KEY", "")
+        _req.post(
+            f"{api_base}/webhooks/emit",
+            json={"event_type": event_type, "source": "container_logs",
+                  "data": data or {}},
+            headers={"x-api-key": api_key},
+            timeout=5, verify=False,
+        )
+    except Exception:
+        pass
+
+
+def _recreate_db_consumers_async(reason: str, delay_sec: float = 2.0):
+    """Spawn a background thread that force-recreates the DB-consumer
+    containers via `docker compose up -d --force-recreate ...`.
+
+    The delay lets the parent HTTP request finish responding before
+    pentest-dashboard restarts (which would otherwise truncate the
+    operator's browser response in flight).  Skips containers that
+    don't currently exist in compose (e.g. profile-gated services
+    not started in this deployment).
+
+    `reason` shows up in the log line so operators can trace WHY a
+    container restart happened (e.g. "db_mode_switch:remote_direct").
+    """
+    import threading
+
+    def _worker():
+        import time as _time
+        _time.sleep(delay_sec)
+        compose_base = os.path.join(PROJECT_DIR, "docker-compose.yml")
+        # `docker compose` here runs INSIDE container-logs but talks to
+        # the HOST daemon via the mounted socket.  Relative bind-mount
+        # sources (e.g. `./db_init`) are resolved by the compose CLI
+        # against the project directory BEFORE being sent to the daemon,
+        # so that directory MUST be the host path -- otherwise the CLI
+        # sends `/project/db_init` and the host daemon rejects it
+        # ("mounts denied").  We therefore pass --project-directory
+        # <host path> while keeping -f / --env-file pointed at the
+        # container-readable /project copies.
+        host_dir = _get_host_project_dir()
+        compose_cmd = ["docker", "compose", "-p", COMPOSE_PROJECT,
+                       "-f", compose_base,
+                       "--project-directory", host_dir,
+                       "--env-file", os.path.join(PROJECT_DIR, ".env")]
+        # Build the list of services that exist in compose.  Filter
+        # against `docker compose ps --services` so we don't error out
+        # on profile-gated services that aren't present in this stack.
+        try:
+            present = subprocess.run(
+                [*compose_cmd, "ps", "--services"],
+                capture_output=True, text=True, timeout=30, cwd=PROJECT_DIR,
+            )
+            present_set = set(
+                (present.stdout or "").strip().splitlines()
+            ) if present.returncode == 0 else set()
+        except Exception:
+            present_set = set()
+
+        # If `ps --services` failed for any reason, fall back to the
+        # full list and let docker compose itself skip missing ones.
+        targets = [s for s in _DB_CONSUMER_SERVICES
+                   if (not present_set) or s in present_set]
+        if not targets:
+            logger.warning("[db-switch-prune] no DB consumers detected -- skipping recreate")
+            _emit_db_event("db_consumers_recreate_skipped",
+                           {"reason": reason, "detail": "no DB consumers detected"})
+            return
+
+        logger.info(
+            "[db-switch-prune] recreating %d DB-consumer container(s) "
+            "after %s: %s",
+            len(targets), reason, ", ".join(targets),
+        )
+        try:
+            result = subprocess.run(
+                [*compose_cmd, "up", "-d",
+                 "--force-recreate", "--no-deps", *targets],
+                capture_output=True, text=True, timeout=300, cwd=PROJECT_DIR,
+            )
+            if result.returncode == 0:
+                logger.info(
+                    "[db-switch-prune] recreate succeeded for %s (reason=%s)",
+                    ", ".join(targets), reason,
+                )
+                _emit_db_event("db_consumers_recreated",
+                               {"reason": reason, "services": targets,
+                                "count": len(targets)})
+            else:
+                logger.error(
+                    "[db-switch-prune] recreate FAILED (rc=%d): %s",
+                    result.returncode,
+                    (result.stderr or result.stdout or "")[:500],
+                )
+                _emit_db_event("db_consumers_recreate_failed",
+                               {"reason": reason, "services": targets,
+                                "rc": result.returncode,
+                                "error": (result.stderr or result.stdout or "")[:500]})
+        except subprocess.TimeoutExpired:
+            logger.error("[db-switch-prune] recreate timed out after 300s")
+            _emit_db_event("db_consumers_recreate_failed",
+                           {"reason": reason, "services": targets,
+                            "error": "timed out after 300s"})
+        except Exception as e:
+            logger.error("[db-switch-prune] recreate exception: %s", e)
+            _emit_db_event("db_consumers_recreate_failed",
+                           {"reason": reason, "services": targets, "error": str(e)})
+
+    # Emit the primary "mode switched" event up front (synchronously)
+    # so subscribers learn about the switch immediately; the recreate
+    # outcome arrives later as db_consumers_recreated / _failed.
+    _emit_db_event("db_mode_switched",
+                   {"mode": reason.split(":", 1)[-1],
+                    "services": list(_DB_CONSUMER_SERVICES)})
+
+    threading.Thread(
+        target=_worker,
+        name=f"db-switch-prune-{reason}",
+        daemon=True,
+    ).start()
+
+
 def _get_host_project_dir() -> str:
     """Get the host-side path for the project directory.
 
@@ -1158,15 +1356,26 @@ def switch_db_mode(mode: str):
     if mode not in ("local", "remote", "remote_direct"):
         return {"ok": False, "error": "mode must be 'local', 'remote', or 'remote_direct'"}
 
+    # Mode-switch pruning rationale (applied at each successful switch
+    # below): the rag-postgres docker hostname re-resolves transparently
+    # but psycopg2 connection pools in DB consumers (rag-api, BFF, etc.)
+    # cache the prior socket and continue talking to the old endpoint.
+    # We force-recreate the DB consumers asynchronously so the operator
+    # gets a fresh stack on the new mode without manually running
+    # `docker compose up -d --force-recreate ...`.
+
     if mode == "remote":
         config = _read_db_config()
         result = _ensure_remote_tunnel(config)
         if result.get("ok"):
             config["mode"] = "remote"
             _write_db_config(config)
+            _recreate_db_consumers_async("db_mode_switch:remote")
             return {"ok": True, "mode": "remote",
                     "output": "SSH tunnel healthy" if not result.get("already_running")
-                              else "Tunnel already running"}
+                              else "Tunnel already running",
+                    "pruning": list(_DB_CONSUMER_SERVICES),
+                    "pruning_status": "force-recreate scheduled (async, ~2s delay)"}
         return {"ok": False, "mode": mode, "error": result.get("error", "Unknown error")}
 
     if mode == "remote_direct":
@@ -1175,9 +1384,12 @@ def switch_db_mode(mode: str):
         if result.get("ok"):
             config["mode"] = "remote_direct"
             _write_db_config(config)
+            _recreate_db_consumers_async("db_mode_switch:remote_direct")
             return {"ok": True, "mode": "remote_direct",
                     "output": "Direct SSL proxy healthy" if not result.get("already_running")
-                              else "Direct proxy already running"}
+                              else "Direct proxy already running",
+                    "pruning": list(_DB_CONSUMER_SERVICES),
+                    "pruning_status": "force-recreate scheduled (async, ~2s delay)"}
         return {"ok": False, "mode": mode, "error": result.get("error", "Unknown error")}
 
     else:
@@ -1190,19 +1402,29 @@ def switch_db_mode(mode: str):
         config["mode"] = "local"
         _write_db_config(config)
 
-        # Bring local postgres back up
+        # Bring local postgres back up.  As with the consumer recreate,
+        # compose runs in-container against the host daemon, so relative
+        # bind-mount sources must resolve against the HOST project dir
+        # (--project-directory) or the daemon rejects them.
         compose_base = os.path.join(PROJECT_DIR, "docker-compose.yml")
+        host_dir = _get_host_project_dir()
         try:
             result = subprocess.run(
                 ["docker", "compose", "-p", COMPOSE_PROJECT,
                  "--profile", "local-db",
                  "-f", compose_base,
+                 "--project-directory", host_dir,
+                 "--env-file", os.path.join(PROJECT_DIR, ".env"),
                  "up", "-d", "rag-postgres", "wait-for-db"],
                 capture_output=True, text=True, timeout=120, cwd=PROJECT_DIR,
             )
             if result.returncode != 0:
                 return {"ok": False, "error": result.stderr or result.stdout, "mode": mode}
-            return {"ok": True, "mode": "local", "output": "Local postgres restored"}
+            _recreate_db_consumers_async("db_mode_switch:local")
+            return {"ok": True, "mode": "local",
+                    "output": "Local postgres restored",
+                    "pruning": list(_DB_CONSUMER_SERVICES),
+                    "pruning_status": "force-recreate scheduled (async, ~2s delay)"}
         except subprocess.TimeoutExpired:
             return {"ok": False, "error": "Timed out starting local postgres", "mode": mode}
         except Exception as e:
