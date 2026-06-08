@@ -851,12 +851,36 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                     if proxy_url:
                         payload["proxy"] = proxy_url
                     r = await client.post(f"{service_url}/jobs/nuclei-scan", json=payload, headers=headers)
-                elif scanner in ("nikto", "gobuster", "feroxbuster", "dirsearch", "sqlmap"):
+                elif scanner in ("nikto", "gobuster"):
+                    # web_scanner has per-tool endpoints (/jobs/nikto-scan,
+                    # /jobs/gobuster) that take target_url and run JUST that
+                    # tool, with each tool inserting directly into the
+                    # web_findings table (no separate ingest step needed --
+                    # different pattern from nuclei).  The old code routed
+                    # everything to /jobs/web-scan, which runs the multi-
+                    # tool pipeline (gobuster+playwright+katana+zap) and
+                    # crucially DOES NOT INCLUDE NIKTO -- so a recon-agent
+                    # dispatch of "nikto" actually never ran nikto.
                     port = rec.get("port") or 80
-                    payload = {"url": f"http://{ip}:{port}"}
+                    target_url = f"http://{ip}:{port}"
+                    endpoint = "/jobs/nikto-scan" if scanner == "nikto" else "/jobs/gobuster"
+                    payload = {"target_url": target_url}
                     if proxy_url:
                         payload["proxy"] = proxy_url
-                    r = await client.post(f"{service_url}/jobs/web-scan", json=payload, headers=headers)
+                    r = await client.post(f"{service_url}{endpoint}", json=payload, headers=headers)
+                elif scanner in ("feroxbuster", "dirsearch", "sqlmap"):
+                    # web_scanner does not yet have endpoints for these
+                    # tools.  Mark as 'skipped' so the recon agent's Phase
+                    # 4 (PR #33) updates the rec's DB status and stops
+                    # re-picking it every cycle.  Operators can run these
+                    # tools via the Kali container ("Use Kali" flag) until
+                    # web_scanner exposes them natively.
+                    result["status"] = "skipped"
+                    result["detail"] = (
+                        f"{scanner} not yet implemented in web_scanner -- "
+                        "enable 'Use Kali' to run via internal Kali container"
+                    )
+                    return result
                 elif scanner in ("whatweb", "httpx"):
                     payload = {"targets": [ip]}
                     if proxy_url:
