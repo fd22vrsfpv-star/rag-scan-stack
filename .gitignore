@@ -194,3 +194,7 @@ datasets/
 
 # Setup script transcripts (timestamped)
 logs/
+
+# Wordlist payloads — populated by scripts/install-wordlists.sh (rockyou ~134MB, SecLists ~30MB)
+wordlists/*
+!wordlists/.gitkeep

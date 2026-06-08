@@ -316,13 +316,30 @@ def run_brutus(req: BrutusReq, background_tasks: BackgroundTasks):
     # them by shape.
     cmd = ["brutus", "creds", "-o", output_file, "-q"]
 
+    # Wordlist paths must live under one of these prefixes.  The Dockerfile
+    # populates /wordlists/{seclists,rockyou.txt} and symlinks
+    # /usr/share/wordlists -> /wordlists so the Kali-convention path
+    # operators paste from the KB (`/usr/share/wordlists/rockyou.txt`)
+    # resolves to the same file as the legacy `/wordlists/...` form.
+    # `".." in wl` still blocks path traversal in either prefix.
+    _ALLOWED_WORDLIST_PREFIXES = ("/wordlists/", "/usr/share/wordlists/")
+
+    def _validate_wordlist_path(wl: str, field: str):
+        if (not any(wl.startswith(p) for p in _ALLOWED_WORDLIST_PREFIXES)) or ".." in wl:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{field} must be under one of "
+                    f"{', '.join(_ALLOWED_WORDLIST_PREFIXES)}"
+                ),
+            )
+        if not os.path.isfile(wl):
+            raise HTTPException(status_code=400, detail=f"{field} not found: {wl}")
+
     # Usernames — inline list or wordlist file
     if req.username_wordlist_path:
         wl = req.username_wordlist_path
-        if not wl.startswith("/wordlists/") or ".." in wl:
-            raise HTTPException(status_code=400, detail="username_wordlist_path must be under /wordlists/")
-        if not os.path.isfile(wl):
-            raise HTTPException(status_code=400, detail=f"Username wordlist not found: {wl}")
+        _validate_wordlist_path(wl, "username_wordlist_path")
         cmd.extend(["-U", wl])
     elif req.usernames:
         cmd.extend(["-u", ",".join(req.usernames)])
@@ -331,10 +348,7 @@ def run_brutus(req: BrutusReq, background_tasks: BackgroundTasks):
     pass_file = None
     if req.wordlist_path:
         wl = req.wordlist_path
-        if not wl.startswith("/wordlists/") or ".." in wl:
-            raise HTTPException(status_code=400, detail="wordlist_path must be under /wordlists/")
-        if not os.path.isfile(wl):
-            raise HTTPException(status_code=400, detail=f"Password wordlist not found: {wl}")
+        _validate_wordlist_path(wl, "wordlist_path")
         cmd.extend(["-P", wl])
     elif req.passwords:
         if len(req.passwords) <= 20:
