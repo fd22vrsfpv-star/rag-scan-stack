@@ -422,10 +422,45 @@ def persist_recommendations(
     model: Optional[str] = None,
     extra: Optional[Dict] = None,
 ) -> int:
+    """Insert scan_recommendations rows for the given IP.
+
+    `asset_id` resolution: callers historically passed `asset_id=None`
+    (the /next_scan handler is a notable example -- it has the IP but
+    not the asset PK).  That left every persisted rec with a NULL FK,
+    which breaks any downstream consumer that joins through assets
+    (e.g. the recon agent's Phase 4 engagement scoping).  When
+    asset_id is None and ip is provided, look it up from assets so
+    the FK is populated.  Picks the most-recently-updated row to be
+    deterministic when multiple assets share an IP across engagements.
+    """
     if not recs:
         return 0
+
     inserted = 0
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # Resolve asset_id from IP if the caller didn't have it.  Cheap
+        # one-shot lookup; persisting recs without the FK link silently
+        # breaks the recon agent's KB-drain queue scoping.  Wrapped in a
+        # SAVEPOINT so a lookup error (missing column, type mismatch)
+        # doesn't poison the surrounding transaction and abort the
+        # subsequent INSERTs.
+        if asset_id is None and ip:
+            cur.execute("SAVEPOINT asset_lookup")
+            try:
+                cur.execute(
+                    "SELECT id FROM public.assets WHERE host(ip)=%s "
+                    "ORDER BY last_seen DESC NULLS LAST, first_seen DESC NULLS LAST "
+                    "LIMIT 1",
+                    (ip,),
+                )
+                row = cur.fetchone()
+                if row:
+                    asset_id = row["id"]
+                cur.execute("RELEASE SAVEPOINT asset_lookup")
+            except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT asset_lookup")
+                logger.debug(f"asset_id resolution skipped for {ip}: {e}")
+
         for rec in recs:
             cur.execute(
                 """

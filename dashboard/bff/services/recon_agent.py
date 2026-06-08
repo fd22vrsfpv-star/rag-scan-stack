@@ -591,15 +591,25 @@ class ReconAgent:
                 # report under kb_skipped_pending when the queue's deeper
                 # than this cycle can drain.
                 with get_db() as conn, conn.cursor() as cur:
+                    # IMPORTANT: query by IP membership, not asset_id JOIN.
+                    # scan_recommender's `persist_recommendations` historically
+                    # inserts with asset_id=NULL (the /next_scan callers don't
+                    # resolve the IP -> asset_id mapping before persisting), so
+                    # joining on sr.asset_id would skip every rec.  Subselect
+                    # for the engagement's asset IPs keeps the scoping correct
+                    # without depending on the FK being populated.
                     cur.execute(
                         """
                         SELECT sr.id::text, sr.ip::text, sr.service,
                                sr.scanner, sr.action, sr.script, sr.template,
                                sr.priority
                           FROM scan_recommendations sr
-                          JOIN assets a ON sr.asset_id = a.id
-                         WHERE a.engagement_id = %s::uuid
-                           AND sr.status = 'pending'
+                         WHERE sr.status = 'pending'
+                           AND sr.ip IN (
+                                 SELECT a.ip FROM assets a
+                                  WHERE a.engagement_id = %s::uuid
+                                    AND a.ip IS NOT NULL
+                               )
                          ORDER BY sr.priority ASC, sr.created_at DESC
                          LIMIT %s
                         """,
