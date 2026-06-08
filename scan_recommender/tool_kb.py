@@ -509,6 +509,42 @@ class ToolKnowledgeBase:
         """
         return self._port_to_service.get(port)
 
+    def resolve_service_name(self, service_name: str) -> Optional[str]:
+        """Return the canonical KB key for a (possibly aliased) service name.
+
+        Returns None if the input doesn't resolve to any KB entry.  Used by
+        `get_tools_for_service` so the result's `service` field reflects the
+        resolved key (e.g. input "amqp" -> "rabbitmq") rather than echoing
+        the operator's input -- otherwise downstream consumers can't tell
+        whether alias resolution happened.
+        """
+        if not service_name:
+            return None
+        services = self._data.get("services", {})
+        s = service_name.lower().strip()
+        # 1. Exact
+        if s in services:
+            return s
+        # 2. Alias
+        normalized = _normalize_service_name(s)
+        if normalized != s and normalized in services:
+            return normalized
+        # 3. ssl/tls strip
+        if s.startswith(("ssl/", "tls/")):
+            inner = s.split("/", 1)[1]
+            if inner in services:
+                return inner
+            inner_normalized = _normalize_service_name(inner)
+            if inner_normalized in services:
+                return inner_normalized
+        # 4. Longest substring match -- mirrors the partial-match branch
+        #    in get_service_info so callers see the same canonical key.
+        matches = [name for name in services if s in name or name in s]
+        if matches:
+            matches.sort(key=lambda x: -len(x))
+            return matches[0]
+        return None
+
     def get_service_info(self, service_name: str) -> Optional[Dict[str, Any]]:
         """
         Get full service information by name.
@@ -616,8 +652,13 @@ class ToolKnowledgeBase:
                 "nuclei_tags": []
             }
 
+        # Surface the canonical KB key (post-alias) so consumers can tell
+        # whether alias resolution happened.  `input_service` preserves the
+        # operator's original string for debugging / audit.
+        canonical = self.resolve_service_name(service) or service.lower()
         result = {
-            "service": service.lower(),
+            "service": canonical,
+            "input_service": service.lower(),
             "description": service_info.get("description", ""),
             "common_ports": service_info.get("ports", []),
             "tools": service_info.get("tools", []),
