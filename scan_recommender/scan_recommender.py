@@ -86,6 +86,14 @@ class ScanRecommendation(BaseModel):
     action: Optional[str] = None
     script: Optional[str] = None
     template: Optional[str] = None
+    # Source-row context.  Stamped by generate_recommendations() so the
+    # persistence path can label each rec with its OWN service/port/banner
+    # instead of the batch's first-row values.  Optional in the API
+    # response (callers can ignore), but lets operators see at a glance
+    # which discovered port a rec was generated for.
+    service: Optional[str] = None
+    port: Optional[int] = None
+    banner: Optional[str] = None
 
 
 class ScanRecommendationsResponse(BaseModel):
@@ -305,6 +313,62 @@ def _append_proactive_vulnx_recs(recs: List[Dict], ip: str):
 
 
 # ---- Rules ----
+# Ports that look like HTTP even when nmap can't fingerprint the service.
+# When the port row has service=null/unknown AND port is in this set, the
+# generator appends an httpx rec so the recon agent's KB-drain phase probes
+# the port.  httpx confirms whether it's HTTP, fills banner+title, and on
+# the NEXT ingest the KB lookup picks up the full web toolchain.  Without
+# this fallback an `nmap tcpwrapped`/`unknown` finding on 8443 would emit
+# only a generic nmap banner rec and the agent would never reach the port
+# with web tooling.
+COMMON_WEB_PORTS = {80, 443, 8080, 8443, 8000, 8008, 8888, 3000, 5000, 9000, 9090, 4443, 9443}
+COMMON_HTTPS_PORTS = {443, 8443, 4443, 9443}
+
+
+def _append_common_web_fallback(recs: List[Dict], port: Optional[int]):
+    """Append an httpx rec for HTTP-likely ports when no httpx rec exists.
+
+    Idempotent: if a KB lookup already emitted httpx (e.g. service was
+    fingerprinted as http/https), do nothing.  Otherwise append a
+    minimal httpx command that does fingerprint + tech detect + status
+    code, so the recon agent's KB-drain phase has something to dispatch
+    against unfingerprinted web ports.
+    """
+    if port is None or port not in COMMON_WEB_PORTS:
+        return
+    if any((r.get("scanner") or "").lower() == "httpx" for r in recs):
+        return
+    scheme = "https" if port in COMMON_HTTPS_PORTS else "http"
+    recs.append({
+        "scanner": "httpx",
+        "action": "fingerprint + tech detect (port-based fallback)",
+        "script": (
+            f"httpx -u {scheme}://{{target}}:{{port}} -title -tech-detect "
+            "-status-code -web-server -follow-redirects"
+            + (" -tls-probe" if scheme == "https" else "")
+        ),
+        "template": None,
+    })
+
+
+def _stamp_source_context(recs: List[Dict], row: Dict, port: Optional[int]) -> List[Dict]:
+    """Stamp each generated rec with its source row's service/port/banner.
+
+    Without this, the /next_scan handler's batch persist call assigns
+    `rows[0].service` to every persisted rec -- a port-53 lookup and a
+    port-80 lookup in the same call both end up labeled with whichever
+    came first.  `setdefault` ensures we don't overwrite if a helper
+    (e.g. _append_common_web_fallback) deliberately set its own context.
+    """
+    row_service = row.get("service")
+    row_banner = row.get("banner")
+    for r in recs:
+        r.setdefault("service", row_service)
+        r.setdefault("port", port)
+        r.setdefault("banner", row_banner)
+    return recs
+
+
 def generate_recommendations(row: Dict, port: Optional[int] = None, ip: Optional[str] = None) -> List[Dict]:
     service = (row.get("service") or "").lower()
     kb = get_tool_kb()
@@ -321,10 +385,11 @@ def generate_recommendations(row: Dict, port: Optional[int] = None, ip: Optional
         recs = _kb_result_to_recommendations(kb_result)
         if recs:
             _append_vulnx_rec(recs, row)
+            _append_common_web_fallback(recs, port)
             # Add proactive vulnx recommendations if IP is provided
             if ip:
                 _append_proactive_vulnx_recs(recs, ip)
-            return recs
+            return _stamp_source_context(recs, row, port)
 
     # Try YAML KB
     kb_result = kb.get_tools_for_service(service=service, port=port)
@@ -332,10 +397,11 @@ def generate_recommendations(row: Dict, port: Optional[int] = None, ip: Optional
         recs = _kb_result_to_recommendations(kb_result)
         if recs:
             _append_vulnx_rec(recs, row)
+            _append_common_web_fallback(recs, port)
             # Add proactive vulnx recommendations if IP is provided
             if ip:
                 _append_proactive_vulnx_recs(recs, ip)
-            return recs
+            return _stamp_source_context(recs, row, port)
 
     # Fallback to old 3-rule logic
     recs: List[Dict] = []
@@ -347,12 +413,13 @@ def generate_recommendations(row: Dict, port: Optional[int] = None, ip: Optional
     else:
         recs.append({"scanner": "nmap", "action": None, "script": "banner", "template": None})
     _append_vulnx_rec(recs, row)
+    _append_common_web_fallback(recs, port)
 
     # Add proactive vulnx recommendations if IP is provided
     if ip:
         _append_proactive_vulnx_recs(recs, ip)
 
-    return recs
+    return _stamp_source_context(recs, row, port)
 
 
 def _dispatch_auto_execute(ip: str, service: str, port: int):
@@ -381,11 +448,60 @@ def persist_recommendations(
     model: Optional[str] = None,
     extra: Optional[Dict] = None,
 ) -> int:
+    """Insert scan_recommendations rows for the given IP.
+
+    `asset_id` resolution: callers historically passed `asset_id=None`
+    (the /next_scan handler is a notable example -- it has the IP but
+    not the asset PK).  That left every persisted rec with a NULL FK,
+    which breaks any downstream consumer that joins through assets
+    (e.g. the recon agent's Phase 4 engagement scoping).  When
+    asset_id is None and ip is provided, look it up from assets so
+    the FK is populated.  Picks the most-recently-updated row to be
+    deterministic when multiple assets share an IP across engagements.
+    """
     if not recs:
         return 0
+
     inserted = 0
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # Resolve asset_id from IP if the caller didn't have it.  Cheap
+        # one-shot lookup; persisting recs without the FK link silently
+        # breaks the recon agent's KB-drain queue scoping.  Wrapped in a
+        # SAVEPOINT so a lookup error (missing column, type mismatch)
+        # doesn't poison the surrounding transaction and abort the
+        # subsequent INSERTs.
+        if asset_id is None and ip:
+            cur.execute("SAVEPOINT asset_lookup")
+            try:
+                cur.execute(
+                    "SELECT id FROM public.assets WHERE host(ip)=%s "
+                    "ORDER BY last_seen DESC NULLS LAST, first_seen DESC NULLS LAST "
+                    "LIMIT 1",
+                    (ip,),
+                )
+                row = cur.fetchone()
+                if row:
+                    asset_id = row["id"]
+                cur.execute("RELEASE SAVEPOINT asset_lookup")
+            except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT asset_lookup")
+                logger.debug(f"asset_id resolution skipped for {ip}: {e}")
+
         for rec in recs:
+            # Per-rec service/banner/port (stamped by
+            # _stamp_source_context in generate_recommendations) take
+            # priority over the batch-level fallbacks.  Without this,
+            # every rec in a multi-port /next_scan call gets the first
+            # row's service value -- a port-53 dig finding and a port-80
+            # httpx finding both end up labeled "domain".  Port goes
+            # into `extra.port` since the table has no port column.
+            rec_service = rec.get("service") or service
+            rec_banner = rec.get("banner") or banner
+            rec_port = rec.get("port")
+            rec_extra = dict(extra or {})
+            if rec_port is not None:
+                rec_extra.setdefault("port", rec_port)
+
             cur.execute(
                 """
                 INSERT INTO public.scan_recommendations
@@ -396,10 +512,11 @@ def persist_recommendations(
                 RETURNING id;
                 """,
                 (
-                    asset_id, ip, service, banner,
+                    asset_id, ip, rec_service, rec_banner,
                     rec.get("scanner"), rec.get("action"),
                     rec.get("script"), rec.get("template"),
-                    source, model, Json(extra) if extra is not None else None,
+                    source, model,
+                    Json(rec_extra) if rec_extra else None,
                 ),
             )
             if cur.rowcount > 0:
