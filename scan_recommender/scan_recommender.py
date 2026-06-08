@@ -86,6 +86,14 @@ class ScanRecommendation(BaseModel):
     action: Optional[str] = None
     script: Optional[str] = None
     template: Optional[str] = None
+    # Source-row context.  Stamped by generate_recommendations() so the
+    # persistence path can label each rec with its OWN service/port/banner
+    # instead of the batch's first-row values.  Optional in the API
+    # response (callers can ignore), but lets operators see at a glance
+    # which discovered port a rec was generated for.
+    service: Optional[str] = None
+    port: Optional[int] = None
+    banner: Optional[str] = None
 
 
 class ScanRecommendationsResponse(BaseModel):
@@ -343,6 +351,24 @@ def _append_common_web_fallback(recs: List[Dict], port: Optional[int]):
     })
 
 
+def _stamp_source_context(recs: List[Dict], row: Dict, port: Optional[int]) -> List[Dict]:
+    """Stamp each generated rec with its source row's service/port/banner.
+
+    Without this, the /next_scan handler's batch persist call assigns
+    `rows[0].service` to every persisted rec -- a port-53 lookup and a
+    port-80 lookup in the same call both end up labeled with whichever
+    came first.  `setdefault` ensures we don't overwrite if a helper
+    (e.g. _append_common_web_fallback) deliberately set its own context.
+    """
+    row_service = row.get("service")
+    row_banner = row.get("banner")
+    for r in recs:
+        r.setdefault("service", row_service)
+        r.setdefault("port", port)
+        r.setdefault("banner", row_banner)
+    return recs
+
+
 def generate_recommendations(row: Dict, port: Optional[int] = None, ip: Optional[str] = None) -> List[Dict]:
     service = (row.get("service") or "").lower()
     kb = get_tool_kb()
@@ -363,7 +389,7 @@ def generate_recommendations(row: Dict, port: Optional[int] = None, ip: Optional
             # Add proactive vulnx recommendations if IP is provided
             if ip:
                 _append_proactive_vulnx_recs(recs, ip)
-            return recs
+            return _stamp_source_context(recs, row, port)
 
     # Try YAML KB
     kb_result = kb.get_tools_for_service(service=service, port=port)
@@ -375,7 +401,7 @@ def generate_recommendations(row: Dict, port: Optional[int] = None, ip: Optional
             # Add proactive vulnx recommendations if IP is provided
             if ip:
                 _append_proactive_vulnx_recs(recs, ip)
-            return recs
+            return _stamp_source_context(recs, row, port)
 
     # Fallback to old 3-rule logic
     recs: List[Dict] = []
@@ -393,7 +419,7 @@ def generate_recommendations(row: Dict, port: Optional[int] = None, ip: Optional
     if ip:
         _append_proactive_vulnx_recs(recs, ip)
 
-    return recs
+    return _stamp_source_context(recs, row, port)
 
 
 def _dispatch_auto_execute(ip: str, service: str, port: int):
@@ -462,6 +488,20 @@ def persist_recommendations(
                 logger.debug(f"asset_id resolution skipped for {ip}: {e}")
 
         for rec in recs:
+            # Per-rec service/banner/port (stamped by
+            # _stamp_source_context in generate_recommendations) take
+            # priority over the batch-level fallbacks.  Without this,
+            # every rec in a multi-port /next_scan call gets the first
+            # row's service value -- a port-53 dig finding and a port-80
+            # httpx finding both end up labeled "domain".  Port goes
+            # into `extra.port` since the table has no port column.
+            rec_service = rec.get("service") or service
+            rec_banner = rec.get("banner") or banner
+            rec_port = rec.get("port")
+            rec_extra = dict(extra or {})
+            if rec_port is not None:
+                rec_extra.setdefault("port", rec_port)
+
             cur.execute(
                 """
                 INSERT INTO public.scan_recommendations
@@ -472,10 +512,11 @@ def persist_recommendations(
                 RETURNING id;
                 """,
                 (
-                    asset_id, ip, service, banner,
+                    asset_id, ip, rec_service, rec_banner,
                     rec.get("scanner"), rec.get("action"),
                     rec.get("script"), rec.get("template"),
-                    source, model, Json(extra) if extra is not None else None,
+                    source, model,
+                    Json(rec_extra) if rec_extra else None,
                 ),
             )
             if cur.rowcount > 0:
