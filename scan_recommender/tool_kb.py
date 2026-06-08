@@ -263,6 +263,177 @@ def get_critical_msf2_vulns() -> List[Dict[str, Any]]:
 DEFAULT_KB_PATH = os.getenv("TOOL_KB_PATH", "/knowledge/service_tools.yaml")
 
 
+# Service-name aliases for nmap output variants.
+#
+# nmap emits service strings that don't always match canonical KB keys --
+# things like `ssl/http`, `http-proxy`, `microsoft-ds`, `domain`.  This map
+# normalizes those variants so a port detected as "ssl/https-alt" hits the
+# `https` KB entry rather than falling through to a generic banner grab.
+#
+# Add new entries here as new nmap service-name variants are observed in
+# real scans.  Keep keys lowercase; values must reference an actual KB key
+# in `knowledge/service_tools.yaml`.
+_SERVICE_ALIASES: Dict[str, str] = {
+    # HTTP family
+    "http-proxy":     "http",
+    "http-alt":       "http",
+    "http-rpc-epmap": "http",
+    "http-mgmt":      "http",
+    "https-alt":      "https",
+    "ssl/http":       "https",   # TLS-wrapped HTTP == HTTPS semantically
+    "ssl/https":      "https",
+    "ssl/http-alt":   "https",
+    "ssl/http-proxy": "https",
+    "ssl/http-mgmt":  "https",
+    # SMB / Windows file-sharing
+    "microsoft-ds":   "smb",
+    "netbios-ssn":    "smb",
+    "netbios-ns":     "smb",
+    # DNS
+    "domain":         "dns",
+    "domain-s":       "dns",
+    # SSH variants (some scanners emit banner-derived names)
+    "openssh":        "ssh",
+    "dropbear":       "ssh",
+    # Database aliases
+    "mariadb":        "mysql",
+    "postgres":       "postgresql",
+    "ms-sql-s":       "mssql",
+    "ms-sql":         "mssql",
+    "ssl/ms-sql-s":   "mssql",
+    # RDP
+    "ms-wbt-server":  "rdp",
+    "ssl/ms-wbt-server": "rdp",
+    # SMTP variants -- canonicalize to smtp; KB has tls coverage already
+    "submission":     "smtp",   # port 587 (mail submission)
+    "smtps":          "smtp",
+    "ssl/smtp":       "smtp",
+    "ssl/submission": "smtp",
+    # POP3 / IMAP TLS variants
+    "pop3s":          "pop3",
+    "ssl/pop3":       "pop3",
+    "imaps":          "imap",
+    "ssl/imap":       "imap",
+    # LDAP
+    "ldaps":          "ldap",
+    "ssl/ldap":       "ldap",
+    # FTP
+    "ftps":           "ftp",
+    "ssl/ftp":        "ftp",
+    "ftp-data":       "ftp",
+    # VNC
+    "vnc-http":       "vnc",
+    # Kerberos
+    "kerberos-sec":   "kerberos",
+    # SNMP variants
+    "snmptrap":       "snmp",
+    # WinRM
+    "wsmans":         "winrm",
+    "ssl/wsmans":     "winrm",
+    # Top-100 expansion (2026-06-07) - nmap variants for the new services
+    "elastic":          "elasticsearch",
+    "elasticsearch-tcp":"elasticsearch",
+    "rabbitmq-amqp":    "rabbitmq",
+    "amqp":             "rabbitmq",
+    "amqps":            "rabbitmq",
+    "ssl/amqp":         "rabbitmq",
+    "mqtt-tls":         "mqtt",
+    "ssl/mqtt":         "mqtt",
+    "secure-mqtt":      "mqtt",
+    "kafka-broker":     "kafka",
+    "couchdb-https":    "couchdb",
+    "ssl/couchdb":      "couchdb",
+    "etcd-client":      "etcd",
+    "etcd-server":      "etcd",
+    "consul-http":      "consul",
+    "consul-rpc":       "consul",
+    "consul-dns":       "consul",
+    "zk":               "zookeeper",
+    "zk-client":        "zookeeper",
+    "neo4j-http":       "neo4j",
+    "neo4j-bolt":       "neo4j",
+    "ssl/neo4j":        "neo4j",
+    "influx":           "influxdb",
+    "click-house":      "clickhouse",
+    "ms-sql-browser":   "mssql_browser",
+    "ms-sql-m":         "mssql_browser",
+    "rpcbind":          "portmap",
+    "sunrpc":           "portmap",
+    "epmap":            "msrpc",
+    "ms-rpc":           "msrpc",
+    "dce-rpc":          "msrpc",
+    "ntp-udp":          "ntp",
+    "tftp-udp":         "tftp",
+    "rsync-tcp":        "rsync",
+    "syslog-udp":       "syslog",
+    "syslog-tls":       "syslog",
+    "ssl/syslog":       "syslog",
+    "snmp-trap":        "snmptrap",
+    "ipmi-rmcp":        "ipmi",
+    "ipmi-udp":         "ipmi",
+    "asf-rmcp":         "ipmi",
+    "modbus-tcp":       "modbus",
+    "bacnet-udp":       "bacnet",
+    "enip":             "ethernetip",
+    "ethernet-ip":      "ethernetip",
+    "coap-udp":         "coap",
+    "secure-coap":      "coap",
+    "ssl/coap":         "coap",
+    "sip-tls":          "sip",
+    "sips":             "sip",
+    "ssl/sip":          "sip",
+    "h.323":            "h323",
+    "h323-q931":        "h323",
+    "ipp":              "ipp",    # canonical (kept for clarity)
+    "cups":             "ipp",
+    "ipps":             "ipp",
+    "printer":          "lpd",
+    "afp-over-tcp":     "afp",
+    "afpovertcp":       "afp",
+    "iscsi-target":     "iscsi",
+    "vmware-auth":      "vmware_esxi",
+    "vmware-vsphere":   "vmware_esxi",
+    "esxi":             "vmware_esxi",
+    "vcenter":          "vmware_esxi",
+    "ssl/vmware-auth":  "vmware_esxi",
+    "squid-http":       "squid",
+    "http-proxy-squid": "squid",
+    "x11-1":            "x11",
+    "x11-2":            "x11",
+    "x11-3":            "x11",
+    "bonjour":          "mdns",
+    "avahi":            "mdns",
+    "llmnr":            "mdns",
+    "domain-mdns":      "mdns",
+    "ssl/nntp":         "nntp",
+    "nntps":            "nntp",
+    "submission-ssl":   "smtp",  # already smtp via existing entries, keep for clarity
+    "ms-wbt":           "rdp",   # short form sometimes seen
+}
+
+
+def _normalize_service_name(name: str) -> str:
+    """Map a service-name variant to its canonical KB key.
+
+    Returns the alias's target if `name` is in `_SERVICE_ALIASES`;
+    otherwise returns `name` lowercased.  Used by `get_service_info` to
+    canonicalize nmap output before the substring-fallback lookup.
+
+    Examples:
+        _normalize_service_name("ssl/http")    -> "https"
+        _normalize_service_name("http-proxy")  -> "http"
+        _normalize_service_name("microsoft-ds") -> "smb"
+        _normalize_service_name("ssh")         -> "ssh"
+        _normalize_service_name("WeirdService") -> "weirdservice"
+    """
+    if not name:
+        return name
+    s = name.lower().strip()
+    if s in _SERVICE_ALIASES:
+        return _SERVICE_ALIASES[s]
+    return s
+
+
 class ToolKnowledgeBase:
     """
     Loads and queries the service-to-tools knowledge base.
@@ -338,27 +509,102 @@ class ToolKnowledgeBase:
         """
         return self._port_to_service.get(port)
 
+    def resolve_service_name(self, service_name: str) -> Optional[str]:
+        """Return the canonical KB key for a (possibly aliased) service name.
+
+        Returns None if the input doesn't resolve to any KB entry.  Used by
+        `get_tools_for_service` so the result's `service` field reflects the
+        resolved key (e.g. input "amqp" -> "rabbitmq") rather than echoing
+        the operator's input -- otherwise downstream consumers can't tell
+        whether alias resolution happened.
+        """
+        if not service_name:
+            return None
+        services = self._data.get("services", {})
+        s = service_name.lower().strip()
+        # 1. Exact
+        if s in services:
+            return s
+        # 2. Alias
+        normalized = _normalize_service_name(s)
+        if normalized != s and normalized in services:
+            return normalized
+        # 3. ssl/tls strip
+        if s.startswith(("ssl/", "tls/")):
+            inner = s.split("/", 1)[1]
+            if inner in services:
+                return inner
+            inner_normalized = _normalize_service_name(inner)
+            if inner_normalized in services:
+                return inner_normalized
+        # 4. Longest substring match -- mirrors the partial-match branch
+        #    in get_service_info so callers see the same canonical key.
+        matches = [name for name in services if s in name or name in s]
+        if matches:
+            matches.sort(key=lambda x: -len(x))
+            return matches[0]
+        return None
+
     def get_service_info(self, service_name: str) -> Optional[Dict[str, Any]]:
         """
         Get full service information by name.
 
+        Resolution order:
+          1. Exact lowercase match (e.g. "http" → http entry).
+          2. Alias map (nmap variants like "ssl/http", "http-proxy",
+             "microsoft-ds", "domain" → canonical KB key).
+          3. ssl/tls prefix strip + recheck (so "ssl/<anything>" still
+             routes to the wrapped service, tagged as TLS via the alias
+             map for http/https).
+          4. Longest-substring partial match (so "ssl/https-alt" hits
+             `https` instead of getting swallowed by `http` due to YAML
+             ordering).
+
         Args:
-            service_name: Service name (e.g., 'ssh', 'http', 'smb')
+            service_name: Service name as emitted by nmap or the
+                operator (e.g., 'ssh', 'http', 'ssl/https-alt',
+                'microsoft-ds').
 
         Returns:
-            Service info dict or None if not found
+            Service info dict or None if no match.
         """
-        services = self._data.get("services", {})
-        # Case-insensitive lookup
-        service_name_lower = service_name.lower()
+        if not service_name:
+            return None
 
+        services = self._data.get("services", {})
+        service_name_lower = service_name.lower().strip()
+
+        # 1. Exact match
         if service_name_lower in services:
             return services[service_name_lower]
 
-        # Try to find by alias/partial match
+        # 2. Alias map (catches the bulk of nmap's variant strings)
+        normalized = _normalize_service_name(service_name_lower)
+        if normalized != service_name_lower and normalized in services:
+            return services[normalized]
+
+        # 3. Strip ssl/tls wrapper if present and recheck (covers
+        #    `ssl/<service>` where <service> is a direct KB key but not
+        #    in the alias map -- e.g. `ssl/mysql`).
+        if service_name_lower.startswith(("ssl/", "tls/")):
+            inner = service_name_lower.split("/", 1)[1]
+            if inner in services:
+                return services[inner]
+            inner_normalized = _normalize_service_name(inner)
+            if inner_normalized in services:
+                return services[inner_normalized]
+
+        # 4. Longest-substring partial match -- prefer the more specific
+        #    match.  Without the length sort, "https-alt" gets swallowed
+        #    by `http` because YAML key order puts `http` before
+        #    `https`.
+        matches: List[tuple] = []
         for name, data in services.items():
             if service_name_lower in name or name in service_name_lower:
-                return data
+                matches.append((name, data))
+        if matches:
+            matches.sort(key=lambda x: -len(x[0]))
+            return matches[0][1]
 
         return None
 
@@ -406,8 +652,13 @@ class ToolKnowledgeBase:
                 "nuclei_tags": []
             }
 
+        # Surface the canonical KB key (post-alias) so consumers can tell
+        # whether alias resolution happened.  `input_service` preserves the
+        # operator's original string for debugging / audit.
+        canonical = self.resolve_service_name(service) or service.lower()
         result = {
-            "service": service.lower(),
+            "service": canonical,
+            "input_service": service.lower(),
             "description": service_info.get("description", ""),
             "common_ports": service_info.get("ports", []),
             "tools": service_info.get("tools", []),
