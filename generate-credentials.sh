@@ -168,7 +168,7 @@ NMAP_SCANNER_URL=http://nmap_scanner:8012
 # ==========================================
 
 # Wordlist for directory/file brute forcing
-WORDLIST=/opt/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt
+WORDLIST=/opt/seclists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-medium.txt
 
 # Ports to scan for web services (comma-separated)
 WEB_PORTS=80,443,8080,8443,8000,8888,3000,5000
