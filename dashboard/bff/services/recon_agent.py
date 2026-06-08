@@ -89,7 +89,15 @@ def _guess_target_type(target: str) -> str:
     return "domain"
 
 
-MAX_CONCURRENT_RECON_SCANS = int(os.environ.get("RECON_AGENT_MAX_CONCURRENT", "3"))
+# Concurrent-scan ceiling.  The agent never has more than this many scans
+# in-flight at once across all engagements -- gates both the seed-stage
+# dispatches and Phase 4's KB-drain.  Bumped from 3 to 6 (2026-06-08)
+# because 3 was the real bottleneck draining the KB queue: with most
+# real scans (nmap/nuclei/hydra) running 30s-3min, the queue spent the
+# majority of its time waiting on the concurrent cap to free a slot.
+# 6 is still moderate (a manual pentest sustains 10-20 in parallel
+# easily).  Override per-deployment via RECON_AGENT_MAX_CONCURRENT.
+MAX_CONCURRENT_RECON_SCANS = int(os.environ.get("RECON_AGENT_MAX_CONCURRENT", "6"))
 
 
 class ReconAgent:
@@ -191,7 +199,12 @@ class ReconAgent:
         headers = {"x-api-key": s.api_key}
         profile = config.get("profile", "pentest")
         interval = agent_state.get("interval_sec", 300)
-        max_dispatches = config.get("max_dispatches_per_cycle", 5 if profile == "pentest" else 2)
+        # Per-cycle dispatch budget.  Bumped from 5/2 to 10/4 (2026-06-08)
+        # alongside MAX_CONCURRENT_RECON_SCANS 3->6 to drain the KB queue
+        # faster.  Pentest profile sustains the higher rate fine against
+        # a single target; redteam stays more conservative for OPSEC.
+        # Operators can override per-engagement via config.max_dispatches_per_cycle.
+        max_dispatches = config.get("max_dispatches_per_cycle", 10 if profile == "pentest" else 4)
         dispatched = 0
         # KB-driven recon: skip the legacy hardcoded stage 3 (httpx) / stage 4
         # (nuclei) dispatches and instead drain the scan_recommendations queue
