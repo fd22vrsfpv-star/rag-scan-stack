@@ -42,6 +42,29 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 echo "Full setup log: $LOG_FILE"
 echo ""
 
+# ── Seed db-config.json as a FILE ─────────────────────────────────────────
+# docker-compose bind-mounts ./db-config.json into container-logs and
+# pentest-dashboard (`./db-config.json:/app/db-config.json`).  If the host
+# path does not exist when `docker compose up` first runs, Docker silently
+# creates it as a *directory* -- which then makes _write_db_config() fail
+# with IsADirectoryError and blocks every DB mode switch.  Pre-create it as
+# a file (default local mode) before any compose run so the mount is a file.
+DB_CONFIG_FILE="$PROJECT_ROOT/db-config.json"
+if [ -d "$DB_CONFIG_FILE" ]; then
+    # A previous run (or a compose up before this fix) left a directory here.
+    # Only safe to remove if empty; rmdir fails loudly otherwise.
+    if rmdir "$DB_CONFIG_FILE" 2>/dev/null; then
+        echo '{"mode": "local"}' > "$DB_CONFIG_FILE"
+        echo "Replaced stray db-config.json directory with a seeded file"
+    else
+        echo "WARNING: db-config.json exists as a non-empty directory -- " \
+             "please inspect and replace it with a JSON file ({\"mode\":\"local\"})"
+    fi
+elif [ ! -f "$DB_CONFIG_FILE" ]; then
+    echo '{"mode": "local"}' > "$DB_CONFIG_FILE"
+    echo "Seeded db-config.json (default local mode)"
+fi
+
 # ── Flags ──────────────────────────────────────────────────────────────────
 SKIP_GO_TOOLS=false
 FORCE_GO_TOOLS=false

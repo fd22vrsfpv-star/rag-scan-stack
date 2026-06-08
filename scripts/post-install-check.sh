@@ -352,6 +352,20 @@ for s in cleanup-old-files.sh vault-seed.sh ensure_db_schema.sh build-go-tools.s
 done
 
 echo ""
+echo "=== Runtime config files ==="
+# db-config.json MUST be a file. docker-compose bind-mounts it into
+# container-logs + pentest-dashboard; if it's missing at first `up`, Docker
+# auto-creates it as a *directory*, which breaks every DB mode switch
+# (_write_db_config -> IsADirectoryError). setup.sh seeds it as a file.
+if [[ -f "db-config.json" ]]; then
+  pass "db-config.json is a file"
+elif [[ -d "db-config.json" ]]; then
+  fail "db-config.json is a DIRECTORY (Docker auto-created it) — rmdir it and seed: echo '{\"mode\":\"local\"}' > db-config.json, then recreate container-logs + pentest-dashboard"
+else
+  warn "db-config.json missing — run ./scripts/setup.sh or seed: echo '{\"mode\":\"local\"}' > db-config.json"
+fi
+
+echo ""
 echo "=== Vault layout (only required if using --profile vault) ==="
 for d in vault/config vault/data vault/init vault/logs; do
   if [[ -d "$d" ]]; then
