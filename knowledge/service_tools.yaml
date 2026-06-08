@@ -898,6 +898,1119 @@ services:
     common_vulns:
       - "CVE-2020-1938: Ghostcat - arbitrary file read, potential RCE"
 
+  # =====================================================================
+  # Top-100 typical-pentest expansion (PR follow-up 2026-06-07).
+  # Each entry has: ports, description, tools[] with runnable commands,
+  # metasploit[] where applicable, nuclei_tags, common_vulns.
+  # =====================================================================
+
+  # ---- Mail family (in addition to smtp/imap base entries below) ----
+  pop3:
+    ports: [110, 995]
+    description: "POP3 - Post Office Protocol v3 (mail retrieval)"
+    tools:
+      - name: nmap
+        purpose: POP3 version + capabilities
+        command: "nmap -sV --script pop3-capabilities,pop3-ntlm-info -p {port} {target}"
+      - name: hydra
+        purpose: brute force POP3 credentials
+        command: "hydra -L users.txt -P passwords.txt pop3://{target}:{port}"
+      - name: medusa
+        purpose: parallel POP3 brute force
+        command: "medusa -h {target} -U users.txt -P passwords.txt -M pop3"
+      - name: openssl
+        purpose: STARTTLS / SSL banner inspection
+        command: "openssl s_client -starttls pop3 -connect {target}:{port}"
+    metasploit:
+      - module: auxiliary/scanner/pop3/pop3_login
+        purpose: POP3 login brute force
+      - module: auxiliary/scanner/pop3/pop3_version
+        purpose: POP3 version detection
+    nuclei_tags: ["pop3", "mail", "network", "default-login", "cve"]
+    common_vulns:
+      - "Plaintext authentication (no TLS)"
+      - "Default / weak credentials"
+
+  imap:
+    ports: [143, 993]
+    description: "IMAP - Internet Message Access Protocol"
+    tools:
+      - name: nmap
+        purpose: IMAP capabilities + NTLM info
+        command: "nmap -sV --script imap-capabilities,imap-ntlm-info -p {port} {target}"
+      - name: hydra
+        purpose: IMAP brute force
+        command: "hydra -L users.txt -P passwords.txt imap://{target}:{port}"
+      - name: medusa
+        purpose: parallel IMAP brute force
+        command: "medusa -h {target} -U users.txt -P passwords.txt -M imap"
+      - name: openssl
+        purpose: STARTTLS / SSL banner inspection
+        command: "openssl s_client -starttls imap -connect {target}:{port}"
+    metasploit:
+      - module: auxiliary/scanner/imap/imap_version
+        purpose: IMAP version
+    nuclei_tags: ["imap", "mail", "network", "cve"]
+    common_vulns:
+      - "Plaintext authentication"
+      - "NTLM information leak"
+
+  nntp:
+    ports: [119, 433, 563]
+    description: "NNTP - Network News Transfer Protocol"
+    tools:
+      - name: nmap
+        purpose: NNTP detection
+        command: "nmap -sV --script nntp-ntlm-info -p {port} {target}"
+      - name: ncat
+        purpose: manual NNTP probe
+        command: "ncat {target} {port}"
+    nuclei_tags: ["nntp", "network"]
+    common_vulns:
+      - "NTLM information disclosure"
+
+  # ---- Web app servers / management UIs ----
+  jenkins:
+    ports: [8080, 8443, 50000]
+    description: "Jenkins - CI/CD automation server"
+    tools:
+      - name: httpx
+        purpose: Jenkins fingerprint + version
+        command: "httpx -u http://{target}:{port} -title -tech-detect -web-server"
+      - name: nuclei
+        purpose: Jenkins-specific CVE + misconfig templates
+        command: "nuclei -u http://{target}:{port} -tags jenkins,cve,misconfig,exposure"
+      - name: jenkins-cli
+        purpose: anonymous job execution check
+        command: "java -jar jenkins-cli.jar -s http://{target}:{port}/ who-am-i"
+      - name: hydra
+        purpose: Jenkins login brute force
+        command: "hydra -L users.txt -P passwords.txt {target} -s {port} http-get /login"
+    metasploit:
+      - module: exploit/multi/http/jenkins_script_console
+        purpose: Jenkins Script Console RCE
+      - module: auxiliary/scanner/http/jenkins_enum
+        purpose: Jenkins enumeration
+    nuclei_tags: ["jenkins", "cicd", "cve", "default-login", "misconfig", "rce"]
+    common_vulns:
+      - "Unauthenticated /script (Groovy console) → RCE"
+      - "CVE-2024-23897: arbitrary file read via CLI"
+      - "Default admin credentials"
+
+  gitlab:
+    ports: [80, 443, 22, 5050]
+    description: "GitLab - DevOps platform"
+    tools:
+      - name: httpx
+        purpose: GitLab fingerprint
+        command: "httpx -u https://{target}:{port} -title -tech-detect -tls-probe"
+      - name: nuclei
+        purpose: GitLab CVE templates
+        command: "nuclei -u https://{target}:{port} -tags gitlab,cve,misconfig"
+      - name: gitlab-api
+        purpose: probe public projects + version
+        command: "curl -sk https://{target}:{port}/api/v4/version"
+    nuclei_tags: ["gitlab", "cve", "misconfig", "exposure", "default-login"]
+    common_vulns:
+      - "CVE-2023-7028: account takeover via email confirmation"
+      - "CVE-2021-22205: unauthenticated RCE via ExifTool"
+      - "Public projects leaking secrets"
+
+  jira:
+    ports: [80, 443, 8080]
+    description: "Atlassian Jira - issue tracking + project management"
+    tools:
+      - name: httpx
+        purpose: Jira fingerprint + version
+        command: "httpx -u https://{target}:{port} -title -tech-detect"
+      - name: nuclei
+        purpose: Jira CVE templates
+        command: "nuclei -u https://{target}:{port} -tags jira,atlassian,cve,exposure"
+      - name: curl
+        purpose: anonymous user picker (user enum)
+        command: "curl -sk 'https://{target}:{port}/rest/api/2/user/picker?query=a'"
+    nuclei_tags: ["jira", "atlassian", "cve", "misconfig", "ssrf"]
+    common_vulns:
+      - "CVE-2019-11581: template injection RCE"
+      - "CVE-2022-26134: Confluence/Jira OGNL injection"
+      - "Anonymous user picker leaks usernames"
+
+  confluence:
+    ports: [80, 443, 8090, 8091]
+    description: "Atlassian Confluence - wiki / collaboration"
+    tools:
+      - name: httpx
+        purpose: Confluence fingerprint
+        command: "httpx -u https://{target}:{port} -title -tech-detect"
+      - name: nuclei
+        purpose: Confluence CVE templates
+        command: "nuclei -u https://{target}:{port} -tags confluence,atlassian,cve"
+    nuclei_tags: ["confluence", "atlassian", "cve", "rce", "exposure"]
+    common_vulns:
+      - "CVE-2023-22515: privilege escalation via /setup/setupadministrator.action"
+      - "CVE-2022-26134: OGNL injection RCE"
+      - "CVE-2021-26084: pre-auth OGNL RCE"
+
+  jboss:
+    ports: [8080, 8443, 9990, 9999, 4447]
+    description: "JBoss / WildFly - Java application server"
+    tools:
+      - name: nmap
+        purpose: JBoss admin port detection
+        command: "nmap -sV --script http-title,http-headers -p {port} {target}"
+      - name: nuclei
+        purpose: JBoss exposure / CVE templates
+        command: "nuclei -u http://{target}:{port} -tags jboss,wildfly,cve,exposure"
+      - name: curl
+        purpose: probe JMX-Console
+        command: "curl -sk http://{target}:{port}/jmx-console/"
+    metasploit:
+      - module: exploit/multi/http/jboss_invoke_deploy
+        purpose: JBoss DeploymentFileRepository WAR deploy
+      - module: exploit/multi/http/jboss_maindeployer
+        purpose: JBoss MainDeployer RCE
+    nuclei_tags: ["jboss", "wildfly", "java", "cve", "rce", "misconfig"]
+    common_vulns:
+      - "Unauthenticated /jmx-console → arbitrary MBean invoke"
+      - "CVE-2017-12149: insecure deserialization RCE"
+
+  weblogic:
+    ports: [7001, 7002, 7003, 7004, 7005, 7777]
+    description: "Oracle WebLogic - Java application server"
+    tools:
+      - name: nmap
+        purpose: WebLogic version
+        command: "nmap -sV --script weblogic-t3-info -p {port} {target}"
+      - name: nuclei
+        purpose: WebLogic CVE templates
+        command: "nuclei -u http://{target}:{port} -tags weblogic,oracle,cve"
+    metasploit:
+      - module: exploit/multi/misc/weblogic_deserialize_rce
+        purpose: WebLogic T3/IIOP deserialization RCE
+    nuclei_tags: ["weblogic", "oracle", "java", "cve", "rce", "deserialization"]
+    common_vulns:
+      - "CVE-2020-14882 / CVE-2020-14883: console auth bypass + RCE"
+      - "CVE-2019-2725: deserialization RCE"
+
+  websphere:
+    ports: [9043, 9060, 9080, 9443]
+    description: "IBM WebSphere - Java application server"
+    tools:
+      - name: nmap
+        purpose: WebSphere detection
+        command: "nmap -sV --script http-title -p {port} {target}"
+      - name: nuclei
+        purpose: WebSphere CVE / exposure
+        command: "nuclei -u https://{target}:{port} -tags websphere,ibm,cve"
+    nuclei_tags: ["websphere", "ibm", "java", "cve", "rce"]
+    common_vulns:
+      - "CVE-2020-4450: deserialization RCE via IIOP"
+      - "Admin console exposed without IP restriction"
+
+  glassfish:
+    ports: [4848, 8080, 8181]
+    description: "GlassFish / Payara - Java EE app server"
+    tools:
+      - name: nmap
+        purpose: GlassFish admin port detection
+        command: "nmap -sV -p {port} {target}"
+      - name: nuclei
+        purpose: GlassFish CVE templates
+        command: "nuclei -u https://{target}:{port} -tags glassfish,java,cve"
+    nuclei_tags: ["glassfish", "payara", "java", "cve", "default-login"]
+    common_vulns:
+      - "Default admin/admin"
+      - "CVE-2017-1000028: arbitrary file read"
+
+  solr:
+    ports: [8983, 7574]
+    description: "Apache Solr - search platform"
+    tools:
+      - name: httpx
+        purpose: Solr admin UI fingerprint
+        command: "httpx -u http://{target}:{port}/solr/ -title -tech-detect"
+      - name: nuclei
+        purpose: Solr CVE / RCE templates
+        command: "nuclei -u http://{target}:{port} -tags solr,apache,cve,rce"
+    metasploit:
+      - module: exploit/multi/http/solr_velocity_rce
+        purpose: Solr Velocity template RCE
+    nuclei_tags: ["solr", "apache", "search", "cve", "rce", "exposure"]
+    common_vulns:
+      - "CVE-2019-17558: Velocity template RCE"
+      - "CVE-2021-27905: arbitrary file read via replication handler"
+
+  elasticsearch:
+    ports: [9200, 9300]
+    description: "Elasticsearch - search + analytics engine"
+    tools:
+      - name: curl
+        purpose: cluster banner + version
+        command: "curl -sk http://{target}:{port}/"
+      - name: nuclei
+        purpose: Elasticsearch CVE / exposure
+        command: "nuclei -u http://{target}:{port} -tags elastic,elasticsearch,cve,exposure"
+      - name: nmap
+        purpose: Elasticsearch detection
+        command: "nmap -sV --script http-title -p {port} {target}"
+      - name: curl
+        purpose: enumerate indices anonymously
+        command: "curl -sk http://{target}:{port}/_cat/indices?v"
+    nuclei_tags: ["elastic", "elasticsearch", "cve", "exposure", "default-login", "misconfig"]
+    common_vulns:
+      - "CVE-2015-1427: Groovy sandbox bypass RCE"
+      - "Anonymous read of all indices (security plugin disabled)"
+
+  kibana:
+    ports: [5601]
+    description: "Kibana - Elasticsearch visualization UI"
+    tools:
+      - name: httpx
+        purpose: Kibana fingerprint
+        command: "httpx -u http://{target}:{port} -title -tech-detect"
+      - name: nuclei
+        purpose: Kibana CVE templates
+        command: "nuclei -u http://{target}:{port} -tags kibana,elastic,cve"
+    nuclei_tags: ["kibana", "elastic", "cve", "exposure", "rce"]
+    common_vulns:
+      - "CVE-2018-17246: arbitrary file inclusion → RCE"
+      - "CVE-2019-7609: Timelion prototype pollution RCE"
+
+  grafana:
+    ports: [3000]
+    description: "Grafana - observability + dashboards"
+    tools:
+      - name: httpx
+        purpose: Grafana fingerprint + version
+        command: "httpx -u http://{target}:{port} -title -tech-detect"
+      - name: nuclei
+        purpose: Grafana CVE templates
+        command: "nuclei -u http://{target}:{port} -tags grafana,cve,exposure"
+    nuclei_tags: ["grafana", "cve", "default-login", "ssrf", "exposure"]
+    common_vulns:
+      - "CVE-2021-43798: arbitrary file read via plugins"
+      - "Default admin/admin credentials"
+
+  prometheus:
+    ports: [9090, 9091, 9093, 9100]
+    description: "Prometheus - metrics + monitoring"
+    tools:
+      - name: httpx
+        purpose: Prometheus UI fingerprint
+        command: "httpx -u http://{target}:{port} -title -tech-detect"
+      - name: curl
+        purpose: enumerate metrics anonymously
+        command: "curl -sk http://{target}:{port}/api/v1/targets"
+      - name: nuclei
+        purpose: Prometheus exposure templates
+        command: "nuclei -u http://{target}:{port} -tags prometheus,exposure,misconfig"
+    nuclei_tags: ["prometheus", "monitoring", "exposure", "misconfig"]
+    common_vulns:
+      - "Unauthenticated /api/v1/targets exposes infrastructure"
+      - "node_exporter (9100) reveals host metrics"
+
+  # ---- Databases ----
+  oracle:
+    ports: [1521, 1526, 1531, 2483, 2484]
+    description: "Oracle Database / TNS Listener"
+    tools:
+      - name: nmap
+        purpose: TNS listener fingerprint
+        command: "nmap -sV --script oracle-tns-version,oracle-sid-brute -p {port} {target}"
+      - name: odat
+        purpose: Oracle Database Attacking Tool
+        command: "odat all -s {target} -p {port}"
+      - name: hydra
+        purpose: brute force SID/credentials
+        command: "hydra -L users.txt -P passwords.txt {target} -s {port} oracle-listener"
+      - name: tnscmd10g
+        purpose: TNS listener probe
+        command: "tnscmd10g version -h {target} -p {port}"
+    metasploit:
+      - module: auxiliary/scanner/oracle/tnslsnr_version
+        purpose: TNS listener version
+      - module: auxiliary/scanner/oracle/sid_brute
+        purpose: SID enumeration
+    nuclei_tags: ["oracle", "database", "cve", "default-login"]
+    common_vulns:
+      - "CVE-2012-1675: TNS Poison attack"
+      - "Default SIDs (orcl, xe, prod)"
+
+  cassandra:
+    ports: [7000, 7001, 7199, 9042, 9160]
+    description: "Apache Cassandra - NoSQL distributed DB"
+    tools:
+      - name: nmap
+        purpose: Cassandra detection + brute
+        command: "nmap -sV --script cassandra-info,cassandra-brute -p {port} {target}"
+      - name: cqlsh
+        purpose: CQL shell connection probe
+        command: "cqlsh {target} {port}"
+    nuclei_tags: ["cassandra", "database", "nosql", "default-login", "exposure"]
+    common_vulns:
+      - "Default cassandra/cassandra credentials"
+      - "Authenticator set to AllowAllAuthenticator"
+
+  couchdb:
+    ports: [5984, 6984]
+    description: "Apache CouchDB - document database"
+    tools:
+      - name: curl
+        purpose: anonymous _all_dbs enumeration
+        command: "curl -sk http://{target}:{port}/_all_dbs"
+      - name: nuclei
+        purpose: CouchDB CVE templates
+        command: "nuclei -u http://{target}:{port} -tags couchdb,database,cve"
+    metasploit:
+      - module: exploit/linux/http/apache_couchdb_cmd_exec
+        purpose: CouchDB RCE via Erlang cookie
+    nuclei_tags: ["couchdb", "database", "nosql", "cve", "rce", "exposure"]
+    common_vulns:
+      - "CVE-2017-12635 / CVE-2017-12636: privilege escalation + RCE"
+      - "Anonymous database listing"
+
+  memcached:
+    ports: [11211]
+    description: "Memcached - distributed memory cache"
+    tools:
+      - name: nmap
+        purpose: Memcached info + stats
+        command: "nmap -sV --script memcached-info -p {port} {target}"
+      - name: ncat
+        purpose: manual stats / version
+        command: "echo 'stats' | ncat -w 5 {target} {port}"
+      - name: memcdump
+        purpose: enumerate stored keys (libmemcached)
+        command: "memcdump --servers={target}:{port}"
+    nuclei_tags: ["memcached", "database", "cache", "exposure", "ddos"]
+    common_vulns:
+      - "Unauthenticated key dump exposes session/credential data"
+      - "UDP amplification DDoS (block 11211/udp at edge)"
+
+  influxdb:
+    ports: [8086, 8088]
+    description: "InfluxDB - time-series database"
+    tools:
+      - name: curl
+        purpose: ping + version
+        command: "curl -sk http://{target}:{port}/ping"
+      - name: nuclei
+        purpose: InfluxDB CVE templates
+        command: "nuclei -u http://{target}:{port} -tags influxdb,database,cve"
+    nuclei_tags: ["influxdb", "database", "timeseries", "cve", "default-login"]
+    common_vulns:
+      - "CVE-2019-20933: JWT auth bypass"
+      - "Default admin/admin or no auth on v1.x"
+
+  neo4j:
+    ports: [7474, 7687, 7473]
+    description: "Neo4j - graph database"
+    tools:
+      - name: httpx
+        purpose: Neo4j browser fingerprint
+        command: "httpx -u http://{target}:{port} -title -tech-detect"
+      - name: nuclei
+        purpose: Neo4j CVE templates
+        command: "nuclei -u http://{target}:{port} -tags neo4j,database,cve"
+    nuclei_tags: ["neo4j", "database", "graph", "cve", "default-login"]
+    common_vulns:
+      - "Default neo4j/neo4j credentials"
+      - "Anonymous access on legacy versions"
+
+  db2:
+    ports: [50000, 50001, 50002]
+    description: "IBM Db2 - relational database"
+    tools:
+      - name: nmap
+        purpose: Db2 banner + version
+        command: "nmap -sV --script db2-das-info -p {port} {target}"
+      - name: hydra
+        purpose: Db2 brute force
+        command: "hydra -L users.txt -P passwords.txt db2://{target}:{port}"
+    metasploit:
+      - module: auxiliary/scanner/db2/db2_auth
+        purpose: Db2 authentication brute
+    nuclei_tags: ["db2", "ibm", "database", "default-login"]
+    common_vulns:
+      - "Default db2admin / instance owner credentials"
+
+  clickhouse:
+    ports: [8123, 9000, 9009, 8443]
+    description: "ClickHouse - columnar OLAP database"
+    tools:
+      - name: curl
+        purpose: ping + version
+        command: "curl -sk http://{target}:{port}/?query=SELECT+version()"
+      - name: nuclei
+        purpose: ClickHouse exposure templates
+        command: "nuclei -u http://{target}:{port} -tags clickhouse,database,exposure"
+    nuclei_tags: ["clickhouse", "database", "olap", "exposure", "cve"]
+    common_vulns:
+      - "Default no-auth listener on 0.0.0.0"
+      - "CVE-2021-43304: heap buffer overflow"
+
+  # ---- Messaging / streaming ----
+  rabbitmq:
+    ports: [5672, 5671, 15672, 15671, 25672]
+    description: "RabbitMQ - AMQP message broker"
+    tools:
+      - name: httpx
+        purpose: RabbitMQ mgmt UI fingerprint
+        command: "httpx -u http://{target}:{port} -title -tech-detect"
+      - name: nuclei
+        purpose: RabbitMQ CVE / default-login templates
+        command: "nuclei -u http://{target}:{port} -tags rabbitmq,amqp,cve,default-login"
+      - name: hydra
+        purpose: mgmt UI brute force
+        command: "hydra -L users.txt -P passwords.txt {target} -s {port} http-get /"
+    nuclei_tags: ["rabbitmq", "amqp", "messaging", "default-login", "exposure"]
+    common_vulns:
+      - "Default guest/guest credentials (restricted to localhost since 3.6)"
+      - "Management plugin exposed publicly"
+
+  mqtt:
+    ports: [1883, 8883]
+    description: "MQTT - IoT publish/subscribe broker"
+    tools:
+      - name: nmap
+        purpose: MQTT broker detection
+        command: "nmap -sV --script mqtt-subscribe -p {port} {target}"
+      - name: mosquitto_sub
+        purpose: anonymous topic subscription probe
+        command: "mosquitto_sub -h {target} -p {port} -t '#' -v -W 5"
+      - name: nuclei
+        purpose: MQTT exposure templates
+        command: "nuclei -u tcp://{target}:{port} -tags mqtt,iot,exposure"
+    nuclei_tags: ["mqtt", "iot", "messaging", "exposure", "misconfig"]
+    common_vulns:
+      - "Anonymous subscribe to '#' leaks all topic traffic"
+      - "Plaintext credentials over 1883 without TLS"
+
+  kafka:
+    ports: [9092, 9093, 9094, 2181]
+    description: "Apache Kafka - distributed event streaming"
+    tools:
+      - name: nmap
+        purpose: Kafka broker detection
+        command: "nmap -sV -p {port} {target}"
+      - name: kafkacat
+        purpose: list topics / consume messages
+        command: "kafkacat -b {target}:{port} -L"
+      - name: nuclei
+        purpose: Kafka exposure templates
+        command: "nuclei -u tcp://{target}:{port} -tags kafka,exposure"
+    nuclei_tags: ["kafka", "messaging", "streaming", "exposure", "misconfig"]
+    common_vulns:
+      - "Unauthenticated topic listing leaks event schemas"
+      - "PLAINTEXT listener exposed without SASL"
+
+  nats:
+    ports: [4222, 6222, 8222]
+    description: "NATS - cloud-native messaging system"
+    tools:
+      - name: nmap
+        purpose: NATS detection
+        command: "nmap -sV -p {port} {target}"
+      - name: curl
+        purpose: monitoring endpoint (NATS HTTP mon)
+        command: "curl -sk http://{target}:8222/varz"
+    nuclei_tags: ["nats", "messaging", "exposure", "misconfig"]
+    common_vulns:
+      - "Anonymous publish/subscribe by default"
+      - "Monitoring endpoint exposes server config"
+
+  activemq:
+    ports: [61616, 8161, 5672, 1883]
+    description: "Apache ActiveMQ - message broker"
+    tools:
+      - name: httpx
+        purpose: ActiveMQ admin console fingerprint
+        command: "httpx -u http://{target}:8161 -title -tech-detect"
+      - name: nuclei
+        purpose: ActiveMQ CVE templates
+        command: "nuclei -u http://{target}:8161 -tags activemq,cve,default-login"
+    metasploit:
+      - module: exploit/multi/misc/apache_activemq_rce_cve_2023_46604
+        purpose: ActiveMQ OpenWire deserialization RCE
+    nuclei_tags: ["activemq", "messaging", "cve", "rce", "default-login"]
+    common_vulns:
+      - "CVE-2023-46604: OpenWire deserialization RCE"
+      - "Default admin/admin on web console"
+
+  # ---- Service mesh / config stores ----
+  etcd:
+    ports: [2379, 2380]
+    description: "etcd - distributed key-value store (Kubernetes / CoreOS)"
+    tools:
+      - name: curl
+        purpose: etcd version + member list
+        command: "curl -sk http://{target}:{port}/version"
+      - name: etcdctl
+        purpose: list all keys recursively
+        command: "etcdctl --endpoints=http://{target}:{port} get / --prefix --keys-only"
+      - name: nuclei
+        purpose: etcd exposure templates
+        command: "nuclei -u http://{target}:{port} -tags etcd,kubernetes,exposure"
+    nuclei_tags: ["etcd", "kubernetes", "k8s", "exposure", "misconfig"]
+    common_vulns:
+      - "Unauthenticated /v2/keys leaks cluster secrets"
+      - "TLS client-cert auth disabled exposes API"
+
+  consul:
+    ports: [8500, 8501, 8502, 8300, 8301, 8302, 8600]
+    description: "HashiCorp Consul - service mesh + discovery"
+    tools:
+      - name: curl
+        purpose: agent self + services enumeration
+        command: "curl -sk http://{target}:{port}/v1/agent/self"
+      - name: nuclei
+        purpose: Consul exposure templates
+        command: "nuclei -u http://{target}:{port} -tags consul,hashicorp,exposure,misconfig"
+    nuclei_tags: ["consul", "hashicorp", "service-mesh", "exposure", "rce"]
+    common_vulns:
+      - "Anonymous /v1/agent/self leaks node config"
+      - "RCE via insecure -enable-script-checks=true"
+
+  zookeeper:
+    ports: [2181, 2888, 3888]
+    description: "Apache ZooKeeper - distributed coordination"
+    tools:
+      - name: nmap
+        purpose: ZooKeeper info + commands
+        command: "nmap -sV --script zookeeper-info -p {port} {target}"
+      - name: ncat
+        purpose: send 4-letter command (stat, mntr, envi)
+        command: "echo 'mntr' | ncat -w 5 {target} {port}"
+    nuclei_tags: ["zookeeper", "kafka", "exposure", "misconfig"]
+    common_vulns:
+      - "Anonymous 'stat'/'envi' 4-letter commands leak config"
+      - "Unauthenticated znode read"
+
+  # ---- Authentication ----
+  radius:
+    ports: [1812, 1813, 1645, 1646]
+    description: "RADIUS - Remote Authentication Dial-In User Service"
+    tools:
+      - name: nmap
+        purpose: RADIUS shared-secret brute
+        command: "nmap -sU --script radius-brute -p {port} {target}"
+      - name: radclient
+        purpose: send Access-Request probe
+        command: "echo 'User-Name=admin,User-Password=admin' | radclient {target}:{port} auth secret"
+    nuclei_tags: ["radius", "auth", "network", "udp"]
+    common_vulns:
+      - "Weak shared secret (brute-forceable)"
+      - "CVE-2024-3596: BlastRADIUS MD5 collision"
+
+  tacacs:
+    ports: [49]
+    description: "TACACS+ - Cisco AAA protocol"
+    tools:
+      - name: nmap
+        purpose: TACACS+ detection
+        command: "nmap -sV -p {port} {target}"
+      - name: hydra
+        purpose: TACACS+ shared-secret brute
+        command: "hydra -L users.txt -P passwords.txt tacacs+://{target}"
+    nuclei_tags: ["tacacs", "cisco", "auth", "network"]
+    common_vulns:
+      - "Weak shared secret (key)"
+      - "Plaintext fallback when MD5 fails"
+
+  # ---- Network infrastructure ----
+  ntp:
+    ports: [123]
+    description: "NTP - Network Time Protocol"
+    tools:
+      - name: nmap
+        purpose: NTP info + monlist amplification check
+        command: "nmap -sU --script ntp-info,ntp-monlist -p {port} {target}"
+      - name: ntpq
+        purpose: query peers and config
+        command: "ntpq -c rv -c peers {target}"
+      - name: ntpdate
+        purpose: probe NTP server
+        command: "ntpdate -q {target}"
+    nuclei_tags: ["ntp", "network", "udp", "amplification", "misconfig"]
+    common_vulns:
+      - "monlist UDP amplification DDoS (deprecated, still seen)"
+      - "Read variables leak system info"
+
+  ssdp:
+    ports: [1900]
+    description: "SSDP / UPnP - Simple Service Discovery Protocol"
+    tools:
+      - name: nmap
+        purpose: SSDP M-SEARCH info
+        command: "nmap -sU --script upnp-info -p {port} {target}"
+      - name: upnpc
+        purpose: UPnP port-forward enumeration
+        command: "upnpc -m {target} -l"
+    nuclei_tags: ["ssdp", "upnp", "network", "udp", "amplification"]
+    common_vulns:
+      - "UPnP exposes internal device info + port mappings"
+      - "CallStranger (CVE-2020-12695) reflection / amplification"
+
+  tftp:
+    ports: [69]
+    description: "TFTP - Trivial File Transfer Protocol"
+    tools:
+      - name: nmap
+        purpose: TFTP enumeration
+        command: "nmap -sU --script tftp-enum -p {port} {target}"
+      - name: tftp
+        purpose: manual file fetch (try config files)
+        command: "tftp {target} -c get running-config"
+    metasploit:
+      - module: auxiliary/scanner/tftp/tftpbrute
+        purpose: TFTP filename brute force
+    nuclei_tags: ["tftp", "network", "udp", "misconfig", "default-login"]
+    common_vulns:
+      - "Anonymous read of router/switch configs (Cisco running-config)"
+      - "Anonymous write enables firmware backdoor"
+
+  syslog:
+    ports: [514, 6514]
+    description: "Syslog - centralized logging"
+    tools:
+      - name: nmap
+        purpose: syslog detection
+        command: "nmap -sU -p {port} {target}"
+      - name: logger
+        purpose: send a probe message
+        command: "logger -n {target} -P {port} 'pentest-probe'"
+    nuclei_tags: ["syslog", "logging", "network", "udp"]
+    common_vulns:
+      - "Plaintext logs over UDP (no integrity / confidentiality)"
+      - "Open relay allows arbitrary log injection"
+
+  rsync:
+    ports: [873]
+    description: "rsync - file synchronization daemon"
+    tools:
+      - name: nmap
+        purpose: list rsync modules + version
+        command: "nmap -sV --script rsync-list-modules -p {port} {target}"
+      - name: rsync
+        purpose: anonymous module listing
+        command: "rsync rsync://{target}:{port}/"
+    nuclei_tags: ["rsync", "network", "misconfig", "exposure"]
+    common_vulns:
+      - "Anonymous read of backup modules leaks files"
+      - "Writable anonymous module = arbitrary file write"
+
+  snmptrap:
+    ports: [162]
+    description: "SNMP Trap - asynchronous SNMP notifications"
+    tools:
+      - name: nmap
+        purpose: SNMP trap port probe
+        command: "nmap -sU -p {port} {target}"
+      - name: snmptrap
+        purpose: send a test trap
+        command: "snmptrap -v 2c -c public {target}:{port} '' .1.3.6.1.4.1"
+    nuclei_tags: ["snmp", "snmptrap", "network", "udp"]
+    common_vulns:
+      - "Open trap receiver accepts arbitrary input → DoS / log poisoning"
+
+  portmap:
+    ports: [111]
+    description: "Portmap / rpcbind - Sun RPC port mapper"
+    tools:
+      - name: nmap
+        purpose: list RPC services
+        command: "nmap -sV --script rpcinfo -p {port} {target}"
+      - name: rpcinfo
+        purpose: enumerate registered RPC programs
+        command: "rpcinfo -p {target}"
+    nuclei_tags: ["rpc", "rpcbind", "portmap", "network", "misconfig"]
+    common_vulns:
+      - "Anonymous program listing leaks NFS / NIS / mountd"
+      - "Amplification source (CVE-2015-7236)"
+
+  msrpc:
+    ports: [135]
+    description: "MS-RPC / DCE/RPC / EPMAP - Microsoft endpoint mapper"
+    tools:
+      - name: nmap
+        purpose: MS-RPC enumeration
+        command: "nmap -sV --script msrpc-enum -p {port} {target}"
+      - name: rpcclient
+        purpose: anonymous enumeration (NetBIOS / Samba)
+        command: "rpcclient -U '' -N {target}"
+      - name: impacket-rpcdump
+        purpose: dump endpoint mapper entries
+        command: "impacket-rpcdump {target}"
+    nuclei_tags: ["msrpc", "windows", "rpc", "network", "cve"]
+    common_vulns:
+      - "CVE-2003-0352: MS03-026 Blaster"
+      - "CVE-2021-26414: DCOM hardening bypass"
+
+  finger:
+    ports: [79]
+    description: "Finger - user information service"
+    tools:
+      - name: nmap
+        purpose: finger user enumeration
+        command: "nmap --script finger -p {port} {target}"
+      - name: finger
+        purpose: query user list
+        command: "finger @{target}"
+    metasploit:
+      - module: auxiliary/scanner/finger/finger_users
+        purpose: enumerate users via finger
+    nuclei_tags: ["finger", "network", "info-leak"]
+    common_vulns:
+      - "User enumeration (root, bin, daemon presence)"
+
+  whois:
+    ports: [43]
+    description: "WHOIS - domain / IP registration lookup"
+    tools:
+      - name: whois
+        purpose: query WHOIS data
+        command: "whois -h {target} -p {port} example.com"
+    nuclei_tags: ["whois", "network", "info-leak"]
+    common_vulns:
+      - "Internal WHOIS server may leak asset inventory"
+
+  ident:
+    ports: [113]
+    description: "Ident / Auth - identification protocol"
+    tools:
+      - name: nmap
+        purpose: ident user enumeration via auth-owners
+        command: "nmap --script auth-owners -p {port} {target}"
+    nuclei_tags: ["ident", "auth", "network", "info-leak"]
+    common_vulns:
+      - "Leaks UID of process listening on associated TCP port"
+
+  mdns:
+    ports: [5353]
+    description: "mDNS - multicast DNS (Bonjour / Avahi)"
+    tools:
+      - name: nmap
+        purpose: mDNS service discovery
+        command: "nmap -sU --script dns-service-discovery -p {port} {target}"
+      - name: avahi-browse
+        purpose: enumerate advertised services
+        command: "avahi-browse -a -r -t"
+    nuclei_tags: ["mdns", "bonjour", "network", "udp", "info-leak"]
+    common_vulns:
+      - "Service announcements leak hostnames, printers, AirPlay devices"
+
+  # ---- Voice / video ----
+  sip:
+    ports: [5060, 5061]
+    description: "SIP - Session Initiation Protocol (VoIP)"
+    tools:
+      - name: nmap
+        purpose: SIP method enumeration
+        command: "nmap -sU --script sip-methods,sip-enum-users -p {port} {target}"
+      - name: sipvicious
+        purpose: SIP scanner + user enumeration
+        command: "svmap {target}:{port}"
+      - name: hydra
+        purpose: SIP credential brute
+        command: "hydra -L users.txt -P passwords.txt sip://{target}:{port}"
+    metasploit:
+      - module: auxiliary/scanner/sip/options
+        purpose: SIP OPTIONS scan
+      - module: auxiliary/scanner/sip/enumerator
+        purpose: SIP user enumeration
+    nuclei_tags: ["sip", "voip", "network", "udp", "default-login"]
+    common_vulns:
+      - "INVITE flood / amplification"
+      - "Default credentials on PBX (admin/admin, 1000/1000)"
+
+  h323:
+    ports: [1720]
+    description: "H.323 - VoIP signalling protocol"
+    tools:
+      - name: nmap
+        purpose: H.323 detection
+        command: "nmap -sV -p {port} {target}"
+    nuclei_tags: ["h323", "voip", "network"]
+
+  # ---- Printing ----
+  ipp:
+    ports: [631]
+    description: "IPP / CUPS - Internet Printing Protocol"
+    tools:
+      - name: nmap
+        purpose: CUPS info + printer enumeration
+        command: "nmap -sV --script cups-info,cups-queue-info -p {port} {target}"
+      - name: curl
+        purpose: CUPS admin interface
+        command: "curl -sk http://{target}:{port}/printers/"
+      - name: nuclei
+        purpose: CUPS CVE / exposure
+        command: "nuclei -u http://{target}:{port} -tags cups,ipp,cve"
+    nuclei_tags: ["cups", "ipp", "printing", "cve", "exposure"]
+    common_vulns:
+      - "CVE-2024-47176/47076/47175/47177: CUPS RCE chain"
+      - "Anonymous printer enumeration"
+
+  lpd:
+    ports: [515]
+    description: "LPD - Line Printer Daemon"
+    tools:
+      - name: nmap
+        purpose: LPD detection + queue listing
+        command: "nmap -sV --script lpd-info -p {port} {target}"
+    nuclei_tags: ["lpd", "printing", "network", "cve"]
+    common_vulns:
+      - "CVE-2024-12356: BeyondTrust PRA LPD command injection"
+
+  # ---- Remote access / file ----
+  citrix:
+    ports: [1494, 2598, 80, 443]
+    description: "Citrix - ICA / NetScaler"
+    tools:
+      - name: nmap
+        purpose: Citrix detection
+        command: "nmap -sV --script citrix-enum-apps -p {port} {target}"
+      - name: nuclei
+        purpose: Citrix / NetScaler CVE templates
+        command: "nuclei -u https://{target}:{port} -tags citrix,netscaler,cve"
+    nuclei_tags: ["citrix", "netscaler", "cve", "rce"]
+    common_vulns:
+      - "CVE-2023-3519: NetScaler unauthenticated RCE"
+      - "CVE-2019-19781: Citrix ADC path traversal"
+      - "CVE-2023-4966: Citrix Bleed session hijack"
+
+  x11:
+    ports: [6000, 6001, 6002, 6003]
+    description: "X11 - X Window System remote display"
+    tools:
+      - name: nmap
+        purpose: X11 access check + xkeyboard
+        command: "nmap --script x11-access -p {port} {target}"
+      - name: xspy
+        purpose: keystroke logger on open X server
+        command: "xspy {target}:0"
+      - name: xwd
+        purpose: capture screenshot
+        command: "xwd -display {target}:0 -root -out screen.xwd"
+    metasploit:
+      - module: auxiliary/scanner/x11/open_x11
+        purpose: open X11 server detection
+    nuclei_tags: ["x11", "remote-access", "exposure"]
+    common_vulns:
+      - "Unauthenticated X11 server allows keystroke capture + screenshot"
+
+  afp:
+    ports: [548, 427]
+    description: "AFP - Apple Filing Protocol"
+    tools:
+      - name: nmap
+        purpose: AFP server info + shares
+        command: "nmap -sV --script afp-showmount,afp-serverinfo -p {port} {target}"
+    metasploit:
+      - module: auxiliary/scanner/afp/afp_login
+        purpose: AFP login brute
+    nuclei_tags: ["afp", "apple", "filesharing", "network"]
+    common_vulns:
+      - "Anonymous mount of root volume"
+      - "Default guest access enabled"
+
+  iscsi:
+    ports: [860, 3260]
+    description: "iSCSI - SCSI commands over TCP"
+    tools:
+      - name: nmap
+        purpose: iSCSI target / LUN enumeration
+        command: "nmap -sV --script iscsi-info,iscsi-brute -p {port} {target}"
+      - name: iscsiadm
+        purpose: discover and login to targets
+        command: "iscsiadm -m discovery -t sendtargets -p {target}:{port}"
+    nuclei_tags: ["iscsi", "storage", "network"]
+    common_vulns:
+      - "Anonymous SendTargets exposes LUN names"
+      - "No CHAP authentication"
+
+  # ---- Industrial / IoT ----
+  modbus:
+    ports: [502]
+    description: "Modbus TCP - industrial control protocol"
+    tools:
+      - name: nmap
+        purpose: Modbus device + slave-id enumeration
+        command: "nmap -sV --script modbus-discover -p {port} {target}"
+      - name: modbus-cli
+        purpose: read coil / register
+        command: "modbus -h {target} -p {port} read 1 100"
+    metasploit:
+      - module: auxiliary/scanner/scada/modbusclient
+        purpose: Modbus client scanner
+    nuclei_tags: ["modbus", "scada", "ics", "iot", "exposure"]
+    common_vulns:
+      - "Unauthenticated read/write of holding registers"
+      - "Coil writes can stop industrial processes"
+
+  bacnet:
+    ports: [47808]
+    description: "BACnet - building automation protocol"
+    tools:
+      - name: nmap
+        purpose: BACnet device discovery
+        command: "nmap -sU --script bacnet-info -p {port} {target}"
+    nuclei_tags: ["bacnet", "scada", "ics", "iot", "udp"]
+    common_vulns:
+      - "Anonymous device-info reveals vendor/model/firmware"
+
+  ethernetip:
+    ports: [44818]
+    description: "EtherNet/IP - industrial automation (Rockwell / Allen-Bradley)"
+    tools:
+      - name: nmap
+        purpose: EtherNet/IP device enumeration
+        command: "nmap -sV --script enip-info -p {port} {target}"
+    nuclei_tags: ["enip", "ethernetip", "scada", "ics", "rockwell"]
+    common_vulns:
+      - "Anonymous identity request leaks PLC model + firmware"
+
+  coap:
+    ports: [5683, 5684]
+    description: "CoAP - Constrained Application Protocol (IoT)"
+    tools:
+      - name: nmap
+        purpose: CoAP resource discovery
+        command: "nmap -sU --script coap-resources -p {port} {target}"
+      - name: coap-client
+        purpose: probe well-known resources
+        command: "coap-client coap://{target}:{port}/.well-known/core"
+    nuclei_tags: ["coap", "iot", "udp", "exposure"]
+    common_vulns:
+      - "Amplification source (RFC 7252 §11.3)"
+      - "Unauthenticated resource discovery"
+
+  # ---- Virtualization / management ----
+  vmware_esxi:
+    ports: [902, 903, 443, 5988, 5989, 8000, 8100, 8182]
+    description: "VMware ESXi / vCenter - hypervisor management"
+    tools:
+      - name: httpx
+        purpose: ESXi welcome page fingerprint
+        command: "httpx -u https://{target}:{port} -title -tech-detect -tls-probe"
+      - name: nuclei
+        purpose: VMware CVE templates
+        command: "nuclei -u https://{target}:{port} -tags vmware,esxi,vcenter,cve"
+      - name: govc
+        purpose: VMware vSphere CLI probe
+        command: "govc about -u https://{target}:{port}"
+    nuclei_tags: ["vmware", "esxi", "vcenter", "cve", "rce", "ransomware"]
+    common_vulns:
+      - "CVE-2021-21974: ESXi OpenSLP RCE (used by ESXiArgs ransomware)"
+      - "CVE-2024-37085: ESXi Active Directory auth bypass"
+      - "Default root with blank password (legacy)"
+
+  ipmi:
+    ports: [623]
+    description: "IPMI - Intelligent Platform Management Interface (BMC)"
+    tools:
+      - name: nmap
+        purpose: IPMI version + cipher zero check
+        command: "nmap -sU --script ipmi-version,ipmi-cipher-zero,ipmi-brute -p {port} {target}"
+      - name: ipmitool
+        purpose: IPMI 2.0 over LAN probe
+        command: "ipmitool -I lanplus -H {target} -p {port} -U admin -P admin chassis status"
+    metasploit:
+      - module: auxiliary/scanner/ipmi/ipmi_cipher_zero
+        purpose: IPMI 2.0 Cipher 0 auth bypass
+      - module: auxiliary/scanner/ipmi/ipmi_dumphashes
+        purpose: dump IPMI 2.0 RAKP hashes
+    nuclei_tags: ["ipmi", "bmc", "network", "udp", "cve", "rce"]
+    common_vulns:
+      - "Cipher Zero authentication bypass (any password works)"
+      - "IPMI 2.0 RAKP password hash retrieval"
+      - "Default root/calvin (Dell), ADMIN/ADMIN (Supermicro)"
+
+  squid:
+    ports: [3128, 8080]
+    description: "Squid - HTTP caching proxy"
+    tools:
+      - name: nmap
+        purpose: Squid version detection
+        command: "nmap -sV -p {port} {target}"
+      - name: curl
+        purpose: open-proxy check (CONNECT to external)
+        command: "curl -x http://{target}:{port} -sk https://www.google.com/"
+      - name: nuclei
+        purpose: Squid CVE / exposure templates
+        command: "nuclei -u http://{target}:{port} -tags squid,proxy,cve"
+    nuclei_tags: ["squid", "proxy", "cve", "misconfig"]
+    common_vulns:
+      - "Open proxy (forwards arbitrary requests)"
+      - "CVE-2023-46847: pre-auth heap buffer overflow"
+
+  pcanywhere:
+    ports: [5631, 5632]
+    description: "Symantec pcAnywhere - remote access"
+    tools:
+      - name: nmap
+        purpose: pcAnywhere detection
+        command: "nmap -sV --script pcanywhere-brute -p {port} {target}"
+    nuclei_tags: ["pcanywhere", "remote-access", "cve", "legacy"]
+    common_vulns:
+      - "Plaintext credentials in transit (pre-12.5)"
+
+  # ---- Misc useful ----
+  mssql_browser:
+    ports: [1434]
+    description: "MS SQL Server Browser - instance discovery (UDP)"
+    tools:
+      - name: nmap
+        purpose: MSSQL instance enumeration
+        command: "nmap -sU --script ms-sql-info -p {port} {target}"
+    metasploit:
+      - module: auxiliary/scanner/mssql/mssql_ping
+        purpose: discover SQL Server instances
+    nuclei_tags: ["mssql", "database", "udp", "info-leak"]
+    common_vulns:
+      - "Reveals all named instances, ports, and versions"
+
+  zabbix:
+    ports: [10050, 10051, 80, 443]
+    description: "Zabbix - monitoring server + agent"
+    tools:
+      - name: nmap
+        purpose: Zabbix agent probe
+        command: "nmap -sV --script zabbix-agent-version -p {port} {target}"
+      - name: nuclei
+        purpose: Zabbix CVE templates
+        command: "nuclei -u http://{target}:{port} -tags zabbix,monitoring,cve"
+    nuclei_tags: ["zabbix", "monitoring", "cve", "rce", "default-login"]
+    common_vulns:
+      - "CVE-2022-23131: SSO auth bypass"
+      - "Default Admin/zabbix credentials"
+
+  splunk:
+    ports: [8000, 8089, 8088, 9997]
+    description: "Splunk - log analytics + SIEM"
+    tools:
+      - name: httpx
+        purpose: Splunk Web fingerprint
+        command: "httpx -u https://{target}:{port} -title -tech-detect"
+      - name: nuclei
+        purpose: Splunk CVE templates
+        command: "nuclei -u https://{target}:{port} -tags splunk,cve,default-login"
+    nuclei_tags: ["splunk", "siem", "cve", "default-login", "rce"]
+    common_vulns:
+      - "CVE-2023-46214: insecure XSLT RCE (auth required)"
+      - "Default admin/changeme credentials"
+
+  nodeexporter:
+    ports: [9100]
+    description: "Prometheus node_exporter - host metrics endpoint"
+    tools:
+      - name: curl
+        purpose: enumerate host metrics
+        command: "curl -sk http://{target}:{port}/metrics"
+    nuclei_tags: ["prometheus", "node-exporter", "monitoring", "exposure", "info-leak"]
+    common_vulns:
+      - "Unauthenticated /metrics exposes host CPU, mem, processes, mount points"
+
 # Port-only mappings for common ports where service is unknown
 port_hints:
   22: ssh
