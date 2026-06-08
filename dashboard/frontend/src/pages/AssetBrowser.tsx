@@ -11,10 +11,11 @@ import { DataTable } from '@/components/common/DataTable'
 import { StatusDot } from '@/components/common/StatusDot'
 import type { ColumnDef, RowSelectionState } from '@tanstack/react-table'
 import type { Asset, Port, Vuln, ScanRecommendation } from '@/lib/types'
-import { X, Trash2, Key, Plus, ShieldCheck, ShieldX, ShieldQuestion, ShieldOff, AlertTriangle, Globe, Camera, Cpu, Settings2, Search, ExternalLink, Cloud, Server } from 'lucide-react'
+import { X, Trash2, Key, Plus, ShieldCheck, ShieldX, ShieldQuestion, ShieldOff, AlertTriangle, Globe, Camera, Cpu, Settings2, Search, ExternalLink, Cloud, Server, ChevronDown, ChevronRight } from 'lucide-react'
 import { ScopeAssignModal } from '@/components/common/ScopeAssignModal'
 import { ScopeFilter } from '@/components/common/ScopeFilter'
 import { KbSuggestionsModal } from '@/components/recommendations/KbSuggestionsModal'
+import { CredentialAuditPanel } from '@/components/credentials/CredentialAuditPanel'
 import { useScopeFilter } from '@/hooks/useScopeFilter'
 import { useUIStore } from '@/stores/ui'
 import { useScreenshots, useReconDomainOverview } from '@/api/recon'
@@ -565,6 +566,18 @@ export default function AssetBrowser() {
   const [detailTab, setDetailTab] = useState<'ports' | 'credentials' | 'screenshots' | 'recon'>('ports')
   const [search, setSearch] = useState('')
   const [credStatusFilter, setCredStatusFilter] = useState<string>('')
+  // Track which credential rows have their audit panel expanded.  Keyed by
+  // credential.id; population is rendered lazily when expanded[id]==true.
+  // Rows without metadata.audit show a disabled "no audit" hint instead of
+  // an expander button.
+  const [credAuditExpanded, setCredAuditExpanded] = useState<Set<string>>(new Set())
+  const toggleCredAudit = (id: string) => {
+    setCredAuditExpanded(prev => {
+      const next = new Set(prev)
+      next.has(id) ? next.delete(id) : next.add(id)
+      return next
+    })
+  }
   const globalScope = useUIStore(s => s.selectedScopeName)
   const [scopeFilter, setScopeFilter] = useState(globalScope || '')
   const { matchesScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilter)
@@ -1142,7 +1155,32 @@ export default function AssetBrowser() {
                         }`}
                       >{s}</button>
                     ))}
+                    {/* Audit expander.  Only rendered when the credential
+                        has metadata.audit populated -- i.e. it came from
+                        the credential-check path (nmap_scanner) rather than
+                        the brutus runner (no per-attempt detail).  When
+                        absent, we surface a discreet hint so operators
+                        understand WHY the expander doesn't appear. */}
+                    {c.metadata?.audit ? (
+                      <button
+                        type="button"
+                        onClick={() => toggleCredAudit(c.id)}
+                        className="ml-auto inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] border border-border text-muted-foreground hover:text-foreground hover:border-primary"
+                        title="Show the per-attempt audit (usernames + masked passwords tried, failure modes, KEX detection, fallback)"
+                      >
+                        {credAuditExpanded.has(c.id) ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                        {credAuditExpanded.has(c.id) ? 'Hide audit' : 'View audit'}
+                      </button>
+                    ) : (
+                      <span className="ml-auto text-[10px] text-muted-foreground/60 italic"
+                            title="No per-attempt audit data on this row.  Brutus runner credentials don't include audit; credential-check (nmap_scanner) credentials do.">
+                        (no audit)
+                      </span>
+                    )}
                   </div>
+                  {credAuditExpanded.has(c.id) && c.metadata?.audit && (
+                    <CredentialAuditPanel audit={c.metadata.audit} />
+                  )}
                 </div>
               ))}
             </div>
