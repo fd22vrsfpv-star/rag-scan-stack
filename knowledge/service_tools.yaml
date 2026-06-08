@@ -2011,6 +2011,85 @@ services:
     common_vulns:
       - "Unauthenticated /metrics exposes host CPU, mem, processes, mount points"
 
+# ─────────────────────────────────────────────────────────────────────────
+# Tech-stack signatures (G1: detected CMS/framework -> targeted nuclei tags)
+# ─────────────────────────────────────────────────────────────────────────
+# When httpx/whatweb fingerprint a web technology (stored in
+# recon_findings.data->'tech' and ->>'webserver'), the scan-recommender
+# matches those tokens against `match:` substrings (case-insensitive) and
+# adds nuclei recommendations scoped to the matched `nuclei_tags`.  This
+# selects CMS/framework-specific templates instead of only generic
+# service-based ones.  Edit freely via the /kb flow -- read at load time.
+tech_signatures:
+  wordpress:
+    match: ["wordpress", "wp-content", "wp-includes"]
+    nuclei_tags: ["wordpress", "wp-plugin", "wp-theme"]
+    note: "WordPress CMS"
+  drupal:
+    match: ["drupal"]
+    nuclei_tags: ["drupal"]
+    note: "Drupal CMS"
+  joomla:
+    match: ["joomla"]
+    nuclei_tags: ["joomla"]
+    note: "Joomla CMS"
+  magento:
+    match: ["magento"]
+    nuclei_tags: ["magento"]
+    note: "Magento e-commerce"
+  tomcat:
+    match: ["tomcat", "coyote"]
+    nuclei_tags: ["tomcat", "apache"]
+    note: "Apache Tomcat"
+  jboss:
+    match: ["jboss", "wildfly"]
+    nuclei_tags: ["jboss"]
+    note: "JBoss/WildFly"
+  weblogic:
+    match: ["weblogic"]
+    nuclei_tags: ["weblogic", "oracle"]
+    note: "Oracle WebLogic"
+  jenkins:
+    match: ["jenkins"]
+    nuclei_tags: ["jenkins"]
+    note: "Jenkins CI"
+  gitlab:
+    match: ["gitlab"]
+    nuclei_tags: ["gitlab"]
+    note: "GitLab"
+  grafana:
+    match: ["grafana"]
+    nuclei_tags: ["grafana"]
+    note: "Grafana"
+  phpmyadmin:
+    match: ["phpmyadmin"]
+    nuclei_tags: ["phpmyadmin"]
+    note: "phpMyAdmin"
+  jira:
+    match: ["jira"]
+    nuclei_tags: ["jira", "atlassian"]
+    note: "Atlassian Jira"
+  confluence:
+    match: ["confluence"]
+    nuclei_tags: ["confluence", "atlassian"]
+    note: "Atlassian Confluence"
+  springboot:
+    match: ["spring", "spring boot", "springboot"]
+    nuclei_tags: ["springboot", "spring"]
+    note: "Spring Boot"
+  iis:
+    match: ["iis", "microsoft-iis"]
+    nuclei_tags: ["iis", "microsoft"]
+    note: "Microsoft IIS"
+  apache:
+    match: ["apache httpd", "apache/"]
+    nuclei_tags: ["apache"]
+    note: "Apache HTTP Server"
+  nginx:
+    match: ["nginx"]
+    nuclei_tags: ["nginx"]
+    note: "nginx"
+
 # Port-only mappings for common ports where service is unknown
 port_hints:
   22: ssh

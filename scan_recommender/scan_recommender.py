@@ -13,7 +13,7 @@ from fastapi import FastAPI, APIRouter, Query, HTTPException, Body
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from exploits_rag import rag_router
-from tool_kb import get_tool_kb
+from tool_kb import get_tool_kb, get_high_value_port_info
 from log_manager import get_log_handler, setup_log_capture, LOGS_UI_HTML
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -130,6 +130,33 @@ SAFE_TOOLS = {
 # ---- Auto-execute config ----
 KALI_LISTENER_URL = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
 AUTO_EXECUTE = os.environ.get("AUTO_EXECUTE_SAFE", "1").lower() in ("1", "true", "yes")
+
+# ---- Webhook emit (cross-container HTTP) ----
+# scan-recommender is its own container/image with no access to rag-api's
+# `webhooks` package, so it emits over HTTP to rag-api's /webhooks/emit
+# (same pattern as web_scanner/scan_pipeline.py).  Fire-and-forget: a
+# webhook failure must never break recommendation generation.
+API_BASE = os.environ.get("API_BASE", "https://rag-api:8000")
+API_KEY = os.environ.get("API_KEY", "changeme")
+WEBHOOK_ENABLED = os.environ.get("WEBHOOK_ENABLED", "1").lower() in ("1", "true", "yes")
+
+
+def _emit_webhook(event_type: str, data: Dict, severity: Optional[str] = None):
+    """POST a webhook event to rag-api so external tools can subscribe."""
+    if not WEBHOOK_ENABLED:
+        return
+    try:
+        payload = {"event_type": event_type, "source": "scan_recommender",
+                   "data": data or {}}
+        if severity:
+            payload["severity"] = severity
+        requests.post(
+            f"{API_BASE}/webhooks/emit", json=payload,
+            headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
+            timeout=5, verify=False,
+        )
+    except Exception as e:
+        logger.debug("webhook emit failed (%s): %s", event_type, e)
 
 
 def _kb_result_to_recommendations(kb_result: Dict) -> List[Dict]:
@@ -302,14 +329,140 @@ def _append_proactive_vulnx_recs(recs: List[Dict], ip: str):
     for i, rec in enumerate(vulnx_recs[:5]):
         # Add priority based on version availability (versioned software gets higher priority)
         software_ctx = rec.get("software_context", {})
+        # Priority scale (lower = runs first): high-value-port MSF=5,
+        # high-value-port=10, tech-targeted=15, then proactive vulnx.
         if software_ctx.get("version"):
-            rec["priority"] = 1  # High priority for versioned software
+            rec["priority"] = 20  # versioned software (more actionable)
         else:
-            rec["priority"] = 2  # Lower priority for unversioned software
+            rec["priority"] = 30  # unversioned software
 
         recs.append(rec)
 
     logger.info(f"Added {len(vulnx_recs[:5])} proactive vulnx recommendations for {ip} (from {len(discovered)} discovered software products)")
+
+
+def _get_detected_tech(ip: Optional[str], port: Optional[int] = None) -> tuple:
+    """Return (tech_tokens, source) for an IP[:port] (G1).
+
+    Reads the tech-stack httpx/whatweb already detected and persisted to
+    `recon_findings.data` (`->'tech'` array + `->>'webserver'`).  Used to
+    pick CMS/framework-targeted nuclei templates.  Defensive: returns
+    ([], "") on any error so recommendation generation never breaks.
+    """
+    if not ip:
+        return [], ""
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT rf.data, rf.source
+                FROM public.recon_findings rf
+                JOIN public.assets a ON a.id = rf.asset_id
+                WHERE host(a.ip) = %s
+                  AND rf.source IN ('httpx', 'whatweb')
+                  AND (%s IS NULL OR rf.data->>'port' = %s)
+                ORDER BY rf.created_at DESC
+                LIMIT 10
+                """,
+                (ip, port, str(port) if port is not None else None),
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        logger.debug(f"tech lookup skipped for {ip}: {e}")
+        return [], ""
+
+    tokens: List[str] = []
+    source = ""
+    for r in rows:
+        data = r.get("data") or {}
+        if isinstance(data, dict):
+            tech = data.get("tech") or []
+            if isinstance(tech, list):
+                tokens.extend(str(t) for t in tech if t)
+            ws = data.get("webserver")
+            if ws:
+                tokens.append(str(ws))
+        source = source or (r.get("source") or "")
+    return tokens, source
+
+
+def _append_tech_targeted_recs(recs: List[Dict], ip: Optional[str],
+                               port: Optional[int] = None) -> List[Dict]:
+    """G1: add nuclei recs targeting the detected CMS/framework.
+
+    Returns the list of matched tech signatures (for webhook reporting).
+    Uses a tech-distinct `action` string so the rec's fingerprint differs
+    from the generic service-based nuclei rec (the unique fingerprint
+    excludes priority/extra, so distinct action is what avoids collision).
+    """
+    tokens, source = _get_detected_tech(ip, port)
+    if not tokens:
+        return []
+    matches = get_tool_kb().match_tech_to_tags(tokens)
+    for m in matches:
+        tags = m.get("nuclei_tags") or []
+        if not tags:
+            continue
+        recs.append({
+            "scanner": "nuclei",
+            "action": f"tech-targeted scan ({m['name']})",
+            "script": None,
+            "template": ",".join(tags),
+            "priority": 15,
+            "tech_context": {"matched": m["name"], "source": source},
+        })
+    return matches
+
+
+def _append_high_value_port_recs(recs: List[Dict], port: Optional[int]) -> Optional[Dict]:
+    """G2: prioritize + enqueue curated module for a high-value port.
+
+    When `port` is in the curated HIGH_VALUE_PORTS intel, bump the priority
+    of every rec already generated for it (lower int = runs first) and, if
+    the port has a curated Metasploit module, enqueue it as its own rec.
+    Returns the port info dict (for webhook reporting) or None.
+    """
+    if port is None:
+        return None
+    info = get_high_value_port_info(port)
+    if not info:
+        return None
+    msf = info.get("msf")
+    base_priority = 5 if msf else 10
+    hv_ctx = {"vulns": info.get("vulns", []), "note": info.get("note", ""),
+              "service": info.get("service", ""), "port": port}
+    for r in recs:
+        cur = r.get("priority")
+        if cur is None or cur > base_priority:
+            r["priority"] = base_priority
+        r.setdefault("high_value", hv_ctx)
+    if msf:
+        recs.append({
+            "scanner": "metasploit",
+            "action": f"high-value port {port}: {info.get('note', '')}",
+            "script": msf,
+            "template": None,
+            "priority": 5,
+            "high_value": hv_ctx,
+        })
+    return info
+
+
+def _enrich_and_finalize(recs: List[Dict], row: Dict, port: Optional[int],
+                         ip: Optional[str]) -> List[Dict]:
+    """Shared recommendation enrichment tail used by every branch of
+    generate_recommendations() so G1/G2 fire consistently.
+
+    Order matters: high-value-port handling runs LAST so it can bump the
+    priority of everything already appended (tech-targeted, vulnx, etc.).
+    """
+    _append_vulnx_rec(recs, row)
+    _append_common_web_fallback(recs, port)
+    if ip:
+        _append_tech_targeted_recs(recs, ip, port)      # G1
+        _append_proactive_vulnx_recs(recs, ip)
+    _append_high_value_port_recs(recs, port)            # G2 (last)
+    return _stamp_source_context(recs, row, port)
 
 
 # ---- Rules ----
@@ -384,24 +537,14 @@ def generate_recommendations(row: Dict, port: Optional[int] = None, ip: Optional
         }
         recs = _kb_result_to_recommendations(kb_result)
         if recs:
-            _append_vulnx_rec(recs, row)
-            _append_common_web_fallback(recs, port)
-            # Add proactive vulnx recommendations if IP is provided
-            if ip:
-                _append_proactive_vulnx_recs(recs, ip)
-            return _stamp_source_context(recs, row, port)
+            return _enrich_and_finalize(recs, row, port, ip)
 
     # Try YAML KB
     kb_result = kb.get_tools_for_service(service=service, port=port)
     if not kb_result.get("error"):
         recs = _kb_result_to_recommendations(kb_result)
         if recs:
-            _append_vulnx_rec(recs, row)
-            _append_common_web_fallback(recs, port)
-            # Add proactive vulnx recommendations if IP is provided
-            if ip:
-                _append_proactive_vulnx_recs(recs, ip)
-            return _stamp_source_context(recs, row, port)
+            return _enrich_and_finalize(recs, row, port, ip)
 
     # Fallback to old 3-rule logic
     recs: List[Dict] = []
@@ -412,14 +555,8 @@ def generate_recommendations(row: Dict, port: Optional[int] = None, ip: Optional
         recs.append({"scanner": "nmap", "action": None, "script": "ssh2-enum-algos", "template": None})
     else:
         recs.append({"scanner": "nmap", "action": None, "script": "banner", "template": None})
-    _append_vulnx_rec(recs, row)
-    _append_common_web_fallback(recs, port)
 
-    # Add proactive vulnx recommendations if IP is provided
-    if ip:
-        _append_proactive_vulnx_recs(recs, ip)
-
-    return _stamp_source_context(recs, row, port)
+    return _enrich_and_finalize(recs, row, port, ip)
 
 
 def _dispatch_auto_execute(ip: str, service: str, port: int):
@@ -501,13 +638,23 @@ def persist_recommendations(
             rec_extra = dict(extra or {})
             if rec_port is not None:
                 rec_extra.setdefault("port", rec_port)
+            # Carry G1/G2 context through into extra so it survives even
+            # though the unique `fingerprint` excludes priority/extra.
+            if rec.get("tech_context"):
+                rec_extra["tech_context"] = rec["tech_context"]
+            if rec.get("high_value"):
+                rec_extra["high_value"] = rec["high_value"]
+            if rec.get("software_context"):
+                rec_extra.setdefault("software_context", rec["software_context"])
+            # priority: NULL → DB default (50) via COALESCE.  Lower runs first.
+            rec_priority = rec.get("priority")
 
             cur.execute(
                 """
                 INSERT INTO public.scan_recommendations
-                  (asset_id, ip, service, banner, scanner, action, script, template, source, model, extra)
+                  (asset_id, ip, service, banner, scanner, action, script, template, source, model, extra, priority)
                 VALUES
-                  (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                  (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 50))
                 ON CONFLICT (fingerprint) DO NOTHING
                 RETURNING id;
                 """,
@@ -517,6 +664,7 @@ def persist_recommendations(
                     rec.get("script"), rec.get("template"),
                     source, model,
                     Json(rec_extra) if rec_extra else None,
+                    rec_priority,
                 ),
             )
             if cur.rowcount > 0:
@@ -963,6 +1111,13 @@ def get_next_scan_recommendations(
                     logger.warning(f"Persistence skipped/failed: {pe}")
         else:
             seen_keys: set = set()
+            # Keep the RAW rec dicts (not the ScanRecommendation round-trip)
+            # for persistence: the model drops extra keys (priority,
+            # tech_context, high_value), so persisting r.dict() would lose
+            # the G1/G2 enrichment.  raw_recs preserves them.
+            raw_recs: List[Dict] = []
+            tech_matched: List[str] = []
+            high_value_hits: List[Dict] = []
             for row in rows:
                 row_port = port or row.get("port")
                 for rec in generate_recommendations(row, port=row_port, ip=ip):
@@ -975,16 +1130,21 @@ def get_next_scan_recommendations(
                         continue
                     seen_keys.add(key)
                     recommendations.append(ScanRecommendation(**rec))
+                    raw_recs.append(rec)
+                    # Collect G1/G2 signal for the webhooks below.
+                    if rec.get("tech_context", {}).get("matched"):
+                        tech_matched.append(rec["tech_context"]["matched"])
+                    if rec.get("high_value") and rec.get("scanner") == "metasploit":
+                        high_value_hits.append(rec["high_value"])
                 # Track for auto-execute
                 if not effective_service:
                     effective_service = row.get("service")
                 if not effective_port:
                     effective_port = row.get("port")
             if persist and PERSIST_RECS:
-                dict_recs = [r.dict() for r in recommendations]
                 try:
                     inserted = persist_recommendations(
-                        ip=ip, recs=dict_recs, asset_id=None,
+                        ip=ip, recs=raw_recs, asset_id=None,
                         service=service or (rows[0].get("service") if rows else None),
                         banner=banner or (rows[0].get("banner") if rows else None),
                         source="rules", model=None,
@@ -993,6 +1153,18 @@ def get_next_scan_recommendations(
                     logger.info(f"Persisted {inserted} rule-based recommendations for {ip}")
                 except Exception as pe:
                     logger.warning(f"Persistence skipped/failed: {pe}")
+
+            # Webhooks for the new enrichment actions (per CLAUDE.md).
+            if tech_matched:
+                _emit_webhook("scan_recommender_tech_targeted_recs_added", {
+                    "ip": ip, "port": effective_port,
+                    "matched_tech": sorted(set(tech_matched)),
+                })
+            for hv in high_value_hits:
+                _emit_webhook("scan_recommender_high_value_port_detected", {
+                    "ip": ip, "port": hv.get("port"), "service": hv.get("service"),
+                    "vulns": hv.get("vulns", []), "note": hv.get("note"),
+                }, severity="high")
 
         # Auto-execute safe tools via kali-listener
         if AUTO_EXECUTE and effective_port and effective_service:

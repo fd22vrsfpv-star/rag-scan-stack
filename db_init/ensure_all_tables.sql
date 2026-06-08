@@ -2747,6 +2747,26 @@ DROP TRIGGER IF EXISTS trg_followups_engagement ON follow_up_items;
 CREATE TRIGGER trg_followups_engagement
     BEFORE INSERT ON follow_up_items FOR EACH ROW EXECUTE FUNCTION propagate_engagement_to_followups();
 
+-- recon_findings: inherit from asset_id (G3 — discovery findings should
+-- carry their asset's engagement so they're scoped consistently with
+-- web_findings/vulns; subfinder/dnsx also stamp it explicitly when in-scope).
+CREATE OR REPLACE FUNCTION propagate_engagement_to_recon_findings()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.engagement_id IS NULL AND NEW.asset_id IS NOT NULL THEN
+        SELECT engagement_id INTO NEW.engagement_id FROM assets WHERE id = NEW.asset_id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_recon_findings_engagement ON recon_findings;
+CREATE TRIGGER trg_recon_findings_engagement
+    BEFORE INSERT ON recon_findings FOR EACH ROW EXECUTE FUNCTION propagate_engagement_to_recon_findings();
+
+-- G3: hot lookup for the Recon Agent's engagement-scoped asset queries and
+-- the discovery scope-gate stamping path.
+CREATE INDEX IF NOT EXISTS idx_assets_engagement_ip ON public.assets(engagement_id, ip);
+
 -- ============================================================================
 -- ENGAGEMENT-SCOPED SCOPES (scope_targets belongs to an engagement)
 -- ============================================================================
