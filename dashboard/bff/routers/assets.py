@@ -813,11 +813,25 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         result = {"id": rec["id"], "scanner": scanner, "ip": ip}
 
         if not service_url:
-            # Try Kali container for manual/CLI tools
+            # Try Kali container for manual/CLI tools — preflight first.
             if use_kali and scanner not in ("metasploit",):
+                pf = await _preflight_tool("kali", scanner, None)
+                if not pf["ok"]:
+                    result["status"] = "skipped"
+                    result["detail"] = pf["detail"]
+                    await _emit_tool_webhook("tool_unavailable",
+                        {"tool": scanner, "executor": "kali", "ip": ip, "detail": pf["detail"]})
+                    return result
                 return await _dispatch_via_kali(rec, scanner, ip, result)
-            # Try remote node via SSH
+            # Try remote node via SSH — preflight first.
             if node_id and scanner not in ("metasploit",):
+                pf = await _preflight_tool("node", scanner, node_id)
+                if not pf["ok"]:
+                    result["status"] = "skipped"
+                    result["detail"] = pf["detail"]
+                    await _emit_tool_webhook("tool_unavailable",
+                        {"tool": scanner, "executor": f"node:{node_id}", "ip": ip, "detail": pf["detail"]})
+                    return result
                 return await _dispatch_via_node(rec, scanner, ip, node_id, result)
             if scanner in MANUAL_TOOLS:
                 result["status"] = "skipped"
@@ -1128,6 +1142,62 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             result["detail"] = f"Node: {type(e).__name__}"
         return result
 
+    async def _emit_tool_webhook(event_type, data, severity=None):
+        """Fire-and-forget capability webhook (preflight install / unavailable)."""
+        try:
+            payload = {"event_type": event_type, "source": "bff", "data": data}
+            if severity:
+                payload["severity"] = severity
+            async with httpx.AsyncClient(verify=False, timeout=5) as c:
+                await c.post(f"{s.rag_api_url}/webhooks/emit", json=payload,
+                             headers={"x-api-key": s.api_key, **engagement_headers()})
+        except Exception as e:
+            log.debug(f"{event_type} webhook failed: {e}")
+
+    async def _preflight_tool(executor, scanner, nid):
+        """Confirm `scanner` is callable on the chosen executor; auto-install if
+        missing. Returns {"ok": bool, "detail": str}. Best-effort: on probe
+        error we allow the dispatch through (don't block on a flaky check)."""
+        try:
+            if executor == "kali":
+                async with httpx.AsyncClient(verify=False, timeout=10) as c:
+                    chk = await c.get(f"{s.kali_listener_url}/tools/check",
+                                      params={"tools": scanner}, headers=headers)
+                    if chk.status_code == 200 and scanner in (chk.json().get("found") or []):
+                        return {"ok": True, "detail": "present"}
+                # Missing → attempt install
+                async with httpx.AsyncClient(verify=False, timeout=600) as c:
+                    inst = await c.post(f"{s.kali_listener_url}/tools/install",
+                                        json={"tool": scanner}, headers=headers)
+                ok = inst.status_code == 200 and (inst.json() or {}).get("installed")
+                await _emit_tool_webhook("tool_preflight_install",
+                    {"tool": scanner, "executor": "kali", "ok": bool(ok)})
+                return {"ok": bool(ok),
+                        "detail": "installed on kali" if ok else f"'{scanner}' missing on kali; install failed"}
+            else:  # node
+                async with httpx.AsyncClient(verify=False, timeout=30) as c:
+                    chk = await c.post(f"{s.tunnel_manager_url}/ssh/{nid}/exec",
+                                       json={"command": f"which {scanner}", "timeout": 15},
+                                       headers=headers)
+                    if chk.status_code == 200 and chk.json().get("exit_code") == 0:
+                        return {"ok": True, "detail": "present"}
+                    # Missing → install via apt on the node, then recheck.
+                    await c.post(f"{s.tunnel_manager_url}/ssh/{nid}/exec",
+                                 json={"command": f"DEBIAN_FRONTEND=noninteractive apt-get install -y {scanner}",
+                                       "timeout": 300}, headers=headers)
+                    recheck = await c.post(f"{s.tunnel_manager_url}/ssh/{nid}/exec",
+                                           json={"command": f"which {scanner}", "timeout": 15},
+                                           headers=headers)
+                    ok = recheck.status_code == 200 and recheck.json().get("exit_code") == 0
+                await _emit_tool_webhook("tool_preflight_install",
+                    {"tool": scanner, "executor": f"node:{nid}", "ok": bool(ok)})
+                return {"ok": bool(ok),
+                        "detail": f"installed on node {nid}" if ok else f"'{scanner}' missing on node {nid}; install failed"}
+        except Exception as e:
+            # Don't block dispatch on a flaky preflight probe.
+            log.debug(f"preflight {executor}/{scanner} error: {e}")
+            return {"ok": True, "detail": f"preflight skipped ({type(e).__name__})"}
+
     dispatched_results = await asyncio.gather(*[dispatch_rec(r) for r in selected])
     # Combine fresh dispatches with the idempotency-guard skips so the UI
     # sees one consistent list -- "already queued" recs surface as skipped.
@@ -1144,6 +1214,86 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         "failed": failed,
         "skipped": skipped,
         "results": results,
+    }
+
+
+# Tools the recommender routes to dedicated runner services (not Kali/nodes).
+# "Covered" by their own container; listed so the coverage audit can tell
+# native-runner tools apart from generic Kali/node tools.
+_NATIVE_RUNNER_TOOLS = {
+    "nmap", "nuclei", "nikto", "gobuster", "feroxbuster", "dirsearch", "ffuf",
+    "whatweb", "httpx", "sqlmap", "metasploit", "wfuzz", "wappalyzer",
+    "subfinder", "dnsx", "alterx", "hydra", "medusa", "ncrack", "vulnx",
+}
+
+
+@router.get("/api/recommender/tool-coverage")
+async def recommender_tool_coverage(live: bool = Query(False)):
+    """Capability matrix: every tool in the canonical registry × executors
+    {native-runner, kali, each online node} → is it callable?
+
+    Sources: node_manager /tools/registry (universe), kali /tools/check (real
+    `which`), and per-node provision-status (cached unless live=true).  Lets an
+    operator see, before dispatching, which recommended tools can actually run
+    and where the gaps are.
+    """
+    s = get_settings()
+    headers = {"x-api-key": s.api_key, **engagement_headers()}
+    universe, kali_found, nodes_cov = [], set(), {}
+
+    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        # 1. Universe from the canonical registry.
+        try:
+            r = await c.get(f"{s.tunnel_manager_url}/tools/registry", headers=headers)
+            if r.status_code == 200:
+                universe = sorted(set((r.json() or {}).get("names", [])) | _NATIVE_RUNNER_TOOLS)
+        except Exception as e:
+            log.warning(f"tool-coverage: registry fetch failed: {e}")
+            universe = sorted(_NATIVE_RUNNER_TOOLS)
+
+        # 2. Kali real presence.
+        try:
+            kr = await c.get(f"{s.kali_listener_url}/tools/check",
+                             params={"tools": ",".join(universe)}, headers=headers)
+            if kr.status_code == 200:
+                kali_found = set(kr.json().get("found") or [])
+        except Exception as e:
+            log.debug(f"tool-coverage: kali check failed: {e}")
+
+        # 3. Online nodes: cached provisioned tools (or live probe).
+        try:
+            nr = await c.get(f"{s.tunnel_manager_url}/nodes", headers=headers)
+            online = [n for n in (nr.json().get("nodes") or [])
+                      if n.get("status") == "online"] if nr.status_code == 200 else []
+            for node in online:
+                nid = node.get("id")
+                try:
+                    pr = await c.get(f"{s.tunnel_manager_url}/ssh/{nid}/provision-status",
+                                     params={"live": str(live).lower()}, headers=headers,
+                                     timeout=120 if live else 15)
+                    prov = set((pr.json() or {}).get("provisioned_tools") or []) if pr.status_code == 200 else set()
+                except Exception:
+                    prov = set()
+                nodes_cov[nid] = {"name": node.get("name"), "tools": sorted(prov)}
+        except Exception as e:
+            log.debug(f"tool-coverage: nodes fetch failed: {e}")
+
+    matrix = {}
+    for tool in universe:
+        matrix[tool] = {
+            "native_runner": tool in _NATIVE_RUNNER_TOOLS,
+            "kali": tool in kali_found,
+            "nodes": {nid: (tool in cov["tools"]) for nid, cov in nodes_cov.items()},
+        }
+    # A tool is "callable somewhere" if a native runner exists, kali has it, or any node does.
+    uncovered = [t for t, m in matrix.items()
+                 if not (m["native_runner"] or m["kali"] or any(m["nodes"].values()))]
+    return {
+        "ok": True,
+        "universe_count": len(universe),
+        "nodes": {nid: cov["name"] for nid, cov in nodes_cov.items()},
+        "uncovered": uncovered,
+        "matrix": matrix,
     }
 
 

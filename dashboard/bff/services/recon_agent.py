@@ -222,8 +222,31 @@ class ReconAgent:
                 log.warning("[recon:%s] tunnel fetch failed: %s", eid[:8], e)
         self._tunnel_idx = 0
 
-        log.info("[recon:%s] starting cycle (profile=%s, interval=%ds, tunnels=%d, proxy=%s)",
-                 eid[:8], profile, interval, len(tunnel_proxies), proxy_single or "none")
+        # Resolve where generic (non-native-runner) tools should execute.
+        # OPSEC: all OFF by default — opt-in per engagement.  use_kali runs them
+        # in the internal Kali container; use_nodes_for_tools round-robins them
+        # across online tunneled nodes (or tool_node_id pins one).  The dispatch
+        # endpoint preflights + auto-installs the tool on the chosen executor.
+        use_kali = bool(config.get("use_kali", False))
+        use_nodes_for_tools = bool(config.get("use_nodes_for_tools", False))
+        explicit_tool_node = config.get("tool_node_id")
+        exclude_tool_nodes = set(config.get("exclude_tool_nodes") or [])
+        tool_node_ids: list[str] = []
+        if use_nodes_for_tools and not explicit_tool_node:
+            try:
+                async with httpx.AsyncClient(verify=False, timeout=5) as c:
+                    nr = await c.get(f"{s.tunnel_manager_url}/nodes", headers=headers)
+                    if nr.status_code == 200:
+                        for node in (nr.json().get("nodes") or []):
+                            if node.get("status") == "online" and node.get("id") not in exclude_tool_nodes:
+                                tool_node_ids.append(node["id"])
+            except Exception as e:
+                log.warning("[recon:%s] tool-node fetch failed: %s", eid[:8], e)
+        self._tool_node_idx = 0
+
+        log.info("[recon:%s] starting cycle (profile=%s, interval=%ds, tunnels=%d, proxy=%s, use_kali=%s, tool_nodes=%d)",
+                 eid[:8], profile, interval, len(tunnel_proxies), proxy_single or "none",
+                 use_kali, len(tool_node_ids))
 
         # 0. Update stale "running" coverage entries — check if their jobs actually finished
         from polling import active_jobs
@@ -655,10 +678,21 @@ class ReconAgent:
                     elif proxy_single:
                         kb_proxy = proxy_single
 
+                    # Pick a tool-dispatch target for generic (non-native)
+                    # tools: explicit node, else round-robin over online nodes.
+                    kb_node_id = explicit_tool_node
+                    if not kb_node_id and tool_node_ids:
+                        kb_node_id = tool_node_ids[self._tool_node_idx % len(tool_node_ids)]
+                        self._tool_node_idx += 1
+
                     bff_port = os.environ.get("BFF_PORT", "443")
                     payload = {"ids": [r["id"] for r in recs_to_dispatch]}
                     if kb_proxy:
                         payload["proxy"] = kb_proxy
+                    if use_kali:
+                        payload["use_kali"] = True
+                    if kb_node_id:
+                        payload["node_id"] = kb_node_id
 
                     try:
                         # Self-call into the BFF dispatch endpoint — same
@@ -703,6 +737,8 @@ class ReconAgent:
                                             "scanner": r.get("scanner"),
                                             "job_id": r.get("job_id"),
                                             "proxy": kb_proxy,
+                                            "use_kali": use_kali,
+                                            "node_id": kb_node_id,
                                             "source": "kb_recon",
                                         },
                                     )
