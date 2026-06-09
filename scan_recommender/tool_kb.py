@@ -678,6 +678,44 @@ class ToolKnowledgeBase:
 
         return result
 
+    def get_tech_signatures(self) -> Dict[str, Any]:
+        """Return the `tech_signatures` map from the KB (G1).
+
+        Maps a detected web technology (CMS/framework) to the nuclei tags
+        worth running against it.  Empty dict if the KB has no such section.
+        """
+        return self._data.get("tech_signatures", {}) or {}
+
+    def match_tech_to_tags(self, tech_tokens: List[str]) -> List[Dict[str, Any]]:
+        """Match detected tech tokens to tech_signatures entries (G1).
+
+        Each token (e.g. "WordPress 5.9", "Apache/2.4.41") is compared
+        case-insensitively against every signature's `match:` substrings.
+        Returns a deduped list of {name, nuclei_tags, note} for each
+        signature that matched at least one token.
+
+        Args:
+            tech_tokens: detected technology strings from httpx/whatweb
+                         (recon_findings.data->'tech' + ->>'webserver').
+        """
+        if not tech_tokens:
+            return []
+        haystack = [t.lower() for t in tech_tokens if t]
+        matched: List[Dict[str, Any]] = []
+        seen = set()
+        for name, sig in self.get_tech_signatures().items():
+            if name in seen:
+                continue
+            patterns = [p.lower() for p in (sig.get("match") or [])]
+            if any(p in tok for p in patterns for tok in haystack):
+                matched.append({
+                    "name": name,
+                    "nuclei_tags": sig.get("nuclei_tags", []),
+                    "note": sig.get("note", ""),
+                })
+                seen.add(name)
+        return matched
+
     def _format_commands(
         self,
         tools: List[Dict[str, Any]],
