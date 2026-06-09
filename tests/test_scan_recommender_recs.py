@@ -26,6 +26,9 @@ from tool_kb import ToolKnowledgeBase, get_high_value_port_info  # noqa: E402
 _spec = importlib.util.spec_from_file_location("sr_module", SR_DIR / "scan_recommender.py")
 sr = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sr)
+# kali_listener/ and scan_recommender/ both ship a `log_manager` module; drop the
+# cached one so a sibling test re-imports its own copy cleanly (test isolation).
+sys.modules.pop("log_manager", None)
 
 
 def _kb_with(sigs):

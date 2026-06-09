@@ -4,6 +4,7 @@ Handles nc/socat listeners and captures callback connections.
 """
 
 import os
+import re
 import uuid
 import signal
 import subprocess
@@ -88,6 +89,12 @@ class ToolExecuteRequest(BaseModel):
     timeout: int = Field(default=300, ge=30, le=3600, description="Execution timeout in seconds")
     scan_id: Optional[str] = Field(None, description="Associated scan ID for result linking")
     service: Optional[str] = Field(None, description="Service being tested")
+
+
+class ToolInstallRequest(BaseModel):
+    """Request to install a single tool in the Kali container."""
+    tool: str = Field(..., description="Tool name to install")
+    timeout: int = Field(default=300, ge=30, le=1800, description="Install timeout (s)")
 
 
 class ToolExecutionResponse(BaseModel):
@@ -866,13 +873,69 @@ def parse_tool_output(tool: str, output: str) -> Optional[Dict[str, Any]]:
 # Track active tool executions
 active_executions: Dict[str, Dict[str, Any]] = {}
 
-# Allowed tools for security
-ALLOWED_TOOLS = {
+# Allowed tools for security.
+#
+# The canonical tool set is the node_manager registry (/tools/registry, derived
+# from _PROVISION_TOOLS) so the recommender, node provisioning, and this gate
+# all reconcile against ONE list and can't drift.  We fetch it lazily and cache,
+# unioning with the fallback below, then subtract _MSF_DENY: per policy the
+# allowlist is "full known tool universe MINUS Metasploit" — MSF modules stay
+# manual (run via the Exploit Manager, never auto-dispatched here).
+NODE_MANAGER_URL = os.environ.get("NODE_MANAGER_URL", "https://node-manager:8027")
+
+# Fallback if the registry is unreachable — the original hardcoded set.
+_FALLBACK_ALLOWED_TOOLS = {
     "nmap", "hydra", "medusa", "nikto", "whatweb", "enum4linux",
     "smbclient", "smbmap", "ssh-audit", "netexec", "crackmapexec", "nbtscan",
     "snmpwalk", "onesixtyone", "ldapsearch", "dig", "host", "nslookup",
     "redis-cli", "psql", "mysql", "rpcclient", "showmount"
 }
+# Metasploit is never auto-dispatchable here.
+_MSF_DENY = {"metasploit", "msfconsole", "msfvenom", "msf"}
+
+# Lazily-populated cache of {tool_name: install_cmd}.  None until first fetch.
+_TOOL_REGISTRY: Optional[Dict[str, Optional[str]]] = None
+
+
+def _fetch_tool_registry() -> Dict[str, Optional[str]]:
+    """Fetch+cache the canonical tool registry from node_manager.
+
+    Returns {tool_name: kali_install_cmd}.  On any failure, returns the
+    fallback set (no install commands) so the gate still works offline.
+    """
+    global _TOOL_REGISTRY
+    if _TOOL_REGISTRY is not None:
+        return _TOOL_REGISTRY
+    try:
+        import requests as _req
+        r = _req.get(f"{NODE_MANAGER_URL}/tools/registry",
+                     headers={"x-api-key": API_KEY}, timeout=5, verify=False)
+        if r.status_code == 200:
+            tools = (r.json() or {}).get("tools", {})
+            reg = {name.lower(): spec.get("install") for name, spec in tools.items()}
+            # Union with fallback so we never regress below the known-good set.
+            for t in _FALLBACK_ALLOWED_TOOLS:
+                reg.setdefault(t, None)
+            # Drop MSF.
+            for d in _MSF_DENY:
+                reg.pop(d, None)
+            _TOOL_REGISTRY = reg
+            logger.info("Tool registry loaded: %d tools allowed", len(reg))
+            return _TOOL_REGISTRY
+    except Exception as e:
+        logger.warning("Tool registry fetch failed (%s); using fallback set", e)
+    _TOOL_REGISTRY = {t: None for t in _FALLBACK_ALLOWED_TOOLS}
+    return _TOOL_REGISTRY
+
+
+def get_allowed_tools() -> set:
+    """The current allowed-tool set (registry-derived, minus MSF)."""
+    return set(_fetch_tool_registry().keys())
+
+
+# Compatibility alias: some code/readers reference ALLOWED_TOOLS as a set.
+# It now reflects the fallback at import; runtime checks call get_allowed_tools().
+ALLOWED_TOOLS = _FALLBACK_ALLOWED_TOOLS
 
 
 async def execute_tool(exec_id: str, tool: str, command: str, timeout: int):
@@ -1256,12 +1319,17 @@ async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: B
     The tool must be in the allowed list for security reasons.
     Results are parsed automatically for common tools (nmap, hydra, nikto, etc.)
     """
-    # Validate tool is allowed
+    # Validate tool token shape (no shell metacharacters in the tool name).
     tool_lower = request.tool.lower()
-    if tool_lower not in ALLOWED_TOOLS:
+    if not re.match(r'^[a-zA-Z0-9_.-]+$', tool_lower):
+        raise HTTPException(status_code=400,
+                            detail=f"Invalid tool name: '{request.tool}'")
+    # Validate tool is allowed (registry-derived, minus Metasploit).
+    allowed = get_allowed_tools()
+    if tool_lower not in allowed:
         raise HTTPException(
             status_code=400,
-            detail=f"Tool '{request.tool}' is not in allowed list. Allowed: {', '.join(sorted(ALLOWED_TOOLS))}"
+            detail=f"Tool '{request.tool}' is not in allowed list ({len(allowed)} allowed; Metasploit excluded — use the Exploit Manager)."
         )
 
     # Basic command validation - prevent obvious shell injection
@@ -1409,11 +1477,70 @@ async def get_tool_execution(exec_id: str):
 
 @app.get("/tools/allowed")
 async def list_allowed_tools():
-    """List all allowed tools that can be executed."""
+    """List all allowed tools that can be executed (registry-derived, minus MSF)."""
+    allowed = get_allowed_tools()
     return {
-        "tools": sorted(ALLOWED_TOOLS),
-        "total": len(ALLOWED_TOOLS)
+        "tools": sorted(allowed),
+        "total": len(allowed),
     }
+
+
+@app.get("/tools/check")
+async def check_tools(tools: str):
+    """Report which of the given comma-separated tools are actually present
+    (via `which`) in this Kali container — real binary presence, not just
+    allowlist membership.  Used by the recommender coverage audit + pre-dispatch
+    preflight."""
+    names = [t.strip().lower() for t in (tools or "").split(",") if t.strip()]
+    found, missing = [], []
+    for t in names:
+        if not re.match(r'^[a-zA-Z0-9_.-]+$', t):
+            missing.append(t)
+            continue
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "which", t,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            await proc.communicate()
+            (found if proc.returncode == 0 else missing).append(t)
+        except Exception:
+            missing.append(t)
+    return {"ok": True, "found": found, "missing": missing, "total": len(names)}
+
+
+@app.post("/tools/install")
+async def install_tool(request: ToolInstallRequest):
+    """Install a single tool in this Kali container.  Uses the registry's
+    install command when available, else falls back to apt.  Tool must be in
+    the allowed set (registry-derived, minus MSF)."""
+    tool = (request.tool or "").lower()
+    if not re.match(r'^[a-zA-Z0-9_.-]+$', tool):
+        raise HTTPException(status_code=400, detail=f"Invalid tool name: '{request.tool}'")
+    if tool not in get_allowed_tools():
+        raise HTTPException(status_code=400, detail=f"Tool '{tool}' not allowed")
+    install_cmd = _fetch_tool_registry().get(tool) or (
+        f"DEBIAN_FRONTEND=noninteractive apt-get install -y {tool}")
+    # Refresh apt lists first — Kali containers often have stale/empty lists,
+    # which yields "Unable to locate package" even for valid apt tools.  The
+    # `|| true` keeps a flaky mirror from aborting the install attempt.
+    if "apt-get install" in install_cmd:
+        install_cmd = f"apt-get update -qq || true; {install_cmd}"
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            install_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=request.timeout)
+        ok = proc.returncode == 0
+        # Confirm with which
+        chk = await asyncio.create_subprocess_exec(
+            "which", tool, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        await chk.communicate()
+        present = chk.returncode == 0
+        return {"ok": ok and present, "tool": tool, "installed": present,
+                "detail": (err or out).decode("utf-8", "replace")[-400:] if not present else "installed"}
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"install of '{tool}' timed out")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"install failed: {e}")
 
 
 @app.post("/tools/execute-recommended")
