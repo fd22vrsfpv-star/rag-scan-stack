@@ -145,6 +145,36 @@ else
   warn "assets.provider check skipped (no DB connection helper available)"
 fi
 
+# scan_recommendations.priority — written by the recommender (G1/G2 ranking)
+HAS_PRIO=$(_run_sql "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='scan_recommendations' AND column_name='priority')")
+if [[ "$HAS_PRIO" == "t" ]]; then
+  pass "scan_recommendations.priority column present"
+elif [[ "$HAS_PRIO" == "f" ]]; then
+  fail "scan_recommendations.priority missing — run ./scripts/ensure_db_schema.sh"
+else
+  warn "scan_recommendations.priority check skipped (no DB connection helper available)"
+fi
+
+# idx_assets_engagement_ip — G3 discovery scan-loop hot lookup
+HAS_ENG_IDX=$(_run_sql "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename='assets' AND indexname='idx_assets_engagement_ip')")
+if [[ "$HAS_ENG_IDX" == "t" ]]; then
+  pass "assets: idx_assets_engagement_ip present"
+elif [[ "$HAS_ENG_IDX" == "f" ]]; then
+  fail "assets: idx_assets_engagement_ip missing — run ./scripts/ensure_db_schema.sh"
+else
+  warn "idx_assets_engagement_ip check skipped (no DB connection helper available)"
+fi
+
+# recon_findings engagement-propagation trigger (G3)
+HAS_RF_TRG=$(_run_sql "SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_recon_findings_engagement')")
+if [[ "$HAS_RF_TRG" == "t" ]]; then
+  pass "recon_findings: trg_recon_findings_engagement present"
+elif [[ "$HAS_RF_TRG" == "f" ]]; then
+  fail "recon_findings: trg_recon_findings_engagement missing — run ./scripts/ensure_db_schema.sh"
+else
+  warn "trg_recon_findings_engagement check skipped (no DB connection helper available)"
+fi
+
 # ── 2. Go Tool Binaries ──
 echo ""
 echo "=== Go Tool Binaries ==="
