@@ -3673,8 +3673,22 @@ async def provision_node(node_id: str, req: ProvisionRequest):
     return StreamingResponse(_stream(), media_type="text/event-stream")
 
 
+# Entries that _PROVISION_TOOLS installs for the runtime/provisioning flow but
+# that are NOT dispatchable scan tools — language runtimes, Python libraries,
+# wordlist collections, and infrastructure.  They stay in _PROVISION_TOOLS (a
+# node still needs them installed) but are excluded from the dispatchable
+# registry so they don't pollute the kali-listener allowlist or the recommender
+# tool-coverage matrix as if an operator could "run" them against a target.
+_NON_DISPATCHABLE_TOOLS = {
+    "python3", "dnspython", "pillow", "pdfplumber",  # runtime + python libs
+    "seclists", "rockyou",                            # wordlists
+    "wireguard", "mcp-kali-server",                   # infrastructure
+    "chromium",                                       # headless-browser dep (used by gowitness)
+}
+
+
 @app.get("/tools/registry")
-async def tools_registry():
+async def tools_registry(include_all: bool = Query(False)):
     """Canonical tool registry — the single source of truth for which tools the
     system knows how to detect/install, and how to check each.
 
@@ -3682,14 +3696,21 @@ async def tools_registry():
     allowlist, the recommender tool-coverage audit, pre-dispatch preflight)
     all reconcile against one list and can't drift.  Only the safe-to-share
     `check`/`verify` probes are exposed (install commands stay internal).
+
+    Non-dispatchable provisioning entries (runtimes, libraries, wordlists,
+    infra) are filtered out by default so the dispatchable allowlist/coverage
+    only contains real, callable tools.  Pass include_all=true to see the full
+    provisioning set (e.g. for node provision-status).
     """
     tools = {
         name: {"check": spec.get("check"), "verify": spec.get("verify"),
                "install": spec.get("kali")}
         for name, spec in _PROVISION_TOOLS.items()
+        if include_all or name not in _NON_DISPATCHABLE_TOOLS
     }
     return {"ok": True, "count": len(tools), "tools": tools,
-            "names": sorted(tools.keys())}
+            "names": sorted(tools.keys()),
+            "excluded": sorted(_NON_DISPATCHABLE_TOOLS) if not include_all else []}
 
 
 @app.get("/ssh/{node_id}/provision-status")
