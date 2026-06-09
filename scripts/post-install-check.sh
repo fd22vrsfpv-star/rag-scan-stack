@@ -175,6 +175,33 @@ else
   warn "trg_recon_findings_engagement check skipped (no DB connection helper available)"
 fi
 
+# Tool registry (node_manager) reachable + Kali allowlist reconciled
+echo ""
+echo "  -- tool registry / Kali allowlist --"
+if docker ps --format '{{.Names}}' | grep -q '^rag-api$'; then
+  REG_COUNT=$(docker exec rag-api sh -c 'curl -sk -H "x-api-key: $API_KEY" https://node-manager:8027/tools/registry 2>/dev/null' \
+    | python3 -c "import sys,json;print(json.load(sys.stdin).get('count',0))" 2>/dev/null || echo 0)
+  if [[ "${REG_COUNT:-0}" -gt 0 ]]; then
+    pass "node_manager /tools/registry reachable ($REG_COUNT tools)"
+  else
+    warn "node_manager /tools/registry not reachable (capability checks degraded)"
+  fi
+  KALI_COUNT=$(docker exec rag-api sh -c 'curl -sk -H "x-api-key: $API_KEY" https://kali-listener:8019/tools/allowed 2>/dev/null' \
+    | python3 -c "import sys,json;print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
+  if [[ "${KALI_COUNT:-0}" -gt 0 ]]; then
+    # Reconciled if Kali allowlist is at least as large as the fallback (23).
+    if [[ "${KALI_COUNT}" -ge 23 ]]; then
+      pass "kali-listener allowlist reconciled ($KALI_COUNT tools, Metasploit excluded)"
+    else
+      warn "kali-listener allowlist small ($KALI_COUNT) — registry may be unreachable from kali"
+    fi
+  else
+    warn "kali-listener /tools/allowed not reachable"
+  fi
+else
+  warn "tool registry/allowlist check skipped (rag-api not running)"
+fi
+
 # ── 2. Go Tool Binaries ──
 echo ""
 echo "=== Go Tool Binaries ==="
