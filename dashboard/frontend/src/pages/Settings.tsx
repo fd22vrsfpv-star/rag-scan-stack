@@ -15,7 +15,7 @@ import { useUIStore, ALPHA_FEATURES } from '@/stores/ui'
 import { apiFetch } from '@/api/client'
 import { cn } from '@/lib/utils'
 import { BUILD_VERSION, SCAN_CATEGORIES, SCAN_FIELDS, TARGET_FIELD_KEYS, TOOL_CLI_OPTIONS } from '@/lib/constants'
-import { Trash2, Download, X, Search, RefreshCw, Eye, EyeOff, Plus, Upload, Loader2, CheckCircle2, XCircle, Database, Wifi, Server, ArrowRightLeft, BarChart3, RotateCcw, ChevronDown, ChevronRight, Zap, Power, PowerOff, Shield } from 'lucide-react'
+import { Trash2, Download, X, Search, RefreshCw, Eye, EyeOff, Plus, Upload, Loader2, CheckCircle2, XCircle, Database, Wifi, Server, ArrowRightLeft, BarChart3, RotateCcw, ChevronDown, ChevronRight, Zap, Power, PowerOff, Shield, Info } from 'lucide-react'
 
 type SettingsTab = 'general' | 'scope' | 'zap-addons' | 'api-keys' | 'database' | 'tool-options' | 'mcp-servers' | 'vendor-pages' | 'scan-timeouts' | 'llm-tuning' | 'exploit-watcher'
 
@@ -1607,6 +1607,40 @@ function DatabaseTab() {
           >
             <RefreshCw className="w-3.5 h-3.5" />
           </button>
+        </div>
+
+        {/* Instructions — how mode switching actually works + the common error */}
+        <div className="mt-4 border border-blue-500/30 bg-blue-500/5 rounded-lg p-3">
+          <div className="flex items-center gap-2 mb-2">
+            <Info className="w-4 h-4 text-blue-400" />
+            <span className="text-xs font-semibold text-blue-400">How database mode switching works</span>
+          </div>
+          <ul className="text-[11px] text-muted-foreground space-y-1.5 list-disc pl-4">
+            <li><strong className="text-foreground">Required: <span className="font-mono">db-config.json</span> must exist as a regular file</strong> on the host before the stack starts (seeded with <span className="font-mono">{`{"mode":"local"}`}</span>). It is bind-mounted into <span className="font-mono">container-logs</span> and <span className="font-mono">pentest-dashboard</span> and holds the persisted mode + remote settings. <span className="font-mono">scripts/setup.sh</span> seeds it automatically; <span className="font-mono">scripts/post-install-check.sh</span> verifies it.</li>
+            <li><strong className="text-foreground">Save before switching.</strong> Enter the remote host, SSH user and key (or SSL settings) below and click <strong>Save</strong> first. The switch buttons read the <em>persisted</em> <span className="font-mono">db-config.json</span>, not the unsaved form.</li>
+            <li><strong className="text-foreground">Remote Tunnel</strong> routes through an SSH tunnel (requires an SSH key). <strong className="text-foreground">Remote Direct</strong> connects via SSL (requires port 5432 open + SSL enabled on the server). Use <strong>Test SSH Tunnel</strong> to pre-flight before switching.</li>
+            <li>Switching force-recreates DB-consumer containers so connection pools reconnect cleanly — this page may briefly reload while <span className="font-mono">pentest-dashboard</span> restarts.</li>
+            <li><strong className="text-foreground">Seeing "remote_db_host not configured"?</strong> Either you switched before saving the host, or the host <span className="font-mono">db-config.json</span> became a <strong>directory</strong> (Docker auto-creates one when the file is missing at startup). Fix on the host: <span className="font-mono">{`rmdir db-config.json && echo '{"mode":"local"}' > db-config.json`}</span>, then recreate <span className="font-mono">container-logs</span> + <span className="font-mono">pentest-dashboard</span>.</li>
+          </ul>
+
+          {/* Full example — every variable and whether it is required */}
+          <div className="mt-3">
+            <div className="text-[11px] font-semibold text-foreground mb-1">Example <span className="font-mono">db-config.json</span> (remote tunnel) — all variables:</div>
+            <pre className="text-[10.5px] leading-relaxed font-mono bg-background/60 border border-border rounded p-2.5 overflow-x-auto whitespace-pre">{`{
+  "mode": "remote",                     // required: "local" | "remote" (SSH tunnel) | "remote_direct" (SSL)
+  "remote_db_host": "10.0.0.5",         // required for remote/remote_direct — hostname or IP
+  "remote_db_port": 5432,               // required — Postgres port (default 5432)
+  "remote_db_user": "app",              // required — Postgres user (default "app")
+  "remote_db_password": "••••••••",     // required unless the server uses key/peer auth
+  "remote_db_ssh_user": "azureuser",    // required for "remote" (tunnel) — SSH login user
+  "remote_db_ssh_key": "remote_db.pem"  // required for "remote" (tunnel) — key file under ssh-keys/
+}`}</pre>
+            <div className="text-[10.5px] text-muted-foreground mt-1.5 space-y-1">
+              <div><strong className="text-foreground">local</strong> — only <span className="font-mono">mode</span> is needed; all remote_* fields are ignored.</div>
+              <div><strong className="text-foreground">remote</strong> (SSH tunnel) — requires <span className="font-mono">remote_db_host</span>, <span className="font-mono">remote_db_ssh_user</span>, <span className="font-mono">remote_db_ssh_key</span> (place the key in <span className="font-mono">ssh-keys/</span>), plus <span className="font-mono">remote_db_user</span>/<span className="font-mono">remote_db_password</span>.</div>
+              <div><strong className="text-foreground">remote_direct</strong> (SSL) — requires <span className="font-mono">remote_db_host</span>, <span className="font-mono">remote_db_port</span>, <span className="font-mono">remote_db_user</span>, <span className="font-mono">remote_db_password</span> (no SSH key); the server must have port 5432 open + SSL enabled.</div>
+            </div>
+          </div>
         </div>
 
         {switching && (
