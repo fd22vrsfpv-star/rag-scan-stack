@@ -1035,8 +1035,17 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                     data = r.json()
                     result["status"] = "dispatched"
                     result["detail"] = f"Kali: {command[:50]}"
-                    result["exec_id"] = data.get("execution_id", data.get("id", ""))
+                    exec_id = data.get("execution_id", data.get("id", ""))
+                    result["exec_id"] = exec_id
                     result["via"] = "kali"
+                    # Mark the rec dispatched so the idempotency guard stops it
+                    # re-firing every agent cycle (kali exec is fire-and-forget,
+                    # so without this the autonomous loop re-dispatches forever).
+                    await _mark_rec_dispatched(
+                        rec_id=rec["id"], job_id=exec_id or f"kali:{ip}",
+                        ip=ip, port=rec.get("port"), service=rec.get("service"),
+                        scanner=scanner, node_id=None,
+                    )
                 else:
                     result["status"] = "failed"
                     result["detail"] = f"Kali HTTP {r.status_code}: {r.text[:80]}"
@@ -1134,6 +1143,13 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                     result["detail"] = f"Node {nid}: exit={exit_code}"
                     result["output"] = (data.get("stdout", "") or "")[:200]
                     result["via"] = f"node:{nid}"
+                    # Mark dispatched so the agent doesn't re-fire it each cycle.
+                    if exit_code == 0:
+                        await _mark_rec_dispatched(
+                            rec_id=rec["id"], job_id=f"node:{nid}",
+                            ip=ip, port=rec.get("port"), service=rec.get("service"),
+                            scanner=scanner, node_id=nid,
+                        )
                 else:
                     result["status"] = "failed"
                     result["detail"] = f"Node SSH HTTP {r.status_code}"
