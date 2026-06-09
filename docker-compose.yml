@@ -686,6 +686,10 @@ services:
       OPENAI_API_BASE: ${OPENAI_API_BASE:-https://api.openai.com}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}
+      # Lets the recommender emit webhook events (tech-targeted recs,
+      # high-value-port detected) to rag-api's authenticated /webhooks/emit.
+      API_BASE: https://rag-api:8000
+      API_KEY: ${API_KEY:-changeme}
     depends_on:
       ollama:
         condition: service_healthy

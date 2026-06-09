@@ -1978,11 +1978,15 @@ def dedupe_masscan(file: UploadFile = File(...), authorized: bool = Depends(auth
         os.remove(path)
 
 @app.post("/ingest/subfinder")
-def ingest_subfinder(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
+def ingest_subfinder(file: UploadFile = File(...), job_id: str = None,
+                     engagement_id: Optional[str] = None, authorized: bool = Depends(auth)):
     path = _save_upload_to_tmp(file)
     try:
         from etl.parse_subfinder import parse_subfinder
-        stats = parse_subfinder(path, profile="api-upload", job_id=job_id)
+        # Resolve engagement from the explicit param or the X-Engagement-Id
+        # header so in-scope discoveries can enter the engagement scan loop.
+        eid = _resolve_engagement_id(engagement_id)
+        stats = parse_subfinder(path, profile="api-upload", job_id=job_id, engagement_id=eid)
         return {"ok": True, "stats": stats}
     finally:
         os.remove(path)
@@ -2048,11 +2052,15 @@ def ingest_brutus(file: UploadFile = File(...), job_id: str = None, secret_type:
         os.remove(path)
 
 @app.post("/ingest/dnsx")
-def ingest_dnsx(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
+def ingest_dnsx(file: UploadFile = File(...), job_id: str = None,
+                engagement_id: Optional[str] = None, authorized: bool = Depends(auth)):
     path = _save_upload_to_tmp(file)
     try:
         from etl.parse_dnsx import parse_dnsx
-        stats = parse_dnsx(path, profile="api-upload", job_id=job_id)
+        # Resolve engagement (explicit param or X-Engagement-Id header) so
+        # in-scope resolved hosts can enter the engagement scan loop.
+        eid = _resolve_engagement_id(engagement_id)
+        stats = parse_dnsx(path, profile="api-upload", job_id=job_id, engagement_id=eid)
         return {"ok": True, "stats": stats}
     finally:
         os.remove(path)
