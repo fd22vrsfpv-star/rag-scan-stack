@@ -57,6 +57,27 @@ into both `container-logs` (`/project/db-config.json`) and `pentest-dashboard`
 - The operator must **Save** remote settings (host/user/key) before switching to a
   remote mode — the switch endpoint reads only the persisted file, not the form.
 
+Complete `db-config.json` variable reference (keep the Settings → Database UI help
+box in `dashboard/frontend/src/pages/Settings.tsx` in sync with this table):
+
+| Variable | Type | Required when | Default | Description |
+|----------|------|---------------|---------|-------------|
+| `mode` | string | always | `"local"` | `"local"` \| `"remote"` (SSH tunnel) \| `"remote_direct"` (SSL) |
+| `remote_db_host` | string | remote, remote_direct | `""` | VPS public IP / hostname of the remote Postgres |
+| `remote_db_port` | number | remote, remote_direct | `5432` | Postgres TCP port |
+| `remote_db_user` | string | remote, remote_direct | `"app"` | Postgres role |
+| `remote_db_password` | string | remote, remote_direct (unless key/peer auth) | `""` | Postgres password |
+| `remote_db_ssh_user` | string | remote (tunnel) only | `"azureuser"` | SSH login user for the tunnel |
+| `remote_db_ssh_key` | string | remote (tunnel) only | `"remote_db.pem"` | Private-key filename in `ssh-keys/` |
+| `enabled` | boolean | auto-managed | `false` | Legacy nested-shape flag; true when `mode != local`. Do not hand-edit. |
+| `metadata` | object | auto-managed | `{}` | `last_modified`, `last_modified_by`, `note`; written on Save/Toggle. |
+
+Per-mode required set: **local** → only `mode`. **remote** (tunnel) → `remote_db_host`,
+`remote_db_ssh_user`, `remote_db_ssh_key`, `remote_db_user`, `remote_db_password`.
+**remote_direct** (SSL) → `remote_db_host`, `remote_db_port`, `remote_db_user`,
+`remote_db_password` (no SSH key; server needs 5432 open + SSL). The database name is
+fixed to `scans` (node_manager `remote_db_name` default) and is not set here.
+
 ### Dedup + Delta
 Implement:
 - Finding fingerprinting (stable hash) to deduplicate across tools/runs
