@@ -30,6 +30,22 @@ def _db_config_path_problem() -> str:
     return ""
 
 
+async def _trigger_dsn_sync() -> dict:
+    """Ask container-logs to rebuild DB_DSN from the just-saved config.
+
+    Services authenticate via ${DB_DSN}; saving the config only rewrites
+    db-config.json, so without this the new password/user never reaches the
+    running stack. Best-effort — never fails the save.
+    """
+    try:
+        s = get_settings()
+        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+            r = await c.post(f"{s.container_logs_url}/db/sync-dsn")
+            return r.json() if r.status_code < 400 else {"ok": False, "status": r.status_code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 class ApiKeyBody(BaseModel):
     value: str = Field(..., min_length=1)
 
@@ -298,7 +314,11 @@ async def save_db_config(body: DbConfigBody):
         with open(config_file_path, 'w') as f:
             json.dump(updated_config, f, indent=2)
 
-        return {"ok": True, "message": "Database configuration saved successfully"}
+        # Propagate credential changes into DB_DSN so running services pick them up.
+        dsn_sync = await _trigger_dsn_sync()
+
+        return {"ok": True, "message": "Database configuration saved successfully",
+                "dsn_sync": dsn_sync}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -390,6 +410,9 @@ async def toggle_remote_db(body: RemoteDbToggleBody):
             logger = logging.getLogger("database_config")
             logger.warning(f"Failed to emit database change webhook: {e}")
 
+        # Propagate credential/mode change into DB_DSN for the running services.
+        dsn_sync = await _trigger_dsn_sync()
+
         return {
             "ok": True,
             "enabled": body.enabled,
@@ -397,6 +420,7 @@ async def toggle_remote_db(body: RemoteDbToggleBody):
             "previous_mode": previous_mode,
             "webhook_sent": webhook_success,
             "config_updated": True,
+            "dsn_sync": dsn_sync,
             "message": f"Remote database {'enabled' if body.enabled else 'disabled'} successfully",
             "audit_trail": f"Database mode change completed: {previous_mode} -> {'remote' if body.enabled else 'local'}"
         }
