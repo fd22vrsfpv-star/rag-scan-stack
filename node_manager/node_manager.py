@@ -3673,6 +3673,25 @@ async def provision_node(node_id: str, req: ProvisionRequest):
     return StreamingResponse(_stream(), media_type="text/event-stream")
 
 
+@app.get("/tools/registry")
+async def tools_registry():
+    """Canonical tool registry — the single source of truth for which tools the
+    system knows how to detect/install, and how to check each.
+
+    Derived from _PROVISION_TOOLS so downstream consumers (kali-listener
+    allowlist, the recommender tool-coverage audit, pre-dispatch preflight)
+    all reconcile against one list and can't drift.  Only the safe-to-share
+    `check`/`verify` probes are exposed (install commands stay internal).
+    """
+    tools = {
+        name: {"check": spec.get("check"), "verify": spec.get("verify"),
+               "install": spec.get("kali")}
+        for name, spec in _PROVISION_TOOLS.items()
+    }
+    return {"ok": True, "count": len(tools), "tools": tools,
+            "names": sorted(tools.keys())}
+
+
 @app.get("/ssh/{node_id}/provision-status")
 async def provision_status(node_id: str, live: bool = Query(False)):
     """Check which tools are installed on a remote SSH node.
