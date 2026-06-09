@@ -37,6 +37,26 @@ Design a normalized schema that supports:
 Use a database ( Postgres with RAG).
 Include migrations.
 
+#### Settings → Database mode changes (local / remote tunnel / remote direct)
+The DB mode is persisted in `db-config.json`, which docker-compose bind-mounts
+into both `container-logs` (`/project/db-config.json`) and `pentest-dashboard`
+(`/app/db-config.json`). When changing anything in this flow:
+- `db-config.json` MUST exist as a **file** before `docker compose up`. If it is
+  missing, Docker silently creates it as a **directory**, after which every read
+  returns empty defaults and every write raises `IsADirectoryError` — surfacing
+  to the operator as the misleading error **"remote_db_host not configured"** when
+  switching modes. Remediation: `rmdir db-config.json && echo '{"mode":"local"}' >
+  db-config.json`, then recreate `container-logs` + `pentest-dashboard`.
+- `scripts/setup.sh` seeds it as a file (and replaces a stray empty directory);
+  `scripts/post-install-check.sh` asserts it is a file. Keep both in sync with any
+  change to the mount path or default contents.
+- Config is read/written in two places that must stay shape-compatible: the BFF
+  `dashboard/bff/routers/settings.py` (save/toggle/get) and `container_logs.py`
+  (`_read_db_config`/`_write_db_config`/`_ensure_remote_*`). The on-disk shape may
+  be flat or nested `{enabled, mode, config, metadata}`; readers must tolerate both.
+- The operator must **Save** remote settings (host/user/key) before switching to a
+  remote mode — the switch endpoint reads only the persisted file, not the form.
+
 ### Dedup + Delta
 Implement:
 - Finding fingerprinting (stable hash) to deduplicate across tools/runs

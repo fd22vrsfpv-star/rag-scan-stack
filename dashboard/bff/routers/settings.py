@@ -12,6 +12,23 @@ from utils import safe_json
 
 router = APIRouter()
 
+# db-config.json is bind-mounted from the host into this container at
+# /app/db-config.json. If the host path was missing at the first
+# `docker compose up`, Docker silently creates it as a *directory*, which makes
+# every read return defaults and every write raise IsADirectoryError — surfacing
+# as the misleading "remote_db_host not configured" on a DB mode switch.
+DB_CONFIG_PATH = "/app/db-config.json"
+
+
+def _db_config_path_problem() -> str:
+    """Return a human-readable reason db-config.json is unusable, else ""."""
+    if os.path.isdir(DB_CONFIG_PATH):
+        return ("db-config.json is a DIRECTORY, not a file (Docker auto-created it "
+                "because the host path was missing at compose-up). On the host: "
+                "rmdir db-config.json && echo '{\"mode\":\"local\"}' > db-config.json, "
+                "then recreate container-logs + pentest-dashboard.")
+    return ""
+
 
 class ApiKeyBody(BaseModel):
     value: str = Field(..., min_length=1)
@@ -189,7 +206,10 @@ async def get_db_config():
     """Get current database mode and configuration from mounted db-config.json."""
     try:
         # Read from mounted db-config.json file
-        config_file_path = "/app/db-config.json"
+        config_file_path = DB_CONFIG_PATH
+        problem = _db_config_path_problem()
+        if problem:
+            return {"mode": "local", "config": {}, "containers": {}, "error": problem}
         if os.path.exists(config_file_path):
             with open(config_file_path, 'r') as f:
                 db_config = json.load(f)
@@ -243,7 +263,10 @@ async def get_db_config():
 async def save_db_config(body: DbConfigBody):
     """Save remote database configuration to mounted db-config.json."""
     try:
-        config_file_path = "/app/db-config.json"
+        config_file_path = DB_CONFIG_PATH
+        problem = _db_config_path_problem()
+        if problem:
+            return {"ok": False, "error": problem}
 
         # Read current configuration
         current_config = {}
@@ -290,7 +313,10 @@ async def toggle_remote_db(body: RemoteDbToggleBody):
     """Toggle remote database settings using db-config.json with webhook emission."""
     s = get_settings()
     try:
-        config_file_path = "/app/db-config.json"
+        config_file_path = DB_CONFIG_PATH
+        problem = _db_config_path_problem()
+        if problem:
+            return {"ok": False, "error": problem}
 
         # Read current configuration
         current_config = {}

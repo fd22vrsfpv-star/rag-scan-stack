@@ -625,6 +625,24 @@ _FLAT_DEFAULT = {
 }
 
 
+def _db_config_path_problem() -> str:
+    """Return a human-readable reason db-config.json is unusable, else "".
+
+    The classic failure: docker-compose bind-mounts ./db-config.json into
+    container-logs and pentest-dashboard. If the host path is missing at the
+    first `docker compose up`, Docker silently creates it as a *directory*.
+    Every read then yields defaults (empty remote_db_host) and every write
+    raises IsADirectoryError, so DB mode switches fail with the misleading
+    "remote_db_host not configured". Detect that here so callers can say so.
+    """
+    if os.path.isdir(DB_CONFIG_FILE):
+        return ("db-config.json is a DIRECTORY, not a file (Docker auto-created "
+                "it because the host path was missing at compose-up). On the host: "
+                "rmdir db-config.json && echo '{\"mode\":\"local\"}' > db-config.json, "
+                "then recreate container-logs + pentest-dashboard.")
+    return ""
+
+
 def _read_db_config() -> dict:
     """Read remote DB config from db-config.json.
 
@@ -634,6 +652,10 @@ def _read_db_config() -> dict:
 
     Always returns a flat dict so callers can do `config.get("remote_db_host")`.
     """
+    problem = _db_config_path_problem()
+    if problem:
+        logger.warning("db-config.json unreadable: %s", problem)
+        return dict(_FLAT_DEFAULT)
     if not os.path.exists(DB_CONFIG_FILE):
         return dict(_FLAT_DEFAULT)
     try:
@@ -662,6 +684,10 @@ def _write_db_config(config: dict):
     Preserves the on-disk nested shape ({enabled, mode, config, metadata}) if
     the file already uses it; otherwise writes the flat shape it was given.
     """
+    problem = _db_config_path_problem()
+    if problem:
+        raise RuntimeError(problem)
+
     existing = None
     if os.path.exists(DB_CONFIG_FILE):
         try:
@@ -708,7 +734,11 @@ def _ensure_remote_tunnel(config: dict = None) -> dict:
     remote_user = config.get("remote_db_ssh_user") or "azureuser"
     remote_port = str(config.get("remote_db_port") or 5432)
     if not remote_host:
-        return {"ok": False, "error": "remote_db_host not configured"}
+        problem = _db_config_path_problem()
+        if problem:
+            return {"ok": False, "error": problem}
+        return {"ok": False, "error": "remote_db_host not configured — save the "
+                "remote DB settings (host/user/key) before switching to remote."}
 
     # If tunnel already running and healthy, nothing to do.
     try:
@@ -808,7 +838,11 @@ def _ensure_remote_direct(config: dict = None) -> dict:
     remote_host = config.get("remote_db_host") or ""
     remote_port = str(config.get("remote_db_port") or 5432)
     if not remote_host:
-        return {"ok": False, "error": "remote_db_host not configured"}
+        problem = _db_config_path_problem()
+        if problem:
+            return {"ok": False, "error": problem}
+        return {"ok": False, "error": "remote_db_host not configured — save the "
+                "remote DB settings (host/user) before switching to remote_direct."}
 
     # If proxy already running and healthy, nothing to do.
     try:
