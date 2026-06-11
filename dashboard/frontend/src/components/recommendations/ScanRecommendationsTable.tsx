@@ -293,6 +293,7 @@ export function ScanRecommendationsPanel({
         {runResult && (
           <span className={`text-[10px] ${runResult.ok ? 'text-green-400' : 'text-red-400'}`}>
             {runResult.dispatched > 0 && `${runResult.dispatched} dispatched`}
+            {runResult.queued > 0 && ` ${runResult.queued} queued for approval`}
             {runResult.failed > 0 && ` ${runResult.failed} failed`}
             {runResult.skipped > 0 && ` ${runResult.skipped} skipped`}
             {runResult.error && runResult.error}
