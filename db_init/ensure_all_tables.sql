@@ -851,6 +851,21 @@ EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 CREATE INDEX IF NOT EXISTS idx_pending_exploits_category ON public.pending_exploits(exploit_category);
 
+-- Fix schema drift: older installs created target_ip as text; code and this
+-- schema expect inet (exploit_watcher compares with %s::inet).
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'pending_exploits'
+      AND column_name = 'target_ip' AND data_type = 'text'
+  ) THEN
+    ALTER TABLE public.pending_exploits
+      ALTER COLUMN target_ip TYPE inet USING NULLIF(target_ip, '')::inet;
+  END IF;
+EXCEPTION WHEN OTHERS THEN
+  RAISE WARNING 'Could not convert pending_exploits.target_ip to inet: %', SQLERRM;
+END $$;
+
 -- exploit_results
 CREATE TABLE IF NOT EXISTS public.exploit_results (
     id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
