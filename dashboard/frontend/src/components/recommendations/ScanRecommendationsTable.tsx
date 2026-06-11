@@ -13,7 +13,7 @@
  */
 
 import { useState } from 'react'
-import { useScanRecommendations, type StoredRecommendation } from '@/api/assets'
+import { useScanRecommendations, useGenerateRecommendations, type StoredRecommendation } from '@/api/assets'
 import {
   Wand2, ChevronDown, ChevronRight, Eye, Play, Loader2,
 } from 'lucide-react'
@@ -124,6 +124,7 @@ export function ScanRecommendationsPanel({
   const [checking, setChecking] = useState(false)
   const [installing, setInstalling] = useState(false)
   const { data, isLoading, refetch } = useScanRecommendations('all')
+  const generateRecs = useGenerateRecommendations()
   const allRecs = data?.recommendations ?? []
 
   // Apply optional client-side filters.
@@ -200,12 +201,35 @@ export function ScanRecommendationsPanel({
   // When standalone, show an empty state so the user knows the page loaded.
   if (!recs.length && !isLoading) {
     if (embedded) return null
+    const filtersActive = !!(filters && (filters.status || filters.service || filters.ip || filters.source))
     return (
-      <div className="border border-border rounded-lg p-6 text-center text-sm text-muted-foreground">
-        No scan recommendations
-        {filters && (filters.status || filters.service || filters.ip || filters.source)
-          ? ' match the current filters.'
-          : ' yet — run a port-discovery scan to generate them.'}
+      <div className="border border-border rounded-lg p-6 text-center text-sm text-muted-foreground space-y-3">
+        <div>
+          No scan recommendations
+          {filtersActive
+            ? ' match the current filters.'
+            : ' yet. If a port scan has already run, generate recommendations for the detected ports.'}
+        </div>
+        {!filtersActive && (
+          <div>
+            <button
+              onClick={() => generateRecs.mutate(undefined, { onSuccess: () => refetch() })}
+              disabled={generateRecs.isPending}
+              className="px-3 py-1.5 rounded-md text-sm font-medium border border-primary/50 bg-primary/10 text-primary hover:bg-primary/20 disabled:opacity-50"
+            >
+              {generateRecs.isPending ? 'Generating…' : 'Generate from detected ports'}
+            </button>
+            {generateRecs.isError && (
+              <div className="mt-2 text-xs text-red-400">Generation failed — see logs.</div>
+            )}
+            {generateRecs.isSuccess && (
+              <div className="mt-2 text-xs text-muted-foreground">
+                Considered {generateRecs.data?.ports_considered ?? 0} port(s), generated{' '}
+                {generateRecs.data?.generated ?? 0}. {generateRecs.data?.generated ? 'Refreshing…' : 'No new ports needed recommendations.'}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     )
   }

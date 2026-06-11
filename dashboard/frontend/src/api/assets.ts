@@ -95,6 +95,21 @@ export function useScanRecommendations(status = 'pending') {
   })
 }
 
+// Generate recommendations on demand for all currently-detected open ports
+// that don't have one yet (no time window). Populates the scan_recommendations
+// table so suggested scans can be dispatched against ports scanned earlier.
+export function useGenerateRecommendations() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (ip?: string) =>
+      apiFetch<{ ok: boolean; ports_considered: number; generated: number }>(
+        `/recommendations/generate${ip ? `?ip=${encodeURIComponent(ip)}` : ''}`,
+        { method: 'POST' },
+      ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['scan-recommendations'] }),
+  })
+}
+
 // ---- KB tool-recommend (per-port "Suggest from KB" modal) ----
 //
 // Backed by the BFF proxy GET /api/rag/tools/recommend which forwards to
