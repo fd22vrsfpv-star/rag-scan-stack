@@ -933,13 +933,105 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                         headers=headers,
                     )
                 elif scanner == "metasploit":
-                    module = rec.get("script", "")
-                    if module:
+                    # Don't auto-exploit. Queue the module into the
+                    # pending_exploits approval workflow (Exploit Manager), with
+                    # RHOSTS/RPORT prefilled, for human approve/reject. Approval
+                    # then runs it via exploit-runner /execute/by-id.
+                    module = (rec.get("script") or "").strip()
+                    if not module:
                         result["status"] = "skipped"
-                        result["detail"] = f"Metasploit module '{module}' — use Exploit Manager to execute"
-                    else:
+                        result["detail"] = "Metasploit rec has no module — nothing to queue"
+                        return result
+                    port = rec.get("port")
+                    service = rec.get("service")
+                    asset_id = rec.get("asset_id")
+                    eid = rec.get("engagement_id")
+                    rec_id = rec.get("id")
+                    exploit_type = "rce" if module.startswith("exploit/") else "other"
+                    title = (rec.get("action") or module)[:200]
+
+                    def _queue_pending():
+                        from db import get_db
+                        with get_db() as conn, conn.cursor() as cur:
+                            # The recommender's /recommendations response omits
+                            # port (it lives in extra), so resolve it from the
+                            # rec row to set a correct RPORT.
+                            nonlocal port
+                            if port is None and rec_id:
+                                cur.execute(
+                                    "SELECT (extra->>'port')::int FROM scan_recommendations WHERE id = %s",
+                                    (rec_id,),
+                                )
+                                prow = cur.fetchone()
+                                if prow and prow[0]:
+                                    port = prow[0]
+                            cmd = (f"use {module}; set RHOSTS {ip};"
+                                   + (f" set RPORT {port};" if port else "") + " run")
+                            # Dedup: don't re-queue the same module against the
+                            # same target while one is still in flight.
+                            cur.execute(
+                                """
+                                SELECT id FROM pending_exploits
+                                 WHERE target_ip = %s::inet AND exploit_id = %s
+                                   AND status IN ('pending','approved','executed')
+                                 LIMIT 1
+                                """,
+                                (ip, module),
+                            )
+                            existing = cur.fetchone()
+                            if existing:
+                                return {"created": False, "pending_id": existing[0]}
+                            cur.execute(
+                                """
+                                INSERT INTO pending_exploits
+                                    (source, exploit_id, exploit_title, exploit_type,
+                                     target_ip, target_port, target_service,
+                                     customized_command, parameters, match_reasoning,
+                                     status, requested_by, metadata, asset_id, engagement_id)
+                                VALUES
+                                    ('metasploit', %s, %s, %s,
+                                     %s::inet, %s, %s,
+                                     %s, %s::jsonb, %s,
+                                     'pending', 'recommendations_ui', %s::jsonb, %s, %s)
+                                RETURNING id
+                                """,
+                                (module, title, exploit_type,
+                                 ip, port, service,
+                                 cmd, Json({}),
+                                 f"Queued from scan recommendation: {rec.get('action') or module}",
+                                 Json({"source_rec_id": rec_id, "auto_triggered": False}),
+                                 asset_id, eid),
+                            )
+                            pending_id = cur.fetchone()[0]
+                            if rec_id:
+                                cur.execute(
+                                    "UPDATE scan_recommendations SET status='queued', "
+                                    "extra = COALESCE(extra,'{}'::jsonb) || %s::jsonb, "
+                                    "updated_at=now() WHERE id = %s",
+                                    (Json({"pending_exploit_id": str(pending_id)}), rec_id),
+                                )
+                            conn.commit()
+                            return {"created": True, "pending_id": pending_id}
+
+                    try:
+                        q = await asyncio.to_thread(_queue_pending)
+                    except Exception as e:
+                        result["status"] = "failed"
+                        result["detail"] = f"Failed to queue exploit: {str(e)[:160]}"
+                        return result
+
+                    pid = str(q["pending_id"])
+                    if not q["created"]:
                         result["status"] = "skipped"
-                        result["detail"] = "Metasploit — use Exploit Manager for module execution"
+                        result["detail"] = f"Already queued for approval (pending_exploit {pid[:8]})"
+                        return result
+                    result["status"] = "queued"
+                    result["pending_exploit_id"] = pid
+                    result["detail"] = f"Queued for approval in Exploit Manager (module {module})"
+                    await _emit_tool_webhook("metasploit_queued_for_approval", {
+                        "module": module, "ip": ip, "port": port,
+                        "pending_exploit_id": pid, "source_rec_id": rec_id,
+                    })
                     return result
                 else:
                     result["status"] = "skipped"
@@ -1222,11 +1314,14 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
     dispatched = sum(1 for r in results if r.get("status") == "dispatched")
     failed = sum(1 for r in results if r.get("status") == "failed")
     skipped = sum(1 for r in results if r.get("status") == "skipped")
+    # 'queued' = metasploit recs queued into the Exploit Manager approval flow.
+    queued = sum(1 for r in results if r.get("status") == "queued")
 
     return {
-        "ok": dispatched > 0,
+        "ok": (dispatched + queued) > 0,
         "total": len(results),
         "dispatched": dispatched,
+        "queued": queued,
         "failed": failed,
         "skipped": skipped,
         "results": results,
