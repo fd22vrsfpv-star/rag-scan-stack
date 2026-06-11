@@ -1085,6 +1085,13 @@ else
 # ==========================================
 
 # ==========================================
+# BUILD METADATA
+# ==========================================
+# Injected into service containers via docker-compose (\${BUILD_VERSION:-dev}).
+# Sourced from dashboard/frontend/package.json so all three stay in sync.
+BUILD_VERSION=$(grep '"version"' "$PROJECT_ROOT/dashboard/frontend/package.json" | head -1 | sed -E 's/.*"version": *"([^"]+)".*/\1/')
+
+# ==========================================
 # CRITICAL SECURITY CREDENTIALS
 # ==========================================
 
