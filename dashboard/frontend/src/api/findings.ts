@@ -1,7 +1,48 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './client'
 import type { FindingsResponse, FindingActivity, WorkflowStatus } from '@/lib/types'
 import { POLL } from '@/lib/polling'
+
+// Page size for the Findings Explorer "Load more" pagination. The BFF/rag-api
+// cap a single request at 1000, so this stays at or below that.
+export const FINDINGS_PAGE_SIZE = 500
+
+function buildFindingsParams(filters: FindingsFilter): URLSearchParams {
+  const params = new URLSearchParams()
+  if (filters.severity?.length) filters.severity.forEach(s => params.append('severity', s))
+  if (filters.source?.length) filters.source.forEach(s => params.append('source', s))
+  if (filters.ip) params.set('ip', filters.ip)
+  if (filters.cve) params.set('cve', filters.cve)
+  if (filters.search) params.set('search', filters.search)
+  if (filters.port) params.set('port', String(filters.port))
+  if (filters.workflow_status?.length) filters.workflow_status.forEach(s => params.append('workflow_status', s))
+  if (filters.engagement_id) params.set('engagement_id', filters.engagement_id)
+  if (filters.tags?.length) filters.tags.forEach(t => params.append('tags', t))
+  return params
+}
+
+// Offset-paginated findings query that accumulates pages, so the explorer can
+// load all findings via "Load more" instead of being capped at one page.
+// Keyed by filters (no offset), so any filter change resets the accumulation
+// and refetches from the first page server-side.
+export function useInfiniteFindings(filters: FindingsFilter = {}) {
+  const pageSize = filters.limit ?? FINDINGS_PAGE_SIZE
+  return useInfiniteQuery({
+    queryKey: ['findings-infinite', { ...filters, limit: pageSize }],
+    initialPageParam: 0,
+    queryFn: ({ pageParam }) => {
+      const params = buildFindingsParams(filters)
+      params.set('limit', String(pageSize))
+      params.set('offset', String(pageParam))
+      return apiFetch<FindingsResponse>(`/findings?${params}`)
+    },
+    getNextPageParam: (lastPage, allPages) => {
+      const loaded = allPages.reduce((n, p) => n + (p.findings?.length ?? 0), 0)
+      return loaded < (lastPage.total ?? 0) ? loaded : undefined
+    },
+    refetchInterval: POLL.NORMAL,
+  })
+}
 
 export interface FindingsFilter {
   severity?: string[]

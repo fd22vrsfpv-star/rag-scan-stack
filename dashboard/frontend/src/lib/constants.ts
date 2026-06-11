@@ -1,4 +1,4 @@
-export const BUILD_VERSION = '2026.06.10-01'
+export const BUILD_VERSION = '2026.06.10-03'
 export const SEVERITY_LEVELS = ['critical', 'high', 'medium', 'low', 'info', 'recon', 'error'] as const
 export type Severity = (typeof SEVERITY_LEVELS)[number]
 
