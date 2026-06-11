@@ -1417,11 +1417,46 @@ async def check_tools_on_node(body: ToolCheckRequest):
 
 @router.post("/api/tools/install")
 async def install_tools_on_node(body: ToolInstallRequest):
-    """Install missing tools on a remote node via SSH."""
+    """Install missing tools on the internal Kali container or a remote node.
+
+    The Recommendations UI sends node_id='kali-local' (the same sentinel
+    /api/tools/check accepts). Previously this handler ignored that and always
+    tried to SSH to a node literally named 'kali-local', so every Kali-targeted
+    install failed. Route the Kali sentinels to the Kali listener's own
+    /tools/install (registry-driven), and only fall back to SSH for real nodes.
+    """
     s = get_settings()
     headers = {"x-api-key": s.api_key, "Content-Type": "application/json", **engagement_headers()}
     results = []
 
+    # Internal Kali container — use the listener's /tools/install endpoint.
+    if body.node_id in ("kali-local", "kali", "internal"):
+        async with httpx.AsyncClient(verify=False, timeout=300) as client:
+            for tool in body.tools:
+                try:
+                    r = await client.post(
+                        f"{s.kali_listener_url}/tools/install",
+                        json={"tool": tool, "timeout": 180},
+                        headers=headers,
+                    )
+                    if r.status_code == 200 and r.json().get("installed"):
+                        results.append({"tool": tool, "status": "installed", "detail": "Success"})
+                    else:
+                        detail = (r.json().get("detail") if r.status_code == 200 else f"HTTP {r.status_code}")
+                        results.append({"tool": tool, "status": "failed", "detail": (detail or "")[:200]})
+                except Exception as e:
+                    results.append({"tool": tool, "status": "failed", "detail": str(e)[:100]})
+        installed = sum(1 for r in results if r["status"] == "installed")
+        return {
+            "ok": installed > 0,
+            "node_id": "kali-local",
+            "total": len(body.tools),
+            "installed": installed,
+            "failed": sum(1 for r in results if r["status"] == "failed"),
+            "results": results,
+        }
+
+    # Remote node — install via SSH exec.
     async with httpx.AsyncClient(verify=False, timeout=120) as client:
         for tool in body.tools:
             install_cmd = TOOL_INSTALL_MAP.get(tool)
