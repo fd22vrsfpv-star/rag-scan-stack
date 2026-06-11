@@ -2182,8 +2182,15 @@ def compare_databases():
     import time
 
     config = _read_db_config()
+    # Remote DB credentials (used only for the remote query below).
     db_user = config.get("remote_db_user") or "app"
     db_password = config.get("remote_db_password") or ""
+    # Local DB has its OWN credentials (POSTGRES_*), not the remote ones.
+    # Using the remote creds for the local query made the local stats fail with
+    # "fe_sendauth: no password supplied" whenever remote_db_password was empty
+    # (e.g. in local mode). Mirror _sync_db_dsn's local-credential resolution.
+    local_user = _read_env_value("POSTGRES_USER", "app") or "app"
+    local_password = _read_env_value("POSTGRES_PASSWORD", "app") or "app"
     mode = _detect_db_mode()
 
     # ── Get local DB stats ─────────────────────────────────────────
@@ -2253,7 +2260,7 @@ def compare_databases():
     local_stats: dict
     if local_host:
         try:
-            local_stats = _query_db_stats(local_host, 5432, db_user, db_password)
+            local_stats = _query_db_stats(local_host, 5432, local_user, local_password)
         except Exception as e:
             local_stats = {"ok": False, "error": f"Local DB query failed: {e}", "tables": {}, "sync": {}}
     else:
