@@ -260,6 +260,23 @@ async def get_recommendations():
         return safe_json(resp)
 
 
+@router.post("/api/recommendations/generate")
+async def generate_recommendations(ip: Optional[str] = None):
+    """(Re)generate scan recommendations for all currently-detected open ports
+    that don't have one yet. Used by the Recommendations page to populate recs
+    for targets scanned earlier (outside the reactive 10-minute ingest window).
+    Synchronous + LLM-backed, so allow a generous timeout."""
+    s = get_settings()
+    params = {"ip": ip} if ip else None
+    async with httpx.AsyncClient(verify=False, timeout=300) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/recommendations/generate",
+            params=params,
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
 # ── Finding Workflow (C1) ──
 
 class WorkflowBody(BaseModel):
