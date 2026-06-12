@@ -1418,6 +1418,24 @@ class ToolInstallRequest(BaseModel):
     tools: List[str]
 
 
+def _kali_unmanageable(tool: str) -> Optional[str]:
+    """Return a reason if a tool is NOT a Kali-installable package (so it should
+    not be offered for 'install on Kali'), else None.
+
+    - metasploit/msf*: runs in its own container, dispatched via the Exploit
+      Manager approval flow — never an apt install here.
+    - nmap-*/*-nmap: a pseudo-tool (an nmap NSE script preset, e.g.
+      'nmap-smb-vuln'); nmap is already installed and it's dispatched as an
+      nmap run, not a separate package.
+    """
+    t = (tool or "").lower()
+    if t in ("metasploit", "msf", "msfconsole", "msfvenom") or t.startswith("msf"):
+        return "Metasploit runs in its own container — dispatch via Exploit Manager (approve to run), not a Kali install."
+    if t.startswith("nmap-") or t.endswith("-nmap"):
+        return "nmap script preset — nmap is already installed; runs as an nmap scan, not a separate tool."
+    return None
+
+
 # Package manager install commands for common pentest tools
 TOOL_INSTALL_MAP = {
     "nmap": "apt-get install -y nmap",
@@ -1454,6 +1472,21 @@ TOOL_INSTALL_MAP = {
 }
 
 
+@router.get("/api/tools/allowed")
+async def list_allowed_tools():
+    """The Kali container's effective tool allowlist (registry + fallback +
+    operator Settings overrides − MSF). Used by the Settings allowlist panel."""
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        resp = await c.get(
+            f"{s.kali_listener_url}/tools/allowed",
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:300])
+        return safe_json(resp)
+
+
 @router.post("/api/tools/check")
 async def check_tools_on_node(body: ToolCheckRequest):
     """Check which tools are installed on Kali container or remote node."""
@@ -1470,12 +1503,21 @@ async def check_tools_on_node(body: ToolCheckRequest):
                 )
                 if r.status_code == 200:
                     allowed = set(t.lower() for t in r.json().get("tools", []))
-                    found = [t for t in body.tools if t.lower() in allowed]
+                    # Tools that aren't Kali-installable (MSF / nmap presets) are
+                    # reported as 'managed' with a reason, NOT 'missing', so the
+                    # "Install missing" action never tries (and fails) on them.
+                    managed = [{"tool": t, "reason": _kali_unmanageable(t)}
+                               for t in body.tools if _kali_unmanageable(t)]
+                    managed_names = {m["tool"].lower() for m in managed}
+                    found = [t for t in body.tools
+                             if t.lower() in allowed and t.lower() not in managed_names]
                     missing = [
                         {"tool": t, "install": TOOL_INSTALL_MAP.get(t, f"apt-get install -y {t}")}
-                        for t in body.tools if t.lower() not in allowed
+                        for t in body.tools
+                        if t.lower() not in allowed and t.lower() not in managed_names
                     ]
-                    return {"ok": True, "node_id": "kali-local", "found": found, "missing": missing, "total": len(body.tools)}
+                    return {"ok": True, "node_id": "kali-local", "found": found,
+                            "missing": missing, "managed": managed, "total": len(body.tools)}
                 return {"ok": False, "error": f"Kali health: HTTP {r.status_code}"}
         except Exception as e:
             return {"ok": False, "error": f"Kali unreachable: {e}"}
@@ -1528,6 +1570,10 @@ async def install_tools_on_node(body: ToolInstallRequest):
     if body.node_id in ("kali-local", "kali", "internal"):
         async with httpx.AsyncClient(verify=False, timeout=300) as client:
             for tool in body.tools:
+                reason = _kali_unmanageable(tool)
+                if reason:
+                    results.append({"tool": tool, "status": "skipped", "detail": reason})
+                    continue
                 try:
                     r = await client.post(
                         f"{s.kali_listener_url}/tools/install",
