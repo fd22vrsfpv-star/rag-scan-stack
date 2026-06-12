@@ -2,6 +2,52 @@
 # Maps services/ports to recommended penetration testing tools
 # Used by scan-recommender to provide AI agents with tool recommendations
 
+# ---------------------------------------------------------------------------
+# tool_metadata: classifies tools and declares where they overlap.
+#
+# - type "cve_lookup" tools are NOT scanners: they look up known CVEs for a
+#   product+version that was ALREADY detected. The recommender does NOT emit
+#   them as per-service scan recommendations; they run via the assets software
+#   flow (software-assets / bulk-check) instead.
+# - overlap_groups list tools/modules that return substantially the SAME data.
+#   The recommender tags each rec with its group and treats a group as an "OR"
+#   (recommend one, not all) so e.g. nmap -sV, ssh-audit, and the metasploit
+#   *_version modules aren't all queued for the same banner.
+# ---------------------------------------------------------------------------
+tool_metadata:
+  tools:
+    vulnx:
+      type: cve_lookup          # NOT a scanner
+      active: false             # offline CVE DB lookup; does not touch the target
+      needs: [product, version]
+      note: >
+        vulnx is NOT a network/port scanner. It looks up known CVEs for a
+        product+version already detected by another tool. Never recommend it
+        as a port/service probe or run it "against a port" — it only consumes
+        prior version-detection output. Surfaced via the assets software view.
+
+  # Tools/modules within a group return overlapping data → recommend ONE (OR).
+  # A member may be a tool name, or "metasploit:<glob>" to match MSF modules.
+  overlap_groups:
+    version_detection:
+      description: "Service product + version banner — pick one (nmap -sV and the metasploit *_version modules return the same banner)."
+      members: [nmap, "metasploit:*_version"]
+    content_discovery:
+      description: "Directory/file brute force — pick one."
+      members: [gobuster, feroxbuster, dirsearch, wfuzz, ffuf]
+    web_vuln_scan:
+      description: "Generic web vulnerability scan — pick one."
+      members: [nikto, nuclei]
+    tech_fingerprint:
+      description: "Web technology fingerprint — pick one."
+      members: [whatweb, wappalyzer]
+    login_bruteforce:
+      description: "Credential brute force — pick one."
+      members: [hydra, medusa, ncrack, "metasploit:*_login"]
+    sql_injection:
+      description: "SQL injection testing."
+      members: [sqlmap]
+
 services:
   ssh:
     ports: [22, 2222, 22222]
