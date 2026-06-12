@@ -508,10 +508,21 @@ def _get_tool_feedback() -> List[Dict]:
 
 
 def _apply_tool_feedback(recs: List[Dict], service: Optional[str]) -> List[Dict]:
-    """Apply operator/agent feedback policies (suppress / add_overlap / add_tool)
-    to a service's recs. service=None feedback rows apply to every service."""
+    """Apply suppress / add_overlap / add_tool policies to a service's recs.
+
+    Two sources, combined: the KB's stable suppress rules (tool_metadata.suppress
+    in service_tools.yaml — ships in git, reloads) and the DB feedback loop
+    (scan_tool_feedback — per-install/ad-hoc). Rows with service=None apply to
+    every service. (KB overlap_groups are handled separately in _build_overlap_maps.)
+    """
     import fnmatch
-    fb = _get_tool_feedback()
+    # KB suppress rules → same shape as feedback rows (verdict='suppress').
+    kb_suppress = [
+        {"verdict": "suppress", "scanner": r.get("scanner"),
+         "service": r.get("service"), "selector": r.get("selector")}
+        for r in get_tool_kb().get_suppress_rules()
+    ]
+    fb = kb_suppress + _get_tool_feedback()
     if not fb:
         return recs
     svc = (service or "").lower()
