@@ -1,6 +1,7 @@
 import { useState, useRef, useMemo, useEffect } from 'react'
 import PageHelp from '@/components/PageHelp'
 import InfoTip from '@/components/InfoTip'
+import KaliAllowlistPanel from '@/components/settings/KaliAllowlistPanel'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useScopeNames, useScope, useAddToScope, useRemoveFromScope } from '@/api/scope'
 import { useBurpStatus } from '@/api/burp'
@@ -2329,6 +2330,9 @@ function ToolOptionsTab() {
 
       {/* Tool Updates */}
       <ToolUpdates />
+
+      {/* Kali tool allowlist (what the internal Kali container may install/run) */}
+      <KaliAllowlistPanel />
 
       {/* Wordlist Paths */}
       <WordlistSettings />
