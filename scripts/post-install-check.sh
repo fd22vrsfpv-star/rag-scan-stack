@@ -31,7 +31,7 @@ EXPECTED_TABLES=(
   # TIER 4: Content intelligence
   dom_analysis content_extractions content_intel_patterns
   # TIER 5: ZAP / KB
-  zap_sessions kb_service_overrides
+  zap_sessions kb_service_overrides scan_tool_feedback
   # TIER 6: Jobs / Tasks
   jobs tasks
   # TIER 7: Agent / LLM

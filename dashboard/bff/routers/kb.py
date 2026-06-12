@@ -90,3 +90,35 @@ async def delete_kb_service(name: str):
         result = safe_json(resp)
     await _emit_kb_webhook("kb_override_deleted", name)
     return result
+
+
+# ── Tool-selection feedback (durable loop that steers which tools get picked) ──
+
+@router.get("/api/kb/feedback")
+async def list_kb_feedback():
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        resp = await c.get(f"{s.scan_recommender_url}/kb/feedback")
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.post("/api/kb/feedback")
+async def add_kb_feedback(body: Dict[str, Any] = Body(...)):
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        resp = await c.post(f"{s.scan_recommender_url}/kb/feedback", json=body)
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.delete("/api/kb/feedback/{feedback_id}")
+async def delete_kb_feedback(feedback_id: str):
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        resp = await c.delete(f"{s.scan_recommender_url}/kb/feedback/{feedback_id}")
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
