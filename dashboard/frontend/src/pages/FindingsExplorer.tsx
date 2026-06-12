@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect } from 'react'
 import PageHelp from '@/components/PageHelp'
-import { useFindings, useUpdateFindingWorkflow, useFindingActivity, useAddFindingComment, useExploitMatches, useUpdateFindingTags, useTagSuggestions, useDeleteFindings, type FindingsFilter } from '@/api/findings'
+import { useInfiniteFindings, useUpdateFindingWorkflow, useFindingActivity, useAddFindingComment, useExploitMatches, useUpdateFindingTags, useTagSuggestions, useDeleteFindings, type FindingsFilter } from '@/api/findings'
 import { ScopeAssignModal } from '@/components/common/ScopeAssignModal'
 import { useFindingEvidence, useUploadEvidence, useLinkEvidence } from '@/api/evidence'
 import { useScopeNames, useAddToScope, useScope } from '@/api/scope'
@@ -136,7 +136,7 @@ export default function FindingsExplorer() {
   const engagementId = useUIStore(s => s.selectedEngagementId)
   const [scopeFilter, setScopeFilter] = useState(globalScope || '')
   const { matchesScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilter)
-  const [filters, setFilters] = useState<FindingsFilter>({ limit: 500 })
+  const [filters, setFilters] = useState<FindingsFilter>({})
   // Merge engagement_id into the active filter set so the API pre-filters server-side
   const activeFilters = useMemo(() => ({
     ...filters,
@@ -164,18 +164,21 @@ export default function FindingsExplorer() {
   const topCreateAdhocRule = useCreateAdhocRule()
   const [showScopeModal, setShowScopeModal] = useState(false)
   const deleteFindings = useDeleteFindings()
-  const { data, isLoading, error } = useFindings(activeFilters)
+  const { data, isLoading, error, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteFindings(activeFilters)
 
   const toggleSelect = (id: string) => {
     setSelectedIds(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
   }
 
-  const allFindings = data?.findings ?? []
+  const allFindings = useMemo(() => (data?.pages ?? []).flatMap(p => p.findings ?? []), [data])
   const findings = useMemo(() => {
     if (!isScopeFiltering) return allFindings
     return allFindings.filter(f => matchesScope(f.hostname || f.ip || f.url || ''))
   }, [allFindings, isScopeFiltering, matchesScope])
-  const total = isScopeFiltering ? findings.length : (data?.total ?? 0)
+  // total = server-side count for the active filter set (respects severity/source/status).
+  const serverTotal = data?.pages?.[0]?.total ?? 0
+  const total = isScopeFiltering ? findings.length : serverTotal
+  const loadedCount = allFindings.length
 
   const toggleSelectAll = () => {
     if (selectedIds.size === findings.length) setSelectedIds(new Set())
@@ -192,8 +195,8 @@ export default function FindingsExplorer() {
       target_type: f.ip ? 'ip' as const : 'domain' as const,
     })).filter(t => t.target)
   }, [selectedIds, findings])
-  // Recompute source counts from the scope-filtered findings (not the raw API
-  // aggregations) so counts match what the user actually sees.
+  // Source counts from the loaded + scope-filtered findings (what the user can
+  // currently see), used as the chip count when scope filtering is active.
   const scopedBySource = useMemo(() => {
     const counts: Record<string, number> = {}
     for (const f of findings) {
@@ -202,7 +205,18 @@ export default function FindingsExplorer() {
     }
     return counts
   }, [findings])
-  const activeSources = useMemo(() => Object.keys(scopedBySource).sort(), [scopedBySource])
+  // Global source aggregations from the API — these list EVERY source in the
+  // dataset (not just the loaded page), so all sources are always filterable.
+  const aggBySource = useMemo(
+    () => data?.pages?.[0]?.aggregations?.by_source ?? {},
+    [data],
+  )
+  // Show the union of every source the API knows about plus any currently
+  // loaded, so no source is ever missing a filter chip.
+  const activeSources = useMemo(() => {
+    const set = new Set<string>([...Object.keys(aggBySource), ...Object.keys(scopedBySource)])
+    return [...set].sort()
+  }, [aggBySource, scopedBySource])
 
   const grouped = useMemo(() => groupFindings(findings), [findings])
 
@@ -232,7 +246,13 @@ export default function FindingsExplorer() {
         <h2 className="text-lg font-semibold">Findings Explorer</h2>
         <div className="flex items-center gap-3">
           <ScopeFilter value={scopeFilter} onChange={setScopeFilter} />
-          <span className="text-xs text-muted-foreground">{total} findings{isScopeFiltering ? ` in ${scopeFilter}` : ''}</span>
+          <span className="text-xs text-muted-foreground">
+            {isScopeFiltering
+              ? `${total.toLocaleString()} findings in ${scopeFilter}`
+              : loadedCount < total
+                ? `${loadedCount.toLocaleString()} of ${total.toLocaleString()} findings`
+                : `${total.toLocaleString()} findings`}
+          </span>
         </div>
       </div>
 
@@ -257,7 +277,9 @@ export default function FindingsExplorer() {
           <span className="text-xs text-muted-foreground py-1">Source:</span>
           {activeSources.map(s => {
             const active = filters.source?.includes(s)
-            const count = scopedBySource[s] ?? 0
+            // When scope filtering (client-side), show what's visible; otherwise
+            // show the global per-source total from the API aggregations.
+            const count = isScopeFiltering ? (scopedBySource[s] ?? 0) : (aggBySource[s] ?? 0)
             return (
               <button
                 key={s}
@@ -574,6 +596,24 @@ export default function FindingsExplorer() {
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+
+      {/* Load more — accumulate additional pages until all findings are loaded */}
+      {!isLoading && !isScopeFiltering && total > 0 && (
+        <div className="flex items-center justify-center gap-3 py-2">
+          <span className="text-xs text-muted-foreground">
+            Showing {loadedCount.toLocaleString()} of {total.toLocaleString()}
+          </span>
+          {hasNextPage && (
+            <button
+              onClick={() => fetchNextPage()}
+              disabled={isFetchingNextPage}
+              className="px-3 py-1.5 rounded-md text-sm font-medium border border-border bg-muted/50 text-foreground hover:border-primary/50 disabled:opacity-50"
+            >
+              {isFetchingNextPage ? 'Loading…' : 'Load more'}
+            </button>
+          )}
         </div>
       )}
 

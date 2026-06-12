@@ -1760,6 +1760,83 @@ def _emit_ingest_event(source: str, stats: dict = None):
         logger.warning("recommender trigger failed for source=%s: %s", source, e)
 
 
+def _select_open_ports_without_recs(window_minutes: int = None, limit: int = 200,
+                                    ip: str = None):
+    """Return open ports that don't yet have a scan recommendation.
+
+    LEFT JOIN + IS NULL keeps this idempotent: ports already recommended are
+    filtered out, so running again over the same data is a no-op.
+
+    window_minutes: if set, only consider ports touched within that many
+    minutes (the reactive ingest path uses 10). If None, consider ALL current
+    open ports — used by on-demand generation for targets scanned earlier.
+    """
+    clauses = ["COALESCE(p.is_open, true)", "sr.id IS NULL"]
+    params: dict = {"limit": limit}
+    if window_minutes is not None:
+        clauses.append("p.last_seen >= now() - make_interval(mins => %(mins)s)")
+        params["mins"] = window_minutes
+    if ip:
+        clauses.append("host(a.ip)::text = %(ip)s")
+        params["ip"] = ip
+    where_sql = " AND ".join(clauses)
+    with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT host(a.ip)::text AS ip,
+                   p.port,
+                   p.service,
+                   COALESCE(NULLIF(p.banner, ''),
+                            NULLIF(CONCAT_WS(' ', p.product, p.version), '')
+                   ) AS banner
+            FROM public.ports p
+            JOIN public.assets a ON a.id = p.asset_id
+            LEFT JOIN public.scan_recommendations sr
+              ON sr.ip = a.ip
+             AND COALESCE(sr.service, '') = COALESCE(p.service, '')
+            WHERE {where_sql}
+            ORDER BY p.last_seen DESC
+            LIMIT %(limit)s
+        """, params)
+        return cur.fetchall()
+
+
+def _dispatch_recommender_for_ports(rows) -> int:
+    """Call the scan_recommender's /next_scan (persist=true) for each port row,
+    generating + persisting recommendations. Returns the number dispatched.
+
+    Must run inside a copy_context() (or a request scope) so
+    _outgoing_runner_headers() resolves the engagement_id contextvar.
+    """
+    scan_rec_url = os.environ.get("SCAN_RECOMMENDER_URL",
+                                  "https://scan-recommender:8013")
+    dispatched = 0
+    for row in rows:
+        params = {
+            "ip": row["ip"],
+            "port": str(row["port"]),
+            "persist": "true",
+        }
+        if row.get("service"):
+            params["service"] = row["service"]
+        if row.get("banner"):
+            params["banner"] = row["banner"]
+        try:
+            requests.get(
+                f"{scan_rec_url}/next_scan",
+                params=params,
+                headers=_outgoing_runner_headers(),
+                timeout=60,
+                verify=False,
+            )
+            dispatched += 1
+        except Exception as e:
+            logger.debug(
+                "recommender call failed for %s:%s — %s",
+                row["ip"], row["port"], e,
+            )
+    return dispatched
+
+
 def _trigger_recommendations_for(source: str, stats: dict = None):
     """Fire-and-forget: ask the local-LLM scan_recommender to recommend next
     probes for every recently-touched open port without a recommendation yet.
@@ -1771,63 +1848,11 @@ def _trigger_recommendations_for(source: str, stats: dict = None):
         return
 
     def _worker():
-        scan_rec_url = os.environ.get("SCAN_RECOMMENDER_URL",
-                                      "https://scan-recommender:8013")
-        api_key = os.environ.get("API_KEY", "changeme")
         try:
             # Pull the most-recently-touched open ports that haven't been
-            # recommended on yet.  LEFT JOIN + IS NULL keeps this idempotent:
-            # running again over the same data is a no-op because rows
-            # already-recommended are filtered out.
-            with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
-                    SELECT host(a.ip)::text AS ip,
-                           p.port,
-                           p.service,
-                           COALESCE(NULLIF(p.banner, ''),
-                                    NULLIF(CONCAT_WS(' ', p.product, p.version), '')
-                           ) AS banner
-                    FROM public.ports p
-                    JOIN public.assets a ON a.id = p.asset_id
-                    LEFT JOIN public.scan_recommendations sr
-                      ON sr.ip = a.ip
-                     AND COALESCE(sr.service, '') = COALESCE(p.service, '')
-                    WHERE COALESCE(p.is_open, true)
-                      AND p.last_seen >= now() - interval '10 minutes'
-                      AND sr.id IS NULL
-                    ORDER BY p.last_seen DESC
-                    LIMIT 100
-                """)
-                rows = cur.fetchall()
-
-            dispatched = 0
-            for row in rows:
-                params = {
-                    "ip": row["ip"],
-                    "port": str(row["port"]),
-                    "persist": "true",
-                }
-                if row.get("service"):
-                    params["service"] = row["service"]
-                if row.get("banner"):
-                    params["banner"] = row["banner"]
-                try:
-                    # Worker runs inside copy_context() (see Thread spawn
-                    # below), so _outgoing_runner_headers() resolves the
-                    # engagement_id from the captured contextvar.
-                    requests.get(
-                        f"{scan_rec_url}/next_scan",
-                        params=params,
-                        headers=_outgoing_runner_headers(),
-                        timeout=60,
-                        verify=False,
-                    )
-                    dispatched += 1
-                except Exception as e:
-                    logger.debug(
-                        "recommender call failed for %s:%s — %s",
-                        row["ip"], row["port"], e,
-                    )
+            # recommended on yet (10-minute reactive window for ingest).
+            rows = _select_open_ports_without_recs(window_minutes=10)
+            dispatched = _dispatch_recommender_for_ports(rows)
 
             if dispatched:
                 logger.info(
@@ -4904,6 +4929,42 @@ def cleanup_recommendations(
         conn.commit()
 
     return {"dry_run": False, "recommendations": recs_deleted}
+
+
+@app.post("/recommendations/generate", tags=["Recommendations"])
+def generate_recommendations(
+    ip: Optional[str] = Query(default=None),
+    authorized: bool = Depends(auth),
+):
+    """Generate scan recommendations for currently-detected open ports that
+    don't have one yet — with NO time window.
+
+    The reactive ingest path (`_trigger_recommendations_for`) only generates
+    recs for ports touched in the last 10 minutes, so a target scanned earlier
+    shows an empty Recommendations page ("run a port-discovery scan"). This
+    endpoint lets the operator (re)populate recommendations on demand for all
+    detected ports, so suggested scans can then be dispatched against them.
+
+    Runs synchronously (one local-LLM call per port) and returns the count.
+    Optionally scope to a single `ip`.
+    """
+    rows = _select_open_ports_without_recs(window_minutes=None, ip=ip)
+    # Runs in a request scope, so _outgoing_runner_headers() resolves the
+    # engagement contextvar set by middleware.
+    generated = _dispatch_recommender_for_ports(rows)
+
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("recommendations_generated", "manual", {
+            "source": "manual",
+            "ip": ip,
+            "ports_considered": len(rows),
+            "dispatched": generated,
+        })
+    except Exception:
+        pass
+
+    return {"ok": True, "ports_considered": len(rows), "generated": generated}
 
 
 @app.post("/cleanup/exploits", tags=["Maintenance"])
