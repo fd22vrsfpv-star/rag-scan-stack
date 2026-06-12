@@ -211,6 +211,30 @@ Once remote DB is set up, team members can work offline and sync:
 
 See the Sync Dashboard in the UI under System > Sync for visual management.
 
+## Refreshing the Connection After a Password / Mode Change (outside the GUI)
+
+Services authenticate using `DB_DSN`. Changing the password in Settings → Database
+now propagates into `DB_DSN` automatically (the save/switch re-syncs it and
+force-recreates the DB consumers). To do the same from the host without the GUI:
+
+```bash
+# Rebuild DB_DSN from db-config.json for the active mode and reconnect the stack:
+./scripts/optional/refresh-db-connection.sh
+
+# Set/propagate a new password (also persisted into db-config.json):
+./scripts/optional/refresh-db-connection.sh --password 'NewStrongPassword' --persist
+
+# Preview without changing anything:
+./scripts/optional/refresh-db-connection.sh --dry-run
+```
+
+For `remote_direct` mode the script adds `?sslmode=require` to `DB_DSN` — the
+`rag-db-tunnel` socat sidecar is a plaintext pipe, so libpq must negotiate TLS
+end-to-end or the remote rejects the connection with
+`no pg_hba.conf entry for host ... no encryption`. A plain `docker restart` is
+**not** enough: containers cache the old env + connection pools, so the script
+uses `docker compose up -d --force-recreate`.
+
 ## Security Notes
 
 - Postgres only listens on `127.0.0.1` + `10.13.13.1` (WireGuard interface) — never public
@@ -242,4 +266,5 @@ See the Sync Dashboard in the UI under System > Sync for visual management.
 | `scripts/optional/test-remote-db.sh` | Local | Connectivity verification |
 | `scripts/optional/sync-push.sh` | Local | Push local changes to remote DB |
 | `scripts/optional/sync-pull.sh` | Local | Pull remote changes to local DB |
+| `scripts/optional/refresh-db-connection.sh` | Local | Rebuild `DB_DSN` from `db-config.json` + reconnect all DB consumers (CLI alternative to the Settings → Database switch) |
 | `wireguard/wg0.conf` | Local | WireGuard client config (gitignored) |

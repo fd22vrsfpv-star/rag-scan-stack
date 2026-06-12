@@ -161,7 +161,7 @@ NMAP_VERSION_INTENSITY=9
 NMAP_SCRIPTS=banner,http-title,ssl-cert,ssl-enum-ciphers,ssh2-enum-algos,vulscan/vulscan.nse
 
 # Nmap scanner service URL
-NMAP_SCANNER_URL=http://nmap_scanner:8012
+NMAP_SCANNER_URL=https://nmap_scanner:8012
 
 # ==========================================
 # WEB SCANNER CONFIGURATION
@@ -235,21 +235,21 @@ SCREENSHOT_FORMAT=png
 # ==========================================
 
 # RAG API
-RAG_API_URL=http://rag-api:8000
-API_BASE=http://rag-api:8000
+RAG_API_URL=https://rag-api:8000
+API_BASE=https://rag-api:8000
 
 # Scanner Services
-WEB_SCANNER_URL=http://web-scanner:8010
-NUCLEI_URL=http://nuclei-runner:8011
-NMAP_URL=http://nmap_scanner:8012
-SCAN_RECOMMENDER_URL=http://scan-recommender:8013
-PLAYWRIGHT_URL=http://playwright-scanner:8014
-AUTOGEN_URL=http://autogen-agents:8015
-EXPLOIT_RUNNER_URL=http://exploit-runner:8017
-PD_RUNNER_URL=http://pd-runner:8023
-OSINT_RUNNER_URL=http://osint-runner:8024
-BRUTUS_RUNNER_URL=http://brutus-runner:8025
-NODE_MANAGER_URL=http://node-manager:8027
+WEB_SCANNER_URL=https://web-scanner:8010
+NUCLEI_URL=https://nuclei-runner:8011
+NMAP_URL=https://nmap_scanner:8012
+SCAN_RECOMMENDER_URL=https://scan-recommender:8013
+PLAYWRIGHT_URL=https://playwright-scanner:8014
+AUTOGEN_URL=https://autogen-agents:8015
+EXPLOIT_RUNNER_URL=https://exploit-runner:8017
+PD_RUNNER_URL=https://pd-runner:8023
+OSINT_RUNNER_URL=https://osint-runner:8024
+BRUTUS_RUNNER_URL=https://brutus-runner:8025
+NODE_MANAGER_URL=https://node-manager:8027
 
 # ==========================================
 # OSINT / EXTERNAL API KEYS

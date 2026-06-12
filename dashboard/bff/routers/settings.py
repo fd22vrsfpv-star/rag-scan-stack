@@ -12,6 +12,39 @@ from utils import safe_json
 
 router = APIRouter()
 
+# db-config.json is bind-mounted from the host into this container at
+# /app/db-config.json. If the host path was missing at the first
+# `docker compose up`, Docker silently creates it as a *directory*, which makes
+# every read return defaults and every write raise IsADirectoryError — surfacing
+# as the misleading "remote_db_host not configured" on a DB mode switch.
+DB_CONFIG_PATH = "/app/db-config.json"
+
+
+def _db_config_path_problem() -> str:
+    """Return a human-readable reason db-config.json is unusable, else ""."""
+    if os.path.isdir(DB_CONFIG_PATH):
+        return ("db-config.json is a DIRECTORY, not a file (Docker auto-created it "
+                "because the host path was missing at compose-up). On the host: "
+                "rmdir db-config.json && echo '{\"mode\":\"local\"}' > db-config.json, "
+                "then recreate container-logs + pentest-dashboard.")
+    return ""
+
+
+async def _trigger_dsn_sync() -> dict:
+    """Ask container-logs to rebuild DB_DSN from the just-saved config.
+
+    Services authenticate via ${DB_DSN}; saving the config only rewrites
+    db-config.json, so without this the new password/user never reaches the
+    running stack. Best-effort — never fails the save.
+    """
+    try:
+        s = get_settings()
+        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+            r = await c.post(f"{s.container_logs_url}/db/sync-dsn")
+            return r.json() if r.status_code < 400 else {"ok": False, "status": r.status_code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 
 class ApiKeyBody(BaseModel):
     value: str = Field(..., min_length=1)
@@ -189,7 +222,10 @@ async def get_db_config():
     """Get current database mode and configuration from mounted db-config.json."""
     try:
         # Read from mounted db-config.json file
-        config_file_path = "/app/db-config.json"
+        config_file_path = DB_CONFIG_PATH
+        problem = _db_config_path_problem()
+        if problem:
+            return {"mode": "local", "config": {}, "containers": {}, "error": problem}
         if os.path.exists(config_file_path):
             with open(config_file_path, 'r') as f:
                 db_config = json.load(f)
@@ -243,7 +279,10 @@ async def get_db_config():
 async def save_db_config(body: DbConfigBody):
     """Save remote database configuration to mounted db-config.json."""
     try:
-        config_file_path = "/app/db-config.json"
+        config_file_path = DB_CONFIG_PATH
+        problem = _db_config_path_problem()
+        if problem:
+            return {"ok": False, "error": problem}
 
         # Read current configuration
         current_config = {}
@@ -275,7 +314,11 @@ async def save_db_config(body: DbConfigBody):
         with open(config_file_path, 'w') as f:
             json.dump(updated_config, f, indent=2)
 
-        return {"ok": True, "message": "Database configuration saved successfully"}
+        # Propagate credential changes into DB_DSN so running services pick them up.
+        dsn_sync = await _trigger_dsn_sync()
+
+        return {"ok": True, "message": "Database configuration saved successfully",
+                "dsn_sync": dsn_sync}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -290,7 +333,10 @@ async def toggle_remote_db(body: RemoteDbToggleBody):
     """Toggle remote database settings using db-config.json with webhook emission."""
     s = get_settings()
     try:
-        config_file_path = "/app/db-config.json"
+        config_file_path = DB_CONFIG_PATH
+        problem = _db_config_path_problem()
+        if problem:
+            return {"ok": False, "error": problem}
 
         # Read current configuration
         current_config = {}
@@ -364,6 +410,9 @@ async def toggle_remote_db(body: RemoteDbToggleBody):
             logger = logging.getLogger("database_config")
             logger.warning(f"Failed to emit database change webhook: {e}")
 
+        # Propagate credential/mode change into DB_DSN for the running services.
+        dsn_sync = await _trigger_dsn_sync()
+
         return {
             "ok": True,
             "enabled": body.enabled,
@@ -371,6 +420,7 @@ async def toggle_remote_db(body: RemoteDbToggleBody):
             "previous_mode": previous_mode,
             "webhook_sent": webhook_success,
             "config_updated": True,
+            "dsn_sync": dsn_sync,
             "message": f"Remote database {'enabled' if body.enabled else 'disabled'} successfully",
             "audit_trail": f"Database mode change completed: {previous_mode} -> {'remote' if body.enabled else 'local'}"
         }

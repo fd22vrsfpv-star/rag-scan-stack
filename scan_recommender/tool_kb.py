@@ -745,6 +745,25 @@ class ToolKnowledgeBase:
         """Get list of all known service names."""
         return list(self._data.get("services", {}).keys())
 
+    def get_tool_metadata(self) -> Dict[str, Any]:
+        """Return the tool_metadata block (per-tool classification + overlap
+        groups). Empty dict if the KB has none."""
+        return dict(self._data.get("tool_metadata", {}) or {})
+
+    def get_non_scanner_tools(self) -> set:
+        """Tool names classified as non-scanners (e.g. cve_lookup) — these must
+        NOT be emitted as per-service scan recommendations."""
+        meta = self.get_tool_metadata().get("tools", {}) or {}
+        return {
+            name.lower()
+            for name, spec in meta.items()
+            if (spec or {}).get("type") == "cve_lookup" or (spec or {}).get("active") is False
+        }
+
+    def get_overlap_groups(self) -> Dict[str, Any]:
+        """Return overlap_groups {group: {description, members[]}}."""
+        return dict(self.get_tool_metadata().get("overlap_groups", {}) or {})
+
     def get_all_port_mappings(self) -> Dict[int, str]:
         """Get all port-to-service mappings."""
         return dict(self._port_to_service)
