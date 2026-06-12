@@ -16,8 +16,9 @@
  */
 
 import { useState } from 'react'
-import { Crosshair, X } from 'lucide-react'
+import { Crosshair, X, Sparkles } from 'lucide-react'
 import { ScanRecommendationsPanel } from '@/components/recommendations/ScanRecommendationsTable'
+import { useGenerateRecommendations } from '@/api/assets'
 
 const STATUS_OPTIONS = [
   { value: '',           label: 'All' },
@@ -41,6 +42,7 @@ export default function Recommendations() {
   const [service, setService] = useState('')
   const [ip, setIp] = useState('')
   const [source, setSource] = useState('')
+  const generateRecs = useGenerateRecommendations()
 
   const filters = {
     status: status || undefined,
@@ -59,7 +61,24 @@ export default function Recommendations() {
           Dispatch suggested scans against detected ports; the status loop
           surfaces queued → running → completed/failed in real time.
         </span>
+        <button
+          onClick={() => generateRecs.mutate(ip || undefined)}
+          disabled={generateRecs.isPending}
+          className="ml-auto flex items-center gap-1.5 px-2.5 py-1 text-xs rounded border border-primary/50 bg-primary/10 text-primary hover:bg-primary/20 disabled:opacity-50"
+          title="Generate recommendations for all currently-detected open ports that don't have one yet"
+        >
+          <Sparkles className="h-3.5 w-3.5" />
+          {generateRecs.isPending ? 'Generating…' : 'Generate from detected ports'}
+        </button>
       </div>
+      {generateRecs.isSuccess && (
+        <div className="text-xs text-muted-foreground">
+          Considered {generateRecs.data?.ports_considered ?? 0} port(s), generated {generateRecs.data?.generated ?? 0}.
+        </div>
+      )}
+      {generateRecs.isError && (
+        <div className="text-xs text-red-400">Generation failed — see logs.</div>
+      )}
 
       {/* Filter bar */}
       <div className="flex flex-wrap items-center gap-2 text-xs">

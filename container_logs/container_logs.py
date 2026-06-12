@@ -625,6 +625,24 @@ _FLAT_DEFAULT = {
 }
 
 
+def _db_config_path_problem() -> str:
+    """Return a human-readable reason db-config.json is unusable, else "".
+
+    The classic failure: docker-compose bind-mounts ./db-config.json into
+    container-logs and pentest-dashboard. If the host path is missing at the
+    first `docker compose up`, Docker silently creates it as a *directory*.
+    Every read then yields defaults (empty remote_db_host) and every write
+    raises IsADirectoryError, so DB mode switches fail with the misleading
+    "remote_db_host not configured". Detect that here so callers can say so.
+    """
+    if os.path.isdir(DB_CONFIG_FILE):
+        return ("db-config.json is a DIRECTORY, not a file (Docker auto-created "
+                "it because the host path was missing at compose-up). On the host: "
+                "rmdir db-config.json && echo '{\"mode\":\"local\"}' > db-config.json, "
+                "then recreate container-logs + pentest-dashboard.")
+    return ""
+
+
 def _read_db_config() -> dict:
     """Read remote DB config from db-config.json.
 
@@ -634,6 +652,10 @@ def _read_db_config() -> dict:
 
     Always returns a flat dict so callers can do `config.get("remote_db_host")`.
     """
+    problem = _db_config_path_problem()
+    if problem:
+        logger.warning("db-config.json unreadable: %s", problem)
+        return dict(_FLAT_DEFAULT)
     if not os.path.exists(DB_CONFIG_FILE):
         return dict(_FLAT_DEFAULT)
     try:
@@ -662,6 +684,10 @@ def _write_db_config(config: dict):
     Preserves the on-disk nested shape ({enabled, mode, config, metadata}) if
     the file already uses it; otherwise writes the flat shape it was given.
     """
+    problem = _db_config_path_problem()
+    if problem:
+        raise RuntimeError(problem)
+
     existing = None
     if os.path.exists(DB_CONFIG_FILE):
         try:
@@ -708,7 +734,11 @@ def _ensure_remote_tunnel(config: dict = None) -> dict:
     remote_user = config.get("remote_db_ssh_user") or "azureuser"
     remote_port = str(config.get("remote_db_port") or 5432)
     if not remote_host:
-        return {"ok": False, "error": "remote_db_host not configured"}
+        problem = _db_config_path_problem()
+        if problem:
+            return {"ok": False, "error": problem}
+        return {"ok": False, "error": "remote_db_host not configured — save the "
+                "remote DB settings (host/user/key) before switching to remote."}
 
     # If tunnel already running and healthy, nothing to do.
     try:
@@ -808,7 +838,11 @@ def _ensure_remote_direct(config: dict = None) -> dict:
     remote_host = config.get("remote_db_host") or ""
     remote_port = str(config.get("remote_db_port") or 5432)
     if not remote_host:
-        return {"ok": False, "error": "remote_db_host not configured"}
+        problem = _db_config_path_problem()
+        if problem:
+            return {"ok": False, "error": problem}
+        return {"ok": False, "error": "remote_db_host not configured — save the "
+                "remote DB settings (host/user) before switching to remote_direct."}
 
     # If proxy already running and healthy, nothing to do.
     try:
@@ -1035,6 +1069,82 @@ def _update_env_file(config: dict):
         f.writelines(new_lines)
 
 
+def _read_env_value(key: str, default: str = "") -> str:
+    """Read a single KEY=value from .env (first match), else default."""
+    if not os.path.exists(ENV_FILE):
+        return default
+    with open(ENV_FILE, "r") as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith(f"{key}="):
+                return s.split("=", 1)[1]
+    return default
+
+
+def _write_env_line(key: str, value: str) -> bool:
+    """Replace (or append) a single KEY=value line in .env. Returns True if changed."""
+    if not os.path.exists(ENV_FILE):
+        return False
+    with open(ENV_FILE, "r") as f:
+        lines = f.readlines()
+    new_line = f"{key}={value}\n"
+    out = []
+    found = False
+    changed = False
+    for line in lines:
+        if line.strip().startswith(f"{key}=") or line.strip().startswith(f"# {key}="):
+            found = True
+            if line != new_line:
+                changed = True
+            out.append(new_line)
+        else:
+            out.append(line)
+    if not found:
+        out.append(new_line)
+        changed = True
+    if changed:
+        with open(ENV_FILE, "w") as f:
+            f.writelines(out)
+    return changed
+
+
+def _sync_db_dsn(config: dict, mode: str) -> bool:
+    """Rebuild DB_DSN in .env to match the active mode + current credentials.
+
+    Propagates the remote DB password/user automatically so a change made in
+    Settings → Database (or db-config.json) actually reaches the services —
+    they all connect via ${DB_DSN}, which the mode switch previously never
+    updated.  Host/port/db are constant (the rag-postgres alias on 5432, served
+    by the local container, the SSH-tunnel sidecar, or the socat proxy); only
+    credentials + sslmode vary by mode:
+
+      - local:         local POSTGRES_USER/POSTGRES_PASSWORD, no sslmode
+      - remote:        remote_db_user/remote_db_password, no sslmode
+                       (the SSH tunnel encrypts transport; remote sees localhost)
+      - remote_direct: remote creds + sslmode=require — the rag-db-tunnel socat
+                       sidecar is a plaintext pipe, so libpq must negotiate TLS
+                       end-to-end or the remote rejects "... no encryption".
+
+    Returns True if the DB_DSN line changed.
+    """
+    from urllib.parse import quote
+    dbname = _read_env_value("POSTGRES_DB", "scans") or "scans"
+    if mode in ("remote", "remote_direct"):
+        user = config.get("remote_db_user") or "app"
+        pw = config.get("remote_db_password") or ""
+    else:
+        user = _read_env_value("POSTGRES_USER", "app") or "app"
+        pw = _read_env_value("POSTGRES_PASSWORD", "app") or "app"
+    dsn = f"postgresql://{quote(user, safe='')}:{quote(pw, safe='')}@rag-postgres:5432/{dbname}"
+    if mode == "remote_direct":
+        dsn += "?sslmode=require"
+    changed = _write_env_line("DB_DSN", dsn)
+    if changed:
+        logger.info("[db-dsn] DB_DSN rebuilt for mode=%s (user=%s, sslmode=%s)",
+                    mode, user, "require" if mode == "remote_direct" else "none")
+    return changed
+
+
 @app.get("/db/config")
 def get_db_config():
     """Get current database configuration and mode."""
@@ -1074,7 +1184,35 @@ def save_db_config(body: DbConfigBody):
     config = body.model_dump()
     _write_db_config(config)
     _update_env_file(config)
-    return {"ok": True, "config": config}
+    # Propagate credential changes into DB_DSN so the running stack picks them
+    # up.  Recreate consumers only when active mode is remote and the DSN
+    # actually changed (no point churning the local stack).
+    mode = config.get("mode") or _detect_db_mode()
+    dsn_changed = _sync_db_dsn(config, mode)
+    if dsn_changed and mode in ("remote", "remote_direct"):
+        _recreate_db_consumers_async("db_config_save:dsn_propagate")
+    return {"ok": True, "config": config, "dsn_changed": dsn_changed}
+
+
+@app.post("/db/sync-dsn")
+def sync_db_dsn_endpoint(recreate: bool = True):
+    """Rebuild DB_DSN from the persisted config for the active mode.
+
+    Lets the Settings UI (and the host-side refresh script) propagate a
+    password / user change to the running services without a full mode switch.
+    """
+    config = _read_db_config()
+    mode = config.get("mode") or _detect_db_mode()
+    changed = _sync_db_dsn(config, mode)
+    did_recreate = bool(changed and recreate)
+    if did_recreate:
+        _recreate_db_consumers_async("db_dsn_sync")
+    _emit_db_event("database_dsn_synced", {
+        "mode": mode,
+        "dsn_changed": changed,
+        "recreated": did_recreate,
+    })
+    return {"ok": True, "mode": mode, "dsn_changed": changed, "recreated": did_recreate}
 
 
 class RemoteDbToggleBody(PydanticBaseModel):
@@ -1370,6 +1508,7 @@ def switch_db_mode(mode: str):
         if result.get("ok"):
             config["mode"] = "remote"
             _write_db_config(config)
+            _sync_db_dsn(config, "remote")  # propagate remote creds into DB_DSN
             _recreate_db_consumers_async("db_mode_switch:remote")
             return {"ok": True, "mode": "remote",
                     "output": "SSH tunnel healthy" if not result.get("already_running")
@@ -1384,6 +1523,7 @@ def switch_db_mode(mode: str):
         if result.get("ok"):
             config["mode"] = "remote_direct"
             _write_db_config(config)
+            _sync_db_dsn(config, "remote_direct")  # remote creds + sslmode=require
             _recreate_db_consumers_async("db_mode_switch:remote_direct")
             return {"ok": True, "mode": "remote_direct",
                     "output": "Direct SSL proxy healthy" if not result.get("already_running")
@@ -1401,6 +1541,7 @@ def switch_db_mode(mode: str):
         config = _read_db_config()
         config["mode"] = "local"
         _write_db_config(config)
+        _sync_db_dsn(config, "local")  # restore local creds, no sslmode
 
         # Bring local postgres back up.  As with the consumer recreate,
         # compose runs in-container against the host daemon, so relative
@@ -2041,8 +2182,15 @@ def compare_databases():
     import time
 
     config = _read_db_config()
+    # Remote DB credentials (used only for the remote query below).
     db_user = config.get("remote_db_user") or "app"
     db_password = config.get("remote_db_password") or ""
+    # Local DB has its OWN credentials (POSTGRES_*), not the remote ones.
+    # Using the remote creds for the local query made the local stats fail with
+    # "fe_sendauth: no password supplied" whenever remote_db_password was empty
+    # (e.g. in local mode). Mirror _sync_db_dsn's local-credential resolution.
+    local_user = _read_env_value("POSTGRES_USER", "app") or "app"
+    local_password = _read_env_value("POSTGRES_PASSWORD", "app") or "app"
     mode = _detect_db_mode()
 
     # ── Get local DB stats ─────────────────────────────────────────
@@ -2112,7 +2260,7 @@ def compare_databases():
     local_stats: dict
     if local_host:
         try:
-            local_stats = _query_db_stats(local_host, 5432, db_user, db_password)
+            local_stats = _query_db_stats(local_host, 5432, local_user, local_password)
         except Exception as e:
             local_stats = {"ok": False, "error": f"Local DB query failed: {e}", "tables": {}, "sync": {}}
     else:

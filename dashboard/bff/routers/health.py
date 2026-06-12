@@ -205,24 +205,32 @@ async def health(bust: bool = False):
         check_remote_postgres(),
     )
 
-    # Detect DB proxy type (direct SSL vs SSH tunnel) from container-logs config
+    # Detect DB mode + proxy type (direct SSL vs SSH tunnel) from container-logs config
+    db_mode = "local"  # default
     db_proxy_type = "ssh_tunnel"  # default
     try:
         async with httpx.AsyncClient(verify=False, timeout=2) as client:
             db_cfg = await client.get(f"{settings.container_logs_url}/db/config")
             if db_cfg.status_code == 200:
-                cfg_mode = db_cfg.json().get("mode", "local")
-                if cfg_mode == "remote_direct":
+                db_mode = db_cfg.json().get("mode", "local") or "local"
+                if db_mode == "remote_direct":
                     db_proxy_type = "direct_ssl"
     except Exception:
         pass
+
+    # In local mode rag-api's pool points at the LOCAL postgres, so the
+    # "remote_postgres" probe (which queries rag-api) succeeds against the same
+    # local DB — that is NOT a real remote. Only treat remote as up when the
+    # configured mode is actually remote; otherwise local-mode installs get a
+    # false "dual postgres" conflict warning.
+    remote_mode = db_mode in ("remote", "remote_direct")
 
     # Tag the db_tunnel entry with proxy type
     if "db_tunnel" in results:
         results["db_tunnel"]["proxy_type"] = db_proxy_type
 
     # If remote postgres is healthy, the proxy/tunnel must be working — override status
-    remote_pg_up = results.get("remote_postgres", {}).get("status") == "healthy"
+    remote_pg_up = remote_mode and results.get("remote_postgres", {}).get("status") == "healthy"
     if remote_pg_up:
         label = "Direct SSL proxy" if db_proxy_type == "direct_ssl" else "SSH tunnel"
         if results.get("db_tunnel", {}).get("status") != "healthy":
@@ -230,7 +238,9 @@ async def health(bust: bool = False):
                                     "proxy_type": db_proxy_type,
                                     "note": f"Remote DB reachable — {label} working"}
 
-    # Dual-postgres warning: both local and remote running simultaneously
+    # Dual-postgres warning: both local and remote running simultaneously.
+    # Only meaningful in a remote mode — guarded by remote_pg_up (which is now
+    # false in local mode).
     warnings = []
     local_pg_up = results.get("postgres", {}).get("status") in ("healthy",)
     if local_pg_up and remote_pg_up:

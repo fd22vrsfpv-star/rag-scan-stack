@@ -110,7 +110,12 @@ curl -X POST http://localhost:8014/scan \
 - `GET /docs` - Interactive Swagger UI documentation
 - `POST /ingest/masscan` - Ingest Masscan results
 - `POST /ingest/nmap` - Ingest Nmap results
+- `POST /recommendations/generate?ip=<optional>` - Generate scan recommendations for all currently-detected open ports that don't have one yet (no time window). Populates `scan_recommendations` so suggested scans can be dispatched against targets scanned earlier (the reactive ingest trigger only covers ports seen in the last 10 minutes). Synchronous + local-LLM-backed; emits a `recommendations_generated` webhook. Idempotent.
+
+**Dispatch note (BFF `POST /api/scan-recommendations/run`):** dispatching a `metasploit` recommendation does NOT auto-exploit. It creates a `pending_exploits` row (`source=metasploit`, RHOSTS/RPORT prefilled, `status=pending`, `requested_by=recommendations_ui`) that surfaces in the Exploit Manager (`/exploits/all`) for human approve/reject; approval runs it via exploit-runner `/execute/by-id`. The run response includes a `queued` count for these, and emits a `metasploit_queued_for_approval` webhook.
 - Additional endpoints available (check `/docs`)
+
+> **Note:** internal service-to-service URLs use **HTTPS** (e.g. `https://rag-api:8000`, `https://scan-recommender:8013`). The recommender in particular must be reached over `https://` — `SCAN_RECOMMENDER_URL` is set accordingly in `.env` and the install scripts.
 
 ### 7. Autogen Agents (Port 8015)
 **Base URL**: `http://localhost:8015` (external) or `http://autogen-agents:8015` (internal)
