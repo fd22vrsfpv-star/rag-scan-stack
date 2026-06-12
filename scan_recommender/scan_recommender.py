@@ -471,7 +471,101 @@ def _enrich_and_finalize(recs: List[Dict], row: Dict, port: Optional[int],
     if ip:
         _append_tech_targeted_recs(recs, ip, port)      # G1
     _append_high_value_port_recs(recs, port)            # G2 (last)
+    svc = row.get("service") if isinstance(row, dict) else None
+    recs = _apply_tool_feedback(recs, svc)
     return _stamp_source_context(_dedupe_overlapping(recs), row, port)
+
+
+# Durable tool-selection feedback (scan_tool_feedback table). Cached briefly so
+# rec generation doesn't hit the DB on every call.
+_TOOL_FEEDBACK_CACHE: Dict[str, Any] = {"ts": 0.0, "rows": []}
+_TOOL_FEEDBACK_TTL = 20.0  # seconds
+
+
+def _invalidate_tool_feedback_cache():
+    _TOOL_FEEDBACK_CACHE["ts"] = 0.0
+
+
+def _get_tool_feedback() -> List[Dict]:
+    """Active rows from scan_tool_feedback (cached for _TOOL_FEEDBACK_TTL)."""
+    import time
+    now = time.monotonic()
+    if _TOOL_FEEDBACK_CACHE["rows"] and (now - _TOOL_FEEDBACK_CACHE["ts"]) < _TOOL_FEEDBACK_TTL:
+        return _TOOL_FEEDBACK_CACHE["rows"]
+    rows: List[Dict] = []
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT service, scanner, selector, verdict, payload "
+                "FROM public.scan_tool_feedback WHERE active = true"
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        logger.debug("tool feedback load failed: %s", e)
+    _TOOL_FEEDBACK_CACHE["ts"] = now
+    _TOOL_FEEDBACK_CACHE["rows"] = rows
+    return rows
+
+
+def _apply_tool_feedback(recs: List[Dict], service: Optional[str]) -> List[Dict]:
+    """Apply operator/agent feedback policies (suppress / add_overlap / add_tool)
+    to a service's recs. service=None feedback rows apply to every service."""
+    import fnmatch
+    fb = _get_tool_feedback()
+    if not fb:
+        return recs
+    svc = (service or "").lower()
+
+    def _scope_ok(f) -> bool:
+        return not f.get("service") or f["service"].lower() == svc
+
+    def _matches(f, rec) -> bool:
+        sc = (f.get("scanner") or "").lower()
+        if sc and (rec.get("scanner") or "").lower() != sc:
+            return False
+        sel = f.get("selector")
+        if sel and not fnmatch.fnmatch((rec.get("script") or "").lower(), sel.lower()):
+            return False
+        return True
+
+    # add_overlap: retag matching recs into a group (so dedup collapses them).
+    for f in fb:
+        if f["verdict"] != "add_overlap" or not _scope_ok(f):
+            continue
+        group = (f.get("payload") or {}).get("group")
+        if group:
+            for r in recs:
+                if _matches(f, r):
+                    r["purpose_group"] = group
+
+    # suppress: drop matching recs.
+    recs = [
+        r for r in recs
+        if not any(f["verdict"] == "suppress" and _scope_ok(f) and _matches(f, r) for f in fb)
+    ]
+
+    # add_tool: inject a tool rec for this service (deduped by name+command).
+    have = {((r.get("scanner") or "").lower(), r.get("script") or "") for r in recs}
+    for f in fb:
+        if f["verdict"] != "add_tool" or not _scope_ok(f):
+            continue
+        p = f.get("payload") or {}
+        name = p.get("name")
+        if not name:
+            continue
+        key = (name.lower(), p.get("command") or "")
+        if key in have:
+            continue
+        recs.append({
+            "scanner": name,
+            "action": p.get("action"),
+            "script": p.get("command"),
+            "template": None,
+            "purpose_group": p.get("purpose_group"),
+        })
+        have.add(key)
+
+    return recs
 
 
 def _dedupe_overlapping(recs: List[Dict]) -> List[Dict]:
@@ -1497,6 +1591,91 @@ def delete_kb_service_override(name: str):
     except Exception as e:
         logger.error(f"Failed to delete KB override {svc_name}: {e}")
         raise HTTPException(500, f"Failed to delete: {e}")
+
+
+class ToolFeedbackBody(BaseModel):
+    verdict: str                       # 'suppress' | 'add_tool' | 'add_overlap'
+    service: Optional[str] = None      # e.g. 'http'; None = all services
+    scanner: Optional[str] = None      # e.g. 'metasploit', 'vulnx'
+    selector: Optional[str] = None     # glob vs rec script/module
+    payload: Optional[Dict[str, Any]] = None   # add_tool: {name,action,command}; add_overlap: {group}
+    reason: Optional[str] = None
+    created_by: Optional[str] = None
+
+
+@kb_router.get("/feedback")
+def list_tool_feedback():
+    """List recorded tool-selection feedback (the durable policy rows)."""
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, service, scanner, selector, verdict, payload, reason, "
+                "created_by, active, created_at FROM public.scan_tool_feedback "
+                "ORDER BY created_at DESC"
+            )
+            return {"feedback": [dict(r) for r in cur.fetchall()]}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to list feedback: {e}")
+
+
+@kb_router.post("/feedback")
+def add_tool_feedback(body: ToolFeedbackBody):
+    """Record a tool-selection feedback policy that steers future recs.
+
+    verdict 'suppress'    → stop recommending scanner [+ selector] (service or global)
+    verdict 'add_tool'    → inject a tool rec (payload {name, action, command}) for a service
+    verdict 'add_overlap' → tag matching recs into an overlap group (payload {group})
+    """
+    if body.verdict not in ("suppress", "add_tool", "add_overlap"):
+        raise HTTPException(400, "verdict must be suppress | add_tool | add_overlap")
+    if body.verdict == "add_tool" and not (body.payload or {}).get("name"):
+        raise HTTPException(400, "add_tool requires payload.name")
+    if body.verdict == "add_overlap" and not (body.payload or {}).get("group"):
+        raise HTTPException(400, "add_overlap requires payload.group")
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO public.scan_tool_feedback
+                    (service, scanner, selector, verdict, payload, reason, created_by)
+                VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s)
+                RETURNING id, created_at
+                """,
+                (body.service, body.scanner, body.selector, body.verdict,
+                 Json(body.payload or {}), body.reason, body.created_by or "operator"),
+            )
+            row = cur.fetchone()
+            conn.commit()
+    except Exception as e:
+        raise HTTPException(500, f"Failed to record feedback: {e}")
+
+    _invalidate_tool_feedback_cache()  # apply immediately to subsequent recs
+    _emit_webhook("scan_recommender_tool_feedback_recorded", {
+        "verdict": body.verdict, "service": body.service, "scanner": body.scanner,
+        "selector": body.selector, "reason": body.reason,
+    })
+    return {"ok": True, "id": str(row["id"]), "created_at": str(row["created_at"])}
+
+
+@kb_router.delete("/feedback/{feedback_id}")
+def deactivate_tool_feedback(feedback_id: str):
+    """Deactivate a feedback policy (soft-delete; stops affecting recs)."""
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE public.scan_tool_feedback SET active = false, updated_at = now() "
+                "WHERE id = %s RETURNING id",
+                (feedback_id,),
+            )
+            conn.commit()
+            if cur.rowcount == 0:
+                raise HTTPException(404, "feedback not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Failed to deactivate: {e}")
+    _invalidate_tool_feedback_cache()
+    return {"ok": True, "deactivated": feedback_id}
 
 
 app.include_router(kb_router)
