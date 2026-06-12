@@ -893,19 +893,55 @@ _FALLBACK_ALLOWED_TOOLS = {
 # Metasploit is never auto-dispatchable here.
 _MSF_DENY = {"metasploit", "msfconsole", "msfvenom", "msf"}
 
-# Lazily-populated cache of {tool_name: install_cmd}.  None until first fetch.
+# Cache of {tool_name: install_cmd}, rebuilt every _TOOL_REGISTRY_TTL seconds so
+# operator allowlist edits (from Settings) take effect without a restart.
 _TOOL_REGISTRY: Optional[Dict[str, Optional[str]]] = None
+_TOOL_REGISTRY_TS: float = 0.0
+_TOOL_REGISTRY_TTL: float = 60.0
+
+
+def _load_allowlist_overrides():
+    """Operator-configured allowlist edits from Settings, stored in
+    app_settings.kali_tool_allowlist as {"extra": [...], "deny": [...]}.
+
+    Returns (extra:set, deny:set). MSF is never addable (filtered out of extra).
+    """
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM app_settings "
+                    "WHERE key = 'kali_tool_allowlist' AND category = 'config'"
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        if row and row[0]:
+            data = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            extra = {t.strip().lower() for t in (data.get("extra") or []) if t and t.strip()}
+            deny = {t.strip().lower() for t in (data.get("deny") or []) if t and t.strip()}
+            extra -= _MSF_DENY  # MSF can't be allowlisted via settings
+            return extra, deny
+    except Exception as e:
+        logger.debug("allowlist override load failed: %s", e)
+    return set(), set()
 
 
 def _fetch_tool_registry() -> Dict[str, Optional[str]]:
-    """Fetch+cache the canonical tool registry from node_manager.
+    """Build+cache the effective allowlist {tool_name: kali_install_cmd}.
 
-    Returns {tool_name: kali_install_cmd}.  On any failure, returns the
-    fallback set (no install commands) so the gate still works offline.
+    Sources, in order: node_manager registry → fallback set → operator
+    `extra` (Settings) → minus operator `deny` (Settings) → minus MSF (always).
+    Rebuilt every _TOOL_REGISTRY_TTL so Settings edits apply without a restart.
     """
-    global _TOOL_REGISTRY
-    if _TOOL_REGISTRY is not None:
+    global _TOOL_REGISTRY, _TOOL_REGISTRY_TS
+    import time
+    now = time.monotonic()
+    if _TOOL_REGISTRY is not None and (now - _TOOL_REGISTRY_TS) < _TOOL_REGISTRY_TTL:
         return _TOOL_REGISTRY
+
+    reg: Dict[str, Optional[str]] = {}
     try:
         import requests as _req
         r = _req.get(f"{NODE_MANAGER_URL}/tools/registry",
@@ -913,18 +949,25 @@ def _fetch_tool_registry() -> Dict[str, Optional[str]]:
         if r.status_code == 200:
             tools = (r.json() or {}).get("tools", {})
             reg = {name.lower(): spec.get("install") for name, spec in tools.items()}
-            # Union with fallback so we never regress below the known-good set.
-            for t in _FALLBACK_ALLOWED_TOOLS:
-                reg.setdefault(t, None)
-            # Drop MSF.
-            for d in _MSF_DENY:
-                reg.pop(d, None)
-            _TOOL_REGISTRY = reg
-            logger.info("Tool registry loaded: %d tools allowed", len(reg))
-            return _TOOL_REGISTRY
     except Exception as e:
         logger.warning("Tool registry fetch failed (%s); using fallback set", e)
-    _TOOL_REGISTRY = {t: None for t in _FALLBACK_ALLOWED_TOOLS}
+
+    # Union with fallback so we never regress below the known-good set.
+    for t in _FALLBACK_ALLOWED_TOOLS:
+        reg.setdefault(t, None)
+    # Operator overrides from Settings (extra adds, deny removes).
+    extra, deny = _load_allowlist_overrides()
+    for t in extra:
+        reg.setdefault(t, None)
+    for t in deny:
+        reg.pop(t, None)
+    # MSF is never auto-dispatchable — enforced last so it can't be overridden.
+    for d in _MSF_DENY:
+        reg.pop(d, None)
+
+    _TOOL_REGISTRY = reg
+    _TOOL_REGISTRY_TS = now
+    logger.info("Tool registry: %d allowed (extra=%d deny=%d)", len(reg), len(extra), len(deny))
     return _TOOL_REGISTRY
 
 
