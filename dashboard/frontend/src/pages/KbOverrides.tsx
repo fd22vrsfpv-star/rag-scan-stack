@@ -16,6 +16,7 @@
 
 import { useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
+import InfoTip from '@/components/InfoTip'
 import { AlertTriangle, BookOpen, Edit, RotateCcw, X, Plus, Loader2 } from 'lucide-react'
 import {
   useKBServices,
@@ -55,6 +56,19 @@ export default function KbOverrides() {
       <div className="flex items-center gap-2">
         <BookOpen className="h-4 w-4 text-blue-400" />
         <h2 className="text-base font-semibold">KB Service Overrides</h2>
+        <InfoTip side="bottom" text={
+          <>
+            Two ways to steer which tools the recommender suggests for a service:
+            <br /><br />
+            <b>Overrides</b> (this page) <i>replace</i> a service’s whole tool / metasploit /
+            nuclei-tag list — submit the full list you want.
+            <br /><br />
+            <b>Feedback policies</b> are surgical and layer on top — <code>suppress</code> a
+            tool (e.g. metasploit <code>*robots_txt</code>), <code>add_tool</code> a
+            lightweight one (e.g. <code>curl …/robots.txt</code>), or <code>add_overlap</code>
+            to mark tools redundant. Both apply live, no rebuild.
+          </>
+        } />
         <span className="text-xs text-muted-foreground">
           {data ? `${data.count} services` : ''}
         </span>
