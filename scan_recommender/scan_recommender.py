@@ -94,6 +94,9 @@ class ScanRecommendation(BaseModel):
     service: Optional[str] = None
     port: Optional[int] = None
     banner: Optional[str] = None
+    # Overlap group (from the KB). Tools sharing a group return the same data;
+    # the recommender keeps only one per group (an "OR").
+    purpose_group: Optional[str] = None
 
 
 class ScanRecommendationsResponse(BaseModel):
@@ -159,32 +162,70 @@ def _emit_webhook(event_type: str, data: Dict, severity: Optional[str] = None):
         logger.debug("webhook emit failed (%s): %s", event_type, e)
 
 
+def _build_overlap_maps():
+    """Build overlap-group lookups from the KB's tool_metadata.overlap_groups.
+
+    Returns (tool_to_group, msf_globs) where tool_to_group maps a tool name to
+    its group and msf_globs is a list of (group, glob) for matching metasploit
+    modules (members written as "metasploit:<glob>"). Falls back to the legacy
+    hardcoded groups if the KB declares none."""
+    groups = get_tool_kb().get_overlap_groups()
+    tool_to_group: Dict[str, str] = {}
+    msf_globs: List = []  # (group, glob)
+    if groups:
+        for group, spec in groups.items():
+            for member in (spec or {}).get("members", []) or []:
+                ml = str(member).lower()
+                if ml.startswith("metasploit:"):
+                    msf_globs.append((group, ml.split(":", 1)[1]))
+                else:
+                    tool_to_group[ml] = group
+    else:
+        legacy = {
+            "content_discovery": ["gobuster", "feroxbuster", "dirsearch", "wfuzz", "ffuf"],
+            "web_vuln_scan": ["nikto", "nuclei"],
+            "tech_fingerprint": ["whatweb", "wappalyzer"],
+            "sql_injection": ["sqlmap"],
+        }
+        for group, tools in legacy.items():
+            for t in tools:
+                tool_to_group[t] = group
+    return tool_to_group, msf_globs
+
+
+def _msf_module_group(module: str, msf_globs) -> Optional[str]:
+    """Match a metasploit module path against the overlap-group globs."""
+    import fnmatch
+    m = (module or "").lower()
+    for group, glob in msf_globs:
+        if fnmatch.fnmatch(m, glob):
+            return group
+    return None
+
+
 def _kb_result_to_recommendations(kb_result: Dict) -> List[Dict]:
     """Convert ToolKnowledgeBase result into List[Dict] recommendation format.
-    Tags tools with their purpose_group so the UI can group overlapping tools."""
 
-    # Tools that serve the same purpose — tagged so UI can group them
-    PURPOSE_GROUPS = {
-        "content_discovery": ["gobuster", "feroxbuster", "dirsearch", "wfuzz", "ffuf"],
-        "web_vuln_scan": ["nikto", "nuclei"],
-        "tech_fingerprint": ["whatweb", "wappalyzer"],
-        "sql_injection": ["sqlmap"],
-    }
-    _tool_to_group = {}
-    for group, tools in PURPOSE_GROUPS.items():
-        for t in tools:
-            _tool_to_group[t] = group
+    - Skips tools the KB classifies as non-scanners (e.g. vulnx = CVE lookup);
+      those are handled by the assets software flow, not run against ports.
+    - Tags each rec with its overlap purpose_group (from the KB) so overlapping
+      tools (nmap -sV / ssh-audit / msf *_version, etc.) are treated as an OR."""
+    tool_to_group, msf_globs = _build_overlap_maps()
+    non_scanners = get_tool_kb().get_non_scanner_tools()
 
     recs: List[Dict] = []
 
     for tool in kb_result.get("tools", []):
         name = tool.get("name", "unknown").lower()
+        if name in non_scanners:
+            # e.g. vulnx — CVE lookup for already-detected software, not a scan.
+            continue
         recs.append({
             "scanner": tool.get("name", "unknown"),
             "action": tool.get("purpose"),
             "script": tool.get("command"),
             "template": None,
-            "purpose_group": _tool_to_group.get(name),
+            "purpose_group": tool_to_group.get(name),
         })
 
     # nuclei_tags → one recommendation
@@ -195,15 +236,18 @@ def _kb_result_to_recommendations(kb_result: Dict) -> List[Dict]:
             "action": "template scan",
             "script": None,
             "template": ",".join(tags),
+            "purpose_group": tool_to_group.get("nuclei"),
         })
 
     # Each metasploit[] entry
     for msf in kb_result.get("metasploit", []):
+        module = msf.get("module")
         recs.append({
             "scanner": "metasploit",
             "action": msf.get("purpose"),
-            "script": msf.get("module"),
+            "script": module,
             "template": None,
+            "purpose_group": _msf_module_group(module, msf_globs),
         })
 
     return recs
@@ -222,20 +266,6 @@ def _get_kb_overrides(service_name: str) -> Optional[Dict]:
     except Exception:
         return None
 
-
-def _append_vulnx_rec(recs: List[Dict], row: Dict):
-    """Append a vulnx CVE lookup recommendation when product/banner info is available."""
-    product = (row.get("product") or "").strip()
-    version = (row.get("version") or "").strip()
-    banner_text = (row.get("banner") or "").strip()
-    if product or banner_text:
-        query_parts = [product, version] if product else [banner_text]
-        recs.append({
-            "scanner": "vulnx",
-            "action": f"CVE lookup for {' '.join(filter(None, query_parts))}",
-            "script": None,
-            "template": None,
-        })
 
 
 def _get_discovered_software(ip: Optional[str] = None, limit: int = 50) -> List[Dict]:
@@ -314,31 +344,6 @@ def _generate_vulnx_recommendations_for_software(software_list: List[Dict]) -> L
         })
 
     return recs
-
-
-def _append_proactive_vulnx_recs(recs: List[Dict], ip: str):
-    """Append proactive vulnx recommendations based on all discovered software for the IP."""
-    discovered = _get_discovered_software(ip=ip, limit=20)  # Limit to prevent overwhelming recommendations
-
-    if not discovered:
-        return
-
-    vulnx_recs = _generate_vulnx_recommendations_for_software(discovered)
-
-    # Add up to 5 most relevant vulnx recommendations to avoid overwhelming the user
-    for i, rec in enumerate(vulnx_recs[:5]):
-        # Add priority based on version availability (versioned software gets higher priority)
-        software_ctx = rec.get("software_context", {})
-        # Priority scale (lower = runs first): high-value-port MSF=5,
-        # high-value-port=10, tech-targeted=15, then proactive vulnx.
-        if software_ctx.get("version"):
-            rec["priority"] = 20  # versioned software (more actionable)
-        else:
-            rec["priority"] = 30  # unversioned software
-
-        recs.append(rec)
-
-    logger.info(f"Added {len(vulnx_recs[:5])} proactive vulnx recommendations for {ip} (from {len(discovered)} discovered software products)")
 
 
 def _get_detected_tech(ip: Optional[str], port: Optional[int] = None) -> tuple:
@@ -456,13 +461,35 @@ def _enrich_and_finalize(recs: List[Dict], row: Dict, port: Optional[int],
     Order matters: high-value-port handling runs LAST so it can bump the
     priority of everything already appended (tech-targeted, vulnx, etc.).
     """
-    _append_vulnx_rec(recs, row)
+    # NOTE: vulnx is a CVE-lookup for detected *software*, not a port probe.
+    # It is no longer emitted as a per-port scan recommendation (that produced
+    # dozens of duplicate / raw-banner "CVE lookup" recs that looked like tools
+    # to run against ports). Software CVE lookups are handled by the assets
+    # software flow (/software-assets + bulk-check), which keys off the
+    # detected_software product/version rather than raw banners.
     _append_common_web_fallback(recs, port)
     if ip:
         _append_tech_targeted_recs(recs, ip, port)      # G1
-        _append_proactive_vulnx_recs(recs, ip)
     _append_high_value_port_recs(recs, port)            # G2 (last)
-    return _stamp_source_context(recs, row, port)
+    return _stamp_source_context(_dedupe_overlapping(recs), row, port)
+
+
+def _dedupe_overlapping(recs: List[Dict]) -> List[Dict]:
+    """Collapse overlapping recommendations to one per purpose_group (an "OR").
+
+    Tools/modules tagged with the same purpose_group (e.g. nmap -sV and the
+    metasploit *_version modules) return the same data, so only the first
+    (highest-priority) one is kept. Untagged recs are always kept."""
+    seen_groups = set()
+    out: List[Dict] = []
+    for rec in recs:
+        group = rec.get("purpose_group")
+        if group:
+            if group in seen_groups:
+                continue
+            seen_groups.add(group)
+        out.append(rec)
+    return out
 
 
 # ---- Rules ----
@@ -865,6 +892,14 @@ Rules:
   service: {service!r}
   banner: {banner!r}
 - Prefer practical web and service probes (nmap scripts, nuclei templates, ZAP actions).
+- Do NOT recommend vulnx (or any CVE-lookup tool). vulnx is NOT a scanner — it
+  only looks up CVEs for an already-detected product+version and runs via the
+  assets software flow, never as a port/service probe.
+- Tools that return the same data are redundant; recommend only ONE per group:
+  version detection (nmap -sV / ssh-audit / metasploit *_version),
+  content discovery (gobuster / feroxbuster / dirsearch / ffuf / wfuzz),
+  web vuln scan (nikto / nuclei), tech fingerprint (whatweb / wappalyzer),
+  login brute force (hydra / medusa / ncrack / metasploit *_login).
 """
     if LLM_BACKEND == "azure":
         try:
