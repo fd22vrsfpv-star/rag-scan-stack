@@ -249,16 +249,76 @@ def compute_attack_vectors(engagement_id: Optional[str] = None) -> Dict[str, Any
                     ))
                     written += 1
         conn.commit()
+        edges = _build_path_edges(conn, engagement_id, cfg)
     finally:
         conn.close()
-    logger.info("attack_vectors computed: %d findings -> %d vectors (eng=%s)",
-                considered, written, engagement_id)
-    return {"findings_considered": considered, "vectors_written": written}
+    logger.info("attack_vectors computed: %d findings -> %d vectors, %d edges (eng=%s)",
+                considered, written, edges, engagement_id)
+    return {"findings_considered": considered, "vectors_written": written, "edges_written": edges}
+
+
+def _build_path_edges(conn, engagement_id: Optional[str], cfg: Dict[str, Any]) -> int:
+    """Build per-target attack-progression edges: order a target's techniques by
+    ATT&CK tactic position and link each to the next (forward) one ('enables').
+    Models 'on host X you progress recon → access → privesc → ...'."""
+    from collections import defaultdict
+    tactics = cfg.get("tactics", {})
+
+    def pos(tactic):
+        return float((tactics.get(tactic) or {}).get("position", 0.0))
+
+    eng = "WHERE engagement_id = %(eid)s" if engagement_id else ""
+    params = {"eid": engagement_id}
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT target, technique, tactic,
+                   max(risk_score) AS risk,
+                   (array_agg(asset_id))[1] AS asset_id,
+                   (array_agg(engagement_id))[1] AS engagement_id
+            FROM public.attack_vectors {eng}
+            GROUP BY target, technique, tactic
+        """, params)
+        rows = [dict(r) for r in cur.fetchall()]
+
+    by_target: Dict[str, list] = defaultdict(list)
+    for r in rows:
+        by_target[r["target"]].append(r)
+
+    written = 0
+    with conn.cursor() as cur:
+        # Clear prior edges for this scope so recompute is idempotent.
+        if engagement_id:
+            cur.execute("DELETE FROM public.attack_path_edges WHERE engagement_id = %s", (engagement_id,))
+        else:
+            cur.execute("DELETE FROM public.attack_path_edges WHERE engagement_id IS NULL")
+        for target, techs in by_target.items():
+            techs.sort(key=lambda t: pos(t["tactic"]))
+            for a, b in zip(techs, techs[1:]):
+                if pos(b["tactic"]) <= pos(a["tactic"]):
+                    continue  # only forward progression
+                weight = round(min(float(a["risk"]), float(b["risk"])), 1)
+                cur.execute("""
+                    INSERT INTO public.attack_path_edges
+                      (engagement_id, asset_id, target, from_technique, to_technique, edge_type, weight)
+                    VALUES (%s,%s,%s,%s,%s,'enables',%s)
+                    ON CONFLICT (target, from_technique, to_technique, edge_type)
+                    DO UPDATE SET weight = EXCLUDED.weight
+                """, (b.get("engagement_id"), b.get("asset_id"), target,
+                      a["technique"], b["technique"], weight))
+                written += 1
+        conn.commit()
+    return written
 
 
 def get_attack_vectors(engagement_id: Optional[str] = None, limit: int = 100,
-                       min_risk: float = 0.0) -> List[Dict[str, Any]]:
-    """Ranked attack vectors (highest risk first) — the AI's prioritized list."""
+                       min_risk: float = 0.0, grouped: bool = True) -> List[Dict[str, Any]]:
+    """Ranked attack vectors (highest risk first) — the AI's prioritized list.
+
+    grouped=True (default) collapses per-finding rows to one distinct attack
+    path per (target, technique): the highest-risk representative plus a
+    finding_count, so the AI/UI sees distinct paths instead of N duplicates of
+    the same technique on the same host. grouped=False returns raw rows.
+    """
     conn = _get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -267,15 +327,37 @@ def get_attack_vectors(engagement_id: Optional[str] = None, limit: int = 100,
             if engagement_id:
                 where.append("engagement_id = %(eid)s")
                 params["eid"] = engagement_id
-            cur.execute(f"""
-                SELECT id, engagement_id, asset_id, finding_source, finding_id,
-                       technique, technique_name, tactic, severity, risk_score,
-                       risk_factors, rationale, target, updated_at
-                FROM public.attack_vectors
-                WHERE {' AND '.join(where)}
-                ORDER BY risk_score DESC, updated_at DESC
-                LIMIT %(limit)s
-            """, params)
+            wsql = " AND ".join(where)
+            if grouped:
+                cur.execute(f"""
+                    SELECT target, technique,
+                           max(technique_name) AS technique_name,
+                           tactic,
+                           max(risk_score)     AS risk_score,
+                           count(*)            AS finding_count,
+                           (array_agg(severity ORDER BY risk_score DESC))[1]  AS severity,
+                           (array_agg(asset_id ORDER BY risk_score DESC))[1]  AS asset_id,
+                           (array_agg(rationale ORDER BY risk_score DESC))[1] AS rationale,
+                           (array_agg(risk_factors ORDER BY risk_score DESC))[1] AS risk_factors,
+                           (array_agg(finding_id ORDER BY risk_score DESC))[1] AS finding_id,
+                           (array_agg(finding_source ORDER BY risk_score DESC))[1] AS finding_source,
+                           max(updated_at)     AS updated_at
+                    FROM public.attack_vectors
+                    WHERE {wsql}
+                    GROUP BY target, technique, tactic
+                    ORDER BY risk_score DESC, finding_count DESC
+                    LIMIT %(limit)s
+                """, params)
+            else:
+                cur.execute(f"""
+                    SELECT id, engagement_id, asset_id, finding_source, finding_id,
+                           technique, technique_name, tactic, severity, risk_score,
+                           risk_factors, rationale, target, updated_at
+                    FROM public.attack_vectors
+                    WHERE {wsql}
+                    ORDER BY risk_score DESC, updated_at DESC
+                    LIMIT %(limit)s
+                """, params)
             return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
@@ -302,7 +384,24 @@ def get_graph(engagement_id: Optional[str] = None) -> Dict[str, Any]:
         _node(f"target:{tgt}", "target", tgt, risk)
         _node(f"technique:{tech}", "technique", f"{tech} {v.get('technique_name') or ''}".strip(), risk)
         _node(f"tactic:{tac}", "tactic", tac, risk)
-        edges.append({"from": f"target:{tgt}", "to": f"technique:{tech}", "risk": risk})
-        edges.append({"from": f"technique:{tech}", "to": f"tactic:{tac}", "risk": risk})
+        edges.append({"from": f"target:{tgt}", "to": f"technique:{tech}", "type": "has", "risk": risk})
+        edges.append({"from": f"technique:{tech}", "to": f"tactic:{tac}", "type": "in_tactic", "risk": risk})
+
+    # Attack-progression edges (technique -> technique) from attack_path_edges.
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            where = "WHERE engagement_id = %(eid)s" if engagement_id else ""
+            cur.execute(f"""
+                SELECT from_technique, to_technique, max(weight) AS weight
+                FROM public.attack_path_edges {where}
+                GROUP BY from_technique, to_technique
+            """, {"eid": engagement_id})
+            for e in cur.fetchall():
+                fn, tn = f"technique:{e['from_technique']}", f"technique:{e['to_technique']}"
+                if fn in nodes and tn in nodes:
+                    edges.append({"from": fn, "to": tn, "type": "enables", "risk": float(e["weight"])})
+    finally:
+        conn.close()
 
     return {"nodes": list(nodes.values()), "edges": edges, "count": len(vectors)}

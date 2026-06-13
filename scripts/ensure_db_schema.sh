@@ -108,6 +108,7 @@ CRITICAL_TABLES=(
     "exploit_chunks"
     "scan_tool_feedback"
     "attack_vectors"
+    "attack_path_edges"
     "tool_executions"
     "webhooks"
     "webhook_events"
