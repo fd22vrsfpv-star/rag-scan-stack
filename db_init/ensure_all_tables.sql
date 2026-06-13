@@ -692,6 +692,24 @@ CREATE INDEX IF NOT EXISTS idx_attack_vectors_risk ON public.attack_vectors(risk
 CREATE INDEX IF NOT EXISTS idx_attack_vectors_tactic ON public.attack_vectors(tactic);
 CREATE INDEX IF NOT EXISTS idx_attack_vectors_asset ON public.attack_vectors(asset_id);
 
+-- attack_path_edges (per-asset attack progression: technique -> technique
+-- ordered by ATT&CK tactic position, plus credential-access lateral edges).
+-- Built by compute_attack_vectors; feeds the Attack Map graph + path queries.
+CREATE TABLE IF NOT EXISTS public.attack_path_edges (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid,
+    asset_id      uuid REFERENCES public.assets(id) ON DELETE CASCADE,
+    target        text,
+    from_technique text NOT NULL,
+    to_technique   text NOT NULL,
+    edge_type     text NOT NULL DEFAULT 'enables',  -- enables | lateral | cred_access
+    weight        numeric NOT NULL DEFAULT 0,        -- combined risk 0..100
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (target, from_technique, to_technique, edge_type)
+);
+CREATE INDEX IF NOT EXISTS idx_attack_path_edges_engagement ON public.attack_path_edges(engagement_id);
+CREATE INDEX IF NOT EXISTS idx_attack_path_edges_asset ON public.attack_path_edges(asset_id);
+
 -- ============================================================================
 -- TIER 3: Job / Task scheduling
 -- ============================================================================
