@@ -19,6 +19,7 @@ from routers.feedback import router as feedback_router
 from routers.maintenance import router as maintenance_router
 from routers.agent_sessions import router as agent_sessions_router
 from routers.kb import router as kb_router
+from routers.attack_vectors import router as attack_vectors_router
 from routers.scope import router as scope_router
 from routers.scope_classify import router as scope_classify_router
 from routers.zap_addons import router as zap_addons_router
@@ -101,6 +102,7 @@ app.include_router(webhook_router)
 app.include_router(maintenance_router)
 app.include_router(agent_sessions_router)
 app.include_router(kb_router)
+app.include_router(attack_vectors_router)
 app.include_router(scope_router)
 app.include_router(scope_classify_router)
 app.include_router(zap_addons_router)

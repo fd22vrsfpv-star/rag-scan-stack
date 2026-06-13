@@ -583,6 +583,12 @@ export default function ScanMonitor() {
                     $ {String((job.last_data as any).command)}
                   </p>
                 )}
+                {(job.last_data as any)?.output && (
+                  <details className="ml-7 mb-1 max-w-[700px]">
+                    <summary className="text-[10px] text-primary/70 cursor-pointer hover:text-primary">View output</summary>
+                    <pre className="text-[10px] text-muted-foreground bg-muted/40 border border-border rounded p-2 mt-1 max-h-64 overflow-auto whitespace-pre-wrap">{String((job.last_data as any).output).slice(0, 20000)}</pre>
+                  </details>
+                )}
                 {isMasscanStopped && (
                   <button
                     onClick={() => resumeScan.mutate(job.job_id, {

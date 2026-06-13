@@ -748,6 +748,28 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
     if not selected:
         return {"ok": False, "error": "No matching recommendations found", "results": []}
 
+    # The /recommendations response omits port (it lives in extra), but dispatch
+    # commands use {port}. Backfill each selected rec's port from the DB so
+    # placeholder substitution (curl/kali/metasploit) works.
+    def _backfill_ports(recs):
+        from db import get_db
+        ids = [r["id"] for r in recs if r.get("port") is None]
+        if not ids:
+            return
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id::text, (extra->>'port')::int FROM scan_recommendations WHERE id = ANY(%s::uuid[])",
+                (ids,),
+            )
+            port_by_id = {row[0]: row[1] for row in cur.fetchall()}
+        for r in recs:
+            if r.get("port") is None and port_by_id.get(r["id"]):
+                r["port"] = port_by_id[r["id"]]
+    try:
+        await asyncio.to_thread(_backfill_ports, selected)
+    except Exception as e:
+        log.warning("port backfill for dispatch failed: %s", e)
+
     # Idempotency guard: a rec that's already 'queued' / 'running' / 'completed'
     # MUST NOT be re-dispatched -- doing so spawns a second runner job for the
     # same target and leaves the old job_id orphaned in the rec's extra.jsonb.
@@ -1130,9 +1152,23 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                     exec_id = data.get("execution_id", data.get("id", ""))
                     result["exec_id"] = exec_id
                     result["via"] = "kali"
+                    # Register in the Scan Monitor as a 'kali_exec' job so the
+                    # poller tracks it (polls /tools/executions/{exec_id}) and it
+                    # shows up alongside native-runner scans.
+                    if exec_id:
+                        try:
+                            register_job(
+                                job_id=exec_id,
+                                service_url=s.kali_listener_url,
+                                scan_type=scanner,
+                                target=ip,
+                                source_rec_id=rec["id"],
+                                kind="kali_exec",
+                            )
+                        except Exception:
+                            pass
                     # Mark the rec dispatched so the idempotency guard stops it
-                    # re-firing every agent cycle (kali exec is fire-and-forget,
-                    # so without this the autonomous loop re-dispatches forever).
+                    # re-firing every agent cycle.
                     await _mark_rec_dispatched(
                         rec_id=rec["id"], job_id=exec_id or f"kali:{ip}",
                         ip=ip, port=rec.get("port"), service=rec.get("service"),
@@ -1233,12 +1269,35 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                     exit_code = data.get("exit_code", data.get("returncode", -1))
                     result["status"] = "dispatched" if exit_code == 0 else "failed"
                     result["detail"] = f"Node {nid}: exit={exit_code}"
-                    result["output"] = (data.get("stdout", "") or "")[:200]
+                    full_output = data.get("stdout", "") or ""
+                    result["output"] = full_output[:200]
                     result["via"] = f"node:{nid}"
                     # Mark dispatched so the agent doesn't re-fire it each cycle.
                     if exit_code == 0:
+                        import uuid as _uuid
+                        from datetime import datetime as _dt, timezone as _tz
+                        from polling import active_jobs as _aj
+                        node_job_id = str(_uuid.uuid4())
+                        # SSH exec is synchronous — register an already-completed
+                        # job so it shows in the Scan Monitor with its output.
+                        try:
+                            register_job(
+                                job_id=node_job_id, service_url=s.tunnel_manager_url,
+                                scan_type=scanner, target=ip, source_rec_id=rec["id"],
+                                kind="node_exec",
+                            )
+                            if node_job_id in _aj:
+                                _aj[node_job_id]["status"] = "completed"
+                                _aj[node_job_id]["completed_at"] = _dt.now(_tz.utc).isoformat()
+                                _aj[node_job_id]["last_data"] = {
+                                    "status": "completed", "command": command,
+                                    "exit_code": exit_code, "output": full_output[:20000],
+                                    "node_id": nid,
+                                }
+                        except Exception:
+                            pass
                         await _mark_rec_dispatched(
-                            rec_id=rec["id"], job_id=f"node:{nid}",
+                            rec_id=rec["id"], job_id=node_job_id,
                             ip=ip, port=rec.get("port"), service=rec.get("service"),
                             scanner=scanner, node_id=nid,
                         )
@@ -1418,6 +1477,24 @@ class ToolInstallRequest(BaseModel):
     tools: List[str]
 
 
+def _kali_unmanageable(tool: str) -> Optional[str]:
+    """Return a reason if a tool is NOT a Kali-installable package (so it should
+    not be offered for 'install on Kali'), else None.
+
+    - metasploit/msf*: runs in its own container, dispatched via the Exploit
+      Manager approval flow — never an apt install here.
+    - nmap-*/*-nmap: a pseudo-tool (an nmap NSE script preset, e.g.
+      'nmap-smb-vuln'); nmap is already installed and it's dispatched as an
+      nmap run, not a separate package.
+    """
+    t = (tool or "").lower()
+    if t in ("metasploit", "msf", "msfconsole", "msfvenom") or t.startswith("msf"):
+        return "Metasploit runs in its own container — dispatch via Exploit Manager (approve to run), not a Kali install."
+    if t.startswith("nmap-") or t.endswith("-nmap"):
+        return "nmap script preset — nmap is already installed; runs as an nmap scan, not a separate tool."
+    return None
+
+
 # Package manager install commands for common pentest tools
 TOOL_INSTALL_MAP = {
     "nmap": "apt-get install -y nmap",
@@ -1454,6 +1531,50 @@ TOOL_INSTALL_MAP = {
 }
 
 
+@router.get("/api/tools/executions")
+async def list_tool_executions(limit: int = 50):
+    """Recent Kali tool executions (the output of Kali-dispatched recs)."""
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        resp = await c.get(
+            f"{s.kali_listener_url}/tools/executions",
+            params={"limit": limit},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:300])
+        return safe_json(resp)
+
+
+@router.get("/api/tools/executions/{exec_id}")
+async def get_tool_execution(exec_id: str):
+    """A single Kali tool execution with full output + parsed results."""
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        resp = await c.get(
+            f"{s.kali_listener_url}/tools/executions/{exec_id}",
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:300])
+        return safe_json(resp)
+
+
+@router.get("/api/tools/allowed")
+async def list_allowed_tools():
+    """The Kali container's effective tool allowlist (registry + fallback +
+    operator Settings overrides − MSF). Used by the Settings allowlist panel."""
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        resp = await c.get(
+            f"{s.kali_listener_url}/tools/allowed",
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:300])
+        return safe_json(resp)
+
+
 @router.post("/api/tools/check")
 async def check_tools_on_node(body: ToolCheckRequest):
     """Check which tools are installed on Kali container or remote node."""
@@ -1470,12 +1591,21 @@ async def check_tools_on_node(body: ToolCheckRequest):
                 )
                 if r.status_code == 200:
                     allowed = set(t.lower() for t in r.json().get("tools", []))
-                    found = [t for t in body.tools if t.lower() in allowed]
+                    # Tools that aren't Kali-installable (MSF / nmap presets) are
+                    # reported as 'managed' with a reason, NOT 'missing', so the
+                    # "Install missing" action never tries (and fails) on them.
+                    managed = [{"tool": t, "reason": _kali_unmanageable(t)}
+                               for t in body.tools if _kali_unmanageable(t)]
+                    managed_names = {m["tool"].lower() for m in managed}
+                    found = [t for t in body.tools
+                             if t.lower() in allowed and t.lower() not in managed_names]
                     missing = [
                         {"tool": t, "install": TOOL_INSTALL_MAP.get(t, f"apt-get install -y {t}")}
-                        for t in body.tools if t.lower() not in allowed
+                        for t in body.tools
+                        if t.lower() not in allowed and t.lower() not in managed_names
                     ]
-                    return {"ok": True, "node_id": "kali-local", "found": found, "missing": missing, "total": len(body.tools)}
+                    return {"ok": True, "node_id": "kali-local", "found": found,
+                            "missing": missing, "managed": managed, "total": len(body.tools)}
                 return {"ok": False, "error": f"Kali health: HTTP {r.status_code}"}
         except Exception as e:
             return {"ok": False, "error": f"Kali unreachable: {e}"}
@@ -1528,6 +1658,10 @@ async def install_tools_on_node(body: ToolInstallRequest):
     if body.node_id in ("kali-local", "kali", "internal"):
         async with httpx.AsyncClient(verify=False, timeout=300) as client:
             for tool in body.tools:
+                reason = _kali_unmanageable(tool)
+                if reason:
+                    results.append({"tool": tool, "status": "skipped", "detail": reason})
+                    continue
                 try:
                     r = await client.post(
                         f"{s.kali_listener_url}/tools/install",

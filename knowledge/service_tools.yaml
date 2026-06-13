@@ -47,6 +47,38 @@ tool_metadata:
     sql_injection:
       description: "SQL injection testing."
       members: [sqlmap]
+    # Native enum/recon tools cover these MSF auxiliary scanners — the native
+    # one is recommended first, so it wins the OR and the MSF module is dropped.
+    smb_enum:
+      description: "SMB share/user enumeration — smbmap/enum4linux cover it."
+      members: [smbmap, "metasploit:*smb_enumshares", "metasploit:*smb_enumusers"]
+    snmp_enum:
+      description: "SNMP enumeration — snmpwalk covers it."
+      members: [snmpwalk, "metasploit:*snmp_enum"]
+    dns_recon:
+      description: "DNS info/brute — dnsenum/dnsrecon cover it."
+      members: [dnsenum, "metasploit:*dns_info", "metasploit:*dns_bruteforce"]
+
+  # Recommendations the recommender should NEVER emit (a lighter/native tool
+  # already does the job). Each rule matches a scanner [+ optional service +
+  # selector glob vs the rec's script/module]. This is config — edit here (it
+  # reloads from git), no code change. The DB feedback loop layers on top for
+  # per-install / ad-hoc tweaks.
+  suppress:
+    - scanner: metasploit
+      selector: "*_version"
+      reason: "Version/banner already captured by nmap -sV / httpx / tlsx."
+    - scanner: metasploit
+      selector: "*robots_txt"
+      reason: "Trivial HTTP GET — use curl, no need to load Metasploit."
+    - scanner: metasploit
+      service: http
+      selector: "*dir_scanner"
+      reason: "Content discovery covered by gobuster / feroxbuster."
+    - scanner: metasploit
+      service: http
+      selector: "*files_dir"
+      reason: "Content discovery covered by gobuster / feroxbuster."
 
 services:
   ssh:
@@ -129,6 +161,9 @@ services:
       - name: curl
         purpose: manual HTTP requests
         command: "curl -v http://{target}:{port}/"
+      - name: curl
+        purpose: fetch & parse robots.txt
+        command: "curl -s http://{target}:{port}/robots.txt"
       - name: vulnx
         purpose: CVE lookup by product and version
         command: "vulnx search \"{product} {version}\" --json"

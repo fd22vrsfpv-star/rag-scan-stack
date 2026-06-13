@@ -4967,6 +4967,54 @@ def generate_recommendations(
     return {"ok": True, "ports_considered": len(rows), "generated": generated}
 
 
+# ── Attack vector map (MITRE ATT&CK prioritization) ──────────────────────────
+
+@app.post("/attack-vectors/compute", tags=["Attack Vectors"])
+def attack_vectors_compute(
+    engagement_id: Optional[str] = Query(default=None),
+    authorized: bool = Depends(auth),
+):
+    """(Re)compute the attack vector map: map findings → MITRE ATT&CK techniques
+    + unified risk score, into the attack_vectors table. Emits a webhook."""
+    import attack_vectors as _av
+    eid = engagement_id or _resolve_engagement_id(None)
+    result = _av.compute_attack_vectors(engagement_id=eid)
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("attack_vectors_recomputed", "attack_map", {
+            "engagement_id": eid, **result,
+        })
+    except Exception:
+        pass
+    return {"ok": True, "engagement_id": eid, **result}
+
+
+@app.get("/attack-vectors", tags=["Attack Vectors"])
+def attack_vectors_list(
+    engagement_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, le=1000),
+    min_risk: float = Query(default=0.0, ge=0, le=100),
+    authorized: bool = Depends(auth),
+):
+    """Ranked attack vectors (highest risk first) — the prioritized list the AI
+    agents and UI consume to choose the next-best action."""
+    import attack_vectors as _av
+    eid = engagement_id or _resolve_engagement_id(None)
+    vectors = _av.get_attack_vectors(engagement_id=eid, limit=limit, min_risk=min_risk)
+    return {"count": len(vectors), "vectors": vectors}
+
+
+@app.get("/attack-vectors/graph", tags=["Attack Vectors"])
+def attack_vectors_graph(
+    engagement_id: Optional[str] = Query(default=None),
+    authorized: bool = Depends(auth),
+):
+    """Graph (nodes+edges: target → technique → tactic) for the Attack Map UI."""
+    import attack_vectors as _av
+    eid = engagement_id or _resolve_engagement_id(None)
+    return _av.get_graph(engagement_id=eid)
+
+
 @app.post("/cleanup/exploits", tags=["Maintenance"])
 def cleanup_exploits(
     dry_run: bool = Query(default=False),

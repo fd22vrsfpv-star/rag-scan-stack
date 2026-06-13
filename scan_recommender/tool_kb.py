@@ -764,6 +764,13 @@ class ToolKnowledgeBase:
         """Return overlap_groups {group: {description, members[]}}."""
         return dict(self.get_tool_metadata().get("overlap_groups", {}) or {})
 
+    def get_suppress_rules(self) -> List[Dict[str, Any]]:
+        """Return the KB suppress rules — recommendations the recommender should
+        never emit. Each: {scanner, service?, selector?, reason?}. These are the
+        stable, ships-in-git defaults; the DB feedback loop layers on top."""
+        rules = self.get_tool_metadata().get("suppress", []) or []
+        return [dict(r) for r in rules if isinstance(r, dict)]
+
     def get_all_port_mappings(self) -> Dict[int, str]:
         """Get all port-to-service mappings."""
         return dict(self._port_to_service)

@@ -1,5 +1,7 @@
 import { useState, useRef, useMemo, useEffect } from 'react'
 import PageHelp from '@/components/PageHelp'
+import InfoTip from '@/components/InfoTip'
+import KaliAllowlistPanel from '@/components/settings/KaliAllowlistPanel'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useScopeNames, useScope, useAddToScope, useRemoveFromScope } from '@/api/scope'
 import { useBurpStatus } from '@/api/burp'
@@ -1507,7 +1509,18 @@ function DatabaseTab() {
               {isRemote ? <Wifi className="w-5 h-5 text-blue-400" /> : <Database className="w-5 h-5 text-green-400" />}
             </div>
             <div>
-              <h3 className="text-sm font-semibold">Database Mode</h3>
+              <h3 className="text-sm font-semibold inline-flex items-center gap-1">
+                Database Mode
+                <InfoTip side="bottom" text={
+                  <>
+                    Where services read/write data: <b>local</b> (the bundled rag-postgres
+                    container), <b>remote</b> (a VPS Postgres over an SSH tunnel), or
+                    <b>remote_direct</b> (a VPS Postgres over direct SSL). Save the remote
+                    host/credentials below <i>before</i> switching to a remote mode — the
+                    switch reads the persisted settings, not the unsaved form.
+                  </>
+                } />
+              </h3>
               <p className="text-xs text-muted-foreground">
                 {isDirect ? 'Connected to remote database via direct SSL' : isTunnel ? 'Connected to remote database via SSH tunnel' : 'Using local PostgreSQL container'}
               </p>
@@ -1593,6 +1606,22 @@ function DatabaseTab() {
             {comparing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <BarChart3 className="w-3.5 h-3.5" />}
             Compare Databases
           </button>
+          <InfoTip side="top" text={
+            <>
+              Shows row counts + latest-modified per table for the <b>local</b> and
+              <b>remote</b> databases side by side, so you can confirm a migration/sync
+              before switching modes. The local side uses the local
+              <span className="font-mono"> POSTGRES_*</span> credentials; the remote side
+              uses the saved remote credentials (starting a temporary tunnel if needed).
+            </>
+          } />
+          <InfoTip side="top" className="ml-1" text={
+            <>
+              <b>“Database Configuration Conflict”</b> banner: only fires in a <i>remote</i>
+              mode when the local postgres container is <i>also</i> running — services could
+              hit the wrong DB. In local mode it stays silent (the local DB is expected).
+            </>
+          } />
           <button
             onClick={testConnection}
             disabled={testing}
@@ -2301,6 +2330,9 @@ function ToolOptionsTab() {
 
       {/* Tool Updates */}
       <ToolUpdates />
+
+      {/* Kali tool allowlist (what the internal Kali container may install/run) */}
+      <KaliAllowlistPanel />
 
       {/* Wordlist Paths */}
       <WordlistSettings />

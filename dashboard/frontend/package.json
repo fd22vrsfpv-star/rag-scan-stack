@@ -1,7 +1,7 @@
 {
   "name": "pentest-dashboard",
   "private": true,
-  "version": "2026.06.11-04",
+  "version": "2026.06.13-04",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -30,6 +30,7 @@
     "react-markdown": "^9.0.1",
     "react-qr-code": "^2.0.21",
     "react-router-dom": "^7.1.1",
+    "reactflow": "^11.11.4",
     "recharts": "^2.15.0",
     "tailwind-merge": "^2.6.0",
     "zustand": "^5.0.2"
