@@ -15,6 +15,15 @@ function riskColor(risk: number): string {
 
 const COL_X: Record<string, number> = { target: 20, technique: 380, tactic: 760 }
 
+// Shorten the MIDDLE so both the host and the distinguishing tail (e.g. the
+// URL path …/vulnerabilities/sqli) stay visible.
+function middleTruncate(s: string, max = 52): string {
+  if (!s || s.length <= max) return s
+  const head = Math.ceil((max - 1) * 0.45)
+  const tail = max - 1 - head
+  return `${s.slice(0, head)}…${s.slice(s.length - tail)}`
+}
+
 export default function AttackMap() {
   const { data: graph, isLoading } = useAttackGraph()
   const { data: ranked } = useAttackVectors(0, 100)
@@ -121,8 +130,9 @@ export default function AttackMap() {
                     <span className="text-[10px] text-muted-foreground">×{v.finding_count}</span>
                   )}
                 </div>
-                <div className="text-muted-foreground mt-0.5 truncate" title={v.rationale}>
-                  {v.technique_name} — {v.target}
+                <div className="text-muted-foreground mt-0.5">{v.technique_name}</div>
+                <div className="text-muted-foreground/80 font-mono text-[10px]" title={v.target}>
+                  {middleTruncate(v.target || '')}
                 </div>
               </div>
             ))}
