@@ -57,6 +57,7 @@ const NAV_GROUPS: NavEntry[] = [
       { to: '/findings', icon: Search, label: 'Findings' },
       { to: '/follow-ups', icon: Flag, label: 'Follow-Ups' },
       { to: '/recommendations', icon: Crosshair, label: 'Recommendations' },
+      { to: '/attack-map', icon: Workflow, label: 'Attack Map' },
       { to: '/recon', icon: Globe2, label: 'Recon' },
       { to: '/users', icon: Users, label: 'Users' },
       { to: '/delta', icon: GitCompare, label: 'Delta Compare' },
