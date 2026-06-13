@@ -80,18 +80,23 @@ _load_persisted()
 def register_job(job_id: str, service_url: str, scan_type: str,
                   proxy: str | None = None, engagement_id: str | None = None,
                   scope_name: str | None = None, target: str | None = None,
-                  source_rec_id: str | None = None):
+                  source_rec_id: str | None = None, kind: str = "runner"):
     """Track an in-flight scan job.
 
     ``source_rec_id`` is the ``scan_recommendations.id`` that spawned this
     run, when applicable.  Persisted in active_jobs so the polling loop can
     backfill the recommendation row's status when the job reaches a
     terminal state (closes the dispatch→ingest UX loop).
+
+    ``kind`` selects how the poller fetches status: "runner" (default) polls
+    ``{service_url}/jobs/{id}``; "kali_exec" polls
+    ``{service_url}/tools/executions/{id}`` (the Kali container's tool runs).
     """
     now = datetime.now(timezone.utc).isoformat()
     active_jobs[job_id] = {
         "service_url": service_url,
         "type": scan_type,
+        "kind": kind,
         "status": "queued",
         "last_data": None,
         "created_at": now,
@@ -340,12 +345,18 @@ async def _poll_once(client: httpx.AsyncClient):
             finished.append(job_id)
             continue
         try:
-            resp = await client.get(
-                f"{info['service_url']}/jobs/{job_id}", headers=headers
-            )
+            # Kali tool executions live at a different status endpoint.
+            if info.get("kind") == "kali_exec":
+                status_url = f"{info['service_url']}/tools/executions/{job_id}"
+            else:
+                status_url = f"{info['service_url']}/jobs/{job_id}"
+            resp = await client.get(status_url, headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
                 new_status = data.get("status", info["status"])
+                # Kali execs use 'timeout' as a terminal state — fold into failed.
+                if info.get("kind") == "kali_exec" and new_status == "timeout":
+                    new_status = "failed"
 
                 # Post-process status to detect partial failures or timeouts
                 if new_status == "completed":

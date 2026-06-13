@@ -882,6 +882,27 @@ active_executions: Dict[str, Dict[str, Any]] = {}
 # allowlist is "full known tool universe MINUS Metasploit" — MSF modules stay
 # manual (run via the Exploit Manager, never auto-dispatched here).
 NODE_MANAGER_URL = os.environ.get("NODE_MANAGER_URL", "https://node-manager:8027")
+RAG_API_URL = os.environ.get("RAG_API_URL", "https://rag-api:8000")
+
+
+def _emit_webhook_sync(event_type: str, data: dict):
+    """Fire-and-forget webhook emit to rag-api. Best-effort; never raises."""
+    try:
+        req_lib.post(
+            f"{RAG_API_URL}/webhooks/emit",
+            json={"event_type": event_type, "source": "kali-listener", "data": data},
+            headers={"x-api-key": API_KEY}, timeout=5, verify=False,
+        )
+    except Exception as e:
+        logger.debug("webhook emit failed (%s): %s", event_type, e)
+
+
+async def _emit_webhook(event_type: str, data: dict):
+    """Async wrapper — runs the sync emit off the event loop."""
+    try:
+        await asyncio.to_thread(_emit_webhook_sync, event_type, data)
+    except Exception:
+        pass
 
 # Fallback if the registry is unreachable — the original hardcoded set.
 _FALLBACK_ALLOWED_TOOLS = {
@@ -895,9 +916,14 @@ _MSF_DENY = {"metasploit", "msfconsole", "msfvenom", "msf"}
 
 # Cache of {tool_name: install_cmd}, rebuilt every _TOOL_REGISTRY_TTL seconds so
 # operator allowlist edits (from Settings) take effect without a restart.
+# On a FAILED node-manager fetch we cache the fallback for only
+# _TOOL_REGISTRY_FAIL_TTL so a transient blip (e.g. node-manager restarting)
+# self-heals quickly instead of rejecting valid tools for the full TTL.
 _TOOL_REGISTRY: Optional[Dict[str, Optional[str]]] = None
 _TOOL_REGISTRY_TS: float = 0.0
 _TOOL_REGISTRY_TTL: float = 60.0
+_TOOL_REGISTRY_FAIL_TTL: float = 10.0
+_TOOL_REGISTRY_OK: bool = False  # whether the last build used a live registry fetch
 
 
 def _load_allowlist_overrides():
@@ -935,22 +961,44 @@ def _fetch_tool_registry() -> Dict[str, Optional[str]]:
     `extra` (Settings) → minus operator `deny` (Settings) → minus MSF (always).
     Rebuilt every _TOOL_REGISTRY_TTL so Settings edits apply without a restart.
     """
-    global _TOOL_REGISTRY, _TOOL_REGISTRY_TS
+    global _TOOL_REGISTRY, _TOOL_REGISTRY_TS, _TOOL_REGISTRY_OK
     import time
     now = time.monotonic()
-    if _TOOL_REGISTRY is not None and (now - _TOOL_REGISTRY_TS) < _TOOL_REGISTRY_TTL:
+    # Use the short TTL while we're serving the fallback (last fetch failed) so
+    # a transient node-manager blip recovers within seconds, not a full minute.
+    ttl = _TOOL_REGISTRY_TTL if _TOOL_REGISTRY_OK else _TOOL_REGISTRY_FAIL_TTL
+    if _TOOL_REGISTRY is not None and (now - _TOOL_REGISTRY_TS) < ttl:
         return _TOOL_REGISTRY
 
     reg: Dict[str, Optional[str]] = {}
-    try:
-        import requests as _req
-        r = _req.get(f"{NODE_MANAGER_URL}/tools/registry",
-                     headers={"x-api-key": API_KEY}, timeout=5, verify=False)
-        if r.status_code == 200:
-            tools = (r.json() or {}).get("tools", {})
-            reg = {name.lower(): spec.get("install") for name, spec in tools.items()}
-    except Exception as e:
-        logger.warning("Tool registry fetch failed (%s); using fallback set", e)
+    fetched = False
+    import requests as _req
+    # Retry a few times with short backoff — node-manager occasionally closes
+    # the connection (RemoteDisconnected) under load / while starting.
+    for attempt in range(3):
+        try:
+            r = _req.get(f"{NODE_MANAGER_URL}/tools/registry",
+                         headers={"x-api-key": API_KEY}, timeout=5, verify=False)
+            if r.status_code == 200:
+                tools = (r.json() or {}).get("tools", {})
+                reg = {name.lower(): spec.get("install") for name, spec in tools.items()}
+                fetched = True
+                break
+            logger.warning("Tool registry fetch HTTP %s (attempt %d/3)", r.status_code, attempt + 1)
+        except Exception as e:
+            logger.warning("Tool registry fetch failed (attempt %d/3): %s", attempt + 1, e)
+        time.sleep(0.5 * (attempt + 1))
+
+    if not fetched:
+        # Keep a previously-good registry if we have one, rather than dropping
+        # to the 23-tool fallback on a transient failure.
+        if _TOOL_REGISTRY_OK and _TOOL_REGISTRY:
+            _TOOL_REGISTRY_TS = now  # re-arm short retry; keep good data
+            _TOOL_REGISTRY_OK = False
+            logger.warning("Tool registry fetch failed; keeping last good set (%d), will retry in %ss",
+                           len(_TOOL_REGISTRY), _TOOL_REGISTRY_FAIL_TTL)
+            return _TOOL_REGISTRY
+        logger.warning("Tool registry unavailable; using fallback set")
 
     # Union with fallback so we never regress below the known-good set.
     for t in _FALLBACK_ALLOWED_TOOLS:
@@ -967,7 +1015,9 @@ def _fetch_tool_registry() -> Dict[str, Optional[str]]:
 
     _TOOL_REGISTRY = reg
     _TOOL_REGISTRY_TS = now
-    logger.info("Tool registry: %d allowed (extra=%d deny=%d)", len(reg), len(extra), len(deny))
+    _TOOL_REGISTRY_OK = fetched
+    logger.info("Tool registry: %d allowed (extra=%d deny=%d, live=%s)",
+                len(reg), len(extra), len(deny), fetched)
     return _TOOL_REGISTRY
 
 
@@ -988,6 +1038,11 @@ async def execute_tool(exec_id: str, tool: str, command: str, timeout: int):
     # Update status to running
     db_update_tool_execution(exec_id, "running")
     active_executions[exec_id]["status"] = "running"
+    _ex = active_executions[exec_id]
+    await _emit_webhook("tool_execution_started", {
+        "exec_id": exec_id, "tool": tool, "command": command[:300],
+        "target": _ex.get("target"), "port": _ex.get("port"),
+    })
 
     start_time = datetime.now()
 
@@ -1057,6 +1112,18 @@ async def execute_tool(exec_id: str, tool: str, command: str, timeout: int):
             "duration_seconds": duration
         })
         logger.error(f"[{exec_id[:8]}] Execution error: {e}")
+
+    # Completion webhook (any terminal state) so external tools + the Scan
+    # Monitor poller see the result, not just the dispatch.
+    fin = active_executions.get(exec_id, {})
+    parsed = fin.get("parsed_results")
+    findings_count = (len(parsed) if isinstance(parsed, (list, dict)) else 0)
+    await _emit_webhook("tool_execution_completed", {
+        "exec_id": exec_id, "tool": tool, "status": fin.get("status"),
+        "exit_code": fin.get("exit_code"), "target": fin.get("target"),
+        "port": fin.get("port"), "duration_seconds": fin.get("duration_seconds"),
+        "findings_count": findings_count,
+    })
 
 
 # --- FastAPI App ---
