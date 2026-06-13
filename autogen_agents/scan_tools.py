@@ -2971,6 +2971,34 @@ def get_scan_recommendations(context: str) -> str:
     return json.dumps(result, indent=2)
 
 
+def get_attack_vectors(limit: int = 15, min_risk: float = 0.0) -> str:
+    """
+    Get the prioritized attack vector map: findings mapped to MITRE ATT&CK
+    techniques + a unified risk score, ranked highest-risk first. Use this to
+    decide the next-best action — which finding/technique to act on.
+
+    Args:
+        limit: max vectors to return (default 15)
+        min_risk: only return vectors at/above this risk score (0..100)
+
+    Returns JSON string: {count, vectors:[...]}.
+    """
+    t = get_scan_tools()
+    api_key = os.environ.get("API_KEY", "changeme")
+    try:
+        r = httpx.get(
+            f"{t.rag_api_url}/attack-vectors",
+            params={"limit": limit, "min_risk": min_risk},
+            headers={"x-api-key": api_key},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return json.dumps({"error": f"HTTP {r.status_code}", "vectors": []})
+        return json.dumps(r.json(), indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e), "vectors": []})
+
+
 def check_system_status() -> str:
     """
     Check the status of all scanning services and tools.
