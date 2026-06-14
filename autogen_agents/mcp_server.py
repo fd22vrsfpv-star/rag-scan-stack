@@ -601,6 +601,24 @@ Uses Ollama LLM for intelligent recommendations.""",
             "required": ["context"]
         }
     ),
+    Tool(
+        name="get_attack_vectors",
+        description="""Get the prioritized attack vector map — findings mapped to MITRE
+ATT&CK techniques with a unified risk score, ranked highest-risk first.
+
+Use this to decide the NEXT-BEST ACTION: it tells you which finding/technique on which
+target has the highest attack value (factoring severity, CVSS, CISA KEV, exploit
+availability, ATT&CK tactic position, and asset criticality). Prefer this over raw
+scan recommendations when choosing what to attack/investigate next.""",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Max vectors (default 15)"},
+                "min_risk": {"type": "number", "description": "Only vectors at/above this risk score 0..100 (default 0)"}
+            },
+            "required": []
+        }
+    ),
     # ==========================================
     # Exploit Approval Workflow Tools
     # ==========================================
@@ -1202,6 +1220,15 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             result = get_scan_recommendations(context=arguments["context"])
             formatted_result = format_tool_response(result)
             return [TextContent(type="text", text=formatted_result)]
+
+        elif name == "get_attack_vectors":
+            from scan_tools import get_attack_vectors
+
+            result = get_attack_vectors(
+                limit=arguments.get("limit", 15),
+                min_risk=arguments.get("min_risk", 0.0),
+            )
+            return [TextContent(type="text", text=format_tool_response(result))]
 
         # ==========================================
         # Exploit Approval Workflow Handlers

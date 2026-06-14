@@ -1,0 +1,106 @@
+# MITRE ATT&CK mapping + risk-weighting config for the attack "vector map".
+#
+# This is CONFIG (lives in git, reloads on service restart). Code in
+# app/rag-api/attack_vectors.py only INTERPRETS it — no hardcoded technique
+# lists or weights. Edit here to change how findings map to ATT&CK and how
+# they're prioritized.
+#
+# How it's used:
+#   - `rules` map a finding (by cwe / cve-prefix / service / source / type /
+#     keyword) to one or more ATT&CK techniques.
+#   - `tactics` give each tactic an ordinal "path position" (later = closer to
+#     impact) used as one risk term.
+#   - `risk` defines the weighting of the unified risk score.
+
+# Curated ATT&CK Enterprise tactics, ordered by typical attack progression.
+# `position` (0..1) feeds the risk score — findings enabling later-stage tactics
+# (impact, exfiltration) are weighted higher than pure recon.
+tactics:
+  reconnaissance:        { id: TA0043, position: 0.10 }
+  resource_development:  { id: TA0042, position: 0.15 }
+  initial_access:        { id: TA0001, position: 0.55 }
+  execution:             { id: TA0002, position: 0.65 }
+  persistence:           { id: TA0003, position: 0.70 }
+  privilege_escalation:  { id: TA0004, position: 0.80 }
+  defense_evasion:       { id: TA0005, position: 0.60 }
+  credential_access:     { id: TA0006, position: 0.75 }
+  discovery:             { id: TA0007, position: 0.30 }
+  lateral_movement:      { id: TA0008, position: 0.85 }
+  collection:            { id: TA0009, position: 0.70 }
+  command_and_control:   { id: TA0011, position: 0.65 }
+  exfiltration:          { id: TA0010, position: 0.90 }
+  impact:                { id: TA0040, position: 1.00 }
+
+# Technique reference (id -> name + tactic). Curated to what this stack detects.
+techniques:
+  T1595:     { name: "Active Scanning", tactic: reconnaissance }
+  T1590:     { name: "Gather Victim Network Information", tactic: reconnaissance }
+  T1046:     { name: "Network Service Discovery", tactic: discovery }
+  T1135:     { name: "Network Share Discovery", tactic: discovery }
+  T1190:     { name: "Exploit Public-Facing Application", tactic: initial_access }
+  T1133:     { name: "External Remote Services", tactic: initial_access }
+  T1078:     { name: "Valid Accounts", tactic: initial_access }
+  T1110:     { name: "Brute Force", tactic: credential_access }
+  T1003:     { name: "OS Credential Dumping", tactic: credential_access }
+  T1212:     { name: "Exploitation for Credential Access", tactic: credential_access }
+  T1059:     { name: "Command and Scripting Interpreter", tactic: execution }
+  T1505.003: { name: "Web Shell", tactic: persistence }
+  T1021:     { name: "Remote Services", tactic: lateral_movement }
+  "T1021.002": { name: "SMB/Windows Admin Shares", tactic: lateral_movement }
+  "T1021.004": { name: "SSH", tactic: lateral_movement }
+  "T1021.001": { name: "Remote Desktop Protocol", tactic: lateral_movement }
+  T1213:     { name: "Data from Information Repositories", tactic: collection }
+  T1071:     { name: "Application Layer Protocol", tactic: command_and_control }
+  T1499:     { name: "Endpoint Denial of Service", tactic: impact }
+
+# Finding -> technique rules. First matching rules ALL apply (a finding can map
+# to several techniques). Match keys (any present must match; omit to ignore):
+#   cwe:        list of CWE ids (matches finding.cwe[])
+#   cve_year_lte / cve: (reserved)
+#   service:    list of service names (matches port/finding service substring)
+#   source:     list of finding sources (nuclei, zap, gobuster, portscan, subfinder, brutus, ...)
+#   finding_type/issue_type: list (web_findings.issue_type / recon_findings.finding_type)
+#   keyword:    list of substrings matched against title/script/issue_type/output (case-insensitive)
+# Each rule sets technique (+ optional confidence 0..1, default 0.6).
+rules:
+  - { keyword: ["sql injection", "sqli"], cwe: ["CWE-89"], technique: T1190, confidence: 0.9 }
+  - { keyword: ["command injection", "rce", "remote code", "code execution", "deserial"], cwe: ["CWE-78","CWE-94","CWE-502"], technique: T1190, confidence: 0.95 }
+  - { keyword: ["command injection", "rce", "webshell", "web shell"], technique: T1059, confidence: 0.7 }
+  - { keyword: ["webshell", "web shell", "file upload", "upload"], cwe: ["CWE-434"], technique: T1505.003, confidence: 0.7 }
+  - { keyword: ["xss", "cross-site scripting"], cwe: ["CWE-79"], technique: T1059, confidence: 0.6 }
+  - { keyword: ["lfi", "rfi", "path traversal", "directory traversal", "file inclusion"], cwe: ["CWE-22","CWE-98"], technique: T1190, confidence: 0.8 }
+  - { keyword: ["ssrf"], cwe: ["CWE-918"], technique: T1190, confidence: 0.7 }
+  - { keyword: ["default login", "default credential", "default password", "weak password", "anonymous"], technique: T1078, confidence: 0.8 }
+  - { keyword: ["brute", "login", "credential"], source: ["brutus"], technique: T1110, confidence: 0.85 }
+  - { keyword: ["hashdump", "dump hash", "kerberoast", "asrep", "ntds"], technique: T1003, confidence: 0.85 }
+  - { service: ["ssh"], technique: "T1021.004", confidence: 0.5 }
+  - { service: ["smb","netbios-ssn","microsoft-ds"], technique: "T1021.002", confidence: 0.5 }
+  - { service: ["rdp","ms-wbt-server"], technique: "T1021.001", confidence: 0.55 }
+  - { service: ["smb","netbios-ssn"], keyword: ["share","enum"], technique: T1135, confidence: 0.6 }
+  - { source: ["subfinder","dnsx","crtsh","amass","asnmap","uncover","whois"], technique: T1590, confidence: 0.4 }
+  - { source: ["portscan","nmap","masscan","naabu","httpx","whatweb"], technique: T1046, confidence: 0.4 }
+  - { keyword: ["exploit public", "public-facing", "cve-"], technique: T1190, confidence: 0.6 }
+  - { keyword: ["denial of service", "dos "], technique: T1499, confidence: 0.5 }
+
+# Unified risk score weights (Phase B refines; baseline here). Final score is a
+# 0..100 blend of these normalized terms.
+risk:
+  weights:
+    severity:        0.30   # finding severity (critical=1.0 .. info=0.05)
+    cvss:            0.20   # cvss/10
+    kev:             0.20   # CISA KEV listed -> 1.0
+    exploit_available: 0.15 # a pending_exploit / exploit_chunk match exists
+    tactic_position: 0.10   # how close the mapped tactic is to impact
+    asset_criticality: 0.05 # asset tag 'crown-jewel'/'prod' -> 1.0
+  severity_scores:
+    critical: 1.0
+    high:     0.8
+    medium:   0.5
+    low:      0.25
+    info:     0.05
+    recon:    0.05
+  asset_criticality_tags:   # asset.tags / env values that bump criticality
+    crown-jewel: 1.0
+    prod: 0.7
+    production: 0.7
+    dmz: 0.5
