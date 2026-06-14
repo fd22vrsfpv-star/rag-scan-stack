@@ -663,6 +663,53 @@ CREATE TABLE IF NOT EXISTS public.scan_tool_feedback (
 CREATE INDEX IF NOT EXISTS idx_scan_tool_feedback_active ON public.scan_tool_feedback(active) WHERE active = true;
 CREATE INDEX IF NOT EXISTS idx_scan_tool_feedback_service ON public.scan_tool_feedback(service);
 
+-- attack_vectors (MITRE ATT&CK "vector map": findings mapped to techniques +
+-- a unified risk score for attack-path prioritization). Populated by
+-- app/rag-api/attack_vectors.py from findings/vulns/web_findings/recon_findings,
+-- using knowledge/mitre/attack_map.yaml. Consumed by the AI agents (ranked
+-- next-best-action), the Attack Map UI, and the webhook bus.
+CREATE TABLE IF NOT EXISTS public.attack_vectors (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id     uuid,
+    asset_id          uuid REFERENCES public.assets(id) ON DELETE CASCADE,
+    finding_source    text NOT NULL,          -- vuln | web_finding | recon_finding
+    finding_id        uuid NOT NULL,
+    technique         text NOT NULL,          -- MITRE technique id (e.g. T1190)
+    technique_name    text,
+    tactic            text,                   -- MITRE tactic (e.g. initial_access)
+    kill_chain_phase  text,
+    severity          text,
+    risk_score        numeric NOT NULL DEFAULT 0,   -- 0..100
+    risk_factors      jsonb NOT NULL DEFAULT '{}'::jsonb,  -- per-term breakdown
+    rationale         text,
+    target            text,                   -- ip/host/url for display
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    updated_at        timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (finding_source, finding_id, technique)
+);
+CREATE INDEX IF NOT EXISTS idx_attack_vectors_engagement ON public.attack_vectors(engagement_id);
+CREATE INDEX IF NOT EXISTS idx_attack_vectors_risk ON public.attack_vectors(risk_score DESC);
+CREATE INDEX IF NOT EXISTS idx_attack_vectors_tactic ON public.attack_vectors(tactic);
+CREATE INDEX IF NOT EXISTS idx_attack_vectors_asset ON public.attack_vectors(asset_id);
+
+-- attack_path_edges (per-asset attack progression: technique -> technique
+-- ordered by ATT&CK tactic position, plus credential-access lateral edges).
+-- Built by compute_attack_vectors; feeds the Attack Map graph + path queries.
+CREATE TABLE IF NOT EXISTS public.attack_path_edges (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid,
+    asset_id      uuid REFERENCES public.assets(id) ON DELETE CASCADE,
+    target        text,
+    from_technique text NOT NULL,
+    to_technique   text NOT NULL,
+    edge_type     text NOT NULL DEFAULT 'enables',  -- enables | lateral | cred_access
+    weight        numeric NOT NULL DEFAULT 0,        -- combined risk 0..100
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (target, from_technique, to_technique, edge_type)
+);
+CREATE INDEX IF NOT EXISTS idx_attack_path_edges_engagement ON public.attack_path_edges(engagement_id);
+CREATE INDEX IF NOT EXISTS idx_attack_path_edges_asset ON public.attack_path_edges(asset_id);
+
 -- ============================================================================
 -- TIER 3: Job / Task scheduling
 -- ============================================================================
@@ -1363,6 +1410,11 @@ END IF; END$$;
 DO $$ BEGIN IF to_regclass('public.scan_tool_feedback') IS NOT NULL THEN
   DROP TRIGGER IF EXISTS trg_scan_tool_feedback_updated_at ON public.scan_tool_feedback;
   CREATE TRIGGER trg_scan_tool_feedback_updated_at BEFORE UPDATE ON public.scan_tool_feedback FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+END IF; END$$;
+
+DO $$ BEGIN IF to_regclass('public.attack_vectors') IS NOT NULL THEN
+  DROP TRIGGER IF EXISTS trg_attack_vectors_updated_at ON public.attack_vectors;
+  CREATE TRIGGER trg_attack_vectors_updated_at BEFORE UPDATE ON public.attack_vectors FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
 END IF; END$$;
 
 DO $$ BEGIN IF to_regclass('public.agent_sessions') IS NOT NULL THEN
