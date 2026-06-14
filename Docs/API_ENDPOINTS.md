@@ -112,6 +112,15 @@ curl -X POST http://localhost:8014/scan \
 - `POST /ingest/nmap` - Ingest Nmap results
 - `POST /recommendations/generate?ip=<optional>` - Generate scan recommendations for all currently-detected open ports that don't have one yet (no time window). Populates `scan_recommendations` so suggested scans can be dispatched against targets scanned earlier (the reactive ingest trigger only covers ports seen in the last 10 minutes). Synchronous + local-LLM-backed; emits a `recommendations_generated` webhook. Idempotent.
 
+**Tool-selection feedback loop (steers which tools the recommender picks):**
+- `GET /api/kb/feedback` — list active feedback policies (BFF → recommender `/kb/feedback`).
+- `POST /api/kb/feedback` — record a policy. Body: `{verdict, service?, scanner?, selector?, payload?, reason?, created_by?}`.
+  - `verdict: "suppress"` — stop recommending `scanner` (optionally only when its module/script matches `selector` glob); `service: null` = all services. (e.g. suppress `metasploit` `*robots_txt`.)
+  - `verdict: "add_tool"` — inject a tool rec for `service`; `payload: {name, action, command}`. (e.g. add `curl -s http://{target}:{port}/robots.txt`.)
+  - `verdict: "add_overlap"` — tag matching recs into an overlap group; `payload: {group}` (collapsed to one via the OR-dedup).
+- `DELETE /api/kb/feedback/{id}` — deactivate a policy.
+  Stored in `scan_tool_feedback`; applied live by the recommender (no rebuild). Emits `scan_recommender_tool_feedback_recorded`.
+
 **Dispatch note (BFF `POST /api/scan-recommendations/run`):** dispatching a `metasploit` recommendation does NOT auto-exploit. It creates a `pending_exploits` row (`source=metasploit`, RHOSTS/RPORT prefilled, `status=pending`, `requested_by=recommendations_ui`) that surfaces in the Exploit Manager (`/exploits/all`) for human approve/reject; approval runs it via exploit-runner `/execute/by-id`. The run response includes a `queued` count for these, and emits a `metasploit_queued_for_approval` webhook.
 - Additional endpoints available (check `/docs`)
 

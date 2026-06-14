@@ -641,6 +641,28 @@ CREATE TABLE IF NOT EXISTS public.kb_service_overrides (
 );
 CREATE INDEX IF NOT EXISTS idx_kb_service_overrides_name ON public.kb_service_overrides(service_name);
 
+-- scan_tool_feedback (durable feedback loop: operator/agent judgments that
+-- steer which tools the recommender picks). The recommender reads active rows
+-- and applies them as policies when generating recs.
+--   verdict 'suppress'     → drop matching recs (scanner [+ selector glob]); service NULL = global
+--   verdict 'add_tool'     → inject a tool rec for a service (payload: {name, action, command})
+--   verdict 'add_overlap'  → tag matching recs into an overlap group (payload: {group})
+CREATE TABLE IF NOT EXISTS public.scan_tool_feedback (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    service     text,                       -- e.g. 'http'; NULL = applies to all services
+    scanner     text,                       -- e.g. 'metasploit', 'vulnx' (NULL for add_tool)
+    selector    text,                       -- glob vs rec script/module (NULL = any)
+    verdict     text NOT NULL CHECK (verdict IN ('suppress','add_tool','add_overlap')),
+    payload     jsonb NOT NULL DEFAULT '{}'::jsonb,
+    reason      text,
+    created_by  text,
+    active      boolean NOT NULL DEFAULT true,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_scan_tool_feedback_active ON public.scan_tool_feedback(active) WHERE active = true;
+CREATE INDEX IF NOT EXISTS idx_scan_tool_feedback_service ON public.scan_tool_feedback(service);
+
 -- ============================================================================
 -- TIER 3: Job / Task scheduling
 -- ============================================================================
@@ -1336,6 +1358,11 @@ END IF; END$$;
 DO $$ BEGIN IF to_regclass('public.kb_service_overrides') IS NOT NULL THEN
   DROP TRIGGER IF EXISTS trg_kb_service_overrides_updated_at ON public.kb_service_overrides;
   CREATE TRIGGER trg_kb_service_overrides_updated_at BEFORE UPDATE ON public.kb_service_overrides FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+END IF; END$$;
+
+DO $$ BEGIN IF to_regclass('public.scan_tool_feedback') IS NOT NULL THEN
+  DROP TRIGGER IF EXISTS trg_scan_tool_feedback_updated_at ON public.scan_tool_feedback;
+  CREATE TRIGGER trg_scan_tool_feedback_updated_at BEFORE UPDATE ON public.scan_tool_feedback FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
 END IF; END$$;
 
 DO $$ BEGIN IF to_regclass('public.agent_sessions') IS NOT NULL THEN

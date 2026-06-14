@@ -1205,6 +1205,9 @@ services:
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
+      API_KEY: ${API_KEY:-changeme}
+      RAG_API_URL: ${RAG_API_URL:-https://rag-api:8000}
+      NODE_MANAGER_URL: ${NODE_MANAGER_URL:-https://node-manager:8027}
       LISTENER_PORT_START: 9080
       LISTENER_PORT_END: 9180
       API_PORT: 8019

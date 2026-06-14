@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect } from 'react'
 import PageHelp from '@/components/PageHelp'
+import InfoTip from '@/components/InfoTip'
 import { useInfiniteFindings, useUpdateFindingWorkflow, useFindingActivity, useAddFindingComment, useExploitMatches, useUpdateFindingTags, useTagSuggestions, useDeleteFindings, type FindingsFilter } from '@/api/findings'
 import { ScopeAssignModal } from '@/components/common/ScopeAssignModal'
 import { useFindingEvidence, useUploadEvidence, useLinkEvidence } from '@/api/evidence'
@@ -274,7 +275,17 @@ export default function FindingsExplorer() {
           ))}
         </div>
         <div className="flex flex-wrap gap-1.5 items-center">
-          <span className="text-xs text-muted-foreground py-1">Source:</span>
+          <span className="text-xs text-muted-foreground py-1 inline-flex items-center gap-1">
+            Source:
+            <InfoTip side="bottom" text={
+              <>
+                Every scan tool that produced findings — listed from the dataset-wide
+                aggregations, so <b>all sources appear even if not in the rows loaded so
+                far</b>. The count is the dataset total for that source (the current
+                scope-filter narrows it). Click to filter; the list refetches server-side.
+              </>
+            } />
+          </span>
           {activeSources.map(s => {
             const active = filters.source?.includes(s)
             // When scope filtering (client-side), show what's visible; otherwise
@@ -602,8 +613,16 @@ export default function FindingsExplorer() {
       {/* Load more — accumulate additional pages until all findings are loaded */}
       {!isLoading && !isScopeFiltering && total > 0 && (
         <div className="flex items-center justify-center gap-3 py-2">
-          <span className="text-xs text-muted-foreground">
+          <span className="text-xs text-muted-foreground inline-flex items-center gap-1">
             Showing {loadedCount.toLocaleString()} of {total.toLocaleString()}
+            <InfoTip side="top" text={
+              <>
+                Findings load in pages of 500. <b>Load more</b> fetches the next page and
+                appends it. <code>total</code> reflects the current severity / source /
+                status filters (applied server-side), so narrowing the filters is the fast
+                way to reach a specific finding instead of paging through everything.
+              </>
+            } />
           </span>
           {hasNextPage && (
             <button

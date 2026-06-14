@@ -106,6 +106,7 @@ CRITICAL_TABLES=(
     "pending_exploits"
     "exploit_results"
     "exploit_chunks"
+    "scan_tool_feedback"
     "tool_executions"
     "webhooks"
     "webhook_events"

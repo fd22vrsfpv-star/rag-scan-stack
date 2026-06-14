@@ -19,6 +19,7 @@ import { useState } from 'react'
 import { Crosshair, X, Sparkles } from 'lucide-react'
 import { ScanRecommendationsPanel } from '@/components/recommendations/ScanRecommendationsTable'
 import { useGenerateRecommendations } from '@/api/assets'
+import InfoTip from '@/components/InfoTip'
 
 const STATUS_OPTIONS = [
   { value: '',           label: 'All' },
@@ -57,19 +58,40 @@ export default function Recommendations() {
       <div className="flex items-center gap-2">
         <Crosshair className="h-4 w-4 text-blue-400" />
         <h2 className="text-base font-semibold">Scan Recommendations</h2>
+        <InfoTip side="bottom" text={
+          <>
+            Suggested next scans for each detected service/port. <b>Run</b> dispatches a
+            scan to its tool (native runner, or the Kali container / a node) and the status
+            tracks <b>queued → running → completed/failed</b> live.
+            <br /><br />
+            <b>Metasploit</b> recs aren’t auto-run — Run queues them in the Exploit Manager
+            for approval. Overlapping tools (e.g. nmap <code>-sV</code> vs metasploit
+            <code>*_version</code>) are collapsed so you see one per job, and tools the KB
+            marks as non-scanners (e.g. vulnx) don’t appear here.
+          </>
+        } />
         <span className="text-xs text-muted-foreground">
           Dispatch suggested scans against detected ports; the status loop
           surfaces queued → running → completed/failed in real time.
         </span>
-        <button
-          onClick={() => generateRecs.mutate(ip || undefined)}
-          disabled={generateRecs.isPending}
-          className="ml-auto flex items-center gap-1.5 px-2.5 py-1 text-xs rounded border border-primary/50 bg-primary/10 text-primary hover:bg-primary/20 disabled:opacity-50"
-          title="Generate recommendations for all currently-detected open ports that don't have one yet"
-        >
-          <Sparkles className="h-3.5 w-3.5" />
-          {generateRecs.isPending ? 'Generating…' : 'Generate from detected ports'}
-        </button>
+        <span className="ml-auto flex items-center gap-1">
+          <button
+            onClick={() => generateRecs.mutate(ip || undefined)}
+            disabled={generateRecs.isPending}
+            className="flex items-center gap-1.5 px-2.5 py-1 text-xs rounded border border-primary/50 bg-primary/10 text-primary hover:bg-primary/20 disabled:opacity-50"
+          >
+            <Sparkles className="h-3.5 w-3.5" />
+            {generateRecs.isPending ? 'Generating…' : 'Generate from detected ports'}
+          </button>
+          <InfoTip side="left" text={
+            <>
+              Generates recommendations for <b>every currently-detected open port</b> that
+              doesn’t have one yet — useful for targets scanned earlier (the automatic
+              trigger only covers ports seen in the last 10 minutes). Honors the IP filter
+              if set. Idempotent: re-running only fills gaps.
+            </>
+          } />
+        </span>
       </div>
       {generateRecs.isSuccess && (
         <div className="text-xs text-muted-foreground">
@@ -84,6 +106,14 @@ export default function Recommendations() {
       <div className="flex flex-wrap items-center gap-2 text-xs">
         {/* Status chip group */}
         <div className="flex items-center gap-1">
+          <InfoTip side="bottom" className="mr-0.5" text={
+            <>
+              Lifecycle of a recommendation: <b>pending</b> (not run) → <b>queued</b>
+              (dispatched / awaiting approval for metasploit) → <b>running</b> →
+              <b>completed</b> or <b>failed</b>. <b>skipped</b> = no handler or a manual
+              tool. Filter the list by any state.
+            </>
+          } />
           {STATUS_OPTIONS.map(opt => (
             <button
               key={opt.value}
