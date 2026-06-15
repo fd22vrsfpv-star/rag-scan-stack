@@ -3,7 +3,7 @@ import { useUIStore, ALPHA_ROUTES } from '@/stores/ui'
 import {
   LayoutDashboard, Network, Rocket, Activity, Bot, Server, Search, Swords, Workflow,
   FileText, MessageSquare, Wrench, BookOpen, Settings, ChevronLeft, ChevronRight, Shield, Globe2, Wifi,
-  Briefcase, Crosshair, ShieldAlert, Flag, FlaskConical, Info, GitCompare, ChevronDown, Cloud, RefreshCw, Brain, Users, Newspaper,
+  Briefcase, Crosshair, ShieldAlert, Flag, FlaskConical, Info, GitCompare, ChevronDown, Cloud, RefreshCw, Brain, Users, Newspaper, LayoutGrid,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useEffect } from 'react'
@@ -58,6 +58,7 @@ const NAV_GROUPS: NavEntry[] = [
       { to: '/follow-ups', icon: Flag, label: 'Follow-Ups' },
       { to: '/recommendations', icon: Crosshair, label: 'Recommendations' },
       { to: '/attack-map', icon: Workflow, label: 'Attack Map' },
+      { to: '/target-board', icon: LayoutGrid, label: 'Target Board' },
       { to: '/recon', icon: Globe2, label: 'Recon' },
       { to: '/users', icon: Users, label: 'Users' },
       { to: '/delta', icon: GitCompare, label: 'Delta Compare' },
