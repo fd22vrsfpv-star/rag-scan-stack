@@ -1,4 +1,5 @@
 import { useState, useMemo, useEffect, Fragment } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   useFollowUps, useFollowUpStats, useFollowUpGrouped, useCreateFollowUp,
   useUpdateFollowUp, useDeleteFollowUp, useSubmitFeedback,
@@ -38,6 +39,7 @@ const STATUS_BADGE: Record<string, string> = {
 
 export default function FollowUps() {
   const engagementId = useUIStore(s => s.selectedEngagementId)
+  const [searchParams] = useSearchParams()
   const [filters, setFilters] = useState<{
     status?: string; severity?: string; priority?: string; flagged_by?: string; search?: string
   }>({})
@@ -50,7 +52,8 @@ export default function FollowUps() {
   const [testResults, setTestResults] = useState<RuleTestResult | null>(null)
   const [ruleSinceMinutes, setRuleSinceMinutes] = useState(1440) // default 24h
 
-  const [searchFilter, setSearchFilter] = useState('')
+  // Seed free-text search from a deep link (e.g. Attack Map "Follow-ups" → ?search=<host>).
+  const [searchFilter, setSearchFilter] = useState(() => searchParams.get('search') || '')
   const [groupBy, setGroupBy] = useState<'none' | 'title' | 'target'>('title')
   const [filterByEngagement, setFilterByEngagement] = useState(false)
   const activeEngagementId = filterByEngagement && engagementId ? engagementId : undefined

@@ -1,4 +1,5 @@
 import { useState, useMemo, useEffect } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import PageHelp from '@/components/PageHelp'
 import InfoTip from '@/components/InfoTip'
 import { useInfiniteFindings, useUpdateFindingWorkflow, useFindingActivity, useAddFindingComment, useExploitMatches, useUpdateFindingTags, useTagSuggestions, useDeleteFindings, type FindingsFilter } from '@/api/findings'
@@ -137,7 +138,14 @@ export default function FindingsExplorer() {
   const engagementId = useUIStore(s => s.selectedEngagementId)
   const [scopeFilter, setScopeFilter] = useState(globalScope || '')
   const { matchesScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilter)
-  const [filters, setFilters] = useState<FindingsFilter>({})
+  const [searchParams] = useSearchParams()
+  // Seed the host filter from a deep link (e.g. the Attack Map "Findings" link
+  // passes ?ip=<host>). Applied once on mount via the lazy initializer.
+  const [filters, setFilters] = useState<FindingsFilter>(() => {
+    const ip = searchParams.get('ip')
+    const search = searchParams.get('search')
+    return { ...(ip ? { ip } : {}), ...(search ? { search } : {}) }
+  })
   // Merge engagement_id into the active filter set so the API pre-filters server-side
   const activeFilters = useMemo(() => ({
     ...filters,

@@ -11,6 +11,8 @@ export interface AttackVector {
   finding_count?: number
   finding_source?: string
   target?: string
+  asset_id?: string
+  finding_id?: string
   rationale?: string
   risk_factors?: Record<string, number>
 }

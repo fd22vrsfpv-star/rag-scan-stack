@@ -320,6 +320,21 @@ def _resolve_engagement_id(explicit: Optional[str] = None) -> Optional[str]:
         return None
 
 
+def _validate_engagement_uuid(eid: Optional[str]) -> Optional[str]:
+    """Validate that a resolved engagement_id is a well-formed UUID before it
+    reaches the SQL layer (the column is ``uuid``). Returns the value unchanged
+    (or None for the unscoped/legacy case). Raises HTTP 422 on a malformed value
+    so a bad query param / ``X-Engagement-Id`` header yields a clean client error
+    instead of a psycopg2 InvalidTextRepresentation 500."""
+    if eid is None:
+        return None
+    try:
+        uuid.UUID(str(eid))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(422, f"engagement_id must be a valid UUID, got: {eid!r}")
+    return eid
+
+
 def _outgoing_runner_headers(
     extra: Optional[Dict[str, str]] = None,
     engagement_id: Optional[str] = None,
@@ -4977,7 +4992,7 @@ def attack_vectors_compute(
     """(Re)compute the attack vector map: map findings → MITRE ATT&CK techniques
     + unified risk score, into the attack_vectors table. Emits a webhook."""
     import attack_vectors as _av
-    eid = engagement_id or _resolve_engagement_id(None)
+    eid = _validate_engagement_uuid(engagement_id or _resolve_engagement_id(None))
     result = _av.compute_attack_vectors(engagement_id=eid)
     try:
         from webhooks import emit_webhook
@@ -4999,7 +5014,7 @@ def attack_vectors_list(
     """Ranked attack vectors (highest risk first) — the prioritized list the AI
     agents and UI consume to choose the next-best action."""
     import attack_vectors as _av
-    eid = engagement_id or _resolve_engagement_id(None)
+    eid = _validate_engagement_uuid(engagement_id or _resolve_engagement_id(None))
     vectors = _av.get_attack_vectors(engagement_id=eid, limit=limit, min_risk=min_risk)
     return {"count": len(vectors), "vectors": vectors}
 
@@ -5011,7 +5026,7 @@ def attack_vectors_graph(
 ):
     """Graph (nodes+edges: target → technique → tactic) for the Attack Map UI."""
     import attack_vectors as _av
-    eid = engagement_id or _resolve_engagement_id(None)
+    eid = _validate_engagement_uuid(engagement_id or _resolve_engagement_id(None))
     return _av.get_graph(engagement_id=eid)
 
 
