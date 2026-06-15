@@ -16,6 +16,7 @@
  */
 
 import { useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Crosshair, X, Sparkles } from 'lucide-react'
 import { ScanRecommendationsPanel } from '@/components/recommendations/ScanRecommendationsTable'
 import { useGenerateRecommendations } from '@/api/assets'
@@ -39,9 +40,11 @@ const SOURCE_OPTIONS = [
 ]
 
 export default function Recommendations() {
+  const [searchParams] = useSearchParams()
   const [status, setStatus] = useState('')
   const [service, setService] = useState('')
-  const [ip, setIp] = useState('')
+  // Seed the IP filter from a deep link (e.g. the Attack Map "Recommendations" link).
+  const [ip, setIp] = useState(() => searchParams.get('ip') || '')
   const [source, setSource] = useState('')
   const generateRecs = useGenerateRecommendations()
 
