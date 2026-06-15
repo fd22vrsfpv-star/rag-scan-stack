@@ -10,6 +10,16 @@ import { useAttackVectors, useAttackGraph, useComputeAttackVectors, type AttackV
 import PageHelp from '@/components/PageHelp'
 import InfoTip from '@/components/InfoTip'
 
+type SortKey = 'risk' | 'findings' | 'severity'
+
+// Severity rank for sorting/ordering (high → low). Unknown sorts last.
+const SEV_RANK: Record<string, number> = { critical: 5, high: 4, medium: 3, low: 2, info: 1 }
+const SEV_ORDER = ['critical', 'high', 'medium', 'low', 'info']
+const SEV_DOT: Record<string, string> = {
+  critical: 'bg-red-600', high: 'bg-orange-500', medium: 'bg-yellow-400',
+  low: 'bg-blue-500', info: 'bg-gray-500',
+}
+
 // Risk 0..100 → green→amber→red.
 function riskColor(risk: number): string {
   const r = Math.max(0, Math.min(100, risk)) / 100
@@ -104,6 +114,54 @@ function AttackMapInner() {
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
   const [selectedVector, setSelectedVector] = useState<AttackVector | null>(null)
   const [selectedNodeIds, setSelectedNodeIds] = useState<Set<string>>(new Set())
+
+  // Ranked-list controls: sort key, hide vectors with no findings, severity filter.
+  const [sortBy, setSortBy] = useState<SortKey>('risk')
+  const [hideEmpty, setHideEmpty] = useState(false)
+  const [sevFilter, setSevFilter] = useState<Set<string>>(new Set())
+
+  const allVectors = ranked?.vectors || []
+
+  // After the "has findings" filter (but before the severity filter) — the basis
+  // for the severity chip counts, so toggling a severity doesn't shift the counts.
+  const baseVectors = useMemo(
+    () => (hideEmpty ? allVectors.filter((v) => (v.finding_count ?? 0) > 0) : allVectors),
+    [allVectors, hideEmpty],
+  )
+
+  // Severity → count over baseVectors. Only severities with >0 get a chip, so a
+  // severity with zero matches is simply not offered as a filter.
+  const sevCounts = useMemo(() => {
+    const m: Record<string, number> = {}
+    for (const v of baseVectors) {
+      const s = v.severity || 'unknown'
+      m[s] = (m[s] || 0) + 1
+    }
+    return m
+  }, [baseVectors])
+
+  // The list actually rendered: severity-filtered then sorted by the active key.
+  const displayVectors = useMemo(() => {
+    let list = baseVectors
+    if (sevFilter.size) list = list.filter((v) => sevFilter.has(v.severity || 'unknown'))
+    const sorted = [...list].sort((a, b) => {
+      if (sortBy === 'findings') return (b.finding_count ?? 0) - (a.finding_count ?? 0)
+      if (sortBy === 'severity') {
+        const d = (SEV_RANK[b.severity || ''] ?? 0) - (SEV_RANK[a.severity || ''] ?? 0)
+        return d !== 0 ? d : b.risk_score - a.risk_score
+      }
+      return b.risk_score - a.risk_score
+    })
+    return sorted
+  }, [baseVectors, sevFilter, sortBy])
+
+  const toggleSeverity = useCallback((sev: string) => {
+    setSevFilter((prev) => {
+      const next = new Set(prev)
+      next.has(sev) ? next.delete(sev) : next.add(sev)
+      return next
+    })
+  }, [])
 
   const { nodes, edges } = useMemo(() => {
     const g = graph || { nodes: [], edges: [] }
@@ -249,14 +307,84 @@ function AttackMapInner() {
         </div>
 
         {/* Ranked next-best-action list */}
-        <div className="rounded-lg border border-border bg-card p-3 overflow-auto h-[600px]">
-          <div className="text-xs font-semibold text-foreground mb-2 flex items-center gap-1">
-            Top attack vectors
-            <InfoTip text="Distinct attack paths (one per target+technique), highest risk first — the prioritized next-best-action list. Click a row to jump the graph to it and link out to its records." />
+        <div className="rounded-lg border border-border bg-card overflow-auto h-[600px]">
+          {/* Sticky controls — count + sort + filters stay pinned while the list scrolls */}
+          <div className="sticky top-0 z-10 bg-card border-b border-border px-3 pt-3 pb-2 space-y-2">
+            <div className="text-xs font-semibold text-foreground flex items-center gap-1.5">
+              Top attack vectors
+              <span className="px-1.5 py-0.5 rounded bg-muted text-[10px] font-mono text-muted-foreground">
+                {displayVectors.length}{displayVectors.length !== allVectors.length ? ` / ${allVectors.length}` : ''}
+              </span>
+              <InfoTip text="Distinct attack paths (one per target+technique). Sort by risk, finding count, or severity; filter out vectors with no findings or by severity. Click a row to jump the graph to it and link out to its records." />
+            </div>
+
+            <div className="flex items-center gap-1 flex-wrap">
+              <span className="text-[10px] text-muted-foreground mr-0.5">Sort</span>
+              {([['risk', 'Risk'], ['findings', 'Findings'], ['severity', 'Severity']] as [SortKey, string][]).map(([key, label]) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => setSortBy(key)}
+                  className={`px-1.5 py-0.5 rounded text-[10px] border transition-colors ${
+                    sortBy === key
+                      ? 'border-primary bg-primary/15 text-primary'
+                      : 'border-border bg-muted/40 text-muted-foreground hover:border-primary/50'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={() => setHideEmpty((v) => !v)}
+                title="Hide attack vectors that have 0 findings"
+                className={`ml-auto px-1.5 py-0.5 rounded text-[10px] border transition-colors ${
+                  hideEmpty
+                    ? 'border-primary bg-primary/15 text-primary'
+                    : 'border-border bg-muted/40 text-muted-foreground hover:border-primary/50'
+                }`}
+              >
+                Has findings
+              </button>
+            </div>
+
+            {/* Severity filter — only severities present in the data get a chip */}
+            <div className="flex items-center gap-1 flex-wrap">
+              <span className="text-[10px] text-muted-foreground mr-0.5">Severity</span>
+              {SEV_ORDER.filter((s) => sevCounts[s]).map((s) => {
+                const active = sevFilter.has(s)
+                return (
+                  <button
+                    key={s}
+                    type="button"
+                    onClick={() => toggleSeverity(s)}
+                    className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] border capitalize transition-colors ${
+                      active
+                        ? 'border-primary bg-primary/15 text-foreground'
+                        : 'border-border bg-muted/40 text-muted-foreground hover:border-primary/50'
+                    }`}
+                  >
+                    <span className={`h-1.5 w-1.5 rounded-full ${SEV_DOT[s] || 'bg-gray-500'}`} />
+                    {s}
+                    <span className="text-muted-foreground/70">{sevCounts[s]}</span>
+                  </button>
+                )
+              })}
+              {sevFilter.size > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setSevFilter(new Set())}
+                  className="text-[10px] text-primary hover:underline ml-0.5"
+                >
+                  clear
+                </button>
+              )}
+            </div>
           </div>
-          {selectedVector && <LinkedRecords vector={selectedVector} />}
-          <div className="space-y-1.5">
-            {(ranked?.vectors || []).slice(0, 40).map((v, i) => {
+
+          <div className="p-3 space-y-1.5">
+            {selectedVector && <LinkedRecords vector={selectedVector} />}
+            {displayVectors.map((v, i) => {
               const isSel = vectorKey(v) === selectedKey
               return (
                 <button
@@ -275,9 +403,15 @@ function AttackMapInner() {
                     </span>
                     <span className="font-mono text-foreground">{v.technique}</span>
                     <span className="text-muted-foreground">{v.tactic}</span>
-                    {v.finding_count && v.finding_count > 1 && (
-                      <span className="text-[10px] text-muted-foreground">×{v.finding_count}</span>
+                    {v.severity && (
+                      <span className="flex items-center gap-1 text-[10px] text-muted-foreground capitalize">
+                        <span className={`h-1.5 w-1.5 rounded-full ${SEV_DOT[v.severity] || 'bg-gray-500'}`} />
+                        {v.severity}
+                      </span>
                     )}
+                    <span className="ml-auto text-[10px] text-muted-foreground" title={`${v.finding_count ?? 0} finding(s)`}>
+                      {v.finding_count ?? 0} <Bug className="inline h-3 w-3 -mt-0.5" />
+                    </span>
                   </div>
                   <div className="text-muted-foreground mt-0.5">{v.technique_name}</div>
                   <div className="text-muted-foreground/80 font-mono text-[10px]" title={v.target}>
@@ -286,9 +420,11 @@ function AttackMapInner() {
                 </button>
               )
             })}
-            {(ranked?.vectors || []).length === 0 && (
+            {allVectors.length === 0 ? (
               <div className="text-xs text-muted-foreground">No vectors. Click Recompute.</div>
-            )}
+            ) : displayVectors.length === 0 ? (
+              <div className="text-xs text-muted-foreground">No vectors match the current filters.</div>
+            ) : null}
           </div>
         </div>
       </div>
