@@ -12,12 +12,17 @@
  *
  * Read-only aggregation over already-fetched data — no new API.
  */
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { LayoutGrid, Crosshair, Flag, Lightbulb, Search, ExternalLink } from 'lucide-react'
+import { LayoutGrid, Crosshair, Flag, Lightbulb, Search, ExternalLink, Globe, Plus, Check, Ban } from 'lucide-react'
 import { useAttackVectors, type AttackVector } from '@/api/attackVectors'
 import { useFollowUps, type FollowUpItem } from '@/api/followups'
 import { useScanRecommendations, type StoredRecommendation } from '@/api/assets'
+import { ScopeFilter } from '@/components/common/ScopeFilter'
+import { useScopeNames, useAddToScope, useExcludeFromScope, useExcludedTargets } from '@/api/scope'
+import { useAddScopeTargets } from '@/api/engagements'
+import { useScopeFilter } from '@/hooks/useScopeFilter'
+import { useUIStore } from '@/stores/ui'
 import PageHelp from '@/components/PageHelp'
 import InfoTip from '@/components/InfoTip'
 
@@ -56,10 +61,46 @@ interface TargetRow {
 }
 
 export default function TargetBoard() {
-  const { data: avData, isLoading: avLoading } = useAttackVectors(0, 100)
+  // Engagement isolation: the active engagement scopes all three data sources.
+  //  - attack vectors: rag-api filters by the explicit engagement_id param.
+  //  - follow-ups:     rag-api filters by the explicit engagement_id param.
+  //  - recommendations: scan_recommender filters by the X-Engagement-Id header.
+  // Passing the id also varies each hook's React Query key so switching the
+  // engagement in the TopBar refetches immediately instead of showing stale rows.
+  const engagementId = useUIStore(s => s.selectedEngagementId)
+  const globalScope = useUIStore(s => s.selectedScopeName)
+
+  // Scope filter: defaults to the engagement's global scope, mirrors the
+  // AssetBrowser / FindingsExplorer pattern. matchesScope(host) restricts the
+  // swimlanes to hosts inside the selected scope; "" means All Scopes.
+  const [scopeFilter, setScopeFilter] = useState(globalScope || '')
+  const { matchesScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilter)
+  // Reset the scope filter whenever the engagement OR its global scope changes.
+  // engagementId MUST be a dependency: scope names are per-engagement, so a scope
+  // selected under one engagement (e.g. jabil's "main_jabil") is meaningless under
+  // another (home_scan's scopes are "msf"). Without this, switching engagements
+  // left a stale cross-engagement scope selected — the dropdown showed the wrong
+  // engagement's scope and matchesScope filtered against a non-existent target set.
+  // (selectedScopeName is empty for engagements with no default scope, so watching
+  // globalScope alone never fires on an engagement switch.)
+  useEffect(() => { setScopeFilter(globalScope || '') }, [globalScope, engagementId])
+
+  const { data: avData, isLoading: avLoading } = useAttackVectors(0, 100, engagementId)
   // Open follow-ups only (exclude dismissed) — the actionable set.
-  const { data: fuData, isLoading: fuLoading } = useFollowUps({ exclude_status: 'dismissed' })
-  const { data: recData, isLoading: recLoading } = useScanRecommendations('pending')
+  const { data: fuData, isLoading: fuLoading } = useFollowUps({
+    exclude_status: 'dismissed',
+    engagement_id: engagementId ?? undefined,
+  })
+  const { data: recData, isLoading: recLoading } = useScanRecommendations('pending', engagementId)
+
+  // Out-of-scope set: hosts the operator marked as "should not be in scope".
+  // These are dropped from the board so noise (e.g. third-party www.owasp.org)
+  // disappears the moment it's excluded.
+  const { data: excludedData } = useExcludedTargets()
+  const excludedSet = useMemo(
+    () => new Set((excludedData?.targets || []).map(t => t.target.toLowerCase().trim())),
+    [excludedData],
+  )
 
   const [sortBy, setSortBy] = useState<SortKey>('risk')
   const [hostSearch, setHostSearch] = useState('')
@@ -95,6 +136,12 @@ export default function TargetBoard() {
 
   const displayRows = useMemo(() => {
     let list = rows
+    // Drop hosts marked out-of-scope, regardless of scope/engagement selection.
+    if (excludedSet.size) list = list.filter((r) => !excludedSet.has(r.host.toLowerCase().trim()))
+    // Scope gate: when a scope is selected, drop hosts outside it. The
+    // 'unknown' bucket (rows with no resolvable host) can never match a scope,
+    // so it is hidden while filtering.
+    if (isScopeFiltering) list = list.filter((r) => r.host !== 'unknown' && matchesScope(r.host))
     const q = hostSearch.trim().toLowerCase()
     if (q) list = list.filter((r) => r.host.toLowerCase().includes(q))
     return [...list].sort((a, b) => {
@@ -102,7 +149,7 @@ export default function TargetBoard() {
       if (sortBy === 'recommendations') return b.recommendations.length - a.recommendations.length
       return b.maxRisk - a.maxRisk
     })
-  }, [rows, hostSearch, sortBy])
+  }, [rows, hostSearch, sortBy, isScopeFiltering, matchesScope, excludedSet])
 
   return (
     <div className="p-4 space-y-4">
@@ -119,10 +166,12 @@ export default function TargetBoard() {
         <h2 className="text-base font-semibold">Target Board</h2>
         <span className="px-1.5 py-0.5 rounded bg-muted text-[10px] font-mono text-muted-foreground">
           {displayRows.length}{displayRows.length !== rows.length ? ` / ${rows.length}` : ''} targets
+          {isScopeFiltering ? ` in ${scopeFilter}` : ''}
         </span>
-        <InfoTip side="bottom" text="Combines attack vectors, open follow-ups, and pending recommendations per host. Cards link out to the full pages, filtered to that host." />
+        <InfoTip side="bottom" text="Combines attack vectors, open follow-ups, and pending recommendations per host, scoped to the active engagement and scope. Cards link out to the full pages, filtered to that host." />
 
         <div className="ml-auto flex items-center gap-2">
+          <ScopeFilter value={scopeFilter} onChange={setScopeFilter} />
           <div className="relative">
             <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
             <input
@@ -184,6 +233,7 @@ function TargetSwimlane({ row }: { row: TargetRow }) {
           <span className="flex items-center gap-1"><Flag className="h-3 w-3 text-amber-400" />{row.followups.length}</span>
           <span className="flex items-center gap-1"><Lightbulb className="h-3 w-3 text-cyan-400" />{row.recommendations.length}</span>
         </span>
+        <AssignScopeControl host={row.host} />
       </div>
 
       {/* Three columns */}
@@ -265,6 +315,151 @@ function BoardColumn({
       {hasItems ? children : <div className="text-[10px] text-muted-foreground/70 italic">{emptyText}</div>}
       {count > 6 && (
         <Link to={to} className="block text-[10px] text-primary hover:underline">+{count - 6} more…</Link>
+      )}
+    </div>
+  )
+}
+
+// Bare-IPv4 test — decides the target_type when assigning to a *global* scope
+// (the engagement-scoped endpoint infers type server-side, so it's only needed
+// on the no-engagement path).
+const IPV4_RE = /^(\d{1,3}\.){3}\d{1,3}$/
+
+/**
+ * Inline "assign this host to a scope" control shown in each swimlane header.
+ * Picks the right backend per context, matching the rest of the app:
+ *   - engagement active → POST /engagements/{eid}/scopes/{name}/targets
+ *   - no engagement     → POST /scope/add (global scope list)
+ * The scope list comes from useScopeNames (already engagement-aware), and a
+ * free-text box lets the operator create-and-assign a brand-new scope in one
+ * step. Assigning invalidates the scope-targets cache, so the Scope filter and
+ * matchesScope() pick up the new membership immediately.
+ */
+function AssignScopeControl({ host }: { host: string }) {
+  const engagementId = useUIStore(s => s.selectedEngagementId)
+  const { data: scopeData } = useScopeNames()
+  const scopes = scopeData?.names ?? []
+  const addToScope = useAddToScope()
+  const addEngTargets = useAddScopeTargets()
+  const excludeFromScope = useExcludeFromScope()
+
+  const [open, setOpen] = useState(false)
+  const [newScope, setNewScope] = useState('')
+  const [assignedTo, setAssignedTo] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const disabled = !host || host === 'unknown'
+  const saving = addToScope.isPending || addEngTargets.isPending || excludeFromScope.isPending
+
+  function markOutOfScope() {
+    if (disabled) return
+    setError(null)
+    excludeFromScope.mutate(
+      { targets: [host], source: 'target-board' },
+      {
+        // The host vanishes from the board once the excluded list refetches
+        // (useExcludedTargets is invalidated by the mutation).
+        onSuccess: () => setOpen(false),
+        onError: (e: unknown) => setError(e instanceof Error ? e.message : 'Failed to exclude'),
+      },
+    )
+  }
+
+  function assign(scopeName: string) {
+    const name = scopeName.trim()
+    if (!name || disabled) return
+    setError(null)
+    const onSuccess = () => {
+      setAssignedTo(name)
+      setNewScope('')
+      setOpen(false)
+    }
+    const onError = (e: unknown) => setError(e instanceof Error ? e.message : 'Failed to assign')
+    if (engagementId) {
+      addEngTargets.mutate(
+        { eid: engagementId, scopeName: name, targets: [host], source: 'target-board' },
+        { onSuccess, onError },
+      )
+    } else {
+      const target_type = IPV4_RE.test(host) ? 'ip' : 'domain'
+      addToScope.mutate(
+        { name, targets: [{ target: host, target_type, source: 'target-board' }] },
+        { onSuccess, onError },
+      )
+    }
+  }
+
+  if (disabled) return null
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] border transition-colors ${
+          assignedTo
+            ? 'border-green-600/50 bg-green-600/15 text-green-500'
+            : 'border-border bg-muted/40 text-muted-foreground hover:border-primary/50 hover:text-foreground'
+        }`}
+        title={assignedTo ? `Added to scope "${assignedTo}"` : 'Assign this host to a scope'}
+      >
+        {assignedTo ? <Check className="h-3 w-3" /> : <Globe className="h-3 w-3" />}
+        {assignedTo ? assignedTo : 'scope'}
+      </button>
+
+      {open && (
+        <div className="absolute right-0 top-full mt-1 z-20 w-52 rounded-lg border border-border bg-card shadow-lg p-2 space-y-1.5">
+          <div className="text-[10px] font-semibold text-muted-foreground px-1">
+            Add <span className="font-mono text-foreground">{host}</span> to scope
+          </div>
+          {scopes.length > 0 && (
+            <div className="max-h-40 overflow-auto space-y-0.5">
+              {scopes.map(s => (
+                <button
+                  key={s.name}
+                  type="button"
+                  disabled={saving}
+                  onClick={() => assign(s.name)}
+                  className="w-full flex items-center justify-between gap-2 px-1.5 py-1 rounded text-[11px] text-left hover:bg-muted/60 disabled:opacity-50"
+                >
+                  <span className="truncate">{s.name}</span>
+                  <span className="text-[9px] text-muted-foreground shrink-0">{s.target_count}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          <form
+            onSubmit={(e) => { e.preventDefault(); assign(newScope) }}
+            className="flex items-center gap-1 border-t border-border pt-1.5"
+          >
+            <input
+              value={newScope}
+              onChange={(e) => setNewScope(e.target.value)}
+              placeholder="New scope…"
+              className="flex-1 min-w-0 px-1.5 py-1 text-[11px] rounded border border-border bg-background focus:outline-none focus:border-primary"
+            />
+            <button
+              type="submit"
+              disabled={saving || !newScope.trim()}
+              className="flex items-center gap-0.5 px-1.5 py-1 rounded text-[10px] border border-primary bg-primary/15 text-primary hover:bg-primary/25 disabled:opacity-50"
+            >
+              <Plus className="h-3 w-3" /> add
+            </button>
+          </form>
+          {error && <div className="text-[10px] text-red-500 px-1">{error}</div>}
+          {!engagementId && (
+            <div className="text-[9px] text-muted-foreground/70 px-1">Adds to the global scope list (no engagement selected).</div>
+          )}
+          <button
+            type="button"
+            disabled={saving}
+            onClick={markOutOfScope}
+            className="w-full flex items-center gap-1 px-1.5 py-1 rounded text-[10px] border border-red-600/40 bg-red-600/10 text-red-500 hover:bg-red-600/20 disabled:opacity-50 border-t"
+            title="Mark this host as out of scope — it won't be shown on the board"
+          >
+            <Ban className="h-3 w-3" /> Mark out of scope
+          </button>
+        </div>
       )}
     </div>
   )

@@ -9,7 +9,7 @@ from typing import Any, List, Optional, Dict
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
-from fastapi import FastAPI, APIRouter, Query, HTTPException, Body
+from fastapi import FastAPI, APIRouter, Query, HTTPException, Body, Header
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from exploits_rag import rag_router
@@ -716,6 +716,7 @@ def persist_recommendations(
     source: str = "ollama",
     model: Optional[str] = None,
     extra: Optional[Dict] = None,
+    engagement_id: Optional[str] = None,
 ) -> int:
     """Insert scan_recommendations rows for the given IP.
 
@@ -743,7 +744,7 @@ def persist_recommendations(
             cur.execute("SAVEPOINT asset_lookup")
             try:
                 cur.execute(
-                    "SELECT id FROM public.assets WHERE host(ip)=%s "
+                    "SELECT id, engagement_id FROM public.assets WHERE host(ip)=%s "
                     "ORDER BY last_seen DESC NULLS LAST, first_seen DESC NULLS LAST "
                     "LIMIT 1",
                     (ip,),
@@ -751,10 +752,29 @@ def persist_recommendations(
                 row = cur.fetchone()
                 if row:
                     asset_id = row["id"]
+                    # Derive engagement scope from the asset when the caller
+                    # didn't pass one, so the rec is engagement-filterable.
+                    if engagement_id is None:
+                        engagement_id = row.get("engagement_id")
                 cur.execute("RELEASE SAVEPOINT asset_lookup")
             except Exception as e:
                 cur.execute("ROLLBACK TO SAVEPOINT asset_lookup")
                 logger.debug(f"asset_id resolution skipped for {ip}: {e}")
+        elif asset_id is not None and engagement_id is None:
+            # Caller gave us the asset PK but not the engagement; look it up so
+            # the persisted rec carries its engagement scope.
+            cur.execute("SAVEPOINT eng_lookup")
+            try:
+                cur.execute(
+                    "SELECT engagement_id FROM public.assets WHERE id=%s", (asset_id,)
+                )
+                row = cur.fetchone()
+                if row:
+                    engagement_id = row.get("engagement_id")
+                cur.execute("RELEASE SAVEPOINT eng_lookup")
+            except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT eng_lookup")
+                logger.debug(f"engagement_id resolution skipped for asset {asset_id}: {e}")
 
         for rec in recs:
             # Per-rec service/banner/port (stamped by
@@ -784,9 +804,9 @@ def persist_recommendations(
             cur.execute(
                 """
                 INSERT INTO public.scan_recommendations
-                  (asset_id, ip, service, banner, scanner, action, script, template, source, model, extra, priority)
+                  (asset_id, ip, service, banner, scanner, action, script, template, source, model, extra, priority, engagement_id)
                 VALUES
-                  (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 50))
+                  (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 50), %s)
                 ON CONFLICT (fingerprint) DO NOTHING
                 RETURNING id;
                 """,
@@ -797,6 +817,7 @@ def persist_recommendations(
                     source, model,
                     Json(rec_extra) if rec_extra else None,
                     rec_priority,
+                    engagement_id,
                 ),
             )
             if cur.rowcount > 0:
@@ -1326,8 +1347,19 @@ def list_all_recommendations(
     status: str = Query("pending"),
     ip: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=500),
+    engagement_id: Optional[str] = Query(None),
+    x_engagement_id: Optional[str] = Header(None, alias="X-Engagement-Id"),
 ):
-    """List all scan recommendations from the database."""
+    """List all scan recommendations from the database.
+
+    Engagement isolation: when an engagement is active it arrives either as the
+    explicit ``engagement_id`` query param or (as the BFF forwards it) the
+    ``X-Engagement-Id`` header. Recommendations are scoped to it. Because
+    legacy rows persisted before engagement stamping have a NULL
+    ``engagement_id``, we also include rows whose linked asset belongs to the
+    engagement, so historical recommendations remain visible under their host.
+    """
+    eid = engagement_id or x_engagement_id
     try:
         with get_db() as conn:
             cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -1339,6 +1371,13 @@ def list_all_recommendations(
             if ip:
                 conditions.append("ip = %s::inet")
                 params.append(ip)
+            if eid:
+                conditions.append(
+                    "(engagement_id = %s::uuid OR (engagement_id IS NULL "
+                    "AND asset_id IN (SELECT id FROM public.assets "
+                    "WHERE engagement_id = %s::uuid)))"
+                )
+                params.extend([eid, eid])
             where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
             cur.execute(
                 f"""

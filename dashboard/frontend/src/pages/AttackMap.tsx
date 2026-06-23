@@ -7,6 +7,7 @@ import ReactFlow, {
 import 'reactflow/dist/style.css'
 import { Crosshair, RefreshCw, Loader2, Bug, Flag, Lightbulb, Zap, ExternalLink } from 'lucide-react'
 import { useAttackVectors, useAttackGraph, useComputeAttackVectors, type AttackVector } from '@/api/attackVectors'
+import { useUIStore } from '@/stores/ui'
 import PageHelp from '@/components/PageHelp'
 import InfoTip from '@/components/InfoTip'
 
@@ -105,8 +106,11 @@ function LinkedRecords({ vector }: { vector: AttackVector }) {
 }
 
 function AttackMapInner() {
-  const { data: graph, isLoading } = useAttackGraph()
-  const { data: ranked } = useAttackVectors(0, 100)
+  // Scope the map to the active engagement so switching engagements refetches
+  // both the graph and the ranked list (keys vary by engagementId).
+  const engagementId = useUIStore(s => s.selectedEngagementId)
+  const { data: graph, isLoading } = useAttackGraph(engagementId)
+  const { data: ranked } = useAttackVectors(0, 100, engagementId)
   const compute = useComputeAttackVectors()
   const rf = useReactFlow()
 

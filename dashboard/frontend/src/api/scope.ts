@@ -71,6 +71,58 @@ export function useRemoveFromScope() {
 }
 
 
+// ── Out-of-scope exclusion (the 'not_in_scope' list) ─────────────────────
+// Lets an operator mark a target that "should not have been in scope" — e.g.
+// a third-party host that got auto-classified in. Reversible via the same
+// endpoint with DELETE. Independent of named scopes.
+
+export interface ExcludedTarget {
+  target: string
+  source: string
+  added_at: string
+}
+
+export function useExcludedTargets() {
+  return useQuery({
+    queryKey: ['scope-excluded'],
+    queryFn: () => apiFetch<{ targets: ExcludedTarget[]; total: number }>('/scope/excluded'),
+    staleTime: 30000,
+  })
+}
+
+export function useExcludeFromScope() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body: { targets: string[]; source?: string }) =>
+      apiFetch<{ ok: boolean; added: number; scope: string }>('/scope/exclude', {
+        method: 'POST',
+        body: JSON.stringify({ source: 'manual', ...body }),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['scope-excluded'] })
+      qc.invalidateQueries({ queryKey: ['scope-names'] })
+      qc.invalidateQueries({ queryKey: ['scope'] })
+    },
+  })
+}
+
+export function useRemoveExclusion() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body: { targets: string[] }) =>
+      apiFetch<{ ok: boolean; removed: number }>('/scope/exclude', {
+        method: 'DELETE',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['scope-excluded'] })
+      qc.invalidateQueries({ queryKey: ['scope-names'] })
+      qc.invalidateQueries({ queryKey: ['scope'] })
+    },
+  })
+}
+
+
 // ── Scope Auto-Classification ───────────────────────────────────────────
 
 export interface ScopeSuggestion {

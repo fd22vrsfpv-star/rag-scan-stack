@@ -14,6 +14,7 @@
 
 import { useState } from 'react'
 import { useScanRecommendations, useGenerateRecommendations, type StoredRecommendation } from '@/api/assets'
+import { useUIStore } from '@/stores/ui'
 import {
   Wand2, ChevronDown, ChevronRight, Eye, Play, Loader2,
 } from 'lucide-react'
@@ -123,7 +124,10 @@ export function ScanRecommendationsPanel({
   const [toolCheck, setToolCheck] = useState<any>(null)
   const [checking, setChecking] = useState(false)
   const [installing, setInstalling] = useState(false)
-  const { data, isLoading, refetch } = useScanRecommendations('all')
+  // Key by the active engagement so the list refetches on engagement switch
+  // (scan_recommender scopes by the forwarded X-Engagement-Id header).
+  const engagementId = useUIStore(s => s.selectedEngagementId)
+  const { data, isLoading, refetch } = useScanRecommendations('all', engagementId)
   const generateRecs = useGenerateRecommendations()
   const allRecs = data?.recommendations ?? []
 
