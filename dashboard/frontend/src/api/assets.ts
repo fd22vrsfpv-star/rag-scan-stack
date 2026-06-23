@@ -85,9 +85,13 @@ export interface StoredRecommendation {
   purpose_group?: string | null
 }
 
-export function useScanRecommendations(status = 'pending') {
+export function useScanRecommendations(status = 'pending', engagementId?: string | null) {
+  // The active engagement reaches scan_recommender via the X-Engagement-Id
+  // header (apiFetch → BFF → engagement_headers()), which scopes the result
+  // server-side. engagementId is included in the queryKey so switching
+  // engagements busts the cache and refetches immediately.
   return useQuery({
-    queryKey: ['scan-recommendations', status],
+    queryKey: ['scan-recommendations', status, engagementId ?? null],
     queryFn: () => apiFetch<{ recommendations: StoredRecommendation[]; total: number }>(
       `/scan-recommendations?status=${status}`
     ),

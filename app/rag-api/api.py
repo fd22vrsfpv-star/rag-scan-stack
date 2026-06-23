@@ -10482,11 +10482,19 @@ def add_to_scope(
             target_val = t.get("target", "").strip()
             if not target_val:
                 continue
+            # Idempotent insert for the GLOBAL scope list (engagement_id IS NULL).
+            # The legacy UNIQUE(name,target) was dropped in favor of
+            # UNIQUE(engagement_id,name,target) (see ensure_all_tables.sql), so
+            # ON CONFLICT (name,target) no longer matches a constraint. Guard on
+            # the NULL-engagement row set instead.
             cur.execute(
                 """INSERT INTO scope_targets (name, target, target_type, source)
-                   VALUES (%s, %s, %s, %s)
-                   ON CONFLICT (name, target) DO NOTHING""",
-                [name, target_val, t.get("target_type"), t.get("source")],
+                   SELECT %s, %s, %s, %s
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM scope_targets
+                       WHERE engagement_id IS NULL AND name = %s AND target = %s
+                   )""",
+                [name, target_val, t.get("target_type"), t.get("source"), name, target_val],
             )
             added += cur.rowcount
         conn.commit()
@@ -11126,11 +11134,17 @@ def exclude_from_scope(
             target_val = t.strip() if isinstance(t, str) else ""
             if not target_val:
                 continue
+            # Idempotent insert into the global not_in_scope list. The legacy
+            # UNIQUE(name,target) is gone (now UNIQUE(engagement_id,name,target)),
+            # so guard on the NULL-engagement row set rather than ON CONFLICT.
             cur.execute(
                 """INSERT INTO scope_targets (name, target, target_type, source)
-                   VALUES ('not_in_scope', %s, 'domain', %s)
-                   ON CONFLICT (name, target) DO NOTHING""",
-                [target_val, source],
+                   SELECT 'not_in_scope', %s, 'domain', %s
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM scope_targets
+                       WHERE engagement_id IS NULL AND name = 'not_in_scope' AND target = %s
+                   )""",
+                [target_val, source, target_val],
             )
             added += cur.rowcount
         conn.commit()

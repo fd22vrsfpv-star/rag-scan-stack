@@ -21,20 +21,31 @@ export interface AttackGraphNode { id: string; type: string; label: string; risk
 export interface AttackGraphEdge { from: string; to: string; type?: string; risk: number }
 export interface AttackGraph { nodes: AttackGraphNode[]; edges: AttackGraphEdge[]; count: number }
 
-export function useAttackVectors(minRisk = 0, limit = 100) {
+export function useAttackVectors(minRisk = 0, limit = 100, engagementId?: string | null) {
+  // engagementId is included in the queryKey so switching the active engagement
+  // immediately refetches (rather than serving the prior engagement's cached
+  // rows until the next poll). It is also forwarded as an explicit query param;
+  // the rag-api already scopes by the X-Engagement-Id header, but passing it
+  // explicitly keeps the request deterministic and cache-correct.
   return useQuery({
-    queryKey: ['attack-vectors', minRisk, limit],
+    queryKey: ['attack-vectors', minRisk, limit, engagementId ?? null],
     queryFn: () => apiFetch<{ count: number; vectors: AttackVector[] }>(
-      `/attack-vectors?limit=${limit}&min_risk=${minRisk}`,
+      `/attack-vectors?limit=${limit}&min_risk=${minRisk}${engagementId ? `&engagement_id=${encodeURIComponent(engagementId)}` : ''}`,
     ),
     refetchInterval: POLL.NORMAL,
   })
 }
 
-export function useAttackGraph() {
+export function useAttackGraph(engagementId?: string | null) {
+  // engagementId in the queryKey so the graph refetches on engagement switch
+  // (the rag-api scopes by the X-Engagement-Id header, but an unvaried key would
+  // serve the prior engagement's graph until the next poll). Forwarded as a param
+  // too for determinism — the BFF /attack-vectors/graph route accepts it.
   return useQuery({
-    queryKey: ['attack-graph'],
-    queryFn: () => apiFetch<AttackGraph>('/attack-vectors/graph'),
+    queryKey: ['attack-graph', engagementId ?? null],
+    queryFn: () => apiFetch<AttackGraph>(
+      `/attack-vectors/graph${engagementId ? `?engagement_id=${encodeURIComponent(engagementId)}` : ''}`,
+    ),
     refetchInterval: POLL.NORMAL,
   })
 }

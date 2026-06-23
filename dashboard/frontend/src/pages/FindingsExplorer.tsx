@@ -152,10 +152,13 @@ export default function FindingsExplorer() {
     ...(engagementId ? { engagement_id: engagementId } : {}),
   }), [filters, engagementId])
 
-  // Sync with global engagement scope (clear when engagement changes)
+  // Sync with global engagement scope (clear when engagement changes).
+  // engagementId must be a dependency: selectedScopeName is empty for engagements
+  // with no default scope, so watching globalScope alone never fires on a bare
+  // engagement switch, leaving a stale cross-engagement scope selected.
   useEffect(() => {
     setScopeFilter(globalScope || '')
-  }, [globalScope])
+  }, [globalScope, engagementId])
 
   // Clear selections + source filter on scope/engagement change
   useEffect(() => {
