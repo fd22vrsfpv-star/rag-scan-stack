@@ -579,6 +579,7 @@ export default function AssetBrowser() {
     })
   }
   const globalScope = useUIStore(s => s.selectedScopeName)
+  const selectedEngagementId = useUIStore(s => s.selectedEngagementId)
   const [scopeFilter, setScopeFilter] = useState(globalScope || '')
   const { matchesScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilter)
   const [portsFilter, setPortsFilter] = useState<'all' | 'with-ports' | 'no-ports'>('all')
@@ -592,10 +593,14 @@ export default function AssetBrowser() {
   // whose provider[] array contains the selected tag.
   const [providerFilter, setProviderFilter] = useState<'any' | 'untagged' | string>('any')
 
-  // Sync with global engagement scope changes
+  // Sync with global engagement scope changes. Depends on selectedEngagementId
+  // too: scope names are per-engagement, so a scope picked under one engagement
+  // is invalid under another. selectedScopeName is empty for engagements without
+  // a default scope, so watching globalScope alone never fires on a bare
+  // engagement switch — leaving a stale cross-engagement scope selected.
   useEffect(() => {
     setScopeFilter(globalScope || '')
-  }, [globalScope])
+  }, [globalScope, selectedEngagementId])
 
   // Clear selections when scope changes
   useEffect(() => {
