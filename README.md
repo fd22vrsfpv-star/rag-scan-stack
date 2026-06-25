@@ -4,6 +4,10 @@ An open-source **workflow collector for authorized penetration testing and red t
 
 > **Authorized testing only.** This tool is built for engagements you have written permission to perform. Read [Authorized use](#authorized-use) before running it.
 
+![RAG Scan Stack dashboard](presentation-materials/dashboard.png)
+
+*The main dashboard — engagement-scoped totals, findings-by-severity, live scans, and the most recent findings across every tool.*
+
 ---
 
 ## Why it exists
