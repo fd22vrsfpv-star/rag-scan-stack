@@ -178,6 +178,15 @@ The database can run **local** (default), **remote over an SSH tunnel**, or **re
 - [`Docs/DEPLOYMENT.md`](Docs/DEPLOYMENT.md), [`Docs/QUICKSTART-MACOS.md`](Docs/QUICKSTART-MACOS.md), [`Docs/QUICKSTART-WINDOWS.md`](Docs/QUICKSTART-WINDOWS.md) — deployment guides
 - [`Docs/HEALTH_CHECK_GUIDE.md`](Docs/HEALTH_CHECK_GUIDE.md) — health checks and diagnostics
 
+### Illustrated guides (PDF)
+
+Walkthroughs with annotated screenshots of the dashboard. Click to view in GitHub's PDF reader or download.
+
+- [Complete Guide](presentation-materials/pdfs-clean/RAG-Scan-Stack-Complete-Guide-NO-INSTRUCTIONS.pdf) — the full platform tour: features, operations, and architecture in one document.
+- [User Guide & Features](presentation-materials/pdfs-clean/01-User-Guide-Features-CLEAN.pdf) — every page of the dashboard and what it does, for testers.
+- [Management & Health](presentation-materials/pdfs-clean/02-Management-Health-CLEAN.pdf) — operations, monitoring, service health, and administrative tasks.
+- [Architecture](presentation-materials/pdfs-clean/03-Architecture-Simple-CLEAN.pdf) — how the services fit together.
+
 ---
 
 ## Authorized use
