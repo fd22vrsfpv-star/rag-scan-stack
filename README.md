@@ -171,6 +171,7 @@ The database can run **local** (default), **remote over an SSH tunnel**, or **re
 
 ## Documentation
 
+- [`Docs/ARCHITECTURE.md`](Docs/ARCHITECTURE.md) — full architecture overview: layers, services, data model, and data flow
 - [`Docs/START_HERE.md`](Docs/START_HERE.md) — getting started + common workflows (external / internal / web app)
 - [`Docs/EXECUTIVE_OVERVIEW.md`](Docs/EXECUTIVE_OVERVIEW.md) — capabilities and positioning
 - [`Docs/DATABASE_SCHEMA.md`](Docs/DATABASE_SCHEMA.md) — the normalized data model
