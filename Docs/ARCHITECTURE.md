@@ -35,8 +35,32 @@ authorized-only operation the path of least resistance.
 
 ## 2. Layered architecture
 
-The system is a **microservice stack** (~50 containers on one Docker network, `agents_net`),
-organized into six tiers. Everything is engagement-scoped and audited.
+The system is a **microservice stack** — **45 services** defined in `docker-compose.yml`, all on one
+Docker network (`agents_net`); several are one-shot init containers (`vault-init`, `ollama-init`,
+`wait-for-db`). It is fundamentally a **tiered API interface**: every layer talks to the next over
+HTTP. For this overview the services are grouped into the six layers below — that grouping is a
+descriptive lens for explanation, not a label that appears in the code. Everything is
+engagement-scoped and audited.
+
+**How many of these do you actually need?** Most are optional capabilities, gated by Compose
+`profiles`. The real footprint:
+
+| Tier | Containers | What runs |
+|---|---|---|
+| Irreducible core | **3** (+1 init) | `rag-postgres`, `rag-api`, `pentest-dashboard` (+ `wait-for-db`) |
+| Practical pentest minimum | **~7–8** | core + `nmap_scanner`, `web-scanner`, `nuclei-runner`, `embedder` |
+| Default `make up` | **~33** | `COMPOSE_PROFILES=local-db` — core + all scanners, MCP servers, AI agents, C2/exploitation, gateway |
+| Everything | **45** | + `vault`, `gpu` (vllm / ollama-gpu / embedder-gpu), and `optional` profiles |
+
+The default is **not** the full 45 — the `vault`, `gpu`, and `optional` profiles are off unless
+enabled. The ~25 default-on-but-optional containers (5 MCP servers, `autogen-agents`,
+`scan-recommender`, `metasploit`, `sliver-server`, `chisel-server`, exploitation/recon runners, `kong`,
+`zap`, …) are capabilities, not requirements. *Note: trimming to the bare 3 requires editing
+`pentest-dashboard`'s `depends_on`, which currently waits on `nmap_scanner`, `web-scanner`,
+`nuclei-runner`, and `autogen-agents`.*
+
+> The diagrams in this document are a **conceptual view** — they show how the services relate, not a
+> traced call graph of every edge.
 
 ```mermaid
 flowchart TB
@@ -67,7 +91,7 @@ flowchart TB
     subgraph INFRA["⑤ Forward infrastructure"]
       NM["node-manager :8027<br/>(Python)"]
       TM["tunnel-manager<br/>(Go, systemd)"]
-      TUN["WireGuard · SSH · SOCKS<br/>Sliver C2 · Chisel"]
+      TUN["WireGuard transport + SOCKS<br/>SSH fallback · Sliver C2 · Chisel"]
     end
     subgraph DATA["⑥ Data & platform"]
       PG["PostgreSQL + pgvector<br/>db: scans / exploitdb / n8n"]
@@ -95,7 +119,7 @@ flowchart TB
 | ② BFF / Gateway | A thin FastAPI backend-for-frontend that fans out to every downstream service, aggregates health, and pushes live events to the browser over WebSocket. Kong optionally fronts external API access. |
 | ③ Core services | `rag-api` (the system of record for assets/findings/scans/exports/recon/RAG), the scan recommender, and the embedding microservice. |
 | ④ Scanner runners | One FastAPI service per tool family; each executes the tool, parses output through the ETL layer, and dual-emits audit + webhook events. |
-| ⑤ Forward infrastructure | Provisions and maintains the tunnels (WireGuard/SSH/SOCKS) and C2 (Sliver/Chisel) that route scanner traffic through remote nodes with IP rotation. |
+| ⑤ Forward infrastructure | Connects each scan node over WireGuard (SSH fallback), exposes a per-node SOCKS proxy over the tunnel, and manages C2 (Sliver/Chisel) so scanner traffic routes through remote nodes with IP rotation. |
 | ⑥ Data & platform | Postgres+pgvector (system of record + RAG index), Vault (secrets), Ollama/vLLM (local LLM), and the MCP servers that expose stack capabilities to LLM clients. |
 
 ---
@@ -133,7 +157,7 @@ callers use `verify=False`). Only a handful of ports are published to the host.
 | embedder | 8030 | zap | 8090 |
 | ollama | 11434 | postgres | 5432 |
 
-Compose entry points: `docker-compose.yml` (main, ~50 services) plus overlays for macOS
+Compose entry points: `docker-compose.yml` (main, 45 services; ~33 up by default) plus overlays for macOS
 (`docker-compose.mac.yml`), remote DB (`docker-compose.remote-db.yml`), VPN/WireGuard
 (`docker-compose.vpn.yml`), Azure, and logging.
 
@@ -264,18 +288,23 @@ One Postgres instance (`rag-postgres:5432`) hosting three logical databases: **`
 - **Migrations:** idempotent `ensure_all_tables.sql` (`IF NOT EXISTS`) + focused scripts
   (`add_engagement_id_to_scan_tables.sql`, `add_remote_nodes.sql`, `grpo_migration.sql`); applied by
   `scripts/ensure_db_schema.sh` / `make db-schema`.
-- **~38 tables**, grouped:
+- **~100 distinct tables** across all `db_init/` scripts (`setup_alldb.sql` alone defines ~38; the rest
+  come from `ensure_all_tables.sql`, `create_agent_tables.sql`, and the focused migrations). The
+  grouping below is **representative, not exhaustive** — the categories are a reading aid, not a schema
+  namespace:
 
-| Group | Tables |
+| Group | Representative tables |
 |---|---|
 | Inventory | `assets`, `ports`, `port_observation`, `scan_targets` |
 | Scans / jobs | `scans`, `jobs`, `tasks`, `raw_output` |
 | Findings | `findings`, `vulns`, `web_findings`, `recon_findings`, `finding_evidence`, `credential_findings` |
 | Browser | `playwright_scans`, `playwright_findings`, `playwright_screenshots`, `dom_analysis` |
+| Engagement / scope | `engagements`, `scope_targets`, `scope_decisions`, `scope_classification_rules`, `scope_suggestions`, `scope_coverage` |
+| Infrastructure / nodes | `remote_nodes`, `node_ip_history`, `node_scan_jobs`, `sync_nodes` |
 | Intelligence | `scan_recommendations`, `cve`, `rag_documents` |
 | Exploits | `edb_exploits`, `edb_raw_files`, `exploit_results`, `pending_exploits`, `msf_modules` |
 | Agents | `agent_sessions`, `agent_messages`, `llm_request_metrics`, `session_scan_metrics` |
-| Integrations | `zap_sessions`, `webhooks`, `webhook_events` |
+| Integrations | `zap_sessions`, `webhooks`, `webhook_events`, `webhook_deliveries` |
 
 pgvector `embedding` columns (with ivfflat indexes) live on scope-decision and RAG/feedback tables.
 The database name is fixed to `scans`. Full reference: [`DATABASE_SCHEMA.md`](DATABASE_SCHEMA.md).
@@ -301,12 +330,16 @@ ship vendored Go binaries; **news_runner** is a lightweight LLM news agent.
 
 ### 5.6 Forward infrastructure — `node_manager/` + `tunnel-manager/`
 
-Routes scanner traffic through remote nodes for IP rotation and OPSEC separation.
+Routes scanner traffic through remote nodes for IP rotation and OPSEC separation. **WireGuard is
+the current transport** each node connects over; a **per-node SOCKS proxy rides on top of the tunnel**
+so scanners route egress through the node. **SSH tunnels remain as a fallback.** A node carries a
+`tunnel_method` of `wireguard` or `ssh`, and the node-manager watchdog auto-reconnects either type
+(dedicated WireGuard reconnect path, re-exposing the node's SOCKS port ~1080).
 - **`node_manager/` (Python/FastAPI, port 8027)** — manages remote scan nodes, allocates a unique
-  SOCKS proxy port per node, and sets up SSH/WireGuard tunnels (`ssh_manager.py` with socat/microsocks;
-  `WGTunnel`/`SSHTunnel`), plus Sliver C2 (`sliver_client.py`) and Active Directory execution
-  (`ad_executor.py`). *Note: provisioning here is Sliver/Chisel/WireGuard-centric; cloud droplets are
-  referenced but no direct DigitalOcean/AWS SDK calls appear in this module.*
+  SOCKS proxy port per node, and stands up the tunnel by `tunnel_method` (`ssh_manager.py` with
+  socat/microsocks; `WGTunnel`/`SSHTunnel`), plus Sliver C2 (`sliver_client.py`) and Active Directory
+  execution (`ad_executor.py`). *Note: provisioning here is WireGuard/Sliver/Chisel-centric; cloud
+  droplets are referenced but no direct DigitalOcean/AWS SDK calls appear in this module.*
 - **`tunnel-manager/` (Go, systemd service)** — owns tunnel lifecycle and port allocation:
   `port_allocator.go` reserves SSH (10120–10149) and WireGuard (10150–10199) ranges;
   `wireguard_manager.go` manages peers on `10.66.0.0/24` (server port 51820); `api.go` exposes the
@@ -450,7 +483,7 @@ health-check scripts.**
 | `app/embedder/` | Embedding microservice. |
 | `etl/` | 38 parsers + fingerprinting + scope-gating. |
 | `db_init/` | Postgres schema + migrations. |
-| `node_manager/` · `tunnel-manager/` | Remote nodes, WireGuard/SSH/SOCKS tunnels (Python + Go). |
+| `node_manager/` · `tunnel-manager/` | Remote nodes: WireGuard transport + per-node SOCKS proxy, SSH fallback (Python + Go). |
 | `nmap_scanner/`, `web_scanner/`, `nuclei/`, `osint_runner/`, `pd_runner/`, `playwright_scanner/`, `brutus_runner/`, `news_runner/`, `exploit_runner/`, `kali_listener/` | Tool-specific scanner runners. |
 | `autogen_agents/` · `scan_recommender/` | Optional LLM/RAG agents. |
 | `mcp/` · `mcpo/` | MCP servers for LLM clients. |
