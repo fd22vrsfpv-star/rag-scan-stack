@@ -1,5 +1,32 @@
 # OS Changes for Migration
 
+## 2026-08-11 (part 3) — walkthrough converter: no OS-specific work
+
+### Files Changed
+- `knowledge/prompts/walkthrough_to_seed.md`, `scan_recommender/scan_recommender.py`,
+  `dashboard/bff/routers/kb.py`, `scripts/walkthrough-to-seed.sh`, UI panel.
+
+### Platforms Affected
+**None differentially.** Logged for completeness, plus two notes for a future port:
+
+1. **No new mounts or env vars.** The guiding prompt is read from the existing
+   `./knowledge:/knowledge:ro` mount at `/knowledge/prompts/walkthrough_to_seed.md`.
+   `WALKTHROUGH_PROMPT_PATH` and `WALKTHROUGH_LLM_TIMEOUT` exist as overrides but are
+   unset by default.
+2. **`scripts/walkthrough-to-seed.sh` is bash + curl + jq**, matching
+   `import-knowledge.sh`. On Windows it needs WSL or Git Bash, the same as every other
+   script in `scripts/` — no new constraint. It shells out to `import-knowledge.sh` for
+   the dry-run using `$SCRIPT_DIR`, so it works from any working directory.
+
+### Notes
+- Conversion quality varies with `LLM_BACKEND` (a small local Ollama model drafts rougher
+  entries than a hosted one), but the review gate makes either safe. That is a quality
+  difference, not a platform one.
+- The Ollama backend sends `format: "json"` and returns JSON rather than the requested
+  YAML. Harmless — `yaml.safe_load` parses JSON, and the schema is identical. Any future
+  backend added to `ollama_query()` should keep that tolerance.
+
+
 ## 2026-08-10 (part 2) — web scan profiles + report import: no new OS-specific work
 
 ### Files Changed

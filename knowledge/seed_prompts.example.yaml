@@ -1,0 +1,118 @@
+# Example seed file for scripts/import-knowledge.sh
+#
+# Each entry becomes a row in `service_prompts`: operator guidance injected into
+# the AI's tool-selection context whenever a matching service, port or
+# technology is discovered, plus optional `training_notes` that are chunked,
+# embedded and retrieved as context for that same target.
+#
+#   ./scripts/import-knowledge.sh --file knowledge/seed_prompts.example.yaml --dry-run
+#   ./scripts/import-knowledge.sh --file knowledge/seed_prompts.example.yaml
+#
+# ── selector_type ────────────────────────────────────────────────────────────
+#   service       requires: service            e.g. every HTTP service
+#   port          requires: port               e.g. anything on 161
+#   port_service  requires: service + port     e.g. SNMP specifically on 161
+#   tech          requires: tech               e.g. any host detected as WordPress
+#
+# ── precedence ───────────────────────────────────────────────────────────────
+# port_service → tech → port → service.  Specificity ALWAYS beats `priority`;
+# priority only breaks ties inside one tier.  Every matching rule is applied, so
+# a broad rule and a narrow one compose rather than one hiding the other.
+#
+# ── fields ───────────────────────────────────────────────────────────────────
+#   title           required, shown in the UI and in the injected block
+#   prompt          the guidance text; may be empty if you only want `tags`
+#   tags            nuclei template tags suggested via /kb/web-guidance
+#   training_notes  markdown, indexed into the knowledge base for retrieval
+#   priority        lower runs first within a tier (default 100)
+#   enabled         default true
+
+prompts:
+  # ── SNMP: what to do when 161 turns up open ────────────────────────────────
+  # The narrow rule. Fires only for SNMP identified on its standard port, and
+  # leads the injected block because port_service is the most specific tier.
+  - selector_type: port_service
+    service: snmp
+    port: 161
+    title: "SNMP on 161"
+    priority: 10
+    prompt: >-
+      Open SNMP is usually an information-disclosure win before it is an exploit.
+      Try the default community strings first (public, private, community) with
+      onesixtyone, then walk the tree with snmpwalk -v2c. Pull the interface
+      table, running processes, installed software and the ARP cache — those map
+      internal hosts you cannot otherwise see. Only consider write access
+      (snmpset) after confirming a writable community, and never without
+      authorisation to change device state.
+    tags: ["snmp", "network", "default-login"]
+    training_notes: |
+      ## SNMP (161/udp)
+
+      ### Community strings worth trying first
+      `public`, `private`, `community`, `manager`, `admin`, plus the vendor
+      defaults (`cisco`, `ILMI`). SNMPv1/v2c send these in cleartext.
+
+      ### High-value OIDs
+      - `1.3.6.1.2.1.1.1.0` — sysDescr: OS and exact version
+      - `1.3.6.1.2.1.25.4.2.1.2` — running processes
+      - `1.3.6.1.2.1.25.6.3.1.2` — installed software
+      - `1.3.6.1.2.1.4.22.1.2` — ARP cache: internal neighbours
+      - `1.3.6.1.2.1.2.2.1.2` — interfaces, including non-routable segments
+
+      ### Why it matters
+      A read-only community on a router or switch commonly leaks the internal
+      topology, hostnames and software inventory in one pass — reconnaissance
+      that would otherwise need credentialed access.
+
+      ### Version notes
+      v3 is authenticated; if the host speaks v3 only, enumerate usernames
+      rather than community strings and do not burn time on onesixtyone.
+
+  # The broad rule. Also fires for SNMP on a non-standard port (e.g. 1161),
+  # which the port_service rule above would miss.
+  - selector_type: service
+    service: snmp
+    title: "SNMP anywhere"
+    priority: 50
+    prompt: >-
+      Treat SNMP as a read-first target: enumerate community strings, then walk
+      for system, process and network-neighbour data before any write attempt.
+    tags: ["snmp"]
+
+  # Port-only: catches whatever is listening on 161 even when service detection
+  # failed to label it, which happens on filtered or rate-limited UDP.
+  - selector_type: port
+    port: 161
+    title: "Unidentified 161"
+    priority: 80
+    prompt: >-
+      Port 161 responded but the service was not fingerprinted. UDP scans lose
+      probes under rate limiting — re-probe with an SNMP-specific tool before
+      assuming it is not SNMP.
+
+  # ── A technology rule, matched from httpx/whatweb detection ────────────────
+  - selector_type: tech
+    tech: wordpress
+    title: "WordPress hosts"
+    prompt: >-
+      Enumerate plugins and users before running generic web templates — the
+      vulnerable surface is almost always a plugin, not core. Check
+      /wp-json/wp/v2/users and xmlrpc.php.
+    tags: ["wordpress", "wp-plugin", "cve"]
+    training_notes: |
+      ## WordPress
+      - `/wp-json/wp/v2/users` enumerates usernames without auth on many installs
+      - `xmlrpc.php` allows password-guess amplification via `system.multicall`
+      - Plugin paths under `/wp-content/plugins/` reveal versions in readme.txt
+
+# Optional: standalone training documents that carry no prompt rule. Useful for
+# reference material you want retrievable but which shouldn't steer tool choice.
+service_docs:
+  - title: "SNMP write access"
+    service: snmp
+    port: 161
+    content: |
+      ## Writable SNMP
+      A writable community (`snmpset`) can change device configuration —
+      including routes and interface state. Confirm authorisation in the rules
+      of engagement before any write, and record the pre-change value first.

@@ -11,6 +11,18 @@ router = APIRouter()
 log = logging.getLogger("bff.kb")
 
 
+def _kb_detail(resp: httpx.Response) -> str:
+    """Unwrap an upstream error so the UI shows the reason, not escaped JSON."""
+    try:
+        body = resp.json()
+        if isinstance(body, dict) and "detail" in body:
+            d = body["detail"]
+            return d if isinstance(d, str) else str(d)
+    except Exception:
+        pass
+    return resp.text
+
+
 async def _emit_kb_webhook(event_type: str, name: str, extra: Dict[str, Any] | None = None):
     """Fire-and-forget webhook so external subscribers see KB override
     edits.  Write to the rag-api's /webhooks/emit endpoint -- failure
@@ -226,3 +238,80 @@ async def web_scan_guidance(
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
         return safe_json(resp)
+
+
+# ── Walkthrough → knowledge conversion ───────────────────────────────────────
+# The converter drafts rules from a pentest writeup. It never writes to the
+# database — it returns proposals that the operator reviews and applies through
+# the normal create path.
+
+@router.post("/api/kb/walkthrough/convert")
+async def convert_walkthrough(body: Dict[str, Any] = Body(...)):
+    """Draft importable rules from a walkthrough. Returns proposals only."""
+    if not (body.get("content") or "").strip():
+        raise HTTPException(400, "content is required")
+    s = get_settings()
+    try:
+        # An LLM pass over a full walkthrough is slow; well past the usual budget.
+        async with httpx.AsyncClient(verify=False, timeout=900) as c:
+            resp = await c.post(
+                f"{s.scan_recommender_url}/kb/walkthrough/convert",
+                json=body, headers=engagement_headers(),
+            )
+    except httpx.TimeoutException:
+        raise HTTPException(
+            504, "Conversion timed out — try a shorter walkthrough, or narrow it with a focus.")
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Knowledge service unreachable: {e}")
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, _kb_detail(resp))
+    return safe_json(resp)
+
+
+@router.get("/api/kb/walkthrough-prompt")
+async def get_walkthrough_prompt():
+    """Current guiding prompt, the shipped default, and whether one is overridden."""
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        resp = await c.get(f"{s.scan_recommender_url}/kb/walkthrough-prompt")
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _kb_detail(resp))
+        return safe_json(resp)
+
+
+@router.put("/api/kb/walkthrough-prompt")
+async def set_walkthrough_prompt(body: Dict[str, Any] = Body(...)):
+    """Override the guiding prompt. An empty string reverts to the shipped default."""
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        resp = await c.put(f"{s.scan_recommender_url}/kb/walkthrough-prompt", json=body)
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _kb_detail(resp))
+        return safe_json(resp)
+
+
+@router.post("/api/kb/url/convert")
+async def convert_url(body: Dict[str, Any] = Body(...)):
+    """Fetch a published guide and draft knowledge from it. Returns proposals only.
+
+    Refusals (bad scheme, internal address, oversized) come back as 400 with the
+    reason intact — those are operator-fixable, unlike a transport failure.
+    """
+    if not (body.get("url") or "").strip():
+        raise HTTPException(400, "url is required")
+    s = get_settings()
+    try:
+        # Crawl + extraction + an LLM pass over the whole guide.
+        async with httpx.AsyncClient(verify=False, timeout=1200) as c:
+            resp = await c.post(
+                f"{s.scan_recommender_url}/kb/url/convert",
+                json=body, headers=engagement_headers(),
+            )
+    except httpx.TimeoutException:
+        raise HTTPException(
+            504, "Import timed out — try a single page (depth 0), or narrow it with a focus.")
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Knowledge service unreachable: {e}")
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, _kb_detail(resp))
+    return safe_json(resp)

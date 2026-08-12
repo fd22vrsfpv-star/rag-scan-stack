@@ -2,9 +2,10 @@
 import os
 import json
 import logging
+import re
 import threading
 from contextlib import contextmanager
-from typing import Any, List, Optional, Dict
+from typing import Any, List, Optional, Dict, Tuple
 
 import requests
 import psycopg2
@@ -994,10 +995,14 @@ def persist_recommendations(
 
 
 # ---- Ollama primitives ----
-def _ollama_streamed_generate(prompt: str, model: str, endpoint: str) -> str:
+def _ollama_streamed_generate(prompt: str, model: str, endpoint: str,
+                              timeout: Optional[int] = None,
+                              options: Optional[Dict] = None) -> str:
     payload = {"model": model, "prompt": prompt, "format": "json", "stream": True}
+    if options:
+        payload["options"] = options
     full = ""
-    with requests.post(endpoint, json=payload, stream=True, timeout=120) as r:
+    with requests.post(endpoint, json=payload, stream=True, timeout=(timeout or 120)) as r:
         r.raise_for_status()
         for line in r.iter_lines():
             if not line:
@@ -1011,9 +1016,13 @@ def _ollama_streamed_generate(prompt: str, model: str, endpoint: str) -> str:
     return full
 
 
-def _ollama_nonstream_generate(prompt: str, model: str, endpoint: str) -> str:
+def _ollama_nonstream_generate(prompt: str, model: str, endpoint: str,
+                               timeout: Optional[int] = None,
+                               options: Optional[Dict] = None) -> str:
     payload = {"model": model, "prompt": prompt, "format": "json", "stream": False}
-    with requests.post(endpoint, json=payload, timeout=120) as r:
+    if options:
+        payload["options"] = options
+    with requests.post(endpoint, json=payload, timeout=(timeout or 120)) as r:
         r.raise_for_status()
         data = r.json()
         # Non-stream returns an object with "response"
@@ -1034,7 +1043,8 @@ def _azure_headers() -> Dict[str, str]:
     return {"api-key": AZURE_API_KEY, "Content-Type": "application/json"}
 
 
-def _azure_generate(prompt: str, json_mode: bool = False) -> str:
+def _azure_generate(prompt: str, json_mode: bool = False,
+                    timeout: Optional[int] = None) -> str:
     """Call Azure chat completions and return the assistant message content."""
     url = _azure_chat_url(AZURE_ENDPOINT, AZURE_MODEL, AZURE_API_VERSION)
     payload: Dict[str, Any] = {
@@ -1044,7 +1054,7 @@ def _azure_generate(prompt: str, json_mode: bool = False) -> str:
     }
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
-    r = requests.post(url, json=payload, headers=_azure_headers(), timeout=120)
+    r = requests.post(url, json=payload, headers=_azure_headers(), timeout=(timeout or 120))
     r.raise_for_status()
     data = r.json()
     return data["choices"][0]["message"]["content"]
@@ -1054,7 +1064,8 @@ def _openai_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
 
-def _openai_generate(prompt: str, json_mode: bool = False) -> str:
+def _openai_generate(prompt: str, json_mode: bool = False,
+                     timeout: Optional[int] = None) -> str:
     """Call OpenAI chat completions and return the assistant message content."""
     url = f"{OPENAI_API_BASE.rstrip('/')}/v1/chat/completions"
     payload: Dict[str, Any] = {
@@ -1065,7 +1076,7 @@ def _openai_generate(prompt: str, json_mode: bool = False) -> str:
     }
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
-    r = requests.post(url, json=payload, headers=_openai_headers(), timeout=120)
+    r = requests.post(url, json=payload, headers=_openai_headers(), timeout=(timeout or 120))
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
@@ -1078,7 +1089,7 @@ def _anthropic_headers() -> Dict[str, str]:
     }
 
 
-def _anthropic_generate(prompt: str) -> str:
+def _anthropic_generate(prompt: str, timeout: Optional[int] = None) -> str:
     """Call Anthropic messages API and return the text content."""
     payload = {
         "model": ANTHROPIC_MODEL,
@@ -1086,7 +1097,7 @@ def _anthropic_generate(prompt: str) -> str:
         "messages": [{"role": "user", "content": prompt}],
     }
     r = requests.post("https://api.anthropic.com/v1/messages",
-                      json=payload, headers=_anthropic_headers(), timeout=120)
+                      json=payload, headers=_anthropic_headers(), timeout=(timeout or 120))
     r.raise_for_status()
     data = r.json()
     for block in data.get("content", []):
@@ -1103,11 +1114,20 @@ def _safe_json_parse(text: str) -> Dict:
         return {"response": text}
 
 
-def ollama_query(prompt: str, model: Optional[str] = None, stream: bool = False) -> Dict:
+def ollama_query(prompt: str, model: Optional[str] = None, stream: bool = False,
+                 timeout: Optional[int] = None, options: Optional[Dict] = None) -> Dict:
+    """Query the configured LLM backend.
+
+    `options` is Ollama-specific (num_ctx / num_predict). Ollama's defaults
+    silently truncate BOTH a long prompt and a long structured response, which
+    is why the walkthrough converter passes generous values — without them a
+    20KB guide produced zero rules with no error. Ignored by the hosted
+    backends, which manage their own limits.
+    """
     if LLM_BACKEND == "azure":
         mdl = AZURE_MODEL or "gpt-4o"
         try:
-            text = _azure_generate(prompt)
+            text = _azure_generate(prompt, timeout=timeout)
         except requests.RequestException as e:
             logger.error(f"Azure query failed: {e}")
             raise
@@ -1119,7 +1139,7 @@ def ollama_query(prompt: str, model: Optional[str] = None, stream: bool = False)
     if LLM_BACKEND == "openai":
         mdl = OPENAI_MODEL
         try:
-            text = _openai_generate(prompt)
+            text = _openai_generate(prompt, timeout=timeout)
         except requests.RequestException as e:
             logger.error(f"OpenAI query failed: {e}")
             raise
@@ -1131,7 +1151,7 @@ def ollama_query(prompt: str, model: Optional[str] = None, stream: bool = False)
     if LLM_BACKEND == "anthropic":
         mdl = ANTHROPIC_MODEL
         try:
-            text = _anthropic_generate(prompt)
+            text = _anthropic_generate(prompt, timeout=timeout)
         except requests.RequestException as e:
             logger.error(f"Anthropic query failed: {e}")
             raise
@@ -1144,12 +1164,15 @@ def ollama_query(prompt: str, model: Optional[str] = None, stream: bool = False)
     endpoint = resolve_ollama_generate_endpoint(OLLAMA_BASE_URL)
 
     try:
-        text = _ollama_streamed_generate(prompt, mdl, endpoint) if stream else _ollama_nonstream_generate(prompt, mdl, endpoint)
+        text = (_ollama_streamed_generate(prompt, mdl, endpoint, timeout=timeout, options=options)
+                if stream else
+                _ollama_nonstream_generate(prompt, mdl, endpoint, timeout=timeout, options=options))
     except requests.HTTPError as e:
         # Retry once with normalized endpoint if 405
         if e.response is not None and e.response.status_code == 405:
             endpoint = resolve_ollama_generate_endpoint(OLLAMA_BASE_URL)
-            text = _ollama_streamed_generate(prompt, mdl, endpoint) if stream else _ollama_nonstream_generate(prompt, mdl, endpoint)
+            text = (_ollama_streamed_generate(prompt, mdl, endpoint, timeout=timeout) if stream
+                else _ollama_nonstream_generate(prompt, mdl, endpoint, timeout=timeout))
         else:
             logger.error(f"HTTP error while querying Ollama: {e.response.status_code} - {e.response.reason}")
             raise
@@ -1939,26 +1962,278 @@ class ServicePromptBody(BaseModel):
     engagement_id: Optional[str] = None
 
 
-def _validate_prompt_selector(body: "ServicePromptBody") -> tuple:
-    """Normalize + validate selector fields. Returns (service, tech, port).
+# ── Walkthrough → knowledge conversion ──────────────────────────────────────
+#
+# Drafts service_prompts entries from a pentest walkthrough. The converter NEVER
+# writes to the database: it returns proposals, and the operator applies them via
+# scripts/import-knowledge.sh or the UI. Walkthroughs are dense with box-specific
+# artifacts and an LLM will happily promote "the password was summer2023" into
+# permanent guidance, so a review gate is the whole point.
 
-    Fields irrelevant to the chosen selector_type are forced to NULL rather than
+WALKTHROUGH_PROMPT_PATH = os.environ.get(
+    "WALKTHROUGH_PROMPT_PATH", "/knowledge/prompts/walkthrough_to_seed.md")
+WALKTHROUGH_PROMPT_SETTING = "walkthrough_import.system_prompt"
+
+# Long input + long structured output; the module's other LLM calls use 120s,
+# which a full walkthrough conversion routinely exceeds.
+WALKTHROUGH_LLM_TIMEOUT = int(os.environ.get("WALKTHROUGH_LLM_TIMEOUT", "600"))
+
+# Ollama defaults (num_ctx 2048) silently truncate a long guide's prompt AND
+# its structured response — the failure mode is zero rules with no error, not a
+# crash. Sized for a full documentation page plus a large YAML payload.
+WALKTHROUGH_NUM_CTX = int(os.environ.get("WALKTHROUGH_NUM_CTX", "16384"))
+WALKTHROUGH_NUM_PREDICT = int(os.environ.get("WALKTHROUGH_NUM_PREDICT", "8192"))
+
+_APP_SETTING_CACHE: Dict[str, Any] = {}
+_APP_SETTING_TTL = 300.0  # seconds
+
+
+def _get_app_setting(key: str, default: str = "") -> str:
+    """Read a config value from app_settings, cached.
+
+    scan_recommender has no app_settings reader of its own (rag-api's
+    `_get_setting` lives in a different container), so this mirrors that shape:
+    category='config', 5-minute cache, falls back to `default` on any error so a
+    DB blip degrades to the shipped prompt rather than breaking conversion.
+    """
+    import time as _t
+    now = _t.monotonic()
+    hit = _APP_SETTING_CACHE.get(key)
+    if hit and (now - hit["ts"]) < _APP_SETTING_TTL:
+        return hit["val"]
+    val = default
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT value FROM app_settings WHERE key = %s AND category = 'config'",
+                (key,),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                val = row[0]
+    except Exception as e:
+        logger.debug("app_setting %s read failed: %s", key, e)
+    _APP_SETTING_CACHE[key] = {"val": val, "ts": now}
+    return val
+
+
+def _invalidate_app_setting(key: str) -> None:
+    _APP_SETTING_CACHE.pop(key, None)
+
+
+def _read_default_walkthrough_prompt() -> str:
+    """The shipped guiding prompt from the read-only knowledge mount."""
+    try:
+        with open(WALKTHROUGH_PROMPT_PATH, "r", encoding="utf-8") as fh:
+            return fh.read()
+    except OSError as e:
+        logger.error(
+            "Default walkthrough prompt unreadable at %s (%s) — is "
+            "./knowledge:/knowledge:ro mounted?", WALKTHROUGH_PROMPT_PATH, e)
+        return ""
+
+
+def resolve_walkthrough_prompt(focus: Optional[str] = None) -> str:
+    """Guiding prompt, most specific layer last.
+
+    file default -> app_settings override -> per-run focus.  An empty override
+    means "use the file", matching the cve_analysis prompt convention where
+    saving a blank value reverts to the shipped default.
+    """
+    base = _get_app_setting(WALKTHROUGH_PROMPT_SETTING, "") or _read_default_walkthrough_prompt()
+    if (focus or "").strip():
+        base += (
+            "\n\n# Additional focus for this run\n"
+            "The operator asked you to focus on the following. It narrows what to "
+            "extract; it does not relax any rule above.\n\n"
+            + focus.strip()
+        )
+    return base
+
+
+# Patterns that suggest an entry carried box-specific data out of the walkthrough.
+# These FLAG rather than drop, because every family overlaps with legitimate
+# content: SNMP guidance genuinely names the community strings public/private,
+# and a vendor default-credential table is exactly the knowledge worth keeping.
+_SCRUB_PATTERNS = (
+    ("capture-the-flag flag value",
+     re.compile(r"\b(?:HTB|THM|FLAG|CTF)\{[^}]{2,}\}", re.I)),
+    ("credential pair",
+     re.compile(r"\b[A-Za-z0-9._-]{3,}:[^\s:'\"]{6,}\b")),
+    ("stated password",
+     re.compile(r"\b(?:password|passwd|creds?|credentials)\s*(?:was|were|is|are|=|:)\s*\S{4,}", re.I)),
+    ("password hash",
+     re.compile(r"(?<![0-9a-fA-F])(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{64})(?![0-9a-fA-F])")),
+    ("lab IP address",
+     re.compile(r"\b(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b")),
+)
+
+
+def scrub_entry(entry: Dict) -> List[str]:
+    """Reasons this entry looks box-specific. Empty list means clean.
+
+    Only operator-visible text is scanned — the selector fields are structural.
+    """
+    haystack = "\n".join(str(entry.get(f) or "") for f in
+                         ("title", "prompt", "training_notes", "content"))
+    reasons = []
+    for reason, rx in _SCRUB_PATTERNS:
+        m = rx.search(haystack)
+        if m:
+            snippet = m.group(0)
+            reasons.append(f"{reason}: {snippet[:60]}")
+    return reasons
+
+
+def _yaml_block(entry: Dict, commented: bool, reasons: List[str]) -> str:
+    """Render one entry as a YAML list item, commented out when flagged.
+
+    Flagged entries stay in the file so the operator can see what was proposed
+    and un-comment anything that is a false positive — but being comments, they
+    are invisible to the importer and cannot reach live scanning by accident.
+    """
+    import yaml as _yaml
+    body = _yaml.safe_dump([entry], sort_keys=False, allow_unicode=True,
+                           default_flow_style=False, width=88)
+    if not commented:
+        return body
+    out = [f"# !REVIEW  {r}" for r in reasons]
+    out += ["# " + line if line.strip() else "#" for line in body.splitlines()]
+    return "\n".join(out) + "\n"
+
+
+def render_seed_yaml(prompts: List[Dict], docs: List[Dict],
+                     flagged_prompt_idx: Dict[int, List[str]],
+                     flagged_doc_idx: Dict[int, List[str]],
+                     source: str) -> str:
+    """Assemble the seed file that scripts/import-knowledge.sh consumes."""
+    lines = [
+        f"# Drafted from walkthrough: {source}",
+        "#",
+        "# Review before importing. Entries commented out below were flagged as",
+        "# possibly box-specific — un-comment only what is genuinely reusable.",
+        "#",
+        "#   ./scripts/import-knowledge.sh --file <this file> --dry-run",
+        "#   ./scripts/import-knowledge.sh --file <this file>",
+        "",
+    ]
+    if prompts:
+        lines.append("prompts:")
+        for i, e in enumerate(prompts):
+            reasons = flagged_prompt_idx.get(i) or []
+            block = _yaml_block(e, bool(reasons), reasons)
+            # safe_dump emits a top-level list; strip its indentation offset by
+            # re-indenting nothing — the dumped "- key:" form is already correct.
+            lines.append(block.rstrip("\n"))
+        lines.append("")
+    if docs:
+        lines.append("service_docs:")
+        for i, e in enumerate(docs):
+            reasons = flagged_doc_idx.get(i) or []
+            lines.append(_yaml_block(e, bool(reasons), reasons).rstrip("\n"))
+        lines.append("")
+    if not prompts and not docs:
+        lines.append("prompts: []")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# Selector values name a service or a technology, so they look like identifiers.
+# Models occasionally emit fragments scraped out of a URL or heading ("//s",
+# "http://x"), which would otherwise be stored as an unmatchable rule.
+_SELECTOR_VALUE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._+-]{1,39}$")
+
+
+def repair_entry(entry: Dict) -> Dict:
+    """Fix the field/selector mismatches models routinely produce.
+
+    Returns a shallow-copied, corrected entry. Purely a normalisation step —
+    it never invents a selector, so an entry that is genuinely unusable still
+    fails validation afterwards with a reason.
+
+    The common failure is naming the right thing in the wrong field, e.g.
+    `selector_type: tech` with the technology in `service`. Rejecting those
+    throws away correct knowledge over a field name.
+    """
+    e = dict(entry)
+    sel = str(e.get("selector_type") or "").strip().lower()
+    service = str(e.get("service") or "").strip()
+    tech = str(e.get("tech") or "").strip()
+    port = e.get("port")
+
+    # Value sanity: drop anything that isn't identifier-shaped.
+    if service and not _SELECTOR_VALUE_RE.match(service):
+        service = ""
+        e.pop("service", None)
+    if tech and not _SELECTOR_VALUE_RE.match(tech):
+        tech = ""
+        e.pop("tech", None)
+
+    # Right value, wrong field.
+    if sel == "tech" and not tech and service:
+        e["tech"], service = service, ""
+        e.pop("service", None)
+        tech = e["tech"]
+    elif sel in ("service", "port_service") and not service and tech:
+        e["service"], tech = tech, ""
+        e.pop("tech", None)
+        service = e["service"]
+
+    # Missing selector_type but the fields make the intent obvious.
+    if not sel:
+        if service and port:
+            e["selector_type"] = "port_service"
+        elif tech:
+            e["selector_type"] = "tech"
+        elif service:
+            e["selector_type"] = "service"
+        elif port:
+            e["selector_type"] = "port"
+
+    # A declared port_service missing one half degrades to whichever half it
+    # actually has, rather than being thrown away.
+    if str(e.get("selector_type") or "") == "port_service":
+        if not port and service:
+            e["selector_type"] = "service"
+        elif not service and port:
+            e["selector_type"] = "port"
+    return e
+
+
+def normalize_selector(selector_type, service, tech, port, title) -> tuple:
+    """Normalize + validate selector fields without raising.
+
+    Returns ``(service, tech, port, error)`` where `error` is None on success and
+    a human-readable string otherwise.  Pure and exception-free so both the CRUD
+    endpoint (which turns `error` into a 400) and the walkthrough converter
+    (which collects errors per proposed entry) enforce exactly one rule table —
+    a second copy would drift and let the converter emit entries the API then
+    rejects.
+
+    Fields irrelevant to the chosen selector_type are forced to None rather than
     passed through, so a stray value can't trip the DB's shape CHECK and produce
     a confusing 500.
     """
-    sel = (body.selector_type or "").strip().lower()
+    sel = (selector_type or "").strip().lower()
     if sel not in ("service", "port", "port_service", "tech"):
-        raise HTTPException(
-            400, "selector_type must be one of: service, port, port_service, tech")
-    service = (body.service or "").strip().lower() or None
-    tech = (body.tech or "").strip().lower() or None
-    port = body.port
+        return None, None, None, (
+            "selector_type must be one of: service, port, port_service, tech")
+
+    service = (service or "").strip().lower() or None
+    tech = (tech or "").strip().lower() or None
+
+    # Accept a stringified port — LLM output and YAML both produce these.
+    if isinstance(port, str):
+        port = port.strip()
+        port = int(port) if port.isdigit() else None
+
     if sel in ("service", "port_service") and not service:
-        raise HTTPException(400, f"selector_type '{sel}' requires a service")
+        return None, None, None, f"selector_type '{sel}' requires a service"
     if sel in ("port", "port_service") and not port:
-        raise HTTPException(400, f"selector_type '{sel}' requires a port")
+        return None, None, None, f"selector_type '{sel}' requires a port"
     if sel == "tech" and not tech:
-        raise HTTPException(400, "selector_type 'tech' requires a tech")
+        return None, None, None, "selector_type 'tech' requires a tech"
+
     if sel == "service":
         port, tech = None, None
     elif sel == "port":
@@ -1967,10 +2242,21 @@ def _validate_prompt_selector(body: "ServicePromptBody") -> tuple:
         tech = None
     elif sel == "tech":
         service, port = None, None
+
     if port is not None and not (0 < port <= 65535):
-        raise HTTPException(400, "port must be between 1 and 65535")
-    if not (body.title or "").strip():
-        raise HTTPException(400, "title is required")
+        return None, None, None, "port must be between 1 and 65535"
+    if not (title or "").strip():
+        return None, None, None, "title is required"
+    return service, tech, port, None
+
+
+def _validate_prompt_selector(body: "ServicePromptBody") -> tuple:
+    """Normalize + validate selector fields for the CRUD path. Returns (service, tech, port)."""
+    service, tech, port, error = normalize_selector(
+        body.selector_type, body.service, body.tech, body.port, body.title,
+    )
+    if error:
+        raise HTTPException(400, error)
     return service, tech, port
 
 
@@ -2245,6 +2531,406 @@ def delete_service_prompt(prompt_id: str):
         "service": row.get("service"), "port": row.get("port"),
     })
     return {"ok": True, "deleted": prompt_id}
+
+
+# ---- KB: draft rules from a pentest walkthrough ----
+class WalkthroughConvertBody(BaseModel):
+    content: str
+    filename: Optional[str] = None
+    focus: Optional[str] = None
+    include_existing: bool = True
+
+
+class WalkthroughPromptBody(BaseModel):
+    """Empty string reverts to the shipped default (cve_analysis convention)."""
+    prompt: str = ""
+
+
+def _existing_rules_for(text: str, limit: int = 20) -> List[Dict]:
+    """Existing rules whose service or tech is named in the walkthrough.
+
+    Fed back to the model so it extends what is already there instead of
+    proposing near-duplicates — which matters because import-knowledge.sh is
+    create-or-update, so a duplicate silently overwrites the original.
+    """
+    low = (text or "").lower()
+    out = []
+    for row in _get_all_service_prompts():
+        key = (row.get("service") or row.get("tech") or "").lower()
+        if key and key in low:
+            out.append({
+                "selector_type": row.get("selector_type"),
+                "service": row.get("service"), "tech": row.get("tech"),
+                "port": row.get("port"), "title": row.get("title"),
+                "prompt": (row.get("prompt") or "")[:400],
+            })
+        if len(out) >= limit:
+            break
+    return out
+
+
+@kb_router.get("/walkthrough-prompt")
+def get_walkthrough_prompt():
+    """Current guiding prompt, the shipped default, and whether one is overridden."""
+    default = _read_default_walkthrough_prompt()
+    override = _get_app_setting(WALKTHROUGH_PROMPT_SETTING, "")
+    return {
+        "prompt": override or default,
+        "default": default,
+        "using_custom": bool(override),
+        "default_path": WALKTHROUGH_PROMPT_PATH,
+        "default_available": bool(default),
+    }
+
+
+@kb_router.put("/walkthrough-prompt")
+def set_walkthrough_prompt(body: WalkthroughPromptBody):
+    """Override the guiding prompt; an empty string deletes the override."""
+    val = (body.prompt or "").strip()
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            if val:
+                cur.execute(
+                    "INSERT INTO app_settings (key, value, category) "
+                    "VALUES (%s, %s, 'config') "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+                    (WALKTHROUGH_PROMPT_SETTING, val),
+                )
+            else:
+                cur.execute(
+                    "DELETE FROM app_settings WHERE key = %s AND category = 'config'",
+                    (WALKTHROUGH_PROMPT_SETTING,),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.error("Failed to save walkthrough prompt: %s", e)
+        raise HTTPException(500, f"Failed to save prompt: {e}")
+    _invalidate_app_setting(WALKTHROUGH_PROMPT_SETTING)
+    _emit_webhook("walkthrough_prompt_updated", {"using_custom": bool(val)})
+    return {"ok": True, "using_custom": bool(val)}
+
+
+@kb_router.post("/walkthrough/convert")
+def convert_walkthrough(body: WalkthroughConvertBody):
+    """Draft importable rules from a walkthrough. Never writes to the database.
+
+    Returns proposals plus the reasons anything was flagged or rejected, so the
+    operator reviews before any of it reaches live scanning.
+    """
+    return convert_text_to_knowledge(
+        content=body.content, source=(body.filename or "pasted"),
+        focus=body.focus, include_existing=body.include_existing,
+    )
+
+
+# A whole documentation page in one LLM call is unreliable: the model spends its
+# output budget narrating and the JSON gets truncated mid-structure, which
+# surfaces as "0 rules drafted" or a parse error. Converting section by section
+# keeps every request small enough to finish, and improves quality because the
+# model considers one service at a time.
+WALKTHROUGH_CHUNK_CHARS = int(os.environ.get("WALKTHROUGH_CHUNK_CHARS", "6000"))
+WALKTHROUGH_MAX_CHUNKS = int(os.environ.get("WALKTHROUGH_MAX_CHUNKS", "12"))
+
+
+def _split_for_conversion(text: str, max_chars: int = None) -> List[str]:
+    """Split on markdown headings, packing sections up to `max_chars`.
+
+    Splitting on headings rather than a fixed window keeps each request coherent
+    — a section about one service stays intact instead of being cut mid-command.
+    """
+    max_chars = max_chars or WALKTHROUGH_CHUNK_CHARS
+    if len(text) <= max_chars:
+        return [text]
+
+    # Keep the heading with the body that follows it.
+    parts = re.split(r"\n(?=#{1,3} )", text)
+    chunks, buf = [], ""
+    for part in parts:
+        if buf and len(buf) + len(part) > max_chars:
+            chunks.append(buf.strip())
+            buf = part
+        else:
+            buf = f"{buf}\n{part}" if buf else part
+    if buf.strip():
+        chunks.append(buf.strip())
+
+    # A single section larger than the budget still has to be broken up.
+    out = []
+    for c in chunks:
+        while len(c) > max_chars * 2:
+            out.append(c[:max_chars])
+            c = c[max_chars:]
+        out.append(c)
+    return [c for c in out if c.strip()][:WALKTHROUGH_MAX_CHUNKS]
+
+
+def _llm_extract(chunk: str, guide: str, existing: List[Dict]) -> Tuple[List, List, str]:
+    """One LLM call over one chunk. Returns (prompts, service_docs, model).
+
+    Never raises on a bad response — a chunk that fails to parse is skipped so
+    one awkward section doesn't lose the whole document.
+    """
+    parts = [guide]
+    if existing:
+        parts.append(
+            "\n# Existing rules that already cover services here\n"
+            "Extend or sharpen these rather than restating them:\n"
+            + json.dumps(existing, indent=2)
+        )
+    parts.append("\n# Walkthrough\n\n" + chunk)
+
+    try:
+        result = ollama_query(
+            prompt="\n".join(parts), timeout=WALKTHROUGH_LLM_TIMEOUT,
+            options={"num_ctx": WALKTHROUGH_NUM_CTX, "num_predict": WALKTHROUGH_NUM_PREDICT},
+        )
+    except requests.RequestException as e:
+        logger.warning("[walkthrough] LLM call failed for a chunk: %s", e)
+        return [], [], ""
+
+    raw = result.get("response", "")
+    model = result.get("model", "")
+    text = re.sub(r"^\s*```(?:ya?ml|json)?\s*|\s*```\s*$", "", (raw or "").strip())
+    try:
+        import yaml as _yaml
+        parsed = _yaml.safe_load(text) or {}
+    except Exception as e:
+        logger.warning("[walkthrough] unparsable chunk response (%s) — skipping", e)
+        return [], [], model
+    if not isinstance(parsed, dict):
+        return [], [], model
+
+    # Reasoning models wrap the payload, e.g. {"thought": ..., "prompts": [...]}.
+    if "prompts" not in parsed and "service_docs" not in parsed:
+        for value in parsed.values():
+            if isinstance(value, dict) and ("prompts" in value or "service_docs" in value):
+                parsed = value
+                break
+
+    return (parsed.get("prompts") or [], parsed.get("service_docs") or [], model)
+
+
+def convert_text_to_knowledge(content: str, source: str, focus: Optional[str] = None,
+                              include_existing: bool = True) -> Dict:
+    """Shared conversion pipeline: text -> drafted rules + seed YAML.
+
+    Called by both the walkthrough endpoint and the URL endpoint so the guiding
+    prompt, scrubber, validator and renderer have exactly one implementation —
+    a second copy would drift and let one path emit entries the other refuses.
+    """
+    content = (content or "").strip()
+    if not content:
+        raise HTTPException(400, "content is required")
+    if len(content) > 400_000:
+        raise HTTPException(413, "walkthrough too large (limit 400KB)")
+
+    source = (source or "pasted").strip()
+    guide = resolve_walkthrough_prompt(focus)
+    if not guide:
+        raise HTTPException(
+            500,
+            f"No guiding prompt available: {WALKTHROUGH_PROMPT_PATH} is unreadable and "
+            "no override is set. Check that ./knowledge:/knowledge:ro is mounted.",
+        )
+
+    existing = _existing_rules_for(content) if include_existing else []
+
+    # Convert section by section and merge. Each request stays small enough to
+    # complete, so a long guide no longer silently yields nothing.
+    chunks = _split_for_conversion(content)
+    logger.info("[walkthrough] %s: %d char(s) in %d chunk(s)", source, len(content), len(chunks))
+
+    prompts_in, docs_in, model = [], [], ""
+    seen_keys = set()
+    for i, chunk in enumerate(chunks, 1):
+        c_prompts, c_docs, c_model = _llm_extract(chunk, guide, existing)
+        model = model or c_model
+        for e in c_prompts:
+            if not isinstance(e, dict):
+                continue
+            # Sections often repeat a service; keep the first, drop re-statements.
+            key = (str(e.get("selector_type")), str(e.get("service") or ""),
+                   str(e.get("tech") or ""), str(e.get("port") or ""),
+                   str(e.get("title") or "").strip().lower())
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            prompts_in.append(e)
+        docs_in.extend(d for d in c_docs if isinstance(d, dict))
+        logger.info("[walkthrough]   chunk %d/%d → %d rule(s)", i, len(chunks), len(c_prompts))
+
+    if not prompts_in and not docs_in:
+        raise HTTPException(
+            422,
+            "The model returned nothing usable from any section. It may be too small for "
+            "structured extraction at this length — try a narrower focus, or a hosted "
+            "LLM_BACKEND.",
+        )
+    tag = f"source:walkthrough:{source}"
+
+    prompts, rejected = [], []
+    flagged_p: Dict[int, List[str]] = {}
+    for entry in prompts_in:
+        if not isinstance(entry, dict):
+            rejected.append({"entry": str(entry)[:120], "reason": "not a mapping"})
+            continue
+        entry = repair_entry(entry)      # fix wrong-field / missing-selector cases first
+        service, tech, port, error = normalize_selector(
+            entry.get("selector_type"), entry.get("service"),
+            entry.get("tech"), entry.get("port"), entry.get("title"),
+        )
+        if error:
+            rejected.append({"entry": str(entry.get("title") or entry)[:120], "reason": error})
+            continue
+        clean = {
+            "selector_type": (entry.get("selector_type") or "").strip().lower(),
+            "title": (entry.get("title") or "").strip(),
+            "prompt": (entry.get("prompt") or "").strip(),
+        }
+        if service: clean["service"] = service
+        if tech:    clean["tech"] = tech
+        if port:    clean["port"] = port
+        if entry.get("training_notes"):
+            clean["training_notes"] = entry["training_notes"]
+        tags = [str(t) for t in (entry.get("tags") or []) if t]
+        clean["tags"] = tags + [tag]          # attribution: bulk-removable later
+        if entry.get("priority") is not None:
+            try: clean["priority"] = int(entry["priority"])
+            except (TypeError, ValueError): pass
+        reasons = scrub_entry(clean)
+        if reasons:
+            flagged_p[len(prompts)] = reasons
+        prompts.append(clean)
+
+    docs = []
+    flagged_d: Dict[int, List[str]] = {}
+    for entry in docs_in:
+        if not isinstance(entry, dict):
+            rejected.append({"entry": str(entry)[:120], "reason": "not a mapping"})
+            continue
+        if not (entry.get("title") or "").strip() or not (entry.get("content") or "").strip():
+            rejected.append({"entry": str(entry.get("title") or entry)[:120],
+                             "reason": "training doc needs a title and content"})
+            continue
+        if not any(entry.get(k) for k in ("service", "port", "tech")):
+            rejected.append({"entry": (entry.get("title") or "")[:120],
+                             "reason": "training doc needs at least one of service, port, tech"})
+            continue
+        clean = {k: entry[k] for k in ("title", "service", "port", "tech", "content")
+                 if entry.get(k) not in (None, "")}
+        reasons = scrub_entry(clean)
+        if reasons:
+            flagged_d[len(docs)] = reasons
+        docs.append(clean)
+
+    yaml_text = render_seed_yaml(prompts, docs, flagged_p, flagged_d, source)
+
+    logger.info(
+        "[walkthrough] %s → %d rules (%d flagged), %d docs (%d flagged), %d rejected",
+        source, len(prompts), len(flagged_p), len(docs), len(flagged_d), len(rejected),
+    )
+    _emit_webhook("walkthrough_converted", {
+        "source": source, "model": model,
+        "prompts": len(prompts), "flagged": len(flagged_p) + len(flagged_d),
+        "docs": len(docs), "rejected": len(rejected),
+    })
+
+    return {
+        "ok": True, "source": source, "model": model,
+        "prompts": prompts, "service_docs": docs,
+        "flagged": (
+            [{"kind": "prompt", "index": i, "title": prompts[i].get("title"), "reasons": r}
+             for i, r in flagged_p.items()]
+            + [{"kind": "service_doc", "index": i, "title": docs[i].get("title"), "reasons": r}
+               for i, r in flagged_d.items()]
+        ),
+        "rejected": rejected,
+        "existing_considered": existing,
+        "yaml": yaml_text,
+    }
+
+
+class UrlConvertBody(BaseModel):
+    url: str
+    depth: int = 0                    # 0 = just this page; 1 = same-origin links too
+    max_pages: int = 1
+    allow_internal: bool = False      # opt-in for deliberate internal sources
+    proxy: Optional[str] = None
+    focus: Optional[str] = None
+    make_playbook: bool = True
+    include_existing: bool = True
+
+
+@kb_router.post("/url/convert")
+def convert_url(body: UrlConvertBody):
+    """Fetch a published guide and draft knowledge from it. Never writes.
+
+    Returns both outputs: a seed YAML of per-service rules (review-gated, same
+    as the walkthrough path) and a cleaned playbook markdown. A broad guide is
+    usually both — per-service technique AND methodology worth retrieving whole.
+
+    The playbook is RETURNED rather than written: knowledge/ is mounted
+    read-only, deliberately, so the service cannot rewrite its own knowledge
+    base. The CLI/UI writes it.
+    """
+    from url_fetch import UrlFetchError, fetch_guide, slugify
+
+    try:
+        fetched = fetch_guide(
+            body.url, depth=body.depth, max_pages=body.max_pages,
+            allow_internal=body.allow_internal, proxy=body.proxy,
+        )
+    except UrlFetchError as e:
+        # Refusals are operator-fixable (wrong scheme, internal address, too
+        # big), so surface them as 400 with the reason intact.
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.exception("URL fetch failed for %s", body.url)
+        raise HTTPException(502, f"Could not fetch {body.url}: {e}")
+
+    text = fetched["markdown"]
+    if len(text.strip()) < 200:
+        raise HTTPException(
+            422,
+            f"Fetched {body.url} but extracted only {len(text.strip())} characters of text. "
+            "The page may be JavaScript-rendered or behind a login.",
+        )
+
+    pages = fetched["pages"]
+    title = pages[0]["title"] if pages else ""
+    slug = slugify(body.url, title)
+
+    result = convert_text_to_knowledge(
+        content=text, source=slug, focus=body.focus,
+        include_existing=body.include_existing,
+    )
+
+    playbook = ""
+    if body.make_playbook:
+        header = [f"# {title or slug}", ""]
+        header.append(f"Imported from {body.url}" if len(pages) == 1
+                      else f"Imported from {body.url} ({len(pages)} pages)")
+        header.append("")
+        playbook = "\n".join(header) + text
+
+    logger.info("[url_convert] %s → %d page(s), %d rule(s), playbook=%dch",
+                body.url, len(pages), len(result.get("prompts") or []), len(playbook))
+    _emit_webhook("url_guide_imported", {
+        "url": body.url, "pages": len(pages), "slug": slug,
+        "prompts": len(result.get("prompts") or []),
+        "flagged": len(result.get("flagged") or []),
+        "playbook_chars": len(playbook),
+    })
+
+    result.update({
+        "url": body.url,
+        "pages": [{"url": p["url"], "title": p["title"], "chars": p["chars"]} for p in pages],
+        "fetch_errors": fetched["errors"],
+        "playbook_markdown": playbook,
+        "playbook_filename": f"{slug}.md",
+        "seed_filename": f"{slug}.yaml",
+    })
+    return result
 
 
 app.include_router(kb_router)

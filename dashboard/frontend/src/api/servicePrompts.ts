@@ -125,3 +125,99 @@ export function describeSelector(p: Pick<ServicePrompt, 'selector_type' | 'servi
     default:             return p.service ?? '—'
   }
 }
+
+/* ────────────── Walkthrough → drafted rules ────────────── */
+
+export interface DraftedFlag {
+  kind: 'prompt' | 'service_doc'
+  index: number
+  title: string | null
+  reasons: string[]
+}
+
+export interface WalkthroughConversion {
+  ok: boolean
+  source: string
+  model: string
+  prompts: ServicePromptInput[]
+  service_docs: Array<Record<string, unknown>>
+  /** Entries that look box-specific (credentials, flags, lab IPs) — review before accepting. */
+  flagged: DraftedFlag[]
+  rejected: Array<{ entry: string; reason: string }>
+  existing_considered: Array<Record<string, unknown>>
+  /** Ready-to-import seed file, with flagged entries commented out. */
+  yaml: string
+}
+
+/**
+ * Draft rules from a walkthrough. Returns proposals only — nothing is written
+ * until the operator accepts individual entries.
+ */
+export function useConvertWalkthrough() {
+  return useMutation({
+    mutationFn: (body: { content: string; filename?: string; focus?: string; include_existing?: boolean }) =>
+      apiFetch<WalkthroughConversion>('/kb/walkthrough/convert', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+  })
+}
+
+export interface WalkthroughPrompt {
+  prompt: string
+  default: string
+  using_custom: boolean
+  default_path: string
+  default_available: boolean
+}
+
+export function useWalkthroughPrompt() {
+  return useQuery({
+    queryKey: ['walkthrough-prompt'],
+    queryFn: () => apiFetch<WalkthroughPrompt>('/kb/walkthrough-prompt'),
+    staleTime: 60_000,
+  })
+}
+
+/** Save a guiding-prompt override. An empty string reverts to the shipped default. */
+export function useSetWalkthroughPrompt() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (prompt: string) =>
+      apiFetch<{ ok: boolean; using_custom: boolean }>('/kb/walkthrough-prompt', {
+        method: 'PUT',
+        body: JSON.stringify({ prompt }),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['walkthrough-prompt'] }),
+  })
+}
+
+/** Result of importing a published guide by URL. Extends the walkthrough shape. */
+export interface UrlConversion extends WalkthroughConversion {
+  url: string
+  pages: Array<{ url: string; title: string; chars: number }>
+  fetch_errors: Array<{ url: string; error: string }>
+  /** Cleaned prose for knowledge/playbooks/ — returned, not written (the mount is read-only). */
+  playbook_markdown: string
+  playbook_filename: string
+  seed_filename: string
+}
+
+/**
+ * Fetch a published guide and draft knowledge from it. Returns proposals only.
+ *
+ * The server refuses private/loopback/metadata addresses unless allow_internal
+ * is set, and re-validates every redirect hop.
+ */
+export function useConvertUrl() {
+  return useMutation({
+    mutationFn: (body: {
+      url: string; depth?: number; max_pages?: number
+      allow_internal?: boolean; focus?: string; make_playbook?: boolean
+    }) =>
+      apiFetch<UrlConversion>('/kb/url/convert', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+  })
+}
