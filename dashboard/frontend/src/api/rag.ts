@@ -220,3 +220,67 @@ export function useRagEvalHistory(limit: number = 10) {
     staleTime: 30_000,
   })
 }
+
+
+/* ────────────── Knowledge import ────────────── */
+
+export interface PlaybookIngestResult {
+  ok: boolean
+  files_processed: number
+  chunks_inserted: number
+  playbook_dir: string
+}
+
+/**
+ * Re-ingest the markdown playbook corpus from knowledge/playbooks/.
+ * Idempotent — each file's chunks are atomically replaced, so running this
+ * after editing a playbook updates it rather than duplicating.
+ */
+export function useIngestPlaybooks() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () =>
+      apiFetch<PlaybookIngestResult>('/rag/playbooks/ingest', {
+        method: 'POST',
+        body: JSON.stringify({}),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['rag-service-docs'] })
+      qc.invalidateQueries({ queryKey: ['kb-status'] })
+    },
+  })
+}
+
+export interface ServiceDoc {
+  doc_id: number
+  title: string
+  service: string | null
+  port: number | null
+  tech: string | null
+  doc_kind: string | null
+  chunks: number
+  chars: number
+}
+
+/** Training documents scoped to a service, port or technology. */
+export function useServiceDocs(params?: { service?: string; port?: number; tech?: string }) {
+  const qs = new URLSearchParams()
+  if (params?.service) qs.set('service', params.service)
+  if (params?.port) qs.set('port', String(params.port))
+  if (params?.tech) qs.set('tech', params.tech)
+  const suffix = qs.toString() ? `?${qs.toString()}` : ''
+  return useQuery({
+    queryKey: ['rag-service-docs', params?.service, params?.port, params?.tech],
+    queryFn: () => apiFetch<{ docs: ServiceDoc[] }>(`/rag/service-docs${suffix}`),
+    staleTime: 30_000,
+  })
+}
+
+export function useDeleteServiceDoc() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (docId: number) =>
+      apiFetch<{ ok: boolean }>(`/rag/service-docs/${docId}`, { method: 'DELETE' }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['rag-service-docs'] }),
+  })
+}

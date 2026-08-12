@@ -450,7 +450,8 @@ echo "=== New API endpoints ==="
 DASH=$(docker ps --filter "name=^pentest-dashboard$" --format '{{.Names}}')
 if [[ -n "$DASH" ]]; then
   for ep in /api/settings/scan-timeouts /api/scans/limits /api/port-profiles /api/kb/prompts \
-            /api/web-profiles /api/import/web-scan/formats; do
+            /api/web-profiles /api/import/web-scan/formats /api/rag/service-docs \
+            /api/kb/walkthrough-prompt; do
     code=$(docker exec "$DASH" curl -sk -o /dev/null -w "%{http_code}" "https://127.0.0.1${ep}" 2>/dev/null || echo "000")
     if [[ "$code" =~ ^(200|401|403)$ ]]; then
       pass "$ep responding (HTTP $code)"
