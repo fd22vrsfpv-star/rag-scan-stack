@@ -507,6 +507,173 @@ def _get_tool_feedback() -> List[Dict]:
     return rows
 
 
+# ── Per-service / per-port operator prompts ────────────────────────────────
+# Rows from public.service_prompts, injected into the LLM's tool-selection
+# prompt whenever a matching service/port is seen.  Cached like the tool
+# feedback above: this is read on every /next_scan LLM call, and the table is
+# small and changes rarely.
+_SERVICE_PROMPT_CACHE: Dict[str, Any] = {"ts": 0.0, "rows": []}
+_SERVICE_PROMPT_TTL = 60.0  # seconds
+
+
+def _invalidate_service_prompt_cache():
+    _SERVICE_PROMPT_CACHE["ts"] = 0.0
+
+
+def _get_all_service_prompts() -> List[Dict]:
+    """All enabled service_prompts rows (cached for _SERVICE_PROMPT_TTL)."""
+    import time
+    now = time.monotonic()
+    if _SERVICE_PROMPT_CACHE["rows"] and (now - _SERVICE_PROMPT_CACHE["ts"]) < _SERVICE_PROMPT_TTL:
+        return _SERVICE_PROMPT_CACHE["rows"]
+    rows: List[Dict] = []
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                # `tags` is selected because /kb/web-guidance turns operator
+                # tags into suggested nuclei templates.
+                "SELECT id::text, selector_type, service, tech, port, title, prompt, "
+                "       tags, priority, engagement_id::text "
+                "  FROM public.service_prompts "
+                # A rule is useful if it carries prompt text OR tags: a
+                # tags-only rule contributes nuclei templates via
+                # /kb/web-guidance without adding anything to the LLM prompt.
+                " WHERE enabled = true "
+                "   AND (prompt <> '' OR coalesce(array_length(tags, 1), 0) > 0)"
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        # Table missing (pre-migration) or DB down — degrade to no guidance
+        # rather than breaking recommendation generation.
+        logger.debug("service prompt load failed: %s", e)
+    _SERVICE_PROMPT_CACHE["ts"] = now
+    _SERVICE_PROMPT_CACHE["rows"] = rows
+    return rows
+
+
+# Specificity ranking — lower sorts first, so the most specific rule leads.
+# `tech` sits between port_service and port: knowing the target runs WordPress
+# is more actionable than knowing the port number, but less specific than an
+# exact (service, port) match the operator wrote for this engagement.
+_SELECTOR_RANK = {"port_service": 0, "tech": 1, "port": 2, "service": 3}
+
+
+def _get_service_prompts(
+    service: Optional[str],
+    port: Optional[int],
+    engagement_id: Optional[str] = None,
+    tech: Optional[List[str]] = None,
+) -> List[Dict]:
+    """Prompts matching (service, port, tech), most specific first.
+
+    Precedence: port_service → tech → port → service.  Within a tier,
+    engagement-scoped rows precede global ones, then lower `priority` wins.
+    All matches are returned (not just the best) so a broad "all http" rule and
+    a narrow "http on 8080" rule compose rather than one silently shadowing the
+    other.
+
+    `tech` is the list of technologies detected on the target (wordpress,
+    tomcat, …) — see _get_detected_tech.  This is what lets operator training
+    data steer WEB scans, where the useful signal is what's running, not which
+    port it's on.
+    """
+    svc = (service or "").strip().lower() or None
+    tech_set = {t.strip().lower() for t in (tech or []) if t and t.strip()}
+    matches: List[Dict] = []
+    for row in _get_all_service_prompts():
+        # Engagement-scoped rows apply only to their engagement.
+        row_eid = row.get("engagement_id")
+        if row_eid and row_eid != engagement_id:
+            continue
+        sel = row.get("selector_type")
+        row_svc = (row.get("service") or "").strip().lower() or None
+        row_tech = (row.get("tech") or "").strip().lower() or None
+        row_port = row.get("port")
+        if sel == "port_service":
+            if svc and row_svc == svc and port and row_port == port:
+                matches.append(row)
+        elif sel == "tech":
+            if row_tech and row_tech in tech_set:
+                matches.append(row)
+        elif sel == "port":
+            if port and row_port == port:
+                matches.append(row)
+        elif sel == "service":
+            if svc and row_svc == svc:
+                matches.append(row)
+    matches.sort(key=lambda r: (
+        _SELECTOR_RANK.get(r.get("selector_type"), 9),
+        0 if r.get("engagement_id") else 1,   # engagement-specific first
+        r.get("priority") if r.get("priority") is not None else 100,
+        r.get("title") or "",
+    ))
+    return matches
+
+
+def _build_guidance_block(
+    service: Optional[str],
+    port: Optional[int],
+    engagement_id: Optional[str] = None,
+    tech: Optional[List[str]] = None,
+) -> str:
+    """Operator guidance for this (service, port, tech), or '' when none applies.
+
+    Returning '' when there are no rows keeps the LLM prompt byte-identical to
+    its pre-feature form, so existing behaviour is unchanged until an operator
+    actually authors a rule.
+    """
+    rows = [r for r in _get_service_prompts(service, port, engagement_id, tech)
+            if (r.get("prompt") or "").strip()]
+    if not rows:
+        return ""
+    lines = [
+        "",
+        "SERVICE-SPECIFIC GUIDANCE (operator-authored — this OVERRIDES the general rules above):",
+    ]
+    for r in rows:
+        scope = {
+            "port_service": f"{r.get('service')} on port {r.get('port')}",
+            "tech": f"technology {r.get('tech')}",
+            "port": f"port {r.get('port')}",
+            "service": f"service {r.get('service')}",
+        }.get(r.get("selector_type"), "match")
+        lines.append(f"- [{scope}] {r.get('title')}: {(r.get('prompt') or '').strip()}")
+    return "\n".join(lines)
+
+
+def _get_training_context(service: Optional[str], port: Optional[int], top_k: int = 3,
+                          tech: Optional[List[str]] = None) -> str:
+    """Retrieved per-service/port/tech training documents, or '' when unavailable.
+
+    Uses the scoped retrieval added to exploits_rag._retrieve. Best-effort: the
+    embedder being down must not break recommendation generation.
+    """
+    tech_list = [t for t in (tech or []) if t]
+    if not service and not port and not tech_list:
+        return ""
+    try:
+        from exploits_rag import _embed, _retrieve, TRAINING_SOURCE_REPO
+        query = " ".join(filter(None, [
+            service or "", f"port {port}" if port else "",
+            " ".join(tech_list), "penetration testing methodology",
+        ])).strip()
+        hits = _retrieve(
+            _embed(query), top_k,
+            service=service, port=port, tech=tech_list or None,
+            source_repos=[TRAINING_SOURCE_REPO],
+        )
+    except Exception as e:
+        logger.debug("training context retrieval failed: %s", e)
+        return ""
+    if not hits:
+        return ""
+    lines = ["", "TRAINING CONTEXT (operator-provided knowledge for this service/port):"]
+    for h in hits:
+        header = h.get("section_header") or h.get("title") or "note"
+        lines.append(f"- [{header}] {(h.get('chunk') or '')[:600].strip()}")
+    return "\n".join(lines)
+
+
 def _apply_tool_feedback(recs: List[Dict], service: Optional[str]) -> List[Dict]:
     """Apply suppress / add_overlap / add_tool policies to a service's recs.
 
@@ -999,8 +1166,17 @@ def ollama_query(prompt: str, model: Optional[str] = None, stream: bool = False)
 
 
 def fetch_ollama_recommendations(
-    ip: str, service: Optional[str], banner: Optional[str], model: str = OLLAMA_MODEL
+    ip: str, service: Optional[str], banner: Optional[str], model: str = OLLAMA_MODEL,
+    port: Optional[int] = None, engagement_id: Optional[str] = None,
 ) -> List[Dict[str, str]]:
+    # Operator-authored guidance and training documents for this target. Tech is
+    # read from what httpx/whatweb already detected, so a "wordpress" rule fires
+    # on a WordPress host without the operator naming the port. All return "" when
+    # nothing matches, leaving the prompt byte-identical to its pre-feature form.
+    tech_tokens, _tech_src = _get_detected_tech(ip, port)
+    guidance = _build_guidance_block(service, port, engagement_id, tech_tokens)
+    training = _get_training_context(service, port, tech=tech_tokens)
+
     prompt = f"""
 Return ONLY a compact JSON object with this exact shape:
 
@@ -1016,6 +1192,7 @@ Rules:
 - Base suggestions on:
   ip: {ip!r}
   service: {service!r}
+  port: {port!r}
   banner: {banner!r}
 - Prefer practical web and service probes (nmap scripts, nuclei templates, ZAP actions).
 - Do NOT recommend vulnx (or any CVE-lookup tool). vulnx is NOT a scanner — it
@@ -1026,7 +1203,14 @@ Rules:
   content discovery (gobuster / feroxbuster / dirsearch / ffuf / wfuzz),
   web vuln scan (nikto / nuclei), tech fingerprint (whatweb / wappalyzer),
   login brute force (hydra / medusa / ncrack / metasploit *_login).
+{guidance}
+{training}
 """
+    if guidance or training:
+        logger.info(
+            "LLM prompt augmented for %s:%s — guidance=%dch, training=%dch",
+            service, port, len(guidance), len(training),
+        )
     if LLM_BACKEND == "azure":
         try:
             text = _azure_generate(prompt.strip(), json_mode=True)
@@ -1256,7 +1440,9 @@ def get_next_scan_recommendations(
             rows = cur.fetchall()
             logger.info(f"DB rows found for {ip} (service={service}, port={port}): {len(rows)}")
         if not rows or use_ollama:
-            ollama_recs = fetch_ollama_recommendations(ip, service, banner)
+            # `port` is passed so per-port and per-(port,service) operator
+            # prompts resolve — previously the LLM path discarded it entirely.
+            ollama_recs = fetch_ollama_recommendations(ip, service, banner, port=port)
             recommendations.extend(ScanRecommendation(**rec) for rec in ollama_recs)
             if persist and PERSIST_RECS:
                 dict_recs = [r.dict() for r in recommendations]
@@ -1726,6 +1912,339 @@ def deactivate_tool_feedback(feedback_id: str):
         raise HTTPException(500, f"Failed to deactivate: {e}")
     _invalidate_tool_feedback_cache()
     return {"ok": True, "deactivated": feedback_id}
+
+
+# ---- KB: per-service / per-port operator prompts ----
+class ServicePromptBody(BaseModel):
+    """A per-service / per-port prompt rule.
+
+    `selector_type` decides which selector fields are required:
+      service      → service only
+      port         → port only
+      port_service → service + port
+      tech         → detected technology only (wordpress, tomcat, ...)
+    The DB enforces the same shape (service_prompts_selector_shape), so a row
+    can never end up unreachable by the resolver.
+    """
+    selector_type: str
+    title: str
+    prompt: str = ""
+    service: Optional[str] = None
+    tech: Optional[str] = None
+    port: Optional[int] = None
+    training_notes: Optional[str] = None
+    tags: Optional[List[str]] = None
+    priority: int = 100
+    enabled: bool = True
+    engagement_id: Optional[str] = None
+
+
+def _validate_prompt_selector(body: "ServicePromptBody") -> tuple:
+    """Normalize + validate selector fields. Returns (service, tech, port).
+
+    Fields irrelevant to the chosen selector_type are forced to NULL rather than
+    passed through, so a stray value can't trip the DB's shape CHECK and produce
+    a confusing 500.
+    """
+    sel = (body.selector_type or "").strip().lower()
+    if sel not in ("service", "port", "port_service", "tech"):
+        raise HTTPException(
+            400, "selector_type must be one of: service, port, port_service, tech")
+    service = (body.service or "").strip().lower() or None
+    tech = (body.tech or "").strip().lower() or None
+    port = body.port
+    if sel in ("service", "port_service") and not service:
+        raise HTTPException(400, f"selector_type '{sel}' requires a service")
+    if sel in ("port", "port_service") and not port:
+        raise HTTPException(400, f"selector_type '{sel}' requires a port")
+    if sel == "tech" and not tech:
+        raise HTTPException(400, "selector_type 'tech' requires a tech")
+    if sel == "service":
+        port, tech = None, None
+    elif sel == "port":
+        service, tech = None, None
+    elif sel == "port_service":
+        tech = None
+    elif sel == "tech":
+        service, port = None, None
+    if port is not None and not (0 < port <= 65535):
+        raise HTTPException(400, "port must be between 1 and 65535")
+    if not (body.title or "").strip():
+        raise HTTPException(400, "title is required")
+    return service, tech, port
+
+
+def _ingest_training_notes(row_id: str, service: Optional[str], port: Optional[int],
+                           title: str, notes: Optional[str],
+                           tech: Optional[str] = None) -> None:
+    """Push a rule's training_notes into the RAG store, best-effort.
+
+    Called after save. A RAG/embedder outage must not fail the save — the notes
+    are already persisted in service_prompts and `rag_ingested_at` stays NULL,
+    which is how the UI shows "not yet indexed".
+    """
+    if not (notes or "").strip():
+        return
+    try:
+        from exploits_rag import ingest_service_doc, ServiceDocIngest
+        ingest_service_doc(ServiceDocIngest(
+            title=title, content=notes, service=service, port=port, tech=tech,
+            doc_kind="training",
+        ))
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE public.service_prompts SET rag_ingested_at = now() WHERE id = %s::uuid",
+                (row_id,),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.warning("training notes ingest failed for %s: %s", title, e)
+
+
+@kb_router.get("/prompts")
+def list_service_prompts(
+    service: Optional[str] = Query(None),
+    port: Optional[int] = Query(None),
+    engagement_id: Optional[str] = Query(None),
+    enabled_only: bool = Query(False),
+):
+    """List prompt rules, optionally filtered."""
+    where, params = [], []
+    if service:
+        where.append("lower(service) = lower(%s)")
+        params.append(service)
+    if port:
+        where.append("port = %s")
+        params.append(port)
+    if engagement_id:
+        where.append("engagement_id = %s::uuid")
+        params.append(engagement_id)
+    if enabled_only:
+        where.append("enabled = true")
+    sql = (
+        "SELECT id::text, selector_type, service, tech, port, title, prompt, "
+        "       training_notes, tags, priority, enabled, engagement_id::text, "
+        "       rag_ingested_at, created_at, updated_at "
+        "  FROM public.service_prompts "
+        + (" WHERE " + " AND ".join(where) if where else "")
+        + " ORDER BY selector_type, priority, title"
+    )
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, tuple(params))
+            return {"prompts": [dict(r) for r in cur.fetchall()]}
+    except Exception as e:
+        logger.error("Failed to list service prompts: %s", e)
+        raise HTTPException(500, f"Failed to list prompts: {e}")
+
+
+@kb_router.get("/prompts/resolve")
+def resolve_service_prompts(
+    service: Optional[str] = Query(None),
+    port: Optional[int] = Query(None),
+    tech: Optional[str] = Query(None, description="Comma-separated technologies"),
+    engagement_id: Optional[str] = Query(None),
+):
+    """Preview exactly what would be injected for a (service, port, tech).
+
+    This is the same resolution the LLM path uses, so the UI's test panel shows
+    the real thing rather than an approximation.
+    """
+    tech_list = [t.strip() for t in (tech or "").split(",") if t.strip()]
+    matches = _get_service_prompts(service, port, engagement_id, tech_list)
+    return {
+        "service": service,
+        "port": port,
+        "tech": tech_list,
+        "matched": matches,
+        "guidance_block": _build_guidance_block(service, port, engagement_id, tech_list),
+        "training_context": _get_training_context(service, port, tech=tech_list),
+    }
+
+
+@kb_router.get("/web-guidance")
+def web_scan_guidance(
+    ip: Optional[str] = Query(None, description="Target IP — detected tech is looked up from it"),
+    service: Optional[str] = Query("http"),
+    port: Optional[int] = Query(None),
+    tech: Optional[str] = Query(None, description="Comma-separated tech; overrides detection"),
+    engagement_id: Optional[str] = Query(None),
+):
+    """What operator training says about scanning THIS web target.
+
+    Returns the guidance text, retrieved training context, and — the part a
+    scanner can act on directly — `suggested_nuclei_tags`, merged from:
+      1. tags on matching service_prompts rows (operator-authored), and
+      2. the KB's tech_signatures for whatever is running on the target.
+
+    Intended as a REFINEMENT on top of a web profile: the profile decides how
+    deep to dig, this decides what to look for once you know it's WordPress.
+    Deliberately additive — it never removes stages or widens scope.
+    """
+    if tech:
+        tech_list = [t.strip().lower() for t in tech.split(",") if t.strip()]
+        tech_source = "explicit"
+    else:
+        tech_list, tech_source = _get_detected_tech(ip, port)
+        tech_list = [t.lower() for t in (tech_list or [])]
+
+    matches = _get_service_prompts(service, port, engagement_id, tech_list)
+
+    # 1. Tags the operator attached to matching rules.
+    suggested: List[str] = []
+    for row in matches:
+        for t in (row.get("tags") or []):
+            t = (t or "").strip().lower()
+            if t and t not in suggested:
+                suggested.append(t)
+
+    # 2. Tags the KB already associates with the detected technology.
+    if tech_list:
+        try:
+            for m in get_tool_kb().match_tech_to_tags(tech_list):
+                for t in (m.get("nuclei_tags") or []):
+                    t = (t or "").strip().lower()
+                    if t and t not in suggested:
+                        suggested.append(t)
+        except Exception as e:
+            logger.debug("tech->tags lookup failed: %s", e)
+
+    return {
+        "ip": ip,
+        "service": service,
+        "port": port,
+        "tech": tech_list,
+        "tech_source": tech_source,
+        "matched": matches,
+        "guidance_block": _build_guidance_block(service, port, engagement_id, tech_list),
+        "training_context": _get_training_context(service, port, tech=tech_list),
+        "suggested_nuclei_tags": suggested,
+    }
+
+
+@kb_router.post("/prompts")
+def create_service_prompt(body: ServicePromptBody):
+    """Create a prompt rule (and index its training notes into RAG)."""
+    service, tech, port = _validate_prompt_selector(body)
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.service_prompts
+                    (selector_type, service, tech, port, title, prompt, training_notes,
+                     tags, priority, enabled, engagement_id)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING id::text
+                """,
+                (body.selector_type.strip().lower(), service, tech, port,
+                 body.title.strip(), body.prompt or "", body.training_notes,
+                 body.tags or [], body.priority, body.enabled,
+                 body.engagement_id or None),
+            )
+            row = cur.fetchone()
+            conn.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        # The unique index gives a clear duplicate message rather than a 500.
+        if "idx_service_prompts_selector" in str(e):
+            raise HTTPException(409, "A rule already exists for this selector")
+        logger.error("Failed to create service prompt: %s", e)
+        raise HTTPException(500, f"Failed to create prompt: {e}")
+
+    prompt_id = row[0]
+    _invalidate_service_prompt_cache()
+    _ingest_training_notes(prompt_id, service, port, body.title.strip(),
+                           body.training_notes, tech)
+    _emit_webhook("service_prompt_saved", {
+        "id": prompt_id, "action": "created", "selector_type": body.selector_type,
+        "service": service, "tech": tech, "port": port, "title": body.title,
+        "has_training_notes": bool((body.training_notes or "").strip()),
+    })
+    return {"ok": True, "id": prompt_id}
+
+
+@kb_router.put("/prompts/{prompt_id}")
+def update_service_prompt(prompt_id: str, body: ServicePromptBody):
+    """Replace a prompt rule (and re-index its training notes)."""
+    service, tech, port = _validate_prompt_selector(body)
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE public.service_prompts
+                   SET selector_type = %s, service = %s, tech = %s, port = %s, title = %s,
+                       prompt = %s, training_notes = %s, tags = %s,
+                       priority = %s, enabled = %s, engagement_id = %s
+                 WHERE id = %s::uuid
+                RETURNING id::text
+                """,
+                (body.selector_type.strip().lower(), service, tech, port,
+                 body.title.strip(), body.prompt or "", body.training_notes,
+                 body.tags or [], body.priority, body.enabled,
+                 body.engagement_id or None, prompt_id),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            if not row:
+                raise HTTPException(404, f"No prompt with id {prompt_id}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        if "idx_service_prompts_selector" in str(e):
+            raise HTTPException(409, "A rule already exists for this selector")
+        logger.error("Failed to update service prompt: %s", e)
+        raise HTTPException(500, f"Failed to update prompt: {e}")
+
+    _invalidate_service_prompt_cache()
+    _ingest_training_notes(prompt_id, service, port, body.title.strip(),
+                           body.training_notes, tech)
+    _emit_webhook("service_prompt_saved", {
+        "id": prompt_id, "action": "updated", "selector_type": body.selector_type,
+        "service": service, "tech": tech, "port": port, "title": body.title,
+        "has_training_notes": bool((body.training_notes or "").strip()),
+    })
+    return {"ok": True, "id": prompt_id}
+
+
+@kb_router.delete("/prompts/{prompt_id}")
+def delete_service_prompt(prompt_id: str):
+    """Delete a prompt rule and any training document it indexed."""
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "DELETE FROM public.service_prompts WHERE id = %s::uuid "
+                "RETURNING title, service, tech, port, training_notes",
+                (prompt_id,),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            if not row:
+                raise HTTPException(404, f"No prompt with id {prompt_id}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to delete service prompt: %s", e)
+        raise HTTPException(500, f"Failed to delete prompt: {e}")
+
+    # Remove the matching RAG document so deleted guidance stops being
+    # retrieved. Keyed identically to ingest, so it targets the same rows.
+    if (row.get("training_notes") or "").strip():
+        try:
+            from exploits_rag import _stable_training_id, delete_service_doc
+            delete_service_doc(_stable_training_id(
+                (row.get("service") or "").lower() or None, row.get("port"),
+                row["title"], (row.get("tech") or "").lower() or None,
+            ))
+        except Exception as e:
+            logger.debug("training doc cleanup skipped for %s: %s", prompt_id, e)
+
+    _invalidate_service_prompt_cache()
+    _emit_webhook("service_prompt_deleted", {
+        "id": prompt_id, "title": row.get("title"),
+        "service": row.get("service"), "port": row.get("port"),
+    })
+    return {"ok": True, "deleted": prompt_id}
 
 
 app.include_router(kb_router)

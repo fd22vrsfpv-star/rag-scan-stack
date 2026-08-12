@@ -1,0 +1,14 @@
+{
+  "host": "10.0.0.7",
+  "ip": "10.0.0.7",
+  "port": "8443",
+  "banner": "nginx/1.18.0",
+  "vulnerabilities": [
+    { "id": "999957", "OSVDB": "0", "method": "GET", "url": "/",
+      "msg": "The X-Content-Type-Options header is not set." },
+    { "id": "888001", "OSVDB": "3268", "method": "GET", "url": "/backup/",
+      "msg": "Directory indexing found." },
+    { "id": "777002", "OSVDB": "5646", "method": "GET", "url": "/db.sql",
+      "msg": "Backup file found: possible source code disclosure." }
+  ]
+}

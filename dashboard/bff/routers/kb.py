@@ -122,3 +122,107 @@ async def delete_kb_feedback(feedback_id: str):
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
         return safe_json(resp)
+
+
+# ── Per-service / per-port operator prompts ──────────────────────────────────
+# Straight proxies to scan-recommender's /kb/prompts endpoints, which own the
+# service_prompts table and the RAG training-doc indexing. Webhooks are emitted
+# upstream (service_prompt_saved / service_prompt_deleted), so unlike the KB
+# override routes above these don't re-emit here.
+
+@router.get("/api/kb/prompts")
+async def list_service_prompts(
+    service: str | None = None,
+    port: int | None = None,
+    engagement_id: str | None = None,
+    enabled_only: bool = False,
+):
+    s = get_settings()
+    params = {k: v for k, v in {
+        "service": service, "port": port,
+        "engagement_id": engagement_id,
+        "enabled_only": str(enabled_only).lower(),
+    }.items() if v not in (None, "")}
+    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        resp = await c.get(f"{s.scan_recommender_url}/kb/prompts", params=params)
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.get("/api/kb/prompts/resolve")
+async def resolve_service_prompts(
+    service: str | None = None,
+    port: int | None = None,
+    tech: str | None = None,
+    engagement_id: str | None = None,
+):
+    """Preview what guidance + training context a (service, port, tech) would inject."""
+    s = get_settings()
+    params = {k: v for k, v in {
+        "service": service, "port": port, "tech": tech,
+        "engagement_id": engagement_id,
+    }.items() if v not in (None, "")}
+    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        resp = await c.get(f"{s.scan_recommender_url}/kb/prompts/resolve", params=params)
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.post("/api/kb/prompts")
+async def create_service_prompt(body: Dict[str, Any] = Body(...)):
+    s = get_settings()
+    # Training-note indexing embeds the text, so allow more headroom than the
+    # 15s used by the other KB proxies.
+    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+        resp = await c.post(f"{s.scan_recommender_url}/kb/prompts", json=body)
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.put("/api/kb/prompts/{prompt_id}")
+async def update_service_prompt(prompt_id: str, body: Dict[str, Any] = Body(...)):
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+        resp = await c.put(f"{s.scan_recommender_url}/kb/prompts/{prompt_id}", json=body)
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.delete("/api/kb/prompts/{prompt_id}")
+async def delete_service_prompt(prompt_id: str):
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        resp = await c.delete(f"{s.scan_recommender_url}/kb/prompts/{prompt_id}")
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.get("/api/kb/web-guidance")
+async def web_scan_guidance(
+    ip: str | None = None,
+    service: str | None = "http",
+    port: int | None = None,
+    tech: str | None = None,
+    engagement_id: str | None = None,
+):
+    """Operator training applicable to scanning one web target.
+
+    Returns guidance text, retrieved training context, and suggested nuclei tags
+    for whatever technology was detected. A web profile decides how deep to dig;
+    this decides what to look for once the stack is known.
+    """
+    s = get_settings()
+    params = {k: v for k, v in {
+        "ip": ip, "service": service, "port": port, "tech": tech,
+        "engagement_id": engagement_id,
+    }.items() if v not in (None, "")}
+    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        resp = await c.get(f"{s.scan_recommender_url}/kb/web-guidance", params=params)
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)

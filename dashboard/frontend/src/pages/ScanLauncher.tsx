@@ -11,12 +11,14 @@ import { useStartBurpScan, useConfigureBurpProxy } from '@/api/burp'
 import { useEngagements, useEngagementScopes } from '@/api/engagements'
 import { useTargetedReconLookup, useTargetedReconExecute } from '@/api/targeted-recon'
 import { useAssetPorts } from '@/api/assets'
+import { usePortProfiles } from '@/api/portProfiles'
+import { useWebProfiles, describeWebProfile } from '@/api/webProfiles'
 import type { ReconCommand } from '@/api/targeted-recon'
 // Remote scan UI moved to Nodes page
 import { useScanDefaultsStore } from '@/stores/scanDefaults'
 import { useUIStore } from '@/stores/ui'
 import { useCloudRecommendations, useRefreshCloudRecommendations, useUpdateCloudRecommendation, useCloudPosture } from '@/api/cloudSuggestor'
-import { SCAN_CATEGORIES, SCAN_FIELDS, SECRET_TYPES, BRUTUS_PROTOCOLS, NUCLEI_TAG_PRESETS, type ScanMeta } from '@/lib/constants'
+import { SCAN_CATEGORIES, SCAN_FIELDS, SECRET_TYPES, BRUTUS_PROTOCOLS, NUCLEI_TAG_PRESETS, WEB_PROFILE_SCANS, type ScanMeta } from '@/lib/constants'
 import { cn } from '@/lib/utils'
 import { useQueryClient } from '@tanstack/react-query'
 import { apiUrl } from '@/api/client'
@@ -219,6 +221,12 @@ export default function ScanLauncher() {
   const engagements = engagementsQuery.data?.engagements ?? []
   const navigate = useNavigate()
   const { defaultTargets, defaultPorts, defaultRate, defaultScope, toolOverrides, activeProfile } = useScanDefaultsStore()
+  const { data: portProfilesData } = usePortProfiles()
+  const portProfiles = portProfilesData?.profiles ?? []
+  const { data: webProfilesData } = useWebProfiles()
+  const webProfiles = webProfilesData?.profiles ?? []
+  // Depth profile for the current web scan ('' = use the fields as typed).
+  const [webProfile, setWebProfile] = useState('')
   const gobusterFindings = useFindings({ source: ['gobuster'], limit: 500 })
   const nodesQuery = useNodes()
   const wgPeersQuery = useWGPeers()
@@ -389,6 +397,12 @@ export default function ScanLauncher() {
       else if (k === 'rate' || k === 'depth' || k === 'max_paths' || k === 'limit' || k === 'aggression' || k === 'timeout' || k === 'timeout_sec' || k === 'max_playwright_urls') parsed[k] = Number(v)
       else if (v === 'true' || v === 'false') parsed[k] = v === 'true'
       else parsed[k] = v
+    }
+
+    // Web depth profile — the BFF fills any web field left blank above from it.
+    // Sent as an id (not expanded here) so resolution stays server-side.
+    if (webProfile && WEB_PROFILE_SCANS.has(selected)) {
+      parsed.web_profile = webProfile
     }
 
     // Inject passive-recon specific params
@@ -830,6 +844,39 @@ export default function ScanLauncher() {
             {(launch.error || scanThroughNode.error) && (
               <p className="text-xs text-red-500">{String(launch.error || scanThroughNode.error)}</p>
             )}
+            {/* Web scan depth profile — fills wordlist / crawl depth / severity /
+                stage flags below. Anything you set explicitly still wins. */}
+            {WEB_PROFILE_SCANS.has(selected) && webProfiles.length > 0 && (
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1">Scan depth</label>
+                <div className="flex flex-wrap gap-1">
+                  {webProfiles.map(p => (
+                    <button
+                      key={p.id}
+                      type="button"
+                      title={`${p.description}\n\n${describeWebProfile(p)}\nRuns: ${p.stages.join(', ')}`}
+                      onClick={() => setWebProfile(webProfile === p.id ? '' : p.id)}
+                      className={cn(
+                        'px-2 py-0.5 text-[10px] rounded border transition-colors',
+                        webProfile === p.id
+                          ? 'bg-primary text-primary-foreground border-primary'
+                          : 'bg-muted border-border hover:border-primary/50',
+                      )}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                </div>
+                {webProfile && (
+                  <p className="text-[10px] text-muted-foreground mt-1">
+                    {webProfiles.find(p => p.id === webProfile)?.stages.join(' → ')}
+                    {' · '}
+                    {describeWebProfile(webProfiles.find(p => p.id === webProfile)!)}
+                    {' — fields left blank below are filled from this profile'}
+                  </p>
+                )}
+              </div>
+            )}
             {SCAN_FIELDS[selected].map(field => (
               <div key={field.key}>
                 <label className="block text-xs text-muted-foreground mb-1">{field.label}</label>
@@ -873,6 +920,38 @@ export default function ScanLauncher() {
                           )}
                         >
                           {p}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : field.key === 'ports' && portProfiles.length > 0 ? (
+                  /* Port scope presets. Chips write the RESOLVED port string into
+                     the field (rather than sending a profile id) so the value stays
+                     editable and the "what will be sent" preview below shows exactly
+                     what reaches the scanner. Resolved strings are masscan-safe. */
+                  <div className="space-y-1">
+                    <input
+                      type="text"
+                      placeholder={field.placeholder}
+                      value={params.ports || ''}
+                      onChange={e => setParams({ ...params, ports: e.target.value })}
+                      className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border outline-none focus:border-primary"
+                    />
+                    <div className="flex flex-wrap gap-1">
+                      {portProfiles.map(p => (
+                        <button
+                          key={p.id}
+                          type="button"
+                          title={`${p.description} → ${p.ports.length > 80 ? p.ports.slice(0, 80) + '…' : p.ports}`}
+                          onClick={() => setParams({ ...params, ports: p.ports })}
+                          className={cn(
+                            'px-1.5 py-0.5 text-[10px] rounded border transition-colors',
+                            (params.ports || '') === p.ports
+                              ? 'bg-primary text-primary-foreground border-primary'
+                              : 'bg-muted border-border hover:border-primary/50'
+                          )}
+                        >
+                          {p.label} ({p.port_count.toLocaleString()})
                         </button>
                       ))}
                     </div>

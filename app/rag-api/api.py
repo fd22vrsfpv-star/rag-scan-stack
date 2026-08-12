@@ -1613,7 +1613,17 @@ def get_open_ports(
     return {"count": len(rows), "total": total, "limit": limit, "offset": offset, "items": rows}
 
 def _save_upload_to_tmp(file: UploadFile) -> str:
-    tmp_path = f"/tmp/{file.filename}"
+    """Persist an upload to a private temp path.
+
+    The filename is attacker-controlled (it comes from the multipart headers),
+    so it is reduced to a basename and scrubbed to a safe charset: a crafted
+    name like "../../etc/cron.d/x" would otherwise let the uploader choose the
+    write destination. The uuid prefix additionally stops two concurrent
+    uploads that share a filename from clobbering each other.
+    """
+    raw = os.path.basename(file.filename or "upload.bin")
+    safe = _re_module.sub(r"[^A-Za-z0-9._-]", "_", raw).lstrip(".") or "upload.bin"
+    tmp_path = f"/tmp/{uuid.uuid4().hex}_{safe[:120]}"
     with open(tmp_path, "wb") as buffer:
         buffer.write(file.file.read())
     return tmp_path
@@ -1961,6 +1971,146 @@ def ingest_burp(file: UploadFile = File(...), authorized: bool = Depends(auth)):
         return {"ok": True, "stats": stats}
     finally:
         os.remove(path)
+
+@app.post("/ingest/zap")
+def ingest_zap_report(file: UploadFile = File(...), authorized: bool = Depends(auth)):
+    """Ingest a saved OWASP ZAP report (JSON or XML).
+
+    Distinct from the live-ZAP path in etl/parse_zap.py, which pulls alerts from
+    a running ZAP's API. This accepts a report file produced anywhere.
+    """
+    path = _save_upload_to_tmp(file)
+    try:
+        from etl.parse_zap_file import parse_zap_file
+        stats = parse_zap_file(path, profile="api-upload")
+        _emit_ingest_event("zap", stats)
+        return {"ok": True, "stats": stats}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        os.remove(path)
+
+
+@app.post("/ingest/nikto")
+def ingest_nikto(file: UploadFile = File(...), authorized: bool = Depends(auth)):
+    """Ingest a Nikto report (XML or JSON)."""
+    path = _save_upload_to_tmp(file)
+    try:
+        from etl.parse_nikto import parse_nikto
+        stats = parse_nikto(path, profile="api-upload")
+        _emit_ingest_event("nikto", stats)
+        return {"ok": True, "stats": stats}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        os.remove(path)
+
+
+# Web scan report formats this stack can auto-detect, checked most-specific
+# first. Each entry is (tool, predicate) where the predicate inspects a text
+# sample of the file. Detection is content-based, not extension-based: reports
+# routinely arrive with uninformative names.
+def _detect_web_scan_tool(path: str) -> Optional[str]:
+    """Identify which web scanner produced a report file, or None."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            head = fh.read(8192)
+    except OSError:
+        return None
+    if not head.strip():
+        return None
+    stripped = head.lstrip()
+    low = stripped.lower()
+
+    # XML dialects — each tool has a distinctive root element.
+    if stripped.startswith("<") or low.startswith("<?xml"):
+        if "<owaspzapreport" in low or "<alertitem" in low:
+            return "zap"
+        if "<niktoscan" in low:
+            return "nikto"
+        if "<issues" in low or "<items" in low:
+            return "burp"      # parse_burp distinguishes scanner vs sitemap itself
+        return None
+
+    # JSON / JSONL dialects.
+    if stripped[0] in "{[":
+        if '"site"' in head or '"alerts"' in head or '"@programName"' in head:
+            return "zap"
+        if '"vulnerabilities"' in head or '"niktoscan"' in head:
+            return "nikto"
+        # Nuclei emits JSONL — one finding object per line.
+        if '"template-id"' in head or '"templateID"' in head or '"template_id"' in head:
+            return "nuclei"
+        return None
+    return None
+
+
+@app.post("/ingest/web-scan")
+def ingest_web_scan(
+    file: UploadFile = File(...),
+    tool: Optional[str] = None,
+    authorized: bool = Depends(auth),
+):
+    """Ingest any supported web scan report, auto-detecting which tool made it.
+
+    Supported: ZAP (JSON/XML), Nikto (XML/JSON), Burp (XML), Nuclei (JSONL).
+    Pass `tool` to override detection when a report is unusual.
+
+    One endpoint rather than making the operator pick the right one — the
+    per-tool endpoints remain available for scripted use.
+    """
+    path = _save_upload_to_tmp(file)
+    try:
+        detected = (tool or "").strip().lower() or _detect_web_scan_tool(path)
+        if not detected:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Could not identify the scanner that produced "
+                    f"{file.filename!r}. Supported: zap (JSON/XML), nikto "
+                    f"(XML/JSON), burp (XML), nuclei (JSONL). Pass ?tool=<name> "
+                    f"to force a parser."
+                ),
+            )
+
+        if detected == "zap":
+            from etl.parse_zap_file import parse_zap_file
+            stats = parse_zap_file(path, profile="api-upload")
+        elif detected == "nikto":
+            from etl.parse_nikto import parse_nikto
+            stats = parse_nikto(path, profile="api-upload")
+        elif detected == "burp":
+            from etl.parse_burp import parse_burp
+            stats = parse_burp(path, profile="api-upload")
+        elif detected == "nuclei":
+            from etl.parse_nuclei import parse_nuclei
+            stats = parse_nuclei(path, profile="api-upload")
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported tool {detected!r}. Supported: zap, nikto, burp, nuclei.",
+            )
+
+        _emit_ingest_event(detected, stats)
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("web_scan_imported", detected, {
+                "tool": detected,
+                "filename": file.filename,
+                "inserted": stats.get("inserted"),
+                "by_severity": stats.get("by_severity"),
+            })
+        except Exception:
+            pass  # fire-and-forget
+        return {"ok": True, "tool": detected, "stats": stats}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        # Parsers raise ValueError for malformed/mis-detected input.
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        os.remove(path)
+
 
 @app.post("/ingest/masscan")
 def ingest_masscan(file: UploadFile = File(...), authorized: bool = Depends(auth)):

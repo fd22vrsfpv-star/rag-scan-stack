@@ -23,6 +23,8 @@ import { cn } from '@/lib/utils'
 import { ArrowLeft, Plus, Square, Play, X, Wrench, Terminal, ChevronDown, ChevronRight, ExternalLink, Trash2, Shield, Crosshair, Wifi, Puzzle } from 'lucide-react'
 import { useScanDefaultsStore } from '@/stores/scanDefaults'
 import { useNodes } from '@/api/nodes'
+import { usePortProfiles } from '@/api/portProfiles'
+import { useWebProfiles } from '@/api/webProfiles'
 
 const SESSION_PROFILES = {
   'full-pentest': {
@@ -752,6 +754,12 @@ function SessionList() {
   const [activeScope, setActiveScope] = useState('')
   const [sessionProfile, setSessionProfile] = useState<SessionProfile>(DEFAULT_PROFILE)
   const [selectedNodeId, setSelectedNodeId] = useState('')
+  const [portProfile, setPortProfile] = useState('')   // '' = agent's built-in quick/deep policy
+  const { data: portProfilesData } = usePortProfiles()
+  const portProfiles = portProfilesData?.profiles ?? []
+  const [webProfile, setWebProfile] = useState('')     // '' = each web tool's own defaults
+  const { data: webProfilesData } = useWebProfiles()
+  const webProfiles = webProfilesData?.profiles ?? []
   const [form, setForm] = useState({
     target_description: defaultTargets,
     session_name: '',
@@ -793,7 +801,13 @@ function SessionList() {
       ? `socks5://node-manager:${selectedNode.proxy_port}`
       : undefined
 
-    const sessionData = { ...form, proxy }
+    // port_profile is omitted entirely when unset, so the scanner agent keeps
+    // its built-in quick (1-1000+web) then deep (1001-65535) policy.
+    const sessionData = {
+      ...form, proxy,
+      ...(portProfile ? { port_profile: portProfile } : {}),
+      ...(webProfile ? { web_profile: webProfile } : {}),
+    }
 
     // Check for model performance warnings
     if (performanceWarningQuery.data) {
@@ -941,7 +955,7 @@ function SessionList() {
               placeholder="e.g. Perform a full reconnaissance and vulnerability assessment of the target network..."
             />
           </div>
-          <div className="flex gap-4 items-end">
+          <div className="flex gap-4 items-end flex-wrap">
             <div>
               <label className="text-xs text-muted-foreground mb-1 block">Max Rounds</label>
               <input
@@ -950,6 +964,39 @@ function SessionList() {
                 onChange={e => setForm(f => ({ ...f, max_rounds: Number(e.target.value) }))}
                 className="w-28 bg-muted rounded-md px-3 py-1.5 text-sm border border-border outline-none focus:border-primary"
               />
+            </div>
+            {/* Port scope for the scanner agent's discovery scans. Leaving this
+                on "Agent default" preserves the built-in quick-then-deep policy. */}
+            <div>
+              <label className="text-xs text-muted-foreground mb-1 block">Port Scope</label>
+              <select
+                value={portProfile}
+                onChange={e => setPortProfile(e.target.value)}
+                className="bg-muted rounded-md px-3 py-1.5 text-sm border border-border outline-none focus:border-primary"
+              >
+                <option value="">Agent default (quick, then deep)</option>
+                {portProfiles.map(p => (
+                  <option key={p.id} value={p.id}>
+                    {p.label} ({p.port_count.toLocaleString()})
+                  </option>
+                ))}
+              </select>
+            </div>
+            {/* Web scan depth for this session's web tools. */}
+            <div>
+              <label className="text-xs text-muted-foreground mb-1 block">Web Depth</label>
+              <select
+                value={webProfile}
+                onChange={e => setWebProfile(e.target.value)}
+                className="bg-muted rounded-md px-3 py-1.5 text-sm border border-border outline-none focus:border-primary"
+              >
+                <option value="">Tool defaults</option>
+                {webProfiles.map(p => (
+                  <option key={p.id} value={p.id}>
+                    {p.label} ({p.stage_count} stages)
+                  </option>
+                ))}
+              </select>
             </div>
             <label className="flex items-center gap-2 text-sm pb-1">
               <input

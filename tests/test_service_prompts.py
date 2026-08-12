@@ -1,0 +1,176 @@
+"""Per-service / per-port prompt resolution tests.
+
+Covers the precedence rules in scan_recommender._get_service_prompts and the
+guidance block assembly in _build_guidance_block.
+
+The properties these lock down:
+  1. Specificity beats priority — a port_service rule always precedes a port
+     rule, which always precedes a service rule, regardless of priority values.
+  2. Engagement-scoped rules never leak across engagements.
+  3. With no matching rules the guidance block is EMPTY, so the LLM prompt is
+     byte-identical to its pre-feature form.
+"""
+import os
+import sys
+import types
+from unittest.mock import patch
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scan_recommender"))
+
+
+SR_DIR = os.path.join(os.path.dirname(__file__), "..", "scan_recommender")
+SR_FILE = os.path.join(SR_DIR, "scan_recommender.py")
+
+
+@pytest.fixture(scope="module")
+def sr():
+    """Load scan_recommender.py with its heavy/IO-bound deps stubbed.
+
+    Loaded from an explicit file path rather than `import scan_recommender`.
+    Other test files put the repo root on sys.path, which makes that name
+    resolve to the scan_recommender *directory* as a namespace package — the
+    module's functions then simply aren't there, and every test here fails, but
+    only when the suite runs in a particular order.
+    """
+    # exploits_rag pulls in psycopg2/pgvector and opens connections at import;
+    # scan_recommender only needs the names, so a stub keeps this hermetic.
+    if not isinstance(sys.modules.get("exploits_rag"), types.ModuleType) or \
+            not hasattr(sys.modules.get("exploits_rag"), "TRAINING_SOURCE_REPO"):
+        from fastapi import APIRouter
+        stub = types.ModuleType("exploits_rag")
+        # Must be a real router — scan_recommender calls app.include_router on it.
+        stub.rag_router = APIRouter()
+        stub.TRAINING_SOURCE_REPO = "training"
+        stub._embed = lambda *a, **k: []
+        stub._retrieve = lambda *a, **k: []
+        sys.modules["exploits_rag"] = stub
+
+    # scan_recommender.py does bare imports of its siblings (tool_kb, ...), so
+    # its own directory must be importable.
+    if SR_DIR not in sys.path:
+        sys.path.insert(0, SR_DIR)
+
+    import importlib.util
+    try:
+        spec = importlib.util.spec_from_file_location("scan_recommender_under_test", SR_FILE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as e:                                    # pragma: no cover
+        pytest.skip(f"scan_recommender not importable in this env: {e}")
+    return module
+
+
+def _row(selector_type, *, service=None, port=None, title="t",
+         prompt="p", priority=100, engagement_id=None):
+    return {
+        "id": f"{selector_type}-{service}-{port}-{title}",
+        "selector_type": selector_type, "service": service, "port": port,
+        "title": title, "prompt": prompt, "priority": priority,
+        "engagement_id": engagement_id,
+    }
+
+
+@pytest.fixture
+def rules(sr):
+    """Patch the cached row loader so tests never touch the database."""
+    def _install(rows):
+        return patch.object(sr, "_get_all_service_prompts", lambda: rows)
+    return _install
+
+
+class TestPrecedence:
+    def test_specificity_beats_priority(self, sr, rules):
+        """A port_service rule leads even when a port rule has better priority."""
+        rows = [
+            _row("service", service="http", title="svc", priority=1),
+            _row("port", port=8080, title="port", priority=1),
+            _row("port_service", service="http", port=8080, title="both", priority=999),
+        ]
+        with rules(rows):
+            got = [r["title"] for r in sr._get_service_prompts("http", 8080)]
+        assert got == ["both", "port", "svc"]
+
+    def test_all_matches_returned_not_just_best(self, sr, rules):
+        """Broad and narrow rules compose rather than shadowing each other."""
+        rows = [
+            _row("service", service="http", title="svc"),
+            _row("port_service", service="http", port=8080, title="both"),
+        ]
+        with rules(rows):
+            assert len(sr._get_service_prompts("http", 8080)) == 2
+
+    def test_priority_breaks_ties_within_a_tier(self, sr, rules):
+        rows = [
+            _row("service", service="http", title="late", priority=200),
+            _row("service", service="http", title="early", priority=1),
+        ]
+        with rules(rows):
+            got = [r["title"] for r in sr._get_service_prompts("http", None)]
+        assert got == ["early", "late"]
+
+    def test_service_match_is_case_insensitive(self, sr, rules):
+        with rules([_row("service", service="http", title="svc")]):
+            assert len(sr._get_service_prompts("HTTP", None)) == 1
+
+
+class TestScoping:
+    def test_non_matching_service_returns_nothing(self, sr, rules):
+        with rules([_row("service", service="http", title="svc")]):
+            assert sr._get_service_prompts("ssh", 22) == []
+
+    def test_port_rule_does_not_match_other_ports(self, sr, rules):
+        with rules([_row("port", port=8080, title="p")]):
+            assert sr._get_service_prompts("http", 443) == []
+
+    def test_port_service_needs_both_to_match(self, sr, rules):
+        rows = [_row("port_service", service="http", port=8080, title="both")]
+        with rules(rows):
+            assert sr._get_service_prompts("http", 443) == []   # right svc, wrong port
+            assert sr._get_service_prompts("ssh", 8080) == []   # right port, wrong svc
+            assert len(sr._get_service_prompts("http", 8080)) == 1
+
+    def test_engagement_rules_do_not_leak(self, sr, rules):
+        rows = [_row("service", service="http", title="scoped", engagement_id="eng-A")]
+        with rules(rows):
+            assert sr._get_service_prompts("http", None, "eng-B") == []
+            assert sr._get_service_prompts("http", None, None) == []
+            assert len(sr._get_service_prompts("http", None, "eng-A")) == 1
+
+    def test_global_rules_apply_within_any_engagement(self, sr, rules):
+        with rules([_row("service", service="http", title="global")]):
+            assert len(sr._get_service_prompts("http", None, "eng-A")) == 1
+
+    def test_engagement_rule_precedes_global_in_same_tier(self, sr, rules):
+        rows = [
+            _row("service", service="http", title="global", priority=1),
+            _row("service", service="http", title="scoped", priority=500,
+                 engagement_id="eng-A"),
+        ]
+        with rules(rows):
+            got = [r["title"] for r in sr._get_service_prompts("http", None, "eng-A")]
+        assert got == ["scoped", "global"]
+
+
+class TestGuidanceBlock:
+    def test_no_rules_yields_empty_string(self, sr, rules):
+        """The critical no-op property: unchanged prompt when unused."""
+        with rules([]):
+            assert sr._build_guidance_block("http", 8080) == ""
+
+    def test_block_labels_each_rule_with_its_scope(self, sr, rules):
+        rows = [
+            _row("port_service", service="http", port=8080, title="T1", prompt="Do X"),
+            _row("service", service="http", title="T2", prompt="Do Y"),
+        ]
+        with rules(rows):
+            block = sr._build_guidance_block("http", 8080)
+        assert "SERVICE-SPECIFIC GUIDANCE" in block
+        assert "[http on port 8080] T1: Do X" in block
+        assert "[service http] T2: Do Y" in block
+        # Most specific must appear first in the injected text.
+        assert block.index("T1") < block.index("T2")
+
+    def test_training_context_empty_without_service_or_port(self, sr):
+        assert sr._get_training_context(None, None) == ""

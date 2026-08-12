@@ -1,0 +1,84 @@
+# Named web scan scope profiles.
+#
+# The web-side counterpart to port_profiles.yaml: where that file controls how
+# WIDE a network sweep goes, this controls how DEEP a web scan digs. Same
+# distribution model — bind-mounted read-only (./knowledge:/knowledge:ro) into
+# pentest-dashboard, autogen-agents, scan-recommender and rag-api.
+#
+# Resolution happens once at the BFF edge (dashboard/bff/services/web_profiles.py),
+# which maps these fields onto each web tool's own parameter names:
+#   - `stages`           -> pipeline skip_* flags and web-scan do_* flags
+#   - `wordlist`         -> gobuster / content-recon wordlist alias
+#   - `max_paths`        -> pipeline max_paths_to_visit, web scan limit
+#   - `crawl_depth`      -> katana depth
+#   - `nuclei_severity`  -> nuclei severity filter
+#   - `nuclei_tags`      -> nuclei tags (empty = let nuclei pick)
+#
+# Operator-authored per-technology guidance (Service Prompts) REFINES these
+# baselines — see /kb/web-guidance. The profile sets the floor; training data
+# adds targeted templates on top for whatever tech was actually detected.
+#
+# `custom` is not an entry here; it is a sentinel meaning "use the individual
+# form fields verbatim".
+
+default: standard
+
+# Stage vocabulary (order is the pipeline's own execution order):
+#   wafw00f    — WAF fingerprint (passive, fast)
+#   katana     — JS-aware crawl
+#   playwright — headless browser render + screenshots
+#   gobuster   — content/dir discovery (the expensive one)
+#   nikto      — legacy web server checks
+#   nuclei     — template-driven vuln scan
+#   zap        — OWASP ZAP active scan (slowest, loudest)
+
+profiles:
+  quick:
+    label: "Quick"
+    description: "Shallow pass for triage or wide scope. WAF check, light crawl, high/critical templates only. No content discovery, no active scanning."
+    stages: [wafw00f, katana, nuclei]
+    wordlist: common
+    max_paths: 25
+    crawl_depth: 1
+    nuclei_severity: "high,critical"
+    nuclei_tags: ""
+
+  standard:
+    label: "Standard"
+    description: "Balanced default. Crawl, render, medium content discovery and medium-and-above templates. No ZAP active scan."
+    stages: [wafw00f, katana, playwright, gobuster, nuclei]
+    wordlist: medium
+    max_paths: 100
+    crawl_depth: 3
+    nuclei_severity: "medium,high,critical"
+    nuclei_tags: ""
+
+  deep:
+    label: "Deep"
+    description: "Everything on, big wordlist, all severities including info, plus the ZAP active scan. Slow and loud — use when you own the window."
+    stages: [wafw00f, katana, playwright, gobuster, nikto, nuclei, zap]
+    wordlist: big
+    max_paths: 500
+    crawl_depth: 5
+    nuclei_severity: "info,low,medium,high,critical"
+    nuclei_tags: ""
+
+  api:
+    label: "API"
+    description: "For JSON/REST targets. JS-aware crawl for endpoint discovery with an API-oriented wordlist; skips browser rendering and directory brute force, which mostly waste time on APIs."
+    stages: [katana, nuclei]
+    wordlist: api
+    max_paths: 200
+    crawl_depth: 4
+    nuclei_severity: "medium,high,critical"
+    nuclei_tags: "api,exposure,misconfig"
+
+  passive-web:
+    label: "Passive web"
+    description: "Fingerprint only — WAF detection and a depth-1 crawl. No content discovery, no vuln templates, no active requests beyond normal browsing."
+    stages: [wafw00f, katana]
+    wordlist: common
+    max_paths: 10
+    crawl_depth: 1
+    nuclei_severity: ""
+    nuclei_tags: ""

@@ -1,0 +1,59 @@
+{
+  "@programName": "ZAP",
+  "@version": "2.15.0",
+  "@generated": "Mon, 10 Aug 2026 10:00:00",
+  "site": [
+    {
+      "@name": "http://10.0.0.9",
+      "@host": "10.0.0.9",
+      "@port": "80",
+      "@ssl": "false",
+      "alerts": [
+        {
+          "pluginid": "40018",
+          "alertRef": "40018",
+          "alert": "SQL Injection",
+          "name": "SQL Injection",
+          "riskcode": "3",
+          "confidence": "2",
+          "riskdesc": "High (Medium)",
+          "desc": "<p>SQL injection may be possible.</p>",
+          "solution": "<p>Use parameterised queries.</p>",
+          "reference": "<p>https://owasp.org/sqli</p>",
+          "cweid": "89",
+          "wascid": "19",
+          "instances": [
+            { "uri": "http://10.0.0.9/search?q=1", "method": "GET",
+              "param": "q", "attack": "1' OR '1'='1", "evidence": "SQL syntax error" },
+            { "uri": "http://10.0.0.9/login", "method": "POST",
+              "param": "user", "attack": "admin'--", "evidence": "SQL syntax error" }
+          ]
+        },
+        {
+          "pluginid": "10021",
+          "alert": "X-Content-Type-Options Header Missing",
+          "name": "X-Content-Type-Options Header Missing",
+          "riskcode": "1",
+          "confidence": "2",
+          "riskdesc": "Low (Medium)",
+          "desc": "<p>The header is not set.</p>",
+          "solution": "<p>Set the header.</p>",
+          "reference": "",
+          "cweid": "693",
+          "instances": [
+            { "uri": "http://10.0.0.9/", "method": "GET", "param": "", "evidence": "" }
+          ]
+        },
+        {
+          "pluginid": "99999",
+          "alert": "Bogus FP alert",
+          "name": "Bogus FP alert",
+          "riskcode": "0",
+          "riskdesc": "False Positive",
+          "desc": "should be skipped",
+          "instances": [ { "uri": "http://10.0.0.9/fp", "method": "GET" } ]
+        }
+      ]
+    }
+  ]
+}

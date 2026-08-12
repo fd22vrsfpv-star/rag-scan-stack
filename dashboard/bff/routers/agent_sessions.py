@@ -15,7 +15,12 @@ class StartSessionRequest(BaseModel):
     initial_task: str
     max_rounds: int = 200
     auto_execute_scans: bool = True
-    proxy: Optional[str] = None  # SOCKS proxy URL from a remote node
+    proxy: Optional[str] = None
+    # Named port scope from knowledge/port_profiles.yaml. Forwarded to the
+    # autogen service, which resolves it once per session (see SessionTracker).
+    port_profile: Optional[str] = None
+    # Named web scan depth from knowledge/web_profiles.yaml.
+    web_profile: Optional[str] = None
 
 
 class ResumeRequest(BaseModel):
