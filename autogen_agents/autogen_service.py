@@ -1527,7 +1527,10 @@ def run_pentest_session_sync(
         )
         team = PentestTeam(passive_only=passive_only, port_profile=port_profile,
                            web_profile=web_profile)
-        session_logger.info(f"[{session_id}] PentestTeam initialized successfully")
+        session_logger.info(
+            f"[{session_id}] PentestTeam initialized successfully"
+            + (f" (prompt config: {team.prompt_config_name})" if team.prompt_config_name else "")
+        )
 
         # Track which model was selected (for A/B testing analysis)
         if team.selected_model != "default":
