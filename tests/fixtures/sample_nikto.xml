@@ -1,0 +1,27 @@
+<?xml version="1.0" ?>
+<!DOCTYPE niktoscan SYSTEM "docs/nikto.dtd">
+<niktoscan hoststest="1" options="-h 10.0.0.5 -Format xml" version="2.5.0">
+<niktoscan>
+<scandetails targetip="10.0.0.5" targethostname="10.0.0.5" targetport="80" targetbanner="Apache/2.4.29" starttime="2026-08-10 10:00:00" sitename="http://10.0.0.5:80/" siteip="http://10.0.0.5:80/" hostheader="10.0.0.5">
+<item id="999957" osvdbid="0" method="GET">
+<description>The anti-clickjacking X-Frame-Options header is not present.</description>
+<uri>/</uri>
+<namelink>http://10.0.0.5:80/</namelink>
+<iplink>http://10.0.0.5:80/</iplink>
+</item>
+<item id="999103" osvdbid="3092" method="GET">
+<description>/admin/: This might be interesting... potential admin login page found.</description>
+<uri>/admin/</uri>
+<namelink>http://10.0.0.5:80/admin/</namelink>
+<iplink>http://10.0.0.5:80/admin/</iplink>
+</item>
+<item id="600012" osvdbid="0" method="GET">
+<description>/cgi-bin/test.cgi: Possible remote code execution vector detected.</description>
+<uri>/cgi-bin/test.cgi</uri>
+<namelink>http://10.0.0.5:80/cgi-bin/test.cgi</namelink>
+<iplink>http://10.0.0.5:80/cgi-bin/test.cgi</iplink>
+</item>
+<statistics elapsed="12" itemsfound="3" itemstested="6000" endtime="2026-08-10 10:00:12"/>
+</scandetails>
+</niktoscan>
+</niktoscan>
