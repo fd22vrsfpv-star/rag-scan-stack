@@ -175,6 +175,7 @@ The database can run **local** (default), **remote over an SSH tunnel**, or **re
 - [`Docs/START_HERE.md`](Docs/START_HERE.md) — getting started + common workflows (external / internal / web app)
 - [`Docs/EXECUTIVE_OVERVIEW.md`](Docs/EXECUTIVE_OVERVIEW.md) — capabilities and positioning
 - [`Docs/DATABASE_SCHEMA.md`](Docs/DATABASE_SCHEMA.md) — the normalized data model
+- [`Docs/KNOWLEDGE_BASE_GUIDE.md`](Docs/KNOWLEDGE_BASE_GUIDE.md) — teaching the AI: playbooks, per-service/port/technology prompts, training data, and converting lab walkthroughs into reusable rules
 - [`Docs/API_ENDPOINTS.md`](Docs/API_ENDPOINTS.md) / [`Docs/RAG_STACK_API_REFERENCE.md`](Docs/RAG_STACK_API_REFERENCE.md) — API reference
 - [`Docs/DEPLOYMENT.md`](Docs/DEPLOYMENT.md), [`Docs/QUICKSTART-MACOS.md`](Docs/QUICKSTART-MACOS.md), [`Docs/QUICKSTART-WINDOWS.md`](Docs/QUICKSTART-WINDOWS.md) — deployment guides
 - [`Docs/HEALTH_CHECK_GUIDE.md`](Docs/HEALTH_CHECK_GUIDE.md) — health checks and diagnostics

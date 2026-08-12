@@ -7,6 +7,7 @@ import {
   type ServicePrompt, type ServicePromptInput, type SelectorType,
 } from '@/api/servicePrompts'
 import { useKBServices } from '@/api/kb'
+import { WalkthroughDraftPanel } from '@/components/common/WalkthroughDraftPanel'
 import { cn } from '@/lib/utils'
 import { Plus, Trash2, Pencil, FlaskConical, BookOpen, X } from 'lucide-react'
 
@@ -331,8 +332,33 @@ export default function ServicePrompts() {
             Priority only breaks ties within the same specificity (lower runs first).</li>
           <li><strong>No rules means no change</strong> — services you haven’t written rules for
             behave exactly as before.</li>
+          <li><strong>Worked example</strong> — “SNMP on 161” as a <em>service on port</em> rule
+            telling the AI to try default community strings before anything else, plus a broader
+            “SNMP anywhere” <em>service</em> rule that still fires when SNMP turns up on a
+            non-standard port. Both are injected, most specific first. See
+            {' '}<code>knowledge/seed_prompts.example.yaml</code>.</li>
+          <li><strong>Bulk loading</strong> — <code>./scripts/import-knowledge.sh --file seed.yaml</code>
+            {' '}creates or updates rules and training docs from one file, so re-running is safe.
+            Add <code>--dry-run</code> to preview what would change.</li>
+          <li><strong>Drafting from a walkthrough</strong> — the panel above (or
+            {' '}<code>./scripts/walkthrough-to-seed.sh writeup.md</code>) reads a lab writeup and
+            extracts the technique that would still apply to a <em>different</em> host. It never
+            writes directly: proposals containing anything box-specific — credentials, flag values,
+            hashes, lab IPs — arrive flagged and unticked. Vendor defaults often trip that check
+            legitimately, so read the reason before discarding. Steer what it extracts with the
+            Guiding prompt editor, or a per-run focus.</li>
         </ul>
       </PageHelp>
+
+      {/* Collapsed by default — drafting is occasional, testing is routine. */}
+      <details className="bg-card border border-border rounded-lg">
+        <summary className="px-3 py-2 text-xs font-semibold cursor-pointer hover:bg-muted/30">
+          Draft rules from a walkthrough
+        </summary>
+        <div className="p-2 pt-0">
+          <WalkthroughDraftPanel />
+        </div>
+      </details>
 
       <TestPanel />
 
