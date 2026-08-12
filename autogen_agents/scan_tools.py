@@ -40,6 +40,13 @@ import threading
 from datetime import datetime
 import uuid
 
+from port_profiles import (
+    PortProfileError,
+    count_ports as count_profile_ports,
+    resolve as resolve_port_profile,
+)
+from web_profiles import WebProfileError, resolve as resolve_web_profile
+
 # Configure logging
 DEBUG_MODE = os.environ.get("SCAN_DEBUG", "false").lower() == "true"
 MCP_MODE = os.environ.get("MCP_MODE", "false").lower() == "true"
@@ -52,6 +59,21 @@ _HIGH_WEB_PORTS = ",".join(
 )
 DEFAULT_QUICK_PORTS = f"1-1000,{_HIGH_WEB_PORTS}" if _HIGH_WEB_PORTS else "1-1000"
 DEFAULT_DEEP_SCAN_PORTS = os.environ.get("DEEP_SCAN_PORTS", "1001-65535")
+
+
+def _is_known_port_scope(ports: str) -> bool:
+    """True if `ports` exactly matches a resolved port profile.
+
+    Used to widen the anti-hallucination guard in start_full_scan: a range the
+    operator actually selected is legitimate, an LLM-invented one is not.
+    """
+    if not ports:
+        return False
+    try:
+        from port_profiles import load_profiles
+        return any(p["ports"] == ports for p in load_profiles()["profiles"].values())
+    except Exception:
+        return False
 LOG_LEVEL = logging.DEBUG if DEBUG_MODE else logging.INFO
 
 # Only configure basicConfig if NOT in MCP mode (MCP uses stdio and stderr logging breaks it)
@@ -108,10 +130,48 @@ class SessionScanTracker:
     }
 
     @classmethod
-    def set_session(cls, session_id: str):
-        """Set the current session context for this thread."""
+    def set_session(cls, session_id: str, port_profile: str = None,
+                    web_profile: str = None):
+        """Set the current session context for this thread.
+
+        `port_profile` names an entry in knowledge/port_profiles.yaml and fixes
+        the port scope for every discovery scan this session runs.  It is
+        resolved once here (rather than per tool call) so a bad id fails loudly
+        at session start instead of silently mid-run, and so the LLM never has
+        to pass port ranges — which is where it hallucinates most.
+        """
         cls._local.session_id = session_id
         cls._local.started_at = datetime.utcnow().isoformat() + "Z"
+
+        cls._local.port_profile = port_profile or None
+        cls._local.port_scope = None
+        if port_profile:
+            try:
+                cls._local.port_scope = resolve_port_profile(port_profile)
+                logger.info(
+                    f"[SessionScanTracker] Port scope for {session_id}: "
+                    f"{port_profile} ({count_profile_ports(cls._local.port_scope)} ports)"
+                )
+            except PortProfileError as e:
+                # Fall back to the agent's built-in quick/deep policy rather than
+                # aborting the session; the warning names the bad id.
+                logger.warning(f"[SessionScanTracker] Ignoring bad port_profile {port_profile!r}: {e}")
+                cls._local.port_profile = None
+
+        # Web scan depth, resolved once for the same reasons as the port scope.
+        cls._local.web_profile = web_profile or None
+        cls._local.web_scope = None
+        if web_profile:
+            try:
+                cls._local.web_scope = resolve_web_profile(web_profile)
+                if cls._local.web_scope:
+                    logger.info(
+                        f"[SessionScanTracker] Web scope for {session_id}: {web_profile} "
+                        f"(stages: {','.join(cls._local.web_scope['stages'])})"
+                    )
+            except WebProfileError as e:
+                logger.warning(f"[SessionScanTracker] Ignoring bad web_profile {web_profile!r}: {e}")
+                cls._local.web_profile = None
 
         # Initialize session in registry if needed
         with cls._lock:
@@ -122,21 +182,45 @@ class SessionScanTracker:
                     "scans": [],
                     "current_phase": "INITIALIZING",
                 }
-        logger.info(f"[SessionTracker] Session context set: {session_id}")
+        logger.info(f"[SessionScanTracker] Session context set: {session_id}")
 
     @classmethod
     def clear_session(cls):
         """Clear the current session context."""
         session_id = getattr(cls._local, 'session_id', None)
         if session_id:
-            logger.info(f"[SessionTracker] Session context cleared: {session_id}")
+            logger.info(f"[SessionScanTracker] Session context cleared: {session_id}")
         cls._local.session_id = None
         cls._local.started_at = None
+        cls._local.port_profile = None
+        cls._local.port_scope = None
+        cls._local.web_profile = None
+        cls._local.web_scope = None
 
     @classmethod
     def get_current_session(cls) -> Optional[str]:
         """Get the current session ID for this thread."""
         return getattr(cls._local, 'session_id', None)
+
+    @classmethod
+    def get_port_scope(cls) -> Optional[str]:
+        """Resolved port string for this session, or None to use agent defaults."""
+        return getattr(cls._local, 'port_scope', None)
+
+    @classmethod
+    def get_port_profile(cls) -> Optional[str]:
+        """Port profile id in effect for this session, if any."""
+        return getattr(cls._local, 'port_profile', None)
+
+    @classmethod
+    def get_web_scope(cls) -> Optional[dict]:
+        """Resolved web profile settings for this session, or None."""
+        return getattr(cls._local, 'web_scope', None)
+
+    @classmethod
+    def get_web_profile(cls) -> Optional[str]:
+        """Web profile id in effect for this session, if any."""
+        return getattr(cls._local, 'web_profile', None)
 
     @classmethod
     def send_heartbeat(cls):
@@ -174,7 +258,7 @@ class SessionScanTracker:
         """
         session_id = cls.get_current_session()
         if not session_id:
-            logger.debug(f"[SessionTracker] No session context, not tracking {scan_type} job {job_id}")
+            logger.debug(f"[SessionScanTracker] No session context, not tracking {scan_type} job {job_id}")
             return
 
         scan_entry = {
@@ -195,7 +279,7 @@ class SessionScanTracker:
                     scan_type, "SCANNING"
                 )
 
-        logger.info(f"[SessionTracker] Tracked {scan_type} job {job_id} for session {session_id}")
+        logger.info(f"[SessionScanTracker] Tracked {scan_type} job {job_id} for session {session_id}")
 
     @classmethod
     def update_scan_status(cls, job_id: str, status: str, result_summary: Dict = None):
@@ -230,7 +314,7 @@ class SessionScanTracker:
 
                         # Persist to database when scan completes
                         if status in ("completed", "failed"):
-                            logger.info(f"[SessionTracker] Scan {job_id} {status}, persisting session data")
+                            logger.info(f"[SessionScanTracker] Scan {job_id} {status}, persisting session data")
                             # Release lock before calling persist (it may acquire locks)
                             from threading import Thread
                             Thread(target=cls.persist_to_db, args=(session_id,), daemon=True).start()
@@ -258,7 +342,7 @@ class SessionScanTracker:
             session_data = cls._registry.get(session_id)
             if not session_data:
                 # Try to restore from database before giving up
-                logger.info(f"[SessionTracker] Session {session_id} not in memory, attempting database restore")
+                logger.info(f"[SessionScanTracker] Session {session_id} not in memory, attempting database restore")
 
         # Release lock before calling restore (it acquires its own lock)
         if not session_data:
@@ -355,7 +439,7 @@ class SessionScanTracker:
             conn.close()
 
             if not rows:
-                logger.debug(f"[SessionTracker] No persisted scans found for session {session_id}")
+                logger.debug(f"[SessionScanTracker] No persisted scans found for session {session_id}")
                 return
 
             # Initialize session in tracker if not exists
@@ -382,10 +466,10 @@ class SessionScanTracker:
                     }
                     cls._registry[session_id]["scans"].append(scan_data)
 
-            logger.info(f"[SessionTracker] Restored {len(rows)} scans for session {session_id} from database")
+            logger.info(f"[SessionScanTracker] Restored {len(rows)} scans for session {session_id} from database")
 
         except Exception as e:
-            logger.error(f"[SessionTracker] Failed to restore session {session_id} from database: {e}")
+            logger.error(f"[SessionScanTracker] Failed to restore session {session_id} from database: {e}")
 
     @classmethod
     def persist_to_db(cls, session_id: str):
@@ -396,7 +480,7 @@ class SessionScanTracker:
         with cls._lock:
             session_data = cls._registry.get(session_id)
             if not session_data or not session_data.get("scans"):
-                logger.debug(f"[SessionTracker] Nothing to persist for session {session_id}")
+                logger.debug(f"[SessionScanTracker] Nothing to persist for session {session_id}")
                 return
 
             scans = list(session_data["scans"])
@@ -430,9 +514,9 @@ class SessionScanTracker:
             conn.commit()
             cur.close()
             conn.close()
-            logger.info(f"[SessionTracker] Persisted {len(scans)} scan entries for session {session_id}")
+            logger.info(f"[SessionScanTracker] Persisted {len(scans)} scan entries for session {session_id}")
         except Exception as e:
-            logger.warning(f"[SessionTracker] Failed to persist scans for {session_id}: {e}")
+            logger.warning(f"[SessionScanTracker] Failed to persist scans for {session_id}: {e}")
 
     @classmethod
     def cleanup_session(cls, session_id: str):
@@ -440,7 +524,7 @@ class SessionScanTracker:
         with cls._lock:
             if session_id in cls._registry:
                 del cls._registry[session_id]
-                logger.info(f"[SessionTracker] Cleaned up session {session_id}")
+                logger.info(f"[SessionScanTracker] Cleaned up session {session_id}")
 
 
 # Global tracker instance
@@ -2317,10 +2401,27 @@ def start_full_scan(
         quick_ports = DEFAULT_QUICK_PORTS
     if rate is None:
         rate = 1000
-    # full_ports should only be non-empty when explicitly set to DEEP_SCAN_PORTS.
-    # LLMs frequently hallucinate values here, so reject anything that isn't
-    # a recognized deep-scan range pattern (e.g. "1001-65535").
-    if full_ports and full_ports != DEFAULT_DEEP_SCAN_PORTS:
+
+    # Session-level port scope (set from the operator's Port Scope selector)
+    # overrides the agent's default quick range.  The operator's explicit
+    # choice outranks whatever the LLM decided to pass — that is the whole
+    # point of the selector.
+    session_scope = scan_tracker.get_port_scope()
+    if session_scope and quick_ports != session_scope:
+        logger.info(
+            f"Port scope '{scan_tracker.get_port_profile()}' overrides "
+            f"quick_ports={quick_ports!r} → {session_scope[:40]}..."
+        )
+        quick_ports = session_scope
+        # A session scope already defines the full sweep; a second deep pass
+        # over 1001-65535 would rescan ports the operator either asked for
+        # (profile 'all') or deliberately excluded.
+        full_ports = ""
+
+    # full_ports should only be non-empty when explicitly set to DEEP_SCAN_PORTS
+    # or to a resolved port profile.  LLMs frequently hallucinate values here,
+    # so reject anything that isn't recognized.
+    if full_ports and full_ports != DEFAULT_DEEP_SCAN_PORTS and not _is_known_port_scope(full_ports):
         logger.warning(f"Ignoring unexpected full_ports='{full_ports}', expected '' or '{DEFAULT_DEEP_SCAN_PORTS}'")
         full_ports = ""
     if full_ports is None:
@@ -2375,6 +2476,26 @@ def start_deep_port_scan(
     targets = targets or target
     if not targets:
         return json.dumps({"error": "No target specified. Use 'targets' parameter with a string like '192.168.1.150'."})
+
+    # When the operator pinned a port scope for this session, the quick scan
+    # already covered exactly the ports they asked for.  A 1001-65535 sweep here
+    # would either duplicate that work (profile 'all') or scan ports they
+    # deliberately excluded — so decline instead, and say why.
+    session_scope = scan_tracker.get_port_scope()
+    if session_scope:
+        profile_id = scan_tracker.get_port_profile()
+        logger.info(f"Skipping deep port scan — session port scope '{profile_id}' already covers the intended range")
+        return json.dumps({
+            "skipped": True,
+            "reason": (
+                f"This session runs with the '{profile_id}' port scope "
+                f"({count_profile_ports(session_scope)} ports), which start_full_scan "
+                f"already covered. A deep 1001-65535 sweep would go outside the "
+                f"operator's selected scope. Do NOT retry this tool — move on to "
+                f"analysing results or running service-specific follow-up scans."
+            ),
+            "port_profile": profile_id,
+        }, indent=2)
 
     # Delegate to start_full_scan with high-port range as the quick scan
     result_str = start_full_scan(
@@ -2533,6 +2654,10 @@ def start_web_scan(do_gobuster: bool = True, do_zap: bool = True, limit: int = 2
     """
     Start a web scan with Gobuster and/or ZAP.
 
+    If the operator selected a web scan depth for this session, its stage list
+    decides which tools run and how many targets are taken — their choice
+    outranks whatever the model passed, which is the point of the selector.
+
     Args:
         do_gobuster: Run Gobuster directory enumeration
         do_zap: Run ZAP proxy scanning
@@ -2540,6 +2665,16 @@ def start_web_scan(do_gobuster: bool = True, do_zap: bool = True, limit: int = 2
 
     Returns JSON string with job information.
     """
+    web_scope = scan_tracker.get_web_scope()
+    if web_scope:
+        stages = set(web_scope["stages"])
+        do_gobuster, do_zap = "gobuster" in stages, "zap" in stages
+        limit = web_scope["max_paths"]
+        logger.info(
+            f"Web scope '{scan_tracker.get_web_profile()}' applied: "
+            f"gobuster={do_gobuster}, zap={do_zap}, limit={limit}"
+        )
+
     result = get_scan_tools().start_web_scan(do_gobuster, do_zap, limit)
 
     # Track the scan job
@@ -2589,6 +2724,25 @@ def start_pipeline_scan(
 
     Returns JSON string with job information including job_id and stages.
     """
+    # A session web scope decides which stages run and how deep. Note the
+    # inversion: the profile lists stages to RUN, these params name stages to
+    # SKIP, so each flag is the negation of stage membership.
+    web_scope = scan_tracker.get_web_scope()
+    if web_scope:
+        stages = set(web_scope["stages"])
+        skip_gobuster = "gobuster" not in stages
+        skip_playwright = "playwright" not in stages
+        skip_zap = "zap" not in stages
+        skip_nuclei = "nuclei" not in stages
+        skip_katana = "katana" not in stages
+        wordlist = wordlist or web_scope["wordlist"] or None
+        max_paths_to_visit = web_scope["max_paths"]
+        logger.info(
+            f"Web scope '{scan_tracker.get_web_profile()}' applied to pipeline: "
+            f"stages={','.join(sorted(stages))}, wordlist={wordlist}, "
+            f"max_paths={max_paths_to_visit}"
+        )
+
     result = get_scan_tools().start_pipeline_scan(
         target_url, wordlist, max_paths_to_visit,
         skip_gobuster, skip_playwright, skip_zap, skip_nuclei, skip_katana
@@ -2622,6 +2776,15 @@ def start_nuclei_scan(limit: int = 25, severity: str = "medium,high,critical", a
 
     Returns JSON string with job information.
     """
+    web_scope = scan_tracker.get_web_scope()
+    if web_scope and web_scope.get("nuclei_severity"):
+        severity = web_scope["nuclei_severity"]
+        limit = web_scope["max_paths"]
+        logger.info(
+            f"Web scope '{scan_tracker.get_web_profile()}' applied to nuclei: "
+            f"severity={severity}, limit={limit}"
+        )
+
     result = get_scan_tools().start_nuclei_scan(limit, severity, all_ports)
 
     # Track the scan job

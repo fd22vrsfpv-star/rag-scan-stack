@@ -7,6 +7,8 @@ import {
 import { useEngagementScopes } from '@/api/engagements'
 import { useNodes } from '@/api/nodes'
 import { apiFetch } from '@/api/client'
+import { usePortProfiles, CUSTOM_PROFILE } from '@/api/portProfiles'
+import { useWebProfiles, describeWebProfile } from '@/api/webProfiles'
 import { useScanDefaultsStore } from '@/stores/scanDefaults'
 import { Play, Pause, Square, RefreshCw, Zap } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -43,29 +45,51 @@ export function ReconAgentPanel({ engagementId }: { engagementId: string }) {
   const activeProxy = activeConfig?.proxy as string | undefined
   const activeUseTunnels = activeConfig?.use_tunnels as boolean | undefined
 
+  // Posture presets. `portProfile` names an entry in knowledge/port_profiles.yaml —
+  // port strings themselves live server-side and are never hardcoded here.
   const PROFILE_PRESETS = {
-    pentest:  { ports: '--top-ports 1000', interval: 300,  label: 'Pentest — top 1000 ports, 5 min cycle' },
-    redteam:  { ports: '21,22,25,80,443,8080,8443,3389,445,3306,5432', interval: 600, label: 'Redteam — targeted ports, 10 min cycle, jitter' },
-    custom:   { ports: '--top-ports 1000', interval: 300, label: 'Custom' },
+    pentest:  { portProfile: 'top-1000',         interval: 300, label: 'Pentest — top 1000 ports, 5 min cycle' },
+    redteam:  { portProfile: 'redteam-targeted', interval: 600, label: 'Redteam — targeted ports, 10 min cycle, jitter' },
+    custom:   { portProfile: 'top-1000',         interval: 300, label: 'Custom' },
   }
+
+  const { data: portProfilesData } = usePortProfiles()
+  const portProfiles = portProfilesData?.profiles ?? []
 
   // Initialize from: saved agent config > global Settings profile > default
   const savedProfile = (activeConfig?.profile as string) || ''
   const initProfile = (savedProfile === 'pentest' || savedProfile === 'redteam') ? savedProfile
     : (globalProfile === 'pentest' || globalProfile === 'redteam') ? globalProfile : 'pentest'
   const [agentProfile, setAgentProfile] = useState<'pentest' | 'redteam' | 'custom'>(initProfile)
-  const [ports, setPorts] = useState(
-    (activeConfig?.ports as string) || PROFILE_PRESETS[initProfile]?.ports || '--top-ports 1000'
+
+  // Port scope is independent of posture. Agents enabled before profiles existed
+  // carry a literal `ports` string and no `port_profile`; show those as "custom"
+  // with the value they're actually running so nothing changes silently.
+  const savedPortProfile = (activeConfig?.port_profile as string) || ''
+  const savedPorts = (activeConfig?.ports as string) || ''
+  const [portProfile, setPortProfile] = useState<string>(
+    savedPortProfile || (savedPorts ? CUSTOM_PROFILE : PROFILE_PRESETS[initProfile].portProfile)
   )
+  const [ports, setPorts] = useState(savedPorts)
 
   // Sync when global profile changes in Settings (only if agent isn't already running with custom config)
   useEffect(() => {
     if (!enabled && (globalProfile === 'pentest' || globalProfile === 'redteam')) {
       setAgentProfile(globalProfile)
-      setPorts(PROFILE_PRESETS[globalProfile].ports)
+      setPortProfile(PROFILE_PRESETS[globalProfile].portProfile)
       setInterval(PROFILE_PRESETS[globalProfile].interval)
     }
   }, [globalProfile])
+
+  const selectedPortProfile = portProfiles.find(p => p.id === portProfile)
+
+  // Web scan depth for the agent's web-tool dispatches. '' = tool defaults.
+  const { data: webProfilesData } = useWebProfiles()
+  const webProfiles = webProfilesData?.profiles ?? []
+  const [webProfile, setWebProfile] = useState<string>(
+    (activeConfig?.web_profile as string) || '',
+  )
+  const selectedWebProfile = webProfiles.find(p => p.id === webProfile)
   const [blockLocal, setBlockLocal] = useState(false)
   useEffect(() => {
     apiFetch<{ value: string }>('/settings/config/block_local_scans')
@@ -95,6 +119,7 @@ export function ReconAgentPanel({ engagementId }: { engagementId: string }) {
           <li><strong>Fills coverage gaps</strong> — checks which scope targets haven't been scanned yet at each stage (Discovery → Fingerprint → Exploit) and auto-dispatches scans</li>
           <li><strong>Never duplicates</strong> — tracks every (target + stage + scan type) in the coverage table AND checks in-flight jobs before dispatching. A target that already has a completed or running nmap scan won't get another one</li>
           <li><strong>Respects profile</strong> — pentest mode dispatches up to 5 scans/cycle; redteam mode limits to 2 with random jitter (0-120s) per dispatch to avoid IDS detection</li>
+          <li><strong>Honours port scope</strong> — the Port scope selector controls how wide each discovery scan sweeps, from the top 100 ports up to all 65,535. Wider scope finds services on non-standard ports that top-N misses, at the cost of time and noise</li>
           <li><strong>Logs everything</strong> — every cycle's decisions are recorded in the Campaign Timeline (operator: recon_agent) for full audit trail</li>
         </ul>
         <p className="text-[10px]">Stages: <strong>Discovery</strong> (masscan+nmap) → <strong>Fingerprint</strong> (httpx probe) → <strong>Exploit</strong> (nuclei CVE scan). Each target progresses independently.</p>
@@ -134,7 +159,7 @@ export function ReconAgentPanel({ engagementId }: { engagementId: string }) {
                   const p = e.target.value as 'pentest' | 'redteam' | 'custom'
                   setAgentProfile(p)
                   if (p !== 'custom') {
-                    setPorts(PROFILE_PRESETS[p].ports)
+                    setPortProfile(PROFILE_PRESETS[p].portProfile)
                     setInterval(PROFILE_PRESETS[p].interval)
                   }
                 }}
@@ -145,25 +170,69 @@ export function ReconAgentPanel({ engagementId }: { engagementId: string }) {
               </select>
               <span className="text-[9px] text-muted-foreground">{PROFILE_PRESETS[agentProfile].label}</span>
             </div>
+
+            {/* Port scope — available for EVERY posture, not just custom. */}
+            <div className="flex items-center gap-1.5">
+              <label className="text-xs text-muted-foreground">Port scope:</label>
+              <select value={portProfile} onChange={e => setPortProfile(e.target.value)}
+                className="bg-muted rounded px-2 py-1 text-xs border border-border">
+                {portProfiles.map(p => (
+                  <option key={p.id} value={p.id}>{p.label}</option>
+                ))}
+                <option value={CUSTOM_PROFILE}>Custom…</option>
+              </select>
+              {selectedPortProfile && (
+                <span className="text-[9px] text-muted-foreground"
+                      title={selectedPortProfile.description}>
+                  {selectedPortProfile.port_count.toLocaleString()} ports
+                </span>
+              )}
+              {portProfilesData?.degraded && (
+                <span className="text-[9px] text-yellow-400"
+                      title="knowledge/port_profiles.yaml could not be read — check the /knowledge mount on pentest-dashboard">
+                  ⚠ profiles degraded
+                </span>
+              )}
+            </div>
+            {portProfile === CUSTOM_PROFILE && (
+              <div className="flex items-center gap-1.5">
+                <label className="text-xs text-muted-foreground">Ports:</label>
+                <input value={ports} onChange={e => setPorts(e.target.value)}
+                  placeholder="1-65535 or 22,80,443"
+                  className="bg-muted rounded px-2 py-1 text-xs border border-border w-48" />
+              </div>
+            )}
+
+            {/* Web scan depth — applies to the agent's httpx/nuclei/web dispatches. */}
+            {webProfiles.length > 0 && (
+              <div className="flex items-center gap-1.5">
+                <label className="text-xs text-muted-foreground">Web depth:</label>
+                <select value={webProfile} onChange={e => setWebProfile(e.target.value)}
+                  className="bg-muted rounded px-2 py-1 text-xs border border-border">
+                  <option value="">Tool defaults</option>
+                  {webProfiles.map(p => (
+                    <option key={p.id} value={p.id}>{p.label}</option>
+                  ))}
+                </select>
+                {selectedWebProfile && (
+                  <span className="text-[9px] text-muted-foreground"
+                        title={`${selectedWebProfile.description}\n\nRuns: ${selectedWebProfile.stages.join(', ')}`}>
+                    {describeWebProfile(selectedWebProfile)}
+                  </span>
+                )}
+              </div>
+            )}
             {agentProfile === 'custom' && (
-              <>
-                <div className="flex items-center gap-1.5">
-                  <label className="text-xs text-muted-foreground">Interval:</label>
-                  <select value={interval} onChange={e => setInterval(Number(e.target.value))}
-                    className="bg-muted rounded px-2 py-1 text-xs border border-border">
-                    <option value={60}>1 min</option>
-                    <option value={300}>5 min</option>
-                    <option value={600}>10 min</option>
-                    <option value={1800}>30 min</option>
-                  </select>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <label className="text-xs text-muted-foreground">Ports:</label>
-                  <input value={ports} onChange={e => setPorts(e.target.value)}
-                    placeholder="--top-ports 1000"
-                    className="bg-muted rounded px-2 py-1 text-xs border border-border w-48" />
-                </div>
-              </>
+              <div className="flex items-center gap-1.5">
+                <label className="text-xs text-muted-foreground">Interval:</label>
+                <select value={interval} onChange={e => setInterval(Number(e.target.value))}
+                  className="bg-muted rounded px-2 py-1 text-xs border border-border">
+                  <option value={60}>1 min</option>
+                  <option value={300}>5 min</option>
+                  <option value={600}>10 min</option>
+                  <option value={1800}>30 min</option>
+                </select>
+              </div>
             )}
             {scopes.length > 0 && (
               <div className="flex items-center gap-1.5">
@@ -238,7 +307,11 @@ export function ReconAgentPanel({ engagementId }: { engagementId: string }) {
               </div>
             )}
             <button onClick={() => {
-                const config: Record<string, unknown> = { profile: agentProfile, ports }
+                const config: Record<string, unknown> = { profile: agentProfile, port_profile: portProfile }
+                // Only meaningful for the custom scope; the BFF ignores `ports`
+                // whenever a named profile is set.
+                if (portProfile === CUSTOM_PROFILE && ports.trim()) config.ports = ports.trim()
+                if (webProfile) config.web_profile = webProfile
                 if (selectedScopes.length > 0) config.scope_names = selectedScopes
                 if (selectedTunnel === 'round-robin') {
                   config.use_tunnels = true
@@ -275,8 +348,20 @@ export function ReconAgentPanel({ engagementId }: { engagementId: string }) {
           {!!activeConfig?.profile && (
             <span>Profile: {String(activeConfig.profile)}</span>
           )}
+          {!!activeConfig?.port_profile && activeConfig.port_profile !== CUSTOM_PROFILE && (
+            <span>
+              Port scope: {portProfiles.find(p => p.id === activeConfig.port_profile)?.label
+                ?? String(activeConfig.port_profile)}
+            </span>
+          )}
           {!!activeConfig?.ports && (
             <span>Ports: {String(activeConfig.ports)}</span>
+          )}
+          {!!activeConfig?.web_profile && (
+            <span>
+              Web depth: {webProfiles.find(p => p.id === activeConfig.web_profile)?.label
+                ?? String(activeConfig.web_profile)}
+            </span>
           )}
           {activeUseTunnels && (
             <span className="text-cyan-400">

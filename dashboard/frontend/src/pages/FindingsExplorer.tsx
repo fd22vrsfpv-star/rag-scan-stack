@@ -4,6 +4,7 @@ import PageHelp from '@/components/PageHelp'
 import InfoTip from '@/components/InfoTip'
 import { useInfiniteFindings, useUpdateFindingWorkflow, useFindingActivity, useAddFindingComment, useExploitMatches, useUpdateFindingTags, useTagSuggestions, useDeleteFindings, type FindingsFilter } from '@/api/findings'
 import { ScopeAssignModal } from '@/components/common/ScopeAssignModal'
+import { WebScanImportPanel } from '@/components/common/WebScanImportPanel'
 import { useFindingEvidence, useUploadEvidence, useLinkEvidence } from '@/api/evidence'
 import { useScopeNames, useAddToScope, useScope } from '@/api/scope'
 import { ScopeFilter } from '@/components/common/ScopeFilter'
@@ -254,6 +255,16 @@ export default function FindingsExplorer() {
       <PageHelp id="findings" title="How to use Findings">
         <p>All findings from every scan tool in one place. Use the filters to narrow by <strong>severity</strong>, <strong>source tool</strong>, <strong>host</strong>, or <strong>port</strong>. Click any finding to see full evidence, set workflow status, assign to team members, and add tester notes. Use the checkboxes for bulk actions (delete, export). Findings with the same title auto-group — expand to see individual instances.</p>
       </PageHelp>
+      {/* Bring in findings from tools run outside this stack. Collapsed by
+          default so it doesn't crowd the findings table. */}
+      <details className="bg-card border border-border rounded-lg">
+        <summary className="px-3 py-2 text-xs font-semibold cursor-pointer hover:bg-muted/30">
+          Import a scan report (ZAP · Nikto · Burp · Nuclei)
+        </summary>
+        <div className="p-2 pt-0">
+          <WebScanImportPanel />
+        </div>
+      </details>
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold">Findings Explorer</h2>
         <div className="flex items-center gap-3">
