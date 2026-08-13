@@ -229,6 +229,31 @@ the number down.
 
 If services you care about are missing, re-run with `--focus` naming them.
 
+#### The gap pass
+
+The chunk pass asks "find everything", which a local model does unreliably on a long
+catalogue. Since the coverage report already knows what was missed, a second pass
+re-asks for each missed service **individually** — a focused prompt naming one service
+is a task a small model handles far better.
+
+On by default; `--no-gap-pass` skips it. Cost scales with the gap, not the document,
+and is capped by `WALKTHROUGH_GAP_MAX` (default 15).
+
+```
+GAP PASS: re-asked for 15 missed service(s), recovered 5 rule(s)
+```
+
+Measured on the Rapid7 guide: a chunk pass that returned only 2 rules (one chunk
+response was unparsable) was lifted to 7 by the gap pass. It is a **floor under
+first-pass variance** — the same input and settings produced 10 rules on one run and
+2 on the next, which is the real problem with a local model.
+
+It is not a cure. Focused calls are more reliable, not reliable: mysql, smb, ftp and
+others still came back empty. Two knobs if you need more: `WALKTHROUGH_GAP_MAX` and
+`WALKTHROUGH_CHUNK_CHARS` (6000; smaller may help, unmeasured).
+
+Roughly 15 extra calls costs ~15 minutes on a local `gemma4:31b`.
+
 #### Extraction quality depends on the model
 
 The guiding prompt now adapts: a **narrative walkthrough** of one box yields a few
