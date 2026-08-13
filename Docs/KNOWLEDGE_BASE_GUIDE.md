@@ -236,8 +236,15 @@ catalogue. Since the coverage report already knows what was missed, a second pas
 re-asks for each missed service **individually** — a focused prompt naming one service
 is a task a small model handles far better.
 
-On by default; `--no-gap-pass` skips it. Cost scales with the gap, not the document,
-and is capped by `WALKTHROUGH_GAP_MAX` (default 15).
+On by default; `--no-gap-pass` skips it, as does unticking **Second pass for missed
+services** in the UI panel. Cost scales with the gap, not the document, and is capped
+by `WALKTHROUGH_GAP_MAX` (default 15).
+
+In the browser the same report appears above the drafted rules. Note the proxy
+timeouts: `dashboard/nginx.conf` gives the two convert routes 1800s/1200s while the
+rest of `/api/` stays at 300s. If you raise the BFF timeouts in
+`dashboard/bff/routers/kb.py`, raise these too — nginx is in front and must be the
+looser of the two, or its generic 504 replaces the BFF's specific message.
 
 ```
 GAP PASS: re-asked for 15 missed service(s), recovered 5 rule(s)
