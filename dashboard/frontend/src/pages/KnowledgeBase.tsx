@@ -1,4 +1,6 @@
 import { useState } from 'react'
+import PageHelp from '@/components/PageHelp'
+import { useIngestPlaybooks, useServiceDocs } from '@/api/rag'
 import {
   useKBServices,
   useKBService,
@@ -855,6 +857,9 @@ export default function KnowledgeBase() {
   const [showAdd, setShowAdd] = useState(false)
   const [search, setSearch] = useState('')
 
+  const ingestPlaybooks = useIngestPlaybooks()
+  const { data: serviceDocs } = useServiceDocs()
+
   const services = (data?.services || []).filter(
     s =>
       !search ||
@@ -864,6 +869,91 @@ export default function KnowledgeBase() {
 
   return (
     <div className="space-y-4">
+      <PageHelp id="knowledge-base" title="How to add knowledge, and how the AI uses it">
+        <p>
+          Four ways in, from broadest to most specific. They stack — a general playbook
+          and a rule for one port both apply.
+        </p>
+        <ul className="list-disc pl-4 space-y-1 mt-1">
+          <li>
+            <strong>Methodology corpus</strong> — drop markdown into <code>knowledge/playbooks/</code>,
+            then re-ingest (below or <code>./scripts/import-knowledge.sh --playbooks</code>). Chunked
+            heading-aware; re-ingesting an edited file replaces its chunks rather than duplicating.
+            Retrieved generally, not tied to a service.
+          </li>
+          <li>
+            <strong>Per-service tooling</strong> — which tools, Metasploit modules and nuclei tags
+            apply to a service. Shipped defaults live in <code>knowledge/service_tools.yaml</code>;
+            per-install changes go through the service table below or the KB Overrides page.
+          </li>
+          <li>
+            <strong>Per-service / port / technology guidance</strong> — the Service Prompts page.
+            This is what tells the AI <em>what to do</em> when it finds something, e.g. “SNMP on 161:
+            try default community strings, then walk for the ARP cache”. Rules can also carry
+            training notes that get indexed and retrieved for that same target.
+          </li>
+          <li>
+            <strong>Standalone training documents</strong> — reference material scoped to a service,
+            port or technology that should be retrievable without steering tool choice.
+          </li>
+        </ul>
+        <p className="mt-1">
+          <strong>Precedence:</strong> service+port → technology → port → service. Specificity always
+          beats priority; priority only breaks ties within a tier. Every matching rule is injected,
+          so broad and narrow guidance compose.
+        </p>
+        <p className="mt-1">
+          <strong>Bulk seeding:</strong> <code>./scripts/import-knowledge.sh --file seed.yaml</code>
+          {' '}loads rules and training docs from one file (see
+          {' '}<code>knowledge/seed_prompts.example.yaml</code>). It is create-or-update, so re-running
+          is safe. Add <code>--dry-run</code> to preview.
+        </p>
+        <p className="mt-1">
+          <strong>From a walkthrough:</strong> Service Prompts → <em>Draft rules from a walkthrough</em>
+          {' '}(or <code>./scripts/walkthrough-to-seed.sh writeup.md</code>) turns a lab writeup into
+          drafted rules, keeping the technique and flagging anything box-specific for review. It
+          proposes only — nothing is saved until you accept it.
+        </p>
+        <p className="mt-1">
+          <strong>Verify before trusting it:</strong> the Service Prompts page has a Resolve panel that
+          runs the exact resolution the AI uses — it shows the real injected text, not an approximation.
+        </p>
+      </PageHelp>
+      {/* Corpus import + indexed-training summary. Playbook ingest previously
+          required calling scan-recommender directly; it is proxied now. */}
+      <div className="bg-card border border-border rounded-lg p-3 flex items-center gap-3 flex-wrap">
+        <div className="flex-1 min-w-[16rem]">
+          <p className="text-xs font-medium">Methodology corpus</p>
+          <p className="text-[10px] text-muted-foreground">
+            Re-reads every markdown file in <code>knowledge/playbooks/</code> and rebuilds its
+            embeddings. Safe to re-run — edited files are replaced, not duplicated.
+          </p>
+        </div>
+        <button
+          onClick={() => ingestPlaybooks.mutate()}
+          disabled={ingestPlaybooks.isPending}
+          className="px-3 py-1.5 bg-primary text-primary-foreground rounded text-xs disabled:opacity-50"
+        >
+          {ingestPlaybooks.isPending ? 'Ingesting…' : 'Re-ingest playbooks'}
+        </button>
+        {ingestPlaybooks.isSuccess && (
+          <span className="text-[10px] text-green-400">
+            {ingestPlaybooks.data.files_processed} files · {ingestPlaybooks.data.chunks_inserted} chunks
+          </span>
+        )}
+        {ingestPlaybooks.isError && (
+          <span className="text-[10px] text-red-400 break-words max-w-sm">
+            {String(ingestPlaybooks.error)}
+          </span>
+        )}
+        {!!serviceDocs?.docs?.length && (
+          <span className="text-[10px] text-muted-foreground border-l border-border pl-3">
+            {serviceDocs.docs.length} training doc{serviceDocs.docs.length === 1 ? '' : 's'} indexed
+            {' '}(scoped by service/port/tech)
+          </span>
+        )}
+      </div>
+
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold">Knowledge Base</h2>
         <div className="flex items-center gap-2">

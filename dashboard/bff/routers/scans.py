@@ -14,6 +14,16 @@ from config import get_settings
 from engagement import engagement_headers
 from polling import register_job, active_jobs, _persist, pending_queue
 from timeouts import TIMEOUT_NORMAL, TIMEOUT_SCAN
+from services.port_profiles import (
+    PortProfileError,
+    list_profiles as list_port_profiles,
+    resolve as resolve_port_profile,
+)
+from services.web_profiles import (
+    WebProfileError,
+    list_profiles as list_web_profiles,
+    resolve as resolve_web_profile,
+)
 
 
 # ── "Cleared scans" deny-list (Bug 2 fix) ─────────────────────────────────
@@ -231,6 +241,111 @@ def _normalize_ports(p: dict) -> None:
     p["ports"] = ""  # cleared so masscan port validator doesn't see it
 
 
+# Scan types whose port string is handed to masscan.  masscan has NO
+# --top-ports flag (that is an nmap-ism) — it only understands `-p <ranges>`,
+# so a --top-ports string reaching these routes produces a broken command line.
+# Use a named port profile instead; profiles always resolve to explicit ranges.
+_MASSCAN_BACKED_SCANS = {"masscan", "full", "nmap", "nmap-tcp"}
+
+
+def _apply_port_profile(scan_type: str, p: dict) -> None:
+    """Resolve `port_profile` into an explicit `ports` string, in place.
+
+    Runs BEFORE any SCAN_ROUTES transform so every scan type inherits profile
+    support from one place.  No profile (or `custom`) leaves `ports` untouched,
+    which keeps every pre-existing caller — including literal `--top-ports N`
+    strings handled by _normalize_ports — working exactly as before.
+    """
+    profile = p.pop("port_profile", None)
+    try:
+        resolved = resolve_port_profile(profile, p.get("ports"))
+    except PortProfileError as e:
+        raise HTTPException(400, str(e))
+
+    if profile and str(profile).strip().lower() != "custom":
+        p["ports"] = resolved
+        # The full-scan route drives its masscan sweep from `quick_ports`, not
+        # `ports`; mirror the resolved value so a profile means the same thing
+        # on that route as it does everywhere else.
+        if scan_type == "full":
+            p["quick_ports"] = resolved
+
+    # Guard the masscan-backed routes.  Reachable when a caller passes a raw
+    # `--top-ports N` string (direct API call, or a saved tool-override that
+    # cleared the frontend's masscan carve-out).  _nmap_payload relocates the
+    # flag into extra_args for nmap, so only the pure-masscan routes are unsafe.
+    ports = (p.get("ports") or "").strip()
+    if scan_type in ("masscan", "full") and ports.startswith("--top-ports"):
+        raise HTTPException(
+            400,
+            f"masscan does not support '--top-ports' (that is an nmap flag), so "
+            f"the '{scan_type}' scan cannot use {ports!r}. Pass an explicit range "
+            f"such as '1-65535', or use port_profile (top-100 / top-1000 / web / all).",
+        )
+
+
+# Scan types whose payload a web profile can shape. Each maps the profile's
+# tool-agnostic fields onto that tool's own parameter names.
+_WEB_PROFILE_SCANS = {
+    "web", "pipeline", "nuclei", "gobuster", "katana", "nikto", "zap",
+    "playwright", "content-recon",
+}
+
+
+def _apply_web_profile(scan_type: str, p: dict) -> None:
+    """Resolve `web_profile` into concrete per-tool settings, in place.
+
+    Runs before the SCAN_ROUTES transform, like _apply_port_profile. Explicit
+    operator fields always win: a profile only fills a key the caller left
+    unset, so someone who typed a wordlist keeps it. No profile (or "custom")
+    leaves the payload untouched, preserving every existing caller.
+    """
+    profile = p.pop("web_profile", None)
+    if not profile or scan_type not in _WEB_PROFILE_SCANS:
+        return
+    try:
+        settings = resolve_web_profile(profile)
+    except WebProfileError as e:
+        raise HTTPException(400, str(e))
+    if settings is None:      # "custom" — caller's own fields verbatim
+        return
+
+    def fill(key: str, value) -> None:
+        """Set `key` only if the caller didn't provide it."""
+        if value in (None, "") or p.get(key) not in (None, ""):
+            return
+        p[key] = value
+
+    stages = set(settings["stages"])
+
+    # Shared knobs.
+    fill("wordlist", settings["wordlist"])
+    fill("max_paths", settings["max_paths"])
+    fill("limit", settings["max_paths"])
+    fill("depth", settings["crawl_depth"])
+    fill("severity", settings["nuclei_severity"])
+    fill("tags", settings["nuclei_tags"])
+
+    # Stage gating. The pipeline route uses skip_* (opt-out) while the web-scan
+    # route uses do_* (opt-in) — same intent, inverted spelling, so both are set
+    # from the one stage list rather than by hand.
+    if scan_type == "pipeline":
+        for stage in ("wafw00f", "katana", "playwright", "gobuster", "nikto", "nuclei", "zap"):
+            key = f"skip_{stage}"
+            if p.get(key) is None:
+                p[key] = stage not in stages
+    elif scan_type == "web":
+        for stage in ("gobuster", "playwright", "katana", "zap"):
+            key = f"do_{stage}"
+            if p.get(key) is None:
+                p[key] = stage in stages
+
+    log.info("scan %s: web_profile=%s → stages=%s, wordlist=%s, depth=%s, severity=%s",
+             scan_type, profile, ",".join(settings["stages"]) or "-",
+             settings["wordlist"] or "-", settings["crawl_depth"],
+             settings["nuclei_severity"] or "-")
+
+
 def _coerce_nmap_opts(p: dict) -> dict:
     """Coerce nmap option strings from the frontend into proper types.
     Caller MUST run _normalize_ports(p) first if --top-ports might be in `ports`."""
@@ -297,6 +412,9 @@ def _nmap_payload(p: dict, with_proxy: bool = False) -> dict:
 SCAN_ROUTES = {
     "full": ("nmap_scanner_url", "/jobs/full-scan", lambda p: {k: v for k, v in {
         "targets": _ensure_target_list(p), "rate": p.get("rate", 1000),
+        # Only sent when a port profile resolved one (see _apply_port_profile);
+        # otherwise omitted so the scanner's DEFAULT_QUICK_PORTS still applies.
+        "quick_ports": p.get("quick_ports") or None,
         "timeout_seconds": _coerce_int(p.get("timeout_seconds")),
     }.items() if v is not None}),
     "masscan": ("nmap_scanner_url", "/jobs/masscan-only", lambda p: {k: v for k, v in {
@@ -541,6 +659,16 @@ class ScanRequest(BaseModel):
             return [t.strip() for t in re.split(r'[\n,]+', v) if t.strip()]
         return v
     ports: Optional[str] = None
+    # Named port scope from knowledge/port_profiles.yaml ("top-100", "top-1000",
+    # "web", "all").  Resolved into an explicit `ports` string by
+    # _apply_port_profile before any SCAN_ROUTES transform runs.  "custom" (or
+    # omitted) means "use `ports` verbatim".
+    port_profile: Optional[str] = None
+    # Named web scan depth from knowledge/web_profiles.yaml ("quick", "standard",
+    # "deep", "api", "passive-web"). Fills in wordlist / crawl depth / severity /
+    # stage flags for web tools; explicit fields always win. "custom" (or
+    # omitted) means "use the individual fields verbatim".
+    web_profile: Optional[str] = None
     rate: Optional[int] = None
     severity: Optional[str] = None
     depth: Optional[int] = None
@@ -749,6 +877,29 @@ async def cleanup_stale_scans(max_age_hours: int = Query(24, ge=1)):
         except (ValueError, TypeError):
             continue
     return {"ok": True, "cleaned": len(cleaned), "job_ids": cleaned}
+
+
+@router.get("/api/port-profiles")
+async def get_port_profiles():
+    """Named port scope profiles available to scans and AI agents.
+
+    Sourced from knowledge/port_profiles.yaml so the UI renders labels and port
+    counts without duplicating the (1000-entry) lists in TypeScript.  `degraded`
+    is true when the YAML could not be read — the UI surfaces that rather than
+    silently offering a narrower set of profiles.
+    """
+    return list_port_profiles()
+
+
+@router.get("/api/web-profiles")
+async def get_web_profiles():
+    """Named web scan depth profiles available to scans and AI agents.
+
+    Sourced from knowledge/web_profiles.yaml. `degraded` is true when the YAML
+    could not be read — the UI surfaces that rather than silently offering a
+    reduced set. `known_stages` lets the UI label stage lists without hardcoding.
+    """
+    return list_web_profiles()
 
 
 @router.get("/api/scans/limits")
@@ -987,6 +1138,31 @@ async def nmap_resume(req: NmapResumeReq):
 async def launch_scan(scan_type: str, req: ScanRequest):
     if scan_type not in SCAN_ROUTES:
         raise HTTPException(400, f"Unknown scan type: {scan_type}")
+
+    # Resolve any named port profile into an explicit `ports` string up front,
+    # so all three transform call sites below (and every scan type) inherit it.
+    _pp: dict = {"ports": req.ports, "port_profile": req.port_profile}
+    _apply_port_profile(scan_type, _pp)          # raises HTTPException(400) on bad input
+    req.ports = _pp.get("ports") or None
+    if _pp.get("quick_ports"):
+        req.quick_ports = _pp["quick_ports"]     # extra="allow" → flows through model_dump
+    if req.port_profile:
+        log.info("scan %s: port_profile=%s → ports=%s (%d chars)",
+                 scan_type, req.port_profile, (req.ports or "")[:60], len(req.ports or ""))
+    req.port_profile = None                      # consumed; never forwarded downstream
+
+    # Resolve any named web profile into concrete per-tool settings. Applied to
+    # a dump (exclude_none) so keys the operator actually set are visible to the
+    # profile's "explicit wins" check, then only the NEWLY added keys are copied
+    # back — never overwriting anything the caller supplied.
+    if req.web_profile:
+        _wp = req.model_dump(exclude_none=True)
+        _wp["web_profile"] = req.web_profile
+        _before = set(_wp)
+        _apply_web_profile(scan_type, _wp)        # raises HTTPException(400) on bad input
+        for _k in set(_wp) - _before:
+            setattr(req, _k, _wp[_k])             # extra="allow" → flows through model_dump
+    req.web_profile = None                        # consumed; never forwarded downstream
 
     # Block local scans if the safety switch is on
     _check_proxy_required(req.proxy, scan_type)

@@ -23,6 +23,20 @@ from typing import Optional
 import httpx
 
 from config import get_settings
+from services.port_profiles import (
+    PortProfileError,
+    count_ports as count_profile_ports,
+    resolve as resolve_port_profile,
+)
+from services.web_profiles import WebProfileError, resolve as resolve_web_profile
+
+# Scan types a web depth profile shapes. Mirrors _WEB_PROFILE_SCANS in
+# routers/scans.py; the BFF is authoritative, this just avoids sending the
+# field on dispatches where it would be ignored.
+WEB_PROFILE_SCANS = {
+    "web", "pipeline", "nuclei", "gobuster", "katana", "nikto", "zap",
+    "playwright", "content-recon", "httpx",
+}
 
 log = logging.getLogger("recon_agent")
 
@@ -200,6 +214,31 @@ class ReconAgent:
         # picks the right tool per discovered (ip, port, service).
         kb_driven_recon = bool(config.get("kb_driven_recon", KB_DRIVEN_RECON_DEFAULT))
 
+        # Port scope for this cycle's network scans.  Resolved here for logging
+        # and telemetry only — the profile id itself is what gets sent to the
+        # BFF, which owns resolution (see the dispatch block below).
+        port_profile = (config.get("port_profile") or "").strip().lower() or None
+        resolved_ports: Optional[str] = None
+        if port_profile:
+            try:
+                resolved_ports = resolve_port_profile(port_profile, config.get("ports"))
+            except PortProfileError as e:
+                # Don't abort the cycle: the dispatch below will surface the
+                # same error per-scan through the existing 400 path, which
+                # already logs and emits recon_agent_blocked.
+                log.error("[recon:%s] bad port_profile %r: %s", eid[:8], port_profile, e)
+
+        # Web scan depth for this cycle's web-tool dispatches (httpx/nuclei and
+        # anything the KB queue picks). Validated here so a bad id is logged once
+        # per cycle rather than once per dispatch.
+        web_profile = (config.get("web_profile") or "").strip().lower() or None
+        if web_profile and web_profile != "custom":
+            try:
+                resolve_web_profile(web_profile)
+            except WebProfileError as e:
+                log.error("[recon:%s] bad web_profile %r: %s", eid[:8], web_profile, e)
+                web_profile = None
+
         # Resolve proxy / tunnel config
         proxy_single = config.get("proxy")  # explicit single proxy URL
         use_tunnels = config.get("use_tunnels", False)
@@ -244,9 +283,28 @@ class ReconAgent:
                 log.warning("[recon:%s] tool-node fetch failed: %s", eid[:8], e)
         self._tool_node_idx = 0
 
-        log.info("[recon:%s] starting cycle (profile=%s, interval=%ds, tunnels=%d, proxy=%s, use_kali=%s, tool_nodes=%d)",
-                 eid[:8], profile, interval, len(tunnel_proxies), proxy_single or "none",
+        log.info("[recon:%s] starting cycle (profile=%s, port_scope=%s, interval=%ds, tunnels=%d, proxy=%s, use_kali=%s, tool_nodes=%d)",
+                 eid[:8], profile, port_profile or config.get("ports") or "default",
+                 interval, len(tunnel_proxies), proxy_single or "none",
                  use_kali, len(tool_node_ids))
+
+        # Webhook: port scope in effect for this cycle.  Emitted once per cycle
+        # (not per dispatch) so subscribers can see the scan scope without
+        # having to infer it from every individual dispatch event.
+        if port_profile:
+            await self._emit_webhook(eid, "port_profile_applied", headers, {
+                "engagement_id": eid,
+                "port_profile": port_profile,
+                "ports": resolved_ports,
+                "port_count": count_profile_ports(resolved_ports) if resolved_ports else None,
+                "profile": profile,
+            })
+        if web_profile:
+            await self._emit_webhook(eid, "web_profile_applied", headers, {
+                "engagement_id": eid,
+                "web_profile": web_profile,
+                "profile": profile,
+            })
 
         # 0. Update stale "running" coverage entries — check if their jobs actually finished
         from polling import active_jobs
@@ -494,10 +552,30 @@ class ReconAgent:
                             payload = {"target": scan_target, "engagement_id": eid}
                         if scan_proxy:
                             payload["proxy"] = scan_proxy
-                        # Port config: default to --top-ports 1000 for nmap (not all 65535)
-                        # Override via config.ports (e.g. "1-65535", "22,80,443", "--top-ports 100")
+                        # Port scope.  Preferred form is a named profile
+                        # (config.port_profile: top-100 / top-1000 / web / all),
+                        # which the BFF resolves into an explicit port string —
+                        # see services/port_profiles.py.  Sending the profile id
+                        # rather than a resolved string keeps resolution in one
+                        # place and lets an unknown id surface through the
+                        # existing 400 handling below.
+                        #
+                        # Legacy configs (enabled before profiles existed) carry
+                        # a literal config.ports string and keep working
+                        # unchanged, including "--top-ports N".
                         if scan_type in ("nmap", "masscan-then-nmap", "nmap-tcp"):
-                            payload["ports"] = config.get("ports", "--top-ports 1000")
+                            if port_profile:
+                                payload["port_profile"] = port_profile
+                                if port_profile == "custom" and config.get("ports"):
+                                    payload["ports"] = config["ports"]
+                            else:
+                                payload["ports"] = config.get("ports", "--top-ports 1000")
+
+                        # Web scan depth. Same contract as the port profile: the
+                        # BFF resolves the id, so an unknown one surfaces through
+                        # the existing 400 handling rather than failing silently.
+                        if web_profile and scan_type in WEB_PROFILE_SCANS:
+                            payload["web_profile"] = web_profile
                         resp = await c.post(
                             f"https://127.0.0.1:{bff_port}/api/scans/{scan_type}",
                             json=payload,
@@ -512,6 +590,8 @@ class ReconAgent:
                             await self._emit_webhook(eid, "recon_agent_scan_dispatched", headers, {
                                 "engagement_id": eid, "target": target, "scan_type": scan_type,
                                 "stage": stage, "job_id": job_id, "proxy": scan_proxy,
+                                "port_profile": port_profile,
+                                "ports": payload.get("ports") or resolved_ports,
                             })
 
                             # Update coverage with job_id

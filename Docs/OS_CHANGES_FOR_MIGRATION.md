@@ -1,5 +1,101 @@
 # OS Changes for Migration
 
+## 2026-08-11 (part 3) — walkthrough converter: no OS-specific work
+
+### Files Changed
+- `knowledge/prompts/walkthrough_to_seed.md`, `scan_recommender/scan_recommender.py`,
+  `dashboard/bff/routers/kb.py`, `scripts/walkthrough-to-seed.sh`, UI panel.
+
+### Platforms Affected
+**None differentially.** Logged for completeness, plus two notes for a future port:
+
+1. **No new mounts or env vars.** The guiding prompt is read from the existing
+   `./knowledge:/knowledge:ro` mount at `/knowledge/prompts/walkthrough_to_seed.md`.
+   `WALKTHROUGH_PROMPT_PATH` and `WALKTHROUGH_LLM_TIMEOUT` exist as overrides but are
+   unset by default.
+2. **`scripts/walkthrough-to-seed.sh` is bash + curl + jq**, matching
+   `import-knowledge.sh`. On Windows it needs WSL or Git Bash, the same as every other
+   script in `scripts/` — no new constraint. It shells out to `import-knowledge.sh` for
+   the dry-run using `$SCRIPT_DIR`, so it works from any working directory.
+
+### Notes
+- Conversion quality varies with `LLM_BACKEND` (a small local Ollama model drafts rougher
+  entries than a hosted one), but the review gate makes either safe. That is a quality
+  difference, not a platform one.
+- The Ollama backend sends `format: "json"` and returns JSON rather than the requested
+  YAML. Harmless — `yaml.safe_load` parses JSON, and the schema is identical. Any future
+  backend added to `ollama_query()` should keep that tolerance.
+
+
+## 2026-08-10 (part 2) — web scan profiles + report import: no new OS-specific work
+
+### Files Changed
+- `knowledge/web_profiles.yaml` (new data file), `autogen_agents/web_profiles.py`,
+  `etl/parse_nikto.py`, `etl/parse_zap_file.py`, `dashboard/bff/routers/imports.py`.
+
+### Platforms Affected
+**None differentially.** Recorded here so the migration log stays complete, and to note two
+things a Windows/macOS port would otherwise trip over:
+
+1. **No new bind mounts.** The web profiles ride the `./knowledge:/knowledge:ro` mount added
+   earlier today (see the entry above); `autogen-agents` and `pentest-dashboard` already have
+   it. Nothing further to add to `docker-compose.mac.yml`.
+2. **Upload temp paths are POSIX-shaped.** `_save_upload_to_tmp` in `app/rag-api/api.py`
+   writes to `/tmp/...`. That is a *container* path — rag-api runs Linux regardless of the
+   host OS — so it needs no Windows adaptation. Only a native (non-Docker) Windows port of
+   rag-api would need `tempfile.gettempdir()` instead, and that port does not exist.
+
+### Notes
+- Report parsing is pure Python + stdlib XML/JSON; no platform-specific binaries were added.
+  Nikto/ZAP themselves do not need to be installed to *import* their reports.
+- Line endings: the parsers read with `encoding="utf-8", errors="replace"`, so CRLF reports
+  produced on Windows import correctly without conversion.
+
+
+## 2026-08-10 — knowledge/ mount added to two more containers (port profiles)
+
+### Files Changed
+- `docker-compose.yml` — added `./knowledge:/knowledge:ro` to the `pentest-dashboard` and
+  `autogen-agents` service blocks. It was already mounted into `rag-api` and
+  `scan-recommender`.
+
+### Platforms Affected
+- **Linux / macOS:** no adaptation needed. `docker-compose.mac.yml` overrides only
+  `depends_on`, `environment`, `ports` and `platform` for these services — it does **not**
+  override `volumes`, so the bind mount merges in automatically from the base file. Verified
+  with `docker compose config -q`.
+- **Windows:** relative bind mounts of a repo directory behave the same under Docker Desktop
+  (WSL2 backend). No path translation required since the source path is repo-relative
+  (`./knowledge`) and the container target is absolute (`/knowledge`). If a Windows user runs
+  Docker Desktop with the Hyper-V backend and the repo lives outside a shared drive, this
+  mount will fail the same way the pre-existing `./knowledge` mounts on `rag-api` /
+  `scan-recommender` already would — so it introduces no new Windows-specific risk.
+
+### Old → New
+```yaml
+# autogen-agents
+      - ./mcp/third_party:/app/third_party:ro
++     - ./knowledge:/knowledge:ro
+      - ./certs:/certs:ro
+
+# pentest-dashboard
+      - ./db-config.json:/app/db-config.json:rw
++     - ./knowledge:/knowledge:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+```
+
+### Notes
+- **Failure mode if the mount is missing:** the loader
+  (`dashboard/bff/services/port_profiles.py`) does not crash — it logs an error naming the
+  mount, serves a reduced built-in set (`top-100`, `web`, `all`) and reports
+  `degraded: true` from `GET /api/port-profiles`. `top-1000` becomes unavailable and any
+  request for it returns a clear error rather than silently substituting a narrower scope.
+- `scripts/post-install-check.sh` asserts `degraded` is false, so a missing mount is caught
+  at install time rather than mid-engagement.
+- No `PORT_PROFILES_PATH` env var needs setting; it defaults to
+  `/knowledge/port_profiles.yaml` and is only there for tests.
+
+
 ## 2026-05-04 — WSL2 / fresh Linux: surface unzip + jq prereq up front
 
 ### Files Changed
