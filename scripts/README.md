@@ -73,6 +73,29 @@ To pull updates and rebuild later:
 | `cleanup_out_of_scope.sql` | SQL to purge findings/assets that fall outside engagement scope. |
 | `fix_scope_detection.sql` | SQL fix-up for scope-detection data. |
 
+### Knowledge Base
+
+Seeding and maintaining the knowledge the AI scanners use. Full reference:
+`Docs/KNOWLEDGE_BASE_GUIDE.md`.
+
+| Script | Purpose |
+|--------|---------|
+| `import-knowledge.sh` | Bulk-load prompt rules and training docs from a YAML/JSON seed file. Create-or-update on the selector, so re-running is how you edit a seeded ruleset. `--dry-run` previews; `--playbooks` re-ingests `knowledge/playbooks/`. See `knowledge/seed_prompts.example.yaml`. |
+| `url-to-guide.sh` | Fetch a published guide by URL and draft knowledge from it — writes `knowledge/seed/<slug>.yaml` **and** `knowledge/playbooks/<slug>.md`, then dry-runs the importer. Refuses private/loopback/cloud-metadata addresses (`--allow-internal` to override), validates every redirect hop, and caps response size. `--depth 1 --max-pages N` follows same-site links. |
+| `walkthrough-to-seed.sh` | Draft rules from a lab walkthrough via the configured LLM, writing `knowledge/seed/<name>.yaml` and auto-running the importer's dry-run. Never writes to the database — entries containing credentials, flags, hashes or lab IPs are emitted commented out with a `# !REVIEW` reason. `--focus` steers a single run. |
+
+```bash
+# seed a ruleset, preview first
+./scripts/import-knowledge.sh --file knowledge/seed_prompts.example.yaml --dry-run
+./scripts/import-knowledge.sh --file knowledge/seed_prompts.example.yaml
+
+# draft rules from a writeup, then review the file before applying
+./scripts/walkthrough-to-seed.sh writeups/lab01.md --focus "Active Directory only"
+
+# or straight from a published guide
+./scripts/url-to-guide.sh https://docs.rapid7.com/metasploit/metasploitable-2-exploitability-guide/
+```
+
 ### TLS & Secrets
 
 | Script | Purpose |

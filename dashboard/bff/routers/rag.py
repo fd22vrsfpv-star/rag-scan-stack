@@ -28,6 +28,23 @@ router = APIRouter()
 log = logging.getLogger("rag")
 
 
+def _detail(resp: httpx.Response) -> str:
+    """Unwrap an upstream error into a readable message.
+
+    Passing `resp.text` straight into HTTPException double-encodes the JSON
+    envelope, so the UI shows escaped JSON instead of the actual reason (e.g.
+    "at least one of service, port or tech is required").
+    """
+    try:
+        body = resp.json()
+        if isinstance(body, dict) and "detail" in body:
+            d = body["detail"]
+            return d if isinstance(d, str) else str(d)
+    except Exception:
+        pass
+    return resp.text
+
+
 class RagAskRequest(BaseModel):
     q: str
     top_k: int = 6
@@ -253,3 +270,103 @@ async def rag_tools_recommend(
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
     return safe_json(resp)
+
+
+# ── Knowledge import ─────────────────────────────────────────────────────────
+# Ingest endpoints that previously existed only on scan-recommender:8013, so
+# importing knowledge required bypassing the dashboard entirely. Proxied here
+# so the Knowledge Base page can drive them.
+
+class ServiceDocIngestRequest(BaseModel):
+    """A training document scoped to a service, port and/or technology.
+
+    At least one scope is required upstream — an unscoped document belongs in
+    knowledge/playbooks/ instead, where it is retrieved generally.
+    """
+    title: str
+    content: str
+    service: Optional[str] = None
+    port: Optional[int] = None
+    tech: Optional[str] = None
+    doc_kind: str = "training"
+
+
+class PlaybookIngestRequest(BaseModel):
+    """Re-ingest the markdown playbook corpus.
+
+    `playbook_dir` is a path *inside the scan-recommender container* (the
+    knowledge/ bind mount), not a host path. Omit to use its default.
+    """
+    playbook_dir: Optional[str] = None
+
+
+@router.post("/api/rag/playbooks/ingest")
+async def ingest_playbooks(body: PlaybookIngestRequest = PlaybookIngestRequest()):
+    """Chunk, embed and store every markdown playbook in the corpus.
+
+    Idempotent: each file's chunks are atomically replaced, so re-running after
+    an edit updates rather than duplicating. Embedding a whole corpus is slow —
+    hence the long timeout.
+    """
+    s = get_settings()
+    payload = {k: v for k, v in body.model_dump().items() if v is not None}
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=900) as c:
+            resp = await c.post(
+                f"{s.scan_recommender_url}/rag/playbooks/ingest",
+                json=payload, headers=engagement_headers(),
+            )
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Playbook ingest timed out — the corpus may be very large.")
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Knowledge service unreachable: {e}")
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, _detail(resp))
+    return safe_json(resp)
+
+
+@router.post("/api/rag/service-docs/ingest")
+async def ingest_service_doc(body: ServiceDocIngestRequest):
+    """Store one training document scoped to a service / port / technology."""
+    s = get_settings()
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=180) as c:
+            resp = await c.post(
+                f"{s.scan_recommender_url}/rag/service-docs/ingest",
+                json=body.model_dump(), headers=engagement_headers(),
+            )
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Knowledge service unreachable: {e}")
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, _detail(resp))
+    return safe_json(resp)
+
+
+@router.get("/api/rag/service-docs")
+async def list_service_docs(
+    service: Optional[str] = Query(None),
+    port: Optional[int] = Query(None),
+    tech: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """List ingested training docs, grouped per document rather than per chunk."""
+    s = get_settings()
+    params = {k: v for k, v in {
+        "service": service, "port": port, "tech": tech, "limit": limit,
+    }.items() if v not in (None, "")}
+    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        resp = await c.get(f"{s.scan_recommender_url}/rag/service-docs", params=params)
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _detail(resp))
+        return safe_json(resp)
+
+
+@router.delete("/api/rag/service-docs/{doc_id}")
+async def delete_service_doc(doc_id: int):
+    """Remove every chunk of one training document."""
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        resp = await c.delete(f"{s.scan_recommender_url}/rag/service-docs/{doc_id}")
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _detail(resp))
+        return safe_json(resp)

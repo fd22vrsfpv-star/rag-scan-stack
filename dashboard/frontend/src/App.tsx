@@ -19,6 +19,7 @@ const AgentSessions = lazy(() => import('@/pages/AgentSessions'))
 const AIAgents = lazy(() => import('@/pages/AIAgents'))
 const Services = lazy(() => import('@/pages/Services'))
 const KnowledgeBase = lazy(() => import('@/pages/KnowledgeBase'))
+const ServicePrompts = lazy(() => import('@/pages/ServicePrompts'))
 const ReconExplorer = lazy(() => import('@/pages/ReconExplorer'))
 const Settings = lazy(() => import('@/pages/Settings'))
 const Nodes = lazy(() => import('@/pages/Nodes'))
@@ -173,6 +174,7 @@ export default function App() {
             <Route path="feedback" element={<Suspense fallback={<Loading />}><Feedback /></Suspense>} />
             <Route path="maintenance" element={<Suspense fallback={<Loading />}><Maintenance /></Suspense>} />
             <Route path="knowledge" element={<Suspense fallback={<Loading />}><KnowledgeBase /></Suspense>} />
+            <Route path="service-prompts" element={<Suspense fallback={<Loading />}><ServicePrompts /></Suspense>} />
             <Route path="services" element={<Suspense fallback={<Loading />}><Services /></Suspense>} />
             <Route path="nodes" element={<Suspense fallback={<Loading />}><Nodes /></Suspense>} />
             <Route path="settings" element={<Suspense fallback={<Loading />}><Settings /></Suspense>} />

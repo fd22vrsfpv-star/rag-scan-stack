@@ -871,6 +871,7 @@ services:
       - ./osint_reports:/app/scanner_data/osint_reports:ro
       - ./pd_reports:/app/scanner_data/pd_reports:ro
       - ./mcp/third_party:/app/third_party:ro
+      - ./knowledge:/knowledge:ro
       - ./certs:/certs:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8015/health || curl -f http://127.0.0.1:8015/health || exit 1"]
@@ -1916,6 +1917,7 @@ services:
       - ./mcp/third_party:/mcp/third_party
       - ./mcpo/config.json:/mcpo/config.json
       - ./db-config.json:/app/db-config.json:rw
+      - ./knowledge:/knowledge:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro  # Enable docker exec for WireGuard status querying
     networks:
       - agents_net

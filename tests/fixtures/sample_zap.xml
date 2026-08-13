@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<OWASPZAPReport version="2.15.0" generated="Mon, 10 Aug 2026 10:00:00">
+<site name="http://10.0.0.11" host="10.0.0.11" port="80" ssl="false">
+<alerts>
+<alertitem>
+<pluginid>40012</pluginid>
+<alert>Cross Site Scripting (Reflected)</alert>
+<name>Cross Site Scripting (Reflected)</name>
+<riskcode>3</riskcode>
+<confidence>2</confidence>
+<riskdesc>High (Medium)</riskdesc>
+<desc>&lt;p&gt;Reflected XSS.&lt;/p&gt;</desc>
+<solution>&lt;p&gt;Encode output.&lt;/p&gt;</solution>
+<reference>&lt;p&gt;https://owasp.org/xss&lt;/p&gt;</reference>
+<cweid>79</cweid>
+<confidencedesc>Medium</confidencedesc>
+<instances>
+<instance><uri>http://10.0.0.11/p?x=1</uri><method>GET</method><param>x</param><attack>&lt;script&gt;</attack><evidence>&lt;script&gt;</evidence></instance>
+</instances>
+</alertitem>
+<alertitem>
+<pluginid>10096</pluginid>
+<alert>Timestamp Disclosure</alert>
+<riskcode>0</riskcode>
+<riskdesc>Informational (Low)</riskdesc>
+<desc>&lt;p&gt;A timestamp was disclosed.&lt;/p&gt;</desc>
+<solution></solution>
+<reference></reference>
+<cweid>200</cweid>
+<instances>
+<instance><uri>http://10.0.0.11/js/app.js</uri><method>GET</method><evidence>1712345678</evidence></instance>
+</instances>
+</alertitem>
+</alerts>
+</site>
+</OWASPZAPReport>

@@ -127,6 +127,7 @@ CRITICAL_TABLES=(
     "scope_targets"
     "detection_rule_state"
     "cloud_scan_recommendations"
+    "service_prompts"
 )
 
 MISSING=0
@@ -152,6 +153,34 @@ for view in "${CRITICAL_VIEWS[@]}"; do
         echo "✓ ${view} (view)"
     else
         echo "❌ Missing critical view: ${view}"
+        MISSING=$((MISSING + 1))
+    fi
+done
+
+echo ""
+
+# ── Required columns on pre-existing tables ───────────────────────────────
+# Tables that gained columns via a later migration. A missing column here means
+# ensure_all_tables.sql ran against an older schema and the ALTERs didn't apply,
+# which surfaces at runtime as a confusing "column does not exist" query error.
+echo "🔍 Verifying required columns..."
+REQUIRED_COLUMNS=(
+    "exploit_chunks:service"     # TIER 24 — per-service RAG training scoping
+    "exploit_chunks:port"        # TIER 24
+    "exploit_chunks:doc_kind"    # TIER 24
+    "exploit_chunks:tech"        # TIER 24 — per-technology web-scan training
+    "service_prompts:tech"       # TIER 24 — 'tech' prompt selector
+)
+
+for entry in "${REQUIRED_COLUMNS[@]}"; do
+    tbl="${entry%%:*}"
+    col="${entry##*:}"
+    if docker exec rag-postgres psql -U app -d scans -tAc \
+        "SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='${tbl}' AND column_name='${col}';" \
+        | grep -q "1"; then
+        echo "✓ ${tbl}.${col}"
+    else
+        echo "❌ Missing required column: ${tbl}.${col}"
         MISSING=$((MISSING + 1))
     fi
 done

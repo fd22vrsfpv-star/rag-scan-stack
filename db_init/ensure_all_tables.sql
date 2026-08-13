@@ -3617,6 +3617,112 @@ CREATE INDEX IF NOT EXISTS idx_installation_tasks_type     ON public.installatio
 CREATE INDEX IF NOT EXISTS idx_installation_tasks_created  ON public.installation_tasks(created_at DESC);
 
 -- ============================================================================
+-- TIER 24: Per-service / per-port prompts + RAG training data
+-- ============================================================================
+-- Kept in sync with db_init/add_service_prompts.sql (the standalone migration
+-- for existing installs). Any change here must be mirrored there.
+
+-- Operator-authored guidance injected into the LLM's tool-selection prompt
+-- whenever a matching service/port is discovered.
+-- selector_type determines which columns are meaningful:
+--   'service'      → service set, port NULL   (e.g. all http)
+--   'port'         → port set, service NULL   (e.g. anything on 8080)
+--   'port_service' → both set                 (e.g. http on 8080)
+-- Resolution is most-specific-first: port_service → port → service.
+CREATE TABLE IF NOT EXISTS public.service_prompts (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    selector_type   text NOT NULL
+                    CHECK (selector_type IN ('service','port','port_service','tech')),
+    service         text,
+    tech            text,
+    port            integer CHECK (port IS NULL OR (port > 0 AND port <= 65535)),
+    title           text NOT NULL,
+    prompt          text NOT NULL DEFAULT '',
+    training_notes  text,
+    tags            text[] NOT NULL DEFAULT '{}'::text[],
+    priority        integer NOT NULL DEFAULT 100,
+    enabled         boolean NOT NULL DEFAULT true,
+    engagement_id   uuid REFERENCES public.engagements(id) ON DELETE CASCADE,
+    rag_ingested_at timestamptz,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    -- Enforce that selector columns match the declared selector_type, so a row
+    -- can never be silently unreachable by the resolver.
+    CONSTRAINT service_prompts_selector_shape CHECK (
+        (selector_type = 'service'      AND service IS NOT NULL AND port IS NULL     AND tech IS NULL)
+     OR (selector_type = 'port'         AND port    IS NOT NULL AND service IS NULL  AND tech IS NULL)
+     OR (selector_type = 'port_service' AND port    IS NOT NULL AND service IS NOT NULL AND tech IS NULL)
+     OR (selector_type = 'tech'         AND tech    IS NOT NULL AND service IS NULL  AND port IS NULL)
+    )
+);
+
+-- Converge installs created before the 'tech' selector existed.
+ALTER TABLE public.service_prompts ADD COLUMN IF NOT EXISTS tech text;
+ALTER TABLE public.service_prompts DROP CONSTRAINT IF EXISTS service_prompts_selector_type_check;
+ALTER TABLE public.service_prompts ADD CONSTRAINT service_prompts_selector_type_check
+    CHECK (selector_type IN ('service','port','port_service','tech'));
+ALTER TABLE public.service_prompts DROP CONSTRAINT IF EXISTS service_prompts_selector_shape;
+ALTER TABLE public.service_prompts ADD CONSTRAINT service_prompts_selector_shape CHECK (
+    (selector_type = 'service'      AND service IS NOT NULL AND port IS NULL     AND tech IS NULL)
+ OR (selector_type = 'port'         AND port    IS NOT NULL AND service IS NULL  AND tech IS NULL)
+ OR (selector_type = 'port_service' AND port    IS NOT NULL AND service IS NOT NULL AND tech IS NULL)
+ OR (selector_type = 'tech'         AND tech    IS NOT NULL AND service IS NULL  AND port IS NULL)
+);
+
+-- COALESCE keeps NULLs from defeating uniqueness — in Postgres NULL <> NULL,
+-- so a plain UNIQUE would allow unlimited duplicate global rules.
+-- `tech` MUST be in the key: for selector_type='tech' service and port are
+-- both NULL, so without it every tech rule collapses onto one index entry.
+DROP INDEX IF EXISTS idx_service_prompts_selector;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_service_prompts_selector
+    ON public.service_prompts (
+        selector_type,
+        COALESCE(service, ''),
+        COALESCE(tech, ''),
+        COALESCE(port, -1),
+        COALESCE(engagement_id, '00000000-0000-0000-0000-000000000000'::uuid)
+    );
+CREATE INDEX IF NOT EXISTS idx_service_prompts_tech
+    ON public.service_prompts (lower(tech)) WHERE tech IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_service_prompts_service
+    ON public.service_prompts (lower(service)) WHERE service IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_service_prompts_port
+    ON public.service_prompts (port) WHERE port IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_service_prompts_engagement
+    ON public.service_prompts (engagement_id);
+CREATE INDEX IF NOT EXISTS idx_service_prompts_enabled
+    ON public.service_prompts (enabled) WHERE enabled = true;
+
+DROP TRIGGER IF EXISTS trg_service_prompts_updated ON public.service_prompts;
+CREATE TRIGGER trg_service_prompts_updated
+  BEFORE UPDATE ON public.service_prompts
+  FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+
+-- exploit_chunks: service/port scoping so training documents can be retrieved
+-- per service or port. Nullable — every existing ExploitDB and playbook row
+-- keeps working unchanged; retrieval only filters when a service is supplied.
+ALTER TABLE public.exploit_chunks ADD COLUMN IF NOT EXISTS service  text;
+ALTER TABLE public.exploit_chunks ADD COLUMN IF NOT EXISTS port     integer;
+ALTER TABLE public.exploit_chunks ADD COLUMN IF NOT EXISTS doc_kind text;
+ALTER TABLE public.exploit_chunks ADD COLUMN IF NOT EXISTS tech     text;
+
+CREATE INDEX IF NOT EXISTS idx_exploit_chunks_service
+    ON public.exploit_chunks (lower(service)) WHERE service IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_exploit_chunks_port
+    ON public.exploit_chunks (port) WHERE port IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_exploit_chunks_doc_kind
+    ON public.exploit_chunks (doc_kind) WHERE doc_kind IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_exploit_chunks_tech
+    ON public.exploit_chunks (lower(tech)) WHERE tech IS NOT NULL;
+
+GRANT ALL PRIVILEGES ON public.service_prompts TO app;
+DO $$ BEGIN
+  GRANT ALL PRIVILEGES ON public.service_prompts TO scans;
+EXCEPTION WHEN undefined_object THEN NULL;
+END $$;
+
+-- ============================================================================
 -- Summary
 -- ============================================================================
 SELECT 'ensure_all_tables.sql complete — schema is ready' as status;

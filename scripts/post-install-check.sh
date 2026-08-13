@@ -73,6 +73,8 @@ EXPECTED_TABLES=(
   news_sources news_items news_runs
   # TIER 22: Chat presets
   chat_presets
+  # TIER 24: Per-service / per-port prompts + RAG training data
+  service_prompts
 )
 
 for table in "${EXPECTED_TABLES[@]}"; do
@@ -447,7 +449,9 @@ echo ""
 echo "=== New API endpoints ==="
 DASH=$(docker ps --filter "name=^pentest-dashboard$" --format '{{.Names}}')
 if [[ -n "$DASH" ]]; then
-  for ep in /api/settings/scan-timeouts /api/scans/limits; do
+  for ep in /api/settings/scan-timeouts /api/scans/limits /api/port-profiles /api/kb/prompts \
+            /api/web-profiles /api/import/web-scan/formats /api/rag/service-docs \
+            /api/kb/walkthrough-prompt; do
     code=$(docker exec "$DASH" curl -sk -o /dev/null -w "%{http_code}" "https://127.0.0.1${ep}" 2>/dev/null || echo "000")
     if [[ "$code" =~ ^(200|401|403)$ ]]; then
       pass "$ep responding (HTTP $code)"
@@ -455,6 +459,25 @@ if [[ -n "$DASH" ]]; then
       fail "$ep unreachable (HTTP $code)"
     fi
   done
+
+  # Port profiles must resolve from the mounted knowledge/ volume. `degraded`
+  # means port_profiles.yaml was unreadable — the API still answers, but
+  # top-1000 is unavailable, so a plain HTTP 200 check above would miss it.
+  DEGRADED=$(docker exec "$DASH" curl -sk "https://127.0.0.1/api/port-profiles" 2>/dev/null \
+    | grep -o '"degraded":[[:space:]]*true' || true)
+  if [[ -n "$DEGRADED" ]]; then
+    fail "port profiles degraded — check ./knowledge:/knowledge:ro mount on pentest-dashboard"
+  else
+    pass "port profiles loaded from knowledge/port_profiles.yaml"
+  fi
+
+  WEB_DEGRADED=$(docker exec "$DASH" curl -sk "https://127.0.0.1/api/web-profiles" 2>/dev/null \
+    | grep -o '"degraded":[[:space:]]*true' || true)
+  if [[ -n "$WEB_DEGRADED" ]]; then
+    fail "web profiles degraded — check ./knowledge:/knowledge:ro mount on pentest-dashboard"
+  else
+    pass "web profiles loaded from knowledge/web_profiles.yaml"
+  fi
 fi
 
 # ── Summary ──
