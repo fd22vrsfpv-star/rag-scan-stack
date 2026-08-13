@@ -86,28 +86,34 @@ export function WalkthroughDraftPanel() {
     <div className="bg-card border border-border rounded-lg p-3 space-y-2">
       <div className="flex items-center justify-between gap-2 flex-wrap">
         <h3 className="text-sm font-semibold flex items-center gap-1.5">
-          <Wand2 className="h-4 w-4" /> Draft rules from a walkthrough
+          <Wand2 className="h-4 w-4" /> Draft rules from a walkthrough or URL
         </h3>
         <button
           onClick={() => { setShowGuiding(!showGuiding); setGuidingDraft(guiding?.prompt ?? '') }}
           className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground"
         >
           <Settings2 className="h-3 w-3" />
-          {guiding?.using_custom ? 'Guiding prompt (customised)' : 'Guiding prompt'}
+          {guiding?.using_custom
+            ? 'Extraction prompt (customised)'
+            : 'Extraction prompt'}
         </button>
       </div>
 
       <p className="text-xs text-muted-foreground">
-        Extracts the technique that would still apply to a <em>different</em> host running the
-        same service. Nothing is saved until you accept it — entries containing anything that
-        looks box-specific are flagged and left unticked.
+        Paste a writeup or give a URL. Extracts the technique that would still apply to a{' '}
+        <em>different</em> host running the same service. Nothing is saved until you accept it —
+        entries containing anything that looks box-specific are flagged and left unticked.
+        The <strong>Extraction prompt</strong> above controls how both are read.
       </p>
 
       {showGuiding && (
         <div className="border border-border rounded p-2 space-y-1.5 bg-muted/20">
           <div className="flex items-center justify-between">
             <p className="text-[10px] text-muted-foreground">
-              Steers what gets extracted. Clear the box and save to restore the shipped default
+              Governs <strong>both</strong> paths — pasted/uploaded walkthroughs and pages
+              fetched from a URL. It decides what counts as reusable technique, how many rules
+              to emit for a catalogue vs a single-box narrative, and what to discard as
+              box-specific. Clear the box and save to restore the shipped default
               ({guiding?.default_path}).
             </p>
             <button onClick={() => setShowGuiding(false)} className="text-muted-foreground hover:text-foreground">

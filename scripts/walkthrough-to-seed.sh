@@ -20,6 +20,7 @@
 #   --focus TEXT     extra steering for this run only
 #   --out PATH       output file (default knowledge/seed/<name>.yaml)
 #   --no-existing    don't show the model your current rules (it dedupes against them)
+#   --no-gap-pass    skip the second pass that re-asks for missed services
 #   --api URL        knowledge API base (default https://localhost:8013)
 #
 # Prereqs: curl, jq. The stack's scan-recommender must be running.
@@ -31,7 +32,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 API="${KNOWLEDGE_API:-https://localhost:8013}"
-FILE=""; FOCUS=""; OUT=""; INCLUDE_EXISTING=true
+FILE=""; FOCUS=""; OUT=""; INCLUDE_EXISTING=true; GAP_PASS=true
 
 usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
@@ -41,6 +42,7 @@ while [[ $# -gt 0 ]]; do
         --out|-o)      OUT="${2:-}"; shift 2 ;;
         --api)         API="${2:-}"; shift 2 ;;
         --no-existing) INCLUDE_EXISTING=false; shift ;;
+        --no-gap-pass) GAP_PASS=false; shift ;;
         --help|-h)     usage 0 ;;
         -*)            echo "Unknown option: $1" >&2; usage 1 ;;
         *)             FILE="$1"; shift ;;
@@ -73,7 +75,8 @@ payload="$(jq -n \
     --arg filename "$base" \
     --arg focus "$FOCUS" \
     --argjson include_existing "$INCLUDE_EXISTING" \
-    '{content: $content, filename: $filename, include_existing: $include_existing}
+    --argjson gap_pass "$GAP_PASS" \
+    '{content: $content, filename: $filename, include_existing: $include_existing, gap_pass: $gap_pass}
      + (if $focus == "" then {} else {focus: $focus} end)')"
 
 resp="$(curl -sk --max-time 900 -w '\n%{http_code}' -X POST "${API}/kb/walkthrough/convert" \
@@ -111,6 +114,14 @@ if [[ "$n_rej" -gt 0 ]]; then
     echo ""
     echo "  ${n_rej} entr(ies) rejected as malformed:"
     echo "$body" | jq -r '.rejected[] | "    x \(.entry)  —  \(.reason)"'
+fi
+
+gap_try="$(echo "$body" | jq -r '.gap_pass.attempted // [] | length')"
+if [[ "${gap_try:-0}" -gt 0 ]]; then
+    echo ""
+    echo "  GAP PASS: re-asked for ${gap_try} missed service(s), recovered $(echo "$body" | jq -r '.gap_pass.recovered') rule(s)"
+    over="$(echo "$body" | jq -r '.gap_pass.skipped_cap // 0')"
+    [[ "$over" -gt 0 ]] && echo "  ${over} further service(s) were beyond the cap — raise WALKTHROUGH_GAP_MAX to chase them"
 fi
 
 cov_missed="$(echo "$body" | jq -r '.coverage.missed // [] | length')"

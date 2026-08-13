@@ -346,14 +346,14 @@ export default function ServicePrompts() {
             writes directly: proposals containing anything box-specific — credentials, flag values,
             hashes, lab IPs — arrive flagged and unticked. Vendor defaults often trip that check
             legitimately, so read the reason before discarding. Steer what it extracts with the
-            Guiding prompt editor, or a per-run focus.</li>
+            Extraction prompt editor (it governs URL imports too), or a per-run focus.</li>
         </ul>
       </PageHelp>
 
       {/* Collapsed by default — drafting is occasional, testing is routine. */}
       <details className="bg-card border border-border rounded-lg">
         <summary className="px-3 py-2 text-xs font-semibold cursor-pointer hover:bg-muted/30">
-          Draft rules from a walkthrough
+          Draft rules from a walkthrough or URL
         </summary>
         <div className="p-2 pt-0">
           <WalkthroughDraftPanel />

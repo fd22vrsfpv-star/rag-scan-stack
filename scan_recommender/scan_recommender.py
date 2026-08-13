@@ -2539,6 +2539,7 @@ class WalkthroughConvertBody(BaseModel):
     filename: Optional[str] = None
     focus: Optional[str] = None
     include_existing: bool = True
+    gap_pass: bool = True          # re-ask for services coverage flagged as missed
 
 
 class WalkthroughPromptBody(BaseModel):
@@ -2620,6 +2621,7 @@ def convert_walkthrough(body: WalkthroughConvertBody):
     return convert_text_to_knowledge(
         content=body.content, source=(body.filename or "pasted"),
         focus=body.focus, include_existing=body.include_existing,
+        gap_pass=body.gap_pass,
     )
 
 
@@ -2769,8 +2771,86 @@ def coverage_report(text: str, prompts: List[Dict], skipped: List[Dict] = None) 
     }
 
 
+# Cap on the gap pass. Bounded so a document naming fifty services can't turn
+# one import into fifty LLM calls.
+WALKTHROUGH_GAP_MAX = int(os.environ.get("WALKTHROUGH_GAP_MAX", "15"))
+# How much surrounding text to hand the focused call. Small on purpose: naming
+# one service and showing only where it appears is a task a local model does
+# reliably, unlike "find everything in this document".
+WALKTHROUGH_GAP_WINDOW = int(os.environ.get("WALKTHROUGH_GAP_WINDOW", "2500"))
+
+
+def _slices_mentioning(text: str, term: str, window: int = None,
+                       max_slices: int = 3) -> str:
+    """Text around each mention of `term`, joined.
+
+    The focused pass only needs the parts of the document that actually discuss
+    the service; sending the whole thing reintroduces the problem the gap pass
+    exists to solve.
+    """
+    window = window or WALKTHROUGH_GAP_WINDOW
+    low, out, start = text.lower(), [], 0
+    rx = re.compile(r"\b" + re.escape(term.lower()) + r"\b")
+    for m in rx.finditer(low):
+        if len(out) >= max_slices:
+            break
+        a = max(0, m.start() - window // 3)
+        b = min(len(text), m.end() + window)
+        if out and a < start:      # overlapping window; skip
+            continue
+        out.append(text[a:b])
+        start = b
+    return "\n...\n".join(out)
+
+
+def _extract_for_service(text: str, term: str, guide: str) -> List[Dict]:
+    """One focused call: extract rules for a single named service.
+
+    Returns [] rather than raising — a failed gap call must not lose the rules
+    the first pass already found.
+    """
+    excerpt = _slices_mentioning(text, term)
+    if len(excerpt.strip()) < 120:
+        return []          # only a passing mention; nothing to extract
+
+    prompt = (
+        guide
+        + f"\n\n# This run is narrowed to ONE service: {term}\n"
+        + f"Extract rules for **{term}** only, from the excerpt below. Ignore every\n"
+        + "other service. If the excerpt gives real technique for it, emit one or two\n"
+        + f"rules. If it only mentions {term} in passing with no technique, return\n"
+        + "`prompts: []` — do not invent anything to fill the gap.\n"
+        + f"\n# Excerpt\n\n{excerpt}"
+    )
+    try:
+        result = ollama_query(
+            prompt=prompt, timeout=WALKTHROUGH_LLM_TIMEOUT,
+            options={"num_ctx": WALKTHROUGH_NUM_CTX, "num_predict": 2048},
+        )
+    except requests.RequestException as e:
+        logger.warning("[walkthrough] gap call failed for %s: %s", term, e)
+        return []
+
+    raw = re.sub(r"^\s*```(?:ya?ml|json)?\s*|\s*```\s*$", "",
+                 (result.get("response") or "").strip())
+    try:
+        import yaml as _yaml
+        parsed = _yaml.safe_load(raw) or {}
+    except Exception:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    if "prompts" not in parsed:
+        for v in parsed.values():
+            if isinstance(v, dict) and "prompts" in v:
+                parsed = v
+                break
+    return [e for e in (parsed.get("prompts") or []) if isinstance(e, dict)]
+
+
 def convert_text_to_knowledge(content: str, source: str, focus: Optional[str] = None,
-                              include_existing: bool = True) -> Dict:
+                              include_existing: bool = True,
+                              gap_pass: bool = True) -> Dict:
     """Shared conversion pipeline: text -> drafted rules + seed YAML.
 
     Called by both the walkthrough endpoint and the URL endpoint so the guiding
@@ -2819,6 +2899,38 @@ def convert_text_to_knowledge(content: str, source: str, focus: Optional[str] = 
             prompts_in.append(e)
         docs_in.extend(d for d in c_docs if isinstance(d, dict))
         logger.info("[walkthrough]   chunk %d/%d → %d rule(s)", i, len(chunks), len(c_prompts))
+
+    # ── Gap pass ────────────────────────────────────────────────────────────
+    # The chunk pass asks "find everything", which a local model does poorly on a
+    # long catalogue. Coverage already knows exactly what it missed, so re-ask
+    # for those services one at a time — a focused prompt naming one service is
+    # a task a small model handles reliably. Cost scales with the gap, not the
+    # document.
+    gap_stats = {"attempted": [], "recovered": 0, "skipped_cap": 0}
+    if gap_pass and prompts_in:
+        provisional = coverage_report(content, [
+            {"service": e.get("service"), "tech": e.get("tech")} for e in prompts_in
+        ], skipped_in)
+        missed = provisional.get("missed") or []
+        if len(missed) > WALKTHROUGH_GAP_MAX:
+            gap_stats["skipped_cap"] = len(missed) - WALKTHROUGH_GAP_MAX
+            missed = missed[:WALKTHROUGH_GAP_MAX]
+        for term in missed:
+            gap_stats["attempted"].append(term)
+            found = _extract_for_service(content, term, guide)
+            for e in found:
+                key = (str(e.get("selector_type")), str(e.get("service") or ""),
+                       str(e.get("tech") or ""), str(e.get("port") or ""),
+                       str(e.get("title") or "").strip().lower())
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                prompts_in.append(e)
+                gap_stats["recovered"] += 1
+        if gap_stats["attempted"]:
+            logger.info("[walkthrough] gap pass: %d service(s) re-asked, %d rule(s) recovered%s",
+                        len(gap_stats["attempted"]), gap_stats["recovered"],
+                        f", {gap_stats['skipped_cap']} beyond cap" if gap_stats["skipped_cap"] else "")
 
     if not prompts_in and not docs_in:
         raise HTTPException(
@@ -2926,6 +3038,7 @@ def convert_text_to_knowledge(content: str, source: str, focus: Optional[str] = 
         "rejected": rejected,
         "existing_considered": existing,
         "coverage": coverage,
+        "gap_pass": gap_stats,
         "yaml": yaml_text,
     }
 
@@ -2939,6 +3052,7 @@ class UrlConvertBody(BaseModel):
     focus: Optional[str] = None
     make_playbook: bool = True
     include_existing: bool = True
+    gap_pass: bool = True
 
 
 @kb_router.post("/url/convert")
@@ -2982,7 +3096,7 @@ def convert_url(body: UrlConvertBody):
 
     result = convert_text_to_knowledge(
         content=text, source=slug, focus=body.focus,
-        include_existing=body.include_existing,
+        include_existing=body.include_existing, gap_pass=body.gap_pass,
     )
 
     playbook = ""
