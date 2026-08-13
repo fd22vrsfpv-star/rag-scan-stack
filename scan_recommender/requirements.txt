@@ -4,3 +4,4 @@ psycopg2-binary
 requests
 uvicorn
 pyyaml
+beautifulsoup4>=4.12

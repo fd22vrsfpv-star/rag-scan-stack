@@ -519,6 +519,10 @@ QUICK SCAN (ALWAYS START WITH THIS):
 
 DEEP PORT SCAN (RUN LAST, after web scans):
 - start_deep_port_scan(targets): Scan remaining ports 1001-65535 with service detection
+  NOTE: if the operator pinned a PORT SCOPE for this session, this tool returns
+  {{"skipped": true, "reason": ...}}. That is expected and final — the selected scope
+  already covers the intended range. Do NOT retry it and do NOT try to work around it
+  by calling start_masscan or start_nmap_scan with a wider range.
 
 PORT DISCOVERY:
 - start_masscan(targets, ports, rate): Fast TCP port discovery (specific port range)

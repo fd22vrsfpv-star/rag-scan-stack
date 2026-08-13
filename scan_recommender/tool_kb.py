@@ -289,6 +289,9 @@ _SERVICE_ALIASES: Dict[str, str] = {
     "microsoft-ds":   "smb",
     "netbios-ssn":    "smb",
     "netbios-ns":     "smb",
+    # Prose name: documentation and writeups say "Samba", the KB says "smb".
+    # Without this, a guide covering Samba resolves to no service at all.
+    "samba":          "smb",
     # DNS
     "domain":         "dns",
     "domain-s":       "dns",

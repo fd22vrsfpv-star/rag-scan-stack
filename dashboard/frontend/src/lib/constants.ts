@@ -1,4 +1,4 @@
-export const BUILD_VERSION = '2026.06.22-03'
+export const BUILD_VERSION = '2026.08.12-2234'
 export const SEVERITY_LEVELS = ['critical', 'high', 'medium', 'low', 'info', 'recon', 'error'] as const
 export type Severity = (typeof SEVERITY_LEVELS)[number]
 
@@ -28,6 +28,17 @@ export const SEVERITY_BG: Record<Severity, string> = {
 // passive: true = queries third-party APIs/databases only, never contacts the target
 // remote: true = can run on a remote node (via SOCKS proxy or SSH remote exec push)
 export type ScanMeta = { id: string; label: string; desc: string; icon: string; proxy?: boolean; touchesTarget?: boolean; passive?: boolean; remote?: boolean }
+
+/**
+ * Scan types a web depth profile can shape. Mirrors `_WEB_PROFILE_SCANS` in
+ * dashboard/bff/routers/scans.py — the BFF is authoritative (it ignores the
+ * profile for anything not in its own set); this copy only decides whether the
+ * depth selector is shown.
+ */
+export const WEB_PROFILE_SCANS = new Set([
+  'web', 'pipeline', 'nuclei', 'gobuster', 'katana', 'nikto', 'zap',
+  'playwright', 'content-recon',
+])
 
 export const NUCLEI_TAG_PRESETS = [
   { id: 'quick-recon',   label: 'Quick Recon',      tags: 'tech,panel,exposure,ssl,header,cors,dns',                                                      desc: 'Fast non-intrusive recon (tech stack, panels, SSL, headers)' },

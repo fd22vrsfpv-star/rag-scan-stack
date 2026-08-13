@@ -36,6 +36,7 @@ from routers.api_tester import router as api_tester_router
 from routers.about import router as about_router
 from routers.delta import router as delta_router
 from routers.cloud_suggestor import router as cloud_suggestor_router
+from routers.imports import router as imports_router
 from routers.sync import router as sync_router
 from routers.content_analysis import router as content_analysis_router
 from routers.burp import router as burp_router
@@ -92,6 +93,9 @@ app.add_middleware(
 app.include_router(health_router)
 app.include_router(assets_router)
 app.include_router(findings_router)
+# Must precede scans_router: its POST /api/import/{tool} catch-all would
+# otherwise shadow the specific /api/import/web-scan route.
+app.include_router(imports_router)
 app.include_router(scans_router)
 app.include_router(rag_router)
 app.include_router(exploits_router)

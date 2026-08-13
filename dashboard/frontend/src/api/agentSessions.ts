@@ -169,6 +169,12 @@ interface StartSessionParams {
   max_rounds: number
   auto_execute_scans: boolean
   proxy?: string
+  /** Named port scope from knowledge/port_profiles.yaml. Omit to keep the
+   *  scanner agent's built-in quick-then-deep policy. */
+  port_profile?: string
+  /** Named web scan depth from knowledge/web_profiles.yaml. Omit to keep each
+   *  web tool's own defaults. */
+  web_profile?: string
 }
 
 interface ResumeSessionParams {

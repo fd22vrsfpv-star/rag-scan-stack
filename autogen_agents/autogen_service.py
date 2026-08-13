@@ -416,6 +416,8 @@ class PentestRequest(BaseModel):
     max_rounds: Optional[int] = Field(200, description="Maximum conversation rounds (status polls don't count)")
     auto_execute_scans: Optional[bool] = Field(True, description="Automatically execute recommended scans")
     proxy: Optional[str] = Field(None, description="SOCKS proxy URL for routing scans through a remote node (e.g., 'socks5://node-manager:10001')")
+    port_profile: Optional[str] = Field(None, description="Named port scope from knowledge/port_profiles.yaml (top-100, top-1000, web, redteam-targeted, all). Omit to use the scanner agent's built-in quick-then-deep policy.")
+    web_profile: Optional[str] = Field(None, description="Named web scan depth from knowledge/web_profiles.yaml (quick, standard, deep, api, passive-web). Omit to use each web tool's own defaults.")
 
 
 class ResumeRequest(BaseModel):
@@ -1403,6 +1405,8 @@ def run_pentest_session_sync(
     session_name: str = "unnamed",
     auto_execute_scans: bool = True,
     proxy: Optional[str] = None,
+    port_profile: Optional[str] = None,
+    web_profile: Optional[str] = None,
 ):
     """
     Synchronous version of run_pentest_session that runs in a thread pool.
@@ -1417,6 +1421,11 @@ def run_pentest_session_sync(
         resume_context: Optional context from a parent session being resumed
         auto_execute_scans: Whether agents should auto-execute scans or just recommend
         proxy: SOCKS proxy URL for routing scans through a remote node
+        port_profile: Named port scope applied to every discovery scan this
+            session runs (see knowledge/port_profiles.yaml). None keeps the
+            scanner agent's built-in quick-then-deep policy.
+        web_profile: Named web scan depth applied to this session's web tools
+            (see knowledge/web_profiles.yaml). None keeps each tool's defaults.
     """
     import sys
     import contextlib
@@ -1511,9 +1520,17 @@ def run_pentest_session_sync(
         if passive_only:
             session_logger.info(f"[{session_id}] Detected PASSIVE-ONLY profile — active scan tools will be blocked")
 
-        session_logger.info(f"[{session_id}] Initializing PentestTeam (passive_only={passive_only})...")
-        team = PentestTeam(passive_only=passive_only)
-        session_logger.info(f"[{session_id}] PentestTeam initialized successfully")
+        session_logger.info(
+            f"[{session_id}] Initializing PentestTeam (passive_only={passive_only}, "
+            f"port_profile={port_profile or 'agent-default'}, "
+            f"web_profile={web_profile or 'tool-default'})..."
+        )
+        team = PentestTeam(passive_only=passive_only, port_profile=port_profile,
+                           web_profile=web_profile)
+        session_logger.info(
+            f"[{session_id}] PentestTeam initialized successfully"
+            + (f" (prompt config: {team.prompt_config_name})" if team.prompt_config_name else "")
+        )
 
         # Track which model was selected (for A/B testing analysis)
         if team.selected_model != "default":
@@ -1595,10 +1612,17 @@ def run_pentest_session_sync(
         flush_thread = threading.Thread(target=_flush_loop, daemon=True, name=f"msg-flush-{session_id}")
         flush_thread.start()
 
-        # Set up scan tracking context for this session
-        scan_tracker.set_session(str(session_id))
+        # Set up scan tracking context for this session. The port profile is
+        # resolved here so every scan tool this session calls inherits the
+        # operator's selected scope without the LLM having to pass port ranges.
+        scan_tracker.set_session(str(session_id), port_profile=port_profile,
+                                 web_profile=web_profile)
         LLMMetricsContext.set_session(str(session_id))
-        session_logger.info(f"[{session_id}] Scan tracker context initialized")
+        session_logger.info(
+            f"[{session_id}] Scan tracker context initialized"
+            + (f" (port scope: {port_profile})" if port_profile else "")
+            + (f" (web scope: {web_profile})" if web_profile else "")
+        )
 
         # Construct initial message with context
         resume_block = f"{resume_context}\n\n" if resume_context else ""
@@ -1984,6 +2008,8 @@ async def start_pentest(request: PentestRequest):
                 "auto_execute_scans": request.auto_execute_scans,
                 "initial_task": request.initial_task,
                 "proxy": request.proxy,
+                "port_profile": request.port_profile,
+                "web_profile": request.web_profile,
             }
         )
 
@@ -2005,6 +2031,8 @@ async def start_pentest(request: PentestRequest):
                 request.session_name,
                 request.auto_execute_scans,
                 request.proxy,
+                request.port_profile,
+                request.web_profile,
             )
         )
 
