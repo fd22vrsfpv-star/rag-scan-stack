@@ -2664,8 +2664,8 @@ def _split_for_conversion(text: str, max_chars: int = None) -> List[str]:
     return [c for c in out if c.strip()][:WALKTHROUGH_MAX_CHUNKS]
 
 
-def _llm_extract(chunk: str, guide: str, existing: List[Dict]) -> Tuple[List, List, str]:
-    """One LLM call over one chunk. Returns (prompts, service_docs, model).
+def _llm_extract(chunk: str, guide: str, existing: List[Dict]) -> Tuple[List, List, List, str]:
+    """One LLM call over one chunk. Returns (prompts, service_docs, skipped, model).
 
     Never raises on a bad response — a chunk that fails to parse is skipped so
     one awkward section doesn't lose the whole document.
@@ -2686,7 +2686,7 @@ def _llm_extract(chunk: str, guide: str, existing: List[Dict]) -> Tuple[List, Li
         )
     except requests.RequestException as e:
         logger.warning("[walkthrough] LLM call failed for a chunk: %s", e)
-        return [], [], ""
+        return [], [], [], ""
 
     raw = result.get("response", "")
     model = result.get("model", "")
@@ -2696,9 +2696,9 @@ def _llm_extract(chunk: str, guide: str, existing: List[Dict]) -> Tuple[List, Li
         parsed = _yaml.safe_load(text) or {}
     except Exception as e:
         logger.warning("[walkthrough] unparsable chunk response (%s) — skipping", e)
-        return [], [], model
+        return [], [], [], model
     if not isinstance(parsed, dict):
-        return [], [], model
+        return [], [], [], model
 
     # Reasoning models wrap the payload, e.g. {"thought": ..., "prompts": [...]}.
     if "prompts" not in parsed and "service_docs" not in parsed:
@@ -2707,7 +2707,66 @@ def _llm_extract(chunk: str, guide: str, existing: List[Dict]) -> Tuple[List, Li
                 parsed = value
                 break
 
-    return (parsed.get("prompts") or [], parsed.get("service_docs") or [], model)
+    return (parsed.get("prompts") or [], parsed.get("service_docs") or [],
+            parsed.get("skipped") or [], model)
+
+
+def coverage_report(text: str, prompts: List[Dict], skipped: List[Dict] = None) -> Dict:
+    """Which services the document mentions vs which became rules.
+
+    A thin conversion is otherwise indistinguishable from a thin document: the
+    Rapid7 Metasploitable guide covers ~20 services and produced 7 rules, and
+    nothing in the output said so. This names the gap explicitly.
+
+    Detection reuses the KB's own vocabulary (97 services + 17 tech signatures)
+    rather than a hand-kept list, so it stays current as the KB grows.
+    """
+    low = (text or "").lower()
+    try:
+        kb = get_tool_kb()
+        # alias -> canonical, so a document saying "Samba" or "microsoft-ds" is
+        # credited against the KB's canonical "smb". Reporting the CANONICAL name
+        # matters: that is the value a rule must use for it to actually fire.
+        import tool_kb as _tool_kb
+        vocab = {n: n for n in (kb.get_all_services() or [])}
+        vocab.update({k: v for k, v in (getattr(_tool_kb, "_SERVICE_ALIASES", {}) or {}).items()
+                      if v in vocab})
+        vocab.update({t: t for t in (kb._data.get("tech_signatures") or {})})
+    except Exception as e:
+        logger.debug("coverage: KB unavailable (%s)", e)
+        return {}
+
+    # Word-boundary match so short names don't fire inside unrelated words.
+    mentioned = {canonical for term, canonical in vocab.items()
+                 if len(term) > 2 and re.search(r"\b" + re.escape(term) + r"\b", low)}
+
+    covered = set()
+    for p in prompts:
+        for field in ("service", "tech"):
+            v = (p.get(field) or "").strip().lower()
+            if v:
+                covered.add(v)
+
+    skipped_names = {(s.get("service") or s.get("tech") or "").strip().lower()
+                     for s in (skipped or [])}
+    skipped_names.discard("")
+
+    missed = sorted(mentioned - covered - skipped_names)
+    return {
+        "mentioned": sorted(mentioned),
+        "covered": sorted(covered & mentioned),
+        "missed": missed,
+        "skipped": [s for s in (skipped or []) if isinstance(s, dict)],
+        "coverage_pct": (
+            round(100 * len(covered & mentioned) / len(mentioned)) if mentioned else None
+        ),
+        "rules_total": len(prompts),
+        # Rules for things the KB has no vocabulary for (mutillidae, distcc,
+        # unrealircd) are real output but cannot be counted against `mentioned`,
+        # so the percentage understates. Surfaced to keep it from reading as a
+        # failure when the rule count is healthy.
+        "rules_outside_kb_vocabulary": sorted(covered - mentioned),
+    }
 
 
 def convert_text_to_knowledge(content: str, source: str, focus: Optional[str] = None,
@@ -2741,9 +2800,11 @@ def convert_text_to_knowledge(content: str, source: str, focus: Optional[str] = 
     logger.info("[walkthrough] %s: %d char(s) in %d chunk(s)", source, len(content), len(chunks))
 
     prompts_in, docs_in, model = [], [], ""
+    skipped_in: List[Dict] = []
     seen_keys = set()
     for i, chunk in enumerate(chunks, 1):
-        c_prompts, c_docs, c_model = _llm_extract(chunk, guide, existing)
+        c_prompts, c_docs, c_skipped, c_model = _llm_extract(chunk, guide, existing)
+        skipped_in.extend(x for x in c_skipped if isinstance(x, dict))
         model = model or c_model
         for e in c_prompts:
             if not isinstance(e, dict):
@@ -2825,6 +2886,24 @@ def convert_text_to_knowledge(content: str, source: str, focus: Optional[str] = 
 
     yaml_text = render_seed_yaml(prompts, docs, flagged_p, flagged_d, source)
 
+    # Each chunk reports skips from ITS OWN view of the document. A service the
+    # port-list chunk dismissed as "no technique given" may be covered in depth
+    # by a later chunk, so a skip that contradicts an actual rule is dropped —
+    # otherwise the report claims FTP was untouched while an FTP rule sits in
+    # the output.
+    covered_names = {(p.get("service") or p.get("tech") or "").strip().lower()
+                     for p in prompts}
+    covered_names.discard("")
+    skipped_in = [x for x in skipped_in
+                  if (x.get("service") or x.get("tech") or "").strip().lower()
+                  not in covered_names]
+
+    coverage = coverage_report(content, prompts, skipped_in)
+    if coverage.get("missed"):
+        logger.info("[walkthrough] %s: %d/%d services covered, missed: %s",
+                    source, len(coverage["covered"]), len(coverage["mentioned"]),
+                    ", ".join(coverage["missed"][:12]))
+
     logger.info(
         "[walkthrough] %s → %d rules (%d flagged), %d docs (%d flagged), %d rejected",
         source, len(prompts), len(flagged_p), len(docs), len(flagged_d), len(rejected),
@@ -2846,6 +2925,7 @@ def convert_text_to_knowledge(content: str, source: str, focus: Optional[str] = 
         ),
         "rejected": rejected,
         "existing_considered": existing,
+        "coverage": coverage,
         "yaml": yaml_text,
     }
 

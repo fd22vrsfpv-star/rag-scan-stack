@@ -45,6 +45,13 @@ def sr():
         sys.modules["exploits_rag"] = stub
     if SR_DIR not in sys.path:
         sys.path.insert(0, SR_DIR)
+    # tool_kb reads TOOL_KB_PATH at import and defaults to the CONTAINER path
+    # (/knowledge/...), which doesn't exist when tests run against a checkout.
+    # Point it at the repo copy so coverage detection has a real vocabulary.
+    os.environ.setdefault(
+        "TOOL_KB_PATH",
+        os.path.join(os.path.dirname(__file__), "..", "knowledge", "service_tools.yaml"),
+    )
     import importlib.util
     try:
         spec = importlib.util.spec_from_file_location("scan_recommender_wt", SR_FILE)
@@ -309,3 +316,73 @@ class TestRepairEntry:
         e = sr.repair_entry({"selector_type": "port_service", "port": 21, "title": "t"})
         assert e["selector_type"] == "port"
         assert sr.normalize_selector(e["selector_type"], None, None, e["port"], "t")[3] is None
+
+
+# ── Coverage reporting ──────────────────────────────────────────────────────
+class TestCoverageReport:
+    """A thin conversion must be distinguishable from a thin document.
+
+    The Rapid7 guide covers ~20 services and produced 7 rules, and nothing in
+    the output said so — this is what makes that visible.
+    """
+
+    def test_names_services_mentioned_but_not_covered(self, sr):
+        text = "The host ran mysql, postgresql and vsftpd. Also samba shares."
+        rep = sr.coverage_report(text, [{"selector_type": "service", "service": "mysql"}])
+        assert "mysql" in rep["covered"]
+        # "samba" is reported as the canonical "smb" — that is the value a rule
+        # must carry for it to fire, so reporting the prose name would mislead.
+        for missed in ("postgresql", "smb"):
+            assert missed in rep["missed"], rep
+
+    def test_prose_aliases_are_detected_as_their_canonical_service(self, sr):
+        """Documents say "Samba" / "microsoft-ds"; the KB canonical is "smb"."""
+        assert "smb" in sr.coverage_report("Samba shares were exposed", [])["mentioned"]
+        assert "smb" in sr.coverage_report("microsoft-ds on 445", [])["mentioned"]
+
+    def test_full_coverage_reports_no_gap(self, sr):
+        text = "Only mysql was exposed."
+        rep = sr.coverage_report(text, [{"selector_type": "service", "service": "mysql"}])
+        assert rep["missed"] == []
+        assert rep["coverage_pct"] == 100
+
+    def test_tech_rules_count_as_coverage(self, sr):
+        text = "The site ran wordpress behind nginx."
+        rep = sr.coverage_report(text, [{"selector_type": "tech", "tech": "wordpress"}])
+        assert "wordpress" in rep["covered"]
+
+    def test_model_declared_skips_are_not_counted_as_missed(self, sr):
+        """A service the model consciously skipped, with a reason, isn't a gap."""
+        text = "telnet was open but nothing was done with it. mysql was exploited."
+        rep = sr.coverage_report(
+            text,
+            [{"selector_type": "service", "service": "mysql"}],
+            skipped=[{"service": "telnet", "reason": "no technique given"}],
+        )
+        assert "telnet" not in rep["missed"]
+        assert rep["skipped"][0]["reason"] == "no technique given"
+
+    def test_matching_is_word_bounded(self, sr):
+        """Short service names must not fire inside unrelated words."""
+        rep = sr.coverage_report("discussion of transmission protocols", [])
+        assert "smb" not in rep["mentioned"]
+
+    def test_empty_document_yields_no_false_gaps(self, sr):
+        rep = sr.coverage_report("nothing relevant here at all", [])
+        assert rep["mentioned"] == [] and rep["missed"] == []
+        assert rep["coverage_pct"] is None
+
+    def test_report_is_absent_rather_than_wrong_when_kb_unavailable(self, sr, monkeypatch):
+        monkeypatch.setattr(sr, "get_tool_kb", lambda: (_ for _ in ()).throw(RuntimeError("down")))
+        assert sr.coverage_report("mysql here", []) == {}
+
+    def test_report_carries_the_total_rule_count(self, sr):
+        rep = sr.coverage_report("mysql here", [{"selector_type": "service", "service": "mysql"},
+                                                {"selector_type": "tech", "tech": "distcc"}])
+        assert rep["rules_total"] == 2
+
+    def test_rules_outside_the_kb_vocabulary_are_surfaced(self, sr):
+        """Real output that can't be counted against `mentioned` — the
+        percentage would otherwise read as a failure."""
+        rep = sr.coverage_report("mysql here", [{"selector_type": "tech", "tech": "mutillidae"}])
+        assert "mutillidae" in rep["rules_outside_kb_vocabulary"]

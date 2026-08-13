@@ -207,6 +207,44 @@ page in one request causes the model to narrate, exhaust its output budget and
 return truncated JSON — which shows up as zero rules. Chunking also improves
 quality, since the model considers one service at a time.
 
+#### Coverage — check what it missed
+
+Both converters report which services the document mentions but did **not** become
+rules, plus anything the model deliberately skipped and why:
+
+```
+COVERAGE: 4/17 KB-known services became rules (24%) — 10 rules total
+Also covered, outside the KB's vocabulary: distccd, dvwa, mutillidae, samba
+Not covered: dns, https, lpd, phpmyadmin, portmap, smb
+```
+
+A thin conversion is otherwise indistinguishable from a thin document. Detection
+uses the KB's own vocabulary (97 services + aliases + 17 tech signatures), and
+reports the **canonical** name — a guide saying "Samba" shows as `smb`, because
+that is the value a rule must carry to fire.
+
+The percentage counts only KB-known services, so rules for things the KB has no
+vocabulary for (distccd, mutillidae) are listed separately rather than dragging
+the number down.
+
+If services you care about are missing, re-run with `--focus` naming them.
+
+#### Extraction quality depends on the model
+
+The guiding prompt now adapts: a **narrative walkthrough** of one box yields a few
+well-judged rules, while an **enumerative reference** covering many services should
+yield roughly one rule per service. A small local model still under-extracts on a
+long catalogue — the Rapid7 Metasploitable guide covers ~20 services and a local
+`gemma4:31b` produces 10–11. A hosted `LLM_BACKEND` does better. The coverage
+report exists so that gap is visible rather than assumed away.
+
+#### A runbook instead of rules
+
+`knowledge/prompts/runbook_from_guide.md` is a copy-paste prompt for Claude that
+turns the same source into a **runbook you follow** — ordered per-service steps
+with reasons, stop conditions and evidence to capture — rather than rules the
+scanner applies. Use the converter for rules, that prompt for prose.
+
 #### Steering what it extracts
 
 Three layers, most specific last:
