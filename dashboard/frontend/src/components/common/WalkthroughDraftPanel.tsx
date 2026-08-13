@@ -30,6 +30,9 @@ export function WalkthroughDraftPanel() {
   const [url, setUrl] = useState('')
   const [depth, setDepth] = useState(0)
   const [allowInternal, setAllowInternal] = useState(false)
+  // On by default, matching the server. It roughly doubles a long run, so it is
+  // the first thing to turn off if a conversion is timing out in the browser.
+  const [gapPass, setGapPass] = useState(true)
   const [result, setResult] = useState<WalkthroughConversion | UrlConversion | null>(null)
   const [accepted, setAccepted] = useState<Set<number>>(new Set())
   const [err, setErr] = useState('')
@@ -48,10 +51,11 @@ export function WalkthroughDraftPanel() {
         ? await convertUrl.mutateAsync({
             url: url.trim(), depth, max_pages: depth >= 1 ? 5 : 1,
             allow_internal: allowInternal, focus: focus || undefined,
-            make_playbook: true,
+            make_playbook: true, gap_pass: gapPass,
           })
         : await convert.mutateAsync({
             content, filename: filename || undefined, focus: focus || undefined,
+            gap_pass: gapPass,
           })
       setResult(r)
       // Pre-tick only the clean entries; flagged ones require a deliberate click.
@@ -234,6 +238,18 @@ export function WalkthroughDraftPanel() {
             className="w-full bg-muted rounded px-2 py-1 text-xs border border-border"
           />
         </div>
+        <label
+          className="flex items-center gap-1 text-[10px] text-muted-foreground pb-1.5"
+          title="The first pass asks the model to find everything at once, which it does unreliably. The second pass re-asks for each missed service on its own — more rules, but roughly double the time."
+        >
+          <input
+            type="checkbox"
+            checked={gapPass}
+            onChange={e => setGapPass(e.target.checked)}
+            className="rounded border-border"
+          />
+          Second pass for missed services
+        </label>
         <button
           onClick={run}
           disabled={(mode === 'url' ? !url.trim() : !content.trim()) || convert.isPending || convertUrl.isPending}
@@ -245,7 +261,9 @@ export function WalkthroughDraftPanel() {
 
       {(convert.isPending || convertUrl.isPending) && (
         <p className="text-[10px] text-muted-foreground">
-          Running the walkthrough through the model — this usually takes a minute or two.
+          {gapPass
+            ? 'Running it through the model, then re-asking for anything missed — on a local model a long guide can take 15 minutes or more. Leave this tab open.'
+            : 'Running it through the model — this usually takes a minute or two.'}
         </p>
       )}
       {err && (
@@ -254,6 +272,47 @@ export function WalkthroughDraftPanel() {
 
       {result && (
         <div className="space-y-2 pt-1">
+          {/* Same report the CLI prints. Without it the operator has no way to tell
+              a guide with three services from one where the model found three of
+              seventeen — both just look like "3 rules". */}
+          {/* Boolean(): a bare `0 &&` would render a literal "0" into the panel. */}
+          {Boolean(result.gap_pass?.attempted?.length || result.coverage?.missed?.length) && (
+            <div className="text-[10px] space-y-0.5 border border-border rounded p-2 bg-muted/30">
+              {result.gap_pass && result.gap_pass.attempted.length > 0 && (
+                <p className="text-muted-foreground">
+                  Second pass re-asked for {result.gap_pass.attempted.length} missed
+                  service{result.gap_pass.attempted.length === 1 ? '' : 's'} and recovered{' '}
+                  <span className="text-foreground">{result.gap_pass.recovered}</span> rule
+                  {result.gap_pass.recovered === 1 ? '' : 's'}.
+                  {result.gap_pass.skipped_cap > 0 && (
+                    <> {result.gap_pass.skipped_cap} more were beyond the per-run cap.</>
+                  )}
+                </p>
+              )}
+              {result.coverage?.missed && result.coverage.missed.length > 0 && (
+                <>
+                  <p className="text-muted-foreground">
+                    Covered {result.coverage.covered?.length ?? 0} of{' '}
+                    {result.coverage.mentioned?.length ?? 0} known services
+                    {typeof result.coverage.coverage_pct === 'number' && ` (${result.coverage.coverage_pct}%)`}
+                    {' '}— {result.coverage.rules_total ?? result.prompts.length} rules total.
+                  </p>
+                  {(result.coverage.rules_outside_kb_vocabulary?.length ?? 0) > 0 && (
+                    <p className="text-muted-foreground">
+                      Also covered, outside the KB's vocabulary:{' '}
+                      {result.coverage.rules_outside_kb_vocabulary!.join(', ')}
+                    </p>
+                  )}
+                  <p className="text-yellow-400 break-words">
+                    Not covered: {result.coverage.missed.join(', ')}
+                  </p>
+                  <p className="text-muted-foreground">
+                    If those matter, re-run with a focus naming them, or add rules by hand.
+                  </p>
+                </>
+              )}
+            </div>
+          )}
           {'pages' in result && (
             <div className="text-[10px] text-muted-foreground space-y-1">
               <p>
