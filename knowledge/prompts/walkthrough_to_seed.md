@@ -112,4 +112,38 @@ material.
 - Do not restate what an existing rule already covers. When existing rules are supplied
   below, extend or sharpen them rather than proposing a near-duplicate — duplicates
   overwrite on import.
-- Prefer three well-judged rules over ten mechanical ones.
+# How many rules to emit
+
+This depends on what kind of document you were given. Judge it first.
+
+**A narrative walkthrough** — one operator, one machine, told in order ("I scanned,
+I found 161, I pivoted"). Most of the text is incidental to that box. Prefer three
+well-judged rules over ten mechanical ones.
+
+**An enumerative reference** — a guide that CATALOGUES many services, each with its
+own heading and its own weakness (vendor exploitability guides, "top N services"
+posts, methodology references). Here the enumeration IS the value. Emit **one rule
+per service the document covers**, and do not stop at the first few. A guide
+covering twenty services should yield roughly twenty rules, not three.
+
+If a section names a service and gives any technique for it, that section deserves
+a rule. Being selective there loses exactly the coverage the document was worth
+importing for.
+
+# Reporting what you skipped
+
+After the schema, add a `skipped` list naming any service or technology the
+document covered that you deliberately did NOT turn into a rule, each with a one-line
+reason:
+
+```
+skipped:
+  - service: telnet
+    reason: mentioned only as an open port, no technique given
+```
+
+Omit the key entirely if you skipped nothing. This is checked against the document,
+so an unexplained gap is visible rather than looking like the document was thin.
+
+- Never pad. A service with no technique in the document belongs in `skipped`, not
+  in a rule invented to fill the gap.
