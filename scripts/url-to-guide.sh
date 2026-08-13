@@ -25,6 +25,7 @@
 #   --allow-internal   permit private/loopback/metadata addresses (off by default)
 #   --proxy URL        route the fetch through a proxy
 #   --no-playbook      skip the playbook markdown, rules only
+#   --no-gap-pass      skip the second pass that re-asks for missed services
 #   --api URL          knowledge API base (default https://localhost:8013)
 #
 # Prereqs: curl, jq. scan-recommender must be running.
@@ -36,7 +37,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 API="${KNOWLEDGE_API:-https://localhost:8013}"
-URL=""; DEPTH=0; MAX_PAGES=5; FOCUS=""; ALLOW_INTERNAL=false; PROXY=""; MAKE_PLAYBOOK=true
+URL=""; DEPTH=0; MAX_PAGES=5; FOCUS=""; ALLOW_INTERNAL=false; PROXY=""; MAKE_PLAYBOOK=true; GAP_PASS=true
 
 usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
@@ -48,6 +49,7 @@ while [[ $# -gt 0 ]]; do
         --allow-internal) ALLOW_INTERNAL=true; shift ;;
         --proxy)          PROXY="${2:-}"; shift 2 ;;
         --no-playbook)    MAKE_PLAYBOOK=false; shift ;;
+        --no-gap-pass)    GAP_PASS=false; shift ;;
         --api)            API="${2:-}"; shift 2 ;;
         --help|-h)        usage 0 ;;
         -*)               echo "Unknown option: $1" >&2; usage 1 ;;
@@ -70,13 +72,15 @@ echo "Fetching $URL"
 [[ "$DEPTH" -ge 1 ]] && echo "  following same-origin links, up to $MAX_PAGES pages"
 [[ "$ALLOW_INTERNAL" == true ]] && echo "  WARNING: --allow-internal is set; internal address checks are relaxed"
 echo "  extracting and drafting rules — a full guide usually takes a few minutes..."
+[[ "$GAP_PASS" == true ]] && echo "  a second pass will re-ask for any services the first pass misses"
 
 payload="$(jq -n \
     --arg url "$URL" --arg focus "$FOCUS" --arg proxy "$PROXY" \
     --argjson depth "$DEPTH" --argjson max_pages "$MAX_PAGES" \
     --argjson allow_internal "$ALLOW_INTERNAL" --argjson make_playbook "$MAKE_PLAYBOOK" \
+    --argjson gap_pass "$GAP_PASS" \
     '{url:$url, depth:$depth, max_pages:$max_pages, allow_internal:$allow_internal,
-      make_playbook:$make_playbook}
+      make_playbook:$make_playbook, gap_pass:$gap_pass}
      + (if $focus == "" then {} else {focus:$focus} end)
      + (if $proxy == "" then {} else {proxy:$proxy} end)')"
 
@@ -132,6 +136,14 @@ if [[ "$n_ferr" -gt 0 ]]; then
     echo ""
     echo "  ${n_ferr} sub-page(s) could not be fetched:"
     echo "$body" | jq -r '.fetch_errors[] | "    x \(.url)  —  \(.error)"'
+fi
+
+gap_try="$(echo "$body" | jq -r '.gap_pass.attempted // [] | length')"
+if [[ "${gap_try:-0}" -gt 0 ]]; then
+    echo ""
+    echo "  GAP PASS: re-asked for ${gap_try} missed service(s), recovered $(echo "$body" | jq -r '.gap_pass.recovered') rule(s)"
+    over="$(echo "$body" | jq -r '.gap_pass.skipped_cap // 0')"
+    [[ "$over" -gt 0 ]] && echo "  ${over} further service(s) were beyond the cap — raise WALKTHROUGH_GAP_MAX to chase them"
 fi
 
 cov_missed="$(echo "$body" | jq -r '.coverage.missed // [] | length')"
