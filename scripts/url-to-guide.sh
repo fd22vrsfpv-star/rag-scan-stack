@@ -134,6 +134,21 @@ if [[ "$n_ferr" -gt 0 ]]; then
     echo "$body" | jq -r '.fetch_errors[] | "    x \(.url)  —  \(.error)"'
 fi
 
+cov_missed="$(echo "$body" | jq -r '.coverage.missed // [] | length')"
+if [[ "${cov_missed:-0}" -gt 0 ]]; then
+    echo ""
+    echo "  COVERAGE: $(echo "$body" | jq -r '.coverage.covered | length')/$(echo "$body" | jq -r '.coverage.mentioned | length') KB-known services became rules ($(echo "$body" | jq -r '.coverage.coverage_pct // 0')%) — $(echo "$body" | jq -r '.coverage.rules_total') rules total"
+    outside="$(echo "$body" | jq -r '.coverage.rules_outside_kb_vocabulary // [] | join(", ")')"
+    [[ -n "$outside" ]] && echo "  Also covered, outside the KB's vocabulary: $outside"
+    echo "  Not covered: $(echo "$body" | jq -r '.coverage.missed | join(", ")')"
+    echo "  If those matter, re-run with --focus naming them, or add rules by hand."
+fi
+if [[ "$(echo "$body" | jq -r '.coverage.skipped // [] | length')" -gt 0 ]]; then
+    echo ""
+    echo "  Deliberately skipped by the model:"
+    echo "$body" | jq -r '.coverage.skipped[] | "    - \(.service // .tech // "?"): \(.reason // "no reason given")"'
+fi
+
 # Show what would land, using the importer itself rather than a re-implementation.
 if [[ "$(echo "$body" | jq '.prompts | length')" -gt 0 ]]; then
     echo ""
