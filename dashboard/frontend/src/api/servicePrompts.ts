@@ -135,11 +135,38 @@ export interface DraftedFlag {
   reasons: string[]
 }
 
+/**
+ * What the second pass did. The first pass asks the model to find everything in a
+ * chunk, which a local model does unreliably; whatever it missed is then re-asked
+ * for one service at a time.
+ */
+export interface GapPassReport {
+  /** Services re-asked individually. Empty when the first pass missed nothing. */
+  attempted: string[]
+  recovered: number
+  /** Missed services beyond WALKTHROUGH_GAP_MAX — reported, not silently dropped. */
+  skipped_cap: number
+}
+
+/** Which services the source mentions vs. which became rules. `{}` if the KB is down. */
+export interface CoverageReport {
+  mentioned?: string[]
+  covered?: string[]
+  missed?: string[]
+  skipped?: Array<{ service?: string; tech?: string; reason?: string }>
+  coverage_pct?: number
+  rules_total?: number
+  /** Rules for things the KB has no name for (e.g. dvwa) — covered, but uncounted above. */
+  rules_outside_kb_vocabulary?: string[]
+}
+
 export interface WalkthroughConversion {
   ok: boolean
   source: string
   model: string
   prompts: ServicePromptInput[]
+  coverage?: CoverageReport
+  gap_pass?: GapPassReport
   service_docs: Array<Record<string, unknown>>
   /** Entries that look box-specific (credentials, flags, lab IPs) — review before accepting. */
   flagged: DraftedFlag[]
@@ -155,7 +182,12 @@ export interface WalkthroughConversion {
  */
 export function useConvertWalkthrough() {
   return useMutation({
-    mutationFn: (body: { content: string; filename?: string; focus?: string; include_existing?: boolean }) =>
+    mutationFn: (body: {
+      content: string; filename?: string; focus?: string
+      include_existing?: boolean
+      /** Defaults to true server-side. Off trades coverage for a much shorter run. */
+      gap_pass?: boolean
+    }) =>
       apiFetch<WalkthroughConversion>('/kb/walkthrough/convert', {
         method: 'POST',
         body: JSON.stringify(body),
@@ -214,6 +246,8 @@ export function useConvertUrl() {
     mutationFn: (body: {
       url: string; depth?: number; max_pages?: number
       allow_internal?: boolean; focus?: string; make_playbook?: boolean
+      /** Defaults to true server-side. Off trades coverage for a much shorter run. */
+      gap_pass?: boolean
     }) =>
       apiFetch<UrlConversion>('/kb/url/convert', {
         method: 'POST',
