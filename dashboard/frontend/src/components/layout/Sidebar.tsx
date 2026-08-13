@@ -37,7 +37,12 @@ const NAV_GROUPS: NavEntry[] = [
       { to: '/engagements', icon: Briefcase, label: 'Engagements' },
       { to: '/scans/launch', icon: Rocket, label: 'Launch Scan' },
       { to: '/scans', icon: Activity, label: 'Scan Monitor' },
-      { to: '/pipelines', icon: Workflow, label: 'Pipelines' },
+      // Named for what distinguishes it: the orchestrator round-robins each
+      // scan across the SOCKS proxies of remote_nodes while progressing every
+      // host in scope through stages 0-5. "Pipelines" collided with the
+      // per-target 'Web Pipeline' scan type in Launch Scan. Route, page,
+      // orchestrator class and scan_pipelines tables keep their names.
+      { to: '/pipelines', icon: Workflow, label: 'Distributed Scans' },
       { to: '/agents', icon: Bot, label: 'AI Agents' },
       { to: '/agent-sessions', icon: Bot, label: 'Agent Sessions' },
     ],
