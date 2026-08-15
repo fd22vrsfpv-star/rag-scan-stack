@@ -566,6 +566,35 @@ def _get_all_service_prompts() -> List[Dict]:
 _SELECTOR_RANK = {"port_service": 0, "tech": 1, "port": 2, "service": 3}
 
 
+def _canonical_service(name: Optional[str]) -> Optional[str]:
+    """Fold a service name to its canonical form, or None.
+
+    Rules drafted from a walkthrough carry the vocabulary of the document —
+    "Samba", "Postgres" — while scanners report what they fingerprint:
+    `netbios-ssn`, `microsoft-ds`. Matching those raw strings meant an ingested
+    rule could never fire on a real scan: a `samba` rule sat unused while every
+    SMB port on the target was reported as `netbios-ssn`.
+
+    tool_kb already maintains the alias table for exactly this
+    (`microsoft-ds` -> `smb`, `netbios-ssn` -> `smb`, `samba` -> `smb`); it was
+    simply never applied here. Folding BOTH sides means a rule and a scan result
+    meet on canonical ground regardless of which vocabulary each came from.
+
+    Falls back to the lowercased name when tool_kb is unavailable, which keeps
+    exact matching working rather than dropping guidance entirely.
+    """
+    s = (name or "").strip().lower()
+    if not s:
+        return None
+    try:
+        # Module-level helper, not a method on the KB object — importing it
+        # lazily keeps this usable even if the KB YAML fails to load.
+        from tool_kb import _normalize_service_name
+        return _normalize_service_name(s) or s
+    except Exception:
+        return s
+
+
 def _get_service_prompts(
     service: Optional[str],
     port: Optional[int],
@@ -585,7 +614,7 @@ def _get_service_prompts(
     data steer WEB scans, where the useful signal is what's running, not which
     port it's on.
     """
-    svc = (service or "").strip().lower() or None
+    svc = _canonical_service(service)
     tech_set = {t.strip().lower() for t in (tech or []) if t and t.strip()}
     matches: List[Dict] = []
     for row in _get_all_service_prompts():
@@ -594,7 +623,7 @@ def _get_service_prompts(
         if row_eid and row_eid != engagement_id:
             continue
         sel = row.get("selector_type")
-        row_svc = (row.get("service") or "").strip().lower() or None
+        row_svc = _canonical_service(row.get("service"))
         row_tech = (row.get("tech") or "").strip().lower() or None
         row_port = row.get("port")
         if sel == "port_service":
