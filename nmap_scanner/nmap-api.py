@@ -467,12 +467,12 @@ class MasscanBody(BaseModel):
         try:
             if self.ports.startswith('--top-ports'):
                 # Handle nmap --top-ports argument (allow spaces, dashes, letters, numbers)
-                sanitize_command_arg(self.ports, allowed_chars=r'^[a-zA-Z0-9\s\-=]+$')
+                sanitize_command_arg(self.ports, allowed_chars=r'^[a-zA-Z0-9\s\-=]+$', max_len=65536)
             else:
                 # Handle traditional port ranges (numbers, commas, dashes only)
                 # Strip spaces for traditional port ranges
                 self.ports = self.ports.replace(' ', '')
-                sanitize_command_arg(self.ports, allowed_chars=r'^[0-9,\-]+$')
+                sanitize_command_arg(self.ports, allowed_chars=r'^[0-9,\-]+$', max_len=65536)
         except ValidationError as e:
             raise HTTPException(status_code=400, detail=f"Invalid ports format: {e}")
 
@@ -1978,12 +1978,12 @@ class UdpScanBody(BaseModel):
         try:
             if self.ports.startswith('--top-ports'):
                 # Handle nmap --top-ports argument (allow spaces, dashes, letters, numbers)
-                sanitize_command_arg(self.ports, allowed_chars=r'^[a-zA-Z0-9\s\-=]+$')
+                sanitize_command_arg(self.ports, allowed_chars=r'^[a-zA-Z0-9\s\-=]+$', max_len=65536)
             else:
                 # Handle traditional port ranges (numbers, commas, dashes only)
                 # Strip spaces for traditional port ranges
                 self.ports = self.ports.replace(' ', '')
-                sanitize_command_arg(self.ports, allowed_chars=r'^[0-9,\-]+$')
+                sanitize_command_arg(self.ports, allowed_chars=r'^[0-9,\-]+$', max_len=65536)
         except ValidationError as e:
             raise HTTPException(status_code=400, detail=f"Invalid ports format: {e}")
 
