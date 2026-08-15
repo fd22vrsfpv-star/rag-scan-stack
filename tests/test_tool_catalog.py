@@ -117,3 +117,113 @@ class TestFilter:
         ok, bad = tc.filter_recommendations(recs)
         assert len(ok) == 1 and len(bad) == 2
         assert all("_rejection" in b for b in bad)
+
+
+class TestFlagsOnlyValues:
+    """A scanner flag is not a script name.
+
+    Observed from qwen3.8: `-sV` returned as an nmap *script*. It passed the
+    original gate because the leading dash made it look like a command line,
+    and a command line names no script to check. But `--script=-sV` is not
+    runnable — the value is junk, not a command.
+    """
+
+    def test_bare_flag_rejected(self):
+        ok, reason = tc.validate_recommendation({"scanner": "nmap", "script": "-sV"})
+        assert not ok, reason
+
+    def test_multiple_flags_rejected(self):
+        ok, _ = tc.validate_recommendation({"scanner": "nmap", "script": "-sV -sC"})
+        assert not ok
+
+    def test_real_command_still_passes(self):
+        """Has a non-flag word, so it is a command, not a stray flag."""
+        assert tc.validate_recommendation(
+            {"scanner": "nmap", "script": "nmap -sV -p {port} {target}"})[0]
+
+    def test_command_with_script_still_validated(self):
+        assert tc.validate_recommendation(
+            {"scanner": "nmap", "script": "nmap -sV --script=snmp-info {target}"})[0]
+
+
+class TestProseAndWrongField:
+    """Junk found by measuring a 3-round benchmark, not by imagination.
+
+    qwen3.8 produced all three of these while ostensibly passing validation.
+    """
+
+    def test_prose_in_the_script_field(self):
+        prose = ("Send IRC command prefixed with 'AB' to test for UnrealIRCd "
+                 "system-command backdoor; verify server response for "
+                 "unauthorized command execution")
+        ok, reason = tc.validate_recommendation({"scanner": "nmap", "script": prose})
+        assert not ok, reason
+
+    def test_flag_in_the_action_field(self):
+        """Only `script` was checked for nmap, so `-sV` in `action` slipped past."""
+        ok, _ = tc.validate_recommendation({"scanner": "nmap", "action": "-sV"})
+        assert not ok
+
+    def test_flags_with_a_port_number(self):
+        ok, _ = tc.validate_recommendation({"scanner": "nmap", "script": "-sV -p 6667"})
+        assert not ok
+
+    def test_short_real_command_still_passes(self):
+        assert tc.validate_recommendation(
+            {"scanner": "nmap", "script": "nmap -sV -p {port} {target}"})[0]
+
+    def test_msf_path_not_mistaken_for_prose(self):
+        assert tc.validate_recommendation(
+            {"scanner": "metasploit",
+             "action": "auxiliary/admin/smb/samba_symlink_traversal"})[0]
+
+
+class TestMsfSingularPlural:
+    """msf module DIRECTORIES are plural; its invocation syntax is singular.
+
+    The catalog is built by walking the source tree, so it holds
+    `exploits/unix/misc/distcc_exec` while every human, playbook and model writes
+    `exploit/unix/misc/distcc_exec`. Without folding, the validator rejected
+    EVERY real exploit module — a false positive, the worst failure mode for a
+    gate that blocks work.
+
+    Earlier tests missed this because `auxiliary` and `post` are spelled the same
+    in both forms.
+    """
+
+    @pytest.fixture(autouse=True)
+    def tree_catalog(self, monkeypatch):
+        """Catalog in source-tree form, exactly as the refresh script emits it."""
+        monkeypatch.setattr(tc, "load_catalogs", lambda *a, **k: {
+            "msf_modules": {
+                "exploits/unix/misc/distcc_exec",
+                "exploits/unix/ftp/vsftpd_234_backdoor",
+                "auxiliary/admin/smb/samba_symlink_traversal",
+                "payloads/cmd/unix/reverse",
+            },
+        })
+
+    def test_singular_exploit_path_accepted(self):
+        ok, reason = tc.validate_recommendation(
+            {"scanner": "metasploit", "script": "exploit/unix/misc/distcc_exec"})
+        assert ok, reason
+
+    def test_the_rule_named_module_accepted(self):
+        ok, reason = tc.validate_recommendation(
+            {"scanner": "metasploit", "script": "exploit/unix/ftp/vsftpd_234_backdoor"})
+        assert ok, reason
+
+    def test_payload_singular_accepted(self):
+        assert tc.validate_recommendation(
+            {"scanner": "metasploit", "script": "payload/cmd/unix/reverse"})[0]
+
+    def test_auxiliary_unaffected(self):
+        assert tc.validate_recommendation(
+            {"scanner": "metasploit",
+             "script": "auxiliary/admin/smb/samba_symlink_traversal"})[0]
+
+    def test_nonexistent_still_rejected(self):
+        """Folding must not turn the gate into a rubber stamp."""
+        ok, _ = tc.validate_recommendation(
+            {"scanner": "metasploit", "script": "exploit/unix/misc/not_a_module"})
+        assert not ok
