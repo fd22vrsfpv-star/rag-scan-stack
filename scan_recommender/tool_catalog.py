@@ -90,6 +90,28 @@ def _script_tokens(value: str) -> List[str]:
         for m in re.finditer(r"--script[= ]([^\s]+)", v):
             out.extend(t for t in m.group(1).strip("\"'").split(",") if t)
         return out
+    # A value STARTING with a flag names no tool. Observed from qwen3.8: `-sV`
+    # and `-sV -p 6667` returned as nmap *scripts* — scanner flags, not scripts,
+    # unrunnable as `--script=-sV`. A genuine command names its binary first
+    # (`nmap -sV -p {port} {target}`), so the first token is the discriminator;
+    # checking "every token is a flag" missed `-sV -p 6667` because 6667 is not.
+    words = [w for w in v.split() if w]
+    if words and words[0].startswith("-"):
+        return [v]                       # hand it back so it fails the ident check
+
+    # Prose, not an invocation. Measured from qwen3.8, which returned
+    # "Send IRC command prefixed with 'AB' to test for UnrealIRCd system-command
+    # backdoor; verify server response..." in the script field. It described the
+    # right technique but is not something a scanner can run, and it slipped
+    # through as a "command" because it contains ordinary words.
+    #
+    # A real command names its binary or a script in the first few tokens, so
+    # anything long-winded with no flag, no path and no placeholder is prose.
+    if (len(words) > 6 and "--script" not in v and "{" not in v
+            and not any(w.startswith("-") for w in words)
+            and "/" not in v):
+        return [v]                       # fails the identifier check below
+
     # Looks like a command (has flags or a placeholder) but names no script.
     if re.search(r"(^|\s)-{1,2}[A-Za-z]", v) or "{" in v:
         return []
@@ -124,7 +146,9 @@ def validate_recommendation(rec: Dict) -> Tuple[bool, Optional[str]]:
 
     if scanner == "nmap":
         catalog, label = cats.get("nmap_scripts") or set(), "nmap script"
-        values = [rec.get("script")]
+        # `action` too: models put the script name in either field, and checking
+        # only `script` let `-sV` and a sentence of prose through in measurement.
+        values = [rec.get("script"), rec.get("action")]
     elif scanner in ("metasploit", "msf"):
         catalog, label = cats.get("msf_modules") or set(), "metasploit module"
         # Modules arrive in either field depending on the generator.
