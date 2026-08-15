@@ -231,3 +231,51 @@ class TestExportRow:
         row = _row("service", service="smb", title="T", prompt="P")
         row["tags"] = ["lab", "smb"]
         assert sr._export_row(row)["tags"] == ["lab", "smb"]
+
+
+class TestMergeKbRecs:
+    """The hybrid pass must add what the rules missed and nothing they covered.
+
+    Before this merge existed, service_prompts had no effect on automated recon
+    at all: /next_scan answers from tool_kb rules whenever port rows exist, and
+    only the LLM branch injects operator guidance.
+    """
+
+    def test_bare_duplicate_of_a_rule_scanner_is_dropped(self, sr):
+        """Observed on the first real run — bare snmpwalk beside the rules' full form."""
+        rules = [{"scanner": "snmpwalk", "action": None,
+                  "script": "snmpwalk -v2c -c public {target}", "template": None}]
+        llm = [{"scanner": "snmpwalk", "action": None, "script": None, "template": None}]
+        assert sr._merge_kb_recs(rules, llm, set()) == []
+
+    def test_bare_rec_for_a_new_scanner_is_kept(self, sr):
+        """The LLM contributing a tool the static KB lacks is the whole point."""
+        rules = [{"scanner": "nmap", "action": None, "script": "snmp-info", "template": None}]
+        llm = [{"scanner": "onesixtyone", "action": None, "script": None, "template": None}]
+        assert len(sr._merge_kb_recs(rules, llm, set())) == 1
+
+    def test_specific_rec_kept_even_when_scanner_overlaps(self, sr):
+        """Same scanner, different script, is a real addition — not a duplicate."""
+        rules = [{"scanner": "nmap", "action": None, "script": "snmp-info", "template": None}]
+        llm = [{"scanner": "nmap", "action": None, "script": "snmp-brute", "template": None}]
+        assert len(sr._merge_kb_recs(rules, llm, set())) == 1
+
+    def test_exact_duplicate_dropped_via_seen_keys(self, sr):
+        seen = {("nuclei", None, None, "snmp-default-creds", "", "")}
+        llm = [{"scanner": "nuclei", "action": None, "script": None,
+                "template": "snmp-default-creds"}]
+        assert sr._merge_kb_recs([], llm, seen) == []
+
+    def test_seen_keys_is_updated_for_the_caller(self, sr):
+        """The caller keeps deduping against this set after we return."""
+        seen = set()
+        llm = [{"scanner": "hydra", "action": "brute", "script": None, "template": None}]
+        sr._merge_kb_recs([], llm, seen)
+        assert ("hydra", "brute", None, None, "", "") in seen
+
+    def test_repeated_llm_recs_collapse(self, sr):
+        llm = [{"scanner": "snmp-check", "action": None, "script": "x", "template": None}] * 3
+        assert len(sr._merge_kb_recs([], llm, set())) == 1
+
+    def test_no_llm_recs_is_empty(self, sr):
+        assert sr._merge_kb_recs([{"scanner": "nmap"}], [], set()) == []
