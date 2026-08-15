@@ -292,3 +292,34 @@ export function useToolCatalog() {
     staleTime: 30_000,
   })
 }
+
+export interface ToolCoverage {
+  ok: boolean
+  reason?: string
+  kb_tool_count: number
+  binary_count?: number
+  /** Tools the KB will recommend that exist nowhere — these fail at dispatch. */
+  unrunnable: Array<{ tool: string; referenced_by: string[]; references: number }>
+  /** Provisioned onto a node but never recommended — paid-for, unusable capability. */
+  uncatalogued: string[]
+  uncatalogued_total?: number
+}
+
+export function useToolCoverage() {
+  return useQuery({
+    queryKey: ['tool-coverage'],
+    queryFn: () => apiFetch<ToolCoverage>('/kb/tool-coverage'),
+    staleTime: 60_000,
+  })
+}
+
+/** Add an installed-but-unused tool to a service's KB override. */
+export function useAdoptTool() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body: { tool: string; service: string; purpose?: string }) =>
+      apiFetch<{ ok: boolean; total_tools?: number; unchanged?: boolean }>(
+        '/kb/tools/adopt', { method: 'POST', body: JSON.stringify(body) }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['tool-coverage'] }),
+  })
+}

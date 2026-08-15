@@ -173,6 +173,28 @@ async def get_tool_catalog():
         return safe_json(resp)
 
 
+@router.get("/api/kb/tool-coverage")
+async def get_tool_coverage():
+    """Tools the KB recommends but nothing can run, and installed tools it ignores."""
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        resp = await c.get(f"{s.scan_recommender_url}/kb/tool-coverage")
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _kb_detail(resp))
+        return safe_json(resp)
+
+
+@router.post("/api/kb/tools/adopt")
+async def adopt_tool(body: Dict[str, Any] = Body(...)):
+    """Add an installed-but-unused tool to a service's KB override."""
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        resp = await c.post(f"{s.scan_recommender_url}/kb/tools/adopt", json=body)
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _kb_detail(resp))
+        return safe_json(resp)
+
+
 @router.get("/api/kb/prompts/export")
 async def export_service_prompts(
     engagement_id: str | None = None,
