@@ -19,7 +19,9 @@
 #    5. Docker Build      — docker compose build
 #    6. Start Services    — docker compose up -d
 #    7. Database Schema   — wait for postgres, apply schema
-#    8. Health Check      — verify services are responding
+#    8. Ollama Models     — pull chat + embedding models, check connectivity
+#    9. Health Check      — verify services are responding
+#   10. Knowledge Seed    — import knowledge/seed/*.yaml into service_prompts
 # ==========================================================================
 
 set -euo pipefail
@@ -1738,6 +1740,67 @@ else
     docker compose ${COMPOSE_FILES} ps --format "table {{.Name}}\t{{.Status}}" 2>/dev/null | head -30 || true
 
     record_phase "Health: $HEALTHY/$TOTAL responding"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PHASE 10 — Seed the knowledge base
+# ══════════════════════════════════════════════════════════════════════════
+#
+# service_prompts is created empty by the schema, so without this a fresh
+# install has no per-service guidance and the AI scans fall back to generic
+# prompting. The seed files under knowledge/seed/ are the committed export of
+# rules that were drafted and reviewed on a working install.
+#
+# Runs last because it seeds over HTTP: scan-recommender must be up, which is
+# only true after phase 9. Everything here is NON-FATAL — the stack is
+# perfectly usable with an empty service_prompts, so a seeding failure must
+# never fail an otherwise-good install.
+#
+# Idempotent: import-knowledge.sh is create-or-update on the unique selector
+# index, so re-running setup updates in place rather than duplicating.
+banner 10 "Seeding knowledge base"
+
+if [ "$NO_START" = true ]; then
+    log_skip "Knowledge seeding skipped (services not started)"
+    record_phase "Knowledge: SKIPPED"
+elif ! compgen -G "knowledge/seed/*.yaml" >/dev/null 2>&1; then
+    log_info "No seed files in knowledge/seed/ — nothing to import"
+    record_phase "Knowledge: none"
+else
+    # scan-recommender owns service_prompts. Wait briefly: it may still be
+    # coming up behind the phase-9 checks, which only probe rag-api and the BFF.
+    SEED_API="${KNOWLEDGE_API:-https://localhost:8013}"
+    SEED_READY=false
+    for _ in $(seq 1 12); do
+        if curl -sk --max-time 5 -o /dev/null "${SEED_API}/kb/prompts" 2>/dev/null; then
+            SEED_READY=true; break
+        fi
+        sleep 5
+    done
+
+    if [ "$SEED_READY" != true ]; then
+        log_warn "scan-recommender not responding — skipping knowledge seeding (non-fatal)"
+        log_warn "  Seed it later with: ./scripts/import-knowledge.sh --file knowledge/seed/<file>.yaml"
+        record_phase "Knowledge: DEFERRED"
+    else
+        SEED_OK=0; SEED_FAIL=0
+        for seed_file in knowledge/seed/*.yaml; do
+            if ./scripts/import-knowledge.sh --file "$seed_file" --api "$SEED_API" >/dev/null 2>&1; then
+                log_ok "Seeded $(basename "$seed_file")"
+                SEED_OK=$((SEED_OK + 1))
+            else
+                log_warn "Could not seed $(basename "$seed_file") (non-fatal)"
+                SEED_FAIL=$((SEED_FAIL + 1))
+            fi
+        done
+        RULE_COUNT=$(curl -sk --max-time 10 "${SEED_API}/kb/prompts" 2>/dev/null \
+                     | jq '.prompts | length' 2>/dev/null || echo "?")
+        log_ok "Knowledge base: ${RULE_COUNT} rule(s) active"
+        record_phase "Knowledge: ${SEED_OK} file(s), ${RULE_COUNT} rules"
+        if [ "$SEED_FAIL" -gt 0 ]; then
+            log_warn "${SEED_FAIL} seed file(s) failed — re-run ./scripts/import-knowledge.sh to retry"
+        fi
+    fi
 fi
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -162,6 +162,28 @@ async def list_service_prompts(
         return safe_json(resp)
 
 
+@router.get("/api/kb/prompts/export")
+async def export_service_prompts(
+    engagement_id: str | None = None,
+    enabled_only: bool = False,
+):
+    """Export rules as a re-importable seed file.
+
+    The round-trip partner to import-knowledge.sh: rules accepted in the UI live
+    only in Postgres until this writes them back out.
+    """
+    s = get_settings()
+    params = {k: v for k, v in {
+        "engagement_id": engagement_id,
+        "enabled_only": str(enabled_only).lower(),
+    }.items() if v not in (None, "")}
+    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        resp = await c.get(f"{s.scan_recommender_url}/kb/prompts/export", params=params)
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _kb_detail(resp))
+        return safe_json(resp)
+
+
 @router.get("/api/kb/prompts/resolve")
 async def resolve_service_prompts(
     service: str | None = None,
