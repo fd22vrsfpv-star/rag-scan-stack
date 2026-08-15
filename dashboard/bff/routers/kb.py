@@ -162,6 +162,17 @@ async def list_service_prompts(
         return safe_json(resp)
 
 
+@router.get("/api/kb/tool-catalog")
+async def get_tool_catalog():
+    """Validator catalog contents, age, and per-node coverage."""
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        resp = await c.get(f"{s.scan_recommender_url}/kb/tool-catalog")
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _kb_detail(resp))
+        return safe_json(resp)
+
+
 @router.get("/api/kb/prompts/export")
 async def export_service_prompts(
     engagement_id: str | None = None,
