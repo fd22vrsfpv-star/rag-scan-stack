@@ -1,0 +1,12 @@
+{
+  "_comment": [
+    "Operator supplement, merged by scripts/refresh-tool-catalogs.sh and never overwritten by it.",
+    "Automated probing only sees what this host can reach. Tools that run on provisioned",
+    "instances, across pipes, or on nodes that are offline at refresh time are invisible to it \u2014",
+    "list them here so the validator does not reject TTPs that use them.",
+    "Keys mirror tool_catalogs.json: nmap_scripts, msf_modules, nuclei_templates, nuclei_tags, binaries."
+  ],
+  "binaries": [],
+  "nmap_scripts": [],
+  "msf_modules": []
+}

@@ -176,3 +176,54 @@ class TestProseAndWrongField:
         assert tc.validate_recommendation(
             {"scanner": "metasploit",
              "action": "auxiliary/admin/smb/samba_symlink_traversal"})[0]
+
+
+class TestMsfSingularPlural:
+    """msf module DIRECTORIES are plural; its invocation syntax is singular.
+
+    The catalog is built by walking the source tree, so it holds
+    `exploits/unix/misc/distcc_exec` while every human, playbook and model writes
+    `exploit/unix/misc/distcc_exec`. Without folding, the validator rejected
+    EVERY real exploit module — a false positive, the worst failure mode for a
+    gate that blocks work.
+
+    Earlier tests missed this because `auxiliary` and `post` are spelled the same
+    in both forms.
+    """
+
+    @pytest.fixture(autouse=True)
+    def tree_catalog(self, monkeypatch):
+        """Catalog in source-tree form, exactly as the refresh script emits it."""
+        monkeypatch.setattr(tc, "load_catalogs", lambda *a, **k: {
+            "msf_modules": {
+                "exploits/unix/misc/distcc_exec",
+                "exploits/unix/ftp/vsftpd_234_backdoor",
+                "auxiliary/admin/smb/samba_symlink_traversal",
+                "payloads/cmd/unix/reverse",
+            },
+        })
+
+    def test_singular_exploit_path_accepted(self):
+        ok, reason = tc.validate_recommendation(
+            {"scanner": "metasploit", "script": "exploit/unix/misc/distcc_exec"})
+        assert ok, reason
+
+    def test_the_rule_named_module_accepted(self):
+        ok, reason = tc.validate_recommendation(
+            {"scanner": "metasploit", "script": "exploit/unix/ftp/vsftpd_234_backdoor"})
+        assert ok, reason
+
+    def test_payload_singular_accepted(self):
+        assert tc.validate_recommendation(
+            {"scanner": "metasploit", "script": "payload/cmd/unix/reverse"})[0]
+
+    def test_auxiliary_unaffected(self):
+        assert tc.validate_recommendation(
+            {"scanner": "metasploit",
+             "script": "auxiliary/admin/smb/samba_symlink_traversal"})[0]
+
+    def test_nonexistent_still_rejected(self):
+        """Folding must not turn the gate into a rubber stamp."""
+        ok, _ = tc.validate_recommendation(
+            {"scanner": "metasploit", "script": "exploit/unix/misc/not_a_module"})
+        assert not ok
