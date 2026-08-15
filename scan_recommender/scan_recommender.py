@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from exploits_rag import rag_router
 from tool_kb import get_tool_kb, get_high_value_port_info
+from tool_catalog import filter_recommendations
 from log_manager import get_log_handler, setup_log_capture, LOGS_UI_HTML
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -1034,22 +1035,45 @@ def persist_recommendations(
 def _ollama_streamed_generate(prompt: str, model: str, endpoint: str,
                               timeout: Optional[int] = None,
                               options: Optional[Dict] = None) -> str:
-    payload = {"model": model, "prompt": prompt, "format": "json", "stream": True}
-    if options:
-        payload["options"] = options
-    full = ""
-    with requests.post(endpoint, json=payload, stream=True, timeout=(timeout or 120)) as r:
-        r.raise_for_status()
-        for line in r.iter_lines():
-            if not line:
-                continue
-            chunk = json.loads(line.decode("utf-8"))
-            # Ollama streams {"response": "..."} lines; could also have "done": true
-            if "response" in chunk:
-                full += chunk["response"]
-            if chunk.get("done"):
-                break
-    return full
+    def _stream(use_format_json: bool) -> str:
+        payload = {"model": model, "prompt": prompt, "stream": True}
+        if use_format_json:
+            payload["format"] = "json"
+        if options:
+            payload["options"] = options
+        out = ""
+        with requests.post(endpoint, json=payload, stream=True, timeout=(timeout or 120)) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                chunk = json.loads(line.decode("utf-8"))
+                # Ollama streams {"response": "..."} lines; could also have "done": true
+                if "response" in chunk:
+                    out += chunk["response"]
+                if chunk.get("done"):
+                    break
+        return out
+
+    full = _stream(True)
+    if full.strip():
+        return full
+
+    # Reasoning models (the qwen3 family) stream their chain of thought in a
+    # separate "thinking" field, and combining that with format=json makes Ollama
+    # emit an EMPTY response — 8 chunks, no content, done_reason=stop. The caller
+    # then sees "returned non-JSON payload" and the whole recommendation is lost.
+    # Measured: qwen3.6 produced 0 recommendations across 6 services this way,
+    # while the same model without format=json returned clean, valid JSON.
+    #
+    # Retrying unconstrained costs one extra call only for models that fail the
+    # first form. Dropping the constraint means the model MAY wrap its JSON in
+    # prose, so callers parse with _extract_json_object rather than json.loads.
+    logger.warning(
+        "Model %r returned an empty response with format=json (typical of "
+        "reasoning models) — retrying without the format constraint", model,
+    )
+    return _stream(False)
 
 
 def _ollama_nonstream_generate(prompt: str, model: str, endpoint: str,
@@ -1140,6 +1164,56 @@ def _anthropic_generate(prompt: str, timeout: Optional[int] = None) -> str:
         if block.get("type") == "text":
             return block["text"]
     return ""
+
+
+def _extract_json_object(text: str) -> Optional[Dict]:
+    """The first JSON object in `text`, or None.
+
+    Needed because the format=json constraint has to be dropped for reasoning
+    models (see _ollama_streamed_generate), and an unconstrained model may wrap
+    its JSON in prose or a ```json fence. Strict json.loads then fails on output
+    that is perfectly usable.
+
+    Scans for a balanced {...} rather than regex-matching, so a nested object
+    does not truncate at the first closing brace.
+    """
+    if not text:
+        return None
+    s = text.strip()
+    # Strip a markdown fence if present — common when the constraint is dropped.
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    start = s.find("{")
+    while start != -1:
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(s)):
+            c = s[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(s[start:i + 1])
+                    except json.JSONDecodeError:
+                        break          # malformed; try the next candidate
+        start = s.find("{", start + 1)
+    return None
 
 
 def _safe_json_parse(text: str) -> Dict:
@@ -1335,7 +1409,9 @@ Rules:
             raise HTTPException(status_code=502, detail=f"Ollama service unavailable: {e}")
 
     try:
-        data = json.loads(text)
+        data = _extract_json_object(text)
+        if data is None:
+            raise json.JSONDecodeError("no JSON object found", text or "", 0)
         recs = data.get("recommendations", [])
         return [{
             "scanner": rec.get("scanner"),
@@ -1536,6 +1612,20 @@ def get_next_scan_recommendations(
             # `port` is passed so per-port and per-(port,service) operator
             # prompts resolve — previously the LLM path discarded it entirely.
             ollama_recs = fetch_ollama_recommendations(ip, service, banner, port=port)
+            # Same catalog gate as the hybrid path below — this branch is the one
+            # that runs when no port rows exist yet, so it must not be the hole
+            # through which unrunnable invocations reach the queue.
+            ollama_recs, rejected_llm = filter_recommendations(ollama_recs)
+            for bad in rejected_llm:
+                logger.warning("Rejected unrunnable recommendation for %s:%s — %s (%s)",
+                               ip, port, bad.get("_rejection"),
+                               bad.get("script") or bad.get("template") or bad.get("action"))
+            if rejected_llm:
+                _emit_webhook("scan_recommender_invalid_recs_rejected", {
+                    "ip": ip, "port": port, "service": service,
+                    "rejected_count": len(rejected_llm),
+                    "reasons": [b.get("_rejection") for b in rejected_llm],
+                })
             recommendations.extend(ScanRecommendation(**rec) for rec in ollama_recs)
             if persist and PERSIST_RECS:
                 dict_recs = [r.dict() for r in recommendations]
@@ -1601,12 +1691,31 @@ def get_next_scan_recommendations(
                 try:
                     tech_tokens, _src = _get_detected_tech(ip, probe_port)
                     if _build_guidance_block(probe_service, probe_port, None, tech_tokens):
-                        for rec in _merge_kb_recs(
+                        merged = _merge_kb_recs(
                             raw_recs,
                             fetch_ollama_recommendations(
                                 ip, probe_service, banner, port=probe_port),
                             seen_keys,
-                        ):
+                        )
+                        # The LLM is not constrained to real tool names. Measured
+                        # on a live run: 2 of 8 suggestions were unrunnable —
+                        # `smb Vuln-MS17-010` (malformed) and `smb-enum-links`
+                        # (no such nmap script). Both would have failed at the
+                        # scanner after costing a dispatch.
+                        merged, rejected_recs = filter_recommendations(merged)
+                        for bad in rejected_recs:
+                            logger.warning(
+                                "Rejected unrunnable recommendation for %s:%s — %s (%s)",
+                                ip, probe_port, bad.get("_rejection"),
+                                bad.get("script") or bad.get("template") or bad.get("action"),
+                            )
+                        if rejected_recs:
+                            _emit_webhook("scan_recommender_invalid_recs_rejected", {
+                                "ip": ip, "port": probe_port, "service": probe_service,
+                                "rejected_count": len(rejected_recs),
+                                "reasons": [b.get("_rejection") for b in rejected_recs],
+                            })
+                        for rec in merged:
                             recommendations.append(ScanRecommendation(**rec))
                             kb_recs.append(rec)
                         logger.info(
