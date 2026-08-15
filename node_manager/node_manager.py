@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -696,8 +697,29 @@ async def _background_software_install(task_id: str, node_id: str, tools: list):
         )
 
         if install_result.get("ok") and install_result.get("exit_code", 1) == 0:
-            log_progress("tool", {"tool": tool_name, "status": "installed"})
-            results[tool_name] = {"status": "installed"}
+            # Exit code alone is not trustworthy: several install commands end in
+            # `|| echo 'manual install needed'`, which returns 0 even when the
+            # install failed outright. That produced entries like
+            #   vulnx: installed — verified: command not found: vulnx
+            # and those names flow into remote_nodes.capabilities, which the
+            # recommendation validator now trusts as "this tool exists here".
+            # Re-run the tool's own check so the claim is grounded in the tool
+            # actually being present.
+            confirm = await ssh_manager.provision_exec(
+                node_id=node_id, host=meta["host"],
+                user=meta.get("user", "root"),
+                ssh_port=meta.get("ssh_port", 22),
+                key_file=meta.get("key_file", "id_rsa"),
+                command=spec["check"], timeout=15,
+            )
+            if confirm.get("ok") and confirm.get("exit_code", 1) == 0:
+                log_progress("tool", {"tool": tool_name, "status": "installed"})
+                results[tool_name] = {"status": "installed"}
+            else:
+                reason = ("install command reported success but the tool is still "
+                          "not present (check: %s)" % spec["check"])
+                log_progress("tool", {"tool": tool_name, "status": "failed", "error": reason})
+                results[tool_name] = {"status": "failed", "error": reason}
         else:
             error = install_result.get("error") or install_result.get("stderr", "unknown error")
             log_progress("tool", {"tool": tool_name, "status": "failed", "error": error})
@@ -1571,6 +1593,11 @@ async def decommission_node(node_id: str):
 class NodePatchRequest(BaseModel):
     os_type: Optional[str] = None  # kali, ubuntu, debian
     tunnel_method: Optional[str] = None  # ssh, wireguard, hybrid
+    # Reconnect reads the SSH identity from metadata (`meta.get("user")`), so
+    # without these a node created as kali@host could never be moved to
+    # root@host — the only remedy was deleting and re-adding it.
+    user: Optional[str] = None      # SSH login user
+    key_name: Optional[str] = None  # private key filename in /ssh-keys
 
 
 @app.patch("/nodes/{node_id}")
@@ -1601,6 +1628,29 @@ async def patch_node(node_id: str, req: NodePatchRequest):
             conn.close()
             raise HTTPException(400, f"Invalid tunnel_method: {req.tunnel_method}")
         db_updates["tunnel_method"] = req.tunnel_method
+
+    if req.user is not None:
+        # This value is interpolated into an ssh command line, so constrain it to
+        # a real POSIX username rather than trusting the caller.
+        u = req.user.strip()
+        if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", u):
+            cur.close()
+            conn.close()
+            raise HTTPException(400, f"Invalid SSH user: {req.user!r}")
+        updates["user"] = u
+
+    if req.key_name is not None:
+        # Must name a key we already hold: this becomes `-i /ssh-keys/<name>`,
+        # so an unchecked value is a path-traversal read primitive.
+        available = SSHManager.list_keys()
+        if req.key_name not in available:
+            cur.close()
+            conn.close()
+            raise HTTPException(
+                400,
+                f"Unknown key {req.key_name!r}. Available: {', '.join(available) or 'none'}",
+            )
+        updates["key_name"] = req.key_name
 
     if updates:
         cur.execute(
@@ -2826,26 +2876,72 @@ _NONINTERACTIVE = (
     # Suppress dpkg config file prompts
     "export APT_OPTS='-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold'"
 )
+# Python tools live in a dedicated venv rather than system site-packages.
+#
+# Kali marks system Python EXTERNALLY-MANAGED (PEP 668) precisely because much of
+# Kali's own tooling IS Python, and pip writing there can break apt-managed
+# packages. The previous specs overrode that with --break-system-packages, which
+# trades a broken install today for a broken box later.
+#
+# A venv also removes the pip3 dependency entirely: `python3 -m venv` ships with
+# python3-venv, and the venv brings its own pip. Library checks must therefore
+# run under the venv interpreter, and CLI entry points are symlinked into
+# /usr/local/bin so the existing `which <tool>` checks keep working unchanged.
+_VENV = "/opt/pentest-venv"
+_VENV_PY = f"{_VENV}/bin/python"
+_VENV_PIP = f"{_VENV}/bin/pip"
+_VENV_LINK = f"ln -sf {_VENV}/bin/%s /usr/local/bin/%s 2>/dev/null || true"
+
 _APT_INSTALL = "apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold'"
 
 # Enhanced prerequisite setup with automatic permission/lock fixes
+# `pkill -f 'apt|dpkg'` matched the command line of the very shell running the
+# install: the remote command is `zsh -c '...apt-get install...'`, whose cmdline
+# contains "apt", so the cleanup killed itself before apt ever ran. Verified on a
+# live node — `pgrep -af "apt|dpkg"` returned the executing shell's own PID.
+#
+# Symptom was a whole provisioning run of "E: Unable to locate package <x>" for
+# packages that plainly exist, because the prerequisite `apt-get update` died the
+# same way and left empty package lists.
+#
+# `pkill -x` matches the executable NAME exactly, so it reaps a genuinely stuck
+# apt/dpkg without touching the wrapper shell.
 _APT_CLEANUP = (
-    "# Clean up any stuck apt processes and locks\n"
-    "pkill -f 'apt|dpkg' 2>/dev/null || true; "
+    "# Clean up any stuck apt processes and locks (exact names only — a -f\n"
+    "# pattern also matches this shell's own command line and kills the install)\n"
+    "for _p in apt apt-get dpkg; do pkill -x \"$_p\" 2>/dev/null || true; done; "
     "rm -f /var/lib/dpkg/lock* /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null || true; "
     "dpkg --configure -a 2>/dev/null || true"
 )
 
 _PROVISION_PREP = {
-    "kali":   f"{_APT_CLEANUP}; {_NONINTERACTIVE} && apt-get update && {_APT_INSTALL} curl unzip python3-pip",
-    "ubuntu": f"{_APT_CLEANUP}; {_NONINTERACTIVE} && apt-get update && {_APT_INSTALL} curl unzip python3-pip",
-    "debian": f"{_APT_CLEANUP}; {_NONINTERACTIVE} && apt-get update && {_APT_INSTALL} curl unzip python3-pip",
+    "kali":   f"{_APT_CLEANUP}; {_NONINTERACTIVE} && apt-get update && {_APT_INSTALL} curl unzip python3-venv && (test -x {_VENV_PY} || python3 -m venv {_VENV}) && {_VENV_PIP} install --quiet --upgrade pip",
+    "ubuntu": f"{_APT_CLEANUP}; {_NONINTERACTIVE} && apt-get update && {_APT_INSTALL} curl unzip python3-venv && (test -x {_VENV_PY} || python3 -m venv {_VENV}) && {_VENV_PIP} install --quiet --upgrade pip",
+    "debian": f"{_APT_CLEANUP}; {_NONINTERACTIVE} && apt-get update && {_APT_INSTALL} curl unzip python3-venv && (test -x {_VENV_PY} || python3 -m venv {_VENV}) && {_VENV_PIP} install --quiet --upgrade pip",
 }
 
 # Helper: download a PD binary release. Works on amd64/arm64 Linux.
 def _pd_binary_cmd(tool: str) -> str:
     """Download latest ProjectDiscovery tool binary from GitHub releases."""
     return _gh_binary_cmd("projectdiscovery", tool, "zip")
+
+
+# Staging directory for downloaded archives.
+#
+# NOT /tmp, for two independent reasons found on a live node:
+#
+#  1. /tmp there is tmpfs capped at 2G, while / has 133G free. A provisioning
+#     run pulls a dozen 30-50MB archives, so staging them in RAM is both wasteful
+#     and liable to fail as the run proceeds.
+#  2. /tmp is sticky and world-writable, and Kali ships fs.protected_regular=2 —
+#     under which even root cannot write to an existing file owned by another
+#     user there. A run as `kali` left /tmp/<tool>.dl behind, and every later run
+#     as `root` then failed with `curl: (23) client returned ERROR on write`.
+#     Ten tools failed for a reason that looked like a network fault and was not.
+#
+# A dedicated root-owned directory avoids both: it is on real disk, and being
+# non-world-writable it falls outside protected_regular's scope entirely.
+_DL_DIR = "/var/tmp/pentest-provision"
 
 
 def _gh_binary_cmd(org: str, tool: str, ext: str = "zip") -> str:
@@ -2855,25 +2951,37 @@ def _gh_binary_cmd(org: str, tool: str, ext: str = "zip") -> str:
     dl_pattern = f"{tool}[^\\\"]*linux[^\\\"]*\\\\.{escaped_ext}"
     if ext == "tar.gz":
         extract = (
-            f'mkdir -p /tmp/{tool}_extract && '
-            f'tar xzf /tmp/{tool}.dl -C /tmp/{tool}_extract && '
-            f'find /tmp/{tool}_extract -name "{tool}" -type f | head -1 | xargs -I{{}} mv {{}} /usr/local/bin/{tool}'
+            f'mkdir -p {_DL_DIR}/{tool}_extract && '
+            f'tar xzf {_DL_DIR}/{tool}.dl -C {_DL_DIR}/{tool}_extract && '
+            f'find {_DL_DIR}/{tool}_extract -name "{tool}" -type f | head -1 | xargs -I{{}} mv {{}} /usr/local/bin/{tool}'
         )
     else:
         extract = (
-            f'unzip -o /tmp/{tool}.dl -d /tmp/{tool}_extract && '
-            f'find /tmp/{tool}_extract -name "{tool}" -type f | head -1 | xargs -I{{}} mv {{}} /usr/local/bin/{tool}'
+            f'unzip -o {_DL_DIR}/{tool}.dl -d {_DL_DIR}/{tool}_extract && '
+            f'find {_DL_DIR}/{tool}_extract -name "{tool}" -type f | head -1 | xargs -I{{}} mv {{}} /usr/local/bin/{tool}'
         )
     return (
         f'ARCH=$(uname -m | sed "s/x86_64/amd64/;s/aarch64/arm64/") && '
         f'URL=$(curl -sL "https://api.github.com/repos/{org}/{tool}/releases/latest" '
         f'| grep -oP "https://[^\\\"]*{tool}[^\\\"]*linux[^\\\"]*${{ARCH}}[^\\\"]*.{ext}" | head -1) && '
         f'if [ -z "$URL" ]; then echo "No release found for {org}/{tool} linux/$ARCH"; exit 1; fi && '
+        f'mkdir -p {_DL_DIR} && chmod 700 {_DL_DIR} && '
         f'echo "Downloading $URL" && '
-        f'curl -sL "$URL" -o /tmp/{tool}.dl && '
+        # Clear stale artefacts BEFORE downloading, not just after success.
+        #
+        # /tmp is sticky and world-writable and Kali ships fs.protected_regular=2,
+        # under which even root cannot write to an existing file owned by another
+        # user in such a directory. A run as `kali` therefore left /tmp/<tool>.dl
+        # files that made every later run as `root` fail with
+        #   curl: (23) client returned ERROR on write
+        # — 10 ProjectDiscovery tools failing for a reason that looked like a
+        # network or disk problem and was neither. Cleaning up only on success
+        # meant a single failed run poisoned all subsequent ones.
+        f'rm -f {_DL_DIR}/{tool}.dl && rm -rf {_DL_DIR}/{tool}_extract && '
+        f'curl -sL "$URL" -o {_DL_DIR}/{tool}.dl && '
         f'{extract} && '
         f'chmod +x /usr/local/bin/{tool} && '
-        f'rm -rf /tmp/{tool}.dl /tmp/{tool}_extract'
+        f'rm -rf {_DL_DIR}/{tool}.dl {_DL_DIR}/{tool}_extract'
     )
 
 # Tools to install and their check/install commands per OS
@@ -2974,9 +3082,9 @@ _PROVISION_TOOLS = {
                   "debian": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' whatweb"},
     "wafw00f":   {"check": "which wafw00f",
                   "verify": "wafw00f --version 2>&1 | head -1",
-                  "kali": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' wafw00f || pip3 install --break-system-packages wafw00f",
-                  "ubuntu": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' wafw00f || pip3 install --break-system-packages wafw00f",
-                  "debian": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' wafw00f || pip3 install --break-system-packages wafw00f"},
+                  "kali": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' wafw00f || {_VENV_PIP} install wafw00f && ln -sf {_VENV}/bin/wafw00f /usr/local/bin/wafw00f",
+                  "ubuntu": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' wafw00f || {_VENV_PIP} install wafw00f && ln -sf {_VENV}/bin/wafw00f /usr/local/bin/wafw00f",
+                  "debian": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' wafw00f || {_VENV_PIP} install wafw00f && ln -sf {_VENV}/bin/wafw00f /usr/local/bin/wafw00f"},
     "shuffledns": {"check": "which shuffledns",
                   "verify": "shuffledns -version 2>&1 | head -1",
                   "kali": _pd_binary_cmd("shuffledns"),
@@ -2999,16 +3107,16 @@ _PROVISION_TOOLS = {
                   "ubuntu": "mkdir -p /usr/share/wordlists && test -f /usr/share/wordlists/rockyou.txt || curl -sL https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt -o /usr/share/wordlists/rockyou.txt",
                   "debian": "mkdir -p /usr/share/wordlists && test -f /usr/share/wordlists/rockyou.txt || curl -sL https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt -o /usr/share/wordlists/rockyou.txt"},
     # --- Content recon tools (PDF, EXIF, wordlist, spider support) ---
-    "pdfplumber": {"check": "python3 -c 'import pdfplumber' 2>/dev/null && echo ok",
+    "pdfplumber": {"check": f"{_VENV_PY} -c 'import pdfplumber' 2>/dev/null && echo ok",
                   "verify": "python3 -c 'import pdfplumber; print(f\"pdfplumber {pdfplumber.__version__}\")' 2>&1",
-                  "kali": "pip3 install --break-system-packages pdfplumber",
-                  "ubuntu": "pip3 install --break-system-packages pdfplumber",
-                  "debian": "pip3 install --break-system-packages pdfplumber"},
-    "pillow":    {"check": "python3 -c 'from PIL import Image' 2>/dev/null && echo ok",
+                  "kali": f"{_VENV_PIP} install pdfplumber",
+                  "ubuntu": f"{_VENV_PIP} install pdfplumber",
+                  "debian": f"{_VENV_PIP} install pdfplumber"},
+    "pillow":    {"check": f"{_VENV_PY} -c 'from PIL import Image' 2>/dev/null && echo ok",
                   "verify": "python3 -c 'from PIL import Image; import PIL; print(f\"Pillow {PIL.__version__}\")' 2>&1",
-                  "kali": "pip3 install --break-system-packages Pillow",
-                  "ubuntu": "pip3 install --break-system-packages Pillow",
-                  "debian": "pip3 install --break-system-packages Pillow"},
+                  "kali": f"{_VENV_PIP} install Pillow",
+                  "ubuntu": f"{_VENV_PIP} install Pillow",
+                  "debian": f"{_VENV_PIP} install Pillow"},
     "exiftool":  {"check": "which exiftool",
                   "verify": "exiftool -ver 2>&1",
                   "kali": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' libimage-exiftool-perl",
@@ -3059,43 +3167,43 @@ _PROVISION_TOOLS = {
                   "debian": _gh_binary_cmd("LukaSikic", "subzy", "tar.gz")},
     "GoLinkFinder": {"check": "which GoLinkFinder || python3 -c 'import golinkfinder' 2>/dev/null && echo ok",
                   "verify": "GoLinkFinder -h 2>&1 | head -1 || echo 'installed'",
-                  "kali": "pip3 install --break-system-packages golinkfinder",
-                  "ubuntu": "pip3 install --break-system-packages golinkfinder",
-                  "debian": "pip3 install --break-system-packages golinkfinder"},
+                  "kali": f"{_VENV_PIP} install golinkfinder",
+                  "ubuntu": f"{_VENV_PIP} install golinkfinder",
+                  "debian": f"{_VENV_PIP} install golinkfinder"},
     # --- Service enumeration (DNS/email) ---
     "mcp-kali-server": {"check": "which kali-server-mcp",
                   "verify": "dpkg -l mcp-kali-server 2>/dev/null | grep ii | head -1 || echo 'not installed'",
                   "kali": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' mcp-kali-server",
                   "ubuntu": "echo 'mcp-kali-server requires Kali Linux'",
                   "debian": "echo 'mcp-kali-server requires Kali Linux'"},
-    "dnspython": {"check": "python3 -c 'import dns' 2>/dev/null && echo ok",
+    "dnspython": {"check": f"{_VENV_PY} -c 'import dns' 2>/dev/null && echo ok",
                   "verify": "python3 -c 'import dns; print(f\"dnspython {dns.__version__}\")' 2>&1",
-                  "kali": "pip3 install --break-system-packages dnspython",
-                  "ubuntu": "pip3 install --break-system-packages dnspython",
-                  "debian": "pip3 install --break-system-packages dnspython"},
+                  "kali": f"{_VENV_PIP} install dnspython",
+                  "ubuntu": f"{_VENV_PIP} install dnspython",
+                  "debian": f"{_VENV_PIP} install dnspython"},
     # ── KB tools (optional — install on demand) ──────────────────────────
     "ssh-audit":  {"check": "which ssh-audit",
                   "verify": "ssh-audit --help 2>&1 | head -1",
-                  "kali": f"{_APT_INSTALL} ssh-audit || pip3 install --break-system-packages ssh-audit",
-                  "ubuntu": "pip3 install --break-system-packages ssh-audit",
-                  "debian": "pip3 install --break-system-packages ssh-audit"},
+                  "kali": f"{_APT_INSTALL} ssh-audit || {_VENV_PIP} install ssh-audit && ln -sf {_VENV}/bin/ssh-audit /usr/local/bin/ssh-audit",
+                  "ubuntu": "/opt/pentest-venv/bin/pip install ssh-audit && ln -sf /opt/pentest-venv/bin/ssh-audit /usr/local/bin/ssh-audit",
+                  "debian": "/opt/pentest-venv/bin/pip install ssh-audit && ln -sf /opt/pentest-venv/bin/ssh-audit /usr/local/bin/ssh-audit"},
     "sslscan":   {"check": "which sslscan", "verify": "sslscan --version 2>&1 | head -1",
                   "kali": f"{_APT_INSTALL} sslscan", "ubuntu": f"{_APT_INSTALL} sslscan", "debian": f"{_APT_INSTALL} sslscan"},
     "sslyze":    {"check": "which sslyze", "verify": "sslyze --version 2>&1",
-                  "kali": "pip3 install --break-system-packages sslyze",
-                  "ubuntu": "pip3 install --break-system-packages sslyze", "debian": "pip3 install --break-system-packages sslyze"},
+                  "kali": "/opt/pentest-venv/bin/pip install sslyze && ln -sf /opt/pentest-venv/bin/sslyze /usr/local/bin/sslyze",
+                  "ubuntu": "/opt/pentest-venv/bin/pip install sslyze && ln -sf /opt/pentest-venv/bin/sslyze /usr/local/bin/sslyze", "debian": "/opt/pentest-venv/bin/pip install sslyze && ln -sf /opt/pentest-venv/bin/sslyze /usr/local/bin/sslyze"},
     "testssl":   {"check": "which testssl.sh || which testssl",
                   "verify": "testssl.sh --version 2>&1 | head -3 || which testssl.sh || echo testssl installed",
                   "kali": f"{_APT_INSTALL} testssl.sh", "ubuntu": "git clone --depth 1 https://github.com/drwetter/testssl.sh.git /opt/testssl && ln -sf /opt/testssl/testssl.sh /usr/local/bin/testssl.sh",
                   "debian": "git clone --depth 1 https://github.com/drwetter/testssl.sh.git /opt/testssl && ln -sf /opt/testssl/testssl.sh /usr/local/bin/testssl.sh"},
     "sqlmap":    {"check": "which sqlmap", "verify": "sqlmap --version 2>&1",
-                  "kali": f"{_APT_INSTALL} sqlmap", "ubuntu": f"{_APT_INSTALL} sqlmap", "debian": "pip3 install --break-system-packages sqlmap"},
+                  "kali": f"{_APT_INSTALL} sqlmap", "ubuntu": f"{_APT_INSTALL} sqlmap", "debian": "/opt/pentest-venv/bin/pip install sqlmap && ln -sf /opt/pentest-venv/bin/sqlmap /usr/local/bin/sqlmap 2>/dev/null || true"},
     "enum4linux":{"check": "which enum4linux", "verify": "enum4linux --version 2>&1 || echo 'installed'",
                   "kali": f"{_APT_INSTALL} enum4linux", "ubuntu": f"{_APT_INSTALL} enum4linux", "debian": f"{_APT_INSTALL} enum4linux"},
     "enum4linux-ng":{"check": "which enum4linux-ng", "verify": "enum4linux-ng --help 2>&1 | head -1 || echo 'installed'",
                   "kali": f"{_APT_INSTALL} enum4linux-ng",
-                  "ubuntu": "pipx install enum4linux-ng || pip3 install --break-system-packages enum4linux-ng",
-                  "debian": "pipx install enum4linux-ng || pip3 install --break-system-packages enum4linux-ng"},
+                  "ubuntu": "pipx install enum4linux-ng || /opt/pentest-venv/bin/pip install enum4linux-ng && ln -sf /opt/pentest-venv/bin/enum4linux-ng /usr/local/bin/enum4linux-ng 2>/dev/null || true",
+                  "debian": "pipx install enum4linux-ng || /opt/pentest-venv/bin/pip install enum4linux-ng && ln -sf /opt/pentest-venv/bin/enum4linux-ng /usr/local/bin/enum4linux-ng 2>/dev/null || true"},
     "impacket-smbclient":{"check": "which impacket-smbclient", "verify": "impacket-smbclient -h 2>&1 | head -1 || echo 'installed'",
                   "kali": f"{_APT_INSTALL} impacket-scripts", "ubuntu": f"{_APT_INSTALL} impacket-scripts", "debian": f"{_APT_INSTALL} impacket-scripts"},
     "lftp":      {"check": "which lftp", "verify": "lftp --version 2>&1 | head -1",
@@ -3103,8 +3211,8 @@ _PROVISION_TOOLS = {
     "smbclient": {"check": "which smbclient", "verify": "smbclient --version 2>&1 | head -1",
                   "kali": f"{_APT_INSTALL} smbclient", "ubuntu": f"{_APT_INSTALL} smbclient", "debian": f"{_APT_INSTALL} smbclient"},
     "smbmap":    {"check": "which smbmap", "verify": "smbmap --version 2>&1 || echo 'installed'",
-                  "kali": f"{_APT_INSTALL} smbmap", "ubuntu": "pip3 install --break-system-packages smbmap",
-                  "debian": "pip3 install --break-system-packages smbmap"},
+                  "kali": f"{_APT_INSTALL} smbmap", "ubuntu": "/opt/pentest-venv/bin/pip install smbmap && ln -sf /opt/pentest-venv/bin/smbmap /usr/local/bin/smbmap 2>/dev/null || true",
+                  "debian": "/opt/pentest-venv/bin/pip install smbmap && ln -sf /opt/pentest-venv/bin/smbmap /usr/local/bin/smbmap 2>/dev/null || true"},
     "medusa":    {"check": "which medusa", "verify": "medusa -V 2>&1 | head -1",
                   "kali": f"{_APT_INSTALL} medusa", "ubuntu": f"{_APT_INSTALL} medusa", "debian": f"{_APT_INSTALL} medusa"},
     "ncrack":    {"check": "which ncrack", "verify": "ncrack --version 2>&1 | head -1",
@@ -3128,22 +3236,22 @@ _PROVISION_TOOLS = {
     "dig":       {"check": "which dig", "verify": "dig -v 2>&1 | head -1",
                   "kali": f"{_APT_INSTALL} dnsutils", "ubuntu": f"{_APT_INSTALL} dnsutils", "debian": f"{_APT_INSTALL} dnsutils"},
     "dnsrecon":  {"check": "which dnsrecon", "verify": "dnsrecon --version 2>&1 || echo 'installed'",
-                  "kali": f"{_APT_INSTALL} dnsrecon", "ubuntu": "pip3 install --break-system-packages dnsrecon",
-                  "debian": "pip3 install --break-system-packages dnsrecon"},
+                  "kali": f"{_APT_INSTALL} dnsrecon", "ubuntu": "/opt/pentest-venv/bin/pip install dnsrecon && ln -sf /opt/pentest-venv/bin/dnsrecon /usr/local/bin/dnsrecon 2>/dev/null || true",
+                  "debian": "/opt/pentest-venv/bin/pip install dnsrecon && ln -sf /opt/pentest-venv/bin/dnsrecon /usr/local/bin/dnsrecon 2>/dev/null || true"},
     "dnsenum":   {"check": "which dnsenum", "verify": "dnsenum --version 2>&1 || echo 'installed'",
                   "kali": f"{_APT_INSTALL} dnsenum", "ubuntu": f"{_APT_INSTALL} dnsenum", "debian": f"{_APT_INSTALL} dnsenum"},
     "feroxbuster":{"check": "which feroxbuster", "verify": "feroxbuster --version 2>&1",
                   "kali": f"{_APT_INSTALL} feroxbuster", "ubuntu": "curl -sL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh | bash -s /usr/local/bin 2>/dev/null || echo feroxbuster-install-failed",
                   "debian": "curl -sL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh | bash -s /usr/local/bin 2>/dev/null || echo feroxbuster-install-failed"},
     "dirsearch": {"check": "which dirsearch", "verify": "dirsearch --version 2>&1 || echo 'installed'",
-                  "kali": f"{_APT_INSTALL} dirsearch", "ubuntu": "pip3 install --break-system-packages dirsearch",
-                  "debian": "pip3 install --break-system-packages dirsearch"},
+                  "kali": f"{_APT_INSTALL} dirsearch", "ubuntu": "/opt/pentest-venv/bin/pip install dirsearch && ln -sf /opt/pentest-venv/bin/dirsearch /usr/local/bin/dirsearch 2>/dev/null || true",
+                  "debian": "/opt/pentest-venv/bin/pip install dirsearch && ln -sf /opt/pentest-venv/bin/dirsearch /usr/local/bin/dirsearch 2>/dev/null || true"},
     "wfuzz":     {"check": "which wfuzz", "verify": "wfuzz --version 2>&1 || echo 'installed'",
-                  "kali": f"{_APT_INSTALL} wfuzz", "ubuntu": "pip3 install --break-system-packages wfuzz",
-                  "debian": "pip3 install --break-system-packages wfuzz"},
+                  "kali": f"{_APT_INSTALL} wfuzz", "ubuntu": "/opt/pentest-venv/bin/pip install wfuzz && ln -sf /opt/pentest-venv/bin/wfuzz /usr/local/bin/wfuzz 2>/dev/null || true",
+                  "debian": "/opt/pentest-venv/bin/pip install wfuzz && ln -sf /opt/pentest-venv/bin/wfuzz /usr/local/bin/wfuzz 2>/dev/null || true"},
     "crackmapexec":{"check": "which crackmapexec || which cme", "verify": "crackmapexec --version 2>&1 || cme --version 2>&1",
-                  "kali": f"{_APT_INSTALL} crackmapexec", "ubuntu": "pip3 install --break-system-packages crackmapexec",
-                  "debian": "pip3 install --break-system-packages crackmapexec"},
+                  "kali": f"{_APT_INSTALL} crackmapexec", "ubuntu": "/opt/pentest-venv/bin/pip install crackmapexec && ln -sf /opt/pentest-venv/bin/crackmapexec /usr/local/bin/crackmapexec 2>/dev/null || true",
+                  "debian": "/opt/pentest-venv/bin/pip install crackmapexec && ln -sf /opt/pentest-venv/bin/crackmapexec /usr/local/bin/crackmapexec 2>/dev/null || true"},
     "evil-winrm":{"check": "which evil-winrm", "verify": "evil-winrm --version 2>&1 || echo 'installed'",
                   "kali": f"{_APT_INSTALL} evil-winrm", "ubuntu": "gem install evil-winrm",
                   "debian": "gem install evil-winrm"},
@@ -3160,11 +3268,11 @@ _PROVISION_TOOLS = {
     "swaks":     {"check": "which swaks", "verify": "swaks --version 2>&1 | head -1",
                   "kali": f"{_APT_INSTALL} swaks", "ubuntu": f"{_APT_INSTALL} swaks", "debian": f"{_APT_INSTALL} swaks"},
     "smtp-user-enum":{"check": "which smtp-user-enum", "verify": "smtp-user-enum --version 2>&1 || echo 'installed'",
-                  "kali": f"{_APT_INSTALL} smtp-user-enum", "ubuntu": "pip3 install --break-system-packages smtp-user-enum",
-                  "debian": "pip3 install --break-system-packages smtp-user-enum"},
+                  "kali": f"{_APT_INSTALL} smtp-user-enum", "ubuntu": "/opt/pentest-venv/bin/pip install smtp-user-enum && ln -sf /opt/pentest-venv/bin/smtp-user-enum /usr/local/bin/smtp-user-enum 2>/dev/null || true",
+                  "debian": "/opt/pentest-venv/bin/pip install smtp-user-enum && ln -sf /opt/pentest-venv/bin/smtp-user-enum /usr/local/bin/smtp-user-enum 2>/dev/null || true"},
     "crowbar":   {"check": "which crowbar", "verify": "crowbar --version 2>&1 || echo 'installed'",
-                  "kali": f"{_APT_INSTALL} crowbar", "ubuntu": "pip3 install --break-system-packages crowbar",
-                  "debian": "pip3 install --break-system-packages crowbar"},
+                  "kali": f"{_APT_INSTALL} crowbar", "ubuntu": "/opt/pentest-venv/bin/pip install crowbar && ln -sf /opt/pentest-venv/bin/crowbar /usr/local/bin/crowbar 2>/dev/null || true",
+                  "debian": "/opt/pentest-venv/bin/pip install crowbar && ln -sf /opt/pentest-venv/bin/crowbar /usr/local/bin/crowbar 2>/dev/null || true"},
     "kerbrute":  {"check": "which kerbrute", "verify": "kerbrute version 2>&1 || echo 'installed'",
                   "kali": f"{_APT_INSTALL} kerbrute || " + "curl -sL https://github.com/ropnop/kerbrute/releases/latest/download/kerbrute_linux_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') -o /usr/local/bin/kerbrute && chmod +x /usr/local/bin/kerbrute",
                   "ubuntu": "curl -sL https://github.com/ropnop/kerbrute/releases/latest/download/kerbrute_linux_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') -o /usr/local/bin/kerbrute && chmod +x /usr/local/bin/kerbrute", "debian": "curl -sL https://github.com/ropnop/kerbrute/releases/latest/download/kerbrute_linux_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') -o /usr/local/bin/kerbrute && chmod +x /usr/local/bin/kerbrute"},
@@ -3172,9 +3280,9 @@ _PROVISION_TOOLS = {
                   "kali": _pd_binary_cmd("alterx"), "ubuntu": _pd_binary_cmd("alterx"), "debian": _pd_binary_cmd("alterx")},
     "vulnx":     {"check": "python3 -c 'import vulnx' 2>/dev/null && echo ok || which vulnx",
                   "verify": "vulnx --version 2>&1 || echo 'installed'",
-                  "kali": "pip3 install --break-system-packages vulnx || echo 'vulnx: manual install needed'",
-                  "ubuntu": "pip3 install --break-system-packages vulnx || echo 'vulnx: manual install needed'",
-                  "debian": "pip3 install --break-system-packages vulnx || echo 'vulnx: manual install needed'"},
+                  "kali": "/opt/pentest-venv/bin/pip install vulnx && ln -sf /opt/pentest-venv/bin/vulnx /usr/local/bin/vulnx || echo 'vulnx: manual install needed'",
+                  "ubuntu": "/opt/pentest-venv/bin/pip install vulnx && ln -sf /opt/pentest-venv/bin/vulnx /usr/local/bin/vulnx || echo 'vulnx: manual install needed'",
+                  "debian": "/opt/pentest-venv/bin/pip install vulnx && ln -sf /opt/pentest-venv/bin/vulnx /usr/local/bin/vulnx || echo 'vulnx: manual install needed'"},
     "snmp-check":{"check": "which snmp-check", "verify": "snmp-check --version 2>&1 || echo 'installed'",
                   "kali": f"{_APT_INSTALL} snmp-check || echo 'snmp-check: Kali only'",
                   "ubuntu": "echo 'snmp-check: available on Kali only'", "debian": "echo 'snmp-check: available on Kali only'"},
@@ -3379,6 +3487,11 @@ async def mcp_proxy(node_id: str, request: Request):
     local_port = info["local_port"]
     body = await request.json()
 
+    # Imported here because this module never imports httpx at top level — the
+    # other three call sites each do a local import. Without it this endpoint
+    # raised NameError on its first call, so the Kali MCP proxy was unusable.
+    import httpx
+
     try:
         async with httpx.AsyncClient(verify=False, timeout=120) as client:
             # The Kali MCP server has a REST API at port 5000, forwarded to local_port
@@ -3509,6 +3622,35 @@ async def provision_node(node_id: str, req: ProvisionRequest):
         if vr.get("ok") and vr.get("exit_code", 1) == 0:
             return vr.get("stdout", "").strip().split("\n")[0][:100]
         return None
+
+    async def _confirm_present(tool_name, spec):
+        """Is the tool actually on the box? Authoritative, unlike `verify`.
+
+        Neither the install command's exit code nor `verify` can be trusted on
+        their own: many of both end in `|| echo 'installed'`, which returns 0
+        while printing failure. That produced entries like
+
+            vulnx: installed — verified: command not found: vulnx
+
+        and those names are written into remote_nodes.capabilities, which the
+        recommendation validator now consumes as "this tool exists here". A tool
+        wrongly recorded as present is worse than one missing: it silently
+        licenses recommendations that cannot run.
+
+        `check` uses `which` / `command -v` / a real import, so its exit code
+        means what it says.
+        """
+        check_cmd = spec.get("check")
+        if not check_cmd:
+            return True          # nothing to check against — do not invent a failure
+        cr = await ssh_manager.provision_exec(
+            node_id=node_id, host=meta["host"],
+            user=meta.get("user", "root"),
+            ssh_port=meta.get("ssh_port", 22),
+            key_file=meta.get("key_file", "id_rsa"),
+            command=check_cmd, timeout=15,
+        )
+        return bool(cr.get("ok")) and cr.get("exit_code", 1) == 0
 
     async def _stream():
         results = {}
@@ -3646,11 +3788,16 @@ async def provision_node(node_id: str, req: ProvisionRequest):
             )
 
             if install_result.get("ok") and install_result.get("exit_code", 1) == 0:
-                ver = await _verify_tool(tool_name, spec)
-                if ver:
-                    r = {"status": "installed", "stdout": f"verified: {ver}"}
+                # Confirm presence before claiming success — see _confirm_present.
+                if await _confirm_present(tool_name, spec):
+                    ver = await _verify_tool(tool_name, spec)
+                    r = {"status": "installed",
+                         "stdout": f"verified: {ver}" if ver
+                                   else install_result.get("stdout", "")[-200:]}
                 else:
-                    r = {"status": "installed", "stdout": install_result.get("stdout", "")[-200:]}
+                    r = {"status": "failed",
+                         "error": "install reported success but the tool is not present",
+                         "stdout": install_result.get("stdout", "")[-200:]}
                 results[tool_name] = r
             else:
                 r = {"status": "failed", "exit_code": install_result.get("exit_code"),
@@ -3665,10 +3812,21 @@ async def provision_node(node_id: str, req: ProvisionRequest):
             conn2 = _get_conn()
             cur2 = conn2.cursor()
             cur2.execute(
-                """UPDATE remote_nodes SET metadata = metadata || %s,
-                   capabilities = (SELECT array_agg(DISTINCT elem) FROM unnest(capabilities || %s::text[]) elem)
+                # capabilities is jsonb, not text[]. The previous statement did
+                # `capabilities || %s::text[]`, which Postgres rejects with
+                # "operator does not exist: jsonb || text[]" — swallowed by the
+                # except below, so 139 provisioned tools were recorded as 3.
+                # That column feeds the recommendation validator's view of what a
+                # node can run, so silently losing it makes the validator blind.
+                """UPDATE remote_nodes
+                   SET metadata = metadata || %s,
+                       capabilities = (
+                           SELECT jsonb_agg(DISTINCT elem)
+                           FROM jsonb_array_elements_text(
+                                    COALESCE(capabilities, '[]'::jsonb) || %s::jsonb) elem)
                    WHERE id = %s""",
-                (psycopg2.extras.Json({"provisioned_tools": installed}), installed, node_id),
+                (psycopg2.extras.Json({"provisioned_tools": installed}),
+                 psycopg2.extras.Json(installed), node_id),
             )
             conn2.commit()
             cur2.close()
@@ -5121,8 +5279,10 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 
 echo "Cleaning up any stuck apt processes and locks..."
-# Clean up any stuck apt processes and locks
-pkill -f 'apt|dpkg' 2>/dev/null || true
+# Exact names only: `pkill -f 'apt|dpkg'` also matches this script's own command
+# line (the remote shell is invoked as `zsh -c '...apt...'`) and kills the very
+# install it is preparing for.
+for _p in apt apt-get dpkg; do pkill -x "$_p" 2>/dev/null || true; done
 rm -f /var/lib/dpkg/lock* /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null || true
 dpkg --configure -a 2>/dev/null || true
 
