@@ -158,3 +158,24 @@ done
 - QR code libraries (`react-qr-code`, `qr-code-styling`) are cross-platform JavaScript
 - No OS-specific changes needed — builds identically on Windows, macOS, and Linux
 - Frontend compiled to static assets served by nginx container
+
+## 2026-08-15 — SSH ControlMaster socket path (macOS-specific)
+
+**Files:** `node_manager/ssh_manager.py`
+**Platforms:** macOS (Docker Desktop) — Linux hosts unaffected.
+
+`SSH_CONTROL_DIR` moved `/tmp/ssh-ctrl` -> `/dev/shm/ssh-ctrl`.
+
+On Docker Desktop for macOS the container's `/tmp` is a bind mount of the host
+(`/run/host_mark/private on /tmp type fakeowner`). ssh's `muxserver_listen` binds a unix socket
+then hard-links it into place, and that link fails there with EBADF:
+
+```
+muxserver_listen: link mux listener /tmp/ssh-ctrl/ctrl-<id>.xxxx
+    => /tmp/ssh-ctrl/ctrl-<id>: Bad file descriptor
+```
+
+Authentication succeeds first, so the failure looks like a credentials problem and is not. On a
+Linux host `/tmp` is an ordinary container filesystem and the original path works, which is why
+this never appeared there. Overridable via `SSH_CONTROL_DIR`; falls back to `/var/tmp/ssh-ctrl`
+if `/dev/shm` is unavailable.
