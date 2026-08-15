@@ -35,11 +35,20 @@ def ensure_asset(cur, ip: str = None, hostname: str = None) -> str:
     # Case 1: IP provided (most common, should be primary)
     if ip:
         # Use UPSERT to handle duplicates gracefully
+        # The conflict target must match an existing unique index EXACTLY, and
+        # the only one on assets is
+        #     ix_assets_ip_hostname ON assets(ip, COALESCE(hostname, ''))
+        # so `ON CONFLICT (ip)` matched nothing and raised
+        #     InvalidColumnReference: there is no unique or exclusion constraint
+        #     matching the ON CONFLICT specification
+        # on every row. A masscan run that found 23 open ports ingested none of
+        # them: 23 records seen, 23 errors, 0 ports — and the scan still reported
+        # "completed", because ingestion errors are counted per-record rather
+        # than failing the job.
         cur.execute("""
             INSERT INTO assets (id, ip, hostname)
             VALUES (%s, %s, %s)
-            ON CONFLICT (ip) DO UPDATE SET
-                hostname = COALESCE(EXCLUDED.hostname, assets.hostname),
+            ON CONFLICT (ip, COALESCE(hostname, '')) DO UPDATE SET
                 last_seen = now(),
                 modified_at = now()
             RETURNING id
