@@ -64,6 +64,10 @@ def load_catalogs(path: str = None) -> Dict[str, List[str]]:
             with open(p) as fh:
                 data = json.load(fh)
             _cache = {k: set(v) for k, v in data.items() if isinstance(v, list)}
+            # tool_flags is a dict of tool -> [flags]; keep it as-is so
+            # flags_for() can distinguish "unprobed" from "no flags".
+            if isinstance(data.get('tool_flags'), dict):
+                _cache['tool_flags'] = data['tool_flags']
             _cache_mtime = mtime
             logger.info("Loaded tool catalogs: %s",
                         ", ".join(f"{k}={len(v)}" for k, v in sorted(_cache.items())))
@@ -121,6 +125,26 @@ def _script_tokens(value: str) -> List[str]:
     return [t.strip() for t in v.split(",") if t.strip()]
 
 
+# Metasploit's module DIRECTORIES are plural (`exploits/`, `payloads/`) while its
+# invocation syntax — and everything humans and models write — is singular
+# (`exploit/unix/misc/distcc_exec`). The catalog is built by walking the source
+# tree, so without folding these the validator rejects every real exploit module
+# it is shown. `auxiliary` and `post` are spelled the same either way, which is
+# why tests using auxiliary/ paths passed and hid this.
+_MSF_DIR_TO_SYNTAX = {"exploits/": "exploit/", "payloads/": "payload/",
+                      "posts/": "post/", "encoders/": "encoder/",
+                      "nops/": "nop/", "evasions/": "evasion/"}
+
+
+def _msf_canonical(path: str) -> str:
+    """Fold a module path to msfconsole syntax."""
+    p = path.strip().lower().lstrip("/")
+    for dir_form, syntax in _MSF_DIR_TO_SYNTAX.items():
+        if p.startswith(dir_form):
+            return syntax + p[len(dir_form):]
+    return p
+
+
 def _known(token: str, catalog: set) -> bool:
     """Is this token in the catalog, allowing glob patterns?"""
     t = token.strip().lower()
@@ -150,9 +174,12 @@ def validate_recommendation(rec: Dict) -> Tuple[bool, Optional[str]]:
         # only `script` let `-sV` and a sentence of prose through in measurement.
         values = [rec.get("script"), rec.get("action")]
     elif scanner in ("metasploit", "msf"):
-        catalog, label = cats.get("msf_modules") or set(), "metasploit module"
+        # Fold both sides to msfconsole syntax — see _MSF_DIR_TO_SYNTAX.
+        catalog = {_msf_canonical(m) for m in (cats.get("msf_modules") or set())}
+        label = "metasploit module"
         # Modules arrive in either field depending on the generator.
-        values = [rec.get("script"), rec.get("action")]
+        values = [_msf_canonical(v) if v else v
+                  for v in (rec.get("script"), rec.get("action"))]
     else:  # nuclei — a template id OR a tag expression
         catalog = (cats.get("nuclei_templates") or set()) | (cats.get("nuclei_tags") or set())
         label, values = "nuclei template/tag", [rec.get("template")]
@@ -169,6 +196,51 @@ def validate_recommendation(rec: Dict) -> Tuple[bool, Optional[str]]:
             if not _known(token, catalog):
                 return False, f"{label} {token!r} does not exist"
     return True, None
+
+
+# Scanner labels that are not the name of an executable.
+_SCANNER_BINARY = {
+    "metasploit": "msfconsole", "msf": "msfconsole",
+    "nmap-smb-vuln": "nmap", "impacket-smbclient": "impacket-smbclient",
+    "vulnx": None,          # runs via the assets software flow, not a binary here
+}
+
+
+def binary_available(rec: Dict) -> Tuple[Optional[bool], str]:
+    """(available, binary_name). `available` is None when it cannot be judged.
+
+    ADVISORY ONLY — deliberately not wired into the blocking path. Scanner labels
+    are not reliably binary names (`metasploit` is msfconsole; tool_kb uses
+    labels like `nmap-smb-vuln`), so blocking on absence would reproduce the
+    false-positive failure that the msf `exploits/` vs `exploit/` bug caused.
+
+    Useful as a signal: measured across the scanner containers, the models and
+    tool_kb between them recommended ncrack, crackmapexec and snmp-check, none of
+    which are installed anywhere in the stack.
+    """
+    cats = load_catalogs()
+    binaries = cats.get("binaries") or set()
+    scanner = (rec.get("scanner") or "").strip().lower()
+    if not binaries or not scanner:
+        return None, scanner
+    mapped = _SCANNER_BINARY.get(scanner, scanner)
+    if mapped is None:
+        return None, scanner
+    return (mapped in binaries), mapped
+
+
+def flags_for(tool: str) -> Optional[List[str]]:
+    """Known flags for a tool, or None when it was never probed successfully.
+
+    None means "unknown", not "no flags" — a caller must not treat an unprobed
+    tool as having an empty flag set and reject everything it is given.
+    """
+    cats = load_catalogs()
+    raw = cats.get("tool_flags")
+    if not isinstance(raw, dict):
+        return None
+    vals = raw.get((tool or "").strip().lower())
+    return list(vals) if vals else None
 
 
 def filter_recommendations(recs: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
