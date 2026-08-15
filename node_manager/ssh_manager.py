@@ -18,8 +18,34 @@ from typing import Optional, Union
 log = logging.getLogger("ssh_manager")
 
 SSH_KEYS_DIR = "/ssh-keys"
-SSH_CONTROL_DIR = "/tmp/ssh-ctrl"
-os.makedirs(SSH_CONTROL_DIR, exist_ok=True)
+
+# ControlMaster sockets must live on a CONTAINER-LOCAL filesystem.
+#
+# /tmp was the obvious choice and is wrong on Docker Desktop for macOS, where it
+# is a bind mount of the host (`/run/host_mark/private on /tmp type fakeowner`).
+# ssh's muxserver_listen binds a temp socket and then hard-links it into place;
+# that link fails on the fakeowner mount with EBADF, and the connection dies
+# AFTER authenticating successfully:
+#
+#   muxserver_listen: link mux listener /tmp/ssh-ctrl/ctrl-<id>.xxxx
+#       => /tmp/ssh-ctrl/ctrl-<id>: Bad file descriptor
+#
+# Confirmed by probe: binding a unix socket in /tmp succeeds, os.link() on it
+# raises EBADF, while /dev/shm, /run and /var/tmp all handle both. The same host
+# and key work from a native filesystem, which is why it only fails in-container.
+#
+# /dev/shm is tmpfs, container-local, and cleared on restart — correct for
+# control sockets, which must not outlive the process that owns them. Keep the
+# path short: unix socket paths are capped near 104 characters.
+SSH_CONTROL_DIR = os.environ.get("SSH_CONTROL_DIR", "/dev/shm/ssh-ctrl")
+try:
+    os.makedirs(SSH_CONTROL_DIR, exist_ok=True)
+except OSError as _e:                        # read-only or missing /dev/shm
+    _fallback = "/var/tmp/ssh-ctrl"
+    log.warning("Cannot create %s (%s) — falling back to %s",
+                SSH_CONTROL_DIR, _e, _fallback)
+    SSH_CONTROL_DIR = _fallback
+    os.makedirs(SSH_CONTROL_DIR, exist_ok=True)
 
 SSH_OPTS = [
     "-o", "StrictHostKeyChecking=no",
