@@ -51,13 +51,44 @@ from web_profiles import WebProfileError, resolve as resolve_web_profile
 DEBUG_MODE = os.environ.get("SCAN_DEBUG", "false").lower() == "true"
 MCP_MODE = os.environ.get("MCP_MODE", "false").lower() == "true"
 
-# Build default quick_ports: 1-1000 + any WEB_PORTS above 1000
+# Default quick scan scope.
+#
+# This used to be the sequential range 1-1000 plus high web ports, which sounds
+# like "the common ports" but is not: it is the first 1000 port NUMBERS. The
+# services that matter most on a typical target sit above it — mysql 3306,
+# postgresql 5432, vnc 5900, irc 6667, tomcat 8180, java-rmi 1099 — so a scan
+# could report "12 open ports" while missing every high-value service, and any
+# operator rule keyed to those services could never fire.
+#
+# nmap's top-1000 is the 1000 most commonly OPEN ports, frequency-ranked from
+# nmap-services. It costs the same number of probes and finds all of the above.
+# For scale: even top-100 — a tenth of the probes — covers mysql, postgresql,
+# vnc, nfs and X11, none of which sequential 1-1000 reaches.
+#
+# Falls back to the old range only if the profile cannot be loaded, so a missing
+# or malformed knowledge/port_profiles.yaml degrades to previous behaviour rather
+# than leaving scans with no scope at all.
 _WEB_PORTS_STR = os.environ.get("WEB_PORTS", "80,443,8080,8443,8000,8888,3000,5000")
 _HIGH_WEB_PORTS = ",".join(
     p.strip() for p in _WEB_PORTS_STR.split(",")
     if p.strip().isdigit() and int(p.strip()) > 1000
 )
-DEFAULT_QUICK_PORTS = f"1-1000,{_HIGH_WEB_PORTS}" if _HIGH_WEB_PORTS else "1-1000"
+_LEGACY_QUICK_PORTS = f"1-1000,{_HIGH_WEB_PORTS}" if _HIGH_WEB_PORTS else "1-1000"
+DEFAULT_QUICK_PORTS_PROFILE = os.environ.get("DEFAULT_QUICK_PORTS_PROFILE", "top-1000")
+try:
+    _profile_ports = resolve_port_profile(DEFAULT_QUICK_PORTS_PROFILE, None)
+    # Union with the configured web ports: the profile is frequency-ranked, and a
+    # site's own non-standard web port may not be in it.
+    DEFAULT_QUICK_PORTS = (
+        f"{_profile_ports},{_HIGH_WEB_PORTS}" if _HIGH_WEB_PORTS else _profile_ports
+    )
+except Exception as _pp_err:      # PortProfileError, missing file, bad YAML
+    logging.getLogger(__name__).warning(
+        "Port profile %r unavailable (%s) — falling back to the sequential range %r, "
+        "which misses mysql/postgresql/vnc/irc/tomcat",
+        DEFAULT_QUICK_PORTS_PROFILE, _pp_err, _LEGACY_QUICK_PORTS,
+    )
+    DEFAULT_QUICK_PORTS = _LEGACY_QUICK_PORTS
 DEFAULT_DEEP_SCAN_PORTS = os.environ.get("DEEP_SCAN_PORTS", "1001-65535")
 
 
@@ -816,7 +847,7 @@ class ScanTools:
     def start_nmap_scan(
         self,
         ip_address: str,
-        ports: str = "1-1000",
+        ports: str = DEFAULT_QUICK_PORTS,
         service_detection: bool = True,
         version_intensity: int = 9,
         enable_scripts: bool = True,
@@ -893,7 +924,7 @@ class ScanTools:
     def start_full_scan(
         self,
         targets: List[str],
-        quick_ports: str = "1-1000",
+        quick_ports: str = DEFAULT_QUICK_PORTS,
         full_ports: str = "1001-65535",
         rate: int = 1000,
         interface: str = "eth0",
@@ -1489,7 +1520,7 @@ class ScanTools:
             headers={"content-type": "application/json"}, json=payload,
         )
 
-    def start_naabu(self, targets: List[str], ports: str = "1-1000", rate: int = 1000) -> Dict:
+    def start_naabu(self, targets: List[str], ports: str = DEFAULT_QUICK_PORTS, rate: int = 1000) -> Dict:
         """Start fast port scanning with naabu."""
         return self._make_request(
             method="POST", url=f"{self.pd_runner_url}/jobs/naabu",
@@ -1716,7 +1747,7 @@ class AsyncScanTools:
             params=params
         )
 
-    async def start_masscan(self, targets: str, ports: str = "1-1000", rate: int = 1000) -> Dict:
+    async def start_masscan(self, targets: str, ports: str = DEFAULT_QUICK_PORTS, rate: int = 1000) -> Dict:
         """Start a masscan+nmap scan"""
         return await self._make_request(
             method="POST",
@@ -1726,7 +1757,7 @@ class AsyncScanTools:
             json={"targets": targets, "ports": ports, "rate": rate}
         )
 
-    async def start_nmap_scan(self, ip_address: str, ports: str = "1-1000") -> Dict:
+    async def start_nmap_scan(self, ip_address: str, ports: str = DEFAULT_QUICK_PORTS) -> Dict:
         """Start an nmap scan on a single IP"""
         return await self._make_request(
             method="POST",
@@ -1979,14 +2010,14 @@ async def query_vulnerabilities_async(severity: str = None, limit: int = 100) ->
     return json.dumps(result, indent=2)
 
 
-async def start_masscan_async(targets: str, ports: str = "1-1000", rate: int = 1000) -> str:
+async def start_masscan_async(targets: str, ports: str = DEFAULT_QUICK_PORTS, rate: int = 1000) -> str:
     """Async: Start a masscan+nmap scan. Returns JSON string."""
     tools = await get_async_scan_tools()
     result = await tools.start_masscan(targets, ports, rate)
     return json.dumps(result, indent=2)
 
 
-async def start_nmap_scan_async(ip_address: str, ports: str = "1-1000") -> str:
+async def start_nmap_scan_async(ip_address: str, ports: str = DEFAULT_QUICK_PORTS) -> str:
     """Async: Start an nmap scan. Returns JSON string."""
     tools = await get_async_scan_tools()
     result = await tools.start_nmap_scan(ip_address, ports)
@@ -2340,7 +2371,7 @@ def search_all_findings(target: str = None, severity: str = None, source: str = 
     return json.dumps(result, indent=2)
 
 
-def start_masscan(targets: str = None, target: str = None, ports: str = "1-1000", rate: int = 1000) -> str:
+def start_masscan(targets: str = None, target: str = None, ports: str = DEFAULT_QUICK_PORTS, rate: int = 1000) -> str:
     """
     Start a fast Masscan port scan (no service detection).
 
@@ -2372,7 +2403,7 @@ def start_masscan(targets: str = None, target: str = None, ports: str = "1-1000"
     return json.dumps(result, indent=2)
 
 
-def start_nmap_scan(ip_address: str, ports: str = "1-1000", service_detection: bool = True, version_intensity: int = 9, enable_scripts: bool = True) -> str:
+def start_nmap_scan(ip_address: str, ports: str = DEFAULT_QUICK_PORTS, service_detection: bool = True, version_intensity: int = 9, enable_scripts: bool = True) -> str:
     """
     Start an Nmap port scan with service detection (Masscan + Nmap).
 
@@ -3092,7 +3123,7 @@ def start_httpx_probe(targets: str = "from_db", ports: str = None, tech_detect: 
     return json.dumps(result, indent=2)
 
 
-def start_naabu(targets: str = None, target: str = None, ports: str = "1-1000", rate: int = 1000) -> str:
+def start_naabu(targets: str = None, target: str = None, ports: str = DEFAULT_QUICK_PORTS, rate: int = 1000) -> str:
     """
     Start fast port scanning with naabu.
 
@@ -3959,11 +3990,18 @@ def _enrich_with_follow_ups(result: dict, job_id: str) -> dict:
     target_ip = targets_list[0] if targets_list else "TARGET"
 
     # Also query database for all known open ports on this target
+    db_guidance: List[Dict] = []
     if target_ip != "TARGET":
         try:
             db_result = json.loads(query_open_ports(target=target_ip, limit=200))
             for item in db_result.get("items", []):
                 ports.add(item.get("port", 0))
+            # query_open_ports already resolved operator rules for these services.
+            # Carry them through: recommended_follow_up_scans is the field the
+            # agent is told to read and act on, and until now it was built purely
+            # from hardcoded port lists, so ingested walkthrough knowledge had no
+            # influence on what the agent actually ran next.
+            db_guidance = db_result.get("operator_guidance") or []
             if len(ports) > len(scan_result.get("ports", [])):
                 logger.info(f"[{job_id[:8]}] Enriched ports from DB: {len(scan_result.get('ports',[]))} scan → {len(ports)} total")
         except Exception as e:
@@ -4006,6 +4044,28 @@ def _enrich_with_follow_ups(result: dict, job_id: str) -> dict:
         has_high_ports = any(p > 1000 for p in ports if p not in (8080, 8443))
         if not has_high_ports:
             follow_ups.append(f"AFTER vuln scans + cred checks: start_deep_port_scan(targets='{target_ip}') — discover services on ports 1001-65535, then run nuclei on any new findings")
+
+        # Operator guidance goes FIRST: the groups above are generic defaults
+        # derived from port numbers alone, while these rules were authored (often
+        # ingested from a walkthrough) against these specific services.
+        if db_guidance:
+            lines = [
+                "OPERATOR GUIDANCE — authored for the services found on this host. "
+                "Apply these BEFORE the generic groups below; where they conflict, "
+                "these win."
+            ]
+            for g in db_guidance:
+                body = " ".join(
+                    ln.strip().lstrip("- ")
+                    for ln in (g.get("guidance") or "").splitlines()
+                    if ln.strip().startswith("-")
+                )
+                if body:
+                    lines.append(f"  • {g.get('service')}:{g.get('port')} — {body}")
+            if len(lines) > 1:
+                follow_ups.insert(0, "\n".join(lines))
+                logger.info("[%s] Added operator guidance for %d service(s) to follow-ups",
+                            job_id[:8], len(db_guidance))
 
         if follow_ups:
             result["recommended_follow_up_scans"] = follow_ups
