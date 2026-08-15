@@ -243,6 +243,68 @@ def flags_for(tool: str) -> Optional[List[str]]:
     return list(vals) if vals else None
 
 
+def catalog_info(path: str = None) -> Dict:
+    """Everything the UI needs to judge whether validation can be trusted.
+
+    The catalog is a SNAPSHOT, deliberately: validation must not require live
+    containers. The cost is that it goes stale silently — install a tool on a
+    node and the validator will not know until someone re-runs the refresh. The
+    file has always carried `generated_at` and nothing read it, so staleness was
+    invisible. This surfaces it.
+    """
+    import datetime as _dt
+
+    p = path or CATALOG_PATH
+    info: Dict = {
+        "path": p,
+        "exists": os.path.exists(p),
+        "counts": {},
+        "generated_at": None,
+        "age_seconds": None,
+        "validated_scanners": sorted(_VALIDATED_SCANNERS),
+        "supplement": {"path": None, "exists": False, "counts": {}},
+    }
+    if not info["exists"]:
+        return info
+    try:
+        with open(p) as fh:
+            data = json.load(fh)
+    except Exception as e:
+        info["error"] = f"unreadable: {e}"
+        return info
+
+    info["counts"] = {k: len(v) for k, v in data.items() if isinstance(v, list)}
+    if isinstance(data.get("tool_flags"), dict):
+        info["counts"]["tool_flags"] = len(data["tool_flags"])
+    info["generated_at"] = data.get("generated_at")
+    if info["generated_at"]:
+        try:
+            gen = _dt.datetime.fromisoformat(info["generated_at"])
+            if gen.tzinfo is None:
+                gen = gen.replace(tzinfo=_dt.timezone.utc)
+            info["age_seconds"] = int(
+                (_dt.datetime.now(_dt.timezone.utc) - gen).total_seconds())
+        except Exception:
+            pass
+
+    supp = os.path.join(os.path.dirname(p) or ".", "tool_catalogs.local.json")
+    info["supplement"]["path"] = supp
+    if os.path.exists(supp):
+        info["supplement"]["exists"] = True
+        try:
+            with open(supp) as fh:
+                sdata = json.load(fh)
+            info["supplement"]["counts"] = {
+                k: len(v) for k, v in sdata.items() if isinstance(v, list)}
+            note = sdata.get("_comment")
+            if isinstance(note, list):
+                info["supplement"]["notes"] = [
+                    n for n in note if n.startswith("Inventoried from node")]
+        except Exception as e:
+            info["supplement"]["error"] = str(e)
+    return info
+
+
 def filter_recommendations(recs: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     """Split into (runnable, rejected). Rejected carry a `_rejection` reason."""
     ok, bad = [], []

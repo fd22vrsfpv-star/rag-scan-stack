@@ -255,3 +255,40 @@ export function useConvertUrl() {
       }),
   })
 }
+
+/* ────────────── Validator catalog ────────────── */
+
+export interface ToolCatalogInfo {
+  path: string
+  exists: boolean
+  counts: Record<string, number>
+  /** ISO timestamp of the last refresh, or null when the catalog is missing. */
+  generated_at: string | null
+  /** Seconds since generation. The catalog cannot detect its own staleness. */
+  age_seconds: number | null
+  /** Only these scanners are gated; everything else passes unvalidated. */
+  validated_scanners: string[]
+  supplement: {
+    path: string | null
+    exists: boolean
+    counts: Record<string, number>
+    notes?: string[]
+    error?: string
+  }
+  nodes?: Array<{ name: string; status: string; tools: number }>
+  error?: string
+}
+
+/**
+ * What the recommendation validator knows, and how old that knowledge is.
+ *
+ * The catalog is a deliberate snapshot — validation must not require live
+ * containers — so it goes stale silently unless someone re-runs the refresh.
+ */
+export function useToolCatalog() {
+  return useQuery({
+    queryKey: ['tool-catalog'],
+    queryFn: () => apiFetch<ToolCatalogInfo>('/kb/tool-catalog'),
+    staleTime: 30_000,
+  })
+}
