@@ -86,6 +86,30 @@ for table in "${EXPECTED_TABLES[@]}"; do
   fi
 done
 
+# Knowledge base content, not just schema. The table existing tells you nothing
+# about whether setup.sh phase 10 actually seeded it — an empty service_prompts
+# silently degrades AI scans to generic prompting, which looks like a model
+# quality problem rather than a missing install step.
+#
+# WARN not FAIL: the stack is usable with no rules, and an operator may have
+# deliberately cleared them.
+echo ""
+echo "  -- Knowledge base content --"
+SEED_FILES=$(ls knowledge/seed/*.yaml 2>/dev/null | wc -l | tr -d ' ')
+RULE_ROWS=$(docker exec rag-postgres psql -U app -d scans -tAc \
+  "SELECT COUNT(*) FROM public.service_prompts" 2>/dev/null || echo "")
+if [[ -z "$RULE_ROWS" ]]; then
+  warn "service_prompts — could not be queried"
+elif [[ "$RULE_ROWS" -gt 0 ]]; then
+  pass "service_prompts — $RULE_ROWS rule(s) seeded"
+elif [[ "$SEED_FILES" -gt 0 ]]; then
+  warn "service_prompts is empty but $SEED_FILES seed file(s) exist — seeding did not run"
+  echo "         Fix: ./scripts/import-knowledge.sh --file knowledge/seed/<file>.yaml"
+else
+  warn "service_prompts is empty and no seed files present — AI scans use generic prompts"
+  echo "         Add rules in the UI (Service Prompts), then ./scripts/export-knowledge.sh"
+fi
+
 # Check critical views
 echo ""
 echo "  -- Views --"

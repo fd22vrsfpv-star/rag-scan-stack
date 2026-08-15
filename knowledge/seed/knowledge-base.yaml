@@ -1,0 +1,221 @@
+# Exported from the live knowledge base — 13 rule(s), all engagements.
+#
+# These were already reviewed when accepted, so nothing here is commented out.
+#
+#   ./scripts/import-knowledge.sh --file <this file> --dry-run
+#   ./scripts/import-knowledge.sh --file <this file>
+
+prompts:
+- selector_type: port
+  port: 161
+  title: Unidentified 161
+  prompt: Port 161 responded but the service was not fingerprinted. UDP scans lose probes
+    under rate limiting — re-probe with an SNMP-specific tool before assuming it is not SNMP.
+  priority: 80
+  enabled: true
+- selector_type: port_service
+  service: irc
+  port: 6667
+  title: IRC on 6667
+  prompt: Enumerate the IRC server for version information. If it is UnrealIRCd, check for
+    known backdoors such as the one triggered by 'AB' prefixing a system command.
+  tags:
+  - source:walkthrough:metasploitable-2-exploitability-guide
+  priority: 100
+  enabled: true
+- selector_type: port_service
+  service: postgresql
+  port: 5432
+  title: PostgreSQL Default Credentials
+  prompt: Attempt authentication using the default administrative account 'postgres' with
+    the password 'postgres'. Many legacy or lab-configured installations of PostgreSQL may
+    use these identical credentials for the initial setup.
+  training_notes: '## Default Credentials
+
+    - Username: postgres
+
+    - Password: postgres'
+  tags:
+  - source:walkthrough:metasploitable-2-exploitability-guide
+  priority: 100
+  enabled: true
+- selector_type: port_service
+  service: snmp
+  port: 161
+  title: SNMP on 161
+  prompt: Open SNMP is usually an information-disclosure win before it is an exploit. Try
+    the default community strings first (public, private, community) with onesixtyone, then
+    walk the tree with snmpwalk -v2c. Pull the interface table, running processes, installed
+    software and the ARP cache — those map internal hosts you cannot otherwise see. Only consider
+    write access (snmpset) after confirming a writable community, and never without authorisation
+    to change device state.
+  training_notes: '## SNMP (161/udp)
+
+
+    ### Community strings worth trying first
+
+    `public`, `private`, `community`, `manager`, `admin`, plus the vendor
+
+    defaults (`cisco`, `ILMI`). SNMPv1/v2c send these in cleartext.
+
+
+    ### High-value OIDs
+
+    - `1.3.6.1.2.1.1.1.0` — sysDescr: OS and exact version
+
+    - `1.3.6.1.2.1.25.4.2.1.2` — running processes
+
+    - `1.3.6.1.2.1.25.6.3.1.2` — installed software
+
+    - `1.3.6.1.2.1.4.22.1.2` — ARP cache: internal neighbours
+
+    - `1.3.6.1.2.1.2.2.1.2` — interfaces, including non-routable segments
+
+
+    ### Why it matters
+
+    A read-only community on a router or switch commonly leaks the internal
+
+    topology, hostnames and software inventory in one pass — reconnaissance
+
+    that would otherwise need credentialed access.
+
+
+    ### Version notes
+
+    v3 is authenticated; if the host speaks v3 only, enumerate usernames
+
+    rather than community strings and do not burn time on onesixtyone.
+
+    '
+  tags:
+  - snmp
+  - network
+  - default-login
+  priority: 10
+  enabled: true
+- selector_type: service
+  service: distccd
+  title: Distcc Command Execution
+  prompt: Check for command execution vulnerabilities in distccd. This service is often designed
+    to scale compiler jobs and can be abused to execute arbitrary commands if misconfigured.
+  training_notes: '## Metasploit Module
+
+    - `exploit/unix/misc/distcc_exec`'
+  tags:
+  - source:walkthrough:metasploitable-2-exploitability-guide
+  priority: 10
+  enabled: true
+- selector_type: service
+  service: mysql
+  title: MySQL Root Empty Password
+  prompt: Attempt to login as root with an empty password. MySQL installations frequently
+    leave the root account unsecured in default configurations.
+  training_notes: '## Default Credentials
+
+    - Username: `root`
+
+    - Password: (empty)'
+  tags:
+  - source:walkthrough:metasploitable-2-exploitability-guide
+  priority: 100
+  enabled: true
+- selector_type: service
+  service: samba
+  title: Samba Symlink Traversal
+  prompt: Check for Samba symlink traversal vulnerabilities. If a writeable share exists and
+    'wide links' are enabled (a common default), it may be allowed to access the root filesystem.
+  training_notes: '## Metasploit Module
+
+    - `auxiliary/admin/smb/samba_symlink_traversal`'
+  tags:
+  - source:walkthrough:metasploitable-2-exploitability-guide
+  priority: 20
+  enabled: true
+- selector_type: service
+  service: snmp
+  title: SNMP anywhere
+  prompt: 'Treat SNMP as a read-first target: enumerate community strings, then walk for system,
+    process and network-neighbour data before any write attempt.'
+  tags:
+  - snmp
+  priority: 50
+  enabled: true
+- selector_type: service
+  service: vnc
+  title: VNC Default Password
+  prompt: Attempt to login with common default passwords for VNC servers. Some distributions
+    ship with a very simple password.
+  training_notes: '## Common Defaults
+
+    - Password: `password`'
+  tags:
+  - source:walkthrough:metasploitable-2-exploitability-guide
+  priority: 100
+  enabled: true
+- selector_type: tech
+  tech: dvwa
+  title: DVWA Default Credentials
+  prompt: Attempt authentication using the default credentials for DVWA. These are often left
+    unchanged in labs or training environments.
+  training_notes: "| \n## Default Credentials\n- Username: admin\n- Password: password"
+  tags:
+  - default-login
+  - source:walkthrough:metasploitable-2-exploitability-guide
+  priority: 10
+  enabled: true
+- selector_type: tech
+  tech: mutillidae
+  title: Mutillidae Enumeration
+  prompt: Check for the existence of Mutillidae by looking for specific pages like `add-to-your-blog.php`
+    or `phpinfo.php`. If found, target the following endpoints for SQL injection and XSS,
+    as they are characteristically vulnerable in this application. Prioritize testing the
+    `UID` cookie and the `username` fields across various registration and login forms.
+  training_notes: "| \n## Vulnerable Endpoints\n- `add-to-your-blog.php`: SQLi and XSS on\
+    \ blog entry, username\n- `browser-info.php`: XSS/JS Injection via Referer/User-Agent\
+    \ headers\n- `dns-lookup.php`: OS Command injection on host/ip field; SQLi/XSS on logs\n\
+    - `login.php` & `process-login-attempt.php`: Auth bypass and SQLi in username/password\
+    \ fields\n- `user-info.php`: SQLi to dump usernames/passwords via username/password fields\n\
+    - `source-viewer.php` / `text-file-viewer.php`: Arbitrary file inclusion (LFI)\n- `index.php`:\
+    \ SQLi in the UID cookie; HTTP Response Splitting via username\n- `log-visit.php`: `Referer`\
+    \ and `User-Agent` headers are targets for SQLi/XSS\n- `register.php`: SQLi/XSS on username,\
+    \ signature, password fields\n- `robots.txt`: May reveal private directories\n- `config.inc*`:\
+    \ may contain unencrypted DB credentials"
+  tags:
+  - mutillidae
+  - sqli
+  - xss
+  - source:walkthrough:metasploitable-2-exploitability-guide
+  priority: 100
+  enabled: true
+- selector_type: tech
+  tech: unrealircd
+  title: UnrealIRCd Backdoor Check
+  prompt: Check for the UnrealIRCd backdoor. Send 'AB' followed by a system command to the
+    server to verify if it is vulnerable. This specific backdoor allows for remote code execution
+    without authentication.
+  tags:
+  - source:walkthrough:metasploitable-2-exploitability-guide
+  priority: 10
+  enabled: true
+- selector_type: tech
+  tech: wordpress
+  title: WordPress hosts
+  prompt: Enumerate plugins and users before running generic web templates — the vulnerable
+    surface is almost always a plugin, not core. Check /wp-json/wp/v2/users and xmlrpc.php.
+  training_notes: '## WordPress
+
+    - `/wp-json/wp/v2/users` enumerates usernames without auth on many installs
+
+    - `xmlrpc.php` allows password-guess amplification via `system.multicall`
+
+    - Plugin paths under `/wp-content/plugins/` reveal versions in readme.txt
+
+    '
+  tags:
+  - wordpress
+  - wp-plugin
+  - cve
+  priority: 100
+  enabled: true
+

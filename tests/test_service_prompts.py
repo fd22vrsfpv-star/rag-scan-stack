@@ -174,3 +174,60 @@ class TestGuidanceBlock:
 
     def test_training_context_empty_without_service_or_port(self, sr):
         assert sr._get_training_context(None, None) == ""
+
+
+class TestExportRow:
+    """Seed export must be re-importable and must not leak this install's identity.
+
+    The round-trip property that matters: exporting the live KB and re-importing
+    it produces UPDATEs, never CREATEs. That holds only if every field the
+    importer keys on survives, and every field local to this database is dropped.
+    """
+
+    def test_drops_db_only_columns(self, sr):
+        row = _row("service", service="mysql", title="T", prompt="P")
+        row.update({
+            "id": "3f2b1c00-0000-0000-0000-000000000001",
+            "created_at": "2026-08-14T00:00:00Z",
+            "updated_at": "2026-08-14T00:00:00Z",
+            "rag_ingested_at": "2026-08-14T00:00:00Z",
+        })
+        out = sr._export_row(row)
+        for gone in ("id", "created_at", "updated_at", "rag_ingested_at"):
+            assert gone not in out
+        assert out["service"] == "mysql"
+        assert out["title"] == "T"
+
+    def test_drops_engagement_id(self, sr):
+        """A UUID from this install would fail the FK on any other one."""
+        row = _row("service", service="vnc", title="T", prompt="P")
+        row["engagement_id"] = "3f2b1c00-0000-0000-0000-0000000000ff"
+        assert "engagement_id" not in sr._export_row(row)
+
+    def test_keeps_enabled_false(self, sr):
+        """Regression: dropping falsey values would silently re-enable a rule.
+
+        `enabled: false` is the intended way to ship a noisy lab rule, so losing
+        it on export turns a disabled rule back on at the next install.
+        """
+        row = _row("service", service="dvwa", title="T", prompt="P")
+        row["enabled"] = False
+        out = sr._export_row(row)
+        assert out["enabled"] is False
+
+    def test_keeps_zero_priority(self, sr):
+        row = _row("service", service="ftp", title="T", prompt="P")
+        row["priority"] = 0
+        assert sr._export_row(row)["priority"] == 0
+
+    def test_drops_nulls_and_empty_tags(self, sr):
+        row = _row("service", service="smb", title="T", prompt="P")
+        row.update({"tech": None, "port": None, "training_notes": None, "tags": []})
+        out = sr._export_row(row)
+        for gone in ("tech", "port", "training_notes", "tags"):
+            assert gone not in out
+
+    def test_keeps_populated_tags(self, sr):
+        row = _row("service", service="smb", title="T", prompt="P")
+        row["tags"] = ["lab", "smb"]
+        assert sr._export_row(row)["tags"] == ["lab", "smb"]

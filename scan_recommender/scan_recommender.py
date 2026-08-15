@@ -2105,9 +2105,16 @@ def _yaml_block(entry: Dict, commented: bool, reasons: List[str]) -> str:
 def render_seed_yaml(prompts: List[Dict], docs: List[Dict],
                      flagged_prompt_idx: Dict[int, List[str]],
                      flagged_doc_idx: Dict[int, List[str]],
-                     source: str) -> str:
-    """Assemble the seed file that scripts/import-knowledge.sh consumes."""
-    lines = [
+                     source: str,
+                     header: Optional[List[str]] = None) -> str:
+    """Assemble the seed file that scripts/import-knowledge.sh consumes.
+
+    `header` overrides the comment block only. Exports are already-reviewed rules
+    rather than drafts, so the default "review before importing" preamble would be
+    wrong on them; the body format stays identical either way, which is what makes
+    an export re-importable.
+    """
+    lines = header if header is not None else [
         f"# Drafted from walkthrough: {source}",
         "#",
         "# Review before importing. Entries commented out below were flagged as",
@@ -2322,6 +2329,85 @@ def list_service_prompts(
     except Exception as e:
         logger.error("Failed to list service prompts: %s", e)
         raise HTTPException(500, f"Failed to list prompts: {e}")
+
+
+# Columns that describe a row's life in this database rather than the knowledge
+# itself. They must not reach a seed file: `id` and the timestamps are
+# regenerated on import, and `engagement_id` is a UUID that will not exist on any
+# other install — carrying it over turns a portable seed into one that fails its
+# foreign key.
+_EXPORT_DROP = ("id", "created_at", "updated_at", "rag_ingested_at", "engagement_id")
+
+
+def _export_row(row: Dict) -> Dict:
+    """Reduce a DB row to the fields the importer accepts."""
+    out = {}
+    for k, v in row.items():
+        if k in _EXPORT_DROP:
+            continue
+        # Drop nulls to keep the file readable, but never drop a false/0 — omitting
+        # `enabled: false` would silently re-import the rule as enabled.
+        if v is None:
+            continue
+        if k == "tags":
+            v = list(v)
+            if not v:
+                continue
+        out[k] = v
+    return out
+
+
+@kb_router.get("/prompts/export")
+def export_service_prompts(
+    engagement_id: Optional[str] = Query(None),
+    enabled_only: bool = Query(False),
+):
+    """Export prompt rules as a seed file, re-importable by import-knowledge.sh.
+
+    The round-trip partner to the importer: rules accepted in the UI live only in
+    Postgres until this writes them back out, so a clean install starts empty and
+    an accepted rule is lost on `docker compose down -v`.
+
+    Nothing is flagged or commented out here — these rules already passed review
+    when they were accepted, unlike converter drafts.
+    """
+    where, params = [], []
+    if engagement_id:
+        where.append("engagement_id = %s::uuid")
+        params.append(engagement_id)
+    if enabled_only:
+        where.append("enabled = true")
+    sql = (
+        "SELECT id::text, selector_type, service, tech, port, title, prompt, "
+        "       training_notes, tags, priority, enabled, engagement_id::text, "
+        "       rag_ingested_at, created_at, updated_at "
+        "  FROM public.service_prompts "
+        + (" WHERE " + " AND ".join(where) if where else "")
+        # Stable ordering keeps successive exports diffable — an export that
+        # reshuffles rows produces noise in git for no change in content.
+        + " ORDER BY selector_type, COALESCE(service, tech, ''), COALESCE(port, -1), title"
+    )
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, tuple(params))
+            rows = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        logger.error("Failed to export service prompts: %s", e)
+        raise HTTPException(500, f"Failed to export prompts: {e}")
+
+    entries = [_export_row(r) for r in rows]
+    scope = f"engagement {engagement_id}" if engagement_id else "all engagements"
+    header = [
+        f"# Exported from the live knowledge base — {len(entries)} rule(s), {scope}.",
+        "#" + (" Enabled rules only." if enabled_only else ""),
+        "# These were already reviewed when accepted, so nothing here is commented out.",
+        "#",
+        "#   ./scripts/import-knowledge.sh --file <this file> --dry-run",
+        "#   ./scripts/import-knowledge.sh --file <this file>",
+        "",
+    ]
+    yaml_text = render_seed_yaml(entries, [], {}, {}, scope, header=header)
+    return {"ok": True, "count": len(entries), "yaml": yaml_text}
 
 
 @kb_router.get("/prompts/resolve")
