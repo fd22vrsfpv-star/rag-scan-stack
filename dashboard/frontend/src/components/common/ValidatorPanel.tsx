@@ -1,6 +1,6 @@
 import { useState } from 'react'
-import { ShieldCheck, AlertTriangle, RefreshCw, Copy, Check } from 'lucide-react'
-import { useToolCatalog } from '@/api/servicePrompts'
+import { ShieldCheck, AlertTriangle, RefreshCw, Copy, Check, Plus } from 'lucide-react'
+import { useToolCatalog, useToolCoverage, useAdoptTool } from '@/api/servicePrompts'
 import { cn } from '@/lib/utils'
 
 /** Past this, the snapshot is old enough that a recently installed tool is
@@ -57,6 +57,115 @@ function CopyCmd({ cmd }: { cmd: string }) {
  * an explicit refresh so that validation never depends on live containers. The
  * cost of that choice is silent staleness, which is what the age below is for.
  */
+
+/**
+ * Cross-check: what the KB recommends vs what is installed.
+ *
+ * Two failures in opposite directions, and the validator catches NEITHER — it
+ * only gates nmap/metasploit/nuclei, so a recommendation for `snmp-check` (which
+ * the shipped YAML contains and nothing can run) passes straight through and
+ * fails at dispatch.
+ */
+function CoverageSection() {
+  const { data, isLoading } = useToolCoverage()
+  const adopt = useAdoptTool()
+  const [svc, setSvc] = useState<Record<string, string>>({})
+  const [done, setDone] = useState<Record<string, string>>({})
+
+  if (isLoading) return <p className="text-[11px] text-muted-foreground">Checking coverage…</p>
+  if (!data) return null
+  if (!data.ok) {
+    return <p className="text-[11px] text-yellow-400">{data.reason}</p>
+  }
+
+  return (
+    <div className="space-y-2 border-t border-border pt-2">
+      <h4 className="text-xs font-semibold">KB vs installed tools</h4>
+
+      {data.unrunnable.length > 0 && (
+        <div className="space-y-1">
+          <p className="text-[11px] text-yellow-400 flex items-start gap-1.5">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+            <span>
+              <strong>{data.unrunnable.length}</strong> tool(s) the KB recommends are
+              installed nowhere. These are not blocked by the validator — it only gates{' '}
+              nmap/metasploit/nuclei — so they reach dispatch and fail there.
+            </span>
+          </p>
+          <div className="max-h-32 overflow-y-auto text-[10px] font-mono space-y-0.5 pl-5">
+            {data.unrunnable.slice(0, 20).map(u => (
+              <div key={u.tool} className="text-muted-foreground">
+                <span className="text-foreground">{u.tool}</span>
+                {' — '}{u.referenced_by.join(', ')}
+                {u.references > u.referenced_by.length && ` +${u.references - u.referenced_by.length}`}
+              </div>
+            ))}
+          </div>
+          <p className="text-[10px] text-muted-foreground pl-5">
+            Fix by installing them on a node, declaring them in{' '}
+            <code className="font-mono">tool_catalogs.local.json</code> if they live where the
+            probe cannot see, or removing them from the service in KB Overrides.
+          </p>
+        </div>
+      )}
+
+      {data.uncatalogued.length > 0 && (
+        <div className="space-y-1">
+          <p className="text-[11px] text-muted-foreground">
+            <strong>{data.uncatalogued_total ?? data.uncatalogued.length}</strong> tool(s) are
+            provisioned on a node but no KB entry mentions them, so they can never be
+            recommended. Adopt one into a service to make it usable:
+          </p>
+          <div className="max-h-40 overflow-y-auto space-y-1 pl-1">
+            {data.uncatalogued.map(t => (
+              <div key={t} className="flex items-center gap-1.5">
+                <code className="text-[10px] font-mono w-28 shrink-0">{t}</code>
+                {done[t] ? (
+                  <span className="text-[10px] text-green-400">added to {done[t]}</span>
+                ) : (
+                  <>
+                    <input
+                      value={svc[t] ?? ''}
+                      onChange={e => setSvc(v => ({ ...v, [t]: e.target.value }))}
+                      placeholder="service (e.g. http)"
+                      className="flex-1 min-w-0 bg-muted rounded px-1.5 py-0.5 text-[10px] border border-border"
+                    />
+                    <button
+                      disabled={!svc[t]?.trim() || adopt.isPending}
+                      onClick={async () => {
+                        try {
+                          await adopt.mutateAsync({ tool: t, service: svc[t].trim() })
+                          setDone(d => ({ ...d, [t]: svc[t].trim() }))
+                        } catch (e) {
+                          alert(e instanceof Error ? e.message : 'Adopt failed')
+                        }
+                      }}
+                      className="flex items-center gap-0.5 px-1.5 py-0.5 text-[10px] border border-border rounded disabled:opacity-40"
+                    >
+                      <Plus className="h-3 w-3" /> Add
+                    </button>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+          <p className="text-[10px] text-muted-foreground">
+            Adopting seeds the override from the service's existing YAML entry first, so it
+            adds to those recommendations rather than replacing them. A tool that is not
+            actually installed is refused.
+          </p>
+        </div>
+      )}
+
+      {data.unrunnable.length === 0 && data.uncatalogued.length === 0 && (
+        <p className="text-[11px] text-muted-foreground">
+          Everything the KB recommends is installed, and every provisioned tool is referenced.
+        </p>
+      )}
+    </div>
+  )
+}
+
 export function ValidatorPanel() {
   const { data, isLoading, error, refetch, isFetching } = useToolCatalog()
 
@@ -164,6 +273,8 @@ export function ValidatorPanel() {
           )}
         </>
       )}
+
+      <CoverageSection />
 
       <details className="text-[11px]">
         <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
