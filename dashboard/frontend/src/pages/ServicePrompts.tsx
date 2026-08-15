@@ -8,6 +8,7 @@ import {
 } from '@/api/servicePrompts'
 import { useKBServices } from '@/api/kb'
 import { WalkthroughDraftPanel } from '@/components/common/WalkthroughDraftPanel'
+import { ValidatorPanel } from '@/components/common/ValidatorPanel'
 import { cn } from '@/lib/utils'
 import { Plus, Trash2, Pencil, FlaskConical, BookOpen, X } from 'lucide-react'
 
@@ -361,6 +362,8 @@ export default function ServicePrompts() {
       </details>
 
       <TestPanel />
+
+      <ValidatorPanel />
 
       <div className="bg-card border border-border rounded-lg overflow-hidden">
         {isLoading ? (
