@@ -279,3 +279,54 @@ class TestMergeKbRecs:
 
     def test_no_llm_recs_is_empty(self, sr):
         assert sr._merge_kb_recs([{"scanner": "nmap"}], [], set()) == []
+
+
+class TestServiceNameAliasing:
+    """A rule must fire on the name the SCANNER reports, not just the one the
+    walkthrough used.
+
+    This was the single biggest blocker to ingested knowledge having any effect:
+    a walkthrough says "Samba", so the drafted rule is keyed `samba`, but nmap
+    reports `netbios-ssn` or `microsoft-ds`. Matching raw strings meant the rule
+    sat unused while every SMB port on the target went unguided. Observed live:
+    a Metasploitable host with 28 open ports produced ONE guidance entry;
+    folding both sides through tool_kb's alias table raised it to four.
+    """
+
+    def test_scanner_name_matches_walkthrough_keyed_rule(self, sr, rules):
+        rows = [_row("service", service="samba", title="Symlink", prompt="Check symlinks")]
+        with rules(rows):
+            for scanner_name in ("netbios-ssn", "microsoft-ds", "smb", "SAMBA"):
+                got = sr._get_service_prompts(scanner_name, None)
+                assert len(got) == 1, f"{scanner_name} should match a samba-keyed rule"
+
+    def test_rule_keyed_on_scanner_name_matches_walkthrough_name(self, sr, rules):
+        """Folding is symmetric — it must work whichever vocabulary was authored."""
+        rows = [_row("service", service="netbios-ssn", title="SMB", prompt="Enumerate")]
+        with rules(rows):
+            assert len(sr._get_service_prompts("samba", None)) == 1
+
+    def test_unrelated_services_still_do_not_match(self, sr, rules):
+        """Aliasing must not collapse distinct services into each other."""
+        rows = [_row("service", service="samba", title="SMB", prompt="Enumerate")]
+        with rules(rows):
+            for other in ("ssh", "ftp", "mysql", "http"):
+                assert sr._get_service_prompts(other, None) == []
+
+    def test_port_service_selector_also_folds(self, sr, rules):
+        rows = [_row("port_service", service="samba", port=445, title="T", prompt="P")]
+        with rules(rows):
+            assert len(sr._get_service_prompts("microsoft-ds", 445)) == 1
+            # Wrong port must still not match, aliasing or not.
+            assert sr._get_service_prompts("microsoft-ds", 139) == []
+
+    def test_canonical_service_helper(self, sr):
+        assert sr._canonical_service("netbios-ssn") == "smb"
+        assert sr._canonical_service("SAMBA") == "smb"
+        assert sr._canonical_service("ssh") == "ssh"
+        assert sr._canonical_service("  ") is None
+        assert sr._canonical_service(None) is None
+
+    def test_unknown_service_passes_through_lowercased(self, sr):
+        """An unrecognised name must still match itself, not vanish."""
+        assert sr._canonical_service("WeirdService") == "weirdservice"
