@@ -74,7 +74,12 @@ def _resolve_asset_id(cur, target: str) -> Optional[str]:
         import uuid as _uuid
         asset_id = str(_uuid.uuid4())
         cur.execute(
-            "INSERT INTO assets (id, ip) VALUES (%s, %s) ON CONFLICT (ip) DO UPDATE SET ip = EXCLUDED.ip RETURNING id",
+            # Conflict target must match ix_assets_ip_hostname exactly — see
+            # etl/asset_utils.py. `ON CONFLICT (ip)` matches no index and
+            # raises InvalidColumnReference on every row.
+            "INSERT INTO assets (id, ip) VALUES (%s, %s) "
+            "ON CONFLICT (ip, COALESCE(hostname, '')) DO UPDATE SET last_seen = now() "
+            "RETURNING id",
             (asset_id, target),
         )
         row = cur.fetchone()
