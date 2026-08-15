@@ -2102,6 +2102,68 @@ scan_tools = _LazyInit()
 
 
 # Function wrappers for Autogen function calling
+# Bounds on how much operator knowledge is injected into the agent's context per
+# port-discovery call. A host with many open ports must not crowd out the rest of
+# the conversation.
+_GUIDANCE_MAX_SERVICES = 8
+_GUIDANCE_TRAINING_CHARS = 700
+
+
+def _operator_guidance_for(ports: List[Dict], max_services: int = _GUIDANCE_MAX_SERVICES) -> List[Dict]:
+    """Operator-authored guidance for the services just discovered.
+
+    This is what connects an ingested walkthrough to the agent's next decision.
+    Rules drafted from a walkthrough live in service_prompts and were, until now,
+    read only by the /next_scan recommender — the agent planned without them. By
+    attaching them to the port list the agent already queries, the guidance lands
+    in context at exactly the moment the agent is choosing what to run.
+
+    Deliberately narrow:
+      * only (service, port) pairs that actually resolved to a rule — services
+        with no authored guidance add nothing and are omitted entirely
+      * deduplicated, and capped at `max_services`, so a host with fifty open
+        ports cannot flood the agent's context window
+      * training context truncated; it is retrieved prose, useful as a hint but
+        not worth thousands of tokens per service
+      * every failure is non-fatal — the port list is the primary payload and
+        must survive scan-recommender being unreachable
+    """
+    base = os.environ.get("SCAN_RECOMMENDER_URL", "https://scan-recommender:8013")
+    seen, out = set(), []
+    for p in ports:
+        service = (p.get("service") or "").strip()
+        port = p.get("port")
+        if not service or service.lower() in ("unknown", "tcpwrapped"):
+            continue
+        key = (service.lower(), port)
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(out) >= max_services:
+            break
+        try:
+            resp = _httpx.get(
+                f"{base}/kb/prompts/resolve",
+                params={"service": service, "port": port},
+                timeout=10.0, verify=False,
+            )
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+        except Exception as e:            # network, TLS, JSON — all non-fatal
+            logger.debug("guidance lookup failed for %s:%s — %s", service, port, e)
+            continue
+        guidance = (data.get("guidance_block") or "").strip()
+        if not guidance:
+            continue                      # no authored rule for this service
+        entry = {"service": service, "port": port, "guidance": guidance}
+        training = (data.get("training_context") or "").strip()
+        if training:
+            entry["training_context"] = training[:_GUIDANCE_TRAINING_CHARS]
+        out.append(entry)
+    return out
+
+
 def query_open_ports(target: str = None, limit: int = 100) -> str:
     """
     Query open ports from the database.
@@ -2110,14 +2172,35 @@ def query_open_ports(target: str = None, limit: int = 100) -> str:
         target: Optional IP address to filter results (e.g., "192.168.1.150")
         limit: Maximum number of results
 
-    Returns JSON string with open ports data.
+    Returns JSON string with open ports data, plus `operator_guidance` — rules
+    the operator authored (often ingested from a walkthrough) for the services
+    found. Use that guidance when choosing which tools to run next; it reflects
+    technique proven against these services and overrides generic defaults.
     """
     result = get_scan_tools().query_open_ports(limit)
 
+    # rag-api returns the rows under "items"; older callers looked for "ports",
+    # which silently matched nothing — the target filter below never ran, so
+    # asking for one host returned every host. Accept both keys.
+    rows_key = "items" if isinstance(result, dict) and "items" in result else "ports"
+
     # Filter by target if specified
-    if target and isinstance(result, dict) and "ports" in result:
-        result["ports"] = [p for p in result["ports"] if p.get("ip") == target or p.get("host") == target]
+    if target and isinstance(result, dict) and rows_key in result:
+        result[rows_key] = [p for p in result[rows_key]
+                            if p.get("ip") == target or p.get("host") == target]
         result["filtered_by"] = target
+        result["count"] = len(result[rows_key])
+
+    if isinstance(result, dict) and result.get(rows_key):
+        guidance = _operator_guidance_for(result[rows_key])
+        if guidance:
+            result["operator_guidance"] = guidance
+            result["operator_guidance_note"] = (
+                "Operator-authored guidance for the services above. Prefer these "
+                "techniques over generic defaults when selecting the next tool."
+            )
+            logger.info("Attached operator guidance for %d service(s) to port list",
+                        len(guidance))
 
     return json.dumps(result, indent=2)
 
