@@ -68,6 +68,13 @@ DB_PASSWORD = os.environ.get("DB_PASSWORD", "app")
 
 PERSIST_RECS = os.environ.get("PERSIST_RECS", "1").lower() in ("1", "true", "yes")
 
+# When /next_scan finds port rows it answers from the deterministic tool_kb rules,
+# which never consult service_prompts. This adds a second, LLM pass carrying the
+# operator's authored guidance — but only for services that actually have a rule,
+# so an install with an empty knowledge base behaves exactly as before and pays
+# nothing. Set to 0 to keep recommendations purely deterministic.
+HYBRID_KB_RECS = os.environ.get("HYBRID_KB_RECS", "1").lower() in ("1", "true", "yes")
+
 
 # ---- DB helper ----
 @contextmanager
@@ -1188,6 +1195,40 @@ def ollama_query(prompt: str, model: Optional[str] = None, stream: bool = False,
     return {"model": mdl, "response": data.get("response", text)}
 
 
+def _merge_kb_recs(rule_recs: List[Dict], llm_recs: List[Dict],
+                   seen_keys: set) -> List[Dict]:
+    """LLM recommendations that genuinely add to the rule-based ones.
+
+    Two kinds of duplicate have to go:
+
+    1. Exact repeats, caught by the same (scanner, action, script, template) key
+       the rules path already uses — `seen_keys` is mutated so the caller's set
+       stays authoritative.
+    2. *Bare* recommendations — a scanner named with no action, script or
+       template — when the rules already produced that scanner WITH specifics.
+       "snmpwalk" adds nothing next to "snmpwalk -v2c -c public", but the
+       exact-match key misses it because null != the populated script. This was
+       observed on the first real run: the model returned bare `snmpwalk` and
+       `onesixtyone` alongside the rules' fully-formed versions.
+
+    A bare rec for a scanner the rules did NOT suggest is kept — that is the LLM
+    contributing a tool the static KB does not know about, which is the point.
+    """
+    rule_scanners = {r.get("scanner") for r in rule_recs if r.get("scanner")}
+    kept: List[Dict] = []
+    for rec in llm_recs:
+        bare = not any(rec.get(f) for f in ("action", "script", "template"))
+        if bare and rec.get("scanner") in rule_scanners:
+            continue
+        key = (rec.get("scanner"), rec.get("action"),
+               rec.get("script"), rec.get("template"), "", "")
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        kept.append(rec)
+    return kept
+
+
 def fetch_ollama_recommendations(
     ip: str, service: Optional[str], banner: Optional[str], model: str = OLLAMA_MODEL,
     port: Optional[int] = None, engagement_id: Optional[str] = None,
@@ -1511,6 +1552,51 @@ def get_next_scan_recommendations(
                     effective_service = row.get("service")
                 if not effective_port:
                     effective_port = row.get("port")
+            # ── Hybrid pass: operator knowledge on top of the deterministic rules ──
+            #
+            # The rules above come from tool_kb YAML and never consult
+            # service_prompts, so before this the seeded operator rules had no
+            # effect on automated recon: _dispatch_recommender_for_ports does not
+            # pass use_ollama, and `rows` is always non-empty when dispatching per
+            # discovered port, so the LLM branch that *does* inject guidance was
+            # never taken. Every stored recommendation was source='rules'.
+            #
+            # Gated on guidance actually existing: with no authored rule for this
+            # service/port the LLM would only re-derive what tool_kb already gave
+            # us, so the call is skipped. Cost therefore scales with the size of
+            # the knowledge base, not with the number of open ports.
+            kb_recs: List[Dict] = []
+            if HYBRID_KB_RECS and raw_recs:
+                probe_service = service or (rows[0].get("service") if rows else None)
+                probe_port = effective_port or port
+                try:
+                    tech_tokens, _src = _get_detected_tech(ip, probe_port)
+                    if _build_guidance_block(probe_service, probe_port, None, tech_tokens):
+                        for rec in _merge_kb_recs(
+                            raw_recs,
+                            fetch_ollama_recommendations(
+                                ip, probe_service, banner, port=probe_port),
+                            seen_keys,
+                        ):
+                            recommendations.append(ScanRecommendation(**rec))
+                            kb_recs.append(rec)
+                        logger.info(
+                            "KB-guided pass added %d rec(s) for %s:%s on top of %d rule-based",
+                            len(kb_recs), ip, probe_port, len(raw_recs),
+                        )
+                except HTTPException as he:
+                    # A model that returns junk must not cost us the rule-based
+                    # recommendations we already have — they are the reliable half.
+                    logger.warning(
+                        "KB-guided pass failed for %s:%s (%s) — keeping %d rule-based rec(s)",
+                        ip, probe_port, he.detail, len(raw_recs),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "KB-guided pass errored for %s:%s (%s) — keeping rule-based only",
+                        ip, probe_port, e,
+                    )
+
             if persist and PERSIST_RECS:
                 try:
                     inserted = persist_recommendations(
@@ -1523,6 +1609,27 @@ def get_next_scan_recommendations(
                     logger.info(f"Persisted {inserted} rule-based recommendations for {ip}")
                 except Exception as pe:
                     logger.warning(f"Persistence skipped/failed: {pe}")
+                # Persisted separately so provenance survives: querying
+                # source='ollama' tells you what the operator's knowledge added
+                # that the static KB did not.
+                if kb_recs:
+                    try:
+                        inserted_kb = persist_recommendations(
+                            ip=ip, recs=kb_recs, asset_id=None,
+                            service=service or (rows[0].get("service") if rows else None),
+                            banner=banner or (rows[0].get("banner") if rows else None),
+                            source="ollama", model=OLLAMA_MODEL,
+                            extra={"generator": "scan_recommender.py/next_scan:kb_guided"},
+                        )
+                        logger.info(f"Persisted {inserted_kb} KB-guided recommendations for {ip}")
+                    except Exception as pe:
+                        logger.warning(f"KB-guided persistence skipped/failed: {pe}")
+
+            if kb_recs:
+                _emit_webhook("scan_recommender_kb_guided_recs_added", {
+                    "ip": ip, "port": effective_port, "service": effective_service,
+                    "kb_guided_count": len(kb_recs), "rule_based_count": len(raw_recs),
+                })
 
             # Webhooks for the new enrichment actions (per CLAUDE.md).
             if tech_matched:
@@ -2105,9 +2212,16 @@ def _yaml_block(entry: Dict, commented: bool, reasons: List[str]) -> str:
 def render_seed_yaml(prompts: List[Dict], docs: List[Dict],
                      flagged_prompt_idx: Dict[int, List[str]],
                      flagged_doc_idx: Dict[int, List[str]],
-                     source: str) -> str:
-    """Assemble the seed file that scripts/import-knowledge.sh consumes."""
-    lines = [
+                     source: str,
+                     header: Optional[List[str]] = None) -> str:
+    """Assemble the seed file that scripts/import-knowledge.sh consumes.
+
+    `header` overrides the comment block only. Exports are already-reviewed rules
+    rather than drafts, so the default "review before importing" preamble would be
+    wrong on them; the body format stays identical either way, which is what makes
+    an export re-importable.
+    """
+    lines = header if header is not None else [
         f"# Drafted from walkthrough: {source}",
         "#",
         "# Review before importing. Entries commented out below were flagged as",
@@ -2322,6 +2436,85 @@ def list_service_prompts(
     except Exception as e:
         logger.error("Failed to list service prompts: %s", e)
         raise HTTPException(500, f"Failed to list prompts: {e}")
+
+
+# Columns that describe a row's life in this database rather than the knowledge
+# itself. They must not reach a seed file: `id` and the timestamps are
+# regenerated on import, and `engagement_id` is a UUID that will not exist on any
+# other install — carrying it over turns a portable seed into one that fails its
+# foreign key.
+_EXPORT_DROP = ("id", "created_at", "updated_at", "rag_ingested_at", "engagement_id")
+
+
+def _export_row(row: Dict) -> Dict:
+    """Reduce a DB row to the fields the importer accepts."""
+    out = {}
+    for k, v in row.items():
+        if k in _EXPORT_DROP:
+            continue
+        # Drop nulls to keep the file readable, but never drop a false/0 — omitting
+        # `enabled: false` would silently re-import the rule as enabled.
+        if v is None:
+            continue
+        if k == "tags":
+            v = list(v)
+            if not v:
+                continue
+        out[k] = v
+    return out
+
+
+@kb_router.get("/prompts/export")
+def export_service_prompts(
+    engagement_id: Optional[str] = Query(None),
+    enabled_only: bool = Query(False),
+):
+    """Export prompt rules as a seed file, re-importable by import-knowledge.sh.
+
+    The round-trip partner to the importer: rules accepted in the UI live only in
+    Postgres until this writes them back out, so a clean install starts empty and
+    an accepted rule is lost on `docker compose down -v`.
+
+    Nothing is flagged or commented out here — these rules already passed review
+    when they were accepted, unlike converter drafts.
+    """
+    where, params = [], []
+    if engagement_id:
+        where.append("engagement_id = %s::uuid")
+        params.append(engagement_id)
+    if enabled_only:
+        where.append("enabled = true")
+    sql = (
+        "SELECT id::text, selector_type, service, tech, port, title, prompt, "
+        "       training_notes, tags, priority, enabled, engagement_id::text, "
+        "       rag_ingested_at, created_at, updated_at "
+        "  FROM public.service_prompts "
+        + (" WHERE " + " AND ".join(where) if where else "")
+        # Stable ordering keeps successive exports diffable — an export that
+        # reshuffles rows produces noise in git for no change in content.
+        + " ORDER BY selector_type, COALESCE(service, tech, ''), COALESCE(port, -1), title"
+    )
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, tuple(params))
+            rows = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        logger.error("Failed to export service prompts: %s", e)
+        raise HTTPException(500, f"Failed to export prompts: {e}")
+
+    entries = [_export_row(r) for r in rows]
+    scope = f"engagement {engagement_id}" if engagement_id else "all engagements"
+    header = [
+        f"# Exported from the live knowledge base — {len(entries)} rule(s), {scope}.",
+        "#" + (" Enabled rules only." if enabled_only else ""),
+        "# These were already reviewed when accepted, so nothing here is commented out.",
+        "#",
+        "#   ./scripts/import-knowledge.sh --file <this file> --dry-run",
+        "#   ./scripts/import-knowledge.sh --file <this file>",
+        "",
+    ]
+    yaml_text = render_seed_yaml(entries, [], {}, {}, scope, header=header)
+    return {"ok": True, "count": len(entries), "yaml": yaml_text}
 
 
 @kb_router.get("/prompts/resolve")

@@ -229,6 +229,41 @@ the number down.
 
 If services you care about are missing, re-run with `--focus` naming them.
 
+### Getting rules back out — export
+
+Rules accepted in the UI live only in Postgres. Until they are exported they do not
+survive `docker compose down -v` and do not reach any other install.
+
+```bash
+./scripts/export-knowledge.sh                     # -> knowledge/seed/exported-<date>.yaml
+./scripts/export-knowledge.sh --enabled-only
+./scripts/export-knowledge.sh --stdout | less
+```
+
+Output is the format `import-knowledge.sh` consumes, so the round trip is closed.
+Verify it before committing — every entry should say **would update**:
+
+```bash
+./scripts/import-knowledge.sh --file <exported.yaml> --dry-run
+```
+
+A `would create` means the export lost something that distinguishes the rule.
+
+`engagement_id` is deliberately **not** written to the seed: it is a UUID that will not
+exist on another install, and carrying it over turns a portable seed into one that fails
+its foreign key. Use `--engagement` to *select* which rules to export; the file itself is
+engagement-neutral.
+
+**Seeding on install.** `setup.sh` phase 10 imports every `knowledge/seed/*.yaml` after the
+health check. It is idempotent (create-or-update on the unique selector index, verified by
+importing the same file twice) and non-fatal — a seeding failure warns rather than failing
+an otherwise-good install. `post-install-check.sh` warns when `service_prompts` is empty but
+seed files exist, which is the signature of seeding having silently not run.
+
+Note that seeded rules fire on **every** engagement. Lab-specific ones (DVWA, Mutillidae)
+are noise on a real target; ship those with `enabled: false` rather than removing them from
+the seed.
+
 #### The gap pass
 
 The chunk pass asks "find everything", which a local model does unreliably on a long
