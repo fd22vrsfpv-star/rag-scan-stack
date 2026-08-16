@@ -834,6 +834,33 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
     selected = dispatchable
 
     # Map scanner → service URL
+    # ── Tool → service routing ────────────────────────────────────────────
+    #
+    # A recommended tool with NO entry here falls through to the manual-Kali
+    # branch, which tries `apt-get install <scanner>` in the Kali container. That
+    # is the wrong answer whenever the stack ALREADY runs a service for the tool:
+    # katana, naabu and tlsx were all being skipped as "missing on kali" while
+    # pd-runner sat there serving /jobs/katana, /jobs/naabu and /jobs/tlsx with
+    # the binaries installed.
+    #
+    # Before adding a tool to MANUAL_TOOLS or leaving it unmapped, check whether a
+    # service already owns it. Inventory below is taken from each service's actual
+    # @app.post("/jobs/...") routes, not from memory:
+    #
+    #   nmap_scanner    nmap, masscan (masscan-then-nmap, masscan-only, full-scan,
+    #                   nmap-udp, smb-vuln-scan, credential-check)
+    #   nuclei-runner   nuclei
+    #   web-scanner     gobuster, nikto, content-recon, web-scan, pipeline-scan
+    #   pd-runner       httpx, naabu, katana, tlsx, whatweb, ffuf
+    #   osint-runner    subfinder, dnsx, alterx, vulnx, amass, gau, waybackurls,
+    #                   wafw00f, gowitness, whois, trufflehog, subzy, dns-enum,
+    #                   service-enum, subdomain-takeover, crtsh, shuffledns, ...
+    #   brutus-runner   hydra/medusa/ncrack (all via /jobs/brutus)
+    #   exploit-runner  metasploit (queued for approval, never auto-exploited)
+    #   kali-listener   genuinely CLI-only tools — the fallback, not the default
+    #
+    # Adding a route needs BOTH an entry here and a payload branch in
+    # dispatch_rec(); a URL alone yields "No automated handler for '<scanner>'".
     SCANNER_URLS = {
         "nmap": s.nmap_scanner_url,
         "nuclei": s.nuclei_url,
@@ -844,6 +871,14 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         "ffuf": s.pd_runner_url,
         "whatweb": s.pd_runner_url,
         "httpx": s.pd_runner_url,
+        # katana / naabu / tlsx were absent from this map even though pd-runner
+        # serves /jobs/katana, /jobs/naabu and /jobs/tlsx and ships all three
+        # binaries. Missing here meant they fell through to the manual-Kali
+        # branch and were skipped as "missing on kali" — asking a Kali container
+        # to install tools the stack already runs a dedicated container for.
+        "katana": s.pd_runner_url,
+        "naabu": s.pd_runner_url,
+        "tlsx": s.pd_runner_url,
         "sqlmap": s.web_scanner_url,
         "metasploit": s.exploit_runner_url,
         "wfuzz": s.pd_runner_url,
@@ -875,7 +910,36 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         service_url = SCANNER_URLS.get(scanner)
         result = {"id": rec["id"], "scanner": scanner, "ip": ip}
 
+        # Tools a service DOES serve but which are not mapped above. Without this
+        # the operator is told "missing on kali" for something the stack already
+        # runs — the exact confusion that hid the katana/naabu/tlsx gap.
+        SERVED_ELSEWHERE = {
+            "katana": "pd-runner /jobs/katana",
+            "naabu": "pd-runner /jobs/naabu",
+            "tlsx": "pd-runner /jobs/tlsx",
+            "ffuf": "pd-runner /jobs/ffuf",
+            "whatweb": "pd-runner /jobs/whatweb",
+            "httpx": "pd-runner /jobs/httpx",
+            "amass": "osint-runner /jobs/amass",
+            "gau": "osint-runner /jobs/gau",
+            "waybackurls": "osint-runner /jobs/waybackurls",
+            "wafw00f": "osint-runner /jobs/wafw00f",
+            "gowitness": "osint-runner /jobs/gowitness",
+            "whois": "osint-runner /jobs/whois",
+            "trufflehog": "osint-runner /jobs/trufflehog",
+            "dnsenum": "osint-runner /jobs/dns-enum",
+            "dnsrecon": "osint-runner /jobs/dns-enum",
+            "subfinder": "osint-runner /jobs/subfinder",
+        }
+
         if not service_url:
+            hint = SERVED_ELSEWHERE.get(scanner)
+            if hint:
+                result["status"] = "skipped"
+                result["detail"] = (
+                    f"'{scanner}' is served by {hint} but is not in SCANNER_URLS — "
+                    f"route it there rather than installing it on kali")
+                return result
             # Try Kali container for manual/CLI tools — preflight first.
             if use_kali and scanner not in ("metasploit",):
                 pf = await _preflight_tool("kali", scanner, None)
@@ -915,7 +979,12 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                         result["status"] = "skipped"
                         result["detail"] = f"Nmap script '{script.split(' ')[0]}' — already run during service detection"
                         return result
-                    payload = {"targets": [ip], "ports": str(rec.get("port", "1-1000"))}
+                    # Omit ports when the rec does not name one: the scanner then
+                    # applies its top-1000 profile. "1-1000" is the first 1000 port
+                    # NUMBERS, not the 1000 most commonly open ports.
+                    payload = {"targets": [ip]}
+                    if rec.get("port"):
+                        payload["ports"] = str(rec["port"])
                     if proxy_url:
                         payload["proxy"] = proxy_url
                     r = await client.post(f"{service_url}/jobs/masscan-then-nmap", json=payload, headers=headers)
@@ -988,6 +1057,31 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                     if proxy_url:
                         payload["proxy"] = proxy_url
                     r = await client.post(f"{service_url}/jobs/brutus", json=payload, headers=headers)
+                elif scanner == "katana":
+                    port = rec.get("port") or 80
+                    scheme = "https" if str(port) in ("443", "8443") else "http"
+                    r = await client.post(
+                        f"{service_url}/jobs/katana",
+                        json={"targets": [f"{scheme}://{ip}:{port}"], "depth": 3,
+                              "js_crawl": True},
+                        headers=headers,
+                    )
+                elif scanner == "naabu":
+                    # No `ports` -> pd_runner falls back to -top-ports 1000, the
+                    # frequency-ranked list, rather than a sequential low range.
+                    payload = {"targets": [ip], "rate": 1000}
+                    if rec.get("port"):
+                        payload["ports"] = str(rec["port"])
+                    if proxy_url:
+                        payload["proxy"] = proxy_url
+                    r = await client.post(f"{service_url}/jobs/naabu",
+                                          json=payload, headers=headers)
+                elif scanner == "tlsx":
+                    payload = {"targets": [ip], "ports": str(rec.get("port") or 443)}
+                    if proxy_url:
+                        payload["proxy"] = proxy_url
+                    r = await client.post(f"{service_url}/jobs/tlsx",
+                                          json=payload, headers=headers)
                 elif scanner == "wappalyzer":
                     port = rec.get("port") or 80
                     r = await client.post(
