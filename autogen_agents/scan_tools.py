@@ -479,6 +479,141 @@ class SessionScanTracker:
             "by_type": by_type,
         }
 
+    # Result keys worth surfacing per tool. A scan that "completed" having found
+    # nothing is a materially different outcome from one that found 40 things, and
+    # the existing summary counted both as simply "completed".
+    _RESULT_KEYS = (
+        "total_valid_credentials", "vulnerabilities_found", "findings_count",
+        "paths_found", "urls_scanned", "urls_discovered", "pages_crawled",
+        "ports_found", "open_ports", "screenshots", "alerts", "inserted",
+        "total", "count",
+    )
+
+    @classmethod
+    def _result_highlights(cls, result: Any) -> Dict[str, Any]:
+        """Pull countable outcomes out of a tool's result blob, flattened one level."""
+        out: Dict[str, Any] = {}
+        if not isinstance(result, dict):
+            return out
+        for k in cls._RESULT_KEYS:
+            if isinstance(result.get(k), (int, float)):
+                out[k] = result[k]
+        for section in ("stages", "ingest", "stats", "result"):
+            sub = result.get(section)
+            if isinstance(sub, dict):
+                for k in cls._RESULT_KEYS:
+                    if isinstance(sub.get(k), (int, float)) and k not in out:
+                        out[k] = sub[k]
+
+        # Several tools report findings as LISTS, not counts — full-scan's
+        # ports_discovered is {"quick": [...], "full": [...]}, and all_open_ports
+        # is a bare list. Without this a full scan that found 25 ports reported
+        # "produced nothing", which is the exact false negative this summary
+        # exists to prevent.
+        for key in ("all_open_ports", "ports_found", "open_ports", "urls", "findings"):
+            v = result.get(key)
+            if isinstance(v, list) and v and key not in out:
+                out[key] = len(v)
+        pd = result.get("ports_discovered")
+        if isinstance(pd, dict):
+            for sub_key, v in pd.items():
+                if isinstance(v, list) and v:
+                    out[f"ports_{sub_key}"] = len(v)
+                elif isinstance(v, (int, float)) and v:
+                    out[f"ports_{sub_key}"] = v
+        return out
+
+    @classmethod
+    def build_flow_summary(cls, session_id: str = None) -> Dict[str, Any]:
+        """End-of-session report: what each SCAN TYPE actually did, in order.
+
+        _generate_summary only ever answered "how many finished". That cannot tell
+        an operator whether the engagement did its job: a session where nuclei ran
+        and found nothing looks identical to one where nuclei never produced a
+        usable result, and a failed stage is invisible once the count says
+        "completed". This reconstructs the flow per type — sequence, targets,
+        durations, what each produced, and why anything failed.
+        """
+        session_id = session_id or cls.get_current_session()
+        data = cls.get_session_status(session_id) or {}
+        scans = data.get("scans", []) or []
+
+        by_type: Dict[str, Any] = {}
+        for idx, scan in enumerate(scans, start=1):
+            st = scan.get("type") or "unknown"
+            entry = by_type.setdefault(st, {
+                "scan_type": st, "runs": 0, "completed": 0, "failed": 0,
+                "running": 0, "targets": [], "total_duration_seconds": 0.0,
+                "results": {}, "failures": [], "sequence": [],
+            })
+            entry["runs"] += 1
+            status = (scan.get("status") or "unknown").lower()
+            if status in ("completed", "failed", "running"):
+                entry[status] += 1
+
+            params = scan.get("params") or {}
+            for key in ("targets", "target", "target_url", "ip_address", "targets_list"):
+                v = params.get(key)
+                if not v:
+                    continue
+                for t in (v if isinstance(v, (list, tuple)) else [v]):
+                    t = str(t)
+                    if t not in entry["targets"]:
+                        entry["targets"].append(t)
+
+            dur = scan.get("duration_seconds")
+            if isinstance(dur, (int, float)):
+                entry["total_duration_seconds"] += float(dur)
+
+            highlights = cls._result_highlights(scan.get("result_summary"))
+            for k, v in highlights.items():
+                entry["results"][k] = entry["results"].get(k, 0) + v
+
+            if status == "failed":
+                res = scan.get("result_summary")
+                why = (res.get("error") if isinstance(res, dict) else None) or "no error recorded"
+                entry["failures"].append({"job_id": scan.get("job_id"), "error": str(why)[:300]})
+
+            entry["sequence"].append({
+                "step": idx,
+                "job_id": scan.get("job_id"),
+                "status": status,
+                "started_at": scan.get("started_at"),
+                "duration_seconds": dur,
+                "produced": highlights or None,
+            })
+
+        for e in by_type.values():
+            e["total_duration_seconds"] = round(e["total_duration_seconds"], 1)
+            # "completed but produced nothing" is the case worth surfacing: it reads
+            # as success everywhere else and is usually where a broken tool hides.
+            e["produced_nothing"] = (
+                e["completed"] > 0 and not any(v for v in e["results"].values())
+            )
+
+        ordered = [s.get("type") for s in scans]
+        seen, flow = set(), []
+        for t in ordered:
+            if t and t not in seen:
+                seen.add(t)
+                flow.append(t)
+
+        return {
+            "session_id": session_id,
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "scan_types_run": len(by_type),
+            "total_scans": len(scans),
+            "flow_order": flow,
+            "totals": cls._generate_summary(data),
+            "by_scan_type": [by_type[k] for k in sorted(by_type)],
+            "types_that_produced_nothing": sorted(
+                k for k, v in by_type.items() if v["produced_nothing"]
+            ),
+            "types_with_failures": sorted(
+                k for k, v in by_type.items() if v["failures"]
+            ),
+        }
+
     @classmethod
     def get_running_scans(cls, session_id: str = None) -> List[Dict[str, Any]]:
         """Get all running scans for the current (or specified) session."""
