@@ -3,11 +3,26 @@
 # Where autonomy is granted, where it is CONSTRAINED, and how the loop closes.
 # Every control shown was verified present in code, not assumed.
 #
-# Render:
-#   d2 --layout elk --theme 200 Docs/diagrams/agentic-security-harness.d2 \
+# Render (theme 0 is the neutral LIGHT theme — see the style.fill note below,
+# theme 200 is dark and made the plain-text title and legend unreadable):
+#   d2 --layout elk --theme 0 Docs/diagrams/agentic-security-harness.d2 \
+#      Docs/diagrams/agentic-security-harness.svg
+#   rsvg-convert -f png -o Docs/diagrams/agentic-security-harness.png \
 #      Docs/diagrams/agentic-security-harness.svg
 
 direction: right
+
+# Light canvas, set explicitly.
+#
+# theme 200 is a DARK theme — its background is rgb(30,30,46). The shapes here
+# carry explicit light fills so they looked fine, which hid the problem: the
+# title and legend are plain text with no fill behind them, so near-black text
+# was being drawn on a near-black canvas and was invisible. It read as "the
+# legend is missing from the PNG".
+#
+# Fixing the canvas rather than the text keeps the dark-on-light contrast that
+# every other label depends on.
+style.fill: "#ffffff"
 
 # High-contrast typography.
 #
@@ -22,14 +37,12 @@ direction: right
 (** -> **)[*].style.font-color: "#111827"
 (** -> **)[*].style.bold: true
 
-title: |md
-  # Agentic Security Harness — Landscape
-  Autonomy flows left to right. Red = enforcement: every path to a packet crosses one.
-| {
+title: "Agentic Security Harness — Landscape\nAutonomy flows left to right.  Red = enforcement · Purple = agent-output validation" {
   near: top-center
-  # Markdown blocks do not inherit the glob above — they carry their own CSS.
-  style.font-size: 44
-  style.font-color: "#0b0b0c"
+  shape: text
+  # Native text, NOT |md|: markdown blocks become foreignObject, which librsvg
+  # and most non-browser SVG renderers drop entirely.
+  style: {font-size: 42; bold: true; font-color: "#0b0b0c"}
 }
 
 # ─────────────────────────────────────── who decides what to run
@@ -82,7 +95,11 @@ control: "CONSTRAIN — enforcement plane" {
     tooltip: "Metasploit is never auto-exploited — queued for human approval"
   }
   claims: "Agent-output validation\n(claims vs recorded data)" {
-    style: {fill: "#ffc9c9"; stroke: "#c92a2a"; bold: true}
+    # Grape, deliberately NOT the red used for scope enforcement. This control
+    # answers a different question: scope asks "may we touch this host?", this
+    # asks "did the agent tell the truth about what it found?". Same plane,
+    # different failure mode, so it gets its own colour.
+    style: {fill: "#f3d9fa"; stroke: "#ae3ec9"; stroke-width: 3; bold: true}
     tooltip: "Regex + SQL, deterministic. Catches FABRICATED ports/CVEs/hosts. Unsupported can also mean ingestion broke"
   }
   tls: "CA trust bundle" {
@@ -198,9 +215,9 @@ execute -> know.pg: "ingest findings"
 know.pg -> decide.kb: "post-ingest trigger" {style.stroke-dash: 3}
 know.kbfiles -> control.matcher: "scope presets" {style.stroke-dash: 4}
 know.vec -> decide.kb {style.stroke-dash: 3}
-control.claims -> report.flow: "verdicts" {style.stroke: "#c92a2a"}
-know.pg -> control.claims: "what was actually recorded" {style.stroke-dash: 3}
-decide.session -> control.claims: "what the agents claimed" {style: {stroke: "#c92a2a"; stroke-width: 2}}
+control.claims -> report.flow: "verdicts: supported / unsupported" {style: {stroke: "#ae3ec9"; stroke-width: 3}}
+know.pg -> control.claims: "what was actually recorded" {style: {stroke: "#ae3ec9"; stroke-width: 3; stroke-dash: 3}}
+decide.session -> control.claims: "what the agents claimed" {style: {stroke: "#ae3ec9"; stroke-width: 3}}
 know.pg -> report.flow
 know.pg -> report.coverage
 know.pg -> know.grpo {style.stroke-dash: 3}
@@ -209,16 +226,8 @@ report.coverage -> decide.operator
 report.manual -> decide.operator: "run by hand"
 report.hooks -> decide.operator: "Slack / n8n"
 
-legend: |md
-  ### Reading this
-  - **Red** — enforcement. Every route to a packet crosses the scanner scope gate.
-  - **Dashed** — knowledge / feedback, not a dispatch path.
-  - The scanner gate exists because a real agent scan bypassed the BFF one entirely.
-  - **Agent-output validation** is the control aimed at the AGENTS, not the target:
-    it checks claimed ports/CVEs/hosts against what the scans recorded.
-  - `target_kind` splits recommendations that cannot be automated into manual
-    follow-ups **with the command**, instead of failing silently.
-| {
+legend: "READING THIS\n\nRED — enforcement. Every route to a packet crosses the scanner scope gate.\nPURPLE — agent-output validation: claimed ports / CVEs / hosts checked against\n         what the scans actually recorded. \"Unsupported\" means not found in the\n         data, which can equally mean ingestion broke — read it beside the flow\n         summary's produced counts.\nGREEN — reporting and manual follow-ups.  ORANGE — packets to the target.\nDASHED — knowledge / feedback, not a dispatch path.\n\nThe scanner gate exists because a real agent scan bypassed the BFF one entirely.\ntarget_kind splits recommendations that cannot be automated into manual\nfollow-ups WITH the command, instead of failing silently." {
   near: bottom-center
-  style: {fill: "#f8f9fa"; stroke: "#adb5bd"; font-size: 26; font-color: "#0b0b0c"}
+  shape: text
+  style: {font-size: 24; font-color: "#0b0b0c"}
 }
