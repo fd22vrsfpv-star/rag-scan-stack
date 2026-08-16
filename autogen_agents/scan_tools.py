@@ -552,21 +552,36 @@ class SessionScanTracker:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
                     if targets:
                         cur.execute(
-                            "SELECT scanner, service, source, status, priority "
+                            "SELECT scanner, service, source, status, priority, "
+                            "       target_kind "
                             "FROM scan_recommendations "
                             "WHERE host(ip)::text = ANY(%s)", (list(targets),))
                     else:
                         cur.execute(
-                            "SELECT scanner, service, source, status, priority "
+                            "SELECT scanner, service, source, status, priority, "
+                            "       target_kind "
                             "FROM scan_recommendations")
                     rows = [dict(r) for r in cur.fetchall()]
         except Exception as e:
             logger.warning("KB coverage lookup failed: %s", e)
             return {"available": False, "reason": str(e)[:200]}
 
+        # 'resource' recommendations are inputs (wordlists, template sets), not
+        # scans. Counting them would make coverage unreachable by construction:
+        # they can never be "acted on", so every run would report them as
+        # recommended-but-never-done forever. Reported separately as
+        # prerequisites instead.
+        prerequisites = sorted({(r.get("scanner") or "?") for r in rows
+                                if (r.get("target_kind") or "service") == "resource"})
+        non_dispatchable = sorted({(r.get("scanner") or "?") for r in rows
+                                   if (r.get("target_kind") or "service") in ("artifact", "range")})
+        rows = [r for r in rows if (r.get("target_kind") or "service") == "service"]
+
         if not rows:
             return {"available": True, "recommendations": 0,
-                    "note": "no KB recommendations exist for these targets"}
+                    "prerequisites": prerequisites,
+                    "not_yet_dispatchable": non_dispatchable,
+                    "note": "no dispatchable KB recommendations for these targets"}
 
         ran = {str(t).lower() for t in types_run}
 
@@ -629,6 +644,9 @@ class SessionScanTracker:
             "coverage_pct": round(100.0 * acted / len(rows), 1),
             "recommended_but_never_run": ignored[:15],
             "pending_status_count": sum(1 for r in rows if (r.get("status") or "") == "pending"),
+            # Kept out of the coverage maths on purpose — see above.
+            "prerequisites": prerequisites,
+            "not_yet_dispatchable": non_dispatchable,
         }
 
     @classmethod

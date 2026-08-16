@@ -161,6 +161,18 @@ else
   warn "scope_targets: index check skipped (no DB connection helper available)"
 fi
 
+# scan_recommendations.target_kind — dispatch refuses non-'service' kinds rather
+# than firing a file/range/resource recommendation at an IP as a network scan.
+# Missing column means every rec reads as 'service' and that guard cannot work.
+HAS_TK=$(_run_sql "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='scan_recommendations' AND column_name='target_kind')")
+if [[ "$HAS_TK" == "t" ]]; then
+  pass "scan_recommendations.target_kind column present"
+elif [[ "$HAS_TK" == "f" ]]; then
+  fail "scan_recommendations.target_kind missing — run ./scripts/ensure_db_schema.sh (dispatch cannot distinguish file/range/resource recs)"
+else
+  warn "scan_recommendations.target_kind check skipped (no DB connection helper available)"
+fi
+
 # assets.provider column + GIN index — required for cloud-hosting filter
 HAS_PROVIDER=$(_run_sql "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='assets' AND column_name='provider')")
 if [[ "$HAS_PROVIDER" == "t" ]]; then
