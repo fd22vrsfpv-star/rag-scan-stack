@@ -89,7 +89,54 @@ except Exception as _pp_err:      # PortProfileError, missing file, bad YAML
         DEFAULT_QUICK_PORTS_PROFILE, _pp_err, _LEGACY_QUICK_PORTS,
     )
     DEFAULT_QUICK_PORTS = _LEGACY_QUICK_PORTS
-DEFAULT_DEEP_SCAN_PORTS = os.environ.get("DEEP_SCAN_PORTS", "1001-65535")
+# Deep follow-up sweep — masscan over the FULL range, not "everything above 1000".
+#
+# 1001-65535 was the correct complement back when the quick pass was the
+# sequential range 1-1000: the two together tiled 1-65535 exactly once. That is
+# no longer true. The quick pass is now nmap's frequency-ranked top-1000, whose
+# members are scattered across the whole range (3306, 5432, 5900, 8180, 49152…),
+# so 1001-65535 both re-probes ports the quick pass already covered AND leaves a
+# hole: the ~600 low ports below 1001 that are not in the top-1000 list would
+# never be scanned by either pass.
+#
+# masscan over 1-65535 closes the hole. It is a SYN sweep at `rate` pps, so the
+# cost is a function of the rate, not of which subrange is asked for, and the
+# overlap with the quick pass is deduplicated downstream at ingest.
+DEFAULT_DEEP_SCAN_PORTS = os.environ.get("DEEP_SCAN_PORTS", "1-65535")
+
+# Sequential low ranges an LLM reaches for when it means "the common ports".
+# They are not the common ports — they are the first N port NUMBERS, which is
+# why the quick default moved to the frequency-ranked profile. Callers that pass
+# one of these are upgraded rather than obeyed; see _upgrade_sequential_quick_ports.
+_SEQUENTIAL_LOW_RANGES = {"1-1000", "0-1000", "1-1024", "0-1024"}
+
+
+def _upgrade_sequential_quick_ports(ports: str) -> str:
+    """Map a sequential low range onto the frequency-ranked quick default.
+
+    `start_full_scan(quick_ports=...)` is LLM-callable, and the model reaches for
+    "1-1000" because that phrasing is everywhere in scanning lore. Defaulting the
+    parameter is not enough — an explicitly-passed 1-1000 sails straight past a
+    `if not quick_ports` check and silently reinstates the exact scope the
+    top-1000 profile exists to replace, missing mysql/postgresql/vnc/tomcat.
+
+    Only exact sequential low ranges are upgraded (optionally carrying the
+    configured high web-port suffix, which is how the legacy default was built).
+    Anything else — a real operator selection, a single port, a custom list — is
+    left untouched.
+    """
+    if not ports:
+        return ports
+    candidate = ports.strip()
+    if candidate in _SEQUENTIAL_LOW_RANGES or candidate == _LEGACY_QUICK_PORTS:
+        logger.info(
+            "Upgrading quick_ports=%r to the top-1000 profile: a sequential low "
+            "range is the first 1000 port NUMBERS, not the 1000 most commonly "
+            "open ports, and misses mysql/postgresql/vnc/tomcat",
+            candidate,
+        )
+        return DEFAULT_QUICK_PORTS
+    return candidate
 
 
 def _is_known_port_scope(ports: str) -> bool:
@@ -925,7 +972,7 @@ class ScanTools:
         self,
         targets: List[str],
         quick_ports: str = DEFAULT_QUICK_PORTS,
-        full_ports: str = "1001-65535",
+        full_ports: str = DEFAULT_DEEP_SCAN_PORTS,
         rate: int = 1000,
         interface: str = "eth0",
         run_smb_vuln_scan: bool = False,
@@ -935,9 +982,14 @@ class ScanTools:
         Start a comprehensive full port scan with parallel phases.
 
         This runs a phased scanning approach for maximum coverage:
-        - Phase 1: Quick masscan (ports 1-1000)
-        - Phase 2: PARALLEL - Nmap on Phase 1 ports + Masscan (ports 1001-65535)
+        - Phase 1: Quick masscan over nmap's top-1000 (frequency-ranked)
+        - Phase 2: PARALLEL - Nmap on Phase 1 ports + Masscan over 1-65535
         - Phase 3: Nmap service detection on Phase 2 ports
+
+        Phase 2 sweeps the full range rather than 1001-65535: the quick pass is
+        frequency-ranked and its members are scattered across the whole range, so
+        "everything above 1000" is no longer its complement and would leave the
+        low ports outside the top-1000 unscanned by either phase.
 
         Discovers high-value ports often missed by limited scans:
         - 1099 (Java RMI), 1524 (Bindshell), 3306 (MySQL)
@@ -946,8 +998,8 @@ class ScanTools:
 
         Args:
             targets: List of IP addresses or CIDRs
-            quick_ports: Ports for quick initial scan (default "1-1000")
-            full_ports: Ports for full scan (default "1001-65535")
+            quick_ports: Ports for quick initial scan (default: nmap top-1000)
+            full_ports: Ports for the follow-up sweep (default "1-65535")
             rate: Masscan rate in packets per second
             interface: Network interface to use
             run_smb_vuln_scan: Run SMB vulnerability scan if 139/445 found
@@ -2482,19 +2534,25 @@ def start_full_scan(
     """
     Start a quick port scan with service detection.
 
-    Default: scans ports 1-1000 + high WEB_PORTS from settings with service detection (~2-3 min).
-    After this completes, run web scans on discovered HTTP ports, then start_deep_port_scan.
+    Default: nmap's top-1000 (the 1000 most commonly OPEN ports, frequency-ranked)
+    plus any high WEB_PORTS from settings, with service detection. A full-range
+    masscan follow-up over 1-65535 is scheduled automatically and runs in parallel,
+    so you do NOT need to call start_deep_port_scan afterwards.
+
+    Do not pass quick_ports="1-1000". That is the first 1000 port NUMBERS, not the
+    1000 most commonly open ports — it misses mysql 3306, postgresql 5432, vnc 5900
+    and tomcat 8180. It will be upgraded to the top-1000 profile anyway.
 
     Phases:
-    1. Quick masscan on specified ports
-    2. Nmap service detection on discovered ports (+ full masscan if full_ports is set)
-    3. Service detection on any additional ports (if full_ports was set)
+    1. Quick masscan over the top-1000
+    2. Nmap service detection on discovered ports, in PARALLEL with a masscan over 1-65535
+    3. Service detection on any additional ports found in phase 2
 
     Args:
         targets: Comma-separated string of IPs or CIDRs (e.g. "192.168.1.150")
         target: Alias for targets
-        quick_ports: Ports for quick scan (default from WEB_PORTS setting)
-        full_ports: Ports for deep scan (default "" = skip, use start_deep_port_scan later)
+        quick_ports: Ports for quick scan (default: nmap top-1000 + high WEB_PORTS)
+        full_ports: Ports for the follow-up sweep (default: automatic, 1-65535)
         rate: Masscan rate in packets per second
         run_smb_vuln_scan: Run SMB vuln scan if 139/445 found (default False - decide after reviewing results)
         run_credential_check: Run credential checking on auth services (default False - decide after reviewing results)
@@ -2513,6 +2571,11 @@ def start_full_scan(
     # Guard against LLM passing null/None/empty for optional params
     if not quick_ports:
         quick_ports = DEFAULT_QUICK_PORTS
+    else:
+        # An explicitly-passed sequential low range is upgraded, not obeyed —
+        # defaulting the parameter alone never fixed this, because the model
+        # passes "1-1000" outright.
+        quick_ports = _upgrade_sequential_quick_ports(quick_ports)
     if rate is None:
         rate = 1000
 
@@ -2528,7 +2591,7 @@ def start_full_scan(
         )
         quick_ports = session_scope
         # A session scope already defines the full sweep; a second deep pass
-        # over 1001-65535 would rescan ports the operator either asked for
+        # over the full range would rescan ports the operator either asked for
         # (profile 'all') or deliberately excluded.
         full_ports = ""
 
@@ -2540,6 +2603,28 @@ def start_full_scan(
         full_ports = ""
     if full_ports is None:
         full_ports = ""
+
+    # Full-range follow-up is now automatic rather than a separate call the model
+    # had to remember to make.  It ran as Phase 2 in parallel with the Phase 1
+    # nmap enrichment, so scheduling it here costs no extra wall-clock — whereas
+    # leaving it to a later start_deep_port_scan meant that whenever the model
+    # skipped that step (or the session ended first) the engagement silently
+    # shipped with only top-1000 coverage.
+    #
+    # Not applied when the operator picked a session scope: that selection
+    # already defines the sweep, and widening it back to 1-65535 would ignore a
+    # deliberately narrow (e.g. redteam-targeted) choice.  The session-scope
+    # branch above clears full_ports for exactly this reason.
+    # Also skipped when the quick pass IS the full range — start_deep_port_scan
+    # delegates here with quick_ports=1-65535, and without this it would queue a
+    # second identical sweep behind the first.
+    _quick_is_full_range = quick_ports.strip() in (DEFAULT_DEEP_SCAN_PORTS, "1-65535", "0-65535")
+    if not full_ports and not session_scope and not _quick_is_full_range:
+        full_ports = DEFAULT_DEEP_SCAN_PORTS
+        logger.info(
+            "Scheduling the full-range masscan follow-up (%s) alongside the "
+            "top-1000 quick pass", full_ports,
+        )
 
     result = get_scan_tools().start_full_scan(
         target_list,
@@ -2575,10 +2660,14 @@ def start_deep_port_scan(
     rate: int = 1000
 ) -> str:
     """
-    Start a deep port scan covering ports 1001-65535.
+    Start a deep port scan covering the full range, 1-65535.
 
-    Run this AFTER web scans have completed. Uses the same backend as start_full_scan
-    but targets only the remaining high ports (1001-65535) with service detection.
+    USUALLY UNNECESSARY: start_full_scan now schedules this sweep automatically as
+    its phase 2. Call this only to re-sweep a target whose full scan predates that
+    change, or when you deliberately skipped the full scan.
+
+    Uses the same backend as start_full_scan, with the full range as the discovery
+    pass and service detection on whatever it finds.
 
     Args:
         targets: Comma-separated string of IPs or CIDRs (e.g. "192.168.1.150")
@@ -2592,7 +2681,7 @@ def start_deep_port_scan(
         return json.dumps({"error": "No target specified. Use 'targets' parameter with a string like '192.168.1.150'."})
 
     # When the operator pinned a port scope for this session, the quick scan
-    # already covered exactly the ports they asked for.  A 1001-65535 sweep here
+    # already covered exactly the ports they asked for.  A full-range sweep here
     # would either duplicate that work (profile 'all') or scan ports they
     # deliberately excluded — so decline instead, and say why.
     session_scope = scan_tracker.get_port_scope()
@@ -2604,7 +2693,7 @@ def start_deep_port_scan(
             "reason": (
                 f"This session runs with the '{profile_id}' port scope "
                 f"({count_profile_ports(session_scope)} ports), which start_full_scan "
-                f"already covered. A deep 1001-65535 sweep would go outside the "
+                f"already covered. A deep 1-65535 sweep would go outside the "
                 f"operator's selected scope. Do NOT retry this tool — move on to "
                 f"analysing results or running service-specific follow-up scans."
             ),
@@ -4043,7 +4132,7 @@ def _enrich_with_follow_ups(result: dict, job_id: str) -> dict:
         # Deep port discovery — run after vuln scans to find services on high ports
         has_high_ports = any(p > 1000 for p in ports if p not in (8080, 8443))
         if not has_high_ports:
-            follow_ups.append(f"AFTER vuln scans + cred checks: start_deep_port_scan(targets='{target_ip}') — discover services on ports 1001-65535, then run nuclei on any new findings")
+            follow_ups.append(f"AFTER vuln scans + cred checks: review the phase-2 full-range (1-65535) masscan results from start_full_scan, then run nuclei on any newly discovered services")
 
         # Operator guidance goes FIRST: the groups above are generic defaults
         # derived from port numbers alone, while these rules were authored (often

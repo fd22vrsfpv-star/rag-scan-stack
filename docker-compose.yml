@@ -598,7 +598,7 @@ services:
       NMAP_SCRIPTS: ${NMAP_SCRIPTS:-banner,http-title,ssl-cert,ssl-enum-ciphers,ssh2-enum-algos,vulscan/vulscan.nse,vulners}
       NMAP_PORT_BATCH: ${NMAP_PORT_BATCH:-100}
       WEB_PORTS: ${WEB_PORTS:-80,443,8080,8443,8000,8888,3000,5000}
-      DEEP_SCAN_PORTS: ${DEEP_SCAN_PORTS:-1001-65535}
+      DEEP_SCAN_PORTS: ${DEEP_SCAN_PORTS:-1-65535}
       PYTHONPATH: /app
       # API_BASE hardcoded to https:// rather than ${API_BASE:-...} -- the
       # other 5 runners (brutus, node-manager, nuclei, osint, pd) all
@@ -621,6 +621,10 @@ services:
       - ./scan_results:/scan_results
       - ./scan_audit:/scan_audit
       - ./scan_audit/audit_writer.py:/app/audit_writer.py:ro
+      # Port scope profiles. nmap-api resolves DEFAULT_QUICK_PORTS_PROFILE from
+      # here so its own empty-ports fallback matches what the BFF and the agents
+      # send, rather than reinstating the sequential 1-1000 range.
+      - ./knowledge:/knowledge:ro
       - ./certs:/certs:ro
     cap_add: [NET_RAW, NET_ADMIN]
     healthcheck:
@@ -823,7 +827,7 @@ services:
       OSINT_RUNNER_URL: "https://osint-runner:8024"
       BRUTUS_RUNNER_URL: "https://brutus-runner:8025"
       WEB_PORTS: ${WEB_PORTS:-80,443,8080,8443,8000,8888,3000,5000}
-      DEEP_SCAN_PORTS: ${DEEP_SCAN_PORTS:-1001-65535}
+      DEEP_SCAN_PORTS: ${DEEP_SCAN_PORTS:-1-65535}
       SCAN_DEBUG: "false"
       LLM_TIMEOUT: "900"
       SESSION_STALL_TIMEOUT: "3600"

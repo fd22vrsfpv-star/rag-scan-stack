@@ -415,6 +415,12 @@ SCAN_ROUTES = {
         # Only sent when a port profile resolved one (see _apply_port_profile);
         # otherwise omitted so the scanner's DEFAULT_QUICK_PORTS still applies.
         "quick_ports": p.get("quick_ports") or None,
+        # An operator-selected port profile defines the whole sweep, so suppress
+        # the scanner's default full-range follow-up: widening a deliberately
+        # narrow choice (e.g. redteam-targeted) back out to 1-65535 would scan
+        # exactly what they excluded. With no profile, this is omitted and the
+        # scanner's DEFAULT_DEEP_SCAN_PORTS follow-up runs.
+        "full_ports": "" if p.get("quick_ports") else None,
         "timeout_seconds": _coerce_int(p.get("timeout_seconds")),
     }.items() if v is not None}),
     "masscan": ("nmap_scanner_url", "/jobs/masscan-only", lambda p: {k: v for k, v in {

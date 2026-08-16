@@ -502,6 +502,29 @@ if [[ -n "$DASH" ]]; then
   else
     pass "web profiles loaded from knowledge/web_profiles.yaml"
   fi
+
+  # nmap_scanner resolves the SAME profile for its own empty-ports fallback, so
+  # it needs the knowledge/ mount too. Without it the fallback degrades to the
+  # sequential 1-1000 range — which still returns HTTP 200 and still produces
+  # results, just results that miss mysql/postgresql/vnc/tomcat. Nothing else in
+  # this script would catch that.
+  if docker ps --format '{{.Names}}' | grep -q '^nmap_scanner$'; then
+    if docker exec nmap_scanner test -r /knowledge/port_profiles.yaml 2>/dev/null; then
+      pass "nmap_scanner can read knowledge/port_profiles.yaml"
+    else
+      fail "nmap_scanner cannot read /knowledge/port_profiles.yaml — add ./knowledge:/knowledge:ro to the nmap_scanner volumes; its default quick scan will silently fall back to the sequential 1-1000 range"
+    fi
+
+    # The deep sweep must cover the full range. 1001-65535 was correct only while
+    # the quick pass was sequential 1-1000; against the frequency-ranked top-1000
+    # it leaves the low ports outside that list unscanned by either phase.
+    DEEP=$(docker exec nmap_scanner printenv DEEP_SCAN_PORTS 2>/dev/null || echo "")
+    if [[ "$DEEP" == "1001-65535" ]]; then
+      fail "nmap_scanner DEEP_SCAN_PORTS=1001-65535 — stale value; set DEEP_SCAN_PORTS=1-65535 in .env and recreate the container"
+    else
+      pass "nmap_scanner deep sweep scope = ${DEEP:-1-65535 (default)}"
+    fi
+  fi
 fi
 
 # ── Summary ──

@@ -488,7 +488,7 @@ MASSCAN-FIRST WORKFLOW:
 - Only after masscan finds open ports should nmap run for service detection
 
 HANDOFF EXAMPLES:
-- No existing data: "Scanner, please run MASSCAN on 192.168.1.150 ports 1-1000 FIRST"
+- No existing data: "Scanner, please run MASSCAN on 192.168.1.150 over the top-1000 ports FIRST"
 - Masscan found ports: "Scanner, masscan found ports 22,80,443. Run nmap on these ports"
 - During scan wait: "I'll query existing assets while we wait for the scan"
 
@@ -505,20 +505,28 @@ CRITICAL: When asked to scan, IMMEDIATELY call the tool function. Never say "I w
 YOUR FIRST ACTION MUST BE: call start_full_scan(targets='TARGET_IP'). Do NOT call get_scan_recommendations first. Do NOT describe what you plan to do. Just call start_full_scan immediately.
 
 SCAN WORKFLOW (follow this order):
-1. start_full_scan(targets) — quick scan ports 1-1000 + web ports from settings + service detection (~2-3 min)
+1. start_full_scan(targets) — quick pass over nmap's TOP-1000 ports + web ports from settings + service detection.
+   It ALSO schedules a full-range (1-65535) masscan follow-up automatically, in parallel.
+   NEVER pass quick_ports='1-1000'. That is the first 1000 port NUMBERS, not the 1000 most
+   commonly open ports — it misses mysql 3306, postgresql 5432, vnc 5900, tomcat 8180.
+   Call start_full_scan(targets='TARGET_IP') with NO port arguments and let it choose.
 2. Read follow-ups → run web scans ONE AT A TIME: start_pipeline_scan → wait → start_nuclei_scan → wait
-3. start_deep_port_scan(targets) — scans remaining ports 1001-65535 (CRITICAL: always run after web scans)
+3. start_deep_port_scan(targets) — NOT normally needed: step 1 already sweeps 1-65535.
+   Call it only if start_full_scan was skipped for this target.
 4. start_udp_scan(targets) — UDP service discovery on common ports (53,161,500,etc.) - ALWAYS RUN if targets are live
 ALWAYS wait for each scan to complete before starting the next one.
 
 YOUR SCAN TOOLS - CALL THESE TO START SCANS:
 
 QUICK SCAN (ALWAYS START WITH THIS):
-- start_full_scan(targets): Quick port scan (1-1000 + high web ports) + service detection
-  Phase 1: Quick masscan, Phase 2: Nmap service detection on discovered ports
+- start_full_scan(targets): Quick port scan (nmap top-1000 + high web ports) + service detection
+  Phase 1: Quick masscan over the top-1000, Phase 2: Nmap service detection on discovered
+  ports IN PARALLEL with a full-range 1-65535 masscan, Phase 3: service detection on what
+  that sweep adds
 
 DEEP PORT SCAN (RUN LAST, after web scans):
-- start_deep_port_scan(targets): Scan remaining ports 1001-65535 with service detection
+- start_deep_port_scan(targets): Full-range 1-65535 sweep with service detection.
+  USUALLY REDUNDANT — start_full_scan already runs this sweep as its phase 2.
   NOTE: if the operator pinned a PORT SCOPE for this session, this tool returns
   {{"skipped": true, "reason": ...}}. That is expected and final — the selected scope
   already covers the intended range. Do NOT retry it and do NOT try to work around it
@@ -565,7 +573,8 @@ AFTER FULL_SCAN COMPLETES - CRITICAL:
 - After starting parallel scans, call wait_for_job_completion on the web pipeline job_id
   The other scans will likely finish while ZAP runs
 - SEQUENTIAL SCANS (run in this exact order after parallel scans complete):
-  1. start_deep_port_scan(targets) — ALWAYS run to scan full port range 1001-65535
+  1. start_deep_port_scan(targets) — SKIP unless start_full_scan did not run; its
+     phase 2 already swept the full 1-65535 range
   2. start_udp_scan(targets) — ALWAYS run to discover UDP services (DNS, SNMP, etc.)
   3. Run credential checks ONLY if auth services were found
 - You do NOT have shell access — your ONLY way to scan is through the registered tool functions
@@ -683,7 +692,8 @@ CRITICAL EFFICIENCY RULES:
 5. Only check status ONCE after starting a scan, then move on to parallel tasks
 
 FINDINGS-DRIVEN WORKFLOW:
-1. "Scanner, call start_full_scan(targets='TARGET_IP')" — quick scan ports 1-1000 + web ports
+1. "Scanner, call start_full_scan(targets='TARGET_IP')" — top-1000 quick pass + web ports,
+   with a full-range 1-65535 masscan following automatically
    Then "Scanner, call wait_for_job_completion(job_id='JOB_ID', job_type='nmap')"
    ONLY Scanner should call scan tools and wait_for_job_completion — never ask Analyzer or Reconnaissance.
 
@@ -696,7 +706,7 @@ FINDINGS-DRIVEN WORKFLOW:
    b. "Scanner, call start_smb_vuln_scan(target='TARGET_IP')" → wait — if ports 139/445 found
    c. "Scanner, call start_credential_check(target='TARGET_IP', services='ssh,ftp')" → wait — if auth services found
    d. "Scanner, call start_nuclei_scan(target_url='http://TARGET_IP')" → wait — if HTTP ports found
-   e. "Scanner, call start_deep_port_scan(targets='TARGET_IP')" → wait — deep scan remaining ports 1001-65535
+   e. Skip the deep port scan — start_full_scan's phase 2 already swept 1-65535
    Do NOT say "investigate port 80" or "run nikto" — give the EXACT tool call.
 
 4. "Scanner, start_udp_scan" (run LAST - slowest, only if time permits)
