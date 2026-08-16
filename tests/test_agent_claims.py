@@ -111,3 +111,50 @@ class TestVerification:
         r = ac.verify_claims(_FakeCur(set()), [{"kind": "port", "value": 22, "context": ""}])
         assert "supported" in r[0] and r[0]["supported"] is False
         assert "false" not in r[0]
+
+
+class TestNotability:
+    """Severity crossed with support. Neither axis alone is enough:
+    verification is negative-only, so a supported root shell was being filed
+    silently as 'fine'."""
+
+    def _claim(self, ctx, supported=True):
+        return {"kind": "port", "value": 4444, "context": ctx, "supported": supported}
+
+    def test_root_shell_is_notable(self):
+        r = ac.score_notability(self._claim("obtained a root shell on the target"))
+        assert r["notable"] and r["notable_score"] >= 5
+
+    def test_credentials_are_notable(self):
+        r = ac.score_notability(self._claim("recovered plaintext credentials from the config"))
+        assert r["notable"] and "credentials" in r["notable_reason"]
+
+    def test_ordinary_claim_is_not_notable(self):
+        r = ac.score_notability(self._claim("the port responded to a TCP connect"))
+        assert not r["notable"] and r["notable_score"] == 0
+
+    def test_unsupported_high_impact_outranks_supported(self):
+        """The worst case: a big claim with nothing behind it. It must sort
+        ABOVE the same claim when the database backs it up."""
+        sup = ac.score_notability(self._claim("got a root shell", supported=True))
+        uns = ac.score_notability(self._claim("got a root shell", supported=False))
+        assert uns["notable_score"] > sup["notable_score"]
+        assert "NO SUPPORTING SCAN DATA" in uns["notable_reason"]
+
+    def test_summary_separates_the_two_axes(self):
+        results = [
+            {"kind": "port", "value": 1, "supported": True,  "context": "root shell obtained"},
+            {"kind": "port", "value": 2, "supported": False, "context": "just an open port"},
+        ]
+        s = ac.summarise(results)
+        assert s["unsupported_count"] == 1     # port 2
+        assert s["notable_count"] == 1         # port 1
+        assert s["notable"][0]["value"] == 1   # different claims, different axes
+
+    def test_notable_sorted_by_score(self):
+        results = [
+            {"kind": "port", "value": 1, "supported": True, "context": "sudo misconfiguration"},
+            {"kind": "port", "value": 2, "supported": True, "context": "obtained a reverse shell"},
+        ]
+        s = ac.summarise(results)
+        assert s["notable"][0]["value"] == 2
