@@ -16,7 +16,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 import secrets
 import base64
 
@@ -5567,13 +5567,85 @@ def _get_next_wg_ip():
     conn.close()
     raise HTTPException(503, "No available IPs in WireGuard subnet")
 
+_WG_PUBKEY_PATH = "/opt/rag-scan-stack/wireguard/server/server/publickey-server"
+
+# wg-server sits behind an "optional" compose profile and is OFF by default, so
+# `docker compose up -d` never starts it and `docker compose ps` does not list
+# it. Telling the operator to "start wg-server first" was accurate and useless —
+# the ordinary start command does not start it, and nothing said why. The exact
+# command is included here because that is the missing piece.
+_WG_NOT_RUNNING = (
+    "WireGuard server is not running. It is behind an optional compose profile, "
+    "so a normal `docker compose up -d` does not start it and it will not appear "
+    "in `docker compose ps`.\n\n"
+    "Start it with:\n"
+    "    docker compose --profile optional up -d wg-server\n\n"
+    "Then retry. If it is already running, the server keys are missing — check "
+    "`docker logs wg-server` for its first-run key generation."
+)
+
+
+
+_WG_CONF_PATH = "/opt/rag-scan-stack/wireguard/server/wg_confs/wg0.conf"
+
+
+def _wg_peers_from_config() -> Dict[str, str]:
+    """Map peer IP -> public key by reading the server config we already mount.
+
+    Replaces `subprocess.run(["docker", "exec", "wg-server", "wg", "show", ...])`,
+    which failed with "No such file or directory: 'docker'" because the CLI is
+    not in this image and the socket is not mounted.
+
+    NOT mounting the socket is deliberate. Docker socket access is
+    root-equivalent on the host — a container that can talk to it can start a
+    privileged container and escape. Granting that to a service which already
+    executes operator-supplied commands on remote hosts is a poor trade for
+    reading a key mapping, particularly in a security tool.
+
+    The data wanted here is configuration, not runtime: the caller only needs
+    peer IP -> public key, and `_add_peer_to_server` writes that same file. Live
+    handshake state genuinely does need the runtime namespace, and the caller
+    that wants it already falls back to a connectivity test.
+    """
+    peers: Dict[str, str] = {}
+    try:
+        with open(_WG_CONF_PATH, "r") as fh:
+            current_key = None
+            for raw in fh:
+                line = raw.strip()
+                if line.lower().startswith("[peer]"):
+                    current_key = None
+                elif line.lower().startswith("publickey"):
+                    current_key = line.split("=", 1)[1].strip()
+                elif line.lower().startswith("allowedips") and current_key:
+                    ips = line.split("=", 1)[1].strip()
+                    for entry in ips.split(","):
+                        ip = entry.strip().split("/")[0]
+                        if ip:
+                            peers[ip] = current_key
+    except FileNotFoundError:
+        log.debug("WireGuard config not present at %s — server likely not started",
+                  _WG_CONF_PATH)
+    except Exception as e:
+        log.warning("Could not parse WireGuard config: %s", e)
+    return peers
+
+
 def _get_server_public_key():
     """Read WireGuard server public key."""
     try:
-        with open("/opt/rag-scan-stack/wireguard/server/server/publickey-server", "r") as f:
-            return f.read().strip()
+        with open(_WG_PUBKEY_PATH, "r") as f:
+            key = f.read().strip()
     except FileNotFoundError:
-        raise HTTPException(503, "WireGuard server not initialized. Start wg-server container first.")
+        raise HTTPException(503, _WG_NOT_RUNNING)
+    if not key:
+        # File exists but is empty — the container started and did not finish
+        # generating keys. A different failure from "never started", and one the
+        # old message would have mislabelled.
+        raise HTTPException(
+            503, "WireGuard server key file is empty — the container started but has "
+                 "not finished initialising. Check `docker logs wg-server`.")
+    return key
 
 def _add_peer_to_server(public_key: str, allowed_ip: str, name: str = ""):
     """Add peer to WireGuard server configuration."""
@@ -5629,13 +5701,21 @@ def _remove_peer_from_server(public_key: str):
 def _get_peer_status(public_key: str):
     """Get live status for a WireGuard peer from the WireGuard server."""
     try:
-        # Try to get real WireGuard status via docker exec to wg-server container
+        # Peer PRESENCE comes from the mounted config; live handshake state would
+        # need wg-server's network namespace, which is what the docker exec here
+        # was reaching for. That call always failed ("No such file or directory:
+        # 'docker'") and fell through to the connectivity test below — which is
+        # the honest check anyway, since it proves the tunnel carries traffic
+        # rather than merely that a peer is configured.
         try:
-            # Execute 'wg show' inside the wg-server container to get real status
-            result = subprocess.run(
-                ["docker", "exec", "wg-server", "wg", "show", "wg0"],
-                capture_output=True, text=True, timeout=5
-            )
+            configured = _wg_peers_from_config()
+
+            class _Result:            # shape the fallback logic already expects
+                returncode = 0 if configured else 1
+                stdout = "\n".join(f"peer: {k}" for k in configured.values())
+                stderr = "" if configured else "no peers in server config"
+
+            result = _Result()
 
             if result.returncode != 0:
                 # Fall back to connectivity test
@@ -5871,29 +5951,12 @@ def _sync_wg_server_to_database():
     """
     try:
         # Get WireGuard server configuration
-        result = subprocess.run(
-            ["docker", "exec", "wg-server", "wg", "show", "wg0", "dump"],
-            capture_output=True, text=True, timeout=10
-        )
-
-        if result.returncode != 0:
-            log.warning("Could not get WireGuard server configuration: %s", result.stderr)
+        # Read the mounted server config rather than shelling out to docker —
+        # see _wg_peers_from_config for why the socket is deliberately not mounted.
+        server_peers = _wg_peers_from_config()
+        if not server_peers:
+            log.debug("No WireGuard peers in server config — nothing to sync")
             return
-
-        # Parse server peers
-        server_peers = {}
-        lines = result.stdout.strip().split('\n')
-
-        for line in lines[1:]:  # Skip interface line
-            parts = line.strip().split('\t')
-            if len(parts) >= 2:
-                public_key = parts[0]
-                allowed_ips = parts[3] if len(parts) > 3 else ""
-
-                # Extract IP from allowed_ips (e.g., "10.66.0.3/32" -> "10.66.0.3")
-                if allowed_ips and '/' in allowed_ips:
-                    peer_ip = allowed_ips.split('/')[0]
-                    server_peers[peer_ip] = public_key
 
         # Update database with correct public keys
         conn = _get_conn()
