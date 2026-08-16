@@ -337,7 +337,7 @@ so scanners route egress through the node. **SSH tunnels remain as a fallback.**
 (dedicated WireGuard reconnect path, re-exposing the node's SOCKS port ~1080).
 - **`node_manager/` (Python/FastAPI, port 8027)** — manages remote scan nodes, allocates a unique
   SOCKS proxy port per node, and stands up the tunnel by `tunnel_method` (`ssh_manager.py` with
-  socat/microsocks; `WGTunnel`/`SSHTunnel`), plus Sliver C2 (`sliver_client.py`) and Active Directory
+  socat forwarding to a node-side dante SOCKS server; `WGTunnel`/`SSHTunnel`), plus Sliver C2 (`sliver_client.py`) and Active Directory
   execution (`ad_executor.py`). *Note: provisioning here is WireGuard/Sliver/Chisel-centric; cloud
   droplets are referenced but no direct DigitalOcean/AWS SDK calls appear in this module.*
 - **`tunnel-manager/` (Go, systemd service)** — owns tunnel lifecycle and port allocation:
