@@ -521,10 +521,27 @@ async def call_tool(name: str, arguments: dict):
                 ports = arguments.get("ports")  # None -> scanner picks the top-1000
                 scan_type = arguments.get("scan_type", "service")
 
+                # This request body was wrong in two ways and the tool could never
+                # have worked:
+                #
+                #   "target": target       -> the endpoint requires `targets`, a LIST.
+                #                             MasscanBody ignores unknown fields, so
+                #                             `targets` was simply absent and every
+                #                             call returned HTTP 422 "Field required".
+                #   "nmap_options": "-sV"  -> not a MasscanBody field either, so it was
+                #                             silently dropped. The quick/service
+                #                             distinction never reached nmap.
+                #
+                # Service detection is expressed by `service_detection`, which is the
+                # -sV this was reaching for. `scripts` is deliberately left unset so
+                # the scanner's NMAP_SCRIPTS env default applies, rather than this
+                # client inventing a script list of its own.
+                targets = [target] if isinstance(target, str) else list(target)
                 try:
                     resp = await client.post(f"{NMAP_URL}/jobs/masscan-then-nmap", json={
-                        "target": target,
-                        "nmap_options": "-sV" if scan_type == "service" else "-sT",
+                        "targets": targets,
+                        "rate": 1000,
+                        "service_detection": scan_type in ("service", "full"),
                         **({"ports": ports} if ports else {})
                     })
                     if resp.status_code == 200:
@@ -533,7 +550,11 @@ async def call_tool(name: str, arguments: dict):
                             "status": "started",
                             "job_id": result.get("job_id"),
                             "target": target,
-                            "ports": ports,
+                            # Report the scope that is actually in effect. Echoing a
+                            # bare null here would read to the model as "no ports
+                            # scanned" and invite it to retry with an explicit range.
+                            "ports": ports or "server default (nmap top-1000)",
+                            "service_detection": scan_type in ("service", "full"),
                             "message": "Scan started. Use get_nmap_job_status to monitor progress."
                         }, indent=2))]
                     else:
