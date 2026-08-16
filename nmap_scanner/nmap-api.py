@@ -383,14 +383,70 @@ def _save_session_results(job_id, job_type, scanner, files, metadata=None):
     except Exception as e:
         logging.warning(f"[session] Failed to save session results: {e}")
 
-# Build default quick_ports: 1-1000 + any WEB_PORTS above 1000
+# Build default quick_ports: nmap's frequency-ranked top-1000 + any WEB_PORTS
+# above 1000.
+#
+# This is the fallback used when a caller sends empty ports. It used to be the
+# sequential range 1-1000, which sounds like "the common ports" but is not — it
+# is the first 1000 port NUMBERS. The services that matter most sit above it
+# (mysql 3306, postgresql 5432, vnc 5900, irc 6667, tomcat 8180, java-rmi 1099),
+# so a fallback scan could report "12 open ports" while missing every
+# high-value service.
+#
+# nmap's top-1000 is the 1000 most commonly OPEN ports. Same probe count, finds
+# all of the above. Resolved from knowledge/port_profiles.yaml — the same file
+# the BFF and the agents resolve — so this fallback cannot drift away from what
+# the rest of the stack considers "the default scope".
 _WEB_PORTS_STR = os.environ.get("WEB_PORTS", "80,443,8080,8443,8000,8888,3000,5000")
 _HIGH_WEB_PORTS = ",".join(
     p.strip() for p in _WEB_PORTS_STR.split(",")
     if p.strip().isdigit() and int(p.strip()) > 1000
 )
-DEFAULT_QUICK_PORTS = f"1-1000,{_HIGH_WEB_PORTS}" if _HIGH_WEB_PORTS else "1-1000"
-DEFAULT_DEEP_SCAN_PORTS = os.environ.get("DEEP_SCAN_PORTS", "1001-65535")
+_LEGACY_QUICK_PORTS = f"1-1000,{_HIGH_WEB_PORTS}" if _HIGH_WEB_PORTS else "1-1000"
+DEFAULT_QUICK_PORTS_PROFILE = os.environ.get("DEFAULT_QUICK_PORTS_PROFILE", "top-1000")
+PORT_PROFILES_PATH = os.environ.get("PORT_PROFILES_PATH", "/knowledge/port_profiles.yaml")
+
+
+def _resolve_default_quick_ports() -> str:
+    """Read the quick-scan profile from knowledge/port_profiles.yaml.
+
+    Degrades to the old sequential range rather than leaving scans with no scope
+    at all — a missing /knowledge mount should not take the scanner down. The
+    warning names what the degraded scope misses so it is actionable in the log.
+    """
+    import yaml
+    with open(PORT_PROFILES_PATH) as fh:
+        data = yaml.safe_load(fh) or {}
+    profiles = data.get("profiles") or {}
+    entry = profiles.get(DEFAULT_QUICK_PORTS_PROFILE)
+    if not entry or not entry.get("ports"):
+        raise KeyError(
+            f"profile {DEFAULT_QUICK_PORTS_PROFILE!r} not in {PORT_PROFILES_PATH}"
+        )
+    ports = str(entry["ports"]).strip()
+    # masscan has no --top-ports flag; the YAML is documented as explicit ranges
+    # only, but assert it here so a hand-edit cannot reach the binary.
+    if "--top-ports" in ports:
+        raise ValueError(f"profile {DEFAULT_QUICK_PORTS_PROFILE!r} contains --top-ports")
+    return f"{ports},{_HIGH_WEB_PORTS}" if _HIGH_WEB_PORTS else ports
+
+
+try:
+    DEFAULT_QUICK_PORTS = _resolve_default_quick_ports()
+except Exception as _pp_err:      # missing mount, bad YAML, unknown profile
+    logging.warning(
+        "Port profile %r unavailable (%s) — falling back to the sequential range %r, "
+        "which misses mysql/postgresql/vnc/irc/tomcat",
+        DEFAULT_QUICK_PORTS_PROFILE, _pp_err, _LEGACY_QUICK_PORTS,
+    )
+    DEFAULT_QUICK_PORTS = _LEGACY_QUICK_PORTS
+
+# Follow-up sweep: the FULL range, not "everything above 1000". 1001-65535 was
+# the correct complement only while the quick pass was the sequential 1-1000.
+# The top-1000 is frequency-ranked and scattered across 1-65535, so 1001-65535
+# would both re-probe ports phase 1 already covered and leave the low ports
+# outside the top-1000 unscanned by either phase.
+DEFAULT_DEEP_SCAN_PORTS = os.environ.get("DEEP_SCAN_PORTS", "1-65535")
 
 
 def emit_webhook_event(event_type: str, source: str, data: dict, severity: str = None):
@@ -684,7 +740,7 @@ def _run_nmap_fallback(targets: List[str], ports: str, job_id: str = None) -> st
 
     target_str = " ".join(targets)
 
-    # Guard against empty ports — use default 1-1000 if not specified
+    # Guard against empty ports — fall back to the top-1000 profile if not specified
     if not ports or not ports.strip():
         ports = DEFAULT_QUICK_PORTS
         logging.warning("[nmap-fallback] Empty ports string — defaulting to %s", ports)
@@ -2236,7 +2292,14 @@ async def export_logs():
 class FullScanRequest(BaseModel):
     targets: List[str] = Field(..., description="List of IPs/CIDRs to scan")
     quick_ports: str = Field(DEFAULT_QUICK_PORTS, description="Ports for quick initial scan")
-    full_ports: str = Field("", description="Ports for full scan (empty = skip deep scan)")
+    # Defaults to the full-range follow-up rather than "". Phase 2 runs it in
+    # PARALLEL with the phase-1 nmap enrichment, so it costs no extra wall-clock,
+    # and leaving it opt-in meant every caller that omitted the field — including
+    # the BFF's own /scans/full route — silently shipped top-1000-only coverage.
+    # Callers that deliberately want a narrow scope (an operator-selected port
+    # profile) send "" explicitly to skip it.
+    full_ports: str = Field(DEFAULT_DEEP_SCAN_PORTS,
+                            description="Ports for the follow-up sweep (empty = skip deep scan)")
     rate: int = Field(1000, ge=1, le=100000, description="Masscan rate (packets per second)")
     interface: Optional[str] = Field(None, description="Network interface for Masscan (-e)")
     run_smb_vuln_scan: bool = Field(False, description="Run SMB vulnerability scan if 139/445 found")
@@ -2378,8 +2441,8 @@ def _run_full_scan_async(
 ):
     """
     Background task for phased full scan:
-    Phase 1: Quick masscan (1-1000)
-    Phase 2: Parallel - Nmap on Phase 1 ports + Masscan (1001-65535)
+    Phase 1: Quick masscan (nmap top-1000, frequency-ranked)
+    Phase 2: Parallel - Nmap on Phase 1 ports + Masscan (full range, 1-65535)
     Phase 3: Nmap on Phase 2 ports
     Phase 4: SMB vulnerability scan (if enabled and 139/445 found)
     """
@@ -2397,7 +2460,12 @@ def _run_full_scan_async(
             "scan_type": "full-scan",
             "targets": targets[:10],
             "targets_count": len(targets),
-            "phases": ["quick-discovery", "parallel-enum", "service-detection", "vuln-scan"]
+            "phases": ["quick-discovery", "parallel-enum", "service-detection", "vuln-scan"],
+            # Scope, so a subscriber can tell a top-1000 pass from a narrow
+            # operator-selected profile without inferring it from the results.
+            "quick_ports": quick_ports,
+            "full_ports": full_ports or None,
+            "deep_sweep": bool(full_ports.strip()),
         })
 
         result = {
@@ -2409,7 +2477,7 @@ def _run_full_scan_async(
         }
 
         # ========================================
-        # PHASE 1: Quick Masscan (1-1000)
+        # PHASE 1: Quick Masscan (top-1000)
         # ========================================
         update_job_status(job_id, "running", "phase1_quick_scan", f"Phase 1: Quick scan ports {quick_ports}")
         logging.info(f"[{job_id}] Phase 1: Quick masscan {quick_ports}")
@@ -2476,7 +2544,7 @@ def _run_full_scan_async(
             return results
 
         def run_full_masscan():
-            """Run masscan on remaining ports (1001-65535)"""
+            """Run the follow-up masscan sweep over the full range (1-65535)"""
             nonlocal full_ports_found
             try:
                 path = _run_masscan(targets, full_ports, rate, interface)
@@ -2739,8 +2807,8 @@ def full_scan(body: FullScanRequest, background_tasks: BackgroundTasks):
     Start a comprehensive full port scan with parallel phases.
 
     This runs a phased scanning approach for maximum coverage:
-    - Phase 1: Quick masscan (ports 1-1000)
-    - Phase 2: PARALLEL - Nmap on Phase 1 ports + Masscan (ports 1001-65535)
+    - Phase 1: Quick masscan (nmap top-1000, frequency-ranked)
+    - Phase 2: PARALLEL - Nmap on Phase 1 ports + Masscan (full range, 1-65535)
     - Phase 3: Nmap service detection on Phase 2 ports
     - Phase 4: SMB vulnerability scan (if 139/445 found)
 

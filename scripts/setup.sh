@@ -1180,7 +1180,7 @@ NMAP_SCANNER_URL=https://nmap_scanner:8012
 
 WORDLIST=/opt/seclists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-medium.txt
 WEB_PORTS=80,443,8080,8443,8000,8888,3000,5000
-DEEP_SCAN_PORTS=1001-65535
+DEEP_SCAN_PORTS=1-65535
 SCHEME_HINT=auto
 REPORT_DIR=/reports
 
