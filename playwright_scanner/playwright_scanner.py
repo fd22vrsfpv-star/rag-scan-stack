@@ -1246,11 +1246,33 @@ async def start_crawl(req: CrawlRequest, background_tasks: BackgroundTasks):
 
     Pipeline usage: Katana → **Playwright crawl** → Gobuster → Nikto → Nuclei → ZAP
     """
-    # Validate target
+    # Validate target.
+    #
+    # allow_private=True, matching all 23 other validate_scan_target call sites
+    # across nmap_scanner / web_scanner / nuclei. This route was the lone
+    # exception, so the SSRF guard rejected every RFC1918 address — i.e. the
+    # normal case for an internal engagement. A pipeline scan of
+    # http://192.168.1.150 failed here with HTTP 400 and the log only said
+    # "Playwright crawl start failed: HTTP 400", so it read as a transport
+    # problem rather than the target being refused on principle.
+    #
+    # Authorization is not this function's job: scope enforcement (BFF +
+    # nmap_scanner, via etl.scope_gate) decides what may be scanned. This check
+    # is input validation.
+    # validate_scan_target takes a HOST, not a URL — handing it the full
+    # "http://192.168.1.150" fails with "Invalid domain name format". The nine
+    # other URL-based callers in this stack all parse first
+    # (validate_scan_target(parsed.hostname, allow_private=True)); this one did
+    # not, so every crawl of an http:// target was rejected before it started.
     try:
-        validate_scan_target(req.url)
+        _parsed = urlparse(req.url)
+        _host = _parsed.hostname or _parsed.netloc or req.url
+        validate_scan_target(_host, allow_private=True)
     except ValidationError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid crawl target {req.url!r} (host {_host!r}): {e}",
+        )
 
     job_id = str(uuid.uuid4())
     _crawl_jobs[job_id] = {

@@ -642,7 +642,17 @@ class WebScanPipeline:
             )
 
             if response.status_code != 200:
-                logger.warning(f"Playwright crawl start failed: HTTP {response.status_code}")
+                # Include the body. This logged a bare "HTTP 400" while the
+                # scanner was returning a perfectly clear reason, so a target
+                # being REFUSED looked identical to the service being broken.
+                try:
+                    why = response.json().get("detail") or response.text[:200]
+                except Exception:
+                    why = response.text[:200]
+                logger.warning(
+                    "Playwright crawl start failed: HTTP %s — %s",
+                    response.status_code, why,
+                )
                 return result
 
             data = response.json()
