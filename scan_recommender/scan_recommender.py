@@ -2632,6 +2632,10 @@ class VerifyAgentBody(BaseModel):
     session_id: Optional[str] = None
     text: Optional[str] = None
     ip: Optional[str] = None
+    # Off by default: it costs a model call, and the regex pass already covers
+    # ports/CVEs/hosts/services. Turn it on to catch assertions with no token to
+    # match, e.g. "the share was writable without credentials".
+    use_llm: bool = False
 
 
 @kb_router.post("/agent-output/verify")
@@ -2684,6 +2688,16 @@ def verify_agent_output(body: VerifyAgentBody):
         logger.debug("verify: KB vocabulary unavailable (%s)", e)
 
     claims = extract_claims(text, service_vocab=vocab)
+    llm_used = False
+    if body.use_llm:
+        # The model PROPOSES; SQL still decides. Nothing it returns can mark a
+        # claim supported — every checkable kind goes through verify_claims, and
+        # anything else lands in manual follow-up.
+        from agent_claims import llm_extract_claims, merge_claims
+        proposed = llm_extract_claims(text, ollama_query)
+        if proposed:
+            llm_used = True
+            claims = merge_claims(claims, proposed)
     try:
         with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             results = verify_claims(cur, claims, ip=body.ip)
@@ -2699,7 +2713,8 @@ def verify_agent_output(body: VerifyAgentBody):
             "unsupported_count": out["unsupported_count"],
             "kinds": {k: v["unsupported"] for k, v in out["by_kind"].items()},
         })
-    return {"ok": True, "session_id": session_id or None, **out}
+    return {"ok": True, "session_id": session_id or None,
+            "llm_extraction_used": llm_used, **out}
 
 
 @kb_router.get("/tool-coverage")

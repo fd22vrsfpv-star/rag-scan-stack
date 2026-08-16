@@ -158,3 +158,151 @@ class TestNotability:
         ]
         s = ac.summarise(results)
         assert s["notable"][0]["value"] == 2
+
+
+class _CovCur(_FakeCur):
+    """Cursor that can also answer the coverage probes."""
+    def __init__(self, present, has_ports=True, has_assets=True, has_findings=True):
+        super().__init__(present)
+        self.has = {"ports": has_ports, "assets": has_assets, "findings": has_findings}
+
+    def execute(self, sql, params=()):
+        low = sql.lower()
+        if "information_schema" in low:
+            self._rows = []
+            self._row = None
+            return
+        if "limit 1" in low and not params:
+            table = ("ports" if " ports" in low else
+                     "assets" if " assets" in low else "findings")
+            self._row = {"x": 1} if self.has.get(table) else None
+            return
+        super().execute(sql, params)
+
+    def fetchall(self):
+        return []
+
+
+class TestUnverifiable:
+    """The distinction the first version got wrong.
+
+    "The scan recorded 23 ports and none was 31337" is evidence of absence.
+    "No ports were recorded" is absence of evidence. Reporting the second as
+    unsupported manufactures a finding out of missing coverage — and today's
+    ingestion bug (23 ports found, 0 stored) would have done exactly that to
+    every true claim.
+    """
+
+    def test_absent_from_recorded_data_is_unsupported(self):
+        cur = _CovCur(set(), has_ports=True)
+        r = ac.verify_claims(cur, [{"kind": "port", "value": 31337, "context": ""}])
+        assert r[0]["verdict"] == "unsupported"
+
+    def test_no_data_at_all_is_unverifiable(self):
+        cur = _CovCur(set(), has_ports=False)
+        r = ac.verify_claims(cur, [{"kind": "port", "value": 22, "context": ""}])
+        assert r[0]["verdict"] == "unverifiable"
+        assert "absence of evidence" in r[0]["detail"]
+
+    def test_unknown_kind_is_unverifiable_not_unsupported(self):
+        """An LLM-proposed 'other' claim has no table to check — it goes to a
+        human, it is not declared false."""
+        cur = _CovCur(set())
+        r = ac.verify_claims(cur, [{"kind": "other", "value": "writable share", "context": ""}])
+        assert r[0]["verdict"] == "unverifiable"
+
+    def test_supported_still_wins(self):
+        cur = _CovCur({3306}, has_ports=True)
+        r = ac.verify_claims(cur, [{"kind": "port", "value": 3306, "context": ""}])
+        assert r[0]["verdict"] == "supported" and r[0]["supported"]
+
+    def test_follow_up_collects_unverifiable_and_notable_unsupported(self):
+        results = [
+            {"kind": "other", "value": "writable share", "verdict": "unverifiable",
+             "supported": False, "context": "world-readable export"},
+            {"kind": "port", "value": 31337, "verdict": "unsupported",
+             "supported": False, "context": "obtained a root shell"},
+            {"kind": "port", "value": 80, "verdict": "unsupported",
+             "supported": False, "context": "an open port"},
+        ]
+        s = ac.summarise(results)
+        vals = [f["value"] for f in s["manual_follow_up"]]
+        assert "writable share" in vals      # unverifiable
+        assert 31337 in vals                 # unsupported AND notable
+        assert 80 not in vals                # unsupported but unremarkable
+        assert s["manual_follow_up"][0]["value"] == 31337   # highest impact first
+
+
+class TestLlmExtraction:
+    """The model proposes; SQL decides. It can widen recall but never clear a claim."""
+
+    def test_parses_model_json(self):
+        def fake(prompt, model=None):
+            return {"response": '{"claims":[{"kind":"other","value":"smb share","assertion":"world writable"}]}'}
+        out = ac.llm_extract_claims("notes", fake)
+        assert out[0]["kind"] == "other" and out[0]["source"] == "llm"
+
+    def test_tolerates_prose_wrapped_json(self):
+        def fake(prompt, model=None):
+            return "Sure!\n```json\n{\"claims\":[{\"kind\":\"port\",\"value\":\"445\"}]}\n```"
+        out = ac.llm_extract_claims("notes", fake)
+        assert out[0]["value"] == 445
+
+    def test_model_failure_yields_nothing_not_an_error(self):
+        def boom(prompt, model=None):
+            raise RuntimeError("model down")
+        assert ac.llm_extract_claims("notes", boom) == []
+
+    def test_garbage_response_yields_nothing(self):
+        assert ac.llm_extract_claims("notes", lambda p, model=None: "no json here") == []
+
+    def test_regex_claims_win_on_collision(self):
+        regex = [{"kind": "port", "value": 3306, "context": "literal match"}]
+        llm = [{"kind": "port", "value": 3306, "context": "inferred", "source": "llm"}]
+        merged = ac.merge_claims(regex, llm)
+        assert len(merged) == 1 and merged[0]["context"] == "literal match"
+
+    def test_llm_adds_what_regex_missed(self):
+        regex = [{"kind": "port", "value": 3306, "context": ""}]
+        llm = [{"kind": "other", "value": "anonymous ftp", "context": "", "source": "llm"}]
+        assert len(ac.merge_claims(regex, llm)) == 2
+
+    def test_rejects_absurd_port(self):
+        def fake(prompt, model=None):
+            return '{"claims":[{"kind":"port","value":"99999"}]}'
+        assert ac.llm_extract_claims("notes", fake) == []
+
+
+class TestRunFailureDiagnosis:
+    """No data at all is a run failure, not a series of small mysteries.
+
+    Claim by claim it looks like ambiguity; in aggregate it is one finding. The
+    real ingestion bug — 23 ports found, 0 stored — would have produced exactly
+    this shape.
+    """
+
+    def test_widespread_no_coverage_is_flagged(self):
+        results = [{"kind": "port", "value": p, "verdict": "unverifiable",
+                    "unverifiable_reason": "no_coverage", "supported": False, "context": ""}
+                   for p in (22, 80, 443)]
+        s = ac.summarise(results)
+        assert s["probable_run_failure"]
+        assert "ingest" in s["run_failure_hint"]
+
+    def test_one_gap_among_findings_is_not_a_run_failure(self):
+        results = [
+            {"kind": "port", "value": 22, "verdict": "supported", "supported": True, "context": ""},
+            {"kind": "port", "value": 80, "verdict": "supported", "supported": True, "context": ""},
+            {"kind": "other", "value": "x", "verdict": "unverifiable",
+             "unverifiable_reason": "unknown_kind", "supported": False, "context": ""},
+        ]
+        s = ac.summarise(results)
+        assert not s["probable_run_failure"]
+
+    def test_unknown_kind_alone_never_implies_run_failure(self):
+        """LLM 'other' claims are unverifiable by nature — that says nothing
+        about whether the scan worked."""
+        results = [{"kind": "other", "value": f"c{i}", "verdict": "unverifiable",
+                    "unverifiable_reason": "unknown_kind", "supported": False, "context": ""}
+                   for i in range(4)]
+        assert not ac.summarise(results)["probable_run_failure"]
