@@ -848,6 +848,12 @@ class WebScanPipeline:
                     f"{OSINT_RUNNER_URL}/jobs/{waf_job_id}",
                     headers={"x-api-key": API_KEY},
                     timeout=10,
+                    # Internal service-to-service call over the stack's own
+                    # self-signed certs. The POST that STARTED this job three
+                    # lines up passes verify=False; this poll did not, so wafw00f
+                    # dispatched fine and then failed on the very first status
+                    # check with CERTIFICATE_VERIFY_FAILED.
+                    verify=False,
                 )
                 if sr.status_code == 200:
                     data = sr.json()

@@ -290,6 +290,19 @@ services:
     build:
       context: ./zap
     container_name: zap
+    # ZAP was OOM-killed (exit 137, OOMKilled=true) part-way through a real scan,
+    # passively scanning TWiki on the target, and never came back — every later
+    # web scan then reported "ZAP not reachable at zap:8090" and the pipeline
+    # recorded a failed stage. It was the only service here with NEITHER a restart
+    # policy NOR a memory limit.
+    #
+    # mem_limit is the actual fix, not just a guard: with no cgroup limit the JVM
+    # sizes its max heap from total HOST memory and grows until Docker kills the
+    # container. Given a limit it caps the heap at a fraction of that and garbage
+    # collects instead. restart:unless-stopped then means a single bad target
+    # degrades one scan rather than disabling web scanning until someone notices.
+    restart: unless-stopped
+    mem_limit: ${ZAP_MEM_LIMIT:-4g}
     networks: [agents_net]
     environment:
       BUILD_VERSION: ${BUILD_VERSION:-dev}

@@ -3066,6 +3066,29 @@ def _run_credential_check_async(
                 all_results.append(result)
                 total_valid += result.get("total_valid", 0)
 
+                # Enumerate every hit into the JOB log. cred_checker already logs
+                # each one, but without the job id — so a job-scoped log view
+                # showed the ports being tried and then nothing, reading as "found
+                # nothing" even on a run that recovered msfadmin:msfadmin. The
+                # count alone in the completion line is not enough to act on;
+                # the operator needs service/host/port/username to use it.
+                for chk in (result.get("checks") or []):
+                    for cred in (chk.get("valid_credentials") or []):
+                        logging.info(
+                            "[%s] VALID CREDENTIAL: %s://%s:%s  %s:%s",
+                            job_id,
+                            chk.get("service", "?"),
+                            chk.get("target", validated_target),
+                            chk.get("port", "?"),
+                            cred.get("username", "?"),
+                            cred.get("password", "?"),
+                        )
+                if result.get("total_valid", 0) == 0:
+                    logging.info("[%s] no valid credentials on %s (%d pairs tried)",
+                                 job_id, validated_target,
+                                 sum((c.get("credentials_tested") or 0)
+                                     for c in (result.get("checks") or [])))
+
             except Exception as e:
                 logging.error(f"[{job_id}] Credential check failed for {target}: {e}")
                 all_results.append({
