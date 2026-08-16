@@ -701,22 +701,53 @@ class ReconAgent:
                     # joining on sr.asset_id would skip every rec.  Subselect
                     # for the engagement's asset IPs keeps the scoping correct
                     # without depending on the FK being populated.
+                    # Scoped by the engagement's SCOPE as well as by stamped
+                    # assets. assets.engagement_id alone was not enough: with 166
+                    # pending recommendations for 192.168.1.150 and that IP sitting
+                    # in the engagement's scope_targets, this query returned ZERO,
+                    # because no asset row had ever been stamped with an
+                    # engagement_id. The queue could not drain no matter how often
+                    # the agent ran.
+                    #
+                    # scope_targets IS reliably populated (it is what the operator
+                    # enters), so it is the authoritative answer to "does this IP
+                    # belong to this engagement". Assets are kept in the OR as the
+                    # faster path for when the FK is populated.
+                    #
+                    # host() on both sides: sr.ip is inet and renders as
+                    # "192.168.1.150/32", while scope_targets.target is plain text
+                    # "192.168.1.150" — comparing them raw never matches.
                     cur.execute(
                         """
-                        SELECT sr.id::text, sr.ip::text, sr.service,
+                        SELECT sr.id::text, host(sr.ip)::text, sr.service,
                                sr.scanner, sr.action, sr.script, sr.template,
                                sr.priority
                           FROM scan_recommendations sr
                          WHERE sr.status = 'pending'
-                           AND sr.ip IN (
-                                 SELECT a.ip FROM assets a
-                                  WHERE a.engagement_id = %s::uuid
-                                    AND a.ip IS NOT NULL
+                           AND sr.ip IS NOT NULL
+                           AND (
+                                 sr.ip IN (
+                                   SELECT a.ip FROM assets a
+                                    WHERE a.engagement_id = %s::uuid
+                                      AND a.ip IS NOT NULL
+                                 )
+                                 OR EXISTS (
+                                   SELECT 1 FROM scope_targets st
+                                    WHERE st.engagement_id = %s::uuid
+                                      AND st.target <> ''
+                                      AND (
+                                        (st.target_type = 'ip'
+                                          AND host(sr.ip)::text = st.target)
+                                        OR (st.target_type = 'cidr'
+                                          AND st.target ~ '^[0-9]+([.][0-9]+){3}/[0-9]+$'
+                                          AND sr.ip <<= st.target::inet)
+                                      )
+                                 )
                                )
                          ORDER BY sr.priority ASC, sr.created_at DESC
                          LIMIT %s
                         """,
-                        (eid, max(budget * 3, 10)),
+                        (eid, eid, max(budget * 3, 10)),
                     )
                     pending_recs = [
                         {"id": r[0], "ip": r[1], "service": r[2],
