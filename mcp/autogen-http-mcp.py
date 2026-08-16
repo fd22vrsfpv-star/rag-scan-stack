@@ -194,7 +194,7 @@ Returns a job_id - use get_nmap_job_status to monitor progress.""",
             "type": "object",
             "properties": {
                 "target": {"type": "string", "description": "IP address, hostname, or CIDR range (e.g., 10.0.1.0/24)"},
-                "ports": {"type": "string", "description": "Port range (e.g., '22,80,443' or '1-1000')", "default": "1-1000"},
+                "ports": {"type": "string", "description": "Port range. OMIT for the server default (nmap's top-1000 for nmap scans, full range for masscan discovery). Do NOT pass '1-1000' — that is the first 1000 port NUMBERS and misses mysql 3306, postgresql 5432, vnc 5900, tomcat 8180."},
                 "scan_type": {"type": "string", "enum": ["quick", "full", "service"], "default": "service"}
             },
             "required": ["target"]
@@ -518,14 +518,14 @@ async def call_tool(name: str, arguments: dict):
             # === Scanning Tools ===
             elif name == "start_nmap_scan":
                 target = arguments["target"]
-                ports = arguments.get("ports", "1-1000")
+                ports = arguments.get("ports")  # None -> scanner picks the top-1000
                 scan_type = arguments.get("scan_type", "service")
 
                 try:
                     resp = await client.post(f"{NMAP_URL}/jobs/masscan-then-nmap", json={
                         "target": target,
-                        "ports": ports,
-                        "nmap_options": "-sV" if scan_type == "service" else "-sT"
+                        "nmap_options": "-sV" if scan_type == "service" else "-sT",
+                        **({"ports": ports} if ports else {})
                     })
                     if resp.status_code == 200:
                         result = resp.json()

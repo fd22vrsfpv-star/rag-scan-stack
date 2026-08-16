@@ -248,6 +248,20 @@ def _normalize_ports(p: dict) -> None:
 _MASSCAN_BACKED_SCANS = {"masscan", "full", "nmap", "nmap-tcp"}
 
 
+def _default_quick_ports() -> str:
+    """The top-1000 profile, for routes that need a literal default port string.
+
+    Degrades to the sequential range rather than raising: a missing /knowledge
+    mount should not turn every naabu dispatch into a 500. The degraded scope is
+    the old behaviour, and /api/port-profiles already reports `degraded: true`
+    for the operator, so this does not hide the condition.
+    """
+    try:
+        return resolve_port_profile("top-1000", None)
+    except Exception:
+        return "1-1000"
+
+
 def _apply_port_profile(scan_type: str, p: dict) -> None:
     """Resolve `port_profile` into an explicit `ports` string, in place.
 
@@ -441,7 +455,10 @@ SCAN_ROUTES = {
         "http_proxy": _inject_burp_proxy(p).get("http_proxy"),
     }.items() if v is not None}),
     "httpx": ("pd_runner_url", "/jobs/httpx", lambda p: {**{"targets": _ensure_target_list(p), "ports": p.get("ports"), "tech_detect": True}, **({} if not _inject_burp_proxy(p).get("http_proxy") else {"http_proxy": p["http_proxy"]})}),
-    "naabu": ("pd_runner_url", "/jobs/naabu", lambda p: {"targets": _ensure_target_list(p), "ports": p.get("ports", "1-1000"), "rate": p.get("rate", 1000)}),
+    # Default resolves the top-1000 profile rather than the sequential 1-1000 that
+    # used to be hardcoded here — same reasoning as every other port default. The
+    # helper falls back to the literal range only if knowledge/ is unreadable.
+    "naabu": ("pd_runner_url", "/jobs/naabu", lambda p: {"targets": _ensure_target_list(p), "ports": p.get("ports") or _default_quick_ports(), "rate": p.get("rate", 1000)}),
     "katana": ("pd_runner_url", "/jobs/katana", lambda p: {k: v for k, v in {
         "targets": _ensure_target_list(p), "depth": p.get("depth", 3), "js_crawl": True,
         "xhr_extraction": p.get("xhr_extraction", True), "form_extraction": p.get("form_extraction", True),

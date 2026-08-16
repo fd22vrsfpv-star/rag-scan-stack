@@ -335,14 +335,14 @@ async def get_all_scanner_status() -> str:
 @mcp.tool()
 async def start_masscan(
     target: str,
-    ports: str = "1-1000",
+    ports: str = None,
     rate: int = 1000
 ) -> str:
     """Start a fast Masscan port discovery scan. Run this FIRST for quick port discovery.
 
     Args:
         target: IP address, hostname, or CIDR range
-        ports: Port range (e.g., '1-1000' for top 1000, '1-65535' for all)
+        ports: Omit for the top-1000 default. Never pass '1-1000' — that is the first 1000 port NUMBERS, not the 1000 most commonly open ports.
         rate: Packets per second (default: 1000)
     """
     targets = [target] if isinstance(target, str) else target
@@ -358,14 +358,14 @@ async def start_masscan(
 @mcp.tool()
 async def start_nmap_scan(
     target: str,
-    ports: str = "1-1000",
+    ports: str = None,
     scan_type: str = "service"
 ) -> str:
     """Start an Nmap port scan with service detection. Run AFTER masscan finds open ports.
 
     Args:
         target: IP address, hostname, or CIDR range
-        ports: Port range (e.g., '22,80,443' or '1-1000')
+        ports: Omit for the top-1000 default. Never pass '1-1000' — that is the first 1000 port NUMBERS, not the 1000 most commonly open ports.
         scan_type: Scan type - 'quick', 'full', or 'service' (default)
     """
     targets = [target] if isinstance(target, str) else target
@@ -931,7 +931,7 @@ async def start_naabu(
 
     Args:
         targets: List of IPs, hostnames, or CIDR ranges
-        ports: Port specification (e.g., '80,443', '1-1000', 'top-100')
+        ports: Port specification. Omit for the top-1000 default. Do NOT pass '1-1000' — that is the first 1000 port NUMBERS, not the 1000 most commonly open ports.
         rate: Packets per second rate limit
     """
     payload = {"targets": targets}

@@ -391,7 +391,11 @@ class HttpxReq(BaseModel):
 
 class NaabuReq(BaseModel):
     targets: List[str]
-    ports: Optional[str] = "1-1000"
+    # None means "not specified" — run_naabu then falls back to naabu's own
+    # -top-ports 1000, the frequency-ranked list. The previous "1-1000" default
+    # was the first 1000 port NUMBERS, which misses mysql 3306, postgresql 5432,
+    # vnc 5900 and tomcat 8180, and applied to every caller that omitted the field.
+    ports: Optional[str] = None
     rate: Optional[int] = 1000
     top_ports: Optional[str] = None
     proxy: Optional[str] = None
@@ -524,6 +528,13 @@ def run_naabu(req: NaabuReq, background_tasks: BackgroundTasks):
         cmd.extend(["-rate", str(req.rate)])
     if req.top_ports:
         cmd.extend(["-top-ports", req.top_ports])
+    # Neither given: naabu supports -top-ports natively, so the frequency-ranked
+    # top-1000 costs nothing to express here and needs no profile lookup — unlike
+    # masscan, which has no such flag and forces profiles to resolve to explicit
+    # lists. Without this, omitting ports fell through to naabu's own default of
+    # its top-100, a tenth of the intended scope.
+    if not req.ports and not req.top_ports:
+        cmd.extend(["-top-ports", "1000"])
     if req.proxy:
         cmd.extend(["-proxy", req.proxy])
 

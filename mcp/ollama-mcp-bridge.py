@@ -115,7 +115,7 @@ MCP_TOOLS = [
                 "type": "object",
                 "properties": {
                     "target": {"type": "string", "description": "IP, hostname, or CIDR range"},
-                    "ports": {"type": "string", "description": "Port range", "default": "1-1000"},
+                    "ports": {"type": "string", "description": "Port range. OMIT for the server default (nmap's top-1000 for nmap scans, full range for masscan discovery). Do NOT pass '1-1000' — that is the first 1000 port NUMBERS and misses mysql 3306, postgresql 5432, vnc 5900, tomcat 8180."},
                     "scan_type": {"type": "string", "enum": ["quick", "full", "service"], "default": "service"}
                 },
                 "required": ["target"]
@@ -280,7 +280,7 @@ async def execute_tool(name: str, arguments: dict) -> str:
             elif name == "start_nmap_scan":
                 resp = await client.post(f"{NMAP_URL}/jobs/masscan-then-nmap", json={
                     "target": arguments["target"],
-                    "ports": arguments.get("ports", "1-1000"),
+                    **({"ports": arguments["ports"]} if arguments.get("ports") else {}),
                     "nmap_options": "-sV" if arguments.get("scan_type") == "service" else "-sT"
                 })
 

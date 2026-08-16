@@ -74,12 +74,17 @@ TOOL_ROUTES: dict[str, tuple[str, callable, callable]] = {
     "start_masscan": (
         "POST",
         lambda s, a: f"{s.nmap_scanner_url}/jobs/masscan-only",
-        lambda a: {"targets": _split_targets(a["target"]), "ports": a.get("ports", "1-1000"), "rate": a.get("rate", 1000)},
+        lambda a: {"targets": _split_targets(a["target"]), "rate": a.get("rate", 1000),
+                   # Omitted when unset so the scanner applies its per-route default
+                   # (top-1000 for nmap enrichment, full range for masscan discovery)
+                   # instead of the sequential 1-1000 that used to be hardcoded here.
+                   **({"ports": a["ports"]} if a.get("ports") else {})},
     ),
     "start_nmap_scan": (
         "POST",
         lambda s, a: f"{s.nmap_scanner_url}/jobs/masscan-then-nmap",
-        lambda a: {"targets": _split_targets(a["target"]), "ports": a.get("ports", "1-1000"), "rate": 1000},
+        lambda a: {"targets": _split_targets(a["target"]), "rate": 1000,
+                   **({"ports": a["ports"]} if a.get("ports") else {})},
     ),
     "start_full_port_scan": (
         "POST",
@@ -123,7 +128,8 @@ TOOL_ROUTES: dict[str, tuple[str, callable, callable]] = {
     "start_naabu": (
         "POST",
         lambda s, a: f"{s.pd_runner_url}/jobs/naabu",
-        lambda a: {"targets": a["targets"], "ports": a.get("ports", "1-1000"), "rate": a.get("rate", 1000)},
+        lambda a: {"targets": a["targets"], "rate": a.get("rate", 1000),
+                   **({"ports": a["ports"]} if a.get("ports") else {})},
     ),
     "start_udp_scan": (
         "POST",
