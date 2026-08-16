@@ -296,17 +296,26 @@ services:
     build:
       context: ./zap
     container_name: zap
-    # ZAP was OOM-killed (exit 137, OOMKilled=true) part-way through a real scan,
-    # passively scanning TWiki on the target, and never came back — every later
-    # web scan then reported "ZAP not reachable at zap:8090" and the pipeline
-    # recorded a failed stage. It was the only service here with NEITHER a restart
-    # policy NOR a memory limit.
+    # ZAP was OOM-killed (exit 137) part-way through a real scan and never came
+    # back — every later web scan reported "ZAP not reachable at zap:8090". It was
+    # the only service here with NEITHER a restart policy NOR a memory limit.
     #
-    # mem_limit is the actual fix, not just a guard: with no cgroup limit the JVM
-    # sizes its max heap from total HOST memory and grows until Docker kills the
-    # container. Given a limit it caps the heap at a fraction of that and garbage
-    # collects instead. restart:unless-stopped then means a single bad target
-    # degrades one scan rather than disabling web scanning until someone notices.
+    # mem_limit alone is NOT sufficient, and an earlier version of this comment
+    # wrongly claimed it was. zap.sh sizes the JVM heap itself, and it reads the
+    # container limit from /sys/fs/cgroup/memory/memory.stat — the **cgroup v1**
+    # path. This host is cgroup v2 (/sys/fs/cgroup/memory.max), so that check
+    # silently misses and zap.sh falls back to HOST memory:
+    #
+    #     Available memory: 39540 MB
+    #     Using JVM args: -Xmx9885m        <- a 9.9GB heap inside a 4GiB container
+    #
+    # So the JVM happily grew past the cgroup limit. -Xmx below is the actual fix;
+    # zap.sh explicitly honours a -Xmx argument ("Overridden by the user"). Keep it
+    # meaningfully under mem_limit — the JVM needs headroom beyond the heap for
+    # metaspace, thread stacks and native buffers.
+    #
+    # restart:unless-stopped stays: it means a single bad target degrades one scan
+    # rather than disabling web scanning until someone notices.
     restart: unless-stopped
     mem_limit: ${ZAP_MEM_LIMIT:-4g}
     networks: [agents_net]
@@ -316,7 +325,20 @@ services:
     ports: ["8090:8090"]
     volumes:
       - zap-plugins:/home/zap/.ZAP/plugin
-    command: ["zap.sh","-daemon","-host","0.0.0.0","-port","8090",
+    # -silent disables the marketplace update check and telemetry.
+    #
+    # Without it ZAP contacts the add-on marketplace at startup, installs any
+    # updates it finds, and then RESTARTS ITSELF to load them. That is why zap
+    # exited with code 0 (a clean, self-initiated stop — not OOM, not a crash)
+    # part-way through scans: measured 3 startup announcements against
+    # RestartCount=2, with "Installing new addon retire v0.64.0" in the log. The
+    # restart wipes the session, which is how a scan of Metasploitable with 207
+    # seeded URLs reported "0 alerts".
+    #
+    # Add-ons are already baked into the image at build time (see zap/Dockerfile
+    # + addons.txt), so there is nothing to fetch at runtime. This also stops the
+    # scanner making outbound marketplace calls during an engagement.
+    command: ["zap.sh","-daemon","-silent","-Xmx${ZAP_JVM_HEAP:-3g}","-host","0.0.0.0","-port","8090",
               "-config","api.key=${ZAP_API_KEY:-changeme}",
               "-config","api.addrs.addr.name=.*",
               "-config","api.addrs.addr.regex=true"]

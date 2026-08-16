@@ -1127,6 +1127,10 @@ ZAP_API_KEY=${ZAP_API_KEY}
 # Container memory cap for ZAP. Without one the JVM sizes its heap from host
 # RAM and gets OOM-killed mid-scan (exit 137), taking web scanning down with it.
 ZAP_MEM_LIMIT=4g
+# JVM max heap for ZAP. Must stay under ZAP_MEM_LIMIT: zap.sh only reads the
+# cgroup v1 memory path, so on a cgroup v2 host it sizes the heap from HOST RAM
+# and blows past the container limit.
+ZAP_JVM_HEAP=3g
 ZAP_ADDR=zap
 ZAP_PORT=8090
 
