@@ -1396,6 +1396,88 @@ async def receive_scan_event(payload: dict):
     return {"ok": True, "matched": False}
 
 
+
+def _emit_flow_summary(session_id) -> dict:
+    """End-of-session summary of what each SCAN TYPE actually did.
+
+    Runs BEFORE cleanup_session(), which discards the in-memory scan registry this
+    is built from. Every step is individually guarded: a reporting failure must
+    never take down the session teardown around it — a missing summary is a
+    nuisance, a crashed teardown leaks the session.
+    """
+    import json as _json
+    try:
+        summary = scan_tracker.build_flow_summary(str(session_id))
+    except Exception as e:
+        session_logger.warning("[%s] flow summary build failed: %s", session_id, e)
+        return {}
+
+    # Persist onto the session row so it outlives the process.
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE agent_sessions "
+                    "SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb "
+                    "WHERE id = %s::uuid",
+                    (_json.dumps({"scan_flow_summary": summary}), str(session_id)),
+                )
+            conn.commit()
+    except Exception as e:
+        session_logger.warning("[%s] flow summary persist failed: %s", session_id, e)
+
+    # Webhook, per project convention: features that perform actions emit one so
+    # Slack/n8n subscribers can react without polling.
+    try:
+        api_base = os.environ.get("API_BASE", "https://rag-api:8000")
+        with httpx.Client(verify=False, timeout=10) as c:
+            c.post(
+                f"{api_base}/webhooks/emit",
+                headers={"x-api-key": os.environ.get("API_KEY", "changeme")},
+                json={
+                    "event_type": "agent_session_flow_summary",
+                    "source": "autogen-agents",
+                    "data": {
+                        "session_id": str(session_id),
+                        "scan_types_run": summary.get("scan_types_run"),
+                        "total_scans": summary.get("total_scans"),
+                        "flow_order": summary.get("flow_order"),
+                        "types_that_produced_nothing": summary.get("types_that_produced_nothing"),
+                        "types_with_failures": summary.get("types_with_failures"),
+                    },
+                },
+            )
+    except Exception as e:
+        session_logger.warning("[%s] flow summary webhook failed: %s", session_id, e)
+
+    # Human-readable trace into the session log, which is what an operator reads.
+    session_logger.info(
+        "[%s] ===== SCAN FLOW SUMMARY: %s scan type(s), %s scan(s) =====",
+        session_id, summary.get("scan_types_run"), summary.get("total_scans"),
+    )
+    session_logger.info(
+        "[%s] flow: %s", session_id,
+        " -> ".join(summary.get("flow_order") or []) or "(no scans ran)",
+    )
+    for t in (summary.get("by_scan_type") or []):
+        produced = ", ".join(f"{k}={v}" for k, v in (t.get("results") or {}).items()) or "nothing"
+        session_logger.info(
+            "[%s]   %-22s runs=%s completed=%s failed=%s  %ss  produced: %s",
+            session_id, t.get("scan_type"), t.get("runs"), t.get("completed"),
+            t.get("failed"), t.get("total_duration_seconds"), produced,
+        )
+        for f in (t.get("failures") or []):
+            session_logger.info("[%s]     FAILED %s: %s", session_id,
+                                f.get("job_id"), f.get("error"))
+    if summary.get("types_that_produced_nothing"):
+        session_logger.warning(
+            "[%s]   completed but produced NOTHING: %s "
+            "— these read as success in every other view",
+            session_id, ", ".join(summary["types_that_produced_nothing"]),
+        )
+    return summary
+
+
 def run_pentest_session_sync(
     session_id: uuid.UUID,
     target_description: str,
@@ -1816,6 +1898,10 @@ Coordinator, please start by analyzing the target and assigning initial tasks to
                 session_logger.info(f"[{session_id}] Session outputs saved to {output_dir}")
         except Exception as collect_err:
             session_logger.warning(f"[{session_id}] Output collection failed: {collect_err}")
+
+        # End-of-session scan flow summary. MUST run before cleanup_session(),
+        # which discards the registry it is built from.
+        _emit_flow_summary(session_id)
 
         # Persist scan metrics to DB before cleanup
         scan_tracker.persist_to_db(str(session_id))
@@ -2406,6 +2492,36 @@ async def get_pentest_status(session_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/pentest/{session_id}/flow-summary")
+def get_session_flow_summary(session_id: uuid.UUID):
+    """Per-scan-type summary of everything the session ran.
+
+    Served from the live tracker while the session is active, and from the
+    persisted copy on agent_sessions.metadata once it has ended.
+    """
+    live = {}
+    try:
+        live = scan_tracker.build_flow_summary(str(session_id)) or {}
+    except Exception:
+        live = {}
+    if live.get("total_scans"):
+        return {"source": "live", **live}
+
+    row = get_agent_session(session_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    stored = ((row.get("metadata") or {}).get("scan_flow_summary")) or {}
+    if not stored:
+        return {
+            "source": "none",
+            "session_id": str(session_id),
+            "total_scans": 0,
+            "detail": "No scan flow recorded — the session ran no scans, or it "
+                      "predates flow-summary collection.",
+        }
+    return {"source": "persisted", **stored}
 
 
 @app.get("/pentest/{session_id}/messages")
