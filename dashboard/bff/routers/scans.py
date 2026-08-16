@@ -1211,8 +1211,18 @@ async def _load_scope_rows() -> list:
                 payload = r.json()
                 items = payload if isinstance(payload, list) else (
                     payload.get("targets") or payload.get("scope") or payload.get("items") or [])
-                rows += [(i.get("target"), i.get("target_type"))
-                         for i in items if isinstance(i, dict) and i.get("target")]
+                # Drop placeholder/blank entries defensively. rag-api filters
+                # them now, but this gate decides whether to REFUSE scans: a
+                # scope whose only row is a placeholder would read as "scope
+                # exists", match nothing, and 403 every scan. Belt and braces on
+                # the side that fails safe.
+                rows += [
+                    (i.get("target"), i.get("target_type"))
+                    for i in items
+                    if isinstance(i, dict)
+                    and (i.get("target") or "").strip()
+                    and i.get("source") != "__placeholder__"
+                ]
     except Exception as e:
         # Do NOT fail closed here: a rag-api hiccup must not block an operator's
         # scan. The empty list falls through to the warn-and-allow path below,

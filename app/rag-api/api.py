@@ -10550,16 +10550,23 @@ def params_summary(
 @app.get("/scope/names", tags=["Scope"])
 def list_scope_names(authorized: bool = Depends(auth)):
     """List distinct scope names with target counts."""
+    # Placeholder rows (empty target, source '__placeholder__') exist so a named
+    # scope can be created before it has any targets. They are NOT targets and
+    # must not be counted — the engagement-scoped endpoints below already filter
+    # them with the same predicate; these global ones did not, so a scope holding
+    # only a placeholder reported target_count=1 and looked populated.
     sql = """
         SELECT name,
-               COUNT(*) AS target_count,
+               COUNT(*) FILTER (
+                   WHERE target <> '' AND source IS DISTINCT FROM %s
+               ) AS target_count,
                MAX(added_at) AS last_updated
         FROM scope_targets
         GROUP BY name
         ORDER BY last_updated DESC
     """
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql)
+        cur.execute(sql, (_SCOPE_PLACEHOLDER_SOURCE,))
         rows = cur.fetchall()
     return {
         "names": [
@@ -10582,9 +10589,14 @@ def get_scope(
     """List targets for a named scope. Match is case-insensitive so the
     operator (or LLM) can pass "Default" / "default" / "DEFAULT" interchangeably."""
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # Exclude placeholder rows — see list_scope_names. A caller treating this
+        # response as "the scope" (the BFF scan gate does exactly that) would
+        # otherwise enforce against a scope whose only entry matches nothing,
+        # refusing every scan.
         cur.execute(
-            "SELECT COUNT(*) FROM scope_targets WHERE LOWER(name) = LOWER(%s)",
-            [name],
+            "SELECT COUNT(*) FROM scope_targets "
+            "WHERE LOWER(name) = LOWER(%s) AND target <> '' AND source IS DISTINCT FROM %s",
+            [name, _SCOPE_PLACEHOLDER_SOURCE],
         )
         total = cur.fetchone()["count"]
 
@@ -10592,9 +10604,10 @@ def get_scope(
             """SELECT id::text, name, target, target_type, source, added_at
                FROM scope_targets
                WHERE LOWER(name) = LOWER(%s)
+                 AND target <> '' AND source IS DISTINCT FROM %s
                ORDER BY added_at DESC
                LIMIT %s""",
-            [name, limit],
+            [name, _SCOPE_PLACEHOLDER_SOURCE, limit],
         )
         rows = cur.fetchall()
 

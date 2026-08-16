@@ -158,3 +158,48 @@ def test_aliasing_does_not_grant_scope_to_unrelated_hosts():
     scope = [("127.0.0.1", "ip")]
     assert _in_scope_with_aliases("www.owasp.org", scope) is False
     assert _in_scope_with_aliases("192.168.1.150", scope) is False
+
+
+# ------------------------------------------------------- placeholder rows
+# scope_targets can hold a sentinel row (target='', source='__placeholder__') so
+# a NAMED scope can exist before it has targets. It is not a target. The
+# engagement-scoped endpoints always filtered it; the global /scope ones did not,
+# so a scope holding only a placeholder reported target_count=1 and read as
+# populated. For a gate that REFUSES scans that is the worst possible shape:
+# "scope exists" plus "nothing matches" means 403 on everything.
+
+def _strip_placeholders(rows):
+    """Mirror of the BFF loader's filter."""
+    return [
+        (r.get("target"), r.get("target_type"))
+        for r in rows
+        if (r.get("target") or "").strip() and r.get("source") != "__placeholder__"
+    ]
+
+
+@pytest.mark.unit
+def test_placeholder_row_is_not_a_scope_target():
+    rows = [
+        {"target": "", "target_type": "domain", "source": "__placeholder__"},
+        {"target": "192.168.1.150", "target_type": "ip", "source": "manual"},
+    ]
+    assert _strip_placeholders(rows) == [("192.168.1.150", "ip")]
+
+
+@pytest.mark.unit
+def test_placeholder_only_scope_reads_as_no_scope():
+    """The dangerous shape: must be indistinguishable from an empty scope.
+
+    If it read as "scope exists", the gate would enforce against a scope that
+    matches nothing and refuse every scan, including in-scope ones.
+    """
+    rows = [{"target": "", "target_type": "domain", "source": "__placeholder__"}]
+    assert _strip_placeholders(rows) == []
+
+
+@pytest.mark.unit
+def test_placeholder_never_grants_scope():
+    """An empty target must not match anything, even if it slips through."""
+    scope = [("", "domain")]
+    assert is_in_scope("www.owasp.org", scope) is False
+    assert is_in_scope("192.168.1.150", scope) is False
