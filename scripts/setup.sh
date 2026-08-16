@@ -1491,6 +1491,25 @@ else
     log_warn "scripts/generate-certs.sh not found — skipping TLS cert generation"
 fi
 
+# The self-signed cert above is not in any default trust store, so every internal
+# HTTPS call fails verification unless the caller passes verify=False — which is
+# how ~19 call sites ended up disabling verification on a security tool. Build a
+# bundle that MERGES the public CA roots with our cert instead: services point
+# REQUESTS_CA_BUNDLE / SSL_CERT_FILE at it, internal calls verify for real, and
+# external HTTPS (nuclei templates, CVE feeds) keeps working because the public
+# roots are still there. Must run AFTER cert generation.
+if [ -f "scripts/generate-ca-bundle.sh" ]; then
+    log_info "Building merged CA bundle (certs/ca-bundle.crt)"
+    if bash scripts/generate-ca-bundle.sh >/dev/null 2>&1; then
+        log_ok "CA bundle ready — internal TLS verifies without disabling verification"
+    else
+        log_warn "CA bundle generation failed — internal HTTPS calls that verify will fail; \
+run scripts/generate-ca-bundle.sh manually"
+    fi
+else
+    log_warn "scripts/generate-ca-bundle.sh not found — skipping CA bundle"
+fi
+
 # ══════════════════════════════════════════════════════════════════════════
 #  PHASE 5 — Docker Build
 # ══════════════════════════════════════════════════════════════════════════
