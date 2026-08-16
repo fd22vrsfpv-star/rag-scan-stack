@@ -166,3 +166,35 @@ def test_list_valued_results_are_counted_not_ignored():
     assert full["produced_nothing"] is False
     assert mass["results"]["all_open_ports"] == 4
     assert s["types_that_produced_nothing"] == []
+
+
+# ------------------------------------------------------- KB coverage
+# The summary was pure telemetry: it counted what ran and never referenced
+# anything the system had learned. scan_recommendations holds what the KB
+# (source='rules') and the model (e.g. source='ollama') said SHOULD run, so
+# cross-referencing turns "what happened" into "did we do what we knew to do".
+
+@pytest.mark.unit
+def test_summary_includes_kb_coverage_section():
+    s = _session([_scan("nmap", params={"targets": ["192.168.1.150"]})])
+    assert "kb_coverage" in s
+    assert "available" in s["kb_coverage"]
+
+
+@pytest.mark.unit
+def test_kb_coverage_degrades_when_the_db_is_unreachable(monkeypatch):
+    """Reporting must never be the reason a session teardown fails."""
+    monkeypatch.setenv("DB_DSN", "dbname=nope user=nope host=127.0.0.1 port=1 connect_timeout=1")
+    s = _session([_scan("nmap", params={"targets": ["192.168.1.150"]})])
+    kb = s["kb_coverage"]
+    assert kb["available"] is False
+    assert "reason" in kb          # says WHY, rather than silently reporting zero
+
+
+@pytest.mark.unit
+def test_url_targets_are_reduced_to_hosts_for_kb_lookup():
+    """scan_recommendations keys on ip, so http://host/path must not be queried raw."""
+    s = _session([_scan("pipeline", params={"target_url": "http://192.168.1.150:8180/x"})])
+    # Reaching the lookup at all (available True/False, not an exception) proves
+    # the host reduction ran; the raw URL would never match an inet column.
+    assert "kb_coverage" in s

@@ -1469,6 +1469,21 @@ def _emit_flow_summary(session_id) -> dict:
         for f in (t.get("failures") or []):
             session_logger.info("[%s]     FAILED %s: %s", session_id,
                                 f.get("job_id"), f.get("error"))
+    kb = summary.get("kb_coverage") or {}
+    if kb.get("available") and kb.get("recommendations"):
+        session_logger.info(
+            "[%s]   KB coverage: acted on %s/%s recommendation(s) (%s%%), sources: %s",
+            session_id, kb.get("acted_on"), kb.get("recommendations"),
+            kb.get("coverage_pct"), kb.get("by_source"),
+        )
+        for r in (kb.get("recommended_but_never_run") or [])[:8]:
+            session_logger.warning(
+                "[%s]     RECOMMENDED BUT NEVER RUN: %s (x%s, priority %s)",
+                session_id, r.get("scanner"), r.get("recommended"), r.get("top_priority"),
+            )
+    elif kb.get("available"):
+        session_logger.info("[%s]   KB coverage: no recommendations for these targets", session_id)
+
     if summary.get("types_that_produced_nothing"):
         session_logger.warning(
             "[%s]   completed but produced NOTHING: %s "
