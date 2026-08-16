@@ -173,6 +173,17 @@ async def get_tool_catalog():
         return safe_json(resp)
 
 
+@router.post("/api/kb/agent-output/verify")
+async def verify_agent_output(body: Dict[str, Any] = Body(...)):
+    """Check an agent's factual claims against what the scans actually recorded."""
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+        resp = await c.post(f"{s.scan_recommender_url}/kb/agent-output/verify", json=body)
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _kb_detail(resp))
+        return safe_json(resp)
+
+
 @router.get("/api/kb/tool-coverage")
 async def get_tool_coverage():
     """Tools the KB recommends but nothing can run, and installed tools it ignores."""
