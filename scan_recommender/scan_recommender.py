@@ -2630,24 +2630,28 @@ def get_tool_catalog_info():
 
 @kb_router.get("/tool-coverage")
 def get_tool_coverage():
-    """Cross-check what the KB RECOMMENDS against what is actually installed.
+    """Cross-check the KB's tool names against the local catalog.
 
-    Two independent failures, in opposite directions:
+    IMPORTANT — what "not installed" does and does not mean.
 
-    * `unrunnable` — a tool the KB (YAML or operator override) will recommend
-      that exists nowhere in the stack. The validator does NOT catch these: it
-      only gates nmap/metasploit/nuclei, so a recommendation for `snmp-check`
-      sails through and fails at dispatch. Measured today: the shipped YAML
-      recommends snmp-check, which is installed on nothing.
+    Binary availability is a LOCAL AVAILABILITY signal, not a correctness one.
+    Tools execute on provisioned nodes, across pipes, and on instances that may
+    not exist yet; a stack that lacks `vncviewer` today says nothing about the
+    node that will run it. Names like `mysqltuner`, `impacket-getnpusers` and
+    `kubectl` are perfectly correct KB entries whether or not this host has them.
 
-    * `uncatalogued` — a tool that IS installed (often provisioned onto a node)
-      but which no KB entry mentions, so it can never be recommended. Every one
-      of these is capability the stack paid to install and cannot use.
+    That is a different question from IDENTIFIER VALIDITY, which is what the
+    validator actually gates. For nmap scripts, msf modules and nuclei templates
+    the catalog is authoritative about whether a name is REAL — nmap ships a
+    fixed script set, so `smb-enum-links` does not exist anywhere, not merely
+    here. Those are rejected because they are wrong, not because they are absent.
 
-    Advisory. Scanner labels are not reliably binary names (`metasploit` is
-    msfconsole; the KB uses labels like `nmap-smb-vuln`), so this reports rather
-    than enforces — the same reasoning that keeps the binary check out of the
-    blocking path.
+    So:
+    * `not_installed_locally` — informational. Useful for deciding what to
+      provision; NOT a prediction of failure.
+    * `uncatalogued` — installed (often provisioned onto a node) but referenced
+      by no KB entry, so it can never be recommended. Capability paid for and
+      unused.
     """
     from tool_catalog import load_catalogs, _SCANNER_BINARY
 
@@ -2655,7 +2659,8 @@ def get_tool_coverage():
     binaries = cats.get("binaries") or set()
     if not binaries:
         return {"ok": False, "reason": "no binary catalog — run scripts/refresh-tool-catalogs.sh",
-                "unrunnable": [], "uncatalogued": [], "kb_tool_count": 0}
+                "not_installed_locally": [], "unrunnable": [],
+        "uncatalogued": [], "kb_tool_count": 0}
 
     # Every tool name the KB can recommend, and where it came from.
     referenced: Dict[str, set] = {}
@@ -2684,7 +2689,7 @@ def get_tool_coverage():
         mapped = _SCANNER_BINARY.get(name, name)
         return mapped is None or mapped in binaries
 
-    unrunnable = sorted(
+    not_local = sorted(
         ({"tool": n, "referenced_by": sorted(s)[:6], "references": len(s)}
          for n, s in referenced.items() if not _installed(n)),
         key=lambda r: -r["references"],
@@ -2713,7 +2718,12 @@ def get_tool_coverage():
         "ok": True,
         "kb_tool_count": len(referenced),
         "binary_count": len(binaries),
-        "unrunnable": unrunnable,
+        # Renamed from "unrunnable": these names are correct, just absent
+        # locally. Tools run on nodes and provisioned instances, so local
+        # absence predicts nothing. `unrunnable` is kept as an alias so an
+        # older UI build does not silently render an empty section.
+        "not_installed_locally": not_local,
+        "unrunnable": not_local,
         "uncatalogued": sorted(interesting)[:60],
         "uncatalogued_total": len(interesting),
     }
