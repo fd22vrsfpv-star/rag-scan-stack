@@ -1135,6 +1135,13 @@ CHISEL_USER=pentest
 CHISEL_PASSWORD=${CHISEL_PASSWORD}
 
 # Metasploit RPC Credentials
+# WARNING: read by TWO services that must agree — the \`metasploit\` container
+# starts msfrpcd with these, and \`exploit-runner\` authenticates with them.
+# After changing either, RECREATE metasploit (not just restart): the msfrpcd
+# command line is fixed at container creation, so a restart keeps the old value.
+#   docker compose up -d --force-recreate --no-deps metasploit exploit-runner
+# A mismatch shows up as HTTP 500 on /msf/jobs and /msf/sessions, and msfrpcd
+# reports "Login Failed". See Docs/SECURITY_SETUP.md.
 MSF_RPC_USER=msf
 MSF_RPC_PASS=${MSF_RPC_PASS}
 MSF_RPC_HOST=metasploit
