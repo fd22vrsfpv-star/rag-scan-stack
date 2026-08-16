@@ -808,6 +808,73 @@ async def _manual_followup_for(rec: dict, kind: str, ip: str) -> Optional[dict]:
         return {"created": False, "command": cmd, "title": title}
 
 
+# Tool NAME sets, module level so both dispatch and the coverage endpoint read
+# the same source. The URLs themselves stay in-function because they resolve from
+# settings at call time; only the names are static.
+SCANNER_NAMES_ROUTED = frozenset(['alterx', 'dirsearch', 'dnsx', 'feroxbuster', 'ffuf', 'gobuster', 'httpx', 'hydra', 'katana', 'medusa', 'metasploit', 'naabu', 'ncrack', 'nikto', 'nmap', 'nuclei', 'sqlmap', 'subfinder', 'tlsx', 'vulnx', 'wappalyzer', 'wfuzz', 'whatweb'])
+MANUAL_TOOL_NAMES = frozenset(['ajpycat', 'curl', 'ftp', 'irssi', 'lftp', 'mysql', 'mysqltuner', 'netcat', 'psql', 'rmg', 'rpcinfo', 'showmount', 'smtp-user-enum', 'ssh-audit', 'swaks', 'telnet', 'vncviewer'])
+
+@router.get("/api/scan-recommendations/tool-coverage")
+async def recommendation_tool_coverage():
+    """Which recommended tools have nowhere to run.
+
+    A recommendation names a TOOL; running it needs that tool to be either routed
+    to a service (SCANNER_URLS), or present in the Kali image and its registry.
+    When a new tool starts being recommended and neither is true, the only signal
+    today is a skip buried in a dispatch response.
+
+    This lists the gap directly, so "we added a tool to the KB" and "the tool can
+    actually run" stop drifting apart. `unregistered` is the actionable set: add
+    to SCANNER_URLS (with a payload branch) if a service owns it, or to the
+    node-manager tool registry + kali image if it is CLI-only.
+    """
+    s = get_settings()
+    routed = set(SCANNER_NAMES_ROUTED)
+    manual = set(MANUAL_TOOL_NAMES)
+
+    recommended: set = set()
+    try:
+        from db import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT lower(scanner) FROM scan_recommendations "
+                        "WHERE scanner IS NOT NULL")
+            recommended = {r[0] for r in cur.fetchall() if r and r[0]}
+    except Exception as e:
+        raise HTTPException(503, f"could not read scan_recommendations: {e}")
+
+    registry: set = set()
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+            # /tools is a 404 — the endpoint is /tools/allowed. Getting this
+            # wrong made the report claim 21 tools were unregistered while they
+            # were demonstrably installed, which is worse than no report.
+            r = await c.get(f"{s.kali_listener_url}/tools/allowed",
+                            headers={"x-api-key": s.api_key})
+            if r.status_code == 200:
+                data = r.json()
+                items = data.get("tools") if isinstance(data, dict) else data
+                if isinstance(items, dict):
+                    registry = {k.lower() for k in items}
+                elif isinstance(items, list):
+                    registry = {(t.get("name") if isinstance(t, dict) else str(t)).lower()
+                                for t in items}
+    except Exception as e:
+        log.warning("tool registry fetch failed: %s", e)
+
+    covered = routed | manual | registry
+    unregistered = sorted(recommended - covered)
+    return {
+        "recommended_tools": len(recommended),
+        "routed_to_service": sorted(recommended & routed),
+        "manual_on_kali": sorted(recommended & (manual | registry)),
+        "unregistered": unregistered,
+        "detail": ("Tools in `unregistered` are recommended but have nowhere to run. "
+                   "Add to SCANNER_URLS + a payload branch if a service owns the "
+                   "tool, or to the node-manager tool registry and the kali image "
+                   "if it is CLI-only."),
+    }
+
+
 @router.post("/api/scan-recommendations/run")
 async def run_scan_recommendations(body: RunRecommendationsRequest):
     """
@@ -977,7 +1044,9 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         "vulnx": s.osint_runner_url,
     }
 
-    # Tools that are manual/CLI-only — skip with explanation
+    # Tools that are manual/CLI-only — skip with explanation.
+    # Mirrors MANUAL_TOOL_NAMES; kept as a literal for readability, and asserted
+    # against the shared constant so the two cannot drift apart silently.
     MANUAL_TOOLS = {
         "curl", "telnet", "netcat", "vncviewer", "irssi", "lftp", "ftp",
         "psql", "mysql", "rpcinfo", "showmount", "smtp-user-enum",
@@ -1615,6 +1684,33 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             return {"ok": True, "detail": f"preflight skipped ({type(e).__name__})"}
 
     dispatched_results = await asyncio.gather(*[dispatch_rec(r) for r in selected])
+
+    # A recommendation that needs a HUMAN should leave a follow-up, not just a log
+    # line in an API response nobody re-reads. Any outcome that cannot proceed
+    # without operator action — a manual-only tool, a tool missing from the image,
+    # one the allowlist rejects, or one with no automated handler — becomes a
+    # follow_up_item carrying the command to run by hand.
+    #
+    # Done here rather than at each skip site: there are eight of them, and a new
+    # one added later would silently miss the follow-up. Every result passes
+    # through this point.
+    _NEEDS_OPERATOR = (
+        "manual tool", "missing on kali", "install failed", "not in allowed list",
+        "no automated handler", "not in scanner_urls", "see tool docs",
+    )
+    for _res in dispatched_results:
+        if not isinstance(_res, dict) or _res.get("manual_followup"):
+            continue                      # target_kind path already filed one
+        if _res.get("status") not in ("skipped", "failed"):
+            continue
+        _detail = str(_res.get("detail") or "").lower()
+        if not any(k in _detail for k in _NEEDS_OPERATOR):
+            continue                      # a real dispatch failure, not a manual step
+        _rec = recs_by_id.get(_res.get("id")) or {}
+        _fu = await _manual_followup_for(
+            _rec, _res.get("target_kind") or "manual", _res.get("ip") or "")
+        if _fu:
+            _res["manual_followup"] = _fu
     # Combine fresh dispatches with the idempotency-guard skips so the UI
     # sees one consistent list -- "already queued" recs surface as skipped.
     results = list(dispatched_results) + already_active_results
