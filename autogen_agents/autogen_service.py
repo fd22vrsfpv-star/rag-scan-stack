@@ -4,6 +4,7 @@ FastAPI service for orchestrating AI agents in penetration testing
 """
 
 import os
+import re
 import uuid
 import httpx
 import threading
@@ -1553,6 +1554,110 @@ def _enable_recon_agent_if_requested(engagement_id, enabled, interval_sec) -> No
         session_logger.warning("recon agent enable failed for %s: %s", engagement_id, e)
 
 
+
+def _validate_agent_output(session_id, summary) -> dict:
+    """Check what the agents CLAIMED against what the scans actually recorded.
+
+    scan-recommender has had /kb/agent-output/verify since the claim-validation
+    work — regex + SQL, deterministic, catching fabricated ports/CVEs/hosts. But
+    nothing ever called it: it only ran if a human POSTed to it by hand, so in
+    practice no session's output was ever validated. Running it here, at the same
+    teardown point as the flow summary, is what makes it actually happen.
+
+    Deliberately NOT the LLM path (use_llm stays false): the regex+SQL pass is
+    deterministic, and asking a second model to judge the first adds another thing
+    that can hallucinate. Ports, CVEs, services and hosts all have exact database
+    answers.
+
+    Caveat worth carrying into the log: broken ingestion makes every claim look
+    unsupported, so this is read alongside the flow summary's produced/failed
+    counts, not on its own.
+    """
+    import json as _json
+    try:
+        msgs = get_agent_messages(session_id, limit=400) or []
+    except Exception as e:
+        session_logger.warning("[%s] claim validation: could not read messages: %s",
+                               session_id, e)
+        return {}
+    text = "\n".join(
+        str(m.get("content") or "") for m in msgs
+        if (m.get("role") or "").lower() in ("assistant", "agent", "")
+    ).strip()
+    if not text:
+        return {}
+
+    # Validate against the host the session actually scanned.
+    targets = []
+    for t in (summary or {}).get("by_scan_type", []) or []:
+        targets.extend(t.get("targets") or [])
+    ip = None
+    for t in targets:
+        m = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", str(t))
+        if m:
+            ip = m.group(1)
+            break
+
+    try:
+        rec_url = os.environ.get("SCAN_RECOMMENDER_URL", "https://scan-recommender:8013")
+        with httpx.Client(verify=False, timeout=60) as c:
+            r = c.post(f"{rec_url}/kb/agent-output/verify",
+                       json={"session_id": str(session_id), "text": text[:60000],
+                             "ip": ip, "use_llm": False},
+                       headers={"x-api-key": os.environ.get("API_KEY", "changeme")})
+        if r.status_code >= 400:
+            session_logger.warning("[%s] claim validation HTTP %s: %s",
+                                   session_id, r.status_code, r.text[:160])
+            return {}
+        v = r.json()
+    except Exception as e:
+        session_logger.warning("[%s] claim validation failed: %s", session_id, e)
+        return {}
+
+    session_logger.info(
+        "[%s] CLAIM VALIDATION — %s claim(s) checked, %s unsupported%s",
+        session_id, v.get("claims_checked"), v.get("unsupported_count"),
+        " (POSSIBLE RUN FAILURE)" if v.get("probable_run_failure") else "",
+    )
+    for u in (v.get("unsupported") or [])[:10]:
+        session_logger.warning("[%s]   UNSUPPORTED %s: %s", session_id,
+                               u.get("kind"), str(u.get("value"))[:80])
+    if v.get("probable_run_failure"):
+        session_logger.warning(
+            "[%s]   run-failure hint: %s — unsupported claims can also mean "
+            "INGESTION broke, not that the agent invented them; check the flow "
+            "summary's produced counts before treating these as fabrication",
+            session_id, v.get("run_failure_hint"))
+
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE agent_sessions "
+                    "SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb "
+                    "WHERE id = %s::uuid",
+                    (_json.dumps({"claim_validation": v}), str(session_id)),
+                )
+            conn.commit()
+    except Exception as e:
+        session_logger.warning("[%s] claim validation persist failed: %s", session_id, e)
+
+    try:
+        api_base = os.environ.get("API_BASE", "https://rag-api:8000")
+        with httpx.Client(verify=False, timeout=10) as c:
+            c.post(f"{api_base}/webhooks/emit",
+                   headers={"x-api-key": os.environ.get("API_KEY", "changeme")},
+                   json={"event_type": "agent_output_validated",
+                         "source": "autogen-agents",
+                         "data": {"session_id": str(session_id),
+                                  "claims_checked": v.get("claims_checked"),
+                                  "unsupported_count": v.get("unsupported_count"),
+                                  "probable_run_failure": v.get("probable_run_failure")}})
+    except Exception as e:
+        session_logger.warning("[%s] claim validation webhook failed: %s", session_id, e)
+    return v
+
+
 def _drain_recommendations_if_enabled(session_id, summary, enabled) -> None:
     """Dispatch the KB recommendations this run generated but never acted on.
 
@@ -2038,6 +2143,9 @@ Coordinator, please start by analyzing the target and assigning initial tasks to
         _summary = _emit_flow_summary(session_id)
 
         # Optionally act on what the KB recommended but the run never did.
+        # Validate what the agents CLAIMED against what the scans recorded.
+        _validate_agent_output(session_id, _summary)
+
         _drain_recommendations_if_enabled(session_id, _summary, auto_run_recommendations)
 
         # Persist scan metrics to DB before cleanup
