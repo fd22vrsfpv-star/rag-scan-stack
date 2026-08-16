@@ -222,13 +222,51 @@ _STRIP_TAGS = ("script", "style", "nav", "header", "footer", "aside", "noscript"
                "form", "iframe", "svg", "button")
 
 
-def extract_markdown(html: str, source_url: str = "") -> Dict:
+def _looks_like_markdown(body: str, content_type: str, url: str) -> bool:
+    """Is this already markdown/plain text rather than HTML?
+
+    raw.githubusercontent.com, gists and any linked .md file serve markdown as
+    text/plain. Running that through an HTML parser destroys it: a 23KB HTB
+    writeup came out as 168 characters, and the import failed with "the page may
+    be JavaScript-rendered" — a misleading diagnosis of a format mismatch.
+    """
+    ct = (content_type or "").lower()
+    if "html" in ct:
+        return False
+    if "markdown" in ct or ct.startswith("text/plain"):
+        return True
+    if url.lower().split("?")[0].endswith((".md", ".markdown", ".txt")):
+        return True
+    # No usable content-type: decide on shape. Any opening TAG means HTML —
+    # checking only for <!doctype/<html misread a bare `<main>…</main>` fragment
+    # as markdown and passed it through unparsed, dropping every extracted link.
+    # Markdown that opens with a tag is rare enough to accept as a trade.
+    head = (body or "").lstrip()[:200]
+    return not re.match(r"<[a-zA-Z!?]", head)
+
+
+def extract_markdown(html: str, source_url: str = "", content_type: str = "") -> Dict:
     """Reduce an HTML page to markdown-ish text.
 
     Headings become `#` levels and code blocks stay fenced: the heading
     structure is what `_chunk_markdown` in exploits_rag.py splits on, and the
     command syntax is the most valuable part of a technical guide.
+
+    Content that is ALREADY markdown is passed through untouched — see
+    _looks_like_markdown.
     """
+    if _looks_like_markdown(html, content_type, source_url):
+        text = html or ""
+        title = ""
+        for line in text.splitlines():
+            if line.startswith("# "):
+                title = line[2:].strip()
+                break
+        if not title and source_url:
+            title = source_url.rstrip("/").split("/")[-1]
+        return {"title": title, "markdown": text, "chars": len(text),
+                "url": source_url, "links": []}
+
     try:
         from bs4 import BeautifulSoup
     except ImportError:  # pragma: no cover
@@ -311,7 +349,7 @@ def fetch_guide(url: str, depth: int = 0, max_pages: int = 1,
     pages, errors, seen = [], [], set()
 
     first = fetch_url(url, allow_internal=allow_internal, proxy=proxy)
-    doc = extract_markdown(first["html"], first["final_url"])
+    doc = extract_markdown(first["html"], first["final_url"], first.get("content_type", ""))
     seen.add(first["final_url"].rstrip("/"))
     pages.append({"url": first["final_url"], "title": doc["title"],
                   "markdown": doc["markdown"], "chars": doc["chars"]})
@@ -328,7 +366,7 @@ def fetch_guide(url: str, depth: int = 0, max_pages: int = 1,
             seen.add(norm)
             try:
                 sub = fetch_url(link, allow_internal=allow_internal, proxy=proxy)
-                sdoc = extract_markdown(sub["html"], sub["final_url"])
+                sdoc = extract_markdown(sub["html"], sub["final_url"], sub.get("content_type", ""))
                 if sdoc["chars"] < 200:
                     continue      # nav stubs and redirects to landing pages
                 pages.append({"url": sub["final_url"], "title": sdoc["title"],
