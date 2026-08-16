@@ -21,6 +21,15 @@ class StartSessionRequest(BaseModel):
     port_profile: Optional[str] = None
     # Named web scan depth from knowledge/web_profiles.yaml.
     web_profile: Optional[str] = None
+    # Launch options. model_dump() is what gets forwarded, so a field missing
+    # here is silently dropped no matter what the autogen service accepts.
+    #
+    # Turn on the continuous recon agent for this session's engagement. It was
+    # never enabled for ANY engagement (recon_agent_state was empty), which is why
+    # the KB recommendation queue had never been drained even once.
+    enable_recon_agent: Optional[bool] = None
+    # Dispatch still-pending KB recommendations when the session ends.
+    auto_run_recommendations: Optional[bool] = None
 
 
 class ResumeRequest(BaseModel):

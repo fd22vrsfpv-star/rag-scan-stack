@@ -18,7 +18,7 @@ from tenacity import (
 )
 import logging
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
@@ -415,6 +415,17 @@ class PentestRequest(BaseModel):
     )
     max_rounds: Optional[int] = Field(200, description="Maximum conversation rounds (status polls don't count)")
     auto_execute_scans: Optional[bool] = Field(True, description="Automatically execute recommended scans")
+    enable_recon_agent: Optional[bool] = Field(
+        None,
+        description=(
+            "Enable the continuous recon agent for this session's engagement at "
+            "launch (X-Engagement-Id). It drains the KB recommendation queue every "
+            "cycle. Defaults to the ENABLE_RECON_AGENT_ON_LAUNCH env var."
+        ),
+    )
+    recon_agent_interval_sec: Optional[int] = Field(
+        300, description="Recon agent cycle interval when enable_recon_agent is set."
+    )
     auto_run_recommendations: Optional[bool] = Field(
         None,
         description=(
@@ -1504,6 +1515,44 @@ def _emit_flow_summary(session_id) -> dict:
 
 
 
+
+def _enable_recon_agent_if_requested(engagement_id, enabled, interval_sec) -> None:
+    """Turn on the continuous recon agent for this engagement at session launch.
+
+    recon_agent_state was EMPTY for every engagement, so Phase 4 — the loop that
+    drains the KB recommendation queue — had never executed once. Enabling it was
+    a manual step nothing prompted you to take, which is why 166 recommendations
+    accumulated unread.
+
+    Off unless asked for: the recon agent dispatches scans on a timer, so it is an
+    explicit choice per session, with an ENABLE_RECON_AGENT_ON_LAUNCH env default.
+    Scope enforcement still applies at the scanner.
+    """
+    if enabled is None:
+        enabled = os.environ.get("ENABLE_RECON_AGENT_ON_LAUNCH", "false").strip().lower() in (
+            "1", "true", "yes", "on")
+    if not enabled:
+        return
+    if not engagement_id:
+        session_logger.warning(
+            "enable_recon_agent requested but no X-Engagement-Id was supplied — "
+            "the recon agent is scoped per engagement, so there is nothing to enable")
+        return
+    try:
+        bff = os.environ.get("BFF_URL", "https://pentest-dashboard")
+        with httpx.Client(verify=False, timeout=30) as c:
+            r = c.post(
+                f"{bff}/api/recon-agent/{engagement_id}/enable",
+                json={"interval_sec": int(interval_sec or 300),
+                      "config": {"kb_driven_recon": True}},
+                headers={"x-api-key": os.environ.get("API_KEY", "changeme")},
+            )
+        session_logger.info(
+            "recon agent enable for engagement %s -> HTTP %s", engagement_id, r.status_code)
+    except Exception as e:
+        session_logger.warning("recon agent enable failed for %s: %s", engagement_id, e)
+
+
 def _drain_recommendations_if_enabled(session_id, summary, enabled) -> None:
     """Dispatch the KB recommendations this run generated but never acted on.
 
@@ -2159,7 +2208,7 @@ async def proxy_system_health():
 
 
 @app.post("/pentest", response_model=PentestResponse)
-async def start_pentest(request: PentestRequest):
+async def start_pentest(request: PentestRequest, http_request: Request = None):
     """
     Start a new multi-agent penetration testing session
 
@@ -2194,6 +2243,14 @@ async def start_pentest(request: PentestRequest):
 
         # Start the pentest session in background using asyncio.to_thread
         # This runs the synchronous function in a thread pool to avoid blocking the event loop
+        # Launch option: turn on the continuous recon agent for this engagement.
+        _eid = None
+        if http_request is not None:
+            _eid = (http_request.headers.get("x-engagement-id")
+                    or http_request.headers.get("X-Engagement-Id"))
+        _enable_recon_agent_if_requested(
+            _eid, request.enable_recon_agent, request.recon_agent_interval_sec)
+
         asyncio.create_task(
             asyncio.to_thread(
                 run_pentest_session_sync,
