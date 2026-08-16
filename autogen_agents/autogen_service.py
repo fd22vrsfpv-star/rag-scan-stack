@@ -415,6 +415,16 @@ class PentestRequest(BaseModel):
     )
     max_rounds: Optional[int] = Field(200, description="Maximum conversation rounds (status polls don't count)")
     auto_execute_scans: Optional[bool] = Field(True, description="Automatically execute recommended scans")
+    auto_run_recommendations: Optional[bool] = Field(
+        None,
+        description=(
+            "When the session ends, dispatch the KB scan recommendations it "
+            "generated but never acted on. The post-ingest recommender writes "
+            "scan_recommendations per discovered (ip, service); without this they "
+            "sit at status='pending' indefinitely. Defaults to the "
+            "AUTO_RUN_RECOMMENDATIONS env var (off unless set)."
+        ),
+    )
     proxy: Optional[str] = Field(None, description="SOCKS proxy URL for routing scans through a remote node (e.g., 'socks5://node-manager:10001')")
     port_profile: Optional[str] = Field(None, description="Named port scope from knowledge/port_profiles.yaml (top-100, top-1000, web, redteam-targeted, all). Omit to use the scanner agent's built-in quick-then-deep policy.")
     web_profile: Optional[str] = Field(None, description="Named web scan depth from knowledge/web_profiles.yaml (quick, standard, deep, api, passive-web). Omit to use each web tool's own defaults.")
@@ -1493,6 +1503,65 @@ def _emit_flow_summary(session_id) -> dict:
     return summary
 
 
+
+def _drain_recommendations_if_enabled(session_id, summary, enabled) -> None:
+    """Dispatch the KB recommendations this run generated but never acted on.
+
+    The post-ingest recommender writes scan_recommendations per discovered
+    (ip, service). Nothing consumed them: a real engagement finished with 166 rows
+    at status='pending', including 41 metasploit and 5 hydra recommendations, and
+    no view surfaced that. This closes the loop at the point where the session's
+    own coverage is already known.
+
+    Off unless asked for. Draining the queue dispatches real scans at real hosts,
+    so it is opt-in per session (auto_run_recommendations) with an
+    AUTO_RUN_RECOMMENDATIONS env default. Scope enforcement still applies at the
+    scanner — this cannot reach a host the engagement is not authorized for.
+    """
+    if enabled is None:
+        enabled = os.environ.get("AUTO_RUN_RECOMMENDATIONS", "false").strip().lower() in (
+            "1", "true", "yes", "on")
+    if not enabled:
+        return
+
+    kb = (summary or {}).get("kb_coverage") or {}
+    if not kb.get("available"):
+        session_logger.info(
+            "[%s] auto-run recommendations: skipped, KB coverage unavailable (%s)",
+            session_id, kb.get("reason", "unknown"))
+        return
+    if not kb.get("ignored"):
+        session_logger.info(
+            "[%s] auto-run recommendations: nothing pending to run", session_id)
+        return
+
+    try:
+        bff = os.environ.get("BFF_URL", "https://pentest-dashboard")
+        hdr = {"x-api-key": os.environ.get("API_KEY", "changeme")}
+        with httpx.Client(verify=False, timeout=60) as c:
+            # Ask the recommender for the pending set rather than reconstructing
+            # it here — that endpoint already owns status writeback and dedupe
+            # against in-flight jobs.
+            r = c.get(f"{bff}/api/scan-recommendations",
+                      params={"status": "pending", "limit": 200}, headers=hdr)
+            recs = (r.json().get("recommendations") or []) if r.status_code == 200 else []
+            ids = [x.get("id") for x in recs if x.get("id")]
+            if not ids:
+                session_logger.info(
+                    "[%s] auto-run recommendations: queue empty at dispatch time",
+                    session_id)
+                return
+            run = c.post(f"{bff}/api/scan-recommendations/run",
+                         json={"ids": ids}, headers=hdr)
+            session_logger.info(
+                "[%s] auto-run recommendations: dispatched %s rec(s) -> HTTP %s",
+                session_id, len(ids), run.status_code)
+    except Exception as e:
+        # Never let this take down the teardown around it.
+        session_logger.warning(
+            "[%s] auto-run recommendations failed: %s", session_id, e)
+
+
 def run_pentest_session_sync(
     session_id: uuid.UUID,
     target_description: str,
@@ -1504,6 +1573,7 @@ def run_pentest_session_sync(
     proxy: Optional[str] = None,
     port_profile: Optional[str] = None,
     web_profile: Optional[str] = None,
+    auto_run_recommendations: Optional[bool] = None,
 ):
     """
     Synchronous version of run_pentest_session that runs in a thread pool.
@@ -1916,7 +1986,10 @@ Coordinator, please start by analyzing the target and assigning initial tasks to
 
         # End-of-session scan flow summary. MUST run before cleanup_session(),
         # which discards the registry it is built from.
-        _emit_flow_summary(session_id)
+        _summary = _emit_flow_summary(session_id)
+
+        # Optionally act on what the KB recommended but the run never did.
+        _drain_recommendations_if_enabled(session_id, _summary, auto_run_recommendations)
 
         # Persist scan metrics to DB before cleanup
         scan_tracker.persist_to_db(str(session_id))
@@ -2134,6 +2207,7 @@ async def start_pentest(request: PentestRequest):
                 request.proxy,
                 request.port_profile,
                 request.web_profile,
+                request.auto_run_recommendations,
             )
         )
 
