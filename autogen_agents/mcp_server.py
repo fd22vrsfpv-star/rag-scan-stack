@@ -440,8 +440,7 @@ Use this for detailed service fingerprinting.""",
                 },
                 "ports": {
                     "type": "string",
-                    "description": "Port range (e.g., '1-1000', '80,443,8080') (default: '1-1000')",
-                    "default": "1-1000"
+                    "description": "Port range. Omit for the top-1000 default (the 1000 most commonly OPEN ports). Do NOT pass '1-1000' — that is the first 1000 port NUMBERS and misses mysql 3306, postgresql 5432, vnc 5900, tomcat 8180."
                 },
                 "service_detection": {
                     "type": "boolean",
@@ -1044,10 +1043,12 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             return [TextContent(type="text", text=formatted_result)]
 
         elif name == "start_nmap_scan":
-            from scan_tools import start_nmap_scan
+            from scan_tools import start_nmap_scan, DEFAULT_QUICK_PORTS
 
             ip = arguments["ip_address"]
-            ports = arguments.get("ports", "1-1000")
+            # None -> scan_tools applies its top-1000 default. A literal "1-1000"
+            # from the model is upgraded at the scan_tools choke point regardless.
+            ports = arguments.get("ports") or DEFAULT_QUICK_PORTS
             service_detection = arguments.get("service_detection", True)
             version_intensity = arguments.get("version_intensity", 9)
             enable_scripts = arguments.get("enable_scripts", True)

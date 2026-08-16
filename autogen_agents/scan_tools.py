@@ -871,13 +871,19 @@ class ScanTools:
 
         Args:
             targets: List of IP addresses or CIDRs (e.g., ["192.168.1.0/24", "10.0.0.1"])
-            ports: Port range (e.g., "1-65535" or "80,443,8080")
+            ports: Port range. Defaults to nmap's top-1000. Do NOT pass "1-1000" —
+                   that is the first 1000 port NUMBERS, not the 1000 most commonly
+                   open ports, and it will be upgraded to the top-1000 anyway.
             rate: Scan rate in packets per second (default 1000)
             interface: Network interface to use (default "eth0")
 
         Returns:
             Dictionary with scan job information
         """
+        # Same upgrade start_full_scan applies. This is the choke point every
+        # wrapper funnels through, so an LLM-passed sequential low range is
+        # caught here regardless of which tool it called.
+        ports = _upgrade_sequential_quick_ports(ports)
         return self._make_request(
             method="POST",
             url=f"{self.nmap_url}/jobs/masscan-only",
@@ -905,7 +911,9 @@ class ScanTools:
 
         Args:
             ip_address: Target IP address or CIDR (e.g., "192.168.1.1" or "10.0.0.0/24")
-            ports: Port range (e.g., "1-1000" or "80,443,8080")
+            ports: Port range. Defaults to nmap's top-1000. Do NOT pass "1-1000" —
+                   that is the first 1000 port NUMBERS, not the 1000 most commonly
+                   open ports, and it will be upgraded to the top-1000 anyway.
             service_detection: Enable service version detection (-sV flag)
             version_intensity: Service detection intensity 0-9 (9=aggressive)
             enable_scripts: Enable NSE scripts for banner grabbing and vulnerability detection
@@ -914,6 +922,10 @@ class ScanTools:
         Returns:
             Dictionary with scan job information
         """
+        # Same upgrade start_full_scan applies. This is the choke point every
+        # wrapper funnels through, so an LLM-passed sequential low range is
+        # caught here regardless of which tool it called.
+        ports = _upgrade_sequential_quick_ports(ports)
         return self._make_request(
             method="POST",
             url=f"{self.nmap_url}/jobs/masscan-then-nmap",
@@ -1573,7 +1585,11 @@ class ScanTools:
         )
 
     def start_naabu(self, targets: List[str], ports: str = DEFAULT_QUICK_PORTS, rate: int = 1000) -> Dict:
-        """Start fast port scanning with naabu."""
+        """Start fast port scanning with naabu. Defaults to nmap's top-1000."""
+        # Same upgrade start_full_scan applies. This is the choke point every
+        # wrapper funnels through, so an LLM-passed sequential low range is
+        # caught here regardless of which tool it called.
+        ports = _upgrade_sequential_quick_ports(ports)
         return self._make_request(
             method="POST", url=f"{self.pd_runner_url}/jobs/naabu",
             operation=f"Naabu scan of {', '.join(targets[:3])}",
@@ -2430,7 +2446,10 @@ def start_masscan(targets: str = None, target: str = None, ports: str = DEFAULT_
     Args:
         targets: Comma-separated list of IPs or CIDRs (e.g., "192.168.1.0/24,10.0.0.1")
         target: Alias for targets (single IP also works)
-        ports: Port range (e.g., "1-1000" or "80,443,8080")
+        ports: Port range. Omit it — the default is nmap's top-1000, the 1000 most
+               commonly OPEN ports. Do NOT pass "1-1000": that is the first 1000 port
+               NUMBERS, which misses mysql 3306, postgresql 5432, vnc 5900 and tomcat
+               8180. Pass a value only for a genuinely specific scope (e.g. "80,443").
         rate: Scan rate in packets per second
 
     Returns JSON string with job information.
@@ -2461,7 +2480,10 @@ def start_nmap_scan(ip_address: str, ports: str = DEFAULT_QUICK_PORTS, service_d
 
     Args:
         ip_address: Target IP address or CIDR
-        ports: Port range (e.g., "1-1000" or "80,443,8080")
+        ports: Port range. Omit it — the default is nmap's top-1000, the 1000 most
+               commonly OPEN ports. Do NOT pass "1-1000": that is the first 1000 port
+               NUMBERS, which misses mysql 3306, postgresql 5432, vnc 5900 and tomcat
+               8180. Pass a value only for a genuinely specific scope (e.g. "80,443").
         service_detection: Enable service version detection (-sV flag)
         version_intensity: Service detection intensity 0-9 (9=aggressive)
         enable_scripts: Enable NSE scripts for banner grabbing and vulnerability detection
@@ -3219,7 +3241,10 @@ def start_naabu(targets: str = None, target: str = None, ports: str = DEFAULT_QU
     Args:
         targets: Comma-separated list of IPs or CIDRs (e.g., "192.168.1.0/24,10.0.0.1")
         target: Alias for targets
-        ports: Port range (e.g., "1-1000" or "80,443,8080")
+        ports: Port range. Omit it — the default is nmap's top-1000, the 1000 most
+               commonly OPEN ports. Do NOT pass "1-1000": that is the first 1000 port
+               NUMBERS, which misses mysql 3306, postgresql 5432, vnc 5900 and tomcat
+               8180. Pass a value only for a genuinely specific scope (e.g. "80,443").
         rate: Scan rate in packets per second
 
     Returns JSON string with job information.
@@ -4493,7 +4518,7 @@ def get_session_scan_status(session_id: str = None) -> str:
                 "started_at": "...",
                 "completed_at": "...",
                 "duration_seconds": 45,
-                "params": {"targets": ["192.168.1.150"], "ports": "1-1000"}
+                "params": {"targets": ["192.168.1.150"], "ports": "<top-1000>"}
             },
             {
                 "type": "nmap",

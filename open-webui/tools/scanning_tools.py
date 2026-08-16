@@ -32,12 +32,12 @@ class Tools:
     def __init__(self):
         self.valves = self.Valves()
 
-    def start_masscan(self, target: str, ports: str = "1-1000", rate: int = 1000) -> str:
+    def start_masscan(self, target: str, ports: str = None, rate: int = 1000) -> str:
         """
         Start a fast Masscan port discovery scan. Use this FIRST for quick port enumeration.
 
         :param target: Target IP address or CIDR range (e.g., '192.168.1.0/24')
-        :param ports: Port range to scan (e.g., '1-1000', '1-65535', '22,80,443')
+        :param ports: Port specification. Omit for the top-1000 default. Do NOT pass '1-1000' — that is the first 1000 port NUMBERS, not the 1000 most commonly open ports.
         :param rate: Packets per second (default: 1000)
         :return: Job ID for tracking
         """
@@ -51,12 +51,12 @@ class Tools:
         except Exception as e:
             return json.dumps({"error": str(e)})
 
-    def start_nmap_scan(self, target: str, ports: str = "1-1000") -> str:
+    def start_nmap_scan(self, target: str, ports: str = None) -> str:
         """
         Start an Nmap scan with service detection. Run AFTER masscan finds open ports.
 
         :param target: Target IP, hostname, or CIDR range
-        :param ports: Port range to scan (e.g., '22,80,443' or '1-1000')
+        :param ports: Port specification. Omit for the top-1000 default. Do NOT pass '1-1000' — that is the first 1000 port NUMBERS, not the 1000 most commonly open ports.
         :return: Job ID for tracking
         """
         try:
@@ -69,12 +69,12 @@ class Tools:
         except Exception as e:
             return json.dumps({"error": str(e)})
 
-    def start_naabu(self, targets: str, ports: str = "1-1000") -> str:
+    def start_naabu(self, targets: str, ports: str = None) -> str:
         """
         Start a fast port scan using Naabu (alternative to Masscan/Nmap).
 
         :param targets: Comma-separated IPs or CIDR ranges
-        :param ports: Port specification (e.g., '80,443', '1-1000')
+        :param ports: Port specification. Omit for the top-1000 default. Do NOT pass '1-1000' — that is the first 1000 port NUMBERS, not the 1000 most commonly open ports.
         :return: Job ID for tracking
         """
         try:

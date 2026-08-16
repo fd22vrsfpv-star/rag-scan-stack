@@ -490,7 +490,14 @@ class _MasscanInterruptedError(Exception):
 
 class MasscanBody(BaseModel):
     targets: List[str] = Field(..., description="List of IPs/CIDRs to scan")
-    ports: str = Field("1-65535", description="Ports range or list")
+    # None means "caller did not specify" — deliberately distinct from an explicit
+    # value, because the right default differs per route and could not be
+    # expressed while this model hardcoded one for both. /jobs/masscan-only is a
+    # pure discovery sweep and keeps 1-65535; /jobs/masscan-then-nmap feeds nmap
+    # enrichment and defaults to the top-1000 profile, so an MCP client that omits
+    # ports no longer silently gets a scope neither the operator nor the profile
+    # asked for. Callers passing an explicit value are unaffected.
+    ports: Optional[str] = Field(None, description="Ports range or list. Omit for the route default.")
     rate: int = Field(1000, ge=1, le=100000, description="Masscan rate (packets per second)")
     interface: Optional[str] = Field(None, description="Network interface for Masscan (-e)")
     proxy: Optional[str] = Field(None, description="SOCKS proxy URL (e.g. socks5://host:port). When set, skips masscan and uses nmap -sT --proxies")
@@ -518,19 +525,23 @@ class MasscanBody(BaseModel):
                 raise HTTPException(status_code=400, detail=f"Invalid target '{target}': {e}")
         self.targets = validated_targets
 
-        # Validate ports format - handle both port ranges and nmap arguments
-        self.ports = self.ports.strip()
-        try:
-            if self.ports.startswith('--top-ports'):
-                # Handle nmap --top-ports argument (allow spaces, dashes, letters, numbers)
-                sanitize_command_arg(self.ports, allowed_chars=r'^[a-zA-Z0-9\s\-=]+$', max_len=65536)
-            else:
-                # Handle traditional port ranges (numbers, commas, dashes only)
-                # Strip spaces for traditional port ranges
-                self.ports = self.ports.replace(' ', '')
-                sanitize_command_arg(self.ports, allowed_chars=r'^[0-9,\-]+$', max_len=65536)
-        except ValidationError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid ports format: {e}")
+        # Validate ports format - handle both port ranges and nmap arguments.
+        # None means "not specified" — each route substitutes its own default
+        # afterwards, so there is nothing to sanitize yet. Guarded rather than
+        # returned early, so interface validation below still runs.
+        if self.ports is not None:
+            self.ports = self.ports.strip()
+            try:
+                if self.ports.startswith('--top-ports'):
+                    # Handle nmap --top-ports argument (allow spaces, dashes, letters, numbers)
+                    sanitize_command_arg(self.ports, allowed_chars=r'^[a-zA-Z0-9\s\-=]+$', max_len=65536)
+                else:
+                    # Handle traditional port ranges (numbers, commas, dashes only)
+                    # Strip spaces for traditional port ranges
+                    self.ports = self.ports.replace(' ', '')
+                    sanitize_command_arg(self.ports, allowed_chars=r'^[0-9,\-]+$', max_len=65536)
+            except ValidationError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid ports format: {e}")
 
         # Validate interface if provided
         if self.interface:
@@ -538,6 +549,16 @@ class MasscanBody(BaseModel):
                 sanitize_command_arg(self.interface, allowed_chars=r'^[a-zA-Z0-9_-]+$')
             except ValidationError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid interface: {e}")
+
+    def resolve_ports(self, default: str) -> str:
+        """The caller's ports, or `default` when they did not specify any.
+
+        Routes call this AFTER validate_inputs. The substituted default comes from
+        DEFAULT_QUICK_PORTS / a literal, both of which are trusted values built in
+        this module — not caller input — so they need no re-sanitising.
+        """
+        return self.ports if self.ports else default
+
 
 def create_job(job_type: str, params: Dict) -> str:
     """Create a new job and return job_id"""
@@ -1314,6 +1335,12 @@ def masscan_then_nmap(body: MasscanBody, background_tasks: BackgroundTasks):
     # Validate inputs
     body.validate_inputs()
 
+    # This route feeds nmap enrichment, so an unspecified scope means the
+    # frequency-ranked top-1000 — NOT the model's old blanket 1-65535, which made
+    # every MCP client that omitted ports run a full sweep plus service detection
+    # on everything it found.
+    body.ports = body.resolve_ports(DEFAULT_QUICK_PORTS)
+
     # Store per-scan nmap options for the background task to pick up
     global _nmap_scan_opts
     _nmap_scan_opts = {
@@ -1461,6 +1488,11 @@ def masscan_only(body: MasscanBody, background_tasks: BackgroundTasks):
     """
     # Validate inputs
     body.validate_inputs()
+
+    # Pure discovery sweep with no nmap enrichment behind it, so an unspecified
+    # scope means the full range — same value this model defaulted to before, kept
+    # deliberately rather than by omission.
+    body.ports = body.resolve_ports("1-65535")
 
     # Create job
     job_id = create_job("masscan-only", {
@@ -2323,13 +2355,22 @@ class FullScanRequest(BaseModel):
             if not ports_field.strip():
                 continue
             try:
+                # max_len=65536 matches the masscan/UDP request models above. The
+                # 1000-char default is far too small for a port SPEC: profiles must
+                # resolve to explicit lists (masscan has no --top-ports), and the
+                # top-1000 is 3,808 characters — 3,838 once WEB_PORTS are unioned in.
+                # Without this the route rejected its own default scope with
+                # "Invalid ports format: argument too long (3838 > 1000)", and the
+                # agent quietly fell back to a plain 1-1000 masscan.
+                # Length is not what makes this argument dangerous; the character
+                # allowlist is, and that still applies unchanged.
                 if ports_field.startswith('--top-ports'):
                     # Handle nmap --top-ports argument (allow spaces, dashes, letters, numbers)
-                    sanitize_command_arg(ports_field, allowed_chars=r'^[a-zA-Z0-9\s\-=]+$')
+                    sanitize_command_arg(ports_field, allowed_chars=r'^[a-zA-Z0-9\s\-=]+$', max_len=65536)
                 else:
                     # Handle traditional port ranges (numbers, commas, dashes only)
                     ports_field = ports_field.replace(' ', '')
-                    sanitize_command_arg(ports_field, allowed_chars=r'^[0-9,\-]+$')
+                    sanitize_command_arg(ports_field, allowed_chars=r'^[0-9,\-]+$', max_len=65536)
             except ValidationError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid ports format: {e}")
 
