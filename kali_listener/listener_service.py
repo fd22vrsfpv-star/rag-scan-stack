@@ -909,7 +909,13 @@ _FALLBACK_ALLOWED_TOOLS = {
     "nmap", "hydra", "medusa", "nikto", "whatweb", "enum4linux",
     "smbclient", "smbmap", "ssh-audit", "netexec", "crackmapexec", "nbtscan",
     "snmpwalk", "onesixtyone", "ldapsearch", "dig", "host", "nslookup",
-    "redis-cli", "psql", "mysql", "rpcclient", "showmount"
+    "redis-cli", "psql", "mysql", "rpcclient", "showmount",
+    # Baked into this image (see kali_listener/Dockerfile). Present in the
+    # node-manager registry too; listed here so a registry fetch failure does not
+    # reject a tool the image demonstrably has.
+    "rmg", "dnsenum", "dnsrecon", "enum4linux-ng", "sqlmap", "gobuster",
+    "nuclei", "smtp-user-enum", "snmpcheck", "swaks", "avahi-browse",
+    "tftp", "telnet", "ftp", "lftp", "vncviewer", "ntpq", "ntpdate",
 }
 # Metasploit is never auto-dispatchable here.
 _MSF_DENY = {"metasploit", "msfconsole", "msfvenom", "msf"}

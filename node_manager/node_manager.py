@@ -3117,6 +3117,16 @@ _PROVISION_TOOLS = {
                   "kali": f"{_VENV_PIP} install Pillow",
                   "ubuntu": f"{_VENV_PIP} install Pillow",
                   "debian": f"{_VENV_PIP} install Pillow"},
+    # remote-method-guesser: java-rmi enumeration (port 1099). Not packaged by
+    # Kali, so it is a pinned GitHub release jar behind a /usr/local/bin wrapper.
+    # `verify` greps the banner instead of trusting the exit code — rmg --help
+    # prints correct usage and then exits 1, like many Java CLIs, which fails a
+    # naive `command && echo ok` check on a perfectly good install.
+    "rmg":       {"check": "which rmg",
+                  "verify": "rmg --help 2>&1 | grep -m1 remote-method-guesser",
+                  "kali": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y default-jre-headless && curl -fsSL -o /opt/rmg.jar https://github.com/qtc-de/remote-method-guesser/releases/download/v5.1.0/rmg-5.1.0-jar-with-dependencies.jar && printf '#!/bin/sh\\nexec java -jar /opt/rmg.jar \"$@\"\\n' > /usr/local/bin/rmg && chmod +x /usr/local/bin/rmg",
+                  "ubuntu": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y default-jre-headless && curl -fsSL -o /opt/rmg.jar https://github.com/qtc-de/remote-method-guesser/releases/download/v5.1.0/rmg-5.1.0-jar-with-dependencies.jar && printf '#!/bin/sh\\nexec java -jar /opt/rmg.jar \"$@\"\\n' > /usr/local/bin/rmg && chmod +x /usr/local/bin/rmg",
+                  "debian": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y default-jre-headless && curl -fsSL -o /opt/rmg.jar https://github.com/qtc-de/remote-method-guesser/releases/download/v5.1.0/rmg-5.1.0-jar-with-dependencies.jar && printf '#!/bin/sh\\nexec java -jar /opt/rmg.jar \"$@\"\\n' > /usr/local/bin/rmg && chmod +x /usr/local/bin/rmg"},
     "exiftool":  {"check": "which exiftool",
                   "verify": "exiftool -ver 2>&1",
                   "kali": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' libimage-exiftool-perl",

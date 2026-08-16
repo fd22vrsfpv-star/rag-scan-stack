@@ -8,6 +8,53 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+def resolve_engagement_for_ip(cur, ip: str):
+    """The engagement whose SCOPE contains `ip`, when exactly one does.
+
+    Assets were being created with engagement_id NULL by every scan ingest
+    (parse_nmap and friends insert (id, ip, hostname) only), while the discovery
+    ingests — parse_subfinder, parse_dnsx — did stamp it. The result: an
+    engagement with a populated scope and real assets, none of which were linked
+    to it. Every engagement-scoped query then returned nothing, and the KB
+    recommendation drain in particular could not see a single asset.
+
+    Scope is the authoritative statement of what belongs to an engagement, so it
+    is what resolves the link. Returns None when NO scope matches, and also when
+    MORE THAN ONE does: guessing an owner for a host two engagements both claim
+    would silently attribute findings to the wrong engagement, which is worse
+    than leaving it unstamped.
+    """
+    if not ip:
+        return None
+    try:
+        cur.execute(
+            """
+            SELECT DISTINCT st.engagement_id::text
+              FROM public.scope_targets st
+             WHERE st.engagement_id IS NOT NULL
+               AND st.target <> ''
+               AND (
+                    (st.target_type = 'ip' AND st.target = host(%s::inet)::text)
+                 OR (st.target_type = 'cidr'
+                     AND st.target ~ '^[0-9]+([.][0-9]+){3}/[0-9]+$'
+                     AND %s::inet <<= st.target::inet)
+               )
+             LIMIT 2
+            """,
+            (ip, ip),
+        )
+        rows = cur.fetchall()
+    except Exception as e:
+        logger.debug("engagement resolution failed for %s: %s", ip, e)
+        return None
+    if len(rows) != 1:
+        if len(rows) > 1:
+            logger.info("ip %s is in more than one engagement scope — leaving unstamped", ip)
+        return None
+    r = rows[0]
+    return (r.get("engagement_id") if isinstance(r, dict) else r[0])
+
+
 def ensure_asset(cur, ip: str = None, hostname: str = None) -> str:
     """
     Ensure an asset exists, returning its ID. Creates if missing, updates if needed.
@@ -56,6 +103,21 @@ def ensure_asset(cur, ip: str = None, hostname: str = None) -> str:
 
         result = cur.fetchone()
         asset_id = str(result["id"]) if result else None
+
+        # Link the asset to its engagement if scope says which one it belongs to.
+        # Only ever FILLS a NULL — never overwrites an existing value, so an
+        # operator's manual assignment always wins over inference.
+        if asset_id:
+            eid = resolve_engagement_for_ip(cur, ip)
+            if eid:
+                try:
+                    cur.execute(
+                        "UPDATE assets SET engagement_id = %s::uuid "
+                        " WHERE id = %s::uuid AND engagement_id IS NULL",
+                        (eid, asset_id),
+                    )
+                except Exception as e:
+                    logger.debug("engagement stamp failed for asset %s: %s", asset_id, e)
 
         if asset_id:
             logger.debug(f"Asset ensured for IP {ip}: {asset_id}")
