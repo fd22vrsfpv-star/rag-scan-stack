@@ -314,10 +314,17 @@ services:
     # meaningfully under mem_limit — the JVM needs headroom beyond the heap for
     # metaspace, thread stacks and native buffers.
     #
+    # Measured, not guessed: with -Xmx3g under a 4g limit ZAP sat at 97.5% and was
+    # still CLIMBING (98.4%) during an active scan of 209 URLs. -Xmx caps the HEAP,
+    # not the process; ZAP's non-heap overhead is ~900MB, so 3g heap + 4g limit
+    # leaves effectively zero slack. 6g against a 3g heap gives that overhead room.
+    # Raise the limit rather than shrink the heap: ZAP's passive scan queue grows
+    # with the site tree, so a smaller heap just moves the failure to GC thrash.
+    #
     # restart:unless-stopped stays: it means a single bad target degrades one scan
     # rather than disabling web scanning until someone notices.
     restart: unless-stopped
-    mem_limit: ${ZAP_MEM_LIMIT:-4g}
+    mem_limit: ${ZAP_MEM_LIMIT:-6g}
     networks: [agents_net]
     environment:
       BUILD_VERSION: ${BUILD_VERSION:-dev}
