@@ -44,6 +44,55 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# Tools the KB recommender asks for that were missing from this image.
+#
+# Every one of these was recommended by scan_recommendations and then skipped at
+# dispatch with "'<tool>' missing on kali; install failed". A runtime
+# auto-install path exists, but apt inside a running container is slow, flaky and
+# lost on the next rebuild — baking them in makes the recommendation queue
+# actionable and keeps it that way.
+#
+# Package names differ from the tool names the recommender emits, which is WHY the
+# runtime auto-install failed even for tools that do exist: it apt-installs the
+# scanner name verbatim. Each mapping below was verified with apt-cache policy
+# against the Kali repo before being added:
+#   avahi-browse -> avahi-utils       ntpq / ntpdate -> ntpsec, ntpsec-ntpdate
+#   snmp-check   -> snmpcheck         tftp           -> tftp-hpa
+#   vncviewer    -> tigervnc-viewer   xspy / xwd     -> x11-apps, x11-utils
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    avahi-utils \
+    crackmapexec \
+    dnsenum \
+    dnsrecon \
+    enum4linux-ng \
+    ftp \
+    gobuster \
+    irssi \
+    lftp \
+    ntpsec \
+    ntpsec-ntpdate \
+    nuclei \
+    smtp-user-enum \
+    snmpcheck \
+    sqlmap \
+    swaks \
+    telnet \
+    tftp-hpa \
+    tigervnc-viewer \
+    x11-apps \
+    x11-utils \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Deliberately NOT installed here:
+#   metasploit-framework (~2GB) — the stack already runs a dedicated `metasploit`
+#     container with msfrpcd, which exploit-runner drives over RPC. A second copy
+#     inside kali costs ~2GB for no new capability; the 41 metasploit
+#     recommendations need ROUTING to that service, not another install.
+#   katana, rmg — not in the Kali repos at all (verified with apt-cache policy).
+#     Both are upstream release binaries, so adding them means vendoring a
+#     download, which is a separate decision from installing a package.
+
 # Extract rockyou wordlist (comes compressed)
 RUN gunzip -k /usr/share/wordlists/rockyou.txt.gz 2>/dev/null || true
 
