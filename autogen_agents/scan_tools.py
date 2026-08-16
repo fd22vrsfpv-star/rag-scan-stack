@@ -4,6 +4,7 @@ Provides function interfaces to all scanning services
 """
 
 import os
+from urllib.parse import urlparse
 import httpx as _httpx
 import json
 
@@ -524,6 +525,113 @@ class SessionScanTracker:
         return out
 
     @classmethod
+    def _kb_coverage(cls, targets: List[str], types_run: List[str]) -> Dict[str, Any]:
+        """Did the run act on what the knowledge base recommended?
+
+        The flow summary was otherwise pure telemetry — counts of what happened,
+        with no reference to anything the system had learned. That answers "what
+        ran" but not "did it run what the KB said to run", which for a RAG-driven
+        scanner is the question worth asking.
+
+        scan_recommendations is populated per discovered (ip, service) by the
+        post-ingest recommender: `source='rules'` rows come from the KB, other
+        sources (e.g. 'ollama') come from the model. Cross-referencing them
+        against the scan types that actually ran turns the summary into a coverage
+        report — and surfaces recommendations that were generated and then ignored,
+        which is invisible everywhere else.
+
+        Degrades to {"available": False} on any DB problem: this is reporting, and
+        must never be the reason a session teardown fails.
+        """
+        db_dsn = os.environ.get(
+            "DB_DSN", "dbname=scans user=app password=app host=rag-postgres port=5432")
+        try:
+            import psycopg2
+            from psycopg2.extras import RealDictCursor
+            with psycopg2.connect(db_dsn) as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    if targets:
+                        cur.execute(
+                            "SELECT scanner, service, source, status, priority "
+                            "FROM scan_recommendations "
+                            "WHERE host(ip)::text = ANY(%s)", (list(targets),))
+                    else:
+                        cur.execute(
+                            "SELECT scanner, service, source, status, priority "
+                            "FROM scan_recommendations")
+                    rows = [dict(r) for r in cur.fetchall()]
+        except Exception as e:
+            logger.warning("KB coverage lookup failed: %s", e)
+            return {"available": False, "reason": str(e)[:200]}
+
+        if not rows:
+            return {"available": True, "recommendations": 0,
+                    "note": "no KB recommendations exist for these targets"}
+
+        ran = {str(t).lower() for t in types_run}
+
+        # Which SCAN TYPES satisfy a recommended SCANNER. Substring matching is not
+        # good enough: "nmap" does not appear in "full_scan", so a full scan — which
+        # IS an nmap scan — was reported as "nmap recommended x48, never run".
+        # A coverage report that wrongly accuses is worse than none, so the mapping
+        # is explicit. Recommenders naming a tool the stack has no scan type for
+        # (metasploit, enum4linux) correctly stay uncovered — that is a real gap,
+        # not a matching artefact.
+        SATISFIED_BY = {
+            "nmap": {"nmap", "full_scan", "masscan-then-nmap", "nmap-tcp",
+                     "deep_port_scan", "nmap-udp", "udp_scan"},
+            "masscan": {"masscan", "full_scan", "masscan-then-nmap", "deep_port_scan"},
+            "naabu": {"naabu", "full_scan"},
+            "nuclei": {"nuclei", "pipeline", "web"},
+            "gobuster": {"gobuster", "pipeline", "web"},
+            "nikto": {"nikto", "pipeline", "web"},
+            "katana": {"katana", "pipeline", "web"},
+            "zap": {"zap", "pipeline", "web"},
+            "playwright": {"playwright", "pipeline", "web"},
+            "hydra": {"credential-check", "credential_check", "brutus"},
+            "smbmap": {"smb-vuln-scan", "smb_vuln_scan"},
+            "enum4linux": {"smb-vuln-scan", "smb_vuln_scan"},
+            "crackmapexec": {"credential-check", "smb-vuln-scan"},
+        }
+
+        def _acted(scanner: str) -> bool:
+            sc = (scanner or "").lower()
+            if sc in ran:
+                return True
+            return bool(SATISFIED_BY.get(sc, set()) & ran)
+
+        by_source, by_scanner = {}, {}
+        acted = 0
+        for r in rows:
+            src = r.get("source") or "unknown"
+            by_source[src] = by_source.get(src, 0) + 1
+            sc = r.get("scanner") or "unknown"
+            e = by_scanner.setdefault(sc, {"recommended": 0, "acted_on": False,
+                                           "top_priority": None})
+            e["recommended"] += 1
+            pr = r.get("priority")
+            if isinstance(pr, int) and (e["top_priority"] is None or pr > e["top_priority"]):
+                e["top_priority"] = pr
+            if _acted(sc):
+                e["acted_on"] = True
+                acted += 1
+
+        ignored = sorted(
+            ({"scanner": k, **v} for k, v in by_scanner.items() if not v["acted_on"]),
+            key=lambda x: (-(x["top_priority"] or 0), -x["recommended"]),
+        )
+        return {
+            "available": True,
+            "recommendations": len(rows),
+            "by_source": by_source,           # 'rules' = KB, others = model
+            "acted_on": acted,
+            "ignored": len(rows) - acted,
+            "coverage_pct": round(100.0 * acted / len(rows), 1),
+            "recommended_but_never_run": ignored[:15],
+            "pending_status_count": sum(1 for r in rows if (r.get("status") or "") == "pending"),
+        }
+
+    @classmethod
     def build_flow_summary(cls, session_id: str = None) -> Dict[str, Any]:
         """End-of-session report: what each SCAN TYPE actually did, in order.
 
@@ -598,9 +706,17 @@ class SessionScanTracker:
                 seen.add(t)
                 flow.append(t)
 
+        all_targets = sorted({t for e in by_type.values() for t in e["targets"]})
+        # Strip URLs down to hosts so they match scan_recommendations.ip.
+        hosts = sorted({
+            (urlparse(t if "://" in t else "//" + t).hostname or t)
+            for t in all_targets
+        })
+
         return {
             "session_id": session_id,
             "generated_at": datetime.utcnow().isoformat() + "Z",
+            "kb_coverage": cls._kb_coverage(hosts, flow),
             "scan_types_run": len(by_type),
             "total_scans": len(scans),
             "flow_order": flow,
