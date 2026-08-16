@@ -759,7 +759,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                 """
                 SELECT id::text, host(ip)::text AS ip, service, scanner, action,
                        script, template, source, model, confidence, priority,
-                       status, extra
+                       status, extra, target_kind
                   FROM scan_recommendations
                  WHERE id = ANY(%s::uuid[])
                 """,
@@ -904,11 +904,34 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
     node_id = body.node_id
 
     # Map scanner → endpoint and payload builder
+    # Dispatch understands ONE shape: (ip, service, port) -> scanner. Anything
+    # else must be refused with a reason rather than fired at an IP as though it
+    # were a network scan — a silent no-op that then sits in the KB coverage
+    # report forever as "recommended but never run".
+    NON_SERVICE_KIND_REASON = {
+        "artifact": ("targets a FILE, not a host — it needs an artifact reference "
+                     "(evidence_store / content_extractions), which this dispatch "
+                     "path does not carry yet"),
+        "range": ("targets a CIDR/scope, not a single service — it must be "
+                  "deduped to one sweep per scope at GENERATION time, or it "
+                  "produces one identical sweep per discovered service"),
+        "resource": ("is not runnable — it is an INPUT to other tools (wordlists, "
+                     "template sets). Treat it as a prerequisite to install, not "
+                     "a scan to dispatch"),
+    }
+
     async def dispatch_rec(rec):
         scanner = rec.get("scanner", "").lower()
         ip = (rec.get("ip") or "").replace("/32", "")
         service_url = SCANNER_URLS.get(scanner)
         result = {"id": rec["id"], "scanner": scanner, "ip": ip}
+
+        kind = (rec.get("target_kind") or "service").lower()
+        if kind != "service":
+            result["status"] = "skipped"
+            result["target_kind"] = kind
+            result["detail"] = f"'{scanner}' {NON_SERVICE_KIND_REASON.get(kind, f'has target_kind={kind}, which dispatch does not handle')}"
+            return result
 
         # Tools a service DOES serve but which are not mapped above. Without this
         # the operator is told "missing on kali" for something the stack already

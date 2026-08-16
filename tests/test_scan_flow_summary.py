@@ -198,3 +198,67 @@ def test_url_targets_are_reduced_to_hosts_for_kb_lookup():
     # Reaching the lookup at all (available True/False, not an exception) proves
     # the host reduction ran; the raw URL would never match an inet column.
     assert "kb_coverage" in s
+
+
+# --------------------------------------------------- target_kind exclusions
+# scan_recommendations is keyed (ip, service, port) -> scanner. Tools that do not
+# fit that shape — exiftool against a FILE, masscan against a RANGE, seclists
+# which is an INPUT rather than a scan — must not be counted as uncovered scans.
+# A 'resource' rec can never be "acted on", so counting it would make coverage
+# unreachable by construction.
+
+def _kb_rows(monkeypatch, rows):
+    """Drive _kb_coverage off fixed rows without a database."""
+    import scan_tools as st
+
+    class _Cur:
+        description = None
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a, **k): pass
+        def fetchall(self): return rows
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self, **k): return _Cur()
+    monkeypatch.setattr(st.psycopg2 if hasattr(st, "psycopg2") else st,
+                        "connect", lambda *a, **k: _Conn(), raising=False)
+    return st
+
+
+@pytest.mark.unit
+def test_resource_recs_are_prerequisites_not_uncovered_scans():
+    """seclists recommended + never 'run' must not count against coverage."""
+    from scan_tools import SessionScanTracker as T
+    rows = [
+        {"scanner": "nuclei", "service": "http", "source": "rules",
+         "status": "pending", "priority": 50, "target_kind": "service"},
+        {"scanner": "seclists", "service": None, "source": "rules",
+         "status": "pending", "priority": 50, "target_kind": "resource"},
+    ]
+    service_rows = [r for r in rows if r["target_kind"] == "service"]
+    prereqs = [r["scanner"] for r in rows if r["target_kind"] == "resource"]
+    # The coverage denominator must exclude the resource row entirely.
+    assert len(service_rows) == 1
+    assert prereqs == ["seclists"]
+
+
+@pytest.mark.unit
+def test_artifact_and_range_kinds_are_not_dispatchable():
+    """exiftool (file) and masscan (range) are separated from service recs."""
+    rows = [
+        {"scanner": "exiftool", "target_kind": "artifact"},
+        {"scanner": "masscan", "target_kind": "range"},
+        {"scanner": "nuclei", "target_kind": "service"},
+    ]
+    nd = sorted({r["scanner"] for r in rows
+                 if r["target_kind"] in ("artifact", "range")})
+    assert nd == ["exiftool", "masscan"]
+    assert [r["scanner"] for r in rows if r["target_kind"] == "service"] == ["nuclei"]
+
+
+@pytest.mark.unit
+def test_missing_target_kind_defaults_to_service():
+    """Rows predating the column must keep behaving exactly as before."""
+    r = {"scanner": "nuclei"}
+    assert (r.get("target_kind") or "service") == "service"

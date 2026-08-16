@@ -357,10 +357,36 @@ CREATE TABLE IF NOT EXISTS public.scan_recommendations (
     confidence  numeric,
     priority    integer DEFAULT 50,
     status      text DEFAULT 'pending' CHECK (status IN ('pending','queued','running','completed','failed','skipped')),
+    -- What the recommendation is actually aimed at. Dispatch only understands
+    -- 'service' — (ip, service, port) -> scanner. The others exist so a
+    -- recommendation that does NOT fit that shape is refused with a reason
+    -- instead of being fired at an IP as if it were a network scan:
+    --   service   default; a network service on a host
+    --   artifact  a FILE, not a host (exiftool on a downloaded document). Needs
+    --             an artifact reference; `ip` is meaningless for it.
+    --   range     a CIDR/scope swept once (masscan). Must be deduped at
+    --             GENERATION, not per discovered service, or it produces N
+    --             identical sweeps.
+    --   resource  not runnable at all (seclists, wordlists) — an INPUT to other
+    --             tools. Must never count against KB coverage, or the metric can
+    --             never reach 100% by construction.
+    target_kind text NOT NULL DEFAULT 'service'
+                CHECK (target_kind IN ('service','artifact','range','resource')),
     executed_at timestamptz,
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
+-- Existing installs: add target_kind + its constraint without failing if present.
+DO $$ BEGIN
+    ALTER TABLE public.scan_recommendations
+        ADD COLUMN IF NOT EXISTS target_kind text NOT NULL DEFAULT 'service';
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN
+    ALTER TABLE public.scan_recommendations
+        ADD CONSTRAINT scan_recommendations_target_kind_check
+        CHECK (target_kind IN ('service','artifact','range','resource'));
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
+CREATE INDEX IF NOT EXISTS idx_scan_recommendations_target_kind ON public.scan_recommendations(target_kind);
 CREATE INDEX IF NOT EXISTS idx_scan_recommendations_asset_id ON public.scan_recommendations(asset_id);
 CREATE INDEX IF NOT EXISTS idx_scan_recommendations_ip ON public.scan_recommendations(ip);
 CREATE INDEX IF NOT EXISTS idx_scan_recommendations_scanner ON public.scan_recommendations(scanner);
