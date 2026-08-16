@@ -16,7 +16,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Tuple, Union
 import secrets
 import base64
 
@@ -5228,6 +5228,10 @@ class WireGuardConfig(BaseModel):
     qr_code: Optional[str] = None
     installation_status: str = "pending"  # pending, success, failed
     installation_logs: list[str] = []
+    # How the Endpoint was determined, and what still has to be true for it to
+    # work (NAT forwarding). Present only when it had to be derived, i.e. when
+    # WG_SERVERURL was left at "auto".
+    endpoint_note: Optional[str] = None
 
 class CreateWGPeerRequest(BaseModel):
     """Request to create a WireGuard peer."""
@@ -5631,6 +5635,82 @@ def _wg_peers_from_config() -> Dict[str, str]:
     return peers
 
 
+
+async def _derive_wg_endpoint(node_id: str) -> Optional[Tuple[str, str]]:
+    """Where this server is reachable, as (address, how_we_learned_it).
+
+    `WG_SERVERURL` defaults to "auto", which reaches the client config verbatim
+    and yields `Endpoint = auto:51820` — an unroutable string.
+
+    Two ways to answer, tried in this order:
+
+    1. **Ask the node.** Our SSH session arrives from some address and the node
+       has it in `$SSH_CLIENT`. That is authoritative FOR THAT NODE: by
+       definition an address it can route to us on, correct even when this host
+       is multi-homed or the node is on the same LAN.
+    2. **Ask a public-IP service.** Works with no node connected, but it answers
+       "what does the INTERNET see", which is not necessarily what a particular
+       node sees, and it discloses a lookup to a third party — a small but real
+       consideration for a tool run from an operator's box. Hence second, and
+       only when the node cannot answer.
+
+    Note the direction: the node's own IP (54.186.15.40 here) is the WRONG
+    answer — that is where WE dial IT. The endpoint is where IT dials US; behind
+    NAT those differ, and this host is 199.168.198.186 from the node's side.
+
+    CAVEAT either way: this yields the right ADDRESS, not a working path. If it
+    is a NAT gateway, UDP/51820 must still be forwarded here. Callers say so
+    rather than implying the tunnel will work.
+    """
+    # 1. The node's own view.
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT metadata FROM remote_nodes WHERE id = %s", (node_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        meta = (row[0] if row else None) or {}
+    except Exception as e:
+        log.debug("wg endpoint: no metadata for %s (%s)", node_id, e)
+        meta = {}
+
+    if meta.get("host"):
+        try:
+            res = await ssh_manager.exec_command(
+                node_id=node_id, host=meta["host"],
+                user=meta.get("user", "root"),
+                ssh_port=meta.get("ssh_port", 22),
+                key_file=meta.get("key_file", "id_rsa"),
+                command="echo $SSH_CLIENT",
+                timeout=15,
+            )
+            addr = ((res or {}).get("stdout") or "").strip().split()
+            addr = addr[0] if addr else ""
+            if addr and re.match(r"^[0-9a-fA-F:.]+$", addr) and len(addr) <= 45:
+                log.info("WireGuard endpoint %s derived from node %s SSH_CLIENT",
+                         addr, node_id)
+                return addr, "node's SSH_CLIENT (authoritative for this node)"
+        except Exception as e:
+            log.debug("wg endpoint: node %s could not report SSH_CLIENT (%s)", node_id, e)
+
+    # 2. Public-IP lookup. Opt-out, because it is an outbound call to a third
+    #    party from the operator's host.
+    if os.getenv("WG_ENDPOINT_PUBLIC_LOOKUP", "1").lower() in ("1", "true", "yes"):
+        for url in ("https://ifconfig.me/ip", "https://api.ipify.org"):
+            try:
+                import urllib.request
+                with urllib.request.urlopen(url, timeout=6) as r:
+                    addr = r.read().decode().strip()
+                if addr and re.match(r"^[0-9a-fA-F:.]+$", addr) and len(addr) <= 45:
+                    log.info("WireGuard endpoint %s derived from %s", addr, url)
+                    return addr, f"public-IP lookup via {url}"
+            except Exception as e:
+                log.debug("wg endpoint: %s failed (%s)", url, e)
+
+    return None
+
+
 def _get_server_public_key():
     """Read WireGuard server public key."""
     try:
@@ -5859,6 +5939,27 @@ async def create_wg_peer(request: CreateWGPeerRequest):
         server_public_key = _get_server_public_key()
         server_url = request.endpoint or os.getenv("WG_SERVERURL", "auto")
         server_port = os.getenv("WG_LISTEN_PORT", "51820")
+        endpoint_note = None
+        if not server_url or server_url == "auto":
+            # "auto" reaches the client config verbatim as `Endpoint = auto:51820`,
+            # which cannot be dialled. Ask the node where it sees us from, or fall
+            # back to a public-IP lookup.
+            derived = await _derive_wg_endpoint(request.node_id)
+            if derived:
+                server_url, how = derived
+                endpoint_note = (
+                    f"Endpoint {server_url}:{server_port} was derived from the {how}. "
+                    f"If that address is a NAT gateway, UDP/{server_port} must be "
+                    f"forwarded to this host — deriving the address cannot do that. "
+                    f"Set WG_SERVERURL to pin it explicitly."
+                )
+            else:
+                endpoint_note = (
+                    "Could not determine a reachable endpoint; the config says "
+                    "'auto', which is NOT dialable. Set WG_SERVERURL to this "
+                    "server's reachable address."
+                )
+            log.warning("WireGuard endpoint resolution: %s", endpoint_note)
 
         # Store WireGuard config but keep tunnel_method as 'ssh' until verified
         cur.execute("""
@@ -5937,7 +6038,8 @@ PersistentKeepalive = 25
             node_id=request.node_id,
             client_config=client_config,
             installation_status=installation_status,
-            installation_logs=installation_logs
+            installation_logs=installation_logs,
+            endpoint_note=endpoint_note,
         )
 
     except Exception as e:
