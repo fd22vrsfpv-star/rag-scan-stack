@@ -971,7 +971,9 @@ async def create_wg_peer(request: Request):
     s = get_settings()
     body = await request.json()
 
-    async with httpx.AsyncClient(verify=False, timeout=300) as c:
+    # Remote package installation over SSH; the node_manager step alone
+    # allows 420s. Must exceed it or the BFF times out mid-install.
+    async with httpx.AsyncClient(verify=False, timeout=900) as c:
         resp = await c.post(
             f"{s.tunnel_manager_url}/api/wg/peers",
             json=body

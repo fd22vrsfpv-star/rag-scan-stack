@@ -1158,7 +1158,7 @@ async def _reload_wg_tunnels():
     """Reload/reconnect ALL WireGuard tunnels from DB on startup.
 
     Starts WireGuard tunnels for nodes with successful WireGuard installation.
-    Uses socat to forward local SOCKS port to remote microsocks.
+    Uses socat to forward the local SOCKS port to the remote SOCKS server (danted).
     """
     try:
         conn = _get_conn()
@@ -1218,7 +1218,7 @@ async def _reload_wg_tunnels():
 
             # Start WireGuard tunnel using socat
             try:
-                # Create socat process to forward local SOCKS port to remote microsocks
+                # Create socat process to forward local SOCKS port to the remote SOCKS server
                 socat_cmd = [
                     "socat",
                     f"TCP-LISTEN:{socks_port},fork",
@@ -5273,7 +5273,7 @@ async def _auto_install_wireguard(node_id: str, client_config: str, assigned_ip:
     logs.append(f"Starting WireGuard installation on {user}@{host}:{ssh_port}")
 
     try:
-        # Step 1: Install WireGuard and microsocks using script upload approach
+        # Step 1: Install WireGuard and the SOCKS server using script upload approach
         logs.append("Step 1: Installing WireGuard and dependencies...")
 
         # Create installation script content
@@ -5283,29 +5283,100 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 
 echo "Cleaning up any stuck apt processes and locks..."
-# Exact names only: `pkill -f 'apt|dpkg'` also matches this script's own command
-# line (the remote shell is invoked as `zsh -c '...apt...'`) and kills the very
-# install it is preparing for.
-for _p in apt apt-get dpkg; do pkill -x "$_p" 2>/dev/null || true; done
+# Serialise installs on this node with a lock, and do NOT kill other apt runs.
+#
+# The previous approach waited, then pkill'd whatever survived. With two
+# invocations in flight that is mutual destruction: one reaches its pkill and
+# kills the other's `apt-get update` mid-fetch, which the log shows as
+# "Terminated  apt-get ... update -qq" and the caller sees as a step timeout.
+# Nothing serialised installs on a node, so any overlap — a retry, the watchdog,
+# two operators — produced exactly that.
+#
+# flock makes overlap wait instead of fight. The lock is released automatically
+# when this shell exits, including on kill, so a crashed run cannot wedge it.
+exec 9>/var/lock/rag-wg-install.lock 2>/dev/null || exec 9>/tmp/rag-wg-install.lock
+if ! flock -w 600 9; then
+    echo "ERROR: another WireGuard install has held the lock for 10 minutes"
+    exit 1
+fi
+echo "Acquired install lock"
+
+# Only now consider genuinely orphaned apt state. A process still running here
+# is not a competing install (the lock excludes those) — it is unattended
+# upgrades or a leftover, so wait for it rather than killing it.
+echo "Waiting for any in-flight apt/dpkg to finish..."
+for _i in $(seq 1 48); do
+    if ! pgrep -x apt-get >/dev/null 2>&1 && ! pgrep -x dpkg >/dev/null 2>&1 \
+       && ! pgrep -x unattended-upgrade >/dev/null 2>&1; then
+        break
+    fi
+    sleep 5
+done
+
+# Stale lock FILES (not processes) are safe to clear once nothing is running.
+if ! pgrep -x apt-get >/dev/null 2>&1 && ! pgrep -x dpkg >/dev/null 2>&1; then
+    rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
+          /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null || true
+    dpkg --configure -a >/dev/null 2>&1 || true
+fi
 rm -f /var/lib/dpkg/lock* /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null || true
 dpkg --configure -a 2>/dev/null || true
 
-echo "Updating package lists..."
-apt-get update -qq
+# Wait for the dpkg lock rather than dying on it. The pkill above clears a
+# STUCK apt, but a legitimately running one — unattended-upgrades, or another
+# provisioning run — is not stuck and must not be killed. Without this, a
+# concurrent `apt-get update` made the install fail instantly with
+# "Could not get lock /var/lib/dpkg/lock-frontend", which then presented as a
+# 180s step timeout rather than as a lock conflict.
+APT_OPTS="-o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+export DEBIAN_FRONTEND=noninteractive
+
+# Refresh package lists only when they are actually stale.
+#
+# Measured on a live node: lists 60 days old, and `apt-get update` still running
+# after 182 seconds — a full 76MB refetch. Every install paid that cost even when
+# the previous one had just done it, which is most of why a fixed step budget
+# kept expiring. Six hours is well inside the window where a package that
+# resolved before still resolves.
+LISTS_AGE_MIN=99999
+NEWEST="$(find /var/lib/apt/lists -maxdepth 1 -name '*Packages*' -printf '%T@\n' 2>/dev/null | sort -rn | head -1)"
+if [ -n "$NEWEST" ]; then
+    LISTS_AGE_MIN=$(( ( $(date +%s) - ${{NEWEST%.*}} ) / 60 ))
+fi
+if [ "$LISTS_AGE_MIN" -gt 360 ]; then
+    echo "Package lists are ${LISTS_AGE_MIN} min old — updating (this can take minutes)..."
+    apt-get $APT_OPTS update -qq
+else
+    echo "Package lists are ${LISTS_AGE_MIN} min old — skipping update"
+fi
 
 echo "Installing WireGuard tools..."
-apt-get install -y wireguard-tools iproute2 curl netcat-openbsd
+apt-get $APT_OPTS install -y wireguard-tools iproute2 curl netcat-openbsd
 
-# Install microsocks if not present
-if ! command -v microsocks >/dev/null 2>&1; then
-    if [ ! -f /usr/local/bin/microsocks ]; then
-        echo "Downloading microsocks..."
-        curl -L -o /tmp/microsocks https://github.com/rofl0r/microsocks/releases/download/v1.0.3/microsocks-linux-x86_64
-        chmod +x /tmp/microsocks
-        mv /tmp/microsocks /usr/local/bin/microsocks
-        echo "microsocks installed"
-    fi
+# SOCKS proxy: dante-server, not microsocks.
+#
+# microsocks was fetched from
+#   github.com/rofl0r/microsocks/releases/download/v1.0.3/microsocks-linux-x86_64
+# which 404s — that project ships SOURCE-ONLY releases. `curl -L -o` without -f
+# then wrote the 404 body to disk, leaving a 9-byte "Not Found" file marked
+# executable, and the failure surfaced much later as "microsocks startup failed
+# - Unknown error".
+#
+# dante-server is packaged (1.4.4), and three properties matter more than the
+# download being fixable:
+#   * systemd-managed — supervised, restarted on failure, survives reboot. The
+#     microsocks path used nohup, so the proxy died with the shell or the box.
+#   * real logging to syslog rather than a redirect into /tmp.
+#   * ACCESS CONTROL. `microsocks -i <ip> -p 1080` accepts anyone who can reach
+#     that address — an open SOCKS relay on an internet-facing node. danted
+#     restricts to the WireGuard subnet below.
+echo "Installing dante-server..."
+apt-get $APT_OPTS install -y dante-server >/dev/null 2>&1 || true
+if ! command -v danted >/dev/null 2>&1 && [ ! -x /usr/sbin/danted ]; then
+    echo "ERROR: dante-server did not install"
+    exit 1
 fi
+echo "dante-server ready"
 
 echo "Installation completed successfully"
 """
@@ -5333,7 +5404,11 @@ echo "Installation completed successfully"
             # Execute script remotely (simple command that won't be blocked)
             result = await ssh_manager.exec_command(
                 node_id=node_id, host=host, user=user, ssh_port=ssh_port,
-                key_file=key_file, command="bash /tmp/install_wg.sh", timeout=180
+                key_file=key_file, command="bash /tmp/install_wg.sh",
+            # Must exceed the 120s dpkg lock wait above plus the actual install,
+            # otherwise the step times out while apt is legitimately waiting and
+            # the operator sees "Command timed out" instead of the real cause.
+            timeout=420
             )
 
         finally:
@@ -5456,42 +5531,68 @@ echo "Config installed: /etc/wireguard/wg0.conf"
         if result.get("stdout"):
             logs.append(f"Interface info: {result['stdout'][:100]}...")
 
-        # Step 4: Start microsocks
-        logs.append("Step 4: Starting microsocks SOCKS proxy...")
-        microsocks_cmd = f"""
-        # Kill any existing microsocks
-        pkill microsocks 2>/dev/null || true
+        # Step 4: Configure and start the SOCKS server
+        logs.append("Step 4: Configuring dante SOCKS proxy...")
+        socks_cmd = f"""
+        set -e
+        # The external interface is whatever carries the default route; danted
+        # needs it named explicitly and it is not always eth0.
+        EXT_IF="$(ip route get 1.1.1.1 2>/dev/null | awk '{{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}}' | head -1)"
+        EXT_IF="${{EXT_IF:-eth0}}"
+        echo "External interface: $EXT_IF"
 
-        # Start microsocks on WireGuard interface
-        echo "Starting microsocks on {assigned_ip}:1080..."
-        nohup /usr/local/bin/microsocks -i {assigned_ip} -p 1080 >/tmp/microsocks.log 2>&1 &
+        # Bind to the WireGuard address and accept ONLY the WireGuard subnet.
+        # microsocks had no equivalent — it accepted anyone who could reach the
+        # address, which on an internet-facing node is an open relay.
+        cat > /etc/danted.conf <<DANTED
+logoutput: syslog
+internal: {assigned_ip} port = 1080
+external: $EXT_IF
+socksmethod: none
+clientmethod: none
+user.privileged: root
+user.unprivileged: nobody
+
+client pass {{
+    from: 10.66.0.0/24 to: 0.0.0.0/0
+    log: connect disconnect error
+}}
+socks pass {{
+    from: 10.66.0.0/24 to: 0.0.0.0/0
+    log: connect disconnect error
+}}
+DANTED
+
+        # danted binds `internal` at startup, so wg0 must already carry the
+        # address — step 3 brought it up. Restart rather than start so a stale
+        # instance bound to a previous IP is replaced.
+        systemctl enable danted >/dev/null 2>&1 || true
+        systemctl restart danted 2>&1 | tail -3 || true
         sleep 3
 
-        # Verify microsocks is listening
-        echo "Checking microsocks status..."
-        if netstat -ln 2>/dev/null | grep {assigned_ip}:1080; then
-            echo "microsocks is listening on {assigned_ip}:1080"
-        elif ss -ln 2>/dev/null | grep {assigned_ip}:1080; then
-            echo "microsocks is listening on {assigned_ip}:1080 (ss)"
+        echo "Checking danted status..."
+        if ss -ln 2>/dev/null | grep -q "{assigned_ip}:1080" || netstat -ln 2>/dev/null | grep -q "{assigned_ip}:1080"; then
+            echo "danted is listening on {assigned_ip}:1080"
         else
-            echo "ERROR: microsocks not listening on {assigned_ip}:1080"
-            cat /tmp/microsocks.log 2>/dev/null || echo "No microsocks log"
+            echo "ERROR: danted not listening on {assigned_ip}:1080"
+            systemctl status danted --no-pager 2>&1 | tail -12 || true
+            journalctl -u danted -n 20 --no-pager 2>&1 | tail -20 || true
             exit 1
         fi
         """
 
         result = await ssh_manager.exec_command(
             node_id=node_id, host=host, user=user, ssh_port=ssh_port,
-            key_file=key_file, command=microsocks_cmd, timeout=30
+            key_file=key_file, command=socks_cmd, timeout=30
         )
 
         if not result.get("ok"):
-            logs.append(f"ERROR: microsocks startup failed - {result.get('error', 'Unknown error')}")
+            logs.append(f"ERROR: dante startup failed - {result.get('error', 'Unknown error')}")
             if result.get("stderr"):
                 logs.append(f"STDERR: {result['stderr'][:200]}")
             return logs, False
 
-        logs.append("✓ microsocks SOCKS proxy started")
+        logs.append("✓ dante SOCKS proxy started (systemd-managed, restricted to the WG subnet)")
 
         # Step 5: Test connectivity
         logs.append("Step 5: Testing WireGuard connectivity...")
@@ -5505,11 +5606,11 @@ echo "Config installed: /etc/wireguard/wg0.conf"
         fi
 
         # Test if microsocks responds
-        echo "Testing microsocks connectivity..."
+        echo "Testing SOCKS connectivity..."
         if nc -z {assigned_ip} 1080; then
-            echo "✓ microsocks is responding"
+            echo "✓ SOCKS proxy is responding"
         else
-            echo "ERROR: microsocks not responding"
+            echo "ERROR: SOCKS proxy not responding"
             exit 1
         fi
 
@@ -6675,7 +6776,7 @@ async def start_wg_tunnel(node_id: str):
 
     # Start the WireGuard tunnel
     try:
-        # Create socat process to forward local SOCKS port to remote microsocks
+        # Create socat process to forward local SOCKS port to the remote SOCKS server
         # socat TCP-LISTEN:10120,fork TCP:10.66.0.3:1080
         socat_cmd = [
             "socat",
