@@ -916,6 +916,72 @@ def _dispatch_auto_execute(ip: str, service: str, port: int):
 
 
 # ---- Persistence ----
+# ── Tool classification for scan_recommendations.target_kind ─────────────────
+#
+# Dispatch understands ONE shape: (ip, service, port) -> scanner. Tools that do
+# not fit it must be labelled at GENERATION, because two of the three classes
+# cannot be fixed later:
+#
+#   range     A sweep of a CIDR, run ONCE. The unique fingerprint is
+#             md5(ip|service|scanner|action|script|template), so a range tool
+#             recommended per discovered (ip, service) produces a DIFFERENT
+#             fingerprint every time — one identical sweep per service found. On
+#             a host with 18 open ports that is 18 masscans of the same range.
+#             Deduping at dispatch cannot recover this: the rows already exist.
+#   artifact  Targets a FILE, not a host. `ip` is meaningless for it.
+#   resource  Not runnable at all — an INPUT to other tools.
+#
+# Anything unlisted is 'service', the default, so this map only ever narrows
+# behaviour for tools explicitly known not to fit.
+RANGE_TOOLS = {"masscan", "nmap-sweep", "netdiscover", "arp-scan", "fping", "zmap"}
+ARTIFACT_TOOLS = {"exiftool", "binwalk", "strings", "foremost", "steghide", "pdfid",
+                  "oledump", "peepdf"}
+RESOURCE_TOOLS = {"seclists", "wordlists", "rockyou", "nuclei-templates",
+                  "payloadsallthethings", "fuzzdb"}
+
+
+def classify_target_kind(scanner: Optional[str]) -> str:
+    """'service' | 'range' | 'artifact' | 'resource' for a tool name."""
+    t = (scanner or "").strip().lower()
+    if t in RANGE_TOOLS:
+        return "range"
+    if t in ARTIFACT_TOOLS:
+        return "artifact"
+    if t in RESOURCE_TOOLS:
+        return "resource"
+    return "service"
+
+
+def _scope_cidr_for(cur, engagement_id: Optional[str], ip: str) -> Optional[str]:
+    """The engagement CIDR containing `ip`, if one is defined.
+
+    A range sweep belongs to a SCOPE, not a host. Keying it to the covering CIDR
+    is what makes the existing fingerprint collapse many per-host suggestions
+    into one sweep. Falls back to None (caller then keys on the host with a NULL
+    service, which still collapses per-service duplicates for that host).
+    """
+    if not engagement_id:
+        return None
+    try:
+        cur.execute(
+            """
+            SELECT st.target FROM public.scope_targets st
+             WHERE st.engagement_id = %s::uuid
+               AND st.target_type = 'cidr'
+               AND st.target ~ '^[0-9]+([.][0-9]+){3}/[0-9]+$'
+               AND %s::inet <<= st.target::inet
+             ORDER BY masklen(st.target::inet) ASC
+             LIMIT 1
+            """,
+            (engagement_id, ip),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception as e:
+        logger.debug("scope CIDR lookup failed for %s: %s", ip, e)
+        return None
+
+
 def persist_recommendations(
     ip: str,
     recs: List[Dict[str, Optional[str]]],
@@ -1011,23 +1077,45 @@ def persist_recommendations(
             # priority: NULL → DB default (50) via COALESCE.  Lower runs first.
             rec_priority = rec.get("priority")
 
+            # Classify, and for RANGE tools rewrite the identity so the existing
+            # unique fingerprint does the deduping for us.
+            #
+            # fingerprint = md5(ip|service|scanner|action|script|template). A
+            # range sweep suggested once per discovered (ip, service) therefore
+            # gets a distinct fingerprint each time — 18 open ports on one host
+            # meant 18 masscans of the same range. Keying it to the covering
+            # scope CIDR with a NULL service collapses them all to ONE row.
+            # Dispatch-side dedupe cannot fix this; by then the rows exist.
+            rec_kind = classify_target_kind(rec.get("scanner"))
+            rec_ip = ip
+            if rec_kind == "range":
+                scope_cidr = _scope_cidr_for(cur, engagement_id, ip)
+                rec_ip = scope_cidr or ip
+                rec_service = None          # a sweep is not service-specific
+                rec_banner = None
+                rec_extra.pop("port", None)  # nor port-specific
+                rec_asset_id = None          # a CIDR is not one asset
+            else:
+                rec_asset_id = asset_id
+
             cur.execute(
                 """
                 INSERT INTO public.scan_recommendations
-                  (asset_id, ip, service, banner, scanner, action, script, template, source, model, extra, priority, engagement_id)
+                  (asset_id, ip, service, banner, scanner, action, script, template, source, model, extra, priority, engagement_id, target_kind)
                 VALUES
-                  (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 50), %s)
+                  (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 50), %s, %s)
                 ON CONFLICT (fingerprint) DO NOTHING
                 RETURNING id;
                 """,
                 (
-                    asset_id, ip, rec_service, rec_banner,
+                    rec_asset_id, rec_ip, rec_service, rec_banner,
                     rec.get("scanner"), rec.get("action"),
                     rec.get("script"), rec.get("template"),
                     source, model,
                     Json(rec_extra) if rec_extra else None,
                     rec_priority,
                     engagement_id,
+                    rec_kind,
                 ),
             )
             if cur.rowcount > 0:
