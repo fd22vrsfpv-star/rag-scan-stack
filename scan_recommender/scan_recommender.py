@@ -2628,6 +2628,80 @@ def get_tool_catalog_info():
     return info
 
 
+class VerifyAgentBody(BaseModel):
+    session_id: Optional[str] = None
+    text: Optional[str] = None
+    ip: Optional[str] = None
+
+
+@kb_router.post("/agent-output/verify")
+def verify_agent_output(body: VerifyAgentBody):
+    """Check an agent's factual claims against what the scans actually recorded.
+
+    Deterministic by design — regex extraction, SQL verification. Asking a second
+    model to judge the first adds another thing that can hallucinate, and ports,
+    CVEs, services and hosts all have exact database answers.
+
+    Catches FABRICATION, not wrongness: a claim about a port that was recorded
+    counts as supported even if its service label is wrong. Nor can it prove a
+    negative — an unsupported claim may be true but unrecorded, which is why the
+    field is `unsupported` rather than `false`. Ingestion being broken would make
+    every claim look unsupported, so read this alongside the scan's ingest stats.
+    """
+    from agent_claims import extract_claims, verify_claims, summarise
+
+    text = body.text or ""
+    session_id = (body.session_id or "").strip()
+    if session_id:
+        try:
+            with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT agent_name, role, content FROM public.agent_messages "
+                    " WHERE session_id = %s::uuid ORDER BY created_at", (session_id,))
+                rows = cur.fetchall()
+        except Exception as e:
+            raise HTTPException(400, f"Could not read session {session_id}: {e}")
+        if not rows:
+            raise HTTPException(404, f"No messages for session {session_id}")
+        # Executor messages are raw tool output, not the agent's own assertions;
+        # verifying a tool's own JSON against the database it fed would be
+        # circular. Only narrative roles make checkable claims.
+        text = "\n".join(r["content"] for r in rows
+                          if (r["agent_name"] or "").lower() not in ("executor", "admin"))
+        if not text.strip():
+            return {"ok": True, "session_id": session_id, "claims_checked": 0,
+                    "unsupported_count": 0, "by_kind": {}, "unsupported": [],
+                    "note": "session contains only tool output, no agent narrative to check"}
+
+    if not text.strip():
+        raise HTTPException(400, "provide session_id or text")
+
+    vocab = []
+    try:
+        kb = get_tool_kb()
+        vocab = list((kb._data.get("services") or {}).keys())
+    except Exception as e:
+        logger.debug("verify: KB vocabulary unavailable (%s)", e)
+
+    claims = extract_claims(text, service_vocab=vocab)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            results = verify_claims(cur, claims, ip=body.ip)
+    except Exception as e:
+        logger.error("verify_agent_output failed: %s", e)
+        raise HTTPException(500, f"Verification failed: {e}")
+
+    out = summarise(results)
+    if out["unsupported_count"]:
+        _emit_webhook("agent_output_unsupported_claims", {
+            "session_id": session_id or None, "ip": body.ip,
+            "claims_checked": out["claims_checked"],
+            "unsupported_count": out["unsupported_count"],
+            "kinds": {k: v["unsupported"] for k, v in out["by_kind"].items()},
+        })
+    return {"ok": True, "session_id": session_id or None, **out}
+
+
 @kb_router.get("/tool-coverage")
 def get_tool_coverage():
     """Cross-check the KB's tool names against the local catalog.

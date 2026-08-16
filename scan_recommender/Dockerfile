@@ -15,6 +15,7 @@ COPY run_ingest.py        /app/run_ingest.py
 COPY tool_kb.py           /app/tool_kb.py
 COPY url_fetch.py         /app/url_fetch.py
 COPY tool_catalog.py      /app/tool_catalog.py
+COPY agent_claims.py      /app/agent_claims.py
 COPY entrypoint.sh        /app/entrypoint.sh
 COPY requirements.txt /app/requirements.txt
 
