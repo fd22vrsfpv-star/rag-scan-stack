@@ -4118,10 +4118,16 @@ def get_vulnerabilities(
 
     where_sql = "WHERE " + " AND ".join(where) if where else ""
 
+    # LEFT JOIN, not INNER. vulns.port_id is NULL for findings that belong to an
+    # ASSET rather than a specific port — every nuclei/web finding, for one. An
+    # inner join through ports silently discarded all of them: a high-severity
+    # CVE-2012-1823 (PHP CGI RCE) sat ingested in the table while
+    # /vulns?severity=high returned 0 results. Assets are reached via the port
+    # when there is one and via vulns.asset_id when there is not.
     count_sql = f"""
         SELECT count(*) AS n FROM public.vulns v
-        JOIN public.ports p ON v.port_id = p.id
-        JOIN public.assets a ON p.asset_id = a.id
+        LEFT JOIN public.ports p ON v.port_id = p.id
+        LEFT JOIN public.assets a ON a.id = COALESCE(p.asset_id, v.asset_id)
         {where_sql}
     """
 
@@ -4132,8 +4138,8 @@ def get_vulnerabilities(
                p.port, p.proto, p.service, p.product, p.version, p.banner,
                v.created_at
         FROM public.vulns v
-        JOIN public.ports p ON v.port_id = p.id
-        JOIN public.assets a ON p.asset_id = a.id
+        LEFT JOIN public.ports p ON v.port_id = p.id
+        LEFT JOIN public.assets a ON a.id = COALESCE(p.asset_id, v.asset_id)
         {where_sql}
         ORDER BY v.created_at DESC
         LIMIT %s OFFSET %s
