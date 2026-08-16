@@ -1124,6 +1124,9 @@ EDB_RW_PASSWORD=${EXPLOITDB_PASSWORD}
 
 # ZAP (OWASP ZAP Proxy) API Key
 ZAP_API_KEY=${ZAP_API_KEY}
+# Container memory cap for ZAP. Without one the JVM sizes its heap from host
+# RAM and gets OOM-killed mid-scan (exit 137), taking web scanning down with it.
+ZAP_MEM_LIMIT=4g
 ZAP_ADDR=zap
 ZAP_PORT=8090
 

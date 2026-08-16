@@ -57,7 +57,11 @@ def emit_webhook_event(event_type: str, source: str, data: dict, severity: str =
             f"{API_BASE}/webhooks/emit",
             headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
             json=payload,
-            timeout=5
+            timeout=5,
+            # rag-api serves HTTPS with the stack's self-signed cert, so every
+            # webhook emit failed verification and was swallowed by the except
+            # below as a warning. Subscribers silently received nothing.
+            verify=False,
         )
     except Exception as e:
         logger.warning(f"Failed to emit webhook: {e}")

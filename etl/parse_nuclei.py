@@ -4,10 +4,12 @@ Parse Nuclei JSONL output and insert into vulns table
 import os
 import uuid
 import json
+import re
 import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from typing import Dict, Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -173,12 +175,30 @@ def parse_nuclei(path: str, profile: str = None, job_id: str = None, target: str
                             output_parts.append(f"\n--- References ---\n{reference}")
                         output_text = "\n".join(output_parts) if output_parts else f"Nuclei finding: {template_name}"
 
-                        # Extract port from matched_at (could be "192.168.1.150:22" or "http://host:80/path")
-                        port_num = None
+                        # Resolve the port from matched_at. Two things were wrong:
+                        #
+                        #   re.search(r':(\d+)', "http://192.168.1.150/x") finds
+                        #   nothing, so a plain http:// finding recorded port None
+                        #   — the common case, not the edge case. It could also
+                        #   match a colon further along the path or query.
+                        #
+                        # A web finding always HAS a port; when the URL omits it,
+                        # the scheme states it. Parse properly and fall back to the
+                        # scheme default.
                         matched_url = matched_at or ""
-                        port_match = re.search(r':(\d+)', matched_url)
-                        if port_match:
-                            port_num = int(port_match.group(1))
+                        port_num = None
+                        try:
+                            _pu = urlparse(matched_url if "://" in matched_url
+                                           else "//" + matched_url)
+                            port_num = _pu.port
+                            if port_num is None and _pu.scheme:
+                                port_num = {"https": 443, "http": 80}.get(_pu.scheme)
+                        except Exception:
+                            port_num = None
+                        if port_num is None:
+                            m = re.match(r'^[^/]*?:(\d+)(?:/|$)', matched_url)
+                            if m:
+                                port_num = int(m.group(1))
 
                         # Only store URL if it's a proper HTTP URL (not bare ip:port)
                         metadata = {
@@ -196,14 +216,31 @@ def parse_nuclei(path: str, profile: str = None, job_id: str = None, target: str
                             cves=[cve_id] if cve_id else None,
                         )
 
+                        # Link the finding to the ports row when one exists.
+                        # port_id was never set here — only asset_id — so every
+                        # nuclei finding landed with port_id NULL and was dropped
+                        # by anything joining through ports. Knowing the port and
+                        # not recording it is what made the finding unmatched.
+                        port_id = None
+                        if port_num is not None and asset_id:
+                            cur.execute(
+                                "SELECT id FROM ports WHERE asset_id = %s AND port = %s "
+                                "AND proto = 'tcp' LIMIT 1",
+                                (asset_id, port_num),
+                            )
+                            _pr = cur.fetchone()
+                            if _pr:
+                                port_id = _pr["id"] if isinstance(_pr, dict) else _pr[0]
+
                         vuln_id = str(uuid.uuid4())
                         cur.execute("""
-                            INSERT INTO vulns (id, asset_id, script, output, severity, cve, metadata, fingerprint)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            INSERT INTO vulns (id, asset_id, port_id, script, output, severity, cve, metadata, fingerprint)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                             ON CONFLICT DO NOTHING
                         """, (
                             vuln_id,
                             asset_id,
+                            port_id,
                             f"nuclei:{template_id}",
                             output_text[:4000],
                             severity,
