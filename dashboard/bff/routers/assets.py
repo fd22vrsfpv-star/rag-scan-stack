@@ -723,6 +723,91 @@ class RunRecommendationsRequest(BaseModel):
     node_id: Optional[str] = None  # Remote node for SSH-based tool execution
 
 
+# Suggested manual commands for recommendations dispatch cannot run.
+#
+# This tool exists to feed MANUAL workflows, so "skipped, here is why" is half an
+# answer. Each entry turns an undispatchable recommendation into something the
+# operator can paste. Placeholders are filled from the rec.
+_MANUAL_COMMANDS = {
+    # artifact — operate on a downloaded file, not a host
+    "exiftool": "exiftool -a -u -g1 '{file}'",
+    "binwalk": "binwalk -e '{file}'",
+    "strings": "strings -n 8 '{file}' | less",
+    "steghide": "steghide info '{file}'",
+    "pdfid": "pdfid.py '{file}'",
+    "oledump": "oledump.py '{file}'",
+    # range — sweep a scope once
+    "masscan": "masscan {target} -p1-65535 --rate 1000 -oJ masscan.json",
+    "netdiscover": "netdiscover -r {target}",
+    "arp-scan": "arp-scan --localnet",
+    "fping": "fping -a -g {target} 2>/dev/null",
+    # resource — wordlists / template sets: what to USE them with
+    "seclists": ("gobuster dir -u http://{target} -w "
+                 "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt"),
+    "wordlists": ("hydra -L /usr/share/seclists/Usernames/top-usernames-shortlist.txt "
+                  "-P /usr/share/wordlists/rockyou.txt {target} <service>"),
+    "rockyou": "hydra -l <user> -P /usr/share/wordlists/rockyou.txt {target} <service>",
+    "nuclei-templates": "nuclei -u http://{target} -t /root/nuclei-templates/ -severity high,critical",
+}
+
+_KIND_TITLE = {
+    "artifact": "Run {tool} against collected files",
+    "range": "Sweep {target} with {tool} (scope-wide, run once)",
+    "resource": "Use {tool} with an appropriate tool against {target}",
+}
+
+
+async def _manual_followup_for(rec: dict, kind: str, ip: str) -> Optional[dict]:
+    """Create a follow_up_item carrying the command to run by hand.
+
+    Returns the follow-up summary, or None if it could not be recorded. Never
+    raises: failing to file a follow-up must not turn a clean skip into an error.
+    """
+    scanner = (rec.get("scanner") or "").lower()
+    target = ip or "<target>"
+    cmd = _MANUAL_COMMANDS.get(scanner)
+    if cmd:
+        cmd = cmd.format(target=target, file="<path/to/file>")
+    else:
+        # Unknown tool of a known kind — still worth surfacing, without
+        # inventing a command line we cannot vouch for.
+        cmd = f"{scanner} <see tool docs>  # target: {target}"
+
+    title = _KIND_TITLE.get(kind, "Manual step: {tool}").format(tool=scanner, target=target)
+    reason = (f"Recommended by the KB but not dispatchable automatically "
+              f"(target_kind={kind}). Suggested command: {cmd}")
+    try:
+        s = get_settings()
+        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+            r = await c.post(
+                f"{s.rag_api_url}/follow-ups",
+                # Fields match FollowUpCreate exactly. It has no metadata column,
+                # so the command goes in `notes` — where the operator will
+                # actually read it — rather than an extra key pydantic drops.
+                json={
+                    "title": title,
+                    "target": target,
+                    "severity": "info",
+                    "reason": reason,
+                    "priority": "low",
+                    "flagged_by": "scan_recommender",
+                    "rule_id": f"manual_{kind}_tool",
+                    "tags": ["manual", kind, scanner],
+                    "notes": (f"$ {cmd}\n\n"
+                              f"tool={scanner} target_kind={kind} "
+                              f"recommendation_id={rec.get('id')}"),
+                },
+                headers={"x-api-key": s.api_key, **engagement_headers()},
+            )
+        if r.status_code < 400:
+            return {"created": True, "command": cmd, "title": title}
+        log.warning("manual follow-up POST failed (%s): %s", r.status_code, r.text[:160])
+        return {"created": False, "command": cmd, "title": title}
+    except Exception as e:
+        log.warning("manual follow-up for %s failed: %s", scanner, e)
+        return {"created": False, "command": cmd, "title": title}
+
+
 @router.post("/api/scan-recommendations/run")
 async def run_scan_recommendations(body: RunRecommendationsRequest):
     """
@@ -931,6 +1016,12 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             result["status"] = "skipped"
             result["target_kind"] = kind
             result["detail"] = f"'{scanner}' {NON_SERVICE_KIND_REASON.get(kind, f'has target_kind={kind}, which dispatch does not handle')}"
+            # A skip with no next step is a dead end. These tools are still worth
+            # running — just by hand — so hand the operator the command instead of
+            # only explaining why the pipeline will not.
+            fu = await _manual_followup_for(rec, kind, ip)
+            if fu:
+                result["manual_followup"] = fu
             return result
 
         # Tools a service DOES serve but which are not mapped above. Without this
