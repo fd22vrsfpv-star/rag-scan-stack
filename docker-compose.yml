@@ -1930,6 +1930,10 @@ services:
       - ./mcpo/config.json:/mcpo/config.json
       - ./db-config.json:/app/db-config.json:rw
       - ./knowledge:/knowledge:ro
+      # Scope matcher, shared rather than copied. The BFF runs from /app/bff, so
+      # this lands on its import path and `from etl.scope_gate import is_in_scope`
+      # resolves to the SAME fail-closed matcher the discovery ingests use.
+      - ./etl:/app/bff/etl:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro  # Enable docker exec for WireGuard status querying
     networks:
       - agents_net

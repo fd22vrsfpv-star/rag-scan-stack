@@ -1,6 +1,7 @@
 from typing import Optional, Any
 import os
 import re
+import time
 import json
 import logging
 import pathlib
@@ -14,6 +15,15 @@ from config import get_settings
 from engagement import engagement_headers
 from polling import register_job, active_jobs, _persist, pending_queue
 from timeouts import TIMEOUT_NORMAL, TIMEOUT_SCAN
+# Scope matching is delegated to the shared fail-closed matcher rather than
+# reimplemented here — a third copy of ip/cidr/domain/url semantics is exactly
+# how the three of them drift apart.
+try:
+    from etl.scope_gate import is_in_scope as _is_in_scope, _host_from_url as _host_only
+except ImportError:  # etl/ not mounted (older compose) — gate degrades to inactive
+    _is_in_scope = None
+    _host_only = None
+
 from services.port_profiles import (
     PortProfileError,
     list_profiles as list_port_profiles,
@@ -1157,10 +1167,153 @@ async def nmap_resume(req: NmapResumeReq):
     return data
 
 
+# ---------------------------------------------------------------- scope gate
+# An out-of-scope SCAN is an authorization problem, not a tidiness one: it sends
+# packets at a host nobody agreed we could touch. Crawled links are the realistic
+# route in — a target page linking to www.owasp.org / irongeek.com / java.sun.com
+# turns into a follow-up, and a follow-up turns into a dispatched scan.
+#
+# Default-deny WHEN A SCOPE EXISTS. When scope_targets is empty there is nothing
+# to authorize against, and refusing every scan would make the tool unusable, so
+# the request proceeds with a loud warning + webhook rather than silently. Set
+# SCAN_SCOPE_ENFORCE=strict to refuse instead — the right setting for an
+# engagement where scope has been entered deliberately.
+_SCOPE_CACHE: dict = {"rows": None, "at": 0.0}
+_SCOPE_TTL = 30.0
+
+
+async def _load_scope_rows() -> list:
+    """[(target, target_type)] from rag-api, briefly cached. [] means no scope."""
+    now = time.monotonic()
+    if _SCOPE_CACHE["rows"] is not None and (now - _SCOPE_CACHE["at"]) < _SCOPE_TTL:
+        return _SCOPE_CACHE["rows"]
+    s = get_settings()
+    rows: list = []
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+            # GET /scope defaults to name="default" and returns ONLY that named
+            # scope. This operator's scope is named "msf", so a bare call came
+            # back empty and the gate sat silently inactive while real scope
+            # existed. Authorization must not depend on which name was used, so
+            # enumerate every scope name and union them.
+            hdr = {"x-api-key": s.api_key}
+            names = ["default"]
+            rn = await c.get(f"{s.rag_api_url}/scope/names", headers=hdr)
+            if rn.status_code == 200:
+                found = [n.get("name") for n in (rn.json().get("names") or []) if n.get("name")]
+                if found:
+                    names = found
+            for nm in names:
+                r = await c.get(f"{s.rag_api_url}/scope",
+                                params={"name": nm, "limit": 5000}, headers=hdr)
+                if r.status_code != 200:
+                    continue
+                payload = r.json()
+                items = payload if isinstance(payload, list) else (
+                    payload.get("targets") or payload.get("scope") or payload.get("items") or [])
+                rows += [(i.get("target"), i.get("target_type"))
+                         for i in items if isinstance(i, dict) and i.get("target")]
+    except Exception as e:
+        # Do NOT fail closed here: a rag-api hiccup must not block an operator's
+        # scan. The empty list falls through to the warn-and-allow path below,
+        # which is logged, so the condition is visible rather than silent.
+        log.warning("scope load failed (%s) — scope gate cannot enforce this request", e)
+    _SCOPE_CACHE["rows"], _SCOPE_CACHE["at"] = rows, now
+    return rows
+
+
+def _scan_targets_of(req) -> list:
+    """Every host this request would put packets on."""
+    out = []
+    for field in ("target", "targets", "target_url", "target_urls", "ip_address"):
+        v = getattr(req, field, None)
+        if not v:
+            continue
+        for item in (v if isinstance(v, (list, tuple)) else [v]):
+            h = _host_only(str(item))
+            if h:
+                out.append(h)
+    return out
+
+
+async def _host_aliases(host: str) -> set:
+    """Observed ip<->hostname pairings for `host`, from rag-api's assets."""
+    aliases = {host}
+    if host in ("localhost", "127.0.0.1", "::1"):
+        aliases |= {"localhost", "127.0.0.1", "::1"}
+    s = get_settings()
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+            r = await c.get(f"{s.rag_api_url}/assets", params={"limit": 5000},
+                            headers={"x-api-key": s.api_key})
+            if r.status_code == 200:
+                for a in (r.json().get("assets") or []):
+                    ip = str(a.get("ip") or "").strip().lower()
+                    hn = _host_only(str(a.get("hostname") or "")) if _host_only else ""
+                    if host in (ip, hn):
+                        aliases |= {x for x in (ip, hn) if x}
+    except Exception as e:
+        log.warning("alias lookup failed for %r: %s", host, e)
+    return aliases
+
+
+async def _enforce_scan_scope(scan_type: str, req) -> None:
+    """Refuse a scan whose target is not in scope. No-op when no scope exists."""
+    if _is_in_scope is None or _host_only is None:
+        # etl/ not mounted — the matcher is unavailable. Say so once per request
+        # rather than crash the scan or pretend the gate ran.
+        log.warning("scope gate UNAVAILABLE (etl/scope_gate not importable) — "
+                    "add ./etl:/app/bff/etl:ro to pentest-dashboard")
+        return
+    hosts = _scan_targets_of(req)
+    if not hosts:
+        return
+    scope_rows = await _load_scope_rows()
+    mode = os.environ.get("SCAN_SCOPE_ENFORCE", "warn").strip().lower()
+
+    if not scope_rows:
+        if mode == "strict":
+            raise HTTPException(
+                403,
+                "Scan refused: SCAN_SCOPE_ENFORCE=strict but no scope is defined. "
+                "Add targets via POST /scope/add before scanning.",
+            )
+        log.warning(
+            "scope gate INACTIVE for %s %s — no scope_targets defined. Add scope via "
+            "POST /scope/add to enforce; set SCAN_SCOPE_ENFORCE=strict to refuse instead.",
+            scan_type, hosts[:5],
+        )
+        return
+
+    # A host can be in scope under a different identity: scope lists 127.0.0.1 but
+    # the request says "localhost", or scope lists a hostname the scan already
+    # resolved to an IP. rag-api owns the observed ip<->hostname pairings, so ask
+    # it rather than guessing — and never resolve DNS live, which would let an
+    # attacker-controlled record talk its way into scope.
+    blocked = []
+    for h in hosts:
+        if _is_in_scope(h, scope_rows):
+            continue
+        if any(_is_in_scope(a, scope_rows) for a in await _host_aliases(h)):
+            continue
+        blocked.append(h)
+    if blocked:
+        log.warning("scope gate BLOCKED %s for out-of-scope host(s): %s", scan_type, blocked)
+        raise HTTPException(
+            403,
+            f"Scan refused — out of scope: {', '.join(blocked)}. "
+            f"These hosts are not in the engagement scope. Add them via POST /scope/add "
+            f"if authorized, or scan an in-scope target.",
+        )
+
+
 @router.post("/api/scans/{scan_type}")
 async def launch_scan(scan_type: str, req: ScanRequest):
     if scan_type not in SCAN_ROUTES:
         raise HTTPException(400, f"Unknown scan type: {scan_type}")
+
+    # Authorization boundary — refuse out-of-scope targets before any packet.
+    await _enforce_scan_scope(scan_type, req)
 
     # Resolve any named port profile into an explicit `ports` string up front,
     # so all three transform call sites below (and every scan type) inherit it.
