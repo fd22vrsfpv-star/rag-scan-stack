@@ -215,9 +215,81 @@ def verify_claims(cur, claims: List[Dict], ip: Optional[str] = None) -> List[Dic
     return results
 
 
+
+# ── Notability ──────────────────────────────────────────────────────────────
+#
+# Verification alone is negative-only: it reports what cannot be supported and
+# files everything else as "fine". But a SUPPORTED claim of a root shell or
+# recovered credentials is the most important line in the report, and it was
+# being passed over in silence.
+#
+# Scoring is deterministic keyword matching against the claim's surrounding
+# context. It is a PRIORITISATION signal, not a judgement of truth — the truth
+# question is answered by `supported`, which comes from the database.
+
+_NOTABLE_PATTERNS = (
+    # (weight, category, regex) — highest weight wins for a given claim.
+    (5, "access",         r"\b(root|SYSTEM|administrator)\s+(shell|access|privileg|account)"),
+    (5, "access",         r"\b(reverse|bind)\s*shell\b|\bgot\s+(a\s+)?shell\b|\brce\b"),
+    (5, "access",         r"\bremote code execution\b|\bcommand execution\b"),
+    (5, "backdoor",       r"\bbackdoor(ed)?\b|\bimplant\b|\balready compromised\b"),
+    (4, "credentials",    r"\bcredential|password|hash(es)?\b|\bcracked\b|\bplaintext\b"),
+    (4, "credentials",    r"\bdefault (creds|credentials|password)\b|\banonymous (login|access)\b"),
+    (4, "unauthenticated", r"\bunauthenticated\b|\bno (auth|authentication|password)\b"),
+    (4, "unauthenticated", r"\bworld[- ]readable\b|\bpublicly (accessible|readable)\b"),
+    (3, "data-exposure",  r"\bexfiltrat|\bdump(ed)?\b|\bdisclos(ure|ed)\b|\bleak(ed|s)?\b"),
+    (3, "lateral",        r"\bpivot|lateral movement|password reuse\b"),
+    (3, "critical-vuln",  r"\bcritical\b|\bexploitable\b|\bproof[- ]of[- ]concept\b"),
+    (2, "privesc",        r"\bprivilege escalation|privesc|suid\b|\bsudo\b"),
+)
+
+
+def score_notability(claim: Dict) -> Dict:
+    """Attach {notable, notable_score, notable_reason} to a verified claim.
+
+    Priority is severity CROSSED WITH support, because the two combine in a way
+    neither shows alone:
+
+      supported + high severity  -> act on this
+      unsupported + high severity -> verify first; a big claim with no evidence
+                                     behind it is the most expensive kind to put
+                                     in a report
+      unsupported + low severity  -> minor, likely a stray number in prose
+    """
+    ctx = (claim.get("context") or "")
+    best_w, best_cat = 0, None
+    for weight, category, pattern in _NOTABLE_PATTERNS:
+        if weight > best_w and re.search(pattern, ctx, re.I):
+            best_w, best_cat = weight, category
+
+    if best_w == 0:
+        return {**claim, "notable": False, "notable_score": 0, "notable_reason": None}
+
+    supported = claim.get("supported")
+    if supported:
+        reason = f"{best_cat}: supported by recorded scan data"
+        score = best_w
+    else:
+        # An unsupported high-severity claim outranks a supported one: it is
+        # both important and unevidenced, which is the combination that damages
+        # a report.
+        reason = f"{best_cat}: HIGH-IMPACT CLAIM WITH NO SUPPORTING SCAN DATA"
+        score = best_w + 1
+    return {**claim, "notable": True, "notable_score": score, "notable_reason": reason}
+
+
 def summarise(results: List[Dict]) -> Dict:
-    """Counts plus the unsupported claims, which are the actionable part."""
+    """Counts, the unsupported claims, and the notable ones.
+
+    Two separate axes deliberately: `unsupported` answers "can this be backed
+    up", `notable` answers "does this matter". A claim can be either, both, or
+    neither, and conflating them would hide the worst case — an important claim
+    with nothing behind it.
+    """
+    results = [score_notability(r) for r in results]
     unsupported = [r for r in results if not r["supported"]]
+    notable = sorted((r for r in results if r.get("notable")),
+                     key=lambda r: -r["notable_score"])
     by_kind: Dict[str, Dict[str, int]] = {}
     for r in results:
         b = by_kind.setdefault(r["kind"], {"total": 0, "unsupported": 0})
@@ -229,4 +301,6 @@ def summarise(results: List[Dict]) -> Dict:
         "unsupported_count": len(unsupported),
         "by_kind": by_kind,
         "unsupported": unsupported[:50],
+        "notable_count": len(notable),
+        "notable": notable[:50],
     }
