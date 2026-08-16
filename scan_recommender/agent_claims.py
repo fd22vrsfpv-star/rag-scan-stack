@@ -131,6 +131,48 @@ def _text_columns(cur) -> Dict[str, List[str]]:
     return out
 
 
+
+def _coverage(cur, ip: Optional[str]) -> Dict[str, bool]:
+    """Can the database answer questions of each kind at all?
+
+    THE DISTINCTION THAT MATTERS. "The scan recorded 23 ports and none was
+    31337" is evidence of absence. "No ports were recorded for this host" is
+    absence of evidence, and calling that unsupported is a lie that reads as a
+    finding.
+
+    Today's ingestion bug made the difference concrete: a scan found 23 ports and
+    stored none of them, so every true claim would have been reported as
+    unsupported. Coverage is checked first so that failure mode surfaces as
+    "cannot verify" instead.
+    """
+    cov = {"port": False, "service": False, "host": False, "cve": False}
+    try:
+        if ip:
+            cur.execute(
+                "SELECT 1 FROM ports p JOIN assets a ON a.id = p.asset_id "
+                " WHERE host(a.ip) = %s LIMIT 1", (ip,))
+        else:
+            cur.execute("SELECT 1 FROM ports LIMIT 1")
+        has_ports = cur.fetchone() is not None
+        cov["port"] = cov["service"] = has_ports
+    except Exception as e:
+        logger.debug("coverage: ports unavailable (%s)", e)
+    try:
+        cur.execute("SELECT 1 FROM assets LIMIT 1")
+        cov["host"] = cur.fetchone() is not None
+    except Exception as e:
+        logger.debug("coverage: assets unavailable (%s)", e)
+    for table in ("findings", "vulns"):
+        try:
+            cur.execute(f"SELECT 1 FROM {table} LIMIT 1")
+            if cur.fetchone() is not None:
+                cov["cve"] = True
+                break
+        except Exception:
+            continue
+    return cov
+
+
 def verify_claims(cur, claims: List[Dict], ip: Optional[str] = None) -> List[Dict]:
     """Check each claim against recorded scan data.
 
@@ -140,6 +182,7 @@ def verify_claims(cur, claims: List[Dict], ip: Optional[str] = None) -> List[Dic
     multi-target sessions.
     """
     text_cols = _text_columns(cur)
+    cov = _coverage(cur, ip)
     results = []
     for c in claims:
         kind, value = c["kind"], c["value"]
@@ -211,9 +254,178 @@ def verify_claims(cur, claims: List[Dict], ip: Optional[str] = None) -> List[Dic
             except Exception:
                 pass
 
-        results.append({**c, "supported": supported, "detail": detail})
+        # Three states, not two. `unverifiable` is the honest answer when the
+        # database cannot speak to the question — an unrecognised claim kind, or
+        # no scan data of that kind at all. Reporting those as "unsupported"
+        # would manufacture findings out of missing coverage.
+        reason = None
+        if supported:
+            verdict = "supported"
+        elif kind not in cov:
+            verdict, reason = "unverifiable", "unknown_kind"
+            detail = detail or f"no way to check a {kind!r} claim against scan data"
+        elif not cov.get(kind):
+            # No data of this kind AT ALL. Distinguished from the other reasons
+            # because a run that produced nothing is a different problem from a
+            # claim that cannot be expressed in the schema — see run_failure below.
+            verdict, reason = "unverifiable", "no_coverage"
+            detail = detail or (
+                f"no {kind} data recorded{' for ' + ip if ip else ''} — absence of "
+                f"evidence, not evidence of absence")
+        elif detail.startswith("could not be checked"):
+            verdict, reason = "unverifiable", "check_error"
+        else:
+            verdict = "unsupported"
+
+        results.append({**c, "verdict": verdict,
+                        "unverifiable_reason": reason,
+                        # Kept for callers written against the old shape; only
+                        # a genuine contradiction now counts as not-supported.
+                        "supported": verdict == "supported",
+                        "detail": detail})
     return results
 
+
+
+# ── LLM-assisted extraction ─────────────────────────────────────────────────
+#
+# The regexes above catch tokens: ports, CVEs, IPs, known service names. They
+# cannot catch "the database was reachable without a password" — a real,
+# checkable assertion with no token to match.
+#
+# THE MODEL PROPOSES, SQL DECIDES. An LLM verdict on whether a claim is true
+# would be circular (we are auditing LLM output) and unreliable — measured on the
+# simpler task of naming real tools, gemma4 was wrong 7% of the time and qwen3.8
+# 29%. So the model is used only to widen extraction: everything it proposes with
+# a checkable kind still goes through verify_claims, where the database decides.
+# A missed claim is cheap; a fabrication cleared by a model is not, and this
+# arrangement makes the latter impossible.
+#
+# Claims it finds that are NOT mechanically checkable are not discarded either —
+# they are routed to manual follow-up rather than silently dropped or, worse,
+# adjudicated by the model.
+
+_LLM_CLAIM_PROMPT = """You are extracting factual assertions from a penetration-test agent's notes.
+
+List every SPECIFIC, CHECKABLE assertion about what was found. Do NOT judge whether
+any of them is true — something else verifies them.
+
+Return ONLY a JSON object:
+{"claims":[{"kind":"port|cve|host|service|other","value":"<the specific thing>","assertion":"<what is claimed about it, one short phrase>"}]}
+
+Rules:
+- kind "port" -> value is the port number alone, e.g. "3306"
+- kind "cve" -> value is the identifier, e.g. "CVE-2007-2447"
+- kind "host" -> value is the IP or hostname
+- kind "service" -> value is the service name, e.g. "mysql"
+- kind "other" -> anything checkable that fits none of the above, such as a
+  writable share, a disabled control, or a recovered credential. Put the subject
+  in value.
+- Skip opinions, recommendations, next steps and anything vague.
+- If the notes contain no checkable assertion, return {"claims":[]}.
+
+NOTES:
+"""
+
+
+def llm_extract_claims(text: str, query_fn, model: Optional[str] = None) -> List[Dict]:
+    """Ask a model to propose claims the regexes cannot see.
+
+    `query_fn(prompt, model=...)` returns the raw model response. Any failure
+    yields [] — extraction is an enrichment, and losing it must never fail the
+    verification that already worked.
+    """
+    if not text or not text.strip() or query_fn is None:
+        return []
+    try:
+        raw = query_fn(_LLM_CLAIM_PROMPT + text[:12000], model=model)
+    except Exception as e:
+        logger.warning("LLM claim extraction failed (%s) — regex claims stand alone", e)
+        return []
+
+    body = raw.get("response") if isinstance(raw, dict) else raw
+    obj = _first_json_object(body or "")
+    if not isinstance(obj, dict):
+        logger.warning("LLM claim extraction returned no usable JSON")
+        return []
+
+    out = []
+    for c in (obj.get("claims") or []):
+        if not isinstance(c, dict):
+            continue
+        kind = str(c.get("kind") or "other").strip().lower()
+        value = str(c.get("value") or "").strip()
+        if not value or len(value) > 120:
+            continue
+        if kind == "port":
+            digits = re.sub(r"\D", "", value)
+            if not digits or not (1 <= int(digits) <= 65535):
+                continue
+            value = int(digits)
+        elif kind not in ("cve", "host", "service", "other"):
+            kind = "other"
+        out.append({
+            "kind": kind,
+            "value": value,
+            "context": str(c.get("assertion") or "")[:200],
+            "source": "llm",
+        })
+    return out
+
+
+def _first_json_object(text: str) -> Optional[Dict]:
+    """First balanced {...} in the text, tolerating prose and fences."""
+    if not text:
+        return None
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t)
+    try:
+        import json as _json
+        return _json.loads(t)
+    except Exception:
+        pass
+    import json as _json
+    start = t.find("{")
+    while start != -1:
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(t)):
+            ch = t[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return _json.loads(t[start:i + 1])
+                    except Exception:
+                        break
+        start = t.find("{", start + 1)
+    return None
+
+
+def merge_claims(regex_claims: List[Dict], llm_claims: List[Dict]) -> List[Dict]:
+    """Regex claims win on collision — they matched literal text, not inference."""
+    out = list(regex_claims)
+    seen = {(c["kind"], str(c["value"]).lower()) for c in regex_claims}
+    for c in llm_claims:
+        key = (c["kind"], str(c["value"]).lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
 
 
 # ── Notability ──────────────────────────────────────────────────────────────
@@ -286,21 +498,61 @@ def summarise(results: List[Dict]) -> Dict:
     neither, and conflating them would hide the worst case — an important claim
     with nothing behind it.
     """
-    results = [score_notability(r) for r in results]
-    unsupported = [r for r in results if not r["supported"]]
+    # Derive a verdict for results that predate the three-state model (or come
+    # from a caller that only set `supported`), so they are counted rather than
+    # silently falling into neither bucket.
+    results = [score_notability({**r, "verdict": r.get("verdict") or
+                                 ("supported" if r.get("supported") else "unsupported")})
+               for r in results]
+    unsupported = [r for r in results if r.get("verdict") == "unsupported"]
+    unverifiable = [r for r in results if r.get("verdict") == "unverifiable"]
     notable = sorted((r for r in results if r.get("notable")),
                      key=lambda r: -r["notable_score"])
+    # Manual follow-up: everything a human must resolve because the database
+    # cannot — either it has no answer, or the claim is important and the answer
+    # was "no". Sorted so the consequential ones come first.
+    follow_up = sorted(
+        [r for r in results
+         if r.get("verdict") == "unverifiable"
+         or (r.get("verdict") == "unsupported" and r.get("notable"))],
+        key=lambda r: -(r.get("notable_score") or 0),
+    )
     by_kind: Dict[str, Dict[str, int]] = {}
     for r in results:
         b = by_kind.setdefault(r["kind"], {"total": 0, "unsupported": 0})
         b["total"] += 1
         if not r["supported"]:
             b["unsupported"] += 1
+    # A run that produced no data looks, claim by claim, like a series of small
+    # mysteries. In aggregate it is one big finding. Today's ingestion bug is the
+    # case in point: a scan found 23 ports and stored none, so every true claim
+    # would have come back unverifiable and the operator would have been left
+    # puzzling over each one instead of being told the run had failed.
+    no_coverage = [r for r in results if r.get("unverifiable_reason") == "no_coverage"]
+    probable_run_failure = bool(
+        no_coverage and len(no_coverage) >= max(2, int(0.5 * len(results)))
+    )
+    kinds_missing = sorted({r["kind"] for r in no_coverage})
+    run_failure_hint = None
+    if probable_run_failure:
+        run_failure_hint = (
+            f"{len(no_coverage)} of {len(results)} claims could not be checked because no "
+            f"{'/'.join(kinds_missing)} data was recorded at all. That usually means the scan "
+            f"or its ingestion failed rather than the agent inventing things — check the job's "
+            f"ingest stats before treating any of this as fabrication."
+        )
+
     return {
         "claims_checked": len(results),
+        "probable_run_failure": probable_run_failure,
+        "run_failure_hint": run_failure_hint,
         "unsupported_count": len(unsupported),
         "by_kind": by_kind,
         "unsupported": unsupported[:50],
+        "unverifiable_count": len(unverifiable),
+        "unverifiable": unverifiable[:50],
         "notable_count": len(notable),
         "notable": notable[:50],
+        "manual_follow_up_count": len(follow_up),
+        "manual_follow_up": follow_up[:50],
     }
