@@ -971,8 +971,14 @@ class ReconAgent:
         except Exception:
             pass
 
-        log.info("[recon:%s] cycle done: dispatched=%d, followups=%d, targets=%d",
-                 eid[:8], dispatched, len(open_followups), len(targets))
+        # kb_drained belongs here. Without it the cycle reported "dispatched=0"
+        # while the KB drain silently did nothing, and the two are separate
+        # counters — so a queue that never moved looked identical to a healthy
+        # cycle with no seed work to do.
+        log.info("[recon:%s] cycle done: dispatched=%d, kb_drained=%d, "
+                 "kb_pending_left=%d, followups=%d, targets=%d",
+                 eid[:8], dispatched, kb_drained, kb_skipped_pending,
+                 len(open_followups), len(targets))
 
         # Webhook: cycle completed
         await self._emit_webhook(eid, "recon_agent_cycle_completed", headers, {
