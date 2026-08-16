@@ -503,6 +503,28 @@ if [[ -n "$DASH" ]]; then
     pass "web profiles loaded from knowledge/web_profiles.yaml"
   fi
 
+  # The merged CA bundle is what lets internal HTTPS verify instead of every
+  # caller passing verify=False. If it is missing, REQUESTS_CA_BUNDLE points at a
+  # nonexistent path and EVERY verifying TLS call in that container fails — a far
+  # louder failure than the one it replaced, so check it explicitly.
+  if [[ -f certs/ca-bundle.crt ]]; then
+    bundle_n=$(grep -c "BEGIN CERTIFICATE" certs/ca-bundle.crt || echo 0)
+    if [[ "$bundle_n" -gt 100 ]] && grep -q "RagScanStack internal" certs/ca-bundle.crt; then
+      pass "CA bundle present (${bundle_n} certs, includes the internal cert)"
+    else
+      fail "certs/ca-bundle.crt looks wrong (${bundle_n} certs, internal cert marker missing) — rerun scripts/generate-ca-bundle.sh"
+    fi
+    if docker ps --format '{{.Names}}' | grep -q '^rag-api$'; then
+      if docker exec rag-api test -r /certs/ca-bundle.crt 2>/dev/null; then
+        pass "rag-api can read /certs/ca-bundle.crt"
+      else
+        fail "rag-api cannot read /certs/ca-bundle.crt — REQUESTS_CA_BUNDLE points at a missing file; every verifying HTTPS call in it will fail"
+      fi
+    fi
+  else
+    fail "certs/ca-bundle.crt missing — run scripts/generate-ca-bundle.sh (services set REQUESTS_CA_BUNDLE to it)"
+  fi
+
   # nmap_scanner resolves the SAME profile for its own empty-ports fallback, so
   # it needs the knowledge/ mount too. Without it the fallback degrades to the
   # sequential 1-1000 range — which still returns HTTP 200 and still produces

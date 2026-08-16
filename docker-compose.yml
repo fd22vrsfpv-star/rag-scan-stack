@@ -173,6 +173,12 @@ services:
     environment:
       BUILD_VERSION: ${BUILD_VERSION:-2026.04.17-1}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       API_KEY: ${API_KEY:-changeme}
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       EMBEDDER_URL: ${EMBEDDER_URL:-https://embedder:8030}
@@ -340,6 +346,12 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       WORDLIST: ${WORDLIST:-/opt/seclists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-medium.txt}
       WEB_PORTS: ${WEB_PORTS:-80,443,8080,8443,8000,8888,3000,5000}
@@ -385,6 +397,12 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       API_BASE: https://rag-api:8000
       API_KEY: ${API_KEY:-changeme}
@@ -435,6 +453,12 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       API_BASE: https://rag-api:8000
       API_KEY: ${API_KEY:-changeme}
@@ -486,6 +510,12 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       API_BASE: https://rag-api:8000
       API_KEY: ${API_KEY:-changeme}
@@ -562,6 +592,12 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       API_BASE: https://rag-api:8000
       API_KEY: ${API_KEY:-changeme}
@@ -604,6 +640,12 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       NMAP_OUT_DIR: /app/nmap_out
       NMAP_SERVICE_DETECTION: ${NMAP_SERVICE_DETECTION:-1}
@@ -666,6 +708,12 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       PG_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       # Individual DB_* vars for scan_recommender's _conn() helper.  The
@@ -753,6 +801,12 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       BROWSER_TYPE: ${BROWSER_TYPE:-chromium}  # chromium, firefox, or webkit
       VIEWPORT_WIDTH: ${VIEWPORT_WIDTH:-1920}
@@ -806,6 +860,12 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       API_KEY: ${API_KEY:-changeme}
       # LLM Backend: "ollama", "vllm", "azure", "openai", or "anthropic"
@@ -1132,6 +1192,12 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       MSF_RPC_HOST: ${MSF_RPC_HOST:-metasploit}
       MSF_RPC_PORT: ${MSF_RPC_PORT:-55553}
@@ -1182,6 +1248,12 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       PROJECT_DIR: /project
       # Lets the DB-mode-switch handler emit webhook events
       # (db_mode_switched / db_consumers_recreated) to rag-api.
@@ -1222,6 +1294,12 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       API_KEY: ${API_KEY:-changeme}
       RAG_API_URL: ${RAG_API_URL:-https://rag-api:8000}
@@ -1797,6 +1875,12 @@ services:
       PYTHONHTTPSVERIFY: "0"
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       # Remote database configuration
       REMOTE_DB_HOST: ${REMOTE_DB_HOST:-}

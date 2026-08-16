@@ -488,6 +488,90 @@ class _MasscanInterruptedError(Exception):
         self.paused_conf = paused_conf
         super().__init__(f"Masscan interrupted, paused.conf at {paused_conf}")
 
+# ─────────────────────── scope enforcement (authorization) ───────────────────
+# The BFF gates /api/scans, but that only covers the dashboard. A real scan went
+# autogen-agents -> nmap_scanner directly and never touched it, which is exactly
+# the path that would pick up a crawled www.owasp.org and point a scanner at it.
+# Every scan path converges HERE, so this is where the boundary belongs.
+#
+# Default-deny WHEN A SCOPE EXISTS. With no scope defined there is nothing to
+# authorize against and refusing everything would make the scanner useless, so it
+# warns loudly instead. SCAN_SCOPE_ENFORCE=strict refuses in that case too.
+_SCOPE_CACHE = {"rows": None, "at": 0.0}
+_SCOPE_TTL = 30.0
+
+
+def _scope_rows():
+    """[(target, target_type)] from rag-api, briefly cached. [] means no scope."""
+    now = time.time()
+    if _SCOPE_CACHE["rows"] is not None and (now - _SCOPE_CACHE["at"]) < _SCOPE_TTL:
+        return _SCOPE_CACHE["rows"]
+    rows = []
+    try:
+        hdr = {"x-api-key": API_KEY}
+        names = ["default"]
+        rn = requests.get(f"{API_BASE}/scope/names", headers=hdr, timeout=10)
+        if rn.status_code == 200:
+            found = [n.get("name") for n in (rn.json().get("names") or []) if n.get("name")]
+            if found:
+                names = found
+        for nm in names:
+            r = requests.get(f"{API_BASE}/scope", params={"name": nm, "limit": 5000},
+                             headers=hdr, timeout=10)
+            if r.status_code != 200:
+                continue
+            for i in (r.json().get("targets") or []):
+                t = (i.get("target") or "").strip()
+                # Placeholder rows carry an empty target; they are not scope.
+                if t and i.get("source") != "__placeholder__":
+                    rows.append((t, i.get("target_type")))
+    except Exception as e:
+        # Never fail closed on a transport hiccup — that would stop an operator
+        # scanning because rag-api blipped. Logged so it is visible, not silent.
+        logging.warning("scope load failed (%s) — scope gate cannot enforce this request", e)
+    _SCOPE_CACHE["rows"], _SCOPE_CACHE["at"] = rows, now
+    return rows
+
+
+def _enforce_scope(targets, scan_type="scan"):
+    """Raise HTTP 403 for any target outside the engagement scope."""
+    if _in_scope is None or _scope_host is None:
+        logging.warning("scope gate UNAVAILABLE (etl/scope_gate not importable) — "
+                        "check the ./etl:/app/etl:ro mount")
+        return
+    hosts = []
+    for t in (targets or []):
+        h = _scope_host(str(t))
+        if h:
+            hosts.append(h)
+    if not hosts:
+        return
+    rows = _scope_rows()
+    mode = os.environ.get("SCAN_SCOPE_ENFORCE", "warn").strip().lower()
+    if not rows:
+        if mode == "strict":
+            raise HTTPException(status_code=403, detail=(
+                "Scan refused: SCAN_SCOPE_ENFORCE=strict but no scope is defined. "
+                "Add targets via POST /scope/add before scanning."))
+        logging.warning("scope gate INACTIVE for %s %s — no scope_targets defined",
+                        scan_type, hosts[:5])
+        return
+    blocked = [h for h in hosts if not _in_scope(h, rows)]
+    if blocked:
+        logging.warning("scope gate BLOCKED %s for out-of-scope host(s): %s", scan_type, blocked)
+        raise HTTPException(status_code=403, detail=(
+            f"Scan refused — out of scope: {', '.join(blocked)}. Add them via "
+            f"POST /scope/add if authorized, or scan an in-scope target."))
+
+
+# Same fail-closed matcher the discovery ingests and the BFF gate use, so scope
+# semantics cannot drift between the places that enforce it.
+try:
+    from etl.scope_gate import is_in_scope as _in_scope, _host_from_url as _scope_host
+except ImportError:
+    _in_scope = None
+    _scope_host = None
+
 class MasscanBody(BaseModel):
     targets: List[str] = Field(..., description="List of IPs/CIDRs to scan")
     # None means "caller did not specify" — deliberately distinct from an explicit
@@ -524,6 +608,10 @@ class MasscanBody(BaseModel):
             except ValidationError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid target '{target}': {e}")
         self.targets = validated_targets
+        # Authorization boundary. Placed in validate_inputs, which every
+        # job-creating route already calls, so no route can add itself
+        # later and quietly skip the check.
+        _enforce_scope(self.targets, self.__class__.__name__)
 
         # Validate ports format - handle both port ranges and nmap arguments.
         # None means "not specified" — each route substitutes its own default
@@ -2060,6 +2148,10 @@ class UdpScanBody(BaseModel):
             except ValidationError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid target '{target}': {e}")
         self.targets = validated_targets
+        # Authorization boundary. Placed in validate_inputs, which every
+        # job-creating route already calls, so no route can add itself
+        # later and quietly skip the check.
+        _enforce_scope(self.targets, self.__class__.__name__)
 
         # Validate ports format - handle both port ranges and nmap arguments
         self.ports = self.ports.strip()
@@ -2349,6 +2441,10 @@ class FullScanRequest(BaseModel):
             except ValidationError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid target '{target}': {e}")
         self.targets = validated_targets
+        # Authorization boundary. Placed in validate_inputs, which every
+        # job-creating route already calls, so no route can add itself
+        # later and quietly skip the check.
+        _enforce_scope(self.targets, self.__class__.__name__)
 
         # Validate ports format (skip empty full_ports — means no deep scan)
         for ports_field in [self.quick_ports, self.full_ports]:
@@ -3017,6 +3113,10 @@ class CredentialCheckRequest(BaseModel):
             except ValidationError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid target '{target}': {e}")
         self.targets = validated_targets
+        # Authorization boundary. Placed in validate_inputs, which every
+        # job-creating route already calls, so no route can add itself
+        # later and quietly skip the check.
+        _enforce_scope(self.targets, self.__class__.__name__)
 
         # Validate services if provided
         valid_services = ["ssh", "ftp", "telnet", "mysql", "postgres", "vnc", "tomcat", "smb", "redis", "mongodb", "mssql"]
