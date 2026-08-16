@@ -312,3 +312,43 @@ class TestSlugify:
 
     def test_slug_is_bounded_and_never_empty(self):
         assert 0 < len(uf.slugify("https://d.test/", "!" * 200)) <= 60
+
+
+class TestMarkdownPassthrough:
+    """Raw .md sources must not be run through the HTML extractor.
+
+    raw.githubusercontent.com serves markdown as text/plain. Parsing that as
+    HTML reduced a 23KB HTB writeup to 168 characters, and the import failed
+    with "the page may be JavaScript-rendered" — a misleading diagnosis of a
+    format mismatch.
+    """
+
+    MD = "# Title\n\nSome text with `code` and a [link](https://x.test/a).\n\n## Section\n"
+
+    def test_markdown_content_type_passes_through(self):
+        doc = uf.extract_markdown(self.MD, "https://raw.x.test/f.md", "text/plain; charset=utf-8")
+        assert doc["markdown"] == self.MD
+        assert doc["title"] == "Title"
+
+    def test_md_extension_passes_through_without_content_type(self):
+        doc = uf.extract_markdown(self.MD, "https://raw.x.test/guide.md", "")
+        assert doc["markdown"] == self.MD
+
+    def test_html_still_parsed_when_content_type_says_so(self):
+        html = "<html><body><h1>H</h1><p>hello</p></body></html>"
+        doc = uf.extract_markdown(html, "https://x.test/", "text/html")
+        assert "<html>" not in doc["markdown"]
+        assert "hello" in doc["markdown"]
+
+    def test_html_fragment_without_doctype_still_parsed(self):
+        """Regression: a bare <main> fragment was misread as markdown, so its
+        links were never extracted."""
+        html = '<main><a href="/real">r</a></main>'
+        doc = uf.extract_markdown(html, "https://d.test/", "")
+        assert doc["links"] == ["https://d.test/real"]
+
+    def test_markdown_wins_over_shape_when_extension_says_md(self):
+        """A .md file may legitimately open with an inline HTML tag."""
+        body = '<img src="badge.png">\n\n# Real Title\n'
+        doc = uf.extract_markdown(body, "https://raw.x.test/README.md", "text/plain")
+        assert doc["markdown"] == body

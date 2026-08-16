@@ -1,0 +1,158 @@
+# Operator rules for the services with the THINNEST existing coverage.
+#
+# Priority was computed from a live scan rather than guessed: of 23 services
+# discovered on the target, 17 had no rule, and these are the ones where
+# tool_kb is also thin — exec and login had literally zero entries. Where the
+# static KB is already deep (http: 19 tools) operator guidance adds little, as
+# the SNMP case demonstrated by netting nothing.
+#
+# NATIVE KALI TOOLING ONLY — no Metasploit modules, per operator preference.
+# Every tool named here was verified present in the validator's binary/NSE
+# catalog before being written, so none of these can produce the "unrunnable"
+# recommendations the coverage check exists to surface.
+#
+#   ./scripts/import-knowledge.sh --file knowledge/seed/native-tools-gaps.yaml --dry-run
+#   ./scripts/import-knowledge.sh --file knowledge/seed/native-tools-gaps.yaml
+
+prompts:
+- selector_type: port_service
+  service: exec
+  port: 512
+  title: rexec — remote execution service
+  prompt: >-
+    Berkeley rexec accepts a username and password over cleartext and runs a command.
+    Enumerate with `nmap -p512 --script=rexec-brute {target}` to test credentials; any
+    success is direct command execution, not just an information leak. Capture traffic
+    if possible — credentials cross the wire in the clear, so a single observed login
+    yields reusable credentials for the whole r-services family (512/513/514) and often
+    for SSH on the same host. Do not assume the service is unused because it is
+    obsolete: on legacy and lab hosts it is frequently left with weak or shared
+    credentials.
+  training_notes: >-
+    Paired with login/513 and shell/514. If any one of the three authenticates, try the
+    same credentials against the others immediately — they usually share an account
+    database (~/.rhosts or hosts.equiv).
+  tags: [r-services, cleartext, legacy]
+  priority: 20
+
+- selector_type: port_service
+  service: login
+  port: 513
+  title: rlogin — trust-based remote login
+  prompt: >-
+    rlogin authenticates by host trust as well as password, so a permissive
+    `~/.rhosts` or `/etc/hosts.equiv` grants a shell with NO credentials at all.
+    Probe with `nmap -p513 --script=rlogin-brute {target}`. Try `root` and common
+    service accounts first: the classic misconfiguration is `+ +` in .rhosts, which
+    trusts every host and user. Check 512 and 514 on the same target — the three
+    r-services are installed together and share trust configuration.
+  training_notes: >-
+    A trust-based success needs no password, so an empty-credential result is a finding
+    rather than a failed brute force. Note which source host was trusted; that is the
+    pivot for reaching it again.
+  tags: [r-services, trust, legacy]
+  priority: 20
+
+- selector_type: port_service
+  service: rpcbind
+  port: 111
+  title: rpcbind — enumerate RPC programs before anything else
+  prompt: >-
+    rpcbind is a directory, not a target: it tells you which RPC services exist and on
+    which ports, several of which will be on high ports the port scan may have missed.
+    Run `rpcinfo -p {target}` first, then `nmap -p111 --script=rpcinfo {target}`.
+    Look for nfs and mountd (leads to 2049 — see the nfs rule), ypserv/NIS (password
+    map disclosure), and rquotad/statd. Feed any newly revealed high ports back into a
+    targeted scan; that is the whole point of enumerating it early.
+  training_notes: >-
+    rpc-grind fingerprints programs whose version is unclear. rpcbind is the cheapest
+    way to discover services that a top-1000 port scan does not reach.
+  tags: [rpc, enumeration, pivot]
+  priority: 10
+
+- selector_type: port_service
+  service: nfs
+  port: 2049
+  title: NFS — exports and no_root_squash
+  prompt: >-
+    List exports with `showmount -e {target}`, and check what is actually readable with
+    `nmap -p2049 --script=nfs-showmount,nfs-ls,nfs-statfs {target}`. A world-readable
+    export is a file-disclosure finding on its own. The higher-value case is an export
+    with `no_root_squash`: mount it and write a setuid binary, or drop a key into a
+    user's `~/.ssh/authorized_keys`, for a direct path to that account. Always note the
+    export options, not just the paths — the options are what determine exploitability.
+  training_notes: >-
+    Cross-reference with rpcbind/111, which announces mountd. Home directories exported
+    read-write are the usual route to SSH access.
+  tags: [nfs, file-disclosure, privesc]
+  priority: 20
+
+- selector_type: port_service
+  service: x11
+  port: 6000
+  title: X11 — unauthenticated display access
+  prompt: >-
+    An X server with access control disabled hands over the interactive session. Test
+    with `nmap -p6000 --script=x11-access {target}`; if it reports access granted,
+    confirm with `xdpyinfo -display {target}:0` and enumerate windows with
+    `xwininfo -root -tree -display {target}:0`. This yields keystroke capture and
+    screenshots of whatever the logged-in user is doing — treat a positive result as
+    session compromise, not an information leak.
+  training_notes: >-
+    Caused by `xhost +` or a display manager started without authentication. Ports
+    6000-6005 map to displays :0-:5, so probe the range rather than 6000 alone.
+  tags: [x11, unauthenticated, session]
+  priority: 20
+
+- selector_type: port_service
+  service: java-rmi
+  port: 1099
+  title: Java RMI registry — enumerate bound objects
+  prompt: >-
+    Dump the registry with `nmap -p1099 --script=rmi-dumpregistry {target}` to list
+    bound objects and their classes; the names alone often reveal the application and
+    its internals. Then check `rmi-vuln-classloader`, which reports whether the
+    registry permits remote class loading — that is remote code execution as the
+    service account. Note the JDK version from the banner: default-allow class loading
+    is a property of older JDKs.
+  training_notes: >-
+    Frequently paired with an application server on another port. Object names in the
+    registry are useful pivots for finding the app's own endpoints.
+  tags: [java, rmi, rce]
+  priority: 20
+
+- selector_type: port_service
+  service: ajp13
+  port: 8009
+  title: AJP connector — Ghostcat file read
+  prompt: >-
+    AJP is Tomcat's binary connector and is routinely exposed without authentication.
+    Enumerate with `nmap -p8009 --script=ajp-auth,ajp-headers,ajp-methods {target}`.
+    The significant issue is Ghostcat (CVE-2020-1938): a reachable AJP connector allows
+    reading files under the web root, including `WEB-INF/web.xml`, which typically
+    contains database credentials and internal endpoints. If file upload is possible
+    anywhere on the host it escalates to code execution. Always check the paired HTTP
+    connector (commonly 8080 or 8180) with any credentials recovered.
+  training_notes: >-
+    AJP is a Tomcat indicator even when the HTTP port is filtered. ajp-brute exists but
+    Ghostcat needs no credentials — check the file read first.
+  tags: [tomcat, ajp, ghostcat, file-read]
+  priority: 10
+
+- selector_type: port_service
+  service: bindshell
+  port: 1524
+  title: bindshell on 1524 — connect before scanning further
+  prompt: >-
+    Port 1524 answering is the classic ingreslock backdoor: a root shell bound to a
+    port with no authentication. Connect directly with `nc {target} 1524` and issue
+    `id` — if it answers, the host is already compromised and you have root without
+    exploiting anything. Verify before reporting: the port is also legitimately used by
+    Ingres, so confirm you have an interactive shell rather than a database banner.
+    Treat a live bindshell as a finding about the host's existing compromise, not only
+    as your access route.
+  training_notes: >-
+    `socat - TCP:{target}:1524` is an alternative when nc's flavour behaves oddly.
+    Preserve evidence of the pre-existing backdoor: someone else put it there.
+  tags: [backdoor, unauthenticated, root]
+  priority: 5
