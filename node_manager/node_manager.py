@@ -5605,7 +5605,7 @@ DANTED
             echo "WARNING: Cannot ping WireGuard server"
         fi
 
-        # Test if microsocks responds
+        # Test if the SOCKS server (danted) responds
         echo "Testing SOCKS connectivity..."
         if nc -z {assigned_ip} 1080; then
             echo "✓ SOCKS proxy is responding"

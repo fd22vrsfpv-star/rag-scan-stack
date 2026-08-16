@@ -81,7 +81,7 @@ def is_wireguard_safe_command(command: str) -> bool:
 
     # Allow multi-line WireGuard installation scripts
     if any(keyword in command for keyword in [
-        'wireguard', 'microsocks', '/etc/wireguard', 'wg-quick',
+        'wireguard', 'danted', 'dante-server', '/etc/wireguard', 'wg-quick',
         'DEBIAN_FRONTEND=noninteractive', 'apt-get install -y wireguard-tools'
     ]):
         # Additional safety checks for WireGuard commands
@@ -267,12 +267,12 @@ class SSHManager:
                     return {
                         "ok": False,
                         "error": f"WireGuard peer {tunnel.wg_assigned_ip}:1080 not reachable",
-                        "hint": "Ensure microsocks is running on the remote node and WireGuard connection is active"
+                        "hint": "Ensure danted is running on the remote node (systemctl status danted) and the WireGuard connection is active"
                     }
             except (subprocess.TimeoutExpired, subprocess.SubprocessError) as e:
                 return {"ok": False, "error": f"Failed to test WireGuard connectivity: {e}"}
 
-            # Start socat to forward local SOCKS port to remote microsocks
+            # Start socat to forward local SOCKS port to the remote SOCKS server (danted)
             cmd = [
                 "socat",
                 f"TCP-LISTEN:{tunnel.socks_port},fork,reuseaddr,bind=0.0.0.0",
@@ -321,7 +321,7 @@ class SSHManager:
             return {
                 "ok": False,
                 "error": f"WireGuard tunnel started but SOCKS port {tunnel.socks_port} not responsive after 5s",
-                "hint": "Check that microsocks is running on the remote node and accepting connections"
+                "hint": "Check that danted is running on the remote node and accepting connections from the WireGuard subnet (journalctl -u danted)"
             }
 
         except Exception as e:
