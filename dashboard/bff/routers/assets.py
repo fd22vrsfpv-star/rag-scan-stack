@@ -733,16 +733,57 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
     headers = {"x-api-key": s.api_key, "Content-Type": "application/json", **engagement_headers()}
     results = []
 
-    # Fetch the full recommendation details
-    async with httpx.AsyncClient(verify=False, timeout=15) as client:
-        resp = await client.get(
-            f"{s.scan_recommender_url}/recommendations",
-            params={"status": "all", "limit": 500},
-            headers=headers,
-        )
-        all_recs = resp.json().get("recommendations", []) if resp.status_code == 200 else []
+    # Resolve the requested ids DIRECTLY against the table, not via the
+    # recommender's list endpoint.
+    #
+    # That endpoint selects
+    #   SELECT DISTINCT ON (ip, scanner, COALESCE(action,''), COALESCE(template,''))
+    # so it collapses duplicates — 182 rows in the table came back as 119 — and
+    # DISTINCT ON keeps only one row per group. Any id that lost the tie-break was
+    # simply absent, and this endpoint answered "No matching recommendations
+    # found" for a row that plainly exists and is pending.
+    #
+    # That made it structurally impossible for the recon agent's KB drain to work:
+    # the drain selects ids from the RAW table, then posts them here, where they
+    # were looked up in the DEDUPLICATED view. Ids the drain picks are exactly the
+    # ones most likely to have been deduped away.
+    #
+    # Ids are exact keys, so dedupe is meaningless for this lookup — query for
+    # them. The list endpoint stays as-is: collapsing duplicates is right for
+    # DISPLAY, just not for resolution by primary key.
+    recs_by_id: dict = {}
+    try:
+        from db import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id::text, host(ip)::text AS ip, service, scanner, action,
+                       script, template, source, model, confidence, priority,
+                       status, extra
+                  FROM scan_recommendations
+                 WHERE id = ANY(%s::uuid[])
+                """,
+                (list(body.ids),),
+            )
+            cols = [d[0] for d in cur.description]
+            for row in cur.fetchall():
+                rec = dict(zip(cols, row))
+                recs_by_id[rec["id"]] = rec
+    except Exception as e:
+        # Fall back to the list endpoint rather than failing outright — a DB
+        # hiccup should not make dispatch impossible, even if dedupe may hide
+        # some ids on that path.
+        log.warning("recommendation id lookup failed (%s) — falling back to the "
+                    "recommender list, which deduplicates and may not find every id", e)
+        async with httpx.AsyncClient(verify=False, timeout=15) as client:
+            resp = await client.get(
+                f"{s.scan_recommender_url}/recommendations",
+                params={"status": "all", "limit": 500},
+                headers=headers,
+            )
+            all_recs = resp.json().get("recommendations", []) if resp.status_code == 200 else []
+        recs_by_id = {r["id"]: r for r in all_recs}
 
-    recs_by_id = {r["id"]: r for r in all_recs}
     selected = [recs_by_id[rid] for rid in body.ids if rid in recs_by_id]
 
     if not selected:
