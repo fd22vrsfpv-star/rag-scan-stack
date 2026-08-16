@@ -306,3 +306,34 @@ class TestRunFailureDiagnosis:
                     "unverifiable_reason": "unknown_kind", "supported": False, "context": ""}
                    for i in range(4)]
         assert not ac.summarise(results)["probable_run_failure"]
+
+
+class TestContextBounding:
+    """Severity must not bleed between statements.
+
+    The original ±45-character window made a host claim inherit "root shell"
+    from the preceding sentence and score as an access finding.
+    """
+
+    def test_severity_does_not_bleed_across_sentences(self):
+        text = "I obtained a root shell on the box. Host 10.1.2.3 also answered ping."
+        host = [c for c in ac.extract_claims(text) if c["kind"] == "host"][0]
+        assert "root shell" not in host["context"]
+        assert not ac.score_notability({**host, "supported": True})["notable"]
+
+    def test_severity_is_kept_within_its_own_sentence(self):
+        text = "Port 4444 gave me a root shell."
+        port = [c for c in ac.extract_claims(text) if c["kind"] == "port"][0]
+        assert ac.score_notability({**port, "supported": True})["notable"]
+
+    def test_bullet_lines_are_separate_statements(self):
+        """Agent notes are often bullets with no full stops — a sentence-only
+        split would lump the whole list into one context."""
+        text = "- obtained a root shell\n- port 8080 is open\n"
+        port = [c for c in ac.extract_claims(text) if c["kind"] == "port"][0]
+        assert "root shell" not in port["context"]
+
+    def test_unpunctuated_dump_is_still_bounded(self):
+        text = "root shell " + ("filler " * 300) + "port 9999 open"
+        port = [c for c in ac.extract_claims(text) if c["kind"] == "port"][0]
+        assert len(port["context"]) < 400

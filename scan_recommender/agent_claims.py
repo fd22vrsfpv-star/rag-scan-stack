@@ -65,9 +65,28 @@ def extract_claims(text: str, service_vocab=None) -> List[Dict]:
     if not text:
         return claims
 
+    # Sentence- or line-bounded, NOT a character window.
+    #
+    # A ±45-char window bled severity between neighbouring sentences: in testing,
+    # a host claim inherited "root shell" from the sentence before it and was
+    # scored as an access finding. Severity is a property of the statement the
+    # claim appears in, so the statement is the right unit.
+    #
+    # Split on sentence enders AND newlines, because agent notes are frequently
+    # bullet lists and JSON fragments with no full stops at all — a
+    # sentence-only split would return the entire blob for those.
+    _bounds = [0] + [m.end() for m in re.finditer(r"(?<=[.!?])\s+|\n+", text)] + [len(text)]
+
     def _ctx(m) -> str:
-        s = max(0, m.start() - 45)
-        return re.sub(r"\s+", " ", text[s:m.end() + 45]).strip()
+        start = max((b for b in _bounds if b <= m.start()), default=0)
+        end = min((b for b in _bounds if b >= m.end()), default=len(text))
+        # A pathologically long "sentence" (unpunctuated log dump) still gets
+        # bounded, or one claim would carry thousands of characters of context.
+        seg = text[start:end]
+        if len(seg) > 400:
+            rel = m.start() - start
+            seg = seg[max(0, rel - 120):rel + 160]
+        return re.sub(r"\s+", " ", seg).strip()
 
     for m in _CVE_RE.finditer(text):
         claims.append({"kind": "cve", "value": m.group(0).upper(), "context": _ctx(m)})

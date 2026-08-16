@@ -110,6 +110,11 @@ class ScanRecommendation(BaseModel):
 
 class ScanRecommendationsResponse(BaseModel):
     recommendations: List[ScanRecommendation]
+    # Optional so existing callers are unaffected; FastAPI's response_model would
+    # otherwise strip it. Carries the preflight verdict when the target had no
+    # observed data, so "recommendations from a service name alone" is visible
+    # at the point of use rather than only in a log line.
+    preflight: Optional[Dict] = None
 
 
 class OllamaQueryRequest(BaseModel):
@@ -1592,6 +1597,7 @@ def get_next_scan_recommendations(
     recommendations: List[ScanRecommendation] = []
     effective_service = service
     effective_port = port
+    preflight_verdict = None
     try:
         # Build filtered query — narrow to specific service/port when provided
         query = "SELECT p.service, p.banner, p.port FROM public.ports p JOIN public.assets a ON p.asset_id = a.id WHERE host(a.ip)=%s"
@@ -1609,6 +1615,16 @@ def get_next_scan_recommendations(
             rows = cur.fetchall()
             logger.info(f"DB rows found for {ip} (service={service}, port={port}): {len(rows)}")
         if not rows or use_ollama:
+            # Nothing observed for this target: the model is being asked to
+            # recommend probes for a service no scan reported. Sometimes correct
+            # (the operator may know it is there), but it must not be silent —
+            # the preflight verdict rides along with the response so the caller
+            # can see the recommendations rest on a service name alone.
+            if not rows:
+                logger.warning(
+                    "next_scan: no recorded ports for %s — recommending from the "
+                    "service name alone", ip)
+                preflight_verdict = preflight_check(ip, service, port)
             # `port` is passed so per-port and per-(port,service) operator
             # prompts resolve — previously the LLM path discarded it entirely.
             ollama_recs = fetch_ollama_recommendations(ip, service, banner, port=port)
@@ -1789,7 +1805,8 @@ def get_next_scan_recommendations(
                 daemon=True,
             ).start()
 
-        return ScanRecommendationsResponse(recommendations=recommendations)
+        return ScanRecommendationsResponse(recommendations=recommendations,
+                                           preflight=preflight_verdict)
     except HTTPException:
         raise
     except Exception as e:
@@ -2715,6 +2732,88 @@ def verify_agent_output(body: VerifyAgentBody):
         })
     return {"ok": True, "session_id": session_id or None,
             "llm_extraction_used": llm_used, **out}
+
+
+def preflight_check(ip: Optional[str] = None, service: Optional[str] = None,
+                    port: Optional[int] = None) -> Dict:
+    """Is the input sound enough to base recommendations on?
+
+    Runs BEFORE generation, because every downstream check is wasted on garbage
+    input. `/next_scan` will happily answer for a host with no recorded ports —
+    the `if not rows` branch asks the model to recommend probes for a service it
+    has never observed. That is not always wrong (an operator may know the
+    service is there), but it should be visible rather than silent.
+
+    DETERMINISTIC ON PURPOSE. This gates the LLM path, so implementing it with an
+    LLM would put the thing being guarded in charge of the gate. Every question
+    here — is there scan data, is the catalog present, how old is it — has an
+    exact answer.
+
+    Returns {ok, blockers, warnings, facts}. `blockers` are conditions under
+    which recommendations are probably worthless; `warnings` are worth knowing
+    but not disqualifying. Nothing here refuses to run: the operator decides.
+    """
+    blockers: List[str] = []
+    warnings: List[str] = []
+    facts: Dict = {}
+
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if ip:
+                cur.execute(
+                    "SELECT COUNT(*) AS n, MAX(p.last_seen) AS last "
+                    "  FROM ports p JOIN assets a ON a.id = p.asset_id "
+                    " WHERE host(a.ip) = %s", (ip,))
+            else:
+                cur.execute("SELECT COUNT(*) AS n, MAX(last_seen) AS last FROM ports")
+            row = cur.fetchone() or {}
+            facts["ports_recorded"] = int(row.get("n") or 0)
+            facts["last_seen"] = str(row.get("last")) if row.get("last") else None
+
+            if facts["ports_recorded"] == 0:
+                blockers.append(
+                    f"No ports recorded{' for ' + ip if ip else ''}. Recommendations would be "
+                    f"generated from the service name alone, with nothing observed to ground "
+                    f"them — check the scan ran and its ingest stats before trusting the output."
+                )
+            elif service:
+                cur.execute(
+                    "SELECT 1 FROM ports p JOIN assets a ON a.id = p.asset_id "
+                    " WHERE host(a.ip) = %s AND lower(p.service) = lower(%s) LIMIT 1"
+                    if ip else
+                    "SELECT 1 FROM ports WHERE lower(service) = lower(%s) LIMIT 1",
+                    (ip, service) if ip else (service,))
+                if not cur.fetchone():
+                    warnings.append(
+                        f"{service!r} was not observed{' on ' + ip if ip else ''} — "
+                        f"recommending for a service no scan reported.")
+    except Exception as e:
+        warnings.append(f"Could not check recorded scan data: {e}")
+
+    try:
+        from tool_catalog import catalog_info
+        info = catalog_info()
+        facts["catalog_entries"] = sum(info.get("counts", {}).values())
+        facts["catalog_age_seconds"] = info.get("age_seconds")
+        if not info.get("exists"):
+            warnings.append(
+                "No tool catalog — recommendations will not be validated, so unrunnable "
+                "invocations can reach dispatch. Run scripts/refresh-tool-catalogs.sh.")
+        elif (info.get("age_seconds") or 0) > 7 * 86400:
+            warnings.append(
+                f"Tool catalog is {int(info['age_seconds'] / 86400)} days old; anything "
+                f"installed since is invisible to validation.")
+    except Exception as e:
+        warnings.append(f"Could not read the tool catalog: {e}")
+
+    return {"ok": not blockers, "blockers": blockers, "warnings": warnings, "facts": facts}
+
+
+@kb_router.get("/preflight")
+def preflight(ip: Optional[str] = Query(None), service: Optional[str] = Query(None),
+              port: Optional[int] = Query(None)):
+    """Check whether recommendations for this target would rest on real data."""
+    return preflight_check(ip, service, port)
 
 
 @kb_router.get("/tool-coverage")
