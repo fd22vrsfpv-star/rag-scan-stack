@@ -1414,8 +1414,28 @@ async def receive_scan_event(payload: dict):
             webhook_logger.info(f"Woke up waiter for job {job_id[:8]}")
             return {"ok": True, "matched": True}
 
+    # No waiter — the usual case for a job that outlived its session. This is
+    # exactly the scan whose results the teardown snapshot missed, so refresh the
+    # summary now that it has landed. Runs in a thread: this handler is async and
+    # the refresh does blocking DB work.
+    #
+    # Only for sessions that have ENDED. A live session still owns its in-memory
+    # registry and will build a complete summary at its own teardown; refreshing
+    # underneath it would race that.
+    refreshed = False
+    try:
+        # Function-local, matching this module's convention — asyncio is not
+        # imported at module scope here.
+        import asyncio
+        sess_id, sess_status = _session_id_for_job(job_id)
+        if sess_id and sess_status not in ("active", "running", None):
+            await asyncio.to_thread(_refresh_flow_summary, sess_id)
+            refreshed = True
+    except Exception as e:
+        webhook_logger.warning(f"Post-session summary refresh failed for {job_id[:8]}: {e}")
+
     webhook_logger.debug(f"No waiter registered for job {job_id[:8]} (may have already completed)")
-    return {"ok": True, "matched": False}
+    return {"ok": True, "matched": False, "summary_refreshed": refreshed}
 
 
 
@@ -1433,6 +1453,31 @@ def _emit_flow_summary(session_id) -> dict:
     except Exception as e:
         session_logger.warning("[%s] flow summary build failed: %s", session_id, e)
         return {}
+
+    # Record which types were STILL RUNNING when this snapshot was taken.
+    #
+    # Teardown regularly happens while scans are in flight — on a real session,
+    # udp and credential_check were both still running, and credential_check is
+    # the one that finds valid credentials. Their results are simply absent from
+    # this snapshot, which otherwise reads as a complete and final account.
+    #
+    # _refresh_flow_summary() fills them in once the scan-completed webhooks
+    # arrive; until then this field is what tells a reader the numbers are
+    # provisional rather than a scan that genuinely found nothing.
+    try:
+        in_flight = sorted({
+            t.get("scan_type") for t in (summary.get("by_scan_type") or [])
+            if (t.get("running") or 0) > 0
+        } - {None})
+        summary["in_flight_at_teardown"] = in_flight
+        if in_flight:
+            session_logger.info(
+                "[%s] flow summary taken with %d type(s) still running: %s "
+                "— will refresh on scan completion",
+                session_id, len(in_flight), ", ".join(in_flight),
+            )
+    except Exception:
+        summary["in_flight_at_teardown"] = []
 
     # Persist onto the session row so it outlives the process.
     try:
@@ -1714,6 +1759,149 @@ def _drain_recommendations_if_enabled(session_id, summary, enabled) -> None:
         # Never let this take down the teardown around it.
         session_logger.warning(
             "[%s] auto-run recommendations failed: %s", session_id, e)
+
+
+def _session_id_for_job(job_id: str):
+    """Which session owns this scan job, and had it already ended?
+
+    session_scan_metrics is the link. It is only reliable now that persist_to_db
+    upserts on (session_id, job_id) — before that it re-inserted on every call,
+    so a job could match several rows carrying different statuses.
+    """
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT m.session_id::text, s.status "
+                    "  FROM session_scan_metrics m "
+                    "  LEFT JOIN agent_sessions s ON s.id = m.session_id "
+                    " WHERE m.job_id = %s "
+                    " ORDER BY m.created_at DESC LIMIT 1",
+                    (str(job_id),),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None, None
+                return row[0], row[1]
+    except Exception as e:
+        webhook_logger.debug("job->session lookup failed for %s: %s", job_id, e)
+        return None, None
+
+
+def _refresh_flow_summary(session_id) -> None:
+    """Re-build the flow summary for an ENDED session from persisted scan rows.
+
+    The teardown snapshot is taken while scans are often still running, so it
+    under-reports. This runs when a scan-completed webhook arrives for a session
+    that has already finished, and replaces the snapshot with one that includes
+    the late results.
+
+    It must read from session_scan_metrics rather than the in-memory registry:
+    cleanup_session() has already discarded that, and build_flow_summary() would
+    otherwise cheerfully report a session with zero scans and overwrite a good
+    summary with an empty one.
+
+    Claim validation is re-run afterwards for the same reason it exists: with
+    ingestion now complete, claims that looked "unsupported" purely because their
+    scan had not finished get a fair second evaluation.
+    """
+    import json as _json
+    sid = str(session_id)
+    try:
+        scans = scan_tracker.load_scans_from_db(sid)
+        if not scans:
+            return
+        summary = scan_tracker.build_flow_summary(sid, scans=scans)
+        if not summary.get("total_scans"):
+            return
+        summary["refreshed_at"] = datetime.utcnow().isoformat() + "Z"
+        summary["in_flight_at_teardown"] = sorted({
+            t.get("scan_type") for t in (summary.get("by_scan_type") or [])
+            if (t.get("running") or 0) > 0
+        } - {None})
+
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE agent_sessions "
+                    "SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb "
+                    "WHERE id = %s::uuid",
+                    (_json.dumps({"scan_flow_summary": summary}), sid),
+                )
+            conn.commit()
+        webhook_logger.info(
+            "[%s] flow summary refreshed: %d scans, %d types, still running: %s",
+            sid[:8], summary.get("total_scans"), summary.get("scan_types_run"),
+            summary.get("in_flight_at_teardown") or "none",
+        )
+
+        try:
+            _validate_agent_output(session_id, summary)
+        except Exception as e:
+            webhook_logger.warning("[%s] revalidation failed: %s", sid[:8], e)
+    except Exception as e:
+        webhook_logger.warning("[%s] flow summary refresh failed: %s", sid[:8], e)
+
+
+def _finalize_session(session_id, auto_run_recommendations) -> None:
+    """Everything that must happen when a session ends, however it ended.
+
+    This used to be inline at the bottom of the happy path, which meant the three
+    most valuable steps — the flow summary, claim validation and the KB drain —
+    ran ONLY when a session completed cleanly. Both `except` handlers persisted
+    scan rows and cleaned up, but produced no summary and validated nothing.
+
+    The `stalled` session in agent_sessions is what that looks like from the
+    outside: no scan_flow_summary, no claim_validation, no termination metadata.
+    A failed run is exactly when an operator most needs to know what each scan
+    type produced and whether the agents' claims held up, so the reporting now
+    runs from a `finally`.
+
+    ORDER IS LOAD-BEARING. build_flow_summary() reads the in-memory scan registry
+    that cleanup_session() discards, so every reporting step has to complete
+    before cleanup. That is also why the except handlers no longer clean up
+    themselves — doing so would wipe the registry before this function ran.
+
+    Every step is individually guarded: reporting is a nicety, releasing the
+    session is not, and a failure in the former must never strand the latter.
+    """
+    sid = str(session_id)
+    summary = {}
+
+    try:
+        summary = _emit_flow_summary(session_id) or {}
+    except Exception as e:
+        session_logger.warning("[%s] flow summary failed: %s", sid, e)
+
+    try:
+        _validate_agent_output(session_id, summary)
+    except Exception as e:
+        session_logger.warning("[%s] claim validation failed: %s", sid, e)
+
+    try:
+        _drain_recommendations_if_enabled(session_id, summary, auto_run_recommendations)
+    except Exception as e:
+        session_logger.warning("[%s] recommendation drain failed: %s", sid, e)
+
+    try:
+        scan_tracker.persist_to_db(sid)
+    except Exception as e:
+        session_logger.warning("[%s] scan persist failed: %s", sid, e)
+
+    try:
+        LLMMetricsContext.flush_buffer()
+        LLMMetricsContext.clear_session()
+    except Exception as e:
+        session_logger.warning("[%s] LLM metrics flush failed: %s", sid, e)
+
+    # Release last — after this the registry is gone.
+    try:
+        scan_tracker.clear_session()
+        scan_tracker.cleanup_session(sid)
+    except Exception as e:
+        session_logger.warning("[%s] scan tracker cleanup failed: %s", sid, e)
+
+    active_sessions.pop(sid, None)
 
 
 def run_pentest_session_sync(
@@ -2138,26 +2326,9 @@ Coordinator, please start by analyzing the target and assigning initial tasks to
         except Exception as collect_err:
             session_logger.warning(f"[{session_id}] Output collection failed: {collect_err}")
 
-        # End-of-session scan flow summary. MUST run before cleanup_session(),
-        # which discards the registry it is built from.
-        _summary = _emit_flow_summary(session_id)
-
-        # Optionally act on what the KB recommended but the run never did.
-        # Validate what the agents CLAIMED against what the scans recorded.
-        _validate_agent_output(session_id, _summary)
-
-        _drain_recommendations_if_enabled(session_id, _summary, auto_run_recommendations)
-
-        # Persist scan metrics to DB before cleanup
-        scan_tracker.persist_to_db(str(session_id))
-        # Flush and clear LLM metrics context
-        LLMMetricsContext.flush_buffer()
-        LLMMetricsContext.clear_session()
-        # Cleanup scan tracker and remove from active sessions
-        scan_tracker.clear_session()
-        scan_tracker.cleanup_session(str(session_id))
-        if str(session_id) in active_sessions:
-            del active_sessions[str(session_id)]
+        # Teardown (flow summary, claim validation, KB drain, persist, cleanup)
+        # is handled by _finalize_session in the `finally` below, so it runs on
+        # the error paths too.
 
     except RuntimeError as e:
         # Stop the live message flusher if it was started
@@ -2177,14 +2348,9 @@ Coordinator, please start by analyzing the target and assigning initial tasks to
             summary=f"Service Unavailable: {error_msg}",
             metadata={"scans": scans_metadata, "scan_summary": scan_status.get("summary") if isinstance(scan_status, dict) else None}
         )
-        # Flush and clear LLM metrics context
-        LLMMetricsContext.flush_buffer()
-        LLMMetricsContext.clear_session()
-        # Cleanup scan tracker and remove from active sessions
-        scan_tracker.clear_session()
-        scan_tracker.cleanup_session(str(session_id))
-        if str(session_id) in active_sessions:
-            del active_sessions[str(session_id)]
+        # Cleanup deliberately NOT done here — _finalize_session in the
+        # `finally` owns it. Cleaning up here would discard the scan registry
+        # before the flow summary could be built from it.
 
         session_logger.error(f"[{session_id}] Session failed pre-flight checks: {e}")
 
@@ -2216,18 +2382,18 @@ Coordinator, please start by analyzing the target and assigning initial tasks to
             summary=f"Error ({error_type}): {error_msg}{service_hint}",
             metadata={"scans": scans_metadata, "scan_summary": scan_status.get("summary") if isinstance(scan_status, dict) else None}
         )
-        # Flush and clear LLM metrics context
-        LLMMetricsContext.flush_buffer()
-        LLMMetricsContext.clear_session()
-        # Cleanup scan tracker and remove from active sessions
-        scan_tracker.clear_session()
-        scan_tracker.cleanup_session(str(session_id))
-        if str(session_id) in active_sessions:
-            del active_sessions[str(session_id)]
+        # Cleanup deliberately NOT done here — _finalize_session in the
+        # `finally` owns it. Cleaning up here would discard the scan registry
+        # before the flow summary could be built from it.
 
         import traceback
         session_logger.error(f"[{session_id}] Session failed with {error_type}: {e}")
         session_logger.error(f"[{session_id}] Traceback: {traceback.format_exc()}")
+
+    finally:
+        # Runs on success, RuntimeError and Exception alike. Reporting a failed
+        # session is the case this exists for.
+        _finalize_session(session_id, auto_run_recommendations)
 
 
 # API Endpoints

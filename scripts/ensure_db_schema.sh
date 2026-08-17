@@ -142,6 +142,30 @@ done
 
 echo ""
 
+# Verify constraints that application code depends on.
+#
+# Table existence is not enough here. autogen_agents/scan_tools.py::persist_to_db
+# issues ON CONFLICT (session_id, job_id), which RAISES if no matching unique
+# index exists. Before this index was added the clause was
+# `ON CONFLICT DO NOTHING` with nothing to match, so every persist silently
+# re-inserted: 104 rows for 75 distinct jobs, and scans stuck at 'running' that
+# could never be corrected once they completed.
+echo "🔍 Verifying critical indexes..."
+CRITICAL_INDEXES=(
+    "uq_session_scan_metrics_session_job"
+)
+for idx in "${CRITICAL_INDEXES[@]}"; do
+    if docker exec rag-postgres psql -U app -d scans -t -c \
+        "SELECT 1 FROM pg_indexes WHERE indexname = '${idx}';" | grep -q 1; then
+        echo "✓ ${idx}"
+    else
+        echo "❌ Missing critical index: ${idx} (upserts into session_scan_metrics will fail)"
+        MISSING=$((MISSING + 1))
+    fi
+done
+
+echo ""
+
 # Verify critical views exist
 echo "🔍 Verifying critical views..."
 CRITICAL_VIEWS=(

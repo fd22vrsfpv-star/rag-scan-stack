@@ -262,3 +262,54 @@ def test_missing_target_kind_defaults_to_service():
     """Rows predating the column must keep behaving exactly as before."""
     r = {"scanner": "nuclei"}
     assert (r.get("target_kind") or "service") == "service"
+
+
+# ------------------------------------------------- control-flow audit fixes
+# Four instrumentation features were present but never executed. Each failed
+# silently — plausible output, no error — so these pin the executions rather
+# than the formatting.
+
+@pytest.mark.unit
+def test_summary_can_be_built_from_supplied_scans_not_only_the_registry():
+    """The post-session refresh runs AFTER cleanup_session() has emptied the
+    registry. Without an explicit scans source, build_flow_summary would report a
+    session with zero scans and overwrite a good summary with an empty one."""
+    rows = [
+        _scan("nmap", status="completed", result={"ports_found": 12}),
+        _scan("udp", status="completed", result={"ports_found": 3}),
+    ]
+    s = T.build_flow_summary("session-not-in-registry", scans=rows)
+    assert s["total_scans"] == 2
+    assert s["scan_types_run"] == 2
+    assert {t["scan_type"] for t in s["by_scan_type"]} == {"nmap", "udp"}
+
+
+@pytest.mark.unit
+def test_running_scans_are_not_flagged_as_produced_nothing():
+    """A scan still in flight has produced nothing YET. Flagging it would mean
+    every session that tears down mid-scan reports a false broken tool."""
+    s = _session([
+        _scan("credential_check", status="running", result=None),
+        _scan("zap", status="completed", result={"alerts": 0}),
+    ])
+    cred = next(t for t in s["by_scan_type"] if t["scan_type"] == "credential_check")
+    zap = next(t for t in s["by_scan_type"] if t["scan_type"] == "zap")
+    assert cred["produced_nothing"] is False   # running, not broken
+    assert zap["produced_nothing"] is True     # completed with nothing
+    assert s["types_that_produced_nothing"] == ["zap"]
+
+
+@pytest.mark.unit
+def test_in_flight_types_are_identifiable_from_the_summary():
+    """Drives the in_flight_at_teardown marker: a reader must be able to tell a
+    provisional count from a final one. On a real session udp and
+    credential_check were both still running when the summary was frozen."""
+    s = _session([
+        _scan("udp", status="running"),
+        _scan("credential_check", status="running"),
+        _scan("nmap", status="completed", result={"ports_found": 5}),
+    ])
+    still_running = sorted(
+        t["scan_type"] for t in s["by_scan_type"] if t["running"] > 0
+    )
+    assert still_running == ["credential_check", "udp"]

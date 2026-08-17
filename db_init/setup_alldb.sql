@@ -1429,6 +1429,14 @@ BEGIN
     CREATE INDEX idx_session_scan_metrics_scan_type ON public.session_scan_metrics(scan_type);
     CREATE INDEX idx_session_scan_metrics_created_at ON public.session_scan_metrics(created_at DESC);
   END IF;
+  -- One row per (session, job). REQUIRED by the upsert in
+  -- autogen_agents/scan_tools.py::persist_to_db — without it the
+  -- ON CONFLICT (session_id, job_id) clause raises at runtime.
+  --
+  -- Created outside the table guard so existing installs pick it up too; the
+  -- matching dedupe-then-create migration lives in ensure_all_tables.sql.
+  CREATE UNIQUE INDEX IF NOT EXISTS uq_session_scan_metrics_session_job
+      ON public.session_scan_metrics(session_id, job_id);
 END$$;
 
 -- ===============================

@@ -131,6 +131,46 @@ async def get_session_scans(session_id: str):
         return safe_json(resp)
 
 
+@router.get("/api/agent-sessions/{session_id}/flow-summary")
+async def get_session_flow_summary(session_id: str):
+    """Per-scan-type summary of what the session actually ran.
+
+    The upstream endpoint serves this LIVE from the in-memory tracker while a
+    session is active, and from the persisted copy on agent_sessions.metadata
+    once it has ended. It existed for some time with no BFF route in front of
+    it, so the UI could not reach it at all (404) and had to read the frozen
+    metadata blob instead — which is taken at teardown, while scans are often
+    still running.
+    """
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        resp = await c.get(
+            f"{s.autogen_url}/pentest/{session_id}/flow-summary",
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.get("/api/model/performance-warning")
+async def get_model_performance_warning():
+    """Warn when the configured model is a poor fit for agent tool-calling.
+
+    The frontend has always called this (`api/agents.ts`), but no BFF route
+    existed, so every request 404'd and the warning modal could never fire.
+    """
+    s = get_settings()
+    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        resp = await c.get(
+            f"{s.autogen_url}/model/performance-warning",
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
 @router.delete("/api/agent-sessions/{session_id}")
 async def delete_session(session_id: str):
     """Delete a single agent session (proxies to autogen service)"""

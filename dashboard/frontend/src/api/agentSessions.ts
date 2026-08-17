@@ -21,6 +21,24 @@ export function useAgentSession(id: string | undefined) {
   })
 }
 
+/** Per-scan-type flow summary.
+ *
+ * Served LIVE from the in-memory tracker while the session is active, and from
+ * the persisted copy once it has ended — so this is fresher than reading
+ * `session.metadata.scan_flow_summary`, which is frozen at teardown while scans
+ * are often still running.
+ */
+export function useSessionFlowSummary(id: string | undefined) {
+  return useQuery({
+    queryKey: ['agent-session-flow-summary', id],
+    queryFn: () => apiFetch<Record<string, unknown>>(`/agent-sessions/${id}/flow-summary`),
+    enabled: !!id,
+    refetchInterval: POLL.FAST,
+    placeholderData: (prev: Record<string, unknown> | undefined) => prev,
+    retry: 1,
+  })
+}
+
 export function useAgentMessages(id: string | undefined) {
   return useQuery({
     queryKey: ['agent-messages', id],

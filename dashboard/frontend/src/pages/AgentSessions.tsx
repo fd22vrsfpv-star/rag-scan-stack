@@ -6,6 +6,7 @@ import {
   useAgentSession,
   useAgentMessages,
   useSessionScans,
+  useSessionFlowSummary,
   useStartSession,
   useStopSession,
   useResumeSession,
@@ -163,6 +164,11 @@ interface FlowSummary {
   types_with_failures: string[]
   kb_coverage?: KbCoverage
   generated_at?: string
+  /** Types still running when the teardown snapshot was taken. Non-empty means
+   *  the numbers are provisional until the post-session refresh lands. */
+  in_flight_at_teardown?: string[]
+  refreshed_at?: string
+  source?: string
 }
 
 interface ClaimValidation {
@@ -184,6 +190,7 @@ function ScanFlowSummary({ summary, validation }: {
   const kb = summary.kb_coverage
   const quiet = summary.types_that_produced_nothing ?? []
   const broken = summary.types_with_failures ?? []
+  const inFlight = summary.in_flight_at_teardown ?? []
 
   return (
     <div className="bg-card border border-border rounded-lg">
@@ -205,6 +212,11 @@ function ScanFlowSummary({ summary, validation }: {
         {broken.length > 0 && (
           <span className="text-xs px-1.5 py-0.5 rounded bg-red-500/10 text-red-500">
             {broken.length} with failures
+          </span>
+        )}
+        {inFlight.length > 0 && (
+          <span className="text-xs px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500">
+            {inFlight.length} still running
           </span>
         )}
       </button>
@@ -327,9 +339,21 @@ function ScanFlowSummary({ summary, validation }: {
             </div>
           )}
 
-          {summary.generated_at && (
+          {/* Say plainly that the numbers are provisional. Without this a scan
+              that simply had not finished is indistinguishable from one that
+              genuinely found nothing. */}
+          {inFlight.length > 0 && (
+            <p className="text-xs text-blue-400">
+              Still running when this was taken: <span className="font-mono">{inFlight.join(', ')}</span>.
+              Counts for these are provisional and refresh when the scans report in.
+            </p>
+          )}
+
+          {(summary.generated_at || summary.refreshed_at) && (
             <p className="text-[11px] text-muted-foreground">
-              generated {new Date(summary.generated_at).toLocaleString()}
+              {summary.generated_at && <>generated {new Date(summary.generated_at).toLocaleString()}</>}
+              {summary.refreshed_at && <> · refreshed {new Date(summary.refreshed_at).toLocaleString()}</>}
+              {summary.source && <> · {summary.source}</>}
             </p>
           )}
         </div>
@@ -485,11 +509,18 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const [resumeNodeId, setResumeNodeId] = useState('')
   const nodesQuery = useNodes()
   const resumeOnlineNodes = (nodesQuery.data?.nodes ?? []).filter(n => n.status === 'online')
-  // Already returned by /agent-sessions/{id}; no new endpoint needed. Persisted
-  // at teardown to agent_sessions.metadata, so it is present for finished
-  // sessions and absent for ones that never reached teardown.
+  // Prefer the dedicated endpoint: it serves the LIVE tracker while the session
+  // is active and the persisted copy once it has ended. session.metadata holds
+  // only the teardown snapshot, which is taken while scans are frequently still
+  // running, so it under-reports until the post-session refresh lands.
+  const { data: liveFlow } = useSessionFlowSummary(sessionId)
   const sessionMeta = (session as unknown as { metadata?: Record<string, unknown> } | undefined)?.metadata
-  const flowSummary = sessionMeta?.scan_flow_summary as FlowSummary | undefined
+  const storedFlow = sessionMeta?.scan_flow_summary as FlowSummary | undefined
+  // `source: "none"` means the endpoint found nothing — fall back rather than
+  // rendering an empty panel over a summary we already have.
+  const flowSummary = (liveFlow && (liveFlow as { total_scans?: number }).total_scans
+    ? (liveFlow as unknown as FlowSummary)
+    : storedFlow)
   const claimValidation = sessionMeta?.claim_validation as ClaimValidation | undefined
   const [activeTab, setActiveTab] = useState<'messages' | 'scans'>('messages')
   const [showToolCalls, setShowToolCalls] = useState(true)

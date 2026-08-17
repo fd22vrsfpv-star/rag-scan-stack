@@ -845,6 +845,40 @@ CREATE INDEX IF NOT EXISTS idx_session_scan_metrics_session_id ON public.session
 CREATE INDEX IF NOT EXISTS idx_session_scan_metrics_scan_type ON public.session_scan_metrics(scan_type);
 CREATE INDEX IF NOT EXISTS idx_session_scan_metrics_created_at ON public.session_scan_metrics(created_at DESC);
 
+-- One row per (session, job). REQUIRED by the upsert in
+-- autogen_agents/scan_tools.py::persist_to_db.
+--
+-- The table's only key was PRIMARY KEY (id), so the existing
+-- `ON CONFLICT DO NOTHING` had no constraint to match and never fired: every
+-- persist re-INSERTED. A live database held 104 rows for 75 distinct jobs,
+-- including one job with 6 copies carrying two different statuses.
+--
+-- It also made a scan persisted while `running` impossible to correct once it
+-- completed, which is what stops session_scan_metrics being a usable source for
+-- rebuilding a flow summary after the in-memory registry is discarded.
+--
+-- Deduplicate before creating the index or it cannot be built. Keep the most
+-- advanced row per job: a terminal status beats `running`, then the most recent.
+DELETE FROM public.session_scan_metrics a
+ USING public.session_scan_metrics b
+ WHERE a.job_id IS NOT NULL
+   AND a.session_id = b.session_id
+   AND a.job_id     = b.job_id
+   AND a.id <> b.id
+   -- id is the final tiebreaker so the ordering is STRICT and total. Without it
+   -- two rows with the same status rank and the same timestamp would each fail
+   -- the "<" test, both survive, and CREATE UNIQUE INDEX would then error out.
+   AND (
+         (CASE WHEN a.status IN ('running','queued') THEN 0 ELSE 1 END,
+          COALESCE(a.completed_at, a.started_at, a.created_at), a.id)
+         <
+         (CASE WHEN b.status IN ('running','queued') THEN 0 ELSE 1 END,
+          COALESCE(b.completed_at, b.started_at, b.created_at), b.id)
+       );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_session_scan_metrics_session_job
+    ON public.session_scan_metrics(session_id, job_id);
+
 -- llm_request_metrics
 CREATE TABLE IF NOT EXISTS public.llm_request_metrics (
     id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
