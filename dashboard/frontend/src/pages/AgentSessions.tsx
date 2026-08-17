@@ -20,7 +20,7 @@ import { StatusDot } from '@/components/common/StatusDot'
 import { JsonViewer } from '@/components/common/JsonViewer'
 import { ModelPerformanceWarningModal } from '@/components/common/ModelPerformanceWarningModal'
 import { cn } from '@/lib/utils'
-import { ArrowLeft, Plus, Square, Play, X, Wrench, Terminal, ChevronDown, ChevronRight, ExternalLink, Trash2, Shield, Crosshair, Wifi, Puzzle } from 'lucide-react'
+import { ArrowLeft, Plus, Square, Play, X, Wrench, Terminal, ChevronDown, ChevronRight, ExternalLink, Trash2, Shield, Crosshair, Wifi, Puzzle, AlertTriangle, ListChecks } from 'lucide-react'
 import { useScanDefaultsStore } from '@/stores/scanDefaults'
 import { useNodes } from '@/api/nodes'
 import { usePortProfiles } from '@/api/portProfiles'
@@ -116,6 +116,227 @@ function extractToolName(msg: AgentMessage): string | null {
 }
 
 /* ────────────── Scan Card ────────────── */
+
+/* ────────────── End-of-session scan flow summary ──────────────
+ *
+ * Built at teardown by scan_tools.build_flow_summary() and persisted to
+ * agent_sessions.metadata.scan_flow_summary, so it survives the process. It was
+ * previously written to logs and a webhook only — invisible in the UI, which is
+ * where an operator actually reviews a finished run.
+ *
+ * The signal that earns its place at the top: produced_nothing. A scan type that
+ * COMPLETED while producing nothing is the exact shape of a silently-broken tool
+ * (ZAP once reported "0 alerts" from 207 seeded URLs after its session was
+ * wiped) and is indistinguishable from a clean run if you only count statuses.
+ */
+
+interface FlowType {
+  scan_type: string
+  runs: number
+  completed: number
+  running: number
+  failed: number
+  targets: string[]
+  results: Record<string, number>
+  failures: { job_id?: string; error?: string }[]
+  produced_nothing: boolean
+  total_duration_seconds: number
+}
+
+interface KbCoverage {
+  available: boolean
+  reason?: string
+  acted_on?: number
+  ignored?: number
+  coverage_pct?: number
+  recommendations?: number
+  by_source?: Record<string, number>
+  recommended_but_never_run?: { scanner: string; recommendations?: number }[]
+}
+
+interface FlowSummary {
+  total_scans: number
+  scan_types_run: number
+  flow_order: string[]
+  by_scan_type: FlowType[]
+  types_that_produced_nothing: string[]
+  types_with_failures: string[]
+  kb_coverage?: KbCoverage
+  generated_at?: string
+}
+
+interface ClaimValidation {
+  ok?: boolean
+  by_kind?: Record<string, { total: number; unsupported: number }>
+  notable?: { kind: string; value: string; detail?: string; context?: string }[]
+}
+
+function dur(seconds: number | null | undefined): string {
+  if (seconds == null || seconds === 0) return '—'
+  return seconds < 60 ? `${seconds.toFixed(1)}s` : `${(seconds / 60).toFixed(1)}m`
+}
+
+function ScanFlowSummary({ summary, validation }: {
+  summary: FlowSummary
+  validation?: ClaimValidation
+}) {
+  const [expanded, setExpanded] = useState(true)
+  const kb = summary.kb_coverage
+  const quiet = summary.types_that_produced_nothing ?? []
+  const broken = summary.types_with_failures ?? []
+
+  return (
+    <div className="bg-card border border-border rounded-lg">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-muted/30 transition-colors"
+      >
+        {expanded ? <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />}
+        <ListChecks className="h-4 w-4 shrink-0 text-muted-foreground" />
+        <span className="text-sm font-medium flex-1">Session flow summary</span>
+        <span className="text-xs text-muted-foreground">
+          {summary.total_scans} scans · {summary.scan_types_run} types
+        </span>
+        {quiet.length > 0 && (
+          <span className="text-xs px-1.5 py-0.5 rounded bg-yellow-500/10 text-yellow-500">
+            {quiet.length} produced nothing
+          </span>
+        )}
+        {broken.length > 0 && (
+          <span className="text-xs px-1.5 py-0.5 rounded bg-red-500/10 text-red-500">
+            {broken.length} with failures
+          </span>
+        )}
+      </button>
+
+      {expanded && (
+        <div className="px-4 pb-4 space-y-4 border-t border-border pt-3">
+          {/* Flow order — the actual sequence the session ran, not alphabetical */}
+          {summary.flow_order?.length > 0 && (
+            <div className="flex items-center gap-1.5 flex-wrap text-xs">
+              {summary.flow_order.map((t, i) => (
+                <span key={t} className="flex items-center gap-1.5">
+                  {i > 0 && <span className="text-muted-foreground">→</span>}
+                  <span className="px-1.5 py-0.5 rounded bg-muted/50 font-mono">{t}</span>
+                </span>
+              ))}
+            </div>
+          )}
+
+          {/* Per-type outcomes */}
+          <div className="space-y-1.5">
+            {(summary.by_scan_type ?? []).map(t => {
+              const produced = Object.entries(t.results ?? {})
+              return (
+                <div key={t.scan_type} className="text-xs border border-border/60 rounded px-3 py-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-mono font-medium">{t.scan_type}</span>
+                    <span className="text-muted-foreground">{t.runs} run{t.runs === 1 ? '' : 's'}</span>
+                    {t.completed > 0 && <span className="text-green-500">{t.completed} completed</span>}
+                    {t.running > 0 && <span className="text-blue-500">{t.running} running</span>}
+                    {t.failed > 0 && <span className="text-red-500">{t.failed} failed</span>}
+                    <span className="text-muted-foreground ml-auto">{dur(t.total_duration_seconds)}</span>
+                  </div>
+
+                  {/* What it PRODUCED — the question status counts cannot answer */}
+                  <div className="mt-1 flex items-center gap-2 flex-wrap text-muted-foreground">
+                    {produced.length > 0 ? (
+                      produced.map(([k, v]) => (
+                        <span key={k} className="px-1.5 py-0.5 rounded bg-muted/40">
+                          {k.replace(/_/g, ' ')}: <span className="text-foreground">{String(v)}</span>
+                        </span>
+                      ))
+                    ) : t.produced_nothing ? (
+                      <span className="flex items-center gap-1 text-yellow-500">
+                        <AlertTriangle className="h-3 w-3" />
+                        completed but produced nothing
+                      </span>
+                    ) : (
+                      <span>no results recorded yet</span>
+                    )}
+                    {t.targets?.length > 0 && (
+                      <span className="ml-auto font-mono">{t.targets.join(', ')}</span>
+                    )}
+                  </div>
+
+                  {t.failures?.length > 0 && (
+                    <div className="mt-1 space-y-0.5">
+                      {t.failures.map((f, i) => (
+                        <div key={i} className="text-red-400 font-mono truncate">
+                          {f.error || 'no error recorded'}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+
+          {/* KB coverage — did the run do what the knowledge base said to do */}
+          {kb && (
+            <div className="text-xs border-t border-border pt-3">
+              <div className="font-medium mb-1">Knowledge-base coverage</div>
+              {kb.available === false ? (
+                <p className="text-muted-foreground">Unavailable{kb.reason ? ` — ${kb.reason}` : ''}</p>
+              ) : (
+                <div className="flex items-center gap-3 flex-wrap text-muted-foreground">
+                  <span>acted on <span className="text-foreground">{kb.acted_on ?? 0}</span> of <span className="text-foreground">{kb.recommendations ?? 0}</span></span>
+                  {kb.coverage_pct != null && (
+                    <span className={cn(kb.coverage_pct < 50 ? 'text-yellow-500' : 'text-green-500')}>
+                      {kb.coverage_pct}% coverage
+                    </span>
+                  )}
+                  {kb.by_source && Object.entries(kb.by_source).map(([src, n]) => (
+                    <span key={src} className="px-1.5 py-0.5 rounded bg-muted/40">{src}: {n}</span>
+                  ))}
+                </div>
+              )}
+              {(kb.recommended_but_never_run?.length ?? 0) > 0 && (
+                <div className="mt-1 text-muted-foreground">
+                  never run:{' '}
+                  <span className="font-mono">
+                    {kb.recommended_but_never_run!.slice(0, 8).map(r => r.scanner).join(', ')}
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Agent claims checked against what the scans actually recorded */}
+          {validation?.by_kind && (
+            <div className="text-xs border-t border-border pt-3">
+              <div className="font-medium mb-1">Agent claim validation</div>
+              <div className="flex items-center gap-3 flex-wrap text-muted-foreground">
+                {Object.entries(validation.by_kind).map(([kind, v]) => (
+                  <span key={kind} className="px-1.5 py-0.5 rounded bg-muted/40">
+                    {kind}: <span className="text-foreground">{v.total}</span>
+                    {v.unsupported > 0 && (
+                      <span className="text-yellow-500"> · {v.unsupported} unsupported</span>
+                    )}
+                  </span>
+                ))}
+              </div>
+              {/* "Unsupported" is deliberately not called "false": it can equally
+                  mean ingestion broke, which is why it reads beside the produced
+                  counts above rather than on its own. */}
+              <p className="mt-1 text-muted-foreground">
+                Unsupported = not found in recorded scan data. That can mean a fabricated
+                claim <em>or</em> that ingestion failed — compare with what each type produced above.
+              </p>
+            </div>
+          )}
+
+          {summary.generated_at && (
+            <p className="text-[11px] text-muted-foreground">
+              generated {new Date(summary.generated_at).toLocaleString()}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
 
 function ScanCard({ scan }: { scan: SessionScan }) {
   const [expanded, setExpanded] = useState(false)
@@ -264,6 +485,12 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const [resumeNodeId, setResumeNodeId] = useState('')
   const nodesQuery = useNodes()
   const resumeOnlineNodes = (nodesQuery.data?.nodes ?? []).filter(n => n.status === 'online')
+  // Already returned by /agent-sessions/{id}; no new endpoint needed. Persisted
+  // at teardown to agent_sessions.metadata, so it is present for finished
+  // sessions and absent for ones that never reached teardown.
+  const sessionMeta = (session as unknown as { metadata?: Record<string, unknown> } | undefined)?.metadata
+  const flowSummary = sessionMeta?.scan_flow_summary as FlowSummary | undefined
+  const claimValidation = sessionMeta?.claim_validation as ClaimValidation | undefined
   const [activeTab, setActiveTab] = useState<'messages' | 'scans'>('messages')
   const [showToolCalls, setShowToolCalls] = useState(true)
 
@@ -602,6 +829,12 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
       {/* Scans & Tools tab */}
       {activeTab === 'scans' && (
         <div className="space-y-3">
+          {/* End-of-session flow summary. Rendered FIRST: it answers "did each
+              kind of scan do its job", which is the question an operator opens a
+              finished session to ask. The per-scan cards below answer "what ran". */}
+          {flowSummary && (
+            <ScanFlowSummary summary={flowSummary} validation={claimValidation} />
+          )}
           {/* Summary bar */}
           <div className="flex items-center gap-4 text-xs">
             <span className="text-muted-foreground">
