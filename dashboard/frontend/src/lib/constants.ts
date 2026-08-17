@@ -1,4 +1,4 @@
-export const BUILD_VERSION = '2026.08.16-2213'
+export const BUILD_VERSION = '2026.08.16-2312'
 export const SEVERITY_LEVELS = ['critical', 'high', 'medium', 'low', 'info', 'recon', 'error'] as const
 export type Severity = (typeof SEVERITY_LEVELS)[number]
 
@@ -160,7 +160,7 @@ export const SCAN_CATEGORIES: { name: string; desc: string; scans: ScanMeta[] }[
 // Flat list for backwards compatibility
 export const SCAN_TYPES = SCAN_CATEGORIES.flatMap(c => c.scans)
 
-export const SOURCES = ['nmap', 'nuclei', 'zap', 'gobuster', 'playwright', 'httpx', 'katana', 'nikto', 'subfinder', 'whatweb', 'amass', 'gau', 'waybackurls', 'trufflehog', 'ffuf', 'netexec', 'impacket', 'hashcat', 'censys', 'gowitness', 'whois', 'wafw00f', 'greyhatwarfare', 'subdomain-takeover', 'prowler', 'scoutsuite', 'pacu', 'cloudfox', 'azurehound', 'microburst', 'ssh-audit', 'sslscan', 'testssl', 'sslyze', 'vulscan', 'vulners', 'masscan', 'burpsuite'] as const
+export const SOURCES = ['nmap', 'nuclei', 'zap', 'gobuster', 'playwright', 'httpx', 'katana', 'nikto', 'subfinder', 'whatweb', 'amass', 'gau', 'waybackurls', 'trufflehog', 'ffuf', 'netexec', 'impacket', 'hashcat', 'brutus', 'censys', 'gowitness', 'whois', 'wafw00f', 'greyhatwarfare', 'subdomain-takeover', 'prowler', 'scoutsuite', 'pacu', 'cloudfox', 'azurehound', 'microburst', 'ssh-audit', 'sslscan', 'testssl', 'sslyze', 'vulscan', 'vulners', 'masscan', 'burpsuite', 'portscan', 'pipeline'] as const
 
 // AD Attack types for Sliver nodes (categorized)
 export const AD_ATTACK_TYPES = [

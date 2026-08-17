@@ -4378,6 +4378,74 @@ def search_findings(
         FROM ports pt
         LEFT JOIN assets a ON a.id = pt.asset_id
         WHERE pt.is_open = true
+
+        UNION ALL
+
+        -- From credential_findings (brutus/hydra/medusa/ncrack, credential-check)
+        --
+        -- A working set of credentials is one of the highest-value results an
+        -- engagement produces, and it was the only finding class not reachable
+        -- from the findings list: it lived in its own table and had no branch
+        -- here, so 7 valid credentials on a live engagement were invisible to
+        -- every severity filter, export and report built on this endpoint.
+        --
+        -- valid_cred = true is the gate. Failed attempts are audit trail, not
+        -- findings; surfacing them would bury the working credentials among the
+        -- passwords that did NOT work.
+        --
+        -- The secret itself is NOT exposed here. credential_findings stores only
+        -- a masked form (metadata.audit…password_masked) by design; the cleartext
+        -- belongs in credential_vault behind its own access control. The evidence
+        -- below is what an operator needs to act — which account, which service,
+        -- proven working — without spraying passwords through every findings
+        -- list, export and screenshot.
+        SELECT
+            cf.id::text,
+            COALESCE(cf.source, 'credentials') as source,
+            cf.asset_id::text,
+            COALESCE(host(cf.ip)::text, host(a.ip)::text, '') as ip,
+            a.hostname,
+            cf.port,
+            NULL::text as url,
+            COALESCE(cf.severity, 'critical') as severity,
+            'Valid credentials — ' || COALESCE(cf.username, '(unknown user)')
+                || '@' || COALESCE(cf.protocol, 'service')
+                || COALESCE(':' || cf.port::text, '') as title,
+            'Authentication succeeded as user=' || COALESCE(cf.username, '?')
+                || COALESCE(' auth_type=' || cf.auth_type, '')
+                || COALESCE(' secret_type=' || cf.secret_type, '')
+                || COALESCE(' proto=' || cf.protocol, '')
+                || COALESCE(' [' || (cf.metadata->'audit'->>'summary') || ']', '')
+                || ' — secret masked; see credential vault' as evidence,
+            ARRAY[]::text[] as cve,
+            -- CWE-798 Use of Hard-coded Credentials / CWE-521 Weak Password
+            -- Requirements: the closest standard classification for a guessable
+            -- or default account, so credential findings join CWE-filtered
+            -- reporting instead of being uncategorised.
+            ARRAY['CWE-521']::text[] as cwe,
+            NULL::float as cvss,
+            NULL::text as method,
+            'Valid credentials were recovered for this service. Any account '
+                || 'reachable with a guessed, default or reused password grants '
+                || 'the access that account holds.' as description,
+            'Rotate the credential, disable the account if unused, and enforce '
+                || 'a password policy plus lockout on this service.' as solution,
+            NULL::text as reference,
+            'confirmed' as confidence,
+            ARRAY[]::text[] as tags,
+            cf.created_at,
+            NULL::text as workflow_status,
+            NULL::text as assigned_to,
+            NULL::text as verified_by,
+            cf.last_verified_at as verified_at,
+            NULL::text as tester_notes,
+            NULL::text as original_severity,
+            NULL::boolean as report_ready,
+            cf.engagement_id::text,
+            'credential' as finding_source
+        FROM credential_findings cf
+        LEFT JOIN assets a ON a.id = cf.asset_id
+        WHERE cf.valid_cred = true
     )
     SELECT * FROM unified
     """
@@ -4436,14 +4504,33 @@ def search_findings(
         params_pg.append(list(workflow_status))
 
     if engagement_id:
-        # Match findings directly linked to engagement OR whose IP is in the engagement's scope
+        # Match findings directly linked to the engagement OR whose IP is in its
+        # scope.
+        #
+        # The scope side resolves scope_targets by its OWN engagement_id, which is
+        # reliably populated. It previously joined by NAME —
+        # scope_targets.name = engagements.scope_name — and that silently matched
+        # nothing whenever the two strings disagreed: on a live engagement,
+        # `engagements.scope_name` was EMPTY while its scope_targets rows were
+        # named 'msf'. The subquery returned no targets, so the filter degraded to
+        # `engagement_id = %s` alone, and every finding whose row had a NULL
+        # engagement_id vanished from the engagement view — 49 nmap and 28,232
+        # zap findings on that engagement, with no error to explain it. Only
+        # sources that stamp engagement_id (e.g. nuclei) appeared, which made it
+        # look like a per-tool ingestion problem rather than a filter bug.
+        #
+        # The name-based lookup is kept as a fallback so rows predating
+        # scope_targets.engagement_id still resolve.
         where_clauses_pg.append(
             "(engagement_id = %s OR ip IN ("
-            "  SELECT target FROM scope_targets WHERE name = ("
-            "    SELECT scope_name FROM engagements WHERE id = %s::uuid"
-            "  ) AND target_type = 'ip'"
+            "  SELECT target FROM scope_targets"
+            "   WHERE target_type = 'ip' AND target <> ''"
+            "     AND (engagement_id = %s::uuid"
+            "          OR name = NULLIF((SELECT scope_name FROM engagements"
+            "                             WHERE id = %s::uuid), ''))"
             "))"
         )
+        params_pg.append(engagement_id)
         params_pg.append(engagement_id)
         params_pg.append(engagement_id)
 
@@ -4499,6 +4586,13 @@ def search_findings(
         SELECT 'playwright' as source, pf.severity FROM playwright_findings pf
         UNION ALL
         SELECT 'portscan' as source, CASE WHEN service = 'tcpwrapped' THEN 'info' ELSE 'recon' END as severity FROM ports WHERE is_open = true
+        UNION ALL
+        -- Must mirror the credential branch in the main query above, including
+        -- the valid_cred gate. If these two drift, the severity facet counts
+        -- disagree with the rows actually returned.
+        SELECT COALESCE(cf.source, 'credentials') as source,
+               COALESCE(cf.severity, 'critical') as severity
+          FROM credential_findings cf WHERE cf.valid_cred = true
     )
     SELECT
         COALESCE(severity, 'recon') as severity,
