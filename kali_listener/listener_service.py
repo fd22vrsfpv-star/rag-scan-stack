@@ -920,6 +920,24 @@ _FALLBACK_ALLOWED_TOOLS = {
 # Metasploit is never auto-dispatchable here.
 _MSF_DENY = {"metasploit", "msfconsole", "msfvenom", "msf"}
 
+# Alias -> canonical tool name, applied only when the alias itself is not
+# allowlisted. Purely a naming fix: the canonical name must still be present in
+# the allowlist for the call to proceed, so this cannot grant a capability that
+# was not already granted.
+#
+# Deliberately NOT an alias for anything in _MSF_DENY — Metasploit stays
+# reachable only through the Exploit Manager's approval queue.
+# Every entry must be verified on BOTH sides: the alias is a name the
+# recommender actually emits, and the canonical name is both allowlisted and
+# present as a binary in this image. `ncat` and `cme` were considered and
+# rejected — neither binary exists here, so aliasing them would swap a clear
+# "not in allowed list" rejection for a confusing exec failure.
+TOOL_ALIASES = {
+    # KB recommender emits `nc`; the registry lists `netcat`. /usr/bin/nc and
+    # /usr/bin/netcat are both present (netcat-traditional).
+    "nc": "netcat",
+}
+
 # Cache of {tool_name: install_cmd}, rebuilt every _TOOL_REGISTRY_TTL seconds so
 # operator allowlist edits (from Settings) take effect without a restart.
 # On a FAILED node-manager fetch we cache the fallback for only
@@ -1442,6 +1460,20 @@ async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: B
                             detail=f"Invalid tool name: '{request.tool}'")
     # Validate tool is allowed (registry-derived, minus Metasploit).
     allowed = get_allowed_tools()
+    # Canonicalise well-known aliases before the check.
+    #
+    # This does NOT widen the allowlist: every alias resolves to a name that had
+    # to be allowed on its own merits, and an alias whose canonical name is not
+    # allowed is still rejected. It only stops the same tool being accepted or
+    # refused depending on which of its two names the caller happened to use.
+    #
+    # Real case: the KB recommender emits `nc`, the registry lists `netcat`, and
+    # the binary in this image is `nc` (from netcat-traditional). Dispatches were
+    # rejected with "Tool 'nc' is not in allowed list" while `netcat` — the same
+    # binary, the same capability — was permitted. Same failure shape as the
+    # tool-name vs apt-package-name mismatches in Docs/TOOL_ROUTING.md.
+    if tool_lower not in allowed:
+        tool_lower = TOOL_ALIASES.get(tool_lower, tool_lower)
     if tool_lower not in allowed:
         raise HTTPException(
             status_code=400,

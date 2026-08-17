@@ -225,7 +225,13 @@ Tailwind 3.
 - **Charts/graphs:** `recharts` + `reactflow` (Attack Map).
 
 **BFF (`dashboard/bff/`)** — FastAPI on port **8050** (uvicorn), started with a background poll loop
-and recon agent (`main.py` lifespan).
+and recon agent (`main.py` lifespan). The recon agent's cycle, the
+`scan_recommendations` queue it drains, its budgets and a "queue never drains"
+runbook are documented in [RECON_AGENT.md](RECON_AGENT.md).
+
+> The BFF is **baked into the `pentest-dashboard` image**, not bind-mounted —
+> `docker compose restart` runs the old code. Rebuild after editing
+> `dashboard/bff/**`.
 - **~38 routers (`routers/*`)** are mostly **thin async proxies** (`httpx.AsyncClient(verify=False)`)
   to downstream services, attaching `x-api-key` + engagement headers. Examples: `scans`, `findings`,
   `assets`, `reports`, `exploits`, `rag` → rag-api; `nodes`/`node_maintenance` → node/tunnel-manager;

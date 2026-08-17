@@ -139,6 +139,63 @@ _KB_PENDING_SCOPE_SQL = """
 """
 
 
+# How many times a recommendation may fail transiently before it is retired.
+# Retiring on the FIRST failure would discard valid recon work whenever a scanner
+# container happened to be restarting; never retiring lets a permanently broken
+# rec sit at the head of the priority-ordered queue and consume the budget
+# forever. Three attempts distinguishes a blip from a broken rec.
+MAX_DISPATCH_ATTEMPTS = int(os.environ.get("RECON_AGENT_MAX_DISPATCH_ATTEMPTS", "3"))
+
+# Failure details that will NEVER succeed on an identical retry.
+_PERMANENT_FAILURE_MARKERS = (
+    "not in allowed list",
+    "no automated handler",
+    "manual tool",
+    "unknown scanner",
+    "not supported",
+)
+
+# Transport-level failures — the request never got a verdict, so it is retryable.
+_TRANSIENT_EXC_MARKERS = (
+    "connecterror", "connecttimeout", "readtimeout", "readerror",
+    "pooltimeout", "remoteprotocolerror", "timeout", "connection refused",
+)
+
+_HTTP_CODE_RE = _re.compile(r"HTTP (\d{3})")
+
+
+def _is_permanent_dispatch_failure(detail: str) -> bool:
+    """Should this failed rec be retired, or retried next cycle?
+
+    Conservative by design: anything unrecognised is treated as TRANSIENT and
+    stays pending. Wrongly retrying costs one dispatch slot; wrongly retiring
+    silently drops a recommendation the operator never learns about. The attempt
+    counter (MAX_DISPATCH_ATTEMPTS) is what stops an unrecognised-but-permanent
+    failure from blocking the queue indefinitely.
+    """
+    raw = detail or ""
+    d = raw.lower()
+
+    if any(m in d for m in _PERMANENT_FAILURE_MARKERS):
+        return True
+
+    m = _HTTP_CODE_RE.search(raw)
+    if m:
+        code = int(m.group(1))
+        # 408 Request Timeout and 429 Too Many Requests are explicitly retryable
+        # despite being 4xx.
+        if code in (408, 429):
+            return False
+        # Any other 4xx means the REQUEST is wrong; resending it unchanged gives
+        # the same answer. 5xx is the server's problem and may clear.
+        return 400 <= code < 500
+
+    if any(t in d for t in _TRANSIENT_EXC_MARKERS):
+        return False
+
+    return False
+
+
 class ReconAgent:
     def __init__(self):
         self._stopped = False
@@ -853,6 +910,7 @@ class ReconAgent:
                             body = resp.json() or {}
                             skipped_rec_ids: list[str] = []
                             failed_rec_ids: list[str] = []
+                            transient_rec_ids: list[str] = []
                             for r in (body.get("results") or []):
                                 r_status = (r.get("status") or "").lower()
                                 if r_status in (
@@ -919,15 +977,31 @@ class ReconAgent:
                                     # table, so recording it here is consistent and
                                     # leaves the rec visible for re-queueing rather
                                     # than deleting it.
+                                    #
+                                    # But only PERMANENT failures are retired here.
+                                    # "failed" covers both "Tool 'nc' is not in
+                                    # allowed list" (a 400 that will never succeed)
+                                    # and ConnectError/502 from a container that
+                                    # happened to be restarting. Retiring both would
+                                    # silently discard good recon work on a blip,
+                                    # so transient failures stay pending and are
+                                    # retried, bounded by MAX_DISPATCH_ATTEMPTS.
                                     rid = r.get("id")
+                                    detail = r.get("detail") or ""
+                                    permanent = _is_permanent_dispatch_failure(detail)
                                     kb_failed += 1
                                     log.warning(
-                                        "[recon:%s] KB rec FAILED (%s for %s): %s",
-                                        eid[:8], r.get("scanner"), r.get("ip"),
-                                        (r.get("detail") or "no detail")[:160],
+                                        "[recon:%s] KB rec FAILED [%s] (%s for %s): %s",
+                                        eid[:8],
+                                        "permanent" if permanent else "transient",
+                                        r.get("scanner"), r.get("ip"),
+                                        (detail or "no detail")[:160],
                                     )
                                     if rid:
-                                        failed_rec_ids.append(rid)
+                                        if permanent:
+                                            failed_rec_ids.append(rid)
+                                        else:
+                                            transient_rec_ids.append(rid)
                                     await self._emit_webhook(
                                         eid, "recon_agent_kb_dispatch_failed",
                                         headers,
@@ -936,13 +1010,58 @@ class ReconAgent:
                                             "rec_id": rid,
                                             "ip": r.get("ip"),
                                             "scanner": r.get("scanner"),
-                                            "detail": (r.get("detail") or "")[:300],
+                                            "detail": detail[:300],
+                                            "failure_kind": (
+                                                "permanent" if permanent
+                                                else "transient"
+                                            ),
                                         },
                                         severity="warning",
                                     )
                             # Bulk-update skipped rec IDs so they leave the
                             # pending queue.  One UPDATE per cycle keeps the
                             # txn small even if many recs were rejected.
+                            # Transient failures: bump the attempt counter and
+                            # leave the rec PENDING so it retries next cycle.
+                            # Anything that has now burned MAX_DISPATCH_ATTEMPTS
+                            # is retired regardless of classification — that is
+                            # the backstop for a permanent failure whose detail
+                            # string we did not recognise.
+                            if transient_rec_ids:
+                                try:
+                                    with get_db() as conn, conn.cursor() as cur:
+                                        cur.execute(
+                                            """
+                                            UPDATE scan_recommendations
+                                               SET extra = jsonb_set(
+                                                     COALESCE(extra, '{}'::jsonb),
+                                                     '{dispatch_failures}',
+                                                     to_jsonb(COALESCE(
+                                                       (extra->>'dispatch_failures')::int, 0) + 1)
+                                                   ),
+                                                   updated_at = now()
+                                             WHERE id = ANY(%s::uuid[])
+                                         RETURNING id::text,
+                                                   (extra->>'dispatch_failures')::int
+                                            """,
+                                            (transient_rec_ids,),
+                                        )
+                                        rows = cur.fetchall()
+                                        conn.commit()
+                                    for _rid, _n in rows:
+                                        if _n and _n >= MAX_DISPATCH_ATTEMPTS:
+                                            failed_rec_ids.append(_rid)
+                                            log.warning(
+                                                "[recon:%s] rec %s retired after %d "
+                                                "failed attempts",
+                                                eid[:8], _rid[:8], _n,
+                                            )
+                                except Exception as e:
+                                    log.warning(
+                                        "[recon:%s] failed to record %d transient "
+                                        "failures: %s",
+                                        eid[:8], len(transient_rec_ids), e,
+                                    )
                             if failed_rec_ids:
                                 try:
                                     with get_db() as conn, conn.cursor() as cur:
