@@ -650,7 +650,58 @@ class SessionScanTracker:
         }
 
     @classmethod
-    def build_flow_summary(cls, session_id: str = None) -> Dict[str, Any]:
+    def load_scans_from_db(cls, session_id: str) -> List[Dict[str, Any]]:
+        """Rebuild the scan list from session_scan_metrics.
+
+        The in-memory registry is discarded by cleanup_session(), so anything
+        that needs the flow AFTER a session ends — notably the post-teardown
+        refresh, which exists because scans are often still running when the
+        session finishes — has to read it back from the database.
+
+        Returns the same shape build_flow_summary() expects from the registry.
+        Ordered by started_at so flow_order stays the real execution order.
+        """
+        db_dsn = os.environ.get(
+            "DB_DSN",
+            "dbname=scans user=app password=app host=rag-postgres port=5432")
+        rows: List[Dict[str, Any]] = []
+        try:
+            import psycopg2
+            from psycopg2.extras import RealDictCursor
+            with psycopg2.connect(db_dsn) as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(
+                        """SELECT scan_type, job_id, status, started_at,
+                                  completed_at, duration_seconds, params,
+                                  result_summary
+                             FROM session_scan_metrics
+                            WHERE session_id = %s::uuid
+                            ORDER BY started_at NULLS LAST, id""",
+                        (str(session_id),),
+                    )
+                    for r in cur.fetchall():
+                        rows.append({
+                            "type": r["scan_type"],
+                            "job_id": r["job_id"],
+                            "status": r["status"],
+                            "started_at": (r["started_at"].isoformat()
+                                           if r["started_at"] else None),
+                            "completed_at": (r["completed_at"].isoformat()
+                                             if r["completed_at"] else None),
+                            "duration_seconds": (float(r["duration_seconds"])
+                                                 if r["duration_seconds"] is not None
+                                                 else None),
+                            "params": r["params"] or {},
+                            "result_summary": r["result_summary"] or None,
+                        })
+        except Exception as e:
+            logger.warning("[SessionScanTracker] load_scans_from_db failed for %s: %s",
+                           session_id, e)
+        return rows
+
+    @classmethod
+    def build_flow_summary(cls, session_id: str = None,
+                           scans: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         """End-of-session report: what each SCAN TYPE actually did, in order.
 
         _generate_summary only ever answered "how many finished". That cannot tell
@@ -661,8 +712,18 @@ class SessionScanTracker:
         durations, what each produced, and why anything failed.
         """
         session_id = session_id or cls.get_current_session()
-        data = cls.get_session_status(session_id) or {}
-        scans = data.get("scans", []) or []
+        if scans is None:
+            # Default source is the live registry. Callers running AFTER
+            # cleanup_session() must pass scans explicitly (see
+            # load_scans_from_db) — the registry is empty by then and this would
+            # silently report a session with no scans at all.
+            data = cls.get_session_status(session_id) or {}
+            scans = data.get("scans", []) or []
+        else:
+            # `data` is still needed below for the `totals` block. Synthesise it
+            # from the supplied scans so the DB-sourced path produces the same
+            # shape as the registry path.
+            data = {"session_id": session_id, "scans": scans}
 
         by_type: Dict[str, Any] = {}
         for idx, scan in enumerate(scans, start=1):
@@ -840,11 +901,35 @@ class SessionScanTracker:
             cur = conn.cursor()
             for scan in scans:
                 cur.execute(
+                    # UPSERT on (session_id, job_id).
+                    #
+                    # This was `ON CONFLICT DO NOTHING` with no matching unique
+                    # constraint — the table's only key is PRIMARY KEY (id) — so
+                    # nothing ever conflicted and every call INSERTED AGAIN. The
+                    # live table held 104 rows for 75 distinct jobs, including one
+                    # job with 6 copies carrying two different statuses.
+                    #
+                    # It also meant a scan persisted while still `running` could
+                    # never be corrected to `completed`: the update was silently
+                    # dropped, leaving rows permanently stuck mid-flight. That
+                    # makes this table unusable as the source for rebuilding a
+                    # flow summary after the in-memory registry is gone.
+                    #
+                    # Requires the unique index added in
+                    # db_init/ensure_all_tables.sql.
                     """INSERT INTO session_scan_metrics
                        (session_id, scan_type, scan_phase, job_id, status,
                         started_at, completed_at, duration_seconds, params, result_summary)
                        VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                       ON CONFLICT DO NOTHING""",
+                       ON CONFLICT (session_id, job_id) DO UPDATE SET
+                           status           = EXCLUDED.status,
+                           completed_at     = COALESCE(EXCLUDED.completed_at,
+                                                       session_scan_metrics.completed_at),
+                           duration_seconds = COALESCE(EXCLUDED.duration_seconds,
+                                                       session_scan_metrics.duration_seconds),
+                           result_summary   = COALESCE(EXCLUDED.result_summary,
+                                                       session_scan_metrics.result_summary),
+                           scan_phase       = EXCLUDED.scan_phase""",
                     (
                         session_id,
                         scan.get("type"),
