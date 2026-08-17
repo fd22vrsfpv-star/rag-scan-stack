@@ -94,6 +94,22 @@ docker compose up -d rag-postgres
 ### Vulnerability Management (1)
 - `vulns` - Nmap NSE vulnerability findings
 
+### Credentials (3)
+- `credential_findings` - per-service authentication results (brutus/hydra/medusa/ncrack)
+- `credential_vault` - cleartext/cracked secrets, access-controlled
+- `credential_access_map` - what a credential grants access to
+
+Rows with `valid_cred = true` are surfaced by `/findings/search` as a finding
+source (`finding_source = 'credential'`, severity `critical`). Failed attempts
+are deliberately NOT surfaced — they are audit trail, and listing them buries the
+working credentials among the passwords that did not work.
+
+**The secret is never selected into the findings union.** `credential_findings`
+stores only a masked form (`metadata.audit…password_masked`); cleartext belongs
+in `credential_vault` behind its own access control. Findings lists are rendered,
+exported and screenshotted, so a secret exposed there escapes the vault's
+controls entirely. Guarded by `tests/test_findings_credential_source.py`.
+
 ### Scan Intelligence (1)
 - `scan_recommendations` - AI-suggested next scans
 
