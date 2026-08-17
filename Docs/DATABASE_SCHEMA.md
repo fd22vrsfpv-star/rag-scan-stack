@@ -97,6 +97,36 @@ docker compose up -d rag-postgres
 ### Scan Intelligence (1)
 - `scan_recommendations` - AI-suggested next scans
 
+The recon agent drains this table, so its status column is a queue state, not
+just a label. Full lifecycle in [RECON_AGENT.md](RECON_AGENT.md).
+
+| `status` | Meaning | Still in the queue? |
+|---|---|---|
+| `pending` | awaiting dispatch | yes |
+| `queued` / `completed` | dispatched, a job exists | no |
+| `skipped` | deliberately not run (already covered by service detection, in-flight duplicate, manual-only tool) | no |
+| `failed` | dispatch attempted and permanently rejected | no |
+
+Columns worth knowing about:
+
+- **`ip` is `inet`**, so it renders as `192.168.1.150/32`. Comparing it to
+  `scope_targets.target` (plain `text`) without `host()` on both sides silently
+  matches nothing.
+- **`action`, `script`, `template`, `banner` are nullable.** A NULL arrives in
+  Python as a key that *is present* holding `None`, so `rec.get("action", "")`
+  returns `None` rather than the default — use `(rec.get(col) or "")`. This
+  caused a live outage; see `tests/test_rec_dispatch_nullable_fields.py`.
+- **`target_kind`** — `service` | `artifact` | `range` | `resource`. Only
+  `service` is dispatchable against an `(ip, port)`; the others are refused with
+  a reason and become manual follow-ups. A NULL is treated as `service` so rows
+  predating the column behave as before.
+- **`extra.dispatch_failures`** (jsonb) — count of transient dispatch failures.
+  At `RECON_AGENT_MAX_DISPATCH_ATTEMPTS` (default 3) the rec is retired even if
+  its failure was never classified as permanent.
+- **`engagement_id`** — populated, but the recon agent's scoping query does
+  **not** rely on it alone; it unions with `scope_targets` because assets are not
+  always stamped.
+
 ### Playwright/Browser Testing (4)
 - `playwright_scans` - Browser automation sessions
 - `playwright_findings` - Client-side security issues
