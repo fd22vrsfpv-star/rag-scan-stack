@@ -105,6 +105,39 @@ def _guess_target_type(target: str) -> str:
 
 MAX_CONCURRENT_RECON_SCANS = int(os.environ.get("RECON_AGENT_MAX_CONCURRENT", "3"))
 
+# Engagement-scoping predicate for pending KB recommendations.
+#
+# Shared verbatim by the drain's fetch and by the queue-depth COUNT, so the depth
+# the operator is shown can never drift from the rows the drain actually
+# considers. Takes the engagement id TWICE (assets path, then scope_targets path).
+#
+# host() on both sides of the ip comparison: sr.ip is inet and renders as
+# "192.168.1.150/32", while scope_targets.target is plain text "192.168.1.150".
+_KB_PENDING_SCOPE_SQL = """
+          FROM scan_recommendations sr
+         WHERE sr.status = 'pending'
+           AND sr.ip IS NOT NULL
+           AND (
+                 sr.ip IN (
+                   SELECT a.ip FROM assets a
+                    WHERE a.engagement_id = %s::uuid
+                      AND a.ip IS NOT NULL
+                 )
+                 OR EXISTS (
+                   SELECT 1 FROM scope_targets st
+                    WHERE st.engagement_id = %s::uuid
+                      AND st.target <> ''
+                      AND (
+                        (st.target_type = 'ip'
+                          AND host(sr.ip)::text = st.target)
+                        OR (st.target_type = 'cidr'
+                          AND st.target ~ '^[0-9]+([.][0-9]+){3}/[0-9]+$'
+                          AND sr.ip <<= st.target::inet)
+                      )
+                 )
+               )
+"""
+
 
 class ReconAgent:
     def __init__(self):
@@ -684,6 +717,8 @@ class ReconAgent:
         # so we only drain THIS engagement's pending recs.
         kb_drained = 0
         kb_skipped_pending = 0
+        kb_total_pending = 0
+        kb_failed = 0
         if kb_driven_recon and dispatched < max_dispatches:
             pending_recs: list[dict] = []
             try:
@@ -722,28 +757,9 @@ class ReconAgent:
                         SELECT sr.id::text, host(sr.ip)::text, sr.service,
                                sr.scanner, sr.action, sr.script, sr.template,
                                sr.priority
-                          FROM scan_recommendations sr
-                         WHERE sr.status = 'pending'
-                           AND sr.ip IS NOT NULL
-                           AND (
-                                 sr.ip IN (
-                                   SELECT a.ip FROM assets a
-                                    WHERE a.engagement_id = %s::uuid
-                                      AND a.ip IS NOT NULL
-                                 )
-                                 OR EXISTS (
-                                   SELECT 1 FROM scope_targets st
-                                    WHERE st.engagement_id = %s::uuid
-                                      AND st.target <> ''
-                                      AND (
-                                        (st.target_type = 'ip'
-                                          AND host(sr.ip)::text = st.target)
-                                        OR (st.target_type = 'cidr'
-                                          AND st.target ~ '^[0-9]+([.][0-9]+){3}/[0-9]+$'
-                                          AND sr.ip <<= st.target::inet)
-                                      )
-                                 )
-                               )
+                        """
+                        + _KB_PENDING_SCOPE_SQL
+                        + """
                          ORDER BY sr.priority ASC, sr.created_at DESC
                          LIMIT %s
                         """,
@@ -755,6 +771,17 @@ class ReconAgent:
                          "template": r[6], "priority": r[7]}
                         for r in cur.fetchall()
                     ]
+                    # TRUE queue depth, not the fetch window.
+                    #
+                    # The fetch is LIMITed to max(budget*3, 10), so deriving the
+                    # remainder from len(pending_recs) capped the reported backlog
+                    # at ~13 no matter how deep the queue really was — it read as
+                    # "nearly drained" while 144 recs were outstanding, and it
+                    # could never show the queue GROWING faster than it drains,
+                    # which is the condition worth alerting on.
+                    cur.execute("SELECT count(*) " + _KB_PENDING_SCOPE_SQL,
+                                (eid, eid))
+                    kb_total_pending = int(cur.fetchone()[0] or 0)
             except Exception as e:
                 log.warning("[recon:%s] KB queue fetch failed: %s",
                             eid[:8], e)
@@ -825,6 +852,7 @@ class ReconAgent:
                         if resp.status_code < 400:
                             body = resp.json() or {}
                             skipped_rec_ids: list[str] = []
+                            failed_rec_ids: list[str] = []
                             for r in (body.get("results") or []):
                                 r_status = (r.get("status") or "").lower()
                                 if r_status in (
@@ -871,9 +899,66 @@ class ReconAgent:
                                             eid[:8], r.get("scanner"),
                                             (r.get("detail") or "")[:80],
                                         )
+                                else:
+                                    # Anything else is a FAILED dispatch, and it
+                                    # used to fall through here silently: not
+                                    # counted as drained, not marked skipped, not
+                                    # logged. The cycle then reported
+                                    # "dispatched=0" with no reason anywhere.
+                                    #
+                                    # Worse, it blocked the queue head. The fetch
+                                    # is ORDER BY priority, created_at, so the same
+                                    # failing recs came back first every cycle and
+                                    # consumed the entire budget forever — 144 recs
+                                    # pending, nothing moving, and the errors
+                                    # (an AttributeError in the nmap branch, and a
+                                    # tool missing from the Kali allowlist) never
+                                    # reached the operator.
+                                    #
+                                    # 'failed' is already an existing status in this
+                                    # table, so recording it here is consistent and
+                                    # leaves the rec visible for re-queueing rather
+                                    # than deleting it.
+                                    rid = r.get("id")
+                                    kb_failed += 1
+                                    log.warning(
+                                        "[recon:%s] KB rec FAILED (%s for %s): %s",
+                                        eid[:8], r.get("scanner"), r.get("ip"),
+                                        (r.get("detail") or "no detail")[:160],
+                                    )
+                                    if rid:
+                                        failed_rec_ids.append(rid)
+                                    await self._emit_webhook(
+                                        eid, "recon_agent_kb_dispatch_failed",
+                                        headers,
+                                        {
+                                            "engagement_id": eid,
+                                            "rec_id": rid,
+                                            "ip": r.get("ip"),
+                                            "scanner": r.get("scanner"),
+                                            "detail": (r.get("detail") or "")[:300],
+                                        },
+                                        severity="warning",
+                                    )
                             # Bulk-update skipped rec IDs so they leave the
                             # pending queue.  One UPDATE per cycle keeps the
                             # txn small even if many recs were rejected.
+                            if failed_rec_ids:
+                                try:
+                                    with get_db() as conn, conn.cursor() as cur:
+                                        cur.execute(
+                                            "UPDATE scan_recommendations "
+                                            "   SET status = 'failed', "
+                                            "       updated_at = now() "
+                                            " WHERE id = ANY(%s::uuid[])",
+                                            (failed_rec_ids,),
+                                        )
+                                        conn.commit()
+                                except Exception as e:
+                                    log.warning(
+                                        "[recon:%s] failed to mark %d recs as failed: %s",
+                                        eid[:8], len(failed_rec_ids), e,
+                                    )
                             if skipped_rec_ids:
                                 try:
                                     with get_db() as conn, conn.cursor() as cur:
@@ -936,14 +1021,16 @@ class ReconAgent:
                             f"{len(targets)} scope targets, "
                             f"dispatched {dispatched} scans "
                             f"({kb_drained} from KB queue, "
-                            f"{kb_skipped_pending} KB recs deferred)"
+                            f"{kb_skipped_pending} deferred this cycle, "
+                            f"{kb_total_pending} still pending overall)"
                         ),
                         "operator": "recon_agent",
                         "detected": False,
                         "metadata": {
                             "dispatched": dispatched,
                             "kb_dispatched": kb_drained,
-                            "kb_remaining_pending": kb_skipped_pending,
+                            "kb_deferred_this_cycle": kb_skipped_pending,
+                            "kb_pending_total": kb_total_pending,
                             "kb_driven_recon": kb_driven_recon,
                             "targets_checked": len(targets),
                             "followups_open": len(open_followups),
@@ -957,15 +1044,22 @@ class ReconAgent:
 
         # 6. Update state
         now_iso = datetime.now(timezone.utc).isoformat()
+        # last_dispatch_at is "when did this agent last dispatch anything", so it
+        # has to survive cycles that dispatch nothing. Sending None on an idle
+        # cycle PATCHed a null straight over the real timestamp, so the field only
+        # ever reflected whether the MOST RECENT cycle happened to dispatch.
+        #
+        # That reads as "this agent has never dispatched" — which is exactly how
+        # a healthy agent draining 1-2 recs every five minutes gets misdiagnosed
+        # as stalled. Omit the key instead so the stored value stands.
+        state_patch = {"last_run_at": now_iso, "last_scan_at": now_iso}
+        if dispatched > 0:
+            state_patch["last_dispatch_at"] = now_iso
         try:
             async with httpx.AsyncClient(verify=False, timeout=10) as c:
                 await c.patch(
                     f"{s.rag_api_url}/recon-agent/{eid}",
-                    json={
-                        "last_run_at": now_iso,
-                        "last_scan_at": now_iso,
-                        "last_dispatch_at": now_iso if dispatched > 0 else None,
-                    },
+                    json=state_patch,
                     headers=headers,
                 )
         except Exception:
@@ -975,10 +1069,13 @@ class ReconAgent:
         # while the KB drain silently did nothing, and the two are separate
         # counters — so a queue that never moved looked identical to a healthy
         # cycle with no seed work to do.
+        # Report the real backlog. kb_deferred is what THIS cycle looked at and
+        # could not take; kb_pending_total is the whole queue for the engagement.
         log.info("[recon:%s] cycle done: dispatched=%d, kb_drained=%d, "
-                 "kb_pending_left=%d, followups=%d, targets=%d",
-                 eid[:8], dispatched, kb_drained, kb_skipped_pending,
-                 len(open_followups), len(targets))
+                 "kb_failed=%d, kb_deferred=%d, kb_pending_total=%d, "
+                 "followups=%d, targets=%d",
+                 eid[:8], dispatched, kb_drained, kb_failed, kb_skipped_pending,
+                 kb_total_pending, len(open_followups), len(targets))
 
         # Webhook: cycle completed
         await self._emit_webhook(eid, "recon_agent_cycle_completed", headers, {

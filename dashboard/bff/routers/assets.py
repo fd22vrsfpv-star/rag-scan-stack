@@ -1075,7 +1075,9 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
     }
 
     async def dispatch_rec(rec):
-        scanner = rec.get("scanner", "").lower()
+        # `or ""` — same nullable-column trap as the nmap branch below:
+        # .get(k, "") returns None when the key exists with a NULL value.
+        scanner = (rec.get("scanner") or "").lower()
         ip = (rec.get("ip") or "").replace("/32", "")
         service_url = SCANNER_URLS.get(scanner)
         result = {"id": rec["id"], "scanner": scanner, "ip": ip}
@@ -1154,8 +1156,20 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         try:
             async with httpx.AsyncClient(verify=False, timeout=30) as client:
                 if scanner == "nmap":
-                    script = rec.get("script", "")
-                    action = rec.get("action", "")
+                    # `or ""`, NOT .get(k, ""). The second argument to .get only
+                    # applies when the KEY IS ABSENT; these rows come from
+                    # scan_recommendations where `action` and `script` are
+                    # nullable columns, so the key is present with a None value
+                    # and .get happily returns None.
+                    #
+                    # That made action.lower() below raise
+                    #   AttributeError: 'NoneType' object has no attribute 'lower'
+                    # for every nmap rec with a NULL action — 20 of them, all
+                    # reported as "failed" with no traceback and no retry, which
+                    # is why the KB queue sat at 144 pending while the agent
+                    # dispatched nothing cycle after cycle.
+                    script = rec.get("script") or ""
+                    action = rec.get("action") or ""
                     # Nmap script recommendations (banner, http-title, etc.) are already covered
                     # by service detection — only dispatch actual port scans
                     if script and not any(kw in action.lower() for kw in ("port scan", "discovery", "full scan")):
@@ -1172,7 +1186,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                         payload["proxy"] = proxy_url
                     r = await client.post(f"{service_url}/jobs/masscan-then-nmap", json=payload, headers=headers)
                 elif scanner == "nuclei":
-                    template = rec.get("template", "")
+                    template = rec.get("template") or ""
                     payload = {"targets": [f"http://{ip}"]}
                     if template:
                         tags = [t.strip() for t in template.split(",") if t.strip()]
@@ -1426,7 +1440,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
 
     async def _dispatch_via_kali(rec, scanner, ip, result):
         """Route tool execution to the internal Kali container."""
-        command = rec.get("script", "")
+        command = rec.get("script") or ""
         if not command:
             # Build a sensible default command
             port = rec.get("port") or ""
