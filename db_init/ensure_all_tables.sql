@@ -3902,3 +3902,60 @@ DELETE FROM public.credential_findings a
 CREATE UNIQUE INDEX IF NOT EXISTS uq_credential_findings_identity
     ON public.credential_findings(ip, port, username, auth_type)
  WHERE username IS NOT NULL;
+
+-- ===========================================================================
+-- web_findings: fingerprint + dedup at the database, not in 18 call sites
+-- ===========================================================================
+--
+-- Fingerprints only dedupe if EVERY writer computes one. They did not: of ~26
+-- insert sites across 6 services, one (ZAP) computed a fingerprint. Everything
+-- else wrote NULL, and NULL never conflicts, so the unique index was inert for
+-- them — katana re-inserted an entire crawl every run (32,218 rows for 630
+-- findings).
+--
+-- Patching each site is fragile (different column sets, gen_random_uuid()
+-- inline, four services) and silently fails again the next time someone adds a
+-- parser. Doing it here makes the invariant hold for current AND future writers.
+--
+-- TRADE-OFF, stated plainly: this is behaviour that is not visible at the call
+-- site. An INSERT of a finding that already exists becomes an UPDATE of
+-- last_seen and inserts no row. Callers relying on RETURNING id therefore get
+-- no row back — only app/rag-api/api.py:4682 did, and it now handles that.
+CREATE OR REPLACE FUNCTION public.web_findings_dedup() RETURNS trigger AS $fn$
+DECLARE
+    existing_id uuid;
+BEGIN
+    -- Must match etl/fingerprint.py::web_fingerprint exactly, or a row inserted
+    -- by a Python-side writer and one inserted here would not recognise each
+    -- other as the same finding.
+    IF NEW.fingerprint IS NULL THEN
+        NEW.fingerprint := md5('web|' || rtrim(lower(btrim(coalesce(NEW.url, ''))), '/')
+                                || '|' || lower(btrim(coalesce(NEW.name, '')))
+                                || '|' || lower(btrim(coalesce(NEW.issue_type, ''))));
+    END IF;
+
+    SELECT id INTO existing_id
+      FROM public.web_findings
+     WHERE fingerprint = NEW.fingerprint;
+
+    IF FOUND THEN
+        -- Re-seeing a finding is new information about WHEN, not a new finding.
+        UPDATE public.web_findings
+           SET last_seen   = now(),
+               severity    = COALESCE(NEW.severity, severity),
+               evidence    = COALESCE(NEW.evidence, evidence),
+               status_code = COALESCE(NEW.status_code, status_code)
+         WHERE id = existing_id;
+        RETURN NULL;   -- skip the INSERT
+    END IF;
+
+    IF NEW.first_seen IS NULL THEN NEW.first_seen := now(); END IF;
+    IF NEW.last_seen  IS NULL THEN NEW.last_seen  := now(); END IF;
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_web_findings_dedup ON public.web_findings;
+CREATE TRIGGER trg_web_findings_dedup
+    BEFORE INSERT ON public.web_findings
+    FOR EACH ROW EXECUTE FUNCTION public.web_findings_dedup();

@@ -173,6 +173,24 @@ done
 
 echo ""
 
+# ── Dedup trigger ─────────────────────────────────────────────────────────
+# web_findings dedup does not live in the application: ~26 insert sites across
+# 6 services write to this table and only one computed a fingerprint, so the
+# invariant is enforced by a BEFORE INSERT trigger instead. Without it, writers
+# that omit a fingerprint insert NULL, NULL never conflicts with the unique
+# index, and duplicates silently return (katana previously re-inserted an entire
+# crawl every run).
+echo "🔍 Verifying dedup trigger..."
+if docker exec rag-postgres psql -U app -d scans -tAc \
+     "SELECT 1 FROM pg_trigger WHERE tgname='trg_web_findings_dedup' AND NOT tgisinternal;" | grep -q 1; then
+    echo "✓ trg_web_findings_dedup"
+else
+    echo "❌ Missing trg_web_findings_dedup — web findings will duplicate on every re-scan"
+    MISSING=$((MISSING + 1))
+fi
+
+echo ""
+
 # ── ExploitDB (separate database) ─────────────────────────────────────────
 # Not part of the `scans` schema, so the table loop above cannot see it. It was
 # absent entirely on a live install: db_init/create_exploits.sh began with

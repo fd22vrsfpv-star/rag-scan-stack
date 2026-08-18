@@ -4685,8 +4685,22 @@ def create_finding_note(note: NoteRequest, authorized: bool = Depends(auth)):
             (note.url, note.source, note.name, note.severity, note.evidence),
         )
         row = cur.fetchone()
+        # The web_findings dedup trigger skips the INSERT when this finding
+        # already exists (it advances last_seen instead), and a skipped insert
+        # returns NO row — `row["id"]` would raise TypeError on a perfectly
+        # normal re-scan. Fall back to looking up the row it merged into so the
+        # caller still gets the id of the finding it just recorded.
+        if row is None:
+            cur.execute(
+                """SELECT id FROM web_findings
+                    WHERE fingerprint = md5('web|' || rtrim(lower(btrim(%s)), '/')
+                                             || '|' || lower(btrim(coalesce(%s, '')))
+                                             || '|' || 'scan_execution')""",
+                (note.url or "", note.name),
+            )
+            row = cur.fetchone()
         conn.commit()
-    return {"ok": True, "id": str(row["id"])}
+    return {"ok": True, "id": str(row["id"]) if row else None}
 
 
 @app.get("/last-completed-scan")
