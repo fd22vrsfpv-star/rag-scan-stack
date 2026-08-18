@@ -214,6 +214,10 @@ def _parse_scanner_issues(filepath: str, cur, stats: dict, dedupe: bool):
                    method, payload, cwe, refs, description, solution, reference,
                    confidence, tags, first_seen, last_seen, fingerprint)
                 VALUES (%s, %s, %s, 'burp', 'burp-scanner', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now(), %s)
+                ON CONFLICT (fingerprint) DO UPDATE SET
+                    last_seen = now(),
+                    severity  = EXCLUDED.severity,
+                    evidence  = COALESCE(EXCLUDED.evidence, web_findings.evidence)
             """, (
                 finding_id,
                 asset_id,
@@ -328,6 +332,10 @@ def _parse_sitemap_items(filepath: str, cur, stats: dict, dedupe: bool):
                    method, payload, cwe, refs, description, solution, reference,
                    confidence, tags, first_seen, last_seen, fingerprint)
                 VALUES (%s, %s, %s, 'burp', 'burp-sitemap', %s, 'info', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now(), %s)
+                ON CONFLICT (fingerprint) DO UPDATE SET
+                    last_seen = now(),
+                    severity  = EXCLUDED.severity,
+                    evidence  = COALESCE(EXCLUDED.evidence, web_findings.evidence)
             """, (
                 finding_id,
                 asset_id,

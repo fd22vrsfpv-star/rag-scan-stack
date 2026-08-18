@@ -1581,3 +1581,18 @@ WHERE er.executed_at IS NOT NULL;
 \i /docker-entrypoint-initdb.d/grpo_migration.sql
 
 -- End of file
+
+-- Finding deduplication (see ensure_all_tables.sql for the dedupe migration that
+-- existing databases need first). CLAUDE.md requires fingerprint-based dedup and
+-- first/last seen; etl/fingerprint.py computes the hashes and the parsers upsert
+-- with ON CONFLICT (fingerprint), which REQUIRES these indexes to exist.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_web_findings_fingerprint
+    ON public.web_findings(fingerprint);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_vulns_fingerprint
+    ON public.vulns(fingerprint);
+
+-- One credential finding per account. Partial: NULL usernames carry no account
+-- identity to deduplicate on. Required by the ON CONFLICT in etl/parse_brutus.py.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_credential_findings_identity
+    ON public.credential_findings(ip, port, username, auth_type)
+ WHERE username IS NOT NULL;

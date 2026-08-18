@@ -410,6 +410,10 @@ def parse_nmap(path: str, profile: str = "upload", job_id: str = None, target: s
                                 INSERT INTO vulns
                                   (id, asset_id, port_id, script, output, severity, cve, cvss, metadata, fingerprint)
                                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (fingerprint) DO UPDATE SET
+                                    updated_at = now(),
+                                    severity   = EXCLUDED.severity,
+                                    output     = COALESCE(EXCLUDED.output, vulns.output)
                             """, (
                                 vuln_id,
                                 asset_id,

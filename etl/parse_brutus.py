@@ -100,6 +100,16 @@ def parse_brutus(path: str, profile: str = "upload", job_id: str = None, secret_
                     cur.execute("""
                         INSERT INTO credential_findings (id, asset_id, port_id, ip, port, protocol, username, valid_cred, auth_type, secret_type, source, metadata, discovered_at, status)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, true, %s, %s, 'brutus', %s, now(), 'valid')
+                        -- Re-testing a known credential is a re-verification,
+                        -- not a new finding. Requires uq_credential_findings_identity.
+                        ON CONFLICT (ip, port, username, auth_type)
+                          WHERE username IS NOT NULL
+                          DO UPDATE SET
+                            valid_cred       = EXCLUDED.valid_cred,
+                            status           = EXCLUDED.status,
+                            last_verified_at = now(),
+                            metadata         = COALESCE(EXCLUDED.metadata,
+                                                        credential_findings.metadata)
                     """, (str(uuid.uuid4()), asset_id, port_id, ip, int(port), protocol, username,
                           secret_type, secret_type, json.dumps(meta)))
                     stats["credentials_found"] += 1
