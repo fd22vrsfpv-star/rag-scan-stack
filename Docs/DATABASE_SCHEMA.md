@@ -189,6 +189,35 @@ Columns worth knowing about:
 ./scripts/ensure_db_schema.sh
 ```
 
+### Issue: agent sessions fail to persist scans — `ON CONFLICT ... no unique constraint`
+**Cause**: Missing `uq_session_scan_metrics_session_job` on an existing database.
+
+`autogen_agents/scan_tools.py::persist_to_db` upserts with
+`ON CONFLICT (session_id, job_id)`, which **raises** unless that unique index
+exists. Fresh installs get it from `setup_alldb.sql`; **databases created before
+2026-08-17 do not have it and must run the migration.**
+
+**Solution**:
+```bash
+./scripts/ensure_db_schema.sh     # dedupes, creates the index, then asserts it
+```
+
+The migration deduplicates first, because the index cannot be built while
+duplicates exist. They *will* exist on any pre-existing database: the code
+previously used `ON CONFLICT DO NOTHING` against a table keyed only on `id`, so
+nothing ever conflicted and every persist re-inserted — one live database held
+104 rows for 75 distinct jobs. The dedupe keeps the most advanced row per job (a
+terminal status beats `running`, then most recent, with `id` as a final
+tiebreaker).
+
+Second-order symptom on un-migrated databases: a scan persisted while `running`
+could never be corrected once it completed, so `session_scan_metrics` accumulated
+rows permanently stuck mid-flight. That also makes the post-session flow-summary
+refresh under-report, since it rebuilds from this table.
+
+`scripts/ensure_db_schema.sh` now fails loudly if the index is absent rather than
+letting the first agent session hit it at runtime.
+
 ## Development Workflow
 
 ### Adding New Tables
