@@ -1648,8 +1648,18 @@ BEGIN
     IF NEW.fingerprint IS NULL THEN
         SELECT coalesce(host(a.ip), '') INTO v_ip
           FROM public.assets a WHERE a.id = NEW.asset_id;
-        SELECT CASE WHEN p.port IS NOT NULL AND p.port <> 0 THEN p.port::text ELSE '0' END
+        SELECT CASE WHEN p.port IS NOT NULL AND p.port <> 0 THEN p.port::text ELSE NULL END
           INTO v_port FROM public.ports p WHERE p.id = NEW.port_id;
+
+        -- Fall back to metadata.port when port_id is not set. vuln_fingerprint
+        -- hashes the port the SCANNER observed, which is often recorded in
+        -- metadata even when no ports row was linked — e.g. nuclei's
+        -- CVE-2011-2523 match on 6200. Using it takes this expression from
+        -- reproducing 33 of 34 live fingerprints to 34 of 34.
+        IF v_port IS NULL AND (NEW.metadata->>'port') ~ '^[0-9]+$'
+           AND (NEW.metadata->>'port') <> '0' THEN
+            v_port := NEW.metadata->>'port';
+        END IF;
 
         v_ip   := coalesce(v_ip, '');
         v_port := coalesce(v_port, '0');
