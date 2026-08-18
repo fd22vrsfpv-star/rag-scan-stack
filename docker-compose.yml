@@ -1997,6 +1997,13 @@ services:
     environment:
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # 14 other services already had this; pentest-dashboard did not, and it
+      # holds 554 of the ~905 verify=False calls in the tree — the busiest
+      # caller in the stack could not verify anything, which is what made those
+      # verify=False flags unremovable rather than merely untidy.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       RAG_API_URL: https://rag-api:8000
       NMAP_SCANNER_URL: https://nmap_scanner:8012
       WEB_SCANNER_URL: https://web-scanner:8010
@@ -2055,6 +2062,7 @@ services:
       - ./mcp/third_party:/mcp/third_party
       - ./mcpo/config.json:/mcpo/config.json
       - ./db-config.json:/app/db-config.json:rw
+      - ./certs:/certs:ro          # CA bundle for outbound TLS verification
       - ./knowledge:/knowledge:ro
       # Scope matcher, shared rather than copied. The BFF runs from /app/bff, so
       # this lands on its import path and `from etl.scope_gate import is_in_scope`

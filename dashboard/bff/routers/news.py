@@ -15,7 +15,7 @@ _TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 
 
 def _client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(verify=False, timeout=_TIMEOUT)
+    return httpx.AsyncClient(timeout=_TIMEOUT)
 
 
 # --- Models ---

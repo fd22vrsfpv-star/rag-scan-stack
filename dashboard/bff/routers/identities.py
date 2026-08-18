@@ -35,7 +35,7 @@ async def list_identities(
     ):
         if v is not None:
             params[k] = v
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/identities",
             params=params, headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -58,7 +58,7 @@ async def identities_groups(
                  ("limit", limit), ("offset", offset)):
         if v is not None:
             params[k] = v
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/identities/groups",
             params=params, headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -71,7 +71,7 @@ async def identities_groups(
 @router.get("/api/identities/summary")
 async def identities_summary():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/identities/stats/summary",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -84,7 +84,7 @@ async def identities_summary():
 @router.get("/api/identities/{identity_id}")
 async def get_identity(identity_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/identities/{identity_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},

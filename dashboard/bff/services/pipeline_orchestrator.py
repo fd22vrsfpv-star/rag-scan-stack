@@ -120,7 +120,7 @@ class PipelineOrchestrator:
     # ── Persistence helpers ──────────────────────────────────────────────
     async def _update_pipeline(self, **fields: Any) -> None:
         try:
-            async with httpx.AsyncClient(verify=False, timeout=10) as c:
+            async with httpx.AsyncClient(timeout=10) as c:
                 await c.patch(
                     f"{self._rag_api}/pipelines/{self.pipeline_id}",
                     json=fields,
@@ -131,7 +131,7 @@ class PipelineOrchestrator:
 
     async def _record_job(self, job_id: str, host: str, stage: int, scan_type: str) -> None:
         try:
-            async with httpx.AsyncClient(verify=False, timeout=10) as c:
+            async with httpx.AsyncClient(timeout=10) as c:
                 await c.post(
                     f"{self._rag_api}/pipelines/{self.pipeline_id}/jobs",
                     json={"pipeline_id": self.pipeline_id, "job_id": job_id,
@@ -143,7 +143,7 @@ class PipelineOrchestrator:
 
     async def _complete_job(self, job_id: str, status: str, result: dict | None = None) -> None:
         try:
-            async with httpx.AsyncClient(verify=False, timeout=10) as c:
+            async with httpx.AsyncClient(timeout=10) as c:
                 await c.patch(
                     f"{self._rag_api}/pipelines/{self.pipeline_id}/jobs/{job_id}",
                     json={"status": status, "result": result},
@@ -162,7 +162,7 @@ class PipelineOrchestrator:
             params["proxy"] = proxy
         params.setdefault("engagement_id", self.engagement_id)
         try:
-            async with httpx.AsyncClient(verify=False, timeout=60) as c:
+            async with httpx.AsyncClient(timeout=60) as c:
                 resp = await c.post(
                     f"https://127.0.0.1:{os.environ.get('BFF_PORT', '443')}/api/scans/{scan_type}",
                     json=params,

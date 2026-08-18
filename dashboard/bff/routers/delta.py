@@ -22,14 +22,14 @@ async def list_scan_runs(tool: str = None, limit: int = Query(50, le=200)):
     params = {"limit": limit}
     if tool:
         params["tool"] = tool
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.get(_api("/scan-runs"), params=params, headers=_headers())
     return r.json()
 
 
 @router.post("/scan-runs/backfill")
 async def backfill_scan_runs():
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.post(_api("/scan-runs/backfill"), headers=_headers())
     return r.json()
 
@@ -48,21 +48,21 @@ async def create_scan_run(
         params["job_id"] = job_id
     if profile:
         params["profile"] = profile
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.post(_api("/scan-runs"), params=params, headers=_headers())
     return r.json()
 
 
 @router.patch("/scan-runs/{run_id}")
 async def finish_scan_run(run_id: str):
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.patch(_api(f"/scan-runs/{run_id}"), headers=_headers())
     return r.json()
 
 
 @router.post("/scan-runs/{run_id}/link")
 async def link_findings(run_id: str, finding_type: str = Query(...)):
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.post(
             _api(f"/scan-runs/{run_id}/link"),
             params={"finding_type": finding_type},
@@ -76,7 +76,7 @@ async def compare_runs(
     run_a: str = Query(...),
     run_b: str = Query(...),
 ):
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.get(
             _api("/scan-runs/compare"),
             params={"run_a": run_a, "run_b": run_b},
@@ -87,13 +87,13 @@ async def compare_runs(
 
 @router.post("/backfill-fingerprints")
 async def backfill_fingerprints():
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.post(_api("/findings/backfill-fingerprints"), headers=_headers())
     return r.json()
 
 
 @router.get("/dedup-report")
 async def dedup_report():
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.get(_api("/findings/dedup-report"), headers=_headers())
     return r.json()

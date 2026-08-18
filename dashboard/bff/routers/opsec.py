@@ -11,7 +11,7 @@ router = APIRouter()
 @router.get("/api/opsec/timeline")
 async def opsec_timeline(hours: int = Query(24)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/opsec/timeline",
             params={"hours": hours},
@@ -23,7 +23,7 @@ async def opsec_timeline(hours: int = Query(24)):
 @router.get("/api/opsec/alerts")
 async def opsec_alerts(threshold: int = Query(20)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/opsec/alerts",
             params={"threshold": threshold},
@@ -38,7 +38,7 @@ async def list_scheduled_scans(status: Optional[str] = Query(None)):
     params = {}
     if status:
         params["status"] = status
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/scheduled-scans",
             params=params,
@@ -50,7 +50,7 @@ async def list_scheduled_scans(status: Optional[str] = Query(None)):
 @router.post("/api/scheduled-scans")
 async def create_scheduled_scan(body: dict):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/scheduled-scans",
             json=body,
@@ -62,7 +62,7 @@ async def create_scheduled_scan(body: dict):
 @router.delete("/api/scheduled-scans/{sid}")
 async def cancel_scheduled_scan(sid: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/scheduled-scans/{sid}",
             headers={"x-api-key": s.api_key, **engagement_headers()},

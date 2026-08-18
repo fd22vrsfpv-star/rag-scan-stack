@@ -37,7 +37,7 @@ async def _emit_kb_webhook(event_type: str, name: str, extra: Dict[str, Any] | N
     if extra:
         data.update(extra)
     try:
-        async with httpx.AsyncClient(verify=False, timeout=5) as c:
+        async with httpx.AsyncClient(timeout=5) as c:
             await c.post(
                 f"{s.rag_api_url}/webhooks/emit",
                 json={"event_type": event_type, "source": "bff_kb", "data": data},
@@ -50,7 +50,7 @@ async def _emit_kb_webhook(event_type: str, name: str, extra: Dict[str, Any] | N
 @router.get("/api/kb/services")
 async def list_kb_services():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.scan_recommender_url}/kb/services")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -60,7 +60,7 @@ async def list_kb_services():
 @router.get("/api/kb/services/{name}")
 async def get_kb_service(name: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.scan_recommender_url}/kb/services/{name}")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -70,7 +70,7 @@ async def get_kb_service(name: str):
 @router.put("/api/kb/services/{name}")
 async def upsert_kb_service(name: str, body: Dict[str, Any] = Body(...)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.put(
             f"{s.scan_recommender_url}/kb/services/{name}",
             json=body,
@@ -95,7 +95,7 @@ async def upsert_kb_service(name: str, body: Dict[str, Any] = Body(...)):
 @router.delete("/api/kb/services/{name}")
 async def delete_kb_service(name: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(f"{s.scan_recommender_url}/kb/services/{name}")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -109,7 +109,7 @@ async def delete_kb_service(name: str):
 @router.get("/api/kb/feedback")
 async def list_kb_feedback():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.scan_recommender_url}/kb/feedback")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -119,7 +119,7 @@ async def list_kb_feedback():
 @router.post("/api/kb/feedback")
 async def add_kb_feedback(body: Dict[str, Any] = Body(...)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(f"{s.scan_recommender_url}/kb/feedback", json=body)
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -129,7 +129,7 @@ async def add_kb_feedback(body: Dict[str, Any] = Body(...)):
 @router.delete("/api/kb/feedback/{feedback_id}")
 async def delete_kb_feedback(feedback_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(f"{s.scan_recommender_url}/kb/feedback/{feedback_id}")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -155,7 +155,7 @@ async def list_service_prompts(
         "engagement_id": engagement_id,
         "enabled_only": str(enabled_only).lower(),
     }.items() if v not in (None, "")}
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.scan_recommender_url}/kb/prompts", params=params)
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -166,7 +166,7 @@ async def list_service_prompts(
 async def get_tool_catalog():
     """Validator catalog contents, age, and per-node coverage."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.scan_recommender_url}/kb/tool-catalog")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, _kb_detail(resp))
@@ -177,7 +177,7 @@ async def get_tool_catalog():
 async def verify_agent_output(body: Dict[str, Any] = Body(...)):
     """Check an agent's factual claims against what the scans actually recorded."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.post(f"{s.scan_recommender_url}/kb/agent-output/verify", json=body)
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, _kb_detail(resp))
@@ -188,7 +188,7 @@ async def verify_agent_output(body: Dict[str, Any] = Body(...)):
 async def get_tool_coverage():
     """Tools the KB recommends but nothing can run, and installed tools it ignores."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(f"{s.scan_recommender_url}/kb/tool-coverage")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, _kb_detail(resp))
@@ -199,7 +199,7 @@ async def get_tool_coverage():
 async def adopt_tool(body: Dict[str, Any] = Body(...)):
     """Add an installed-but-unused tool to a service's KB override."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(f"{s.scan_recommender_url}/kb/tools/adopt", json=body)
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, _kb_detail(resp))
@@ -221,7 +221,7 @@ async def export_service_prompts(
         "engagement_id": engagement_id,
         "enabled_only": str(enabled_only).lower(),
     }.items() if v not in (None, "")}
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.scan_recommender_url}/kb/prompts/export", params=params)
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, _kb_detail(resp))
@@ -241,7 +241,7 @@ async def resolve_service_prompts(
         "service": service, "port": port, "tech": tech,
         "engagement_id": engagement_id,
     }.items() if v not in (None, "")}
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(f"{s.scan_recommender_url}/kb/prompts/resolve", params=params)
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -253,7 +253,7 @@ async def create_service_prompt(body: Dict[str, Any] = Body(...)):
     s = get_settings()
     # Training-note indexing embeds the text, so allow more headroom than the
     # 15s used by the other KB proxies.
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.post(f"{s.scan_recommender_url}/kb/prompts", json=body)
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -263,7 +263,7 @@ async def create_service_prompt(body: Dict[str, Any] = Body(...)):
 @router.put("/api/kb/prompts/{prompt_id}")
 async def update_service_prompt(prompt_id: str, body: Dict[str, Any] = Body(...)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.put(f"{s.scan_recommender_url}/kb/prompts/{prompt_id}", json=body)
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -273,7 +273,7 @@ async def update_service_prompt(prompt_id: str, body: Dict[str, Any] = Body(...)
 @router.delete("/api/kb/prompts/{prompt_id}")
 async def delete_service_prompt(prompt_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.delete(f"{s.scan_recommender_url}/kb/prompts/{prompt_id}")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -299,7 +299,7 @@ async def web_scan_guidance(
         "ip": ip, "service": service, "port": port, "tech": tech,
         "engagement_id": engagement_id,
     }.items() if v not in (None, "")}
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(f"{s.scan_recommender_url}/kb/web-guidance", params=params)
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -319,7 +319,7 @@ async def convert_walkthrough(body: Dict[str, Any] = Body(...)):
     s = get_settings()
     try:
         # An LLM pass over a full walkthrough is slow; well past the usual budget.
-        async with httpx.AsyncClient(verify=False, timeout=900) as c:
+        async with httpx.AsyncClient(timeout=900) as c:
             resp = await c.post(
                 f"{s.scan_recommender_url}/kb/walkthrough/convert",
                 json=body, headers=engagement_headers(),
@@ -338,7 +338,7 @@ async def convert_walkthrough(body: Dict[str, Any] = Body(...)):
 async def get_walkthrough_prompt():
     """Current guiding prompt, the shipped default, and whether one is overridden."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.scan_recommender_url}/kb/walkthrough-prompt")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, _kb_detail(resp))
@@ -349,7 +349,7 @@ async def get_walkthrough_prompt():
 async def set_walkthrough_prompt(body: Dict[str, Any] = Body(...)):
     """Override the guiding prompt. An empty string reverts to the shipped default."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.put(f"{s.scan_recommender_url}/kb/walkthrough-prompt", json=body)
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, _kb_detail(resp))
@@ -368,7 +368,7 @@ async def convert_url(body: Dict[str, Any] = Body(...)):
     s = get_settings()
     try:
         # Crawl + extraction + an LLM pass over the whole guide.
-        async with httpx.AsyncClient(verify=False, timeout=1200) as c:
+        async with httpx.AsyncClient(timeout=1200) as c:
             resp = await c.post(
                 f"{s.scan_recommender_url}/kb/url/convert",
                 json=body, headers=engagement_headers(),

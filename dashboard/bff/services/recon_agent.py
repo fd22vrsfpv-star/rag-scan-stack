@@ -219,7 +219,7 @@ class ReconAgent:
         """One tick: fetch all enabled agents, run cycle for those due."""
         s = self._settings
         try:
-            async with httpx.AsyncClient(verify=False, timeout=15) as c:
+            async with httpx.AsyncClient(timeout=15) as c:
                 resp = await c.get(
                     f"{s.rag_api_url}/recon-agent/all/enabled",
                     headers={"x-api-key": s.api_key},
@@ -278,7 +278,7 @@ class ReconAgent:
                              data: dict, severity: str | None = None) -> None:
         """Emit a webhook event via rag-api's webhook dispatcher."""
         try:
-            async with httpx.AsyncClient(verify=False, timeout=5) as c:
+            async with httpx.AsyncClient(timeout=5) as c:
                 payload = {"event_type": event_type, "source": "recon_agent", "data": data}
                 if severity:
                     payload["severity"] = severity
@@ -336,7 +336,7 @@ class ReconAgent:
         tunnel_proxies: list[str] = []
         if use_tunnels:
             try:
-                async with httpx.AsyncClient(verify=False, timeout=5) as c:
+                async with httpx.AsyncClient(timeout=5) as c:
                     nr = await c.get(f"{s.tunnel_manager_url}/nodes", headers=headers)
                     if nr.status_code == 200:
                         for node in (nr.json().get("nodes") or []):
@@ -363,7 +363,7 @@ class ReconAgent:
         tool_node_ids: list[str] = []
         if use_nodes_for_tools and not explicit_tool_node:
             try:
-                async with httpx.AsyncClient(verify=False, timeout=5) as c:
+                async with httpx.AsyncClient(timeout=5) as c:
                     nr = await c.get(f"{s.tunnel_manager_url}/nodes", headers=headers)
                     if nr.status_code == 200:
                         for node in (nr.json().get("nodes") or []):
@@ -399,7 +399,7 @@ class ReconAgent:
         # 0. Update stale "running" coverage entries — check if their jobs actually finished
         from polling import active_jobs
         try:
-            async with httpx.AsyncClient(verify=False, timeout=15) as c:
+            async with httpx.AsyncClient(timeout=15) as c:
                 resp = await c.get(f"{s.rag_api_url}/recon-agent/{eid}/coverage",
                                    headers=headers)
                 if resp.status_code == 200:
@@ -442,7 +442,7 @@ class ReconAgent:
         # 1. Run detection rules on recent findings
         since_minutes = max(1, interval // 60 + 1)
         try:
-            async with httpx.AsyncClient(verify=False, timeout=60) as c:
+            async with httpx.AsyncClient(timeout=60) as c:
                 resp = await c.post(
                     f"{s.rag_api_url}/agent/scan",
                     params={"since_minutes": since_minutes, "engagement_id": eid},
@@ -457,7 +457,7 @@ class ReconAgent:
         # 2. Check unresolved follow-ups
         open_followups = []
         try:
-            async with httpx.AsyncClient(verify=False, timeout=15) as c:
+            async with httpx.AsyncClient(timeout=15) as c:
                 resp = await c.get(
                     f"{s.rag_api_url}/follow-ups",
                     params={"status": "open", "engagement_id": eid, "limit": 50},
@@ -474,7 +474,7 @@ class ReconAgent:
         targets = []           # list of target strings
         target_types = {}      # target -> type (domain/ip/cidr/url)
         try:
-            async with httpx.AsyncClient(verify=False, timeout=15) as c:
+            async with httpx.AsyncClient(timeout=15) as c:
                 resp = await c.get(
                     f"{s.rag_api_url}/engagements/{eid}/scopes",
                     headers=headers,
@@ -501,7 +501,7 @@ class ReconAgent:
         # Skip stale "running" records older than 2h — treat as failed so they can be retried
         coverage_set: set[tuple[str, int, str]] = set()
         try:
-            async with httpx.AsyncClient(verify=False, timeout=15) as c:
+            async with httpx.AsyncClient(timeout=15) as c:
                 # First: reset stale running records
                 try:
                     await c.post(
@@ -602,7 +602,7 @@ class ReconAgent:
 
                 # Record coverage as running
                 try:
-                    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+                    async with httpx.AsyncClient(timeout=10) as c:
                         await c.post(
                             f"{s.rag_api_url}/recon-agent/{eid}/coverage",
                             json={"target": target, "stage": stage,
@@ -634,7 +634,7 @@ class ReconAgent:
                             except Exception:
                                 pass
 
-                    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+                    async with httpx.AsyncClient(timeout=60) as c:
                         # Use target_url for web scans, target for network scans
                         if scan_type in ("web", "gobuster", "nikto", "katana", "playwright", "pipeline"):
                             payload = {"target_url": target, "engagement_id": eid}
@@ -686,7 +686,7 @@ class ReconAgent:
 
                             # Update coverage with job_id
                             try:
-                                async with httpx.AsyncClient(verify=False, timeout=10) as c2:
+                                async with httpx.AsyncClient(timeout=10) as c2:
                                     await c2.post(
                                         f"{s.rag_api_url}/recon-agent/{eid}/coverage",
                                         json={"target": target, "stage": stage,
@@ -715,7 +715,7 @@ class ReconAgent:
                             }, severity="high")
                             # Log to campaign events
                             try:
-                                async with httpx.AsyncClient(verify=False, timeout=10) as c3:
+                                async with httpx.AsyncClient(timeout=10) as c3:
                                     await c3.post(
                                         f"{s.rag_api_url}/engagements/{eid}/campaign-events",
                                         json={
@@ -735,7 +735,7 @@ class ReconAgent:
                                 pass
                             # Disable the agent
                             try:
-                                async with httpx.AsyncClient(verify=False, timeout=10) as c3:
+                                async with httpx.AsyncClient(timeout=10) as c3:
                                     await c3.post(
                                         f"{s.rag_api_url}/recon-agent/{eid}/disable",
                                         headers=headers,
@@ -896,7 +896,7 @@ class ReconAgent:
                         # the downstream handler's engagement_headers()
                         # resolves correctly regardless of middleware state
                         # on this background task.
-                        async with httpx.AsyncClient(verify=False, timeout=120) as c:
+                        async with httpx.AsyncClient(timeout=120) as c:
                             resp = await c.post(
                                 f"https://127.0.0.1:{bff_port}/api/scan-recommendations/run",
                                 json=payload,
@@ -1129,7 +1129,7 @@ class ReconAgent:
 
         # 5. Log to campaign events
         try:
-            async with httpx.AsyncClient(verify=False, timeout=10) as c:
+            async with httpx.AsyncClient(timeout=10) as c:
                 await c.post(
                     f"{s.rag_api_url}/engagements/{eid}/campaign-events",
                     json={
@@ -1175,7 +1175,7 @@ class ReconAgent:
         if dispatched > 0:
             state_patch["last_dispatch_at"] = now_iso
         try:
-            async with httpx.AsyncClient(verify=False, timeout=10) as c:
+            async with httpx.AsyncClient(timeout=10) as c:
                 await c.patch(
                     f"{s.rag_api_url}/recon-agent/{eid}",
                     json=state_patch,

@@ -17,7 +17,7 @@ async def list_engagements(status: Optional[str] = Query(None)):
     params = {}
     if status:
         params["status"] = status
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/engagements",
             params=params,
@@ -29,7 +29,7 @@ async def list_engagements(status: Optional[str] = Query(None)):
 @router.get("/api/engagements/{eid}")
 async def get_engagement(eid: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/engagements/{eid}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -53,7 +53,7 @@ class EngagementBody(BaseModel):
 @router.post("/api/engagements")
 async def create_engagement(body: EngagementBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/engagements",
             json=body.model_dump(exclude_none=True),
@@ -78,7 +78,7 @@ class EngagementUpdateBody(BaseModel):
 @router.put("/api/engagements/{eid}")
 async def update_engagement(eid: str, body: EngagementUpdateBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.put(
             f"{s.rag_api_url}/engagements/{eid}",
             json=body.model_dump(exclude_none=True),
@@ -90,7 +90,7 @@ async def update_engagement(eid: str, body: EngagementUpdateBody):
 @router.delete("/api/engagements/{eid}")
 async def delete_engagement(eid: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/engagements/{eid}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -119,7 +119,7 @@ class CampaignEventBody(BaseModel):
 @router.post("/api/engagements/{eid}/campaign-events")
 async def create_campaign_event(eid: str, body: CampaignEventBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/engagements/{eid}/campaign-events",
             json=body.model_dump(exclude_none=True),
@@ -134,7 +134,7 @@ async def list_campaign_events(eid: str, kill_chain_phase: Optional[str] = Query
     params = {}
     if kill_chain_phase:
         params["kill_chain_phase"] = kill_chain_phase
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/engagements/{eid}/campaign-events",
             params=params,
@@ -158,7 +158,7 @@ class CampaignEventUpdateBody(BaseModel):
 @router.put("/api/campaign-events/{event_id}")
 async def update_campaign_event(event_id: str, body: CampaignEventUpdateBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.put(
             f"{s.rag_api_url}/campaign-events/{event_id}",
             json=body.model_dump(exclude_none=True),
@@ -170,7 +170,7 @@ async def update_campaign_event(event_id: str, body: CampaignEventUpdateBody):
 @router.delete("/api/campaign-events/{event_id}")
 async def delete_campaign_event(event_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/campaign-events/{event_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -181,7 +181,7 @@ async def delete_campaign_event(event_id: str):
 @router.get("/api/engagements/{eid}/campaign-summary")
 async def campaign_summary(eid: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/engagements/{eid}/campaign-summary",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -194,7 +194,7 @@ async def campaign_summary(eid: str):
 @router.get("/api/engagements/{eid}/scopes")
 async def list_engagement_scopes(eid: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/engagements/{eid}/scopes",
                            headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -203,7 +203,7 @@ async def list_engagement_scopes(eid: str):
 @router.get("/api/engagements/{eid}/scopes/{scope_name}")
 async def get_engagement_scope(eid: str, scope_name: str, limit: int = Query(500)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/engagements/{eid}/scopes/{scope_name}",
                            params={"limit": limit},
                            headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -218,7 +218,7 @@ class ScopeTargetsBody(BaseModel):
 @router.post("/api/engagements/{eid}/scopes/{scope_name}/targets")
 async def add_scope_targets(eid: str, scope_name: str, body: ScopeTargetsBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(f"{s.rag_api_url}/engagements/{eid}/scopes/{scope_name}/targets",
                             json=body.dict(),
                             headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -228,7 +228,7 @@ async def add_scope_targets(eid: str, scope_name: str, body: ScopeTargetsBody):
 @router.delete("/api/engagements/{eid}/scopes/{scope_name}")
 async def delete_scope(eid: str, scope_name: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.delete(f"{s.rag_api_url}/engagements/{eid}/scopes/{scope_name}",
                               headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -241,7 +241,7 @@ class ScopeRenameBody(BaseModel):
 @router.put("/api/engagements/{eid}/scopes/{scope_name}")
 async def rename_scope(eid: str, scope_name: str, body: ScopeRenameBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.put(f"{s.rag_api_url}/engagements/{eid}/scopes/{scope_name}",
                            json=body.dict(),
                            headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -257,7 +257,7 @@ class MoveTargetsBody(BaseModel):
 @router.post("/api/engagements/{eid}/scopes/{scope_name}/move")
 async def move_scope_targets(eid: str, scope_name: str, body: MoveTargetsBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(f"{s.rag_api_url}/engagements/{eid}/scopes/{scope_name}/move",
                             json=body.dict(),
                             headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -271,7 +271,7 @@ class MoveScopeBody(BaseModel):
 @router.post("/api/engagements/{eid}/scopes/{scope_name}/move-all")
 async def move_entire_scope(eid: str, scope_name: str, body: MoveScopeBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(f"{s.rag_api_url}/engagements/{eid}/scopes/{scope_name}/move-all",
                             json=body.dict(),
                             headers={"x-api-key": s.api_key, **engagement_headers()})

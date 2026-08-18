@@ -18,7 +18,7 @@ async def report_summary(session_id: Optional[str] = None):
     params = {}
     if session_id:
         params["session_id"] = session_id
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.get(
             f"{s.autogen_url}/reports/summary",
             params=params,
@@ -38,7 +38,7 @@ async def report_full(
 ):
     s = get_settings()
 
-    async with httpx.AsyncClient(verify=False, timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         # Try autogen report endpoint first (uses tool_executions table)
         autogen_ok = False
         try:
@@ -196,7 +196,7 @@ async def export_pdf(req: ExportRequest):
     findings_data = {}
     summary_data = {}
 
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         # Get findings
         params: dict = {"limit": 500}
         if req.severity_filter:
@@ -247,7 +247,7 @@ async def export_pdf(req: ExportRequest):
 async def export_zap_xml():
     """Proxy the latest ZAP XML report from web-scanner."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.get(f"{s.web_scanner_url}/reports/zap-xml")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -269,7 +269,7 @@ async def export_burp(req: ExportRequest):
     if req.target:
         params["ip"] = req.target
 
-    async with httpx.AsyncClient(verify=False, timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.get(
             f"{s.rag_api_url}/export/burp",
             params=params,
@@ -300,7 +300,7 @@ async def export_har(request: Request):
     if body.get("search"):
         params["search"] = body["search"]
 
-    async with httpx.AsyncClient(verify=False, timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.get(
             f"{s.rag_api_url}/export/har",
             params=params,
@@ -320,7 +320,7 @@ async def export_har(request: Request):
 async def proxy_replay_status():
     """Get proxy replay progress."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=5) as c:
+    async with httpx.AsyncClient(timeout=5) as c:
         resp = await c.get(f"{s.rag_api_url}/export/proxy-replay/status", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
@@ -330,7 +330,7 @@ async def proxy_replay(request: Request):
     """Replay finding URLs through a configured proxy."""
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(
             f"{s.rag_api_url}/export/proxy-replay",
             json=body,
@@ -354,7 +354,7 @@ async def export_zap_report(request: Request):
     if body.get("target"):
         params["ip"] = body["target"]
 
-    async with httpx.AsyncClient(verify=False, timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.get(
             f"{s.rag_api_url}/export/zap-report",
             params=params,
@@ -383,7 +383,7 @@ async def sarif_export(
     if source:
         params["source"] = source.split(",")
 
-    async with httpx.AsyncClient(verify=False, timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.get(
             f"{s.rag_api_url}/export/sarif",
             params=params,

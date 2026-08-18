@@ -414,7 +414,7 @@ async def execute_tool(name: str, arguments: dict, allowed_tools: list[str] | No
     method, url_fn, payload_fn = TOOL_ROUTES[name]
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             # Special: get_job_status tries multiple services
             if method == "MULTI_GET":
                 return await _get_job_status(client, arguments, settings, headers)
@@ -461,7 +461,7 @@ async def _start_pipeline(args: dict, settings, headers) -> dict:
             "scope_name": args.get("scope_name"),
             "config": {"use_tunnels": args.get("use_tunnels", False)},
         }
-        async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        async with httpx.AsyncClient(timeout=30) as c:
             resp = await c.post(f"{_BFF_BASE}/api/pipelines", json=body,
                                 headers={**headers, "Content-Type": "application/json"})
             return resp.json() if resp.status_code < 500 else {"error": resp.text[:300]}
@@ -472,7 +472,7 @@ async def _start_pipeline(args: dict, settings, headers) -> dict:
 async def _get_pipeline_status(args: dict, settings, headers) -> dict:
     pid = args.get("pipeline_id", "")
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15) as c:
             resp = await c.get(f"{settings.rag_api_url}/pipelines/{pid}", headers=headers)
             if resp.status_code >= 400:
                 return {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
@@ -492,7 +492,7 @@ async def _get_pipeline_status(args: dict, settings, headers) -> dict:
 async def _stop_pipeline(args: dict, settings, headers) -> dict:
     pid = args.get("pipeline_id", "")
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15) as c:
             resp = await c.post(f"{_BFF_BASE}/api/pipelines/{pid}/stop",
                                 headers=headers)
             return resp.json() if resp.status_code < 500 else {"error": resp.text[:300]}
@@ -526,7 +526,7 @@ async def _read_uploaded_file(args: dict, settings, headers) -> dict:
     as_text = args.get("as_text", True)
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        async with httpx.AsyncClient(timeout=30) as c:
             # First fetch metadata to know content_type + total size
             meta_resp = await c.get(f"{settings.rag_api_url}/evidence/{file_id}",
                                     headers=headers)
@@ -648,7 +648,7 @@ async def _execute_mcp_tool(name: str, arguments: dict) -> dict:
     base_url = info.get("url") or f"{mcp_scheme}://{mcp_host}:{port}/mcp"
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=120) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 base_url,
                 json={
@@ -719,7 +719,7 @@ async def _execute_sse_mcp_tool(name: str, arguments: dict, info: dict) -> dict:
 
         def sse_listener():
             try:
-                with httpx.Client(verify=False, timeout=180) as sse_client:
+                with httpx.Client(timeout=180) as sse_client:
                     with connect_sse(sse_client, "GET", sse_url) as event_source:
                         for event in event_source.iter_sse():
                             if stop_event.is_set():
@@ -749,7 +749,7 @@ async def _execute_sse_mcp_tool(name: str, arguments: dict, info: dict) -> dict:
 
         message_url = data
 
-        with httpx.Client(verify=False, timeout=120) as client:
+        with httpx.Client(timeout=120) as client:
             # Initialize
             client.post(message_url, json={
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -806,7 +806,7 @@ async def _execute_remote_mcp_tool(name: str, arguments: dict, node_id: str) -> 
     import os
     tunnel_manager_url = os.environ.get("TUNNEL_MANAGER_URL", "http://host.docker.internal:8027")
     try:
-        async with httpx.AsyncClient(verify=False, timeout=120) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 f"{tunnel_manager_url}/ssh/{node_id}/mcp-proxy",
                 json={

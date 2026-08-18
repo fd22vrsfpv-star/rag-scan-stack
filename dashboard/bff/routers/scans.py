@@ -120,7 +120,7 @@ def _is_local_blocked() -> bool:
         import httpx as _hx
         s = get_settings()
         r = _hx.get(f"{s.rag_api_url}/settings/config/block_local_scans",
-                     headers={"x-api-key": s.api_key, **engagement_headers()}, verify=False, timeout=3)
+                     headers={"x-api-key": s.api_key, **engagement_headers()}, timeout=3)
         val = r.json().get("value", "") if r.status_code == 200 else ""
         _block_local_cache["val"] = val.lower() in ("1", "true", "yes")
         _block_local_cache["ts"] = now
@@ -787,7 +787,7 @@ async def launch_pipeline(req: PipelineRequest):
     s = get_settings()
 
     # 1. Create pipeline record in rag-api
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(
             f"{s.rag_api_url}/pipelines",
             json=req.dict(),
@@ -804,7 +804,7 @@ async def launch_pipeline(req: PipelineRequest):
     config = req.config or {}
     if config.get("use_tunnels"):
         try:
-            async with httpx.AsyncClient(verify=False, timeout=5) as c:
+            async with httpx.AsyncClient(timeout=5) as c:
                 nr = await c.get(f"{s.tunnel_manager_url}/nodes", headers={"x-api-key": s.api_key, **engagement_headers()})
                 if nr.status_code == 200:
                     for node in (nr.json().get("nodes") or []):
@@ -841,7 +841,7 @@ async def list_pipelines(engagement_id: Optional[str] = None, status: Optional[s
         params["engagement_id"] = engagement_id
     if status:
         params["status"] = status
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/pipelines", params=params,
                            headers={"x-api-key": s.api_key, **engagement_headers()})
     return safe_json(resp)
@@ -850,7 +850,7 @@ async def list_pipelines(engagement_id: Optional[str] = None, status: Optional[s
 @router.get("/api/pipelines/{pipeline_id}")
 async def get_pipeline(pipeline_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/pipelines/{pipeline_id}",
                            headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code >= 400:
@@ -866,7 +866,7 @@ async def list_pipeline_jobs(pipeline_id: str, stage: Optional[int] = None, host
         params["stage"] = stage
     if host:
         params["host"] = host
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/pipelines/{pipeline_id}/jobs",
                            params=params, headers={"x-api-key": s.api_key, **engagement_headers()})
     return safe_json(resp)
@@ -880,7 +880,7 @@ async def stop_pipeline(pipeline_id: str):
     if orch:
         orch.stop()
     # Mark in DB
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(f"{s.rag_api_url}/pipelines/{pipeline_id}/stop",
                             headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code >= 400:
@@ -986,7 +986,7 @@ async def scan_limits():
     agent_active = 0
     try:
         settings = get_settings()
-        async with httpx.AsyncClient(verify=False, timeout=5) as client:
+        async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(
                 f"{settings.autogen_url}/pentest/sessions",
                 headers={"x-api-key": settings.api_key, **engagement_headers()},
@@ -1090,7 +1090,7 @@ async def _detect_scope_for_target(target: str, api_key: str, rag_api_url: str) 
     if not hostname:
         return None
     try:
-        async with httpx.AsyncClient(verify=False, timeout=5) as c:
+        async with httpx.AsyncClient(timeout=5) as c:
             resp = await c.get(
                 f"{rag_api_url}/scope/classify/{hostname}",
                 headers={"x-api-key": api_key, **engagement_headers()},
@@ -1109,7 +1109,7 @@ async def _detect_scope_for_target(target: str, api_key: str, rag_api_url: str) 
 async def _resolve_scope_targets(scope_name: str, api_key: str, rag_api_url: str) -> list[str]:
     """Fetch web-targetable hostnames from a named scope."""
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15) as c:
             resp = await c.get(
                 f"{rag_api_url}/scope",
                 params={"name": scope_name, "limit": 2000},
@@ -1149,7 +1149,7 @@ async def nmap_resume(req: NmapResumeReq):
     s = get_settings()
     service_url = s.nmap_scanner_url
     payload = {k: v for k, v in req.dict().items() if v is not None}
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_SCAN) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_SCAN) as c:
         resp = await c.post(
             f"{service_url}/jobs/nmap-resume",
             json=payload,
@@ -1190,7 +1190,7 @@ async def _load_scope_rows() -> list:
     s = get_settings()
     rows: list = []
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             # GET /scope defaults to name="default" and returns ONLY that named
             # scope. This operator's scope is named "msf", so a bare call came
             # back empty and the gate sat silently inactive while real scope
@@ -1253,7 +1253,7 @@ async def _host_aliases(host: str) -> set:
         aliases |= {"localhost", "127.0.0.1", "::1"}
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(f"{s.rag_api_url}/assets", params={"limit": 5000},
                             headers={"x-api-key": s.api_key})
             if r.status_code == 200:
@@ -1409,7 +1409,7 @@ async def launch_scan(scan_type: str, req: ScanRequest):
                 if req.proxy:
                     payload["proxy"] = req.proxy
                 try:
-                    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_SCAN) as c:
+                    async with httpx.AsyncClient(timeout=TIMEOUT_SCAN) as c:
                         resp = await c.post(f"{service_url}{path}", json=payload,
                                             headers={"x-api-key": s.api_key, **engagement_headers()})
                         if resp.status_code < 400:
@@ -1471,7 +1471,7 @@ async def launch_scan(scan_type: str, req: ScanRequest):
     if req.no_ingest:
         payload["no_ingest"] = True
 
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_SCAN) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_SCAN) as c:
         resp = await c.post(
             f"{service_url}{path}",
             json=payload,
@@ -1504,7 +1504,7 @@ async def launch_scan(scan_type: str, req: ScanRequest):
                 evidence_parts.append(f"ports={req.ports}")
             if req.severity:
                 evidence_parts.append(f"severity={req.severity}")
-            async with httpx.AsyncClient(verify=False, timeout=5) as note_client:
+            async with httpx.AsyncClient(timeout=5) as note_client:
                 await note_client.post(
                     f"{s.rag_api_url}/findings/note",
                     json={
@@ -1560,7 +1560,7 @@ async def list_scans(engagement_id: Optional[str] = None):
     # Merge in scans from active autogen agent sessions
     try:
         settings = get_settings()
-        async with httpx.AsyncClient(verify=False, timeout=5) as client:
+        async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(
                 f"{settings.autogen_url}/pentest/sessions",
                 headers={"x-api-key": settings.api_key, **engagement_headers()},
@@ -1851,7 +1851,7 @@ async def get_scan(job_id: str):
         for attr in ["nmap_scanner_url", "web_scanner_url", "nuclei_url", "pd_runner_url", "osint_runner_url", "brutus_runner_url", "kali_listener_url"]:
             try:
                 url = getattr(s, attr)
-                async with httpx.AsyncClient(verify=False, timeout=5) as c:
+                async with httpx.AsyncClient(timeout=5) as c:
                     resp = await c.get(f"{url}/jobs/{job_id}", headers={"x-api-key": s.api_key, **engagement_headers()})
                     if resp.status_code == 200:
                         return safe_json(resp)
@@ -1859,7 +1859,7 @@ async def get_scan(job_id: str):
                 continue
         raise HTTPException(404, "Job not found")
 
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{service_url}/jobs/{job_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -1890,7 +1890,7 @@ async def stop_scan(job_id: str):
     info = active_jobs.get(job_id)
     if not info:
         raise HTTPException(404, "Job not tracked")
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{info['service_url']}/jobs/{job_id}/stop",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -1908,7 +1908,7 @@ async def resume_scan(job_id: str):
     info = active_jobs.get(job_id)
     if not info:
         raise HTTPException(404, "Job not tracked")
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(
             f"{info['service_url']}/jobs/{job_id}/resume",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -1932,7 +1932,7 @@ async def nmap_resume_info(job_id: str):
     info = active_jobs.get(job_id)
     if not info:
         raise HTTPException(404, "Job not tracked")
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(
             f"{info['service_url']}/jobs/{job_id}/nmap-resume-info",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -1968,7 +1968,7 @@ async def cloud_import(
     s = get_settings()
     content = await file.read()
     data = {"engagement_id": engagement_id} if engagement_id else None
-    async with httpx.AsyncClient(verify=False, timeout=300) as c:
+    async with httpx.AsyncClient(timeout=300) as c:
         resp = await c.post(
             f"{s.rag_api_url}/ingest/{ingest_path}",
             files={"file": (file.filename, content, file.content_type or "application/octet-stream")},
@@ -2014,7 +2014,7 @@ async def cloud_import_status(job_id: str):
     """Poll the status of an async cloud-import job (e.g. MicroBurst).
     Proxies rag-api GET /jobs/{job_id}; returns status, progress, result, error."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/jobs/{job_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},

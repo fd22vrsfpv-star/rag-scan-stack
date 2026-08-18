@@ -35,7 +35,7 @@ class ChatRequest(BaseModel):
 async def _resolve_llm_backend(settings) -> str:
     """Read LLM backend from app_settings DB, fallback to env."""
     try:
-        async with httpx.AsyncClient(verify=False, timeout=5) as c:
+        async with httpx.AsyncClient(timeout=5) as c:
             resp = await c.get(f"{settings.rag_api_url}/settings/config/llm.backend",
                                headers={"x-api-key": settings.api_key, **engagement_headers()})
             if resp.status_code == 200:
@@ -59,7 +59,7 @@ async def _resolve_llm_keys(settings, backend: str) -> dict:
     if not db_keys:
         return keys
     try:
-        async with httpx.AsyncClient(verify=False, timeout=5) as c:
+        async with httpx.AsyncClient(timeout=5) as c:
             for k in db_keys:
                 resp = await c.get(f"{settings.rag_api_url}/settings/config/{k}",
                                    headers={"x-api-key": settings.api_key, **engagement_headers()})

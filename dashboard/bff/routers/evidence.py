@@ -31,7 +31,7 @@ async def upload_evidence(
         params["uploaded_by"] = uploaded_by
     if tags:
         params["tags"] = tags
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.post(
             f"{s.rag_api_url}/evidence/upload",
             params=params,
@@ -55,7 +55,7 @@ async def list_evidence(
         params["evidence_type"] = evidence_type
     if tags:
         params["tags"] = tags
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/evidence",
             params=params,
@@ -67,7 +67,7 @@ async def list_evidence(
 @router.get("/api/evidence/{eid}")
 async def get_evidence(eid: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/evidence/{eid}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -78,7 +78,7 @@ async def get_evidence(eid: str):
 @router.get("/api/evidence/{eid}/content")
 async def get_evidence_content(eid: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/evidence/{eid}/content",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -92,7 +92,7 @@ async def get_evidence_content(eid: str):
 @router.get("/api/evidence/{eid}/thumbnail")
 async def get_evidence_thumbnail(eid: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/evidence/{eid}/thumbnail",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -110,7 +110,7 @@ async def link_evidence(
     entity_id: str = Query(...),
 ):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/evidence/{eid}/link",
             params={"entity_type": entity_type, "entity_id": entity_id},
@@ -122,7 +122,7 @@ async def link_evidence(
 @router.get("/api/findings/{source}/{fid}/evidence")
 async def get_finding_evidence(source: str, fid: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/findings/{source}/{fid}/evidence",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -133,7 +133,7 @@ async def get_finding_evidence(source: str, fid: str):
 @router.delete("/api/evidence/{eid}")
 async def delete_evidence(eid: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/evidence/{eid}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
