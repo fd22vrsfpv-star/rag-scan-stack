@@ -173,6 +173,33 @@ done
 
 echo ""
 
+# ── ExploitDB (separate database) ─────────────────────────────────────────
+# Not part of the `scans` schema, so the table loop above cannot see it. It was
+# absent entirely on a live install: db_init/create_exploits.sh began with
+# `docker exec ... rag-postgres psql` while being mounted into the container's
+# own /docker-entrypoint-initdb.d, where there is no docker CLI — so it failed
+# on every init and exploitdb-etl crash-looped with "password authentication
+# failed for user edb_rw", which reads like a bad password rather than a
+# database that was never created.
+echo "🔍 Verifying exploitdb..."
+if docker exec rag-postgres psql -U app -d postgres -tAc \
+     "SELECT 1 FROM pg_database WHERE datname='exploits';" | grep -q 1; then
+    EDB_ROWS=$(docker exec rag-postgres psql -U app -d exploits -tAc \
+                 "SELECT count(*) FROM edb.exploits;" 2>/dev/null | tr -d ' ')
+    echo "✓ exploits database (edb.exploits rows: ${EDB_ROWS:-unknown})"
+    if [ "${EDB_ROWS:-0}" = "0" ]; then
+        echo "  ⚠  empty — run: docker compose up -d searchsploit-updater exploitdb-etl"
+    fi
+else
+    echo "❌ Missing exploits database — CVE/exploit matching has no data"
+    echo "   Create it with:"
+    echo "     docker exec -e EDB_RW_PASSWORD=\"\$EDB_RW_PASSWORD\" -e POSTGRES_USER=app \\"
+    echo "       rag-postgres bash /docker-entrypoint-initdb.d/create_exploits.sh"
+    MISSING=$((MISSING + 1))
+fi
+
+echo ""
+
 # Verify critical views exist
 echo "🔍 Verifying critical views..."
 CRITICAL_VIEWS=(
