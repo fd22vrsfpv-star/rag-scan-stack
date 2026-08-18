@@ -3449,9 +3449,26 @@ def _ingest_gowitness_jsonl(jsonl_path: str, screenshot_dir: str, job_id: str) -
     from urllib.parse import urlparse as _up
 
     ingested = 0
+    # Bound here, not inside the cursor block: the summary below runs after
+    # the try/finally and would NameError if an exception fired first.
+    _out_of_scope = 0
     try:
         conn = _pg.connect(DB_DSN)
         with conn.cursor(cursor_factory=_RDC) as cur:
+            # Ingest scope gate, loaded ONCE for the whole file.
+            #
+            # gowitness screenshots whatever URL list it is handed, and that list
+            # comes from discovery which can wander off-target — the same way a
+            # katana crawl produced findings for twitter.com and wikipedia.
+            #
+            # Imported at the top of the function, not inside the record loop: the
+            # first version ran load_ingest_scope() per record, which is a database
+            # round trip for every screenshot (563 on one real run), and swallowed
+            # ImportError so a broken import silently disabled the gate — the wrong
+            # direction to fail for something that exists to keep third-party hosts
+            # out of an engagement.
+            from etl.scope_gate import load_ingest_scope, host_in_scope
+            _enf, _rows = load_ingest_scope(cur)
             with open(jsonl_path) as f:
                 for line in f:
                     line = line.strip()
@@ -3592,15 +3609,11 @@ def _ingest_gowitness_jsonl(jsonl_path: str, screenshot_dir: str, job_id: str) -
                     except Exception:
                         pass
 
-                    # gowitness scope gate: it screenshots whatever URL list it
-                    # is handed, which may include hosts discovered off-target.
-                    try:
-                        from etl.scope_gate import load_ingest_scope, host_in_scope
-                        _enf, _rows = load_ingest_scope(cur)
-                        if not host_in_scope(target_host or url, _enf, _rows):
-                            continue
-                    except ImportError:
-                        pass
+                    # Skip anything outside the engagement scope: no finding, no
+                    # web_findings row, and no screenshot_metadata row either.
+                    if not host_in_scope(target_host or url, _enf, _rows):
+                        _out_of_scope += 1
+                        continue
 
                     # Insert into recon_findings (OSINT Explorer source)
                     cur.execute("""
@@ -3654,6 +3667,9 @@ def _ingest_gowitness_jsonl(jsonl_path: str, screenshot_dir: str, job_id: str) -
             conn.close()
         except Exception:
             pass
+    if _out_of_scope:
+        logging.info("[gowitness] skipped %d out-of-scope URL(s) — not recorded "
+                     "as findings", _out_of_scope)
     return ingested
 
 
