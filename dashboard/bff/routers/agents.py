@@ -17,7 +17,7 @@ router = APIRouter()
 async def agents_status():
     """Aggregate status of all AI agents."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/agents/status",
                            headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -29,7 +29,7 @@ async def agents_status():
 async def trigger_gap_analysis(eid: str):
     """Trigger recon gap analysis for an engagement."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(f"{s.rag_api_url}/agent/gap-analysis/{eid}",
                             headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -40,7 +40,7 @@ async def get_gap_report(eid: str, all: bool = Query(False)):
     """Get latest (or all) gap analysis report(s)."""
     s = get_settings()
     params = {"all": str(all).lower()} if all else {}
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/agent/gap-analysis/{eid}",
                            params=params, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -53,7 +53,7 @@ async def auto_fill_gaps(eid: str, report_id: Optional[str] = Query(None)):
     params = {}
     if report_id:
         params["report_id"] = report_id
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_LONG) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_LONG) as c:
         resp = await c.post(f"{s.rag_api_url}/agent/gap-analysis/{eid}/auto-fill",
                             params=params, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -63,7 +63,7 @@ async def auto_fill_gaps(eid: str, report_id: Optional[str] = Query(None)):
 async def get_gap_schedule(eid: str):
     """Get gap analysis auto-schedule config."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/agent/gap-analysis/{eid}/schedule",
                            headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -74,7 +74,7 @@ async def set_gap_schedule(eid: str, request: Request):
     """Set gap analysis auto-schedule config."""
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(f"{s.rag_api_url}/agent/gap-analysis/{eid}/schedule",
                             json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -98,7 +98,7 @@ async def takeover_hunter_run(body: TakeoverRunBody):
     s = get_settings()
     # Long timeout: 5,000 candidates × 50 concurrency × 6s timeout could take
     # several minutes worst-case. Use TIMEOUT_LONG so the BFF doesn't 504.
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_LONG) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_LONG) as c:
         resp = await c.post(f"{s.rag_api_url}/agents/takeover-hunter/run",
                             json=body.model_dump(exclude_none=True),
                             headers={"x-api-key": s.api_key, **engagement_headers()})

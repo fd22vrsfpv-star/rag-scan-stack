@@ -33,7 +33,7 @@ async def _nm_get(path: str, retries: int = 3, backoff: float = 2.0) -> dict:
     last_error = None
     for attempt in range(retries):
         try:
-            async with httpx.AsyncClient(verify=False, timeout=30) as c:
+            async with httpx.AsyncClient(timeout=30) as c:
                 resp = await c.get(url)
             if resp.status_code < 400:
                 return safe_json(resp)
@@ -69,7 +69,7 @@ async def _nm_post(path: str, payload: dict = None, retries: int = 2, backoff: f
     last_error = None
     for attempt in range(retries):
         try:
-            async with httpx.AsyncClient(verify=False, timeout=60) as c:
+            async with httpx.AsyncClient(timeout=60) as c:
                 resp = await c.post(url, json=payload or {})
             if resp.status_code < 400:
                 return safe_json(resp)
@@ -98,7 +98,7 @@ async def _nm_post(path: str, payload: dict = None, retries: int = 2, backoff: f
 
 async def _nm_delete(path: str) -> dict:
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.delete(f"{s.tunnel_manager_url}{path}")
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
@@ -297,7 +297,7 @@ async def scan_through_node(node_id: str, req: NodeScanRequest):
                 extra.extend(["-s", req.protocols])
             remote_payload["extra_args"] = extra
         s = get_settings()
-        async with httpx.AsyncClient(verify=False, timeout=660) as c:
+        async with httpx.AsyncClient(timeout=660) as c:
             resp = await c.post(
                 f"{s.tunnel_manager_url}/ssh/{node_id}/remote-scan",
                 json=remote_payload,
@@ -420,7 +420,7 @@ async def scan_through_node(node_id: str, req: NodeScanRequest):
             payload_template = dict(payload)
             payload_template.pop("target_url", None)
 
-            async with httpx.AsyncClient(verify=False, timeout=30) as c:
+            async with httpx.AsyncClient(timeout=30) as c:
                 for url in all_urls:
                     if _count_active_scans() >= MAX_CONCURRENT_SCANS:
                         pending_queue.append({
@@ -469,7 +469,7 @@ async def scan_through_node(node_id: str, req: NodeScanRequest):
         raise HTTPException(429, f"Scan limit reached: {active}/{MAX_CONCURRENT_SCANS} active. "
                                  f"Wait for running scans to complete.")
 
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(f"{service_url}{path}", json=payload)
 
     if resp.status_code >= 400:
@@ -498,7 +498,7 @@ async def scan_through_node(node_id: str, req: NodeScanRequest):
 async def patch_node(node_id: str, payload: dict):
     """Update node metadata (e.g. os_type)."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.patch(f"{s.tunnel_manager_url}/nodes/{node_id}", json=payload)
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
@@ -515,7 +515,7 @@ async def provision_node(node_id: str, payload: dict = {}):
     s = get_settings()
 
     async def _proxy():
-        async with httpx.AsyncClient(verify=False, timeout=600) as c:
+        async with httpx.AsyncClient(timeout=600) as c:
             async with c.stream("POST", f"{s.tunnel_manager_url}/ssh/{node_id}/provision",
                                 json=payload) as resp:
                 async for line in resp.aiter_lines():
@@ -554,7 +554,7 @@ async def provision_status(node_id: str, live: bool = False):
     s = get_settings()
 
     async def _proxy():
-        async with httpx.AsyncClient(verify=False, timeout=120) as c:
+        async with httpx.AsyncClient(timeout=120) as c:
             async with c.stream("GET", f"{s.tunnel_manager_url}/ssh/{node_id}/provision-status?live=true") as resp:
                 async for line in resp.aiter_lines():
                     yield line + "\n"
@@ -630,7 +630,7 @@ async def node_mcp_status(node_id: str):
     """Check if MCP is active for a node."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             resp = await c.get(f"{s.tunnel_manager_url}/ssh/{node_id}/mcp-status")
             return safe_json(resp)
     except Exception as e:
@@ -642,7 +642,7 @@ async def node_mcp_proxy(node_id: str, request: Request):
     """Proxy MCP requests to remote Kali MCP."""
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.post(
             f"{s.tunnel_manager_url}/ssh/{node_id}/mcp-proxy",
             json=body,
@@ -666,7 +666,7 @@ async def list_mcp_nodes():
     """List all nodes with active MCP."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             resp = await c.get(f"{s.tunnel_manager_url}/mcp-nodes")
             return safe_json(resp)
     except Exception as e:
@@ -712,7 +712,7 @@ async def ssh_reconnect(node_id: str):
 @router.post("/api/nodes/{node_id}/ssh/exec")
 async def ssh_exec(node_id: str, payload: dict):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.post(f"{s.tunnel_manager_url}/ssh/{node_id}/exec", json=payload)
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
@@ -723,7 +723,7 @@ async def ssh_exec(node_id: str, payload: dict):
 async def ssh_upload(node_id: str, file: UploadFile = File(...), remote_path: str = Form(...)):
     s = get_settings()
     file_bytes = await file.read()
-    async with httpx.AsyncClient(verify=False, timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.post(
             f"{s.tunnel_manager_url}/ssh/{node_id}/upload",
             params={"remote_path": remote_path},
@@ -738,7 +738,7 @@ async def ssh_upload(node_id: str, file: UploadFile = File(...), remote_path: st
 async def remote_scan(node_id: str, payload: dict):
     """Run a scan tool directly on a remote SSH host."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=660) as c:
+    async with httpx.AsyncClient(timeout=660) as c:
         resp = await c.post(f"{s.tunnel_manager_url}/ssh/{node_id}/remote-scan", json=payload)
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
@@ -748,7 +748,7 @@ async def remote_scan(node_id: str, payload: dict):
 @router.post("/api/nodes/{node_id}/ssh/download")
 async def ssh_download(node_id: str, payload: dict):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.post(
             f"{s.tunnel_manager_url}/ssh/{node_id}/download",
             json=payload,
@@ -769,7 +769,7 @@ async def ssh_download(node_id: str, payload: dict):
 @router.get("/api/cloud/do/options")
 async def do_options():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.tunnel_manager_url}/cloud/do/options")
         return safe_json(resp)
 
@@ -777,7 +777,7 @@ async def do_options():
 @router.get("/api/cloud/do/status/{droplet_id}")
 async def do_status(droplet_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.tunnel_manager_url}/cloud/do/status/{droplet_id}")
         return safe_json(resp)
 
@@ -785,7 +785,7 @@ async def do_status(droplet_id: str):
 @router.get("/api/cloud/do/droplets")
 async def list_do_droplets():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.tunnel_manager_url}/cloud/do/droplets")
         return safe_json(resp)
 
@@ -794,7 +794,7 @@ async def list_do_droplets():
 async def create_do_droplet(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=180) as c:
+    async with httpx.AsyncClient(timeout=180) as c:
         resp = await c.post(f"{s.tunnel_manager_url}/cloud/do/create", json=body)
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -804,7 +804,7 @@ async def create_do_droplet(request: Request):
 @router.delete("/api/cloud/do/droplet-by-id/{droplet_id}")
 async def destroy_do_droplet_by_id(droplet_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.request("DELETE", f"{s.tunnel_manager_url}/cloud/do/droplet-by-id/{droplet_id}")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -814,7 +814,7 @@ async def destroy_do_droplet_by_id(droplet_id: str):
 @router.delete("/api/cloud/do/droplet/{node_id}")
 async def destroy_do_droplet(node_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.request("DELETE", f"{s.tunnel_manager_url}/cloud/do/droplet/{node_id}")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -834,7 +834,7 @@ async def aws_options():
 async def create_aws_instance(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=180) as c:
+    async with httpx.AsyncClient(timeout=180) as c:
         resp = await c.post(f"{s.tunnel_manager_url}/cloud/aws/create", json=body, timeout=60)
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -854,7 +854,7 @@ async def list_aws_instances(region: str = Query("us-east-1")):
 @router.delete("/api/cloud/aws/instance-by-id/{instance_id}")
 async def destroy_aws_instance_by_id(instance_id: str, region: str = Query("us-east-1")):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.request("DELETE", f"{s.tunnel_manager_url}/cloud/aws/instance-by-id/{instance_id}?region={region}")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -864,7 +864,7 @@ async def destroy_aws_instance_by_id(instance_id: str, region: str = Query("us-e
 @router.delete("/api/cloud/aws/instance/{node_id}")
 async def destroy_aws_instance(node_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.request("DELETE", f"{s.tunnel_manager_url}/cloud/aws/instance/{node_id}")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -905,7 +905,7 @@ async def tunnel_events(node_id: Optional[str] = None, limit: int = 50):
     if node_id:
         params["node_id"] = node_id
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             resp = await c.get(f"{s.tunnel_manager_url}/tunnel-events", params=params)
             if resp.status_code == 200:
                 return safe_json(resp)
@@ -923,7 +923,7 @@ async def wordlist_check(payload: dict):
 
     # Get online nodes
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             resp = await c.get(f"{s.tunnel_manager_url}/nodes")
             if resp.status_code != 200:
                 return {"results": results}
@@ -933,7 +933,7 @@ async def wordlist_check(payload: dict):
         return {"results": results}
 
     # Check each file on each node
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         for node in nodes:
             nid = node["id"]
             nname = node.get("name", nid[:8])
@@ -973,7 +973,7 @@ async def create_wg_peer(request: Request):
 
     # Remote package installation over SSH; the node_manager step alone
     # allows 420s. Must exceed it or the BFF times out mid-install.
-    async with httpx.AsyncClient(verify=False, timeout=900) as c:
+    async with httpx.AsyncClient(timeout=900) as c:
         resp = await c.post(
             f"{s.tunnel_manager_url}/api/wg/peers",
             json=body
@@ -988,7 +988,7 @@ async def delete_wg_peer(peer_id: str):
     """Delete a WireGuard peer."""
     s = get_settings()
 
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.delete(f"{s.tunnel_manager_url}/api/wg/peers/{peer_id}")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -1005,7 +1005,7 @@ async def get_wg_peer_config(peer_id: str):
 async def get_wg_client_status(peer_id: str):
     """Check WireGuard client status on remote node."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.post(f"{s.tunnel_manager_url}/api/wg/peers/{peer_id}/client/status")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -1016,7 +1016,7 @@ async def get_wg_client_status(peer_id: str):
 async def start_wg_client(peer_id: str):
     """Start WireGuard client on remote node."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.post(f"{s.tunnel_manager_url}/api/wg/peers/{peer_id}/client/start")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -1027,7 +1027,7 @@ async def start_wg_client(peer_id: str):
 async def stop_wg_client(peer_id: str):
     """Stop WireGuard client on remote node."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.post(f"{s.tunnel_manager_url}/api/wg/peers/{peer_id}/client/stop")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
@@ -1038,7 +1038,7 @@ async def stop_wg_client(peer_id: str):
 async def restart_wg_client(peer_id: str):
     """Restart WireGuard client on remote node."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.post(f"{s.tunnel_manager_url}/api/wg/peers/{peer_id}/client/restart")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)

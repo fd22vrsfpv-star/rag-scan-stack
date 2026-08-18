@@ -6,6 +6,17 @@ from config import get_settings
 from engagement import engagement_headers
 from utils import safe_json
 
+# TLS verification is ON for every call in this router.
+#
+# pentest-dashboard now mounts /certs and sets REQUESTS_CA_BUNDLE /
+# SSL_CERT_FILE to the stack's CA bundle (public roots + the self-signed server
+# cert), so httpx verifies internal peers without `verify=False`. Before that
+# mount existed the flag was load-bearing - there was nothing to verify against -
+# which is why ~554 of them accumulated across the BFF.
+#
+# If a call here starts failing with CERTIFICATE_VERIFY_FAILED, regenerate the
+# bundle with scripts/generate-ca-bundle.sh rather than reinstating verify=False.
+
 router = APIRouter()
 
 
@@ -41,7 +52,7 @@ class ResumeRequest(BaseModel):
 @router.get("/api/agent-sessions")
 async def list_sessions():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.autogen_url}/pentest/sessions",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -54,7 +65,7 @@ async def list_sessions():
 @router.post("/api/agent-sessions")
 async def start_session(req: StartSessionRequest):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.post(
             f"{s.autogen_url}/pentest",
             json=req.model_dump(),
@@ -68,7 +79,7 @@ async def start_session(req: StartSessionRequest):
 @router.get("/api/agent-sessions/{session_id}")
 async def get_session(session_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.autogen_url}/pentest/{session_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -81,7 +92,7 @@ async def get_session(session_id: str):
 @router.get("/api/agent-sessions/{session_id}/messages")
 async def get_messages(session_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.autogen_url}/pentest/{session_id}/messages",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -94,7 +105,7 @@ async def get_messages(session_id: str):
 @router.post("/api/agent-sessions/{session_id}/stop")
 async def stop_session(session_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(
             f"{s.autogen_url}/pentest/{session_id}/stop",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -107,7 +118,7 @@ async def stop_session(session_id: str):
 @router.post("/api/agent-sessions/{session_id}/resume")
 async def resume_session(session_id: str, req: ResumeRequest):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.post(
             f"{s.autogen_url}/pentest/{session_id}/resume",
             json=req.model_dump(),
@@ -121,7 +132,7 @@ async def resume_session(session_id: str, req: ResumeRequest):
 @router.get("/api/agent-sessions/{session_id}/scans")
 async def get_session_scans(session_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.autogen_url}/pentest/{session_id}/scans",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -143,7 +154,7 @@ async def get_session_flow_summary(session_id: str):
     still running.
     """
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.autogen_url}/pentest/{session_id}/flow-summary",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -161,7 +172,7 @@ async def get_model_performance_warning():
     existed, so every request 404'd and the warning modal could never fire.
     """
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.autogen_url}/model/performance-warning",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -175,7 +186,7 @@ async def get_model_performance_warning():
 async def delete_session(session_id: str):
     """Delete a single agent session (proxies to autogen service)"""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.delete(
             f"{s.autogen_url}/pentest/{session_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -189,7 +200,7 @@ async def delete_session(session_id: str):
 async def clear_session_history():
     """Clear all agent session history (proxies to rag-api cleanup)"""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.post(
             f"{s.rag_api_url}/cleanup/sessions",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -204,7 +215,7 @@ async def list_agent_mcp_tools():
     """List MCP tools available to the autogen agents."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15) as c:
             resp = await c.get(
                 f"{s.autogen_url}/pentest/mcp-tools",
                 headers={"x-api-key": s.api_key, **engagement_headers()},

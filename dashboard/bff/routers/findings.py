@@ -54,7 +54,7 @@ async def search_findings(
     if tags:
         params["tags"] = tags
 
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/findings/search",
             params=params,
@@ -67,7 +67,7 @@ async def search_findings(
 async def delete_findings_bulk(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.request("DELETE", f"{s.rag_api_url}/findings/bulk",
                                json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -77,7 +77,7 @@ async def delete_findings_bulk(request: Request):
 async def delete_recon_findings_bulk(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.request("DELETE", f"{s.rag_api_url}/recon/findings/bulk",
                                json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -118,7 +118,7 @@ async def search_recon(
     if date_to:
         params["date_to"] = date_to
 
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/recon/search",
             params=params,
@@ -143,7 +143,7 @@ async def list_recon_domains(
     if include_excluded:
         params["include_excluded"] = "true"
 
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/recon/domains",
             params=params,
@@ -155,7 +155,7 @@ async def list_recon_domains(
 @router.get("/api/recon/domains/{domain}/overview")
 async def get_domain_overview(domain: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/recon/domains/{domain}/overview",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -166,7 +166,7 @@ async def get_domain_overview(domain: str):
 @router.get("/api/ports/summary")
 async def ports_summary():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.rag_api_url}/ports/summary", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
@@ -174,7 +174,7 @@ async def ports_summary():
 @router.get("/api/recon/domains/{domain}/sitemap")
 async def get_domain_sitemap(domain: str, limit: int = 2000):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/recon/domains/{domain}/sitemap",
             params={"limit": limit},
@@ -203,7 +203,7 @@ async def search_params(
     if min_occurrences > 1:
         params["min_occurrences"] = min_occurrences
 
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/params",
             params=params,
@@ -222,7 +222,7 @@ async def params_summary(
     if min_occurrences > 1:
         params["min_occurrences"] = min_occurrences
 
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/params/summary",
             params=params,
@@ -240,7 +240,7 @@ async def list_vulns(
     params: dict = {"limit": limit}
     if ip:
         params["ip"] = ip
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/vulns",
             params=params,
@@ -252,7 +252,7 @@ async def list_vulns(
 @router.get("/api/recommendations")
 async def get_recommendations():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.scan_recommender_url}/get_next_recommendations",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -268,7 +268,7 @@ async def generate_recommendations(ip: Optional[str] = None):
     Synchronous + LLM-backed, so allow a generous timeout."""
     s = get_settings()
     params = {"ip": ip} if ip else None
-    async with httpx.AsyncClient(verify=False, timeout=300) as c:
+    async with httpx.AsyncClient(timeout=300) as c:
         resp = await c.post(
             f"{s.rag_api_url}/recommendations/generate",
             params=params,
@@ -291,7 +291,7 @@ class WorkflowBody(BaseModel):
 @router.patch("/api/findings/{source}/{fid}/workflow")
 async def update_finding_workflow(source: str, fid: str, body: WorkflowBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.patch(
             f"{s.rag_api_url}/findings/{source}/{fid}/workflow",
             json=body.model_dump(exclude_none=True),
@@ -310,7 +310,7 @@ class CommentBody(BaseModel):
 @router.post("/api/findings/{source}/{fid}/comments")
 async def add_comment(source: str, fid: str, body: CommentBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/findings/{source}/{fid}/comments",
             json=body.model_dump(exclude_none=True),
@@ -322,7 +322,7 @@ async def add_comment(source: str, fid: str, body: CommentBody):
 @router.get("/api/findings/{source}/{fid}/activity")
 async def get_activity(source: str, fid: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/findings/{source}/{fid}/activity",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -335,7 +335,7 @@ async def get_activity(source: str, fid: str):
 @router.get("/api/findings/{source}/{fid}/exploit-matches")
 async def get_exploit_matches(source: str, fid: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/findings/{source}/{fid}/exploit-matches",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -348,7 +348,7 @@ async def get_exploit_matches(source: str, fid: str):
 @router.get("/api/scope/{scope_name}/intelligence")
 async def scope_intelligence(scope_name: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/scope/{scope_name}/intelligence",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -359,7 +359,7 @@ async def scope_intelligence(scope_name: str):
 @router.get("/api/scope/{scope_name}/analysis")
 async def scope_analysis(scope_name: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/scope/{scope_name}/analysis",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -376,7 +376,7 @@ async def list_screenshots(search: Optional[str] = None):
     params = {}
     if search:
         params["search"] = search
-    async with httpx.AsyncClient(verify=False, timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(f"{s.osint_runner_url}/screenshots/list", params=params)
         return r.json()
 
@@ -385,7 +385,7 @@ async def list_screenshots(search: Optional[str] = None):
 async def proxy_screenshot(path: str):
     """Proxy screenshot files from osint-runner."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(f"{s.osint_runner_url}/screenshots/{path}")
         if r.status_code != 200:
             raise HTTPException(r.status_code, "Screenshot not found")
@@ -402,7 +402,7 @@ class TagBody(BaseModel):
 @router.patch("/api/findings/{source}/{fid}/tags")
 async def update_finding_tags(source: str, fid: str, body: TagBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.patch(
             f"{s.rag_api_url}/findings/{source}/{fid}/tags",
             json=body.model_dump(),
@@ -414,7 +414,7 @@ async def update_finding_tags(source: str, fid: str, body: TagBody):
 @router.get("/api/tags/suggestions")
 async def get_tag_suggestions():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/tags/suggestions",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -444,7 +444,7 @@ async def get_screenshot_metadata(
         params["path"] = path
     if tag:
         params["tag"] = tag
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/screenshots/metadata",
             params=params,
@@ -456,7 +456,7 @@ async def get_screenshot_metadata(
 @router.patch("/api/screenshots/metadata")
 async def upsert_screenshot_metadata(body: ScreenshotMetaBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.patch(
             f"{s.rag_api_url}/screenshots/metadata",
             json=body.model_dump(exclude_none=True),

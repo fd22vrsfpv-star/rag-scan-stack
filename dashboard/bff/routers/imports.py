@@ -74,7 +74,7 @@ async def import_web_scan(
     params = {"tool": tool.lower()} if tool else {}
     try:
         # Parsing a large report is DB-bound; allow well past the normal timeout.
-        async with httpx.AsyncClient(verify=False, timeout=300) as c:
+        async with httpx.AsyncClient(timeout=300) as c:
             resp = await c.post(
                 f"{s.rag_api_url}/ingest/web-scan",
                 params=params,

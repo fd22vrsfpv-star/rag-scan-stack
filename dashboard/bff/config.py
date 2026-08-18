@@ -65,4 +65,4 @@ def get_settings() -> Settings:
 
 def http_client(timeout: int = 15) -> _httpx.AsyncClient:
     """Create an httpx client that trusts self-signed certs."""
-    return _httpx.AsyncClient(timeout=timeout, verify=False)
+    return _httpx.AsyncClient(timeout=timeout)

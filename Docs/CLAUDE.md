@@ -105,6 +105,7 @@ Provide a lightweight web UI:
 
 ### Quality
 - Unit tests for parsers and fingerprinting
+- Save the unit tests so that they can be run indpendantly
 - Minimal linting + formatting
 - Clear error messages and logging
 - Sample data fixtures and a “quickstart”
@@ -118,7 +119,8 @@ Provide a lightweight web UI:
 - Focus on defensible engineering: parsing, normalization, reporting, workflow support.
 
 ## Implementation rules (Claude Code behavior)
-- Work on ONE file at a time, sequentially.
+#- Work on no more then one file at a time, sequentially.
+- Work on no more then three files at a time. 
 - After each change: summarize what changed and why.
 - If changes would need to be mirrored in osx or windows, log them in:
   Docs/OS_CHANGES_FOR_MIGRATION.md (date, files changed, platforms, old→new, notes).
@@ -134,7 +136,7 @@ When implementing features, always provide:
 - Next steps checklist
 - Ensure that new changes will be included in future clean builds installation scripts.
 - Ensure that all files required for the build are included in the containers and rebuild as required.
-Do NOT use background agents or background tasks. Do NOT split into multiple agents. Process files ONE AT A TIME, sequentially. Update the user regularly on each step."
+#Do NOT use background agents or background tasks. Do NOT split into multiple agents. Process files ONE AT A TIME, sequentially. Update the user regularly on each step."
 
 Every time you make a change to an app that would also need to be applied , log it in Docs/CHANGES_MADE.md. Include: date, files changed, which platforms it applies to, what specifically changed (old to new values, code snippets if helpful), any notes about platform-specific adaptations completed and/or needed."
 

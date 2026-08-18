@@ -19,7 +19,7 @@ router = APIRouter()
 async def create_credential(request: Request):
     s = get_settings()
     params = dict(request.query_params)
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/credentials",
             params=params,
@@ -31,7 +31,7 @@ async def create_credential(request: Request):
 @router.delete("/api/credentials/{cid}")
 async def delete_credential(cid: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/credentials/{cid}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -51,7 +51,7 @@ async def list_all_credentials(
     if status: params["status"] = status
     if protocol: params["protocol"] = protocol
     if source: params["source"] = source
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/credentials",
             params=params,
@@ -63,7 +63,7 @@ async def list_all_credentials(
 @router.get("/api/assets")
 async def list_assets(limit: int = Query(100, le=5000)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/assets",
             params={"limit": limit},
@@ -76,7 +76,7 @@ async def list_assets(limit: int = Query(100, le=5000)):
 async def purge_by_pattern(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.request(
             "DELETE",
             f"{s.rag_api_url}/purge/pattern",
@@ -90,7 +90,7 @@ async def purge_by_pattern(request: Request):
 async def delete_assets(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.request(
             "DELETE",
             f"{s.rag_api_url}/assets",
@@ -103,7 +103,7 @@ async def delete_assets(request: Request):
 @router.delete("/api/targets/{domain}")
 async def purge_target_domain(domain: str, dry_run: bool = Query(False)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/targets/{domain}",
             params={"dry_run": str(dry_run).lower()},
@@ -118,7 +118,7 @@ async def purge_target_domain(domain: str, dry_run: bool = Query(False)):
 @router.get("/api/assets/{ip}/ports")
 async def asset_ports(ip: str, limit: int = Query(200, le=5000)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/ports/open",
             params={"ip": ip, "limit": limit},
@@ -130,7 +130,7 @@ async def asset_ports(ip: str, limit: int = Query(200, le=5000)):
 @router.get("/api/assets/{ip}/vulns")
 async def asset_vulns(ip: str, limit: int = Query(200, le=5000)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/vulns",
             params={"ip": ip, "limit": limit},
@@ -145,7 +145,7 @@ async def recon_subdomains(domain: str = Query(None), limit: int = Query(500, le
     params = {"limit": limit}
     if domain:
         params["domain"] = domain
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/recon/subdomains",
             params=params,
@@ -158,7 +158,7 @@ async def recon_subdomains(domain: str = Query(None), limit: int = Query(500, le
 async def delete_subdomains(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.request(
             "DELETE",
             f"{s.rag_api_url}/recon/subdomains",
@@ -171,7 +171,7 @@ async def delete_subdomains(request: Request):
 @router.get("/api/assets/{ip}/credentials")
 async def asset_credentials(ip: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/assets/{ip}/credentials",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -183,7 +183,7 @@ async def asset_credentials(ip: str):
 async def update_credential_status(cid: str, request: Request):
     s = get_settings()
     params = dict(request.query_params)
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.patch(
             f"{s.rag_api_url}/credential-findings/{cid}/status",
             params=params,
@@ -206,7 +206,7 @@ async def detected_software(
     elif ip: params["ip"] = ip
     if product and not search: params["product"] = product
     if source: params["source"] = source
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/software",
             params=params,
@@ -218,7 +218,7 @@ async def detected_software(
 @router.get("/api/software/cve-tuning")
 async def get_cve_tuning():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/cve-tuning", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
@@ -227,7 +227,7 @@ async def get_cve_tuning():
 async def update_cve_tuning(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.put(f"{s.rag_api_url}/software/cve-tuning", json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
@@ -236,7 +236,7 @@ async def update_cve_tuning(request: Request):
 async def bulk_dismiss_software(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(
             f"{s.rag_api_url}/software/bulk-dismiss",
             json=body,
@@ -252,7 +252,7 @@ async def bulk_dismiss_software(request: Request):
 async def software_searchsploit(product: str, version: str = "", target_version: str = "", analyze: bool = False, limit: int = 20):
     s = get_settings()
     timeout = 120 if analyze else 15
-    async with httpx.AsyncClient(verify=False, timeout=timeout) as c:
+    async with httpx.AsyncClient(timeout=timeout) as c:
         resp = await c.get(
             f"{s.rag_api_url}/software/searchsploit",
             params={"product": product, "version": version, "target_version": target_version, "analyze": str(analyze).lower(), "limit": limit},
@@ -264,7 +264,7 @@ async def software_searchsploit(product: str, version: str = "", target_version:
 @router.get("/api/software/research-cache")
 async def software_research_cache(product: str, version: str = ""):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(
             f"{s.rag_api_url}/software/research-cache",
             params={"product": product, "version": version},
@@ -280,7 +280,7 @@ async def software_bulk_check(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(f"{s.rag_api_url}/software/bulk-check",
                             json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         if resp.status_code >= 400:
@@ -313,7 +313,7 @@ async def software_bulk_check(request: Request):
 @router.get("/api/software/bulk-check/status")
 async def software_bulk_check_status():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/bulk-check/status",
                            headers={"x-api-key": s.api_key, **engagement_headers()})
         data = resp.json()
@@ -338,7 +338,7 @@ async def software_bulk_check_status():
 @router.post("/api/software/bulk-check/cancel")
 async def software_bulk_check_cancel():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.post(f"{s.rag_api_url}/software/bulk-check/cancel",
                             headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -348,7 +348,7 @@ async def software_bulk_check_cancel():
 async def software_cve_decision(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(f"{s.rag_api_url}/software/cve-decision",
                             json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -357,7 +357,7 @@ async def software_cve_decision(request: Request):
 @router.get("/api/software/cve-decisions")
 async def get_cve_decisions(product: str, version: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/cve-decisions",
                            params={"product": product, "version": version},
                            headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -367,7 +367,7 @@ async def get_cve_decisions(product: str, version: str):
 @router.delete("/api/software/research-cache")
 async def clear_research_cache(product: str, version: str = ""):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.delete(f"{s.rag_api_url}/software/research-cache",
                               params={"product": product, "version": version},
                               headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -377,7 +377,7 @@ async def clear_research_cache(product: str, version: str = ""):
 @router.post("/api/software/backfill-refs")
 async def backfill_followup_refs():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(f"{s.rag_api_url}/software/backfill-refs",
                             headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -386,7 +386,7 @@ async def backfill_followup_refs():
 @router.get("/api/nuclei/templates/search")
 async def search_nuclei_templates(q: str, limit: int = 20):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.nuclei_url}/templates/search",
                            params={"q": q, "limit": limit})
         return safe_json(resp)
@@ -395,7 +395,7 @@ async def search_nuclei_templates(q: str, limit: int = 20):
 @router.get("/api/software/llm-debug")
 async def software_llm_debug(product: str, version: str = ""):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/llm-debug",
                            params={"product": product, "version": version},
                            headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -405,7 +405,7 @@ async def software_llm_debug(product: str, version: str = ""):
 @router.get("/api/software/release-date")
 async def get_release_date(product: str, version: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/release-date",
                            params={"product": product, "version": version},
                            headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -416,7 +416,7 @@ async def get_release_date(product: str, version: str):
 async def set_release_date(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.put(f"{s.rag_api_url}/software/release-date",
                            json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -425,7 +425,7 @@ async def set_release_date(request: Request):
 @router.get("/api/software/ddg-jobs")
 async def list_ddg_jobs():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/ddg-jobs",
                            headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -434,7 +434,7 @@ async def list_ddg_jobs():
 @router.get("/api/software/vendor-pages")
 async def list_vendor_pages():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/vendor-pages", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
@@ -443,7 +443,7 @@ async def list_vendor_pages():
 async def save_vendor_page(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.put(f"{s.rag_api_url}/software/vendor-pages", json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
@@ -451,7 +451,7 @@ async def save_vendor_page(request: Request):
 @router.delete("/api/software/vendor-pages/{keyword}")
 async def delete_vendor_page(keyword: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.delete(f"{s.rag_api_url}/software/vendor-pages/{keyword}", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
@@ -460,7 +460,7 @@ async def delete_vendor_page(keyword: str):
 async def scan_manual_urls(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.post(f"{s.rag_api_url}/software/scan-urls",
                             json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -469,7 +469,7 @@ async def scan_manual_urls(request: Request):
 @router.get("/api/software/deep-search-cache")
 async def get_deep_search_cache(product: str, version: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/deep-search-cache",
                            params={"product": product, "version": version},
                            headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -480,7 +480,7 @@ async def get_deep_search_cache(product: str, version: str):
 async def cve_deep_search(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.post(f"{s.rag_api_url}/software/cve-deep-search",
                             json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -489,7 +489,7 @@ async def cve_deep_search(request: Request):
 @router.get("/api/software/cve-prompt")
 async def get_cve_prompt():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/cve-prompt",
                            headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -499,7 +499,7 @@ async def get_cve_prompt():
 async def update_cve_prompt(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.put(f"{s.rag_api_url}/software/cve-prompt",
                            json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -509,7 +509,7 @@ async def update_cve_prompt(request: Request):
 async def software_ddg_search_raw(query: str = Query(...), max_results: int = Query(20)):
     """Generic DDG search — returns raw results (for GitHub PoC tab)."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/software/ddg-search-raw",
             params={"query": query, "max_results": max_results},
@@ -521,7 +521,7 @@ async def software_ddg_search_raw(query: str = Query(...), max_results: int = Qu
 @router.get("/api/software/ddg-search")
 async def software_ddg_search(product: str, version: str = "", force: bool = False):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.get(
             f"{s.rag_api_url}/software/ddg-search",
             params={"product": product, "version": version, "force": str(force).lower()},
@@ -538,7 +538,7 @@ async def software_ddg_search(product: str, version: str = "", force: bool = Fal
 @router.get("/api/software/ddg-search/{job_id}")
 async def software_ddg_search_status(job_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/software/ddg-search/{job_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -559,7 +559,7 @@ async def list_scan_recommendations(
     """List all scan recommendations from the DB, optionally filtered by status."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             params = {"limit": str(limit)}
             if status != "all":
                 params["status"] = status
@@ -686,7 +686,7 @@ async def add_scan_recommendation(body: AddScanRecommendationRequest):
     # alongside the auto-generated rule firings.
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=5) as c:
+        async with httpx.AsyncClient(timeout=5) as c:
             await c.post(
                 f"{s.rag_api_url}/webhooks/emit",
                 json={
@@ -778,7 +778,7 @@ async def _manual_followup_for(rec: dict, kind: str, ip: str) -> Optional[dict]:
               f"(target_kind={kind}). Suggested command: {cmd}")
     try:
         s = get_settings()
-        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15) as c:
             r = await c.post(
                 f"{s.rag_api_url}/follow-ups",
                 # Fields match FollowUpCreate exactly. It has no metadata column,
@@ -844,7 +844,7 @@ async def recommendation_tool_coverage():
 
     registry: set = set()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15) as c:
             # /tools is a 404 — the endpoint is /tools/allowed. Getting this
             # wrong made the report claim 21 tools were unregistered while they
             # were demonstrably installed, which is worse than no report.
@@ -927,7 +927,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         # some ids on that path.
         log.warning("recommendation id lookup failed (%s) — falling back to the "
                     "recommender list, which deduplicates and may not find every id", e)
-        async with httpx.AsyncClient(verify=False, timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
                 f"{s.scan_recommender_url}/recommendations",
                 params={"status": "all", "limit": 500},
@@ -1154,7 +1154,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             return result
 
         try:
-            async with httpx.AsyncClient(verify=False, timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30) as client:
                 if scanner == "nmap":
                     # `or ""`, NOT .get(k, ""). The second argument to .get only
                     # applies when the KEY IS ABSENT; these rows come from
@@ -1471,7 +1471,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             command = command.replace("{port}", str(rec["port"]))
 
         try:
-            async with httpx.AsyncClient(verify=False, timeout=60) as client:
+            async with httpx.AsyncClient(timeout=60) as client:
                 r = await client.post(
                     f"{s.kali_listener_url}/tools/execute",
                     json={"tool": scanner, "command": command, "target": ip},
@@ -1564,7 +1564,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
 
         # Step 2: fire-and-forget webhook.
         try:
-            async with httpx.AsyncClient(verify=False, timeout=5) as c:
+            async with httpx.AsyncClient(timeout=5) as c:
                 await c.post(
                     f"{s.rag_api_url}/webhooks/emit",
                     json={
@@ -1590,7 +1590,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         command = rec.get("script") or f"{scanner} {ip}"
         command = command.replace("{target}", ip).replace("{ip}", ip)
         try:
-            async with httpx.AsyncClient(verify=False, timeout=60) as client:
+            async with httpx.AsyncClient(timeout=60) as client:
                 r = await client.post(
                     f"{s.tunnel_manager_url}/ssh/{nid}/exec",
                     json={"command": command, "timeout": 45},
@@ -1647,7 +1647,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             payload = {"event_type": event_type, "source": "bff", "data": data}
             if severity:
                 payload["severity"] = severity
-            async with httpx.AsyncClient(verify=False, timeout=5) as c:
+            async with httpx.AsyncClient(timeout=5) as c:
                 await c.post(f"{s.rag_api_url}/webhooks/emit", json=payload,
                              headers={"x-api-key": s.api_key, **engagement_headers()})
         except Exception as e:
@@ -1659,13 +1659,13 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         error we allow the dispatch through (don't block on a flaky check)."""
         try:
             if executor == "kali":
-                async with httpx.AsyncClient(verify=False, timeout=10) as c:
+                async with httpx.AsyncClient(timeout=10) as c:
                     chk = await c.get(f"{s.kali_listener_url}/tools/check",
                                       params={"tools": scanner}, headers=headers)
                     if chk.status_code == 200 and scanner in (chk.json().get("found") or []):
                         return {"ok": True, "detail": "present"}
                 # Missing → attempt install
-                async with httpx.AsyncClient(verify=False, timeout=600) as c:
+                async with httpx.AsyncClient(timeout=600) as c:
                     inst = await c.post(f"{s.kali_listener_url}/tools/install",
                                         json={"tool": scanner}, headers=headers)
                 ok = inst.status_code == 200 and (inst.json() or {}).get("installed")
@@ -1674,7 +1674,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                 return {"ok": bool(ok),
                         "detail": "installed on kali" if ok else f"'{scanner}' missing on kali; install failed"}
             else:  # node
-                async with httpx.AsyncClient(verify=False, timeout=30) as c:
+                async with httpx.AsyncClient(timeout=30) as c:
                     chk = await c.post(f"{s.tunnel_manager_url}/ssh/{nid}/exec",
                                        json={"command": f"which {scanner}", "timeout": 15},
                                        headers=headers)
@@ -1770,7 +1770,7 @@ async def recommender_tool_coverage(live: bool = Query(False)):
     headers = {"x-api-key": s.api_key, **engagement_headers()}
     universe, kali_found, nodes_cov = [], set(), {}
 
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         # 1. Universe from the canonical registry.
         try:
             r = await c.get(f"{s.tunnel_manager_url}/tools/registry", headers=headers)
@@ -1894,7 +1894,7 @@ TOOL_INSTALL_MAP = {
 async def list_tool_executions(limit: int = 50):
     """Recent Kali tool executions (the output of Kali-dispatched recs)."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(
             f"{s.kali_listener_url}/tools/executions",
             params={"limit": limit},
@@ -1909,7 +1909,7 @@ async def list_tool_executions(limit: int = 50):
 async def get_tool_execution(exec_id: str):
     """A single Kali tool execution with full output + parsed results."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(
             f"{s.kali_listener_url}/tools/executions/{exec_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -1924,7 +1924,7 @@ async def list_allowed_tools():
     """The Kali container's effective tool allowlist (registry + fallback +
     operator Settings overrides − MSF). Used by the Settings allowlist panel."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(
             f"{s.kali_listener_url}/tools/allowed",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -1943,7 +1943,7 @@ async def check_tools_on_node(body: ToolCheckRequest):
     # Internal Kali container — use /tools/allowed endpoint
     if body.node_id in ("kali-local", "kali", "internal"):
         try:
-            async with httpx.AsyncClient(verify=False, timeout=10) as client:
+            async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.get(
                     f"{s.kali_listener_url}/tools/allowed",
                     headers=headers,
@@ -1972,7 +1972,7 @@ async def check_tools_on_node(body: ToolCheckRequest):
     # Remote node — use SSH exec
     checks = " && ".join(f'(which {t} >/dev/null 2>&1 && echo "FOUND:{t}" || echo "MISSING:{t}")' for t in body.tools)
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
                 f"{s.tunnel_manager_url}/ssh/{body.node_id}/exec",
                 json={"command": checks, "timeout": 20},
@@ -2015,7 +2015,7 @@ async def install_tools_on_node(body: ToolInstallRequest):
 
     # Internal Kali container — use the listener's /tools/install endpoint.
     if body.node_id in ("kali-local", "kali", "internal"):
-        async with httpx.AsyncClient(verify=False, timeout=300) as client:
+        async with httpx.AsyncClient(timeout=300) as client:
             for tool in body.tools:
                 reason = _kali_unmanageable(tool)
                 if reason:
@@ -2045,7 +2045,7 @@ async def install_tools_on_node(body: ToolInstallRequest):
         }
 
     # Remote node — install via SSH exec.
-    async with httpx.AsyncClient(verify=False, timeout=120) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         for tool in body.tools:
             install_cmd = TOOL_INSTALL_MAP.get(tool)
             if not install_cmd:
@@ -2097,7 +2097,7 @@ async def port_recommendations(
         params["banner"] = banner
     if port:
         params["port"] = str(port)
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.scan_recommender_url}/next_scan",
             params=params,
@@ -2118,7 +2118,7 @@ async def get_vulnx_findings(
         params["version"] = version
     if ip:
         params["ip"] = ip
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/software/vulnx-findings",
             params=params,

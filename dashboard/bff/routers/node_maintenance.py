@@ -11,7 +11,7 @@ async def analyze_nodes():
     s = get_settings()
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             # Get nodes
             nodes_resp = await client.get(f"{s.tunnel_manager_url}/nodes")
             nodes_resp.raise_for_status()
@@ -57,7 +57,7 @@ async def cleanup_nodes(cleanup_options: dict):
     results = {"success": [], "failed": [], "summary": ""}
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=60) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             # Get current analysis
             analysis_resp = await client.get(f"{s.bff_base_url}/api/maintenance/nodes/analysis")
             analysis_resp.raise_for_status()

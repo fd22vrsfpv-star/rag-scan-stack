@@ -20,7 +20,7 @@ class FeedbackCreate(BaseModel):
 @router.post("/api/feedback")
 async def create_feedback(req: FeedbackCreate):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.autogen_url}/feedback",
             json=req.model_dump(exclude_none=True),
@@ -39,7 +39,7 @@ async def list_feedback(
     params: dict = {"limit": limit, "offset": offset}
     if rating is not None:
         params["rating"] = rating
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.autogen_url}/feedback",
             params=params,
@@ -56,7 +56,7 @@ class FeedbackUpdate(BaseModel):
 @router.put("/api/feedback/{feedback_id}")
 async def update_feedback(feedback_id: str, req: FeedbackUpdate):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.put(
             f"{s.autogen_url}/feedback/{feedback_id}",
             json=req.model_dump(exclude_none=True),
@@ -68,7 +68,7 @@ async def update_feedback(feedback_id: str, req: FeedbackUpdate):
 @router.get("/api/feedback/export")
 async def export_feedback():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.autogen_url}/feedback/export",
             headers={"x-api-key": s.api_key, **engagement_headers()},

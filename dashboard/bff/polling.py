@@ -135,7 +135,7 @@ async def _post_scan_campaign_event(
         "metadata": {"job_id": job_id, "scan_type": scan_type, "event": action},
     }
     try:
-        async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_FAST) as c:
+        async with httpx.AsyncClient(timeout=TIMEOUT_FAST) as c:
             await c.post(
                 f"{settings.rag_api_url}/engagements/{engagement_id}/campaign-events",
                 json=body,
@@ -222,7 +222,7 @@ async def _backfill_recommendation_status(
         else "scan_recommendation_failed"
     )
     try:
-        async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_FAST) as c:
+        async with httpx.AsyncClient(timeout=TIMEOUT_FAST) as c:
             await c.post(
                 f"{settings.rag_api_url}/webhooks/emit",
                 json={
@@ -321,7 +321,7 @@ async def poll_loop():
     log.info("Starting job polling loop (every %ds, stale_timeout=%.1fh)",
              interval, _STALE_JOB_TIMEOUT_HOURS)
     poll_count = 0
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as client:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as client:
         while True:
             try:
                 await _poll_once(client)

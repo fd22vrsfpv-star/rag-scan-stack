@@ -39,7 +39,7 @@ async def _trigger_dsn_sync() -> dict:
     """
     try:
         s = get_settings()
-        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15) as c:
             r = await c.post(f"{s.container_logs_url}/db/sync-dsn")
             return r.json() if r.status_code < 400 else {"ok": False, "status": r.status_code}
     except Exception as e:
@@ -53,7 +53,7 @@ class ApiKeyBody(BaseModel):
 @router.get("/api/settings/keys")
 async def list_api_keys():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/settings/keys",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -66,7 +66,7 @@ async def list_api_keys():
 @router.put("/api/settings/keys/{key_name}")
 async def upsert_api_key(key_name: str, body: ApiKeyBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.put(
             f"{s.rag_api_url}/settings/keys/{key_name}",
             json=body.model_dump(),
@@ -84,7 +84,7 @@ class ConfigBody(BaseModel):
 @router.get("/api/settings/config/{key_name}")
 async def get_config_setting(key_name: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/settings/config/{key_name}",
                            headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code == 404:
@@ -97,7 +97,7 @@ async def get_config_setting(key_name: str):
 @router.put("/api/settings/config/{key_name}")
 async def put_config_setting(key_name: str, body: ConfigBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.put(f"{s.rag_api_url}/settings/config/{key_name}",
                            json={"value": body.value},
                            headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -123,7 +123,7 @@ class ExploitWatcherSettings(BaseModel):
 async def get_exploit_watcher_settings():
     """Get current exploit watcher configuration."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/settings/exploit-watcher",
                            headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code == 404:
@@ -138,7 +138,7 @@ async def get_exploit_watcher_settings():
 async def update_exploit_watcher_settings(settings: ExploitWatcherSettings):
     """Update exploit watcher configuration."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.put(f"{s.rag_api_url}/settings/exploit-watcher",
                            json=settings.model_dump(),
                            headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -155,7 +155,6 @@ async def test_proxy(body: ProxyTestBody):
         async with httpx.AsyncClient(
             proxy=body.proxy_url,
             timeout=10,
-            verify=False,
         ) as c:
             resp = await c.get(body.test_url)
             elapsed = round((time.time() - start) * 1000)
@@ -195,7 +194,7 @@ async def test_proxy(body: ProxyTestBody):
 @router.delete("/api/settings/keys/{key_name}")
 async def delete_api_key(key_name: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/settings/keys/{key_name}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -374,7 +373,7 @@ async def toggle_remote_db(body: RemoteDbToggleBody):
         # Emit webhook for database mode change with audit logging
         webhook_success = False
         try:
-            async with httpx.AsyncClient(verify=False, timeout=5) as c:
+            async with httpx.AsyncClient(timeout=5) as c:
                 payload = {
                     "event_type": "database_mode_changed",
                     "source": "settings",
@@ -436,7 +435,7 @@ async def switch_db_mode(mode: str):
     """Switch between local and remote database modes."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=180) as c:
+        async with httpx.AsyncClient(timeout=180) as c:
             resp = await c.post(
                 f"{s.container_logs_url}/db/switch/{mode}",
                 timeout=150,
@@ -451,7 +450,7 @@ async def test_db_connection():
     """Test the current database connection."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             resp = await c.post(f"{s.container_logs_url}/db/test-connection")
             return safe_json(resp)
     except Exception as e:
@@ -463,7 +462,7 @@ async def preflight_remote():
     """Pre-flight: test SSH tunnel + DB connectivity before switching."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=90) as c:
+        async with httpx.AsyncClient(timeout=90) as c:
             resp = await c.post(
                 f"{s.container_logs_url}/db/preflight",
                 timeout=80,
@@ -478,7 +477,7 @@ async def compare_databases():
     """Compare local and remote database row counts and timestamps."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=120) as c:
+        async with httpx.AsyncClient(timeout=120) as c:
             resp = await c.get(
                 f"{s.container_logs_url}/db/compare",
                 timeout=110,
@@ -578,7 +577,7 @@ async def list_mcp_servers():
     tp_ports = [s.get("port", 9030) for s in third_party if s.get("enabled", False)]
     check_ports = all_ports + tp_ports
 
-    async with httpx.AsyncClient(verify=False, timeout=2) as c:
+    async with httpx.AsyncClient(timeout=2) as c:
         results = await asyncio.gather(
             *[_check_mcp_health(c, p) for p in check_ports],
             return_exceptions=True,
@@ -741,7 +740,7 @@ async def list_updatable_tools():
         try:
             url = getattr(s, info["service_attr"])
             headers = {"x-api-key": s.api_key, **engagement_headers()} if info["service_attr"] == "rag_api_url" else {}
-            async with httpx.AsyncClient(verify=False, timeout=10) as c:
+            async with httpx.AsyncClient(timeout=10) as c:
                 resp = await c.get(f"{url}{info['version_path']}", headers=headers)
                 if resp.status_code == 200:
                     entry["version"] = resp.json().get("output", "")[:200]
@@ -761,7 +760,7 @@ async def update_tool(tool_id: str):
     url = getattr(s, info["service_attr"])
     headers = {"x-api-key": s.api_key, **engagement_headers()} if info["service_attr"] == "rag_api_url" else {}
     try:
-        async with httpx.AsyncClient(verify=False, timeout=180) as c:
+        async with httpx.AsyncClient(timeout=180) as c:
             resp = await c.post(f"{url}{info['update_path']}", headers=headers, timeout=120)
             if resp.status_code == 200:
                 return safe_json(resp)
@@ -785,7 +784,7 @@ async def get_llm_settings():
     """Get LLM backend configuration. API keys are masked."""
     s = get_settings()
     result = {"env_backend": os.environ.get("LLM_BACKEND", "ollama")}
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         for key in _LLM_KEYS:
             try:
                 resp = await c.get(f"{s.rag_api_url}/settings/config/{key}",
@@ -824,7 +823,7 @@ async def save_llm_settings(body: LlmSettingsBody):
         ("anthropic_model", "llm.anthropic_model"), ("azure_api_key", "llm.azure_api_key"),
         ("azure_endpoint", "llm.azure_endpoint"), ("azure_model", "llm.azure_model"),
     ]
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         for field, key in mapping:
             val = getattr(body, field, None)
             if val is not None:
@@ -843,7 +842,7 @@ async def test_llm_backend(body: dict):
 
     # Read unmasked API keys from DB
     keys: dict = {}
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         for key in _LLM_KEYS:
             try:
                 resp = await c.get(f"{s.rag_api_url}/settings/config/{key}",
@@ -854,7 +853,7 @@ async def test_llm_backend(body: dict):
                 pass
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15) as c:
             if backend == "openai":
                 api_key = keys.get("openai_api_key") or os.environ.get("OPENAI_API_KEY", "")
                 model = keys.get("openai_model") or os.environ.get("OPENAI_MODEL", "gpt-4o")
@@ -944,7 +943,7 @@ async def get_scan_timeouts():
     s = get_settings()
     defaults = _scan_timeout_defaults()
     out: Dict[str, int] = {}
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         for key in SCAN_TIMEOUT_KEYS:
             try:
                 resp = await c.get(
@@ -979,7 +978,7 @@ async def put_scan_timeouts(body: ScanTimeoutsBody):
         raise HTTPException(400, f"Timeout values must be int >=0: {bad}")
 
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         for key, seconds in body.timeouts.items():
             resp = await c.put(
                 f"{s.rag_api_url}/settings/config/{key}",
@@ -1018,7 +1017,7 @@ async def get_llm_tuning():
     """Return current LLM tuning params with defaults + metadata."""
     s = get_settings()
     result: Dict[str, dict] = {}
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         for key, meta in LLM_TUNING_KEYS.items():
             entry = {"value": meta["default"], **meta, "source": "default"}
             entry.pop("type", None)
@@ -1052,7 +1051,7 @@ async def put_llm_tuning(body: LLMTuningBody):
             raise HTTPException(400, f"{k}: value {v} out of range [{meta['min']}, {meta['max']}]")
 
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         for k, v in body.tuning.items():
             resp = await c.put(f"{s.rag_api_url}/settings/config/{k}",
                                json={"value": str(v)},
@@ -1070,7 +1069,7 @@ async def get_agent_models():
     """Return registered AI agents + currently-resolved models + available
     Ollama models for the dropdown."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/settings/agent-models",
                            headers={"x-api-key": s.api_key, **engagement_headers()})
         if resp.status_code >= 400:
@@ -1086,7 +1085,7 @@ class AgentModelBody(BaseModel):
 async def put_agent_model(agent_id: str, body: AgentModelBody):
     """Set or clear the model override for one agent."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.put(f"{s.rag_api_url}/settings/agent-models/{agent_id}",
                            json={"model": body.model},
                            headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -1105,7 +1104,7 @@ async def put_agent_auto(agent_id: str, body: AgentAutoBody):
     after the relevant ingest/refresh cycle (vault_import_agent runs after a
     MicroBurst ingest; cloud_triage_agent re-ranks recommendations)."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.put(f"{s.rag_api_url}/settings/agent-models/{agent_id}/auto",
                            json={"enabled": body.enabled},
                            headers={"x-api-key": s.api_key, **engagement_headers()})
