@@ -4,6 +4,12 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 try:
+    from scope_gate import load_ingest_scope, host_in_scope
+except ImportError:  # pragma: no cover — etl/ may already be on PYTHONPATH
+    from etl.scope_gate import load_ingest_scope, host_in_scope
+
+
+try:
     from _provider_detect import tag_asset as _tag_provider
 except ImportError:
     from etl._provider_detect import tag_asset as _tag_provider
@@ -21,16 +27,23 @@ def _load_jsonl(path):
     return results
 
 def parse_tlsx(path: str, profile: str = "upload", job_id: str = None):
-    stats = dict(records_seen=0, findings_inserted=0, expired_certs=0, self_signed_certs=0, skipped=0, errors=0, error_examples=[])
+    stats = dict(out_of_scope=0, records_seen=0, findings_inserted=0, expired_certs=0, self_signed_certs=0, skipped=0, errors=0, error_examples=[])
     records = _load_jsonl(path); stats["records_seen"] = len(records)
     if not records: return stats
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            _enforce_scope, _scope_rows = load_ingest_scope(cur)
             for rec in records:
                 try:
                     cur.execute("SAVEPOINT rec_sp")
                     host = rec.get("host")
+                    # Ingest scope gate: never record a host the engagement
+                    # does not cover, whatever the tool reported.
+                    if not host_in_scope(host, _enforce_scope, _scope_rows):
+                        stats["out_of_scope"] = stats.get("out_of_scope", 0) + 1
+                        cur.execute("RELEASE SAVEPOINT rec_sp")
+                        continue
                     if not host:
                         stats["skipped"] += 1
                         cur.execute("RELEASE SAVEPOINT rec_sp")

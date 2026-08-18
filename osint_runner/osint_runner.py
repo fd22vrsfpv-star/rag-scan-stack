@@ -3592,6 +3592,16 @@ def _ingest_gowitness_jsonl(jsonl_path: str, screenshot_dir: str, job_id: str) -
                     except Exception:
                         pass
 
+                    # gowitness scope gate: it screenshots whatever URL list it
+                    # is handed, which may include hosts discovered off-target.
+                    try:
+                        from etl.scope_gate import load_ingest_scope, host_in_scope
+                        _enf, _rows = load_ingest_scope(cur)
+                        if not host_in_scope(target_host or url, _enf, _rows):
+                            continue
+                    except ImportError:
+                        pass
+
                     # Insert into recon_findings (OSINT Explorer source)
                     cur.execute("""
                         INSERT INTO recon_findings
