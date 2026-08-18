@@ -181,13 +181,15 @@ echo ""
 # index, and duplicates silently return (katana previously re-inserted an entire
 # crawl every run).
 echo "🔍 Verifying dedup trigger..."
-if docker exec rag-postgres psql -U app -d scans -tAc \
-     "SELECT 1 FROM pg_trigger WHERE tgname='trg_web_findings_dedup' AND NOT tgisinternal;" | grep -q 1; then
-    echo "✓ trg_web_findings_dedup"
-else
-    echo "❌ Missing trg_web_findings_dedup — web findings will duplicate on every re-scan"
-    MISSING=$((MISSING + 1))
-fi
+for trg in trg_web_findings_dedup trg_vulns_dedup; do
+    if docker exec rag-postgres psql -U app -d scans -tAc \
+         "SELECT 1 FROM pg_trigger WHERE tgname='${trg}' AND NOT tgisinternal;" | grep -q 1; then
+        echo "✓ ${trg}"
+    else
+        echo "❌ Missing ${trg} — findings will duplicate on every re-scan"
+        MISSING=$((MISSING + 1))
+    fi
+done
 
 echo ""
 
