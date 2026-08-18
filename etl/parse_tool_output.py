@@ -17,6 +17,13 @@ import logging
 from typing import Optional
 
 import psycopg2
+
+# Shared fingerprint helpers. This module previously used a LOCAL _fingerprint()
+# (md5 of its arguments joined by "|"), which produced hashes that could never
+# match the ones every other writer computes for the same finding — so a finding
+# recorded here and the same finding recorded by parse_nuclei/parse_nmap would
+# survive as two rows no matter how good the unique index was.
+from etl.fingerprint import vuln_fingerprint, web_fingerprint, recon_fingerprint
 from psycopg2.extras import RealDictCursor
 
 log = logging.getLogger(__name__)
@@ -683,7 +690,7 @@ def _insert_json_finding(cur, rec: dict, tool_name: str, target: str,
              json.dumps(rec, default=str)[:4000],
              _CWE_RE.findall(json.dumps(rec)) or None,
              json.dumps({"cves": cve_list}) if cve_list else "{}",
-             _fingerprint(tool_name, rec_url, rec_name)),
+             web_fingerprint(rec_url, tool_name, rec_name, "tool_finding")),
         )
         row = cur.fetchone()
         return str(row["id"]) if row else fid
@@ -711,7 +718,7 @@ def _insert_json_finding(cur, rec: dict, tool_name: str, target: str,
              json.dumps(rec, default=str)[:4000],
              rec_severity, cve_list,
              json.dumps({"source": tool_name, "job_id": job_id, "port": port}),
-             _fingerprint(tool_name, rec_target, str(cve_list))),
+             vuln_fingerprint(rec_target, port, f"{tool_name}:{rec_name or 'finding'}", cve_list)),
         )
         row = cur.fetchone()
         return str(row["id"]) if row else fid
@@ -729,7 +736,8 @@ def _insert_json_finding(cur, rec: dict, tool_name: str, target: str,
          rec_target or target,
          json.dumps(data, default=str),
          rec_severity,
-         _fingerprint(tool_name, rec_target, json.dumps(rec, default=str)[:200])),
+         recon_fingerprint(tool_name, "tool_finding", rec_target or target,
+                           json.dumps(rec, default=str)[:200])),
     )
     return fid
 
@@ -773,7 +781,8 @@ def _insert_table_row_finding(cur, row: dict, tool_name: str, target: str,
          row_target or target,
          json.dumps(data, default=str),
          severity,
-         _fingerprint(tool_name, row_target, json.dumps(row, default=str)[:200])),
+         recon_fingerprint(tool_name, "tool_finding", row_target or target,
+                           json.dumps(row, default=str)[:200])),
     )
     return fid
 
@@ -804,7 +813,7 @@ def _insert_vuln_finding(cur, tool_name: str, target: str, port: Optional[int],
          stdout[:4000],
          severity, cves[:10],
          json.dumps({"source": tool_name, "job_id": job_id, "port": port}),
-         _fingerprint(tool_name, target, str(cves[:3]))),
+         vuln_fingerprint(target, port, f"{tool_name}:targeted-recon", cves)),
     )
     row = cur.fetchone()
     return str(row["id"]) if row else fid
@@ -824,12 +833,13 @@ def _insert_web_finding(cur, tool_name: str, url: str, target: str,
          f"URL discovered by {tool_name}",
          "info",
          f"Found during targeted recon of {target}",
-         _fingerprint(tool_name, url, "discovered_url")),
+         web_fingerprint(url, tool_name, f"URL discovered by {tool_name}", "discovered_url")),
     )
     row = cur.fetchone()
     return str(row["id"]) if row else fid
 
 
-def _fingerprint(*parts) -> str:
-    import hashlib
-    return hashlib.md5("|".join(str(p) for p in parts).encode()).hexdigest()
+# _fingerprint() removed. It was md5 of its arguments joined by "|", a scheme
+# unique to this module, so a finding recorded here could never match the same
+# finding recorded by any other parser and both rows survived the unique index.
+# All call sites now use the shared helpers in etl/fingerprint.py.

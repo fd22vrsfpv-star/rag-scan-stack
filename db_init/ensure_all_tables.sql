@@ -3980,12 +3980,15 @@ CREATE TRIGGER trg_web_findings_dedup
 --     hash still deduplicates repeat inserts from the same writer, which is the
 --     common case; NULL deduplicates nothing at all.
 --
--- Verified against live data: this expression reproduces 33 of 34 stored
--- fingerprints. The one that differs was written by
--- etl/parse_tool_output.py::_fingerprint, which is a SEPARATE scheme
--- (md5 of parts joined by "|") — so vulns currently has two incompatible
--- fingerprint formats and rows from the two can never dedupe against each
--- other. That is a real defect, recorded here, NOT fixed by this trigger.
+-- Verified against live data: reproduces 34 of 34 stored fingerprints once the
+-- metadata.port fallback below is applied. (A first version got 33/34 and the
+-- outlier was misread as proof of a second hash format in the data; it was in
+-- fact a vuln_fingerprint row whose port lived only in metadata.)
+--
+-- A second format DOES exist in the code — etl/parse_tool_output.py used a local
+-- _fingerprint() that is just md5 of its arguments joined by "|" — but it had not
+-- written any of the live rows. That writer has since been moved onto
+-- vuln_fingerprint / web_fingerprint so the two cannot diverge in future.
 CREATE OR REPLACE FUNCTION public.vulns_dedup() RETURNS trigger AS $fn$
 DECLARE
     existing_id uuid;
@@ -3996,8 +3999,18 @@ BEGIN
     IF NEW.fingerprint IS NULL THEN
         SELECT coalesce(host(a.ip), '') INTO v_ip
           FROM public.assets a WHERE a.id = NEW.asset_id;
-        SELECT CASE WHEN p.port IS NOT NULL AND p.port <> 0 THEN p.port::text ELSE '0' END
+        SELECT CASE WHEN p.port IS NOT NULL AND p.port <> 0 THEN p.port::text ELSE NULL END
           INTO v_port FROM public.ports p WHERE p.id = NEW.port_id;
+
+        -- Fall back to metadata.port when port_id is not set. vuln_fingerprint
+        -- hashes the port the SCANNER observed, which is often recorded in
+        -- metadata even when no ports row was linked — e.g. nuclei's
+        -- CVE-2011-2523 match on 6200. Using it takes this expression from
+        -- reproducing 33 of 34 live fingerprints to 34 of 34.
+        IF v_port IS NULL AND (NEW.metadata->>'port') ~ '^[0-9]+$'
+           AND (NEW.metadata->>'port') <> '0' THEN
+            v_port := NEW.metadata->>'port';
+        END IF;
 
         v_ip   := coalesce(v_ip, '');
         v_port := coalesce(v_port, '0');
