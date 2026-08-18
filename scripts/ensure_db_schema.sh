@@ -160,6 +160,7 @@ CRITICAL_INDEXES=(
     "uq_web_findings_fingerprint"
     "uq_vulns_fingerprint"
     "uq_credential_findings_identity"
+    "uq_recon_findings_fingerprint"
 )
 for idx in "${CRITICAL_INDEXES[@]}"; do
     if docker exec rag-postgres psql -U app -d scans -t -c \
@@ -181,7 +182,7 @@ echo ""
 # index, and duplicates silently return (katana previously re-inserted an entire
 # crawl every run).
 echo "🔍 Verifying dedup trigger..."
-for trg in trg_web_findings_dedup trg_vulns_dedup; do
+for trg in trg_web_findings_dedup trg_vulns_dedup trg_recon_findings_dedup; do
     if docker exec rag-postgres psql -U app -d scans -tAc \
          "SELECT 1 FROM pg_trigger WHERE tgname='${trg}' AND NOT tgisinternal;" | grep -q 1; then
         echo "✓ ${trg}"
