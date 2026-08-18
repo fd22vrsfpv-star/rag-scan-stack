@@ -3787,3 +3787,118 @@ END $$;
 -- ============================================================================
 SELECT 'ensure_all_tables.sql complete — schema is ready' as status;
 SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;
+
+-- ===========================================================================
+-- Finding deduplication: enforce the fingerprints that were already computed
+-- ===========================================================================
+--
+-- CLAUDE.md requires "finding fingerprinting (stable hash) to deduplicate across
+-- tools/runs" and "first seen / last seen". etl/fingerprint.py implements the
+-- hashes, the tables carry fingerprint/first_seen/last_seen columns — and
+-- nothing ever enforced them, so duplicates accumulated unchecked:
+--
+--     vulns                369 rows /    34 fingerprints   10.9x
+--     web_findings/katana  32218 rows /   630 (url,name)   51.1x
+--     web_findings/zap     28232 rows / 27039 fingerprints  1.04x
+--
+-- ZAP was the only source computing a fingerprint at all, which is also why it
+-- is the only one that is nearly clean — evidence the mechanism works as soon as
+-- it is applied. Every other source wrote NULL, and NULLs never conflict, so no
+-- index alone could have deduplicated them.
+--
+-- Order matters: backfill the missing fingerprints, collapse duplicates, and
+-- only then add the unique index.
+
+-- 1. Backfill web_findings.fingerprint for the ~54% of rows that never got one.
+--
+-- This MUST reproduce etl/fingerprint.py::web_fingerprint exactly, or the
+-- backfilled rows will not match what the parsers generate and the same finding
+-- will duplicate once more. That function is:
+--     key = "web|" + url.strip().lower().rstrip("/") + "|" + name.strip().lower()
+--           + "|" + issue_type.strip().lower()
+-- Verified byte-for-byte against the Python for URL casing, surrounding
+-- whitespace, repeated trailing slashes, and NULL fields.
+UPDATE public.web_findings
+   SET fingerprint = md5('web|' || rtrim(lower(btrim(coalesce(url, ''))), '/')
+                          || '|' || lower(btrim(coalesce(name, '')))
+                          || '|' || lower(btrim(coalesce(issue_type, ''))))
+ WHERE fingerprint IS NULL;
+
+-- 2. Collapse duplicates, preserving the real first/last seen window.
+--    Aggregate BEFORE deleting: the surviving row must span the whole group,
+--    otherwise collapsing rows silently narrows a finding's observed lifetime.
+UPDATE public.web_findings w
+   SET first_seen = g.min_first,
+       last_seen  = g.max_last
+  FROM (SELECT fingerprint,
+               min(coalesce(first_seen, created_at)) AS min_first,
+               max(coalesce(last_seen,  created_at)) AS max_last
+          FROM public.web_findings
+         WHERE fingerprint IS NOT NULL
+         GROUP BY fingerprint HAVING count(*) > 1) g
+ WHERE w.fingerprint = g.fingerprint;
+
+DELETE FROM public.web_findings a
+ USING public.web_findings b
+ WHERE a.fingerprint IS NOT NULL
+   AND a.fingerprint = b.fingerprint
+   AND a.id <> b.id
+   -- Keep the most recently seen row; id is the final tiebreaker so the
+   -- ordering is strict and total and exactly one row per group survives.
+   AND (coalesce(a.last_seen, a.created_at), a.id)
+       < (coalesce(b.last_seen, b.created_at), b.id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_web_findings_fingerprint
+    ON public.web_findings(fingerprint);
+
+-- 3. Same for vulns. Every row already carries a fingerprint here, so there is
+--    nothing to backfill — only 10.9x of accumulated duplication to collapse.
+DELETE FROM public.vulns a
+ USING public.vulns b
+ WHERE a.fingerprint IS NOT NULL
+   AND a.fingerprint = b.fingerprint
+   AND a.id <> b.id
+   AND (coalesce(a.updated_at, a.created_at), a.id)
+       < (coalesce(b.updated_at, b.created_at), b.id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_vulns_fingerprint
+    ON public.vulns(fingerprint);
+
+-- credential_findings: one row per (ip, port, username, auth_type).
+--
+-- Same class as the fingerprint problem above, but this table has no
+-- fingerprint column — its natural key is the account itself. Re-testing the
+-- same credential re-inserted every time: 22 rows for 7 real credentials, and
+-- the findings list showed "Valid credentials — anonymous@ftp:21" twice.
+--
+-- Re-verification is meaningful information, so the upsert advances
+-- last_verified_at rather than ignoring the row. NULL usernames are excluded
+-- from the key via a partial index; they carry no account identity to dedupe on.
+UPDATE public.credential_findings c
+   SET last_verified_at = g.max_seen
+  FROM (SELECT ip, port, username, auth_type,
+               max(coalesce(last_verified_at, discovered_at, created_at)) AS max_seen
+          FROM public.credential_findings
+         WHERE username IS NOT NULL
+         GROUP BY ip, port, username, auth_type HAVING count(*) > 1) g
+ WHERE c.ip = g.ip AND c.port IS NOT DISTINCT FROM g.port
+   AND c.username = g.username AND c.auth_type IS NOT DISTINCT FROM g.auth_type;
+
+DELETE FROM public.credential_findings a
+ USING public.credential_findings b
+ WHERE a.username IS NOT NULL AND b.username IS NOT NULL
+   AND a.ip = b.ip
+   AND a.port IS NOT DISTINCT FROM b.port
+   AND a.username = b.username
+   AND a.auth_type IS NOT DISTINCT FROM b.auth_type
+   AND a.id <> b.id
+   -- Prefer a confirmed-valid row over a failed attempt for the same account,
+   -- then the most recently seen; id makes the ordering strict.
+   AND (coalesce(a.valid_cred, false),
+        coalesce(a.last_verified_at, a.discovered_at, a.created_at), a.id)
+       < (coalesce(b.valid_cred, false),
+          coalesce(b.last_verified_at, b.discovered_at, b.created_at), b.id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_credential_findings_identity
+    ON public.credential_findings(ip, port, username, auth_type)
+ WHERE username IS NOT NULL;

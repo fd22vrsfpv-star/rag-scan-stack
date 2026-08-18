@@ -153,13 +153,20 @@ echo ""
 echo "🔍 Verifying critical indexes..."
 CRITICAL_INDEXES=(
     "uq_session_scan_metrics_session_job"
+    # Required by the ON CONFLICT (fingerprint) upserts in the ETL parsers.
+    # etl/parse_tool_output.py already depended on this and was failing at
+    # runtime with "no unique or exclusion constraint matching the ON CONFLICT
+    # specification" because the index had never been created.
+    "uq_web_findings_fingerprint"
+    "uq_vulns_fingerprint"
+    "uq_credential_findings_identity"
 )
 for idx in "${CRITICAL_INDEXES[@]}"; do
     if docker exec rag-postgres psql -U app -d scans -t -c \
         "SELECT 1 FROM pg_indexes WHERE indexname = '${idx}';" | grep -q 1; then
         echo "✓ ${idx}"
     else
-        echo "❌ Missing critical index: ${idx} (upserts into session_scan_metrics will fail)"
+        echo "❌ Missing critical index: ${idx} (ON CONFLICT upserts depending on it will fail at runtime)"
         MISSING=$((MISSING + 1))
     fi
 done

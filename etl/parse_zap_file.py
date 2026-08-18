@@ -165,6 +165,10 @@ def _insert_finding(cur, stats: dict, dedupe: bool, *, url: str, name: str,
                method, payload, cwe, refs, description, solution, reference,
                confidence, tags, first_seen, last_seen, fingerprint)
             VALUES (%s, %s, %s, 'zap', 'zap-alert', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now(), %s)
+            ON CONFLICT (fingerprint) DO UPDATE SET
+                last_seen = now(),
+                severity  = EXCLUDED.severity,
+                evidence  = COALESCE(EXCLUDED.evidence, web_findings.evidence)
         """, (
             finding_id, asset_id, url, name, severity,
             (evidence or None), (method or None), (attack or None),

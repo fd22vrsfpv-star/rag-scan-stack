@@ -463,6 +463,13 @@ def parse_zap_alerts(
                                confidence, tags, request_data, response_data,
                                first_seen, last_seen, fingerprint)
                             VALUES (%s, %s, %s, 'zap', 'zap-alert', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now(), %s)
+                            -- Re-seeing a finding advances last_seen instead of
+                            -- inserting it again. Requires uq_web_findings_fingerprint;
+                            -- without that index this raises rather than deduping.
+                            ON CONFLICT (fingerprint) DO UPDATE SET
+                                last_seen = now(),
+                                severity  = EXCLUDED.severity,
+                                evidence  = COALESCE(EXCLUDED.evidence, web_findings.evidence)
                         """, (
                             finding_id,
                             asset_id,
