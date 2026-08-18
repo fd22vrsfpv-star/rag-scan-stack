@@ -1636,3 +1636,58 @@ DROP TRIGGER IF EXISTS trg_web_findings_dedup ON public.web_findings;
 CREATE TRIGGER trg_web_findings_dedup
     BEFORE INSERT ON public.web_findings
     FOR EACH ROW EXECUTE FUNCTION public.web_findings_dedup();
+
+-- Dedup trigger for vulns (see ensure_all_tables.sql for rationale/limits).
+CREATE OR REPLACE FUNCTION public.vulns_dedup() RETURNS trigger AS $fn$
+DECLARE
+    existing_id uuid;
+    v_ip   text;
+    v_port text;
+    v_cve  text;
+BEGIN
+    IF NEW.fingerprint IS NULL THEN
+        SELECT coalesce(host(a.ip), '') INTO v_ip
+          FROM public.assets a WHERE a.id = NEW.asset_id;
+        SELECT CASE WHEN p.port IS NOT NULL AND p.port <> 0 THEN p.port::text ELSE '0' END
+          INTO v_port FROM public.ports p WHERE p.id = NEW.port_id;
+
+        v_ip   := coalesce(v_ip, '');
+        v_port := coalesce(v_port, '0');
+
+        -- Mirrors _extract_first_cve: first array element matching the CVE
+        -- shape, upper-cased. unnest preserves array order.
+        SELECT upper(c) INTO v_cve
+          FROM unnest(coalesce(NEW.cve, ARRAY[]::text[])) c
+         WHERE c ~* '^CVE-[0-9]{4}-[0-9]+'
+         LIMIT 1;
+
+        IF v_cve IS NOT NULL THEN
+            NEW.fingerprint := md5('cve|' || v_cve || '|' || v_ip || '|' || v_port);
+        ELSE
+            -- _normalize_script is strip().lower()
+            NEW.fingerprint := md5('script|' || lower(btrim(coalesce(NEW.script, '')))
+                                   || '|' || v_ip || '|' || v_port);
+        END IF;
+    END IF;
+
+    SELECT id INTO existing_id
+      FROM public.vulns WHERE fingerprint = NEW.fingerprint;
+
+    IF FOUND THEN
+        UPDATE public.vulns
+           SET updated_at = now(),
+               severity   = COALESCE(NEW.severity, severity),
+               output     = COALESCE(NEW.output, output),
+               cvss       = COALESCE(NEW.cvss, cvss)
+         WHERE id = existing_id;
+        RETURN NULL;   -- skip the INSERT
+    END IF;
+
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_vulns_dedup ON public.vulns;
+CREATE TRIGGER trg_vulns_dedup
+    BEFORE INSERT ON public.vulns
+    FOR EACH ROW EXECUTE FUNCTION public.vulns_dedup();
