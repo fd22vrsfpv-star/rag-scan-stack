@@ -3,7 +3,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from urllib.parse import urlparse, parse_qs
 from etl.fingerprint import web_fingerprint
-from etl.scope_gate import is_in_scope
+from etl.scope_gate import load_ingest_scope, host_in_scope
 
 
 def _is_ip(value: str) -> bool:
@@ -424,11 +424,7 @@ def parse_katana(path: str, profile: str = "upload", job_id: str = None):
             # Union of every configured scope target rather than one engagement:
             # this parser is called for uploads and jobs that carry no engagement
             # id, and a finding is legitimate if it is in scope for ANY of them.
-            cur.execute("SELECT target, target_type FROM scope_targets WHERE target <> ''")
-            _scope_rows = [(r["target"], r["target_type"]) for r in cur.fetchall()]
-            # No scope configured at all means nothing to enforce — pass through
-            # rather than silently discarding every finding on a fresh install.
-            _enforce_scope = bool(_scope_rows)
+            _enforce_scope, _scope_rows = load_ingest_scope(cur)
             if not _enforce_scope:
                 print("[katana] WARNING: no scope_targets configured — "
                       "ingesting every host without scope filtering")
@@ -457,7 +453,7 @@ def parse_katana(path: str, profile: str = "upload", job_id: str = None):
                     # unparseable host is refused rather than admitted.
                     if _enforce_scope:
                         _h = urlparse(url).hostname
-                        if not is_in_scope(_h, _scope_rows):
+                        if not host_in_scope(_h, _enforce_scope, _scope_rows):
                             stats["out_of_scope"] = stats.get("out_of_scope", 0) + 1
                             _oos = stats.setdefault("out_of_scope_hosts", {})
                             _oos[_h or "(unparseable)"] = _oos.get(_h or "(unparseable)", 0) + 1

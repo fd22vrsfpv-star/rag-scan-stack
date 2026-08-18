@@ -47,6 +47,54 @@ def load_engagement_scope(cur, engagement_id):
     return out
 
 
+def load_ingest_scope(cur):
+    """Scope for INGEST-time filtering: (enforce, rows).
+
+    Crawlers and archive-fed tools return hosts nobody asked about — a katana
+    crawl of a target's TWiki app followed links to twiki.org, twitter.com and
+    youtube.com, and those were stored as engagement findings. Scope was checked
+    when choosing what to point a tool AT, never on what came BACK.
+
+    Differs from load_engagement_scope in two deliberate ways:
+
+    * It is the UNION of every configured scope target, not one engagement's.
+      These parsers also run for uploads and jobs that carry no engagement id,
+      and a finding is legitimate if it is in scope for ANY engagement.
+
+    * `enforce` is False when NO scope is configured anywhere. Failing closed
+      there would silently discard every finding on a fresh install, which is
+      indistinguishable from a broken parser. With scope configured it is
+      enforced, and is_in_scope itself remains fail-closed per host.
+    """
+    try:
+        cur.execute(
+            "SELECT target, target_type FROM public.scope_targets "
+            "WHERE target IS NOT NULL AND target <> ''"
+        )
+        rows = cur.fetchall()
+    except Exception as e:
+        logger.warning("ingest scope load failed: %s", e)
+        return False, []
+
+    out = []
+    for r in rows:
+        if isinstance(r, dict):
+            out.append((r.get("target"), r.get("target_type")))
+        else:
+            out.append((r[0], r[1]))
+    return bool(out), out
+
+
+def host_in_scope(value, enforce, rows):
+    """True if `value` (a url or bare host) may be ingested.
+
+    Accepts either form so callers do not each re-derive the host.
+    """
+    if not enforce:
+        return True
+    return is_in_scope(_host_from_url(value) or value, rows)
+
+
 def _host_from_url(value):
     """Extract the bare host from a url/authority string."""
     try:

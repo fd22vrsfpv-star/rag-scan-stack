@@ -3,6 +3,12 @@ from datetime import datetime
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+try:
+    from scope_gate import load_ingest_scope, host_in_scope
+except ImportError:  # pragma: no cover — etl/ may already be on PYTHONPATH
+    from etl.scope_gate import load_ingest_scope, host_in_scope
+
+
 DB_DSN = os.environ.get("DB_DSN", "postgresql://app:app@rag-postgres:5432/scans")
 
 def _load_jsonl(path):
@@ -16,16 +22,23 @@ def _load_jsonl(path):
     return results
 
 def parse_crtsh(path: str, profile: str = "upload", job_id: str = None):
-    stats = dict(records_seen=0, findings_inserted=0, expired_certs=0, wildcard_certs=0, skipped=0, errors=0, error_examples=[])
+    stats = dict(out_of_scope=0, records_seen=0, findings_inserted=0, expired_certs=0, wildcard_certs=0, skipped=0, errors=0, error_examples=[])
     records = _load_jsonl(path); stats["records_seen"] = len(records)
     if not records: return stats
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            _enforce_scope, _scope_rows = load_ingest_scope(cur)
             for rec in records:
                 try:
                     cur.execute("SAVEPOINT rec_sp")
                     common_name = rec.get("common_name", "").strip()
+                    # Ingest scope gate. certificate transparency returns every name on a cert, which
+                    # routinely includes unrelated domains sharing the certificate.
+                    if not host_in_scope(common_name, _enforce_scope, _scope_rows):
+                        stats["out_of_scope"] = stats.get("out_of_scope", 0) + 1
+                        cur.execute("RELEASE SAVEPOINT rec_sp")
+                        continue
                     if not common_name:
                         stats["skipped"] += 1
                         cur.execute("RELEASE SAVEPOINT rec_sp")
