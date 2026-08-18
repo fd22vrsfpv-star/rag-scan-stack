@@ -3,6 +3,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from urllib.parse import urlparse, parse_qs
 from etl.fingerprint import web_fingerprint
+from etl.scope_gate import is_in_scope
 
 
 def _is_ip(value: str) -> bool:
@@ -403,13 +404,34 @@ def parse_katana(path: str, profile: str = "upload", job_id: str = None):
     stats = dict(
         records_seen=0, findings_inserted=0, params_extracted=0,
         api_endpoints_found=0, api_endpoints_by_type={},
-        skipped=0, errors=0, error_examples=[]
+        skipped=0, errors=0, error_examples=[],
+        out_of_scope=0, out_of_scope_hosts={}
     )
     records = _load_jsonl(path); stats["records_seen"] = len(records)
     if not records: return stats
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Scope gate for INGESTION.
+            #
+            # Crawlers follow links off-host. A crawl of a Metasploitable TWiki
+            # instance produced findings for twiki.org, twitter.com, youtube.com,
+            # wikipedia and owasp.org — none of them in any engagement's scope.
+            # Scope was enforced at DISPATCH (which target we point a tool at),
+            # and nothing checked what came BACK, so third-party hosts were
+            # recorded as engagement findings.
+            #
+            # Union of every configured scope target rather than one engagement:
+            # this parser is called for uploads and jobs that carry no engagement
+            # id, and a finding is legitimate if it is in scope for ANY of them.
+            cur.execute("SELECT target, target_type FROM scope_targets WHERE target <> ''")
+            _scope_rows = [(r["target"], r["target_type"]) for r in cur.fetchall()]
+            # No scope configured at all means nothing to enforce — pass through
+            # rather than silently discarding every finding on a fresh install.
+            _enforce_scope = bool(_scope_rows)
+            if not _enforce_scope:
+                print("[katana] WARNING: no scope_targets configured — "
+                      "ingesting every host without scope filtering")
             for rec in records:
                 try:
                     cur.execute("SAVEPOINT katana_rec")
@@ -429,6 +451,17 @@ def parse_katana(path: str, profile: str = "upload", job_id: str = None):
                     source = request.get("source") or rec.get("source", "")
                     response = rec.get("response", {})
                     status_code = response.get("status_code") if isinstance(response, dict) else None
+
+                    # Drop anything outside the engagement scope BEFORE it
+                    # becomes a finding. is_in_scope is fail-closed, so an
+                    # unparseable host is refused rather than admitted.
+                    if _enforce_scope:
+                        _h = urlparse(url).hostname
+                        if not is_in_scope(_h, _scope_rows):
+                            stats["out_of_scope"] = stats.get("out_of_scope", 0) + 1
+                            _oos = stats.setdefault("out_of_scope_hosts", {})
+                            _oos[_h or "(unparseable)"] = _oos.get(_h or "(unparseable)", 0) + 1
+                            continue
 
                     # Try to lookup asset_id from URL hostname
                     asset_id = None

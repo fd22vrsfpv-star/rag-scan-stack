@@ -412,6 +412,12 @@ class KatanaReq(BaseModel):
     filter_similar: Optional[bool] = True       # collapse /users/123 and /users/456
     proxy: Optional[str] = None
     no_ingest: Optional[bool] = False
+    # Crawl scope. katana's default is "rdn" (root domain), which is far too
+    # loose for an engagement: crawling a Metasploitable TWiki instance followed
+    # links off-host and issued requests to twiki.org, twitter.com, youtube.com,
+    # wikipedia and others — third parties that are not in anyone's scope. "fqdn"
+    # keeps the crawler on the exact host it was pointed at.
+    field_scope: Optional[str] = "fqdn"          # fqdn | rdn | dn, or a regex
 
 class TlsxReq(BaseModel):
     targets: Any = None  # list or "from_db"
@@ -565,6 +571,12 @@ def run_katana(req: KatanaReq, background_tasks: BackgroundTasks):
 
     cmd = ["katana", "-list", targets_file, "-jsonl", "-o", output_file, "-silent",
            "-depth", str(req.depth or 3)]
+    # Keep the crawler on the target host. Without this katana uses its default
+    # root-domain scope and will follow off-site links out of the engagement —
+    # a real authorization problem, not just noisy data, because it means the
+    # scanner sends traffic to third-party sites during an engagement.
+    if req.field_scope:
+        cmd.extend(["-field-scope", req.field_scope])
     if req.js_crawl:
         cmd.append("-js-crawl")
     if req.xhr_extraction:
