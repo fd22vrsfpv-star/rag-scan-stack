@@ -1701,3 +1701,38 @@ DROP TRIGGER IF EXISTS trg_vulns_dedup ON public.vulns;
 CREATE TRIGGER trg_vulns_dedup
     BEFORE INSERT ON public.vulns
     FOR EACH ROW EXECUTE FUNCTION public.vulns_dedup();
+
+-- recon_findings dedup (see ensure_all_tables.sql for the data-key rationale).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_recon_findings_fingerprint
+    ON public.recon_findings(fingerprint);
+
+CREATE OR REPLACE FUNCTION public.recon_findings_dedup() RETURNS trigger AS $fn$
+DECLARE
+    existing_id uuid;
+BEGIN
+    IF NEW.fingerprint IS NULL THEN
+        NEW.fingerprint := md5('recon|' || lower(btrim(coalesce(NEW.source, '')))
+                                || '|' || lower(btrim(coalesce(NEW.finding_type, '')))
+                                || '|' || lower(btrim(coalesce(NEW.target, '')))
+                                || '|' || lower(btrim(coalesce(NEW.data::text, ''))));
+    END IF;
+
+    SELECT id INTO existing_id
+      FROM public.recon_findings WHERE fingerprint = NEW.fingerprint;
+
+    IF FOUND THEN
+        UPDATE public.recon_findings
+           SET severity = COALESCE(NEW.severity, severity),
+               data     = COALESCE(NEW.data, data)
+         WHERE id = existing_id;
+        RETURN NULL;   -- skip the INSERT
+    END IF;
+
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_recon_findings_dedup ON public.recon_findings;
+CREATE TRIGGER trg_recon_findings_dedup
+    BEFORE INSERT ON public.recon_findings
+    FOR EACH ROW EXECUTE FUNCTION public.recon_findings_dedup();

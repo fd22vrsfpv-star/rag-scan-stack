@@ -4052,3 +4052,73 @@ DROP TRIGGER IF EXISTS trg_vulns_dedup ON public.vulns;
 CREATE TRIGGER trg_vulns_dedup
     BEFORE INSERT ON public.vulns
     FOR EACH ROW EXECUTE FUNCTION public.vulns_dedup();
+
+-- ===========================================================================
+-- recon_findings: fingerprint + dedup
+-- ===========================================================================
+--
+-- Every one of the 575 live rows had a NULL fingerprint: ~50 insert sites across
+-- ~30 files write this table and none of them computed one. Patching them
+-- individually is not realistic, so this follows the web_findings pattern and
+-- enforces the invariant at the database.
+--
+-- THE DATA KEY IS LOAD-BEARING. recon_fingerprint takes
+-- (source, finding_type, target, data_key), and `target` alone is NOT the
+-- identity here: gowitness writes one row per screenshot but sets target to the
+-- HOST, so all 563 of its rows share target='192.168.1.150' and differ only in
+-- `data`. Keying on (source, finding_type, target) would have collapsed 575 rows
+-- to 5 and destroyed 558 distinct findings. `data` must be part of the key.
+--
+-- Known limit: the trigger uses jsonb's canonical text form, while a Python
+-- writer passing its own data_key (e.g. parse_tool_output's
+-- json.dumps(rec)[:200]) may serialise differently. Rows from those two paths
+-- may therefore not dedupe against each other. Supplied fingerprints are never
+-- recomputed, so this only affects the fill.
+
+UPDATE public.recon_findings
+   SET fingerprint = md5('recon|' || lower(btrim(coalesce(source, '')))
+                          || '|' || lower(btrim(coalesce(finding_type, '')))
+                          || '|' || lower(btrim(coalesce(target, '')))
+                          || '|' || lower(btrim(coalesce(data::text, ''))))
+ WHERE fingerprint IS NULL;
+
+DELETE FROM public.recon_findings a
+ USING public.recon_findings b
+ WHERE a.fingerprint IS NOT NULL
+   AND a.fingerprint = b.fingerprint
+   AND a.id <> b.id
+   AND (a.created_at, a.id) < (b.created_at, b.id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_recon_findings_fingerprint
+    ON public.recon_findings(fingerprint);
+
+CREATE OR REPLACE FUNCTION public.recon_findings_dedup() RETURNS trigger AS $fn$
+DECLARE
+    existing_id uuid;
+BEGIN
+    IF NEW.fingerprint IS NULL THEN
+        NEW.fingerprint := md5('recon|' || lower(btrim(coalesce(NEW.source, '')))
+                                || '|' || lower(btrim(coalesce(NEW.finding_type, '')))
+                                || '|' || lower(btrim(coalesce(NEW.target, '')))
+                                || '|' || lower(btrim(coalesce(NEW.data::text, ''))));
+    END IF;
+
+    SELECT id INTO existing_id
+      FROM public.recon_findings WHERE fingerprint = NEW.fingerprint;
+
+    IF FOUND THEN
+        UPDATE public.recon_findings
+           SET severity = COALESCE(NEW.severity, severity),
+               data     = COALESCE(NEW.data, data)
+         WHERE id = existing_id;
+        RETURN NULL;   -- skip the INSERT
+    END IF;
+
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_recon_findings_dedup ON public.recon_findings;
+CREATE TRIGGER trg_recon_findings_dedup
+    BEFORE INSERT ON public.recon_findings
+    FOR EACH ROW EXECUTE FUNCTION public.recon_findings_dedup();
