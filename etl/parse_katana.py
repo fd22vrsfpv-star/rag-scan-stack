@@ -2,6 +2,7 @@ import os, json, uuid, re, ipaddress
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from urllib.parse import urlparse, parse_qs
+from etl.fingerprint import web_fingerprint
 
 
 def _is_ip(value: str) -> bool:
@@ -473,11 +474,30 @@ def parse_katana(path: str, profile: str = "upload", job_id: str = None):
                         issue_type = f"api_endpoint:{api_class['api_type']}"
 
                     finding_id = str(uuid.uuid4())
+                    # Fingerprint so re-crawls update rather than duplicate.
+                    #
+                    # katana was by far the worst offender in the table: 32,218
+                    # rows for 630 real findings (51x), because it wrote no
+                    # fingerprint at all and NULLs never conflict, so the unique
+                    # index could not help it. Every crawl re-inserted the whole
+                    # site.
+                    #
+                    # katana sets no `name`, so identity is url + issue_type.
+                    # That is deliberately the SAME key the backfill in
+                    # ensure_all_tables.sql used, so existing rows update in
+                    # place instead of forking a second copy of the site.
+                    fp = web_fingerprint(url, "katana", None, issue_type)
                     cur.execute("""
                         INSERT INTO web_findings
-                        (id, asset_id, url, source, method, status_code, severity, evidence, refs, issue_type)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """, (finding_id, asset_id, url, "katana", method, status_code, severity, evidence, json.dumps(refs), issue_type))
+                        (id, asset_id, url, source, method, status_code, severity, evidence, refs, issue_type,
+                         first_seen, last_seen, fingerprint)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now(), %s)
+                        ON CONFLICT (fingerprint) DO UPDATE SET
+                            last_seen   = now(),
+                            status_code = EXCLUDED.status_code,
+                            severity    = EXCLUDED.severity,
+                            evidence    = COALESCE(EXCLUDED.evidence, web_findings.evidence)
+                    """, (finding_id, asset_id, url, "katana", method, status_code, severity, evidence, json.dumps(refs), issue_type, fp))
                     stats["findings_inserted"] += 1
 
                     # Ensure port record exists
