@@ -1198,17 +1198,27 @@ def persist_recommendations(
                 cur.execute("ROLLBACK TO SAVEPOINT sat_check")
                 logger.debug(f"already-satisfied check skipped for {ip}: {e}")
                 _reason = None
+            # Record the suppression instead of dropping the row.
+            #
+            # The first version skipped the INSERT entirely, which meant an
+            # operator who disagreed with the call had no way to run it — the
+            # recommendation simply did not exist. Persisting it as 'skipped'
+            # with a reason keeps it visible, filterable and dispatchable with
+            # force=true, which is the difference between the tool making a
+            # suggestion and the tool making the decision.
+            rec_status = "pending"
             if _reason:
                 suppressed += 1
+                rec_status = "skipped"
+                rec_extra["skip_reason"] = _reason
                 logger.debug(f"suppressed {rec.get('scanner')} for {ip}: {_reason}")
-                continue
 
             cur.execute(
                 """
                 INSERT INTO public.scan_recommendations
-                  (asset_id, ip, service, banner, scanner, action, script, template, source, model, extra, priority, engagement_id, target_kind)
+                  (asset_id, ip, service, banner, scanner, action, script, template, source, model, extra, priority, engagement_id, target_kind, status)
                 VALUES
-                  (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 50), %s, %s)
+                  (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 50), %s, %s, %s)
                 ON CONFLICT (fingerprint) DO NOTHING
                 RETURNING id;
                 """,
@@ -1221,6 +1231,7 @@ def persist_recommendations(
                     rec_priority,
                     engagement_id,
                     rec_kind,
+                                        rec_status,
                 ),
             )
             if cur.rowcount > 0:
@@ -2052,7 +2063,12 @@ def list_all_recommendations(
                 SELECT DISTINCT ON (ip, scanner, COALESCE(action,''), COALESCE(template,''))
                        id, ip::text, service, banner, scanner, action, script, template,
                        source, model, confidence, priority, status, executed_at,
-                       created_at, updated_at
+                       created_at, updated_at, target_kind,
+                       -- Why a recommendation was suppressed. Without this the UI
+                       -- can filter to status='skipped' but cannot say WHY, which
+                       -- makes the decision unreviewable — and the operator has to
+                       -- take the tool's word for it.
+                       extra->>'skip_reason' AS skip_reason
                 FROM scan_recommendations
                 {where}
                 ORDER BY ip, scanner, COALESCE(action,''), COALESCE(template,''),

@@ -722,6 +722,14 @@ class RunRecommendationsRequest(BaseModel):
     proxy: Optional[str] = None  # SOCKS proxy URL, e.g. socks5://node-manager:10001
     use_kali: bool = False       # Route manual tools to the internal Kali container
     node_id: Optional[str] = None  # Remote node for SSH-based tool execution
+    # Run a recommendation the platform decided was unnecessary.
+    #
+    # Suppression is a suggestion, not a verdict: "nmap already produced results
+    # for this host" or "credentials already recovered" is usually right and
+    # occasionally wrong, and the operator is better placed to judge. Without
+    # this, a suppressed recommendation is unrunnable and the tool has quietly
+    # overruled the tester.
+    force: bool = False
 
 
 # Suggested manual commands for recommendations dispatch cannot run.
@@ -974,6 +982,12 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
     already_active_results = []
     for rec in selected:
         cur_status = (rec.get("status") or "pending").lower()
+        # `force` only overrides a SUPPRESSION decision. It deliberately does not
+        # override queued/running: that guard prevents double-dispatch of work
+        # already in flight, which is a different problem.
+        if body.force and cur_status == "skipped":
+            dispatchable.append(rec)
+            continue
         if cur_status in _ACTIVE_REC_STATES:
             already_active_results.append({
                 "id": rec["id"],
@@ -1206,7 +1220,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                                 # one redundant scan.
                                 log.debug(f"nse-already-ran check failed for {ip}: {_e}")
                                 _already = False
-                        if _already:
+                        if _already and not getattr(body, "force", False):
                             result["status"] = "skipped"
                             result["detail"] = (
                                 f"Nmap script '{script.split(' ')[0]}' — already produced "
