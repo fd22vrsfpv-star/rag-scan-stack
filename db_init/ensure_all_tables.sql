@@ -4122,3 +4122,73 @@ DROP TRIGGER IF EXISTS trg_recon_findings_dedup ON public.recon_findings;
 CREATE TRIGGER trg_recon_findings_dedup
     BEFORE INSERT ON public.recon_findings
     FOR EACH ROW EXECUTE FUNCTION public.recon_findings_dedup();
+
+-- ── raw_artifacts: complete, untruncated tool output ──────────────────────
+--
+-- Every byte a tool produced, kept verbatim for post-analysis and LLM
+-- processing. This exists because the pipeline was lossy in three places at
+-- once and each loss was invisible:
+--
+--   1. tool_executions.output is written ONLY by kali-listener. Output from
+--      the scanner services and targeted_recon had no durable home at all.
+--   2. When a tool writes its own JSON (nuclei -jsonl, whatweb --log-json,
+--      enum4linux-ng -oJ, dnsrecon --json, sqlmap --report-json), that file
+--      was read, POSTed to the parser, then UNLINKED — the authoritative
+--      structured artifact was the one thing never persisted.
+--   3. The parser keeps 8 KB of raw_output on a finding; ingest truncates at
+--      200 KB. Fine for display, useless as a source of truth.
+--
+-- Content is deduped on (tool, target, sha256) rather than blindly appended:
+-- re-running the same scan yields byte-identical output, and paying an LLM to
+-- re-read it is pure waste. Repeats bump last_seen/occurrences, matching the
+-- first_seen/last_seen convention used by the finding tables.
+CREATE TABLE IF NOT EXISTS public.raw_artifacts (
+    id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id    uuid,
+    tool             text NOT NULL,
+    command          text,
+    target           text,
+    port             integer,
+    service          text,
+    exec_id          uuid,
+    job_id           text,
+    scan_id          uuid,
+    source           text DEFAULT 'unknown',
+    content_format   text DEFAULT 'text',
+    native_json      boolean DEFAULT false,
+    content          text NOT NULL,
+    content_sha256   text NOT NULL,
+    byte_size        integer,
+    first_seen       timestamptz DEFAULT now(),
+    last_seen        timestamptz DEFAULT now(),
+    occurrences      integer DEFAULT 1,
+    -- LLM post-processing state. 'pending' is the work queue.
+    llm_status       text DEFAULT 'pending',
+    llm_model        text,
+    llm_processed_at timestamptz,
+    llm_result       jsonb,
+    llm_error        text,
+    llm_attempts     integer DEFAULT 0,
+    created_at       timestamptz DEFAULT now(),
+    CONSTRAINT raw_artifacts_llm_status_check CHECK (
+        llm_status IN ('pending','processing','done','failed','skipped'))
+);
+
+ALTER TABLE public.raw_artifacts
+    DROP CONSTRAINT IF EXISTS raw_artifacts_scan_id_fkey;
+ALTER TABLE public.raw_artifacts
+    ADD CONSTRAINT raw_artifacts_scan_id_fkey
+    FOREIGN KEY (scan_id) REFERENCES public.scans(id) ON DELETE SET NULL;
+
+-- Required by the ON CONFLICT upsert in /ingest/raw-artifact. Without a
+-- matching unique index that statement RAISES rather than deduping.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_artifacts_identity
+    ON public.raw_artifacts (tool, COALESCE(target,''), content_sha256);
+-- The post-processing queue reads WHERE llm_status='pending' ORDER BY created_at.
+CREATE INDEX IF NOT EXISTS idx_raw_artifacts_llm_status
+    ON public.raw_artifacts (llm_status, created_at);
+CREATE INDEX IF NOT EXISTS idx_raw_artifacts_tool     ON public.raw_artifacts (tool);
+CREATE INDEX IF NOT EXISTS idx_raw_artifacts_target   ON public.raw_artifacts (target);
+CREATE INDEX IF NOT EXISTS idx_raw_artifacts_exec_id  ON public.raw_artifacts (exec_id);
+CREATE INDEX IF NOT EXISTS idx_raw_artifacts_job_id   ON public.raw_artifacts (job_id);
+CREATE INDEX IF NOT EXISTS idx_raw_artifacts_created  ON public.raw_artifacts (created_at DESC);

@@ -523,7 +523,7 @@ def structure_tool_output(
                         cur.execute("SAVEPOINT tool_rec")
                         fid = _insert_table_row_finding(
                             cur, row, tool_name, target, port,
-                            service, asset_id, job_id
+                            service, asset_id, job_id, stdout
                         )
                         cur.execute("RELEASE SAVEPOINT tool_rec")
                         if fid:
@@ -759,8 +759,22 @@ def _insert_json_finding(cur, rec: dict, tool_name: str, target: str,
 
 def _insert_table_row_finding(cur, row: dict, tool_name: str, target: str,
                               port: Optional[int], service: Optional[str],
-                              asset_id: Optional[str], job_id: Optional[str]) -> Optional[str]:
-    """Insert a parsed table row as a recon_finding."""
+                              asset_id: Optional[str], job_id: Optional[str],
+                              raw_output: Optional[str] = None) -> Optional[str]:
+    """Insert a parsed table row as a recon_finding.
+
+    `raw_output` is kept alongside the inferred columns because the inference is
+    frequently wrong. crackmapexec prints a whitespace-aligned SMB banner, which
+    the table strategy read as a header row — so the DATA became the column
+    NAMES:
+
+        keys: metasploitable, 445, smb, 192.168.1.150,
+              [*]_unix_(name:metasploitable)_(domain:localdomain)_(signing:false)_(smbv1:true)
+
+    Those rows exported cleanly and were useless to process. Structure inference
+    on arbitrary CLI output will keep guessing wrong; keeping the raw text means
+    a wrong guess costs fidelity in one field instead of losing the finding.
+    """
     # Try to extract a target from the row
     row_target = (row.get("host") or row.get("ip") or row.get("target")
                   or row.get("address") or target)
@@ -779,6 +793,8 @@ def _insert_table_row_finding(cur, row: dict, tool_name: str, target: str,
                 break
 
     data = dict(row)
+    if raw_output:
+        data["raw_output"] = raw_output[:8000]
     if job_id:
         data["job_id"] = job_id
     if port:

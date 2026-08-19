@@ -2824,6 +2824,12 @@ class ToolOutputRequest(BaseModel):
     service: Optional[str] = None
     job_id: Optional[str] = None
     engagement_id: Optional[str] = None
+    # Set by callers that already POSTed to /ingest/raw-artifact themselves
+    # (kali-listener does). Without it the same bytes get archived twice per
+    # execution and `occurrences` counts round-trips instead of re-scans.
+    archived: bool = False
+    command: Optional[str] = None
+    source: Optional[str] = None
 
 
 @app.post("/ingest/tool-output", tags=["Ingest"])
@@ -2834,6 +2840,19 @@ def ingest_tool_output(req: ToolOutputRequest, authorized: bool = Depends(auth))
     Tries (in order): JSON parsing, table parsing, CVE extraction,
     URL extraction, key-value extraction, raw text fallback.
     """
+    # Archive first, parse second. Structuring is lossy by design (8 KB of
+    # evidence per finding); if the parser chokes on an unfamiliar format the
+    # complete output must still survive for later analysis.
+    if not req.archived:
+        try:
+            ingest_raw_artifact(RawArtifactRequest(
+                tool=req.tool_name, content=req.stdout, command=req.command,
+                target=req.target, port=req.port, service=req.service,
+                job_id=req.job_id, engagement_id=req.engagement_id,
+                source=req.source or "ingest"), authorized=True)
+        except Exception as e:
+            logger.warning("raw artifact archive failed for tool=%s: %s", req.tool_name, e)
+
     from etl.parse_tool_output import structure_tool_output
     stats = structure_tool_output(
         stdout=req.stdout,
@@ -2845,6 +2864,242 @@ def ingest_tool_output(req: ToolOutputRequest, authorized: bool = Depends(auth))
         engagement_id=req.engagement_id,
     )
     return {"ok": True, "stats": stats}
+
+
+# ── Raw artifact store ────────────────────────────────────────────────────
+#
+# Complete, untruncated tool output, kept for post-analysis and LLM
+# processing. Everything else in the pipeline is lossy on purpose (findings
+# keep 8 KB of evidence, ingest truncates at 200 KB); this is the source of
+# truth those are derived from.
+
+class RawArtifactRequest(BaseModel):
+    tool: str
+    content: str
+    command: Optional[str] = None
+    target: Optional[str] = None
+    port: Optional[int] = None
+    service: Optional[str] = None
+    exec_id: Optional[str] = None
+    job_id: Optional[str] = None
+    scan_id: Optional[str] = None
+    source: str = "unknown"
+    # Omit to auto-detect from the content itself.
+    content_format: Optional[str] = None
+    native_json: bool = False
+    engagement_id: Optional[str] = None
+
+
+class ArtifactProcessedRequest(BaseModel):
+    llm_status: str = "done"          # done | failed | skipped
+    llm_model: Optional[str] = None
+    llm_result: Optional[dict] = None
+    llm_error: Optional[str] = None
+
+
+def _detect_content_format(text: str) -> str:
+    """Classify a payload so a downstream LLM knows how to read it.
+
+    JSONL is checked before JSON: a stream of per-line objects (nuclei -jsonl)
+    is not valid JSON as a whole, so json.loads() alone would file it as text
+    and lose the fact that it is machine-readable.
+    """
+    s = (text or "").strip()
+    if not s:
+        return "empty"
+    if s[0] == "<":
+        return "xml"
+    if s[0] in "{[":
+        try:
+            json.loads(s)
+            return "json"
+        except Exception:
+            pass
+    lines = [ln for ln in s.splitlines() if ln.strip()][:20]
+    if lines and all(ln.lstrip()[:1] == "{" for ln in lines):
+        try:
+            for ln in lines:
+                json.loads(ln)
+            return "jsonl"
+        except Exception:
+            pass
+    return "text"
+
+
+@app.post("/ingest/raw-artifact", tags=["Ingest"])
+def ingest_raw_artifact(req: RawArtifactRequest, authorized: bool = Depends(auth)):
+    """Persist one tool's complete output verbatim.
+
+    Deduped on (tool, target, sha256) so re-running an unchanged scan bumps
+    last_seen/occurrences instead of re-queuing identical bytes for the LLM.
+    A repeat deliberately does NOT reset llm_status — the content was already
+    analysed, and paying to analyse the same bytes again is waste.
+    """
+    content = req.content or ""
+    sha = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
+    fmt = req.content_format or _detect_content_format(content)
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO raw_artifacts
+                (engagement_id, tool, command, target, port, service, exec_id,
+                 job_id, scan_id, source, content_format, native_json, content,
+                 content_sha256, byte_size)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (tool, COALESCE(target,''), content_sha256) DO UPDATE
+               SET last_seen    = now(),
+                   occurrences  = raw_artifacts.occurrences + 1,
+                   exec_id      = COALESCE(EXCLUDED.exec_id, raw_artifacts.exec_id),
+                   job_id       = COALESCE(EXCLUDED.job_id, raw_artifacts.job_id),
+                   scan_id      = COALESCE(EXCLUDED.scan_id, raw_artifacts.scan_id),
+                   command      = COALESCE(EXCLUDED.command, raw_artifacts.command)
+            RETURNING id, (xmax = 0) AS inserted, occurrences
+            """,
+            (req.engagement_id, req.tool, req.command, req.target, req.port,
+             req.service, req.exec_id, req.job_id, req.scan_id, req.source,
+             fmt, req.native_json, content, sha, len(content.encode("utf-8", "replace"))),
+        )
+        row = cur.fetchone()
+    artifact_id, inserted, occurrences = str(row[0]), bool(row[1]), row[2]
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("raw_artifact_stored", req.tool, {
+            "artifact_id": artifact_id, "tool": req.tool, "target": req.target,
+            "bytes": len(content), "content_format": fmt,
+            "native_json": req.native_json, "new": inserted,
+            "engagement_id": req.engagement_id,
+        })
+    except Exception:
+        pass  # Never fail a store because the webhook fan-out did.
+    return {"ok": True, "artifact_id": artifact_id, "new": inserted,
+            "occurrences": occurrences, "content_format": fmt, "sha256": sha}
+
+
+@app.get("/artifacts/stats", tags=["Artifacts"])
+def artifact_stats(authorized: bool = Depends(auth)):
+    """Queue depth by processing state, plus totals."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT llm_status, count(*) n, sum(byte_size) bytes "
+                    "FROM raw_artifacts GROUP BY llm_status")
+        by_status = {r["llm_status"]: {"count": r["n"], "bytes": int(r["bytes"] or 0)}
+                     for r in cur.fetchall()}
+        cur.execute("SELECT count(*) n, sum(byte_size) bytes, count(DISTINCT tool) tools "
+                    "FROM raw_artifacts")
+        tot = cur.fetchone()
+    return {"by_status": by_status, "total": tot["n"],
+            "total_bytes": int(tot["bytes"] or 0), "distinct_tools": tot["tools"]}
+
+
+@app.get("/artifacts", tags=["Artifacts"])
+def list_artifacts(llm_status: Optional[str] = None, tool: Optional[str] = None,
+                   target: Optional[str] = None, source: Optional[str] = None,
+                   content_format: Optional[str] = None,
+                   include_content: bool = False,
+                   limit: int = 50, offset: int = 0,
+                   authorized: bool = Depends(auth)):
+    """List artifacts. Content is omitted unless asked for — these rows are
+    deliberately large, and a listing that inlined them would be unusable."""
+    where, params = [], {}
+    for col, val in (("llm_status", llm_status), ("tool", tool),
+                     ("source", source), ("content_format", content_format)):
+        if val:
+            where.append(f"{col} = %({col})s")
+            params[col] = val
+    if target:
+        where.append("target ILIKE %(target)s")
+        params["target"] = f"%{target}%"
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    cols = ("id, tool, command, target, port, service, exec_id, job_id, scan_id, "
+            "source, content_format, native_json, content_sha256, byte_size, "
+            "first_seen, last_seen, occurrences, llm_status, llm_model, "
+            "llm_processed_at, llm_attempts, llm_error, created_at")
+    if include_content:
+        cols += ", content"
+    params.update({"limit": max(1, min(limit, 500)), "offset": max(0, offset)})
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"SELECT count(*) n FROM raw_artifacts {clause}", params)
+        total = cur.fetchone()["n"]
+        cur.execute(f"SELECT {cols} FROM raw_artifacts {clause} "
+                    f"ORDER BY created_at DESC LIMIT %(limit)s OFFSET %(offset)s", params)
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"total": total, "limit": params["limit"], "offset": params["offset"],
+            "artifacts": rows}
+
+
+@app.post("/artifacts/claim", tags=["Artifacts"])
+def claim_artifacts(limit: int = 5, tool: Optional[str] = None,
+                    llm_model: Optional[str] = None,
+                    authorized: bool = Depends(auth)):
+    """Atomically claim pending artifacts for LLM processing.
+
+    FOR UPDATE SKIP LOCKED means two workers running concurrently take
+    disjoint batches instead of both processing the same rows. Claimed rows
+    move to 'processing'; the caller must report back via
+    /artifacts/{id}/processed (or they stay claimed and can be requeued).
+    """
+    params = {"limit": max(1, min(limit, 100)), "model": llm_model}
+    tool_clause = ""
+    if tool:
+        tool_clause = "AND tool = %(tool)s"
+        params["tool"] = tool
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"""
+            UPDATE raw_artifacts SET llm_status = 'processing',
+                                     llm_attempts = llm_attempts + 1,
+                                     llm_model = COALESCE(%(model)s, llm_model)
+             WHERE id IN (SELECT id FROM raw_artifacts
+                           WHERE llm_status = 'pending' {tool_clause}
+                           ORDER BY created_at
+                           LIMIT %(limit)s FOR UPDATE SKIP LOCKED)
+            RETURNING id, tool, command, target, port, service, exec_id, job_id,
+                      scan_id, source, content_format, native_json, byte_size,
+                      occurrences, llm_attempts, content
+        """, params)
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"claimed": len(rows), "artifacts": rows}
+
+
+@app.get("/artifacts/{artifact_id}", tags=["Artifacts"])
+def get_artifact(artifact_id: str, authorized: bool = Depends(auth)):
+    """One artifact including its complete, untruncated content."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM raw_artifacts WHERE id = %s", (artifact_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, f"artifact {artifact_id} not found")
+    return dict(row)
+
+
+@app.post("/artifacts/{artifact_id}/processed", tags=["Artifacts"])
+def mark_artifact_processed(artifact_id: str, req: ArtifactProcessedRequest,
+                            authorized: bool = Depends(auth)):
+    """Record the outcome of an LLM pass over one artifact."""
+    if req.llm_status not in ("done", "failed", "skipped", "pending"):
+        raise HTTPException(400, "llm_status must be done|failed|skipped|pending")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            UPDATE raw_artifacts
+               SET llm_status = %s, llm_model = COALESCE(%s, llm_model),
+                   llm_result = COALESCE(%s, llm_result), llm_error = %s,
+                   llm_processed_at = now()
+             WHERE id = %s
+            RETURNING id, tool, target, llm_status, llm_model, llm_processed_at
+        """, (req.llm_status, req.llm_model,
+              Json(req.llm_result) if req.llm_result is not None else None,
+              req.llm_error, artifact_id))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, f"artifact {artifact_id} not found")
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("raw_artifact_processed", row["tool"], {
+            "artifact_id": str(row["id"]), "tool": row["tool"],
+            "target": row["target"], "llm_status": row["llm_status"],
+            "llm_model": row["llm_model"],
+        })
+    except Exception:
+        pass
+    return {"ok": True, **{k: (str(v) if k == "id" else v) for k, v in dict(row).items()}}
 
 
 @app.post("/ingest/vulnx")
