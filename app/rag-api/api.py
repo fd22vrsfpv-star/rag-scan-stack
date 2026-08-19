@@ -3102,6 +3102,151 @@ def mark_artifact_processed(artifact_id: str, req: ArtifactProcessedRequest,
     return {"ok": True, **{k: (str(v) if k == "id" else v) for k, v in dict(row).items()}}
 
 
+class QueueActionsRequest(BaseModel):
+    """Actions the operator chose to queue as scan recommendations."""
+    action_ids: List[str]
+    engagement_id: Optional[str] = None
+
+
+def _already_ran(cur, scanner: str, target: str, script: str) -> dict:
+    """Has this exact follow-up already been executed against this target?
+
+    Evidence-based on purpose. An earlier version of this idea suppressed 63
+    NSE recommendations because a *similar* scan had run, when in fact
+    nfs-showmount, rmi-*, distcc-*, snmp-*, tftp-enum, ntp-monlist and
+    x11-access had never run at all. So: match the tool AND the distinctive
+    tokens of the command (script names, template tags), never the tool alone.
+    """
+    if not scanner or not target:
+        return {"ran": False, "count": 0}
+    # `re` is aliased to _re_module at the top of this file; plain `re` is not bound.
+    tokens = [t for t in _re_module.findall(r"[a-z0-9][a-z0-9-]{4,}", (script or "").lower())
+              if t not in ("nmap", "target", "script", "sudo", "http", "https",
+                           "netexec", "nuclei", "katana", "searchsploit")]
+    cur.execute("""
+        SELECT id, command, status, completed_at
+          FROM tool_executions
+         WHERE tool = %s AND target = %s
+         ORDER BY started_at DESC LIMIT 50
+    """, (scanner, target))
+    rows = cur.fetchall()
+    if not rows:
+        return {"ran": False, "count": 0}
+    if not tokens:
+        # No distinguishing tokens — report the tool ran, but do NOT claim this
+        # specific action did.
+        return {"ran": False, "count": 0, "tool_ran_count": len(rows)}
+    matches = [r for r in rows
+               if all(t in (r["command"] or "").lower() for t in tokens)]
+    if not matches:
+        return {"ran": False, "count": 0, "tool_ran_count": len(rows)}
+    newest = matches[0]
+    return {"ran": True, "count": len(matches),
+            "last_exec_id": str(newest["id"]), "last_status": newest["status"],
+            "last_at": newest["completed_at"].isoformat() if newest["completed_at"] else None}
+
+
+@app.get("/artifacts/{artifact_id}/actions", tags=["Artifacts"])
+def get_artifact_actions(artifact_id: str, authorized: bool = Depends(auth)):
+    """Possible follow-on actions derived from this artifact's raw output.
+
+    Each suggestion cites the exact text that triggered it, and is checked
+    against tool_executions so the operator can see what has already been done
+    WITHOUT it being hidden — a suppressed action the operator cannot see is
+    indistinguishable from one that was never considered.
+    """
+    from artifact_actions import suggest_actions
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM raw_artifacts WHERE id = %s", (artifact_id,))
+        art = cur.fetchone()
+        if not art:
+            raise HTTPException(404, f"artifact {artifact_id} not found")
+        actions = suggest_actions(
+            content=art["content"], tool=art["tool"], target=art["target"] or "",
+            port=art["port"], service=art["service"] or "",
+            llm_result=art.get("llm_result"),
+        )
+        for a in actions:
+            a["already_run"] = _already_ran(cur, a["scanner"], art["target"] or "", a["script"])
+        # Which of these are already queued as recommendations?
+        cur.execute("""
+            SELECT scanner, script, status FROM scan_recommendations
+             WHERE host(ip) = %s AND source = 'artifact'
+        """, (art["target"] or "",))
+        queued = {(r["scanner"], r["script"]): r["status"] for r in cur.fetchall()}
+    for a in actions:
+        a["queued_status"] = queued.get((a["scanner"], a["script"]))
+    return {
+        "artifact_id": artifact_id,
+        "tool": art["tool"], "target": art["target"],
+        "content_format": art["content_format"], "native_json": art["native_json"],
+        "llm_status": art["llm_status"],
+        "actions": actions,
+        "counts": {
+            "total": len(actions),
+            "already_run": sum(1 for a in actions if a["already_run"]["ran"]),
+            "queued": sum(1 for a in actions if a["queued_status"]),
+            "needs_input": sum(1 for a in actions if a["needs_input"]),
+        },
+    }
+
+
+@app.post("/artifacts/{artifact_id}/actions/queue", tags=["Artifacts"])
+def queue_artifact_actions(artifact_id: str, req: QueueActionsRequest,
+                           authorized: bool = Depends(auth)):
+    """Queue chosen follow-on actions as scan recommendations.
+
+    Deliberately reuses scan_recommendations rather than inventing a second
+    execution path: that table already has a dispatcher, a force-run override
+    for skipped items, and a UI. Queued rows land as 'pending' and are run from
+    the Recommendations page like any other.
+    """
+    from artifact_actions import suggest_actions
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM raw_artifacts WHERE id = %s", (artifact_id,))
+        art = cur.fetchone()
+        if not art:
+            raise HTTPException(404, f"artifact {artifact_id} not found")
+        if not art["target"]:
+            raise HTTPException(400, "artifact has no target; nothing to scan")
+        actions = {a["id"]: a for a in suggest_actions(
+            content=art["content"], tool=art["tool"], target=art["target"],
+            port=art["port"], service=art["service"] or "",
+            llm_result=art.get("llm_result"))}
+        chosen = [actions[i] for i in req.action_ids if i in actions]
+        unknown = [i for i in req.action_ids if i not in actions]
+        queued = []
+        for a in chosen:
+            cur.execute("""
+                INSERT INTO scan_recommendations
+                    (ip, service, scanner, action, script, source, priority,
+                     status, engagement_id, extra)
+                VALUES (%s,%s,%s,%s,%s,'artifact',%s,'pending',%s,%s)
+                ON CONFLICT (fingerprint) DO UPDATE
+                   SET updated_at = now(),
+                       extra = scan_recommendations.extra || EXCLUDED.extra
+                RETURNING id, status
+            """, (art["target"], art["service"], a["scanner"], a["title"],
+                  a["script"], a["priority"], req.engagement_id or art["engagement_id"],
+                  Json({"artifact_id": artifact_id, "rule_id": a["id"],
+                        "rationale": a["rationale"], "evidence": a["evidence"],
+                        "origin_tool": art["tool"], "suggestion_source": a["source"]})))
+            row = cur.fetchone()
+            queued.append({"recommendation_id": str(row["id"]), "action_id": a["id"],
+                           "scanner": a["scanner"], "script": a["script"],
+                           "status": row["status"]})
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("artifact_actions_queued", art["tool"], {
+            "artifact_id": artifact_id, "target": art["target"],
+            "queued": len(queued), "action_ids": [q["action_id"] for q in queued],
+            "engagement_id": str(req.engagement_id or art["engagement_id"] or ""),
+        })
+    except Exception:
+        pass
+    return {"ok": True, "queued": queued, "unknown_action_ids": unknown}
+
+
 @app.post("/ingest/vulnx")
 def ingest_vulnx(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
     path = _save_upload_to_tmp(file)

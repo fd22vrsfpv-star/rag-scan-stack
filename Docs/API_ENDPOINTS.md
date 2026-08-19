@@ -239,3 +239,5 @@ See `Docs/RAW_ARTIFACTS.md`.
 | POST | `/artifacts/claim` | Atomically claim pending artifacts for LLM processing |
 | GET | `/artifacts/{id}` | One artifact including full content |
 | POST | `/artifacts/{id}/processed` | Record LLM outcome (`done`/`failed`/`skipped`) |
+| GET | `/artifacts/{id}/actions` | Evidence-cited follow-on actions for this artifact |
+| POST | `/artifacts/{id}/actions/queue` | Queue chosen actions as scan recommendations |

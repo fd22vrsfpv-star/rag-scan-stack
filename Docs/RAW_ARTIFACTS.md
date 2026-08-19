@@ -84,6 +84,8 @@ polls.
 | POST | `/artifacts/claim` | Atomically claim pending work (`limit`, `tool`, `llm_model`) |
 | GET | `/artifacts/{id}` | One artifact with full content |
 | POST | `/artifacts/{id}/processed` | Record the LLM outcome |
+| GET | `/artifacts/{id}/actions` | Follow-on actions derived from the artifact |
+| POST | `/artifacts/{id}/actions/queue` | Queue chosen actions as scan recommendations |
 
 Content is omitted from listings unless `include_content=true` — these rows are
 deliberately large.
@@ -108,10 +110,63 @@ Claimed rows sit in `processing`. If a worker dies they stay there rather than
 being silently lost — requeue with
 `UPDATE raw_artifacts SET llm_status='pending' WHERE llm_status='processing' AND llm_processed_at IS NULL`.
 
+## UI — Scan Results
+
+`/scans/results` (sidebar: **Operations → Scan Results**).
+
+A filterable table of every stored output (tool, target, format, size,
+occurrences, processing state). Native-JSON rows are badged, since that is the
+copy worth reading. Opening a row gives two tabs:
+
+**Raw Output** — the complete bytes, JSON/JSONL pretty-printed, with copy and
+download. Nothing is truncated for display.
+
+**Follow-On Actions** — what to do next, derived from the content itself.
+
+### How follow-on actions are decided
+
+Rules live in `app/rag-api/artifact_actions.py` — pure functions, no database
+and no network, so they are testable on fixtures alone. Four constraints shape
+them, each learned from a real failure in this codebase:
+
+1. **Every suggestion cites its evidence** — the exact line that triggered it,
+   shown in the UI. A follow-up an operator cannot justify is one they cannot
+   act on.
+2. **Tool chatter is not evidence.** crackmapexec prints
+   `Generating SSL certificate` while creating its *own* config directory; that
+   proposed a TLS audit of a host showing no TLS. `strip_tool_noise()` drops
+   these lines, and a test pins both halves — the noise must not fire, and
+   genuine TLS evidence must still fire.
+3. **Nothing is hidden as "already done."** Each action is checked against
+   `tool_executions`, matching the tool AND the command's distinctive tokens,
+   and shown as `ran N×` rather than suppressed. Suppressing on assumption
+   previously hid 63 NSE scripts that had never actually run. A tool that ran
+   with *different* arguments reports `tool_ran_count` and is NOT claimed as
+   already run.
+4. **Only the artifact's own target is ever acted on.** Hosts merely mentioned
+   in output (a redirect to twitter.com, a banner citing twiki.org) are never
+   turned into scan targets.
+
+Commands with unresolved placeholders — recovered credentials, for instance —
+are marked **needs input** rather than presented as runnable.
+
+### Queuing
+
+Selected actions are inserted into `scan_recommendations` with
+`source='artifact'` and `extra` carrying `artifact_id`, `rule_id`, `rationale`
+and `evidence`. This deliberately reuses the existing recommendation path
+rather than adding a second executor: that table already has a dispatcher, a
+force-run override for skipped items, and a UI. Queued actions are run from the
+Recommendations page like any other, and the results come back as new
+artifacts — closing the loop.
+
+Webhook: `artifact_actions_queued`.
+
 ## Webhooks
 
 - `raw_artifact_stored` — `{artifact_id, tool, target, bytes, content_format, native_json, new}`
 - `raw_artifact_processed` — `{artifact_id, tool, target, llm_status, llm_model}`
+- `artifact_actions_queued` — `{artifact_id, target, queued, action_ids}`
 
 ## Install & health
 
@@ -123,10 +178,13 @@ ever archived) and `idx_raw_artifacts_llm_status` (the queue scan).
 ## Tests
 
 ```bash
-pytest tests/test_raw_artifacts.py -v
+pytest tests/test_raw_artifacts.py -v      # 26 tests: JSON flags, archive, queue
+pytest tests/test_artifact_actions.py -v   # 20 tests: suggestion rules
 ```
 
-26 tests. The JSON-flag tests parse `apply_json_output` out of the listener
+The action tests pin the failure modes that matter: rules firing on tool
+chatter, suggestions without evidence, placeholders presented as runnable, and
+mentioned hosts becoming targets. The JSON-flag tests parse `apply_json_output` out of the listener
 source rather than importing the module, so they run without fastapi installed.
 The DB tests skip cleanly when no Postgres is reachable:
 
