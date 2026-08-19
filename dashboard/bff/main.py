@@ -32,6 +32,7 @@ from routers.credentials import router as credentials_router
 from routers.identities import router as identities_router
 from routers.opsec import router as opsec_router
 from routers.followups import router as followups_router
+from routers.artifacts import router as artifacts_router
 from routers.api_tester import router as api_tester_router
 from routers.about import router as about_router
 from routers.delta import router as delta_router
@@ -91,6 +92,7 @@ app.add_middleware(
 
 # Register all routers
 app.include_router(health_router)
+app.include_router(artifacts_router)
 app.include_router(assets_router)
 app.include_router(findings_router)
 # Must precede scans_router: its POST /api/import/{tool} catch-all would
