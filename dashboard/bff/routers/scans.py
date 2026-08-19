@@ -1949,6 +1949,55 @@ async def get_scan(job_id: str):
                         return safe_json(resp)
             except Exception:
                 continue
+
+        # Kali tool executions.
+        #
+        # These now appear in the scans LIST (merged from tool_executions), so a
+        # click through to the detail view has to resolve too — otherwise every
+        # tool run in the monitor is a 404, which is worse than not listing them
+        # at all. They have no /jobs/{id} on any scanner because they never went
+        # through a scanner service.
+        #
+        # The captured stdout is returned as `output`: for a CLI tool that IS the
+        # result, and without it the detail page can say a tool completed while
+        # showing nothing it produced.
+        try:
+            from db import get_db
+            with get_db() as _c, _c.cursor() as _cur:
+                _cur.execute(
+                    """SELECT id, tool, command, target, port, service, status,
+                              exit_code, output, error, parsed_results,
+                              started_at, completed_at
+                         FROM tool_executions WHERE id = %s::uuid""",
+                    (job_id,),
+                )
+                _r = _cur.fetchone()
+            if _r:
+                (_id, _tool, _cmd, _target, _port, _svc, _status, _exit,
+                 _out, _err, _parsed, _start, _end) = _r
+                return {
+                    "job_id": str(_id),
+                    "type": _tool,
+                    "kind": "tool",
+                    "status": _status or "unknown",
+                    "target": _target,
+                    "port": _port,
+                    "service": _svc,
+                    "command": _cmd,
+                    "exit_code": _exit,
+                    "created_at": _start.isoformat() if _start else None,
+                    "completed_at": _end.isoformat() if _end else None,
+                    "service_url": "kali-listener",
+                    "output": _out or "",
+                    "error": _err,
+                    "parsed_results": _parsed,
+                    "summary": (_out or "").strip().splitlines()[-1][:300] if _out else "",
+                }
+        except HTTPException:
+            raise
+        except Exception as _e:
+            log.debug(f"tool_executions detail lookup failed for {job_id}: {_e}")
+
         raise HTTPException(404, "Job not found")
 
     async with httpx.AsyncClient(timeout=15) as c:
