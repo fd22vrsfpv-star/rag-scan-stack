@@ -24,6 +24,10 @@ import psycopg2
 # recorded here and the same finding recorded by parse_nuclei/parse_nmap would
 # survive as two rows no matter how good the unique index was.
 from etl.fingerprint import vuln_fingerprint, web_fingerprint, recon_fingerprint
+try:
+    from scope_gate import load_ingest_scope, host_in_scope
+except ImportError:  # pragma: no cover
+    from etl.scope_gate import load_ingest_scope, host_in_scope
 from psycopg2.extras import RealDictCursor
 
 log = logging.getLogger(__name__)
@@ -474,6 +478,7 @@ def structure_tool_output(
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            _enf_scope, _scope_rows = load_ingest_scope(cur)
             asset_id = _resolve_asset_id(cur, target)
 
             # --- Strategy 0: Tool-specific parser ---
@@ -556,6 +561,16 @@ def structure_tool_output(
                 for url in all_urls[:50]:  # cap at 50
                     try:
                         cur.execute("SAVEPOINT tool_rec")
+                        # Tool banners advertise their own project URLs —
+                        # nmap prints nmap.org, sqlmap prints sqlmap.org, and
+                        # several print github.com. Extracting URLs from stdout
+                        # therefore files findings against third-party hosts that
+                        # were never scanned. Four such rows appeared the moment
+                        # tool stdout started being ingested.
+                        if not host_in_scope(url, _enf_scope, _scope_rows):
+                            stats["out_of_scope"] = stats.get("out_of_scope", 0) + 1
+                            cur.execute("RELEASE SAVEPOINT tool_rec")
+                            continue
                         fid = _insert_web_finding(
                             cur, tool_name, url, target,
                             global_severity, job_id
