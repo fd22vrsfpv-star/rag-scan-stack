@@ -578,3 +578,15 @@ else
   echo "All critical checks passed."
   exit 0
 fi
+
+# ── Running code vs working tree ──────────────────────────────────────────
+# Most services bake their source into the image, so `docker compose restart`
+# re-runs OLD code with no error. A scope fix once sat committed and believed
+# live for hours while the container kept ingesting out-of-scope hosts.
+echo ""
+echo "🔍 Verifying containers run the current code..."
+if python3 "$(dirname "${BASH_SOURCE[0]}")/check_image_freshness.py"; then
+    :
+else
+    echo "   ^ rebuild the services listed above; a restart will not help"
+fi

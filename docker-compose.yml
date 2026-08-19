@@ -161,6 +161,25 @@ services:
     build:
       context: .
       dockerfile: app/rag-api/Dockerfile
+    # `docker compose watch` syncs edits into the running container, so a
+    # code change takes effect without a rebuild. Baked images remain the
+    # deploy artifact; this only changes the DEV loop, which is where
+    # silently-stale code actually bites.
+    #
+    # Deliberately NOT a bind mount of the source: a bind mount also hides a
+    # missing COPY in the Dockerfile, so code works locally and the clean
+    # build breaks. sync keeps the image honest.
+    #
+    # target is this image's REAL root (/app) — they differ per service.
+    develop:
+      watch:
+        - action: sync
+          path: ./app/rag-api
+          target: /app
+          ignore:
+            - __pycache__/
+        - action: rebuild
+          path: ./app/rag-api/requirements.txt
     container_name: rag-api
     restart: unless-stopped
     logging:
@@ -467,6 +486,25 @@ services:
     build:
       context: .
       dockerfile: osint_runner/Dockerfile
+    # `docker compose watch` syncs edits into the running container, so a
+    # code change takes effect without a rebuild. Baked images remain the
+    # deploy artifact; this only changes the DEV loop, which is where
+    # silently-stale code actually bites.
+    #
+    # Deliberately NOT a bind mount of the source: a bind mount also hides a
+    # missing COPY in the Dockerfile, so code works locally and the clean
+    # build breaks. sync keeps the image honest.
+    #
+    # target is this image's REAL root (/runner) — they differ per service.
+    develop:
+      watch:
+        - action: sync
+          path: ./osint_runner
+          target: /runner
+          ignore:
+            - __pycache__/
+        - action: rebuild
+          path: ./osint_runner/requirements.txt
     container_name: osint-runner
     restart: unless-stopped
     logging:
@@ -524,6 +562,25 @@ services:
     build:
       context: .
       dockerfile: pd_runner/Dockerfile
+    # `docker compose watch` syncs edits into the running container, so a
+    # code change takes effect without a rebuild. Baked images remain the
+    # deploy artifact; this only changes the DEV loop, which is where
+    # silently-stale code actually bites.
+    #
+    # Deliberately NOT a bind mount of the source: a bind mount also hides a
+    # missing COPY in the Dockerfile, so code works locally and the clean
+    # build breaks. sync keeps the image honest.
+    #
+    # target is this image's REAL root (/runner) — they differ per service.
+    develop:
+      watch:
+        - action: sync
+          path: ./pd_runner
+          target: /runner
+          ignore:
+            - __pycache__/
+        - action: rebuild
+          path: ./pd_runner/requirements.txt
     container_name: pd-runner
     restart: unless-stopped
     logging:
@@ -874,6 +931,25 @@ services:
     build:
       context: ./autogen_agents
       dockerfile: Dockerfile
+    # `docker compose watch` syncs edits into the running container, so a
+    # code change takes effect without a rebuild. Baked images remain the
+    # deploy artifact; this only changes the DEV loop, which is where
+    # silently-stale code actually bites.
+    #
+    # Deliberately NOT a bind mount of the source: a bind mount also hides a
+    # missing COPY in the Dockerfile, so code works locally and the clean
+    # build breaks. sync keeps the image honest.
+    #
+    # target is this image's REAL root (/app) — they differ per service.
+    develop:
+      watch:
+        - action: sync
+          path: ./autogen_agents
+          target: /app
+          ignore:
+            - __pycache__/
+        - action: rebuild
+          path: ./autogen_agents/requirements.txt
     container_name: autogen-agents
     restart: unless-stopped
     logging:
@@ -1985,6 +2061,25 @@ services:
     build:
       context: ./dashboard
       dockerfile: Dockerfile
+    # `docker compose watch` syncs edits into the running container, so a
+    # code change takes effect without a rebuild. Baked images remain the
+    # deploy artifact; this only changes the DEV loop, which is where
+    # silently-stale code actually bites.
+    #
+    # Deliberately NOT a bind mount of the source: a bind mount also hides a
+    # missing COPY in the Dockerfile, so code works locally and the clean
+    # build breaks. sync keeps the image honest.
+    #
+    # target is this image's REAL root (/app/bff) — they differ per service.
+    develop:
+      watch:
+        - action: sync
+          path: ./dashboard/bff
+          target: /app/bff
+          ignore:
+            - __pycache__/
+        - action: rebuild
+          path: ./dashboard/bff/requirements.txt
     container_name: pentest-dashboard
     restart: unless-stopped
     logging:
