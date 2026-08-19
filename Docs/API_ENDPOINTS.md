@@ -225,3 +225,17 @@ Use `http://<service-name>:<port>` (e.g., `http://nmap_scanner:8012`)
 
 ### From Another Container
 Services can communicate using their container names via the `agents_net` Docker network.
+
+## Raw Artifacts
+
+Complete, untruncated tool output for post-analysis and LLM processing.
+See `Docs/RAW_ARTIFACTS.md`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/ingest/raw-artifact` | Store one tool's complete output (deduped on tool+target+sha256) |
+| GET | `/artifacts` | List/filter artifacts (content omitted unless `include_content=true`) |
+| GET | `/artifacts/stats` | Queue depth and bytes by `llm_status` |
+| POST | `/artifacts/claim` | Atomically claim pending artifacts for LLM processing |
+| GET | `/artifacts/{id}` | One artifact including full content |
+| POST | `/artifacts/{id}/processed` | Record LLM outcome (`done`/`failed`/`skipped`) |

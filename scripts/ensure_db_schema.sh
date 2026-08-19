@@ -128,6 +128,7 @@ CRITICAL_TABLES=(
     "detection_rule_state"
     "cloud_scan_recommendations"
     "service_prompts"
+    "raw_artifacts"
 )
 
 MISSING=0
@@ -161,6 +162,12 @@ CRITICAL_INDEXES=(
     "uq_vulns_fingerprint"
     "uq_credential_findings_identity"
     "uq_recon_findings_fingerprint"
+    # Required by the ON CONFLICT upsert in /ingest/raw-artifact. Without it
+    # every archived tool output raises instead of deduping, and the complete
+    # raw output an LLM pass reads from is silently never stored.
+    "uq_raw_artifacts_identity"
+    # The LLM post-processing queue scans WHERE llm_status='pending'.
+    "idx_raw_artifacts_llm_status"
 )
 for idx in "${CRITICAL_INDEXES[@]}"; do
     if docker exec rag-postgres psql -U app -d scans -t -c \

@@ -1055,10 +1055,97 @@ def get_allowed_tools() -> set:
 ALLOWED_TOOLS = _FALLBACK_ALLOWED_TOOLS
 
 
+def store_raw_artifact(tool: str, content: str, command: str = "", target: str = "",
+                       port=None, service=None, exec_id: str = None, job_id: str = None,
+                       native_json: bool = False) -> None:
+    """Persist COMPLETE tool output to the artifact store.
+
+    Deliberately separate from the /ingest/tool-output call below, which
+    truncates at 200 KB and exists to produce findings. This keeps every byte
+    for later analysis — including the tool's native JSON file, which used to
+    be read, parsed and then unlinked, so the one authoritative structured
+    artifact was the only thing never kept.
+
+    Failures are logged and swallowed: the tool already ran, and losing the
+    archive copy must not turn a successful execution into a failed one.
+    """
+    if not content or not content.strip():
+        return
+    try:
+        import requests as req_lib
+        r = req_lib.post(
+            f"{API_BASE}/ingest/raw-artifact",
+            json={"tool": tool, "content": content, "command": (command or "")[:4000],
+                  "target": target or "", "port": port, "service": service,
+                  "exec_id": exec_id, "job_id": job_id,
+                  "source": "kali_listener", "native_json": native_json},
+            headers={"x-api-key": API_KEY}, timeout=120, verify=False,
+        )
+        if r.status_code < 400:
+            d = r.json()
+            logger.info(f"[{(exec_id or '')[:8]}] archived {len(content)} bytes "
+                        f"({d.get('content_format')}, native_json={native_json}) "
+                        f"-> {d.get('artifact_id')} new={d.get('new')}")
+        else:
+            logger.warning(f"[{(exec_id or '')[:8]}] artifact store HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        logger.warning(f"[{(exec_id or '')[:8]}] artifact store failed: {e}")
+
+
+# Tools whose NATIVE JSON output we prefer over parsing their text.
+#
+# Guessing structure out of CLI text goes wrong in ways that are worse than
+# useless: the table strategy read crackmapexec's whitespace-aligned SMB banner
+# as a header row, so the DATA became the column NAMES. Where a tool can emit
+# JSON itself, that is authoritative and free.
+#
+# Each flag was verified against `--help` INSIDE this image, not assumed — most
+# of these write JSON to a FILE rather than stdout, which changes how the output
+# has to be collected:
+#
+#   nuclei          -jsonl                 -> stdout (JSONL)
+#   enum4linux-ng   -oJ <file>             -> file (appends .json itself)
+#   whatweb         --log-json=<file>      -> file
+#   dnsrecon        --json <file>          -> file
+#   sqlmap          --report-json=<file>   -> file
+#
+# crackmapexec, netexec and nikto have no JSON option in this image and keep
+# using the text path, which is why raw_output is still preserved there.
+JSON_CAPABLE = {
+    "nuclei":        {"flag": "-jsonl", "mode": "stdout"},
+    "enum4linux-ng": {"flag": "-oJ {out}", "mode": "file", "suffix": ".json"},
+    "whatweb":       {"flag": "--log-json={out}", "mode": "file"},
+    "dnsrecon":      {"flag": "--json {out}", "mode": "file"},
+    "sqlmap":        {"flag": "--report-json={out}", "mode": "file"},
+}
+
+
+def apply_json_output(tool: str, command: str):
+    """Return (command, json_path). Adds the tool's native JSON flag.
+
+    Never overrides an explicit choice: if the command already asks for JSON, it
+    is left alone. A tool not in the map is returned unchanged rather than
+    guessed at — appending an unsupported flag would fail the whole run, which is
+    worse than parsing its text.
+    """
+    spec = JSON_CAPABLE.get((tool or "").lower())
+    if not spec:
+        return command, None
+    if any(tok in command for tok in ("-json", "--json", "-jsonl", "-oJ", "--log-json")):
+        return command, None
+    if spec["mode"] == "stdout":
+        return f"{command} {spec['flag']}", None
+    out = f"/tmp/{(tool or 'tool')}-{uuid.uuid4().hex[:8]}"
+    cmd = f"{command} {spec['flag'].format(out=out)}"
+    return cmd, out + spec.get("suffix", "")
+
+
 async def execute_tool(exec_id: str, tool: str, command: str, timeout: int,
                        target: str = "", port: int = None,
                        service: str = None, job_id: str = None):
     """Execute a tool command and capture output."""
+    # Prefer the tool's own JSON where it has one.
+    command, _json_path = apply_json_output(tool, command)
     logger.info(f"[{exec_id[:8]}] Executing: {command}")
 
     # Update status to running
@@ -1115,18 +1202,47 @@ async def execute_tool(exec_id: str, tool: str, command: str, timeout: int,
             # /ingest/tool-output applies the generic structurer — JSON, then
             # table, CVE, URL, key-value, raw-text fallback — so every tool
             # surfaces something rather than only the six with bespoke parsers.
-            if output and output.strip():
+            # Prefer the tool's own JSON file when it wrote one: authoritative
+            # structure beats inferring columns from aligned text.
+            ingest_payload = output
+            _native = False
+            if _json_path:
+                try:
+                    _jp = pathlib.Path(_json_path)
+                    if _jp.exists() and _jp.stat().st_size > 0:
+                        ingest_payload = _jp.read_text(errors="replace")
+                        _native = True
+                        logger.info(f"[{exec_id[:8]}] using native JSON from {_json_path}")
+                    _jp.unlink(missing_ok=True)
+                except Exception as _je:
+                    logger.debug(f"[{exec_id[:8]}] JSON output unusable, using stdout: {_je}")
+
+            # Archive EVERY byte before anything lossy touches it. Both copies
+            # are kept when a tool emitted native JSON: the JSON is the better
+            # input for machine processing, but stdout often carries context
+            # (warnings, timing, banners) the JSON file omits entirely.
+            store_raw_artifact(tool, output, command, target, port, service,
+                               exec_id, job_id, native_json=False)
+            if _native:
+                store_raw_artifact(tool, ingest_payload, command, target, port,
+                                   service, exec_id, job_id, native_json=True)
+
+            if ingest_payload and ingest_payload.strip():
                 try:
                     import requests as req_lib
                     req_lib.post(
                         f"{API_BASE}/ingest/tool-output",
                         json={
-                            "stdout": output[:200000],
+                            "stdout": ingest_payload[:200000],
                             "tool_name": tool,
                             "target": target or "",
                             "port": port,
                             "service": service,
                             "job_id": job_id,
+                            # Already archived above — don't double-count.
+                            "archived": True,
+                            "command": command[:4000],
+                            "source": "kali_listener",
                         },
                         headers={"x-api-key": API_KEY},
                         timeout=60,
