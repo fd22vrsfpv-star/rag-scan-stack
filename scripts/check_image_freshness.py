@@ -88,24 +88,46 @@ def md5(path):
     return hashlib.md5(path.read_bytes()).hexdigest()
 
 
-def _container_root(host_files, ctx_dir, table):
-    """Where this build context landed inside the image.
+def _resolve_layout(host_files, ctx_dir, table):
+    """Where this build context landed, and in what shape.
 
-    Anchoring matters. Matching each file by path SUFFIX looks fine until a
-    top-level `__init__.py` matches /usr/share/gcc/python/libstdcxx/__init__.py
-    and the service is reported stale on a file it shares a name with. So pick
-    the most distinctive file — the deepest relative path, which is least likely
-    to collide — resolve THAT one, and derive a single root from it. Everything
-    else is then compared at an exact path.
+    Returns (root, flattened, hits) or None.
+
+    Two shapes exist in this repo:
+
+      structured  host `bff/main.py`      -> container `/app/bff/main.py`
+      flattened   host `node_manager.py`  -> container `/app/node_manager.py`
+                  (node_manager/Dockerfile COPYs each file to /app/<name>.py)
+
+    Scoring beats requiring a unique anchor. node-manager's image contains the
+    source TWICE — once flattened by the Dockerfile at /app/*.py and once via a
+    bind mount at /app/node_manager/* — so every anchor had two candidates and
+    the earlier version refused to guess, leaving the service unchecked.
+
+    Which copy is right is not a toss-up: `uvicorn node_manager:app` imports
+    /app/node_manager.py, and /app/node_manager/ has no __init__.py so it is
+    never imported. Preferring the root that matches the MOST files, and
+    breaking ties toward the shallower root, lands on the code that actually
+    runs.
     """
-    candidates = sorted(host_files, key=lambda f: len(f.relative_to(ctx_dir).parts),
-                        reverse=True)
-    for f in candidates:
-        rel = f.relative_to(ctx_dir).as_posix()
-        hits = [p for p in table if p.endswith("/" + rel)]
-        if len(hits) == 1:
-            return hits[0][: -len(rel)]          # keeps the trailing slash
-    return None
+    rels = [f.relative_to(ctx_dir).as_posix() for f in host_files]
+    roots = {}
+    for path in table:
+        for rel in rels:
+            if path.endswith("/" + rel):
+                roots.setdefault(path[: -len(rel)], set()).add(("structured", rel))
+            elif path.endswith("/" + rel.rsplit("/", 1)[-1]) and "/" not in rel:
+                roots.setdefault(path.rsplit("/", 1)[0] + "/", set()).add(("flat", rel))
+    if not roots:
+        return None
+
+    def score(item):
+        root, hits = item
+        return (len(hits), -root.count("/"))       # most files, then shallowest
+
+    root, hits = max(roots.items(), key=score)
+    flattened = all(kind == "flat" for kind, _ in hits)
+    return root, flattened, len(hits)
 
 
 def check(svc, ctx, live):
@@ -125,21 +147,24 @@ def check(svc, ctx, live):
     if not host_files:
         return None
 
-    root = _container_root(host_files, ctx_dir, table)
-    if root is None:
+    layout = _resolve_layout(host_files, ctx_dir, table)
+    if layout is None:
         print(f"?      {svc}: could not locate this build context inside the image")
         return None
+    root, flattened, _ = layout
 
     drift, checked = [], 0
     for f in host_files:
         rel = f.relative_to(ctx_dir).as_posix()
-        digest = table.get(root + rel)
+        key = root + (rel.rsplit("/", 1)[-1] if flattened else rel)
+        digest = table.get(key)
         if digest is None:
             continue          # not shipped in this image; not drift
         checked += 1
         if md5(f) != digest:
             drift.append(rel)
 
+    shape = "flattened" if flattened else "structured"
     if drift:
         print(f"STALE  {svc} — {len(drift)} of {checked} file(s) differ from the image")
         for d in drift[:8]:
@@ -148,7 +173,7 @@ def check(svc, ctx, live):
             print(f"         ... and {len(drift) - 8} more")
         print(f"       fix: docker compose build {svc} && docker compose up -d {svc}")
     else:
-        print(f"ok     {svc} ({checked} file(s) match, root {root})")
+        print(f"ok     {svc} ({checked} file(s) match, root {root} {shape})")
     return bool(drift)
 
 
