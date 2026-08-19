@@ -17,6 +17,7 @@ Nothing in the stack reported that. This does.
 Exit code 1 if any service is stale, so it can gate a deploy or a test run.
 """
 import hashlib
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -49,12 +50,34 @@ SERVICES = {
 SKIP = ("/proc/", "/__pycache__/", "/site-packages/", "/dist-packages/",
         "/usr/lib/python", "/usr/local/lib/python", "/node_modules/")
 
+# Extensions worth comparing. Python was not enough: a stale frontend bundle, a
+# changed requirements.txt (dependencies differ from the image) or an edited SQL
+# migration are all invisible to a .py-only check. Binaries under bin/ and the
+# .agentic-security/ tool state are excluded as noise rather than source.
+EXTENSIONS = (".py", ".sql", ".sh", ".json", ".yaml", ".yml", ".conf",
+              ".ini", ".toml", ".txt", ".md", ".html", ".css")
+
+_NAME_EXPR = " -o ".join(f"-name '*{e}'" for e in EXTENSIONS)
+
 FIND = (
-    "find / -name '*.py' -type f "
+    f"find / \\( {_NAME_EXPR} \\) -type f "
     "-not -path '*/proc/*' -not -path '*/__pycache__/*' "
     "-not -path '*/site-packages/*' -not -path '*/dist-packages/*' "
+    "-not -path '*/node_modules/*' -not -path '*/.git/*' "
     "2>/dev/null | xargs -r md5sum 2>/dev/null"
 )
+
+
+def _noise(path):
+    """Files that live in a build context but are not shipped source.
+
+    .agentic-security/ is scanner state that changes constantly, bin/ holds
+    vendored tool binaries, and Dockerfile itself is a build input rather than
+    something copied in — comparing them produces drift that means nothing.
+    """
+    parts = set(path.parts)
+    return bool(parts & {"__pycache__", ".agentic-security", "bin", "node_modules",
+                         ".git", "dist", "build"}) or path.name == "Dockerfile"
 
 
 def _sh(args, timeout=120):
@@ -142,8 +165,9 @@ def check(svc, ctx, live):
         print(f"?      {svc}: could not read source from the container")
         return None
 
-    host_files = [f for f in sorted(ctx_dir.rglob("*.py"))
-                  if "__pycache__" not in f.parts]
+    host_files = [f for f in sorted(ctx_dir.rglob("*"))
+                  if f.is_file() and f.suffix in EXTENSIONS
+                  and not _noise(f)]
     if not host_files:
         return None
 
@@ -177,6 +201,48 @@ def check(svc, ctx, live):
     return bool(drift)
 
 
+def check_frontend(live):
+    """Is the SERVED frontend bundle built from this working tree?
+
+    Hashing cannot answer this: the frontend is a build artifact, so
+    src/lib/constants.ts never appears verbatim in dist/assets/*.js. What does
+    survive the build is BUILD_VERSION, which the project already requires to be
+    bumped in lockstep across constants.ts, package.json and .env.
+
+    That makes it a usable staleness marker — and it caught a real one: the repo
+    was at 2026.08.17-1330 while the container was still serving 2026.08.17-1105,
+    invisible to a source-hash check of any kind.
+    """
+    svc = "pentest-dashboard"
+    if svc not in live:
+        return None
+
+    src = ROOT / "dashboard" / "frontend" / "src" / "lib" / "constants.ts"
+    if not src.exists():
+        return None
+    m = re.search(r"BUILD_VERSION\s*=\s*['\"]([^'\"]+)", src.read_text())
+    if not m:
+        return None
+    want = m.group(1)
+
+    out = _sh(["docker", "exec", svc, "sh", "-c",
+               "grep -rhoE '[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}-[0-9]{4}' "
+               "/app/frontend/dist/assets/*.js 2>/dev/null | sort -u"])
+    served = [v for v in out.split() if v]
+    if not served:
+        print(f"?      {svc} frontend: no BUILD_VERSION found in the served bundle")
+        return None
+
+    if want in served:
+        print(f"ok     {svc} frontend bundle is {want}")
+        return False
+
+    print(f"STALE  {svc} frontend bundle is {', '.join(served)} but the tree says {want}")
+    print(f"       the UI is serving an older build than this checkout")
+    print(f"       fix: docker compose build {svc} && docker compose up -d {svc}")
+    return True
+
+
 def main():
     want = sys.argv[1] if len(sys.argv) > 1 else None
     live = running()
@@ -191,6 +257,11 @@ def main():
         r = check(svc, ctx, live)
         if r is not None:
             results.append((svc, r))
+
+    if not want or want == "pentest-dashboard":
+        fr = check_frontend(live)
+        if fr is not None:
+            results.append(("pentest-dashboard frontend", fr))
 
     stale = [s for s, bad in results if bad]
     print()
