@@ -561,9 +561,14 @@ async def list_scan_recommendations(
     s = get_settings()
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            params = {"limit": str(limit)}
-            if status != "all":
-                params["status"] = status
+            # Pass `status` through ALWAYS, including "all".
+            #
+            # Omitting it for "all" let the upstream default take over — and that
+            # default is "pending", so asking for every status returned only
+            # pending and the 28 completed recommendations were invisible. The
+            # upstream already treats "all" as "no filter"; it just has to be
+            # told.
+            params = {"limit": str(limit), "status": status}
             resp = await c.get(
                 f"{s.rag_api_url}/scan-recommendations",
                 params=params,

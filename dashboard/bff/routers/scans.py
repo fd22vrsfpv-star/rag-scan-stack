@@ -1523,7 +1523,14 @@ async def launch_scan(scan_type: str, req: ScanRequest):
 
 
 @router.get("/api/scans")
-async def list_scans(engagement_id: Optional[str] = None):
+async def list_scans(
+    engagement_id: Optional[str] = None,
+    limit: Optional[int] = Query(None, ge=1, le=1000,
+                                 description="Page size. Omit to return everything (default)."),
+    offset: int = Query(0, ge=0, description="Rows to skip, for paging."),
+    kind: Optional[str] = Query(None,
+                                description="Filter by kind, e.g. 'tool' for kali tool runs."),
+):
     """Return all tracked jobs, merged with autogen agent scans and recent audit log entries.
 
     When ``engagement_id`` is provided, only scans belonging to that engagement
@@ -1772,16 +1779,31 @@ async def list_scans(engagement_id: Optional[str] = None):
     #
     # Merged last and keyed by execution id so it cannot collide with a job_id
     # from the sources above.
+    _tool_total = 0
     try:
         from db import get_db
         with get_db() as _c, _c.cursor() as _cur:
+            # Fetch enough to satisfy the requested window rather than a fixed
+            # 200. The other sources are already in `jobs` and are small, but
+            # they can be NEWER than some tool rows and so occupy slots in the
+            # merged ordering — fetching only offset+limit would drop tool rows
+            # that belong on the page. Adding len(jobs) covers that worst case.
+            _cap = (offset + limit + len(jobs)) if limit else 1000
+            # True total, independent of the fetch window. Deriving `total` from
+            # the merged list made it grow with the page number (364 at offset 0,
+            # 414 at offset 50) because the cap itself grows with offset — a
+            # "total" that changes as you page is worse than none, since a UI
+            # computes its page count from it.
+            _cur.execute("SELECT count(*) FROM tool_executions")
+            _tool_total = _cur.fetchone()[0] or 0
             _cur.execute(
                 """SELECT id, tool, target, port, service, status,
                           started_at, completed_at, exit_code,
                           length(coalesce(output, '')) AS out_len
                      FROM tool_executions
                     ORDER BY started_at DESC NULLS LAST
-                    LIMIT 200"""
+                    LIMIT %s""",
+                (_cap,),
             )
             for r in _cur.fetchall():
                 (_id, _tool, _target, _port, _svc, _status,
@@ -1804,7 +1826,34 @@ async def list_scans(engagement_id: Optional[str] = None):
     except Exception as _e:
         log.debug(f"tool_executions merge skipped: {_e}")
 
-    return {"jobs": jobs}
+    if kind:
+        jobs = [j for j in jobs if (j.get("kind") or "") == kind]
+
+    # Sort newest-first across every source so a page means something. Rows with
+    # no timestamp sort last rather than crashing the comparison.
+    jobs.sort(key=lambda j: (j.get("created_at") or ""), reverse=True)
+
+    # non-tool sources are fully materialised; tool rows are windowed, so the
+    # honest total is (everything else) + (all tool executions).
+    _non_tool = len([j for j in jobs if (j.get("kind") or "") != "tool"])
+    total = _non_tool + (_tool_total)
+    if kind == "tool":
+        total = _tool_total
+    elif kind:
+        total = len(jobs)
+    # `limit` is opt-in. Defaulting it on would silently truncate existing
+    # callers — useScanCount counts running/queued across the WHOLE list, so a
+    # default page size would quietly under-report active scans.
+    if limit is not None:
+        jobs = jobs[offset:offset + limit]
+
+    return {
+        "jobs": jobs,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "returned": len(jobs),
+    }
 
 
 @router.delete("/api/scans/{job_id}")
