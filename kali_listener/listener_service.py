@@ -1055,7 +1055,9 @@ def get_allowed_tools() -> set:
 ALLOWED_TOOLS = _FALLBACK_ALLOWED_TOOLS
 
 
-async def execute_tool(exec_id: str, tool: str, command: str, timeout: int):
+async def execute_tool(exec_id: str, tool: str, command: str, timeout: int,
+                       target: str = "", port: int = None,
+                       service: str = None, job_id: str = None):
     """Execute a tool command and capture output."""
     logger.info(f"[{exec_id[:8]}] Executing: {command}")
 
@@ -1098,6 +1100,42 @@ async def execute_tool(exec_id: str, tool: str, command: str, timeout: int):
             db_update_tool_execution(
                 exec_id, status, exit_code, output, error, parsed_results
             )
+
+            # Turn the output into findings.
+            #
+            # Without this a tool runs, succeeds, stores 1KB of real output in
+            # tool_executions — and the operator sees nothing. crackmapexec
+            # returned the host's SMB banner (signing:False, SMBv1:True) 21 times
+            # and produced not one finding, which reads as "selecting the
+            # recommendation does nothing".
+            #
+            # parse_tool_output above only covers 6 tools (nmap, hydra, nikto,
+            # enum4linux, ssh-audit, whatweb) out of 78 allowlisted, so for
+            # nearly everything it returns None and the output dies here.
+            # /ingest/tool-output applies the generic structurer — JSON, then
+            # table, CVE, URL, key-value, raw-text fallback — so every tool
+            # surfaces something rather than only the six with bespoke parsers.
+            if output and output.strip():
+                try:
+                    import requests as req_lib
+                    req_lib.post(
+                        f"{API_BASE}/ingest/tool-output",
+                        json={
+                            "stdout": output[:200000],
+                            "tool_name": tool,
+                            "target": target or "",
+                            "port": port,
+                            "service": service,
+                            "job_id": job_id,
+                        },
+                        headers={"x-api-key": API_KEY},
+                        timeout=60,
+                        verify=False,
+                    )
+                except Exception as e:
+                    # Never fail the execution because reporting failed — the
+                    # output is already persisted on the row above.
+                    logger.warning(f"[{exec_id[:8]}] tool-output ingest failed: {e}")
 
             # Update in-memory tracking
             active_executions[exec_id].update({
@@ -1516,7 +1554,8 @@ async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: B
 
     # Start execution in background
     background_tasks.add_task(
-        execute_tool, exec_id, request.tool, request.command, request.timeout
+        execute_tool, exec_id, request.tool, request.command, request.timeout,
+        request.target, request.port, request.service, request.scan_id
     )
 
     logger.info(f"[{exec_id[:8]}] Queued tool execution: {request.tool} -> {request.target}")
@@ -1768,7 +1807,8 @@ async def execute_recommended_tools(
         }
 
         # Queue execution
-        background_tasks.add_task(execute_tool, exec_id, tool_name, command, 300)
+        background_tasks.add_task(execute_tool, exec_id, tool_name, command, 300,
+                                  target, None, None, None)
 
         executions.append({
             "id": exec_id,
