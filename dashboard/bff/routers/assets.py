@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import httpx
 from typing import List, Optional
 from fastapi import APIRouter, Query, Request, HTTPException
@@ -1170,12 +1171,47 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                     # dispatched nothing cycle after cycle.
                     script = rec.get("script") or ""
                     action = rec.get("action") or ""
-                    # Nmap script recommendations (banner, http-title, etc.) are already covered
-                    # by service detection — only dispatch actual port scans
+                    # Skip an NSE script ONLY when that script has actually
+                    # produced a result for this host.
+                    #
+                    # This used to skip EVERY script rec as "already run during
+                    # service detection". That assumption is wrong: a default
+                    # -sV runs none of nfs-showmount, rmi-dumpregistry,
+                    # distcc-*, snmp-*, tftp-enum, ntp-monlist or x11-access,
+                    # and on a live engagement vulns.script held only nuclei
+                    # entries — so 63 legitimate enumeration scans were being
+                    # refused, permanently, while reporting themselves as
+                    # already done.
+                    #
+                    # `banner` and friends genuinely ARE covered, and they still
+                    # get skipped — but now because the evidence says so.
                     if script and not any(kw in action.lower() for kw in ("port scan", "discovery", "full scan")):
-                        result["status"] = "skipped"
-                        result["detail"] = f"Nmap script '{script.split(' ')[0]}' — already run during service detection"
-                        return result
+                        _tokens = [t for t in re.findall(r"[a-z0-9][a-z0-9-]{3,}", script.lower())
+                                   if t not in ("nmap", "target", "script", "sudo")]
+                        _already = False
+                        if _tokens:
+                            try:
+                                from db import get_db
+                                with get_db() as _c, _c.cursor() as _cur:
+                                    _cur.execute(
+                                        "SELECT 1 FROM vulns v LEFT JOIN assets a ON a.id=v.asset_id "
+                                        " WHERE v.script IS NOT NULL AND lower(v.script) = ANY(%s) "
+                                        "   AND (a.ip IS NULL OR host(a.ip)=%s) LIMIT 1",
+                                        (_tokens, ip),
+                                    )
+                                    _already = _cur.fetchone() is not None
+                            except Exception as _e:
+                                # Fail toward RUNNING the scan: wrongly skipping
+                                # loses coverage silently, wrongly running costs
+                                # one redundant scan.
+                                log.debug(f"nse-already-ran check failed for {ip}: {_e}")
+                                _already = False
+                        if _already:
+                            result["status"] = "skipped"
+                            result["detail"] = (
+                                f"Nmap script '{script.split(' ')[0]}' — already produced "
+                                "results for this host")
+                            return result
                     # Omit ports when the rec does not name one: the scanner then
                     # applies its top-1000 profile. "1-1000" is the first 1000 port
                     # NUMBERS, not the 1000 most commonly open ports.

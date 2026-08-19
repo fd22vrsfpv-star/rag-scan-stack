@@ -982,6 +982,93 @@ def _scope_cidr_for(cur, engagement_id: Optional[str], ip: str) -> Optional[str]
         return None
 
 
+def _already_satisfied(cur, ip, rec, rec_service):
+    """Has this recommendation's work already been done? Returns a reason or None.
+
+    The queue filled with work that could never produce anything: 63 of 143
+    pending recommendations were nmap NSE scripts that the dispatcher ALWAYS
+    skips as "already run during service detection", 16 were nuclei re-runs after
+    nuclei had completed, and 2 were brute-force against services whose
+    credentials had already been recovered. They were regenerated as fast as the
+    recon agent could mark them skipped, so the queue never meaningfully drained.
+
+    Suppression is EVENT-based, not time-based: a scanner is suppressed only
+    until something changes. If a service is discovered after that scanner last
+    completed, the recommendation is allowed through again — a new port is
+    exactly the case where re-running is worth it.
+    """
+    scanner = (rec.get("scanner") or "").lower()
+    script = rec.get("script")
+    action = (rec.get("action") or "")
+
+    # 1. nmap NSE scripts — suppress ONLY when that exact script has actually
+    #    produced a result for this host.
+    #
+    #    The first version of this assumed any NSE rec was "already covered by
+    #    service detection" (mirroring what dispatch_rec says). That is wrong and
+    #    it suppressed 63 real recommendations: nfs-showmount, rmi-*, distcc-*,
+    #    snmp-*, tftp-enum, ntp-monlist, x11-access. A default -sV does not run
+    #    any of those — `vulns.script` for the host held only nuclei:* entries,
+    #    so none of them had ever run.
+    #
+    #    Evidence, not assumption: the script must appear in vulns.script for
+    #    this host. Many recs carry a full command rather than a bare script
+    #    name, so match on the script tokens found inside it.
+    if scanner == "nmap" and script:
+        tokens = [t for t in re.findall(r"[a-z0-9][a-z0-9-]{3,}", script.lower())
+                  if t not in ("nmap", "target", "script", "sudo")]
+        if tokens:
+            cur.execute(
+                """
+                SELECT 1 FROM public.vulns v
+                  LEFT JOIN public.assets a ON a.id = v.asset_id
+                 WHERE v.script IS NOT NULL
+                   AND (a.ip IS NULL OR host(a.ip) = %s)
+                   AND lower(v.script) = ANY(%s)
+                 LIMIT 1
+                """,
+                (ip, tokens),
+            )
+            if cur.fetchone():
+                return f"nmap script {tokens[0]} has already produced results for this host"
+
+    # 2. Brute force where the credentials are already recovered. The objective
+    #    is met; running it again just re-proves a known password.
+    if scanner in ("hydra", "medusa", "ncrack", "brutus") and rec_service:
+        cur.execute(
+            "SELECT 1 FROM public.credential_findings "
+            " WHERE valid_cred AND host(ip)=%s AND lower(protocol)=lower(%s) LIMIT 1",
+            (ip, rec_service),
+        )
+        if cur.fetchone():
+            return f"valid credentials already recovered for {rec_service}"
+
+    # 3. Same scanner already completed for this host, with nothing new since.
+    #    `ports.created_at > completed_at` is the "something changed" test: a
+    #    service found after the scan ran is a reason to run it again.
+    if scanner:
+        cur.execute(
+            """
+            SELECT 1
+              FROM public.session_scan_metrics m
+             WHERE m.status = 'completed'
+               AND (m.scan_type = %s OR m.scan_type ILIKE %s)
+               AND m.completed_at IS NOT NULL
+               AND NOT EXISTS (
+                     SELECT 1 FROM public.ports p
+                       JOIN public.assets a ON a.id = p.asset_id
+                      WHERE host(a.ip) = %s
+                        AND p.created_at > m.completed_at)
+             LIMIT 1
+            """,
+            (scanner, scanner + "%", ip),
+        )
+        if cur.fetchone():
+            return f"{scanner} already completed for this host; nothing new since"
+
+    return None
+
+
 def persist_recommendations(
     ip: str,
     recs: List[Dict[str, Optional[str]]],
@@ -1009,6 +1096,7 @@ def persist_recommendations(
         return 0
 
     inserted = 0
+    suppressed = 0
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         # Resolve asset_id from IP if the caller didn't have it.  Cheap
         # one-shot lookup; persisting recs without the FK link silently
@@ -1098,6 +1186,23 @@ def persist_recommendations(
             else:
                 rec_asset_id = asset_id
 
+            # Suppress work that is already done. Guarded by a SAVEPOINT so a
+            # lookup failure degrades to "recommend it" rather than aborting the
+            # whole batch — withholding a scan on a broken query would be worse
+            # than a redundant row.
+            cur.execute("SAVEPOINT sat_check")
+            try:
+                _reason = _already_satisfied(cur, ip, rec, rec_service)
+                cur.execute("RELEASE SAVEPOINT sat_check")
+            except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT sat_check")
+                logger.debug(f"already-satisfied check skipped for {ip}: {e}")
+                _reason = None
+            if _reason:
+                suppressed += 1
+                logger.debug(f"suppressed {rec.get('scanner')} for {ip}: {_reason}")
+                continue
+
             cur.execute(
                 """
                 INSERT INTO public.scan_recommendations
@@ -1121,6 +1226,10 @@ def persist_recommendations(
             if cur.rowcount > 0:
                 inserted += 1
         conn.commit()
+    if suppressed:
+        logger.info(
+            "persist_recommendations(%s): %d inserted, %d suppressed as "
+            "already satisfied", ip, inserted, suppressed)
     return inserted
 
 
