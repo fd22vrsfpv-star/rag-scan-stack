@@ -2060,7 +2060,16 @@ def list_all_recommendations(
             where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
             cur.execute(
                 f"""
-                SELECT DISTINCT ON (ip, scanner, COALESCE(action,''), COALESCE(template,''))
+                -- `status` is part of the dedup key on purpose.
+                --
+                -- Without it, DISTINCT ON collapses a completed recommendation
+                -- into a pending duplicate with the same (ip, scanner, action,
+                -- template) and the ordering below keeps the pending one — so
+                -- `status=all` returned 93 rows, every one pending, and the 28
+                -- completed recommendations were invisible. Work that HAS run is
+                -- exactly what an operator is looking for when they widen the
+                -- filter.
+                SELECT DISTINCT ON (ip, scanner, COALESCE(action,''), COALESCE(template,''), status)
                        id, ip::text, service, banner, scanner, action, script, template,
                        source, model, confidence, priority, status, executed_at,
                        created_at, updated_at, target_kind,
@@ -2071,7 +2080,7 @@ def list_all_recommendations(
                        extra->>'skip_reason' AS skip_reason
                 FROM scan_recommendations
                 {where}
-                ORDER BY ip, scanner, COALESCE(action,''), COALESCE(template,''),
+                ORDER BY ip, scanner, COALESCE(action,''), COALESCE(template,''), status,
                          priority ASC, created_at DESC
                 LIMIT %s
                 """,
