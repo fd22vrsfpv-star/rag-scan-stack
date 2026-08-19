@@ -1761,6 +1761,49 @@ async def list_scans(engagement_id: Optional[str] = None):
         except Exception:
             pass
 
+    # ── Kali tool executions ──────────────────────────────────────────────
+    #
+    # Tools dispatched from a recommendation (crackmapexec, smbclient,
+    # enum4linux, smbmap, ...) run in the kali-listener and are recorded in
+    # tool_executions. They never touched active_jobs, the autogen session list
+    # or audit.jsonl, so none of them appeared here — a tester who ran
+    # crackmapexec saw no scan, no progress and no history, which is
+    # indistinguishable from it never having run.
+    #
+    # Merged last and keyed by execution id so it cannot collide with a job_id
+    # from the sources above.
+    try:
+        from db import get_db
+        with get_db() as _c, _c.cursor() as _cur:
+            _cur.execute(
+                """SELECT id, tool, target, port, service, status,
+                          started_at, completed_at, exit_code,
+                          length(coalesce(output, '')) AS out_len
+                     FROM tool_executions
+                    ORDER BY started_at DESC NULLS LAST
+                    LIMIT 200"""
+            )
+            for r in _cur.fetchall():
+                (_id, _tool, _target, _port, _svc, _status,
+                 _start, _end, _exit, _outlen) = r
+                jobs.append({
+                    "job_id": str(_id),
+                    "type": _tool,
+                    "kind": "tool",           # distinguishes these from scanner jobs
+                    "status": _status or "unknown",
+                    "target": _target,
+                    "created_at": _start.isoformat() if _start else None,
+                    "completed_at": _end.isoformat() if _end else None,
+                    "service_url": "kali-listener",
+                    # Output size is the honest signal for a CLI tool: exit 0 with
+                    # nothing captured is the shape of a tool that ran and told
+                    # you nothing.
+                    "last_data": {"exit_code": _exit, "output_bytes": _outlen,
+                                  "port": _port, "service": _svc},
+                })
+    except Exception as _e:
+        log.debug(f"tool_executions merge skipped: {_e}")
+
     return {"jobs": jobs}
 
 
