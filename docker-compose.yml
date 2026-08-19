@@ -1964,6 +1964,18 @@ services:
     build:
       context: .
       dockerfile: node_manager/Dockerfile
+    # Sync to /app, matching the Dockerfile's flattening — host
+    # node_manager/node_manager.py becomes /app/node_manager.py, which is what
+    # actually gets imported.
+    develop:
+      watch:
+        - action: sync
+          path: ./node_manager
+          target: /app
+          ignore:
+            - __pycache__/
+        - action: rebuild
+          path: ./node_manager/requirements.txt
     container_name: node-manager
     command: uvicorn node_manager:app --host 0.0.0.0 --port 8027 --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
     restart: unless-stopped
@@ -2008,7 +2020,15 @@ services:
       API_KEY: ${API_KEY:-changeme}
     volumes:
       - ${SSH_KEY_PATH:-./ssh-keys}:/ssh-keys:ro
-      - ./node_manager:/app/node_manager:ro
+      # NOTE: ./node_manager is deliberately NOT mounted here.
+      # It used to be mounted at /app/node_manager, which was actively
+      # misleading: the mount is live, so edits DID change files inside the
+      # container, but nothing imports them. The Dockerfile flattens the
+      # source to /app/*.py and `uvicorn node_manager:app` resolves to
+      # /app/node_manager.py — /app/node_manager/ has no __init__.py, so it is
+      # never imported. Editing a file appeared to take effect while the
+      # running code never changed. Use `docker compose watch` (below) or
+      # rebuild; scripts/check_image_freshness.py will tell you which.
       - ./certs:/certs:ro
       - ./wireguard:/opt/rag-scan-stack/wireguard:rw
       - /tmp:/tmp
