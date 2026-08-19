@@ -2045,15 +2045,15 @@ def list_all_recommendations(
             conditions = []
             params = []
             if status and status != "all":
-                conditions.append("status = %s")
+                conditions.append("r.status = %s")
                 params.append(status)
             if ip:
-                conditions.append("ip = %s::inet")
+                conditions.append("r.ip = %s::inet")
                 params.append(ip)
             if eid:
                 conditions.append(
-                    "(engagement_id = %s::uuid OR (engagement_id IS NULL "
-                    "AND asset_id IN (SELECT id FROM public.assets "
+                    "(r.engagement_id = %s::uuid OR (r.engagement_id IS NULL "
+                    "AND r.asset_id IN (SELECT id FROM public.assets "
                     "WHERE engagement_id = %s::uuid)))"
                 )
                 params.extend([eid, eid])
@@ -2069,19 +2069,37 @@ def list_all_recommendations(
                 -- completed recommendations were invisible. Work that HAS run is
                 -- exactly what an operator is looking for when they widen the
                 -- filter.
-                SELECT DISTINCT ON (ip, scanner, COALESCE(action,''), COALESCE(template,''), status)
-                       id, ip::text, service, banner, scanner, action, script, template,
-                       source, model, confidence, priority, status, executed_at,
-                       created_at, updated_at, target_kind,
+                SELECT DISTINCT ON (r.ip, r.scanner, COALESCE(r.action,''), COALESCE(r.template,''), r.status)
+                       r.id, r.ip::text, r.service, r.banner, r.scanner, r.action,
+                       r.script, r.template,
+                       r.source, r.model, r.confidence, r.priority, r.status,
+                       r.executed_at, r.created_at, r.updated_at, r.target_kind,
+                       -- What the recommendation actually PRODUCED.
+                       --
+                       -- A completed recommendation with no visible result is
+                       -- indistinguishable from one that never ran — the exact
+                       -- complaint that started this. extra.job_id links to the
+                       -- run; for kali tools that is a tool_executions row, so
+                       -- the outcome and a preview of the captured output come
+                       -- back with the recommendation instead of requiring a
+                       -- second lookup the UI was not making.
+                       r.extra->>'job_id' AS job_id,
+                       te.status           AS result_status,
+                       te.exit_code        AS result_exit_code,
+                       length(coalesce(te.output, '')) AS result_bytes,
+                       left(coalesce(te.output, ''), 400) AS result_preview,
                        -- Why a recommendation was suppressed. Without this the UI
                        -- can filter to status='skipped' but cannot say WHY, which
                        -- makes the decision unreviewable — and the operator has to
                        -- take the tool's word for it.
-                       extra->>'skip_reason' AS skip_reason
-                FROM scan_recommendations
+                       r.extra->>'skip_reason' AS skip_reason
+                FROM scan_recommendations r
+                -- 1:1 on a unique id, so this cannot multiply rows.
+                LEFT JOIN tool_executions te
+                       ON te.id::text = r.extra->>'job_id'
                 {where}
-                ORDER BY ip, scanner, COALESCE(action,''), COALESCE(template,''), status,
-                         priority ASC, created_at DESC
+                ORDER BY r.ip, r.scanner, COALESCE(r.action,''), COALESCE(r.template,''), r.status,
+                         r.priority ASC, r.created_at DESC
                 LIMIT %s
                 """,
                 params + [limit]
