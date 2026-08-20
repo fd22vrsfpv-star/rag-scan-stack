@@ -20,6 +20,7 @@ reference) introduced by a later edit.
 Skips cleanly when the stack is not running, so a laptop unit run stays green.
 """
 import os
+import re
 
 import pytest
 
@@ -105,5 +106,10 @@ def test_executed_recommendations_expose_what_ran():
         assert r["command"] == r["dispatched_command"], (
             f"command should show what ran, not the template: "
             f"command={r['command']!r} dispatched={r['dispatched_command']!r}")
-        assert "{" not in (r["command"] or ""), \
-            f"executed command still contains a placeholder: {r['command']!r}"
+        # Match TEMPLATE placeholders ({target}, {port}) specifically, not any
+        # brace: a scanner-service dispatch is recorded as
+        # `POST /jobs/nikto-scan {"target_url": ...}`, where the braces are the
+        # JSON payload that was actually sent and are entirely correct.
+        leftover = re.findall(r"\{[a-zA-Z_]+\}", r["command"] or "")
+        assert not leftover, \
+            f"executed command still contains placeholder(s) {leftover}: {r['command']!r}"

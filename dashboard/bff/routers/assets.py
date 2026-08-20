@@ -1188,6 +1188,12 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             return result
 
         try:
+            # Bound up front because only some branches below assign them. The
+            # dispatch recorder reads both, and referencing an unassigned local
+            # raised UnboundLocalError *after* the scan had already been
+            # accepted — turning successful nmap dispatches into failures.
+            endpoint = None
+            payload = None
             async with httpx.AsyncClient(timeout=30) as client:
                 if scanner == "nmap":
                     # `or ""`, NOT .get(k, ""). The second argument to .get only
@@ -1498,8 +1504,9 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                             node_id=node_id,
                             # No shell command exists for these — the request
                             # itself is the record of what ran.
-                            command=_describe_dispatch(endpoint, payload),
-                            endpoint=f"{service_url}{endpoint}" if endpoint else None,
+                            command=_describe_dispatch(endpoint, payload, scanner, service_url),
+                            endpoint=(f"{service_url}{endpoint}" if endpoint
+                                      else f"{service_url} [{scanner}]" if service_url else None),
                         )
                 else:
                     result["status"] = "failed"
@@ -1620,20 +1627,26 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             result["detail"] = f"Kali: {type(e).__name__}: {str(e)[:60]}"
         return result
 
-    def _describe_dispatch(endpoint, payload):
+    def _describe_dispatch(endpoint, payload, scanner=None, service_url=None):
         """Human-readable record of a scanner-service dispatch.
 
         These tools take a JSON payload rather than a shell command, so the
         request IS the command as far as the operator is concerned.
+
+        Only two branches name `endpoint`; the rest build their URL inline. The
+        payload still describes what ran, so it is recorded with whatever
+        context is available rather than dropping the record entirely and
+        leaving another blank row in the completed list.
         """
-        if not endpoint:
+        if not payload and not endpoint:
             return None
         import json as _json
         try:
             body = _json.dumps(payload, default=str)[:800]
         except Exception:
             body = str(payload)[:800]
-        return f"POST {endpoint} {body}"
+        where = endpoint or (f"{service_url or ''} [{scanner}]" if scanner else "")
+        return f"POST {where} {body}".strip()
 
     async def _mark_rec_dispatched(
         rec_id: str, job_id: str, ip: str, port, service, scanner: str,

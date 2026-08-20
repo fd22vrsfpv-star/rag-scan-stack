@@ -148,6 +148,11 @@ SAFE_TOOLS = {
 KALI_LISTENER_URL = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
 AUTO_EXECUTE = os.environ.get("AUTO_EXECUTE_SAFE", "1").lower() in ("1", "true", "yes")
 
+# Engagement-wide scan ceiling. Defined here, above every use: the auto-execute
+# semaphore is constructed at import time roughly 900 lines before the admission
+# block, so defining it there raised NameError and crash-looped the service.
+SCAN_LIMIT = int(os.environ.get("MAX_CONCURRENT_SCANS", "5"))
+
 # ---- Webhook emit (cross-container HTTP) ----
 # scan-recommender is its own container/image with no access to rag-api's
 # `webhooks` package, so it emits over HTTP to rag-api's /webhooks/emit
@@ -901,8 +906,29 @@ def generate_recommendations(row: Dict, port: Optional[int] = None, ip: Optional
     return _enrich_and_finalize(recs, row, port, ip)
 
 
+# Auto-execute is the side of /next_scan that actually RUNS tools, so it is
+# bounded by the engagement's scan limit. Before this, one recommender call per
+# open port per scan each spawned a dispatch thread, those tools' output was
+# ingested, ingestion triggered more recommender calls, and the loop fed itself
+# — which is how the recommender ended up saturated and dispatches timed out.
+#
+# At capacity the dispatch is SKIPPED, not queued: the recommendation is already
+# persisted, so the work reappears in the pending queue rather than being lost.
+_auto_exec_slots = threading.BoundedSemaphore(SCAN_LIMIT)
+_auto_exec_skipped = {"n": 0}
+
+
 def _dispatch_auto_execute(ip: str, service: str, port: int):
     """Fire-and-forget call to kali-listener's /tools/execute-recommended."""
+    if not _auto_exec_slots.acquire(blocking=False):
+        _auto_exec_skipped["n"] += 1
+        if _auto_exec_skipped["n"] % 20 == 1:
+            logger.warning(
+                "auto-execute at the engagement scan limit (%d) — skipped %d "
+                "dispatch(es); those recommendations stay pending and can be run "
+                "from the Recommendations page.",
+                SCAN_LIMIT, _auto_exec_skipped["n"])
+        return
     try:
         resp = requests.post(
             f"{KALI_LISTENER_URL}/tools/execute-recommended",
@@ -913,6 +939,8 @@ def _dispatch_auto_execute(ip: str, service: str, port: int):
         logger.info(f"Auto-execute dispatch for {ip}:{port}/{service} → {resp.status_code}")
     except Exception as e:
         logger.warning(f"Auto-execute dispatch failed for {ip}:{port}/{service}: {e}")
+    finally:
+        _auto_exec_slots.release()
 
 
 # ---- Persistence ----
@@ -1793,6 +1821,79 @@ def ollama_query_route(req: OllamaQueryRequest):
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Ollama service unavailable: {e}")
 
+# ── Admission control for /next_scan ──────────────────────────────────────
+#
+# nmap_scanner calls this once per OPEN PORT, per host, per scan, and rag-api
+# does the same on ingest. A batch of concurrent scans against a host with ~30
+# open ports therefore produces hundreds of near-simultaneous requests to an
+# endpoint that can reach an LLM. The service saturated, callers hit their
+# 15s read timeout, and the BFF recorded the resulting dispatch timeouts as
+# FAILED recommendations for scans that had actually started.
+#
+# Rejecting fast is strictly better than timing out slowly: the caller learns
+# immediately and stops queuing more work, instead of every request paying the
+# full timeout while the backlog grows. 429 + Retry-After is the standard way to
+# say "not now" without pretending the request was invalid.
+# Tied to the engagement-wide scan limit rather than a number of its own.
+# MAX_CONCURRENT_SCANS is what the operator already sets to say how much
+# activity this engagement may generate, and /next_scan is not a passive query:
+# with AUTO_EXECUTE_SAFE on it LAUNCHES tools (see _dispatch_auto_execute), so a
+# separate limit here would silently overrule the engagement's own ceiling.
+#
+# Override with NEXT_SCAN_MAX_CONCURRENCY only if this endpoint needs to differ
+# from the engagement limit.
+NEXT_SCAN_MAX_CONCURRENCY = int(os.environ.get("NEXT_SCAN_MAX_CONCURRENCY", str(SCAN_LIMIT)))
+# How long a caller may wait for a slot before being turned away. Short on
+# purpose — a caller that waits is a caller not scanning.
+NEXT_SCAN_QUEUE_WAIT_SEC = float(os.environ.get("NEXT_SCAN_QUEUE_WAIT_SEC", "2"))
+
+_next_scan_slots = threading.BoundedSemaphore(NEXT_SCAN_MAX_CONCURRENCY)
+_next_scan_stats = {"admitted": 0, "rejected": 0}
+_next_scan_stats_lock = threading.Lock()
+
+
+@contextmanager
+def _next_scan_admission():
+    """Admit a bounded number of concurrent /next_scan calls.
+
+    Raises HTTPException(429) when the service is already at capacity.
+    """
+    acquired = _next_scan_slots.acquire(timeout=NEXT_SCAN_QUEUE_WAIT_SEC)
+    if not acquired:
+        with _next_scan_stats_lock:
+            _next_scan_stats["rejected"] += 1
+            rejected = _next_scan_stats["rejected"]
+        if rejected % 25 == 1:
+            logger.warning(
+                "next_scan at capacity (%d concurrent); shed %d request(s) so far. "
+                "Callers should back off rather than retry immediately.",
+                NEXT_SCAN_MAX_CONCURRENCY, rejected)
+        raise HTTPException(
+            status_code=429,
+            detail=f"scan recommender at capacity ({NEXT_SCAN_MAX_CONCURRENCY} concurrent)",
+            headers={"Retry-After": "5"},
+        )
+    with _next_scan_stats_lock:
+        _next_scan_stats["admitted"] += 1
+    try:
+        yield
+    finally:
+        _next_scan_slots.release()
+
+
+@router.get("/next_scan/capacity")
+def next_scan_capacity():
+    """Admission stats, so saturation is observable rather than inferred from
+    client-side timeouts."""
+    with _next_scan_stats_lock:
+        stats = dict(_next_scan_stats)
+    return {"max_concurrency": NEXT_SCAN_MAX_CONCURRENCY,
+            "engagement_scan_limit": SCAN_LIMIT,
+            "auto_execute_enabled": AUTO_EXECUTE,
+            "auto_execute_skipped": _auto_exec_skipped["n"],
+            "queue_wait_seconds": NEXT_SCAN_QUEUE_WAIT_SEC, **stats}
+
+
 @router.get("/next_scan", response_model=ScanRecommendationsResponse)
 def get_next_scan_recommendations(
     ip: str = Query(..., description="IP address of the asset"),
@@ -1802,6 +1903,11 @@ def get_next_scan_recommendations(
     use_ollama: bool = Query(False, description="Force fetching from Ollama even if DB has rows"),
     persist: bool = Query(True, description="Persist results to DB if schema exists"),
 ):
+    with _next_scan_admission():
+        return _next_scan_impl(ip, service, banner, port, use_ollama, persist)
+
+
+def _next_scan_impl(ip, service, banner, port, use_ollama, persist):
     recommendations: List[ScanRecommendation] = []
     effective_service = service
     effective_port = port

@@ -130,7 +130,14 @@ INGEST_TIMEOUT        = _env_int("INGEST_TIMEOUT", 600)
 INGEST_TIMEOUT_SHORT  = _env_int("INGEST_TIMEOUT_SHORT", 300)
 
 # Recommender / dispatch HTTP timeouts — seconds
-RECOMMENDER_TIMEOUT   = _env_int("RECOMMENDER_TIMEOUT", 15)
+# Must cover the worst ADMITTED latency, which follows from the engagement scan
+# limit: the recommender admits MAX_CONCURRENT_SCANS calls and largely
+# serialises them at ~4-5s each, so with the default of 5 the last admitted
+# caller waits ~25s. At the old 15s the caller gave up on work the recommender
+# was still doing — the request was neither cancelled nor reused, just recorded
+# as a failure. Requests beyond the limit are shed in ~2s with a 429, so this
+# longer timeout is only ever paid by calls that were actually accepted.
+RECOMMENDER_TIMEOUT   = _env_int("RECOMMENDER_TIMEOUT", 35)
 DISPATCH_TIMEOUT      = _env_int("DISPATCH_TIMEOUT", 10)
 
 # Process-wait timeouts (graceful kill) — seconds
@@ -206,6 +213,8 @@ def _trigger_scan_recommender(nmap_hosts: list, job_id: str = None):
             banner = port_info.get("product")
             if banner and port_info.get("version"):
                 banner = f"{banner} {port_info['version']}"
+            if not _recommender_available():
+                continue
             try:
                 params = {"ip": ip, "persist": "true"}
                 if service:
@@ -214,12 +223,21 @@ def _trigger_scan_recommender(nmap_hosts: list, job_id: str = None):
                     params["banner"] = banner
                 if port:
                     params["port"] = str(port)
-                resp = requests.get(
-                    f"{SCAN_RECOMMENDER_URL}/next_scan",
-                    params=params,
-                    timeout=RECOMMENDER_TIMEOUT,
-                    verify=False,
-                )
+                with _rec_slots:
+                    resp = requests.get(
+                        f"{SCAN_RECOMMENDER_URL}/next_scan",
+                        params=params,
+                        timeout=RECOMMENDER_TIMEOUT,
+                        verify=False,
+                    )
+                # 429 means the recommender shed this request on purpose. Treat
+                # it as a failure for breaker purposes so we back off rather
+                # than retrying into a service that just said "not now".
+                if resp.status_code == 429:
+                    _recommender_note(False)
+                    logging.debug(f"{tag}Recommender at capacity for {ip}/{service}")
+                    continue
+                _recommender_note(resp.status_code == 200)
                 if resp.status_code == 200:
                     recs = resp.json().get("recommendations", [])
                     total += len(recs)
@@ -238,8 +256,66 @@ def _trigger_scan_recommender(nmap_hosts: list, job_id: str = None):
                 else:
                     logging.debug(f"{tag}Recommender returned {resp.status_code} for {ip}/{service}")
             except Exception as e:
+                _recommender_note(False)
                 logging.warning(f"{tag}Recommender call failed for {ip}/{service}: {type(e).__name__}: {e}")
     logging.info(f"{tag}Scan recommender: generated {total} recommendations for {len(nmap_hosts)} hosts")
+
+
+# ── Recommender back-pressure ─────────────────────────────────────────────
+#
+# This module calls /next_scan once per OPEN PORT, per host, per scan. A host
+# with 30 open ports scanned by several concurrent jobs produces hundreds of
+# near-simultaneous requests to an LLM-backed endpoint, which then saturates.
+#
+# Two mechanisms, because they solve different halves:
+#   * a semaphore bounds how many calls THIS process makes at once, so one busy
+#     scanner cannot monopolise the recommender;
+#   * a circuit breaker stops calling entirely for a cooldown once the endpoint
+#     starts refusing or timing out. Without it, every port costs a full
+#     RECOMMENDER_TIMEOUT wait, so saturation makes each scan dramatically
+#     slower AND keeps the recommender pinned — the failure feeds itself.
+#
+# Recommendations are a best-effort enrichment: exploit_watcher's periodic poll
+# picks up anything skipped here, so shedding load costs coverage timing, not
+# coverage.
+# Same ceiling the engagement uses for scans: a recommender call can launch
+# tools, so it counts as scan activity rather than a free lookup.
+RECOMMENDER_MAX_INFLIGHT = _env_int("RECOMMENDER_MAX_INFLIGHT",
+                                    _env_int("MAX_CONCURRENT_SCANS", 5))
+RECOMMENDER_BREAKER_THRESHOLD = _env_int("RECOMMENDER_BREAKER_THRESHOLD", 3)
+RECOMMENDER_BREAKER_COOLDOWN = _env_int("RECOMMENDER_BREAKER_COOLDOWN", 120)
+
+_rec_slots = threading.BoundedSemaphore(RECOMMENDER_MAX_INFLIGHT)
+_rec_breaker = {"failures": 0, "open_until": 0.0, "skipped": 0}
+_rec_breaker_lock = threading.Lock()
+
+
+def _recommender_available() -> bool:
+    """False while the breaker is open, so callers skip without paying a timeout."""
+    with _rec_breaker_lock:
+        if time.time() < _rec_breaker["open_until"]:
+            _rec_breaker["skipped"] += 1
+            return False
+        return True
+
+
+def _recommender_note(ok: bool) -> None:
+    """Record an outcome; trip or reset the breaker."""
+    with _rec_breaker_lock:
+        if ok:
+            if _rec_breaker["failures"] or _rec_breaker["open_until"]:
+                logging.info("Recommender healthy again after %d skipped call(s)",
+                             _rec_breaker["skipped"])
+            _rec_breaker.update({"failures": 0, "open_until": 0.0, "skipped": 0})
+            return
+        _rec_breaker["failures"] += 1
+        if _rec_breaker["failures"] >= RECOMMENDER_BREAKER_THRESHOLD:
+            _rec_breaker["open_until"] = time.time() + RECOMMENDER_BREAKER_COOLDOWN
+            _rec_breaker["failures"] = 0
+            logging.warning(
+                "Recommender unresponsive — pausing recommendation calls for %ds. "
+                "Scans continue; exploit_watcher's poll will pick these up.",
+                RECOMMENDER_BREAKER_COOLDOWN)
 
 
 def _dispatch_nuclei_targeted(ip: str, port: int, tags: str, job_id: str = None):
