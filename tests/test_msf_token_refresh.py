@@ -12,6 +12,14 @@ HTTP 500 permanently.
 These tests drive _call directly with a faked transport, because reproducing the
 real bug otherwise means idling a live msfrpcd for five minutes.
 """
+import pytest
+
+# Skip rather than ERROR when this is unavailable: Metasploit RPC dependency; present in the rag-api image.
+# A collection error reads as a broken test suite; a skip states plainly
+# that the test cannot run in this environment.
+pytest.importorskip("msgpack",
+                    reason="msgpack not available here — Metasploit RPC dependency; present in the rag-api image")
+
 import os
 import sys
 import msgpack

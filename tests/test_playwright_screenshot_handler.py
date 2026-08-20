@@ -2,6 +2,14 @@
 Unit tests for Playwright Screenshot Handler.
 Tests screenshot capture, processing, and storage functionality.
 """
+import pytest
+
+# Skip rather than ERROR when this is unavailable: present in the playwright-scanner image.
+# A collection error reads as a broken test suite; a skip states plainly
+# that the test cannot run in this environment.
+pytest.importorskip("playwright",
+                    reason="playwright not available here — present in the playwright-scanner image")
+
 import hashlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch

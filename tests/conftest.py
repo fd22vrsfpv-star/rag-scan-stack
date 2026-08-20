@@ -12,6 +12,14 @@ from unittest.mock import MagicMock
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+# NOTE: do NOT add service directories (scan_recommender/, kali_listener/, ...)
+# to sys.path here. Services intentionally contain same-named modules — e.g.
+# both scan_recommender/log_manager.py and autogen_agents/log_manager.py exist —
+# because each runs isolated in its own container. Putting them on a shared path
+# makes `import log_manager` resolve to whichever came first, which silently
+# skipped ~120 tests when tried. A test needing a service module should load it
+# by explicit file path with importlib (see tests/test_artifact_actions.py).
+
 
 # ---- Database Fixtures ----
 

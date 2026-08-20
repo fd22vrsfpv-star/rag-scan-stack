@@ -11,6 +11,14 @@ Properties locked down here:
   3. Malformed YAML entries are dropped loudly, never half-applied.
   4. No profile means no change.
 """
+import pytest
+
+# Skip rather than ERROR when this is unavailable: beautifulsoup4; present in the scan-recommender image.
+# A collection error reads as a broken test suite; a skip states plainly
+# that the test cannot run in this environment.
+pytest.importorskip("bs4",
+                    reason="bs4 not available here — beautifulsoup4; present in the scan-recommender image")
+
 import os
 import sys
 import textwrap
