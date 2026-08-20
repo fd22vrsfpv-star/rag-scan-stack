@@ -20,8 +20,16 @@ Design rules, each learned the hard way in this codebase:
 """
 from __future__ import annotations
 
+import glob
+import hashlib
+import logging
+import os
 import re
 from typing import Any, Dict, List, Optional
+
+import yaml
+
+log = logging.getLogger("artifact_actions")
 
 # Cap on how much evidence text travels with a suggestion. Enough to justify
 # the action in the UI without shipping the whole artifact back per rule.
@@ -85,204 +93,135 @@ def strip_tool_noise(text: str) -> str:
     return "\n".join(ln for ln in text.splitlines() if not _NOISE_LINE_RE.search(ln))
 
 
-# ── Rule table ────────────────────────────────────────────────────────────
+# ── Rule loading ──────────────────────────────────────────────────────────
 #
-# `script` templates use {target} and {port}, which the dispatcher already
-# substitutes. Priority follows the existing scan_recommendations convention:
-# higher runs first, 50 is the default.
+# Rules live in YAML under /knowledge (a read-only bind mount), mirroring the
+# existing detection-rule engine. They were previously hardcoded here, which
+# meant every tweak needed a rag-api rebuild and every tool got an identical
+# rule set — whatweb output and crackmapexec output were evaluated against the
+# same 16 patterns whether or not they could possibly apply.
+#
+# Files are re-read when any of their mtimes change, so an operator can edit a
+# pattern and see the effect on the next analysis without restarting anything.
 
-RULES: List[Dict[str, Any]] = [
-    {
-        "id": "smb_signing_disabled",
-        "category": "smb",
-        "pattern": r"signing\s*[:=]\s*(?:False|false|0|disabled)",
-        "scanner": "nmap",
-        "script": "nmap -p445 --script smb-security-mode,smb2-security-mode {target}",
-        "title": "Confirm SMB signing is not required",
-        "rationale": "SMB signing disabled permits relay attacks. Confirm and "
-                     "record the exact security mode before relying on it.",
-        "priority": 70,
-    },
-    {
-        "id": "smbv1_enabled",
-        "category": "smb",
-        "pattern": r"SMBv1\s*[:=]\s*(?:True|true|1|enabled)",
-        "scanner": "nmap",
-        "script": "nmap -p445 --script smb-vuln-ms17-010,smb-vuln-ms08-067 {target}",
-        "title": "Test SMBv1 host for known critical SMB vulnerabilities",
-        "rationale": "SMBv1 is enabled, so the MS17-010/MS08-067 families are "
-                     "worth checking directly rather than inferring from version.",
-        "priority": 85,
-    },
-    {
-        "id": "smb_shares",
-        "category": "smb",
-        "pattern": r"\b(IPC\$|ADMIN\$|C\$|\bsharename\b|Disk\s+Permissions)",
-        "scanner": "smbmap",
-        "script": "smbmap -H {target}",
-        "title": "Enumerate SMB share permissions",
-        "rationale": "Shares are exposed; map read/write access per share.",
-        "priority": 65,
-    },
-    {
-        "id": "anonymous_ftp",
-        "category": "ftp",
-        "pattern": r"(Anonymous\s+FTP\s+login\s+allowed|ftp-anon|anonymous\s+access\s+allowed)",
-        "scanner": "nmap",
-        "script": "nmap -p21 --script ftp-anon,ftp-syst {target}",
-        "title": "Enumerate anonymous FTP contents",
-        "rationale": "Anonymous FTP is permitted — list what is actually readable.",
-        "priority": 75,
-    },
-    {
-        "id": "nfs_export",
-        "category": "nfs",
-        "pattern": r"(/\S+\s+\*\s*$|nfs-showmount|Export\s+list\s+for)",
-        "scanner": "showmount",
-        "script": "showmount -e {target}",
-        "title": "Enumerate NFS exports",
-        "rationale": "An NFS export was referenced; confirm what is world-exported.",
-        "priority": 65,
-    },
-    {
-        "id": "snmp_public",
-        "category": "snmp",
-        "pattern": r"\b(community\s+string|public|private)\b.{0,30}\b(snmp)\b|snmp.{0,30}\bpublic\b",
-        "scanner": "snmpwalk",
-        "script": "snmpwalk -v2c -c public {target}",
-        "title": "Walk SNMP with the default community string",
-        "rationale": "A default community string was referenced — enumerate the MIB.",
-        "priority": 60,
-    },
-    {
-        "id": "ssh_version",
-        "category": "ssh",
-        "pattern": r"SSH-2\.0-\S+|OpenSSH[_ ]\d+\.\d+",
-        "scanner": "ssh-audit",
-        "script": "ssh-audit {target}",
-        "title": "Audit SSH algorithms and key exchange",
-        "rationale": "An SSH banner is present; audit ciphers/KEX rather than "
-                     "judging by version string alone.",
-        "priority": 45,
-    },
-    {
-        "id": "cve_referenced",
-        "category": "exploit",
-        "pattern": r"CVE-\d{4}-\d{4,7}",
-        "scanner": "searchsploit",
-        "script": "searchsploit --cve {cve}",
-        "title": "Look up public exploits for referenced CVEs",
-        "rationale": "The output names specific CVEs; check the local ExploitDB "
-                     "mirror for matching public exploits.",
-        "priority": 80,
-    },
-    {
-        "id": "software_version",
-        "category": "web",
-        # [^0-9]{0,24} bridges the product name to its version across BOTH shapes:
-        # text ("Apache[2.2.8]", "Apache/2.2.8") and the native JSON we now prefer
-        # ('"Apache":{"version":["2.2.8"]}'). Excluding digits from the bridge
-        # stops it skipping over an unrelated number to reach a distant version.
-        "pattern": r"\b(Apache|nginx|lighttpd|IIS|vsftpd|ProFTPD|Postfix|Samba|"
-                   r"MySQL|PostgreSQL|Tomcat|Jetty|OpenSSL)\b[^0-9]{0,24}(\d+\.\d+(?:\.\d+)?)",
-        "scanner": "nuclei",
-        "script": "nuclei -u http://{target} -tags cve,default-login",
-        "title": "Run version-targeted vulnerability templates",
-        "rationale": "A specific software version was identified; nuclei's CVE "
-                     "templates are the cheapest confirmation step.",
-        "priority": 70,
-    },
-    {
-        "id": "http_service",
-        "category": "web",
-        "pattern": r"(HTTP/1\.[01]\s+200|http_status\"?\s*[:=]\s*200|\[200 OK\])",
-        "scanner": "katana",
-        "script": "katana -u http://{target} -field-scope fqdn",
-        "title": "Crawl the web service for additional attack surface",
-        "rationale": "A live HTTP response was observed; enumerate reachable "
-                     "endpoints. Scope is pinned to the target's own FQDN.",
-        "priority": 55,
-    },
-    {
-        "id": "web_directories",
-        "category": "web",
-        "pattern": r"(Directory\s+indexing|Index of /|/(?:admin|phpmyadmin|manager|"
-                   r"wp-admin|cgi-bin)/?\b)",
-        "scanner": "feroxbuster",
-        "script": "feroxbuster -u http://{target} -d 2",
-        "title": "Enumerate content under discovered directories",
-        "rationale": "An interesting path was observed; enumerate siblings and "
-                     "children rather than stopping at the one that surfaced.",
-        "priority": 60,
-    },
-    {
-        "id": "cms_detected",
-        "category": "web",
-        "pattern": r"\b(WordPress|Joomla|Drupal|Magento|TWiki|phpMyAdmin)\b",
-        "scanner": "nuclei",
-        "script": "nuclei -u http://{target} -tags cms,exposure",
-        "title": "Run CMS-specific checks",
-        "rationale": "A CMS was fingerprinted; CMS templates cover its known "
-                     "exposures and default logins.",
-        "priority": 65,
-    },
-    {
-        "id": "credentials_found",
-        "category": "credentials",
-        "pattern": r"(\[\+\]\s*\S+\\\S+:\S+|password\s*[:=]\s*\S{3,}|"
-                   r"valid\s+credentials|login\s+successful)",
-        "scanner": "netexec",
-        "script": "netexec smb {target} -u USER -p PASS --shares",
-        "title": "Validate recovered credentials and map their access",
-        "rationale": "Credential material appeared in the output. Confirm what "
-                     "the account can actually reach — placeholders must be "
-                     "filled in from the credential store before running.",
-        "priority": 90,
-        "needs_input": True,
-    },
-    {
-        "id": "database_service",
-        "category": "database",
-        "pattern": r"\b(mysql|postgresql|mongodb|redis|mssql)\b.{0,40}\b(\d{4})\b|"
-                   r"\b(3306|5432|27017|6379|1433)\b",
-        "scanner": "nmap",
-        "script": "nmap -sV --script '*-info,*-empty-password' {target}",
-        "title": "Probe database service for unauthenticated access",
-        "rationale": "A database service was referenced; check for empty or "
-                     "default authentication.",
-        "priority": 75,
-    },
-    {
-        "id": "open_ports",
-        "category": "recon",
-        "pattern": r"(\d{1,5})/tcp\s+open|Discovered\s+open\s+port\s+(\d{1,5})",
-        "scanner": "nmap",
-        "script": "nmap -sV -sC -p {port} {target}",
-        "title": "Service-scan newly observed open ports",
-        "rationale": "Open ports were observed without full service detection; "
-                     "version and default scripts refine what is actually there.",
-        "priority": 60,
-    },
-    {
-        "id": "tls_present",
-        "category": "tls",
-        "pattern": r"\b(TLSv1(\.[012])?|SSLv[23]|ssl-cert|Certificate)\b",
-        "scanner": "tlsx",
-        "script": "tlsx -u {target} -san -cn -expired -self-signed",
-        "title": "Inspect TLS configuration and certificate",
-        "rationale": "TLS was observed; capture protocol versions, SANs and "
-                     "certificate problems.",
-        "priority": 50,
-    },
-]
+RULES_DIR = os.environ.get("ARTIFACT_RULES_DIR", "/knowledge/artifact_rules")
 
-_COMPILED = [(r, re.compile(r["pattern"], re.IGNORECASE | re.MULTILINE)) for r in RULES]
+# Fields a rule must supply. A rule missing any of these cannot produce a
+# runnable, justifiable suggestion, so it is skipped loudly rather than
+# half-rendered in the UI.
+_REQUIRED = ("id", "pattern", "scanner", "script", "title", "rationale")
+
+_DEFAULTS = {"priority": 50, "category": "general", "auto_queue": False,
+             "enabled": True, "tools": ["*"], "needs_input": False}
+
+# (rules, errors, signature) — signature is the set of (path, mtime) seen.
+_cache: Dict[str, Any] = {"rules": None, "errors": [], "sig": None}
+
+
+def _rule_files(rules_dir: str) -> List[str]:
+    """builtin.yaml first, then custom/*.yaml sorted — later files override
+    earlier ones by `id`, so local edits win over shipped defaults."""
+    files = []
+    builtin = os.path.join(rules_dir, "builtin.yaml")
+    if os.path.exists(builtin):
+        files.append(builtin)
+    files.extend(sorted(glob.glob(os.path.join(rules_dir, "custom", "*.yaml"))))
+    return files
+
+
+def _signature(files: List[str]):
+    """Content hash per file — deliberately not mtime.
+
+    mtime is not reliable here: inside the container two writes to the same rule
+    file report an IDENTICAL st_mtime_ns, so an edit made shortly after a load
+    would never be picked up and the operator would see no effect from their
+    change. Rule files are a few KB, so hashing them on each check costs
+    microseconds against regex work measured in milliseconds, and it is correct
+    on every filesystem.
+    """
+    out = []
+    for f in files:
+        try:
+            with open(f, "rb") as fh:
+                out.append((f, hashlib.sha1(fh.read()).hexdigest()))
+        except OSError:
+            pass
+    return tuple(out)
+
+
+def load_rules(rules_dir: str = None, force: bool = False):
+    """Return (rules, errors). Cached until a rule file changes on disk."""
+    rules_dir = rules_dir or RULES_DIR
+    files = _rule_files(rules_dir)
+    sig = _signature(files)
+    if not force and _cache["rules"] is not None and _cache["sig"] == sig:
+        return _cache["rules"], _cache["errors"]
+
+    by_id: Dict[str, Dict[str, Any]] = {}
+    errors: List[str] = []
+    if not files:
+        errors.append(f"no rule files found in {rules_dir} — no suggestions can be made")
+
+    for path in files:
+        try:
+            with open(path) as fh:
+                doc = yaml.safe_load(fh) or {}
+        except Exception as e:
+            errors.append(f"{os.path.basename(path)}: unreadable ({type(e).__name__}: {e})")
+            continue
+        defaults = {**_DEFAULTS, **(doc.get("defaults") or {})}
+        for raw in (doc.get("rules") or []):
+            if not isinstance(raw, dict):
+                errors.append(f"{os.path.basename(path)}: rule is not a mapping")
+                continue
+            rule = {**defaults, **raw}
+            missing = [k for k in _REQUIRED if not rule.get(k)]
+            if missing:
+                errors.append(f"{os.path.basename(path)}: rule "
+                              f"{raw.get('id', '<no id>')!r} missing {', '.join(missing)}")
+                continue
+            try:
+                rule["_rx"] = re.compile(rule["pattern"], re.IGNORECASE | re.MULTILINE)
+            except re.error as e:
+                errors.append(f"{os.path.basename(path)}: rule {rule['id']!r} "
+                              f"has an invalid pattern ({e})")
+                continue
+            tools = rule.get("tools") or ["*"]
+            if isinstance(tools, str):
+                tools = [tools]
+            rule["tools"] = [str(t).lower() for t in tools]
+            try:
+                rule["priority"] = int(rule["priority"])
+            except (TypeError, ValueError):
+                rule["priority"] = 50
+            by_id[rule["id"]] = rule          # later file wins
+
+    rules = [r for r in by_id.values() if r.get("enabled", True)]
+    _cache.update({"rules": rules, "errors": errors, "sig": sig})
+    if errors:
+        for e in errors:
+            log.warning("artifact rule: %s", e)
+    return rules, errors
+
+
+def rule_applies_to_tool(rule: Dict[str, Any], tool: str) -> bool:
+    """A rule with tools ["*"] (or none) applies everywhere.
+
+    Tool scoping is what stops crackmapexec output being evaluated against web
+    crawl rules and vice versa — the same 16 patterns used to run over every
+    artifact regardless of what produced it.
+    """
+    tools = rule.get("tools") or ["*"]
+    if "*" in tools:
+        return True
+    return (tool or "").lower() in tools
 
 
 def suggest_actions(content: str, tool: str = "", target: str = "",
                     port: Optional[int] = None, service: str = "",
                     llm_result: Optional[Dict[str, Any]] = None,
-                    max_actions: int = 25) -> List[Dict[str, Any]]:
+                    max_actions: int = 25,
+                    rules_dir: str = None) -> List[Dict[str, Any]]:
     """Return candidate follow-on actions, each citing its evidence.
 
     `llm_result` — when an LLM pass has already run over this artifact, any
@@ -295,8 +234,11 @@ def suggest_actions(content: str, tool: str = "", target: str = "",
     text = strip_tool_noise(_strip_ansi(content))
     out: List[Dict[str, Any]] = []
 
-    for rule, rx in _COMPILED:
-        m = rx.search(text)
+    rules, _errors = load_rules(rules_dir)
+    for rule in rules:
+        if not rule_applies_to_tool(rule, tool):
+            continue
+        m = rule["_rx"].search(text)
         if not m:
             continue
         script = rule["script"]
@@ -311,6 +253,7 @@ def suggest_actions(content: str, tool: str = "", target: str = "",
             script = script.replace("{port}", str(found)) if found else script
         if target:
             script = script.replace("{target}", target)
+        needs_input = bool(rule.get("needs_input")) or "{" in script
         out.append({
             "id": rule["id"],
             "category": rule["category"],
@@ -320,7 +263,11 @@ def suggest_actions(content: str, tool: str = "", target: str = "",
             "rationale": rule["rationale"],
             "priority": rule["priority"],
             "evidence": _snippet(text, m),
-            "needs_input": bool(rule.get("needs_input")) or "{" in script,
+            "needs_input": needs_input,
+            # An action that cannot run as written must never auto-queue,
+            # whatever the rule asks for — it would sit in the queue as
+            # permanently un-runnable noise.
+            "auto_queue": bool(rule.get("auto_queue")) and not needs_input,
             "source": "rules",
         })
 
@@ -382,6 +329,9 @@ def _llm_suggestions(llm_result: Optional[Dict[str, Any]]) -> List[Dict[str, Any
             "evidence": str(item.get("evidence", ""))[:EVIDENCE_CHARS],
             # No scanner or no command means nothing to dispatch.
             "needs_input": not (item.get("scanner") and script) or "{" in str(script),
+            # Model-proposed actions are never auto-queued. They carry no
+            # verified evidence and no rule author stood behind them.
+            "auto_queue": False,
             "source": "llm",
         })
     return out

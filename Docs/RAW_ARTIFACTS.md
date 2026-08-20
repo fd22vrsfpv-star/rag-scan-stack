@@ -123,11 +123,77 @@ download. Nothing is truncated for display.
 
 **Follow-On Actions** — what to do next, derived from the content itself.
 
-### How follow-on actions are decided
+### How follow-on actions are created
 
-Rules live in `app/rag-api/artifact_actions.py` — pure functions, no database
-and no network, so they are testable on fixtures alone. Four constraints shape
-them, each learned from a real failure in this codebase:
+Three routes, all landing in the same place:
+
+| Route | Trigger | Result |
+|---|---|---|
+| **Automatic** | Rule sets `auto_queue: true`; fires when new output is stored | Queued as **pending** — never executed |
+| **Manual** | You tick suggestions and press Queue | Queued as pending |
+| **Manual, edited or written** | Edit a suggested command, or write your own | Queued as pending |
+
+**Automatic queuing never runs anything.** Actions land as `pending` and wait
+for a human to press Run, so the audit trail shows what was proposed — and on
+what evidence — before anything touches a target. Only rules that explicitly
+opt in with `auto_queue: true` do this, and an action that `needs_input` can
+never auto-queue however its rule is written, because an un-runnable command
+sitting in the queue is just noise. Re-storing byte-identical output does not
+re-queue.
+
+Toggle it globally (persisted in `app_settings.artifact_auto_queue`):
+
+```bash
+curl -sk -X POST "$API/artifacts/auto-queue" -H "x-api-key: $KEY" \
+     -H 'content-type: application/json' -d '{"enabled": false}'
+```
+
+Turning it off stops new proposals appearing; it never touches what is already
+queued.
+
+### Manual and edited actions
+
+`POST /artifacts/{id}/actions/queue` accepts three fields together:
+
+```json
+{
+  "action_ids": ["smbv1_enabled"],
+  "overrides":  {"credentials_found": {"script": "netexec smb 10.0.0.1 -u msfadmin -p msfadmin --shares"}},
+  "custom_actions": [{"title": "RPC enumeration", "scanner": "rpcinfo",
+                      "script": "rpcinfo -p 10.0.0.1", "priority": 72}]
+}
+```
+
+`overrides` is the **only** way to queue a `needs_input` action: queuing one
+un-edited returns 400 with the offending command, rather than parking a
+command that will fail at dispatch. Note this covers two distinct cases — a
+`{brace}` placeholder the substituter could not fill, and a rule that declared
+`needs_input` because its script carries literal stand-ins like `USER`/`PASS`
+that no substituter would notice. Custom `scanner` names are validated as bare
+tool names (`^[a-zA-Z0-9_.-]+$`), matching the executor's own allowlist check.
+
+### The rules themselves
+
+Rules live in **YAML** under `knowledge/artifact_rules/` — `builtin.yaml` plus
+`custom/*.yaml`, mirroring the existing detection-rule engine. `knowledge/` is
+a read-only bind mount, so **edits take effect on the next analysis with no
+rebuild and no restart**; a custom rule reusing a builtin `id` overrides it, and
+`enabled: false` switches one off.
+
+Rules are **tool-scoped**: `tools: [crackmapexec, netexec, nmap]` limits a rule
+to those tools' output, and `["*"]` (or omitting it) applies everywhere. Before
+this, whatweb output and crackmapexec output were evaluated against an identical
+set of patterns whether or not they could possibly apply.
+
+A malformed rule is skipped with a logged error and reported through
+`GET /artifacts/auto-queue` (`rule_errors`), which the UI surfaces — otherwise a
+broken file silently means "no follow-ups ever", indistinguishable from "nothing
+to act on". `scripts/post-install-check.sh` asserts rules load and that none
+failed to parse.
+
+Rule evaluation itself is pure functions in `app/rag-api/artifact_actions.py` —
+no database, no network — so behaviour is testable on fixtures alone. Four
+constraints shape the rules, each learned from a real failure in this codebase:
 
 1. **Every suggestion cites its evidence** — the exact line that triggered it,
    shown in the UI. A follow-up an operator cannot justify is one they cannot
@@ -152,9 +218,9 @@ are marked **needs input** rather than presented as runnable.
 
 ### Queuing
 
-Selected actions are inserted into `scan_recommendations` with
-`source='artifact'` and `extra` carrying `artifact_id`, `rule_id`, `rationale`
-and `evidence`. This deliberately reuses the existing recommendation path
+Actions are inserted into `scan_recommendations` with `source='artifact'` and `extra` carrying `artifact_id`, `rule_id`, `rationale`
+and `evidence`, plus `queued_by` (`auto` / `manual` / `manual-edited`). This
+deliberately reuses the existing recommendation path
 rather than adding a second executor: that table already has a dispatcher, a
 force-run override for skipped items, and a UI. Queued actions are run from the
 Recommendations page like any other, and the results come back as new
@@ -179,7 +245,7 @@ ever archived) and `idx_raw_artifacts_llm_status` (the queue scan).
 
 ```bash
 pytest tests/test_raw_artifacts.py -v      # 26 tests: JSON flags, archive, queue
-pytest tests/test_artifact_actions.py -v   # 20 tests: suggestion rules
+pytest tests/test_artifact_actions.py -v   # 32 tests: rules, YAML loading, scoping
 ```
 
 The action tests pin the failure modes that matter: rules firing on tool

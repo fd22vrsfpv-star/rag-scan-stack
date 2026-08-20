@@ -240,4 +240,6 @@ See `Docs/RAW_ARTIFACTS.md`.
 | GET | `/artifacts/{id}` | One artifact including full content |
 | POST | `/artifacts/{id}/processed` | Record LLM outcome (`done`/`failed`/`skipped`) |
 | GET | `/artifacts/{id}/actions` | Evidence-cited follow-on actions for this artifact |
-| POST | `/artifacts/{id}/actions/queue` | Queue chosen actions as scan recommendations |
+| POST | `/artifacts/{id}/actions/queue` | Queue chosen, edited, or custom actions as scan recommendations |
+| GET | `/artifacts/auto-queue` | Auto-queue state, which rules opt in, and rule-file errors |
+| POST | `/artifacts/auto-queue` | Enable/disable automatic queuing (never auto-runs) |

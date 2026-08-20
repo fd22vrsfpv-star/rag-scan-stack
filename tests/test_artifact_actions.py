@@ -25,6 +25,9 @@ import pytest
 _PATH = os.path.join(os.path.dirname(__file__), "..", "app", "rag-api", "artifact_actions.py")
 
 
+_RULES_DIR = os.path.join(os.path.dirname(__file__), "..", "knowledge", "artifact_rules")
+
+
 @pytest.fixture(scope="module")
 def aa():
     if not os.path.exists(_PATH):                # pragma: no cover
@@ -32,6 +35,9 @@ def aa():
     spec = importlib.util.spec_from_file_location("artifact_actions", _PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    # Point at the repo's shipped rules rather than the container path, so the
+    # suite runs from a checkout with no /knowledge mount.
+    mod.RULES_DIR = _RULES_DIR
     return mod
 
 
@@ -210,3 +216,129 @@ def test_evidence_centres_on_the_match_in_long_json_lines(aa):
              if x["id"] == "software_version")
     assert "Apache" in a["evidence"], f"match not shown: {a['evidence'][:80]}"
     assert len(a["evidence"]) <= aa.EVIDENCE_CHARS + 2   # +2 for the ellipses
+
+
+# ── YAML rule loading, tool scoping and auto-queue ────────────────────────
+
+def test_shipped_rules_load_without_errors(aa):
+    """A broken builtin.yaml silently disables every suggestion, so the shipped
+    file must parse cleanly and completely."""
+    rules, errors = aa.load_rules(_RULES_DIR, force=True)
+    assert errors == [], f"shipped rules have errors: {errors}"
+    assert len(rules) >= 15
+
+
+def test_every_shipped_rule_is_complete_and_compiles(aa):
+    rules, _ = aa.load_rules(_RULES_DIR, force=True)
+    for r in rules:
+        for field in ("id", "pattern", "scanner", "script", "title", "rationale"):
+            assert r.get(field), f"{r.get('id')} missing {field}"
+        assert r["_rx"] is not None
+        assert 0 <= r["priority"] <= 100
+
+
+def test_tool_scoping_filters_rules(aa):
+    """The point of per-tool rules: identical text, different tools, different
+    suggestions. Previously every artifact was evaluated against every rule."""
+    smb = "SMB 10.0.0.1 445 HOST [*] Unix (signing:False) (SMBv1:True)"
+    assert ids(aa.suggest_actions(smb, tool="crackmapexec", target="10.0.0.1"))
+    assert ids(aa.suggest_actions(smb, tool="katana", target="10.0.0.1")) == []
+
+
+def test_universal_rules_apply_to_any_tool(aa):
+    """A CVE is worth looking up whichever tool mentioned it."""
+    out = "VULNERABLE: CVE-2007-2447"
+    for tool in ("crackmapexec", "katana", "some-unknown-tool"):
+        assert "cve_referenced" in ids(aa.suggest_actions(out, tool=tool, target="10.0.0.1"))
+
+
+def test_auto_queue_is_opt_in_per_rule(aa):
+    """Only rules that explicitly opt in may be queued without a human."""
+    rules, _ = aa.load_rules(_RULES_DIR, force=True)
+    auto = {r["id"] for r in rules if r.get("auto_queue")}
+    assert auto, "expected some rules to opt into auto-queue"
+    assert len(auto) < len(rules), "auto-queue must not be the default for everything"
+
+
+def test_needs_input_actions_never_auto_queue(aa):
+    """An action with an unfilled placeholder cannot run, so auto-queuing it
+    would park permanently un-runnable work in the operator's queue."""
+    creds = "[+] WORKGROUP\\msfadmin:msfadmin"
+    for a in aa.suggest_actions(creds, tool="netexec", target="10.0.0.1"):
+        if a["needs_input"]:
+            assert a["auto_queue"] is False, f"{a['id']} would auto-queue un-runnable"
+
+
+def test_llm_suggestions_never_auto_queue(aa):
+    """Model output carries no verified evidence and no rule author."""
+    got = aa.suggest_actions("SMBv1:True", tool="crackmapexec", target="10.0.0.1",
+                             llm_result={"suggested_actions": [
+                                 {"title": "Do a thing", "scanner": "nmap",
+                                  "script": "nmap 10.0.0.1"}]})
+    for a in got:
+        if a["source"] == "llm":
+            assert a["auto_queue"] is False
+
+
+def test_custom_yaml_overrides_builtin_by_id(aa, tmp_path):
+    """Local rules must win over shipped ones without editing builtin.yaml."""
+    (tmp_path / "custom").mkdir()
+    (tmp_path / "builtin.yaml").write_text(
+        "rules:\n"
+        "  - id: demo\n    pattern: 'FOO'\n    scanner: nmap\n"
+        "    script: 'nmap {target}'\n    title: Builtin\n    rationale: b\n")
+    (tmp_path / "custom" / "local.yaml").write_text(
+        "rules:\n"
+        "  - id: demo\n    pattern: 'FOO'\n    scanner: nmap\n"
+        "    script: 'nmap -A {target}'\n    title: Overridden\n    rationale: o\n")
+    got = aa.suggest_actions("FOO", tool="nmap", target="10.0.0.1", rules_dir=str(tmp_path))
+    assert len(got) == 1
+    assert got[0]["title"] == "Overridden"
+
+
+def test_rule_can_be_disabled(aa, tmp_path):
+    (tmp_path / "builtin.yaml").write_text(
+        "rules:\n"
+        "  - id: off_rule\n    pattern: 'FOO'\n    scanner: nmap\n"
+        "    script: 'nmap {target}'\n    title: t\n    rationale: r\n    enabled: false\n")
+    assert aa.suggest_actions("FOO", tool="nmap", target="10.0.0.1",
+                              rules_dir=str(tmp_path)) == []
+
+
+def test_invalid_rule_is_skipped_not_fatal(aa, tmp_path):
+    """One bad rule must not take out the whole rule set — the others still
+    have to produce suggestions, and the error has to be reported."""
+    (tmp_path / "builtin.yaml").write_text(
+        "rules:\n"
+        "  - id: broken\n    pattern: '([unclosed'\n    scanner: nmap\n"
+        "    script: 'nmap {target}'\n    title: t\n    rationale: r\n"
+        "  - id: missing_script\n    pattern: 'FOO'\n    scanner: nmap\n"
+        "    title: t\n    rationale: r\n"
+        "  - id: good\n    pattern: 'FOO'\n    scanner: nmap\n"
+        "    script: 'nmap {target}'\n    title: Good\n    rationale: r\n")
+    rules, errors = aa.load_rules(str(tmp_path), force=True)
+    assert [r["id"] for r in rules] == ["good"]
+    assert len(errors) == 2
+    assert any("broken" in e for e in errors) and any("missing_script" in e for e in errors)
+
+
+def test_missing_rules_dir_reports_an_error(aa, tmp_path):
+    """Silence here means no suggestions ever appear, with no explanation."""
+    rules, errors = aa.load_rules(str(tmp_path / "nope"), force=True)
+    assert rules == []
+    assert errors and "no rule files" in errors[0]
+
+
+def test_edited_yaml_takes_effect_without_restart(aa, tmp_path):
+    """Rules are bind-mounted, so an edit must be picked up on the next
+    analysis — otherwise operators change a pattern and see no effect."""
+    f = tmp_path / "builtin.yaml"
+    f.write_text("rules:\n  - id: r\n    pattern: 'AAA'\n    scanner: nmap\n"
+                 "    script: 'nmap {target}'\n    title: First\n    rationale: r\n")
+    first = aa.suggest_actions("AAA", tool="nmap", target="10.0.0.1", rules_dir=str(tmp_path))
+    assert first[0]["title"] == "First"
+    os.utime(f, (0, 0))   # force a distinct mtime
+    f.write_text("rules:\n  - id: r\n    pattern: 'AAA'\n    scanner: nmap\n"
+                 "    script: 'nmap {target}'\n    title: Second\n    rationale: r\n")
+    second = aa.suggest_actions("AAA", tool="nmap", target="10.0.0.1", rules_dir=str(tmp_path))
+    assert second[0]["title"] == "Second", "edited rule file was not re-read"

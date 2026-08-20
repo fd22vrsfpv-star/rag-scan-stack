@@ -507,6 +507,20 @@ if [[ -n "$DASH" ]]; then
     pass "port profiles loaded from knowledge/port_profiles.yaml"
   fi
 
+  # Follow-on action rules also come from the knowledge/ mount. A missing or
+  # malformed file does not break any endpoint — it just means NO follow-up is
+  # ever suggested, which looks identical to "this output had nothing to act
+  # on". Assert both that rules loaded and that none failed to parse.
+  RULES_JSON=$(docker exec "$DASH" curl -sk "https://127.0.0.1/api/artifacts/auto-queue" 2>/dev/null || true)
+  RULES_N=$(echo "$RULES_JSON" | grep -o '"rules_loaded":[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
+  if [[ -z "$RULES_N" || "$RULES_N" -eq 0 ]]; then
+    fail "no artifact follow-on rules loaded — check knowledge/artifact_rules/builtin.yaml and the ./knowledge:/knowledge:ro mount"
+  elif echo "$RULES_JSON" | grep -q '"rule_errors":[[:space:]]*\[[^]]'; then
+    fail "artifact rule file has errors (those rules are not running): $(echo "$RULES_JSON" | grep -o '"rule_errors":.*')"
+  else
+    pass "artifact follow-on rules loaded (${RULES_N} rules)"
+  fi
+
   WEB_DEGRADED=$(docker exec "$DASH" curl -sk "https://127.0.0.1/api/web-profiles" 2>/dev/null \
     | grep -o '"degraded":[[:space:]]*true' || true)
   if [[ -n "$WEB_DEGRADED" ]]; then

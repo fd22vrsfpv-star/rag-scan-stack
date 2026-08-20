@@ -2961,8 +2961,35 @@ def ingest_raw_artifact(req: RawArtifactRequest, authorized: bool = Depends(auth
         )
         row = cur.fetchone()
     artifact_id, inserted, occurrences = str(row[0]), bool(row[1]), row[2]
+
+    # Auto-queue follow-ups for genuinely new output only. A repeat is
+    # byte-identical by definition, so re-proposing the same actions would just
+    # churn the queue.
+    auto_queued = []
+    if inserted and req.target and _auto_queue_enabled():
+        try:
+            with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+                auto_queued = _auto_queue_actions(cur, {
+                    "id": artifact_id, "content": content, "tool": req.tool,
+                    "target": req.target, "port": req.port, "service": req.service,
+                    "engagement_id": req.engagement_id})
+            if auto_queued:
+                logger.info("auto-queued %d follow-up(s) from %s output on %s",
+                            len(auto_queued), req.tool, req.target)
+        except Exception as e:
+            # Never fail a store because suggestion queuing failed — the
+            # artifact is the durable thing; proposals can be regenerated.
+            logger.warning("auto-queue failed for artifact %s: %s", artifact_id, e)
+
     try:
         from webhooks import emit_webhook
+        if auto_queued:
+            emit_webhook("artifact_actions_queued", req.tool, {
+                "artifact_id": artifact_id, "target": req.target,
+                "queued": len(auto_queued), "queued_by": "auto",
+                "action_ids": [q["action_id"] for q in auto_queued],
+                "engagement_id": req.engagement_id,
+            })
         emit_webhook("raw_artifact_stored", req.tool, {
             "artifact_id": artifact_id, "tool": req.tool, "target": req.target,
             "bytes": len(content), "content_format": fmt,
@@ -2972,7 +2999,106 @@ def ingest_raw_artifact(req: RawArtifactRequest, authorized: bool = Depends(auth
     except Exception:
         pass  # Never fail a store because the webhook fan-out did.
     return {"ok": True, "artifact_id": artifact_id, "new": inserted,
-            "occurrences": occurrences, "content_format": fmt, "sha256": sha}
+            "occurrences": occurrences, "content_format": fmt, "sha256": sha,
+            "auto_queued": auto_queued}
+
+
+def _insert_recommendation(cur, art: dict, action: dict, queued_by: str,
+                           engagement_id=None):
+    """Insert one follow-on action as a pending scan recommendation.
+
+    Both the manual and automatic paths go through here so a queued action is
+    indistinguishable downstream except for `extra.queued_by` — same dispatcher,
+    same force-run override, same UI.
+    """
+    cur.execute("""
+        INSERT INTO scan_recommendations
+            (ip, service, scanner, action, script, source, priority,
+             status, engagement_id, extra)
+        VALUES (%s,%s,%s,%s,%s,'artifact',%s,'pending',%s,%s)
+        ON CONFLICT (fingerprint) DO UPDATE
+           SET updated_at = now(),
+               extra = scan_recommendations.extra || EXCLUDED.extra
+        RETURNING id, status, (xmax = 0) AS inserted
+    """, (art["target"], art["service"], action["scanner"], action["title"],
+          action["script"], action["priority"],
+          engagement_id or art.get("engagement_id"),
+          Json({"artifact_id": str(art["id"]), "rule_id": action["id"],
+                "rationale": action.get("rationale"), "evidence": action.get("evidence"),
+                "origin_tool": art["tool"], "suggestion_source": action.get("source", "rules"),
+                "queued_by": queued_by})))
+    return cur.fetchone()
+
+
+def _auto_queue_actions(cur, art: dict) -> list:
+    """Queue the actions whose rules opted into auto_queue.
+
+    Queued, never run. Dispatching a scan without a human is a different and
+    much larger decision than proposing one, so these land as 'pending' and wait
+    for someone to press Run — the audit trail shows what was proposed and by
+    what evidence before anything touches the target.
+    """
+    from artifact_actions import suggest_actions
+    actions = [a for a in suggest_actions(
+        content=art["content"], tool=art["tool"], target=art["target"] or "",
+        port=art.get("port"), service=art.get("service") or "")
+        if a.get("auto_queue")]
+    queued = []
+    for a in actions:
+        row = _insert_recommendation(cur, art, a, "auto")
+        if row["inserted"]:
+            queued.append({"action_id": a["id"], "recommendation_id": str(row["id"]),
+                           "scanner": a["scanner"], "priority": a["priority"]})
+    return queued
+
+
+def _auto_queue_enabled() -> bool:
+    """Global kill switch, persisted in app_settings.
+
+    Defaults ON because the queue is inert until a human runs something. Turning
+    it off stops new proposals appearing without touching anything queued.
+    """
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT value FROM app_settings WHERE key = 'artifact_auto_queue'")
+            row = cur.fetchone()
+        return (row[0] or "").strip().lower() != "false" if row else True
+    except Exception:
+        return True
+
+
+class AutoQueueSetting(BaseModel):
+    enabled: bool
+
+
+@app.get("/artifacts/auto-queue", tags=["Artifacts"])
+def get_auto_queue_setting(authorized: bool = Depends(auth)):
+    """Whether high-confidence follow-ups are queued automatically on store.
+
+    Also reports which rules opt in, and any rule-file errors — a broken YAML
+    silently disables every suggestion, which is indistinguishable from "this
+    output had no follow-ups" unless it is surfaced.
+    """
+    from artifact_actions import load_rules
+    rules, errors = load_rules()
+    return {
+        "enabled": _auto_queue_enabled(),
+        "auto_queue_rules": sorted(r["id"] for r in rules if r.get("auto_queue")),
+        "rules_loaded": len(rules),
+        "rule_errors": errors,
+    }
+
+
+@app.post("/artifacts/auto-queue", tags=["Artifacts"])
+def set_auto_queue_setting(req: AutoQueueSetting, authorized: bool = Depends(auth)):
+    """Turn automatic queuing on or off. Never affects already-queued items."""
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO app_settings (key, value, category)
+            VALUES ('artifact_auto_queue', %s, 'artifacts')
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+        """, ("true" if req.enabled else "false",))
+    return {"ok": True, "enabled": req.enabled}
 
 
 @app.get("/artifacts/stats", tags=["Artifacts"])
@@ -3102,9 +3228,29 @@ def mark_artifact_processed(artifact_id: str, req: ArtifactProcessedRequest,
     return {"ok": True, **{k: (str(v) if k == "id" else v) for k, v in dict(row).items()}}
 
 
+class CustomAction(BaseModel):
+    """An action the operator wrote themselves, rather than one a rule proposed."""
+    title: str
+    scanner: str
+    script: str
+    priority: int = 60
+    rationale: Optional[str] = None
+    category: str = "manual"
+
+
 class QueueActionsRequest(BaseModel):
-    """Actions the operator chose to queue as scan recommendations."""
-    action_ids: List[str]
+    """Actions the operator chose to queue as scan recommendations.
+
+    Three ways in, because rule output is a starting point rather than the whole
+    answer: take a suggestion as-is (`action_ids`), take one and adjust it
+    (`overrides` — the only way to run the "needs input" suggestions, whose
+    placeholders must be filled from the credential store or a chosen wordlist),
+    or write your own (`custom_actions`).
+    """
+    action_ids: List[str] = []
+    # action_id -> {"script": ..., "priority": ...}
+    overrides: Dict[str, Dict[str, Any]] = {}
+    custom_actions: List[CustomAction] = []
     engagement_id: Optional[str] = None
 
 
@@ -3213,25 +3359,62 @@ def queue_artifact_actions(artifact_id: str, req: QueueActionsRequest,
             content=art["content"], tool=art["tool"], target=art["target"],
             port=art["port"], service=art["service"] or "",
             llm_result=art.get("llm_result"))}
-        chosen = [actions[i] for i in req.action_ids if i in actions]
+        chosen = []
+        for i in req.action_ids:
+            if i not in actions:
+                continue
+            a = dict(actions[i])
+            # Operator edits win over the rule's own command. This is the only
+            # way to run a "needs input" suggestion, whose placeholders have to
+            # be filled from the credential store or a chosen wordlist.
+            ov = req.overrides.get(i) or {}
+            if ov.get("script"):
+                a["script"] = str(ov["script"])[:2000]
+                a["edited"] = True
+            if ov.get("priority") is not None:
+                try:
+                    a["priority"] = max(0, min(100, int(ov["priority"])))
+                except (TypeError, ValueError):
+                    pass
+            # Two ways a command can be un-runnable, and both must be caught:
+            # a {brace} placeholder the substituter could not fill, and a rule
+            # that declared needs_input because its script carries literal
+            # stand-ins (USER/PASS) no substituter would ever notice. Checking
+            # only for braces let `netexec ... -u USER -p PASS` queue as-is and
+            # fail at dispatch.
+            if a.get("needs_input") and not ov.get("script"):
+                raise HTTPException(
+                    400, f"action '{i}' needs input before it can run: {a['script']}. "
+                         f"Supply overrides['{i}'].script with the placeholders filled in.")
+            if "{" in a["script"]:
+                raise HTTPException(
+                    400, f"action '{i}' still contains a placeholder: {a['script']}. "
+                         "Fill it in before queuing — an unresolved command cannot run.")
+            chosen.append(a)
         unknown = [i for i in req.action_ids if i not in actions]
+
+        for c in req.custom_actions:
+            scanner = (c.scanner or "").strip()
+            script = (c.script or "").strip()
+            if not _re_module.match(r"^[a-zA-Z0-9_.-]+$", scanner):
+                raise HTTPException(400, f"invalid scanner name: {scanner!r}")
+            if not script:
+                raise HTTPException(400, "custom action needs a command")
+            chosen.append({
+                "id": f"manual_{scanner}", "title": (c.title or scanner).strip()[:200],
+                "scanner": scanner, "script": script[:2000],
+                "priority": max(0, min(100, int(c.priority))),
+                "rationale": (c.rationale or "Added manually by the operator.")[:500],
+                "evidence": "", "category": c.category, "source": "manual",
+            })
+
         queued = []
         for a in chosen:
-            cur.execute("""
-                INSERT INTO scan_recommendations
-                    (ip, service, scanner, action, script, source, priority,
-                     status, engagement_id, extra)
-                VALUES (%s,%s,%s,%s,%s,'artifact',%s,'pending',%s,%s)
-                ON CONFLICT (fingerprint) DO UPDATE
-                   SET updated_at = now(),
-                       extra = scan_recommendations.extra || EXCLUDED.extra
-                RETURNING id, status
-            """, (art["target"], art["service"], a["scanner"], a["title"],
-                  a["script"], a["priority"], req.engagement_id or art["engagement_id"],
-                  Json({"artifact_id": artifact_id, "rule_id": a["id"],
-                        "rationale": a["rationale"], "evidence": a["evidence"],
-                        "origin_tool": art["tool"], "suggestion_source": a["source"]})))
-            row = cur.fetchone()
+            row = _insert_recommendation(
+                cur, {**dict(art), "id": artifact_id}, a,
+                "manual-edited" if a.get("edited") else
+                ("manual" if a.get("source") == "manual" else "manual"),
+                req.engagement_id)
             queued.append({"recommendation_id": str(row["id"]), "action_id": a["id"],
                            "scanner": a["scanner"], "script": a["script"],
                            "status": row["status"]})
