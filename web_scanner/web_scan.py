@@ -1,4 +1,8 @@
 import os, time, subprocess, pathlib, re, uuid, threading, logging, shutil, json
+# Module-level: archive_raw_artifact() runs outside the functions that
+# import requests locally, and its except-block would have swallowed the
+# resulting NameError as a failed archive rather than a missing import.
+import requests
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import psycopg2
@@ -105,6 +109,40 @@ def _insert_info_finding(source: str, url: str, name: str, evidence: str):
         logger.warning(f"[{source}] Failed to insert info finding: {e}")
 
 
+def archive_raw_artifact(path, tool: str, job_id: str = None, target: str = None):
+    """Archive one raw scan output file to the artifact store.
+
+    web_scanner delivers its results by INSERTing parsed rows straight into
+    web_findings, so unlike the services that upload to /ingest/<tool> its raw
+    output never reached raw_artifacts. The ZAP and nikto XML were written to
+    the session directory on disk and nowhere else — fine until the container is
+    rebuilt or the volume pruned, and invisible to the Scan Results UI and to
+    LLM post-processing.
+
+    Failures are logged and swallowed: the scan already succeeded and its
+    findings are already stored.
+    """
+    try:
+        fp = pathlib.Path(path)
+        if not fp.exists() or not fp.is_file() or fp.stat().st_size == 0:
+            return
+        content = fp.read_text(errors="replace")
+        r = requests.post(
+            f"{API_BASE}/ingest/raw-artifact",
+            json={"tool": tool, "content": content, "target": target or "",
+                  "job_id": job_id, "source": "web_scanner",
+                  "command": f"file:{fp.name}"},
+            headers={"x-api-key": API_KEY}, timeout=120, verify=False,
+        )
+        if r.status_code < 400:
+            logger.info(f"[archive] {tool} {fp.name} ({fp.stat().st_size} B) -> "
+                        f"{r.json().get('artifact_id')}")
+        else:
+            logger.warning(f"[archive] HTTP {r.status_code} for {fp.name}: {r.text[:200]}")
+    except Exception as e:
+        logger.warning(f"[archive] failed for {path}: {e}")
+
+
 def _save_session_results(job_id, job_type, scanner, files, metadata=None):
     """Copy raw scan output files to a session-based directory."""
     try:
@@ -125,6 +163,17 @@ def _save_session_results(job_id, job_type, scanner, files, metadata=None):
             manifest["metadata"] = metadata
         (session_path / "manifest.json").write_text(json.dumps(manifest, indent=2))
         logger.info(f"[session] Saved {len(copied)} files to {session_path}")
+        # Same files into the artifact store: the session directory is local to
+        # this container, while raw_artifacts is queryable, deduped, and feeds
+        # the follow-on action rules.
+        for fp in files:
+            name = pathlib.Path(str(fp)).name.lower()
+            # Name the producing tool where the filename makes it unambiguous,
+            # so tool-scoped rules apply correctly; otherwise fall back to the
+            # scanner that ran the job.
+            tool = ("nikto" if "nikto" in name else
+                    "zap" if ("zap" in name or name.endswith(".xml")) else scanner)
+            archive_raw_artifact(fp, tool, job_id=job_id)
     except Exception as e:
         logger.warning(f"[session] Failed to save session results: {e}")
 

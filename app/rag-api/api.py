@@ -1612,7 +1612,83 @@ def get_open_ports(
         rows = cur.fetchall()
     return {"count": len(rows), "total": total, "limit": limit, "offset": offset, "items": rows}
 
-def _save_upload_to_tmp(file: UploadFile) -> str:
+# Upload archiving cap. Scan uploads are normally KBs to a few MB; this exists
+# so a pathological file cannot be read into memory whole. Exceeding it is
+# logged loudly and marked in the stored content rather than passing silently,
+# because this table is meant to be the source of truth.
+ARTIFACT_MAX_BYTES = int(os.environ.get("ARTIFACT_MAX_BYTES", str(64 * 1024 * 1024)))
+
+
+def _store_artifact_row(*, tool: str, content: str, command: str = None,
+                        target: str = None, port: int = None, service: str = None,
+                        exec_id: str = None, job_id: str = None, scan_id: str = None,
+                        source: str = "unknown", content_format: str = None,
+                        native_json: bool = False, engagement_id: str = None) -> dict:
+    """Insert or dedupe one artifact. Shared by the HTTP endpoint and the
+    upload chokepoint so the two paths cannot drift apart."""
+    sha = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
+    fmt = content_format or _detect_content_format(content)
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO raw_artifacts
+                (engagement_id, tool, command, target, port, service, exec_id,
+                 job_id, scan_id, source, content_format, native_json, content,
+                 content_sha256, byte_size)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (tool, COALESCE(target,''), content_sha256) DO UPDATE
+               SET last_seen    = now(),
+                   occurrences  = raw_artifacts.occurrences + 1,
+                   exec_id      = COALESCE(EXCLUDED.exec_id, raw_artifacts.exec_id),
+                   job_id       = COALESCE(EXCLUDED.job_id, raw_artifacts.job_id),
+                   scan_id      = COALESCE(EXCLUDED.scan_id, raw_artifacts.scan_id),
+                   command      = COALESCE(EXCLUDED.command, raw_artifacts.command)
+            RETURNING id, (xmax = 0) AS inserted, occurrences
+            """,
+            (engagement_id, tool, command, target, port, service, exec_id, job_id,
+             scan_id, source, fmt, native_json, content, sha,
+             len(content.encode("utf-8", "replace"))),
+        )
+        row = cur.fetchone()
+    return {"artifact_id": str(row[0]), "inserted": bool(row[1]),
+            "occurrences": row[2], "content_format": fmt, "sha256": sha}
+
+
+def _archive_upload(path: str, tool: str, job_id: str = None,
+                    engagement_id: str = None) -> None:
+    """Archive an uploaded scan file verbatim.
+
+    This is where the SCANNER SERVICES get covered. pd_runner, nmap_scanner,
+    osint_runner and brutus_runner all deliver results by POSTing a file to
+    /ingest/<tool>, so their output never passed through the kali-listener path
+    that archived stdout — it was parsed into findings and the original file
+    deleted. Archiving here catches every one of them at a single point rather
+    than editing each service.
+
+    Never raises: the parse that follows is what the caller asked for, and
+    losing the archive copy must not fail an otherwise good ingest.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            raw = fh.read(ARTIFACT_MAX_BYTES)
+        content = raw.decode("utf-8", "replace")
+        if size > ARTIFACT_MAX_BYTES:
+            logger.warning("artifact %s from %s is %d bytes; archived first %d",
+                           os.path.basename(path), tool, size, ARTIFACT_MAX_BYTES)
+            content += (f"\n\n=== TRUNCATED BY ARTIFACT_MAX_BYTES: stored "
+                        f"{ARTIFACT_MAX_BYTES} of {size} bytes ===\n")
+        res = _store_artifact_row(tool=tool, content=content, source="upload",
+                                  job_id=job_id, engagement_id=engagement_id,
+                                  command=f"upload:{os.path.basename(path)}")
+        logger.info("archived %s upload (%d bytes) -> %s new=%s",
+                    tool, size, res["artifact_id"], res["inserted"])
+    except Exception as e:
+        logger.warning("upload archive failed for tool=%s: %s", tool, e)
+
+
+def _save_upload_to_tmp(file: UploadFile, tool: str = None, job_id: str = None,
+                        engagement_id: str = None) -> str:
     """Persist an upload to a private temp path.
 
     The filename is attacker-controlled (it comes from the multipart headers),
@@ -1626,6 +1702,11 @@ def _save_upload_to_tmp(file: UploadFile) -> str:
     tmp_path = f"/tmp/{uuid.uuid4().hex}_{safe[:120]}"
     with open(tmp_path, "wb") as buffer:
         buffer.write(file.file.read())
+    # Archive before parsing. Callers that name their tool get the complete
+    # uploaded file preserved; the parse below is lossy and the temp file is
+    # unlinked immediately after it.
+    if tool:
+        _archive_upload(tmp_path, tool, job_id=job_id, engagement_id=engagement_id)
     return tmp_path
 
 def _parse_targets_text(content: str, whitelist: Optional[List[str]], blacklist: Optional[List[str]]) -> List[str]:
@@ -1920,7 +2001,7 @@ def ingest_nmap(
     target: str = None,
     authorized: bool = Depends(auth)
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="nmap", job_id=job_id)
     try:
         from etl.parse_nmap import parse_nmap
         stats = parse_nmap(path, profile="api-upload", job_id=job_id, target=target)
@@ -1936,7 +2017,7 @@ def ingest_nessus(
     target: str = None,
     authorized: bool = Depends(auth),
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="nessus", job_id=job_id)
     try:
         from etl.parse_nessus import parse_nessus
         stats = parse_nessus(path, profile="api-upload", job_id=job_id, target=target)
@@ -1952,7 +2033,7 @@ def ingest_nuclei(
     target: str = None,
     authorized: bool = Depends(auth)
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="nuclei", job_id=job_id)
     try:
         from etl.parse_nuclei import parse_nuclei
         stats = parse_nuclei(path, profile="api-upload", job_id=job_id, target=target)
@@ -1963,7 +2044,7 @@ def ingest_nuclei(
 
 @app.post("/ingest/burp")
 def ingest_burp(file: UploadFile = File(...), authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="burp")
     try:
         from etl.parse_burp import parse_burp
         stats = parse_burp(path, profile="api-upload")
@@ -1979,7 +2060,7 @@ def ingest_zap_report(file: UploadFile = File(...), authorized: bool = Depends(a
     Distinct from the live-ZAP path in etl/parse_zap.py, which pulls alerts from
     a running ZAP's API. This accepts a report file produced anywhere.
     """
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="zap")
     try:
         from etl.parse_zap_file import parse_zap_file
         stats = parse_zap_file(path, profile="api-upload")
@@ -1994,7 +2075,7 @@ def ingest_zap_report(file: UploadFile = File(...), authorized: bool = Depends(a
 @app.post("/ingest/nikto")
 def ingest_nikto(file: UploadFile = File(...), authorized: bool = Depends(auth)):
     """Ingest a Nikto report (XML or JSON)."""
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="nikto")
     try:
         from etl.parse_nikto import parse_nikto
         stats = parse_nikto(path, profile="api-upload")
@@ -2059,7 +2140,7 @@ def ingest_web_scan(
     One endpoint rather than making the operator pick the right one — the
     per-tool endpoints remain available for scripted use.
     """
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="web-scan")
     try:
         detected = (tool or "").strip().lower() or _detect_web_scan_tool(path)
         if not detected:
@@ -2114,7 +2195,7 @@ def ingest_web_scan(
 
 @app.post("/ingest/masscan")
 def ingest_masscan(file: UploadFile = File(...), authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="masscan")
     try:
         from etl.parse_masscan import parse_masscan
         stats = parse_masscan(path, profile="upload")
@@ -2128,7 +2209,7 @@ def dedupe_masscan(file: UploadFile = File(...), authorized: bool = Depends(auth
     """
     Accept a Masscan -oJ JSON file and return a deduplicated list of host:port pairs.
     """
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="dedupe")
     try:
         items: List[Dict[str, Any]] = []
         pairs = set()
@@ -2170,7 +2251,7 @@ def dedupe_masscan(file: UploadFile = File(...), authorized: bool = Depends(auth
 @app.post("/ingest/subfinder")
 def ingest_subfinder(file: UploadFile = File(...), job_id: str = None,
                      engagement_id: Optional[str] = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="subfinder", job_id=job_id, engagement_id=engagement_id)
     try:
         from etl.parse_subfinder import parse_subfinder
         # Resolve engagement from the explicit param or the X-Engagement-Id
@@ -2183,7 +2264,7 @@ def ingest_subfinder(file: UploadFile = File(...), job_id: str = None,
 
 @app.post("/ingest/httpx")
 def ingest_httpx(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="httpx", job_id=job_id)
     try:
         from etl.parse_httpx import parse_httpx
         stats = parse_httpx(path, profile="api-upload", job_id=job_id)
@@ -2193,7 +2274,7 @@ def ingest_httpx(file: UploadFile = File(...), job_id: str = None, authorized: b
 
 @app.post("/ingest/whatweb")
 def ingest_whatweb(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="whatweb", job_id=job_id)
     try:
         from etl.parse_whatweb import parse_whatweb
         stats = parse_whatweb(path, profile="api-upload", job_id=job_id)
@@ -2203,7 +2284,7 @@ def ingest_whatweb(file: UploadFile = File(...), job_id: str = None, authorized:
 
 @app.post("/ingest/wafw00f")
 def ingest_wafw00f(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="wafw00f", job_id=job_id)
     try:
         from etl.parse_wafw00f import parse_wafw00f
         stats = parse_wafw00f(path, profile="api-upload", job_id=job_id)
@@ -2213,7 +2294,7 @@ def ingest_wafw00f(file: UploadFile = File(...), job_id: str = None, authorized:
 
 @app.post("/ingest/naabu")
 def ingest_naabu(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="naabu", job_id=job_id)
     try:
         from etl.parse_naabu import parse_naabu
         stats = parse_naabu(path, profile="api-upload", job_id=job_id)
@@ -2223,7 +2304,7 @@ def ingest_naabu(file: UploadFile = File(...), job_id: str = None, authorized: b
 
 @app.post("/ingest/katana")
 def ingest_katana(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="katana", job_id=job_id)
     try:
         from etl.parse_katana import parse_katana
         stats = parse_katana(path, profile="api-upload", job_id=job_id)
@@ -2233,7 +2314,7 @@ def ingest_katana(file: UploadFile = File(...), job_id: str = None, authorized: 
 
 @app.post("/ingest/brutus")
 def ingest_brutus(file: UploadFile = File(...), job_id: str = None, secret_type: str = "password", authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="brutus", job_id=job_id)
     try:
         from etl.parse_brutus import parse_brutus
         stats = parse_brutus(path, profile="api-upload", job_id=job_id, secret_type=secret_type)
@@ -2244,7 +2325,7 @@ def ingest_brutus(file: UploadFile = File(...), job_id: str = None, secret_type:
 @app.post("/ingest/dnsx")
 def ingest_dnsx(file: UploadFile = File(...), job_id: str = None,
                 engagement_id: Optional[str] = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="dnsx", job_id=job_id, engagement_id=engagement_id)
     try:
         from etl.parse_dnsx import parse_dnsx
         # Resolve engagement (explicit param or X-Engagement-Id header) so
@@ -2257,7 +2338,7 @@ def ingest_dnsx(file: UploadFile = File(...), job_id: str = None,
 
 @app.post("/ingest/tlsx")
 def ingest_tlsx(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="tlsx", job_id=job_id)
     try:
         from etl.parse_tlsx import parse_tlsx
         stats = parse_tlsx(path, profile="api-upload", job_id=job_id)
@@ -2267,7 +2348,7 @@ def ingest_tlsx(file: UploadFile = File(...), job_id: str = None, authorized: bo
 
 @app.post("/ingest/crtsh")
 def ingest_crtsh(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="crtsh", job_id=job_id)
     try:
         from etl.parse_crtsh import parse_crtsh
         stats = parse_crtsh(path, profile="api-upload", job_id=job_id)
@@ -2278,7 +2359,7 @@ def ingest_crtsh(file: UploadFile = File(...), job_id: str = None, authorized: b
 @app.post("/ingest/cloud-tenant")
 def ingest_cloud_tenant(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
     """JSONL of cloud-tenant discovery results — one record per (domain, provider) pair."""
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="cloud-tenant", job_id=job_id)
     try:
         from etl.parse_cloud_tenant import parse_cloud_tenant
         stats = parse_cloud_tenant(path, profile="api-upload", job_id=job_id)
@@ -2807,7 +2888,7 @@ def news_stats(authorized: bool = Depends(auth)):
 
 @app.post("/ingest/recon")
 def ingest_recon(file: UploadFile = File(...), source: str = "recon", job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="recon", job_id=job_id)
     try:
         from etl.parse_recon import parse_recon
         stats = parse_recon(path, source=source, profile="api-upload", job_id=job_id)
@@ -2936,31 +3017,13 @@ def ingest_raw_artifact(req: RawArtifactRequest, authorized: bool = Depends(auth
     analysed, and paying to analyse the same bytes again is waste.
     """
     content = req.content or ""
-    sha = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
-    fmt = req.content_format or _detect_content_format(content)
-    with get_db() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO raw_artifacts
-                (engagement_id, tool, command, target, port, service, exec_id,
-                 job_id, scan_id, source, content_format, native_json, content,
-                 content_sha256, byte_size)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (tool, COALESCE(target,''), content_sha256) DO UPDATE
-               SET last_seen    = now(),
-                   occurrences  = raw_artifacts.occurrences + 1,
-                   exec_id      = COALESCE(EXCLUDED.exec_id, raw_artifacts.exec_id),
-                   job_id       = COALESCE(EXCLUDED.job_id, raw_artifacts.job_id),
-                   scan_id      = COALESCE(EXCLUDED.scan_id, raw_artifacts.scan_id),
-                   command      = COALESCE(EXCLUDED.command, raw_artifacts.command)
-            RETURNING id, (xmax = 0) AS inserted, occurrences
-            """,
-            (req.engagement_id, req.tool, req.command, req.target, req.port,
-             req.service, req.exec_id, req.job_id, req.scan_id, req.source,
-             fmt, req.native_json, content, sha, len(content.encode("utf-8", "replace"))),
-        )
-        row = cur.fetchone()
-    artifact_id, inserted, occurrences = str(row[0]), bool(row[1]), row[2]
+    res = _store_artifact_row(
+        tool=req.tool, content=content, command=req.command, target=req.target,
+        port=req.port, service=req.service, exec_id=req.exec_id, job_id=req.job_id,
+        scan_id=req.scan_id, source=req.source, content_format=req.content_format,
+        native_json=req.native_json, engagement_id=req.engagement_id)
+    artifact_id, inserted, occurrences = res["artifact_id"], res["inserted"], res["occurrences"]
+    fmt, sha = res["content_format"], res["sha256"]
 
     # Auto-queue follow-ups for genuinely new output only. A repeat is
     # byte-identical by definition, so re-proposing the same actions would just
@@ -3432,7 +3495,7 @@ def queue_artifact_actions(artifact_id: str, req: QueueActionsRequest,
 
 @app.post("/ingest/vulnx")
 def ingest_vulnx(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="vulnx", job_id=job_id)
     try:
         from etl.parse_vulnx import parse_vulnx
         stats = parse_vulnx(path, profile="api-upload", job_id=job_id)
@@ -3442,7 +3505,7 @@ def ingest_vulnx(file: UploadFile = File(...), job_id: str = None, authorized: b
 
 @app.post("/ingest/amass")
 def ingest_amass(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="amass", job_id=job_id)
     try:
         from etl.parse_amass import parse_amass
         stats = parse_amass(path, profile="api-upload", job_id=job_id)
@@ -3452,7 +3515,7 @@ def ingest_amass(file: UploadFile = File(...), job_id: str = None, authorized: b
 
 @app.post("/ingest/gau")
 def ingest_gau(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="gau", job_id=job_id)
     try:
         from etl.parse_gau import parse_gau
         stats = parse_gau(path, source="gau", profile="api-upload", job_id=job_id)
@@ -3462,7 +3525,7 @@ def ingest_gau(file: UploadFile = File(...), job_id: str = None, authorized: boo
 
 @app.post("/ingest/waybackurls")
 def ingest_waybackurls(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="waybackurls", job_id=job_id)
     try:
         from etl.parse_gau import parse_gau
         stats = parse_gau(path, source="waybackurls", profile="api-upload", job_id=job_id)
@@ -3472,7 +3535,7 @@ def ingest_waybackurls(file: UploadFile = File(...), job_id: str = None, authori
 
 @app.post("/ingest/trufflehog")
 def ingest_trufflehog(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="trufflehog", job_id=job_id)
     try:
         from etl.parse_trufflehog import parse_trufflehog
         stats = parse_trufflehog(path, profile="api-upload", job_id=job_id)
@@ -3482,7 +3545,7 @@ def ingest_trufflehog(file: UploadFile = File(...), job_id: str = None, authoriz
 
 @app.post("/ingest/censys")
 def ingest_censys(file: UploadFile = File(...), job_id: str = None, search_type: str = "hosts", authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="censys", job_id=job_id)
     try:
         from etl.parse_censys import parse_censys
         stats = parse_censys(path, search_type=search_type, profile="api-upload", job_id=job_id)
@@ -3492,7 +3555,7 @@ def ingest_censys(file: UploadFile = File(...), job_id: str = None, search_type:
 
 @app.post("/ingest/ffuf")
 def ingest_ffuf(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="ffuf", job_id=job_id)
     try:
         from etl.parse_ffuf import parse_ffuf
         stats = parse_ffuf(path, profile="api-upload", job_id=job_id)
@@ -3502,7 +3565,7 @@ def ingest_ffuf(file: UploadFile = File(...), job_id: str = None, authorized: bo
 
 @app.post("/ingest/netexec")
 def ingest_netexec(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="netexec", job_id=job_id)
     try:
         from etl.parse_netexec import parse_netexec
         stats = parse_netexec(path, profile="api-upload", job_id=job_id)
@@ -3512,7 +3575,7 @@ def ingest_netexec(file: UploadFile = File(...), job_id: str = None, authorized:
 
 @app.post("/ingest/impacket")
 def ingest_impacket(file: UploadFile = File(...), job_id: str = None, tool: str = "secretsdump", target: str = "", authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="impacket", job_id=job_id)
     try:
         from etl.parse_impacket import parse_impacket
         stats = parse_impacket(path, tool=tool, target=target, profile="api-upload", job_id=job_id)
@@ -3522,7 +3585,7 @@ def ingest_impacket(file: UploadFile = File(...), job_id: str = None, tool: str 
 
 @app.post("/ingest/hashcat")
 def ingest_hashcat(file: UploadFile = File(...), job_id: str = None, hash_type: str = "unknown", authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="hashcat", job_id=job_id)
     try:
         from etl.parse_hashcat import parse_hashcat
         stats = parse_hashcat(path, hash_type=hash_type, profile="api-upload", job_id=job_id)
@@ -3537,7 +3600,7 @@ def ingest_greyhatwarfare(
     background_tasks: BackgroundTasks = None,
     authorized: bool = Depends(auth),
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="greyhatwarfare", job_id=job_id)
     try:
         from etl.parse_greyhatwarfare import parse_greyhatwarfare
         stats = parse_greyhatwarfare(path, profile="api-upload", job_id=job_id)
@@ -3559,7 +3622,7 @@ def ingest_subdomain_takeover(
     background_tasks: BackgroundTasks = None,
     authorized: bool = Depends(auth),
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="subdomain_takeover", job_id=job_id)
     try:
         from etl.parse_subdomain_takeover import parse_subdomain_takeover_file
         stats = parse_subdomain_takeover_file(path, source="subdomain_takeover", scan_id=job_id)
@@ -3583,7 +3646,7 @@ def ingest_prowler(
     authorized: bool = Depends(auth),
     background_tasks: BackgroundTasks = None,
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="prowler", job_id=job_id)
     try:
         from etl.parse_prowler import parse_prowler
         stats = parse_prowler(path, profile="api-upload", job_id=job_id)
@@ -3600,7 +3663,7 @@ def ingest_scoutsuite(
     authorized: bool = Depends(auth),
     background_tasks: BackgroundTasks = None,
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="scoutsuite", job_id=job_id)
     try:
         from etl.parse_scoutsuite import parse_scoutsuite
         stats = parse_scoutsuite(path, profile="api-upload", job_id=job_id)
@@ -3617,7 +3680,7 @@ def ingest_pacu(
     authorized: bool = Depends(auth),
     background_tasks: BackgroundTasks = None,
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="pacu", job_id=job_id)
     try:
         from etl.parse_pacu import parse_pacu
         stats = parse_pacu(path, profile="api-upload", job_id=job_id)
@@ -3634,7 +3697,7 @@ def ingest_cloudfox(
     authorized: bool = Depends(auth),
     background_tasks: BackgroundTasks = None,
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="cloudfox", job_id=job_id)
     try:
         from etl.parse_cloudfox import parse_cloudfox
         stats = parse_cloudfox(path, profile="api-upload", job_id=job_id)
@@ -3651,7 +3714,7 @@ def ingest_azurehound(
     authorized: bool = Depends(auth),
     background_tasks: BackgroundTasks = None,
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="azurehound", job_id=job_id)
     try:
         from etl.parse_azurehound import parse_azurehound
         stats = parse_azurehound(path, profile="api-upload", job_id=job_id)
@@ -3877,7 +3940,7 @@ def ingest_microburst(
                 },
             )
 
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="microburst", job_id=job_id, engagement_id=engagement_id)
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         eid = _resolve_engagement_id(engagement_id)
         cur.execute(
