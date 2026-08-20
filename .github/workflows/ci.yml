@@ -23,3 +23,6 @@ jobs:
       - name: Byte-compile python
         run: |
           python -m compileall -q etl app scanner nuclei
+      - name: Check shared module drift
+        run: |
+          python3 scripts/check_shared_code.py --list

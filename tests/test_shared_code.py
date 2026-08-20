@@ -3,110 +3,70 @@
 Run on demand:
 
     pytest tests/test_shared_code.py -v
+    python3 scripts/check_shared_code.py --list     # same check, no pytest
 
 WHY THIS EXISTS
 ---------------
 `common/validation.py` holds the input sanitizers — command arguments, output
-paths, ports, CIDRs. Seven services carry their own copy of that file because
-each has its own Docker build context, and one of them had drifted:
-nmap_scanner's `sanitize_command_arg` gained a `max_len` parameter because the
-hardcoded 1000-character cap rejected nmap's top-1000 port specification (3,808
-characters), which broke scans using that profile.
+paths, ports, CIDRs. Seven services carry their own copy because each has its
+own Docker build context, and one had drifted: nmap_scanner's
+`sanitize_command_arg` gained a `max_len` parameter because the hardcoded
+1000-character cap rejected nmap's top-1000 port specification (3,808 characters
+expanded), which broke scans on that profile. The fix was correct and stayed in
+one service; the other six kept the bug. Nobody was wrong — there was no way to
+notice.
 
-The fix was correct and stayed in one service for as long as the duplication
-lasted. The other six kept the bug. Nobody was wrong at any point — there was
-simply no way to notice.
-
-This asserts every copy still matches `common/`. It does NOT argue against the
-duplication; it makes the duplication survivable until the copies are replaced
-by imports from a mounted `common/` (the pattern `etl/scope_gate.py` now uses).
+The comparison itself lives in scripts/check_shared_code.py, NOT here. Writing
+it twice would make this file the eighth copy of something that must not be
+duplicated, which would be a poor advertisement for the rule it enforces. The
+same script runs from post-install-check.sh and from CI, so the check holds at
+deploy time and on every push, not only when someone runs pytest.
 """
-import ast
-import hashlib
+import importlib.util
 import os
 
 import pytest
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
-CANONICAL = os.path.join(REPO, "common", "validation.py")
-
-# Every public helper the canonical module exposes.
-GUARDED = (
-    "sanitize_scan_id", "sanitize_filename", "validate_output_path",
-    "sanitize_port", "validate_cidr", "sanitize_url_path", "sanitize_command_arg",
-)
-
-
-def _bodies(path):
-    """name -> hash of the function BODY, ignoring comments and docstrings."""
-    out = {}
-    try:
-        tree = ast.parse(open(path, encoding="utf-8", errors="replace").read())
-    except (OSError, SyntaxError):               # pragma: no cover
-        return out
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in GUARDED:
-            body = [n for n in node.body
-                    if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
-                            and isinstance(n.value.value, str))]
-            dumped = ast.dump(ast.Module(body=body, type_ignores=[]))
-            sig = ast.dump(node.args)
-            out[node.name] = hashlib.md5((sig + dumped).encode()).hexdigest()[:12]
-    return out
-
-
-def _copies():
-    found = []
-    for root, dirs, files in os.walk(REPO):
-        dirs[:] = [d for d in dirs
-                   if d not in ("__pycache__", "node_modules", ".git", "tests")]
-        if os.path.realpath(root) == os.path.dirname(CANONICAL):
-            continue
-        for fn in files:
-            if fn == "validation.py":
-                found.append(os.path.join(root, fn))
-    return found
+_CHECKER = os.path.join(REPO, "scripts", "check_shared_code.py")
 
 
 @pytest.fixture(scope="module")
-def canonical():
-    if not os.path.exists(CANONICAL):            # pragma: no cover
-        pytest.skip("common/validation.py not present")
-    b = _bodies(CANONICAL)
-    assert b, "canonical module defines none of the guarded functions"
-    return b
+def checker():
+    if not os.path.exists(_CHECKER):             # pragma: no cover
+        pytest.skip("scripts/check_shared_code.py not present")
+    spec = importlib.util.spec_from_file_location("check_shared_code", _CHECKER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def test_the_canonical_module_defines_every_guarded_helper(canonical):
-    missing = [f for f in GUARDED if f not in canonical]
-    assert not missing, f"common/validation.py is missing: {missing}"
+def test_no_shared_module_drift(checker):
+    """Every per-service copy matches its canonical version."""
+    problems, _compared = checker.check()
+    assert not problems, (
+        "shared module drift:\n  " + "\n  ".join(problems)
+        + "\n\nPort the change into the canonical file, re-sync every copy, and "
+          "rebuild those images.")
 
 
-def test_copies_were_actually_found():
-    """Without this the drift test below passes by finding nothing to compare."""
-    copies = _copies()
-    assert len(copies) >= 5, (
-        f"expected the per-service validation.py copies, found {len(copies)}. "
-        "If they were replaced by imports from common/, delete this test — "
-        "the duplication it guards is gone.")
+def test_the_check_actually_compared_something(checker):
+    """A drift check that finds nothing to compare passes and proves nothing.
 
-
-@pytest.mark.parametrize("copy_path", _copies(), ids=lambda p: os.path.relpath(p, REPO))
-def test_copy_matches_canonical(canonical, copy_path):
-    """A copy that lags the canonical version is a bug fix that did not travel.
-
-    Compares signature + body, ignoring docstrings and comments: a reworded
-    docstring is not drift, a changed default or an extra parameter is.
+    That failure mode has already occurred twice in this repo's guards, so it is
+    asserted rather than assumed. If the per-service copies are ever replaced by
+    imports from a mounted common/, this test should be deleted along with them.
     """
-    theirs = _bodies(copy_path)
-    drifted = [name for name, h in theirs.items()
-               if name in canonical and canonical[name] != h]
-    missing = [name for name in canonical if name not in theirs]
-    rel = os.path.relpath(copy_path, REPO)
-    assert not drifted, (
-        f"{rel} has diverged from common/validation.py in: {drifted}. "
-        f"Port the change into common/validation.py and re-sync every copy — "
-        f"these are input sanitizers, so a weaker one here is a real hole.")
-    assert not missing, (
-        f"{rel} is missing {missing} — it will fall back to whatever the "
-        f"importing service defines, or fail at runtime.")
+    _problems, compared = checker.check()
+    assert compared >= 5, (
+        f"only {compared} copy/copies compared — the checker is not finding the "
+        "per-service files it is meant to guard")
+
+
+def test_canonical_modules_exist_and_define_their_functions(checker):
+    for canonical_rel, (_basename, names) in checker.SHARED_MODULES.items():
+        path = os.path.join(REPO, canonical_rel)
+        assert os.path.exists(path), f"canonical module missing: {canonical_rel}"
+        found = checker.function_hashes(path, names)
+        missing = [n for n in names if n not in found]
+        assert not missing, f"{canonical_rel} does not define: {missing}"

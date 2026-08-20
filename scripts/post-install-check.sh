@@ -620,6 +620,15 @@ fi
 # live for hours while the container kept ingesting out-of-scope hosts.
 echo ""
 echo "🔍 Verifying containers run the current code..."
+# Shared modules copied per Docker build context must stay identical. A weaker
+# sanitizer in one service is a real hole, and drift here is silent: each
+# service works fine in isolation.
+if python3 "$(dirname "${BASH_SOURCE[0]}")/check_shared_code.py" >/dev/null 2>&1; then
+  pass "shared modules consistent across services"
+else
+  fail "shared module drift — run: python3 scripts/check_shared_code.py --list"
+fi
+
 if python3 "$(dirname "${BASH_SOURCE[0]}")/check_image_freshness.py"; then
     :
 else
