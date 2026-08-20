@@ -79,8 +79,6 @@ SCOPE_DEBT = {
         "runs tools for the pipeline; needs the same gate as routers/assets.py",
     "exploit_runner/script_executor.py":
         "sends traffic to a supplied target without a scope check",
-    "kali_listener/listener_service.py":
-        "executes whatever it is handed — the LAST line of defence, and the best place to refuse an out-of-scope target even when a caller insists",
     "nmap_scanner/cred_checker.py":
         "sends traffic to a supplied target without a scope check",
     "osint_runner/service_enum_cli.py":
