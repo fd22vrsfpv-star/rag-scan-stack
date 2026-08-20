@@ -2087,16 +2087,64 @@ def list_all_recommendations(
                        te.status           AS result_status,
                        te.exit_code        AS result_exit_code,
                        length(coalesce(te.output, '')) AS result_bytes,
-                       left(coalesce(te.output, ''), 400) AS result_preview,
+                       -- Fall back to te.error: a tool that fails often writes
+                       -- nothing to stdout, so a failed recommendation showed an
+                       -- empty output box and no reason at all.
+                       left(COALESCE(NULLIF(te.output, ''), te.error, ''), 400)
+                                           AS result_preview,
+                       NULLIF(te.error, '') AS result_error,
                        -- Why a recommendation was suppressed. Without this the UI
                        -- can filter to status='skipped' but cannot say WHY, which
                        -- makes the decision unreviewable — and the operator has to
                        -- take the tool's word for it.
-                       r.extra->>'skip_reason' AS skip_reason
+                       r.extra->>'skip_reason' AS skip_reason,
+                       -- The command that was ACTUALLY dispatched.
+                       --
+                       -- r.script is regularly empty or a fragment ("banner"):
+                       -- the recommender names a scanner, kali builds the real
+                       -- command at dispatch time, and scanner-service
+                       -- dispatches send a JSON payload to an endpoint instead
+                       -- of a shell command. All of that used to be thrown away
+                       -- once the request returned, so a completed
+                       -- recommendation showed no command at all.
+                       -- dispatched_command FIRST: it is what actually ran.
+                       -- r.script is the recommender's TEMPLATE and still holds
+                       -- its placeholders, so showing it for an executed
+                       -- recommendation displays a command the operator never
+                       -- ran and which would not work if copied.
+                       -- NB: this query is an f-string. Do NOT write brace
+                       -- placeholders in these comments -- Python evaluates them
+                       -- and the whole listing dies with "name is not defined",
+                       -- which surfaces as an empty recommendations page.
+                       COALESCE(r.extra->>'dispatched_command', NULLIF(r.script, ''))
+                                           AS command,
+                       NULLIF(r.script, '') AS script_template,
+                       r.extra->>'dispatched_command' AS dispatched_command,
+                       r.extra->>'dispatched_endpoint' AS dispatched_endpoint,
+                       -- Output for the OTHER dispatch route. tool_executions
+                       -- only covers kali tools; httpx/katana/nmap run inside
+                       -- scanner services whose job ids exist nowhere in this
+                       -- database, so those recommendations had no retrievable
+                       -- output whatsoever. Their uploads are now archived with
+                       -- the job id attached, which is the link back.
+                       ra.artifact_id, ra.artifact_tool, ra.artifact_bytes,
+                       ra.artifact_preview
                 FROM scan_recommendations r
                 -- 1:1 on a unique id, so this cannot multiply rows.
                 LEFT JOIN tool_executions te
                        ON te.id::text = r.extra->>'job_id'
+                -- LIMIT 1 keeps this 1:1 as well: a job can produce several
+                -- artifacts (stdout plus native JSON), and without the limit
+                -- each would duplicate the recommendation row.
+                LEFT JOIN LATERAL (
+                    SELECT a.id::text AS artifact_id, a.tool AS artifact_tool,
+                           a.byte_size AS artifact_bytes,
+                           left(coalesce(a.content, ''), 400) AS artifact_preview
+                      FROM raw_artifacts a
+                     WHERE a.job_id = r.extra->>'job_id'
+                     ORDER BY a.native_json DESC, a.created_at DESC
+                     LIMIT 1
+                ) ra ON true
                 {where}
                 ORDER BY r.ip, r.scanner, COALESCE(r.action,''), COALESCE(r.template,''), r.status,
                          r.priority ASC, r.created_at DESC

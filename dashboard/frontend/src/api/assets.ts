@@ -83,6 +83,31 @@ export interface StoredRecommendation {
   executed_at: string | null
   created_at: string
   purpose_group?: string | null
+
+  // What the recommendation actually ran and produced. The API has returned
+  // these for a while; they were simply not declared here, so the completed
+  // list rendered a status and nothing else.
+  /** What actually ran: extra.dispatched_command, falling back to the template. */
+  command?: string | null
+  /** The recommender's raw template, which may still contain {target}/{port}. */
+  script_template?: string | null
+  /** stderr from the tool, when it failed without writing to stdout. */
+  result_error?: string | null
+  /** Command built at dispatch time; `script` is often empty or a fragment. */
+  dispatched_command?: string | null
+  dispatched_endpoint?: string | null
+  job_id?: string | null
+  /** Populated for kali-dispatched tools (tool_executions). */
+  result_status?: string | null
+  result_exit_code?: number | null
+  result_bytes?: number | null
+  result_preview?: string | null
+  /** Populated for scanner-service dispatches, via the archived upload. */
+  artifact_id?: string | null
+  artifact_tool?: string | null
+  artifact_bytes?: number | null
+  artifact_preview?: string | null
+  skip_reason?: string | null
 }
 
 export function useScanRecommendations(status = 'pending', engagementId?: string | null) {

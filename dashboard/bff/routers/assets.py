@@ -923,11 +923,25 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         with get_db() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id::text, host(ip)::text AS ip, service, scanner, action,
-                       script, template, source, model, confidence, priority,
-                       status, extra, target_kind
-                  FROM scan_recommendations
-                 WHERE id = ANY(%s::uuid[])
+                SELECT r.id::text, host(r.ip)::text AS ip, r.service, r.scanner,
+                       r.action, r.script, r.template, r.source, r.model,
+                       r.confidence, r.priority, r.status, r.extra, r.target_kind,
+                       -- scan_recommendations has no port column, so {port} in a
+                       -- script could never be filled and the command was
+                       -- dispatched with the literal placeholder still in it.
+                       -- Prefer a port whose service matches the recommendation.
+                       pt.port
+                  FROM scan_recommendations r
+                  LEFT JOIN LATERAL (
+                      SELECT p.port
+                        FROM ports p
+                        JOIN assets a ON a.id = p.asset_id
+                       WHERE host(a.ip) = host(r.ip)
+                         AND COALESCE(p.is_open, true)
+                       ORDER BY (p.service IS NOT DISTINCT FROM r.service) DESC, p.port
+                       LIMIT 1
+                  ) pt ON true
+                 WHERE r.id = ANY(%s::uuid[])
                 """,
                 (list(body.ids),),
             )
@@ -1482,6 +1496,10 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                             service=rec.get("service"),
                             scanner=scanner,
                             node_id=node_id,
+                            # No shell command exists for these — the request
+                            # itself is the record of what ran.
+                            command=_describe_dispatch(endpoint, payload),
+                            endpoint=f"{service_url}{endpoint}" if endpoint else None,
                         )
                 else:
                     result["status"] = "failed"
@@ -1493,9 +1511,41 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
 
         return result
 
+    def _fill_placeholders(command: str, rec) -> tuple:
+        """Substitute {target}/{ip}/{port}/{service} in a recommendation's script.
+
+        Returns (command, unresolved). The recommender writes templates like
+        `gobuster dir -u http://{target}:{port} -w ...`, and only the remote-node
+        route ever substituted them — the Kali route passed `script` through
+        verbatim, so the tool received a literal "{target}" and failed with a
+        confusing error that looked like a tool problem rather than a templating
+        one.
+
+        Unresolved placeholders are REPORTED rather than dispatched: running a
+        command known to be malformed produces a failure the operator then has to
+        diagnose, when the cause is already known here.
+        """
+        if not command:
+            return command, []
+        ip = rec.get("ip") or ""
+        port = rec.get("port")
+        service = rec.get("service") or ""
+        out = command.replace("{target}", ip).replace("{ip}", ip)
+        if port not in (None, ""):
+            out = out.replace("{port}", str(port))
+        if service:
+            out = out.replace("{service}", service)
+        unresolved = re.findall(r"\{[a-zA-Z_]+\}", out)
+        return out, unresolved
+
     async def _dispatch_via_kali(rec, scanner, ip, result):
         """Route tool execution to the internal Kali container."""
-        command = rec.get("script") or ""
+        command, _unresolved = _fill_placeholders(rec.get("script") or "", rec)
+        if _unresolved:
+            result["status"] = "skipped"
+            result["detail"] = (f"command still contains {', '.join(sorted(set(_unresolved)))} "
+                                f"— no value known for it on {ip}. Edit the command and re-run.")
+            return result
         if not command:
             # Build a sensible default command
             port = rec.get("port") or ""
@@ -1560,6 +1610,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                         rec_id=rec["id"], job_id=exec_id or f"kali:{ip}",
                         ip=ip, port=rec.get("port"), service=rec.get("service"),
                         scanner=scanner, node_id=None,
+                        command=command, endpoint="kali-listener /tools/execute",
                     )
                 else:
                     result["status"] = "failed"
@@ -1569,9 +1620,24 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             result["detail"] = f"Kali: {type(e).__name__}: {str(e)[:60]}"
         return result
 
+    def _describe_dispatch(endpoint, payload):
+        """Human-readable record of a scanner-service dispatch.
+
+        These tools take a JSON payload rather than a shell command, so the
+        request IS the command as far as the operator is concerned.
+        """
+        if not endpoint:
+            return None
+        import json as _json
+        try:
+            body = _json.dumps(payload, default=str)[:800]
+        except Exception:
+            body = str(payload)[:800]
+        return f"POST {endpoint} {body}"
+
     async def _mark_rec_dispatched(
         rec_id: str, job_id: str, ip: str, port, service, scanner: str,
-        node_id: Optional[str],
+        node_id: Optional[str], command: str = None, endpoint: str = None,
     ):
         """Close the first half of the rec → job lifecycle loop.
 
@@ -1595,6 +1661,19 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             extra_merge = {"job_id": job_id}
             if node_id:
                 extra_merge["node_id"] = node_id
+            # Persist WHAT WAS ACTUALLY RUN. Without this the completed list
+            # can show nothing: `script` is frequently empty or a fragment
+            # ("banner") because the recommender names a scanner rather than a
+            # command line, _dispatch_via_kali builds the real command at
+            # dispatch time, and scanner-service dispatches send a JSON payload
+            # to an endpoint instead of a shell command. All of it was
+            # discarded once the request returned.
+            if command:
+                extra_merge["dispatched_command"] = str(command)[:2000]
+            if endpoint:
+                extra_merge["dispatched_endpoint"] = str(endpoint)[:300]
+            from datetime import datetime as _dt, timezone as _tz
+            extra_merge["dispatched_at"] = _dt.now(_tz.utc).isoformat()
             with get_db() as conn, conn.cursor() as cur:
                 cur.execute(
                     """
@@ -1642,8 +1721,12 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
 
     async def _dispatch_via_node(rec, scanner, ip, nid, result):
         """Route tool execution to a remote node via SSH."""
-        command = rec.get("script") or f"{scanner} {ip}"
-        command = command.replace("{target}", ip).replace("{ip}", ip)
+        command, _unresolved = _fill_placeholders(rec.get("script") or f"{scanner} {ip}", rec)
+        if _unresolved:
+            result["status"] = "skipped"
+            result["detail"] = (f"command still contains {', '.join(sorted(set(_unresolved)))} "
+                                f"— no value known for it on {ip}. Edit the command and re-run.")
+            return result
         try:
             async with httpx.AsyncClient(timeout=60) as client:
                 r = await client.post(
