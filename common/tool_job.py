@@ -25,11 +25,44 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Callable, Optional
 
 log = logging.getLogger(__name__)
+
+# ── Concurrency bound ─────────────────────────────────────────────────────
+#
+# Nothing bounded these runners. A caller could submit fifty jobs and fifty
+# tools would start, which is how the recommender's fan-out saturated the stack
+# earlier: one call per open port, each launching a tool, each producing output
+# that triggered more calls.
+#
+# The ceiling is MAX_CONCURRENT_SCANS — the number the operator already sets for
+# the engagement — rather than a new knob. Be precise about what it bounds: this
+# is PER SERVICE, not engagement-wide. Enforcing one global count would need a
+# shared counter (a DB row or a lease service) that this stack does not have, so
+# two runners at the limit can still total 2N. That is a large improvement on
+# unbounded and an honest description of what it does.
+#
+# Jobs WAIT for a slot rather than being rejected: they are background tasks
+# that have already been accepted and whose targets file is on disk, so queuing
+# preserves the work. FastAPI runs sync background tasks in a threadpool, so a
+# waiting job occupies a pool thread — hence the timeout, which fails the job
+# loudly instead of pinning a thread forever.
+MAX_CONCURRENT_SCANS = int(os.environ.get("MAX_CONCURRENT_SCANS", "5"))
+SLOT_WAIT_TIMEOUT = int(os.environ.get("SCAN_SLOT_WAIT_TIMEOUT", "1800"))
+
+_slots = threading.BoundedSemaphore(MAX_CONCURRENT_SCANS)
+
+
+def active_slot_count() -> int:
+    """How many slots are currently in use (best-effort, for diagnostics)."""
+    return MAX_CONCURRENT_SCANS - _slots._value        # noqa: SLF001
+
+
 
 # Tools legitimately exit 1 to mean "ran fine, found nothing" (httpx, subfinder
 # and friends), so only other non-zero codes are treated as failure.
@@ -39,6 +72,30 @@ DEFAULT_TIMEOUT = 3600
 RAW_OUTPUT_CAP = 10000
 STREAM_TAIL_TEST_MODE = 2000
 STREAM_TAIL_NORMAL = 500
+
+
+@contextmanager
+def scan_slot(job_id: str = "", label: str = "scan"):
+    """Hold one of this service's scan slots for the duration of the block.
+
+    For services whose job runner is not run_tool_job (web_scanner and
+    brutus_runner have their own), so the same ceiling applies without them
+    reimplementing the accounting:
+
+        with scan_slot(job_id, "web-scan"):
+            ...run the tools...
+
+    Raises TimeoutError rather than waiting forever, so a caller fails loudly
+    instead of pinning a threadpool worker.
+    """
+    if not _slots.acquire(timeout=SLOT_WAIT_TIMEOUT):
+        raise TimeoutError(
+            f"no scan slot within {SLOT_WAIT_TIMEOUT}s "
+            f"(MAX_CONCURRENT_SCANS={MAX_CONCURRENT_SCANS})")
+    try:
+        yield
+    finally:
+        _slots.release()
 
 
 def run_tool_job(
@@ -78,6 +135,22 @@ def run_tool_job(
             return
 
     cmd_str = " ".join(cmd)
+
+    # Wait for a slot before doing anything expensive. Acquired AFTER the scope
+    # gate so a refused job never consumes capacity.
+    if not _slots.acquire(timeout=SLOT_WAIT_TIMEOUT):
+        log.error("[%s] no scan slot within %ss (limit %d) — failing %s",
+                  job_id, SLOT_WAIT_TIMEOUT, MAX_CONCURRENT_SCANS, tool)
+        job_tracker.update_job(
+            job_id, status="failed",
+            error=f"no scan slot within {SLOT_WAIT_TIMEOUT}s "
+                  f"(MAX_CONCURRENT_SCANS={MAX_CONCURRENT_SCANS})")
+        _cleanup(targets_file)
+        return
+    waited = active_slot_count()
+    if waited >= MAX_CONCURRENT_SCANS:
+        log.info("[%s] running at the concurrency limit (%d)", job_id, MAX_CONCURRENT_SCANS)
+
     t0 = time.time()
     try:
         job_tracker.update_job(job_id, status="running",
@@ -161,6 +234,7 @@ def run_tool_job(
                     {"job_id": job_id, "error": str(e)})
         log.error("[%s] %s failed: %s", job_id, tool, e)
     finally:
+        _slots.release()
         _cleanup(targets_file)
 
 

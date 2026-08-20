@@ -302,6 +302,10 @@ def stop_job(job_id: str):
 # scanner that cannot tell whether it is authorised must not scan.
 try:
     from etl.scope_gate import check_dispatch, load_dispatch_scope
+    # Shared scan-slot accounting, from the rag-common base image. Inside the
+    # same try: if either shared module is unreachable the service fails closed
+    # rather than running unbounded and ungated.
+    from tool_job import scan_slot
     SCOPE_GATE_AVAILABLE = True
 except Exception as _scope_err:                 # pragma: no cover
     SCOPE_GATE_AVAILABLE = False
@@ -402,76 +406,80 @@ def run_brutus(req: BrutusReq, background_tasks: BackgroundTasks):
     _job_tracker.update_progress(job_id, targets_count=len(req.targets))
 
     def _run_brutus_job():
-        try:
-            import time as _time
-            _t0 = _time.time()
-            _job_tracker.update_job(job_id, status="running", started_at=datetime.now().isoformat())
-            _job_tracker.update_progress(job_id, stage="running")
-            emit_webhook_event("scan_started", "brutus", {"job_id": job_id})
-            write_audit("scan_started", "brutus", "brutus_runner", {
-                "job_id": job_id, "targets_count": len(req.targets),
-                "execution_mode": "local",
-            })
+        # Hold a scan slot for the whole job so brutus honours the same
+        # MAX_CONCURRENT_SCANS ceiling as the other runners. The context
+        # manager releases on every exit path, exceptions included.
+        with scan_slot(job_id, "brutus"):
+            try:
+                import time as _time
+                _t0 = _time.time()
+                _job_tracker.update_job(job_id, status="running", started_at=datetime.now().isoformat())
+                _job_tracker.update_progress(job_id, stage="running")
+                emit_webhook_event("scan_started", "brutus", {"job_id": job_id})
+                write_audit("scan_started", "brutus", "brutus_runner", {
+                    "job_id": job_id, "targets_count": len(req.targets),
+                    "execution_mode": "local",
+                })
 
-            logging.info(f"[{job_id}] Running brutus on {len(req.targets)} targets, "
-                         f"{len(req.protocols)} protocols, cmd: {' '.join(cmd)}")
-            logging.info(f"[{job_id}] stdin ({stdin_data.count(chr(10))+1} lines): {stdin_data[:200]}")
+                logging.info(f"[{job_id}] Running brutus on {len(req.targets)} targets, "
+                             f"{len(req.protocols)} protocols, cmd: {' '.join(cmd)}")
+                logging.info(f"[{job_id}] stdin ({stdin_data.count(chr(10))+1} lines): {stdin_data[:200]}")
 
-            cp = subprocess.run(
-                cmd, input=stdin_data, capture_output=True, text=True, timeout=3600,
-            )
-            if cp.stderr:
-                logging.info(f"[{job_id}] brutus stderr: {cp.stderr[:500]}")
+                cp = subprocess.run(
+                    cmd, input=stdin_data, capture_output=True, text=True, timeout=3600,
+                )
+                if cp.stderr:
+                    logging.info(f"[{job_id}] brutus stderr: {cp.stderr[:500]}")
 
-            findings_count = 0
-            if os.path.exists(output_file):
-                with open(output_file) as f:
-                    findings_count = sum(1 for line in f if line.strip())
-            _job_tracker.update_progress(job_id, findings_count=findings_count)
+                findings_count = 0
+                if os.path.exists(output_file):
+                    with open(output_file) as f:
+                        findings_count = sum(1 for line in f if line.strip())
+                _job_tracker.update_progress(job_id, findings_count=findings_count)
 
-            # Ingest
-            _job_tracker.update_progress(job_id, stage="ingesting")
-            ing = _ingest_results("brutus", output_file, job_id=job_id, secret_type=req.secret_type or "password")
+                # Ingest
+                _job_tracker.update_progress(job_id, stage="ingesting")
+                ing = _ingest_results("brutus", output_file, job_id=job_id, secret_type=req.secret_type or "password")
 
-            # Emit critical webhooks for valid credentials
-            if findings_count > 0:
-                emit_webhook_event("finding_critical", "brutus", {
-                    "job_id": job_id, "valid_credentials_found": findings_count,
-                }, severity="critical")
+                # Emit critical webhooks for valid credentials
+                if findings_count > 0:
+                    emit_webhook_event("finding_critical", "brutus", {
+                        "job_id": job_id, "valid_credentials_found": findings_count,
+                    }, severity="critical")
 
-            _job_tracker.update_progress(job_id, stage="done")
-            _job_tracker.update_job(
-                job_id, status="completed",
-                result={"ok": True, "findings_count": findings_count, "ingest": ing,
-                        "stdout": cp.stdout[-500:] if cp.stdout else "",
-                        "stderr": cp.stderr[-500:] if cp.stderr else ""},
-                completed_at=datetime.now().isoformat(),
-            )
-            emit_webhook_event("scan_completed", "brutus", {"job_id": job_id, "findings_count": findings_count})
-            write_audit("scan_completed", "brutus", "brutus_runner", {
-                "job_id": job_id, "findings_count": findings_count,
-                "duration_s": round(_time.time() - _t0, 2),
-            })
+                _job_tracker.update_progress(job_id, stage="done")
+                _job_tracker.update_job(
+                    job_id, status="completed",
+                    result={"ok": True, "findings_count": findings_count, "ingest": ing,
+                            "stdout": cp.stdout[-500:] if cp.stdout else "",
+                            "stderr": cp.stderr[-500:] if cp.stderr else ""},
+                    completed_at=datetime.now().isoformat(),
+                )
+                emit_webhook_event("scan_completed", "brutus", {"job_id": job_id, "findings_count": findings_count})
+                write_audit("scan_completed", "brutus", "brutus_runner", {
+                    "job_id": job_id, "findings_count": findings_count,
+                    "duration_s": round(_time.time() - _t0, 2),
+                })
 
-            # Save session results
-            _save_session_results(job_id, "brutus", "brutus-runner", [output_file],
-                                  metadata={"findings_count": findings_count})
+                # Save session results
+                _save_session_results(job_id, "brutus", "brutus-runner", [output_file],
+                                      metadata={"findings_count": findings_count})
 
-        except Exception as e:
-            _job_tracker.update_job(job_id, status="failed", error=str(e), completed_at=datetime.now().isoformat())
-            _job_tracker.update_progress(job_id, stage="failed")
-            emit_webhook_event("scan_failed", "brutus", {"job_id": job_id, "error": str(e)})
-            write_audit("scan_failed", "brutus", "brutus_runner", {
-                "job_id": job_id, "error": str(e),
-            })
-            logging.error(f"[{job_id}] brutus failed: {e}")
-        finally:
-            for fp in [pass_file]:
-                if fp and os.path.exists(fp):
-                    try:
-                        os.remove(fp)
-                    except OSError:
-                        pass
+            except Exception as e:
+                _job_tracker.update_job(job_id, status="failed", error=str(e), completed_at=datetime.now().isoformat())
+                _job_tracker.update_progress(job_id, stage="failed")
+                emit_webhook_event("scan_failed", "brutus", {"job_id": job_id, "error": str(e)})
+                write_audit("scan_failed", "brutus", "brutus_runner", {
+                    "job_id": job_id, "error": str(e),
+                })
+                logging.error(f"[{job_id}] brutus failed: {e}")
+            finally:
+                for fp in [pass_file]:
+                    if fp and os.path.exists(fp):
+                        try:
+                            os.remove(fp)
+                        except OSError:
+                            pass
 
     background_tasks.add_task(_run_brutus_job)
     return {"ok": True, "job_id": job_id, "status": "queued", "status_url": f"/jobs/{job_id}"}

@@ -3,6 +3,9 @@ import os, time, subprocess, pathlib, re, uuid, threading, logging, shutil, json
 # import requests locally, and its except-block would have swallowed the
 # resulting NameError as a failed archive rather than a missing import.
 import requests
+# Shared scan-slot accounting from the rag-common base image, so this
+# service honours the same MAX_CONCURRENT_SCANS ceiling as the runners.
+from tool_job import scan_slot
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import psycopg2
@@ -1042,6 +1045,16 @@ def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_ka
                                 error=f"Out of scope — {_refusal}")
         return
 
+    # Hold a scan slot for the whole job. Acquired AFTER the scope gate so a
+    # refused job never consumes capacity.
+    try:
+        _slot = scan_slot(job_id, "web-scan")
+        _slot.__enter__()
+    except TimeoutError as e:
+        logger.error("web-scan job %s: %s", job_id, e)
+        _job_tracker.update_job(job_id, status="failed", error=str(e))
+        return
+
     try:
         _t0 = time.time()
         # Emit webhook for scan start
@@ -1350,6 +1363,12 @@ def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_ka
         write_audit("scan_failed", "web-scan", "web_scanner", {
             "job_id": job_id, "error": str(e),
         })
+    finally:
+        # Release the scan slot however this job ends — success, exception, or
+        # early return above. Without this a crashed job would permanently
+        # consume one of the service's MAX_CONCURRENT_SCANS slots, and enough
+        # crashes would wedge the scanner entirely.
+        _slot.__exit__(None, None, None)
 
 
 @app.get("/health")

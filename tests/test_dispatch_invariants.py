@@ -54,7 +54,12 @@ _SCOPE_MARKERS = (
 # reasons that are not authorisation — DDL, health checks, CIDR grouping, and
 # the in_scope column the recommendations UI displays. Counting those cleared
 # three modules that dispatch with no gate at all.
-_LIMIT_MARKERS = ("MAX_CONCURRENT_SCANS",)
+# A module is bounded either by reading the limit itself, or by routing its
+# execution through the shared runner in common/tool_job.py, which holds a
+# semaphore sized by MAX_CONCURRENT_SCANS. Naming only the env var reported
+# pd_runner and osint_runner as unbounded immediately after they were bounded —
+# the same too-narrow-marker mistake the scope list made with scans.py.
+_LIMIT_MARKERS = ("MAX_CONCURRENT_SCANS", "run_tool_job", "scan_slot")
 
 # Directories worth scanning. Tests, migrations and the frontend are excluded.
 _ROOTS = (
@@ -114,10 +119,6 @@ LIMIT_DEBT = {
         "initiates scans without consulting the shared limit",
     "autogen_agents/scan_tools.py":
         "initiates scans without consulting the shared limit",
-    "brutus_runner/brutus_runner.py":
-        "initiates scans without consulting the shared limit",
-    "dashboard/bff/routers/assets.py":
-        "main recommendation dispatcher; batch size is bounded only by how many ids the caller passes",
     "dashboard/bff/services/pipeline_orchestrator.py":
         "drives multi-stage scans; the gate belongs at stage dispatch",
     "dashboard/bff/services/tool_executor.py":
@@ -130,10 +131,6 @@ LIMIT_DEBT = {
         "initiates scans without consulting the shared limit",
     "osint_runner/service_enum_cli.py":
         "initiates scans without consulting the shared limit",
-    "osint_runner/osint_runner.py":
-        "initiates scans without consulting the shared limit",
-    "pd_runner/pd_runner.py":
-        "initiates scans without consulting the shared limit",
     "playwright_scanner/metadata_extractor.py":
         "initiates scans without consulting the shared limit",
     "playwright_scanner/playwright_scanner.py":
@@ -141,8 +138,6 @@ LIMIT_DEBT = {
     "scan_recommender/exploits_rag.py":
         "initiates scans without consulting the shared limit",
     "web_scanner/scan_pipeline.py":
-        "initiates scans without consulting the shared limit",
-    "web_scanner/web_scan.py":
         "initiates scans without consulting the shared limit",
 }
 

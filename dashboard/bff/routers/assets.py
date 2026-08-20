@@ -10,6 +10,10 @@ from config import get_settings
 from engagement import current_engagement_id, engagement_headers
 # One scope implementation for the whole BFF (see scope_guard.py).
 from scope_guard import host_in_scope as _host_in_scope, scope_rows_for as _scope_rows_for
+# The engagement's scan ceiling, read through the accessor so a runtime
+# change via set_max_concurrent() is respected. routers/nodes.py imports
+# from routers.scans the same way, so this introduces no new cycle.
+from routers.scans import get_max_concurrent
 from polling import register_job
 from utils import safe_json
 
@@ -1874,7 +1878,27 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             log.debug(f"preflight {executor}/{scanner} error: {e}")
             return {"ok": True, "detail": f"preflight skipped ({type(e).__name__})"}
 
-    dispatched_results = await asyncio.gather(*[dispatch_rec(r) for r in selected])
+    # Bound the fan-out by the engagement's scan limit.
+    #
+    # asyncio.gather over the selection meant the batch size WAS the concurrency
+    # — 50 selected recommendations dispatched 50 scans at once. That is how the
+    # recommender got saturated: callers hit their read timeout and the results
+    # were recorded as failures for scans that had actually started.
+    #
+    # The semaphore only bounds how many dispatches are in flight from here; it
+    # does not wait for the scans themselves to finish, which are tracked by the
+    # runners and the polling loop.
+    _limit = max(1, get_max_concurrent())
+    _sem = asyncio.Semaphore(_limit)
+
+    async def _bounded(rec):
+        async with _sem:
+            return await dispatch_rec(rec)
+
+    if len(selected) > _limit:
+        log.info("dispatching %d recommendation(s) %d at a time (MAX_CONCURRENT_SCANS)",
+                 len(selected), _limit)
+    dispatched_results = await asyncio.gather(*[_bounded(r) for r in selected])
 
     # A recommendation that needs a HUMAN should leave a follow-up, not just a log
     # line in an API response nobody re-reads. Any outcome that cannot proceed
