@@ -226,3 +226,35 @@ def check_dispatch(target, scope_rows, command=""):
         if not is_in_scope(ip, scope_rows):
             return f"command references {ip}, which is not in the configured scope"
     return None
+
+
+def check_targets_file(path, scope_rows, limit=10000):
+    """Refusal string if any target in a targets file is out of scope, else None.
+
+    The runner services write their targets to a file and hand the path to the
+    tool, so the file — not an argument — is what actually determines where
+    packets go. Comments and blanks are ignored; URLs are reduced to their host.
+
+    A file that cannot be read is a refusal, not a pass: if we cannot tell what
+    a tool is about to be pointed at, we do not run it.
+    """
+    if not scope_rows:
+        return ("no scope targets are configured — refusing to dispatch. "
+                "Configure the engagement scope first.")
+    try:
+        with open(path, "r", errors="replace") as fh:
+            lines = [ln.strip() for ln in fh.readlines()[:limit]]
+    except OSError as e:
+        return f"targets file {path} is unreadable ({e}) — refusing to dispatch"
+    bad = []
+    for raw in lines:
+        if not raw or raw.startswith("#"):
+            continue
+        host = _host_from_url(raw) if "://" in raw else raw.split("/")[0].split(":")[0]
+        if host and not is_in_scope(host, scope_rows):
+            bad.append(host)
+    if bad:
+        uniq = sorted(set(bad))
+        return (f"{len(uniq)} target(s) not in the configured scope: "
+                f"{', '.join(uniq[:5])}{'…' if len(uniq) > 5 else ''}")
+    return None

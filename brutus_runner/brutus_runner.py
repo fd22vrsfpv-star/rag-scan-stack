@@ -296,12 +296,54 @@ def stop_job(job_id: str):
 # Brutus Endpoint
 # ===============================
 
+# ── Scope gate ────────────────────────────────────────────────────────────
+# Shared implementation from etl/scope_gate.py (bind-mounted at /runner/etl).
+# Fails CLOSED: if the gate or the scope cannot be read, the job is refused. A
+# scanner that cannot tell whether it is authorised must not scan.
+try:
+    from etl.scope_gate import check_dispatch, load_dispatch_scope
+    SCOPE_GATE_AVAILABLE = True
+except Exception as _scope_err:                 # pragma: no cover
+    SCOPE_GATE_AVAILABLE = False
+    logging.error("scope gate UNAVAILABLE (%s) — jobs will be refused. "
+                  "Check the ./etl:/runner/etl mount.", _scope_err)
+
+
+def _scope_refusal_for_hosts(hosts):
+    """Refusal string when any host is out of scope, else None."""
+    if not SCOPE_GATE_AVAILABLE:
+        return "scope gate unavailable (etl/scope_gate not importable) — refusing"
+    hosts = [h for h in (hosts or []) if h]
+    if not hosts:
+        return None
+    try:
+        _c = conn()
+        try:
+            with _c.cursor() as cur:
+                rows, _src = load_dispatch_scope(cur)
+        finally:
+            _c.close()
+    except Exception as exc:
+        return f"scope could not be read ({exc}) — refusing"
+    for h in hosts:
+        refusal = check_dispatch(str(h), rows)
+        if refusal:
+            return refusal
+    return None
+
+
 @app.post("/jobs/brutus")
 def run_brutus(req: BrutusReq, background_tasks: BackgroundTasks):
     """Multi-protocol credential testing via brutus pipeline mode."""
     job_id = _job_tracker.create_job(job_type="brutus")
 
     output_file = str(REPORT_DIR / f"brutus_{job_id[:8]}.jsonl")
+    # Refuse before any credential attack is launched.
+    _refusal = _scope_refusal_for_hosts(req.targets)
+    if _refusal:
+        logging.warning("REFUSED brutus: %s", _refusal)
+        raise HTTPException(status_code=403, detail=f"Out of scope — {_refusal}")
+
     stdin_data = _build_fingerprintx_input(req.targets, req.protocols)
 
     # Brutus is multi-subcommand now ("creds", "web", "snmp", "badkeys",

@@ -79,8 +79,6 @@ SCOPE_DEBT = {
         "sends traffic to a supplied target without a scope check",
     "autogen_agents/scan_tools.py":
         "sends traffic to a supplied target without a scope check",
-    "brutus_runner/brutus_runner.py":
-        "sends traffic to a supplied target without a scope check",
     "dashboard/bff/polling.py":
         "re-dispatches queued jobs and never re-checks the scope they were created under",
     "dashboard/bff/routers/nodes.py":
@@ -93,8 +91,6 @@ SCOPE_DEBT = {
         "sends traffic to a supplied target without a scope check",
     "osint_runner/service_enum_cli.py":
         "sends traffic to a supplied target without a scope check",
-    "pd_runner/pd_runner.py":
-        "sends traffic to a supplied target without a scope check",
     "playwright_scanner/metadata_extractor.py":
         "sends traffic to a supplied target without a scope check",
     "playwright_scanner/playwright_scanner.py":
@@ -104,8 +100,6 @@ SCOPE_DEBT = {
     "scan_recommender/scan_recommender.py":
         "auto-execute dispatches tools straight from recommendations",
     "web_scanner/scan_pipeline.py":
-        "sends traffic to a supplied target without a scope check",
-    "web_scanner/web_scan.py":
         "sends traffic to a supplied target without a scope check",
 }
 
@@ -134,9 +128,9 @@ LIMIT_DEBT = {
         "executes whatever it is handed — the LAST line of defence, and the best place to refuse an out-of-scope target even when a caller insists",
     "nmap_scanner/cred_checker.py":
         "initiates scans without consulting the shared limit",
-    "osint_runner/osint_runner.py":
-        "initiates scans without consulting the shared limit",
     "osint_runner/service_enum_cli.py":
+        "initiates scans without consulting the shared limit",
+    "osint_runner/osint_runner.py":
         "initiates scans without consulting the shared limit",
     "pd_runner/pd_runner.py":
         "initiates scans without consulting the shared limit",

@@ -990,12 +990,58 @@ class NiktoReq(BaseModel):
     timeout_sec: int = 1800  # Timeout in seconds (default 30 minutes)
 
 
+# ── Scope gate ────────────────────────────────────────────────────────────
+# Shared implementation from etl/scope_gate.py (bind-mounted at /scanner/etl).
+# Fails CLOSED: if the gate or the scope cannot be read, the job is refused. A
+# scanner that cannot tell whether it is authorised must not scan.
+try:
+    from etl.scope_gate import check_dispatch, load_dispatch_scope
+    SCOPE_GATE_AVAILABLE = True
+except Exception as _scope_err:                 # pragma: no cover
+    SCOPE_GATE_AVAILABLE = False
+    logger.error("scope gate UNAVAILABLE (%s) — jobs will be refused. "
+                  "Check the ./etl:/scanner/etl mount.", _scope_err)
+
+
+def _scope_refusal_for_hosts(hosts):
+    """Refusal string when any host is out of scope, else None."""
+    if not SCOPE_GATE_AVAILABLE:
+        return "scope gate unavailable (etl/scope_gate not importable) — refusing"
+    hosts = [h for h in (hosts or []) if h]
+    if not hosts:
+        return None
+    try:
+        _c = conn()
+        try:
+            with _c.cursor() as cur:
+                rows, _src = load_dispatch_scope(cur)
+        finally:
+            _c.close()
+    except Exception as exc:
+        return f"scope could not be read ({exc}) — refusing"
+    for h in hosts:
+        refusal = check_dispatch(str(h), rows)
+        if refusal:
+            return refusal
+    return None
+
+
 def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_katana: bool, do_zap: bool, limit: Optional[int], wordlist: Optional[str] = None, target_url: Optional[str] = None, target_urls: Optional[List[str]] = None, proxy: Optional[str] = None):
     """Background task to run web scan with progress tracking.
 
     When proxy is set (SOCKS URL), Gobuster gets --proxy flag and ZAP gets
     an upstream proxy configured via API before scanning.
     """
+    # Refuse before any request is made. URLs are reduced to their host by the
+    # shared gate, so http://evil.example/x is judged on `evil.example`.
+    _urls = list(target_urls or []) + ([target_url] if target_url else [])
+    _refusal = _scope_refusal_for_hosts(_urls)
+    if _refusal:
+        logger.warning("REFUSED web-scan job %s: %s", job_id, _refusal)
+        _job_tracker.update_job(job_id, status="failed",
+                                error=f"Out of scope — {_refusal}")
+        return
+
     try:
         _t0 = time.time()
         # Emit webhook for scan start
