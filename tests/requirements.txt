@@ -1,0 +1,22 @@
+# Dependencies the test suite needs.
+#
+# Without this the suite's result depended on whatever happened to be installed:
+# a missing pytest-asyncio silently turned an async test into a FAILURE rather
+# than a skip, and absent bs4/psycopg2 produced failures that looked like code
+# defects. Every one of those cost time to diagnose as "not actually a bug".
+#
+#   pip install -r tests/requirements.txt && pytest tests/
+#
+# Service-specific packages (playwright, msgpack, pydantic-settings) are
+# deliberately NOT here: those tests importorskip and are exercised inside their
+# own images, so requiring them would make a laptop run impossible.
+pytest>=7.4
+pytest-asyncio>=0.21     # async tests fail, not skip, without this
+psycopg2-binary>=2.9     # DB integration tests (they skip without a database)
+pyyaml>=6.0              # rule/profile loading
+requests>=2.31
+httpx>=0.24
+fastapi>=0.100           # routers imported by BFF tests
+pydantic>=2.0
+jinja2>=3.1
+beautifulsoup4>=4.12     # HTML extraction path in url_fetch

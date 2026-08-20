@@ -315,6 +315,19 @@ class TestSlugify:
 
 
 class TestMarkdownPassthrough:
+    @pytest.fixture(autouse=True)
+    def _needs_bs4(self):
+        """These two exercise the HTML path, which needs beautifulsoup4.
+
+        url_fetch imports bs4 lazily and raises UrlFetchError when it is
+        absent, so the module imports cleanly and a module-level
+        importorskip never fires. bs4 IS installed in the scan-recommender
+        image; it is missing only from a bare test runner, so this skips
+        rather than reporting a dependency gap as a code failure.
+        """
+        pytest.importorskip("bs4", reason="beautifulsoup4 not installed here; "
+                                          "present in the scan-recommender image")
+
     """Raw .md sources must not be run through the HTML extractor.
 
     raw.githubusercontent.com serves markdown as text/plain. Parsing that as

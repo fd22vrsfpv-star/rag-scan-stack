@@ -138,6 +138,23 @@ class _FakeCtx:
 
 @pytest.mark.unit
 @pytest.mark.scan_recommender
+def _bound(sql, params, column):
+    """Value bound to `column` in an INSERT, located by NAME not position.
+
+    These tests originally asserted "priority is the last bound param". It was,
+    until engagement_id, target_kind and status were appended — after which the
+    assertion compared priority against a status string and failed, while the
+    code was persisting priority perfectly well. Reading the column list out of
+    the SQL means adding another column cannot break this again.
+    """
+    import re
+    cols = re.search(r"scan_recommendations\s*\(([^)]*)\)", sql, re.S)
+    assert cols, f"could not find the column list in: {sql[:120]}"
+    names = [c.strip() for c in cols.group(1).split(",")]
+    assert column in names, f"{column!r} not among {names}"
+    return params[names.index(column)]
+
+
 class TestPersistPriority:
     def _fake_db(self):
         cur = MagicMock()
@@ -165,10 +182,8 @@ class TestPersistPriority:
         assert len(insert_calls) == 1
         sql, params = insert_calls[0].args[0], insert_calls[0].args[1]
         assert "priority" in sql
-        # priority is the last bound param
-        assert params[-1] == 5
-        # extra (2nd to last) carries the high_value context
-        extra_arg = params[-2]
+        assert _bound(sql, params, "priority") == 5
+        extra_arg = _bound(sql, params, "extra")
         assert extra_arg[0] == "JSON"
         assert extra_arg[1]["high_value"]["port"] == 8009
 
@@ -180,8 +195,9 @@ class TestPersistPriority:
         sr.persist_recommendations("1.2.3.4", [rec], source="rules")
         insert_calls = [c for c in cur.execute.call_args_list
                         if "INSERT INTO public.scan_recommendations" in c.args[0]]
-        params = insert_calls[0].args[1]
-        assert params[-1] is None  # COALESCE(NULL, 50) applies the DB default
+        sql, params = insert_calls[0].args[0], insert_calls[0].args[1]
+        # None here, so COALESCE(%s, 50) applies the DB default.
+        assert _bound(sql, params, "priority") is None
 
 
 @pytest.mark.unit

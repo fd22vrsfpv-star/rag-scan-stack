@@ -732,7 +732,10 @@ class TestMicroBurstParsing:
 
     def test_iter_csvs_directory(self):
         from etl.parse_microburst import _iter_csvs
-        seen = {fname: list(rows) for fname, rows in _iter_csvs(self.FIXTURE_DIR)}
+        # _iter_csvs yields (filename, content_hash, rows_loader). content_hash
+        # was added for resume/dedup and rows became a LAZY loader so the resume
+        # check can skip a file without reading it; this test predated both.
+        seen = {fname: list(load()) for fname, _hash, load in _iter_csvs(self.FIXTURE_DIR)}
         assert any("AzureADUsers" in n for n in seen)
         assert any("Get-AzPasswords" in n for n in seen)
         users = next(rows for n, rows in seen.items() if "AzureADUsers" in n)
@@ -748,7 +751,8 @@ class TestMicroBurstParsing:
             for fn in os.listdir(self.FIXTURE_DIR):
                 zf.write(os.path.join(self.FIXTURE_DIR, fn), arcname=f"microburst-out/{fn}")
 
-        seen = {os.path.basename(fn): list(rows) for fn, rows in _iter_csvs(str(zip_path))}
+        seen = {os.path.basename(fn): list(load())
+                for fn, _hash, load in _iter_csvs(str(zip_path))}
         assert "contoso-AzureADUsers.csv" in seen
         assert len(seen["contoso-AzureADUsers.csv"]) == 3
 
