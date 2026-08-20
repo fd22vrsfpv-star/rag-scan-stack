@@ -340,6 +340,70 @@ def _check_placeholder_args(arguments: dict) -> str | None:
     return None
 
 
+# Argument keys that name something this tool will send traffic AT. Checked
+# against the engagement scope before any dispatch — this path is driven by an
+# LLM choosing tool arguments, so the target is not necessarily anything an
+# operator typed.
+_TARGET_ARG_KEYS = ("target", "targets", "ip", "host", "hosts", "url", "domain")
+
+
+def _hosts_from_arguments(arguments: dict) -> list[str]:
+    """Every host-like value in a tool call, flattened.
+
+    Accepts the shapes these tools actually use: a bare string, a
+    comma-separated string, and a list. A URL is reduced to its hostname so
+    `https://10.0.0.1:8443/x` is checked as `10.0.0.1`.
+    """
+    out: list[str] = []
+    for key in _TARGET_ARG_KEYS:
+        val = (arguments or {}).get(key)
+        if not val:
+            continue
+        items = val if isinstance(val, (list, tuple)) else _split_targets(str(val))
+        for item in items:
+            h = str(item).strip()
+            if not h:
+                continue
+            if "://" in h:
+                from urllib.parse import urlparse
+                h = urlparse(h).hostname or h
+            else:
+                h = h.split("/")[0].split(":")[0]
+            if h:
+                out.append(h)
+    return out
+
+
+def _scope_refusal(name: str, arguments: dict) -> dict | None:
+    """Structured refusal when a tool call names an out-of-scope host.
+
+    Returns the same shape as the allowlist refusal above so the model gets an
+    error it can read and adapt to, rather than an exception.
+    """
+    hosts = _hosts_from_arguments(arguments)
+    if not hosts:
+        return None
+    try:
+        from scope_guard import host_in_scope, scope_rows_for
+        from engagement import current_engagement_id
+        rows, source = scope_rows_for(current_engagement_id.get())
+    except Exception as e:                       # pragma: no cover
+        log.warning("scope check unavailable (%s) — refusing %s", e, name)
+        return {"error": "scope_unavailable", "tool": name,
+                "message": "REFUSED: the engagement scope could not be read."}
+    bad = [h for h in hosts if not host_in_scope(h, rows)]
+    if not bad:
+        return None
+    return {
+        "error": "out_of_scope",
+        "tool": name,
+        "targets": bad,
+        "message": (f"REFUSED: {', '.join(bad)} is not in the engagement scope "
+                    f"({source}). Nothing was dispatched. Only test hosts the "
+                    f"engagement authorises."),
+    }
+
+
 async def execute_tool(name: str, arguments: dict, allowed_tools: list[str] | None = None) -> dict:
     """Execute a tool call and return the result.
 
@@ -359,6 +423,14 @@ async def execute_tool(name: str, arguments: dict, allowed_tools: list[str] | No
         for prefix in ("query:", "functions.", "tools.", "tool:", "function:"):
             if name.startswith(prefix):
                 name = name[len(prefix):]
+
+    # Scope gate. An out-of-scope host is refused regardless of which tool was
+    # asked for, and regardless of the allowlist below — that governs WHICH
+    # tools may run, this governs WHAT they may be pointed at.
+    _refusal = _scope_refusal(name, arguments)
+    if _refusal:
+        log.warning("tool %s refused: %s", name, _refusal.get("targets"))
+        return _refusal
 
     # Layer-3 hardening: per-request allowlist. Refuse anything outside it
     # — including unknown tool names that would otherwise fall through to
