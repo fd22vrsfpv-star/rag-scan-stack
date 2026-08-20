@@ -58,9 +58,18 @@ def test_the_check_actually_compared_something(checker):
     imports from a mounted common/, this test should be deleted along with them.
     """
     _problems, compared = checker.check()
-    assert compared >= 5, (
-        f"only {compared} copy/copies compared — the checker is not finding the "
-        "per-service files it is meant to guard")
+    # Was >= 5 when seven services each carried a copy. Six were deleted once
+    # the rag-common base image began supplying validation.py, so the threshold
+    # follows the duplication down rather than failing on success. Only
+    # playwright_scanner still has one — its image is built FROM the Playwright
+    # base, so it cannot inherit rag-common.
+    #
+    # When that last copy goes, `compared` reaches 0 and this whole module
+    # should be deleted along with it: there is nothing left to drift.
+    assert compared >= 1, (
+        f"{compared} copies compared. If the per-service copies are genuinely "
+        "gone, delete this test module — the duplication it guards no longer "
+        "exists. If they are not, the checker has stopped finding them.")
 
 
 def test_canonical_modules_exist_and_define_their_functions(checker):

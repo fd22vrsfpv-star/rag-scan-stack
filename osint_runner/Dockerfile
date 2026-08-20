@@ -50,7 +50,9 @@ RUN pip install --no-cache-dir -r /runner/requirements.txt
 
 COPY osint_runner/resolvers.txt    /runner/resolvers.txt
 COPY osint_runner/osint_runner.py  /runner/osint_runner.py
-COPY osint_runner/validation.py    /runner/validation.py
+# validation.py now comes from the rag-common base image; the per-service
+# copy was deleted. Seven copies existed and one had drifted with a real
+# fix stranded in it.
 COPY osint_runner/log_manager.py   /runner/log_manager.py
 COPY osint_runner/service_enum.py  /runner/service_enum.py
 
