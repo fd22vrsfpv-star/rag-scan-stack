@@ -34,7 +34,9 @@ COPY pd_runner/requirements.txt /runner/requirements.txt
 RUN pip install --no-cache-dir -r /runner/requirements.txt
 
 COPY pd_runner/pd_runner.py     /runner/pd_runner.py
-COPY pd_runner/validation.py    /runner/validation.py
+# validation.py now comes from the rag-common base image; the per-service
+# copy was deleted. Seven copies existed and one had drifted with a real
+# fix stranded in it.
 COPY pd_runner/log_manager.py   /runner/log_manager.py
 
 EXPOSE 8023
