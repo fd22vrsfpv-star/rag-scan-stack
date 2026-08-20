@@ -114,6 +114,72 @@ Provide a lightweight web UI:
 - Any new database elements need added to the health check scripts
 - Audit any newly delievered features to ensure a complete and stable implementation is provided. This includes ensuring that api endpoints are fully functional and defined correctly
 - Any new feature that performs actions (scans, agent cycles, pipeline stages, etc.) MUST emit webhook events via `POST /webhooks/emit` so external tools (Slack, n8n, etc.) can subscribe. Use descriptive event_type names (e.g. `recon_agent_scan_dispatched`, `pipeline_stage_completed`). Include relevant context (engagement_id, target, scan_type, counts) in the data payload.
+## Enforced invariants
+
+Each rule below names the test that FAILS when it is violated. A rule with no
+enforcing test is a suggestion, and suggestions do not survive contact with a
+large change. Add the test in the same commit as the rule.
+
+### Authorization gates
+- Every code path that sends traffic to a host MUST pass the scope gate before
+  dispatch. **Fail closed**: no configured scope means nothing runs, because the
+  alternative is treating an unconfigured scope as permission to scan anything.
+- Override flags (`force`, retry, "run anyway") overrule the platform's
+  *suppression* judgement, NEVER the operator's *authorization*. A forced
+  out-of-scope dispatch must still be refused.
+- Blocked items MUST be labelled in the UI, not silently dropped. A blocked item
+  that looks identical to a runnable one reads as a bug when it does nothing.
+- When gate logic must be duplicated (e.g. the BFF cannot import
+  `etl/scope_gate.py`), add an agreement test pinning both implementations to a
+  shared case table.
+- *Enforced by:* `tests/test_dispatch_invariants.py::test_no_new_ungated_dispatchers`,
+  `tests/test_dispatch_scope.py::test_bff_and_scope_gate_agree`.
+- *Why:* dispatch had no scope check at all, and 14 recommendations targeting
+  third-party addresses were queued against this engagement — several already
+  executed.
+
+### Scan volume
+- Any component that initiates OR triggers a scan MUST bound itself by
+  `MAX_CONCURRENT_SCANS`. No component invents a private concurrency number.
+- This includes indirect triggers: an endpoint that auto-executes tools as a
+  side effect is a scan initiator.
+- **Shed, do not queue.** Return 429 fast rather than accepting work that will
+  time out. Client timeouts MUST cover the worst *admitted* latency at the
+  limit — admitting a request and then abandoning it wastes the work twice.
+- *Enforced by:* `tests/test_dispatch_invariants.py::test_no_new_unbounded_scan_initiators`.
+- *Why:* `/next_scan` ran once per open port per scan and auto-executed tools
+  whose output triggered more calls. The loop fed itself until dispatches timed
+  out and were recorded as failures for scans that had actually started.
+
+### Tests
+- Every endpoint MUST have a test that **executes** it. `ast.parse` passing,
+  imports succeeding, and containers reporting healthy are NOT verification.
+- A guard test MUST be **sabotage-proven**: reintroduce the bug, watch the test
+  fail, restore. A guard that cannot fail is worse than none, because it is
+  mistaken for coverage.
+- Fixtures come from **real captured tool output**, not invented shapes.
+- Tests run standalone (`pytest tests/test_x.py`) and **skip** cleanly when
+  infrastructure or an optional dependency is missing. A skip says "cannot run
+  here"; an error says "broken", and mixing them hides real breakage.
+- Keep the suite **green**. A permanently red baseline means a new failure is
+  invisible. If a test cannot pass, skip it with a reason or fix it — do not
+  leave it failing.
+- "Verified" in a summary means observed output, quoted. Not "should work".
+- *Enforced by:* `tests/test_fstring_placeholders.py` (runtime-only defects that
+  pass every static check), `tests/test_recommendation_listing.py` (endpoints
+  must actually execute).
+- *Why:* a brace placeholder inside an f-string SQL comment made every
+  recommendations query raise `NameError`. `ast.parse` passed, the module
+  imported, the container was healthy, and the page silently returned zero rows
+  — no test had ever executed that query.
+
+### Known-debt lists
+`tests/test_dispatch_invariants.py` carries `SCOPE_DEBT` and `LIMIT_DEBT`:
+modules that violate the rules above today, each with a reason. They exist to
+make the debt visible while keeping the suite green, and they RATCHET — a new
+violation fails by name, and a resolved entry must be deleted (a separate test
+enforces that). Shrink these lists; do not grow them without a stated reason.
+
 ## Out-of-scope / constraints
 
 - Focus on defensible engineering: parsing, normalization, reporting, workflow support.
