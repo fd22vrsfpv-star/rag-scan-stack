@@ -1071,7 +1071,7 @@ ALLOWED_TOOLS = _FALLBACK_ALLOWED_TOOLS
 # could not reach a shared file; the mount removes that excuse. Only the DB
 # lookup is local, because each service reaches Postgres its own way.
 try:
-    from etl.scope_gate import check_dispatch, load_dispatch_scope
+    from etl.scope_gate import check_dispatch, load_dispatch_scope, load_host_aliases
     SCOPE_GATE_AVAILABLE = True
 except Exception as _scope_import_error:        # pragma: no cover
     SCOPE_GATE_AVAILABLE = False
@@ -1113,7 +1113,21 @@ def enforce_scope(target: str, command: str = "") -> Optional[str]:
         # that is indistinguishable from having no gate at all.
         return ("scope gate is unavailable (etl/scope_gate not importable) — "
                 "refusing to execute")
-    return check_dispatch(target, _scope_rows(), command)
+    # Resolve aliases so this agrees with the BFF and the scan launcher: a host
+    # in scope under its other observed identity must not be refused here purely
+    # because the caller used a different name for it.
+    aliases = set()
+    if target:
+        try:
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cur:
+                    aliases = load_host_aliases(cur, target)
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning(f"alias lookup failed for {target}: {e}")
+    return check_dispatch(target, _scope_rows(), command, aliases=aliases)
 
 
 def store_raw_artifact(tool: str, content: str, command: str = "", target: str = "",

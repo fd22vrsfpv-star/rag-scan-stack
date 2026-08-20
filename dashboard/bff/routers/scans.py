@@ -1246,6 +1246,12 @@ def _scan_targets_of(req) -> list:
     return out
 
 
+try:
+    from scope_guard import host_in_scope as _shared_host_in_scope
+except Exception:                                # pragma: no cover
+    _shared_host_in_scope = None
+
+
 async def _host_aliases(host: str) -> set:
     """Observed ip<->hostname pairings for `host`, from rag-api's assets."""
     aliases = {host}
@@ -1269,12 +1275,20 @@ async def _host_aliases(host: str) -> set:
 
 async def _enforce_scan_scope(scan_type: str, req) -> None:
     """Refuse a scan whose target is not in scope. No-op when no scope exists."""
-    if _is_in_scope is None or _host_only is None:
-        # etl/ not mounted — the matcher is unavailable. Say so once per request
-        # rather than crash the scan or pretend the gate ran.
-        log.warning("scope gate UNAVAILABLE (etl/scope_gate not importable) — "
-                    "add ./etl:/app/bff/etl:ro to pentest-dashboard")
-        return
+    if _is_in_scope is None or _host_only is None or _shared_host_in_scope is None:
+        # etl/ not mounted — the matcher is unavailable.
+        #
+        # This used to RETURN, which let every scan through: a missing volume
+        # silently disabled the gate, which is indistinguishable from having no
+        # gate at all. Every other gate in the stack refuses when it cannot
+        # check, so this one does too.
+        log.error("scope gate UNAVAILABLE (etl/scope_gate not importable) — "
+                  "refusing. Add ./etl:/app/bff/etl:ro to pentest-dashboard.")
+        raise HTTPException(
+            503,
+            "Scan refused: the scope gate is unavailable (etl/scope_gate not "
+            "importable). This is a deployment problem, not a scope problem — "
+            "check the ./etl mount on pentest-dashboard.")
     hosts = _scan_targets_of(req)
     if not hosts:
         return
@@ -1309,9 +1323,11 @@ async def _enforce_scan_scope(scan_type: str, req) -> None:
     # attacker-controlled record talk its way into scope.
     blocked = []
     for h in hosts:
-        if _is_in_scope(h, scope_rows):
-            continue
-        if any(_is_in_scope(a, scope_rows) for a in await _host_aliases(h)):
+        # Delegate to the shared gate so this router, the recommendation
+        # dispatcher and kali-listener reach the SAME verdict. This path used to
+        # be the only one that resolved aliases, so a host in scope under its
+        # other observed identity was accepted here and refused everywhere else.
+        if _shared_host_in_scope(h, scope_rows):
             continue
         blocked.append(h)
     if blocked:

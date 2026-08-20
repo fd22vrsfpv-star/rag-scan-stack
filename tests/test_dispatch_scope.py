@@ -198,3 +198,63 @@ def test_dispatch_check_ignores_self_addresses(gate):
 def test_dispatch_check_fails_closed_on_empty_scope(gate):
     assert gate.check_dispatch("192.168.1.150", [])
 
+
+
+# ── Alias resolution ──────────────────────────────────────────────────────
+
+def test_alias_lets_a_host_match_under_its_other_identity(gate):
+    """A host in scope as an IP must also be in scope by its hostname.
+
+    Four gates existed with three behaviours: routers/scans.py resolved
+    ip<->hostname aliases, nmap_scanner and the shared gate did not. The same
+    target was therefore accepted by the launcher and refused when dispatched
+    from a recommendation — verified live before the fix, where 'metasploitable'
+    got 200 from kali-listener and 403 from the scans router.
+    """
+    rows = [("192.168.1.150", "ip")]
+    assert gate.is_in_scope("metasploitable", rows) is False
+    assert gate.is_in_scope_with_aliases(
+        "metasploitable", rows, {"192.168.1.150"}) is True
+
+
+def test_aliases_cannot_widen_scope_to_an_unrelated_host(gate):
+    """The alias path must not become a way INTO scope.
+
+    An alias set that contains no in-scope identity leaves the verdict
+    unchanged, so a host merely present in the assets table — www.owasp.org and
+    twitter.com both are — is still refused.
+    """
+    rows = [("192.168.1.150", "ip")]
+    assert gate.is_in_scope_with_aliases(
+        "www.owasp.org", rows, {"104.20.44.163"}) is False
+    assert gate.is_in_scope_with_aliases("twitter.com", rows, set()) is False
+
+
+def test_check_dispatch_accepts_aliases(gate):
+    rows = [("192.168.1.150", "ip")]
+    assert gate.check_dispatch("metasploitable", rows) is not None
+    assert gate.check_dispatch("metasploitable", rows,
+                               aliases={"192.168.1.150"}) is None
+
+
+def test_alias_lookup_is_not_dns(gate):
+    """Aliases come from OBSERVED assets, never a live resolver.
+
+    A DNS answer is attacker-influencable; letting a record talk a host into
+    scope would defeat the gate. Asserted structurally because the failure would
+    be silent and only reachable with a hostile resolver.
+    """
+    import ast
+    import inspect
+    # Examine CODE, not prose: the docstring explains WHY DNS is avoided and
+    # therefore contains the very words being searched for. Checking raw source
+    # failed on its own explanation.
+    tree = ast.parse(inspect.getsource(gate.load_host_aliases).lstrip())
+    fn = tree.body[0]
+    body = [n for n in fn.body
+            if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+                    and isinstance(n.value.value, str))]
+    code = "\n".join(ast.dump(n) for n in body)
+    for banned in ("gethostbyname", "getaddrinfo", "resolver", "dns"):
+        assert banned not in code.lower(), f"alias lookup performs DNS via {banned!r}"
+    assert "assets" in code, "alias lookup should read observed asset pairings"

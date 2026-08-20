@@ -208,11 +208,16 @@ def hosts_in_command(command):
                   if not any(h.startswith(p) or h == p for p in _SELF_ADDRS))
 
 
-def check_dispatch(target, scope_rows, command=""):
+def check_dispatch(target, scope_rows, command="", aliases=None):
     """Return a refusal string when this dispatch must be refused, else None.
 
     Checks the declared target AND any IPv4 literal in the command, so omitting
     the target and naming the host in the command line is not a way around it.
+
+    `aliases` (from load_host_aliases) lets a host match the scope under another
+    observed identity — the scope lists an IP, the request names the hostname.
+    Omitting it is safe but STRICTER, and inconsistent strictness between paths
+    is what this parameter exists to remove.
 
     Fails CLOSED on an empty scope: an unconfigured scope is a setup mistake,
     not permission to scan anything.
@@ -220,10 +225,10 @@ def check_dispatch(target, scope_rows, command=""):
     if not scope_rows:
         return ("no scope targets are configured — refusing to dispatch. "
                 "Configure the engagement scope first.")
-    if target and not is_in_scope(str(target), scope_rows):
+    if target and not is_in_scope_with_aliases(str(target), scope_rows, aliases):
         return f"target {target} is not in the configured scope"
     for ip in hosts_in_command(command):
-        if not is_in_scope(ip, scope_rows):
+        if not is_in_scope_with_aliases(ip, scope_rows, aliases):
             return f"command references {ip}, which is not in the configured scope"
     return None
 
@@ -258,3 +263,49 @@ def check_targets_file(path, scope_rows, limit=10000):
         return (f"{len(uniq)} target(s) not in the configured scope: "
                 f"{', '.join(uniq[:5])}{'…' if len(uniq) > 5 else ''}")
     return None
+
+
+def load_host_aliases(cur, host):
+    """Observed ip<->hostname pairings for `host`, from the assets table.
+
+    A host can be in scope under a different identity: the scope lists an IP
+    but the request names the hostname, or vice versa. Without this the same
+    target gets two different answers depending on which path asked —
+    routers/scans.py resolved aliases and every other caller did not, so a scan
+    the launcher accepted would be blocked when dispatched from a
+    recommendation.
+
+    Deliberately uses OBSERVED pairings from assets rather than live DNS: a
+    resolver answer is attacker-influencable, and letting a DNS record talk a
+    host into scope would defeat the gate.
+    """
+    h = (host or "").strip().lower().rstrip(".")
+    if not h:
+        return set()
+    aliases = {h}
+    if h in ("localhost", "127.0.0.1", "::1"):
+        return aliases | {"localhost", "127.0.0.1", "::1"}
+    try:
+        cur.execute(
+            """
+            SELECT host(ip)::text AS ip, lower(coalesce(hostname, '')) AS hostname
+              FROM public.assets
+             WHERE host(ip) = %s OR lower(coalesce(hostname, '')) = %s
+            """,
+            (h, h),
+        )
+        for row in cur.fetchall():
+            ip, hn = (row["ip"], row["hostname"]) if isinstance(row, dict) else (row[0], row[1])
+            aliases |= {x for x in (str(ip or "").lower(), str(hn or "").lower()) if x}
+    except Exception as e:
+        # An alias lookup failure must NARROW, never widen: fall back to the
+        # host as given rather than pretending it has no other identity.
+        logger.warning("alias lookup failed for %r: %s", host, e)
+    return aliases
+
+
+def is_in_scope_with_aliases(host, scope_rows, aliases=None):
+    """is_in_scope(), also accepting any known alias of `host`."""
+    if is_in_scope(host, scope_rows):
+        return True
+    return any(is_in_scope(a, scope_rows) for a in (aliases or set()) if a)
