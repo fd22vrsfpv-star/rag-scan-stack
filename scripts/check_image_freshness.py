@@ -16,6 +16,7 @@ Nothing in the stack reported that. This does.
 
 Exit code 1 if any service is stale, so it can gate a deploy or a test run.
 """
+import os
 import hashlib
 import re
 import subprocess
@@ -243,6 +244,51 @@ def check_frontend(live):
     return True
 
 
+def check_base_image():
+    """Is rag-common:latest carrying the current common/ sources?
+
+    The base image is the one thing `docker compose build <service>` will NOT
+    refresh: it is a FROM dependency, not a layer of the service build. Editing
+    common/tool_job.py and rebuilding a service therefore produces an image
+    built on STALE shared code — which presents as an ImportError for a function
+    that plainly exists in the tree, or worse, silently runs the old version.
+
+    Returns a list of problem strings (empty when fine).
+    """
+    import subprocess as _sp
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    common = os.path.join(repo, "common")
+    if not os.path.isdir(common):
+        return []
+    try:
+        _sp.run(["docker", "image", "inspect", "rag-common:latest"],
+                capture_output=True, check=True)
+    except Exception:
+        return ["rag-common:latest does not exist — run scripts/build-base-image.sh"]
+
+    problems = []
+    for fn in sorted(os.listdir(common)):
+        if not fn.endswith(".py"):
+            continue
+        local = os.path.join(common, fn)
+        with open(local, "rb") as fh:
+            want = hashlib.sha256(fh.read()).hexdigest()
+        try:
+            out = _sp.run(
+                ["docker", "run", "--rm", "--entrypoint", "sha256sum",
+                 "rag-common:latest", f"/usr/local/lib/python3.12/site-packages/{fn}"],
+                capture_output=True, text=True, timeout=60)
+            got = (out.stdout or "").split()[0] if out.stdout.strip() else None
+        except Exception as e:
+            problems.append(f"could not read {fn} from rag-common: {e}")
+            continue
+        if got is None:
+            problems.append(f"common/{fn} is missing from rag-common:latest")
+        elif got != want:
+            problems.append(f"common/{fn} differs from the copy in rag-common:latest")
+    return problems
+
+
 def main():
     want = sys.argv[1] if len(sys.argv) > 1 else None
     live = running()
@@ -263,8 +309,22 @@ def main():
         if fr is not None:
             results.append(("pentest-dashboard frontend", fr))
 
+    # The base image is checked separately: it is a FROM dependency, so
+    # rebuilding a service does NOT refresh it. A stale rag-common ships old
+    # shared code into freshly-built services — which surfaced here as an
+    # ImportError for a function that plainly existed in the tree.
+    base_problems = check_base_image()
+    for problem in base_problems:
+        print(f"STALE  rag-common: {problem}")
+    if base_problems:
+        print("       fix: scripts/build-base-image.sh, then rebuild dependent services")
+
     stale = [s for s, bad in results if bad]
     print()
+    if base_problems:
+        print("rag-common:latest is out of date with common/ — services built on it")
+        print("are running old shared code. Rebuild the base FIRST, then the services.")
+        return 1
     if stale:
         print(f"{len(stale)} service(s) running stale code: {', '.join(stale)}")
         print("A restart will NOT fix this — these images must be rebuilt.")
