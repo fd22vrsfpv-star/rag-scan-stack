@@ -26,3 +26,8 @@ jobs:
       - name: Check shared module drift
         run: |
           python3 scripts/check_shared_code.py --list
+      - name: Run test suite
+        run: |
+          pip install -r tests/requirements.txt
+          # DB-backed and service-backed tests skip cleanly without them.
+          pytest tests/ -q
