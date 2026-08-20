@@ -259,8 +259,50 @@ def _ingest_results(tool: str, output_path: str, job_id: str = None) -> dict:
 # Tool Runner Functions
 # ===============================
 
+# ── Scope gate ────────────────────────────────────────────────────────────
+# Shared implementation from etl/scope_gate.py (bind-mounted at /runner/etl).
+# This runner writes its targets to a FILE and hands the path to the tool, so
+# the file is what actually decides where packets go — that is what gets
+# checked, not just the request arguments.
+try:
+    from etl.scope_gate import check_targets_file, load_dispatch_scope
+    SCOPE_GATE_AVAILABLE = True
+except Exception as _scope_err:                 # pragma: no cover
+    SCOPE_GATE_AVAILABLE = False
+    logging.error("scope gate UNAVAILABLE (%s) — jobs will be refused. "
+                  "Check the ./etl:/runner/etl mount.", _scope_err)
+
+
+def _scope_refusal_for_targets(targets_file: str):
+    """Refusal string when a targets file is out of scope, else None.
+
+    Fails CLOSED: an unavailable gate or unreadable scope refuses the job. A
+    scanner that cannot tell whether it is authorised must not scan.
+    """
+    if not SCOPE_GATE_AVAILABLE:
+        return "scope gate unavailable (etl/scope_gate not importable) — refusing"
+    try:
+        _c = conn()
+        try:
+            with _c.cursor() as cur:
+                rows, _src = load_dispatch_scope(cur)
+        finally:
+            _c.close()
+    except Exception as exc:
+        return f"scope could not be read ({exc}) — refusing"
+    return check_targets_file(targets_file, rows)
+
+
 def _run_tool_job(job_id: str, tool: str, cmd: list, targets_file: str, output_file: str, ingest_as: str = None, env: dict = None, no_ingest: bool = False):
     """Generic background job runner for PD tools."""
+    # Refuse before the tool is launched, not after.
+    _refusal = _scope_refusal_for_targets(targets_file)
+    if _refusal:
+        logging.warning("REFUSED %s job %s: %s", tool, job_id, _refusal)
+        _job_tracker.update_job(job_id, status="failed",
+                                error=f"Out of scope — {_refusal}")
+        return
+
     try:
         import time as _time
         _t0 = _time.time()
