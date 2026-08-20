@@ -732,6 +732,10 @@ services:
       PYTHONHTTPSVERIFY: "0"
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
+      # The engagement-wide scan ceiling. The recommender bounds both its
+      # /next_scan admission and its auto-execute dispatches by this, so a
+      # single number governs how much activity an engagement generates.
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
       TZ: ${TZ:-America/New_York}
       # Trust the stack's self-signed cert WITHOUT disabling verification.
       # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
@@ -800,6 +804,10 @@ services:
       PYTHONHTTPSVERIFY: "0"
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
+      # The engagement-wide scan ceiling. The recommender bounds both its
+      # /next_scan admission and its auto-execute dispatches by this, so a
+      # single number governs how much activity an engagement generates.
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
       TZ: ${TZ:-America/New_York}
       # Trust the stack's self-signed cert WITHOUT disabling verification.
       # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal

@@ -1927,13 +1927,25 @@ def _dispatch_recommender_for_ports(rows) -> int:
         if row.get("banner"):
             params["banner"] = row["banner"]
         try:
-            requests.get(
+            _resp = requests.get(
                 f"{scan_rec_url}/next_scan",
                 params=params,
                 headers=_outgoing_runner_headers(),
                 timeout=60,
                 verify=False,
             )
+            # 429 = the recommender shed this deliberately because it is at
+            # capacity. Continuing the loop would queue dozens more requests
+            # into a service that just said "not now", which is how it got
+            # saturated in the first place. Stop this pass; these ports keep
+            # their "no recommendation yet" state and the next ingest (or
+            # exploit_watcher's poll) picks them up.
+            if _resp is not None and _resp.status_code == 429:
+                logger.info(
+                    "recommender at capacity — stopping this pass after %d of %d "
+                    "port(s); remaining ports will be retried on a later cycle",
+                    dispatched, len(rows))
+                break
             dispatched += 1
         except Exception as e:
             logger.debug(
