@@ -15,7 +15,7 @@
 import { useState } from 'react'
 import { useScanRecommendations, useGenerateRecommendations, type StoredRecommendation } from '@/api/assets'
 import { useUIStore } from '@/stores/ui'
-import { Wand2, ChevronDown, ChevronRight, Eye, Play, Loader2, ExternalLink } from 'lucide-react'
+import { Wand2, ChevronDown, ChevronRight, Eye, Play, Loader2, ExternalLink, ShieldAlert } from 'lucide-react'
 
 // ---- grouping helpers ----
 
@@ -111,6 +111,24 @@ export interface ScanRecommendationsPanelProps {
 
 
 /**
+ * Marks a recommendation whose target is outside the configured scope.
+ *
+ * Dispatch refuses these — including with force, because force overrules the
+ * platform's suppression judgement, not the operator's authorisation. Without a
+ * visible marker a blocked item is indistinguishable from a runnable one and
+ * simply appears broken when clicked.
+ */
+function OutOfScopeBadge() {
+  return (
+    <span
+      title="Target is not in the engagement scope — dispatch is blocked. Add it to the scope if you are authorised to test it."
+      className="px-1.5 py-0.5 rounded text-[10px] font-medium border border-red-500/40 bg-red-500/15 text-red-400 flex items-center gap-1 whitespace-nowrap">
+      <ShieldAlert className="h-3 w-3" /> out of scope
+    </span>
+  )
+}
+
+/**
  * What a recommendation actually ran and produced.
  *
  * Completed recommendations previously showed a status badge and nothing else:
@@ -133,6 +151,13 @@ function RecDetail({ r }: { r: StoredRecommendation }) {
 
   return (
     <div className="px-3 py-2 bg-black/30 border-t border-border/10 text-[11px] space-y-2">
+      {r.in_scope === false && (
+        <div className="text-red-400 border border-red-500/30 bg-red-500/10 rounded px-2 py-1">
+          <b>Blocked — out of scope.</b> {r.ip} is not in the engagement scope, so
+          this will not be dispatched even with force. Add it to the scope only if
+          you are authorised to test it.
+        </div>
+      )}
       {r.skip_reason && (
         <div className="text-orange-400">
           <span className="text-muted-foreground">Skipped: </span>{r.skip_reason}
@@ -474,6 +499,7 @@ export function ScanRecommendationsPanel({
                             <span className="font-mono w-24">{r.scanner}</span>
                             <span className="text-muted-foreground flex-1">{r.action || '—'}</span>
                             <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium border ${statusBadgeClass(r.status)}`}>{r.status}</span>
+                            {r.in_scope === false && <OutOfScopeBadge />}
                             <button onClick={() => toggleRow(r.id)} title="Show command and output"
                                     className="text-muted-foreground hover:text-foreground">
                               {openRows.has(r.id) ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
@@ -508,6 +534,7 @@ export function ScanRecommendationsPanel({
                   </span>
                   <span className="text-muted-foreground w-20">{r.service || '—'}</span>
                   <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium border ${statusBadgeClass(r.status)}`}>{r.status}</span>
+                  {r.in_scope === false && <OutOfScopeBadge />}
                   <button onClick={() => toggleRow(r.id)} title="Show command and output"
                           className="text-muted-foreground hover:text-foreground">
                     {openRows.has(r.id) ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}

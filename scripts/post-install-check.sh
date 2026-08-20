@@ -511,6 +511,27 @@ if [[ -n "$DASH" ]]; then
   # malformed file does not break any endpoint — it just means NO follow-up is
   # ever suggested, which looks identical to "this output had nothing to act
   # on". Assert both that rules loaded and that none failed to parse.
+  # Recommender capacity + LLM backend. Both fail SILENTLY: /next_scan returns
+  # 200 from deterministic rules whether or not the LLM is usable, so a missing
+  # container or an uninstalled model shows up as "fewer recommendations" rather
+  # than as an error. Reported as a warning, not a failure — deterministic-only
+  # is a valid way to run this.
+  CAP_JSON=$(docker exec "$DASH" curl -sk "https://127.0.0.1/api/scan-recommendations/capacity" 2>/dev/null || true)
+  if [[ -z "$CAP_JSON" ]]; then
+    CAP_JSON=$(docker exec scan-recommender curl -sk "https://127.0.0.1:8013/next_scan/capacity" 2>/dev/null || true)
+  fi
+  if echo "$CAP_JSON" | grep -q '"engagement_scan_limit"'; then
+    LIMIT=$(echo "$CAP_JSON" | grep -o '"engagement_scan_limit":[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
+    pass "recommender bounded by engagement scan limit (${LIMIT})"
+    if echo "$CAP_JSON" | grep -q '"reachable":[[:space:]]*false'; then
+      warn "LLM backend unreachable — recommendations are deterministic-only: $(echo "$CAP_JSON" | grep -o '"note":[[:space:]]*"[^"]*"' | head -1)"
+    elif echo "$CAP_JSON" | grep -q '"model_present":[[:space:]]*false'; then
+      warn "configured LLM model is not installed — LLM recommendations fall back to rules"
+    fi
+  else
+    warn "could not read recommender capacity (scan-recommender may be down)"
+  fi
+
   RULES_JSON=$(docker exec "$DASH" curl -sk "https://127.0.0.1/api/artifacts/auto-queue" 2>/dev/null || true)
   RULES_N=$(echo "$RULES_JSON" | grep -o '"rules_loaded":[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
   if [[ -z "$RULES_N" || "$RULES_N" -eq 0 ]]; then

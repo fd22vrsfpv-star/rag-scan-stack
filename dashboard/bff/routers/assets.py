@@ -7,7 +7,7 @@ from fastapi import APIRouter, Query, Request, HTTPException
 from pydantic import BaseModel
 from psycopg2.extras import Json
 from config import get_settings
-from engagement import engagement_headers
+from engagement import current_engagement_id, engagement_headers
 from polling import register_job
 from utils import safe_json
 
@@ -722,6 +722,75 @@ async def add_scan_recommendation(body: AddScanRecommendationRequest):
     }
 
 
+# ── Scope enforcement for dispatch ────────────────────────────────────────
+#
+# Dispatch had NO scope check at all. Recommendations are generated from
+# whatever hosts appear in scan output, so a redirect or a certificate SAN can
+# put a third party's IP into the queue — and 14 recommendations targeting
+# Cloudflare-range addresses (104.20.44.163, 172.66.0.227) were sitting in this
+# database, some already marked completed. Scanning a host nobody authorised is
+# the one failure mode this tool must not have.
+#
+# Fails CLOSED: no scope configured means nothing is dispatchable, because the
+# alternative is "unconfigured == scan anything".
+#
+# Semantics mirror etl/scope_gate.is_in_scope (ip / cidr / domain / url; asn is
+# not matchable from a host alone). tests/test_dispatch_scope.py asserts the two
+# stay in agreement rather than trusting them to.
+def _scope_rows_for(engagement_id):
+    """(rows, source) — the engagement's own scope, else the union of all."""
+    from db import get_db
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            if engagement_id:
+                cur.execute("SELECT target, target_type FROM public.scope_targets "
+                            "WHERE engagement_id = %s::uuid", (engagement_id,))
+                rows = [(r[0], r[1]) for r in cur.fetchall() if r[0]]
+                if rows:
+                    return rows, "engagement"
+            cur.execute("SELECT target, target_type FROM public.scope_targets")
+            return [(r[0], r[1]) for r in cur.fetchall() if r[0]], "all-engagements"
+    except Exception as e:
+        log.warning("scope load failed (%s) — treating everything as out of scope", e)
+        return [], "unavailable"
+
+
+def _host_in_scope(host, rows) -> bool:
+    from ipaddress import ip_address, ip_network
+    from fnmatch import fnmatch
+    if not host or not rows:
+        return False
+    h = str(host).strip().lower().rstrip(".")
+    if not h:
+        return False
+    try:
+        host_ip = ip_address(h)
+    except ValueError:
+        host_ip = None
+    for target, ttype in rows:
+        t = str(target).strip().lower().rstrip(".")
+        tt = (ttype or "").lower()
+        if not t:
+            continue
+        try:
+            if tt == "ip":
+                if host_ip is not None and h == t:
+                    return True
+            elif tt == "cidr":
+                if host_ip is not None and host_ip in ip_network(t, strict=False):
+                    return True
+            elif tt in ("domain", "url"):
+                if h == t or fnmatch(h, "*." + t):
+                    return True
+            elif not tt:
+                # Untyped rows are common in older installs: match either way.
+                if h == t or (host_ip is not None and h == t):
+                    return True
+        except ValueError:
+            continue
+    return False
+
+
 class RunRecommendationsRequest(BaseModel):
     ids: List[str]
     proxy: Optional[str] = None  # SOCKS proxy URL, e.g. socks5://node-manager:10001
@@ -1091,6 +1160,14 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
     use_kali = body.use_kali
     node_id = body.node_id
 
+    # Loaded once per request: dispatching a batch should not re-query the scope
+    # for every recommendation in it.
+    _scope_rows, _scope_source = _scope_rows_for(current_engagement_id.get())
+    if not _scope_rows:
+        log.warning("no scope targets configured (%s) — every dispatch will be "
+                    "blocked; this is deliberate, an unconfigured scope must not "
+                    "mean 'scan anything'", _scope_source)
+
     # Map scanner → endpoint and payload builder
     # Dispatch understands ONE shape: (ip, service, port) -> scanner. Anything
     # else must be refused with a reason rather than fired at an IP as though it
@@ -1115,6 +1192,22 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         ip = (rec.get("ip") or "").replace("/32", "")
         service_url = SCANNER_URLS.get(scanner)
         result = {"id": rec["id"], "scanner": scanner, "ip": ip}
+
+        # Scope gate FIRST, before any other decision. Checked here rather than
+        # at generation time because a recommendation can outlive the scope that
+        # produced it, and `force` must never be able to override authorisation —
+        # it exists to overrule the platform's *suppression* judgement, not the
+        # operator's *scope*.
+        if not _host_in_scope(ip, _scope_rows):
+            result["status"] = "blocked"
+            result["out_of_scope"] = True
+            result["detail"] = (
+                f"BLOCKED — {ip or 'this target'} is not in the engagement scope "
+                f"({_scope_source}). Nothing was dispatched. Add it to the scope "
+                f"if you are authorised to test it.")
+            log.warning("dispatch blocked: %s is out of scope for rec %s (%s)",
+                        ip, rec.get("id"), scanner)
+            return result
 
         kind = (rec.get("target_kind") or "service").lower()
         if kind != "service":
