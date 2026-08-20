@@ -393,6 +393,13 @@ services:
       PYTHONHTTPSVERIFY: "0"
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
+      # web-scanner writes findings straight to Postgres, so it never
+      # needed to authenticate to rag-api and had no API_KEY at all. It
+      # now POSTs raw ZAP/nikto output to /ingest/raw-artifact, which 401s
+      # without this — the archive call was reaching the API and being
+      # rejected, logged only as a warning.
+      API_KEY: ${API_KEY}
+      API_BASE: ${API_BASE:-https://rag-api:8000}
       TZ: ${TZ:-America/New_York}
       # Trust the stack's self-signed cert WITHOUT disabling verification.
       # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
