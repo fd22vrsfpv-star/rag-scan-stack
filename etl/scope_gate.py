@@ -12,6 +12,7 @@ Matching mirrors app/rag-api/scope_classifier.py (fnmatch for domains,
 ipaddress for ip/cidr) so behavior is consistent across the system.
 """
 import logging
+import re as _re   # dispatch gate: IPv4 extraction
 from fnmatch import fnmatch
 from ipaddress import ip_address, ip_network
 from urllib.parse import urlparse
@@ -147,3 +148,81 @@ def is_in_scope(host, scope_rows):
         except (ValueError, TypeError):
             continue
     return False
+
+
+# ── Dispatch-side gate (shared by every service) ──────────────────────────
+#
+# Everything above answers "should I STORE this finding?". Everything below
+# answers "may I SEND traffic at this host?" — the authorisation question.
+#
+# This module is the single implementation. It briefly existed three times over
+# (etl, the BFF, kali-listener) because container build contexts could not reach
+# it; `./etl` is now bind-mounted into every service that dispatches, so they
+# all import these functions instead of carrying a copy.
+#
+# Pure stdlib on purpose: adding a dependency here would have to be installed in
+# every one of those images.
+
+# Bare IPv4 literals. Hostnames are deliberately NOT extracted from command
+# lines: wordlist paths, tool names and version strings produce false positives,
+# and a gate that blocks legitimate work gets switched off.
+_IPV4_RE = _re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+# Addresses that mean "this machine", not "a target": listener binds, local
+# callbacks, and the unspecified address.
+_SELF_ADDRS = ("127.", "0.0.0.0", "::1")
+
+
+def load_dispatch_scope(cur, engagement_id=None):
+    """Scope rows for an authorisation decision.
+
+    Prefers the engagement's own scope; falls back to the union of all
+    configured targets so a dispatch with no engagement context is still
+    checked rather than waved through. Returns (rows, source).
+
+    On ANY error returns ([], "unavailable") — the caller must treat an empty
+    result as "refuse", never as "no restrictions".
+    """
+    try:
+        if engagement_id:
+            rows = load_engagement_scope(cur, engagement_id)
+            if rows:
+                return rows, "engagement"
+        cur.execute("SELECT target, target_type FROM public.scope_targets")
+        out = []
+        for r in cur.fetchall():
+            if isinstance(r, dict):
+                out.append((r.get("target"), r.get("target_type")))
+            else:
+                out.append((r[0], r[1]))
+        return [r for r in out if r[0]], "all-engagements"
+    except Exception as e:
+        logger.warning("dispatch scope load failed: %s", e)
+        return [], "unavailable"
+
+
+def hosts_in_command(command):
+    """IPv4 literals a command will actually talk to, self-addresses removed."""
+    found = set(_IPV4_RE.findall(command or ""))
+    return sorted(h for h in found
+                  if not any(h.startswith(p) or h == p for p in _SELF_ADDRS))
+
+
+def check_dispatch(target, scope_rows, command=""):
+    """Return a refusal string when this dispatch must be refused, else None.
+
+    Checks the declared target AND any IPv4 literal in the command, so omitting
+    the target and naming the host in the command line is not a way around it.
+
+    Fails CLOSED on an empty scope: an unconfigured scope is a setup mistake,
+    not permission to scan anything.
+    """
+    if not scope_rows:
+        return ("no scope targets are configured — refusing to dispatch. "
+                "Configure the engagement scope first.")
+    if target and not is_in_scope(str(target), scope_rows):
+        return f"target {target} is not in the configured scope"
+    for ip in hosts_in_command(command):
+        if not is_in_scope(ip, scope_rows):
+            return f"command references {ip}, which is not in the configured scope"
+    return None

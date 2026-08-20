@@ -19,64 +19,24 @@ together on a shared table of cases so they cannot drift apart silently.
 """
 import importlib.util
 import os
+import re
 
 import pytest
 
-REPO = os.path.join(os.path.dirname(__file__), "..")
-_BFF = os.path.join(REPO, "dashboard", "bff", "scope_guard.py")
+# realpath, NOT a bare join: the unresolved form is ".../tests/..", whose
+# own "/tests" segment matched the skip list below and caused the walk to
+# skip EVERY file — the copy detector silently checked nothing.
+REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 _GATE = os.path.join(REPO, "etl", "scope_gate.py")
-_KALI = os.path.join(REPO, "kali_listener", "listener_service.py")
+_COMPOSE = os.path.join(REPO, "docker-compose.yml")
 
-
-def _load_bff_scope():
-    """Extract the BFF's scope matcher without importing the router stack.
-
-    Reads dashboard/bff/scope_guard.py, the BFF's single implementation. It
-    previously lived inside routers/assets.py; when it moved, this loader kept
-    slicing assets.py, found nothing, and SKIPPED — turning the drift guard into
-    20 silent no-ops while still reporting green. test_loaders_did_not_silently_skip
-    below exists so that cannot recur.
-    """
-    if not os.path.exists(_BFF):                 # pragma: no cover
-        pytest.skip("scope_guard.py not present")
-    src = open(_BFF).read()
-    try:
-        seg = src[src.index("def host_in_scope("):]
-    except ValueError:                           # pragma: no cover
-        pytest.skip("host_in_scope not found in scope_guard.py")
-    ns = {}
-    exec(seg, ns)
-    return ns["host_in_scope"]
-
-
-@pytest.fixture(scope="module")
-def in_scope():
-    return _load_bff_scope()
-
-
-def _load_kali_scope():
-    """Extract kali-listener's matcher without importing the service.
-
-    Its build context is ./kali_listener, so it can import neither
-    etl/scope_gate.py nor the BFF's copy — hence a third implementation, and
-    hence this test.
-    """
-    if not os.path.exists(_KALI):                # pragma: no cover
-        pytest.skip("listener_service.py not present")
-    src = open(_KALI).read()
-    try:
-        seg = src[src.index("def host_in_scope("):src.index("# Bare IPv4 literals")]
-    except ValueError:                           # pragma: no cover
-        pytest.skip("host_in_scope not found in listener_service.py")
-    import fnmatch as _fn, ipaddress as _ip
-    ns = {"ipaddress": _ip, "fnmatch": _fn}
-    exec(seg, ns)
-    return ns["host_in_scope"]
-
-
-@pytest.fixture(scope="module")
-def kali():
-    return _load_kali_scope()
+# Services that dispatch and therefore MUST be able to import the shared gate.
+# A missing mount does not silently disable it — every gate fails closed — but
+# that turns into "nothing runs", so the mount is worth asserting directly.
+_DISPATCHING_SERVICES = (
+    "kali-listener", "pentest-dashboard", "scan-recommender", "nmap_scanner",
+    "pd-runner", "web-scanner", "osint-runner", "brutus-runner",
+)
 
 
 @pytest.fixture(scope="module")
@@ -87,6 +47,12 @@ def gate():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+@pytest.fixture(scope="module")
+def in_scope(gate):
+    """The single matcher. Was three copies; now one shared via the ./etl mount."""
+    return gate.is_in_scope
 
 
 SCOPE = [("192.168.1.150", "ip"), ("10.10.0.0/16", "cidr"), ("example.com", "domain")]
@@ -152,41 +118,83 @@ CASES = [
 
 
 @pytest.mark.parametrize("host,expected", CASES)
-def test_all_three_scope_implementations_agree(in_scope, gate, kali, host, expected):
-    """All THREE implementations must reach the same verdict.
+def test_canonical_gate_verdicts(gate, host, expected):
+    """The shared implementation's verdicts, including the exact third-party
+    addresses that were queued against this engagement."""
+    assert gate.is_in_scope(host, SCOPE) is expected
 
-    They exist separately only because of build-context limits: the BFF cannot
-    import etl/scope_gate.py, and kali-listener (whose context is
-    ./kali_listener) can import neither. A divergence means one path authorises
-    traffic another would refuse — precisely the bug that matters, and the one
-    thing that makes duplicated gate logic acceptable at all.
+
+def test_only_one_implementation_of_the_matching_rules():
+    """No service may carry its own copy.
+
+    Three copies existed at one point — etl, the BFF and kali-listener — because
+    build contexts could not reach a shared file. ./etl is now mounted into every
+    dispatching service, so a re-appearing local copy is a regression, not a
+    workaround. Drift is prevented by construction here rather than policed by
+    an agreement test.
     """
-    verdicts = {
-        "bff": in_scope(host, SCOPE),
-        "scope_gate": gate.is_in_scope(host, SCOPE),
-        "kali_listener": kali(host, SCOPE),
-    }
-    assert set(verdicts.values()) == {expected}, (
-        f"host={host!r}: {verdicts} but all should be {expected}")
+    offenders, scanned = [], 0
+    for root, _dirs, files in os.walk(REPO):
+        if any(skip in root for skip in
+               ("/.git", "/node_modules", "/__pycache__", "/tests", "/etl")):
+            continue
+        for fn in files:
+            if not fn.endswith(".py"):
+                continue
+            path = os.path.join(root, fn)
+            try:
+                src = open(path, encoding="utf-8", errors="replace").read()
+            except OSError:                      # pragma: no cover
+                continue
+            # The signature of a local copy: its own matching loop over
+            # target_type values, rather than a call into the shared module.
+            scanned += 1
+            if 'tt == "cidr"' in src and "ip_network" in src:
+                offenders.append(os.path.relpath(path, REPO))
+    # A detector that scanned nothing passes trivially, which is how this test
+    # first "passed" while a planted copy sat in dashboard/bff/.
+    assert scanned > 50, f"copy detector only scanned {scanned} files — it is not looking"
+    assert not offenders, (
+        "these modules re-implement the scope matching rules instead of importing "
+        "etl.scope_gate: " + ", ".join(offenders))
 
 
+def test_every_dispatching_service_mounts_the_shared_gate():
+    """Each service that dispatches must have ./etl mounted.
 
-def test_loaders_did_not_silently_skip():
-    """All three implementations must be LOADABLE, not skipped.
-
-    Every loader above falls back to pytest.skip when it cannot find its
-    function — which is right when a file is genuinely absent, and disastrous
-    when the function simply moved: the suite stays green while testing nothing.
-    This asserts the files and functions exist, so a rename fails loudly.
+    Without it the import fails and the gate fails CLOSED — correct, but it
+    presents as "every scan is refused", which is a confusing way to discover a
+    missing volume.
     """
+    if not os.path.exists(_COMPOSE):             # pragma: no cover
+        pytest.skip("docker-compose.yml not present")
+    compose = open(_COMPOSE).read()
     missing = []
-    for path, func in ((_BFF, "def host_in_scope("),
-                       (_GATE, "def is_in_scope("),
-                       (_KALI, "def host_in_scope(")):
-        if not os.path.exists(path):
-            missing.append(f"{path} (file missing)")
-        elif func not in open(path).read():
-            missing.append(f"{path} (no {func!r} — did it move?)")
-    assert not missing, (
-        "scope implementations could not be located, so the drift guard above "
-        "is testing nothing:\n  " + "\n  ".join(missing))
+    for svc in _DISPATCHING_SERVICES:
+        # The lookahead must also accept end-of-file: the last service in the
+        # compose file has no following block, and requiring one reported it as
+        # "service not found" — a false alarm on a correctly-mounted service.
+        m = re.search(r"\n  " + re.escape(svc) + r":\n(.*?)(?=\n  [a-z0-9_-]+:\n|\Z)",
+                      compose, re.S)
+        if not m:
+            missing.append(f"{svc} (service not found)")
+        elif "./etl:" not in m.group(1):
+            missing.append(f"{svc} (no ./etl mount)")
+    assert not missing, "shared scope gate not reachable by: " + ", ".join(missing)
+
+
+def test_dispatch_check_rejects_command_hidden_targets(gate):
+    """Naming the host in the command while leaving target blank must not pass."""
+    assert gate.check_dispatch("", SCOPE, "rpcinfo -p 104.20.44.163")
+    assert gate.check_dispatch("", SCOPE, "rpcinfo -p 192.168.1.150") is None
+
+
+def test_dispatch_check_ignores_self_addresses(gate):
+    """Loopback and 0.0.0.0 are the tool talking to itself, not a target."""
+    assert gate.check_dispatch("192.168.1.150", SCOPE, "nc 127.0.0.1 4444") is None
+    assert gate.check_dispatch("192.168.1.150", SCOPE, "bind 0.0.0.0:9001") is None
+
+
+def test_dispatch_check_fails_closed_on_empty_scope(gate):
+    assert gate.check_dispatch("192.168.1.150", [])
+
