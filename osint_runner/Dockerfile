@@ -1,6 +1,8 @@
 # Python runtime with pre-built Go binaries
 # Binaries are built by: scripts/build-go-tools.sh → osint_runner/bin/
-FROM python:3.12-slim
+# Shared modules (validation, tool_job) come from this base — see
+# common/Dockerfile. Build it first: scripts/build-base-image.sh
+FROM rag-common:latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl dnsutils musl whatweb chromium whois \

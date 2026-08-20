@@ -34,6 +34,14 @@ SHARED_MODULES = {
          "sanitize_port", "validate_cidr", "sanitize_url_path",
          "sanitize_command_arg"),
     ),
+    # No per-service copies exist today — pd_runner and osint_runner import this
+    # from the rag-common base image. Listed so that if someone re-copies it
+    # (the exact thing that happened to validation.py), the drift is caught
+    # instead of quietly accumulating for months.
+    "common/tool_job.py": (
+        "tool_job.py",
+        ("run_tool_job", "_count_findings", "_cleanup"),
+    ),
 }
 
 SKIP_DIRS = {"__pycache__", "node_modules", ".git", "tests", ".venv", "venv"}

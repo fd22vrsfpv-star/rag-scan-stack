@@ -15,6 +15,9 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, UploadFile, 
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 import uvicorn, requests
+# Shared job runner, delivered by the rag-common base image
+# (common/tool_job.py). Both runners previously carried their own copy.
+from tool_job import run_tool_job
 
 logging.basicConfig(level=logging.INFO)
 
@@ -486,120 +489,44 @@ def _scope_refusal_for_targets(targets_file: str):
     return check_targets_file(targets_file, rows)
 
 
-def _run_tool_job(job_id: str, tool: str, cmd: list, targets_file: str, output_file: str, ingest_as: str = None, env: dict = None, no_ingest: bool = False):
-    """Generic background job runner for OSINT tools."""
-    # Refuse before the tool is launched, not after.
-    _refusal = _scope_refusal_for_targets(targets_file)
-    if _refusal:
-        logging.warning("REFUSED %s job %s: %s", tool, job_id, _refusal)
-        _job_tracker.update_job(job_id, status="failed",
-                                error=f"Out of scope — {_refusal}")
+def _after_tool_success(job_id: str, tool: str, output_file: str, findings_count: int):
+    """Follow-on work once a tool has succeeded, passed to the shared runner.
+
+    Lives here rather than in common/tool_job.py because it is specific to this
+    service: a subfinder run that found hosts should immediately resolve them.
+    Best-effort by contract — the runner swallows failures, so a follow-on
+    cannot fail a job that actually worked.
+    """
+    if tool != "subfinder" or findings_count <= 0:
         return
+    results = _read_jsonl(output_file)
+    hosts = [r.get("host", "").strip() for r in results if r.get("host", "").strip()]
+    hosts = hosts[:500]          # cap so one large sweep cannot flood dnsx
+    if not hosts:
+        return
+    logging.info(f"[{job_id}] Auto-triggering dnsx for {len(hosts)} subdomains")
+    requests.post("http://localhost:8024/jobs/dnsx", json={"domains": hosts}, timeout=10)
 
-    try:
-        import time as _time
-        _t0 = _time.time()
-        cmd_str = " ".join(cmd)
-        _job_tracker.update_job(job_id, status="running", started_at=datetime.now().isoformat())
-        _job_tracker.push_command(job_id, tool, cmd_str)
-        _job_tracker.update_progress(job_id, stage="running")
 
-        emit_webhook_event("scan_started", tool, {"job_id": job_id, "scan_type": tool})
-        write_audit("scan_started", tool, "osint_runner", {
-            "job_id": job_id, "execution_mode": "local", "command": cmd_str,
-        })
+def _run_tool_job(job_id: str, tool: str, cmd: list, targets_file: str, output_file: str, ingest_as: str = None, env: dict = None, no_ingest: bool = False):
+    """Run one tool job. The implementation is shared — see common/tool_job.py.
 
-        logging.info(f"[{job_id}] Running {tool}: {cmd_str}")
-        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, env=env)
-
-        if cp.returncode not in (0, 1):
-            raise RuntimeError(f"{tool} exit {cp.returncode}: {cp.stderr[:500]}")
-
-        # Count results
-        findings_count = 0
-        raw_output = ""
-        if os.path.exists(output_file):
-            with open(output_file) as f:
-                content = f.read()
-                findings_count = sum(1 for line in content.splitlines() if line.strip())
-                raw_output = content[:10000]
-        _job_tracker.update_progress(job_id, findings_count=findings_count)
-
-        # Ingest (skip if no_ingest / test mode)
-        ing = None
-        if no_ingest:
-            logging.info(f"[{job_id}] no_ingest=true, skipping ingestion")
-        else:
-            _job_tracker.update_progress(job_id, stage="ingesting")
-            ingest_tool = ingest_as or tool
-            ingest_source = tool if ingest_as and ingest_as != tool else None
-            ing = _ingest_results(ingest_tool, output_file, job_id=job_id, source=ingest_source)
-
-        duration_s = round(_time.time() - _t0, 2)
-        _job_tracker.update_progress(job_id, stage="done")
-        result_data = {
-            "ok": True, "findings_count": findings_count,
-            "report": output_file, "ingest": ing,
-            "command": cmd_str,
-            "duration_s": duration_s,
-            "no_ingest": no_ingest,
-        }
-        if no_ingest:
-            result_data["raw_output"] = raw_output
-            result_data["stdout"] = cp.stdout[-2000:] if cp.stdout else None
-            result_data["stderr"] = cp.stderr[-2000:] if cp.stderr else None
-        else:
-            result_data["stdout"] = cp.stdout[-500:] if cp.stdout else None
-            result_data["stderr"] = cp.stderr[-500:] if cp.stderr else None
-        _job_tracker.update_job(
-            job_id, status="completed",
-            result=result_data,
-            completed_at=datetime.now().isoformat(),
-        )
-        emit_webhook_event("scan_completed", tool, {"job_id": job_id, "findings_count": findings_count})
-        write_audit("scan_completed", tool, "osint_runner", {
-            "job_id": job_id, "findings_count": findings_count,
-            "duration_s": duration_s, "command": cmd_str,
-        })
-
-        # Save session results
-        if not no_ingest:
-            _save_session_results(job_id, tool, "osint-runner", [output_file],
-                              metadata={"findings_count": findings_count})
-
-        # Auto-trigger dnsx after subfinder completes with findings
-        if tool == "subfinder" and findings_count > 0:
-            try:
-                results = _read_jsonl(output_file)
-                hosts = [r.get("host", "").strip() for r in results if r.get("host", "").strip()]
-                hosts = hosts[:500]  # Cap at 500 to avoid overload
-                if hosts:
-                    logging.info(f"[{job_id}] Auto-triggering dnsx for {len(hosts)} subdomains")
-                    requests.post(
-                        "http://localhost:8024/jobs/dnsx",
-                        json={"domains": hosts},
-                        timeout=10,
-                    )
-            except Exception as e:
-                logging.debug(f"[{job_id}] dnsx auto-trigger failed (non-fatal): {e}")
-
-    except Exception as e:
-        _job_tracker.update_job(job_id, status="failed", error=str(e),
-                                result={"command": cmd_str, "error": str(e)},
-                                completed_at=datetime.now().isoformat())
-        _job_tracker.update_progress(job_id, stage="failed")
-        emit_webhook_event("scan_failed", tool, {"job_id": job_id, "error": str(e)})
-        write_audit("scan_failed", tool, "osint_runner", {
-            "job_id": job_id, "error": str(e),
-        })
-        logging.error(f"[{job_id}] {tool} failed: {e}")
-    finally:
-        # Cleanup targets file
-        if targets_file and os.path.exists(targets_file):
-            try:
-                os.remove(targets_file)
-            except OSError:
-                pass
+    This module previously carried its own copy. The two copies had drifted,
+    with improvements stranded in one of them, so the shared version is the
+    union and this service gains whatever it was missing.
+    """
+    run_tool_job(
+        job_id=job_id, tool=tool, cmd=cmd, targets_file=targets_file,
+        output_file=output_file, ingest_as=ingest_as, env=env, no_ingest=no_ingest,
+        service_name="osint_runner", session_label="osint-runner",
+        job_tracker=_job_tracker,
+        emit_webhook_event=emit_webhook_event,
+        write_audit=write_audit,
+        ingest_results=_ingest_results,
+        scope_refusal=_scope_refusal_for_targets,
+        save_session_results=_save_session_results,
+        on_success=_after_tool_success,
+    )
 
 
 # ===============================
