@@ -75,8 +75,6 @@ SCOPE_DEBT = {
         "remote-node execution path",
     "dashboard/bff/services/pipeline_orchestrator.py":
         "drives multi-stage scans; the gate belongs at stage dispatch",
-    "dashboard/bff/services/tool_executor.py":
-        "runs tools for the pipeline; needs the same gate as routers/assets.py",
     "exploit_runner/script_executor.py":
         "sends traffic to a supplied target without a scope check",
     "nmap_scanner/cred_checker.py":

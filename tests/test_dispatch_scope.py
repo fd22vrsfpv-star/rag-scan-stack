@@ -23,27 +23,30 @@ import os
 import pytest
 
 REPO = os.path.join(os.path.dirname(__file__), "..")
-_BFF = os.path.join(REPO, "dashboard", "bff", "routers", "assets.py")
+_BFF = os.path.join(REPO, "dashboard", "bff", "scope_guard.py")
 _GATE = os.path.join(REPO, "etl", "scope_gate.py")
 _KALI = os.path.join(REPO, "kali_listener", "listener_service.py")
 
 
 def _load_bff_scope():
-    """Extract the BFF's scope matcher without importing the whole router.
+    """Extract the BFF's scope matcher without importing the router stack.
 
-    assets.py pulls in fastapi, httpx and the BFF's config module; lifting just
-    the matcher keeps this runnable from a bare checkout.
+    Reads dashboard/bff/scope_guard.py, the BFF's single implementation. It
+    previously lived inside routers/assets.py; when it moved, this loader kept
+    slicing assets.py, found nothing, and SKIPPED — turning the drift guard into
+    20 silent no-ops while still reporting green. test_loaders_did_not_silently_skip
+    below exists so that cannot recur.
     """
     if not os.path.exists(_BFF):                 # pragma: no cover
-        pytest.skip("assets.py not present")
+        pytest.skip("scope_guard.py not present")
     src = open(_BFF).read()
     try:
-        seg = src[src.index("def _host_in_scope("):src.index("class RunRecommendationsRequest")]
+        seg = src[src.index("def host_in_scope("):]
     except ValueError:                           # pragma: no cover
-        pytest.skip("_host_in_scope not found in assets.py")
+        pytest.skip("host_in_scope not found in scope_guard.py")
     ns = {}
     exec(seg, ns)
-    return ns["_host_in_scope"]
+    return ns["host_in_scope"]
 
 
 @pytest.fixture(scope="module")
@@ -165,3 +168,25 @@ def test_all_three_scope_implementations_agree(in_scope, gate, kali, host, expec
     }
     assert set(verdicts.values()) == {expected}, (
         f"host={host!r}: {verdicts} but all should be {expected}")
+
+
+
+def test_loaders_did_not_silently_skip():
+    """All three implementations must be LOADABLE, not skipped.
+
+    Every loader above falls back to pytest.skip when it cannot find its
+    function — which is right when a file is genuinely absent, and disastrous
+    when the function simply moved: the suite stays green while testing nothing.
+    This asserts the files and functions exist, so a rename fails loudly.
+    """
+    missing = []
+    for path, func in ((_BFF, "def host_in_scope("),
+                       (_GATE, "def is_in_scope("),
+                       (_KALI, "def host_in_scope(")):
+        if not os.path.exists(path):
+            missing.append(f"{path} (file missing)")
+        elif func not in open(path).read():
+            missing.append(f"{path} (no {func!r} — did it move?)")
+    assert not missing, (
+        "scope implementations could not be located, so the drift guard above "
+        "is testing nothing:\n  " + "\n  ".join(missing))
