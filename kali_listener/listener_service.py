@@ -5,6 +5,11 @@ Handles nc/socat listeners and captures callback connections.
 
 import os
 import re
+import time        # scope gate: cache TTL (module-level; there is a
+                   # function-local `import time` elsewhere, which does NOT
+                   # bind the name at module scope)
+import ipaddress   # scope gate: CIDR membership
+import fnmatch     # scope gate: *.domain matching
 import uuid
 import signal
 import subprocess
@@ -1055,6 +1060,114 @@ def get_allowed_tools() -> set:
 ALLOWED_TOOLS = _FALLBACK_ALLOWED_TOOLS
 
 
+# ── Scope enforcement (last line of defence) ──────────────────────────────
+#
+# This service executes whatever it is handed. Every other dispatcher — the BFF,
+# the recommender's auto-execute, remote nodes, the agents — eventually arrives
+# here, which makes it the one place a scope check cannot be routed around.
+# Callers are gated too, but a caller that forgets, a new dispatcher nobody
+# gated, or a direct API call would otherwise put traffic on an unauthorised
+# host.
+#
+# Fails CLOSED: no configured scope means nothing executes.
+#
+# Semantics mirror etl/scope_gate.is_in_scope and the BFF's _host_in_scope. The
+# build context here is ./kali_listener, so neither module can be imported;
+# tests/test_dispatch_scope.py pins all three to one shared case table so they
+# cannot drift apart.
+SCOPE_CACHE_TTL = int(os.environ.get("SCOPE_CACHE_TTL", "30"))
+_scope_cache = {"rows": None, "at": 0.0}
+
+
+def _scope_rows(force: bool = False):
+    """Scope targets, cached briefly — this runs on every execution."""
+    now = time.time()
+    if not force and _scope_cache["rows"] is not None and \
+            now - _scope_cache["at"] < SCOPE_CACHE_TTL:
+        return _scope_cache["rows"]
+    rows = []
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT target, target_type FROM public.scope_targets")
+                rows = [(r[0], r[1]) for r in cur.fetchall() if r[0]]
+        finally:
+            conn.close()
+    except Exception as e:
+        # Do NOT cache a failed load as "empty scope": a transient DB blip would
+        # then block every execution for the whole TTL. Return empty (fail
+        # closed) for this call and retry on the next one.
+        logger.warning(f"scope load failed: {e} — refusing executions until it recovers")
+        return []
+    _scope_cache.update({"rows": rows, "at": now})
+    return rows
+
+
+def host_in_scope(host, rows) -> bool:
+    """True if `host` matches any scope target. Fail closed on blanks."""
+    if not host or not rows:
+        return False
+    h = str(host).strip().lower().rstrip(".")
+    if not h:
+        return False
+    try:
+        host_ip = ipaddress.ip_address(h)
+    except ValueError:
+        host_ip = None
+    for target, ttype in rows:
+        t = str(target or "").strip().lower().rstrip(".")
+        tt = (ttype or "").lower()
+        if not t:
+            continue
+        try:
+            if tt == "ip":
+                if host_ip is not None and h == t:
+                    return True
+            elif tt == "cidr":
+                if host_ip is not None and host_ip in ipaddress.ip_network(t, strict=False):
+                    return True
+            elif tt in ("domain", "url"):
+                if h == t or fnmatch.fnmatch(h, "*." + t):
+                    return True
+            elif not tt:
+                if h == t:
+                    return True
+        except ValueError:
+            continue
+    return False
+
+
+# Bare IPv4 literals. Hostnames are deliberately NOT extracted from commands:
+# wordlist paths, tool names and version strings produce false positives, and a
+# gate that blocks legitimate work gets switched off.
+_IP_IN_CMD = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+
+def enforce_scope(target: str, command: str = "") -> Optional[str]:
+    """Return an error string when this execution must be refused, else None.
+
+    Checks the declared target AND any IP literal in the command, so omitting
+    `target` while naming the host in the command line is not a way around it.
+    """
+    rows = _scope_rows()
+    if not rows:
+        return ("no scope targets are configured — refusing to execute. "
+                "Configure the engagement scope first.")
+    if target and not host_in_scope(target, rows):
+        return f"target {target} is not in the configured scope"
+    for ip in set(_IP_IN_CMD.findall(command or "")):
+        # Loopback and 0.0.0.0 are the tool talking to itself (listener binds,
+        # local callbacks), not a target being scanned.
+        if ip.startswith("127.") or ip in ("0.0.0.0",):
+            continue
+        if not host_in_scope(ip, rows):
+            return f"command references {ip}, which is not in the configured scope"
+    if not target:
+        logger.info("execution with no declared target; command IPs validated")
+    return None
+
+
 def store_raw_artifact(tool: str, content: str, command: str = "", target: str = "",
                        port=None, service=None, exec_id: str = None, job_id: str = None,
                        native_json: bool = False) -> None:
@@ -1607,6 +1720,15 @@ async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: B
     The tool must be in the allowed list for security reasons.
     Results are parsed automatically for common tools (nmap, hydra, nikto, etc.)
     """
+    # Scope gate FIRST. Every dispatcher in the stack eventually calls this
+    # endpoint, so refusing here covers callers that were never gated — and
+    # there are several. 403, not 400: this is an authorisation decision, not a
+    # malformed request.
+    scope_error = enforce_scope(request.target, request.command)
+    if scope_error:
+        logger.warning(f"REFUSED {request.tool} on {request.target}: {scope_error}")
+        raise HTTPException(status_code=403, detail=f"Out of scope — {scope_error}")
+
     # Validate tool token shape (no shell metacharacters in the tool name).
     tool_lower = request.tool.lower()
     if not re.match(r'^[a-zA-Z0-9_.-]+$', tool_lower):
@@ -1865,6 +1987,14 @@ async def execute_recommended_tools(
 
     Example: POST /tools/execute-recommended?target=192.168.1.1&service=ssh&port=22
     """
+    # Same gate as /tools/execute. This path is driven by the recommender's
+    # auto-execute, which fires from ingest — i.e. from hosts that appeared in
+    # scan output rather than from anything an operator chose.
+    scope_error = enforce_scope(target)
+    if scope_error:
+        logger.warning(f"REFUSED execute-recommended on {target}: {scope_error}")
+        raise HTTPException(status_code=403, detail=f"Out of scope — {scope_error}")
+
     import httpx
 
     # Get recommendations from scan-recommender

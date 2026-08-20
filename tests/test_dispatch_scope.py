@@ -25,6 +25,7 @@ import pytest
 REPO = os.path.join(os.path.dirname(__file__), "..")
 _BFF = os.path.join(REPO, "dashboard", "bff", "routers", "assets.py")
 _GATE = os.path.join(REPO, "etl", "scope_gate.py")
+_KALI = os.path.join(REPO, "kali_listener", "listener_service.py")
 
 
 def _load_bff_scope():
@@ -48,6 +49,31 @@ def _load_bff_scope():
 @pytest.fixture(scope="module")
 def in_scope():
     return _load_bff_scope()
+
+
+def _load_kali_scope():
+    """Extract kali-listener's matcher without importing the service.
+
+    Its build context is ./kali_listener, so it can import neither
+    etl/scope_gate.py nor the BFF's copy — hence a third implementation, and
+    hence this test.
+    """
+    if not os.path.exists(_KALI):                # pragma: no cover
+        pytest.skip("listener_service.py not present")
+    src = open(_KALI).read()
+    try:
+        seg = src[src.index("def host_in_scope("):src.index("# Bare IPv4 literals")]
+    except ValueError:                           # pragma: no cover
+        pytest.skip("host_in_scope not found in listener_service.py")
+    import fnmatch as _fn, ipaddress as _ip
+    ns = {"ipaddress": _ip, "fnmatch": _fn}
+    exec(seg, ns)
+    return ns["host_in_scope"]
+
+
+@pytest.fixture(scope="module")
+def kali():
+    return _load_kali_scope()
 
 
 @pytest.fixture(scope="module")
@@ -123,14 +149,19 @@ CASES = [
 
 
 @pytest.mark.parametrize("host,expected", CASES)
-def test_bff_and_scope_gate_agree(in_scope, gate, host, expected):
-    """The two implementations must reach the same verdict.
+def test_all_three_scope_implementations_agree(in_scope, gate, kali, host, expected):
+    """All THREE implementations must reach the same verdict.
 
-    They exist separately only because the BFF container has no access to
-    etl/scope_gate.py. A divergence here means one path authorises traffic the
-    other would refuse, which is precisely the bug that matters.
+    They exist separately only because of build-context limits: the BFF cannot
+    import etl/scope_gate.py, and kali-listener (whose context is
+    ./kali_listener) can import neither. A divergence means one path authorises
+    traffic another would refuse — precisely the bug that matters, and the one
+    thing that makes duplicated gate logic acceptable at all.
     """
-    bff_verdict = in_scope(host, SCOPE)
-    gate_verdict = gate.is_in_scope(host, SCOPE)
-    assert bff_verdict == gate_verdict == expected, (
-        f"host={host!r}: bff={bff_verdict} scope_gate={gate_verdict} expected={expected}")
+    verdicts = {
+        "bff": in_scope(host, SCOPE),
+        "scope_gate": gate.is_in_scope(host, SCOPE),
+        "kali_listener": kali(host, SCOPE),
+    }
+    assert set(verdicts.values()) == {expected}, (
+        f"host={host!r}: {verdicts} but all should be {expected}")
