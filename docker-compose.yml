@@ -866,6 +866,7 @@ services:
     networks:
       - agents_net
     volumes:
+      - ./etl:/app/etl:ro                             # shared scope gate (etl/scope_gate.py)
       - searchsploit-data:/var/lib/searchsploit
       - ./knowledge:/knowledge:ro
       - ./certs:/certs:ro
@@ -930,6 +931,7 @@ services:
     ports:
       - "8014:8014"
     volumes:
+      - ./etl:/app/etl:ro                             # shared scope gate (etl/scope_gate.py)
       - ./playwright_screenshots:/screenshots
       - ./playwright_reports:/reports
     # SHM size needed for Chromium to avoid crashes
@@ -1336,6 +1338,7 @@ services:
     ports:
       - "8017:8017"
     volumes:
+      - ./etl:/app/etl:ro                             # shared scope gate (etl/scope_gate.py)
       - ./exploitdb:/opt/exploitdb:ro
       - ./modified_exploits:/app/modified_exploits
     # Minimal capabilities for network access
@@ -1433,6 +1436,7 @@ services:
       - "8019:8019"
       - "9080-9180:9080-9180"
     volumes:
+      - ./etl:/app/etl:ro                             # shared scope gate (etl/scope_gate.py)
       - ./certs:/certs:ro
     cap_add:
       - NET_RAW

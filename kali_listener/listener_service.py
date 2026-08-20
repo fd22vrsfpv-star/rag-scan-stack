@@ -1065,16 +1065,20 @@ ALLOWED_TOOLS = _FALLBACK_ALLOWED_TOOLS
 # This service executes whatever it is handed. Every other dispatcher — the BFF,
 # the recommender's auto-execute, remote nodes, the agents — eventually arrives
 # here, which makes it the one place a scope check cannot be routed around.
-# Callers are gated too, but a caller that forgets, a new dispatcher nobody
-# gated, or a direct API call would otherwise put traffic on an unauthorised
-# host.
 #
-# Fails CLOSED: no configured scope means nothing executes.
-#
-# Semantics mirror etl/scope_gate.is_in_scope and the BFF's _host_in_scope. The
-# build context here is ./kali_listener, so neither module can be imported;
-# tests/test_dispatch_scope.py pins all three to one shared case table so they
-# cannot drift apart.
+# The matching rules live in etl/scope_gate.py, bind-mounted at /app/etl. They
+# briefly existed in three copies (etl, the BFF, here) because build contexts
+# could not reach a shared file; the mount removes that excuse. Only the DB
+# lookup is local, because each service reaches Postgres its own way.
+try:
+    from etl.scope_gate import check_dispatch, load_dispatch_scope
+    SCOPE_GATE_AVAILABLE = True
+except Exception as _scope_import_error:        # pragma: no cover
+    SCOPE_GATE_AVAILABLE = False
+    logger.error("scope gate UNAVAILABLE (%s) — every execution will be refused. "
+                 "Check the ./etl:/app/etl mount on kali-listener.",
+                 _scope_import_error)
+
 SCOPE_CACHE_TTL = int(os.environ.get("SCOPE_CACHE_TTL", "30"))
 _scope_cache = {"rows": None, "at": 0.0}
 
@@ -1085,87 +1089,31 @@ def _scope_rows(force: bool = False):
     if not force and _scope_cache["rows"] is not None and \
             now - _scope_cache["at"] < SCOPE_CACHE_TTL:
         return _scope_cache["rows"]
-    rows = []
     try:
         conn = get_db_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT target, target_type FROM public.scope_targets")
-                rows = [(r[0], r[1]) for r in cur.fetchall() if r[0]]
+                rows, _source = load_dispatch_scope(cur)
         finally:
             conn.close()
     except Exception as e:
         # Do NOT cache a failed load as "empty scope": a transient DB blip would
-        # then block every execution for the whole TTL. Return empty (fail
-        # closed) for this call and retry on the next one.
+        # then refuse every execution for the whole TTL rather than just the
+        # call that hit it.
         logger.warning(f"scope load failed: {e} — refusing executions until it recovers")
         return []
     _scope_cache.update({"rows": rows, "at": now})
     return rows
 
 
-def host_in_scope(host, rows) -> bool:
-    """True if `host` matches any scope target. Fail closed on blanks."""
-    if not host or not rows:
-        return False
-    h = str(host).strip().lower().rstrip(".")
-    if not h:
-        return False
-    try:
-        host_ip = ipaddress.ip_address(h)
-    except ValueError:
-        host_ip = None
-    for target, ttype in rows:
-        t = str(target or "").strip().lower().rstrip(".")
-        tt = (ttype or "").lower()
-        if not t:
-            continue
-        try:
-            if tt == "ip":
-                if host_ip is not None and h == t:
-                    return True
-            elif tt == "cidr":
-                if host_ip is not None and host_ip in ipaddress.ip_network(t, strict=False):
-                    return True
-            elif tt in ("domain", "url"):
-                if h == t or fnmatch.fnmatch(h, "*." + t):
-                    return True
-            elif not tt:
-                if h == t:
-                    return True
-        except ValueError:
-            continue
-    return False
-
-
-# Bare IPv4 literals. Hostnames are deliberately NOT extracted from commands:
-# wordlist paths, tool names and version strings produce false positives, and a
-# gate that blocks legitimate work gets switched off.
-_IP_IN_CMD = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-
-
 def enforce_scope(target: str, command: str = "") -> Optional[str]:
-    """Return an error string when this execution must be refused, else None.
-
-    Checks the declared target AND any IP literal in the command, so omitting
-    `target` while naming the host in the command line is not a way around it.
-    """
-    rows = _scope_rows()
-    if not rows:
-        return ("no scope targets are configured — refusing to execute. "
-                "Configure the engagement scope first.")
-    if target and not host_in_scope(target, rows):
-        return f"target {target} is not in the configured scope"
-    for ip in set(_IP_IN_CMD.findall(command or "")):
-        # Loopback and 0.0.0.0 are the tool talking to itself (listener binds,
-        # local callbacks), not a target being scanned.
-        if ip.startswith("127.") or ip in ("0.0.0.0",):
-            continue
-        if not host_in_scope(ip, rows):
-            return f"command references {ip}, which is not in the configured scope"
-    if not target:
-        logger.info("execution with no declared target; command IPs validated")
-    return None
+    """Return an error string when this execution must be refused, else None."""
+    if not SCOPE_GATE_AVAILABLE:
+        # Fail CLOSED. A missing mount must not silently disable the gate —
+        # that is indistinguishable from having no gate at all.
+        return ("scope gate is unavailable (etl/scope_gate not importable) — "
+                "refusing to execute")
+    return check_dispatch(target, _scope_rows(), command)
 
 
 def store_raw_artifact(tool: str, content: str, command: str = "", target: str = "",
