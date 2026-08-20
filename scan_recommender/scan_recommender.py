@@ -1900,7 +1900,13 @@ def _llm_status() -> dict:
         info["note"] = f"backend '{LLM_BACKEND}' is not probed here"
         return info
     try:
-        r = requests.get(resolve_ollama_health_endpoint(OLLAMA_BASE_URL), timeout=3)
+        # resolve_ollama_health_endpoint returns the API BASE (".../api"), which
+        # callers append a path to — the /health endpoint check above does
+        # `f"{endpoint}/tags"`. Requesting the base directly 404s, which this
+        # check previously reported as "LLM backend unreachable" on a perfectly
+        # working install. Ollama here runs natively on the host and is reached
+        # via host.docker.internal.
+        r = requests.get(f"{resolve_ollama_health_endpoint(OLLAMA_BASE_URL)}/tags", timeout=3)
         info["reachable"] = r.status_code < 400
         names = [m.get("name") for m in (r.json().get("models") or [])] if r.ok else []
         info["models_available"] = names[:10]
