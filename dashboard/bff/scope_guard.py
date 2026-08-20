@@ -24,7 +24,9 @@ import logging
 log = logging.getLogger(__name__)
 
 try:
-    from etl.scope_gate import check_dispatch, is_in_scope, load_dispatch_scope
+    from etl.scope_gate import (check_dispatch, is_in_scope,
+                                is_in_scope_with_aliases, load_dispatch_scope,
+                                load_host_aliases)
     SCOPE_GATE_AVAILABLE = True
 except Exception as _err:                        # pragma: no cover
     SCOPE_GATE_AVAILABLE = False
@@ -50,11 +52,34 @@ def scope_rows_for(engagement_id):
         return [], "unavailable"
 
 
-def host_in_scope(host, rows) -> bool:
-    """True if `host` matches any scope target. Fail closed on blanks."""
+def aliases_for(host):
+    """Observed ip<->hostname pairings for `host`. Empty set on any failure."""
+    if not SCOPE_GATE_AVAILABLE or not host:
+        return set()
+    try:
+        from db import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            return load_host_aliases(cur, host)
+    except Exception as e:
+        log.warning("alias lookup failed for %r (%s) — checking the host as given", host, e)
+        return set()
+
+
+def host_in_scope(host, rows, use_aliases: bool = True) -> bool:
+    """True if `host`, or any observed alias of it, matches the scope.
+
+    Alias resolution is ON by default so this agrees with the scan launcher,
+    which has always resolved them. Without it the same target was accepted by
+    one path and refused by another.
+    """
     if not SCOPE_GATE_AVAILABLE:
         return False
-    return bool(is_in_scope(str(host or ""), rows))
+    h = str(host or "")
+    if is_in_scope(h, rows):
+        return True
+    if not use_aliases:
+        return False
+    return bool(is_in_scope_with_aliases(h, rows, aliases_for(h)))
 
 
 def refusal_for(target, rows, command: str = ""):
@@ -65,4 +90,4 @@ def refusal_for(target, rows, command: str = ""):
     """
     if not SCOPE_GATE_AVAILABLE:
         return "scope gate is unavailable (etl/scope_gate not importable) — refusing"
-    return check_dispatch(target, rows, command)
+    return check_dispatch(target, rows, command, aliases=aliases_for(target))

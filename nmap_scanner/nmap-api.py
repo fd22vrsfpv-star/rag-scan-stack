@@ -632,7 +632,12 @@ def _enforce_scope(targets, scan_type="scan"):
         logging.warning("scope gate INACTIVE for %s %s — no scope_targets defined",
                         scan_type, hosts[:5])
         return
-    blocked = [h for h in hosts if not _in_scope(h, rows)]
+    # Alias-aware, matching the BFF gate and kali-listener: a host in scope
+    # under its other observed identity (scope has the IP, request used the
+    # hostname) must not be refused here alone.
+    blocked = [h for h in hosts
+               if not (_in_scope_aliased(h, rows, _scope_aliases(h))
+                       if _in_scope_aliased else _in_scope(h, rows))]
     if blocked:
         logging.warning("scope gate BLOCKED %s for out-of-scope host(s): %s", scan_type, blocked)
         raise HTTPException(status_code=403, detail=(
@@ -643,10 +648,52 @@ def _enforce_scope(targets, scan_type="scan"):
 # Same fail-closed matcher the discovery ingests and the BFF gate use, so scope
 # semantics cannot drift between the places that enforce it.
 try:
-    from etl.scope_gate import is_in_scope as _in_scope, _host_from_url as _scope_host
+    from etl.scope_gate import (is_in_scope as _in_scope,
+                                _host_from_url as _scope_host,
+                                is_in_scope_with_aliases as _in_scope_aliased,
+                                load_host_aliases as _load_aliases)
 except ImportError:
     _in_scope = None
     _scope_host = None
+    _in_scope_aliased = None
+    _load_aliases = None
+
+
+def _scope_aliases(host):
+    """Observed ip<->hostname pairings for `host`, via rag-api.
+
+    This service has no direct database access — it reaches everything through
+    rag-api — so aliases come from /assets rather than a SQL lookup.
+
+    Without this, this gate refused a host that the BFF gate and kali-listener
+    both accepted: the scope listed the IP and the request used the hostname.
+    Four gates with three behaviours meant a target's authorisation depended on
+    which service happened to evaluate it.
+
+    Uses OBSERVED pairings, never live DNS: a resolver answer is
+    attacker-influencable, and letting a DNS record talk a host into scope would
+    defeat the gate.
+    """
+    h = (host or "").strip().lower().rstrip(".")
+    if not h:
+        return set()
+    aliases = {h}
+    if h in ("localhost", "127.0.0.1", "::1"):
+        return aliases | {"localhost", "127.0.0.1", "::1"}
+    try:
+        r = requests.get(f"{API_BASE}/assets", params={"limit": 5000},
+                         headers={"x-api-key": API_KEY}, timeout=10, verify=False)
+        if r.status_code == 200:
+            for a in (r.json().get("assets") or []):
+                ip = str(a.get("ip") or "").strip().lower()
+                hn = str(a.get("hostname") or "").strip().lower()
+                if h in (ip, hn):
+                    aliases |= {x for x in (ip, hn) if x}
+    except Exception as e:
+        # Narrow, never widen: fall back to the host as given.
+        logging.warning("alias lookup failed for %r: %s", host, e)
+    return aliases
+
 
 class MasscanBody(BaseModel):
     targets: List[str] = Field(..., description="List of IPs/CIDRs to scan")
