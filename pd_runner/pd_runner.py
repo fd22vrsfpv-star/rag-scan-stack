@@ -13,6 +13,9 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.responses import HTMLResponse, Response, FileResponse
 from pydantic import BaseModel
 import uvicorn, requests
+# Shared job runner, delivered by the rag-common base image
+# (common/tool_job.py). Both runners previously carried their own copy.
+from tool_job import run_tool_job
 
 logging.basicConfig(level=logging.INFO)
 
@@ -237,7 +240,8 @@ def _read_jsonl(path: str) -> list:
     return results
 
 
-def _ingest_results(tool: str, output_path: str, job_id: str = None) -> dict:
+def _ingest_results(tool: str, output_path: str, job_id: str = None,
+                    source: str = None) -> dict:
     """POST results file to rag-api ingest endpoint."""
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
         return {"ok": True, "skipped": "no output"}
@@ -247,6 +251,10 @@ def _ingest_results(tool: str, output_path: str, job_id: str = None) -> dict:
         params = {}
         if job_id:
             params["job_id"] = job_id
+        # Distinguishes the TOOL that produced the file from the PARSER used to
+        # read it, when one tool's output is ingested in another's format.
+        if source:
+            params["source"] = source
         r = requests.post(f"{API_BASE}/ingest/{tool}", files=files, headers=headers, params=params, timeout=300, verify=False)
         r.raise_for_status()
         return r.json()
@@ -294,91 +302,24 @@ def _scope_refusal_for_targets(targets_file: str):
 
 
 def _run_tool_job(job_id: str, tool: str, cmd: list, targets_file: str, output_file: str, ingest_as: str = None, env: dict = None, no_ingest: bool = False):
-    """Generic background job runner for PD tools."""
-    # Refuse before the tool is launched, not after.
-    _refusal = _scope_refusal_for_targets(targets_file)
-    if _refusal:
-        logging.warning("REFUSED %s job %s: %s", tool, job_id, _refusal)
-        _job_tracker.update_job(job_id, status="failed",
-                                error=f"Out of scope — {_refusal}")
-        return
+    """Run one tool job. The implementation is shared — see common/tool_job.py.
 
-    try:
-        import time as _time
-        _t0 = _time.time()
-        cmd_str = " ".join(cmd)
-        _job_tracker.update_job(job_id, status="running", started_at=datetime.now().isoformat())
-        _job_tracker.push_command(job_id, tool, cmd_str)
-        _job_tracker.update_progress(job_id, stage="running")
-
-        emit_webhook_event("scan_started", tool, {"job_id": job_id, "scan_type": tool})
-        write_audit("scan_started", tool, "pd_runner", {
-            "job_id": job_id, "execution_mode": "local", "command": cmd_str,
-        })
-
-        logging.info(f"[{job_id}] Running {tool}: {cmd_str}")
-        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, env=env)
-
-        if cp.returncode not in (0, 1):
-            raise RuntimeError(f"{tool} exit {cp.returncode}: {cp.stderr[:500]}")
-
-        # Count results
-        findings_count = 0
-        raw_output = ""
-        if os.path.exists(output_file):
-            with open(output_file) as f:
-                content = f.read()
-                findings_count = sum(1 for line in content.splitlines() if line.strip())
-                raw_output = content[:10000]  # cap raw output for test mode
-        _job_tracker.update_progress(job_id, findings_count=findings_count)
-
-        # Ingest (skip if no_ingest / test mode)
-        ing = None
-        if no_ingest:
-            logging.info(f"[{job_id}] no_ingest=true, skipping ingestion")
-        else:
-            _job_tracker.update_progress(job_id, stage="ingesting")
-            ingest_tool = ingest_as or tool
-            ing = _ingest_results(ingest_tool, output_file, job_id=job_id)
-
-        _job_tracker.update_progress(job_id, stage="done")
-        duration_s = round(_time.time() - _t0, 2)
-        result_data = {"ok": True, "findings_count": findings_count, "report": output_file, "ingest": ing, "no_ingest": no_ingest, "command": cmd_str, "duration_s": duration_s}
-        if no_ingest:
-            result_data["raw_output"] = raw_output
-            result_data["stdout"] = cp.stdout[-2000:] if cp.stdout else None
-            result_data["stderr"] = cp.stderr[-2000:] if cp.stderr else None
-        _job_tracker.update_job(
-            job_id, status="completed",
-            result=result_data,
-            completed_at=datetime.now().isoformat(),
-        )
-        emit_webhook_event("scan_completed", tool, {"job_id": job_id, "findings_count": findings_count})
-        write_audit("scan_completed", tool, "pd_runner", {
-            "job_id": job_id, "findings_count": findings_count,
-            "duration_s": duration_s, "command": cmd_str,
-        })
-
-        # Save session results
-        if not no_ingest:
-            _save_session_results(job_id, tool, "pd-runner", [output_file],
-                                  metadata={"findings_count": findings_count})
-
-    except Exception as e:
-        _job_tracker.update_job(job_id, status="failed", error=str(e), completed_at=datetime.now().isoformat())
-        _job_tracker.update_progress(job_id, stage="failed")
-        emit_webhook_event("scan_failed", tool, {"job_id": job_id, "error": str(e)})
-        write_audit("scan_failed", tool, "pd_runner", {
-            "job_id": job_id, "error": str(e),
-        })
-        logging.error(f"[{job_id}] {tool} failed: {e}")
-    finally:
-        # Cleanup targets file
-        if targets_file and os.path.exists(targets_file):
-            try:
-                os.remove(targets_file)
-            except OSError:
-                pass
+    This module previously carried its own copy. The two copies had drifted,
+    with improvements stranded in one of them, so the shared version is the
+    union and this service gains whatever it was missing.
+    """
+    run_tool_job(
+        job_id=job_id, tool=tool, cmd=cmd, targets_file=targets_file,
+        output_file=output_file, ingest_as=ingest_as, env=env, no_ingest=no_ingest,
+        service_name="pd_runner", session_label="pd-runner",
+        job_tracker=_job_tracker,
+        emit_webhook_event=emit_webhook_event,
+        write_audit=write_audit,
+        ingest_results=_ingest_results,
+        scope_refusal=_scope_refusal_for_targets,
+        save_session_results=_save_session_results,
+        on_success=None,
+    )
 
 
 # ===============================

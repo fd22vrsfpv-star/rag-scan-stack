@@ -16,6 +16,11 @@
 #    2. Go Tool Build     — compile Go security tools (~10-15 min first time)
 #    3. Environment       — generate .env with secure credentials
 #    4. Infrastructure    — create network, directories, kong config
+# The shared base image must exist before any service that does
+# `FROM rag-common:latest`. compose builds in parallel and does NOT
+# order builds by their FROM dependencies, so a clean machine fails
+# with "pull access denied for rag-common" without this.
+bash "$(dirname "${BASH_SOURCE[0]}")/build-base-image.sh"
 #    5. Docker Build      — docker compose build
 #    6. Start Services    — docker compose up -d
 #    7. Database Schema   — wait for postgres, apply schema
