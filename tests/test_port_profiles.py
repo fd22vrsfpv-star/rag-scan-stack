@@ -10,6 +10,17 @@ The behaviour these lock down, in priority order:
      masscan has no --top-ports flag and a bad string reaches the binary.
   3. Callers that pass no profile are byte-for-byte unaffected.
 """
+import pytest
+
+# Skip rather than fail: BFF dependency; present in the pentest-dashboard image.
+pytest.importorskip("pydantic_settings", reason="pydantic_settings unavailable — BFF dependency; present in the pentest-dashboard image")
+
+import pytest
+
+# Skip rather than fail when unavailable: HTTP client used by the BFF; present in the pentest-dashboard image.
+pytest.importorskip("httpx",
+                    reason="httpx not available here — HTTP client used by the BFF; present in the pentest-dashboard image")
+
 import os
 import sys
 import textwrap

@@ -1,4 +1,12 @@
 """BFF router tests — verify proxy routes work with mocked upstream services."""
+import pytest
+
+# Skip rather than ERROR when this is unavailable: BFF dependency; present in the pentest-dashboard image.
+# A collection error reads as a broken test suite; a skip states plainly
+# that the test cannot run in this environment.
+pytest.importorskip("pydantic_settings",
+                    reason="pydantic_settings not available here — BFF dependency; present in the pentest-dashboard image")
+
 import sys, os, pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from httpx import Response

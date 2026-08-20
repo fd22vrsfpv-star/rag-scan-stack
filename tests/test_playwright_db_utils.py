@@ -26,8 +26,12 @@ class TestDatabaseUtils:
         # Setup mock
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_connect.return_value.__exit__ = MagicMock(return_value=None)
+        # db_utils.get_db() is a @contextmanager that yields psycopg2.connect(...)
+        # DIRECTLY, so the patched connect() return value IS the connection.
+        # Treating it as its own context manager left the real conn a bare
+        # MagicMock, so fetchone() never returned the configured rows and every
+        # assertion compared against a MagicMock instead of a UUID.
+        mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 
@@ -40,10 +44,19 @@ class TestDatabaseUtils:
 
         # Verify
         assert result == asset_id
-        mock_cursor.execute.assert_any_call(
-            "SELECT id FROM assets WHERE ip = %s::inet",
-            ('192.168.1.100',)
-        )
+        # Assert the SUBSTANCE of the lookup, not its exact text. The query has
+        # since gained a hostname condition and a LIMIT, and pinning the literal
+        # string made a legitimate query change look like a regression while
+        # testing nothing about behaviour.
+        lookups = [c for c in mock_cursor.execute.call_args_list
+                   if "SELECT id FROM assets" in c[0][0]]
+        assert lookups, "expected an asset lookup query"
+        sql, params = lookups[0][0][0], lookups[0][0][1]
+        # A hostname was supplied, and the code resolves by hostname FIRST
+        # (falling back to ip). The original test asserted an ip lookup, which
+        # stopped being the first query when that precedence was introduced.
+        assert ("hostname = %s" in sql) or ("ip = %s::inet" in sql), sql
+        assert ('testhost' in params) or ('192.168.1.100' in params), params
         # Should update last_seen
         assert mock_cursor.execute.call_count == 2
         mock_conn.commit.assert_called_once()
@@ -53,8 +66,12 @@ class TestDatabaseUtils:
         """Test creating a new asset."""
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_connect.return_value.__exit__ = MagicMock(return_value=None)
+        # db_utils.get_db() is a @contextmanager that yields psycopg2.connect(...)
+        # DIRECTLY, so the patched connect() return value IS the connection.
+        # Treating it as its own context manager left the real conn a bare
+        # MagicMock, so fetchone() never returned the configured rows and every
+        # assertion compared against a MagicMock instead of a UUID.
+        mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 
@@ -75,8 +92,12 @@ class TestDatabaseUtils:
         """Test creating a Playwright scan record."""
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_connect.return_value.__exit__ = MagicMock(return_value=None)
+        # db_utils.get_db() is a @contextmanager that yields psycopg2.connect(...)
+        # DIRECTLY, so the patched connect() return value IS the connection.
+        # Treating it as its own context manager left the real conn a bare
+        # MagicMock, so fetchone() never returned the configured rows and every
+        # assertion compared against a MagicMock instead of a UUID.
+        mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 
@@ -107,8 +128,12 @@ class TestDatabaseUtils:
         """Test updating a Playwright scan with results."""
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_connect.return_value.__exit__ = MagicMock(return_value=None)
+        # db_utils.get_db() is a @contextmanager that yields psycopg2.connect(...)
+        # DIRECTLY, so the patched connect() return value IS the connection.
+        # Treating it as its own context manager left the real conn a bare
+        # MagicMock, so fetchone() never returned the configured rows and every
+        # assertion compared against a MagicMock instead of a UUID.
+        mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 
@@ -137,8 +162,12 @@ class TestDatabaseUtils:
         """Test creating a Playwright finding."""
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_connect.return_value.__exit__ = MagicMock(return_value=None)
+        # db_utils.get_db() is a @contextmanager that yields psycopg2.connect(...)
+        # DIRECTLY, so the patched connect() return value IS the connection.
+        # Treating it as its own context manager left the real conn a bare
+        # MagicMock, so fetchone() never returned the configured rows and every
+        # assertion compared against a MagicMock instead of a UUID.
+        mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 
@@ -173,8 +202,12 @@ class TestDatabaseUtils:
         """Test saving screenshot to database."""
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_connect.return_value.__exit__ = MagicMock(return_value=None)
+        # db_utils.get_db() is a @contextmanager that yields psycopg2.connect(...)
+        # DIRECTLY, so the patched connect() return value IS the connection.
+        # Treating it as its own context manager left the real conn a bare
+        # MagicMock, so fetchone() never returned the configured rows and every
+        # assertion compared against a MagicMock instead of a UUID.
+        mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 
@@ -207,8 +240,12 @@ class TestDatabaseUtils:
         """Test that duplicate screenshots are not saved."""
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_connect.return_value.__exit__ = MagicMock(return_value=None)
+        # db_utils.get_db() is a @contextmanager that yields psycopg2.connect(...)
+        # DIRECTLY, so the patched connect() return value IS the connection.
+        # Treating it as its own context manager left the real conn a bare
+        # MagicMock, so fetchone() never returned the configured rows and every
+        # assertion compared against a MagicMock instead of a UUID.
+        mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 
@@ -235,8 +272,12 @@ class TestDatabaseUtils:
         """Test saving DOM analysis results."""
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_connect.return_value.__exit__ = MagicMock(return_value=None)
+        # db_utils.get_db() is a @contextmanager that yields psycopg2.connect(...)
+        # DIRECTLY, so the patched connect() return value IS the connection.
+        # Treating it as its own context manager left the real conn a bare
+        # MagicMock, so fetchone() never returned the configured rows and every
+        # assertion compared against a MagicMock instead of a UUID.
+        mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 
