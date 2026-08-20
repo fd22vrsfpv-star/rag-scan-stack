@@ -108,6 +108,10 @@ export interface StoredRecommendation {
   artifact_bytes?: number | null
   artifact_preview?: string | null
   skip_reason?: string | null
+  /** False when the target is outside the configured scope. Dispatch refuses
+   *  these — including with force — so they must be visibly distinct from
+   *  runnable items rather than just failing when clicked. */
+  in_scope?: boolean | null
 }
 
 export function useScanRecommendations(status = 'pending', engagementId?: string | null) {

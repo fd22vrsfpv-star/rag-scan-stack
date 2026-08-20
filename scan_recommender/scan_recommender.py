@@ -1881,6 +1881,44 @@ def _next_scan_admission():
         _next_scan_slots.release()
 
 
+def _llm_status() -> dict:
+    """Is the configured LLM backend actually usable?
+
+    Worth reporting explicitly because the failure is SILENT: /next_scan only
+    reaches the LLM when a service has no port rows, and if the backend is
+    missing it falls back to deterministic rules and still returns 200. On this
+    install no ollama container was running at all and OLLAMA_MODEL was set to a
+    model that does not exist, so LLM-backed recommendations had simply stopped
+    happening with nothing to indicate it.
+
+    Cheap and fail-soft: a short timeout, and any error is reported rather than
+    raised, since this is a diagnostic endpoint.
+    """
+    info = {"backend": LLM_BACKEND, "model": OLLAMA_MODEL}
+    if LLM_BACKEND != "ollama":
+        info["reachable"] = None
+        info["note"] = f"backend '{LLM_BACKEND}' is not probed here"
+        return info
+    try:
+        r = requests.get(resolve_ollama_health_endpoint(OLLAMA_BASE_URL), timeout=3)
+        info["reachable"] = r.status_code < 400
+        names = [m.get("name") for m in (r.json().get("models") or [])] if r.ok else []
+        info["models_available"] = names[:10]
+        info["model_present"] = OLLAMA_MODEL in names
+        if not info["reachable"]:
+            info["note"] = (f"backend answered HTTP {r.status_code} — LLM "
+                            f"recommendations are deterministic-only")
+        elif not info["model_present"]:
+            info["note"] = (f"model '{OLLAMA_MODEL}' is not installed — LLM "
+                            f"recommendations silently fall back to rules")
+    except Exception as e:
+        info["reachable"] = False
+        info["model_present"] = False
+        info["note"] = (f"{type(e).__name__}: LLM backend unreachable — "
+                        f"recommendations are deterministic-only")
+    return info
+
+
 @router.get("/next_scan/capacity")
 def next_scan_capacity():
     """Admission stats, so saturation is observable rather than inferred from
@@ -1889,6 +1927,7 @@ def next_scan_capacity():
         stats = dict(_next_scan_stats)
     return {"max_concurrency": NEXT_SCAN_MAX_CONCURRENCY,
             "engagement_scan_limit": SCAN_LIMIT,
+            "llm": _llm_status(),
             "auto_execute_enabled": AUTO_EXECUTE,
             "auto_execute_skipped": _auto_exec_skipped["n"],
             "queue_wait_seconds": NEXT_SCAN_QUEUE_WAIT_SEC, **stats}
@@ -2234,7 +2273,24 @@ def list_all_recommendations(
                        -- output whatsoever. Their uploads are now archived with
                        -- the job id attached, which is the link back.
                        ra.artifact_id, ra.artifact_tool, ra.artifact_bytes,
-                       ra.artifact_preview
+                       ra.artifact_preview,
+                       -- Whether this recommendation's target is inside the
+                       -- configured scope. Recommendations are generated from
+                       -- whatever hosts appear in scan output, so a redirect or
+                       -- a certificate SAN can put a third party's address in
+                       -- the queue. Dispatch blocks these, but a blocked item
+                       -- that looks identical to a runnable one just reads as
+                       -- broken -- the operator has to be able to SEE why.
+                       -- Only ip/cidr rows can match an IP target; a domain
+                       -- scope entry cannot authorise a bare address here.
+                       EXISTS (
+                           SELECT 1 FROM public.scope_targets st
+                            WHERE (lower(COALESCE(st.target_type,'ip')) = 'ip'
+                                   AND st.target = host(r.ip))
+                               OR (lower(st.target_type) = 'cidr'
+                                   AND st.target ~ '^[0-9a-fA-F:.]+/[0-9]+$'
+                                   AND r.ip <<= st.target::inet)
+                       ) AS in_scope
                 FROM scan_recommendations r
                 -- 1:1 on a unique id, so this cannot multiply rows.
                 LEFT JOIN tool_executions te
