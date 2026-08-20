@@ -1,12 +1,13 @@
 import { useState, useMemo } from 'react'
 import {
   useArtifacts, useArtifactStats, useArtifact, useArtifactActions,
-  useQueueActions, useMarkProcessed, formatBytes,
-  type Artifact, type ArtifactAction,
+  useQueueActions, useAutoQueueSetting, useSetAutoQueue, formatBytes,
+  type ArtifactAction, type CustomAction,
 } from '@/api/artifacts'
 import {
   FileText, Braces, Loader2, Search, X, Copy, Check, Download, Play,
   AlertTriangle, CheckCircle2, Clock, Zap, RefreshCw, ChevronRight, Sparkles,
+  Pencil, Plus, Bot, RotateCcw,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -336,7 +337,7 @@ function Meta({ label, value, mono }: { label: string; value?: string | number |
   )
 }
 
-/** Follow-on actions, with evidence and already-run state. */
+/** Follow-on actions: rule-derived, editable, plus operator-written ones. */
 function ActionsPanel({ id, actions, loading, onRefresh }: {
   id: string
   actions?: { actions: ArtifactAction[]; counts: Record<string, number>; target: string | null }
@@ -344,7 +345,15 @@ function ActionsPanel({ id, actions, loading, onRefresh }: {
   onRefresh: () => void
 }) {
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  // action_id -> edited command. Kept separate from the suggestion itself so
+  // "Reset" can always restore what the rule actually proposed.
+  const [edits, setEdits] = useState<Record<string, string>>({})
+  const [editing, setEditing] = useState<string | null>(null)
+  const [custom, setCustom] = useState<CustomAction[]>([])
+  const [showCustom, setShowCustom] = useState(false)
   const queue = useQueueActions(id)
+  const { data: autoQ } = useAutoQueueSetting()
+  const setAutoQ = useSetAutoQueue()
 
   function toggle(actionId: string) {
     setSelected(prev => {
@@ -357,45 +366,97 @@ function ActionsPanel({ id, actions, loading, onRefresh }: {
   if (loading) {
     return <div className="p-8 text-center"><Loader2 className="w-5 h-5 animate-spin mx-auto text-gray-500" /></div>
   }
-  if (!actions?.actions.length) {
-    return (
-      <div className="p-8 text-center text-gray-500 text-sm">
-        No follow-on actions matched this output.
-        <p className="text-xs text-gray-600 mt-1">
-          Suggestions are evidence-based — nothing is proposed unless something in the
-          output supports it.
-        </p>
-      </div>
+
+  const list = actions?.actions || []
+  const chosen = Array.from(selected)
+  // An action needing input can only be queued once its placeholders are
+  // filled, so an unedited one blocks the submit rather than failing at the API.
+  const blocked = chosen.filter(cid => {
+    const a = list.find(x => x.id === cid)
+    return a?.needs_input && !edits[cid]
+  })
+  const canQueue = (chosen.length > 0 || custom.length > 0) && blocked.length === 0
+
+  function submit() {
+    const overrides: Record<string, { script?: string }> = {}
+    chosen.forEach(cid => { if (edits[cid]) overrides[cid] = { script: edits[cid] } })
+    queue.mutate(
+      { action_ids: chosen, overrides, custom_actions: custom },
+      { onSuccess: () => { setSelected(new Set()); setCustom([]); setEdits({}) } },
     )
   }
 
-  const runnable = Array.from(selected)
-
   return (
     <div className="space-y-3">
-      <div className="flex items-center gap-2 flex-wrap text-xs">
-        <span className="text-gray-400">{actions.counts.total} suggested</span>
-        {actions.counts.already_run > 0 && (
-          <span className="text-gray-500">· {actions.counts.already_run} already run</span>
-        )}
-        {actions.counts.queued > 0 && (
-          <span className="text-blue-400">· {actions.counts.queued} queued</span>
-        )}
-        <button onClick={onRefresh} className="ml-auto px-2 py-1 bg-gray-800 hover:bg-gray-700 rounded flex items-center gap-1">
-          <RefreshCw className="w-3 h-3" /> Re-analyse
-        </button>
+      {/* Automation state — what happens without anyone clicking. */}
+      <div className="flex items-center gap-2 flex-wrap text-xs bg-gray-900/60 border border-gray-800 rounded p-2">
+        <Bot className="w-4 h-4 text-blue-400" />
+        <span className="text-gray-300">
+          Auto-queue is <b>{autoQ?.enabled ? 'on' : 'off'}</b>
+        </span>
+        <span className="text-gray-500">
+          — {autoQ?.enabled
+            ? `${autoQ.auto_queue_rules.length} rule(s) queue themselves as pending when matching output arrives. Nothing runs until you press Run.`
+            : 'every follow-up must be queued by hand.'}
+        </span>
         <button
-          disabled={!runnable.length || queue.isPending}
-          onClick={() => queue.mutate(runnable, { onSuccess: () => setSelected(new Set()) })}
-          className="px-3 py-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 rounded flex items-center gap-1">
-          {queue.isPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
-          Queue {runnable.length || ''} as scan{runnable.length === 1 ? '' : 's'}
+          onClick={() => setAutoQ.mutate(!(autoQ?.enabled))}
+          className="ml-auto px-2 py-1 bg-gray-800 hover:bg-gray-700 rounded">
+          Turn {autoQ?.enabled ? 'off' : 'on'}
         </button>
       </div>
 
+      {!!autoQ?.rule_errors?.length && (
+        <div className="text-xs bg-red-500/10 border border-red-500/30 text-red-400 rounded p-2">
+          <b>Rule file problems</b> — affected rules are not running:
+          <ul className="list-disc ml-4 mt-1">
+            {autoQ.rule_errors.map((e, i) => <li key={i}>{e}</li>)}
+          </ul>
+        </div>
+      )}
+
+      <div className="flex items-center gap-2 flex-wrap text-xs">
+        <span className="text-gray-400">{list.length} suggested</span>
+        {!!actions?.counts.already_run && <span className="text-gray-500">· {actions.counts.already_run} already run</span>}
+        {!!actions?.counts.queued && <span className="text-blue-400">· {actions.counts.queued} queued</span>}
+        <button onClick={onRefresh} className="ml-auto px-2 py-1 bg-gray-800 hover:bg-gray-700 rounded flex items-center gap-1">
+          <RefreshCw className="w-3 h-3" /> Re-analyse
+        </button>
+        <button onClick={() => setShowCustom(v => !v)}
+                className="px-2 py-1 bg-gray-800 hover:bg-gray-700 rounded flex items-center gap-1">
+          <Plus className="w-3 h-3" /> Add your own
+        </button>
+        <button disabled={!canQueue || queue.isPending} onClick={submit}
+                className="px-3 py-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 rounded flex items-center gap-1">
+          {queue.isPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+          Queue {chosen.length + custom.length || ''}
+        </button>
+      </div>
+
+      {blocked.length > 0 && (
+        <div className="text-xs bg-orange-500/10 border border-orange-500/30 text-orange-400 rounded p-2">
+          {blocked.length} selected action(s) still contain placeholders. Edit the
+          command to fill them in — an unresolved command cannot run.
+        </div>
+      )}
+
+      {showCustom && <CustomActionForm target={actions?.target || ''} onAdd={a => setCustom(c => [...c, a])} />}
+
+      {custom.map((c, i) => (
+        <div key={`c${i}`} className="border border-emerald-500/40 bg-emerald-500/5 rounded-lg p-3">
+          <div className="flex items-center gap-2">
+            <span className="text-xs px-1.5 py-0.5 rounded border border-emerald-500/30 text-emerald-400">manual</span>
+            <span className="font-medium text-sm">{c.title}</span>
+            <button onClick={() => setCustom(list => list.filter((_, j) => j !== i))}
+                    className="ml-auto text-gray-500 hover:text-white"><X className="w-4 h-4" /></button>
+          </div>
+          <pre className="text-xs font-mono bg-black border border-gray-800 rounded px-2 py-1 mt-2 overflow-x-auto">{c.script}</pre>
+        </div>
+      ))}
+
       {queue.isSuccess && (
         <div className="text-xs bg-green-500/10 border border-green-500/30 text-green-400 rounded p-2">
-          Queued as scan recommendations — run them from the Recommendations page.
+          Queued as pending scan recommendations — run them from the Recommendations page.
         </div>
       )}
       {queue.isError && (
@@ -404,63 +465,145 @@ function ActionsPanel({ id, actions, loading, onRefresh }: {
         </div>
       )}
 
-      {actions.actions.map(a => (
-        <div key={a.id}
-             className={cn('border rounded-lg p-3 space-y-2',
-               selected.has(a.id) ? 'border-blue-500/50 bg-blue-500/5' : 'border-gray-800 bg-gray-900/40')}>
-          <div className="flex items-start gap-3">
-            <input type="checkbox" className="mt-1" checked={selected.has(a.id)}
-                   onChange={() => toggle(a.id)} />
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="font-medium">{a.title}</span>
-                <span className={cn('text-xs px-1.5 py-0.5 rounded border', priorityTone(a.priority))}>
-                  P{a.priority}
-                </span>
-                <span className={cn('text-xs', CATEGORY_COLOR[a.category] || 'text-gray-400')}>
-                  {a.category}
-                </span>
-                {a.source === 'llm' && (
-                  <span className="text-xs px-1.5 py-0.5 rounded border border-fuchsia-500/30 bg-fuchsia-500/10 text-fuchsia-400 flex items-center gap-1">
-                    <Sparkles className="w-3 h-3" /> LLM
-                  </span>
+      {!list.length && !custom.length && (
+        <div className="p-8 text-center text-gray-500 text-sm">
+          No follow-on actions matched this output.
+          <p className="text-xs text-gray-600 mt-1">
+            Suggestions are evidence-based — nothing is proposed unless something in
+            the output supports it. You can still add your own above.
+          </p>
+        </div>
+      )}
+
+      {list.map(a => {
+        const script = edits[a.id] ?? a.script
+        const isEdited = edits[a.id] !== undefined && edits[a.id] !== a.script
+        return (
+          <div key={a.id}
+               className={cn('border rounded-lg p-3 space-y-2',
+                 selected.has(a.id) ? 'border-blue-500/50 bg-blue-500/5' : 'border-gray-800 bg-gray-900/40')}>
+            <div className="flex items-start gap-3">
+              <input type="checkbox" className="mt-1" checked={selected.has(a.id)}
+                     onChange={() => toggle(a.id)} />
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-medium">{a.title}</span>
+                  <span className={cn('text-xs px-1.5 py-0.5 rounded border', priorityTone(a.priority))}>P{a.priority}</span>
+                  <span className={cn('text-xs', CATEGORY_COLOR[a.category] || 'text-gray-400')}>{a.category}</span>
+                  {a.auto_queue && (
+                    <span className="text-xs px-1.5 py-0.5 rounded border border-blue-500/30 bg-blue-500/10 text-blue-400 flex items-center gap-1">
+                      <Bot className="w-3 h-3" /> auto-queues
+                    </span>
+                  )}
+                  {a.source === 'llm' && (
+                    <span className="text-xs px-1.5 py-0.5 rounded border border-fuchsia-500/30 bg-fuchsia-500/10 text-fuchsia-400 flex items-center gap-1">
+                      <Sparkles className="w-3 h-3" /> LLM
+                    </span>
+                  )}
+                  {a.already_run.ran && (
+                    <span className="text-xs px-1.5 py-0.5 rounded border border-gray-600 bg-gray-800 text-gray-300 flex items-center gap-1">
+                      <CheckCircle2 className="w-3 h-3" /> ran {a.already_run.count}×
+                    </span>
+                  )}
+                  {a.queued_status && (
+                    <span className="text-xs px-1.5 py-0.5 rounded border border-blue-500/30 bg-blue-500/10 text-blue-400 flex items-center gap-1">
+                      <Clock className="w-3 h-3" /> queued ({a.queued_status})
+                    </span>
+                  )}
+                  {a.needs_input && !edits[a.id] && (
+                    <span className="text-xs px-1.5 py-0.5 rounded border border-orange-500/30 bg-orange-500/10 text-orange-400 flex items-center gap-1">
+                      <AlertTriangle className="w-3 h-3" /> needs input
+                    </span>
+                  )}
+                  {isEdited && (
+                    <span className="text-xs px-1.5 py-0.5 rounded border border-emerald-500/30 bg-emerald-500/10 text-emerald-400">edited</span>
+                  )}
+                </div>
+                <p className="text-xs text-gray-400 mt-1">{a.rationale}</p>
+
+                {editing === a.id ? (
+                  <div className="mt-2 space-y-1">
+                    <textarea
+                      className="w-full bg-black border border-blue-500/40 rounded px-2 py-1 text-xs font-mono"
+                      rows={2} value={script}
+                      onChange={e => setEdits(p => ({ ...p, [a.id]: e.target.value }))} />
+                    <div className="flex gap-2">
+                      <button onClick={() => setEditing(null)}
+                              className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 rounded text-xs">Done</button>
+                      <button onClick={() => { setEdits(p => { const n = { ...p }; delete n[a.id]; return n }); setEditing(null) }}
+                              className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 rounded text-xs flex items-center gap-1">
+                        <RotateCcw className="w-3 h-3" /> Reset
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-start gap-2 mt-2">
+                    <pre className="flex-1 text-xs font-mono bg-black border border-gray-800 rounded px-2 py-1 overflow-x-auto">{script}</pre>
+                    <button onClick={() => setEditing(a.id)} title="Edit command"
+                            className="px-2 py-1 bg-gray-800 hover:bg-gray-700 rounded">
+                      <Pencil className="w-3 h-3" />
+                    </button>
+                  </div>
                 )}
-                {a.already_run.ran && (
-                  <span className="text-xs px-1.5 py-0.5 rounded border border-gray-600 bg-gray-800 text-gray-300 flex items-center gap-1">
-                    <CheckCircle2 className="w-3 h-3" /> ran {a.already_run.count}×
-                  </span>
+
+                {a.evidence && (
+                  <div className="mt-2 text-xs">
+                    <span className="text-gray-600">Evidence from output: </span>
+                    <code className="text-yellow-300/80 bg-yellow-500/5 px-1 rounded break-all">{a.evidence}</code>
+                  </div>
                 )}
-                {a.queued_status && (
-                  <span className="text-xs px-1.5 py-0.5 rounded border border-blue-500/30 bg-blue-500/10 text-blue-400 flex items-center gap-1">
-                    <Clock className="w-3 h-3" /> queued ({a.queued_status})
-                  </span>
-                )}
-                {a.needs_input && (
-                  <span className="text-xs px-1.5 py-0.5 rounded border border-orange-500/30 bg-orange-500/10 text-orange-400 flex items-center gap-1">
-                    <AlertTriangle className="w-3 h-3" /> needs input
-                  </span>
+                {a.already_run.ran && a.already_run.last_at && (
+                  <p className="text-[11px] text-gray-600 mt-1">
+                    Last run {new Date(a.already_run.last_at).toLocaleString()} ({a.already_run.last_status})
+                    — queue again to re-run.
+                  </p>
                 )}
               </div>
-              <p className="text-xs text-gray-400 mt-1">{a.rationale}</p>
-              <pre className="text-xs font-mono bg-black border border-gray-800 rounded px-2 py-1 mt-2 overflow-x-auto">
-                {a.script}
-              </pre>
-              {a.evidence && (
-                <div className="mt-2 text-xs">
-                  <span className="text-gray-600">Evidence from output: </span>
-                  <code className="text-yellow-300/80 bg-yellow-500/5 px-1 rounded break-all">{a.evidence}</code>
-                </div>
-              )}
-              {a.already_run.ran && a.already_run.last_at && (
-                <p className="text-[11px] text-gray-600 mt-1">
-                  Last run {new Date(a.already_run.last_at).toLocaleString()} ({a.already_run.last_status})
-                  — queue again to re-run.
-                </p>
-              )}
             </div>
           </div>
-        </div>
-      ))}
+        )
+      })}
+    </div>
+  )
+}
+
+/** Operator-written follow-up, for anything the rules do not cover. */
+function CustomActionForm({ target, onAdd }: { target: string; onAdd: (a: CustomAction) => void }) {
+  const [title, setTitle] = useState('')
+  const [scanner, setScanner] = useState('')
+  const [script, setScript] = useState('')
+  const [priority, setPriority] = useState(60)
+
+  // The scanner must be a bare tool name: it selects the dispatch route, and
+  // the executor validates it against the tool allowlist.
+  const validScanner = /^[a-zA-Z0-9_.-]+$/.test(scanner)
+  const ready = title.trim() && validScanner && script.trim()
+
+  return (
+    <div className="border border-gray-700 bg-gray-900/60 rounded-lg p-3 space-y-2">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+        <input className="px-2 py-1 bg-gray-950 border border-gray-700 rounded text-sm"
+               placeholder="What is this for?" value={title} onChange={e => setTitle(e.target.value)} />
+        <input className={cn('px-2 py-1 bg-gray-950 border rounded text-sm font-mono',
+                 scanner && !validScanner ? 'border-red-500/60' : 'border-gray-700')}
+               placeholder="tool (e.g. rpcinfo)" value={scanner} onChange={e => setScanner(e.target.value)} />
+        <input type="number" min={0} max={100}
+               className="px-2 py-1 bg-gray-950 border border-gray-700 rounded text-sm"
+               value={priority} onChange={e => setPriority(Number(e.target.value))} />
+      </div>
+      <textarea className="w-full px-2 py-1 bg-black border border-gray-700 rounded text-xs font-mono"
+                rows={2} placeholder={`command to run, e.g. rpcinfo -p ${target || '<target>'}`}
+                value={script} onChange={e => setScript(e.target.value)} />
+      {scanner && !validScanner && (
+        <p className="text-xs text-red-400">
+          Tool name must be a bare command name — no spaces or shell characters.
+        </p>
+      )}
+      <button disabled={!ready}
+              onClick={() => { onAdd({ title, scanner, script, priority }); setTitle(''); setScanner(''); setScript('') }}
+              className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 rounded text-sm flex items-center gap-1">
+        <Plus className="w-3 h-3" /> Add to queue list
+      </button>
     </div>
   )
 }

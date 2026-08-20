@@ -10,7 +10,7 @@ REQUESTS_CA_BUNDLE). If a call starts failing with CERTIFICATE_VERIFY_FAILED,
 regenerate the bundle with scripts/generate-ca-bundle.sh rather than
 reinstating verify=False.
 """
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException
@@ -30,9 +30,26 @@ LIST_TIMEOUT = 30
 ACTIONS_TIMEOUT = 60
 
 
+class CustomAction(BaseModel):
+    title: str
+    scanner: str
+    script: str
+    priority: int = 60
+    rationale: Optional[str] = None
+    category: str = "manual"
+
+
 class QueueActionsRequest(BaseModel):
-    action_ids: List[str]
+    action_ids: List[str] = []
+    # action_id -> {"script": ..., "priority": ...}. Required to queue a
+    # needs_input action, whose placeholders must be filled in first.
+    overrides: Dict[str, Dict[str, Any]] = {}
+    custom_actions: List[CustomAction] = []
     engagement_id: Optional[str] = None
+
+
+class AutoQueueSetting(BaseModel):
+    enabled: bool
 
 
 class ProcessedRequest(BaseModel):
@@ -74,6 +91,30 @@ async def artifact_stats():
     s = get_settings()
     async with httpx.AsyncClient(timeout=LIST_TIMEOUT) as c:
         resp = await c.get(f"{s.rag_api_url}/artifacts/stats", headers=_hdrs())
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.get("/api/artifacts/auto-queue")
+async def get_auto_queue():
+    """Whether high-confidence follow-ups queue themselves on store, which
+    rules opt in, and any rule-file errors."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=LIST_TIMEOUT) as c:
+        resp = await c.get(f"{s.rag_api_url}/artifacts/auto-queue", headers=_hdrs())
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.post("/api/artifacts/auto-queue")
+async def set_auto_queue(req: AutoQueueSetting):
+    """Turn automatic queuing on or off. Never affects already-queued items."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=LIST_TIMEOUT) as c:
+        resp = await c.post(f"{s.rag_api_url}/artifacts/auto-queue",
+                            json=req.model_dump(), headers=_hdrs())
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
         return safe_json(resp)

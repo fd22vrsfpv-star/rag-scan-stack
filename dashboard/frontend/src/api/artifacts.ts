@@ -63,8 +63,12 @@ export interface ArtifactAction {
   priority: number
   /** The exact line from the raw output that triggered this suggestion. */
   evidence: string
-  /** Command still contains placeholders, or the suggestion has no runnable form. */
+  /** Command still contains placeholders, or the suggestion has no runnable form.
+   *  These cannot be queued as-is — supply an edited script instead. */
   needs_input: boolean
+  /** Rule opted into being queued automatically when matching output is stored.
+   *  Auto-queued actions are still only ever queued, never executed. */
+  auto_queue: boolean
   source: 'rules' | 'llm'
   already_run: {
     ran: boolean
@@ -137,13 +141,29 @@ export function useArtifactActions(id: string | null) {
   })
 }
 
+export interface CustomAction {
+  title: string
+  scanner: string
+  script: string
+  priority?: number
+  rationale?: string
+}
+
+export interface QueuePayload {
+  action_ids?: string[]
+  /** action_id -> edited command / priority. The only way to queue a
+   *  needs_input action: its placeholders must be filled in first. */
+  overrides?: Record<string, { script?: string; priority?: number }>
+  custom_actions?: CustomAction[]
+}
+
 export function useQueueActions(id: string | null) {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (action_ids: string[]) =>
+    mutationFn: (payload: QueuePayload) =>
       apiFetch<{ ok: boolean; queued: Array<{ recommendation_id: string; action_id: string }>; unknown_action_ids: string[] }>(
         `/artifacts/${id}/actions/queue`,
-        { method: 'POST', body: JSON.stringify({ action_ids }) },
+        { method: 'POST', body: JSON.stringify(payload) },
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['artifact-actions', id] })
@@ -174,4 +194,32 @@ export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
   return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
+
+export interface AutoQueueSetting {
+  enabled: boolean
+  auto_queue_rules: string[]
+  rules_loaded: number
+  /** A broken rule file silently disables every suggestion — surface it. */
+  rule_errors: string[]
+}
+
+export function useAutoQueueSetting() {
+  return useQuery({
+    queryKey: ['artifact-auto-queue'],
+    queryFn: () => apiFetch<AutoQueueSetting>('/artifacts/auto-queue'),
+  })
+}
+
+export function useSetAutoQueue() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (enabled: boolean) =>
+      apiFetch<{ ok: boolean; enabled: boolean }>('/artifacts/auto-queue', {
+        method: 'POST',
+        body: JSON.stringify({ enabled }),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['artifact-auto-queue'] }),
+  })
 }
