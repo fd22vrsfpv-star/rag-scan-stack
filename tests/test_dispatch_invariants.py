@@ -41,7 +41,19 @@ _DISPATCH_MARKERS = (
     "/tools/execute", "execute-recommended", "/jobs/", "subprocess.Popen",
     "subprocess.run", "asyncio.create_subprocess",
 )
-_SCOPE_MARKERS = ("_host_in_scope", "is_in_scope", "scope_gate", "host_in_scope")
+# Names that constitute "this module consults the scope". Deliberately broad:
+# a detector that misses a real gate produces a FALSE debt entry, which is worse
+# than no list — it hides the genuine gaps in noise. routers/scans.py was
+# flagged for weeks of this list's life despite calling _enforce_scan_scope()
+# before every launch.
+_SCOPE_MARKERS = (
+    "_host_in_scope", "is_in_scope", "scope_gate", "host_in_scope",
+    "scope_guard", "_enforce_scan_scope", "enforce_scope", "scope_rows",
+)
+# NOT a marker: the bare table name "scope_targets". Modules query it for
+# reasons that are not authorisation — DDL, health checks, CIDR grouping, and
+# the in_scope column the recommendations UI displays. Counting those cleared
+# three modules that dispatch with no gate at all.
 _LIMIT_MARKERS = ("MAX_CONCURRENT_SCANS",)
 
 # Directories worth scanning. Tests, migrations and the frontend are excluded.

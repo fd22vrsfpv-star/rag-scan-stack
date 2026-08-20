@@ -1279,7 +1279,14 @@ async def _enforce_scan_scope(scan_type: str, req) -> None:
     if not hosts:
         return
     scope_rows = await _load_scope_rows()
-    mode = os.environ.get("SCAN_SCOPE_ENFORCE", "warn").strip().lower()
+    # Fail CLOSED by default. This used to default to "warn": with no scope
+    # configured, every scan was permitted and only a log line recorded it —
+    # the opposite of every other gate in the stack (kali-listener, the BFF
+    # dispatcher, tool_executor all refuse when scope is empty). An
+    # unconfigured scope is a setup mistake, and treating it as permission to
+    # scan anything is how unauthorised traffic happens.
+    # Set SCAN_SCOPE_ENFORCE=warn to restore the old permissive behaviour.
+    mode = os.environ.get("SCAN_SCOPE_ENFORCE", "strict").strip().lower()
 
     if not scope_rows:
         if mode == "strict":
