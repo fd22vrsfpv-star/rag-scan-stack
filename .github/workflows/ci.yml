@@ -31,3 +31,13 @@ jobs:
           pip install -r tests/requirements.txt
           # DB-backed and service-backed tests skip cleanly without them.
           pytest tests/ -q
+      - name: Check shell script syntax
+        run: |
+          # scripts/cleanup-old-files.sh sat unparseable at HEAD — a stray
+          # 'fi' — so scheduled cleanup could never have run. Nothing
+          # checked, because the script is only invoked from cron.
+          fail=0
+          for f in $(git ls-files '*.sh'); do
+            bash -n "$f" || { echo "SYNTAX ERROR: $f"; fail=1; }
+          done
+          exit $fail
