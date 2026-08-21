@@ -381,6 +381,29 @@ async def list_screenshots(search: Optional[str] = None):
         return r.json()
 
 
+# NOTE: must stay ABOVE /api/screenshots/{path:path}. That catch-all matches
+# any single segment, so while this sat below it the metadata endpoint was
+# unreachable — it returned 404 as a missing screenshot named "metadata".
+@router.get("/api/screenshots/metadata")
+async def get_screenshot_metadata(
+    path: Optional[str] = None,
+    tag: Optional[str] = None,
+):
+    s = get_settings()
+    params: dict = {}
+    if path:
+        params["path"] = path
+    if tag:
+        params["tag"] = tag
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.get(
+            f"{s.rag_api_url}/screenshots/metadata",
+            params=params,
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
 @router.get("/api/screenshots/{path:path}")
 async def proxy_screenshot(path: str):
     """Proxy screenshot files from osint-runner."""
@@ -433,24 +456,6 @@ class ScreenshotMetaBody(BaseModel):
     added_to_scope: Optional[str] = None
 
 
-@router.get("/api/screenshots/metadata")
-async def get_screenshot_metadata(
-    path: Optional[str] = None,
-    tag: Optional[str] = None,
-):
-    s = get_settings()
-    params: dict = {}
-    if path:
-        params["path"] = path
-    if tag:
-        params["tag"] = tag
-    async with httpx.AsyncClient(timeout=15) as c:
-        resp = await c.get(
-            f"{s.rag_api_url}/screenshots/metadata",
-            params=params,
-            headers={"x-api-key": s.api_key, **engagement_headers()},
-        )
-        return safe_json(resp)
 
 
 @router.patch("/api/screenshots/metadata")

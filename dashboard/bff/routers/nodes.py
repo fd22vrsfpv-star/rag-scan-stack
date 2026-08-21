@@ -113,14 +113,78 @@ async def list_nodes():
     return await _nm_get("/nodes")
 
 
+# ── Literal /api/nodes/* routes ───────────────────────────────────────────
+# These MUST stay above the /api/nodes/{node_id} routes below. FastAPI
+# matches in declaration order, so when they sat further down the dynamic
+# route captured them first: /api/nodes/implants arrived as node_id
+# "implants", node-manager cast it to a uuid and returned 500. Eight
+# endpoints were unreachable this way, and nothing noticed because no test
+# called them.
+@router.post("/api/nodes/register")
+async def register_node(payload: dict):
+    return await _nm_post("/nodes/register", payload)
+
+
+# ---------------------------------------------------------------------------
+# Implants
+# ---------------------------------------------------------------------------
+@router.post("/api/nodes/implants/generate")
+async def generate_implant(payload: dict):
+    return await _nm_post("/implants/generate", payload)
+
+
+@router.get("/api/nodes/implants")
+async def list_implants():
+    return await _nm_get("/implants/list")
+
+
+# ---------------------------------------------------------------------------
+# Sliver sessions
+# ---------------------------------------------------------------------------
+@router.get("/api/nodes/sessions")
+async def list_sessions():
+    return await _nm_get("/sessions")
+
+
+# ---------------------------------------------------------------------------
+# AD Attacks
+# ---------------------------------------------------------------------------
+@router.get("/api/nodes/ad/attacks")
+async def list_ad_attacks():
+    return await _nm_get("/ad/attacks")
+
+
+# ---------------------------------------------------------------------------
+# Chisel config
+# ---------------------------------------------------------------------------
+@router.post("/api/nodes/chisel/config")
+async def chisel_config(payload: dict):
+    return await _nm_post("/chisel/config", payload)
+
+
+# ---------------------------------------------------------------------------
+# SSH Tunnel Management
+# ---------------------------------------------------------------------------
+@router.get("/api/nodes/ssh/keys")
+async def list_ssh_keys():
+    return await _nm_get("/ssh/keys")
+
+
+@router.get("/api/nodes/ssh/public-keys")
+async def list_ssh_public_keys():
+    return await _nm_get("/ssh/public-keys")
+
+
+@router.post("/api/nodes/ssh/connect")
+async def ssh_connect(payload: dict):
+    return await _nm_post("/ssh/connect", payload)
+
+
 @router.get("/api/nodes/{node_id}")
 async def get_node(node_id: str):
     return await _nm_get(f"/nodes/{node_id}")
 
 
-@router.post("/api/nodes/register")
-async def register_node(payload: dict):
-    return await _nm_post("/nodes/register", payload)
 
 
 @router.delete("/api/nodes/{node_id}")
@@ -562,33 +626,12 @@ async def provision_status(node_id: str, live: bool = False):
     return SR(_proxy(), media_type="text/event-stream")
 
 
-# ---------------------------------------------------------------------------
-# Implants
-# ---------------------------------------------------------------------------
-@router.post("/api/nodes/implants/generate")
-async def generate_implant(payload: dict):
-    return await _nm_post("/implants/generate", payload)
 
 
-@router.get("/api/nodes/implants")
-async def list_implants():
-    return await _nm_get("/implants/list")
 
 
-# ---------------------------------------------------------------------------
-# Sliver sessions
-# ---------------------------------------------------------------------------
-@router.get("/api/nodes/sessions")
-async def list_sessions():
-    return await _nm_get("/sessions")
 
 
-# ---------------------------------------------------------------------------
-# AD Attacks
-# ---------------------------------------------------------------------------
-@router.get("/api/nodes/ad/attacks")
-async def list_ad_attacks():
-    return await _nm_get("/ad/attacks")
 
 
 @router.post("/api/nodes/{node_id}/ad/{attack_type}")
@@ -673,30 +716,12 @@ async def list_mcp_nodes():
         return {"nodes": [], "error": str(e)}
 
 
-# ---------------------------------------------------------------------------
-# Chisel config
-# ---------------------------------------------------------------------------
-@router.post("/api/nodes/chisel/config")
-async def chisel_config(payload: dict):
-    return await _nm_post("/chisel/config", payload)
 
 
-# ---------------------------------------------------------------------------
-# SSH Tunnel Management
-# ---------------------------------------------------------------------------
-@router.get("/api/nodes/ssh/keys")
-async def list_ssh_keys():
-    return await _nm_get("/ssh/keys")
 
 
-@router.get("/api/nodes/ssh/public-keys")
-async def list_ssh_public_keys():
-    return await _nm_get("/ssh/public-keys")
 
 
-@router.post("/api/nodes/ssh/connect")
-async def ssh_connect(payload: dict):
-    return await _nm_post("/ssh/connect", payload)
 
 
 @router.post("/api/nodes/{node_id}/ssh/disconnect")
