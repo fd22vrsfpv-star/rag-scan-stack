@@ -745,3 +745,39 @@ export function useReorderRecommendations() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['scan-recommendations'] }),
   })
 }
+
+
+export interface BlockerSummary {
+  total: number
+  /** Needs someone to act — will not proceed on its own. */
+  blocked: number
+  /** Genuinely in flight. */
+  will_proceed: number
+  by_reason: Record<string, number>
+  concurrency_limit: number
+  scope_source: string
+  items: Array<{
+    id: string
+    ip: string | null
+    scanner: string
+    status: string
+    priority: number
+    command: string | null
+    reason: string
+    blocked: boolean
+    detail: string
+  }>
+}
+
+/** Why each queued/pending recommendation is not running.
+ *
+ *  Answering this by hand meant checking the row status, whether a job id
+ *  existed, the approval queue, the slot queue and the tool allowlist — five
+ *  places, none of them joined. */
+export function useRecommendationBlockers() {
+  return useQuery({
+    queryKey: ['recommendation-blockers'],
+    queryFn: () => apiFetch<BlockerSummary>('/scan-recommendations/blockers'),
+    refetchInterval: POLL.NORMAL,
+  })
+}
