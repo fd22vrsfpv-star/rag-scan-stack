@@ -629,6 +629,19 @@ else
   fail "shared module drift — run: python3 scripts/check_shared_code.py --list"
 fi
 
+# Call every parameterless GET endpoint and fail on any 5xx.
+#
+# ~1,150 endpoints exist and about 11% are mentioned by any test, so this sweep
+# is the only thing that touches most of them. Its first run found four broken
+# endpoints in two minutes — a query on a non-existent column and a set of
+# routes made unreachable by declaration order.
+if python3 "$(dirname "${BASH_SOURCE[0]}")/smoke_endpoints.py" >/tmp/smoke.log 2>&1; then
+  pass "endpoint smoke sweep — no 5xx ($(grep -c '200' /tmp/smoke.log 2>/dev/null || echo '?') checked)"
+else
+  fail "endpoint smoke sweep found failing endpoint(s):"
+  grep -E '^  ✗' /tmp/smoke.log 2>/dev/null | head -10 || true
+fi
+
 if python3 "$(dirname "${BASH_SOURCE[0]}")/check_image_freshness.py"; then
     :
 else

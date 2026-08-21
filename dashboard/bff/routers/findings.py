@@ -253,10 +253,16 @@ async def list_vulns(
 async def get_recommendations():
     s = get_settings()
     async with httpx.AsyncClient(timeout=30) as c:
+        # scan_recommender exposes /recommendations; there is no
+        # /get_next_recommendations, so this route answered 404 for its whole
+        # life. The 404 came back wrapped in the proxy's own detail, which reads
+        # as "no recommendations" rather than "wrong upstream path".
         resp = await c.get(
-            f"{s.scan_recommender_url}/get_next_recommendations",
+            f"{s.scan_recommender_url}/recommendations",
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
         return safe_json(resp)
 
 
