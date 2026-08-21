@@ -19,6 +19,13 @@ interface CleanupParams {
   dry_run?: boolean
   sources?: string
   status?: string
+  // Category-specific. tool-executions reconciles rows stuck at 'running';
+  // artifacts prunes stored raw output, keeping unprocessed and cited ones.
+  stale_after_hours?: number
+  older_than_days?: number
+  delete_older_than_days?: number
+  keep_unprocessed?: boolean
+  keep_with_findings?: boolean
 }
 
 export function useCleanup() {
@@ -30,6 +37,14 @@ export function useCleanup() {
       if (params.older_than_hours) qs.set('older_than_hours', String(params.older_than_hours))
       if (params.sources) qs.set('sources', params.sources)
       if (params.status) qs.set('status', params.status)
+      if (params.stale_after_hours) qs.set('stale_after_hours', String(params.stale_after_hours))
+      if (params.older_than_days) qs.set('older_than_days', String(params.older_than_days))
+      if (params.delete_older_than_days) qs.set('delete_older_than_days', String(params.delete_older_than_days))
+      // Booleans are sent even when false — omitting them would silently fall
+      // back to the endpoint's default of keeping things, which is the opposite
+      // of what an operator who unticked the box asked for.
+      if (params.keep_unprocessed !== undefined) qs.set('keep_unprocessed', String(params.keep_unprocessed))
+      if (params.keep_with_findings !== undefined) qs.set('keep_with_findings', String(params.keep_with_findings))
       return apiFetch<Record<string, unknown>>(
         `/maintenance/cleanup/${params.category}?${qs}`,
         { method: 'POST' },
@@ -43,6 +58,8 @@ export function useCleanup() {
         qc.invalidateQueries({ queryKey: ['scans'] })
         qc.invalidateQueries({ queryKey: ['jobs'] })
         qc.invalidateQueries({ queryKey: ['recon'] })
+        qc.invalidateQueries({ queryKey: ['artifacts'] })
+        qc.invalidateQueries({ queryKey: ['artifact-stats'] })
         qc.invalidateQueries({ queryKey: ['params'] })
         qc.invalidateQueries({ queryKey: ['dashboard'] })
         qc.invalidateQueries({ queryKey: ['exploits'] })

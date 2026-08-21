@@ -16,7 +16,12 @@ from utils import safe_json
 router = APIRouter()
 log = logging.getLogger("maintenance")
 
-CLEANUP_CATEGORIES = {"findings", "jobs", "sessions", "scans", "assets", "recommendations", "exploits", "followups", "engagements"}
+CLEANUP_CATEGORIES = {"findings", "jobs", "sessions", "scans", "assets", "recommendations",
+                      "exploits", "followups", "engagements",
+                      # Added with their endpoints. Neither was reachable from the
+                      # UI, and the scheduled script that would have called them
+                      # did not parse, so nothing ran either one.
+                      "tool-executions", "artifacts"}
 
 # Paths for file-based exports (mounted volumes)
 SCREENSHOTS_DIR = Path("/osint_reports/screenshots")
@@ -216,6 +221,13 @@ async def cleanup_category(
     status: Optional[str] = Query(default=None),
     dry_run: bool = Query(default=False),
     sources: Optional[str] = Query(default=None),
+    # Category-specific. Forwarded only when supplied, so adding them here does
+    # not change the request any existing category receives.
+    stale_after_hours: Optional[int] = Query(default=None, ge=1),
+    older_than_days: Optional[int] = Query(default=None, ge=1),
+    delete_older_than_days: Optional[int] = Query(default=None, ge=1),
+    keep_unprocessed: Optional[bool] = Query(default=None),
+    keep_with_findings: Optional[bool] = Query(default=None),
 ):
     if category not in CLEANUP_CATEGORIES:
         raise HTTPException(400, f"Unknown category: {category}")
@@ -228,6 +240,13 @@ async def cleanup_category(
         params["status"] = status
     if sources is not None:
         params["sources"] = sources
+    for name, val in (("stale_after_hours", stale_after_hours),
+                      ("older_than_days", older_than_days),
+                      ("delete_older_than_days", delete_older_than_days),
+                      ("keep_unprocessed", keep_unprocessed),
+                      ("keep_with_findings", keep_with_findings)):
+        if val is not None:
+            params[name] = val
 
     async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(
