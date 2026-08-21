@@ -78,6 +78,12 @@ def emit_webhook_event(event_type: str, source: str, data: dict, severity: str =
         logger.warning(f"Failed to emit webhook: {e}")
 
 
+try:
+    from scope_gate import load_ingest_scope, host_in_scope
+except ImportError:  # pragma: no cover — etl/ may already be on PYTHONPATH
+    from etl.scope_gate import load_ingest_scope, host_in_scope
+
+
 def extract_ip_from_url(url: str) -> Optional[str]:
     """Extract IP address from a URL."""
     if not url:
@@ -134,7 +140,8 @@ def _detect_format(filepath: str) -> str:
     return "unknown"
 
 
-def _parse_scanner_issues(filepath: str, cur, stats: dict, dedupe: bool):
+def _parse_scanner_issues(filepath: str, cur, stats: dict, dedupe: bool,
+                           enforce_scope: bool, scope_rows):
     """Parse Burp Scanner issue XML (<issues> root)."""
     for event, elem in iterparse(filepath, events=("end",)):
         if elem.tag != "issue":
@@ -202,6 +209,14 @@ def _parse_scanner_issues(filepath: str, cur, stats: dict, dedupe: bool):
                 continue
 
         # Asset lookup
+        # Ingest scope gate. Burp's sitemap includes whatever the proxy saw —
+        # third-party CDNs, analytics, and any host the browser touched — so a
+        # report can carry hosts nobody authorised. Checked BEFORE the savepoint
+        # so a skip needs no rollback bookkeeping.
+        if not host_in_scope(url, enforce_scope, scope_rows):
+            stats["out_of_scope"] = stats.get("out_of_scope", 0) + 1
+            continue
+
         ip = host_ip or extract_ip_from_url(url)
         asset_id = get_asset_id_for_ip(cur, ip) if ip else None
 
@@ -415,8 +430,10 @@ def parse_burp(
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Loaded once per report and used by every item below.
+            _enforce_scope, _scope_rows = load_ingest_scope(cur)
             if fmt == "scanner":
-                _parse_scanner_issues(filepath, cur, stats, dedupe)
+                _parse_scanner_issues(filepath, cur, stats, dedupe, _enforce_scope, _scope_rows)
             elif fmt == "sitemap":
                 _parse_sitemap_items(filepath, cur, stats, dedupe)
 

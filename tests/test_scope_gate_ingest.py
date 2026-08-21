@@ -92,6 +92,11 @@ GATED = [
     "parse_katana", "parse_gau", "parse_crtsh", "parse_amass", "parse_httpx",
     "parse_whatweb", "parse_wafw00f", "parse_ffuf", "parse_tlsx", "parse_zap",
     "parse_censys", "parse_netexec",
+    # Added later: these four had NO gate at all. A Burp sitemap holds every
+    # host the browser touched, nikto follows redirects, ZAP spiders links, and
+    # impacket output is credential material that must not be stored against an
+    # unauthorised host.
+    "parse_burp", "parse_nikto", "parse_zap_file", "parse_impacket",
 ]
 
 # Their target is an ARN, bucket, repo path, hash type or cloud resource id —
@@ -142,15 +147,39 @@ def test_scope_is_loaded_in_the_same_function_that_uses_it(mod):
                     best = n
         return best.name if best else "(module)"
 
+    def receives_scope(fn_name):
+        """True if the function takes the scope as a PARAMETER.
+
+        Loading in one function and passing to a helper is safe — and safer than
+        a module global, because a missed argument is a TypeError. The original
+        rule only allowed load-and-use in the same function, which flagged the
+        parameter-threading in parse_nikto/parse_zap_file/parse_burp even though
+        the value is plainly bound there.
+
+        What must still fail is a name that is bound NOWHERE in the function:
+        that is the parse_zap bug this test exists for, and it recurred in
+        parse_nikto, whose gate ran in _parse_xml while the load sat in
+        parse_nikto.
+        """
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == fn_name:
+                args = n.args
+                names = {a.arg for a in list(args.args) + list(args.kwonlyargs)
+                         + list(getattr(args, "posonlyargs", []))}
+                if {"scope_rows", "enforce_scope"} & names:
+                    return True
+        return False
+
     lines = src.splitlines()
     loaders = {owner(i) for i, l in enumerate(lines, 1) if "load_ingest_scope(cur)" in l}
     users = [(i, owner(i)) for i, l in enumerate(lines, 1)
              if "host_in_scope(" in l and not l.strip().startswith("#") and "def " not in l]
     assert loaders, f"{mod}: no load_ingest_scope(cur) call found"
     for line, fn in users:
-        assert fn in loaders, (
-            f"{mod}:{line} uses host_in_scope inside {fn}(), but scope is only "
-            f"loaded in {loaders} — this raises NameError at runtime"
+        assert fn in loaders or receives_scope(fn), (
+            f"{mod}:{line} uses host_in_scope inside {fn}(), which neither loads "
+            f"the scope (loaded in {loaders}) nor receives it as a parameter — "
+            f"this raises NameError at runtime"
         )
 
 
