@@ -115,7 +115,7 @@ export interface ScanRecommendationsPanelProps {
 /** Human wording for each blocker reason, and what to do about it. */
 const BLOCKER_LABEL: Record<string, string> = {
   awaiting_approval: 'awaiting approval (Exploits)',
-  needs_approval_record: 'Metasploit — needs approval, never auto-runs',
+  needs_operator_run: 'Metasploit — press Run (never auto-runs)',
   tool_unavailable: 'tool not installed on the executor',
   needs_input: 'command has an unfilled placeholder',
   out_of_scope: 'target not in engagement scope',
@@ -255,6 +255,9 @@ export function ScanRecommendationsPanel({
   const { data: blockers } = useRecommendationBlockers()
   const [showBlockers, setShowBlockers] = useState(false)
   const [useKali, setUseKali] = useState(true)
+  // Default ON: the operator selected these and pressed Run. Left as a
+  // visible control so the consequence is stated, not buried.
+  const [approveExploits, setApproveExploits] = useState(true)
   const [toolCheck, setToolCheck] = useState<any>(null)
   const [checking, setChecking] = useState(false)
   const [installing, setInstalling] = useState(false)
@@ -283,7 +286,16 @@ export function ScanRecommendationsPanel({
       const res = await fetch('/api/scan-recommendations/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: Array.from(selected), use_kali: useKali }),
+        // approve_exploits: pressing Run here IS the human approval, so a
+        // Metasploit module executes in the metasploit container instead of
+        // queueing a second confirmation. The same endpoint is called by the
+        // recon agent and by agent-session finalisation, neither of which sets
+        // this — so automated paths still queue for review.
+        body: JSON.stringify({
+          ids: Array.from(selected),
+          use_kali: useKali,
+          approve_exploits: approveExploits,
+        }),
       })
       const data = await res.json()
       setRunResult(data)
@@ -435,6 +447,16 @@ export function ScanRecommendationsPanel({
         <label className="flex items-center gap-1 text-[10px] cursor-pointer" title="Route manual tools (hydra, ssh-audit, etc.) to internal Kali container">
           <input type="checkbox" checked={useKali} onChange={() => setUseKali(!useKali)} className="rounded" />
           Use Kali
+        </label>
+
+        <label className="flex items-center gap-1.5" title="Metasploit modules run in the metasploit container, through the selected proxy. Untick to queue them for separate approval instead.">
+
+          <input type="checkbox" checked={approveExploits}
+
+            onChange={e => setApproveExploits(e.target.checked)} className="rounded" />
+
+          <span>Run exploits directly</span>
+
         </label>
         {selected.size > 0 && (
           <>

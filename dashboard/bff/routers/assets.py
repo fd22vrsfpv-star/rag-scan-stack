@@ -741,6 +741,18 @@ class RunRecommendationsRequest(BaseModel):
     # this, a suppressed recommendation is unrunnable and the tool has quietly
     # overruled the tester.
     force: bool = False
+    # Run Metasploit modules directly instead of queueing them for approval.
+    #
+    # Defaults to FALSE and must be set explicitly by the caller. This endpoint
+    # is also called by the recon agent (services/recon_agent.py) and by agent
+    # session finalisation (autogen_service.py), and neither of those is a human
+    # deciding to exploit a host. An operator pressing Run in the UI IS that
+    # decision, which is what this flag expresses — so the separate approval
+    # step is redundant there, and still required everywhere else.
+    #
+    # Fail-safe by omission: any caller that does not know about this flag
+    # cannot auto-exploit.
+    approve_exploits: bool = False
 
 
 # Suggested manual commands for recommendations dispatch cannot run.
@@ -1012,9 +1024,11 @@ async def recommendation_blockers(limit: int = 500):
             # "tool_unavailable" was accurate about the allowlist and wrong
             # about the cause, which sends an operator looking for a missing
             # package instead of an approval.
-            return ("needs_approval_record", True,
-                    "Metasploit is never auto-run. This one has no approval record yet — "
-                    "dispatching it creates one for review under Exploits.")
+            return ("needs_operator_run", True,
+                    "Metasploit never runs automatically. Select it and press Run with "
+                    "'Run exploits directly' ticked and it executes in the metasploit "
+                    "container through the selected proxy; untick that and it queues for "
+                    "approval under Exploits instead.")
         if allowed is not None and scanner and scanner not in allowed:
             return ("tool_unavailable", True,
                     f"'{scanner}' is not in the executor's allowlist, so it cannot be run "
@@ -1618,6 +1632,76 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                         json={"targets": [f"http://{ip}:{port}"]},
                         headers=headers,
                     )
+                elif scanner == "metasploit" and body.approve_exploits:
+                    # The operator pressed Run on this module, which IS the
+                    # approval — so execute it in the metasploit container via
+                    # exploit-runner rather than queueing a second confirmation.
+                    #
+                    # Reached only when the caller set approve_exploits. The
+                    # recon agent and agent-session finalisation call this same
+                    # endpoint and do not set it, so they still queue for review.
+                    module = (rec.get("script") or "").strip()
+                    if not module:
+                        result["status"] = "skipped"
+                        result["detail"] = "Metasploit rec has no module — nothing to run"
+                        return result
+
+                    def _resolve_port():
+                        from db import get_db
+                        with get_db() as conn, conn.cursor() as cur:
+                            cur.execute("SELECT (extra->>'port')::int FROM scan_recommendations "
+                                        "WHERE id = %s::uuid", (rec["id"],))
+                            row = cur.fetchone()
+                            return row[0] if row else None
+
+                    msf_port = rec.get("port")
+                    if msf_port is None:
+                        try:
+                            msf_port = await asyncio.to_thread(_resolve_port)
+                        except Exception:
+                            msf_port = None
+
+                    opts = {"RHOSTS": ip}
+                    if msf_port:
+                        opts["RPORT"] = msf_port
+                    payload = {
+                        "module_type": "exploit" if module.startswith("exploit/") else "auxiliary",
+                        "module_name": module,
+                        "options": opts,
+                        # exploit-runner turns this into MSF's Proxies option and
+                        # REFUSES the run if it cannot, rather than connecting
+                        # direct behind the operator's back.
+                        "proxy_url": proxy_url,
+                    }
+                    try:
+                        async with httpx.AsyncClient(timeout=300) as c:
+                            r = await c.post(f"{s.exploit_runner_url}/execute/msf",
+                                             json=payload,
+                                             headers={"x-api-key": s.api_key, **engagement_headers()})
+                        if r.status_code in (200, 201, 202):
+                            data = r.json()
+                            ok = bool(data.get("success"))
+                            result["status"] = "dispatched" if ok else "failed"
+                            result["detail"] = (f"Metasploit {module} ran in the metasploit "
+                                                f"container{' via ' + proxy_url if proxy_url else ''}: "
+                                                f"{'success' if ok else 'no session/failed'}")
+                            await _mark_rec_dispatched(
+                                rec_id=rec["id"], job_id=str(data.get("session_id") or "msf"),
+                                ip=ip, port=msf_port, service=rec.get("service"),
+                                scanner=scanner, node_id=None,
+                                command=f"msf {module} RHOSTS={ip}"
+                                        + (f" RPORT={msf_port}" if msf_port else "")
+                                        + (f" Proxies={proxy_url}" if proxy_url else ""),
+                                endpoint=f"{s.exploit_runner_url}/execute/msf",
+                            )
+                        else:
+                            result["status"] = "failed"
+                            result["detail"] = f"exploit-runner HTTP {r.status_code}: {r.text[:160]}"
+                    except Exception as e:
+                        result["status"] = "failed"
+                        result["detail"] = f"{type(e).__name__}: {str(e)[:120]}"
+                    return result
+
                 elif scanner == "metasploit":
                     # Don't auto-exploit. Queue the module into the
                     # pending_exploits approval workflow (Exploit Manager), with
