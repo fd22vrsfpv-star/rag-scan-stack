@@ -273,3 +273,43 @@ def test_debt_entries_reference_real_files():
 def test_every_debt_entry_has_a_reason():
     for rel, why in list(SCOPE_DEBT.items()) + list(LIMIT_DEBT.items()):
         assert why and len(why) > 15, f"{rel} needs a real reason, got {why!r}"
+
+
+# ── Exploit execution requires an explicit operator decision ──────────────
+
+def test_exploit_execution_is_opt_in_and_defaults_off():
+    """approve_exploits must default to False.
+
+    /api/scan-recommendations/run is called by the recon agent
+    (services/recon_agent.py) and by agent-session finalisation
+    (autogen_service.py). Neither is a human deciding to exploit a host, and
+    neither sets this flag — so the default is what stops an agent
+    auto-exploiting. A caller that does not know the flag exists cannot.
+    """
+    src = open(os.path.join(REPO, "dashboard", "bff", "routers", "assets.py")).read()
+    m = re.search(r"approve_exploits: bool = (\w+)", src)
+    assert m, "approve_exploits field not found on the run request"
+    assert m.group(1) == "False", (
+        f"approve_exploits defaults to {m.group(1)} — an automated caller would "
+        f"auto-exploit without asking")
+
+
+def test_direct_exploit_path_is_gated_on_the_flag():
+    """The direct-execution branch must test the flag, not just the scanner."""
+    src = open(os.path.join(REPO, "dashboard", "bff", "routers", "assets.py")).read()
+    assert 'elif scanner == "metasploit" and body.approve_exploits:' in src, (
+        "the direct metasploit branch is not gated on approve_exploits")
+    # And the approval-queue branch must still exist for everything else.
+    assert 'elif scanner == "metasploit":' in src, (
+        "the approval-queue fallback is gone — automated callers would have no path")
+
+
+def test_msf_proxy_refuses_rather_than_connecting_direct():
+    """An unusable proxy must fail the run, not silently bypass it.
+
+    The operator selected a proxy profile; running the module direct would put
+    traffic on a path they did not choose, which is worse than not running.
+    """
+    src = open(os.path.join(REPO, "exploit_runner", "exploit_runner.py")).read()
+    assert "refusing to run the module unproxied" in src, (
+        "a proxy that cannot be expressed as an MSF Proxies value must refuse")
