@@ -5687,6 +5687,95 @@ def maintenance_stats(authorized: bool = Depends(auth)):
     return counts
 
 
+@app.post("/cleanup/tool-executions", tags=["Maintenance"])
+def cleanup_tool_executions(
+    stale_after_hours: int = Query(default=6, ge=1),
+    delete_older_than_days: Optional[int] = Query(default=None, ge=1),
+    dry_run: bool = Query(default=False),
+    authorized: bool = Depends(auth),
+):
+    """Reconcile stuck tool executions, and optionally prune old ones.
+
+    Two jobs, because the table had neither:
+
+    1. RECONCILE — a row is set to 'running' before the subprocess starts and
+       updated when it finishes. If the process dies in between (restart, OOM,
+       wedged tool) the row stays 'running' for ever. 41 such rows accumulated
+       here, the oldest three days stale.
+
+       The activity view already *displayed* rows like these as 'lost' via a
+       CASE expression, but never wrote it back — so the view looked correct
+       while every other reader, every count and every export still saw
+       'running'. Cosmetic fixes in one query are worse than none: they hide the
+       problem from the place most likely to reveal it.
+
+    2. PRUNE — optional age-based delete, off unless delete_older_than_days is
+       given. Execution rows carry command lines and output, so they are worth
+       keeping longer than the default suggests.
+
+    kali-listener also reaps at startup, which is stricter and immediate: after
+    a restart nothing it launched can still be alive. This endpoint covers what
+    that cannot — a tool that wedged while the service stayed up — and puts the
+    table on the same scheduled cleanup footing as jobs, scans and artifacts.
+    """
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT count(*) FROM tool_executions
+             WHERE status IN ('running','pending')
+               AND started_at < now() - (%s || ' hours')::interval
+            """,
+            [stale_after_hours],
+        )
+        stale = cur.fetchone()[0]
+        if not dry_run and stale:
+            cur.execute(
+                """
+                UPDATE tool_executions
+                   SET status = 'failed',
+                       error = coalesce(nullif(error, ''), '') ||
+                               'reconciled: no completion recorded after %s hours',
+                       completed_at = now()
+                 WHERE status IN ('running','pending')
+                   AND started_at < now() - (%s || ' hours')::interval
+                """,
+                [stale_after_hours, stale_after_hours],
+            )
+
+        deleted = 0
+        if delete_older_than_days:
+            cur.execute(
+                "SELECT count(*) FROM tool_executions WHERE started_at < now() - (%s || ' days')::interval",
+                [delete_older_than_days],
+            )
+            deleted = cur.fetchone()[0]
+            if not dry_run and deleted:
+                cur.execute(
+                    "DELETE FROM tool_executions WHERE started_at < now() - (%s || ' days')::interval",
+                    [delete_older_than_days],
+                )
+
+        cur.execute("SELECT status, count(*) FROM tool_executions GROUP BY 1")
+        remaining = {r[0]: r[1] for r in cur.fetchall()}
+
+    result = {
+        "dry_run": dry_run,
+        "stale_after_hours": stale_after_hours,
+        "reconciled": 0 if dry_run else stale,
+        "reconcilable": stale,
+        "deleted": 0 if dry_run else deleted,
+        "by_status": remaining,
+    }
+    if not dry_run and (stale or deleted):
+        logger.info("tool_executions cleanup: reconciled=%s deleted=%s", stale, deleted)
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("tool_executions_cleaned", "maintenance", result)
+        except Exception:
+            pass
+    return result
+
+
 @app.post("/cleanup/artifacts", tags=["Maintenance"])
 def cleanup_artifacts(
     older_than_days: int = Query(default=90, ge=1),
