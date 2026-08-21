@@ -105,9 +105,170 @@ function formatCount(n: number): string {
   return String(n)
 }
 
+type MaintTab = 'overview' | 'cleanup'
+
+function MaintenanceTabs({ tab, setTab }: { tab: MaintTab; setTab: (t: MaintTab) => void }) {
+  const tabs: Array<{ id: MaintTab; label: string }> = [
+    { id: 'overview', label: 'Overview' },
+    { id: 'cleanup', label: 'Cleanup' },
+  ]
+  return (
+    <div className="flex gap-1 border-b border-border">
+      {tabs.map(t => (
+        <button key={t.id} onClick={() => setTab(t.id)}
+          className={`px-3 py-1.5 text-sm border-b-2 -mb-px ${
+            tab === t.id
+              ? 'border-blue-500 text-foreground'
+              : 'border-transparent text-muted-foreground hover:text-foreground'}`}>
+          {t.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/**
+ * Run the cleanup tasks by hand.
+ *
+ * These endpoints existed and nothing could reach them: the UI had no control,
+ * the scheduled script did not parse, and the cron was never installed — so
+ * 41 tool executions sat stuck at 'running' for days and raw artifacts only
+ * ever grew.
+ *
+ * Every task is dry-run first. The result of a dry run is shown before anything
+ * is deleted, because these operations are not reversible.
+ */
+function CleanupPanel() {
+  const cleanup = useCleanup()
+  const [result, setResult] = useState<{ task: string; dry: boolean; data: unknown } | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+  const [keepUnprocessed, setKeepUnprocessed] = useState(true)
+  const [keepCited, setKeepCited] = useState(true)
+  const [artifactDays, setArtifactDays] = useState(90)
+  const [staleHours, setStaleHours] = useState(6)
+
+  async function run(task: string, dry: boolean) {
+    setBusy(`${task}:${dry}`)
+    setError(null)
+    try {
+      const base: Record<string, unknown> = { category: task, dry_run: dry }
+      if (task === 'tool-executions') base.stale_after_hours = staleHours
+      if (task === 'artifacts') {
+        base.older_than_days = artifactDays
+        base.keep_unprocessed = keepUnprocessed
+        base.keep_with_findings = keepCited
+      }
+      const data = await cleanup.mutateAsync(base as never)
+      setResult({ task, dry, data })
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Cleanup failed')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const TASKS: Array<{ id: string; label: string; blurb: string }> = [
+    {
+      id: 'tool-executions',
+      label: 'Stuck tool executions',
+      blurb: 'A row is marked running before the tool starts. If the process dies — restart, ' +
+             'OOM, a wedged tool — nothing reconciled it and the row stayed running for ever.',
+    },
+    {
+      id: 'artifacts',
+      label: 'Raw artifacts',
+      blurb: 'Stored tool output. Contains recovered credentials in plaintext, so old ' +
+             'artifacts are standing exposure, not just disk usage.',
+    },
+    { id: 'jobs', label: 'Finished jobs', blurb: 'Completed, failed and cancelled jobs with their tasks.' },
+    { id: 'scans', label: 'Old scans', blurb: 'Scan records past the retention window.' },
+  ]
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 text-xs text-amber-300">
+        <b>Nothing here runs on a schedule yet.</b> The cleanup cron is not installed —
+        run <code>scripts/setup-cleanup-cron.sh</code> on the host for that. Until then these
+        are manual. Deletions are not reversible; check a dry run first.
+      </div>
+
+      <div className="bg-card border border-border rounded-lg p-4 space-y-3">
+        <h3 className="text-sm font-semibold">Options</h3>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+          <label className="flex items-center gap-2">
+            <span className="text-muted-foreground w-40">Reconcile executions after</span>
+            <input type="number" min={1} value={staleHours}
+              onChange={e => setStaleHours(Number(e.target.value))}
+              className="w-20 px-2 py-1 bg-background border border-border rounded" />
+            <span className="text-muted-foreground">hours</span>
+          </label>
+          <label className="flex items-center gap-2">
+            <span className="text-muted-foreground w-40">Prune artifacts older than</span>
+            <input type="number" min={1} value={artifactDays}
+              onChange={e => setArtifactDays(Number(e.target.value))}
+              className="w-20 px-2 py-1 bg-background border border-border rounded" />
+            <span className="text-muted-foreground">days</span>
+          </label>
+          <label className="flex items-center gap-2" title="Artifacts still queued for LLM processing">
+            <input type="checkbox" checked={keepUnprocessed}
+              onChange={e => setKeepUnprocessed(e.target.checked)} />
+            <span>Keep unprocessed artifacts</span>
+          </label>
+          <label className="flex items-center gap-2" title="Artifacts a recommendation cites as evidence">
+            <input type="checkbox" checked={keepCited}
+              onChange={e => setKeepCited(e.target.checked)} />
+            <span>Keep artifacts cited by a finding</span>
+          </label>
+        </div>
+        {keepUnprocessed && (
+          <p className="text-[11px] text-muted-foreground">
+            With this ticked and no LLM consumer running, artifacts never leave the
+            queue and pruning will match almost nothing — the dry run reports how
+            many were held back.
+          </p>
+        )}
+      </div>
+
+      {TASKS.map(t => (
+        <div key={t.id} className="bg-card border border-border rounded-lg p-4">
+          <div className="flex items-start justify-between gap-4">
+            <div className="min-w-0">
+              <h3 className="text-sm font-semibold">{t.label}</h3>
+              <p className="text-xs text-muted-foreground mt-0.5">{t.blurb}</p>
+            </div>
+            <div className="flex gap-2 shrink-0">
+              <button onClick={() => run(t.id, true)} disabled={!!busy}
+                className="px-3 py-1 text-xs rounded bg-muted/30 hover:bg-muted/50 disabled:opacity-40">
+                {busy === `${t.id}:true` ? 'Checking…' : 'Dry run'}
+              </button>
+              <button onClick={() => run(t.id, false)} disabled={!!busy}
+                className="px-3 py-1 text-xs rounded bg-red-600/80 hover:bg-red-600 disabled:opacity-40">
+                {busy === `${t.id}:false` ? 'Running…' : 'Run'}
+              </button>
+            </div>
+          </div>
+          {result?.task === t.id && (
+            <div className={`mt-3 text-xs rounded p-2 border ${
+              result.dry ? 'border-blue-500/30 bg-blue-500/10' : 'border-green-500/30 bg-green-500/10'}`}>
+              <div className="font-medium mb-1">{result.dry ? 'Dry run — nothing changed' : 'Completed'}</div>
+              <pre className="whitespace-pre-wrap break-all">{JSON.stringify(result.data, null, 2)}</pre>
+            </div>
+          )}
+        </div>
+      ))}
+
+      {error && (
+        <div className="text-xs rounded p-2 border border-red-500/30 bg-red-500/10 text-red-400">{error}</div>
+      )}
+    </div>
+  )
+}
+
 export default function Maintenance() {
   const { data: stats, isLoading: statsLoading } = useMaintenanceStats()
   const cleanup = useCleanup()
+  const [tab, setTab] = useState<'overview' | 'cleanup'>('overview')
   const dataExport = useDataExport()
   const dataImport = useDataImport()
   const { data: estimate } = useExportEstimate()
@@ -245,9 +406,20 @@ export default function Maintenance() {
     }
   }
 
+  if (tab === 'cleanup') {
+    return (
+      <div className="space-y-6">
+        <h2 className="text-lg font-semibold">Maintenance</h2>
+        <MaintenanceTabs tab={tab} setTab={setTab} />
+        <CleanupPanel />
+      </div>
+    )
+  }
+
   return (
     <div className="space-y-6">
       <h2 className="text-lg font-semibold">Maintenance</h2>
+      <MaintenanceTabs tab={tab} setTab={setTab} />
 
       {/* Database Overview */}
       <div className="bg-card border border-border rounded-lg p-4">
