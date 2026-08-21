@@ -910,6 +910,150 @@ class ReorderRequest(BaseModel):
     step: int = 5
 
 
+async def _allowed_tool_names():
+    """Lowercased tool allowlist from kali-listener, or None if unreadable.
+
+    None is deliberately distinct from an empty set: a failed probe must not be
+    reported as "no tools are available", which would mark every recommendation
+    blocked for the wrong reason. Mirrors the shape handling in the coverage
+    report — /tools/allowed has returned both a dict and a list.
+    """
+    s_cfg = get_settings()
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{s_cfg.kali_listener_url}/tools/allowed",
+                            headers={"x-api-key": s_cfg.api_key})
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        items = data.get("tools") if isinstance(data, dict) else data
+        if isinstance(items, dict):
+            return {k.lower() for k in items}
+        if isinstance(items, list):
+            return {(t.get("name") if isinstance(t, dict) else str(t)).lower() for t in items}
+    except Exception as e:
+        log.debug("tool allowlist unavailable: %s", e)
+    return None
+
+
+@router.get("/api/scan-recommendations/blockers")
+async def recommendation_blockers(limit: int = 500):
+    """Why each non-terminal recommendation is not running.
+
+    Answering this used to mean checking five unrelated places: the row's status,
+    whether extra.job_id existed, the pending_exploits approval queue, the BFF's
+    in-memory slot queue, and the tool allowlist. Nothing joined them, so
+    "queued" looked identical whether the work was seconds away or waiting on a
+    human indefinitely.
+
+    Each item gets one reason and a `blocked` flag — blocked means it will NOT
+    proceed on its own.
+    """
+    from db import get_db
+
+    def _load():
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT r.id::text, host(r.ip)::text AS ip, r.scanner, r.status,
+                       r.priority, r.target_kind,
+                       COALESCE(NULLIF(r.script,''), r.extra->>'dispatched_command') AS command,
+                       r.extra->>'job_id'             AS job_id,
+                       r.extra->>'pending_exploit_id' AS pending_exploit_id,
+                       r.extra->>'skip_reason'        AS skip_reason,
+                       pe.status                      AS approval_status
+                  FROM scan_recommendations r
+                  LEFT JOIN pending_exploits pe
+                         ON pe.id::text = r.extra->>'pending_exploit_id'
+                 WHERE r.status IN ('pending','queued','skipped','failed')
+                 ORDER BY r.priority, r.created_at
+                 LIMIT %s
+            """, (max(1, min(limit, 2000)),))
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    try:
+        rows = await asyncio.to_thread(_load)
+    except Exception as e:
+        raise HTTPException(500, f"could not read recommendations: {e}")
+
+    scope_rows, scope_source = _scope_rows_for(current_engagement_id.get())
+    allowed = await _allowed_tool_names()
+    limit_now = get_max_concurrent()
+
+    def classify(r):
+        scanner = (r["scanner"] or "").lower()
+        # Order matters: report the FIRST thing that would stop it, which is the
+        # thing an operator has to act on.
+        if not _host_in_scope(r["ip"], scope_rows):
+            return ("out_of_scope", True,
+                    f"{r['ip']} is not in the engagement scope ({scope_source}). Dispatch "
+                    f"refuses this, including with force.")
+        if r["pending_exploit_id"]:
+            st = r["approval_status"] or "unknown"
+            return ("awaiting_approval", st == "pending",
+                    f"Metasploit module queued for human approval (approval status: {st}). "
+                    f"Exploits are never auto-run — approve it under Exploits.")
+        if r["status"] == "failed":
+            # blocked=True: `blocked` means "will not proceed without someone
+            # acting". A failed recommendation will not retry itself, so
+            # counting it as will_proceed overstated how much was actually
+            # moving — only in-flight work belongs in that bucket.
+            return ("failed", True,
+                    "Ran and failed. Open the row for the command and output, then re-run.")
+        if r["status"] == "skipped":
+            return ("skipped", True,
+                    r["skip_reason"] or "Suppressed by the platform. Use force to run it anyway.")
+        if (r["target_kind"] or "service") != "service":
+            return ("not_dispatchable", True,
+                    f"target_kind={r['target_kind']} — dispatch only handles service targets.")
+        if scanner == "metasploit":
+            # Metasploit is excluded from the kali allowlist ON PURPOSE — it is
+            # routed to the human approval queue instead. Reporting it as
+            # "tool_unavailable" was accurate about the allowlist and wrong
+            # about the cause, which sends an operator looking for a missing
+            # package instead of an approval.
+            return ("needs_approval_record", True,
+                    "Metasploit is never auto-run. This one has no approval record yet — "
+                    "dispatching it creates one for review under Exploits.")
+        if allowed is not None and scanner and scanner not in allowed:
+            return ("tool_unavailable", True,
+                    f"'{scanner}' is not in the executor's allowlist, so it cannot be run "
+                    f"here. Install it on the executor, or run it by hand.")
+        if r["command"] and re.search(r"\{[a-zA-Z_]+\}", r["command"]):
+            return ("needs_input", True,
+                    f"Command still contains a placeholder: {r['command']}. Edit it before running.")
+        if r["status"] == "queued" and r["job_id"]:
+            return ("running", False,
+                    f"Dispatched as job {r['job_id'][:8]} — in flight.")
+        if r["status"] == "queued":
+            return ("queued_no_job", True,
+                    "Marked queued but carries no job id — the dispatch did not complete. Re-run it.")
+        return ("not_started", True,
+                "Never dispatched. Nothing starts a pending recommendation on its own — "
+                "select it and press Run.")
+
+    items = []
+    for r in rows:
+        reason, blocked, detail = classify(r)
+        items.append({**{k: r[k] for k in ("id", "ip", "scanner", "status", "priority", "command")},
+                      "reason": reason, "blocked": blocked, "detail": detail})
+
+    summary: dict = {}
+    for it in items:
+        summary[it["reason"]] = summary.get(it["reason"], 0) + 1
+
+    return {
+        "total": len(items),
+        # blocked = needs someone to act. will_proceed = genuinely in flight.
+        "blocked": sum(1 for i in items if i["blocked"]),
+        "will_proceed": sum(1 for i in items if not i["blocked"]),
+        "by_reason": summary,
+        "concurrency_limit": limit_now,
+        "scope_source": scope_source,
+        "items": items,
+    }
+
+
 @router.post("/api/scan-recommendations/reorder")
 async def reorder_recommendations(body: ReorderRequest):
     """Set the execution order of queued recommendations.

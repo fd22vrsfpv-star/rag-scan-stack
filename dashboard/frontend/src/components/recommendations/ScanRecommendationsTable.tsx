@@ -14,7 +14,7 @@
 
 import { useState } from 'react'
 import { useScanRecommendations, useGenerateRecommendations, useReorderRecommendations,
-         type StoredRecommendation } from '@/api/assets'
+         useRecommendationBlockers, type StoredRecommendation } from '@/api/assets'
 import { useUIStore } from '@/stores/ui'
 import { Wand2, ChevronDown, ChevronRight, Eye, Play, Loader2, ExternalLink, ShieldAlert, ChevronUp, ListOrdered } from 'lucide-react'
 
@@ -110,6 +110,21 @@ export interface ScanRecommendationsPanelProps {
 
 // ---- Component ----
 
+
+
+/** Human wording for each blocker reason, and what to do about it. */
+const BLOCKER_LABEL: Record<string, string> = {
+  awaiting_approval: 'awaiting approval (Exploits)',
+  needs_approval_record: 'Metasploit — needs approval, never auto-runs',
+  tool_unavailable: 'tool not installed on the executor',
+  needs_input: 'command has an unfilled placeholder',
+  out_of_scope: 'target not in engagement scope',
+  not_started: 'never dispatched — press Run',
+  queued_no_job: 'marked queued but never dispatched — re-run',
+  skipped: 'suppressed by the platform (force to override)',
+  failed: 'ran and failed — re-run',
+  running: 'in flight',
+}
 
 /**
  * Marks a recommendation whose target is outside the configured scope.
@@ -237,6 +252,8 @@ export function ScanRecommendationsPanel({
   // move is visible immediately; persisted by the reorder mutation below.
   const [order, setOrder] = useState<string[] | null>(null)
   const reorder = useReorderRecommendations()
+  const { data: blockers } = useRecommendationBlockers()
+  const [showBlockers, setShowBlockers] = useState(false)
   const [useKali, setUseKali] = useState(true)
   const [toolCheck, setToolCheck] = useState<any>(null)
   const [checking, setChecking] = useState(false)
@@ -487,6 +504,38 @@ export function ScanRecommendationsPanel({
       )}
 
       {/* Per-IP sections */}
+      {blockers && blockers.total > 0 && (
+        <div className="mb-2 rounded border border-border bg-card/60 text-xs">
+          <button onClick={() => setShowBlockers(v => !v)}
+                  className="w-full flex items-center gap-2 px-3 py-2 hover:bg-muted/20">
+            {showBlockers ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+            <span className="font-medium">
+              {blockers.will_proceed > 0
+                ? `${blockers.will_proceed} in flight, ${blockers.blocked} waiting on you`
+                : `Nothing is running — ${blockers.blocked} item(s) need action`}
+            </span>
+            <span className="text-muted-foreground ml-auto">
+              concurrency limit {blockers.concurrency_limit}
+            </span>
+          </button>
+          {showBlockers && (
+            <div className="px-3 pb-2 space-y-1">
+              {Object.entries(blockers.by_reason)
+                .sort((a, b) => b[1] - a[1])
+                .map(([reason, n]) => (
+                  <div key={reason} className="flex items-baseline gap-2">
+                    <span className="w-8 text-right tabular-nums text-muted-foreground">{n}</span>
+                    <span>{BLOCKER_LABEL[reason] ?? reason}</span>
+                  </div>
+                ))}
+              <p className="text-[11px] text-muted-foreground pt-1">
+                Nothing starts a pending recommendation on its own — select and Run.
+                Scope refusals and approval gates cannot be overridden with force.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
       {order && (
         <div className="flex items-center gap-2 px-3 py-2 mb-2 text-xs rounded border border-blue-500/30 bg-blue-500/10">
           <ListOrdered className="h-4 w-4 text-blue-400" />
