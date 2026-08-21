@@ -1382,6 +1382,51 @@ async def execute_tool(exec_id: str, tool: str, command: str, timeout: int,
 # --- FastAPI App ---
 
 @asynccontextmanager
+def _reap_orphaned_executions():
+    """Fail executions this service was running when it last stopped.
+
+    A tool_executions row is set to 'running' before the subprocess starts and
+    updated when it finishes. If the container stops in between — a rebuild, a
+    restart, an OOM kill — the row stays 'running' for ever. Nothing reconciled
+    it, so 41 rows sat at 'running' with no process alive and the oldest three
+    days stale, which reads exactly like a hung scan.
+
+    Safe because of what a restart implies: this service launches its tools as
+    child processes, so nothing it started can have survived its own death. Any
+    row still 'running' at startup is definitionally orphaned.
+
+    NOTE: that reasoning assumes ONE listener. If this is ever scaled to
+    multiple replicas sharing a database, a starting replica would wrongly fail
+    a sibling's live executions — key the reap on an instance id first.
+    """
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE tool_executions
+                       SET status = 'failed',
+                           error = coalesce(nullif(error, ''), '') ||
+                                   'interrupted: kali-listener restarted while this was running',
+                           completed_at = now()
+                     WHERE status IN ('running', 'pending')
+                    RETURNING id
+                """)
+                reaped = cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+        if reaped:
+            logger.warning("reaped %d orphaned tool execution(s) left 'running' by a "
+                           "previous restart", reaped)
+        else:
+            logger.info("no orphaned tool executions to reap")
+    except Exception as e:
+        # Never block startup on this: the service is still useful with stale
+        # rows present, and failing to boot would be a worse outcome.
+        logger.warning("orphan reap failed: %s", e)
+
+
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     logger.info("=" * 60)
@@ -1389,6 +1434,9 @@ async def lifespan(app: FastAPI):
     logger.info(f"Port Range: {PORT_START}-{PORT_END}")
     logger.info(f"API Port: {API_PORT}")
     logger.info("=" * 60)
+    # Reconcile before serving: a row left 'running' by the previous process is
+    # orphaned by definition, and looks identical to a hung scan until cleared.
+    _reap_orphaned_executions()
     yield
     # Cleanup on shutdown
     logger.info("Shutting down - stopping all listeners...")

@@ -721,3 +721,27 @@ export function useUpdateCveTuning() {
     },
   })
 }
+
+
+/** Set the execution order of queued recommendations.
+ *
+ *  Order is carried by the existing `priority` column — LOWER runs first, the
+ *  convention scan_recommender uses — so the listing and the dispatcher both
+ *  honour a reorder with no extra wiring.
+ */
+export function useReorderRecommendations() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (ids: string[]) =>
+      apiFetch<{
+        ok: boolean
+        reordered: Array<{ id: string; priority: number }>
+        not_reordered: string[]
+        detail: string | null
+      }>('/scan-recommendations/reorder', {
+        method: 'POST',
+        body: JSON.stringify({ ids }),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['scan-recommendations'] }),
+  })
+}

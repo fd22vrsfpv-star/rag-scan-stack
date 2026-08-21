@@ -39,10 +39,14 @@ const CATEGORY_COLOR: Record<string, string> = {
   snmp: 'text-teal-400', ssh: 'text-lime-400', llm: 'text-fuchsia-400',
 }
 
+/** LOWER priority runs first — the convention the rest of the stack uses
+ *  (scan_recommender.py: "lower int = runs first", which assigns 5 to a curated
+ *  Metasploit module). This was inverted originally, so the most urgent
+ *  suggestions were coloured as the least urgent. */
 function priorityTone(p: number): string {
-  if (p >= 80) return 'bg-red-500/15 text-red-400 border-red-500/30'
-  if (p >= 65) return 'bg-orange-500/15 text-orange-400 border-orange-500/30'
-  if (p >= 50) return 'bg-yellow-500/15 text-yellow-400 border-yellow-500/30'
+  if (p <= 20) return 'bg-red-500/15 text-red-400 border-red-500/30'
+  if (p <= 35) return 'bg-orange-500/15 text-orange-400 border-orange-500/30'
+  if (p <= 50) return 'bg-yellow-500/15 text-yellow-400 border-yellow-500/30'
   return 'bg-gray-500/15 text-gray-400 border-gray-500/30'
 }
 
@@ -499,7 +503,10 @@ function ActionsPanel({ id, actions, loading, onRefresh }: {
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="font-medium">{a.title}</span>
-                  <span className={cn('text-xs px-1.5 py-0.5 rounded border', priorityTone(a.priority))}>P{a.priority}</span>
+                  <span title="Lower runs first"
+                        className={cn('text-xs px-1.5 py-0.5 rounded border', priorityTone(a.priority))}>
+                    P{a.priority}
+                  </span>
                   <span className={cn('text-xs', CATEGORY_COLOR[a.category] || 'text-gray-400')}>{a.category}</span>
                   {a.auto_queue && (
                     <span className="text-xs px-1.5 py-0.5 rounded border border-blue-500/30 bg-blue-500/10 text-blue-400 flex items-center gap-1">

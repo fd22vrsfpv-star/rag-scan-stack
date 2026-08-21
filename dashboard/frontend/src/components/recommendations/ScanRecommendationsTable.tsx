@@ -13,9 +13,10 @@
  */
 
 import { useState } from 'react'
-import { useScanRecommendations, useGenerateRecommendations, type StoredRecommendation } from '@/api/assets'
+import { useScanRecommendations, useGenerateRecommendations, useReorderRecommendations,
+         type StoredRecommendation } from '@/api/assets'
 import { useUIStore } from '@/stores/ui'
-import { Wand2, ChevronDown, ChevronRight, Eye, Play, Loader2, ExternalLink, ShieldAlert } from 'lucide-react'
+import { Wand2, ChevronDown, ChevronRight, Eye, Play, Loader2, ExternalLink, ShieldAlert, ChevronUp, ListOrdered } from 'lucide-react'
 
 // ---- grouping helpers ----
 
@@ -232,6 +233,10 @@ export function ScanRecommendationsPanel({
   const [running, setRunning] = useState(false)
   // Which rows have their command/output detail open.
   const [openRows, setOpenRows] = useState<Set<string>>(new Set())
+  // Local ordering overlay. Applied on top of the server's priority order so a
+  // move is visible immediately; persisted by the reorder mutation below.
+  const [order, setOrder] = useState<string[] | null>(null)
+  const reorder = useReorderRecommendations()
   const [useKali, setUseKali] = useState(true)
   const [toolCheck, setToolCheck] = useState<any>(null)
   const [checking, setChecking] = useState(false)
@@ -350,6 +355,27 @@ export function ScanRecommendationsPanel({
     )
   }
 
+  /** Queued items in their current display order — server priority, with any
+   *  unsaved local moves applied on top. */
+  function orderedQueued(items: StoredRecommendation[]): StoredRecommendation[] {
+    const queued = items.filter(r => r.status === 'pending' || r.status === 'queued')
+    if (!order) return queued
+    const pos = new Map(order.map((id, i) => [id, i]))
+    // Items missing from the overlay (newly generated since the last move) sort
+    // after the explicitly ordered ones rather than jumping to the front.
+    return [...queued].sort((a, b) =>
+      (pos.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (pos.get(b.id) ?? Number.MAX_SAFE_INTEGER))
+  }
+
+  function move(items: StoredRecommendation[], id: string, delta: number) {
+    const ids = orderedQueued(items).map(r => r.id)
+    const from = ids.indexOf(id)
+    const to = from + delta
+    if (from < 0 || to < 0 || to >= ids.length) return
+    ids.splice(to, 0, ids.splice(from, 1)[0])
+    setOrder(ids)
+  }
+
   function toggleRow(id: string) {
     setOpenRows(prev => {
       const next = new Set(prev)
@@ -461,6 +487,31 @@ export function ScanRecommendationsPanel({
       )}
 
       {/* Per-IP sections */}
+      {order && (
+        <div className="flex items-center gap-2 px-3 py-2 mb-2 text-xs rounded border border-blue-500/30 bg-blue-500/10">
+          <ListOrdered className="h-4 w-4 text-blue-400" />
+          <span>Run order changed — not saved yet. Lower runs first.</span>
+          <button
+            disabled={reorder.isPending}
+            onClick={() => reorder.mutate(orderedQueued(recs).map(r => r.id),
+                                          { onSuccess: () => setOrder(null) })}
+            className="ml-auto px-2 py-1 rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-40">
+            {reorder.isPending ? 'Saving…' : 'Save order'}
+          </button>
+          <button onClick={() => setOrder(null)}
+                  className="px-2 py-1 rounded bg-muted/30 hover:bg-muted/50">Discard</button>
+        </div>
+      )}
+      {reorder.isError && (
+        <div className="px-3 py-2 mb-2 text-xs rounded border border-red-500/30 bg-red-500/10 text-red-400">
+          {(reorder.error as Error).message}
+        </div>
+      )}
+      {reorder.data?.not_reordered?.length ? (
+        <div className="px-3 py-2 mb-2 text-xs rounded border border-amber-500/30 bg-amber-500/10 text-amber-400">
+          {reorder.data.detail}
+        </div>
+      ) : null}
       {Object.entries(byIp).map(([ip, items]) => {
         const grouped = groupByPurpose(items)
         return (
@@ -535,6 +586,22 @@ export function ScanRecommendationsPanel({
                   <span className="text-muted-foreground w-20">{r.service || '—'}</span>
                   <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium border ${statusBadgeClass(r.status)}`}>{r.status}</span>
                   {r.in_scope === false && <OutOfScopeBadge />}
+                  {(r.status === 'pending' || r.status === 'queued') && (
+                    <span className="flex items-center">
+                      {/* Lower priority runs first, so "up" means sooner. */}
+                      <button onClick={() => move(recs, r.id, -1)} title="Run sooner"
+                              className="text-muted-foreground hover:text-foreground px-0.5">
+                        <ChevronUp className="h-3 w-3" />
+                      </button>
+                      <button onClick={() => move(recs, r.id, 1)} title="Run later"
+                              className="text-muted-foreground hover:text-foreground px-0.5">
+                        <ChevronDown className="h-3 w-3" />
+                      </button>
+                      <span className="text-[10px] text-muted-foreground ml-1" title="Lower runs first">
+                        P{r.priority}
+                      </span>
+                    </span>
+                  )}
                   <button onClick={() => toggleRow(r.id)} title="Show command and output"
                           className="text-muted-foreground hover:text-foreground">
                     {openRows.has(r.id) ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
