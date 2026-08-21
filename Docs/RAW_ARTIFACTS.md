@@ -74,6 +74,69 @@ Key columns: `content` (verbatim, untruncated), `content_format`
 skipped`, so a typo'd status fails loudly instead of creating a state nothing
 polls.
 
+## ⚠ This store contains credentials in plaintext
+
+**Read this before granting access to the database, its backups, or this API.**
+
+`raw_artifacts` keeps every byte a tool produced, verbatim and unredacted. That
+is the point of it — findings are a lossy derivative, and post-processing needs
+the original. The direct consequence is that recovered secrets are stored in
+plaintext, because that is what the tools output:
+
+- hydra / netexec / crackmapexec print cracked passwords and `user:pass` pairs
+- secretsdump output is NTLM hashes
+- sqlmap dumps can contain table contents
+- trufflehog output contains the very keys it found
+
+Measured on a lightly-used install: **102 of 275 artifacts (37%) matched
+credential patterns.** Expect that share to be higher on a real engagement.
+
+This was an explicit decision, not an oversight. The alternatives were weighed:
+
+| Option | Why not chosen |
+|---|---|
+| Redact on write | Destroys the evidence the store exists to preserve, and no redactor catches every credential format |
+| Encrypt at rest | Real protection, but the key has to live where the API can read it, so it mainly defends stolen backups — worth doing later, not a substitute for access control |
+| Do not store | Returns to the original problem: findings keep 8 KB, native JSON was deleted, and nothing could be re-analysed |
+
+**What follows from storing it:**
+
+1. **Treat the `scans` database as credential material.** Anyone with Postgres
+   access, a backup file, or the API key can read every password the engagement
+   recovered. Scope DB access accordingly.
+2. **Backups inherit the exposure.** A `pg_dump` of this database is a
+   credential dump. Store and transport it as one.
+3. **`GET /artifacts/{id}` returns full content** behind a single API key.
+   Anyone who can reach the API can read it.
+4. **Exports are a spread path.** Anything that copies `content` out — reports,
+   an LLM post-processing call to an external model, a shared artifact page —
+   moves those credentials with it. An external LLM in particular means sending
+   recovered passwords to a third party; use a local model, or accept that.
+5. **Prune when the engagement ends.** `POST /cleanup/artifacts` exists for
+   this. Old artifacts are not just storage cost, they are standing exposure.
+
+### Retention, and why it may prune nothing
+
+`POST /cleanup/artifacts?older_than_days=90` deletes old artifacts, with two
+safety rails on by default: it keeps anything still queued for LLM processing,
+and anything a recommendation still cites as evidence.
+
+Those rails interact badly with an idle queue, and the endpoint says so in its
+response. **Nothing in this stack consumes `/artifacts/claim`** — post-processing
+is external by design. So every artifact stays `pending` forever, age-based
+pruning matches almost nothing, and the store grows without bound. On the
+install above, 274 of 276 artifacts were `pending` and only 1 was prunable.
+
+Two ways out, and they are a real choice:
+
+- **Run a consumer** against `/artifacts/claim` → `/artifacts/{id}/processed`.
+  Artifacts then reach `done` and age out normally.
+- **Prune with `keep_unprocessed=false`**, accepting that un-analysed output is
+  discarded.
+
+`GET /artifacts/stats` reports the age of the oldest pending artifact and warns
+past 24 hours, so a stalled queue is visible rather than inferred.
+
 ## API
 
 | Method | Path | Purpose |
@@ -84,6 +147,7 @@ polls.
 | POST | `/artifacts/claim` | Atomically claim pending work (`limit`, `tool`, `llm_model`) |
 | GET | `/artifacts/{id}` | One artifact with full content |
 | POST | `/artifacts/{id}/processed` | Record the LLM outcome |
+| POST | `/cleanup/artifacts` | Prune old artifacts (keeps unprocessed + cited by default) |
 | GET | `/artifacts/{id}/actions` | Follow-on actions derived from the artifact |
 | POST | `/artifacts/{id}/actions/queue` | Queue chosen actions as scan recommendations |
 

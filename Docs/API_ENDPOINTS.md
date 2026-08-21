@@ -228,6 +228,11 @@ Services can communicate using their container names via the `agents_net` Docker
 
 ## Raw Artifacts
 
+> **Caution:** artifact `content` is unredacted tool output and therefore
+> contains recovered credentials in plaintext (37% of artifacts matched
+> credential patterns on a lightly-used install). Treat the database, its
+> backups and this API as credential material. See `Docs/RAW_ARTIFACTS.md`.
+
 Complete, untruncated tool output for post-analysis and LLM processing.
 See `Docs/RAW_ARTIFACTS.md`.
 

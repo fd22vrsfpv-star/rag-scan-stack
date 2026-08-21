@@ -3187,8 +3187,29 @@ def artifact_stats(authorized: bool = Depends(auth)):
         cur.execute("SELECT count(*) n, sum(byte_size) bytes, count(DISTINCT tool) tools "
                     "FROM raw_artifacts")
         tot = cur.fetchone()
+    # A queue that only fills is indistinguishable from one being worked, unless
+    # the age of the oldest pending item is visible. Nothing in this stack
+    # consumes /artifacts/claim by default — post-processing is external.
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT min(created_at) AS oldest,
+                   extract(epoch FROM (now() - min(created_at)))/3600 AS age_hours,
+                   count(*) AS n
+              FROM raw_artifacts WHERE llm_status = 'pending'
+        """)
+        q = cur.fetchone() or {}
+    queue = {"pending": int(q.get("n") or 0),
+             "oldest_pending": q["oldest"].isoformat() if q.get("oldest") else None,
+             "oldest_pending_age_hours": round(float(q["age_hours"]), 1) if q.get("age_hours") else None}
+    if queue["pending"] and (queue["oldest_pending_age_hours"] or 0) > 24:
+        queue["warning"] = (
+            "the oldest pending artifact is over 24h old — no consumer appears to "
+            "be claiming work. Retention also skips unprocessed artifacts, so the "
+            "store will grow without bound until something drains this.")
+
     return {"by_status": by_status, "total": tot["n"],
-            "total_bytes": int(tot["bytes"] or 0), "distinct_tools": tot["tools"]}
+            "total_bytes": int(tot["bytes"] or 0), "distinct_tools": tot["tools"],
+            "queue": queue}
 
 
 @app.get("/artifacts", tags=["Artifacts"])
@@ -5664,6 +5685,94 @@ def maintenance_stats(authorized: bool = Depends(auth)):
                 conn.rollback()
                 counts[t] = -1
     return counts
+
+
+@app.post("/cleanup/artifacts", tags=["Maintenance"])
+def cleanup_artifacts(
+    older_than_days: int = Query(default=90, ge=1),
+    keep_unprocessed: bool = Query(default=True),
+    keep_with_findings: bool = Query(default=True),
+    dry_run: bool = Query(default=False),
+    authorized: bool = Depends(auth),
+):
+    """Prune old raw artifacts.
+
+    raw_artifacts stores every byte a tool produced and had NO retention at all:
+    it only ever grew. That matters more than usual here because the content is
+    kept verbatim, so a large share of it is credential material (see
+    Docs/RAW_ARTIFACTS.md) — old data is both storage cost and standing
+    exposure.
+
+    Two safety rails, both on by default:
+
+    * keep_unprocessed — never delete an artifact still queued for LLM
+      processing. Pruning by age alone would silently discard work the queue was
+      about to do, and the loss would be invisible.
+    * keep_with_findings — never delete an artifact a finding still points at.
+      Those are the evidence behind a report; deleting them turns a cited
+      finding into an unverifiable claim.
+
+    Run dry_run=true first: this is not recoverable.
+    """
+    where = ["created_at < now() - (%s || ' days')::interval"]
+    params: list = [older_than_days]
+    if keep_unprocessed:
+        where.append("llm_status <> 'pending'")
+        where.append("llm_status <> 'processing'")
+    if keep_with_findings:
+        # A finding referencing this artifact makes it evidence, not scratch.
+        where.append("""NOT EXISTS (
+            SELECT 1 FROM public.scan_recommendations r
+             WHERE r.extra->>'artifact_id' = raw_artifacts.id::text)""")
+    clause = " AND ".join(where)
+
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT count(*), coalesce(sum(byte_size),0) FROM raw_artifacts WHERE {clause}",
+                    params)
+        count, freed = cur.fetchone()
+        if not dry_run and count:
+            cur.execute(f"DELETE FROM raw_artifacts WHERE {clause}", params)
+        cur.execute("SELECT count(*), coalesce(sum(byte_size),0) FROM raw_artifacts")
+        remaining, remaining_bytes = cur.fetchone()
+
+    # Report what the safety rails held back. keep_unprocessed and an unfed LLM
+    # queue compound: every artifact stays 'pending' forever, so age-based
+    # pruning matches nothing and the store grows without bound. Silence here
+    # would read as "nothing was old enough".
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT count(*) FROM raw_artifacts
+             WHERE created_at < now() - (%s || ' days')::interval
+               AND llm_status IN ('pending','processing')
+        """, [older_than_days])
+        held_unprocessed = cur.fetchone()[0]
+
+    result = {
+        "dry_run": dry_run,
+        "older_than_days": older_than_days,
+        "held_back_unprocessed": held_unprocessed,
+        "kept_unprocessed": keep_unprocessed,
+        "kept_with_findings": keep_with_findings,
+        "artifacts_deleted": 0 if dry_run else count,
+        "artifacts_matching": count,
+        "bytes_freed": 0 if dry_run else int(freed or 0),
+        "remaining": remaining,
+        "remaining_bytes": int(remaining_bytes or 0),
+    }
+    if keep_unprocessed and held_unprocessed:
+        result["note"] = (
+            f"{held_unprocessed} artifact(s) old enough to prune were kept because "
+            f"they are still queued for LLM processing. If nothing is consuming "
+            f"/artifacts/claim, they will never age out — run a consumer, or "
+            f"prune with keep_unprocessed=false once you accept losing that work.")
+    if not dry_run and count:
+        logger.info("pruned %d raw artifact(s), freed %d bytes", count, freed or 0)
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("artifacts_pruned", "maintenance", result)
+        except Exception:
+            pass
+    return result
 
 
 @app.post("/cleanup/jobs", tags=["Maintenance"])

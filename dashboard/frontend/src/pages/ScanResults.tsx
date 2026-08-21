@@ -72,6 +72,17 @@ export default function ScanResults() {
           <p className="text-sm text-gray-400 mt-1">
             Complete raw output from every tool run — and the follow-on actions it suggests.
           </p>
+          {/* Stated where the operator meets the data, not only in the docs.
+              Output is stored unredacted by design, so recovered passwords and
+              hashes are in here verbatim. */}
+          <p className="text-xs text-amber-400/90 mt-1 flex items-start gap-1">
+            <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
+            <span>
+              Raw output is stored unredacted — it contains recovered credentials in
+              plaintext. Treat this view, the database and its backups as credential
+              material.
+            </span>
+          </p>
         </div>
         {stats && (
           <div className="flex gap-2 flex-wrap justify-end">

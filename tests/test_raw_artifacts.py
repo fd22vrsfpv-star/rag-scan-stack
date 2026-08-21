@@ -311,3 +311,65 @@ def test_llm_result_round_trips_as_jsonb(conn, cleanup):
         cur.execute("SELECT llm_result->>'severity', llm_result->'cves'->>0 "
                     "FROM raw_artifacts WHERE tool=%s", (tool,))
         assert cur.fetchone() == ("high", "CVE-2007-2447")
+
+
+# ── Retention ─────────────────────────────────────────────────────────────
+
+def test_retention_keeps_unprocessed_by_default(conn, cleanup):
+    """Pruning by age alone would discard work the LLM queue was about to do.
+
+    That loss would be invisible: the artifact simply stops existing. So the
+    default keeps anything still pending or processing — which also means an
+    idle queue prevents pruning entirely, the interaction /cleanup/artifacts
+    reports in its response.
+    """
+    tool = f"t_{uuid.uuid4().hex[:8]}"
+    cleanup.append(tool)
+    with conn.cursor() as cur:
+        for status, age in (("pending", 400), ("done", 400)):
+            cur.execute("""
+                INSERT INTO raw_artifacts (tool, target, content, content_sha256,
+                                           byte_size, source, llm_status, created_at)
+                VALUES (%s,'10.0.0.1',%s,%s,10,'test',%s, now() - interval '%s days')
+            """, (tool, f"c-{status}", hashlib.sha256(status.encode()).hexdigest(),
+                  status, age))
+        # The query the endpoint runs, with keep_unprocessed on.
+        cur.execute("""
+            SELECT llm_status FROM raw_artifacts
+             WHERE tool = %s AND created_at < now() - interval '90 days'
+               AND llm_status <> 'pending' AND llm_status <> 'processing'
+        """, (tool,))
+        prunable = [r[0] for r in cur.fetchall()]
+    assert prunable == ["done"], f"expected only the processed one to be prunable, got {prunable}"
+
+
+def test_retention_spares_artifacts_cited_by_a_recommendation(conn, cleanup):
+    """A cited artifact is the evidence behind a finding.
+
+    Deleting it turns a cited finding into an unverifiable claim, so the age
+    filter must not reach it.
+    """
+    from psycopg2.extras import Json
+    tool = f"t_{uuid.uuid4().hex[:8]}"
+    cleanup.append(tool)
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO raw_artifacts (tool, target, content, content_sha256, byte_size,
+                                       source, llm_status, created_at)
+            VALUES (%s,'10.0.0.1','cited',%s,5,'test','done', now() - interval '400 days')
+            RETURNING id
+        """, (tool, hashlib.sha256(b"cited").hexdigest()))
+        art_id = cur.fetchone()[0]
+        cur.execute("""
+            INSERT INTO scan_recommendations (ip, scanner, action, source, status, extra)
+            VALUES ('10.0.0.1','nmap','cited-by-test','artifact','pending', %s)
+        """, (Json({"artifact_id": str(art_id)}),))
+        cur.execute("""
+            SELECT count(*) FROM raw_artifacts
+             WHERE id = %s AND created_at < now() - interval '90 days'
+               AND NOT EXISTS (SELECT 1 FROM scan_recommendations r
+                                WHERE r.extra->>'artifact_id' = raw_artifacts.id::text)
+        """, (art_id,))
+        prunable = cur.fetchone()[0]
+        cur.execute("DELETE FROM scan_recommendations WHERE action = 'cited-by-test'")
+    assert prunable == 0, "an artifact cited as evidence was eligible for pruning"
