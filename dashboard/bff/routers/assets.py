@@ -895,6 +895,77 @@ async def recommendation_tool_coverage():
     }
 
 
+class ReorderRequest(BaseModel):
+    """New execution order for queued recommendations.
+
+    `ids` is the desired order, first to run first. Priorities are rewritten to
+    match, spaced apart so a later single-item move does not need a full
+    renumber.
+    """
+    ids: List[str]
+    # Where the reordered block starts. Defaults below the recommender's own
+    # high-value band (5/10) so a manual reorder does not silently outrank a
+    # curated Metasploit module unless the operator asks for it.
+    start: int = 20
+    step: int = 5
+
+
+@router.post("/api/scan-recommendations/reorder")
+async def reorder_recommendations(body: ReorderRequest):
+    """Set the execution order of queued recommendations.
+
+    Order is expressed through the existing `priority` column rather than a new
+    one, so everything that already reads priority — the listing, the dispatcher
+    — honours the change with no further wiring. Lower runs first.
+    """
+    if not body.ids:
+        raise HTTPException(400, "ids is empty — nothing to reorder")
+    if len(set(body.ids)) != len(body.ids):
+        raise HTTPException(400, "ids contains duplicates; the order would be ambiguous")
+
+    def _do():
+        from db import get_db
+        updated = []
+        with get_db() as conn, conn.cursor() as cur:
+            for i, rid in enumerate(body.ids):
+                pri = max(0, min(100, body.start + i * body.step))
+                cur.execute(
+                    """
+                    UPDATE scan_recommendations
+                       SET priority = %s, updated_at = now()
+                     WHERE id = %s::uuid
+                       -- Only reorder work that has not run. Rewriting the
+                       -- priority of a completed scan would rewrite history
+                       -- without changing what happens next.
+                       AND status IN ('pending','queued','skipped','failed')
+                    RETURNING id, priority
+                    """,
+                    (pri, rid),
+                )
+                row = cur.fetchone()
+                if row:
+                    updated.append({"id": str(row[0]), "priority": row[1]})
+            conn.commit()
+        return updated
+
+    try:
+        updated = await asyncio.to_thread(_do)
+    except Exception as e:
+        log.warning("reorder failed: %s", e)
+        raise HTTPException(500, f"reorder failed: {e}")
+
+    skipped = [i for i in body.ids if i not in {u["id"] for u in updated}]
+    return {
+        "ok": True,
+        "reordered": updated,
+        # Named explicitly: an id silently dropped because the scan already ran
+        # would look like the reorder simply did not take.
+        "not_reordered": skipped,
+        "detail": (f"{len(skipped)} id(s) were left alone because they have already "
+                   f"run or no longer exist") if skipped else None,
+    }
+
+
 @router.post("/api/scan-recommendations/run")
 async def run_scan_recommendations(body: RunRecommendationsRequest):
     """
@@ -970,7 +1041,19 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             all_recs = resp.json().get("recommendations", []) if resp.status_code == 200 else []
         recs_by_id = {r["id"]: r for r in all_recs}
 
-    selected = [recs_by_id[rid] for rid in body.ids if rid in recs_by_id]
+    # Dispatch in PRIORITY order, not the order the ids happened to arrive in.
+    #
+    # priority was set by the recommender and the artifact rules but nothing
+    # ordered by it here, so with the concurrency bound in place the first N
+    # dispatched were simply whichever the UI listed first — an arbitrary
+    # selection out of a queue that had already been ranked. Lower runs first,
+    # matching scan_recommender.py ("lower int = runs first"); created_at breaks
+    # ties so the order is stable rather than dependent on dict iteration.
+    selected = sorted(
+        (recs_by_id[rid] for rid in body.ids if rid in recs_by_id),
+        key=lambda r: (r.get("priority") if r.get("priority") is not None else 50,
+                       str(r.get("created_at") or "")),
+    )
 
     if not selected:
         return {"ok": False, "error": "No matching recommendations found", "results": []}
