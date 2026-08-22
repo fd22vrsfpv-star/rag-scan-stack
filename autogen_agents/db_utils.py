@@ -754,10 +754,11 @@ def build_existing_target_context(target_description: str) -> Optional[str]:
         # Query open ports
         cur.execute(
             """
-            SELECT p.port, p.proto, p.service, p.version, p.state
+            SELECT p.port, p.proto, p.service, p.version, p.is_open
             FROM ports p
             JOIN assets a ON p.asset_id = a.id
             WHERE a.ip = %s::inet
+              AND p.is_open
             ORDER BY p.port
             """,
             (target_ip,)
@@ -765,18 +766,28 @@ def build_existing_target_context(target_description: str) -> Optional[str]:
         ports = cur.fetchall()
 
         # Query findings (vulns from nmap, nuclei, etc.)
+        #
+        # Reads `vulns`, not `findings`. This selected f.source and
+        # f.template_id from `findings`, which has neither column, so the query
+        # raised UndefinedColumn. `findings` is also effectively dead: one
+        # writer (etl/parse_vulnx.py) and 0 rows here, while `vulns` has five
+        # parsers writing to it — which is what the comment above describes.
+        #
+        # vulns.script carries values like "nuclei:CVE-2011-2523", so it is the
+        # right column behind the "Sources:" line the caller renders. The
+        # dropped template_id was never read downstream.
         cur.execute(
             """
-            SELECT f.severity, f.title, f.source, f.template_id, f.created_at
-            FROM findings f
-            JOIN assets a ON f.asset_id = a.id
+            SELECT v.severity, v.title, v.script AS source, v.created_at
+            FROM vulns v
+            JOIN assets a ON v.asset_id = a.id
             WHERE a.ip = %s::inet
             ORDER BY
-                CASE f.severity
+                CASE v.severity
                     WHEN 'critical' THEN 1 WHEN 'high' THEN 2
                     WHEN 'medium' THEN 3 WHEN 'low' THEN 4 ELSE 5
                 END,
-                f.created_at DESC
+                v.created_at DESC
             LIMIT 100
             """,
             (target_ip,)
@@ -786,9 +797,17 @@ def build_existing_target_context(target_description: str) -> Optional[str]:
         # Query web findings (gobuster, nikto, zap, playwright, etc.)
         cur.execute(
             """
-            SELECT wf.tool, wf.finding_type, wf.url, wf.severity, wf.title, wf.created_at
+            -- Four of these were wrong: the columns are source, issue_type,
+            -- name and url. Aliased to the names the caller already reads
+            -- (wf.get("tool"), wf.get("finding_type"), wf.get("title")).
+            SELECT wf.source     AS tool,
+                   wf.issue_type AS finding_type,
+                   wf.url,
+                   wf.severity,
+                   wf.name       AS title,
+                   wf.created_at
             FROM web_findings wf
-            WHERE wf.target_url LIKE %s
+            WHERE wf.url LIKE %s
             ORDER BY
                 CASE wf.severity
                     WHEN 'critical' THEN 1 WHEN 'high' THEN 2

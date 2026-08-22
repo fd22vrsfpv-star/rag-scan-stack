@@ -427,9 +427,13 @@ async def perform_scan(scan_request: ScanRequest, scan_id: uuid.UUID):
                     for zap_finding in zap_results.get('alerts', []):
                         cur.execute(
                             """
+                            -- `refs` (jsonb), not `references` — which is both the
+                            -- wrong column name and a SQL reserved word, so every
+                            -- ZAP finding from this path failed to save. Matches
+                            -- how etl/parse_zap.py writes the same data.
                             INSERT INTO web_findings
                             (asset_id, url, source, issue_type, name, severity,
-                             evidence, method, payload, cwe, references)
+                             evidence, method, payload, cwe, refs)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             """,
                             (asset_id, zap_finding['url'], zap_finding['source'],
