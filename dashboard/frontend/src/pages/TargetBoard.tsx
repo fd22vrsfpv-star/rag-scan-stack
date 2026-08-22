@@ -28,10 +28,15 @@ import InfoTip from '@/components/InfoTip'
 
 type SortKey = 'risk' | 'followups' | 'recommendations'
 
-const SEV_RANK: Record<string, number> = { critical: 5, high: 4, medium: 3, low: 2, info: 1 }
+// 'recon' is the pre-migration name for 'info' (collapsed 2026-08-22: the two
+// were treated identically everywhere except sort rank). It was never in these
+// maps, so before the migration 1495 attack vectors sorted as rank 0 — BELOW
+// info and tied with unknown — and rendered with the grey fallback. Mapped here
+// so a database that predates the migration ranks and colours them correctly.
+const SEV_RANK: Record<string, number> = { critical: 5, high: 4, medium: 3, low: 2, info: 1, recon: 1 }
 const SEV_DOT: Record<string, string> = {
   critical: 'bg-red-600', high: 'bg-orange-500', medium: 'bg-yellow-400',
-  low: 'bg-blue-500', info: 'bg-gray-500',
+  low: 'bg-blue-500', info: 'bg-gray-500', recon: 'bg-gray-500',
 }
 
 function riskColor(risk: number): string {
