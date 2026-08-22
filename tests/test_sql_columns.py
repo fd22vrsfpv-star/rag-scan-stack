@@ -373,6 +373,359 @@ def test_no_stale_sql_debt(scanned):
     )
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TIER 3 — parameter TYPE compatibility
+#
+# Column names being right is not enough. web_findings.cwe is text[], and the
+# playwright ZAP path passed the alert's bare string:
+#
+#     scalar "CWE-79": REJECTED -> malformed array literal: "CWE-79"
+#     list  ["CWE-79"]: ACCEPTED   (verified against the live column)
+#
+# Tiers 1 and 2 above check names and cannot see that. This tier maps INSERT
+# columns to their positional %s parameters and checks the value's shape.
+#
+# HONEST LIMITS — read before trusting this.
+# A bare `x.get('cwe')` is opaque: its type is whatever the dict holds, so this
+# tier could NOT have caught the original cwe bug on its own. Rather than skip
+# what it cannot prove (a sweep that silently drops half its inputs reads as
+# coverage it does not have), unprovable ARRAY feeds are enumerated in
+# ARRAY_UNVERIFIED and ratchet: a NEW one fails by name. So reintroducing the
+# bug is still caught — as "a new unverifiable array feed appeared".
+#
+# Local assignments ARE followed, so normalising to a list and passing the
+# variable is recognised as correct. That is deliberate: the guard should reward
+# the fix pattern, not shrug at it.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_TYPE_DECL = re.compile(
+    rf"^[\"']?({IDENT})[\"']?\s+([A-Za-z][A-Za-z0-9_ ]*(?:\[\])?)", re.I)
+
+# Callables whose result is a list (or None). Add a project normaliser here to
+# make its call sites provable.
+LIST_SAFE_FUNCS = {"as_text_array", "to_text_array", "list", "sorted"}
+
+# ARRAY-column parameters whose type cannot be decided statically. Each entry is
+# (relative path, table, column). RATCHETS both ways: a new unprovable feed
+# fails, and one that becomes provable must be deleted.
+ARRAY_UNVERIFIED = {
+    ("app/rag-api/api.py", "credential_vault", "grants_access_to"),
+    ("app/rag-api/api.py", "screenshot_metadata", "tags"),
+    ("app/rag-api/api.py", "follow_up_items", "tags"),
+    ("app/rag-api/api.py", "software_research_cache", "cve_ids"),
+    ("app/rag-api/api.py", "api_endpoints", "tags"),
+    ("app/rag-api/api.py", "chat_presets", "placeholders"),
+    ("app/rag-api/api.py", "chat_presets", "tags"),
+    ("app/rag-api/webhooks/router.py", "webhooks", "event_types"),
+    ("app/rag-api/webhooks/router.py", "webhooks", "sources"),
+    ("app/rag-api/webhooks/router.py", "webhooks", "severities"),
+    ("etl/parse_nessus.py", "vulns", "cve"),
+    ("etl/parse_nmap.py", "vulns", "cve"),
+    ("etl/parse_tool_output.py", "vulns", "cve"),
+    ("etl/parse_tool_output.py", "web_findings", "cwe"),
+    ("news_runner/news_agent.py", "news_items", "all_cves"),
+    ("playwright_scanner/db_utils.py", "playwright_findings", "cwe"),
+    ("scan_recommender/exploits_rag.py", "rag_feedback", "helpful_chunk_ids"),
+    ("scan_recommender/exploits_rag.py", "rag_feedback", "unhelpful_chunk_ids"),
+    ("scan_recommender/scan_recommender.py", "service_prompts", "tags"),
+}
+
+# Provable type mismatches that still ship. Empty is the goal.
+SQL_TYPE_DEBT = {}
+
+
+def _column_kinds(paths):
+    """table -> {column: 'array' | 'jsonb' | 'scalar'}."""
+    out = {}
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                src = fh.read()
+        except OSError:
+            continue
+        if "CREATE TABLE" not in src.upper():
+            continue
+        src = re.sub(r"--[^\n]*", " ", src)
+        for m in re.finditer(
+            rf"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:public\.)?[\"']?({IDENT})[\"']?\s*\(",
+            src, re.I,
+        ):
+            start = m.end() - 1
+            depth, body = 0, None
+            for j in range(start, len(src)):
+                if src[j] == "(":
+                    depth += 1
+                elif src[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        body = src[start + 1:j]
+                        break
+            if body is None:
+                continue
+            cols = out.setdefault(m.group(1).lower(), {})
+            for part in re.split(r",(?![^()]*\))", body):
+                part = part.strip()
+                if not part:
+                    continue
+                if part.split()[0].strip('"').lower() in (
+                        "constraint", "primary", "unique", "foreign", "check",
+                        "exclude", "like"):
+                    continue
+                decl = _TYPE_DECL.match(part)
+                if not decl:
+                    continue
+                col, typ = decl.group(1).lower(), decl.group(2).strip().lower()
+                if typ.endswith("[]") or part.lower().rstrip(",").endswith("[]"):
+                    kind = "array"
+                elif "jsonb" in typ or typ == "json":
+                    kind = "jsonb"
+                else:
+                    kind = "scalar"
+                cols[col] = kind
+    return out
+
+
+def _classify(node):
+    """'str' | 'list' | 'dict' | 'json_wrapped' | 'scalar' | 'none' | 'unknown'."""
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, str):
+            return "str"
+        return "none" if node.value is None else "scalar"
+    if isinstance(node, ast.JoinedStr):
+        return "str"
+    if isinstance(node, (ast.List, ast.Tuple, ast.ListComp)):
+        return "list"
+    if isinstance(node, (ast.Dict, ast.DictComp)):
+        return "dict"
+    if isinstance(node, ast.IfExp):
+        both = {_classify(node.body), _classify(node.orelse)} - {"none"}
+        return both.pop() if len(both) == 1 else "unknown"
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if name in LIST_SAFE_FUNCS:
+            return "list"
+        if name == "Json":
+            return "json_wrapped"
+        if name in ("dumps", "str", "join"):
+            return "str"
+    return "unknown"
+
+
+def _resolve_local(name, scope):
+    """Collapse every local assignment of `name` to one kind, else 'unknown'.
+
+    Without this, the correct fix — normalise to a list, pass the variable —
+    is indistinguishable from passing a raw scalar, and the guard would push
+    people away from doing it properly.
+    """
+    kinds = set()
+    for stmt in ast.walk(scope):
+        if isinstance(stmt, ast.Assign):
+            targets, value = stmt.targets, stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            targets, value = [stmt.target], stmt.value
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id == name:
+                if isinstance(value, ast.IfExp):
+                    kinds.add(_classify(value.body))
+                    kinds.add(_classify(value.orelse))
+                else:
+                    kinds.add(_classify(value))
+    kinds.discard("none")
+    for single in ("list", "json_wrapped", "str"):
+        if kinds and kinds <= {single}:
+            return single
+    return "unknown"
+
+
+_INSERT_COLS = re.compile(rf"INSERT\s+INTO\s+(?:public\.)?({IDENT})\s*\(([^)]*)\)",
+                          re.I | re.S)
+
+
+def _scan_param_types(kinds):
+    """(mismatches, unprovable_array_feeds, positions_checked)."""
+    mismatches, unprovable, checked = [], set(), 0
+
+    for path in _python_files():
+        rel = os.path.relpath(path, REPO)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                tree = ast.parse(fh.read())
+        except SyntaxError:
+            continue
+
+        funcs = [n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+        def enclosing(node):
+            best = None
+            for fn in funcs:
+                if fn.lineno <= node.lineno <= getattr(fn, "end_lineno", fn.lineno):
+                    if best is None or fn.lineno > best.lineno:
+                        best = fn
+            return best
+
+        for call in ast.walk(tree):
+            if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)):
+                continue
+            if call.func.attr != "execute" or len(call.args) < 2:
+                continue
+
+            sql_node = call.args[0]
+            if isinstance(sql_node, ast.Constant) and isinstance(sql_node.value, str):
+                sql = sql_node.value
+            elif isinstance(sql_node, ast.JoinedStr):
+                sql = "".join(
+                    v.value if isinstance(v, ast.Constant) and isinstance(v.value, str)
+                    else " {} " for v in sql_node.values)
+            else:
+                continue
+
+            params = call.args[1]
+            if not isinstance(params, (ast.Tuple, ast.List)):
+                continue
+
+            sql = _strip_sql_comments(sql)
+            m = _INSERT_COLS.search(sql)
+            if not m:
+                continue
+            table, collist = m.group(1).lower(), m.group(2)
+            if table not in kinds or "{" in collist:
+                continue
+            cols = [c.strip().strip('"').lower() for c in collist.split(",") if c.strip()]
+
+            # Positional mapping is only trustworthy when the counts line up.
+            placeholders = sql.count("%s")
+            if not (placeholders == len(cols) == len(params.elts)):
+                continue
+
+            for col, param in zip(cols, params.elts):
+                kind = kinds[table].get(col)
+                if not kind:
+                    continue
+                got = _classify(param)
+                if got == "unknown" and isinstance(param, ast.Name):
+                    scope = enclosing(param)
+                    if scope is not None:
+                        got = _resolve_local(param.id, scope)
+                if got in ("unknown", "none"):
+                    if kind == "array":
+                        unprovable.add((rel, table, col))
+                    continue
+
+                checked += 1
+                problem = None
+                if kind == "array" and got in ("str", "json_wrapped", "dict"):
+                    problem = f"{got} passed to {col} (text[])"
+                elif kind == "jsonb" and got in ("dict", "list"):
+                    problem = f"bare {got} passed to {col} (jsonb) — needs Json()/json.dumps()"
+                elif kind == "scalar" and got in ("list", "dict"):
+                    problem = f"{got} passed to scalar {col}"
+                if problem:
+                    mismatches.append((rel, param.lineno, table, col, problem))
+    return mismatches, unprovable, checked
+
+
+@pytest.fixture(scope="module")
+def column_kinds():
+    sources = sorted(glob.glob(os.path.join(REPO, "db_init", "*.sql"))) + _python_files()
+    return _column_kinds(sources)
+
+
+@pytest.fixture(scope="module")
+def param_scan(column_kinds):
+    return _scan_param_types(column_kinds)
+
+
+def test_column_kinds_are_parsed(column_kinds):
+    """Anti-vacuity: an empty type map would pass every assertion below."""
+    assert len(column_kinds) >= 90, f"only {len(column_kinds)} tables typed"
+    arrays = sum(1 for t in column_kinds.values() for k in t.values() if k == "array")
+    jsonbs = sum(1 for t in column_kinds.values() for k in t.values() if k == "jsonb")
+    assert arrays >= 20, f"only {arrays} array columns found"
+    assert jsonbs >= 50, f"only {jsonbs} jsonb columns found"
+    # The column that motivated this tier.
+    assert column_kinds["web_findings"]["cwe"] == "array"
+    assert column_kinds["web_findings"]["refs"] == "jsonb"
+
+
+def test_classifier_knows_a_list_from_a_scalar():
+    """The distinction the whole tier rests on."""
+    assert _classify(ast.parse("['CWE-79']", mode="eval").body) == "list"
+    assert _classify(ast.parse("'CWE-79'", mode="eval").body) == "str"
+    assert _classify(ast.parse("f'CWE-{n}'", mode="eval").body) == "str"
+    assert _classify(ast.parse("Json({})", mode="eval").body) == "json_wrapped"
+    assert _classify(ast.parse("{'a': 1}", mode="eval").body) == "dict"
+    assert _classify(ast.parse("[str(c) for c in x]", mode="eval").body) == "list"
+    # Opaque on purpose — this is the honest limit stated above.
+    assert _classify(ast.parse("d.get('cwe')", mode="eval").body) == "unknown"
+
+
+def test_local_normalisation_is_recognised():
+    """Normalise-then-pass must read as a list, or the guard punishes the fix."""
+    src = (
+        "def f(d):\n"
+        "    v = d.get('cwe')\n"
+        "    if v is None:\n"
+        "        arr = None\n"
+        "    elif isinstance(v, list):\n"
+        "        arr = [str(c) for c in v]\n"
+        "    else:\n"
+        "        arr = [str(v)]\n"
+    )
+    tree = ast.parse(src)
+    fn = tree.body[0]
+    assert _resolve_local("arr", fn) == "list"
+    assert _resolve_local("v", fn) == "unknown"
+
+
+def test_param_scan_reaches_the_inserts(param_scan):
+    _, _, checked = param_scan
+    assert checked >= 80, f"only {checked} typed parameter positions checked"
+
+
+def test_sql_param_types_are_compatible(param_scan):
+    """The guard: no provable type mismatch between a value and its column."""
+    mismatches, _, _ = param_scan
+    unexpected = [m for m in mismatches
+                  if (m[0], m[2], m[3]) not in SQL_TYPE_DEBT]
+    assert not unexpected, (
+        f"{len(unexpected)} parameter(s) cannot adapt to their column type:\n  "
+        + "\n  ".join(f"{r}:{ln} {t}.{c} — {why}" for r, ln, t, c, why in sorted(unexpected))
+    )
+
+
+def test_unprovable_array_feeds_are_declared(param_scan):
+    """Everything this tier cannot prove must be listed, never silently skipped.
+
+    A new entry means a new array column is fed a value of unknown shape — the
+    exact situation that let the cwe scalar through. Normalise it to a list (or
+    route it through a LIST_SAFE_FUNCS helper) and it stops being listed.
+    """
+    _, unprovable, _ = param_scan
+    added = sorted(unprovable - ARRAY_UNVERIFIED)
+    assert not added, (
+        f"{len(added)} array column(s) fed a value of unprovable type:\n  "
+        + "\n  ".join(f"{r}: {t}.{c}" for r, t, c in added)
+        + "\n\nNormalise to a list before passing it, e.g.\n"
+          "    arr = v if isinstance(v, list) else ([str(v)] if v else None)\n"
+          "or add the entry to ARRAY_UNVERIFIED with a reason."
+    )
+
+
+def test_no_stale_array_exemptions(param_scan):
+    """A feed that became provable must leave the list."""
+    _, unprovable, _ = param_scan
+    stale = sorted(ARRAY_UNVERIFIED - unprovable)
+    assert not stale, (
+        "ARRAY_UNVERIFIED entries are now provable or gone — delete them:\n  "
+        + "\n  ".join(f"{r}: {t}.{c}" for r, t, c in stale)
+    )
+
 def _main():
     """Standalone entry point for scripts/post-install-check.sh (no pytest)."""
     sources = sorted(glob.glob(os.path.join(REPO, "db_init", "*.sql"))) + _python_files()
@@ -384,16 +737,35 @@ def _main():
           f"(db_init/*.sql + runtime DDL in .py)")
     print(f"Checked {refs} qualified reference(s) and {inserts} INSERT column(s)")
 
+    sources = sorted(glob.glob(os.path.join(REPO, "db_init", "*.sql"))) + _python_files()
+    kinds = _column_kinds(sources)
+    type_bad, unprovable, positions = _scan_param_types(kinds)
+    type_bad = [m for m in type_bad if (m[0], m[2], m[3]) not in SQL_TYPE_DEBT]
+    print(f"Checked {positions} typed parameter position(s); "
+          f"{len(unprovable)} array feed(s) unprovable "
+          f"({len(ARRAY_UNVERIFIED)} declared)")
+
     unexpected = [p for p in problems if (p[0], p[2], p[3]) not in SQL_DEBT]
     known = len(problems) - len(unexpected)
     print(f"  {known} known debt entr(ies) tolerated, {len(SQL_DEBT)} listed")
+
+    new_unprovable = sorted(unprovable - ARRAY_UNVERIFIED)
+    stale_unprovable = sorted(ARRAY_UNVERIFIED - unprovable)
 
     if unexpected:
         print(f"\n{len(unexpected)} SQL reference(s) name a nonexistent column:")
         for rel, lineno, table, col, shown in sorted(unexpected):
             print(f"  ✗ {rel}:{lineno}  {shown}  (table {table} has no {col})")
+    for rel, lineno, table, col, why in sorted(type_bad):
+        print(f"  ✗ {rel}:{lineno}  {table}.{col} — {why}")
+    for rel, table, col in new_unprovable:
+        print(f"  ✗ {rel}: {table}.{col} — array fed a value of unprovable type")
+    for rel, table, col in stale_unprovable:
+        print(f"  ✗ {rel}: {table}.{col} — ARRAY_UNVERIFIED entry is stale, delete it")
+
+    if unexpected or type_bad or new_unprovable or stale_unprovable:
         return 1
-    print("\n✅ every resolvable SQL column reference exists")
+    print("\n✅ every resolvable SQL column reference and parameter type checks out")
     return 0
 
 

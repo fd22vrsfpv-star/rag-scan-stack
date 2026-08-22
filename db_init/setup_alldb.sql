@@ -1774,6 +1774,19 @@ CREATE TRIGGER trg_web_findings_dedup
     FOR EACH ROW EXECUTE FUNCTION public.web_findings_dedup();
 
 -- Dedup trigger for vulns (see ensure_all_tables.sql for rationale/limits).
+
+-- vulns needs first_seen / last_seen for the delta view, the same way
+-- web_findings already has them. updated_at cannot stand in: the
+-- trg_vulns_updated_at trigger touches it on ANY write, so an operator adding
+-- tester_notes is indistinguishable from a scan re-observing the finding.
+-- Maintained by vulns_dedup() below.
+DO $$ BEGIN ALTER TABLE public.vulns ADD COLUMN IF NOT EXISTS first_seen timestamptz DEFAULT now(); EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN ALTER TABLE public.vulns ADD COLUMN IF NOT EXISTS last_seen  timestamptz DEFAULT now(); EXCEPTION WHEN OTHERS THEN NULL; END $$;
+-- Backfill existing rows: created_at is when we first saw it, updated_at is the
+-- best available proxy for the last sighting on rows that predate these columns.
+UPDATE public.vulns SET first_seen = COALESCE(first_seen, created_at, now()) WHERE first_seen IS NULL;
+UPDATE public.vulns SET last_seen  = COALESCE(last_seen, updated_at, created_at, now()) WHERE last_seen IS NULL;
+
 CREATE OR REPLACE FUNCTION public.vulns_dedup() RETURNS trigger AS $fn$
 DECLARE
     existing_id uuid;
@@ -1820,8 +1833,16 @@ BEGIN
       FROM public.vulns WHERE fingerprint = NEW.fingerprint;
 
     IF FOUND THEN
+        -- Re-seeing a vuln is new information about WHEN, not a new finding.
+        --
+        -- last_seen is maintained separately from updated_at on purpose:
+        -- trg_vulns_updated_at touches updated_at on ANY write, including an
+        -- operator editing tester_notes or workflow_status, so updated_at
+        -- cannot answer "when did a scan last observe this". The delta view
+        -- needs the scan-observation timestamp, which is this one.
         UPDATE public.vulns
            SET updated_at = now(),
+               last_seen  = now(),
                severity   = COALESCE(NEW.severity, severity),
                output     = COALESCE(NEW.output, output),
                cvss       = COALESCE(NEW.cvss, cvss)
@@ -1829,6 +1850,8 @@ BEGIN
         RETURN NULL;   -- skip the INSERT
     END IF;
 
+    IF NEW.first_seen IS NULL THEN NEW.first_seen := now(); END IF;
+    IF NEW.last_seen  IS NULL THEN NEW.last_seen  := now(); END IF;
     RETURN NEW;
 END;
 $fn$ LANGUAGE plpgsql;

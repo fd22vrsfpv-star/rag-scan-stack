@@ -202,6 +202,49 @@ if [[ -n "$HOSTNAME_EQ_IP" && "$HOSTNAME_EQ_IP" -gt 0 ]]; then
     echo "❌ ${HOSTNAME_EQ_IP} asset(s) still store the IP as the hostname"
     MISSING=$((MISSING + 1))
 fi
+
+# ── Finding dedup: fingerprints, first/last seen ──────────────────────────
+#
+# The unique fingerprint indexes are checked above, but a unique index permits
+# unlimited NULLs — a NULL fingerprint is an unconstrained row that bypasses
+# dedup entirely. The dedup TRIGGERS fill it for the ~19 insert sites that
+# supply none, so their absence silently reopens the duplication.
+for trg in trg_vulns_dedup trg_web_findings_dedup; do
+    if docker exec rag-postgres psql -U app -d scans -t -c \
+        "SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname = '${trg}';" | grep -q 1; then
+        echo "✓ ${trg}"
+    else
+        echo "❌ Missing dedup trigger ${trg} - inserts without a fingerprint will store NULL and bypass the unique index"
+        MISSING=$((MISSING + 1))
+    fi
+done
+
+for tbl in vulns web_findings recon_findings; do
+    NULL_FP=$(docker exec rag-postgres psql -U app -d scans -tAc \
+        "SELECT count(*) FROM public.${tbl} WHERE fingerprint IS NULL;" 2>/dev/null)
+    DUP_FP=$(docker exec rag-postgres psql -U app -d scans -tAc \
+        "SELECT count(*) - count(DISTINCT fingerprint) FROM public.${tbl};" 2>/dev/null)
+    if [[ -z "$NULL_FP" || -z "$DUP_FP" ]]; then
+        echo "⚠  ${tbl} fingerprint check skipped (could not query)"
+    elif [[ "$NULL_FP" -eq 0 && "$DUP_FP" -le 0 ]]; then
+        echo "✓ ${tbl}: no NULL and no duplicate fingerprints"
+    else
+        echo "❌ ${tbl}: ${NULL_FP} NULL fingerprint(s), ${DUP_FP} duplicate(s)"
+        MISSING=$((MISSING + 1))
+    fi
+done
+
+# vulns needs first_seen/last_seen for the delta view. updated_at cannot stand
+# in: trg_vulns_updated_at touches it on ANY write, so an operator editing
+# tester_notes is indistinguishable from a scan re-observing the finding.
+VULN_SEEN=$(docker exec rag-postgres psql -U app -d scans -tAc \
+    "SELECT count(*) FROM information_schema.columns WHERE table_name='vulns' AND column_name IN ('first_seen','last_seen');" 2>/dev/null)
+if [[ "$VULN_SEEN" == "2" ]]; then
+    echo "✓ vulns.first_seen / vulns.last_seen present"
+else
+    echo "❌ vulns is missing first_seen/last_seen (delta view cannot distinguish a re-scan from an edit)"
+    MISSING=$((MISSING + 1))
+fi
 for idx in "${CRITICAL_INDEXES[@]}"; do
     if docker exec rag-postgres psql -U app -d scans -t -c \
         "SELECT 1 FROM pg_indexes WHERE indexname = '${idx}';" | grep -q 1; then
