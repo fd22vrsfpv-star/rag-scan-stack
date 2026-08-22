@@ -1742,6 +1742,97 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_vulns_fingerprint
 -- matching the ON CONFLICT specification" on every row.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_credential_findings_identity
     ON public.credential_findings(ip, port, username, COALESCE(auth_type, ''));
+-- ── credential_findings: fingerprint dedup, matching the other finding tables ──
+--
+-- This table deduped on an identity INDEX while vulns, web_findings and
+-- recon_findings all dedupe on a fingerprint COLUMN plus a trigger. Two
+-- mechanisms for one concept means every reader has to know which table works
+-- which way, and only the fingerprint tables get a stable id for exports and
+-- the delta view.
+--
+-- discovered_at / last_verified_at already serve first_seen / last_seen here,
+-- so no new timestamp columns are needed — but nothing was bumping
+-- last_verified_at except the ON CONFLICT in etl/parse_brutus.py. The trigger
+-- now does it for every writer.
+DO $$ BEGIN ALTER TABLE public.credential_findings ADD COLUMN IF NOT EXISTS fingerprint text; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+
+-- Must match etl/fingerprint.py::credential_fingerprint EXACTLY, or a row
+-- written by a Python-side writer and one written by a raw INSERT of the same
+-- account would not recognise each other. tests/test_fingerprint.py pins both
+-- to a shared case table and exercises this through the real trigger.
+--
+-- valid_cred and status are deliberately NOT hashed: a credential that stopped
+-- working is the same account, and hashing the outcome would add a row every
+-- time the result flipped.
+CREATE OR REPLACE FUNCTION public.credential_findings_dedup() RETURNS trigger AS $fn$
+DECLARE
+    existing_id uuid;
+BEGIN
+    IF NEW.fingerprint IS NULL THEN
+        NEW.fingerprint := md5('cred|' || coalesce(host(NEW.ip), '')
+                               || '|' || CASE WHEN NEW.port IS NOT NULL AND NEW.port <> 0
+                                              THEN NEW.port::text ELSE '0' END
+                               || '|' || lower(btrim(coalesce(NEW.username, '')))
+                               || '|' || lower(btrim(coalesce(NEW.auth_type, ''))));
+    END IF;
+
+    SELECT id INTO existing_id
+      FROM public.credential_findings WHERE fingerprint = NEW.fingerprint;
+
+    IF FOUND THEN
+        -- Re-testing a known credential is a re-verification, not a new
+        -- finding. This mirrors what the ON CONFLICT in etl/parse_brutus.py
+        -- used to be solely responsible for, so every writer now gets it.
+        UPDATE public.credential_findings
+           SET last_verified_at = now(),
+               valid_cred       = COALESCE(NEW.valid_cred, valid_cred),
+               status           = COALESCE(NEW.status, status),
+               secret_type      = COALESCE(NEW.secret_type, secret_type),
+               banner           = COALESCE(NEW.banner, banner),
+               metadata         = COALESCE(NEW.metadata, metadata)
+         WHERE id = existing_id;
+        RETURN NULL;   -- skip the INSERT
+    END IF;
+
+    IF NEW.discovered_at IS NULL THEN NEW.discovered_at := now(); END IF;
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_credential_findings_dedup ON public.credential_findings;
+CREATE TRIGGER trg_credential_findings_dedup
+    BEFORE INSERT ON public.credential_findings
+    FOR EACH ROW EXECUTE FUNCTION public.credential_findings_dedup();
+
+-- Backfill existing rows through the same expression the trigger uses.
+UPDATE public.credential_findings
+   SET fingerprint = md5('cred|' || coalesce(host(ip), '')
+                         || '|' || CASE WHEN port IS NOT NULL AND port <> 0
+                                        THEN port::text ELSE '0' END
+                         || '|' || lower(btrim(coalesce(username, '')))
+                         || '|' || lower(btrim(coalesce(auth_type, ''))))
+ WHERE fingerprint IS NULL;
+
+-- Collapse any rows that the case-insensitive username or coalesced auth_type
+-- now considers identical but the old index treated as distinct.
+DELETE FROM public.credential_findings a
+ USING public.credential_findings b
+ WHERE a.fingerprint = b.fingerprint
+   AND a.id <> b.id
+   -- Prefer a confirmed-valid row, then the most recently seen; id makes the
+   -- ordering strict and total so exactly one row per group survives.
+   AND (coalesce(a.valid_cred, false),
+        coalesce(a.last_verified_at, a.discovered_at, a.created_at), a.id)
+       < (coalesce(b.valid_cred, false),
+          coalesce(b.last_verified_at, b.discovered_at, b.created_at), b.id);
+
+-- Only the unique index. vulns and web_findings each carry a redundant plain
+-- idx_*_fingerprint alongside their uq_*_fingerprint, which buys nothing -- a
+-- unique btree already serves equality lookups -- and costs write throughput on
+-- the highest-volume tables in the schema. Not propagating that here.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_credential_findings_fingerprint
+    ON public.credential_findings(fingerprint);
+
 
 -- Dedup trigger for web_findings (see ensure_all_tables.sql for rationale).
 CREATE OR REPLACE FUNCTION public.web_findings_dedup() RETURNS trigger AS $fn$
