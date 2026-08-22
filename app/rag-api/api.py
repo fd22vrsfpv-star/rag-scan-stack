@@ -4844,6 +4844,8 @@ def get_vulnerabilities(
 
 class UnifiedFinding(BaseModel):
     id: str = Field(..., description="Unique identifier")
+    problem_id: Optional[str] = Field(None, description="Infrastructure problem group (shared across virtual hosts of one machine); null when the finding cannot be grouped")
+    affects_hosts: int = Field(1, description="How many virtual hosts of this machine show the same problem. 1 means it was seen on this host only")
     source: str = Field(..., description="Source scanner (nmap, nuclei, zap, gobuster, playwright)")
     asset_id: Optional[str] = Field(None, description="Asset UUID")
     ip: Optional[str] = Field(None, description="IP address")
@@ -4868,6 +4870,12 @@ class UnifiedFinding(BaseModel):
 class SearchAggregations(BaseModel):
     by_severity: Dict[str, int] = Field(default_factory=dict)
     by_source: Dict[str, int] = Field(default_factory=dict)
+    # Raw row counts double-count a server-level problem once per virtual host.
+    # These two answer "how many distinct problems", which is what a report
+    # headline and a severity chart actually mean.
+    by_severity_deduped: Dict[str, int] = Field(default_factory=dict)
+    distinct_problems: int = Field(0, description="Matching rows collapsed to one per underlying problem")
+    shared_problems: int = Field(0, description="Of those, how many appear on more than one virtual host")
 
 
 class UnifiedSearchResponse(BaseModel):
@@ -4891,6 +4899,9 @@ def search_findings(
     workflow_status: Optional[List[str]] = Query(None, description="Filter by workflow status (new, triaging, confirmed, false_positive, accepted_risk, in_report, deferred)"),
     engagement_id: Optional[str] = Query(None, description="Filter by engagement ID"),
     tags: Optional[List[str]] = Query(None, description="Filter by tags (findings must have ALL specified tags)"),
+    scope: Optional[str] = Query(None, description="Filter by finding scope: 'shared' (one problem seen on several virtual hosts of a machine), 'single' (observed on one host only)"),
+    problem_id: Optional[str] = Query(None, description="Filter to one infrastructure problem group (infrastructure_fingerprint)"),
+    collapse_problems: bool = Query(False, description="Return one row per underlying problem instead of one per virtual host"),
     limit: int = Query(100, ge=1, le=1000, description="Max results to return"),
     offset: int = Query(0, ge=0, description="Pagination offset"),
     authorized: bool = Depends(auth)
@@ -4945,6 +4956,8 @@ def search_findings(
             v.original_severity,
             v.report_ready,
             v.engagement_id::text,
+            NULL::text as problem_id,
+            1 as affects_hosts,
             'vuln' as finding_source
         FROM vulns v
         LEFT JOIN assets a ON a.id = v.asset_id
@@ -4982,9 +4995,21 @@ def search_findings(
             wf.original_severity,
             wf.report_ready,
             wf.engagement_id::text,
+            wf.infrastructure_fingerprint as problem_id,
+            COALESCE(ic.n, 1) as affects_hosts,
             'web' as finding_source
         FROM web_findings wf
         LEFT JOIN assets a ON a.id = wf.asset_id
+        -- One aggregate scan, joined in, rather than a correlated subquery per
+        -- row. affects_hosts > 1 is what makes a finding "shared": the same
+        -- problem observed on several virtual hosts of one machine.
+        LEFT JOIN (
+            SELECT infrastructure_fingerprint AS fp,
+                   count(DISTINCT asset_id)   AS n
+              FROM web_findings
+             WHERE infrastructure_fingerprint IS NOT NULL
+             GROUP BY infrastructure_fingerprint
+        ) ic ON ic.fp = wf.infrastructure_fingerprint
 
         UNION ALL
 
@@ -5021,6 +5046,8 @@ def search_findings(
             pf.original_severity,
             pf.report_ready,
             pf.engagement_id::text,
+            NULL::text as problem_id,
+            1 as affects_hosts,
             'playwright' as finding_source
         FROM playwright_findings pf
         LEFT JOIN assets a ON a.id = pf.asset_id
@@ -5057,6 +5084,8 @@ def search_findings(
             NULL::text as original_severity,
             NULL::boolean as report_ready,
             NULL::text as engagement_id,
+            NULL::text as problem_id,
+            1 as affects_hosts,
             'portscan' as finding_source
         FROM ports pt
         LEFT JOIN assets a ON a.id = pt.asset_id
@@ -5125,6 +5154,8 @@ def search_findings(
             NULL::text as original_severity,
             NULL::boolean as report_ready,
             cf.engagement_id::text,
+            NULL::text as problem_id,
+            1 as affects_hosts,
             'credential' as finding_source
         FROM credential_findings cf
         LEFT JOIN assets a ON a.id = cf.asset_id
@@ -5156,6 +5187,24 @@ def search_findings(
     if port:
         where_clauses_pg.append("port = %s")
         params_pg.append(port)
+
+    # Scope is derived, not declared: "shared" means the same problem was
+    # actually observed on more than one virtual host of a machine. Deciding it
+    # from the data avoids guessing whether a finding is server- or app-level.
+    if scope:
+        wanted = scope.strip().lower()
+        if wanted in ("shared", "infrastructure", "infra"):
+            where_clauses_pg.append("affects_hosts > 1")
+        elif wanted in ("single", "application", "app"):
+            where_clauses_pg.append("affects_hosts <= 1")
+        elif wanted not in ("all", ""):
+            raise HTTPException(
+                400,
+                f"Unknown scope {scope!r}. Use 'shared', 'single' or 'all'.")
+
+    if problem_id:
+        where_clauses_pg.append("problem_id = %s")
+        params_pg.append(problem_id)
 
     if cve:
         where_clauses_pg.append("EXISTS (SELECT 1 FROM unnest(cve) c WHERE c ILIKE %s)")
@@ -5237,12 +5286,32 @@ def search_findings(
         ELSE 7
     END
     """
-    main_sql = f"""
-    {base_query}
-    {where_sql}
-    ORDER BY {severity_order}, created_at DESC
-    LIMIT %s OFFSET %s
-    """
+    if collapse_problems:
+        # One row per underlying problem. DISTINCT ON rather than a window
+        # function so no helper column leaks into the result set.
+        #
+        # PARTITION/DISTINCT key is COALESCE(problem_id, id): partitioning on
+        # problem_id alone would treat every ungroupable row (NULL) as ONE
+        # group and collapse thousands of unrelated findings into a single row.
+        main_sql = f"""
+        SELECT * FROM (
+            SELECT DISTINCT ON (COALESCE(problem_id, id)) *
+            FROM (
+                {base_query}
+                {where_sql}
+            ) filtered
+            ORDER BY COALESCE(problem_id, id), {severity_order}, created_at DESC
+        ) collapsed
+        ORDER BY {severity_order}, created_at DESC
+        LIMIT %s OFFSET %s
+        """
+    else:
+        main_sql = f"""
+        {base_query}
+        {where_sql}
+        ORDER BY {severity_order}, created_at DESC
+        LIMIT %s OFFSET %s
+        """
     params_pg.extend([limit, offset])
 
     # Count query
@@ -5295,6 +5364,34 @@ def search_findings(
         cur.execute(f"SELECT COUNT(*) as total FROM ({count_sql}) sub", count_params)
         total = cur.fetchone()["total"]
 
+        # Deduped counts over the same filtered set. `total` counts ROWS, which
+        # double-counts a server-level problem once per virtual host — fine for
+        # pagination, misleading as a headline. COALESCE(problem_id, id) keeps
+        # every ungroupable row distinct; grouping on problem_id alone would
+        # fold all NULLs into one.
+        cur.execute(f"""
+            SELECT
+                COUNT(DISTINCT COALESCE(problem_id, id))                     AS distinct_problems,
+                COUNT(DISTINCT problem_id) FILTER (WHERE affects_hosts > 1)  AS shared_problems
+            FROM ({count_sql}) sub
+        """, count_params)
+        dedup_row = cur.fetchone()
+        distinct_problems = dedup_row["distinct_problems"] or 0
+        shared_problems = dedup_row["shared_problems"] or 0
+
+        # Severity facets over the collapsed set, so a chart shows one bar per
+        # problem rather than one per affected vhost.
+        cur.execute(f"""
+            SELECT severity, COUNT(*) AS cnt FROM (
+                SELECT DISTINCT ON (COALESCE(problem_id, id))
+                       COALESCE(severity, 'recon') AS severity
+                FROM ({count_sql}) sub
+                ORDER BY COALESCE(problem_id, id)
+            ) collapsed
+            GROUP BY severity
+        """, count_params)
+        by_severity_deduped = {r["severity"]: r["cnt"] for r in cur.fetchall()}
+
         # Get aggregations
         cur.execute(agg_sql)
         agg_rows = cur.fetchall()
@@ -5314,6 +5411,8 @@ def search_findings(
     for row in rows:
         findings.append(UnifiedFinding(
             id=row["id"],
+            problem_id=row.get("problem_id"),
+            affects_hosts=row.get("affects_hosts") or 1,
             source=row["source"],
             asset_id=row["asset_id"],
             ip=row["ip"],
@@ -5340,7 +5439,10 @@ def search_findings(
         total=total,
         aggregations=SearchAggregations(
             by_severity=by_severity,
-            by_source=by_source
+            by_source=by_source,
+            by_severity_deduped=by_severity_deduped,
+            distinct_problems=distinct_problems,
+            shared_problems=shared_problems
         )
     )
 
