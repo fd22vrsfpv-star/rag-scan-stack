@@ -16,12 +16,12 @@ The rollup is ADDITIVE on purpose. The default response is unchanged — one row
 per vhost, because a tester triaging a specific host needs that row. What is new:
 
   * every finding carries `problem_id` and `affects_hosts`
-  * `aggregations.distinct_problems` / `shared_problems` / `by_severity_deduped`
+  * `aggregations.distinct_problems` / `shared_problems` / `problems_by_severity`
     answer "how many distinct problems", which is what a report headline means
-  * `scope=shared|single` filters by whether a problem spans several vhosts
+  * `problem_scope=shared|single` filters by whether a problem spans several vhosts
   * `collapse_problems=true` returns one row per problem
 
-`scope` is derived from the data (`affects_hosts > 1`), not from a guess about
+`problem_scope` is derived from the data (`affects_hosts > 1`), not from a guess about
 whether a finding is server- or app-level. That keeps it honest: a finding is
 "shared" because it was actually observed on more than one host.
 
@@ -125,7 +125,7 @@ def test_counts_are_deduped_while_total_stays_row_based(seeded):
 def test_deduped_severity_facet_counts_each_problem_once(seeded):
     """All five seeded rows are 'high'; the chart should show 2, not 5."""
     agg = _get("limit=50")["aggregations"]
-    assert agg["by_severity_deduped"].get("high") == 2, agg["by_severity_deduped"]
+    assert agg["problems_by_severity"].get("high") == 2, agg["problems_by_severity"]
 
 
 def test_every_finding_carries_the_group_and_affected_count(seeded):
@@ -140,26 +140,26 @@ def test_every_finding_carries_the_group_and_affected_count(seeded):
         "an app-level finding must not join the infrastructure group"
 
 
-def test_scope_shared_selects_only_multi_host_problems(seeded):
-    data = _get("limit=50&scope=shared")
+def test_problem_scope_shared_selects_only_multi_host_problems(seeded):
+    data = _get("limit=50&problem_scope=shared")
     assert data["total"] == 4, data["total"]
     assert all(f["affects_hosts"] > 1 for f in data["findings"])
 
 
-def test_scope_single_selects_only_one_host_problems(seeded):
-    data = _get("limit=50&scope=single")
+def test_problem_scope_single_selects_only_one_host_problems(seeded):
+    data = _get("limit=50&problem_scope=single")
     assert data["total"] == 1, data["total"]
     assert data["findings"][0]["title"] == "Rollup SQLi"
 
 
-def test_scope_all_is_the_same_as_no_filter(seeded):
-    assert _get("limit=50&scope=all")["total"] == _get("limit=50")["total"]
+def test_problem_scope_all_is_the_same_as_no_filter(seeded):
+    assert _get("limit=50&problem_scope=all")["total"] == _get("limit=50")["total"]
 
 
-def test_unknown_scope_is_rejected(seeded):
+def test_unknown_problem_scope_is_rejected(seeded):
     """A typo must not silently return everything."""
     with pytest.raises(urllib.error.HTTPError) as exc:
-        _get("limit=50&scope=nonsense")
+        _get("limit=50&problem_scope=nonsense")
     assert exc.value.code in (400, 422), exc.value.code
 
 
@@ -214,3 +214,103 @@ def test_problem_id_filter_selects_one_group(seeded):
     data = _get(f"limit=50&problem_id={shared_group}")
     assert data["total"] == 4, data["total"]
     assert all(f["problem_id"] == shared_group for f in data["findings"])
+
+
+# ── SARIF export: one result, many locations ─────────────────────────────────
+
+def _sarif(extra=""):
+    """Fetch SARIF from rag-api inside its own container (internal port is TLS)."""
+    script = (
+        "import os, json, ssl, urllib.request\n"
+        "ctx = ssl.create_default_context()\n"
+        "ctx.check_hostname = False\n"
+        "ctx.verify_mode = ssl.CERT_NONE\n"
+        f"req = urllib.request.Request('https://localhost:8000/export/sarif?source=zap&limit=5000&{extra}')\n"
+        "req.add_header('x-api-key', os.environ.get('API_KEY',''))\n"
+        "print(urllib.request.urlopen(req, timeout=90, context=ctx).read().decode())\n"
+    )
+    try:
+        out = subprocess.run(["docker", "exec", "rag-api", "python", "-c", script],
+                             capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        return None
+
+
+def _sarif_results_for(doc, marker):
+    return [r for run in doc.get("runs", [])
+            for r in run.get("results", [])
+            if marker in json.dumps(r)]
+
+
+@pytest.fixture(scope="module")
+def sarif_seeded():
+    """Three rows of one problem across two vhosts of one machine."""
+    if _psql("SELECT 1") != "1":
+        pytest.skip("no reachable rag-postgres")
+    if _sarif("limit=1") is None:
+        pytest.skip("rag-api /export/sarif not reachable")
+    _psql("""
+        INSERT INTO assets (id, ip, hostname) VALUES
+          ('99999999-9999-9999-9999-999999999999','203.0.113.54'::inet,'s1.sarif.test'),
+          ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa','203.0.113.54'::inet,'s2.sarif.test')
+        ON CONFLICT DO NOTHING;
+        INSERT INTO web_findings (asset_id, url, source, issue_type, name, severity) VALUES
+          ('99999999-9999-9999-9999-999999999999','https://s1.sarif.test/','zap','hdr','Sarif Missing Header','high'),
+          ('99999999-9999-9999-9999-999999999999','https://s1.sarif.test/a','zap','hdr','Sarif Missing Header','high'),
+          ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa','https://s2.sarif.test/','zap','hdr','Sarif Missing Header','high');
+    """)
+    yield
+    _psql("DELETE FROM web_findings WHERE url LIKE '%sarif.test%';")
+    _psql("DELETE FROM assets WHERE ip = '203.0.113.54'::inet;")
+
+
+def test_sarif_default_emits_one_result_per_row(sarif_seeded):
+    doc = _sarif()
+    assert doc is not None
+    results = _sarif_results_for(doc, "sarif.test")
+    assert len(results) == 3, f"expected the 3 seeded rows, got {len(results)}"
+    assert all(len(r["locations"]) == 1 for r in results)
+
+
+def test_sarif_collapse_emits_one_result_with_every_location(sarif_seeded):
+    """SARIF represents "one problem, several places" natively.
+
+    A result carries a LIST of locations, so a server-level problem should be one
+    result with a location per affected virtual host — not three near-identical
+    results a report consumer has to dedupe by hand.
+    """
+    doc = _sarif("collapse_problems=true")
+    assert doc is not None
+    results = _sarif_results_for(doc, "sarif.test")
+    assert len(results) == 1, f"expected one collapsed result, got {len(results)}"
+    locations = [l["physicalLocation"]["artifactLocation"]["uri"]
+                 for l in results[0]["locations"]]
+    assert sorted(locations) == [
+        "https://s1.sarif.test/",
+        "https://s1.sarif.test/a",
+        "https://s2.sarif.test/",
+    ], locations
+    assert results[0]["properties"]["affects_locations"] == 3
+    assert results[0]["properties"].get("problem_id"), \
+        "a collapsed result should name the group it represents"
+
+
+def test_sarif_collapse_does_not_merge_ungroupable_rows(sarif_seeded):
+    """Same trap as the listing: keying on the fingerprint alone would fold every
+    NULL-fingerprint row into a single result."""
+    doc = _sarif("collapse_problems=true")
+    plain = _sarif()
+    assert doc is not None and plain is not None
+    n_collapsed = sum(len(run.get("results", [])) for run in doc.get("runs", []))
+    n_plain = sum(len(run.get("results", [])) for run in plain.get("runs", []))
+    # Collapsing removes exactly the duplicate vhost rows, not the bulk.
+    assert n_collapsed >= n_plain - 10, (
+        f"collapse dropped {n_plain - n_collapsed} results — ungroupable rows "
+        "were folded together")
+    assert n_collapsed < n_plain, "collapse changed nothing"

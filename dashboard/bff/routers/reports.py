@@ -375,6 +375,7 @@ async def sarif_export(
     severity: str = None,
     source: str = None,
     limit: int = 5000,
+    collapse_problems: bool = False,
 ):
     s = get_settings()
     params: dict = {"limit": limit}
@@ -382,6 +383,10 @@ async def sarif_export(
         params["severity"] = severity.split(",")
     if source:
         params["source"] = source.split(",")
+    # One SARIF result per underlying problem, with a location per affected
+    # virtual host, instead of N near-identical results a consumer must dedupe.
+    if collapse_problems:
+        params["collapse_problems"] = "true"
 
     async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.get(
