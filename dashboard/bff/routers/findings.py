@@ -24,6 +24,12 @@ async def search_findings(
     workflow_status: Optional[list[str]] = Query(None),
     engagement_id: Optional[str] = None,
     tags: Optional[list[str]] = Query(None),
+    # Virtual-host rollup: 'shared' = one problem seen on several vhosts of a
+    # machine, 'single' = seen on one host only. collapse_problems returns one
+    # row per problem instead of one per vhost.
+    scope: Optional[str] = None,
+    problem_id: Optional[str] = None,
+    collapse_problems: bool = False,
     limit: int = Query(100, le=1000),
     offset: int = 0,
 ):
@@ -53,6 +59,12 @@ async def search_findings(
         params["engagement_id"] = engagement_id
     if tags:
         params["tags"] = tags
+    if scope:
+        params["scope"] = scope
+    if problem_id:
+        params["problem_id"] = problem_id
+    if collapse_problems:
+        params["collapse_problems"] = "true"
 
     async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
