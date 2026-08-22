@@ -114,7 +114,11 @@ def parse_censys(path: str, search_type: str = "hosts", profile: str = "upload",
                             # Also insert into ports table if it exists
                             try:
                                 cur.execute("""
-                                    INSERT INTO ports (id, asset_id, port, protocol, service, banner)
+                                    -- Column is `proto`, not `protocol`. With the
+                                    -- wrong name this INSERT raised inside the
+                                    -- surrounding try/except, so Censys-discovered
+                                    -- services never reached the ports table.
+                                    INSERT INTO ports (id, asset_id, port, proto, service, banner)
                                     VALUES (%s, %s, %s, %s, %s, %s)
                                     ON CONFLICT DO NOTHING
                                 """, (str(uuid.uuid4()), asset_id, port,

@@ -629,6 +629,21 @@ else
   fail "shared module drift — run: python3 scripts/check_shared_code.py --list"
 fi
 
+# Every SQL column reference must exist on the table it reads or writes.
+#
+# The one defect class no other guard here can catch: it passes ast.parse,
+# imports fine, reports a healthy container, and 500s only when that code path
+# runs. Postgres also reports only the FIRST bad column, so one fix can reveal
+# the next. Its first run found 20 — including seven in one function whose
+# caller logged the failure as a warning, so agents silently lost the "what we
+# already know about this target" context and re-scanned covered ground.
+if python3 "$(dirname "${BASH_SOURCE[0]}")/../tests/test_sql_columns.py" >/tmp/sqlcols.log 2>&1; then
+  pass "SQL columns — $(grep -oE 'Checked [0-9]+' /tmp/sqlcols.log | head -1 | awk '{print $2}') reference(s) resolve against the schema"
+else
+  fail "SQL reference(s) name a column their table does not have:"
+  grep -E '^  ✗' /tmp/sqlcols.log 2>/dev/null | head -10 || true
+fi
+
 # Every BFF proxy call must name a path some service actually declares.
 #
 # Static, so it runs before anything is up. 68% of BFF routes are thin proxies

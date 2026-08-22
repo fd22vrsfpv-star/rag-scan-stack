@@ -199,12 +199,17 @@ Two rules that cut across all tiers:
 - **`except: pass` around an HTTP call hides a 404 forever.** If a call may
   legitimately fail, handle that case explicitly and surface it. Silence here
   turns a broken endpoint into "it returned zero results".
-- **SQL column references are not checked by any of the above.** A query naming
-  a column the table lacks passes import, passes `ast.parse`, and 500s only when
-  executed — and Postgres reports only the *first* bad column, so fixing one can
-  reveal another. Endpoints running raw SQL need a test that executes the query.
+- **Every SQL column must exist on its table.** A query naming a column the
+  table lacks passes import, passes `ast.parse`, reports a healthy container,
+  and 500s only when that path executes. Postgres reports only the *first* bad
+  column, so **check the whole statement against the DDL**, never just the one
+  in the traceback. New tables/columns MUST be declared in `db_init/*.sql` (or
+  a runtime `CREATE TABLE`/`ALTER TABLE` the schema parser can see) or every
+  query against them is skipped rather than checked.
 - *Enforced by:* `tests/test_proxy_contracts.py::test_upstream_paths_exist`
   (upstream paths + `PROXY_DYNAMIC`/`PROXY_DEBT` ratchets),
+  `tests/test_sql_columns.py::test_every_sql_column_exists` (qualified
+  references + `INSERT` column lists, with the `SQL_DEBT` ratchet),
   `tests/test_endpoint_smoke.py` and `scripts/smoke_endpoints.py` (live sweep,
   bare + parameterised), `tests/test_route_contracts.py` (declaration order,
   shadowing).
@@ -217,8 +222,19 @@ Two rules that cut across all tiers:
   the suite was green, the OpenAPI schema listed every one, and 361 proxies had
   never had their far end checked.
 
+  The SQL guard's first run found **20** more, the worst being seven in
+  `build_existing_target_context()` — whose caller logs the failure as a
+  *warning*, so every agent session silently lost the "here is what we already
+  know about this target" block and re-ran scans whose data was already in the
+  database. Fixing it recovered 6,391 characters of context: 64 ports, 58
+  vulns, 778 web findings. Two ingest paths also wrote to columns that do not
+  exist, so Censys-discovered services and Playwright's ZAP findings were never
+  stored at all.
+
 ### Known-debt lists
-`tests/test_dispatch_invariants.py` carries `SCOPE_DEBT` and `LIMIT_DEBT`:
+`tests/test_dispatch_invariants.py` carries `SCOPE_DEBT` and `LIMIT_DEBT`,
+`tests/test_proxy_contracts.py` carries `PROXY_DYNAMIC` and `PROXY_DEBT`, and
+`tests/test_sql_columns.py` carries `SQL_DEBT`:
 modules that violate the rules above today, each with a reason. They exist to
 make the debt visible while keeping the suite green, and they RATCHET — a new
 violation fails by name, and a resolved entry must be deleted (a separate test
