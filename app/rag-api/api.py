@@ -15441,7 +15441,16 @@ def scope_analysis(scope_name: str, _: bool = Depends(auth)):
 
         # ── 8. Discovered params in scope ──
         cur.execute(f"""
-            SELECT dp.url_pattern, dp.param_name, dp.method, dp.location,
+            -- Columns are http_method / param_location. This read dp.method
+            -- and dp.location, so every call raised UndefinedColumn and this
+            -- scope-analysis endpoint was a guaranteed 500 — Postgres reports
+            -- only the first bad column, so both had to be found via schema.
+            -- Aliased back to the short names the consumers below already use
+            -- (dp.get("method"), dp.get("location")).
+            -- NB: no braces in this comment; the query is an f-string.
+            SELECT dp.url_pattern, dp.param_name,
+                   dp.http_method   AS method,
+                   dp.param_location AS location,
                    dp.sample_values, dp.occurrence_count
             FROM discovered_params dp
             WHERE ({" OR ".join(["dp.url_pattern ILIKE %s"] * len(like_patterns))})

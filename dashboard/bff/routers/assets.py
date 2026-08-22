@@ -575,22 +575,20 @@ async def list_scan_recommendations(
             # upstream already treats "all" as "no filter"; it just has to be
             # told.
             params = {"limit": str(limit), "status": status}
+            # Straight to scan-recommender, which owns this table.
+            #
+            # This used to try rag-api's /scan-recommendations first and fall
+            # back here on 404. rag-api has never declared that route, so the
+            # first leg was a guaranteed wasted round-trip on every load of the
+            # page — the fallback was doing all the work.
             resp = await c.get(
-                f"{s.rag_api_url}/scan-recommendations",
+                f"{s.scan_recommender_url}/recommendations",
                 params=params,
                 headers={"x-api-key": s.api_key, **engagement_headers()},
             )
             if resp.status_code == 200:
                 return safe_json(resp)
-            # Fallback: query DB directly if rag-api doesn't have the endpoint
-            resp2 = await c.get(
-                f"{s.scan_recommender_url}/recommendations",
-                params=params,
-                headers={"x-api-key": s.api_key, **engagement_headers()},
-            )
-            if resp2.status_code == 200:
-                return resp2.json()
-            return {"recommendations": [], "error": f"No endpoint available (rag-api: {resp.status_code}, recommender: {resp2.status_code})"}
+            return {"recommendations": [], "error": f"recommender returned {resp.status_code}"}
     except Exception as e:
         return {"recommendations": [], "error": str(e)}
 

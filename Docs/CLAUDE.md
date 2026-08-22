@@ -173,6 +173,50 @@ large change. Add the test in the same commit as the rule.
   imported, the container was healthy, and the page silently returned zero rows
   — no test had ever executed that query.
 
+### Endpoint coverage
+Coverage is **tiered by what can actually fail**, because there are ~1,150
+distinct endpoints and a case per endpoint is not realistic. Every endpoint sits
+in exactly one tier, and the tier decides the obligation:
+
+- **Thin proxy** (one upstream call): no hand-written test. The upstream path
+  MUST resolve to a route some service declares. 68% of BFF routes are these,
+  so one generic check covers them all.
+- **Parameterless GET**: covered by the live sweep automatically. No work when
+  adding one.
+- **Parameterised GET**: MUST have a sample value the sweep can substitute —
+  add to `SAMPLE_FROM` (resolved live from a list endpoint, preferred) or
+  `SAMPLE_STATIC` (a safe literal). Routes with no sample are reported as
+  *unsampled*, never silently skipped.
+- **Mutating or logic-bearing** (POST/PUT/PATCH/DELETE, or any handler with real
+  logic): MUST ship an executing test **in the same commit**. This is a forward
+  ratchet — backfill by risk (dispatch, auth, exploit, cleanup first), not by
+  sweep.
+
+Two rules that cut across all tiers:
+- **A fallback leg is an endpoint.** Verify every leg or delete it. A dead
+  primary with a working fallback is a wasted round-trip on every call; two dead
+  legs is an endpoint that can never work, and both look healthy from outside.
+- **`except: pass` around an HTTP call hides a 404 forever.** If a call may
+  legitimately fail, handle that case explicitly and surface it. Silence here
+  turns a broken endpoint into "it returned zero results".
+- **SQL column references are not checked by any of the above.** A query naming
+  a column the table lacks passes import, passes `ast.parse`, and 500s only when
+  executed — and Postgres reports only the *first* bad column, so fixing one can
+  reveal another. Endpoints running raw SQL need a test that executes the query.
+- *Enforced by:* `tests/test_proxy_contracts.py::test_upstream_paths_exist`
+  (upstream paths + `PROXY_DYNAMIC`/`PROXY_DEBT` ratchets),
+  `tests/test_endpoint_smoke.py` and `scripts/smoke_endpoints.py` (live sweep,
+  bare + parameterised), `tests/test_route_contracts.py` (declaration order,
+  shadowing).
+- *Why:* Burp import POSTed every finding to `/findings/web`, a route no service
+  has ever declared, inside `except Exception: pass` — so it reported
+  `{"ok": true, "imported": 0}` while storing nothing. `/api/exploits/pending`
+  had a dead primary AND a dead fallback and returned `{"detail":"Not Found"}`
+  forever. `/scope/{name}/analysis` selected `dp.method` and `dp.location` when
+  the columns are `http_method` and `param_location`. Containers were healthy,
+  the suite was green, the OpenAPI schema listed every one, and 361 proxies had
+  never had their far end checked.
+
 ### Known-debt lists
 `tests/test_dispatch_invariants.py` carries `SCOPE_DEBT` and `LIMIT_DEBT`:
 modules that violate the rules above today, each with a reason. They exist to
