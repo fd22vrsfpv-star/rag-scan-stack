@@ -206,10 +206,30 @@ Two rules that cut across all tiers:
   in the traceback. New tables/columns MUST be declared in `db_init/*.sql` (or
   a runtime `CREATE TABLE`/`ALTER TABLE` the schema parser can see) or every
   query against them is skipped rather than checked.
+- **A column's TYPE matters as much as its name.** `text[]` rejects a bare
+  string (`malformed array literal: "CWE-79"`) and `jsonb` rejects a bare dict
+  (`can't adapt type 'dict'`). Normalize before passing, and where the value's
+  shape cannot be proven statically — a bare `d.get("k")` is opaque — the feed
+  MUST be declared in `ARRAY_UNVERIFIED`. New undeclared ones fail by name, so
+  the class stays caught even where inference cannot reach.
+- **Dedup logic duplicated in SQL needs an agreement test.** `etl/fingerprint.py`
+  and the `vulns_dedup` / `web_findings_dedup` triggers both compute the
+  fingerprint; the triggers fill it for the ~19 insert sites that supply none.
+  If they drift, the same finding gets two fingerprints and the unique index
+  stores both. Pin them to a shared case table, and exercise the SQL side
+  through the REAL trigger — a re-typed copy of the expression only tests the
+  copy.
+- **A unique index permits unlimited NULLs.** A NULL fingerprint is an
+  unconstrained row that bypasses dedup entirely, so the triggers that fill it
+  are load-bearing, not a convenience.
 - *Enforced by:* `tests/test_proxy_contracts.py::test_upstream_paths_exist`
   (upstream paths + `PROXY_DYNAMIC`/`PROXY_DEBT` ratchets),
   `tests/test_sql_columns.py::test_every_sql_column_exists` (qualified
   references + `INSERT` column lists, with the `SQL_DEBT` ratchet),
+  `tests/test_sql_columns.py::test_sql_param_types_are_compatible` and
+  `::test_unprovable_array_feeds_are_declared` (parameter types +
+  `ARRAY_UNVERIFIED` ratchet),
+  `tests/test_fingerprint.py` (unit cases + Python↔SQL trigger agreement),
   `tests/test_endpoint_smoke.py` and `scripts/smoke_endpoints.py` (live sweep,
   bare + parameterised), `tests/test_route_contracts.py` (declaration order,
   shadowing).
@@ -234,7 +254,7 @@ Two rules that cut across all tiers:
 ### Known-debt lists
 `tests/test_dispatch_invariants.py` carries `SCOPE_DEBT` and `LIMIT_DEBT`,
 `tests/test_proxy_contracts.py` carries `PROXY_DYNAMIC` and `PROXY_DEBT`, and
-`tests/test_sql_columns.py` carries `SQL_DEBT`:
+`tests/test_sql_columns.py` carries `SQL_DEBT` and `ARRAY_UNVERIFIED`:
 modules that violate the rules above today, each with a reason. They exist to
 make the debt visible while keeping the suite green, and they RATCHET — a new
 violation fails by name, and a resolved entry must be deleted (a separate test
