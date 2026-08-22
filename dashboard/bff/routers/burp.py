@@ -149,19 +149,36 @@ async def import_burp_results(task_id: str):
                 "name": issue.get("name", ""), "severity": (issue.get("severity") or "info").lower(),
                 "confidence": (issue.get("confidence") or "tentative").lower(),
                 "evidence": issue.get("detail", "")[:2000], "description": issue.get("description", ""),
-                "solution": issue.get("remediation", ""), "source": "burp",
-                "issue_type": f"burp-{issue.get('type_index', 'unknown')}",
+                "solution": issue.get("remediation", ""),
+                # /import/findings-exchange reads the per-finding key as "type";
+                # "source" is a single body-level field, not repeated per item.
+                "type": f"burp-{issue.get('type_index', 'unknown')}",
             })
-        imported = 0
+        # One bulk call to the endpoint built for exactly this ("Import findings
+        # from Burp Suite or other tools in exchange format"), which also dedups
+        # on (url, name, source).
+        #
+        # This used to POST each finding to /findings/web — a route no service
+        # has ever declared — inside `except Exception: pass`. Every import
+        # returned {"ok": true, "imported": 0} and stored nothing, reporting
+        # success while losing the data. Errors now surface instead of being
+        # swallowed, and `skipped` distinguishes "already had it" from "failed".
         async with httpx.AsyncClient(timeout=60) as c:
-            for finding in findings:
-                try:
-                    resp = await c.post(f"{s.rag_api_url}/findings/web", json=finding, headers={"x-api-key": s.api_key, **engagement_headers()})
-                    if resp.status_code < 300:
-                        imported += 1
-                except Exception:
-                    pass
-        return {"ok": True, "imported": imported, "total": len(findings), "task_id": task_id}
+            resp = await c.post(
+                f"{s.rag_api_url}/import/findings-exchange",
+                json={"source": "burp", "findings": findings},
+                headers={"x-api-key": s.api_key, **engagement_headers()},
+            )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, f"Import failed: {resp.text}")
+        result = resp.json()
+        return {
+            "ok": True,
+            "imported": result.get("imported", 0),
+            "skipped": result.get("skipped", 0),
+            "total": len(findings),
+            "task_id": task_id,
+        }
     except HTTPException:
         raise
     except Exception as e:

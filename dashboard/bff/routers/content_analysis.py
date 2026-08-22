@@ -308,8 +308,12 @@ Respond ONLY with valid JSON in this exact format:
         model = s.ollama_model
         try:
             async with httpx.AsyncClient(timeout=5) as c:
+                # Config settings live behind /settings/config/{key}. Calling
+                # /settings/ollama_active_model 404'd, and the bare `except`
+                # below hid it — so this always fell through to s.ollama_model
+                # and the operator's model choice in Settings was ignored.
                 r = await c.get(
-                    f"{s.rag_api_url}/settings/ollama_active_model",
+                    f"{s.rag_api_url}/settings/config/ollama_active_model",
                     headers={"x-api-key": s.api_key, **engagement_headers()},
                 )
                 if r.status_code == 200:

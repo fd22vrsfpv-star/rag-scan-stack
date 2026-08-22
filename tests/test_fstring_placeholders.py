@@ -84,16 +84,37 @@ def _bound_names(node) -> set:
 
 
 def _module_names(tree) -> set:
-    """Names available at module level, including nested definitions."""
+    """Names bound at TRUE module level.
+
+    This used to ast.walk() the whole tree and collect every Store name it
+    found, including ones local to unrelated functions. In a 20,000-line module
+    like app/rag-api/api.py that whitelists nearly every short identifier for
+    every f-string in the file, which made the guard close to vacuous there.
+
+    It missed a real one: a SQL comment inside an f-string mentioning
+    /scope/{name}/analysis raised NameError on every call, and the test stayed
+    green because some unrelated function had a `for name in ...` loop.
+
+    So: do not descend into function or class bodies. Those bindings are not
+    module-level names, and _bound_names() already supplies them per-function.
+    """
     names = set()
-    for child in ast.walk(tree):
-        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
-            names.add(child.id)
-        elif isinstance(child, (ast.Import, ast.ImportFrom)):
-            for alias in child.names:
-                names.add((alias.asname or alias.name).split(".")[0])
-        elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(child.name)
+
+    def visit(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(child.name)
+                continue  # its body is a separate scope
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                names.add(child.id)
+            elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                for alias in child.names:
+                    names.add((alias.asname or alias.name).split(".")[0])
+            elif isinstance(child, ast.Global):
+                names.update(child.names)
+            visit(child)
+
+    visit(tree)
     return names
 
 

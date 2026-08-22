@@ -629,12 +629,27 @@ else
   fail "shared module drift — run: python3 scripts/check_shared_code.py --list"
 fi
 
-# Call every parameterless GET endpoint and fail on any 5xx.
+# Every BFF proxy call must name a path some service actually declares.
+#
+# Static, so it runs before anything is up. 68% of BFF routes are thin proxies
+# whose only real failure mode is naming a dead upstream path — and a fallback
+# or a bare `except` hides that from the live sweep. Its first run found four,
+# including a Burp import that reported success while storing nothing.
+if python3 "$(dirname "${BASH_SOURCE[0]}")/../tests/test_proxy_contracts.py" >/tmp/proxy.log 2>&1; then
+  pass "proxy contracts — $(grep -oE 'Checked [0-9]+' /tmp/proxy.log | head -1 | awk '{print $2}') call(s) resolve upstream"
+else
+  fail "proxy call(s) name an upstream path no service declares:"
+  grep -E '^  ✗' /tmp/proxy.log 2>/dev/null | head -10 || true
+fi
+
+# Call every GET endpoint — bare and parameterised — and fail on any 5xx.
 #
 # ~1,150 endpoints exist and about 11% are mentioned by any test, so this sweep
 # is the only thing that touches most of them. Its first run found four broken
 # endpoints in two minutes — a query on a non-existent column and a set of
-# routes made unreachable by declaration order.
+# routes made unreachable by declaration order. Extending it to parameterised
+# GETs (ids resolved live from list endpoints) immediately found a fifth:
+# /scope/{name}/analysis selected two columns that do not exist.
 if python3 "$(dirname "${BASH_SOURCE[0]}")/smoke_endpoints.py" >/tmp/smoke.log 2>&1; then
   pass "endpoint smoke sweep — no 5xx ($(grep -c '200' /tmp/smoke.log 2>/dev/null || echo '?') checked)"
 else
