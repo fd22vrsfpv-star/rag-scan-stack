@@ -162,6 +162,7 @@ CRITICAL_INDEXES=(
     "uq_vulns_fingerprint"
     "uq_credential_findings_identity"
     "uq_recon_findings_fingerprint"
+    "uq_credential_findings_fingerprint"
     # Required by the ON CONFLICT upsert in /ingest/raw-artifact. Without it
     # every archived tool output raises instead of deduping, and the complete
     # raw output an LLM pass reads from is silently never stored.
@@ -209,7 +210,7 @@ fi
 # unlimited NULLs — a NULL fingerprint is an unconstrained row that bypasses
 # dedup entirely. The dedup TRIGGERS fill it for the ~19 insert sites that
 # supply none, so their absence silently reopens the duplication.
-for trg in trg_vulns_dedup trg_web_findings_dedup; do
+for trg in trg_vulns_dedup trg_web_findings_dedup trg_credential_findings_dedup; do
     if docker exec rag-postgres psql -U app -d scans -t -c \
         "SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname = '${trg}';" | grep -q 1; then
         echo "✓ ${trg}"
@@ -219,7 +220,7 @@ for trg in trg_vulns_dedup trg_web_findings_dedup; do
     fi
 done
 
-for tbl in vulns web_findings recon_findings; do
+for tbl in vulns web_findings recon_findings credential_findings; do
     NULL_FP=$(docker exec rag-postgres psql -U app -d scans -tAc \
         "SELECT count(*) FROM public.${tbl} WHERE fingerprint IS NULL;" 2>/dev/null)
     DUP_FP=$(docker exec rag-postgres psql -U app -d scans -tAc \

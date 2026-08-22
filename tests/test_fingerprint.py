@@ -49,6 +49,7 @@ fingerprint = pytest.importorskip(
 vuln_fingerprint = fingerprint.vuln_fingerprint
 web_fingerprint = fingerprint.web_fingerprint
 recon_fingerprint = fingerprint.recon_fingerprint
+credential_fingerprint = fingerprint.credential_fingerprint
 
 
 # ── shared case table, used by BOTH the unit and agreement tests ─────────────
@@ -64,6 +65,18 @@ VULN_CASES = [
     ("mixed-case cve",     "203.0.113.44", 80,   "x", ["cve-2021-44228"]),
     ("script needs trim",  "203.0.113.45", 22,   "  NMAP:SSH-Weak  ", None),
     ("empty script",       "203.0.113.46", 3306, "", None),
+]
+
+CRED_CASES = [
+    # (label, ip, port, username, auth_type)
+    ("plain",              "203.0.113.60", 445, "msfadmin", "password"),
+    ("mixed-case user",    "203.0.113.61", 22,  "Administrator", "password"),
+    ("null auth_type",     "203.0.113.62", 21,  "anonymous", None),
+    ("padded username",    "203.0.113.63", 23,  "  root  ", "password"),
+    # NB: no None-port case here. credential_findings.port is NOT NULL, so the
+    # SQL side cannot represent it; the Python None -> "0" behaviour is covered
+    # by test_credential_missing_port_is_zero instead.
+    ("high port",          "203.0.113.64", 5985, "svc", "kerberos"),
 ]
 
 WEB_CASES = [
@@ -432,7 +445,14 @@ def test_credential_identity_index_is_total_and_coalesced(db):
 
 
 def test_null_auth_type_no_longer_duplicates(db):
-    """Sabotage the invariant against the live schema, inside a rollback."""
+    """A NULL auth_type must not produce a second row.
+
+    The mechanism changed once trg_credential_findings_dedup landed: the trigger
+    now intercepts the duplicate and merges it, so the insert is SKIPPED rather
+    than rejected by uq_credential_findings_identity. The invariant is "one row",
+    not "an error" — asserting the error would have failed the moment the table
+    got the same dedup treatment as the other three.
+    """
     out = subprocess.run(
         ["docker", "exec", "rag-postgres", "psql", "-U", "app", "-d", "scans", "-c",
          "BEGIN;"
@@ -445,9 +465,14 @@ def test_null_auth_type_no_longer_duplicates(db):
          "ROLLBACK;"],
         capture_output=True, text=True, timeout=30)
     combined = out.stdout + out.stderr
-    assert "uq_credential_findings_identity" in combined, (
-        "a second row with a NULL auth_type was accepted; the index is not "
-        f"constraining NULLs.\n{combined[:400]}")
+    rows = _psql(
+        "SELECT count(*) FROM credential_findings WHERE ip = '203.0.113.95'::inet")
+    assert rows == "0", "the probe rows leaked out of the rollback"
+    assert "ERROR" not in combined or "uq_credential_findings" in combined, combined[:300]
+    # Two inserts, one surviving row: either the trigger merged it or the index
+    # refused it. Both satisfy the invariant; neither may store two rows.
+    assert combined.count("INSERT 0 1") <= 1 or "uq_credential_findings" in combined, (
+        f"a NULL auth_type produced two stored rows:\n{combined[:400]}")
 
 
 def test_brutus_on_conflict_matches_the_index(db):
@@ -488,3 +513,129 @@ def test_parse_brutus_source_matches_the_index_expression():
         "parse_brutus.py ON CONFLICT no longer matches uq_credential_findings_identity"
     assert "WHERE username IS NOT NULL" not in src, \
         "the dead partial-index predicate is back (username is NOT NULL)"
+
+
+# ── credential fingerprints ──────────────────────────────────────────────────
+
+@pytest.mark.unit
+@pytest.mark.parametrize("label,ip,port,user,auth", CRED_CASES)
+def test_credential_fingerprint_is_stable(label, ip, port, user, auth):
+    a = credential_fingerprint(ip, port, user, auth)
+    assert a == credential_fingerprint(ip, port, user, auth), label
+    assert len(a) == 32
+
+
+@pytest.mark.unit
+def test_credential_username_is_case_insensitive():
+    """SMB, FTP and HTTP basic auth all treat the account name that way.
+
+    'Administrator' and 'administrator' are one account; hashing them apart
+    would put the same credential in the table twice.
+    """
+    assert credential_fingerprint("10.0.0.1", 445, "Administrator", "password") == \
+           credential_fingerprint("10.0.0.1", 445, "administrator", "password")
+
+
+@pytest.mark.unit
+def test_credential_username_is_trimmed():
+    assert credential_fingerprint("10.0.0.1", 22, "  root  ", "password") == \
+           credential_fingerprint("10.0.0.1", 22, "root", "password")
+
+
+@pytest.mark.unit
+def test_credential_null_auth_type_equals_empty():
+    """The table's unique index coalesces auth_type; the hash must agree.
+
+    If they disagreed, one mechanism would merge two rows the other kept apart.
+    """
+    assert credential_fingerprint("10.0.0.1", 21, "anon", None) == \
+           credential_fingerprint("10.0.0.1", 21, "anon", "")
+
+
+@pytest.mark.unit
+def test_credential_outcome_is_not_hashed():
+    """valid_cred / status are excluded on purpose.
+
+    A credential that stops working is the SAME account. Hashing the outcome
+    would add a row every time the result flipped.
+    """
+    import inspect
+    src = inspect.getsource(credential_fingerprint)
+    assert "valid_cred" not in src.split('"""')[2], \
+        "valid_cred appears in the hash body; a flipped result would fork the row"
+    # different port / user / ip still discriminate
+    assert credential_fingerprint("10.0.0.1", 21, "a", "password") != \
+           credential_fingerprint("10.0.0.1", 22, "a", "password")
+    assert credential_fingerprint("10.0.0.1", 21, "a", "password") != \
+           credential_fingerprint("10.0.0.1", 21, "b", "password")
+    assert credential_fingerprint("10.0.0.1", 21, "a", "password") != \
+           credential_fingerprint("10.0.0.2", 21, "a", "password")
+
+
+@pytest.mark.unit
+def test_credential_missing_port_is_zero():
+    assert credential_fingerprint("10.0.0.1", None, "a") == \
+           credential_fingerprint("10.0.0.1", 0, "a")
+
+
+@pytest.mark.parametrize("label,ip,port,user,auth", CRED_CASES)
+def test_credential_trigger_agrees_with_python(db, label, ip, port, user, auth):
+    """Exercise the REAL trigger, not a re-typed copy of its md5 expression."""
+    expected = credential_fingerprint(ip, port, user, auth)
+    auth_sql = "NULL" if auth is None else "'%s'" % auth.replace("'", "''")
+    port_sql = "NULL" if port is None else str(port)
+    sql = f"""
+        BEGIN;
+        INSERT INTO credential_findings
+            (ip, port, protocol, username, auth_type, valid_cred, source, status)
+        VALUES ('{ip}'::inet, {port_sql}, 'test',
+                '{user.replace("'", "''")}', {auth_sql}, true, 'agreement', 'valid');
+        SELECT fingerprint FROM credential_findings WHERE source = 'agreement';
+        ROLLBACK;
+    """
+    got = _psql(sql)
+    assert got, f"{label}: query failed -> {_LAST_PSQL_ERROR['msg']}"
+    assert _last_row(got) == expected, (
+        f"{label}: SQL trigger and etl/fingerprint.py disagree.\n"
+        f"  python:  {expected}\n  trigger: {_last_row(got)}")
+
+
+def test_credential_fingerprint_invariants(db):
+    """The table now dedupes the same way as the other three."""
+    assert _psql(
+        "SELECT count(*) FROM pg_indexes "
+        "WHERE indexname='uq_credential_findings_fingerprint'") == "1"
+    assert _psql(
+        "SELECT count(*) FROM credential_findings WHERE fingerprint IS NULL") == "0"
+    total = _psql("SELECT count(*) FROM credential_findings")
+    distinct = _psql("SELECT count(DISTINCT fingerprint) FROM credential_findings")
+    assert total == distinct, f"{total} rows but {distinct} distinct fingerprints"
+
+
+def test_credential_reinsert_bumps_last_verified_at(db):
+    """Re-testing a known credential is a re-verification, not a new finding."""
+    sql = """
+        BEGIN;
+        INSERT INTO credential_findings
+            (ip, port, protocol, username, auth_type, valid_cred, source, status)
+        VALUES ('203.0.113.70'::inet, 22, 'ssh', 'probe', 'password', true, 'p', 'valid');
+        UPDATE credential_findings SET last_verified_at = now() - interval '10 days'
+         WHERE ip = '203.0.113.70'::inet;
+        SELECT count(*) FROM credential_findings;
+        INSERT INTO credential_findings
+            (ip, port, protocol, username, auth_type, valid_cred, source, status)
+        VALUES ('203.0.113.70'::inet, 22, 'ssh', 'probe', 'password', true, 'p', 'valid');
+        SELECT count(*) || ',' || (
+            SELECT count(*) FROM credential_findings
+             WHERE last_verified_at > now() - interval '1 minute'
+        ) FROM credential_findings;
+        ROLLBACK;
+    """
+    out = _psql(sql)
+    assert out, f"probe failed -> {_LAST_PSQL_ERROR['msg']}"
+    rows = [l.strip() for l in out.splitlines()
+            if l.strip() and (l.strip().isdigit() or "," in l.strip())]
+    before = int(rows[-2])
+    after, bumped = (int(x) for x in rows[-1].split(","))
+    assert after == before, f"re-insert created a row ({before} -> {after})"
+    assert bumped >= 1, "re-insert did not bump last_verified_at"

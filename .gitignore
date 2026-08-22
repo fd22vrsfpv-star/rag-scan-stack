@@ -67,7 +67,6 @@ claude_desktop_config*.json
 *.backup
 bs.out
 test_*.sh
-pytest.ini
 
 # Development
 requirements-dev.txt

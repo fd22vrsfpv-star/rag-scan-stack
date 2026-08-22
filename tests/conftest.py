@@ -24,28 +24,6 @@ sys.path.insert(0, str(project_root))
 # ---- Database Fixtures ----
 
 
-def pytest_configure(config):
-    """Register the markers already in use across tests/.
-
-    They were used 119 times (`unit` alone) but registered nowhere, so every run
-    emitted PytestUnknownMarkWarning and `-m unit` was an undocumented
-    convention rather than a supported selection. A wall of known warnings hides
-    a genuinely new one.
-
-    This lives in conftest.py rather than pytest.ini because pytest.ini is
-    deliberately gitignored (.gitignore:70) — a config file there would work
-    locally and never reach CI or anyone else's checkout.
-    """
-    for marker in (
-        "unit: pure-function test, no database, container or network",
-        "integration: crosses a service or process boundary",
-        "database: needs a reachable Postgres; must skip cleanly without one",
-        "e2e: end-to-end, may dispatch real work",
-        "scan_recommender: scoped to the scan_recommender service",
-        "playwright: needs the Playwright browser stack",
-    ):
-        config.addinivalue_line("markers", marker)
-
 @pytest.fixture
 def mock_db_connection():
     """Mock database connection for testing without real DB."""
