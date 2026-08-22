@@ -22,6 +22,7 @@ import { Link } from 'react-router-dom'
 import { useLaunchScan } from '@/api/scans'
 import { useCredentials } from '@/api/credentials'
 import { useFollowUps } from '@/api/followups'
+import { compareSeverity } from '@/lib/constants'
 
 type Tab = 'extractions' | 'sitemap' | 'wordlists' | 'settings'
 type ListType = 'passwords' | 'usernames' | 'directories'
@@ -1188,7 +1189,9 @@ function LoginPageDisplay({ pages }: { pages: LoginPage[] }) {
 
 /* ───────────── Sitemap Tab ───────────── */
 
-const SEVERITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 }
+// Ordering comes from lib/constants.ts. This file used the OPPOSITE convention
+// (0 = most severe) from AttackMap/TargetBoard (5 = most severe) — same intent,
+// two implementations, and neither knew about the backend's 'recon'.
 const SEVERITY_COLORS: Record<string, string> = {
   critical: 'bg-red-500/20 text-red-300',
   high: 'bg-orange-500/20 text-orange-300',
@@ -1392,7 +1395,7 @@ function SitemapTab({ assetFilter, scopeDomains: parentScopeDomains, selectedSco
                     <td className="px-2 py-1.5">
                       <div className="flex gap-0.5">
                         {entry.severities
-                          .sort((a, b) => (SEVERITY_ORDER[a] ?? 9) - (SEVERITY_ORDER[b] ?? 9))
+                          .sort(compareSeverity)
                           .map(s => (
                             <span key={s} className={cn('px-1 rounded text-[10px]', SEVERITY_COLORS[s] || '')}>{s}</span>
                           ))}
