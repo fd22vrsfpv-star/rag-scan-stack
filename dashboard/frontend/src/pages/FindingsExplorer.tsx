@@ -134,6 +134,24 @@ function isGroup(item: Finding | FindingGroup): item is FindingGroup {
   return 'findings' in item && Array.isArray((item as FindingGroup).findings)
 }
 
+// "affects N hosts" marker for a problem seen on several virtual hosts of one
+// machine. Rendered only when N > 1, so it stays quiet for the common case; a
+// badge on every row would be noise rather than signal.
+function HostSpreadBadge({ finding }: { finding: Finding }) {
+  const n = finding.affects_hosts ?? 1
+  if (n <= 1) return null
+  return (
+    <span
+      title={`This problem was also found on ${n - 1} other virtual host${n === 2 ? '' : 's'} of the same machine`}
+      className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium
+                 border border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400 shrink-0"
+    >
+      <Globe className="w-2.5 h-2.5" />
+      {n} hosts
+    </span>
+  )
+}
+
 export default function FindingsExplorer() {
   const globalScope = useUIStore(s => s.selectedScopeName)
   const engagementId = useUIStore(s => s.selectedEngagementId)
@@ -192,6 +210,14 @@ export default function FindingsExplorer() {
   const serverTotal = data?.pages?.[0]?.total ?? 0
   const total = isScopeFiltering ? findings.length : serverTotal
   const loadedCount = allFindings.length
+  // Rollup counts. `total` counts ROWS (one per virtual host); distinctProblems
+  // collapses a server-level problem seen on several vhosts into one. Showing
+  // both is the point — "812 findings / 340 problems" is the honest headline.
+  const agg = data?.pages?.[0]?.aggregations
+  const distinctProblems = agg?.distinct_problems ?? 0
+  const sharedProblems = agg?.shared_problems ?? 0
+  const problemScope = filters.problem_scope ?? 'all'
+  const collapsing = !!filters.collapse_problems
 
   const toggleSelectAll = () => {
     if (selectedIds.size === findings.length) setSelectedIds(new Set())
@@ -275,6 +301,12 @@ export default function FindingsExplorer() {
               : loadedCount < total
                 ? `${loadedCount.toLocaleString()} of ${total.toLocaleString()} findings`
                 : `${total.toLocaleString()} findings`}
+            {distinctProblems > 0 && distinctProblems !== total && (
+              <span className="ml-1.5 text-muted-foreground/80">
+                · {distinctProblems.toLocaleString()} distinct problem{distinctProblems === 1 ? '' : 's'}
+                {sharedProblems > 0 && `, ${sharedProblems} across multiple hosts`}
+              </span>
+            )}
           </span>
         </div>
       </div>
@@ -295,6 +327,52 @@ export default function FindingsExplorer() {
               {s}
             </button>
           ))}
+        </div>
+        {/* Virtual-host rollup. A server-level problem on shared hosting is
+            recorded once per vhost, because a tester triaging one host needs
+            that host's row. These controls let you see it as one problem
+            instead. NOT the engagement scope — that is the ScopeFilter above. */}
+        <div className="flex flex-wrap gap-1.5 items-center">
+          <span className="text-xs text-muted-foreground py-1 inline-flex items-center gap-1">
+            Host spread:
+            <InfoTip text="A problem on shared hosting appears once per virtual host. 'Shared across hosts' shows only problems seen on more than one vhost of the same machine; 'This host only' shows the rest. Separate from the engagement scope filter." />
+          </span>
+          {([
+            { key: 'all', label: 'All' },
+            { key: 'shared', label: 'Shared across hosts' },
+            { key: 'single', label: 'This host only' },
+          ] as const).map(opt => (
+            <button
+              key={opt.key}
+              onClick={() => setFilters(f => ({
+                ...f,
+                problem_scope: opt.key === 'all' ? undefined : opt.key,
+              }))}
+              className={cn(
+                'px-2.5 py-1 rounded-md text-sm font-medium border transition-colors',
+                problemScope === opt.key
+                  ? 'border-primary bg-primary/15 text-primary ring-1 ring-primary/30'
+                  : 'border-border bg-muted/50 text-foreground hover:border-primary/50',
+              )}
+            >
+              {opt.label}
+            </button>
+          ))}
+          <button
+            onClick={() => setFilters(f => ({
+              ...f,
+              collapse_problems: f.collapse_problems ? undefined : true,
+            }))}
+            title="Show one row per underlying problem instead of one per virtual host"
+            className={cn(
+              'ml-2 px-2.5 py-1 rounded-md text-sm font-medium border transition-colors',
+              collapsing
+                ? 'border-primary bg-primary/15 text-primary ring-1 ring-primary/30'
+                : 'border-border bg-muted/50 text-foreground hover:border-primary/50',
+            )}
+          >
+            {collapsing ? 'Grouped by problem' : 'Group by problem'}
+          </button>
         </div>
         <div className="flex flex-wrap gap-1.5 items-center">
           <span className="text-xs text-muted-foreground py-1 inline-flex items-center gap-1">
@@ -543,6 +621,7 @@ export default function FindingsExplorer() {
                               <div className="flex items-center gap-2">
                                 {extractScreenshotPath(f) && <MicroScreenshot path={extractScreenshotPath(f)!} alt={displayTitle(f)} />}
                                 <span className="text-xs text-muted-foreground font-mono">{displayTitle(f)}</span>
+                                <HostSpreadBadge finding={f} />
                               </div>
                             </td>
                             <td className="px-3 py-2">
@@ -585,6 +664,7 @@ export default function FindingsExplorer() {
                         <div className="flex items-center gap-2">
                           {extractScreenshotPath(f) && <MicroScreenshot path={extractScreenshotPath(f)!} alt={displayTitle(f)} />}
                           <span className="text-sm">{displayTitle(f)}</span>
+                          <HostSpreadBadge finding={f} />
                         </div>
                       </td>
                       <td className="px-3 py-2">

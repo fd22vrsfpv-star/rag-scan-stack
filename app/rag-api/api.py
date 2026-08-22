@@ -4868,14 +4868,31 @@ class UnifiedFinding(BaseModel):
 
 
 class SearchAggregations(BaseModel):
-    by_severity: Dict[str, int] = Field(default_factory=dict)
-    by_source: Dict[str, int] = Field(default_factory=dict)
-    # Raw row counts double-count a server-level problem once per virtual host.
-    # These two answer "how many distinct problems", which is what a report
-    # headline and a severity chart actually mean.
-    by_severity_deduped: Dict[str, int] = Field(default_factory=dict)
-    distinct_problems: int = Field(0, description="Matching rows collapsed to one per underlying problem")
-    shared_problems: int = Field(0, description="Of those, how many appear on more than one virtual host")
+    """Two different questions, deliberately answered differently.
+
+    GLOBAL, RAW (by_severity, by_source) — computed over the whole dataset,
+    IGNORING the query filters, and counting rows. That is not a bug: the
+    frontend uses by_source to render a filter chip for every source that
+    exists, so chips do not vanish as you narrow the filter, and Dashboard.tsx /
+    Reports.tsx want dataset totals. Changing these to respect the filter would
+    break all three.
+
+    FILTERED, PER-PROBLEM (problems_by_severity, distinct_problems,
+    shared_problems) — computed over the rows the query actually matched, and
+    collapsed so a server-level problem seen on six virtual hosts counts once.
+
+    They differ on BOTH axes, so the names have to say so. `by_severity` next to
+    a `by_severity_deduped` invited exactly the wrong reading — that the only
+    difference was dedup.
+    """
+
+    # global, raw row counts
+    by_severity: Dict[str, int] = Field(default_factory=dict, description="GLOBAL row counts by severity — ignores query filters")
+    by_source: Dict[str, int] = Field(default_factory=dict, description="GLOBAL row counts by source — ignores query filters, so every source stays filterable")
+    # filtered, one entry per underlying problem
+    problems_by_severity: Dict[str, int] = Field(default_factory=dict, description="FILTERED counts by severity, one per underlying problem")
+    distinct_problems: int = Field(0, description="FILTERED: matching rows collapsed to one per underlying problem")
+    shared_problems: int = Field(0, description="FILTERED: of those, how many appear on more than one virtual host")
 
 
 class UnifiedSearchResponse(BaseModel):
@@ -4899,7 +4916,7 @@ def search_findings(
     workflow_status: Optional[List[str]] = Query(None, description="Filter by workflow status (new, triaging, confirmed, false_positive, accepted_risk, in_report, deferred)"),
     engagement_id: Optional[str] = Query(None, description="Filter by engagement ID"),
     tags: Optional[List[str]] = Query(None, description="Filter by tags (findings must have ALL specified tags)"),
-    scope: Optional[str] = Query(None, description="Filter by finding scope: 'shared' (one problem seen on several virtual hosts of a machine), 'single' (observed on one host only)"),
+    problem_scope: Optional[str] = Query(None, description="Filter by how far a problem spreads: 'shared' (one problem seen on several virtual hosts of a machine), 'single' (observed on one host only), 'all'. NOT the engagement scope — see the `scope_name` concept elsewhere."),
     problem_id: Optional[str] = Query(None, description="Filter to one infrastructure problem group (infrastructure_fingerprint)"),
     collapse_problems: bool = Query(False, description="Return one row per underlying problem instead of one per virtual host"),
     limit: int = Query(100, ge=1, le=1000, description="Max results to return"),
@@ -5191,8 +5208,12 @@ def search_findings(
     # Scope is derived, not declared: "shared" means the same problem was
     # actually observed on more than one virtual host of a machine. Deciding it
     # from the data avoids guessing whether a finding is server- or app-level.
-    if scope:
-        wanted = scope.strip().lower()
+    # Named problem_scope, not scope: in this codebase "scope" already means the
+    # ENGAGEMENT scope — the named set of authorised targets that gates dispatch.
+    # Reusing the word for something else in the same response would be a bad
+    # collision in a tool where scope is a security boundary.
+    if problem_scope:
+        wanted = problem_scope.strip().lower()
         if wanted in ("shared", "infrastructure", "infra"):
             where_clauses_pg.append("affects_hosts > 1")
         elif wanted in ("single", "application", "app"):
@@ -5200,7 +5221,8 @@ def search_findings(
         elif wanted not in ("all", ""):
             raise HTTPException(
                 400,
-                f"Unknown scope {scope!r}. Use 'shared', 'single' or 'all'.")
+                f"Unknown problem_scope {problem_scope!r}. "
+                "Use 'shared', 'single' or 'all'.")
 
     if problem_id:
         where_clauses_pg.append("problem_id = %s")
@@ -5390,7 +5412,7 @@ def search_findings(
             ) collapsed
             GROUP BY severity
         """, count_params)
-        by_severity_deduped = {r["severity"]: r["cnt"] for r in cur.fetchall()}
+        problems_by_severity = {r["severity"]: r["cnt"] for r in cur.fetchall()}
 
         # Get aggregations
         cur.execute(agg_sql)
@@ -5440,7 +5462,7 @@ def search_findings(
         aggregations=SearchAggregations(
             by_severity=by_severity,
             by_source=by_source,
-            by_severity_deduped=by_severity_deduped,
+            problems_by_severity=problems_by_severity,
             distinct_problems=distinct_problems,
             shared_problems=shared_problems
         )
@@ -13113,6 +13135,7 @@ def _build_nessus_xml(data: dict) -> str:
 def export_sarif(
     severity: Optional[List[str]] = Query(None),
     source: Optional[List[str]] = Query(None),
+    collapse_problems: bool = Query(False, description="Emit one SARIF result per underlying problem, with a location per affected virtual host, instead of one result per host"),
     limit: int = Query(5000, ge=1, le=50000),
     authorized: bool = Depends(auth),
 ):
@@ -13166,7 +13189,8 @@ def export_sarif(
         # --- Collect web findings ---
         web_sql = """
             SELECT id, url, source, name, severity, issue_type, evidence,
-                   description, cwe, fingerprint, first_seen
+                   description, cwe, fingerprint, first_seen,
+                   infrastructure_fingerprint
             FROM web_findings WHERE 1=1
         """
         web_params = []
@@ -13233,6 +13257,27 @@ def export_sarif(
         tool_results[tool_name]["results"].append(result)
 
     # Process web findings
+    # SARIF represents "one problem, several places" natively: a result carries a
+    # LIST of locations. So a server-level problem on shared hosting should be
+    # one result with a location per affected virtual host — not N near-identical
+    # results, which is what a report consumer would otherwise have to dedupe by
+    # hand.
+    #
+    # Grouped on COALESCE(infrastructure_fingerprint, id): keying on the
+    # fingerprint alone would fold every ungroupable row into one bucket, since
+    # they all share a NULL.
+    if collapse_problems:
+        merged: Dict[str, Dict[str, Any]] = {}
+        for row in web_rows:
+            key = row.get("infrastructure_fingerprint") or f"row:{row['id']}"
+            if key in merged:
+                merged[key]["_urls"].append(row.get("url") or "")
+                continue
+            head = dict(row)
+            head["_urls"] = [row.get("url") or ""]
+            merged[key] = head
+        web_rows = list(merged.values())
+
     for row in web_rows:
         tool_name = row.get("source") or "web"
         if tool_name not in tool_results:
@@ -13250,16 +13295,23 @@ def export_sarif(
             "ruleId": rule_id,
             "level": sev_map.get(row.get("severity", "info"), "note"),
             "message": {"text": (row.get("description") or name)[:2000]},
-            "locations": [{
-                "physicalLocation": {
-                    "artifactLocation": {"uri": row.get("url") or ""},
-                }
-            }],
+            "locations": [
+                {"physicalLocation": {"artifactLocation": {"uri": u}}}
+                for u in (row.get("_urls") or [row.get("url") or ""])
+            ],
             "properties": {
                 "severity": row.get("severity"),
                 "created_at": str(row.get("first_seen")),
             },
         }
+
+        # Only meaningful when collapsed; a consumer reading affects_hosts=1 on
+        # every result would learn nothing.
+        if collapse_problems:
+            urls = row.get("_urls") or []
+            result["properties"]["affects_locations"] = len(urls)
+            if row.get("infrastructure_fingerprint"):
+                result["properties"]["problem_id"] = row["infrastructure_fingerprint"]
 
         if row.get("fingerprint"):
             result["fingerprints"] = {"finding/v1": row["fingerprint"]}

@@ -27,7 +27,9 @@ async def search_findings(
     # Virtual-host rollup: 'shared' = one problem seen on several vhosts of a
     # machine, 'single' = seen on one host only. collapse_problems returns one
     # row per problem instead of one per vhost.
-    scope: Optional[str] = None,
+    #
+    # problem_scope, NOT scope: "scope" already means the engagement scope here.
+    problem_scope: Optional[str] = None,
     problem_id: Optional[str] = None,
     collapse_problems: bool = False,
     limit: int = Query(100, le=1000),
@@ -59,8 +61,8 @@ async def search_findings(
         params["engagement_id"] = engagement_id
     if tags:
         params["tags"] = tags
-    if scope:
-        params["scope"] = scope
+    if problem_scope:
+        params["problem_scope"] = problem_scope
     if problem_id:
         params["problem_id"] = problem_id
     if collapse_problems:
