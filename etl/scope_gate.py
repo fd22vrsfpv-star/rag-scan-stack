@@ -309,3 +309,64 @@ def is_in_scope_with_aliases(host, scope_rows, aliases=None):
     if is_in_scope(host, scope_rows):
         return True
     return any(is_in_scope(a, scope_rows) for a in (aliases or set()) if a)
+
+# ── Self-contained enforcement for services with no gate of their own ────────
+#
+# check_dispatch() needs scope rows, and loading them needs a cursor, so every
+# caller previously had to wire up its own DB access. That is why 16 modules
+# subprocess straight to a target with no check at all: the gate was more work
+# to adopt than to skip.
+#
+# This does the whole thing — connect, load, check — so a caller adds one line
+# before it sends traffic. psycopg2 is imported lazily so this module keeps its
+# stdlib-only import surface for the parsers that only need the matchers.
+_ENFORCE_CACHE = {"rows": None, "at": 0.0}
+ENFORCE_CACHE_TTL = 30
+
+
+def enforce_target_scope(target, command="", dsn=None, cache_ttl=None,
+                         engagement_id=None):
+    """Return a refusal string when this target must NOT be contacted, else None.
+
+    Usage, immediately before dispatch:
+
+        refusal = enforce_target_scope(target, " ".join(cmd))
+        if refusal:
+            logger.warning("REFUSED %s: %s", target, refusal)
+            return ...
+
+    FAILS CLOSED. An unreadable scope, a missing DSN or a DB error all produce a
+    refusal, because "cannot check" and "is authorised" must never look the same
+    to a tool that is about to send packets. A transient failure is deliberately
+    NOT cached, so one blip does not refuse everything for the whole TTL.
+    """
+    import os
+    import time
+
+    ttl = ENFORCE_CACHE_TTL if cache_ttl is None else cache_ttl
+    now = time.time()
+    rows = _ENFORCE_CACHE["rows"]
+    if rows is None or now - _ENFORCE_CACHE["at"] >= ttl:
+        conn_str = dsn or os.environ.get("DB_DSN")
+        if not conn_str:
+            return ("scope cannot be verified: DB_DSN is unset — refusing to "
+                    "send traffic")
+        try:
+            import psycopg2
+        except ImportError as exc:
+            return f"scope cannot be verified: psycopg2 unavailable ({exc})"
+        try:
+            conn = psycopg2.connect(conn_str)
+            try:
+                with conn.cursor() as cur:
+                    rows, _source = load_dispatch_scope(cur, engagement_id)
+            finally:
+                conn.close()
+        except Exception as exc:
+            return f"scope cannot be verified: {type(exc).__name__}: {exc}"
+        _ENFORCE_CACHE.update({"rows": rows, "at": now})
+
+    # check_dispatch already returns "refusal string or None" — the same
+    # contract this function has, so pass it straight through rather than
+    # inventing a second convention.
+    return check_dispatch(target, rows, command)

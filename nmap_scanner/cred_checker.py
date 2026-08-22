@@ -126,6 +126,31 @@ class CredentialResult:
     details: Optional[str] = None
 
 
+# ── Scope gate ────────────────────────────────────────────────────────────
+#
+# This module subprocesses straight to a target, so nothing downstream can
+# refuse on its behalf. The matcher is shared (etl/scope_gate.py, bind-mounted
+# at /app/etl) and enforce_target_scope does its own DB lookup, so adopting it
+# costs one line per dispatch.
+#
+# FAILS CLOSED: if the gate cannot be imported we refuse, because a missing
+# mount must not be indistinguishable from an authorised target.
+try:
+    from etl.scope_gate import enforce_target_scope
+    _SCOPE_GATE_OK = True
+except Exception as _scope_exc:      # pragma: no cover - deployment problem
+    _SCOPE_GATE_OK = False
+    _SCOPE_GATE_ERROR = str(_scope_exc)
+
+
+def _scope_refusal(target: str = "", command: str = ""):
+    """Refusal string when this must not be sent, else None."""
+    if not _SCOPE_GATE_OK:
+        return (f"scope gate unavailable ({_SCOPE_GATE_ERROR}) — refusing to "
+                "send traffic; check the ./etl:/app/etl mount")
+    return enforce_target_scope(target, command)
+
+
 def get_service_from_port(port: int) -> Optional[str]:
     """Infer service type from port number"""
     for service, ports in SERVICE_PORTS.items():
@@ -239,6 +264,11 @@ def check_credentials_hydra(
     Returns:
         Tuple of (successful credential results, audit dict).
     """
+    refusal = _scope_refusal(target)
+    if refusal:
+        logger.warning("REFUSED hydra against %s: %s", target, refusal)
+        return []
+
     results: List[CredentialResult] = []
     audit_attempts: List[Dict[str, Any]] = []
     kex_legacy_detected = False
@@ -374,6 +404,11 @@ def check_credentials_nmap(
     The audit instead captures the full Cartesian product that was
     submitted plus the parsed successes.
     """
+    refusal = _scope_refusal(target)
+    if refusal:
+        logger.warning("REFUSED nmap against %s: %s", target, refusal)
+        return []
+
     results: List[CredentialResult] = []
     audit_attempts: List[Dict[str, Any]] = []
 
