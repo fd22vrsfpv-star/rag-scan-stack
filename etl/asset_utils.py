@@ -79,6 +79,15 @@ def ensure_asset(cur, ip: str = None, hostname: str = None) -> str:
     if not ip and not hostname:
         raise ValueError("Either ip or hostname must be provided")
 
+    # A hostname equal to the IP is not information, and the unique index
+    # ix_assets_ip_hostname(ip, COALESCE(hostname, '')) treats it as a DIFFERENT
+    # row from hostname=NULL. That produced two asset rows for one host, and
+    # since ports hang off asset_id, a duplicate copy of every port on it.
+    # Mirrored in playwright_scanner/db_utils.py and by CHECK
+    # assets_hostname_not_ip.
+    if ip and hostname and hostname.strip() == ip.strip():
+        hostname = None
+
     # Case 1: IP provided (most common, should be primary)
     if ip:
         # Use UPSERT to handle duplicates gracefully
