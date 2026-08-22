@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { findingFacets } from '@/lib/findingFacets'
 import PageHelp from '@/components/PageHelp'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { useReportSummary, useReportFull, useExportPdf, useExportBurp, useExportZapXml, useExportZapReport, useExportSarif, useExportUrlList, useExportHar, useProxyReplay } from '@/api/reports'
@@ -38,7 +39,19 @@ export default function Reports() {
   if (globalEngagementId) findingsCountParams.set('engagement_id', globalEngagementId)
   const { data: countData } = useQuery({
     queryKey: ['findings-count', target, severities, sources, globalEngagementId],
-    queryFn: () => apiFetch<{ total: number; aggregations: { by_severity: Record<string, number>; by_source: Record<string, number> } }>(`/findings?${findingsCountParams}`),
+    queryFn: () => apiFetch<{
+      total: number
+      aggregations: {
+        by_severity: Record<string, number>
+        by_source: Record<string, number>
+        // Filtered, one entry per underlying problem. The by_* pair is GLOBAL and
+        // ignores the filters, which is wrong for a panel whose whole purpose is
+        // "what the current filters will export" — filter to severity=critical
+        // and by_severity still listed every severity, at dataset totals.
+        problems_by_severity?: Record<string, number>
+        problems_by_source?: Record<string, number>
+      }
+    }>(`/findings?${findingsCountParams}`),
     staleTime: 30000,
   })
   const [preview, setPreview] = useState<string | null>(null)
@@ -275,7 +288,7 @@ export default function Reports() {
               <span className="text-[10px] text-muted-foreground">match current filters — will be included in export</span>
             </div>
             <div className="flex flex-wrap gap-1.5">
-              {Object.entries(countData.aggregations?.by_severity || {})
+              {Object.entries(findingFacets(countData).bySeverity)
                 .filter(([, v]) => v > 0)
                 .sort(([a], [b]) => {
                   const order = ['critical', 'high', 'medium', 'low', 'info', 'recon']
@@ -298,7 +311,7 @@ export default function Reports() {
                 })}
             </div>
             <div className="flex flex-wrap gap-1.5">
-              {Object.entries(countData.aggregations?.by_source || {})
+              {Object.entries(findingFacets(countData).bySource)
                 .filter(([, v]) => v > 0)
                 .sort(([, a], [, b]) => b - a)
                 .map(([src, count]) => (

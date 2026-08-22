@@ -4891,6 +4891,7 @@ class SearchAggregations(BaseModel):
     by_source: Dict[str, int] = Field(default_factory=dict, description="GLOBAL row counts by source — ignores query filters, so every source stays filterable")
     # filtered, one entry per underlying problem
     problems_by_severity: Dict[str, int] = Field(default_factory=dict, description="FILTERED counts by severity, one per underlying problem")
+    problems_by_source: Dict[str, int] = Field(default_factory=dict, description="FILTERED counts by source, one per underlying problem. Use this when a breakdown must agree with the rows the filter actually matched; use by_source when every source must stay visible as a filter option.")
     distinct_problems: int = Field(0, description="FILTERED: matching rows collapsed to one per underlying problem")
     shared_problems: int = Field(0, description="FILTERED: of those, how many appear on more than one virtual host")
 
@@ -5404,15 +5405,20 @@ def search_findings(
         # Severity facets over the collapsed set, so a chart shows one bar per
         # problem rather than one per affected vhost.
         cur.execute(f"""
-            SELECT severity, COUNT(*) AS cnt FROM (
+            SELECT severity, source, COUNT(*) AS cnt FROM (
                 SELECT DISTINCT ON (COALESCE(problem_id, id))
-                       COALESCE(severity, 'recon') AS severity
+                       COALESCE(severity, 'recon') AS severity,
+                       COALESCE(source, 'unknown') AS source
                 FROM ({count_sql}) sub
                 ORDER BY COALESCE(problem_id, id)
             ) collapsed
-            GROUP BY severity
+            GROUP BY severity, source
         """, count_params)
-        problems_by_severity = {r["severity"]: r["cnt"] for r in cur.fetchall()}
+        problems_by_severity: Dict[str, int] = {}
+        problems_by_source: Dict[str, int] = {}
+        for r in cur.fetchall():
+            problems_by_severity[r["severity"]] = problems_by_severity.get(r["severity"], 0) + r["cnt"]
+            problems_by_source[r["source"]] = problems_by_source.get(r["source"], 0) + r["cnt"]
 
         # Get aggregations
         cur.execute(agg_sql)
@@ -5463,6 +5469,7 @@ def search_findings(
             by_severity=by_severity,
             by_source=by_source,
             problems_by_severity=problems_by_severity,
+            problems_by_source=problems_by_source,
             distinct_problems=distinct_problems,
             shared_problems=shared_problems
         )
