@@ -173,6 +173,30 @@ else
   warn "scan_recommendations.target_kind check skipped (no DB connection helper available)"
 fi
 
+# Asset identity: a hostname equal to the IP is not a virtual host, it is
+# "hostname unknown" written wrongly — and ix_assets_ip_hostname(ip,
+# COALESCE(hostname,'')) counts it as a DIFFERENT row from hostname=NULL. Ports
+# hang off asset_id, so each such row carries a duplicate copy of that host's
+# ports, inflating every port count an agent or report reads.
+HAS_HN_CHECK=$(_run_sql "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='assets_hostname_not_ip')")
+if [[ "$HAS_HN_CHECK" == "t" ]]; then
+  pass "assets_hostname_not_ip CHECK present"
+elif [[ "$HAS_HN_CHECK" == "f" ]]; then
+  fail "assets_hostname_not_ip missing — run ./scripts/ensure_db_schema.sh (duplicate assets per IP will recur, each carrying a copy of that host's ports)"
+else
+  warn "assets_hostname_not_ip check skipped (no DB connection helper available)"
+fi
+
+DUP_PORT_ROWS=$(docker exec rag-postgres psql -U app -d scans -tAc \
+  "SELECT (SELECT count(*) FROM ports) - (SELECT count(*) FROM (SELECT DISTINCT a.ip, p.proto, p.port FROM ports p JOIN assets a ON p.asset_id = a.id) d);" 2>/dev/null)
+if [[ -z "$DUP_PORT_ROWS" ]]; then
+  warn "ports duplication check skipped (could not query)"
+elif [[ "$DUP_PORT_ROWS" -le 0 ]]; then
+  pass "ports carry no (ip, proto, port) duplicates"
+else
+  fail "ports has $DUP_PORT_ROWS duplicate (ip, proto, port) row(s) — run ./scripts/ensure_db_schema.sh"
+fi
+
 # assets.provider column + GIN index — required for cloud-hosting filter
 HAS_PROVIDER=$(_run_sql "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='assets' AND column_name='provider')")
 if [[ "$HAS_PROVIDER" == "t" ]]; then

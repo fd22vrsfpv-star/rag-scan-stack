@@ -50,6 +50,16 @@ def get_or_create_asset(ip: str, hostname: Optional[str] = None) -> uuid.UUID:
             if hostname is None:
                 hostname = ip
 
+    # A hostname equal to the IP carries no information, and it is NOT harmless:
+    # the unique index is ix_assets_ip_hostname(ip, COALESCE(hostname, '')), so
+    # hostname='192.168.1.150' and hostname=NULL are two different rows for one
+    # host. Ports hang off asset_id, so the host's ports were duplicated once
+    # per asset row — 99 port rows for 59 real (ip, proto, port) tuples.
+    #
+    # Enforced in the schema too, by CHECK assets_hostname_not_ip.
+    if hostname and hostname == resolved_ip:
+        hostname = None
+
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         # Look up by hostname first (exact match), then by IP+hostname combo
         if hostname:

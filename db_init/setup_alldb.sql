@@ -379,6 +379,142 @@ END$$;
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_ports_asset_proto_port_scans ON public.ports(asset_id, proto, port);
 
+-- ── Normalize asset identity so port data is not duplicated per IP ──
+--
+-- ix_assets_ip_hostname is UNIQUE(ip, COALESCE(hostname,'')) on purpose, so one
+-- IP may legitimately hold several asset rows (virtual hosts). But a hostname
+-- that is merely the IP string is not a vhost — it is "hostname unknown"
+-- written the wrong way, and it counts as a DIFFERENT row from hostname=NULL.
+-- Ports hang off asset_id, so each such row carried its own copy of that host's
+-- ports: this deployment had 99 port rows for 59 real (ip, proto, port) tuples.
+--
+-- Root cause was playwright_scanner calling
+-- get_or_create_asset(netloc, hostname=netloc). Fixed there and in both asset
+-- helpers, with CHECK assets_hostname_not_ip as the schema-level backstop.
+--
+-- Runs as ONE transaction so a partial remap can never be left behind, and the
+-- scratch tables use ON COMMIT DROP so the block is re-runnable in a session.
+-- Idempotent: a no-op once normalized.
+BEGIN;
+
+-- 1. hostname == the IP means "hostname unknown". Normalize to NULL where that
+--    does not collide with an existing NULL-hostname row for the same IP
+--    (step 5 merges those).
+UPDATE assets a
+   SET hostname = NULL
+ WHERE a.hostname = host(a.ip)
+   AND NOT EXISTS (SELECT 1 FROM assets b
+                    WHERE b.ip = a.ip AND b.hostname IS NULL AND b.id <> a.id);
+
+-- 2. One canonical asset per IP owns that IP's network-level data. Ports are a
+--    property of the host, not of a virtual host. Preference: the NULL-hostname
+--    (IP-level) row, then oldest, id as a strict final tiebreaker.
+CREATE TEMP TABLE canonical_asset ON COMMIT DROP AS
+SELECT DISTINCT ON (ip) ip, id AS keep_id
+  FROM assets ORDER BY ip, (hostname IS NULL) DESC, first_seen NULLS LAST, id;
+
+CREATE TEMP TABLE asset_remap ON COMMIT DROP AS
+SELECT a.id AS from_id, c.keep_id AS to_id
+  FROM assets a JOIN canonical_asset c ON c.ip = a.ip
+ WHERE a.id <> c.keep_id;
+
+-- 3. Resolve each port to its DESTINATION asset first, then pick one winner per
+--    (destination, proto, port). Deduping only against rows already at the
+--    target is not enough: several source assets can remap to the same
+--    canonical, and their port sets then collide with each other rather than
+--    with the target. That is exactly how the first draft of this migration
+--    failed, on ux_ports_asset_proto_port_scans.
+CREATE TEMP TABLE port_target ON COMMIT DROP AS
+SELECT p.id, COALESCE(r.to_id, p.asset_id) AS target_asset, p.proto, p.port
+  FROM ports p LEFT JOIN asset_remap r ON r.from_id = p.asset_id;
+
+CREATE TEMP TABLE port_keep ON COMMIT DROP AS
+SELECT DISTINCT ON (t.target_asset, t.proto, t.port) t.id
+  FROM port_target t JOIN ports p ON p.id = t.id
+ ORDER BY t.target_asset, t.proto, t.port, p.last_seen DESC NULLS LAST, p.id;
+
+-- Fold the losers' detail into the winner, so a merge never loses a banner or
+-- version that only the duplicate row happened to carry.
+UPDATE ports w
+   SET first_seen = LEAST(w.first_seen, agg.min_first),
+       last_seen  = GREATEST(w.last_seen, agg.max_last),
+       service    = COALESCE(w.service, agg.service),
+       product    = COALESCE(w.product, agg.product),
+       version    = COALESCE(w.version, agg.version),
+       banner     = COALESCE(w.banner,  agg.banner),
+       is_open    = w.is_open OR agg.any_open
+  FROM (SELECT k.id AS win_id,
+               MIN(p.first_seen) AS min_first, MAX(p.last_seen) AS max_last,
+               MIN(p.service) AS service, MIN(p.product) AS product,
+               MIN(p.version) AS version, MIN(p.banner) AS banner,
+               bool_or(COALESCE(p.is_open, false)) AS any_open
+          FROM port_keep k
+          JOIN port_target t  ON t.id = k.id
+          JOIN port_target t2 ON t2.target_asset = t.target_asset
+                             AND t2.proto = t.proto AND t2.port = t.port
+          JOIN ports p ON p.id = t2.id
+         GROUP BY k.id) agg
+ WHERE w.id = agg.win_id;
+
+DELETE FROM ports WHERE id IN (
+    SELECT id FROM port_target EXCEPT SELECT id FROM port_keep);
+
+UPDATE ports p SET asset_id = r.to_id
+  FROM asset_remap r WHERE p.asset_id = r.from_id;
+
+-- 4. port_observation is an append-only observation log with no uniqueness on
+--    (asset_id, proto, port) — many rows per port is the point. Repoint only.
+UPDATE port_observation o SET asset_id = r.to_id
+  FROM asset_remap r WHERE o.asset_id = r.from_id;
+
+-- 5. A "hostname = the IP" row is the same host as its NULL-hostname sibling.
+--    Repoint its remaining children and drop it. `ports` is the ONLY child with
+--    a unique index on asset_id and is already handled above, so the rest
+--    cannot collide. scan_recommendations.fingerprint is generated from
+--    ip/service/scanner/action/script/template — not asset_id — so repointing
+--    does not change it.
+CREATE TEMP TABLE phantom_remap ON COMMIT DROP AS
+SELECT a.id AS from_id, b.id AS to_id
+  FROM assets a
+  JOIN assets b ON b.ip = a.ip AND b.hostname IS NULL AND b.id <> a.id
+ WHERE a.hostname = host(a.ip);
+
+UPDATE web_findings         t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE vulns                t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE playwright_scans     t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE playwright_findings  t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE dom_analysis         t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE content_extractions  t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE discovered_params    t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE credential_findings  t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE recon_findings       t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE scan_recommendations t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE scan_targets         t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE findings             t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE attack_vectors       t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE attack_path_edges    t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE port_observation     t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE ports                t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+
+UPDATE assets k
+   SET first_seen = LEAST(k.first_seen, a.first_seen),
+       last_seen  = GREATEST(k.last_seen, a.last_seen),
+       os         = COALESCE(k.os, a.os)
+  FROM phantom_remap p JOIN assets a ON a.id = p.from_id
+ WHERE k.id = p.to_id;
+
+DELETE FROM assets WHERE id IN (SELECT from_id FROM phantom_remap);
+
+-- 6. Prevent recurrence. NOT VALID so a pre-existing violation can never block
+--    this migration; steps 1 and 5 have already cleared them.
+DO $NORM$ BEGIN
+    ALTER TABLE public.assets
+      ADD CONSTRAINT assets_hostname_not_ip
+      CHECK (hostname IS NULL OR hostname <> host(ip)) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL; END $NORM$;
+
+COMMIT;
+
 DO $$
 BEGIN
   IF to_regclass('public.findings') IS NULL THEN

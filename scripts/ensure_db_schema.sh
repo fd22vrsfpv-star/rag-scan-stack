@@ -169,6 +169,39 @@ CRITICAL_INDEXES=(
     # The LLM post-processing queue scans WHERE llm_status='pending'.
     "idx_raw_artifacts_llm_status"
 )
+
+# ── Asset identity / port normalization ───────────────────────────────────
+#
+# A hostname equal to the IP is not a virtual host, it is "hostname unknown"
+# written wrongly — and ix_assets_ip_hostname(ip, COALESCE(hostname,'')) counts
+# it as a DIFFERENT row from hostname=NULL. Ports hang off asset_id, so each
+# such row carries a duplicate copy of that host's ports. This deployment had
+# 99 port rows for 59 real (ip, proto, port) tuples before normalization.
+if docker exec rag-postgres psql -U app -d scans -t -c \
+    "SELECT 1 FROM pg_constraint WHERE conname = 'assets_hostname_not_ip';" | grep -q 1; then
+    echo "✓ assets_hostname_not_ip (blocks hostname == ip)"
+else
+    echo "❌ Missing CHECK assets_hostname_not_ip - duplicate assets per IP will recur, each carrying a copy of that host's ports"
+    MISSING=$((MISSING + 1))
+fi
+
+DUP_PORTS=$(docker exec rag-postgres psql -U app -d scans -tAc \
+    "SELECT (SELECT count(*) FROM ports) - (SELECT count(*) FROM (SELECT DISTINCT a.ip, p.proto, p.port FROM ports p JOIN assets a ON p.asset_id = a.id) d);" 2>/dev/null)
+if [[ -z "$DUP_PORTS" ]]; then
+    echo "⚠  port duplication check skipped (could not query)"
+elif [[ "$DUP_PORTS" -le 0 ]]; then
+    echo "✓ ports carry no (ip, proto, port) duplicates"
+else
+    echo "❌ ports has ${DUP_PORTS} duplicate (ip, proto, port) row(s) - re-run ensure_all_tables.sql to normalize"
+    MISSING=$((MISSING + 1))
+fi
+
+HOSTNAME_EQ_IP=$(docker exec rag-postgres psql -U app -d scans -tAc \
+    "SELECT count(*) FROM assets WHERE hostname = host(ip);" 2>/dev/null)
+if [[ -n "$HOSTNAME_EQ_IP" && "$HOSTNAME_EQ_IP" -gt 0 ]]; then
+    echo "❌ ${HOSTNAME_EQ_IP} asset(s) still store the IP as the hostname"
+    MISSING=$((MISSING + 1))
+fi
 for idx in "${CRITICAL_INDEXES[@]}"; do
     if docker exec rag-postgres psql -U app -d scans -t -c \
         "SELECT 1 FROM pg_indexes WHERE indexname = '${idx}';" | grep -q 1; then

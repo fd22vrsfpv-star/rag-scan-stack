@@ -232,11 +232,25 @@ async def perform_scan(scan_request: ScanRequest, scan_id: uuid.UUID):
                 )
                 return
 
-            # Get asset ID from URL
+            # Get asset ID from URL.
+            #
+            # .hostname, not .netloc: netloc keeps the port ("host:8080") and the
+            # userinfo, so an IP target became the un-resolvable string
+            # "192.168.1.150:8080" and landed on the 0.0.0.0 placeholder asset.
+            #
+            # And when the host IS an ip literal, do NOT pass it as the hostname.
+            # This called get_or_create_asset(netloc, hostname=netloc), which
+            # wrote assets(ip='X', hostname='X'). The unique index is
+            # ix_assets_ip_hostname(ip, COALESCE(hostname,'')), so 'X' and ''
+            # count as different rows — creating a second asset for a host that
+            # already had one. Ports hang off asset_id, so every asset row for
+            # an IP carried its own copy of that host's ports: 99 port rows for
+            # 59 real (ip, proto, port) tuples.
+            # get_or_create_asset drops a hostname that is merely the ip, so
+            # passing both is safe and other callers get the same protection.
             parsed_url = urlparse(url_str)
-            hostname = parsed_url.netloc
-            # For now, use hostname as IP (in real scenario, resolve it)
-            asset_id = get_or_create_asset(hostname, hostname=hostname)
+            host = parsed_url.hostname or ""
+            asset_id = get_or_create_asset(host, hostname=host)
 
             # Initialize analyzers
             security_checker = SecurityChecker()
@@ -425,6 +439,18 @@ async def perform_scan(scan_request: ScanRequest, scan_id: uuid.UUID):
                 from db_utils import get_db
                 with get_db() as conn, conn.cursor() as cur:
                     for zap_finding in zap_results.get('alerts', []):
+                        # web_findings.cwe is text[], but the ZAP alert carries a
+                        # single string ("CWE-79") — psycopg2 cannot adapt a str
+                        # to an array, so the insert failed on the type as well
+                        # as on the column name. etl/parse_zap.py builds a list
+                        # for the same column; match it.
+                        cwe_value = zap_finding.get('cwe')
+                        if cwe_value is None or cwe_value == []:
+                            cwe_array = None
+                        elif isinstance(cwe_value, (list, tuple)):
+                            cwe_array = [str(c) for c in cwe_value if c]
+                        else:
+                            cwe_array = [str(cwe_value)]
                         cur.execute(
                             """
                             -- `refs` (jsonb), not `references` — which is both the
@@ -440,7 +466,7 @@ async def perform_scan(scan_request: ScanRequest, scan_id: uuid.UUID):
                              zap_finding['issue_type'], zap_finding['name'],
                              zap_finding['severity'], zap_finding['evidence'],
                              zap_finding.get('method'), zap_finding.get('payload'),
-                             zap_finding.get('cwe'), Json(zap_finding.get('references', {})))
+                             cwe_array, Json(zap_finding.get('references', {})))
                         )
                     conn.commit()
 
