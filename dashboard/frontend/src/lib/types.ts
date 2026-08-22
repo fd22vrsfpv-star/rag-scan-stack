@@ -185,6 +185,7 @@ export interface FindingsResponse {
     by_source: Record<string, number>
     /** FILTERED and collapsed to one entry per underlying problem. */
     problems_by_severity?: Record<string, number>
+    problems_by_source?: Record<string, number>
     distinct_problems?: number
     shared_problems?: number
   }

@@ -314,3 +314,64 @@ def test_sarif_collapse_does_not_merge_ungroupable_rows(sarif_seeded):
         f"collapse dropped {n_plain - n_collapsed} results — ungroupable rows "
         "were folded together")
     assert n_collapsed < n_plain, "collapse changed nothing"
+
+
+# ── filtered vs global facets ────────────────────────────────────────────────
+
+def _get_global(query):
+    """Same call, without the TEST_IP filter _get() applies."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(f"https://localhost:3002/api/findings?{query}")
+    key = _api_key()
+    if key:
+        req.add_header("x-api-key", key)
+    with urllib.request.urlopen(req, timeout=90, context=ctx) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def test_filtered_facets_agree_with_the_filtered_total(seeded):
+    """The bug this fixes: Dashboard charted a GLOBAL facet under a FILTERED total.
+
+    by_severity ignores the query filters by design — the Findings Explorer needs
+    every source chip to stay visible. But Dashboard.tsx passes engagement_id and
+    charted by_severity, so with an engagement selected the card showed a
+    filtered total (838) above a chart summing to the whole dataset (840).
+    problems_by_severity is filtered, so it must reconcile.
+    """
+    data = _get("limit=1")
+    agg = data["aggregations"]
+    assert sum(agg["problems_by_severity"].values()) == agg["distinct_problems"], (
+        "problems_by_severity does not sum to distinct_problems: "
+        f"{agg['problems_by_severity']} vs {agg['distinct_problems']}")
+    assert sum(agg["problems_by_source"].values()) == agg["distinct_problems"], (
+        "problems_by_source does not sum to distinct_problems")
+
+
+def test_global_facets_stay_global(seeded):
+    """Deliberate, and must not regress.
+
+    If by_source started respecting the filter, every source chip in the Findings
+    Explorer would vanish as soon as a filter narrowed the set — the UI comments
+    call this out explicitly.
+    """
+    narrow = _get("limit=1")               # filtered to TEST_IP
+    wide = _get_global("limit=1")          # no ip filter
+    assert narrow["aggregations"]["by_source"] == wide["aggregations"]["by_source"], (
+        "by_source changed with the filter — it is meant to be global")
+    assert narrow["total"] < wide["total"], "the ip filter did not narrow anything"
+
+
+def test_filtered_source_facet_drops_sources_with_no_matching_rows(seeded):
+    """The observable difference between the two facets."""
+    data = _get("limit=1")
+    agg = data["aggregations"]
+    global_sources = set(agg["by_source"])
+    filtered_sources = set(agg["problems_by_source"])
+    assert filtered_sources <= global_sources, (
+        f"filtered facet has sources the global one lacks: "
+        f"{filtered_sources - global_sources}")
+    assert filtered_sources != global_sources, (
+        "filtered and global source facets are identical — this deployment "
+        "cannot demonstrate the difference")
