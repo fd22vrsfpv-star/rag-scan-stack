@@ -5085,7 +5085,12 @@ def search_findings(
             a.hostname,
             pt.port,
             NULL::text as url,
-            CASE WHEN pt.service = 'tcpwrapped' THEN 'info' ELSE 'recon' END as severity,
+            -- Informational, not a separate 'recon' severity. The two were
+            -- functionally identical: both mapped to SARIF 'note', both were
+            -- ordinary severity chips, neither was filtered differently by any
+            -- export or report. Only the sort rank differed. Collapsing them
+            -- means one informational bucket instead of two names for it.
+            'info'::text as severity,
             COALESCE(pt.service, '') || ' ' || COALESCE(pt.product, '') || ' ' || COALESCE(pt.version, '') as title,
             CASE WHEN pt.is_open THEN 'open' ELSE 'closed' END || '/' || pt.proto || ' ' || COALESCE(pt.service, '?') || COALESCE(' ' || pt.product || ' ' || pt.version, '') || COALESCE(' banner=' || LEFT(pt.banner, 100), '') as evidence,
             ARRAY[]::text[] as cve,
@@ -5318,6 +5323,9 @@ def search_findings(
         WHEN 'medium'   THEN 3
         WHEN 'low'      THEN 4
         WHEN 'info'     THEN 5
+        -- 'recon' is no longer written — it was collapsed into 'info'. The rank
+        -- stays so rows from a database that predates the migration still sort
+        -- next to info rather than falling into the ELSE bucket.
         WHEN 'recon'    THEN 6
         ELSE 7
     END
@@ -5377,7 +5385,7 @@ def search_findings(
         UNION ALL
         SELECT 'playwright' as source, pf.severity FROM playwright_findings pf
         UNION ALL
-        SELECT 'portscan' as source, CASE WHEN service = 'tcpwrapped' THEN 'info' ELSE 'recon' END as severity FROM ports WHERE is_open = true
+        SELECT 'portscan' as source, 'info'::text as severity FROM ports WHERE is_open = true
         UNION ALL
         -- Must mirror the credential branch in the main query above, including
         -- the valid_cred gate. If these two drift, the severity facet counts
@@ -5387,11 +5395,11 @@ def search_findings(
           FROM credential_findings cf WHERE cf.valid_cred = true
     )
     SELECT
-        COALESCE(severity, 'recon') as severity,
+        COALESCE(severity, 'info') as severity,
         source,
         COUNT(*) as cnt
     FROM unified
-    GROUP BY COALESCE(severity, 'recon'), source
+    GROUP BY COALESCE(severity, 'info'), source
     """
 
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -5424,7 +5432,7 @@ def search_findings(
         cur.execute(f"""
             SELECT severity, source, COUNT(*) AS cnt FROM (
                 SELECT DISTINCT ON (COALESCE(problem_id, id))
-                       COALESCE(severity, 'recon') AS severity,
+                       COALESCE(severity, 'info') AS severity,
                        COALESCE(source, 'unknown') AS source
                 FROM ({count_sql}) sub
                 ORDER BY COALESCE(problem_id, id)
@@ -7672,6 +7680,7 @@ def proxy_replay(
     if order == "sequential":
         base_urls.sort(key=lambda r: (_path_depth(r["url"]), r["url"]))
     elif order == "severity":
+        # "recon" retained for pre-migration rows; nothing writes it now.
         sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "recon": 5}
         base_urls.sort(key=lambda r: sev_order.get(r.get("severity", "info"), 9))
 
@@ -13184,6 +13193,10 @@ def export_sarif(
         "medium": "warning",
         "low": "note",
         "info": "note",
+        # Explicit rather than relying on sev_map.get(..., "note"). It landed on
+        # "note" by fallthrough, so changing that default would have silently
+        # moved every one of these. Kept for pre-migration rows.
+        "recon": "note",
     }
 
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:

@@ -465,3 +465,75 @@ def test_exports_still_see_the_crawl_surface(seeded):
         f"HAR has only {entries} entries but there are {findings_only} findings — "
         "the crawl surface was excluded from the export too, which breaks the "
         "Burp/ZAP import this tool exists for")
+
+@pytest.fixture(scope="module")
+def db_ready():
+    if _psql("SELECT 1") != "1":
+        pytest.skip("no reachable rag-postgres")
+    return True
+
+
+# ── the 'recon' severity was collapsed into 'info' ───────────────────────────
+
+@pytest.mark.unit
+def test_no_writer_emits_the_recon_severity():
+    """'recon' and 'info' were functionally identical.
+
+    Both mapped to SARIF "note" (recon only by FALLTHROUGH — sev_map had no key
+    for it), both were ordinary severity chips, and no export, filter or report
+    treated them differently. The only difference was sort rank. Two names for
+    one bucket is a distinction that costs comprehension and buys nothing.
+
+    This asserts nothing writes it again. Reading it is still tolerated, for
+    databases that predate the migration.
+    """
+    import re
+    offenders = []
+    for rel in ("etl/parse_katana.py", "etl/parse_whatweb.py", "etl/parse_httpx.py",
+                "app/rag-api/api.py"):
+        path = os.path.join(REPO, rel)
+        if not os.path.exists(path):
+            continue
+        src = open(path, encoding="utf-8", errors="replace").read()
+        # strip comments so the explanation of the change is not itself a hit
+        code = "\n".join(l.split("--")[0].split("#")[0] for l in src.splitlines())
+        if re.search(r"severity\s*=\s*[\"']recon[\"']", code) or "ELSE 'recon'" in code:
+            offenders.append(rel)
+    assert not offenders, f"these still write severity='recon': {offenders}"
+
+
+def test_no_row_carries_the_recon_severity(db_ready):
+    """The migration covered every table with a severity column."""
+    tables = _psql(
+        "SELECT c.table_name FROM information_schema.columns c "
+        "JOIN information_schema.tables t ON t.table_schema=c.table_schema "
+        " AND t.table_name=c.table_name "
+        "WHERE c.table_schema='public' AND c.column_name='severity' "
+        "  AND t.table_type='BASE TABLE'")
+    assert tables, "no severity columns found — is the DB reachable?"
+    leftover = []
+    for t in [x.strip() for x in tables.splitlines() if x.strip()]:
+        n = _psql(f"SELECT count(*) FROM public.{t} WHERE severity='recon'")
+        if n and n != "0":
+            leftover.append(f"{t}={n}")
+    assert not leftover, f"rows still carry severity='recon': {leftover}"
+
+
+def test_recon_is_still_mapped_for_pre_migration_rows(db_ready):
+    """Removing the value must not make an old row render or export as unknown.
+
+    api.py keeps 'recon' in sev_map and in both sort orders, and the frontend
+    keeps it in the colour maps via LEGACY_SEVERITIES while dropping the filter
+    chip. A row from a database that predates the migration still behaves.
+    """
+    api = open(os.path.join(REPO, "app", "rag-api", "api.py"), encoding="utf-8").read()
+    assert '"recon": "note"' in api, "SARIF no longer maps recon explicitly"
+    assert "WHEN 'recon'" in api, "recon lost its sort rank"
+
+    consts = open(os.path.join(REPO, "dashboard", "frontend", "src", "lib",
+                               "constants.ts"), encoding="utf-8").read()
+    assert "LEGACY_SEVERITIES" in consts, "no legacy-severity fallback"
+    assert "recon: '#0891b2'" in consts, "recon lost its colour"
+    # but it must not be offered as a filter any more
+    levels = consts.split("SEVERITY_LEVELS = [", 1)[1].split("]", 1)[0]
+    assert "recon" not in levels, "recon is still offered as a filter chip"

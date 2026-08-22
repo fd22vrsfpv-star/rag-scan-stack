@@ -4190,6 +4190,52 @@ EXCEPTION WHEN OTHERS THEN NULL; END $$;
 CREATE INDEX IF NOT EXISTS idx_web_findings_record_kind
     ON public.web_findings(record_kind);
 
+-- ── Collapse the 'recon' severity into 'info' ──────────────────────────────
+--
+-- The two were functionally identical. Measured before removing it:
+--   * both mapped to SARIF level "note" — and 'recon' only by FALLTHROUGH,
+--     since sev_map had no key for it
+--   * both were ordinary severity chips in the UI, both included in reports
+--   * no export, filter or report treated them differently
+--   * the only difference was sort rank (info 5, recon 6)
+-- A consumer had already given up on the distinction:
+-- burp-extension/RagScanBridge.py buckets {"info","recon","informational",""}
+-- as one thing.
+--
+-- attack_vectors is included because its severity is COPIED from the source
+-- finding (app/rag-api/attack_vectors.py) — the same notion propagated, not a
+-- different scale. 1495 of its rows carried 'recon' purely because the findings
+-- they derive from did.
+--
+-- Idempotent: a second run matches nothing.
+UPDATE public.web_findings   SET severity = 'info' WHERE severity = 'recon';
+UPDATE public.vulns          SET severity = 'info' WHERE severity = 'recon';
+UPDATE public.recon_findings SET severity = 'info' WHERE severity = 'recon';
+UPDATE public.attack_vectors SET severity = 'info' WHERE severity = 'recon';
+
+-- Any other table that grew a severity column since. Named tables above are
+-- kept explicit for reviewability; this catches the rest rather than leaving a
+-- silent gap when a new findings table appears.
+DO $RECON$
+DECLARE
+    t text;
+BEGIN
+    FOR t IN
+        SELECT c.table_name
+          FROM information_schema.columns c
+          JOIN information_schema.tables tb
+            ON tb.table_schema = c.table_schema AND tb.table_name = c.table_name
+         WHERE c.table_schema = 'public'
+           AND c.column_name = 'severity'
+           AND tb.table_type = 'BASE TABLE'
+           AND c.is_generated = 'NEVER'
+           AND c.table_name NOT IN ('web_findings','vulns','recon_findings','attack_vectors')
+    LOOP
+        EXECUTE format(
+            'UPDATE public.%I SET severity = %L WHERE severity = %L', t, 'info', 'recon');
+    END LOOP;
+END $RECON$;
+
 
 CREATE INDEX IF NOT EXISTS idx_web_findings_infra_fp
     ON public.web_findings(infrastructure_fingerprint)

@@ -127,7 +127,8 @@ def parse_httpx(path: str, profile: str = "upload", job_id: str = None):
 
                     # Determine severity: error state (no evidence) vs successful probe
                     is_error = rec.get("failed", False) or (status_code is None and not evidence)
-                    severity = "error" if is_error else "recon"
+                    # informational, not a separate "recon" severity.
+                    severity = "error" if is_error else "info"
 
                     finding_id = str(uuid.uuid4())
                     cur.execute("""
