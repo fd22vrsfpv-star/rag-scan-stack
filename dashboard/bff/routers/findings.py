@@ -32,6 +32,9 @@ async def search_findings(
     problem_scope: Optional[str] = None,
     problem_id: Optional[str] = None,
     collapse_problems: bool = False,
+    # Crawl inventory (URLs a crawler merely discovered) is excluded by default;
+    # 746 of 779 rows were katana output before this existed.
+    include_inventory: bool = False,
     limit: int = Query(100, le=1000),
     offset: int = 0,
 ):
@@ -67,6 +70,8 @@ async def search_findings(
         params["problem_id"] = problem_id
     if collapse_problems:
         params["collapse_problems"] = "true"
+    if include_inventory:
+        params["include_inventory"] = "true"
 
     async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(

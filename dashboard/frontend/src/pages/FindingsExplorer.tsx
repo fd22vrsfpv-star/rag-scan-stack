@@ -218,6 +218,7 @@ export default function FindingsExplorer() {
   const sharedProblems = agg?.shared_problems ?? 0
   const problemScope = filters.problem_scope ?? 'all'
   const collapsing = !!filters.collapse_problems
+  const showingInventory = !!filters.include_inventory
 
   const toggleSelectAll = () => {
     if (selectedIds.size === findings.length) setSelectedIds(new Set())
@@ -358,6 +359,21 @@ export default function FindingsExplorer() {
               {opt.label}
             </button>
           ))}
+          <button
+            onClick={() => setFilters(f => ({
+              ...f,
+              include_inventory: f.include_inventory ? undefined : true,
+            }))}
+            title="Crawl inventory is every URL a crawler discovered. It is what the Burp and HAR exports are built from, but a discovered URL is not a finding — so it is excluded from this list by default."
+            className={cn(
+              'ml-2 px-2.5 py-1 rounded-md text-sm font-medium border transition-colors',
+              showingInventory
+                ? 'border-primary bg-primary/15 text-primary ring-1 ring-primary/30'
+                : 'border-border bg-muted/50 text-foreground hover:border-primary/50',
+            )}
+          >
+            {showingInventory ? 'Including crawled URLs' : 'Show crawled URLs'}
+          </button>
           <button
             onClick={() => setFilters(f => ({
               ...f,

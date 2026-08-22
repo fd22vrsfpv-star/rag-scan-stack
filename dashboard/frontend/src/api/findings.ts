@@ -25,6 +25,8 @@ function buildFindingsParams(filters: FindingsFilter): URLSearchParams {
   }
   if (filters.problem_id) params.set('problem_id', filters.problem_id)
   if (filters.collapse_problems) params.set('collapse_problems', 'true')
+  // Crawl inventory is excluded server-side by default.
+  if (filters.include_inventory) params.set('include_inventory', 'true')
   return params
 }
 
@@ -75,6 +77,10 @@ export interface FindingsFilter {
   problem_id?: string
   /** Return one row per underlying problem instead of one per virtual host. */
   collapse_problems?: boolean
+  /** Include URLs a crawler merely discovered (no name, no issue type). These
+   *  are the crawl surface the Burp/HAR exports are built from, but they are
+   *  not findings — 746 of 779 rows were katana output before this existed. */
+  include_inventory?: boolean
   limit?: number
   offset?: number
 }
