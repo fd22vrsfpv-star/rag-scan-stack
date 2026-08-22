@@ -375,3 +375,93 @@ def test_filtered_source_facet_drops_sources_with_no_matching_rows(seeded):
     assert filtered_sources != global_sources, (
         "filtered and global source facets are identical — this deployment "
         "cannot demonstrate the difference")
+
+# ── crawl inventory vs findings ──────────────────────────────────────────────
+
+def test_inventory_is_excluded_by_default(seeded):
+    """A crawled URL is not a finding.
+
+    746 of 779 rows were katana output — one row per discovered URL with no name
+    and no issue_type — and they were counted as findings everywhere, which made
+    the severity chart read "recon: 782" and left the vhost rollup nothing to
+    group.
+    """
+    default = _get_global("limit=1")
+    with_inv = _get_global("limit=1&include_inventory=true")
+    assert with_inv["total"] > default["total"], (
+        "include_inventory did not widen the result set — is the BFF forwarding "
+        "the parameter? It silently drops unknown ones")
+    assert with_inv["total"] - default["total"] > 100, (
+        f"expected the bulk of the table to be inventory, got "
+        f"{with_inv['total'] - default['total']} extra rows")
+
+
+def test_inventory_sources_are_absent_from_the_default_facet(seeded):
+    """Otherwise the UI renders a chip that returns nothing when clicked.
+
+    by_source is deliberately global — it ignores the query filters so every
+    source keeps a filter chip. But it must still respect the inventory rule, or
+    a `katana` chip with 746 would select zero rows.
+    """
+    default = _get_global("limit=1")["aggregations"]["by_source"]
+    with_inv = _get_global("limit=1&include_inventory=true")["aggregations"]["by_source"]
+    inventory_only = set(with_inv) - set(default)
+    assert inventory_only, (
+        "no source is inventory-only — this deployment cannot demonstrate the rule")
+    assert "katana" in inventory_only, f"expected katana, got {inventory_only}"
+
+
+def test_record_kind_agrees_with_the_grouping_key(seeded):
+    """Two features, one definition of "not a finding".
+
+    infrastructure_fingerprint is NULL for exactly the rows record_kind calls
+    inventory. If they drifted apart, a row could be groupable but not a
+    finding, or vice versa.
+    """
+    mismatch = _psql(
+        "SELECT count(*) FROM web_findings "
+        "WHERE record_kind = 'inventory' AND infrastructure_fingerprint IS NOT NULL")
+    assert mismatch == "0", f"{mismatch} inventory row(s) carry a grouping key"
+
+
+def test_record_kind_is_generated_not_written(seeded):
+    """A generated column cannot drift from the data it describes, and needs no
+    writer changes — parse_katana was not touched."""
+    expr = _psql(
+        "SELECT generation_expression FROM information_schema.columns "
+        "WHERE table_name = 'web_findings' AND column_name = 'record_kind'")
+    assert expr, "record_kind is missing"
+    assert "issue_type" in expr and "name" in expr, (
+        f"record_kind is not derived from name/issue_type: {expr}")
+
+
+def test_exports_still_see_the_crawl_surface(seeded):
+    """The reason inventory is classified rather than moved or deleted.
+
+    /export/burp and /export/har read web_findings BY URL to build the Burp
+    sitemap and the HAR file — the tool's primary deliverable. Excluding
+    inventory from the FINDINGS view must not shrink those.
+    """
+    script = (
+        "import os, json, ssl, urllib.request\n"
+        "ctx = ssl.create_default_context()\n"
+        "ctx.check_hostname = False\n"
+        "ctx.verify_mode = ssl.CERT_NONE\n"
+        "r = urllib.request.Request('https://localhost:8000/export/har?limit=5000')\n"
+        "r.add_header('x-api-key', os.environ.get('API_KEY',''))\n"
+        "d = json.load(urllib.request.urlopen(r, timeout=120, context=ctx))\n"
+        "print(len(d.get('log', {}).get('entries', [])))\n"
+    )
+    try:
+        out = subprocess.run(["docker", "exec", "rag-api", "python3", "-c", script],
+                             capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.SubprocessError):
+        pytest.skip("rag-api not reachable")
+    if out.returncode != 0:
+        pytest.skip(f"HAR export unavailable: {out.stderr[:120]}")
+    entries = int(out.stdout.strip().splitlines()[-1])
+    findings_only = _get_global("limit=1")["total"]
+    assert entries > findings_only, (
+        f"HAR has only {entries} entries but there are {findings_only} findings — "
+        "the crawl surface was excluded from the export too, which breaks the "
+        "Burp/ZAP import this tool exists for")

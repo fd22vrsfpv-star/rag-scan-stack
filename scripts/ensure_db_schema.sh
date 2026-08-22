@@ -272,6 +272,20 @@ else
     MISSING=$((MISSING + 1))
 fi
 
+# web_findings.record_kind separates crawl INVENTORY (a URL a crawler merely
+# discovered — 746 of 779 rows here) from actual findings. Generated, so it
+# cannot drift; without it every severity count includes the crawl surface.
+RK=$(docker exec rag-postgres psql -U app -d scans -tAc \
+    "SELECT count(*) FROM information_schema.columns WHERE table_name='web_findings' AND column_name='record_kind';" 2>/dev/null)
+if [[ "$RK" == "1" ]]; then
+    RK_SPLIT=$(docker exec rag-postgres psql -U app -d scans -tAc \
+        "SELECT string_agg(record_kind||'='||n, ' ' ORDER BY record_kind) FROM (SELECT record_kind, count(*) n FROM public.web_findings GROUP BY record_kind) x;" 2>/dev/null)
+    echo "✓ web_findings.record_kind present (${RK_SPLIT:-empty table})"
+else
+    echo "❌ web_findings.record_kind missing - crawl inventory will be counted as findings"
+    MISSING=$((MISSING + 1))
+fi
+
 if docker exec rag-postgres psql -U app -d scans -t -c \
     "SELECT 1 FROM pg_views WHERE schemaname='public' AND viewname='v_infrastructure_findings';" | grep -q 1; then
     echo "✓ v_infrastructure_findings view present"

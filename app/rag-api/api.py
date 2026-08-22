@@ -4920,6 +4920,7 @@ def search_findings(
     problem_scope: Optional[str] = Query(None, description="Filter by how far a problem spreads: 'shared' (one problem seen on several virtual hosts of a machine), 'single' (observed on one host only), 'all'. NOT the engagement scope — see the `scope_name` concept elsewhere."),
     problem_id: Optional[str] = Query(None, description="Filter to one infrastructure problem group (infrastructure_fingerprint)"),
     collapse_problems: bool = Query(False, description="Return one row per underlying problem instead of one per virtual host"),
+    include_inventory: bool = Query(False, description="Include crawl inventory — URLs a crawler merely discovered, with no name or issue type. Excluded by default because a crawled URL is not a finding: 746 of 779 rows in one deployment were katana output, which made every severity count meaningless"),
     limit: int = Query(100, ge=1, le=1000, description="Max results to return"),
     offset: int = Query(0, ge=0, description="Pagination offset"),
     authorized: bool = Depends(auth)
@@ -4976,6 +4977,7 @@ def search_findings(
             v.engagement_id::text,
             NULL::text as problem_id,
             1 as affects_hosts,
+            'finding'::text as record_kind,
             'vuln' as finding_source
         FROM vulns v
         LEFT JOIN assets a ON a.id = v.asset_id
@@ -5015,6 +5017,7 @@ def search_findings(
             wf.engagement_id::text,
             wf.infrastructure_fingerprint as problem_id,
             COALESCE(ic.n, 1) as affects_hosts,
+            wf.record_kind,
             'web' as finding_source
         FROM web_findings wf
         LEFT JOIN assets a ON a.id = wf.asset_id
@@ -5066,6 +5069,7 @@ def search_findings(
             pf.engagement_id::text,
             NULL::text as problem_id,
             1 as affects_hosts,
+            'finding'::text as record_kind,
             'playwright' as finding_source
         FROM playwright_findings pf
         LEFT JOIN assets a ON a.id = pf.asset_id
@@ -5104,6 +5108,7 @@ def search_findings(
             NULL::text as engagement_id,
             NULL::text as problem_id,
             1 as affects_hosts,
+            'finding'::text as record_kind,
             'portscan' as finding_source
         FROM ports pt
         LEFT JOIN assets a ON a.id = pt.asset_id
@@ -5174,6 +5179,7 @@ def search_findings(
             cf.engagement_id::text,
             NULL::text as problem_id,
             1 as affects_hosts,
+            'finding'::text as record_kind,
             'credential' as finding_source
         FROM credential_findings cf
         LEFT JOIN assets a ON a.id = cf.asset_id
@@ -5228,6 +5234,13 @@ def search_findings(
     if problem_id:
         where_clauses_pg.append("problem_id = %s")
         params_pg.append(problem_id)
+
+    # Crawl inventory is excluded by DEFAULT. It is not deleted or moved —
+    # /export/burp and /export/har read web_findings by URL to build the Burp
+    # sitemap and the HAR file, so those rows are the crawl surface that makes
+    # the tool's primary deliverable work. They just are not findings.
+    if not include_inventory:
+        where_clauses_pg.append("record_kind = 'finding'")
 
     if cve:
         where_clauses_pg.append("EXISTS (SELECT 1 FROM unnest(cve) c WHERE c ILIKE %s)")
@@ -5356,7 +5369,11 @@ def search_findings(
             v.severity
         FROM vulns v
         UNION ALL
+        -- Same inventory rule as the main query. If the global facet counted
+        -- crawl inventory while the default view excluded it, the UI would
+        -- render a `katana` chip with 746 that returns nothing when clicked.
         SELECT wf.source, wf.severity FROM web_findings wf
+         WHERE (%(include_inventory)s OR wf.record_kind = 'finding')
         UNION ALL
         SELECT 'playwright' as source, pf.severity FROM playwright_findings pf
         UNION ALL
@@ -5421,7 +5438,7 @@ def search_findings(
             problems_by_source[r["source"]] = problems_by_source.get(r["source"], 0) + r["cnt"]
 
         # Get aggregations
-        cur.execute(agg_sql)
+        cur.execute(agg_sql, {"include_inventory": bool(include_inventory)})
         agg_rows = cur.fetchall()
 
     # Process aggregations

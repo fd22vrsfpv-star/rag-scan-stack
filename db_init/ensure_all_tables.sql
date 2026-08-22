@@ -4154,6 +4154,43 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_credential_findings_fingerprint
 -- Must match etl/fingerprint.py::infrastructure_fingerprint EXACTLY.
 DO $$ BEGIN ALTER TABLE public.web_findings ADD COLUMN IF NOT EXISTS infrastructure_fingerprint text; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 
+-- ── web_findings: separate crawl INVENTORY from actual FINDINGS ────────────
+--
+-- 746 of 779 rows in this deployment are katana output: one row per discovered
+-- URL, with no name and no issue_type. A crawled URL is not a finding, but they
+-- were counted as one everywhere — the severity chart showed "recon: 782",
+-- exports listed them, and the vhost rollup had almost nothing to group.
+--
+-- They are NOT junk, and must not be moved or deleted: /export/burp and
+-- /export/har both read web_findings BY URL to build the Burp sitemap and the
+-- HAR file, which is the tool's primary deliverable ("import into manual
+-- tools"). The HAR query calls web_findings the "richest data for HAR".
+--
+-- So the fix is classification, not relocation. A generated column means no
+-- writer has to be changed and the value cannot drift from the data it
+-- describes.
+--
+-- Why not just filter severity='recon': whatweb and httpx use 'recon' for real,
+-- NAMED findings. Severity conflates "informational finding" with "a URL we
+-- merely saw". Absence of both name and issue_type is what actually
+-- distinguishes them — and it is the same condition infrastructure_fingerprint
+-- already uses to decide a row cannot be grouped, so the two stay consistent.
+DO $$ BEGIN
+    ALTER TABLE public.web_findings
+      ADD COLUMN IF NOT EXISTS record_kind text
+      GENERATED ALWAYS AS (
+        CASE WHEN COALESCE(btrim(name), '') = ''
+              AND COALESCE(btrim(issue_type), '') = ''
+             THEN 'inventory' ELSE 'finding' END
+      ) STORED;
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
+
+-- Findings queries filter on this on every request, and inventory dominates the
+-- table, so the index earns its keep.
+CREATE INDEX IF NOT EXISTS idx_web_findings_record_kind
+    ON public.web_findings(record_kind);
+
+
 CREATE INDEX IF NOT EXISTS idx_web_findings_infra_fp
     ON public.web_findings(infrastructure_fingerprint)
  WHERE infrastructure_fingerprint IS NOT NULL;
