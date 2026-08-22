@@ -210,7 +210,11 @@ fi
 # unlimited NULLs — a NULL fingerprint is an unconstrained row that bypasses
 # dedup entirely. The dedup TRIGGERS fill it for the ~19 insert sites that
 # supply none, so their absence silently reopens the duplication.
-for trg in trg_vulns_dedup trg_web_findings_dedup trg_credential_findings_dedup; do
+# trg_web_findings_z_infra is named to sort LAST: Postgres fires BEFORE
+# triggers alphabetically, and it needs trg_web_findings_port to have
+# populated NEW.port first. Renaming it earlier silently keys every group on
+# port 0.
+for trg in trg_vulns_dedup trg_web_findings_dedup trg_credential_findings_dedup trg_web_findings_z_infra; do
     if docker exec rag-postgres psql -U app -d scans -t -c \
         "SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname = '${trg}';" | grep -q 1; then
         echo "✓ ${trg}"
@@ -253,6 +257,26 @@ elif [[ "$CRED_IDX" == *"COALESCE(auth_type"* && "$CRED_IDX" != *"WHERE"* ]]; th
 else
     echo "❌ uq_credential_findings_identity is partial or does not coalesce auth_type - NULL auth_type rows will duplicate"
     echo "   got: ${CRED_IDX}"
+    MISSING=$((MISSING + 1))
+fi
+
+# Virtual-host grouping: web_findings.fingerprint contains the hostname, so a
+# server-level problem on shared hosting stores one row per vhost. The
+# infrastructure_fingerprint groups them without merging.
+INFRA_COL=$(docker exec rag-postgres psql -U app -d scans -tAc \
+    "SELECT count(*) FROM information_schema.columns WHERE table_name='web_findings' AND column_name='infrastructure_fingerprint';" 2>/dev/null)
+if [[ "$INFRA_COL" == "1" ]]; then
+    echo "✓ web_findings.infrastructure_fingerprint present"
+else
+    echo "❌ web_findings.infrastructure_fingerprint missing - vhost findings cannot be grouped"
+    MISSING=$((MISSING + 1))
+fi
+
+if docker exec rag-postgres psql -U app -d scans -t -c \
+    "SELECT 1 FROM pg_views WHERE schemaname='public' AND viewname='v_infrastructure_findings';" | grep -q 1; then
+    echo "✓ v_infrastructure_findings view present"
+else
+    echo "❌ v_infrastructure_findings view missing"
     MISSING=$((MISSING + 1))
 fi
 

@@ -75,6 +75,8 @@ EXPECTED_TABLES=(
   chat_presets
   # TIER 24: Per-service / per-port prompts + RAG training data
   service_prompts
+  # TIER 25: Virtual-host finding groups (one problem, N affected vhosts)
+  finding_group_state
 )
 
 for table in "${EXPECTED_TABLES[@]}"; do
@@ -113,7 +115,7 @@ fi
 # Check critical views
 echo ""
 echo "  -- Views --"
-EXPECTED_VIEWS=(detected_software)
+EXPECTED_VIEWS=(detected_software v_infrastructure_findings)
 for view in "${EXPECTED_VIEWS[@]}"; do
   result=$(docker exec rag-postgres psql -U app -d scans -tAc "SELECT EXISTS (SELECT FROM pg_views WHERE schemaname='public' AND viewname='$view')" 2>/dev/null)
   if [[ "$result" == "t" ]]; then

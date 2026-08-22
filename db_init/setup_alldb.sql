@@ -1832,6 +1832,139 @@ DELETE FROM public.credential_findings a
 -- the highest-volume tables in the schema. Not propagating that here.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_credential_findings_fingerprint
     ON public.credential_findings(fingerprint);
+-- ── Virtual-host grouping: one problem, N affected vhosts ──────────────────
+--
+-- web_findings.fingerprint hashes the URL, which contains the hostname, so a
+-- server-level problem on shared hosting stores one row per vhost. That is
+-- correct for app-level findings and wrong for infrastructure ones.
+--
+-- The fix GROUPS rather than merges: every per-vhost row is kept, and a second
+-- host-independent key marks them as facets of one underlying problem. Because
+-- nothing is merged, the grouping key can be heuristic without risking data
+-- loss — which is why no scope classifier is needed.
+--
+-- Must match etl/fingerprint.py::infrastructure_fingerprint EXACTLY.
+DO $$ BEGIN ALTER TABLE public.web_findings ADD COLUMN IF NOT EXISTS infrastructure_fingerprint text; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+
+CREATE INDEX IF NOT EXISTS idx_web_findings_infra_fp
+    ON public.web_findings(infrastructure_fingerprint)
+ WHERE infrastructure_fingerprint IS NOT NULL;
+
+-- Group-level triage. Sparse on purpose: a row exists only once someone has
+-- actually triaged the group, so this does not shadow the per-finding
+-- workflow_status for the untouched majority.
+CREATE TABLE IF NOT EXISTS public.finding_group_state (
+    infrastructure_fingerprint text PRIMARY KEY,
+    status          text DEFAULT 'new',
+    assigned_to     text,
+    notes           text,
+    suppressed      boolean DEFAULT false,
+    created_at      timestamptz DEFAULT now(),
+    updated_at      timestamptz DEFAULT now()
+);
+
+CREATE OR REPLACE FUNCTION public._touch_finding_group_state() RETURNS trigger AS $fn$
+BEGIN
+    NEW.updated_at := now();
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_finding_group_state_updated_at ON public.finding_group_state;
+CREATE TRIGGER trg_finding_group_state_updated_at
+    BEFORE UPDATE ON public.finding_group_state
+    FOR EACH ROW EXECUTE FUNCTION public._touch_finding_group_state();
+
+-- Compute the key on write. The IP comes from the finding's asset, so this
+-- resolves through assets rather than parsing it back out of the URL: after the
+-- vhost normalisation, several asset rows share one ip, which is exactly the
+-- relation being grouped on.
+CREATE OR REPLACE FUNCTION public._web_findings_infra_fp() RETURNS trigger AS $fn$
+DECLARE
+    v_ip   text;
+    v_port text;
+BEGIN
+    IF NEW.infrastructure_fingerprint IS NOT NULL THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT host(a.ip) INTO v_ip FROM public.assets a WHERE a.id = NEW.asset_id;
+
+    -- No host means "same host" is unanswerable, and a blank name AND blank
+    -- issue_type means this is not a finding (katana crawl rows look like that:
+    -- 746 of 779 in one deployment). Either way, leave it ungrouped rather than
+    -- inventing a bucket.
+    IF v_ip IS NULL OR v_ip = ''
+       OR (coalesce(btrim(NEW.name), '') = '' AND coalesce(btrim(NEW.issue_type), '') = '')
+    THEN
+        RETURN NEW;
+    END IF;
+
+    v_port := CASE WHEN NEW.port IS NOT NULL AND NEW.port <> 0
+                   THEN NEW.port::text ELSE '0' END;
+
+    NEW.infrastructure_fingerprint := md5('infra|' || v_ip || '|' || v_port
+        || '|' || lower(btrim(coalesce(NEW.name, '')))
+        || '|' || lower(btrim(coalesce(NEW.issue_type, ''))));
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+-- The name is deliberately "z_infra" so it sorts LAST. Postgres fires BEFORE
+-- triggers in alphabetical order by trigger name, and this one depends on two
+-- earlier ones:
+--
+--   trg_web_findings_dedup  -> RETURNs NULL for a duplicate, so a skipped
+--                              INSERT never bothers computing a grouping key
+--   trg_web_findings_port   -> populates NEW.port from the URL
+--
+-- Named trg_web_findings_infra it would fire at 'i', BEFORE 'port', and key on
+-- port 0 while the stored row ended up with 443 — a wrong grouping key that
+-- also disagrees with etl/fingerprint.py, which receives the real port.
+DROP TRIGGER IF EXISTS trg_web_findings_infra ON public.web_findings;
+DROP TRIGGER IF EXISTS trg_web_findings_z_infra ON public.web_findings;
+CREATE TRIGGER trg_web_findings_z_infra
+    BEFORE INSERT ON public.web_findings
+    FOR EACH ROW EXECUTE FUNCTION public._web_findings_infra_fp();
+
+-- Backfill through the same expression.
+UPDATE public.web_findings w
+   SET infrastructure_fingerprint = md5('infra|' || host(a.ip) || '|'
+       || CASE WHEN w.port IS NOT NULL AND w.port <> 0 THEN w.port::text ELSE '0' END
+       || '|' || lower(btrim(coalesce(w.name, '')))
+       || '|' || lower(btrim(coalesce(w.issue_type, ''))))
+  FROM public.assets a
+ WHERE a.id = w.asset_id
+   AND w.infrastructure_fingerprint IS NULL
+   AND NOT (coalesce(btrim(w.name), '') = '' AND coalesce(btrim(w.issue_type), '') = '');
+
+-- One row per underlying problem, with the vhosts it affects. A view rather
+-- than a table so there is no member count to keep in sync — the per-vhost rows
+-- remain the single source of truth.
+CREATE OR REPLACE VIEW public.v_infrastructure_findings AS
+SELECT
+    w.infrastructure_fingerprint,
+    min(host(a.ip))                                   AS ip,
+    min(w.port)                                       AS port,
+    min(w.name)                                       AS name,
+    min(w.issue_type)                                 AS issue_type,
+    max(w.severity)                                   AS severity,
+    count(*)                                          AS finding_count,
+    count(DISTINCT a.id)                              AS affected_asset_count,
+    array_agg(DISTINCT coalesce(a.hostname, host(a.ip))
+              ORDER BY coalesce(a.hostname, host(a.ip))) AS affected_hosts,
+    min(w.first_seen)                                 AS first_seen,
+    max(w.last_seen)                                  AS last_seen,
+    coalesce(s.status, 'new')                         AS group_status,
+    s.assigned_to                                     AS group_assigned_to,
+    coalesce(s.suppressed, false)                     AS group_suppressed
+FROM public.web_findings w
+JOIN public.assets a ON a.id = w.asset_id
+LEFT JOIN public.finding_group_state s
+       ON s.infrastructure_fingerprint = w.infrastructure_fingerprint
+WHERE w.infrastructure_fingerprint IS NOT NULL
+GROUP BY w.infrastructure_fingerprint, s.status, s.assigned_to, s.suppressed;
+
 
 
 -- Dedup trigger for web_findings (see ensure_all_tables.sql for rationale).
