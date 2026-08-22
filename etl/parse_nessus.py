@@ -32,6 +32,10 @@ Nessus XML structure (NessusClientData_v2):
 """
 import os
 import uuid
+try:  # etl is imported as a package from rag-api, bare from within etl/
+    from etl.sql_types import as_text_array
+except ImportError:  # pragma: no cover
+    from sql_types import as_text_array
 import json
 import logging
 import ipaddress
@@ -388,7 +392,7 @@ def parse_nessus(path: str, profile: str = "upload", job_id: str = None, target:
                                 f"nessus:{plugin_id}",
                                 output_text[:4000],
                                 severity,
-                                cves if cves else None,
+                                as_text_array(cves),
                                 cvss,
                                 Json(refs) if refs else Json({}),
                                 Json(metadata),

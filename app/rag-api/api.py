@@ -14,6 +14,10 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
+
+# text[] columns reject a bare string ('malformed array literal'), so
+# array feeds from parsed documents go through this. See etl/sql_types.py.
+from etl.sql_types import as_text_array
 from psycopg2.pool import ThreadedConnectionPool
 from contextlib import contextmanager
 import threading
@@ -17898,7 +17902,10 @@ def _store_collection(parsed: dict) -> str:
                 cid, ep["method"], ep["path"], ep["operation_id"],
                 ep["summary"], Json(ep["parameters"]), Json(ep["request_body"]),
                 Json(ep["responses"]), Json(ep["security"]),
-                ep["tags"] or [],
+                # api_endpoints.tags is text[] and ep comes from a parsed
+                # OpenAPI document, so its shape is whatever the spec author
+                # wrote — a string is as likely as a list.
+                as_text_array(ep["tags"]),
             ))
 
         conn.commit()

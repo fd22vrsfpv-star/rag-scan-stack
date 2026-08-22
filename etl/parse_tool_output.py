@@ -11,6 +11,10 @@ Given raw stdout from a security tool execution, attempts to:
 import os
 import re
 import json
+try:  # etl is imported as a package from rag-api, bare from within etl/
+    from etl.sql_types import as_text_array
+except ImportError:  # pragma: no cover
+    from sql_types import as_text_array
 import uuid
 import ipaddress
 import logging
@@ -703,7 +707,7 @@ def _insert_json_finding(cur, rec: dict, tool_name: str, target: str,
              rec_name or f"{tool_name} finding",
              rec_severity,
              json.dumps(rec, default=str)[:4000],
-             _CWE_RE.findall(json.dumps(rec)) or None,
+             as_text_array(_CWE_RE.findall(json.dumps(rec))),
              json.dumps({"cves": cve_list}) if cve_list else "{}",
              web_fingerprint(rec_url, tool_name, rec_name, "tool_finding")),
         )
@@ -731,7 +735,7 @@ def _insert_json_finding(cur, rec: dict, tool_name: str, target: str,
             (fid, asset_id, port_id,
              f"{tool_name}:{rec_name or 'finding'}",
              json.dumps(rec, default=str)[:4000],
-             rec_severity, cve_list,
+             rec_severity, as_text_array(cve_list),
              json.dumps({"source": tool_name, "job_id": job_id, "port": port}),
              vuln_fingerprint(rec_target, port, f"{tool_name}:{rec_name or 'finding'}", cve_list)),
         )
@@ -842,7 +846,7 @@ def _insert_vuln_finding(cur, tool_name: str, target: str, port: Optional[int],
         (fid, asset_id, port_id,
          f"{tool_name}:targeted-recon",
          stdout[:4000],
-         severity, cves[:10],
+         severity, as_text_array(cves[:10]),
          json.dumps({"source": tool_name, "job_id": job_id, "port": port}),
          vuln_fingerprint(target, port, f"{tool_name}:targeted-recon", cves)),
     )

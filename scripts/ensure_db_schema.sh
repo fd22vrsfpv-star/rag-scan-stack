@@ -237,6 +237,24 @@ done
 # vulns needs first_seen/last_seen for the delta view. updated_at cannot stand
 # in: trg_vulns_updated_at touches it on ANY write, so an operator editing
 # tester_notes is indistinguishable from a scan re-observing the finding.
+# The credential identity index must be TOTAL and coalesce auth_type. Checking
+# only that the NAME exists would pass even after a regression, because the name
+# did not change when the expression was fixed: auth_type is nullable, and a NULL
+# makes rows non-equal for a unique index, so two runs producing a NULL
+# auth_type stored two rows for one account.
+CRED_IDX=$(docker exec rag-postgres psql -U app -d scans -tAc \
+    "SELECT indexdef FROM pg_indexes WHERE indexname='uq_credential_findings_identity';" 2>/dev/null)
+if [[ -z "$CRED_IDX" ]]; then
+    echo "❌ uq_credential_findings_identity missing - etl/parse_brutus.py ON CONFLICT will fail on every row"
+    MISSING=$((MISSING + 1))
+elif [[ "$CRED_IDX" == *"COALESCE(auth_type"* && "$CRED_IDX" != *"WHERE"* ]]; then
+    echo "✓ uq_credential_findings_identity is total and coalesces auth_type"
+else
+    echo "❌ uq_credential_findings_identity is partial or does not coalesce auth_type - NULL auth_type rows will duplicate"
+    echo "   got: ${CRED_IDX}"
+    MISSING=$((MISSING + 1))
+fi
+
 VULN_SEEN=$(docker exec rag-postgres psql -U app -d scans -tAc \
     "SELECT count(*) FROM information_schema.columns WHERE table_name='vulns' AND column_name IN ('first_seen','last_seen');" 2>/dev/null)
 if [[ "$VULN_SEEN" == "2" ]]; then

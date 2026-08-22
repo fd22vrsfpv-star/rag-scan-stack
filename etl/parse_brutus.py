@@ -102,8 +102,13 @@ def parse_brutus(path: str, profile: str = "upload", job_id: str = None, secret_
                         VALUES (%s, %s, %s, %s, %s, %s, %s, true, %s, %s, 'brutus', %s, now(), 'valid')
                         -- Re-testing a known credential is a re-verification,
                         -- not a new finding. Requires uq_credential_findings_identity.
-                        ON CONFLICT (ip, port, username, auth_type)
-                          WHERE username IS NOT NULL
+                        --
+                        -- The COALESCE must match that index EXPRESSION exactly.
+                        -- auth_type is nullable, and a NULL makes rows non-equal
+                        -- for a unique index — so before this was coalesced, two
+                        -- runs that produced a NULL auth_type stored two rows for
+                        -- one account instead of re-verifying the first.
+                        ON CONFLICT (ip, port, username, COALESCE(auth_type, ''))
                           DO UPDATE SET
                             valid_cred       = EXCLUDED.valid_cred,
                             status           = EXCLUDED.status,

@@ -4010,23 +4010,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_vulns_fingerprint
 -- Re-verification is meaningful information, so the upsert advances
 -- last_verified_at rather than ignoring the row. NULL usernames are excluded
 -- from the key via a partial index; they carry no account identity to dedupe on.
+-- Collapse duplicates on the COALESCED key before tightening the index.
+--
+-- The previous dedupe gated on `username IS NOT NULL`, which is dead: username
+-- is NOT NULL in the schema. The actual hole was auth_type, which IS nullable —
+-- and in Postgres a NULL makes rows non-equal for a unique index, so two rows
+-- with the same (ip, port, username) and a NULL auth_type were both stored.
+-- Demonstrated on this deployment: two identical inserts with auth_type NULL
+-- both landed; with auth_type='password' the second was correctly rejected.
 UPDATE public.credential_findings c
    SET last_verified_at = g.max_seen
-  FROM (SELECT ip, port, username, auth_type,
+  FROM (SELECT ip, port, username, COALESCE(auth_type, '') AS auth_key,
                max(coalesce(last_verified_at, discovered_at, created_at)) AS max_seen
           FROM public.credential_findings
-         WHERE username IS NOT NULL
-         GROUP BY ip, port, username, auth_type HAVING count(*) > 1) g
- WHERE c.ip = g.ip AND c.port IS NOT DISTINCT FROM g.port
-   AND c.username = g.username AND c.auth_type IS NOT DISTINCT FROM g.auth_type;
+         GROUP BY ip, port, username, COALESCE(auth_type, '')
+        HAVING count(*) > 1) g
+ WHERE c.ip = g.ip AND c.port = g.port AND c.username = g.username
+   AND COALESCE(c.auth_type, '') = g.auth_key;
 
 DELETE FROM public.credential_findings a
  USING public.credential_findings b
- WHERE a.username IS NOT NULL AND b.username IS NOT NULL
-   AND a.ip = b.ip
-   AND a.port IS NOT DISTINCT FROM b.port
+ WHERE a.ip = b.ip
+   AND a.port = b.port
    AND a.username = b.username
-   AND a.auth_type IS NOT DISTINCT FROM b.auth_type
+   AND COALESCE(a.auth_type, '') = COALESCE(b.auth_type, '')
    AND a.id <> b.id
    -- Prefer a confirmed-valid row over a failed attempt for the same account,
    -- then the most recently seen; id makes the ordering strict.
@@ -4035,9 +4042,14 @@ DELETE FROM public.credential_findings a
        < (coalesce(b.valid_cred, false),
           coalesce(b.last_verified_at, b.discovered_at, b.created_at), b.id);
 
+-- Total, not partial, and coalesced on the one nullable key column. Any
+-- ON CONFLICT targeting this index must repeat the expression EXACTLY or
+-- Postgres raises "no unique or exclusion constraint matching the ON CONFLICT
+-- specification" on every row (see the comment in etl/asset_utils.py for what
+-- that failure looked like the last time: 23 records seen, 23 errors, 0 stored).
+DROP INDEX IF EXISTS public.uq_credential_findings_identity;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_credential_findings_identity
-    ON public.credential_findings(ip, port, username, auth_type)
- WHERE username IS NOT NULL;
+    ON public.credential_findings(ip, port, username, COALESCE(auth_type, ''));
 
 -- ===========================================================================
 -- web_findings: fingerprint + dedup at the database, not in 18 call sites

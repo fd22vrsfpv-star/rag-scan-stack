@@ -1727,11 +1727,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_web_findings_fingerprint
 CREATE UNIQUE INDEX IF NOT EXISTS uq_vulns_fingerprint
     ON public.vulns(fingerprint);
 
--- One credential finding per account. Partial: NULL usernames carry no account
--- identity to deduplicate on. Required by the ON CONFLICT in etl/parse_brutus.py.
+-- One credential finding per account.
+--
+-- Total, not partial, and coalesced on auth_type. The previous version was
+-- partial on `username IS NOT NULL`, which is dead — username is NOT NULL in
+-- this schema. The real hole was auth_type: it IS nullable, and a NULL makes
+-- rows non-equal for a unique index, so two rows with the same
+-- (ip, port, username) and a NULL auth_type were both stored. Demonstrated:
+-- two identical inserts with auth_type NULL both landed, while the same pair
+-- with auth_type='password' was correctly rejected.
+--
+-- Required by the ON CONFLICT in etl/parse_brutus.py, which must repeat this
+-- expression EXACTLY or Postgres raises "no unique or exclusion constraint
+-- matching the ON CONFLICT specification" on every row.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_credential_findings_identity
-    ON public.credential_findings(ip, port, username, auth_type)
- WHERE username IS NOT NULL;
+    ON public.credential_findings(ip, port, username, COALESCE(auth_type, ''));
 
 -- Dedup trigger for web_findings (see ensure_all_tables.sql for rationale).
 CREATE OR REPLACE FUNCTION public.web_findings_dedup() RETURNS trigger AS $fn$

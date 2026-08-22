@@ -208,10 +208,23 @@ Two rules that cut across all tiers:
   query against them is skipped rather than checked.
 - **A column's TYPE matters as much as its name.** `text[]` rejects a bare
   string (`malformed array literal: "CWE-79"`) and `jsonb` rejects a bare dict
-  (`can't adapt type 'dict'`). Normalize before passing, and where the value's
-  shape cannot be proven statically — a bare `d.get("k")` is opaque — the feed
-  MUST be declared in `ARRAY_UNVERIFIED`. New undeclared ones fail by name, so
-  the class stays caught even where inference cannot reach.
+  (`can't adapt type 'dict'`). Checked for `INSERT` columns and `UPDATE ... SET`
+  assignments alike. Where the shape cannot be proven — a bare `d.get("k")` is
+  opaque — the feed MUST be declared in `ARRAY_UNVERIFIED`; new undeclared ones
+  fail by name, so the class stays caught even where inference cannot reach.
+- **Prefer declaring a type over wrapping a value.** The guard reads Pydantic
+  field annotations, parameter annotations, `-> list` returns, module-level
+  constants, local assignments and the `x or []` idiom. That resolved 18 of the
+  original 19 unprovable array feeds *without touching a call site*. Reach for
+  `etl/sql_types.as_text_array()` when the shape genuinely is unknown at the
+  call site — not to restate a signature that already promises a list. Add new
+  normalisers to `LIST_SAFE_FUNCS` or their call sites stay unprovable.
+- **A partial unique index is easy to get wrong twice.** In Postgres a NULL in
+  any indexed column makes rows non-equal, so uniqueness does not constrain
+  NULL-bearing rows at all. `COALESCE` the nullable columns instead of adding a
+  `WHERE` predicate, and remember that any `ON CONFLICT` MUST repeat the index
+  expression **exactly** or every insert raises "no unique or exclusion
+  constraint matching the ON CONFLICT specification".
 - **Dedup logic duplicated in SQL needs an agreement test.** `etl/fingerprint.py`
   and the `vulns_dedup` / `web_findings_dedup` triggers both compute the
   fingerprint; the triggers fill it for the ~19 insert sites that supply none.
@@ -227,8 +240,9 @@ Two rules that cut across all tiers:
   `tests/test_sql_columns.py::test_every_sql_column_exists` (qualified
   references + `INSERT` column lists, with the `SQL_DEBT` ratchet),
   `tests/test_sql_columns.py::test_sql_param_types_are_compatible` and
-  `::test_unprovable_array_feeds_are_declared` (parameter types +
-  `ARRAY_UNVERIFIED` ratchet),
+  `::test_unprovable_array_feeds_are_declared` (INSERT + UPDATE parameter types,
+  `ARRAY_UNVERIFIED` ratchet), `tests/test_sql_types.py` (the normaliser's own
+  contract, incl. that its names still match `LIST_SAFE_FUNCS`),
   `tests/test_fingerprint.py` (unit cases + Python↔SQL trigger agreement),
   `tests/test_endpoint_smoke.py` and `scripts/smoke_endpoints.py` (live sweep,
   bare + parameterised), `tests/test_route_contracts.py` (declaration order,
@@ -250,6 +264,13 @@ Two rules that cut across all tiers:
   vulns, 778 web findings. Two ingest paths also wrote to columns that do not
   exist, so Censys-discovered services and Playwright's ZAP findings were never
   stored at all.
+
+  `uq_credential_findings_identity` was partial on `username IS NOT NULL` — dead,
+  since username is NOT NULL — while the genuinely nullable `auth_type` went
+  unconstrained. Two identical inserts with a NULL `auth_type` both stored; with
+  `auth_type='password'` the second was correctly rejected. Now
+  `COALESCE(auth_type, '')`, with `etl/parse_brutus.py`'s `ON CONFLICT` updated
+  to match the expression exactly.
 
 ### Known-debt lists
 `tests/test_dispatch_invariants.py` carries `SCOPE_DEBT` and `LIMIT_DEBT`,
