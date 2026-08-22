@@ -1,8 +1,19 @@
-export const BUILD_VERSION = '2026.08.22-2231'
-export const SEVERITY_LEVELS = ['critical', 'high', 'medium', 'low', 'info', 'recon', 'error'] as const
+export const BUILD_VERSION = '2026.08.22-2318'
+// Severities offered as filter chips. 'recon' was removed: it was functionally
+// identical to 'info' — same SARIF level, same treatment in every export and
+// report, differing only in sort rank — so it is now written as 'info' and
+// existing rows were migrated. Leaving the chip would have offered a filter
+// that always returns nothing.
+export const SEVERITY_LEVELS = ['critical', 'high', 'medium', 'low', 'info', 'error'] as const
 export type Severity = (typeof SEVERITY_LEVELS)[number]
 
-export const SEVERITY_COLORS: Record<Severity, string> = {
+// Values that may still appear in DATA but are not offered as filters — a
+// database that predates the recon->info migration. Kept so such a row renders
+// with its own colour instead of falling through to an undefined lookup.
+export const LEGACY_SEVERITIES = ['recon'] as const
+export type DisplaySeverity = Severity | (typeof LEGACY_SEVERITIES)[number]
+
+export const SEVERITY_COLORS: Record<DisplaySeverity, string> = {
   critical: '#dc2626',
   high: '#ea580c',
   medium: '#facc15',
@@ -12,7 +23,7 @@ export const SEVERITY_COLORS: Record<Severity, string> = {
   recon: '#0891b2',
 }
 
-export const SEVERITY_BG: Record<Severity, string> = {
+export const SEVERITY_BG: Record<DisplaySeverity, string> = {
   critical: 'bg-red-600 text-white',
   high: 'bg-orange-600 text-white',
   medium: 'bg-yellow-400 text-black',

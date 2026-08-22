@@ -496,7 +496,11 @@ def parse_katana(path: str, profile: str = "upload", job_id: str = None):
                         refs["api_signals"] = api_class["signals"]
 
                     # Determine severity: API endpoints get "info" for visibility
-                    severity = "recon"
+                    # "info", not a separate "recon" severity: the two were
+                    # functionally identical (same SARIF level, same colour
+                    # chip, same report treatment — only the sort rank
+                    # differed), so one informational bucket is honest.
+                    severity = "info"
                     issue_type = None
                     if api_class:
                         severity = "info"
