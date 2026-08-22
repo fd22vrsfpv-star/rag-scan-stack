@@ -1,4 +1,4 @@
-export const BUILD_VERSION = '2026.08.22-2352'
+export const BUILD_VERSION = '2026.08.23-0012'
 // Severities offered as filter chips. 'recon' was removed: it was functionally
 // identical to 'info' — same SARIF level, same treatment in every export and
 // report, differing only in sort rank — so it is now written as 'info' and
@@ -21,6 +21,75 @@ export const SEVERITY_COLORS: Record<DisplaySeverity, string> = {
   info: '#6b7280',
   error: '#991b1b',
   recon: '#0891b2',
+}
+
+// ── Canonical severity ordering ────────────────────────────────────────────
+//
+// This exists because it did NOT, and four local copies drifted apart:
+//
+//   AttackMap.tsx    SEV_RANK    { critical: 5 ... info: 1 }   high = severe
+//   TargetBoard.tsx  SEV_RANK    { critical: 5 ... info: 1 }   high = severe
+//   ContentIntel.tsx SEVERITY_ORDER { critical: 0 ... info: 4 } LOW = severe
+//   AttackMap.tsx    SEV_ORDER   ['critical'...'info']         display order
+//
+// Two opposite conventions, and none of them knew about the backend's 'recon'
+// value — so 1495 attack vectors sorted at rank 0, BELOW info and tied with
+// unknown, and rendered with a fallback colour. The backend emitted a severity
+// the frontend had never heard of, in four places at once.
+//
+// Derived from SEVERITY_LEVELS so adding a severity there ranks it automatically
+// and cannot be forgotten here.
+
+/** Most severe first. Every value in SEVERITY_LEVELS, plus legacy aliases. */
+export const SEVERITY_RANK: Record<DisplaySeverity, number> = {
+  ...(Object.fromEntries(
+    SEVERITY_LEVELS.map((s, i) => [s, SEVERITY_LEVELS.length - i]),
+  ) as Record<Severity, number>),
+  // 'recon' was collapsed into 'info' (2026-08-22); pre-migration rows must
+  // still rank as informational rather than as unknown.
+  recon: SEVERITY_LEVELS.length - SEVERITY_LEVELS.indexOf('info'),
+}
+
+/**
+ * Rank for sorting, higher = more severe. Unknown/missing returns 0 so it
+ * sorts LAST in a descending sort — the behaviour every local copy intended
+ * via `?? 0`.
+ */
+export function severityRank(severity?: string | null): number {
+  if (!severity) return 0
+  return SEVERITY_RANK[severity.toLowerCase() as DisplaySeverity] ?? 0
+}
+
+/** Comparator: most severe first. Use directly in .sort(). */
+export function compareSeverity(a?: string | null, b?: string | null): number {
+  return severityRank(b) - severityRank(a)
+}
+
+/** Severities in display order, most severe first. */
+export const SEVERITY_BY_RANK: readonly Severity[] =
+  [...SEVERITY_LEVELS].sort((a, b) => severityRank(b) - severityRank(a))
+
+/**
+ * Dot class for a severity, with the fallback built in.
+ *
+ * A function rather than a bare Record so callers can pass the `string` they
+ * actually have without a cast, and so the `|| 'bg-gray-500'` fallback that was
+ * repeated at every call site lives in one place.
+ */
+export function severityDot(severity?: string | null): string {
+  if (!severity) return 'bg-gray-500'
+  return SEVERITY_DOT[severity.toLowerCase() as DisplaySeverity] ?? 'bg-gray-500'
+}
+
+/** The small status-dot shape, shared by AttackMap and TargetBoard. */
+export const SEVERITY_DOT: Record<DisplaySeverity, string> = {
+  critical: 'bg-red-600',
+  high: 'bg-orange-500',
+  medium: 'bg-yellow-400',
+  low: 'bg-blue-500',
+  info: 'bg-gray-500',
+  error: 'bg-red-900',
+  recon: 'bg-gray-500',
 }
 
 export const SEVERITY_BG: Record<DisplaySeverity, string> = {
