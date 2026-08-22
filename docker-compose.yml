@@ -1424,6 +1424,9 @@ services:
     mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
     cpus: ${DEFAULT_CPUS:-2.0}
     environment:
+      # Without this the shared ceiling silently defaults to 5 instead of
+      # using the number the operator actually set.
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
       SSL_CERTFILE: /certs/server.crt
       PYTHONHTTPSVERIFY: "0"
       SSL_KEYFILE: /certs/server.key
@@ -1449,6 +1452,7 @@ services:
       - "9080-9180:9080-9180"
     volumes:
       - ./etl:/app/etl:ro                             # shared scope gate (etl/scope_gate.py)
+      - ./common:/app/common:ro                        # shared scan-slot ceiling (common/tool_job.py)
       - ./certs:/certs:ro
     cap_add:
       - NET_RAW
@@ -2018,6 +2022,7 @@ services:
     mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
     cpus: ${DEFAULT_CPUS:-2.0}
     environment:
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
       SSL_CERTFILE: /certs/server.crt
       SSL_KEYFILE: /certs/server.key
       PYTHONHTTPSVERIFY: "0"
@@ -2050,6 +2055,8 @@ services:
       API_BASE: https://rag-api:8000
       API_KEY: ${API_KEY:-changeme}
     volumes:
+      - ./etl:/app/etl:ro                              # shared scope gate for the remote-node path
+      - ./common:/app/common:ro                        # shared scan-slot ceiling
       - ${SSH_KEY_PATH:-./ssh-keys}:/ssh-keys:ro
       # NOTE: ./node_manager is deliberately NOT mounted here.
       # It used to be mounted at /app/node_manager, which was actively

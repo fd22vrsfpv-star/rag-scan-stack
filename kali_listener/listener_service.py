@@ -1060,6 +1060,31 @@ def get_allowed_tools() -> set:
 ALLOWED_TOOLS = _FALLBACK_ALLOWED_TOOLS
 
 
+# Concurrency ceiling, shared with every other service via common/tool_job.py.
+#
+# The ASYNC variant matters here: this service's executor is
+# `await asyncio.create_subprocess_shell`, and holding the threading semaphore
+# would block the event loop for up to SLOT_WAIT_TIMEOUT (1800s), stalling every
+# other request including the health check that keeps this container marked
+# healthy.
+#
+# ./common is bind-mounted at /app/common (docker-compose.yml), the same way
+# ./etl is for the scope gate. If it is missing we refuse to run tools rather
+# than silently running unbounded — this service executes whatever it is handed,
+# so an unbounded fallback is the worst possible failure mode.
+try:
+    from common.tool_job import (
+        MAX_CONCURRENT_SCANS,
+        active_async_slot_count,
+        async_scan_slot,
+    )
+    _SLOTS_AVAILABLE = True
+except ImportError as _slot_exc:      # pragma: no cover - deployment problem
+    _SLOTS_AVAILABLE = False
+    _SLOT_IMPORT_ERROR = str(_slot_exc)
+    MAX_CONCURRENT_SCANS = 0
+
+
 # ── Scope enforcement (last line of defence) ──────────────────────────────
 #
 # This service executes whatever it is handed. Every other dispatcher — the BFF,
@@ -1218,7 +1243,33 @@ def apply_json_output(tool: str, command: str):
 async def execute_tool(exec_id: str, tool: str, command: str, timeout: int,
                        target: str = "", port: int = None,
                        service: str = None, job_id: str = None):
-    """Execute a tool command and capture output."""
+    """Execute a tool command and capture output.
+
+    Bounded by MAX_CONCURRENT_SCANS. This is the last line of defence: every
+    dispatcher in the stack eventually reaches /tools/execute, so several
+    callers that never consult the limit themselves are bounded here.
+    """
+    if not _SLOTS_AVAILABLE:
+        msg = (f"refusing to execute: common/tool_job is not importable "
+               f"({_SLOT_IMPORT_ERROR}) so the scan limit cannot be enforced")
+        logger.error(f"[{exec_id[:8]}] {msg}")
+        db_update_tool_execution(exec_id, "failed", error=msg)
+        return
+
+    try:
+        async with async_scan_slot(exec_id, f"tool:{tool}"):
+            await _execute_tool_bounded(exec_id, tool, command, timeout,
+                                        target, port, service, job_id)
+    except TimeoutError as exc:
+        # Fail loudly rather than pinning a coroutine forever.
+        logger.error(f"[{exec_id[:8]}] {exc}")
+        db_update_tool_execution(exec_id, "failed", error=str(exc))
+
+
+async def _execute_tool_bounded(exec_id: str, tool: str, command: str, timeout: int,
+                                target: str = "", port: int = None,
+                                service: str = None, job_id: str = None):
+    """The body of execute_tool, run while holding a scan slot."""
     # Prefer the tool's own JSON where it has one.
     command, _json_path = apply_json_output(tool, command)
     logger.info(f"[{exec_id[:8]}] Executing: {command}")
@@ -1730,10 +1781,16 @@ async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: B
     The tool must be in the allowed list for security reasons.
     Results are parsed automatically for common tools (nmap, hydra, nikto, etc.)
     """
-    # Scope gate FIRST. Every dispatcher in the stack eventually calls this
-    # endpoint, so refusing here covers callers that were never gated — and
-    # there are several. 403, not 400: this is an authorisation decision, not a
+    # Scope gate FIRST. 403, not 400: this is an authorisation decision, not a
     # malformed request.
+    #
+    # NB: this endpoint is NOT the universal chokepoint an earlier version of
+    # this comment claimed. Measured against the dispatch-debt list, exactly ONE
+    # of 17 ungated modules reaches here; the other 16 subprocess directly or
+    # call another scanner service over HTTP. So this gate protects its own
+    # callers well and is worth keeping strict, but it is defence in depth, not
+    # coverage — the remaining modules each need their own gate. See
+    # SCOPE_DEBT/LIMIT_DEBT in tests/test_dispatch_invariants.py.
     scope_error = enforce_scope(request.target, request.command)
     if scope_error:
         logger.warning(f"REFUSED {request.tool} on {request.target}: {scope_error}")

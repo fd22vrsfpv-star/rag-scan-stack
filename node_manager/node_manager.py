@@ -2440,6 +2440,52 @@ async def ssh_download(node_id: str, req: SSHDownloadRequest):
 # ---------------------------------------------------------------------------
 # Remote Tool Execution — run tools directly on SSH dropbox hosts
 # ---------------------------------------------------------------------------
+# ── Scope gate for the remote-node path ───────────────────────────────────
+#
+# This service SSHes to a node and runs scanners there, so nothing inside the
+# stack sees that traffic and nothing downstream can refuse it. It was also
+# invisible to the audit: node_manager was not in _ROOTS in
+# tests/test_dispatch_invariants.py, so the whole remote path never appeared in
+# SCOPE_DEBT at all.
+#
+# The gate cannot live in the uploaded script. node_manager pushes
+# service_enum_cli.py to /tmp on the node and runs it with python3; etl/ is
+# never delivered alongside, and the node has no database. So the decision has
+# to be made HERE, before dispatch, where the target is known and Postgres is
+# reachable.
+#
+# FAILS CLOSED: no gate means no remote scan.
+try:
+    from common.tool_job import MAX_CONCURRENT_SCANS, async_scan_slot
+    _NODE_SLOTS_OK = True
+except ImportError as _slot_exc:          # pragma: no cover - deployment problem
+    _NODE_SLOTS_OK = False
+    _NODE_SLOT_ERROR = str(_slot_exc)
+
+try:
+    from etl.scope_gate import enforce_target_scope
+    _NODE_SCOPE_GATE_OK = True
+except Exception as _node_scope_exc:      # pragma: no cover - deployment problem
+    _NODE_SCOPE_GATE_OK = False
+    _NODE_SCOPE_ERROR = str(_node_scope_exc)
+
+
+def _remote_scope_refusal(targets, command=""):
+    """Refusal string when a remote scan must not run, else None."""
+    if not _NODE_SCOPE_GATE_OK:
+        return (f"scope gate unavailable ({_NODE_SCOPE_ERROR}) — refusing remote "
+                "scan; check the ./etl:/app/etl mount on node-manager")
+    for t in (targets or []):
+        refusal = enforce_target_scope(str(t), command)
+        if refusal:
+            return refusal
+    if not targets:
+        # No target at all is not a licence to scan; the command may still name
+        # a host, and an empty list must not skip the check entirely.
+        return enforce_target_scope("", command)
+    return None
+
+
 REMOTE_SCAN_TEMPLATES = {
     "masscan": {
         "cmd": ["masscan", "-p", "{ports}", "--rate", "{rate}", "-oJ", "/tmp/scan_out.json"],
@@ -2530,6 +2576,36 @@ REMOTE_SCAN_TEMPLATES = {
 @app.post("/ssh/{node_id}/remote-scan")
 async def remote_scan(node_id: str, req: RemoteScanRequest):
     """Run a scan tool on a remote SSH host, download results, and ingest them."""
+    # Authorisation before anything else — before the template is resolved, the
+    # script uploaded, or a connection opened.
+    _refusal = _remote_scope_refusal(req.targets, " ".join(req.extra_args or []))
+    if _refusal:
+        log.warning("REFUSED remote %s on %s: %s",
+                    getattr(req, "scan_type", "?"), req.targets, _refusal)
+        raise HTTPException(status_code=403, detail=f"Out of scope — {_refusal}")
+
+    # A remote scan is a scan: it consumes the same ceiling as a local one,
+    # rather than a private number. 503 rather than queueing, because this is a
+    # synchronous request path — admitting it and then abandoning it wastes the
+    # work twice, which is the rule CLAUDE.md states as "shed, do not queue".
+    if not _NODE_SLOTS_OK:
+        raise HTTPException(
+            status_code=503,
+            detail=f"scan limit cannot be enforced ({_NODE_SLOT_ERROR}); "
+                   "check the ./common:/app/common mount on node-manager")
+    try:
+        async with async_scan_slot(node_id, f"remote:{getattr(req, 'scan_type', '?')}",
+                                   timeout=5):
+            return await _remote_scan_bounded(node_id, req)
+    except TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail=f"all {MAX_CONCURRENT_SCANS} scan slots busy — retry shortly")
+
+
+async def _remote_scan_bounded(node_id: str, req):
+    """The body of remote_scan, run while holding a scan slot."""
+
     if req.scan_type not in REMOTE_SCAN_TEMPLATES:
         raise HTTPException(400, f"Unsupported scan type: {req.scan_type}. "
                             f"Available: {list(REMOTE_SCAN_TEMPLATES.keys())}")

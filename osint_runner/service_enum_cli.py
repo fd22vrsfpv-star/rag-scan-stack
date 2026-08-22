@@ -49,10 +49,24 @@ except ImportError:
 LOG_PREFIX = "[service-enum]"
 
 
+
+
 # ── CLI fallback helpers ─────────────────────────────
 
 def _run_cmd(cmd, timeout=15):
-    """Run a command and return stdout."""
+    """Run a command and return stdout.
+
+    NO scope gate here, deliberately. This file is not shipped in the
+    osint-runner image at all — node_manager uploads it to a REMOTE node
+    (_upload_script) and runs it there with python3. etl/ is never delivered
+    alongside it, so an etl-based gate would fail closed on every node and kill
+    email-enum, dns-enum and service-enum outright.
+    scope_gate.enforce_target_scope cannot work where there is no DB and no etl.
+
+    The gate for this path therefore belongs in node_manager, BEFORE the job is
+    dispatched, where the target is known and the database is reachable. See
+    SCOPE_DEBT in tests/test_dispatch_invariants.py.
+    """
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.stdout.strip()

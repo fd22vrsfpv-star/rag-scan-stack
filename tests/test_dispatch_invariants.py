@@ -66,6 +66,11 @@ _ROOTS = (
     "dashboard/bff", "scan_recommender", "nmap_scanner", "pd_runner",
     "web_scanner", "osint_runner", "kali_listener", "autogen_agents",
     "app/rag-api", "exploit_runner", "playwright_scanner", "brutus_runner",
+    # node_manager was MISSING from this tuple, so the entire remote-node path
+    # — SSH to a box and run scanners there, where nothing in the stack sees the
+    # traffic — never appeared in either debt list. A blind spot in the audit is
+    # worse than a debt entry, because the debt entry is at least visible.
+    "node_manager",
 )
 
 # ── Known debt ────────────────────────────────────────────────────────────
@@ -92,10 +97,15 @@ SCOPE_DEBT = {
         "drives multi-stage scans; the gate belongs at stage dispatch",
     "exploit_runner/script_executor.py":
         "sends traffic to a supplied target without a scope check",
-    "nmap_scanner/cred_checker.py":
-        "sends traffic to a supplied target without a scope check",
+    "node_manager/ssh_manager.py":
+        "SSH transport. Its `host` argument is the NODE, not the scan target, so "
+        "gating on it would check the wrong value and give false confidence. The "
+        "target-level gate is upstream in node_manager.remote_scan",
     "osint_runner/service_enum_cli.py":
-        "sends traffic to a supplied target without a scope check",
+        "NOT shipped in the osint-runner image; node_manager uploads it to a "
+        "remote node and runs it there with no etl/ and no database, so an "
+        "etl-based gate would fail closed and kill email/dns/service enum. "
+        "Gated upstream in node_manager.remote_scan instead",
     "playwright_scanner/metadata_extractor.py":
         "sends traffic to a supplied target without a scope check",
     "playwright_scanner/playwright_scanner.py":
@@ -109,6 +119,9 @@ SCOPE_DEBT = {
 }
 
 LIMIT_DEBT = {
+    "node_manager/ssh_manager.py":
+        "SSH transport, not a scan initiator; remote_scan holds the slot around "
+        "the whole dispatch, so bounding here too would double-count one scan",
     "app/rag-api/api.py":
         "job-creation endpoints fan out to the scanner services",
     "app/rag-api/health_router.py":
@@ -125,8 +138,6 @@ LIMIT_DEBT = {
         "runs tools for the pipeline; needs the same gate as routers/assets.py",
     "exploit_runner/script_executor.py":
         "initiates scans without consulting the shared limit",
-    "kali_listener/listener_service.py":
-        "executes whatever it is handed — the LAST line of defence, and the best place to refuse an out-of-scope target even when a caller insists",
     "nmap_scanner/cred_checker.py":
         "initiates scans without consulting the shared limit",
     "osint_runner/service_enum_cli.py":
@@ -313,3 +324,132 @@ def test_msf_proxy_refuses_rather_than_connecting_direct():
     src = open(os.path.join(REPO, "exploit_runner", "exploit_runner.py")).read()
     assert "refusing to run the module unproxied" in src, (
         "a proxy that cannot be expressed as an MSF Proxies value must refuse")
+
+# ── the gates added when this list was shrunk ────────────────────────────────
+
+@pytest.mark.unit
+def test_async_scan_slot_exists_and_does_not_block_the_loop():
+    """kali-listener and node-manager execute with `await create_subprocess_*`.
+
+    Holding the THREADING semaphore there would block the event loop for up to
+    SLOT_WAIT_TIMEOUT (1800s), stalling every other request including the health
+    check that keeps the container marked healthy. So the async variant is not a
+    convenience — a sync slot in an async executor is a self-inflicted outage.
+    """
+    import asyncio
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_tj", os.path.join(REPO, "common", "tool_job.py"))
+    tj = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tj)
+
+    assert hasattr(tj, "async_scan_slot"), "async_scan_slot missing"
+    assert hasattr(tj, "active_async_slot_count")
+
+    async def exercise():
+        tj._async_slots = asyncio.Semaphore(2)
+        peak = cur = 0
+        async def worker():
+            nonlocal peak, cur
+            async with tj.async_scan_slot("j"):
+                cur += 1
+                peak = max(peak, cur)
+                await asyncio.sleep(0.01)
+                cur -= 1
+        await asyncio.gather(*(worker() for _ in range(6)))
+        return peak
+    assert asyncio.run(exercise()) == 2, "async slot did not bound concurrency"
+
+    async def times_out():
+        tj._async_slots = asyncio.Semaphore(1)
+        async with tj.async_scan_slot("holder"):
+            try:
+                async with tj.async_scan_slot("waiter", timeout=0.05):
+                    return False
+            except TimeoutError:
+                return True
+    assert asyncio.run(times_out()), "a full pool must raise, not hang"
+
+
+@pytest.mark.unit
+def test_enforce_target_scope_fails_closed():
+    """"Cannot check" must never look like "is authorised" to a tool about to
+    send packets. Verified without a database, which is the failure mode."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_sg", os.path.join(REPO, "etl", "scope_gate.py"))
+    sg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sg)
+
+    assert hasattr(sg, "enforce_target_scope")
+    sg._ENFORCE_CACHE.update({"rows": None, "at": 0.0})
+    refusal = sg.enforce_target_scope("10.0.0.1", dsn="")
+    assert refusal and "refusing" in refusal.lower(), (
+        f"missing DSN must refuse, got {refusal!r}")
+
+
+@pytest.mark.unit
+def test_closed_entries_actually_carry_a_gate():
+    """A debt entry removed from the list must have gained a real gate.
+
+    The lists are checked by source marker, so deleting an entry without adding
+    enforcement would quietly pass. These assert the enforcement itself.
+    """
+    cred = open(os.path.join(REPO, "nmap_scanner", "cred_checker.py"),
+                encoding="utf-8").read()
+    assert "enforce_target_scope" in cred and "_scope_refusal(target)" in cred, \
+        "cred_checker was removed from SCOPE_DEBT but does not call the gate"
+    assert cred.count("_scope_refusal(target)") >= 2, \
+        "both hydra and nmap credential paths must be gated"
+
+    listener = open(os.path.join(REPO, "kali_listener", "listener_service.py"),
+                    encoding="utf-8").read()
+    assert "async_scan_slot" in listener, \
+        "kali_listener was removed from LIMIT_DEBT but holds no scan slot"
+    assert "_SLOTS_AVAILABLE" in listener and "refusing to execute" in listener, \
+        "a missing slot module must refuse, not run unbounded"
+
+    nm = open(os.path.join(REPO, "node_manager", "node_manager.py"),
+              encoding="utf-8").read()
+    assert "_remote_scope_refusal" in nm and "async_scan_slot" in nm, \
+        "node_manager.remote_scan must gate scope AND hold a slot"
+
+
+@pytest.mark.unit
+def test_the_remote_node_path_is_audited():
+    """node_manager was absent from _ROOTS, so the entire remote path — SSH to a
+    box and run scanners there, where nothing in the stack sees the traffic —
+    never appeared in either debt list. A blind spot is worse than a debt entry."""
+    assert "node_manager" in _ROOTS
+
+
+@pytest.mark.unit
+def test_uploaded_remote_script_is_not_falsely_gated():
+    """osint_runner/service_enum_cli.py must NOT carry an etl-based gate.
+
+    It is not shipped in the osint-runner image; node_manager uploads it to a
+    remote node and runs it with python3, where etl/ and the database do not
+    exist. An etl-based gate there fails closed and kills email/dns/service
+    enum outright — a gate in the wrong layer is an outage, not a safeguard.
+    """
+    path = os.path.join(REPO, "osint_runner", "service_enum_cli.py")
+    src = open(path, encoding="utf-8").read()
+
+    # Check CODE, not prose: the docstring explains why the gate is absent and
+    # names the function, so a bare substring search flags its own explanation.
+    # Same trap the SQL guard hit when a comment mentioning dp.get("method")
+    # read as a column reference.
+    tree = ast.parse(src)
+    imported, called = [], []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("etl"):
+            imported.extend(a.name for a in node.names)
+        if isinstance(node, ast.Call):
+            fn = node.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+            if name in ("enforce_target_scope", "_scope_refusal"):
+                called.append(name)
+    assert not imported, (
+        f"service_enum_cli imports from etl ({imported}) — it runs on a remote "
+        "node where etl does not exist, so this would refuse every enumeration")
+    assert not called, f"service_enum_cli calls the etl gate ({called})"

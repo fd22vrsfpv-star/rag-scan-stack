@@ -22,12 +22,13 @@ service's dependencies along with it.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import subprocess
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from typing import Any, Callable, Optional
 
@@ -72,6 +73,70 @@ DEFAULT_TIMEOUT = 3600
 RAW_OUTPUT_CAP = 10000
 STREAM_TAIL_TEST_MODE = 2000
 STREAM_TAIL_NORMAL = 500
+
+
+_async_slots: Optional["asyncio.Semaphore"] = None
+
+
+def _async_slot_pool() -> "asyncio.Semaphore":
+    """Lazily create the async slot pool.
+
+    Separate from the threading semaphore above, and deliberately so: an async
+    service holding a threading.BoundedSemaphore would block the EVENT LOOP for
+    up to SLOT_WAIT_TIMEOUT (1800s by default), stalling every other request
+    including the health check that keeps the container marked healthy.
+
+    Consequence worth stating: a service using both pools is bounded to
+    MAX_CONCURRENT_SCANS in each, not across both. No service does today, and
+    the alternative — one shared counter across sync and async call paths —
+    needs a lease service this stack does not have. Same honest limitation the
+    per-service note above describes.
+    """
+    global _async_slots
+    if _async_slots is None:
+        _async_slots = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
+    return _async_slots
+
+
+def active_async_slot_count() -> int:
+    """Async slots in use (best-effort, for diagnostics and 429 decisions)."""
+    pool = _async_slots
+    if pool is None:
+        return 0
+    return max(0, MAX_CONCURRENT_SCANS - pool._value)      # noqa: SLF001
+
+
+@asynccontextmanager
+async def async_scan_slot(job_id: str = "", label: str = "scan",
+                          timeout: Optional[float] = None):
+    """Hold one of this service's scan slots, without blocking the event loop.
+
+    The async counterpart to scan_slot(), for services whose executor is
+    `await asyncio.create_subprocess_*` rather than a threadpool job:
+
+        async with async_scan_slot(exec_id, "tool-execute"):
+            proc = await asyncio.create_subprocess_shell(command, ...)
+
+    Ceiling is the same MAX_CONCURRENT_SCANS the operator already sets — no new
+    knob, per the rule that no component invents a private concurrency number.
+
+    Raises TimeoutError rather than waiting forever, so a caller fails loudly
+    instead of accumulating coroutines that will never run.
+    """
+    wait = SLOT_WAIT_TIMEOUT if timeout is None else timeout
+    pool = _async_slot_pool()
+    try:
+        await asyncio.wait_for(pool.acquire(), timeout=wait)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(
+            f"no scan slot within {wait}s "
+            f"(MAX_CONCURRENT_SCANS={MAX_CONCURRENT_SCANS})") from exc
+    if job_id:
+        log.debug("scan slot acquired for %s (%s)", job_id, label)
+    try:
+        yield
+    finally:
+        pool.release()
 
 
 @contextmanager
