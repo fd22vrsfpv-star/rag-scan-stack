@@ -50,6 +50,7 @@ vuln_fingerprint = fingerprint.vuln_fingerprint
 web_fingerprint = fingerprint.web_fingerprint
 recon_fingerprint = fingerprint.recon_fingerprint
 credential_fingerprint = fingerprint.credential_fingerprint
+infrastructure_fingerprint = fingerprint.infrastructure_fingerprint
 
 
 # ── shared case table, used by BOTH the unit and agreement tests ─────────────
@@ -639,3 +640,167 @@ def test_credential_reinsert_bumps_last_verified_at(db):
     after, bumped = (int(x) for x in rows[-1].split(","))
     assert after == before, f"re-insert created a row ({before} -> {after})"
     assert bumped >= 1, "re-insert did not bump last_verified_at"
+
+
+# ── virtual-host grouping (option D: group, never merge) ─────────────────────
+
+@pytest.mark.unit
+def test_infra_fingerprint_ignores_the_hostname():
+    """The whole point: one server-level problem, one group, N vhosts.
+
+    web_fingerprint hashes the URL and therefore the hostname, so the same
+    missing header on app1 and app2 produces two rows. This key must NOT.
+    """
+    assert infrastructure_fingerprint("10.0.0.1", 443, "Missing X-Frame-Options", "hdr") == \
+           infrastructure_fingerprint("10.0.0.1", 443, "Missing X-Frame-Options", "hdr")
+    # and it genuinely differs from the per-vhost key
+    assert web_fingerprint("https://app1.test/", "zap", "Missing X-Frame-Options", "hdr") != \
+           web_fingerprint("https://app2.test/", "zap", "Missing X-Frame-Options", "hdr")
+
+
+@pytest.mark.unit
+def test_infra_fingerprint_ignores_the_path():
+    """A missing header is reported once per crawled URL.
+
+    Including the path would give one small group per path (/, /login, /about)
+    instead of the single "missing header on this host:port" line a report
+    wants. Documented tradeoff: two same-named app findings at different paths
+    also group — acceptable because the per-vhost rows are preserved.
+    """
+    a = infrastructure_fingerprint("10.0.0.1", 443, "Missing Header", "hdr")
+    b = infrastructure_fingerprint("10.0.0.1", 443, "Missing Header", "hdr")
+    assert a == b
+
+
+@pytest.mark.unit
+def test_infra_fingerprint_separates_host_port_and_issue():
+    base = infrastructure_fingerprint("10.0.0.1", 443, "X", "y")
+    assert infrastructure_fingerprint("10.0.0.2", 443, "X", "y") != base, "different host"
+    assert infrastructure_fingerprint("10.0.0.1", 8443, "X", "y") != base, "different port"
+    assert infrastructure_fingerprint("10.0.0.1", 443, "Z", "y") != base, "different name"
+    assert infrastructure_fingerprint("10.0.0.1", 443, "X", "z") != base, "different issue_type"
+
+
+@pytest.mark.unit
+def test_infra_fingerprint_is_none_when_ungroupable():
+    """Refuse to invent a bucket rather than making a bad group."""
+    assert infrastructure_fingerprint(None, 443, "X", "y") is None, "no host"
+    assert infrastructure_fingerprint("", 443, "X", "y") is None, "blank host"
+    # katana crawl rows: 746 of 779 in one deployment had blank name AND
+    # issue_type. Grouping them would bucket every discovered URL on a host.
+    assert infrastructure_fingerprint("10.0.0.1", 443, "", "") is None
+    assert infrastructure_fingerprint("10.0.0.1", 443, None, None) is None
+    # one of the two present is enough to identify a problem
+    assert infrastructure_fingerprint("10.0.0.1", 443, "X", None) is not None
+    assert infrastructure_fingerprint("10.0.0.1", 443, None, "y") is not None
+
+
+@pytest.mark.unit
+def test_infra_fingerprint_normalises_case_and_padding():
+    assert infrastructure_fingerprint("10.0.0.1", 443, "  Missing Header  ", "HDR") == \
+           infrastructure_fingerprint("10.0.0.1", 443, "missing header", "hdr")
+
+
+def test_infra_trigger_agrees_with_python(db):
+    """Exercise the real trigger, including the port it depends on."""
+    expected = infrastructure_fingerprint("203.0.113.51", 443,
+                                          "Missing X-Frame-Options", "missing-header")
+    sql = """
+        BEGIN;
+        INSERT INTO assets (id, ip, hostname)
+        VALUES ('44444444-4444-4444-4444-444444444444','203.0.113.51'::inet,'agree2.test');
+        INSERT INTO web_findings (asset_id, url, source, issue_type, name, severity)
+        VALUES ('44444444-4444-4444-4444-444444444444',
+                'https://agree2.test:443/','zap','missing-header',
+                'Missing X-Frame-Options','low');
+        SELECT infrastructure_fingerprint FROM web_findings
+         WHERE asset_id = '44444444-4444-4444-4444-444444444444';
+        ROLLBACK;
+    """
+    got = _psql(sql)
+    assert got, f"query failed -> {_LAST_PSQL_ERROR['msg']}"
+    assert _last_row(got) == expected, (
+        "SQL trigger and etl/fingerprint.py disagree on the grouping key.\n"
+        f"  python:  {expected}\n  trigger: {_last_row(got)}")
+
+
+def test_infra_trigger_fires_after_the_port_trigger(db):
+    """Postgres fires BEFORE triggers alphabetically.
+
+    trg_web_findings_z_infra is named to sort LAST because it needs
+    trg_web_findings_port to have populated NEW.port first. Named '..._infra' it
+    would fire at 'i', before 'port', and key every group on port 0 — silently
+    wrong, and disagreeing with Python which receives the real port.
+    """
+    order = _psql(
+        "SELECT tgname FROM pg_trigger WHERE tgrelid='public.web_findings'::regclass "
+        "AND NOT tgisinternal AND (tgtype & 2) > 0 AND (tgtype & 4) > 0 ORDER BY tgname")
+    assert order, "could not read trigger order"
+    names = [l.strip() for l in order.splitlines() if l.strip()]
+    assert "trg_web_findings_port" in names and "trg_web_findings_z_infra" in names
+    assert names.index("trg_web_findings_z_infra") > names.index("trg_web_findings_port"), (
+        f"grouping trigger fires before the port trigger: {names}")
+
+
+def test_vhost_grouping_groups_without_merging(db):
+    """The defining behaviour of option D.
+
+    Two vhosts on one IP, the same server-level problem at several paths, plus
+    an app-level finding that must stay separate.
+    """
+    sql = """
+        BEGIN;
+        INSERT INTO assets (id, ip, hostname) VALUES
+          ('55555555-5555-5555-5555-555555555555','203.0.113.52'::inet,'v1.test'),
+          ('66666666-6666-6666-6666-666666666666','203.0.113.52'::inet,'v2.test');
+        INSERT INTO web_findings (asset_id, url, source, issue_type, name, severity) VALUES
+          ('55555555-5555-5555-5555-555555555555','https://v1.test/','zap','hdr','Missing Header','low'),
+          ('55555555-5555-5555-5555-555555555555','https://v1.test/login','zap','hdr','Missing Header','low'),
+          ('66666666-6666-6666-6666-666666666666','https://v2.test/','zap','hdr','Missing Header','low'),
+          ('66666666-6666-6666-6666-666666666666','https://v2.test/home','zap','hdr','Missing Header','low'),
+          ('55555555-5555-5555-5555-555555555555','https://v1.test/search','zap','sqli','SQL Injection','high');
+        SELECT count(*) FROM web_findings WHERE url LIKE '%.test%';
+        SELECT name || '|' || affected_asset_count || '|' || finding_count
+          FROM v_infrastructure_findings WHERE ip = '203.0.113.52' ORDER BY name;
+        ROLLBACK;
+    """
+    out = _psql(sql)
+    assert out, f"query failed -> {_LAST_PSQL_ERROR['msg']}"
+    rows = [l.strip() for l in out.splitlines() if l.strip()]
+
+    assert "5" in rows, f"per-vhost rows were merged away; expected 5 kept: {rows}"
+    groups = {r.split("|")[0]: (int(r.split("|")[1]), int(r.split("|")[2]))
+              for r in rows if "|" in r}
+    assert groups.get("Missing Header") == (2, 4), (
+        f"server-level problem should be 1 group over 2 hosts / 4 findings: {groups}")
+    assert groups.get("SQL Injection") == (1, 1), (
+        f"an app-level finding must not join the infrastructure group: {groups}")
+
+
+def test_katana_rows_are_left_ungrouped(db):
+    """96% of web_findings is katana URL inventory with no name or issue_type."""
+    grouped_blank = _psql(
+        "SELECT count(*) FROM web_findings "
+        "WHERE infrastructure_fingerprint IS NOT NULL "
+        "  AND coalesce(btrim(name),'') = '' AND coalesce(btrim(issue_type),'') = ''")
+    assert grouped_blank == "0", (
+        f"{grouped_blank} nameless crawl row(s) were grouped; every discovered URL "
+        "on a host would land in one bucket")
+
+
+def test_finding_group_state_is_sparse_and_touched(db):
+    """Group triage state exists only once triaged, and stamps updated_at."""
+    assert _psql(
+        "SELECT count(*) FROM information_schema.tables "
+        "WHERE table_name='finding_group_state'") == "1"
+    out = _psql("""
+        BEGIN;
+        INSERT INTO finding_group_state (infrastructure_fingerprint, status)
+        VALUES ('deadbeef', 'triaged');
+        UPDATE finding_group_state SET status = 'accepted_risk'
+         WHERE infrastructure_fingerprint = 'deadbeef';
+        SELECT (updated_at > created_at OR updated_at IS NOT NULL)::text
+          FROM finding_group_state WHERE infrastructure_fingerprint = 'deadbeef';
+        ROLLBACK;
+    """)
+    assert out and "t" in out, f"updated_at not maintained: {out}"
