@@ -410,3 +410,81 @@ def test_reinsert_bumps_last_seen_without_adding_a_row(db, table, cols, vals, wh
     after, bumped = (int(x) for x in rows[-1].split(","))
     assert after == before, f"{table}: re-insert created a row ({before} -> {after})"
     assert bumped >= 1, f"{table}: re-insert did not bump last_seen"
+
+def test_credential_identity_index_is_total_and_coalesced(db):
+    """credential_findings dedupes on an identity index, not a fingerprint.
+
+    username/ip/port are NOT NULL, so the old `WHERE username IS NOT NULL`
+    clause was dead. auth_type IS nullable, and in Postgres a NULL makes rows
+    non-equal for a unique index — so two runs producing a NULL auth_type stored
+    two rows for one account. Demonstrated before the fix: two identical inserts
+    with auth_type NULL both landed; with auth_type='password' the second was
+    correctly rejected.
+    """
+    definition = _psql(
+        "SELECT indexdef FROM pg_indexes "
+        "WHERE indexname = 'uq_credential_findings_identity'")
+    assert definition, "uq_credential_findings_identity is missing"
+    assert "COALESCE(auth_type" in definition, (
+        f"index does not coalesce auth_type; NULL rows will duplicate:\n{definition}")
+    assert "WHERE" not in definition.upper(), (
+        f"index is still partial:\n{definition}")
+
+
+def test_null_auth_type_no_longer_duplicates(db):
+    """Sabotage the invariant against the live schema, inside a rollback."""
+    out = subprocess.run(
+        ["docker", "exec", "rag-postgres", "psql", "-U", "app", "-d", "scans", "-c",
+         "BEGIN;"
+         "INSERT INTO credential_findings (ip, port, protocol, username, auth_type,"
+         " valid_cred, source, status) VALUES"
+         " ('203.0.113.95'::inet, 22, 'ssh', 'probe', NULL, true, 'test', 'valid');"
+         "INSERT INTO credential_findings (ip, port, protocol, username, auth_type,"
+         " valid_cred, source, status) VALUES"
+         " ('203.0.113.95'::inet, 22, 'ssh', 'probe', NULL, true, 'test', 'valid');"
+         "ROLLBACK;"],
+        capture_output=True, text=True, timeout=30)
+    combined = out.stdout + out.stderr
+    assert "uq_credential_findings_identity" in combined, (
+        "a second row with a NULL auth_type was accepted; the index is not "
+        f"constraining NULLs.\n{combined[:400]}")
+
+
+def test_brutus_on_conflict_matches_the_index(db):
+    """An ON CONFLICT expression that does not match the index fails EVERY row.
+
+    That failure mode has bitten this codebase before: asset_utils.py used
+    ON CONFLICT (ip) against a composite index, so a masscan run reported 23
+    records seen, 23 errors and 0 ports stored while the scan still said
+    "completed". This asserts the upsert in etl/parse_brutus.py resolves.
+    """
+    upsert = (
+        "INSERT INTO credential_findings (ip, port, protocol, username,"
+        " valid_cred, auth_type, source, status) VALUES"
+        " ('203.0.113.96'::inet, 21, 'ftp', 'probe', true, 'password', 'brutus', 'valid')"
+        " ON CONFLICT (ip, port, username, COALESCE(auth_type, ''))"
+        " DO UPDATE SET last_verified_at = now();")
+    out = subprocess.run(
+        ["docker", "exec", "rag-postgres", "psql", "-U", "app", "-d", "scans", "-c",
+         "BEGIN;" + upsert + upsert +
+         "SELECT count(*) FROM credential_findings WHERE ip='203.0.113.96'::inet;"
+         "ROLLBACK;"],
+        capture_output=True, text=True, timeout=30)
+    combined = out.stdout + out.stderr
+    assert "no unique or exclusion constraint" not in combined, (
+        "the ON CONFLICT in etl/parse_brutus.py does not match the index:\n"
+        f"{combined[:400]}")
+    assert "ERROR" not in combined, combined[:400]
+    assert "\n     1" in combined or " 1\n" in combined, (
+        f"upsert did not collapse to one row:\n{combined[:400]}")
+
+
+def test_parse_brutus_source_matches_the_index_expression():
+    """Source-level guard, so this is caught without a database too."""
+    path = os.path.join(REPO, "etl", "parse_brutus.py")
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    assert "ON CONFLICT (ip, port, username, COALESCE(auth_type, ''))" in src, \
+        "parse_brutus.py ON CONFLICT no longer matches uq_credential_findings_identity"
+    assert "WHERE username IS NOT NULL" not in src, \
+        "the dead partial-index predicate is back (username is NOT NULL)"

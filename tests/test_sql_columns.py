@@ -65,12 +65,38 @@ import re
 try:
     import pytest
 except ImportError:  # pragma: no cover
+    # Standalone mode: scripts/post-install-check.sh runs this file directly on
+    # hosts with no pytest, the same way it runs check_shared_code.py. The shim
+    # only needs to make the decorators no-ops at import time; _main() calls the
+    # plain helpers, not the test functions.
+    #
+    # It must cover every pytest attribute used below — a shim with only
+    # .fixture broke the standalone path the moment a @pytest.mark.unit was
+    # added, and the traceback was invisible behind a 2>/dev/null.
+    def _identity(fn):
+        return fn
+
+    class _AnyDecorator:
+        def __getattr__(self, _name):
+            def decorator(*args, **kwargs):
+                if len(args) == 1 and not kwargs and callable(args[0]):
+                    return args[0]
+                return _identity
+            return decorator
+
     class _NoPytest:
+        mark = _AnyDecorator()
+
         @staticmethod
         def fixture(*args, **kwargs):
-            def wrap(fn):
-                return fn
-            return wrap(args[0]) if args and callable(args[0]) else wrap
+            if args and callable(args[0]):
+                return args[0]
+            return _identity
+
+        @staticmethod
+        def importorskip(name, **kwargs):
+            import importlib
+            return importlib.import_module(name)
 
     pytest = _NoPytest()
 
@@ -404,32 +430,25 @@ _TYPE_DECL = re.compile(
 
 # Callables whose result is a list (or None). Add a project normaliser here to
 # make its call sites provable.
-LIST_SAFE_FUNCS = {"as_text_array", "to_text_array", "list", "sorted"}
+LIST_SAFE_FUNCS = {"as_text_array", "as_int_array", "to_text_array", "list", "sorted"}
 
 # ARRAY-column parameters whose type cannot be decided statically. Each entry is
 # (relative path, table, column). RATCHETS both ways: a new unprovable feed
 # fails, and one that becomes provable must be deleted.
-ARRAY_UNVERIFIED = {
-    ("app/rag-api/api.py", "credential_vault", "grants_access_to"),
-    ("app/rag-api/api.py", "screenshot_metadata", "tags"),
-    ("app/rag-api/api.py", "follow_up_items", "tags"),
-    ("app/rag-api/api.py", "software_research_cache", "cve_ids"),
-    ("app/rag-api/api.py", "api_endpoints", "tags"),
-    ("app/rag-api/api.py", "chat_presets", "placeholders"),
-    ("app/rag-api/api.py", "chat_presets", "tags"),
-    ("app/rag-api/webhooks/router.py", "webhooks", "event_types"),
-    ("app/rag-api/webhooks/router.py", "webhooks", "sources"),
-    ("app/rag-api/webhooks/router.py", "webhooks", "severities"),
-    ("etl/parse_nessus.py", "vulns", "cve"),
-    ("etl/parse_nmap.py", "vulns", "cve"),
-    ("etl/parse_tool_output.py", "vulns", "cve"),
-    ("etl/parse_tool_output.py", "web_findings", "cwe"),
-    ("news_runner/news_agent.py", "news_items", "all_cves"),
-    ("playwright_scanner/db_utils.py", "playwright_findings", "cwe"),
-    ("scan_recommender/exploits_rag.py", "rag_feedback", "helpful_chunk_ids"),
-    ("scan_recommender/exploits_rag.py", "rag_feedback", "unhelpful_chunk_ids"),
-    ("scan_recommender/scan_recommender.py", "service_prompts", "tags"),
-}
+ARRAY_UNVERIFIED = set()   # NB: set(), not {} — {} is an empty dict
+# EMPTY, and worth keeping that way.
+#
+# This started at 19. Most entries did not need a wrapper at the call site —
+# their type was already written down and the guard simply could not read it
+# yet. Teaching it to follow Pydantic field annotations, parameter
+# annotations, `-> list` returns, local assignments and the `x or []` idiom
+# resolved 18 of the 19. Only one was genuinely opaque (a dict subscript off
+# a parsed OpenAPI document) and that one now calls as_text_array().
+#
+# So: before adding an entry here, check whether the value's type is already
+# declared somewhere the guard could learn to see. Reach for a normaliser
+# when the shape truly is unknown at the call site, not to restate a
+# signature that already promises a list.
 
 # Provable type mismatches that still ship. Empty is the goal.
 SQL_TYPE_DEBT = {}
@@ -478,6 +497,12 @@ def _column_kinds(paths):
                 col, typ = decl.group(1).lower(), decl.group(2).strip().lower()
                 if typ.endswith("[]") or part.lower().rstrip(",").endswith("[]"):
                     kind = "array"
+                elif typ.startswith("vector"):
+                    # pgvector. A Python list is the CORRECT value here, and the
+                    # '[1,2,3]' text form is also accepted, so neither shape is
+                    # a defect — checking it as a scalar flagged three real
+                    # embedding writes as mismatches.
+                    kind = "vector"
                 elif "jsonb" in typ or typ == "json":
                     kind = "jsonb"
                 else:
@@ -501,6 +526,13 @@ def _classify(node):
     if isinstance(node, ast.IfExp):
         both = {_classify(node.body), _classify(node.orelse)} - {"none"}
         return both.pop() if len(both) == 1 else "unknown"
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+        # `x or []` — the idiomatic default-to-empty. `or` yields one of its
+        # operands, so it is a list only if EVERY resolvable operand is one; an
+        # unresolvable operand keeps the whole thing unknown rather than
+        # optimistically assuming the author got it right.
+        kinds = {_classify(v) for v in node.values} - {"none"}
+        return kinds.pop() if len(kinds) == 1 else "unknown"
     if isinstance(node, ast.Call):
         func = node.func
         name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
@@ -511,6 +543,208 @@ def _classify(node):
         if name in ("dumps", "str", "join"):
             return "str"
     return "unknown"
+
+
+def _annotation_is_list(node):
+    """True when an annotation denotes a list — List[str], list[str], Optional[List[int]]."""
+    if node is None:
+        return False
+    if isinstance(node, ast.Name):
+        return node.id in ("list", "List")
+    if isinstance(node, ast.Attribute):
+        return node.attr in ("list", "List")
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return "list[" in node.value.lower()
+    if isinstance(node, ast.Subscript):
+        base = node.value
+        base_name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
+        if base_name in ("list", "List"):
+            return True
+        # Optional[List[x]] / Union[List[x], None] — recurse into the args.
+        if base_name in ("Optional", "Union"):
+            inner = node.slice
+            parts = inner.elts if isinstance(inner, ast.Tuple) else [inner]
+            return any(_annotation_is_list(p) for p in parts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):   # X | None
+        return _annotation_is_list(node.left) or _annotation_is_list(node.right)
+    return False
+
+
+_CLASS_INDEX = None
+
+
+def _class_index():
+    """class name -> {field: is_list}, repo-wide, but only for UNIQUE names.
+
+    Pydantic request models usually live in a sibling module (WebhookCreate is
+    in webhooks/models.py, used from webhooks/router.py), so a same-file-only
+    lookup misses them. A name defined in two places is dropped rather than
+    guessed at — resolving to the wrong class would be worse than not resolving.
+    """
+    global _CLASS_INDEX
+    if _CLASS_INDEX is not None:
+        return _CLASS_INDEX
+
+    seen = {}
+    for path in _python_files():
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                tree = ast.parse(fh.read())
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            fields = {
+                stmt.target.id: _annotation_is_list(stmt.annotation)
+                for stmt in node.body
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+            }
+            if not fields:
+                continue
+            if node.name in seen and seen[node.name] != fields:
+                seen[node.name] = None          # ambiguous, refuse to guess
+            elif node.name not in seen:
+                seen[node.name] = fields
+    _CLASS_INDEX = {k: v for k, v in seen.items() if v}
+    return _CLASS_INDEX
+
+
+def _resolve_model_attr(node, scope, tree):
+    """Resolve `body.tags` via the annotated class of the `body` parameter.
+
+    Many array feeds are Pydantic model fields declared `List[str]`, so their
+    type IS knowable — it is written down one class away. Without this they read
+    as unprovable and would be papered over with a redundant wrapper at the call
+    site instead.
+    """
+    if not (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)):
+        return "unknown"
+    var, field = node.value.id, node.attr
+
+    class_name = None
+    if scope is not None:
+        args = scope.args
+        for arg in list(args.args) + list(args.posonlyargs) + list(args.kwonlyargs):
+            if arg.arg == var and arg.annotation is not None:
+                ann = arg.annotation
+                class_name = ann.attr if isinstance(ann, ast.Attribute) else getattr(ann, "id", None)
+                break
+    if not class_name:
+        return "unknown"
+
+    # Same file first — a local definition wins over a same-named import.
+    for cls in ast.walk(tree):
+        if not (isinstance(cls, ast.ClassDef) and cls.name == class_name):
+            continue
+        for stmt in cls.body:
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) \
+                    and stmt.target.id == field:
+                return "list" if _annotation_is_list(stmt.annotation) else "scalar_annotated"
+
+    fields = _class_index().get(class_name)
+    if fields is not None and field in fields:
+        return "list" if fields[field] else "scalar_annotated"
+    return "unknown"
+
+
+def _deep_classify(node, scope, tree, depth=0):
+    """_classify, but able to follow names, model fields and nested operators.
+
+    Kept separate from _classify so the pure shape-of-a-literal logic stays
+    testable on its own. Recursion is bounded: `a or b or c` chains and
+    conditionals nest, and a cycle through a self-referential assignment would
+    otherwise spin.
+    """
+    if depth > 4:
+        return "unknown"
+
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+        kinds = {_deep_classify(v, scope, tree, depth + 1) for v in node.values} - {"none"}
+        return kinds.pop() if len(kinds) == 1 else "unknown"
+
+    if isinstance(node, ast.IfExp):
+        kinds = {_deep_classify(node.body, scope, tree, depth + 1),
+                 _deep_classify(node.orelse, scope, tree, depth + 1)} - {"none"}
+        return kinds.pop() if len(kinds) == 1 else "unknown"
+
+    kind = _classify(node)
+    if kind != "unknown":
+        return kind
+
+    if isinstance(node, ast.Call) and tree is not None:
+        callee = node.func
+        fname = callee.attr if isinstance(callee, ast.Attribute) else getattr(callee, "id", "")
+        if fname and _returns_list(fname, tree):
+            return "list"
+
+    if isinstance(node, ast.Name):
+        if scope is not None:
+            local = _resolve_local(node.id, scope)
+            if local != "unknown":
+                return local
+            by_ann = _resolve_param_annotation(node.id, scope)
+            if by_ann != "unknown":
+                return by_ann
+        # Module-level constants: _ALL_EVENT_TYPES = [...] is a list, and a
+        # function-scope-only lookup cannot see it.
+        if tree is not None:
+            at_module = _resolve_module_constant(node.id, tree)
+            if at_module != "unknown":
+                return at_module
+        if scope is None:
+            return "unknown"
+        # a local assigned from a `-> list` helper
+        for stmt in ast.walk(scope):
+            if isinstance(stmt, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == node.id for t in stmt.targets):
+                if _deep_classify(stmt.value, scope, tree, depth + 1) == "list":
+                    return "list"
+        return "unknown"
+    if isinstance(node, ast.Attribute):
+        return _resolve_model_attr(node, scope, tree)
+    return "unknown"
+
+
+def _resolve_module_constant(name, tree):
+    """Kind of a module-level assignment, ignoring anything inside a def/class."""
+    kinds = set()
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            targets, value = stmt.targets, stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            targets, value = [stmt.target], stmt.value
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id == name:
+                kinds.add(_classify(value))
+    kinds.discard("none")
+    return kinds.pop() if len(kinds) == 1 else "unknown"
+
+
+def _resolve_param_annotation(name, scope):
+    """A parameter annotated `list` / `List[str]` states its own type.
+
+    Wrapping such a value in a normaliser at the call site would only restate
+    what the signature already promises, so the guard should read the promise.
+    """
+    if scope is None:
+        return "unknown"
+    args = scope.args
+    for arg in list(args.args) + list(args.posonlyargs) + list(args.kwonlyargs):
+        if arg.arg == name and arg.annotation is not None:
+            return "list" if _annotation_is_list(arg.annotation) else "unknown"
+    return "unknown"
+
+
+def _returns_list(func_name, tree):
+    """True when a module-level function is annotated `-> list`."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name == func_name and node.returns is not None:
+            return _annotation_is_list(node.returns)
+    return False
 
 
 def _resolve_local(name, scope):
@@ -544,6 +778,71 @@ def _resolve_local(name, scope):
 
 _INSERT_COLS = re.compile(rf"INSERT\s+INTO\s+(?:public\.)?({IDENT})\s*\(([^)]*)\)",
                           re.I | re.S)
+_UPDATE_HEAD = re.compile(rf"UPDATE\s+(?:public\.)?({IDENT})(?:\s+(?:AS\s+)?({IDENT}))?\s+SET\s",
+                          re.I | re.S)
+def _split_top_level(text):
+    """Split on commas that are not inside parentheses.
+
+    A regex cannot do this: `event_types = COALESCE(%s, event_types), name = %s`
+    has a comma INSIDE the function call, and a comma-avoiding pattern silently
+    dropped the whole assignment rather than mis-parsing it — which is worse,
+    because the column then looked unchecked instead of wrong.
+    """
+    parts, depth, current = [], 0, []
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        parts.append("".join(current))
+    return parts
+
+
+def _update_set_columns(sql):
+    """[(table, column)] for `SET col = %s` assignments, in placeholder order.
+
+    Only assignments whose value is exactly a placeholder consume a parameter
+    whose shape IS the column's shape. `col = EXCLUDED.col` and `col = now()`
+    consume none; `col = COALESCE(%s, col)` consumes one but wraps it, so it
+    yields (table, None) — a slot to skip, keeping later columns aligned.
+
+    The SET clause is cut at WHERE/RETURNING/FROM because those placeholders
+    come AFTER the SET ones positionally, and mapping a WHERE value onto a
+    column would produce confident nonsense.
+    """
+    head = _UPDATE_HEAD.search(sql)
+    if not head:
+        return None, []
+    table = head.group(1).lower()
+    tail = sql[head.end():]
+
+    cut = len(tail)
+    for keyword in (r"\bWHERE\b", r"\bRETURNING\b", r"\bFROM\b"):
+        m = re.search(keyword, tail, re.I)
+        if m:
+            cut = min(cut, m.start())
+    set_clause = tail[:cut]
+
+    ordered = []
+    for chunk in _split_top_level(set_clause):
+        if "=" not in chunk:
+            continue
+        col, _, value = chunk.partition("=")
+        col = col.strip().strip('"').lower()
+        value = value.strip()
+        if not re.fullmatch(IDENT, col):
+            continue
+        if value == "%s":
+            ordered.append((table, col))
+        elif "%s" in value:
+            ordered.append((table, None))
+    return table, ordered
 
 
 def _scan_param_types(kinds):
@@ -590,6 +889,36 @@ def _scan_param_types(kinds):
                 continue
 
             sql = _strip_sql_comments(sql)
+
+            update_table, update_cols = _update_set_columns(sql)
+            if update_cols and update_table in kinds:
+                # SET placeholders are the FIRST parameters; anything beyond
+                # them belongs to WHERE and is left alone.
+                if len(params.elts) >= len(update_cols):
+                    for (tbl, col), param in zip(update_cols, params.elts):
+                        if col is None:
+                            continue
+                        kind = kinds[tbl].get(col)
+                        if not kind:
+                            continue
+                        got = _deep_classify(param, enclosing(param), tree)
+                        if got == "scalar_annotated":
+                            got = "str" if kind == "array" else "unknown"
+                        if got in ("unknown", "none"):
+                            if kind == "array":
+                                unprovable.add((rel, tbl, col))
+                            continue
+                        checked += 1
+                        problem = None
+                        if kind == "array" and got in ("str", "json_wrapped", "dict"):
+                            problem = f"{got} passed to {col} (text[]) in UPDATE SET"
+                        elif kind == "jsonb" and got in ("dict", "list"):
+                            problem = f"bare {got} passed to {col} (jsonb) in UPDATE SET — needs Json()"
+                        elif kind == "scalar" and got in ("list", "dict"):
+                            problem = f"{got} passed to scalar {col} in UPDATE SET"
+                        if problem:
+                            mismatches.append((rel, param.lineno, tbl, col, problem))
+
             m = _INSERT_COLS.search(sql)
             if not m:
                 continue
@@ -607,11 +936,11 @@ def _scan_param_types(kinds):
                 kind = kinds[table].get(col)
                 if not kind:
                     continue
-                got = _classify(param)
-                if got == "unknown" and isinstance(param, ast.Name):
-                    scope = enclosing(param)
-                    if scope is not None:
-                        got = _resolve_local(param.id, scope)
+                got = _deep_classify(param, enclosing(param), tree)
+                if got == "scalar_annotated":
+                    # Annotation found and it is not a list. For an array column
+                    # that is a provable mismatch, not an unknown.
+                    got = "str" if kind == "array" else "unknown"
                 if got in ("unknown", "none"):
                     if kind == "array":
                         unprovable.add((rel, table, col))
@@ -725,6 +1054,158 @@ def test_no_stale_array_exemptions(param_scan):
         "ARRAY_UNVERIFIED entries are now provable or gone — delete them:\n  "
         + "\n  ".join(f"{r}: {t}.{c}" for r, t, c in stale)
     )
+
+
+@pytest.mark.unit
+def test_annotation_is_list_recognises_the_common_forms():
+    """Pydantic and stdlib annotations both, including Optional/union wrappers."""
+    def ann(src):
+        return _annotation_is_list(ast.parse(src, mode="eval").body)
+    assert ann("list")
+    assert ann("List[str]")
+    assert ann("list[int]")
+    assert ann("Optional[List[str]]")
+    assert ann("Union[List[str], None]")
+    assert ann("List[str] | None")
+    assert ann("typing.List[str]")
+    assert not ann("str")
+    assert not ann("Optional[str]")
+    assert not ann("Dict[str, str]")
+
+
+@pytest.mark.unit
+def test_or_empty_list_idiom_is_provable():
+    """`body.tags or []` is how most of these feeds are written."""
+    src = ("def f(body: M):\n"
+           "    cur.execute('INSERT INTO t (tags) VALUES (%s)', (body.tags or [],))\n"
+           "class M:\n"
+           "    tags: List[str]\n")
+    tree = ast.parse(src)
+    fn = tree.body[0]
+    call = fn.body[0].value
+    param = call.args[1].elts[0]
+    assert _deep_classify(param, fn, tree) == "list"
+
+
+@pytest.mark.unit
+def test_annotated_parameter_is_provable():
+    """A parameter annotated `list` states its own type; no wrapper needed."""
+    src = ("def f(cve_ids: list):\n"
+           "    cur.execute('INSERT INTO t (cve_ids) VALUES (%s)', (cve_ids,))\n")
+    tree = ast.parse(src)
+    fn = tree.body[0]
+    param = fn.body[0].value.args[1].elts[0]
+    assert _deep_classify(param, fn, tree) == "list"
+
+
+@pytest.mark.unit
+def test_return_annotated_helper_is_provable():
+    src = ("def _extract() -> list:\n"
+           "    return []\n"
+           "def f():\n"
+           "    cves = _extract()\n"
+           "    cur.execute('INSERT INTO t (cve) VALUES (%s)', (cves,))\n")
+    tree = ast.parse(src)
+    fn = tree.body[1]
+    param = fn.body[1].value.args[1].elts[0]
+    assert _deep_classify(param, fn, tree) == "list"
+
+
+@pytest.mark.unit
+def test_scalar_annotation_on_an_array_column_is_a_mismatch_not_unknown():
+    """A field declared `str` feeding text[] is provably wrong, not unprovable."""
+    src = ("def f(body: M):\n"
+           "    pass\n"
+           "class M:\n"
+           "    tags: str\n")
+    tree = ast.parse(src)
+    attr = ast.parse("body.tags", mode="eval").body
+    assert _resolve_model_attr(attr, tree.body[0], tree) == "scalar_annotated"
+
+
+@pytest.mark.unit
+def test_ambiguous_class_names_are_not_guessed():
+    """Two classes sharing a name must resolve to nothing, not to either one."""
+    global _CLASS_INDEX
+    saved = _CLASS_INDEX
+    try:
+        _CLASS_INDEX = {}
+        attr = ast.parse("body.tags", mode="eval").body
+        src = "def f(body: Nope):\n    pass\n"
+        tree = ast.parse(src)
+        assert _resolve_model_attr(attr, tree.body[0], tree) == "unknown"
+    finally:
+        _CLASS_INDEX = saved
+
+
+@pytest.mark.unit
+def test_update_set_maps_only_placeholder_assignments():
+    """`col = EXCLUDED.col` / `now()` consume no parameter.
+
+    Counting every assignment would misalign every parameter after the first
+    such clause, and then confidently report the wrong column.
+    """
+    table, cols = _update_set_columns(
+        "UPDATE webhooks SET name = %s, event_types = %s, updated_at = now() "
+        "WHERE id = %s")
+    assert table == "webhooks"
+    assert cols == [("webhooks", "name"), ("webhooks", "event_types")]
+
+
+@pytest.mark.unit
+def test_update_set_stops_at_where():
+    """WHERE placeholders come AFTER the SET ones and are not column values."""
+    _, cols = _update_set_columns("UPDATE t SET a = %s WHERE b = %s AND c = %s")
+    assert cols == [("t", "a")]
+
+
+@pytest.mark.unit
+def test_update_set_marks_wrapped_placeholders_as_unmappable():
+    """`col = COALESCE(%s, col)` consumes a parameter but wraps it.
+
+    The parameter's shape is not the column's shape there, so it must be
+    skipped rather than checked — this is what the webhook PATCH handler does
+    for all nine of its columns.
+    """
+    _, cols = _update_set_columns(
+        "UPDATE webhooks SET event_types = COALESCE(%s, event_types), name = %s")
+    assert cols == [("webhooks", None), ("webhooks", "name")]
+
+
+@pytest.mark.unit
+def test_update_head_not_matched_on_a_select():
+    _, cols = _update_set_columns("SELECT a FROM t WHERE b = %s")
+    assert cols == []
+
+
+@pytest.mark.unit
+def test_module_level_constant_is_resolvable():
+    """A list constant at module scope is invisible to a function-scope lookup."""
+    src = ("EVENTS = ['a', 'b']\n"
+           "def f():\n"
+           "    cur.execute('UPDATE t SET c = %s', (EVENTS,))\n")
+    tree = ast.parse(src)
+    fn = tree.body[1]
+    param = fn.body[0].value.args[1].elts[0]
+    assert _deep_classify(param, fn, tree) == "list"
+
+
+@pytest.mark.unit
+def test_module_constant_reassigned_to_two_kinds_is_unknown():
+    """Ambiguity must not resolve to whichever assignment came last."""
+    src = "X = ['a']\nX = 'b'\n"
+    tree = ast.parse(src)
+    assert _resolve_module_constant("X", tree) == "unknown"
+
+
+@pytest.mark.unit
+def test_pgvector_columns_accept_lists():
+    """A `vector` column takes a Python list; treating it as scalar produced
+    three false positives on real embedding writes."""
+    kinds = _column_kinds([os.path.join(REPO, "db_init", "ensure_all_tables.sql")])
+    vector_cols = [(t, c) for t, cols in kinds.items()
+                   for c, k in cols.items() if k == "vector"]
+    assert vector_cols, "no vector columns parsed — pgvector detection regressed"
 
 def _main():
     """Standalone entry point for scripts/post-install-check.sh (no pytest)."""
