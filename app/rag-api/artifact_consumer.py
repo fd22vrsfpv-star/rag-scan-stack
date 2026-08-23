@@ -63,6 +63,39 @@ MAX_ATTEMPTS = int(os.environ.get("ARTIFACT_LLM_MAX_ATTEMPTS", "3"))
 # entire batch's time budget.
 MAX_CONTENT_CHARS = int(os.environ.get("ARTIFACT_LLM_MAX_CHARS", "12000"))
 
+# Above this size an artifact is SKIPPED rather than truncated.
+#
+# Truncation is fine for a 40 KB nmap run: the head really is where the structure
+# is. It is not fine for the 8.0 MB and 7.7 MB katana crawls sitting in this
+# queue — summarising their first 12 KB produces a confident statement about
+# 0.15% of the file, and nothing downstream can tell that from a summary of the
+# whole. A skip with a reason is honest; a sampled summary is not.
+MAX_ARTIFACT_BYTES = int(os.environ.get("ARTIFACT_LLM_MAX_BYTES", str(256 * 1024)))
+
+# Tools whose output already has a dedicated parser, so the structured data is in
+# the database and an LLM pass re-derives it. Discovered from the FILESYSTEM
+# rather than hard-coded: a new etl/parse_<tool>.py should take effect without
+# anyone remembering to edit a list here.
+_PARSER_DIR = os.environ.get("ETL_PARSER_DIR", "/app/etl")
+
+
+def tools_with_parsers(parser_dir: str = None) -> set:
+    """Tool names that have an etl/parse_<tool>.py.
+
+    Underscores in a filename map to hyphens as well, because the tools are
+    named both ways across the stack (`smtp-user-enum` vs `parse_smtp_user_enum`).
+    Returns an empty set if the directory is unreadable — callers must treat that
+    as "skip nothing", never as "skip everything".
+    """
+    import glob
+    out = set()
+    for path in glob.glob(os.path.join(parser_dir or _PARSER_DIR, "parse_*.py")):
+        stem = os.path.basename(path)[len("parse_"):-len(".py")]
+        if stem:
+            out.add(stem)
+            out.add(stem.replace("_", "-"))
+    return out
+
 _PROMPT = """You are summarising one security tool's raw output for a pentester.
 
 Tool: {tool}
@@ -122,6 +155,22 @@ def _call_llm(prompt: str, model: str) -> tuple[str, dict]:
         "prompt_tokens": data.get("prompt_eval_count", 0),
         "completion_tokens": data.get("eval_count", 0),
     }
+
+
+def _commit(cur) -> None:
+    """Commit the cursor's connection, tolerating an autocommit connection.
+
+    The consumer must not hold a transaction open across an LLM call — see the
+    note in process_batch. On an autocommit connection there is nothing to
+    commit, and psycopg2 raises rather than no-op'ing, so that case is caught.
+    """
+    conn = getattr(cur, "connection", None)
+    if conn is None or getattr(conn, "autocommit", False):
+        return
+    try:
+        conn.commit()
+    except Exception as e:                     # pragma: no cover
+        log.debug("commit skipped: %s", e)
 
 
 def requeue_stale(cur, older_than_minutes: int = 30) -> int:
@@ -185,12 +234,47 @@ def process_batch(cur, limit: int = 10, tool: Optional[str] = None,
     requeued = requeue_stale(cur, requeue_stale_minutes)
 
     rows = _claim(cur, limit, tool, chosen)
+    # COMMIT the claim before any model call.
+    #
+    # rag-api's pool sets idle_in_transaction_session_timeout=120000 on every
+    # connection — a deliberate guard against held connections. A batch of N
+    # sequential LLM calls inside one transaction blows straight through it:
+    # Postgres logged "FATAL: terminating connection due to idle-in-transaction
+    # timeout" at exactly 120s and the whole batch was lost, having already
+    # marked its rows 'processing'.
+    #
+    # Committing here also means the claim survives: if this process dies during
+    # a model call, requeue_stale() can recover those rows, which is only true
+    # if the 'processing' state was actually written.
+    _commit(cur)
     done = failed = parked = 0
     errors: list = []
 
+    oversized = 0
+    no_target = 0
     for r in rows:
         aid = str(r["id"])
-        content = (r["content"] or "")[:MAX_CONTENT_CHARS]
+        raw = r["content"] or ""
+        if len(raw) > MAX_ARTIFACT_BYTES:
+            cur.execute("""
+                UPDATE raw_artifacts
+                   SET llm_status = 'skipped', llm_processed_at = now(),
+                       llm_error = %s
+                 WHERE id = %s
+            """, (f"skipped: {len(raw)} bytes exceeds ARTIFACT_LLM_MAX_BYTES="
+                  f"{MAX_ARTIFACT_BYTES}. Summarising the first "
+                  f"{MAX_CONTENT_CHARS} chars would describe "
+                  f"{100.0 * MAX_CONTENT_CHARS / max(1, len(raw)):.2f}% of the "
+                  "file as though it were the whole.", aid))
+            oversized += 1
+            _commit(cur)
+            continue
+        if not (r["target"] or "").strip():
+            # Recorded, not hidden: without a target the overlap check
+            # (_already_ran) and scope attribution cannot run on this artifact,
+            # so its pass is not equivalent to the others in the batch.
+            no_target += 1
+        content = raw[:MAX_CONTENT_CHARS]
         prompt = _PROMPT.format(
             tool=r["tool"], target=r["target"] or "unknown",
             port=f":{r['port']}" if r["port"] else "",
@@ -208,6 +292,9 @@ def process_batch(cur, limit: int = 10, tool: Optional[str] = None,
                  WHERE id = %s
             """, (json.dumps(parsed), chosen, aid))
             done += 1
+            # Per row, for the same reason: the next model call must not start
+            # with an open transaction behind it.
+            _commit(cur)
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
             # Park it once it has had its chances, so it stops re-entering the
@@ -222,6 +309,7 @@ def process_batch(cur, limit: int = 10, tool: Optional[str] = None,
                 parked += 1
             else:
                 failed += 1
+            _commit(cur)
             if len(errors) < 10:
                 errors.append(f"{aid}: {msg}")
             log.warning("artifact %s LLM pass failed (attempt %s/%s): %s",
@@ -232,6 +320,8 @@ def process_batch(cur, limit: int = 10, tool: Optional[str] = None,
         "done": done,
         "retryable_failures": failed,
         "parked": parked,
+        "skipped_oversized": oversized,
+        "no_target": no_target,
         "requeued_stale": requeued,
         "model": chosen,
         "errors": errors,
@@ -245,3 +335,62 @@ def queue_depth(cur) -> dict:
           FROM raw_artifacts GROUP BY 1
     """)
     return {r["status"]: r["n"] for r in cur.fetchall()}
+
+
+def skip_redundant(cur, dry_run: bool = True, limit: int = 5000,
+                   parser_dir: str = None) -> dict:
+    """Mark pending artifacts SKIPPED when a dedicated parser already read them.
+
+    57% of this queue came from nmap/masscan/nuclei/whatweb/httpx/katana, whose
+    structured output is already in `ports`, `vulns` and `web_findings`. An LLM
+    pass over them re-derives normalised data, and the rule engine
+    (artifact_actions) has already extracted follow-ups from their text without a
+    model. So the pass buys little, while 272-pending is a number nobody can act
+    on.
+
+    Rows are KEPT, never deleted: /export/burp and /export/har read artifact
+    content to build the Burp sitemap and the HAR file, and 'skipped' is
+    reversible — /artifacts/{id}/processed accepts it as a status, so a row can be
+    put back to 'pending' if the judgement changes.
+    """
+    parsed = tools_with_parsers(parser_dir)
+    if not parsed:
+        # "Cannot read the parser directory" must mean skip NOTHING. Treating it
+        # as "skip everything" would empty the queue on a bad mount.
+        return {"dry_run": dry_run, "parsers_found": 0, "candidates": 0,
+                "skipped": 0, "by_tool": {},
+                "error": f"no parsers found under {parser_dir or _PARSER_DIR} — "
+                         "skipping nothing rather than guessing"}
+
+    cur.execute("""
+        SELECT tool, count(*) AS n
+          FROM raw_artifacts
+         WHERE llm_status = 'pending' AND tool = ANY(%s)
+         GROUP BY tool ORDER BY n DESC
+    """, (sorted(parsed),))
+    by_tool = {r["tool"]: r["n"] for r in cur.fetchall()}
+    total = sum(by_tool.values())
+
+    skipped = 0
+    if not dry_run and total:
+        cur.execute("""
+            UPDATE raw_artifacts
+               SET llm_status = 'skipped', llm_processed_at = now(),
+                   llm_error = 'skipped: ' || tool || ' has a dedicated parser '
+                               || '(etl/parse_*.py), so its structured output is '
+                               || 'already stored; an LLM pass would re-derive it'
+             WHERE llm_status = 'pending' AND tool = ANY(%s)
+               AND id IN (SELECT id FROM raw_artifacts
+                           WHERE llm_status = 'pending' AND tool = ANY(%s)
+                           LIMIT %s)
+            RETURNING id
+        """, (sorted(parsed), sorted(parsed), int(limit)))
+        skipped = len(cur.fetchall())
+
+    return {
+        "dry_run": dry_run,
+        "parsers_found": len(parsed),
+        "candidates": total,
+        "skipped": skipped,
+        "by_tool": by_tool,
+    }

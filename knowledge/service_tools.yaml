@@ -133,10 +133,10 @@ services:
         command: "nikto -h http://{target}:{port}"
       - name: gobuster
         purpose: directory and file bruteforce
-        command: "gobuster dir -u http://{target}:{port} -w /usr/share/wordlists/dirb/common.txt"
+        command: "gobuster dir -u http://{target}:{port} -w /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt"
       - name: feroxbuster
         purpose: fast recursive content discovery
-        command: "feroxbuster -u http://{target}:{port} -w /usr/share/wordlists/dirb/common.txt"
+        command: "feroxbuster -u http://{target}:{port} -w /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt"
       - name: dirsearch
         purpose: web path scanner
         command: "dirsearch -u http://{target}:{port}"
@@ -157,7 +157,7 @@ services:
         command: "wfuzz -c -z file,wordlist.txt http://{target}:{port}/FUZZ"
       - name: ffuf
         purpose: fast web fuzzer
-        command: "ffuf -u http://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/common.txt"
+        command: "ffuf -u http://{target}:{port}/FUZZ -w /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt"
       - name: curl
         purpose: manual HTTP requests
         command: "curl -v http://{target}:{port}/"
@@ -209,7 +209,7 @@ services:
         command: "nikto -h https://{target}:{port}"
       - name: gobuster
         purpose: directory bruteforce
-        command: "gobuster dir -u https://{target}:{port} -w /usr/share/wordlists/dirb/common.txt -k"
+        command: "gobuster dir -u https://{target}:{port} -w /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt -k"
       - name: nuclei
         purpose: template-based vulnerability scanning
         command: "nuclei -u https://{target}:{port} -tags cve,misconfig,exposure,ssl"
@@ -244,11 +244,14 @@ services:
         purpose: brute force FTP credentials
         command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt ftp://{target}:{port}"
       - name: ftp
-        purpose: manual connection test
-        command: "ftp {target} {port}"
+        purpose: anonymous listing (non-interactive)
+        # Fed on stdin. `ftp {target} {port}` alone opens a prompt, gets nothing,
+        # and exits 0 — 43 of its 78 runs recorded no output at all, which reads
+        # as "nothing there" rather than "we never asked it anything".
+        command: "printf 'user anonymous anonymous\nls -la\nbye\n' | ftp -inv {target} {port}"
       - name: lftp
         purpose: advanced FTP client
-        command: "lftp -u anonymous, ftp://{target}:{port}"
+        command: "lftp -u anonymous, -e 'ls -la; bye' ftp://{target}:{port}"
       - name: vulnx
         purpose: CVE lookup by product and version
         command: "vulnx search \"{product} {version}\" --json"
@@ -280,7 +283,8 @@ services:
         command: "nmap -sV -sC -p {port} --script=mysql-* {target}"
       - name: mysql
         purpose: direct connection
-        command: "mysql -h {target} -P {port} -u root"
+        # -e, or mysql opens a prompt, reads nothing and exits 0.
+        command: "mysql -h {target} -P {port} -u root -e 'select version(); show databases;'"
       - name: hydra
         purpose: brute force credentials
         command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt mysql://{target}:{port}"
@@ -318,7 +322,8 @@ services:
         command: "nmap -sV -sC -p {port} --script=pgsql-* {target}"
       - name: psql
         purpose: direct connection
-        command: "psql -h {target} -p {port} -U postgres"
+        # -c, for the same reason as mysql above.
+        command: "psql -h {target} -p {port} -U postgres -c 'select version();' -c '\\l'"
       - name: hydra
         purpose: brute force credentials
         command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt postgres://{target}:{port}"
@@ -479,7 +484,9 @@ services:
         command: "nmap -sV -sC -p {port} --script=telnet-* {target}"
       - name: telnet
         purpose: manual connection
-        command: "telnet {target} {port}"
+        # Banner grab. Bare telnet waits at a prompt forever (or until the
+        # harness timeout) and records nothing.
+        command: "printf '\\n' | timeout 10 telnet {target} {port}"
       - name: hydra
         purpose: brute force credentials
         command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt telnet://{target}:{port}"
@@ -535,13 +542,13 @@ services:
         command: "nmap -sV -sC -p {port} --script=dns-* {target}"
       - name: dig
         purpose: DNS queries
-        command: "dig @{target} -p {port} ANY example.com"
+        command: "dig @{target} -p {port} ANY {domain}"
       - name: dnsrecon
         purpose: DNS reconnaissance
-        command: "dnsrecon -d example.com -n {target}"
+        command: "dnsrecon -d {domain} -n {target}"
       - name: dnsenum
         purpose: DNS enumeration
-        command: "dnsenum --dnsserver {target} example.com"
+        command: "dnsenum --dnsserver {target} {domain}"
     metasploit:
       - module: auxiliary/scanner/dns/dns_amp
         purpose: DNS amplification check
@@ -1750,7 +1757,7 @@ services:
     tools:
       - name: whois
         purpose: query WHOIS data
-        command: "whois -h {target} -p {port} example.com"
+        command: "whois -h {target} -p {port} {domain}"
     nuclei_tags: ["whois", "network", "info-leak"]
     common_vulns:
       - "Internal WHOIS server may leak asset inventory"
