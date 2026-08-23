@@ -52,7 +52,7 @@ class _Tracker:
     def update_progress(self, *a, **k): pass
 
 
-def _run_many(mod, count, hold=0.25, **overrides):
+def _run_many(monkeypatch, mod, count, hold=0.25, **overrides):
     """Run `count` jobs concurrently against a fake subprocess; return peak."""
     peak = 0
     lock = threading.Lock()
@@ -66,7 +66,14 @@ def _run_many(mod, count, hold=0.25, **overrides):
             returncode, stdout, stderr = 0, "", ""
         return CP()
 
-    mod.subprocess.run = fake_run
+    # monkeypatch, NOT `mod.subprocess.run = ...`.
+    #
+    # `mod` is a fresh module object, but `mod.subprocess` is the SHARED
+    # subprocess module — so a bare assignment replaces subprocess.run for the
+    # WHOLE test session and never restores it. That leak sat here harmlessly
+    # until another test used subprocess.run and started failing with
+    # "RuntimeError: tool exploded" from a test that had already finished.
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
     tracker = overrides.pop("job_tracker", None) or _Tracker()
     kwargs = dict(tool="x", cmd=["true"], targets_file="", output_file="",
                   service_name="t", session_label="t", job_tracker=tracker,
@@ -85,20 +92,20 @@ def _run_many(mod, count, hold=0.25, **overrides):
 
 
 @pytest.mark.parametrize("limit", [1, 2, 3])
-def test_concurrent_tools_never_exceed_the_limit(limit):
+def test_concurrent_tools_never_exceed_the_limit(limit, monkeypatch):
     mod = _load(limit)
-    peak, _ = _run_many(mod, count=limit * 3, hold=0.15)
+    peak, _ = _run_many(monkeypatch, mod, count=limit * 3, hold=0.15)
     assert peak <= limit, f"limit={limit} but {peak} tools ran at once"
 
 
-def test_the_test_would_notice_an_unbounded_runner():
+def test_the_test_would_notice_an_unbounded_runner(monkeypatch):
     """Guards the guard: with a high limit the peak must actually exceed 1.
 
     If the fake never overlaps, the assertions above would pass against a
     completely unbounded runner and prove nothing.
     """
     mod = _load(8)
-    peak, _ = _run_many(mod, count=8, hold=0.3)
+    peak, _ = _run_many(monkeypatch, mod, count=8, hold=0.3)
     assert peak > 1, (
         f"peak was {peak}: the jobs never ran concurrently, so the bound tests "
         "above cannot distinguish a working limiter from no limiter at all")
@@ -110,12 +117,11 @@ def test_limit_comes_from_the_engagement_setting():
     assert mod.MAX_CONCURRENT_SCANS == 4
 
 
-def test_a_refused_job_does_not_consume_a_slot():
+def test_a_refused_job_does_not_consume_a_slot(monkeypatch):
     """An out-of-scope job must not occupy capacity it never used."""
     mod = _load(2)
     tracker = _Tracker()
-    peak, tracker = _run_many(
-        mod, count=4, hold=0.15, job_tracker=tracker,
+    peak, tracker = _run_many(monkeypatch, mod, count=4, hold=0.15, job_tracker=tracker,
         scope_refusal=lambda _tf: "out of scope")
     assert peak == 0, f"refused jobs ran a tool anyway (peak {peak})"
     assert len(tracker.failures) == 4
@@ -124,13 +130,20 @@ def test_a_refused_job_does_not_consume_a_slot():
     assert mod.active_slot_count() == 0, "refusal leaked a slot"
 
 
-def test_slots_are_released_when_a_tool_fails():
+def test_slots_are_released_when_a_tool_fails(monkeypatch):
     """A crashing tool must not permanently consume capacity."""
     mod = _load(2)
 
     def boom(cmd, **kw):
         raise RuntimeError("tool exploded")
-    mod.subprocess.run = boom
+    # monkeypatch, NOT `mod.subprocess.run = ...`.
+    #
+    # `mod` is a fresh module object, but `mod.subprocess` is the SHARED
+    # subprocess module — so a bare assignment replaces subprocess.run for the
+    # WHOLE test session and never restores it. That leak sat here harmlessly
+    # until another test used subprocess.run and started failing with
+    # "RuntimeError: tool exploded" from a test that had already finished.
+    monkeypatch.setattr(mod.subprocess, "run", boom)
     tracker = _Tracker()
     mod.run_tool_job(job_id="j", tool="x", cmd=["true"], targets_file="",
                      output_file="", service_name="t", session_label="t",

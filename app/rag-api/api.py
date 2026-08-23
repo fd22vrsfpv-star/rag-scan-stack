@@ -1587,6 +1587,8 @@ def get_open_ports(
                    p.product, p.version, p.banner,
                    a.os,
                    COALESCE(COUNT(DISTINCT v.id), 0)::int AS finding_count,
+                   -- public.severity_rank() — one scale for the whole stack
+                   -- (etl/severity.py). This was a hand-written descending CASE.
                    CASE MAX(
                        CASE v.severity
                            WHEN 'critical' THEN 5
@@ -5316,20 +5318,12 @@ def search_findings(
         where_sql = "WHERE " + " AND ".join(where_clauses_pg)
 
     # Main query for results — order by severity rank then date
-    severity_order = """
-    CASE severity
-        WHEN 'critical' THEN 1
-        WHEN 'high'     THEN 2
-        WHEN 'medium'   THEN 3
-        WHEN 'low'      THEN 4
-        WHEN 'info'     THEN 5
-        -- 'recon' is no longer written — it was collapsed into 'info'. The rank
-        -- stays so rows from a database that predates the migration still sort
-        -- next to info rather than falling into the ELSE bucket.
-        WHEN 'recon'    THEN 6
-        ELSE 7
-    END
-    """
+    # One scale for the whole stack: public.severity_rank() mirrors
+    # etl/severity.py and the frontend's SEVERITY_RANK, pinned by
+    # tests/test_severity_scale.py. DESC because higher = more severe, which also
+    # puts unknown values LAST — the hand-written ascending CASE this replaces
+    # used ELSE 7 to fake that, and got it wrong if anyone flipped the direction.
+    severity_order = "public.severity_rank(severity) DESC"
     if collapse_problems:
         # One row per underlying problem. DISTINCT ON rather than a window
         # function so no helper column leaks into the result set.
@@ -7665,7 +7659,9 @@ def proxy_replay(
                   AND wf.url NOT LIKE '%%,%%'
                   {where_sql}
                 ORDER BY
-                    CASE wf.severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END
+                    -- was: CASE ... ELSE 4, which lumped low, info and
+                    -- unknown into one bucket. severity_rank keeps them apart.
+                    public.severity_rank(wf.severity) DESC
                 LIMIT %s
             """, (*fparams, limit))
             payload_requests = cur.fetchall()
@@ -7680,9 +7676,14 @@ def proxy_replay(
     if order == "sequential":
         base_urls.sort(key=lambda r: (_path_depth(r["url"]), r["url"]))
     elif order == "severity":
-        # "recon" retained for pre-migration rows; nothing writes it now.
-        sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "recon": 5}
-        base_urls.sort(key=lambda r: sev_order.get(r.get("severity", "info"), 9))
+        # One scale for the whole stack (etl/severity.py). Higher = more
+        # severe, so callers sort DESCENDING; the local dict this replaces
+        # was ascending, which is the sort of inconsistency that put 1495
+        # attack vectors below `info` on the frontend.
+        from etl.severity import severity_rank as _sev_rank
+        # Negated because the scale is higher = more severe; unknown ranks 0
+        # and so sorts last, which the old `, 9)` default faked.
+        base_urls.sort(key=lambda r: -_sev_rank(r.get("severity")))
 
     # Dedup base URLs
     seen = set()
@@ -19272,8 +19273,7 @@ def export_findings_exchange(
                    wf.evidence, wf.method, wf.description, wf.solution, wf.confidence,
                    wf.status_code, wf.payload
             FROM web_findings wf {where}
-            ORDER BY CASE wf.severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2
-                     WHEN 'medium' THEN 3 WHEN 'low' THEN 4 ELSE 5 END
+            ORDER BY public.severity_rank(wf.severity) DESC
             LIMIT %s
         """, params)
 

@@ -528,7 +528,11 @@ def test_recon_is_still_mapped_for_pre_migration_rows(db_ready):
     """
     api = open(os.path.join(REPO, "app", "rag-api", "api.py"), encoding="utf-8").read()
     assert '"recon": "note"' in api, "SARIF no longer maps recon explicitly"
-    assert "WHEN 'recon'" in api, "recon lost its sort rank"
+    # The sort rank moved OUT of a hand-written CASE in api.py and into the
+    # shared scale (etl/severity.py + public.severity_rank), so assert it there
+    # instead. tests/test_severity_scale.py pins all three implementations.
+    from etl.severity import severity_rank as _sr
+    assert _sr("recon") == _sr("info") > 0, "recon lost its rank in the shared scale"
 
     consts = open(os.path.join(REPO, "dashboard", "frontend", "src", "lib",
                                "constants.ts"), encoding="utf-8").read()
