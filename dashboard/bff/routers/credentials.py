@@ -146,6 +146,45 @@ async def vault_import_from_recon(body: VaultImportBody):
         return safe_json(resp)
 
 
+class CredentialBridgeBody(BaseModel):
+    engagement_id: Optional[str] = None
+    only_valid: bool = True
+    dry_run: bool = True
+    limit: int = 1000
+    # Restrict the sweep to specific credential_findings.source values. Omitted
+    # means every source, which is what a post-ingest run wants — but it also
+    # means any caller committing against a live database rewrites every account
+    # in it, so anything experimental should name its own source.
+    sources: Optional[list[str]] = None
+
+
+@router.post("/api/vault/bridge-credential-findings")
+async def vault_bridge_credential_findings(body: CredentialBridgeBody):
+    """Project verified credential_findings into credential_vault + identities.
+
+    The sibling import-from-recon handles cloud secrets via an LLM; this one is a
+    deterministic re-projection of credentials the tester already verified, so it
+    needs no model and no review step — but dry_run is still honoured so an
+    operator can see the accounts before they are written.
+
+    Sent with a plain model_dump rather than exclude_none: engagement_id=None
+    then arrives as an explicit null, which the rag-api body model accepts as
+    Optional[str]. Dropping it would work too, but sending the full body keeps
+    the two sides' shapes identical, which is what the proxy contract test reads.
+    """
+    from fastapi import HTTPException
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=120) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/vault/bridge-credential-findings",
+            json=body.model_dump(),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
 @router.patch("/api/credential-vault/{cid}/refresh-expiry")
 async def refresh_credential_expiry(cid: str, body: dict):
     s = get_settings()

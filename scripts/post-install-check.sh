@@ -199,6 +199,22 @@ else
   fail "ports has $DUP_PORT_ROWS duplicate (ip, proto, port) row(s) — run ./scripts/ensure_db_schema.sh"
 fi
 
+# Verified credentials must reach the vault, or the Users page badge stays dark.
+# The bridge runs automatically after a brutus ingest, so a non-zero count here
+# means an upgrade landed on a database that already had credential findings.
+UNBRIDGED=$(_run_sql "SELECT count(*) FROM (
+    SELECT DISTINCT host(cf.ip) AS h, lower(cf.username) AS u
+      FROM credential_findings cf WHERE cf.valid_cred IS TRUE) f
+   WHERE NOT EXISTS (SELECT 1 FROM credential_vault cv
+                      WHERE lower(cv.username) = f.u AND cv.domain = f.h)")
+if [[ -z "$UNBRIDGED" ]]; then
+  warn "credential bridge check skipped (could not query)"
+elif [[ "$UNBRIDGED" -eq 0 ]]; then
+  pass "every verified credential is present in credential_vault"
+else
+  warn "$UNBRIDGED verified credential account(s) are not in credential_vault — the Users page 'cred' badge will be dark for them; POST /vault/bridge-credential-findings {\"dry_run\": false}"
+fi
+
 # assets.provider column + GIN index — required for cloud-hosting filter
 HAS_PROVIDER=$(_run_sql "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='assets' AND column_name='provider')")
 if [[ "$HAS_PROVIDER" == "t" ]]; then

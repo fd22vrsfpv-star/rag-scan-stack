@@ -2336,6 +2336,13 @@ def ingest_brutus(file: UploadFile = File(...), job_id: str = None, secret_type:
     try:
         from etl.parse_brutus import parse_brutus
         stats = parse_brutus(path, profile="api-upload", job_id=job_id, secret_type=secret_type)
+        # Verified credentials are only useful once they reach the vault and the
+        # identity directory — every consumer (the Users page's has_credential
+        # badge, /identities/{id}, the MCP credential tools) reads those, not
+        # credential_findings. Non-fatal: a bridge failure must not lose the
+        # ingest that already succeeded.
+        if stats.get("credentials_found"):
+            _run_credential_bridge(job_id=job_id)
         return {"ok": True, "stats": stats}
     finally:
         os.remove(path)
@@ -4081,6 +4088,45 @@ def _run_vault_auto_import_if_enabled(engagement_id: Optional[str] = None,
         log.warning("Vault import auto-run failed (non-fatal): %s", e)
 
 
+def _run_credential_bridge(engagement_id: Optional[str] = None,
+                           job_id: Optional[str] = None) -> None:
+    """Post-ingest hook: project fresh credential_findings into the vault and the
+    identity directory.
+
+    Unlike _run_vault_auto_import_if_enabled this is NOT behind an opt-in flag,
+    and the difference is deliberate. That one runs an LLM over unstructured
+    recon rows and materialises credentials it inferred, so an operator should
+    choose it. This is a deterministic re-projection of rows the credential
+    tester already verified and already stored, and it copies no secret material
+    (credential_value stays NULL — see etl/credential_bridge.py). Gating it
+    behind a setting would reproduce exactly the reported symptom: credentials
+    confirmed valid, and a Users page showing nothing.
+    """
+    try:
+        from etl.credential_bridge import bridge_credential_findings
+        with get_db(autocommit=True) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            result = bridge_credential_findings(
+                cur, engagement_id=engagement_id, dry_run=False, limit=1000)
+        log.info("credential bridge: examined=%s accounts=%s creds=%s identities=%s",
+                 result.get("findings_examined"), result.get("accounts"),
+                 result.get("credentials_upserted"), result.get("identities_upserted"))
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("credential_bridge_completed", "credential_bridge", {
+                "job_id": job_id,
+                "engagement_id": engagement_id,
+                "findings_examined": result.get("findings_examined", 0),
+                "accounts": result.get("accounts", 0),
+                "credentials_upserted": result.get("credentials_upserted", 0),
+                "identities_upserted": result.get("identities_upserted", 0),
+                "errors": len(result.get("errors") or []),
+            })
+        except Exception:
+            pass
+    except Exception as e:
+        log.warning("Credential bridge failed (non-fatal): %s", e)
+
+
 @app.get("/cloud/posture")
 def cloud_posture(authorized: bool = Depends(auth)):
     """Cloud posture summary: sources imported, finding counts, credential status."""
@@ -4490,6 +4536,62 @@ def vault_import_from_recon(body: VaultImportBody, _: bool = Depends(auth)):
                 "imported": result.get("imported"),
                 "proposed": result.get("proposed"),
                 "model": result.get("model"),
+            })
+        except Exception:
+            pass
+    return {"ok": True, **result}
+
+
+class CredentialBridgeBody(BaseModel):
+    engagement_id: Optional[str] = None
+    only_valid: bool = True
+    dry_run: bool = True
+    limit: int = 1000
+    # Restrict the sweep to specific credential_findings.source values. Omitted
+    # means every source, which is what a post-ingest run wants — but it also
+    # means any caller committing against a live database rewrites every account
+    # in it, so anything experimental should name its own source.
+    sources: Optional[List[str]] = None
+
+
+@app.post("/vault/bridge-credential-findings", tags=["Vault"])
+def vault_bridge_credential_findings(body: CredentialBridgeBody, _: bool = Depends(auth)):
+    """Project verified `credential_findings` into `credential_vault` + `identities`.
+
+    The sibling /vault/import-from-recon covers cloud-secret recon findings. This
+    covers the credential-testing path (brutus / hydra / medusa / ncrack), whose
+    output the vault has never seen — so every consumer that reads the vault,
+    including the Users page's `has_credential` badge, behaved as if no
+    credentials had been found.
+
+    Grouped by account, not by finding: one vault row per (source, host,
+    username) with the proven services in `grants_access_to`. Idempotent, so
+    re-running updates in place rather than duplicating.
+    """
+    from etl.credential_bridge import bridge_credential_findings
+    with get_db(autocommit=True) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            result = bridge_credential_findings(
+                cur,
+                engagement_id=body.engagement_id,
+                only_valid=body.only_valid,
+                dry_run=body.dry_run,
+                limit=body.limit,
+                sources=body.sources,
+            )
+        except Exception as e:
+            log.exception("vault_bridge_credential_findings failed")
+            raise HTTPException(500, f"credential bridge failed: {type(e).__name__}: {e}")
+    if not body.dry_run and (result.get("credentials_upserted") or result.get("identities_upserted")):
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("credential_bridge_completed", "credential_bridge", {
+                "engagement_id": body.engagement_id,
+                "findings_examined": result.get("findings_examined"),
+                "accounts": result.get("accounts"),
+                "credentials_upserted": result.get("credentials_upserted"),
+                "identities_upserted": result.get("identities_upserted"),
+                "errors": len(result.get("errors") or []),
             })
         except Exception:
             pass

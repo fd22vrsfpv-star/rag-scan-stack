@@ -318,7 +318,7 @@ export default function Users() {
   return (
     <div className="space-y-4">
       <PageHelp id="users" title="How to use Users">
-        <p>Detected user/SP/guest identities aggregated across tools (MicroBurst, AzureHound today; netexec/impacket coming). Each row is keyed on (<code>provider</code>, <code>identifier</code>) — a UPN, AppId, or sAMAccountName depending on source. The <strong>Has Credential</strong> badge is a left-join against <code>credential_vault</code>; click any row to see linked creds and the recon findings that surfaced this identity.</p>
+        <p>Detected identities aggregated across tools: cloud/directory accounts from MicroBurst and AzureHound, plus <strong>host-local service accounts</strong> bridged from verified credential findings (brutus/hydra/medusa/ncrack) under provider <code>local</code>. Each row is keyed on (<code>provider</code>, <code>identifier</code>) — a UPN or AppId for cloud, <code>user@host</code> for local accounts. The <strong>Has Credential</strong> badge is a join against <code>credential_vault</code>; click any row to see linked creds and the recon findings that surfaced this identity. Bridged rows record which services the account is valid on, but not the password itself — credential testing stores only a masked copy.</p>
       </PageHelp>
 
       <div className="flex items-center gap-2">
@@ -363,6 +363,11 @@ export default function Users() {
           <option value="on_prem_ad">on_prem_ad</option>
           <option value="aws">aws</option>
           <option value="gcp">gcp</option>
+          {/* Host-local service accounts bridged from credential_findings
+              (brutus/hydra/medusa/ncrack). Without this option the rows are
+              listed but cannot be filtered to, which is how the whole class
+              stayed invisible. */}
+          <option value="local">local</option>
         </select>
         <select
           value={principalType} onChange={e => setPrincipalTypeF(e.target.value)}
