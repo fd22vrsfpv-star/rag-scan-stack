@@ -505,6 +505,228 @@ UPDATE assets k
 
 DELETE FROM assets WHERE id IN (SELECT from_id FROM phantom_remap);
 
+-- 5b. One address, two asset rows — the SAME machine recorded twice.
+--
+-- Step 5 above only merges the "hostname = the IP" phantom. It deliberately
+-- leaves a genuinely-named row alone, to protect virtual hosts. But a row with
+-- NO hostname is not a virtual host: it is the same machine before its name was
+-- known. ix_assets_ip_hostname is UNIQUE(ip, COALESCE(hostname,'')), so
+-- (192.168.1.150, '') and (192.168.1.150, 'metasploitable') are two legal rows,
+-- and this deployment had exactly that:
+--
+--     nameless row     57 ports,  6 vulns,   1 web,   0 creds,  39 recon
+--     'metasploitable'  0 ports,  2 vulns, 758 web,   7 creds, 110 recon
+--
+-- Step 2 puts ports on the NULL-hostname row by preference, so the host's ports
+-- lived on one row and its findings on the other. Anything joining ports to
+-- findings through asset_id returned nothing, and credential_findings.port_id
+-- was NULL on every row because parse_brutus looks the port up under the
+-- finding's own asset_id.
+--
+-- Merging is only safe when at most ONE distinct hostname is involved. Two
+-- different names on one address IS a multi-name host, where picking a survivor
+-- would be arbitrary — those are reported and left alone.
+--
+-- The child tables come from the CATALOG, not from the foreign-key list:
+-- pending_exploits.asset_id has no FK, so an FK-driven merge would silently
+-- orphan it, and step 5's hand-written list of 16 tables omits it for that
+-- reason. Anything that grows an asset_id later is covered without edits here.
+CREATE OR REPLACE FUNCTION public.merge_duplicate_assets()
+RETURNS TABLE(address inet, winner uuid, losers integer, rows_repointed bigint)
+LANGUAGE plpgsql AS $MDA$
+DECLARE
+    child_tables text[];
+    grp          record;
+    cand         record;
+    tbl          text;
+    n            bigint;
+    kids         bigint;
+    best_kids    bigint;
+    win          uuid;
+    losers_arr   uuid[];
+    moved        bigint;
+    rid          uuid;
+    agg          record;
+BEGIN
+    SELECT array_agg(c.table_name::text ORDER BY c.table_name) INTO child_tables
+      FROM information_schema.columns c
+      JOIN information_schema.tables t
+        ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+     WHERE c.table_schema = 'public'
+       AND c.column_name = 'asset_id'
+       AND t.table_type = 'BASE TABLE';
+
+    FOR grp IN
+        SELECT a.ip
+          FROM public.assets a
+         GROUP BY a.ip
+        HAVING count(*) > 1
+           -- count(DISTINCT ...) ignores NULLs, so (NULL, 'name') counts as one
+           -- name and merges; ('a', 'b') counts as two and does not.
+           AND count(DISTINCT NULLIF(btrim(a.hostname), '')) <= 1
+         ORDER BY a.ip
+    LOOP
+        -- Survivor: the row carrying the most dependent rows, so the merge moves
+        -- as little as possible. The ORDER BY makes ties deterministic and
+        -- prefers keeping the NAMED row, which holds strictly more information.
+        best_kids := -1;
+        win       := NULL;
+        FOR cand IN
+            SELECT id FROM public.assets
+             WHERE ip = grp.ip
+             ORDER BY (NULLIF(btrim(hostname), '') IS NOT NULL) DESC,
+                      first_seen NULLS LAST, id
+        LOOP
+            kids := 0;
+            FOREACH tbl IN ARRAY child_tables LOOP
+                EXECUTE format('SELECT count(*) FROM public.%I WHERE asset_id = $1', tbl)
+                   INTO n USING cand.id;
+                kids := kids + n;
+            END LOOP;
+            IF kids > best_kids THEN
+                best_kids := kids;
+                win       := cand.id;
+            END IF;
+        END LOOP;
+
+        SELECT array_agg(id) INTO losers_arr
+          FROM public.assets WHERE ip = grp.ip AND id <> win;
+        IF losers_arr IS NULL THEN
+            CONTINUE;
+        END IF;
+
+        moved := 0;
+        FOREACH tbl IN ARRAY child_tables LOOP
+            BEGIN
+                EXECUTE format(
+                    'UPDATE public.%I SET asset_id = $1 WHERE asset_id = ANY($2)', tbl)
+                  USING win, losers_arr;
+                GET DIAGNOSTICS n = ROW_COUNT;
+                moved := moved + n;
+            EXCEPTION WHEN unique_violation THEN
+                -- Today only ports has a unique index naming asset_id, but do not
+                -- depend on that staying true. Move what can move; a child that
+                -- already exists on the survivor is the same fact twice, so the
+                -- loser's copy goes rather than blocking the whole merge.
+                FOR rid IN EXECUTE format(
+                        'SELECT id FROM public.%I WHERE asset_id = ANY($1)', tbl)
+                        USING losers_arr
+                LOOP
+                    BEGIN
+                        EXECUTE format(
+                            'UPDATE public.%I SET asset_id = $1 WHERE id = $2', tbl)
+                          USING win, rid;
+                        moved := moved + 1;
+                    EXCEPTION WHEN unique_violation THEN
+                        EXECUTE format('DELETE FROM public.%I WHERE id = $1', tbl)
+                          USING rid;
+                    END;
+                END LOOP;
+            END;
+        END LOOP;
+
+        -- Read the losers' attributes BEFORE deleting them, then apply them AFTER.
+        --
+        -- The order is load-bearing. When the nameless row is the one carrying
+        -- the children it wins, and giving it the loser's hostname while that
+        -- loser still exists violates ix_assets_ip_hostname:
+        --     duplicate key value ... (198.51.100.11, merge-probe.test)
+        -- The live split happened to have the NAMED row winning, so its hostname
+        -- never changed and this never fired there — a synthetic case found it.
+        SELECT min(NULLIF(btrim(a.hostname), ''))       AS hostname,
+               min(a.os)                                AS os,
+               min(a.env)                               AS env,
+               min(a.content_hash)                      AS content_hash,
+               min(a.engagement_id::text)::uuid         AS engagement_id,
+               array_agg(DISTINCT t)  FILTER (WHERE t  IS NOT NULL) AS tags,
+               array_agg(DISTINCT pr) FILTER (WHERE pr IS NOT NULL) AS provider,
+               min(a.provider_evidence::text)::jsonb    AS provider_evidence,
+               min(a.first_seen)                        AS first_seen,
+               max(a.last_seen)                         AS last_seen
+          INTO agg
+          FROM public.assets a
+          LEFT JOIN LATERAL unnest(COALESCE(a.tags, '{}'::text[]))     t  ON true
+          LEFT JOIN LATERAL unnest(COALESCE(a.provider, '{}'::text[])) pr ON true
+         WHERE a.id = ANY(losers_arr);
+
+        DELETE FROM public.assets WHERE id = ANY(losers_arr);
+
+        -- A merge must never drop the one attribute a duplicate row happened to
+        -- be the only carrier of — the hostname above all, which is the whole
+        -- reason the second row existed.
+        UPDATE public.assets w
+           SET hostname          = COALESCE(NULLIF(btrim(w.hostname), ''), agg.hostname),
+               os                = COALESCE(w.os, agg.os),
+               env               = COALESCE(w.env, agg.env),
+               content_hash      = COALESCE(w.content_hash, agg.content_hash),
+               engagement_id     = COALESCE(w.engagement_id, agg.engagement_id),
+               tags              = (SELECT array_agg(DISTINCT x) FROM unnest(
+                                       COALESCE(w.tags, '{}'::text[])
+                                    || COALESCE(agg.tags, '{}'::text[])) x),
+               provider          = (SELECT array_agg(DISTINCT x) FROM unnest(
+                                       COALESCE(w.provider, '{}'::text[])
+                                    || COALESCE(agg.provider, '{}'::text[])) x),
+               -- winner's keys win on conflict
+               provider_evidence = COALESCE(agg.provider_evidence, '{}'::jsonb)
+                                || COALESCE(w.provider_evidence, '{}'::jsonb),
+               first_seen        = LEAST(w.first_seen, agg.first_seen),
+               last_seen         = GREATEST(w.last_seen, agg.last_seen),
+               modified_at       = now()
+         WHERE w.id = win;
+
+        address        := grp.ip;
+        winner         := win;
+        losers         := array_length(losers_arr, 1);
+        rows_repointed := moved;
+        RETURN NEXT;
+    END LOOP;
+
+    -- Report rather than silently skip. An address holding two DIFFERENT
+    -- hostnames is a real multi-name host, and an operator should know it is
+    -- being left alone instead of wondering why the count never drops.
+    FOR grp IN
+        SELECT a.ip, count(*) AS n
+          FROM public.assets a
+         GROUP BY a.ip
+        HAVING count(*) > 1
+           AND count(DISTINCT NULLIF(btrim(a.hostname), '')) > 1
+    LOOP
+        RAISE NOTICE 'assets: % has % rows with different hostnames (virtual hosts) - left unmerged', grp.ip, grp.n;
+    END LOOP;
+END $MDA$;
+
+DO $RUNMDA$
+DECLARE r record; BEGIN
+    FOR r IN SELECT * FROM public.merge_duplicate_assets() LOOP
+        RAISE NOTICE 'assets: merged % duplicate row(s) for % into %, repointed % child row(s)',
+                     r.losers, r.address, r.winner, r.rows_repointed;
+    END LOOP;
+END $RUNMDA$;
+
+
+-- 5c. Backfill credential_findings.port_id, which was NULL on every row.
+--
+-- parse_brutus resolves the port with
+--     SELECT id FROM ports WHERE asset_id = <finding's asset> AND port = <port>
+-- and the finding attached to the nameless asset row that had no ports, so the
+-- lookup found nothing and the column stayed empty. 5b puts the ports and the
+-- credentials on the same asset, which makes the lookup work — but only for rows
+-- ingested from here on. This fills in the ones already stored.
+--
+-- Matched on (asset, port) only: ports.proto is the TRANSPORT ('tcp'), while
+-- credential_findings.protocol is the SERVICE ('ftp', 'telnet'), so they are not
+-- comparable. tcp is preferred because credential testing is TCP.
+UPDATE public.credential_findings cf
+   SET port_id = p.id
+  FROM public.ports p
+ WHERE cf.port_id IS NULL
+   AND p.asset_id = cf.asset_id
+   AND p.port     = cf.port
+   AND p.id = (SELECT p2.id FROM public.ports p2
+                WHERE p2.asset_id = cf.asset_id AND p2.port = cf.port
+                ORDER BY (p2.proto = 'tcp') DESC, p2.last_seen DESC NULLS LAST, p2.id
+                LIMIT 1);
+
 -- 6. Prevent recurrence. NOT VALID so a pre-existing violation can never block
 --    this migration; steps 1 and 5 have already cleared them.
 DO $NORM$ BEGIN

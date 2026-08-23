@@ -90,6 +90,71 @@ def ensure_asset(cur, ip: str = None, hostname: str = None) -> str:
 
     # Case 1: IP provided (most common, should be primary)
     if ip:
+        # An asset row with NO hostname is this host before its name was known —
+        # it is not a virtual host. ix_assets_ip_hostname is
+        # UNIQUE(ip, COALESCE(hostname,'')), so (ip, '') and (ip, 'name') are two
+        # legal rows, and inserting the second is how one machine became two:
+        # 192.168.1.150 held its 57 ports on the nameless row and its hostname,
+        # 758 web findings and 7 credentials on the named one. Anything joining
+        # ports to findings through asset_id returned nothing.
+        #
+        # public.merge_duplicate_assets() repairs that after the fact; these two
+        # lookups stop it happening in the first place.
+        adopted = None
+        if hostname:
+            # Name the existing nameless row rather than adding a sibling. Only
+            # when this address has no OTHER named row: several names on one
+            # address is a genuine vhost set, and adopting would attach the
+            # nameless row's data to whichever name happened to arrive first.
+            cur.execute("""
+                UPDATE assets a
+                   SET hostname = %s, last_seen = now(), modified_at = now()
+                 WHERE a.ip = %s::inet
+                   AND COALESCE(NULLIF(btrim(a.hostname), ''), '') = ''
+                   AND NOT EXISTS (
+                        SELECT 1 FROM assets b
+                         WHERE b.ip = a.ip AND b.id <> a.id
+                           AND COALESCE(NULLIF(btrim(b.hostname), ''), '') <> '')
+                RETURNING a.id
+            """, (hostname, ip))
+            row = cur.fetchone()
+            if row:
+                adopted = str(row["id"])
+        else:
+            # No hostname on offer, so any row for this address is this host.
+            # Prefer the nameless row; otherwise reuse the single named one. With
+            # two or more names this returns nothing and the upsert below creates
+            # or reuses the nameless anchor — an IP-only observation genuinely
+            # cannot say which vhost it belongs to.
+            cur.execute("""
+                SELECT a.id FROM assets a
+                 WHERE a.ip = %s::inet
+                   AND (SELECT count(DISTINCT NULLIF(btrim(b.hostname), ''))
+                          FROM assets b WHERE b.ip = a.ip) <= 1
+                 ORDER BY (COALESCE(NULLIF(btrim(a.hostname), ''), '') = '') DESC,
+                          a.first_seen NULLS LAST, a.id
+                 LIMIT 1
+            """, (ip,))
+            row = cur.fetchone()
+            if row:
+                adopted = str(row["id"])
+                cur.execute("UPDATE assets SET last_seen = now(), modified_at = now()"
+                            " WHERE id = %s::uuid", (adopted,))
+
+        if adopted:
+            eid = resolve_engagement_for_ip(cur, ip)
+            if eid:
+                try:
+                    cur.execute(
+                        "UPDATE assets SET engagement_id = %s::uuid "
+                        " WHERE id = %s::uuid AND engagement_id IS NULL",
+                        (eid, adopted),
+                    )
+                except Exception as e:
+                    logger.debug("engagement stamp failed for asset %s: %s", adopted, e)
+            logger.debug(f"Asset reused for IP {ip}: {adopted}")
+            return adopted
+
         # Use UPSERT to handle duplicates gracefully
         # The conflict target must match an existing unique index EXACTLY, and
         # the only one on assets is
