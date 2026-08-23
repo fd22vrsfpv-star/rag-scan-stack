@@ -18,6 +18,7 @@ import psycopg2
 import requests
 from typing import Dict, List, Optional, Any
 from datetime import datetime
+from urllib.parse import urlparse
 
 logger = logging.getLogger("web_scanner.pipeline")
 
@@ -61,6 +62,50 @@ def emit_webhook_event(event_type: str, source: str, data: dict, severity: str =
         )
     except Exception as e:
         logger.warning(f"Failed to emit webhook: {e}")
+
+
+# ── Authorization gate ──────────────────────────────────────────────────────
+# run_pipeline() drives SEVEN tools at a caller-supplied URL — wafw00f, katana,
+# playwright, gobuster, nikto, nuclei and a full ZAP active scan — and had no
+# scope check. One call is the loudest thing this stack can do to a host.
+#
+# Gated once at the entry point rather than per stage: every stage takes its
+# target from the same `target_url`, so a single check at the top covers all of
+# them, and there is no path into a stage that skips run_pipeline().
+try:
+    from etl.scope_gate import enforce_target_scope
+    _SCOPE_GATE_OK = True
+    _SCOPE_GATE_ERROR = ""
+except Exception as _scope_exc:            # pragma: no cover - deployment problem
+    _SCOPE_GATE_OK = False
+    _SCOPE_GATE_ERROR = str(_scope_exc)
+
+
+# Bound by the shared ceiling rather than a private number. run_pipeline drives
+# seven tools, so one call is one scan's worth of load; see the per-service note
+# in common/tool_job.py about what this does and does not guarantee.
+try:
+    from common.tool_job import scan_slot, MAX_CONCURRENT_SCANS
+    _SLOTS_OK = True
+    _SLOTS_ERROR = ""
+except Exception as _slot_exc:             # pragma: no cover - deployment problem
+    _SLOTS_OK = False
+    _SLOTS_ERROR = str(_slot_exc)
+    MAX_CONCURRENT_SCANS = 0
+
+
+def _scope_refusal_for_url(url, context: str = ""):
+    """Refusal string when this URL must NOT be scanned, else None. Fails closed."""
+    if not _SCOPE_GATE_OK:
+        return (f"scope gate unavailable ({_SCOPE_GATE_ERROR}) — refusing to scan; "
+                "check the ./etl:/app/etl mount on web-scanner")
+    try:
+        host = urlparse(str(url or "")).hostname
+    except Exception as exc:
+        return f"could not parse a host out of {url!r} ({exc}) — refusing"
+    if not host:
+        return f"no host in {url!r} — refusing rather than guessing"
+    return enforce_target_scope(host, context or str(url))
 
 
 class WebScanPipeline:
@@ -132,6 +177,50 @@ class WebScanPipeline:
         Returns:
             Dictionary with results from all stages
         """
+        refusal = _scope_refusal_for_url(target_url, f"web scan pipeline {target_url}")
+        if refusal:
+            logger.warning("REFUSED web scan pipeline for %s: %s", target_url, refusal)
+            try:
+                self.job_tracker.update_job(job_id, status="blocked", error=refusal)
+            except Exception:
+                logger.debug("could not mark job %s blocked", job_id)
+            emit_webhook_event("web_scan_blocked", "web_scanner", {
+                "job_id": job_id, "target": target_url, "reason": refusal,
+            })
+            # Returned, not raised: the caller treats this dict as the pipeline
+            # result, and a labelled refusal is more useful than a traceback.
+            return {"target": target_url, "job_id": job_id,
+                    "blocked": "out_of_scope", "error": refusal, "stages": {}}
+
+        if not _SLOTS_OK:
+            # A missing ./common mount must not silently mean "unbounded".
+            msg = (f"scan slot pool unavailable ({_SLOTS_ERROR}) — check the "
+                   "./common:/scanner/common mount on web-scanner")
+            logger.error(msg)
+            return {"target": target_url, "job_id": job_id,
+                    "blocked": "no_slot_pool", "error": msg, "stages": {}}
+
+        with scan_slot(job_id=job_id, label="web-pipeline"):
+            return self._run_pipeline_slotted(
+                target_url, job_id, wordlist, max_paths_to_visit,
+                skip_gobuster, skip_playwright, skip_zap, skip_nuclei,
+                skip_nikto, skip_katana, skip_wafw00f)
+
+    def _run_pipeline_slotted(
+        self,
+        target_url: str,
+        job_id: str,
+        wordlist: Optional[str] = None,
+        max_paths_to_visit: int = 50,
+        skip_gobuster: bool = False,
+        skip_playwright: bool = False,
+        skip_zap: bool = False,
+        skip_nuclei: bool = False,
+        skip_nikto: bool = False,
+        skip_katana: bool = False,
+        skip_wafw00f: bool = False
+    ) -> Dict[str, Any]:
+        """Body of run_pipeline(), inside the scope gate and a scan slot."""
         context = {
             "target": target_url,
             "job_id": job_id,
