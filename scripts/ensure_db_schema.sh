@@ -186,6 +186,35 @@ else
     MISSING=$((MISSING + 1))
 fi
 
+# One address, two asset rows. ix_assets_ip_hostname is
+# UNIQUE(ip, COALESCE(hostname,'')), so (ip, '') and (ip, 'name') are both legal
+# and ~20 raw "INSERT INTO assets" sites bypass the helper that now adopts the
+# nameless row. ensure_all_tables.sql calls merge_duplicate_assets() on every
+# run, so this should be zero; a non-zero count means a merge was refused.
+# Addresses with two DIFFERENT hostnames are excluded — those are virtual hosts
+# and are meant to stay separate.
+SPLIT_ASSETS=$(docker exec rag-postgres psql -U app -d scans -tAc \
+    "SELECT count(*) FROM (SELECT ip FROM assets GROUP BY ip HAVING count(*) > 1 AND count(DISTINCT NULLIF(btrim(hostname), '')) <= 1) d;" 2>/dev/null)
+if [[ -z "$SPLIT_ASSETS" ]]; then
+    echo "⚠  split-asset check skipped (could not query)"
+elif [[ "$SPLIT_ASSETS" -le 0 ]]; then
+    echo "✓ no address holds a nameless duplicate asset row"
+else
+    echo "❌ ${SPLIT_ASSETS} address(es) have a nameless duplicate asset row - one host split across two rows, ports on one and findings on the other; re-run ensure_all_tables.sql"
+    MISSING=$((MISSING + 1))
+fi
+
+HAS_MERGE_FN=$(docker exec rag-postgres psql -U app -d scans -tAc \
+    "SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'merge_duplicate_assets');" 2>/dev/null)
+if [[ "$HAS_MERGE_FN" == "t" ]]; then
+    echo "✓ merge_duplicate_assets() present"
+elif [[ "$HAS_MERGE_FN" == "f" ]]; then
+    echo "❌ merge_duplicate_assets() missing - split asset rows will not self-heal"
+    MISSING=$((MISSING + 1))
+else
+    echo "⚠  merge_duplicate_assets() check skipped (could not query)"
+fi
+
 DUP_PORTS=$(docker exec rag-postgres psql -U app -d scans -tAc \
     "SELECT (SELECT count(*) FROM ports) - (SELECT count(*) FROM (SELECT DISTINCT a.ip, p.proto, p.port FROM ports p JOIN assets a ON p.asset_id = a.id) d);" 2>/dev/null)
 if [[ -z "$DUP_PORTS" ]]; then

@@ -285,9 +285,16 @@ def bridge_credential_findings(cur,
 
     creds = idents = 0
     errors: list[str] = []
+    # SAVEPOINT is only legal inside a transaction block. On an autocommit
+    # connection every statement is already its own transaction, so a failing row
+    # cannot poison the others and the savepoint is both unnecessary and fatal —
+    # it raises NoActiveSqlTransaction for EVERY row, which is exactly how the
+    # first version of the endpoint reported "4 accounts, 0 upserted, 4 errors".
+    use_savepoint = not getattr(getattr(cur, "connection", None), "autocommit", False)
     for p in proposals:
         try:
-            cur.execute("SAVEPOINT cred_bridge_sp")
+            if use_savepoint:
+                cur.execute("SAVEPOINT cred_bridge_sp")
             cur.execute("""
                 INSERT INTO credential_vault
                     (engagement_id, username, domain, credential_type,
@@ -324,12 +331,14 @@ def bridge_credential_findings(cur,
                 engagement_id=p["engagement_id"],
             )
             idents += 1
-            cur.execute("RELEASE SAVEPOINT cred_bridge_sp")
+            if use_savepoint:
+                cur.execute("RELEASE SAVEPOINT cred_bridge_sp")
         except Exception as e:
-            try:
-                cur.execute("ROLLBACK TO SAVEPOINT cred_bridge_sp")
-            except Exception:
-                pass
+            if use_savepoint:
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT cred_bridge_sp")
+                except Exception:
+                    pass
             if len(errors) < 10:
                 errors.append(f"{p['username']}@{p['domain']}: {type(e).__name__}: {e}")
 

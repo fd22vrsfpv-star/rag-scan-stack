@@ -4064,7 +4064,8 @@ def _run_vault_auto_import_if_enabled(engagement_id: Optional[str] = None,
         return
     try:
         import vault_import_agent
-        with get_db(autocommit=True) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # NOT autocommit -- SAVEPOINT needs a transaction; see the endpoint above.
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             result = vault_import_agent.import_secrets_from_recon(
                 cur, engagement_id=engagement_id,
                 source="microburst", dry_run=False, limit=500,
@@ -4104,7 +4105,9 @@ def _run_credential_bridge(engagement_id: Optional[str] = None,
     """
     try:
         from etl.credential_bridge import bridge_credential_findings
-        with get_db(autocommit=True) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # NOT autocommit: the per-row error handling uses SAVEPOINT, which is only
+        # legal inside a transaction block. get_db() commits on clean exit.
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             result = bridge_credential_findings(
                 cur, engagement_id=engagement_id, dry_run=False, limit=1000)
         log.info("credential bridge: examined=%s accounts=%s creds=%s identities=%s",
@@ -4136,6 +4139,33 @@ def cloud_posture(authorized: bool = Depends(auth)):
 
 
 # ── Identities (unified directory of detected users / SPs / guests) ──────────
+
+def _identity_services(tags) -> List[str]:
+    """The services an identity's credential was proven on, e.g. ['ftp/21'].
+
+    etl/credential_bridge.py records them as `service:<proto>/<port>` tags when it
+    projects a verified credential_findings row, so this is a read of what the
+    bridge already stored rather than another join. Cloud identities have none and
+    get an empty list.
+
+    Sorted by port NUMBER: string ordering puts 'ftp/2121' before 'telnet/23'.
+    """
+    out = []
+    for t in (tags or []):
+        if isinstance(t, str) and t.startswith("service:"):
+            v = t.split(":", 1)[1].strip()
+            if v:
+                out.append(v)
+
+    def _key(svc):
+        proto, _, port = svc.partition("/")
+        try:
+            return (proto, int(port))
+        except ValueError:
+            return (proto, 0)
+
+    return sorted(set(out), key=_key)
+
 
 @app.get("/identities", tags=["Identities"])
 def list_identities(
@@ -4227,6 +4257,9 @@ def list_identities(
             "last_seen": r["last_seen"].isoformat() if r["last_seen"] else None,
             "engagement_id": str(r["engagement_id"]) if r["engagement_id"] else None,
             "has_credential": r["has_credential"],
+            # Which service the credential was found on — an account that is valid
+            # on telnet is a different lead from one valid only on ftp.
+            "services": _identity_services(r["tags"]),
         }
 
     return {"total": total, "limit": limit, "offset": offset,
@@ -4304,17 +4337,35 @@ def get_identity(identity_id: str, authorized: bool = Depends(auth)):
         if not row:
             raise HTTPException(404, "Identity not found")
 
+        # grants_access_to holds the port ids the credential was proven against
+        # (filled by etl/credential_bridge.py). Resolving them here is the
+        # authoritative "found on" answer, rather than the tag projection the
+        # listing uses for speed. has_secret says whether there is anything to
+        # replay: credential testing stores only a masked password.
         cur.execute("""
-            SELECT id, username, domain, credential_type, status, source, created_at
-            FROM credential_vault
-            WHERE LOWER(username) = LOWER(%s)
-               OR LOWER(username || '@' || COALESCE(domain,'')) = LOWER(%s)
-            ORDER BY created_at DESC
+            SELECT cv.id, cv.username, cv.domain, cv.credential_type, cv.status,
+                   cv.source, cv.created_at, cv.notes,
+                   cv.credential_value IS NOT NULL AS has_secret,
+                   -- COALESCE(service, proto): the listing renders 'ftp/21' from
+                   -- the credential finding's service name, so showing 'tcp/21'
+                   -- here would read as a different port set for the same account.
+                   COALESCE((SELECT array_agg(COALESCE(NULLIF(p.service, ''), p.proto)
+                                              || '/' || p.port
+                                              ORDER BY p.port, p.proto)
+                               FROM ports p
+                              WHERE p.id = ANY(cv.grants_access_to)), '{}') AS services
+            FROM credential_vault cv
+            WHERE LOWER(cv.username) = LOWER(%s)
+               OR LOWER(cv.username || '@' || COALESCE(cv.domain,'')) = LOWER(%s)
+            ORDER BY cv.created_at DESC
         """, (row["identifier"], row["identifier"]))
         creds = [{
             "id": str(c["id"]), "username": c["username"], "domain": c["domain"],
             "credential_type": c["credential_type"], "status": c["status"],
             "source": c["source"],
+            "services": list(c["services"] or []),
+            "has_secret": c["has_secret"],
+            "notes": c["notes"],
             "created_at": c["created_at"].isoformat() if c["created_at"] else None,
         } for c in cur.fetchall()]
 
@@ -4341,6 +4392,7 @@ def get_identity(identity_id: str, authorized: bool = Depends(auth)):
         "is_admin": row["is_admin"], "is_guest": row["is_guest"], "is_dirsync": row["is_dirsync"],
         "tags": list(row["tags"] or []),
         "sources": list(row["sources"] or []),
+        "services": _identity_services(row["tags"]),
         "first_seen": row["first_seen"].isoformat() if row["first_seen"] else None,
         "last_seen": row["last_seen"].isoformat() if row["last_seen"] else None,
         "raw": row["raw"],
@@ -4513,7 +4565,10 @@ def vault_import_from_recon(body: VaultImportBody, _: bool = Depends(auth)):
     """Run the vault-import agent over recon_findings of a given source/type
     and either preview (dry_run=true) or commit credential_vault rows."""
     import vault_import_agent
-    with get_db(autocommit=True) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+    # NOT autocommit: import_secrets_from_recon's commit phase wraps each row in a
+    # SAVEPOINT, which raises NoActiveSqlTransaction on an autocommit connection.
+    # Same defect as the credential bridge, found while fixing it.
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         try:
             result = vault_import_agent.import_secrets_from_recon(
                 cur,
@@ -4569,7 +4624,8 @@ def vault_bridge_credential_findings(body: CredentialBridgeBody, _: bool = Depen
     re-running updates in place rather than duplicating.
     """
     from etl.credential_bridge import bridge_credential_findings
-    with get_db(autocommit=True) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+    # NOT autocommit -- see _run_credential_bridge: SAVEPOINT needs a transaction.
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         try:
             result = bridge_credential_findings(
                 cur,

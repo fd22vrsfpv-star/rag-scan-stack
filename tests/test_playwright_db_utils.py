@@ -75,16 +75,29 @@ class TestDatabaseUtils:
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 
-        # No existing asset
+        # No existing asset. THREE lookups now precede the insert, not one:
+        #   1. exact (ip, hostname) combo
+        #   2. NEW: a nameless row for this address, or the single named one —
+        #      a row with no hostname is this host before its name was known, and
+        #      inserting a sibling instead of reusing it is what split
+        #      192.168.1.150 into two assets with its ports on one and its
+        #      findings on the other
+        #   3. the INSERT's RETURNING id
+        # Asserting on a fixed call index would only pin the old sequence, so
+        # find the insert instead of counting to it.
         asset_id = uuid.uuid4()
-        mock_cursor.fetchone.side_effect = [None, {'id': asset_id}]
+        mock_cursor.fetchone.side_effect = [None, None, {'id': asset_id}]
 
         # Execute
         result = db_utils.get_or_create_asset('192.168.1.200')
 
         # Verify
         assert result == asset_id
-        assert 'INSERT INTO assets' in mock_cursor.execute.call_args_list[1][0][0]
+        statements = [c[0][0] for c in mock_cursor.execute.call_args_list]
+        assert any('INSERT INTO assets' in sql for sql in statements), statements
+        # and the adoption lookup really ran, or nothing stops the duplicate
+        assert any('FROM assets b WHERE b.ip = a.ip' in sql for sql in statements), \
+            'the nameless-row lookup is gone; duplicate assets will recur'
         mock_conn.commit.assert_called_once()
 
     @patch('playwright_scanner.db_utils.psycopg2.connect')
