@@ -59,7 +59,14 @@ _SCOPE_MARKERS = (
 # semaphore sized by MAX_CONCURRENT_SCANS. Naming only the env var reported
 # pd_runner and osint_runner as unbounded immediately after they were bounded —
 # the same too-narrow-marker mistake the scope list made with scans.py.
-_LIMIT_MARKERS = ("MAX_CONCURRENT_SCANS", "run_tool_job", "scan_slot")
+# get_max_concurrent is the BFF's accessor: it literally returns
+# MAX_CONCURRENT_SCANS and is the only correct way to read it at runtime
+# there, because set_max_concurrent() rebinds the module global. Without it
+# as a marker, dashboard/bff/routers/assets.py — the REFERENCE dispatcher —
+# matched only on a log-message string that happens to name the env var,
+# which is barely stronger than the comments _strip_comments() removes.
+_LIMIT_MARKERS = ("MAX_CONCURRENT_SCANS", "run_tool_job", "scan_slot",
+                  "get_max_concurrent")
 
 # Directories worth scanning. Tests, migrations and the frontend are excluded.
 _ROOTS = (
@@ -87,14 +94,8 @@ SCOPE_DEBT = {
         "sends traffic to a supplied target without a scope check",
     "autogen_agents/scan_tools.py":
         "sends traffic to a supplied target without a scope check",
-    "dashboard/bff/polling.py":
-        "re-dispatches queued jobs and never re-checks the scope they were created under",
     "dashboard/bff/routers/nodes.py":
         "remote-node execution path",
-    "dashboard/bff/services/pipeline_orchestrator.py":
-        "drives multi-stage scans; the gate belongs at stage dispatch",
-    "scan_recommender/scan_recommender.py":
-        "auto-execute dispatches tools straight from recommendations",
 }
 
 # Flagged by the detector, but these do NOT send traffic to an engagement
@@ -107,6 +108,11 @@ SCOPE_DEBT = {
 # unnecessary — the gate fails closed, and neither destination is ever in an
 # engagement scope, so every call would be refused.
 LIMIT_NOT_APPLICABLE = {
+    "osint_runner/service_enum_cli.py":
+        "runs on a REMOTE NODE, uploaded there by node_manager, with neither "
+        "common/ nor a database — there is no shared semaphore to consult. The "
+        "slot is held upstream: node_manager.remote_scan wraps the whole "
+        "dispatch, so the ceiling is applied where the work is admitted.",
     "app/rag-api/health_router.py":
         "does not initiate scans — it polls our own containers' /health.",
     "scan_recommender/exploits_rag.py":
@@ -152,14 +158,6 @@ LIMIT_DEBT = {
     "autogen_agents/mcp_server.py":
         "initiates scans without consulting the shared limit",
     "autogen_agents/scan_tools.py":
-        "initiates scans without consulting the shared limit",
-    "dashboard/bff/services/pipeline_orchestrator.py":
-        "drives multi-stage scans; the gate belongs at stage dispatch",
-    "dashboard/bff/services/tool_executor.py":
-        "runs tools for the pipeline; needs the same gate as routers/assets.py",
-    "nmap_scanner/cred_checker.py":
-        "initiates scans without consulting the shared limit",
-    "osint_runner/service_enum_cli.py":
         "initiates scans without consulting the shared limit",
 }
 

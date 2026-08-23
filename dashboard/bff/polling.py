@@ -5,6 +5,7 @@ import os
 import pathlib
 from datetime import datetime, timedelta, timezone
 import httpx
+from scope_guard import scope_rows_for, refusal_for
 from config import get_settings
 from timeouts import TIMEOUT_FAST, TIMEOUT_NORMAL
 from ws_hub import hub
@@ -259,6 +260,41 @@ async def _dispatch_pending(client: httpx.AsyncClient):
                 return
             item = pending_queue.pop(0)
         url = item["url"]
+
+        # Re-check scope AT DISPATCH, not only when the item was queued. The two
+        # are different moments: an item can sit in pending_queue while the
+        # operator narrows the engagement scope, and the queued decision is not
+        # authorization for the dispatch that happens later.
+        #
+        # The refusal is RECORDED, not silently dropped — CLAUDE.md: a blocked
+        # item that looks identical to a runnable one reads as a bug when it does
+        # nothing. It lands in active_jobs, which is what the UI already reads.
+        try:
+            _rows, _src = scope_rows_for(item.get("engagement_id"))
+            _refusal = refusal_for(url, _rows, f"{item.get('scan_type','scan')} {url}")
+        except Exception as _e:
+            # Fail closed: "cannot check" must never look like "authorised".
+            _refusal = f"scope could not be evaluated ({type(_e).__name__}: {_e})"
+        if _refusal:
+            log.warning("REFUSED queued scan for %s: %s", url[:80], _refusal)
+            _bid = f"blocked-{item.get('scan_type','scan')}-{abs(hash(url)) % 10**10}"
+            active_jobs[_bid] = {
+                "service_url": item.get("service_url"),
+                "type": item.get("scan_type"),
+                "kind": "blocked",
+                "status": "blocked",
+                "last_data": {"error": _refusal, "blocked": "out_of_scope"},
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "proxy": item.get("proxy"),
+                "engagement_id": item.get("engagement_id"),
+                "scope_name": item.get("scope_name"),
+                "target": url,
+                "source_rec_id": item.get("source_rec_id"),
+            }
+            _persist(_bid)
+            continue
+
         try:
             payload = dict(item["payload_template"])
             payload["target_url"] = url

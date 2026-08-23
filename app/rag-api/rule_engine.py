@@ -251,6 +251,36 @@ def check_exposed_keys(row, _rule):
     return False
 
 
+# Column names rules actually SELECT, in preference order. The resolver used to
+# try target/url/ip only and fall back to the literal string "unknown" — but a
+# rule selecting `url_pattern` (sensitive_parameter), or one that only sets `ip`
+# late (tcpwrapped_security_control), then produced target="unknown", and the
+# scope check evaluates that as a HOSTNAME. Failing closed on an unknown host is
+# correct in isolation, so "we do not know the target" silently became "the
+# target is out of scope": the finding was prefixed [OUT-OF-SCOPE], tagged, and
+# reassigned to the unknown_scope engagement. Two findings on 192.168.1.150 —
+# squarely in scope, with the URL sitting in their own title — were filed that
+# way.
+_TARGET_COLUMNS = ("target", "url", "url_pattern", "endpoint", "api_endpoints",
+                   "hostname", "domain", "ip")
+
+
+def _row_target(row) -> str:
+    """The best target this row carries, or "" when it genuinely has none.
+
+    Returns "" rather than "unknown": an empty target is honestly unknown, while
+    "unknown" is a string scope matching will treat as a hostname and refuse.
+    """
+    for col in _TARGET_COLUMNS:
+        v = row.get(col)
+        if isinstance(v, (list, tuple)):
+            v = v[0] if v else None
+        v = ("" if v is None else str(v)).strip()
+        if v and v.lower() != "unknown":
+            return v
+    return ""
+
+
 def check_sensitive_params(row, _rule):
     """Flag discovered parameters with security-sensitive names."""
     param = (row.get("param_name") or "").lower()
@@ -1453,7 +1483,7 @@ class RuleEngine:
                 row.setdefault("ip", "unknown")
 
             title = _render_template(rule.get("title_template", "{id}"), row)
-            target = row.get("target") or row.get("url") or row.get("ip") or "unknown"
+            target = _row_target(row)
             reason = reason_override or _render_template(
                 rule.get("reason_template", rule.get("description", "")), row
             )
@@ -1551,7 +1581,7 @@ class RuleEngine:
 
             row.setdefault("host", row.get("target", ""))
             title = _render_template(rule.get("title_template", "{id}"), row)
-            target = row.get("url") or row.get("target") or "unknown"
+            target = _row_target(row)
             reason = _render_template(
                 rule.get("reason_template", rule.get("description", "")), row
             )
@@ -1607,7 +1637,7 @@ class RuleEngine:
                 reason_override = row.pop("_reason_override", None)
 
                 title = _render_template(p.get("title_template", "{id}"), row)
-                target = row.get("url") or row.get("target") or "unknown"
+                target = _row_target(row)
                 reason = reason_override or _render_template(
                     p.get("reason_template", rule.get("description", "")), row
                 )

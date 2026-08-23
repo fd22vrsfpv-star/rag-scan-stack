@@ -50,8 +50,29 @@ export function useScopeFilter(scopeName: string) {
     return false
   }, [scopeName, targetsList])
 
+  /**
+   * True when ANY of the given identities is in scope.
+   *
+   * Call sites used to pass `a.hostname || a.ip` — the FIRST non-empty value,
+   * not all of them. A host has both identities and the scope may name either,
+   * so an asset named `metasploitable` whose scope entry is the IP
+   * `192.168.1.150` was filtered OUT of its own scope. That stayed hidden only
+   * because the same host also existed as a second, hostname-less asset row
+   * that matched by IP; once those duplicates were merged, the host vanished
+   * from the scope view entirely.
+   */
+  const matchesAnyScope = useCallback((...vals: (string | null | undefined)[]): boolean => {
+    if (!scopeName) return true
+    const present = vals.filter((v): v is string => !!v && !!v.trim())
+    // Nothing to test. Keep the row rather than hiding it: an asset with no
+    // identity at all is a data problem, and silently dropping it from a scope
+    // view is how one gets missed.
+    if (present.length === 0) return true
+    return present.some(v => matchesScope(v))
+  }, [scopeName, matchesScope])
+
   // isFiltering reflects user intent (a scope is selected), not load state.
   // This keeps the count chip ("N in <scope>") accurate the instant the user
   // changes the dropdown, rather than blinking off during the targets refetch.
-  return { matchesScope, isFiltering: !!scopeName }
+  return { matchesScope, matchesAnyScope, isFiltering: !!scopeName }
 }
