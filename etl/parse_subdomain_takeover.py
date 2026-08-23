@@ -136,38 +136,45 @@ def insert_subdomain_takeover_findings(findings: List[Dict], conn):
         for finding in findings:
             try:
                 # Insert into recon_findings table with takeover-specific data
+                # recon_findings has: source, finding_type, target, data(jsonb),
+                # severity, tags. This used to name scan_id/domain/subdomain/
+                # title/description/evidence_data/discovered_at/metadata — EIGHT
+                # columns the table does not have — so every insert raised
+                # UndefinedColumn and this parser had never stored a row.
+                #
+                # scan_id is deliberately NOT in `data`: the dedup trigger hashes
+                # source|finding_type|target|data, so a per-scan id in there
+                # would fork the fingerprint on every run and defeat the dedup
+                # entirely. Provenance stays available via created_at.
+                #
+                # No ON CONFLICT: trg_recon_findings_dedup computes the
+                # fingerprint and merges duplicates itself, returning NULL to
+                # skip the insert — the clause would never be reached. The old
+                # one named (source, scan_id, domain, subdomain, title), which is
+                # not an index that exists.
                 cur.execute("""
-                    INSERT INTO recon_findings (
-                        source, scan_id, domain, subdomain, title, description,
-                        severity, evidence_data, discovered_at, tags, metadata
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (source, scan_id, domain, subdomain, title) DO UPDATE SET
-                        description = EXCLUDED.description,
-                        evidence_data = EXCLUDED.evidence_data,
-                        discovered_at = EXCLUDED.discovered_at,
-                        metadata = EXCLUDED.metadata
+                    INSERT INTO recon_findings
+                        (source, finding_type, target, data, severity, tags)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                 """, (
                     finding["source"],
-                    finding["scan_id"],
-                    finding["subdomain"].split('.', 1)[-1] if '.' in finding["subdomain"] else finding["subdomain"],  # Extract domain
+                    "subdomain_takeover",
                     finding["subdomain"],
-                    finding["title"],
-                    finding["description"],
-                    finding["severity"],
                     json.dumps({
+                        "title": finding["title"],
+                        "description": finding["description"],
+                        "domain": (finding["subdomain"].split('.', 1)[-1]
+                                   if '.' in finding["subdomain"] else finding["subdomain"]),
                         "service_provider": finding["service_provider"],
                         "confidence": finding["confidence"],
                         "evidence": finding["evidence"],
-                        "risk_score": finding["risk_score"]
-                    }),
-                    datetime.now(),
-                    ["subdomain_takeover", "dns", "security"],
-                    json.dumps({
-                        "takeover_type": "subdomain",
-                        "service_provider": finding["service_provider"],
+                        "risk_score": finding["risk_score"],
                         "remediation": finding["remediation"],
-                        "references": finding["references"]
-                    })
+                        "references": finding["references"],
+                        "takeover_type": "subdomain",
+                    }, sort_keys=True),
+                    finding["severity"],
+                    ["subdomain_takeover", "dns", "security"],
                 ))
                 inserted_count += 1
                 logger.info(f"Inserted takeover finding: {finding['subdomain']} -> {finding['service_provider']}")
