@@ -1360,6 +1360,13 @@ BEGIN
       duration_ms   numeric,
       source        text DEFAULT 'brutus',
       metadata      jsonb DEFAULT '{}'::jsonb,
+      -- CAUTION: PLAINTEXT credential material, by operator decision. A
+      -- recovered password is the primary artefact of a credential-testing
+      -- phase and lateral movement needs the real secret. /export/data carries
+      -- it (the `credentials` category is on by default and reads SELECT *),
+      -- so an export file is as sensitive as this table. metadata.audit stays
+      -- masked: it lists every password TRIED, most belonging to no account.
+      secret_value  text,
       created_at    timestamptz NOT NULL DEFAULT now()
     );
     CREATE INDEX idx_credential_findings_asset_id ON public.credential_findings(asset_id);
@@ -2025,7 +2032,16 @@ BEGIN
                status           = COALESCE(NEW.status, status),
                secret_type      = COALESCE(NEW.secret_type, secret_type),
                banner           = COALESCE(NEW.banner, banner),
-               metadata         = COALESCE(NEW.metadata, metadata)
+               metadata         = COALESCE(NEW.metadata, metadata),
+               -- The recovered secret. A re-verification often DOES
+               -- capture the password when the first observation did
+               -- not, and without this the new value is discarded: this
+               -- trigger RETURNs NULL on a duplicate, so the writer's own
+               -- ON CONFLICT DO UPDATE never runs and there is no other
+               -- path by which secret_value can reach an existing row.
+               -- COALESCE, never assignment: a run that did not recover
+               -- the password must not erase one already stored.
+               secret_value     = COALESCE(NEW.secret_value, secret_value)
          WHERE id = existing_id;
         RETURN NULL;   -- skip the INSERT
     END IF;

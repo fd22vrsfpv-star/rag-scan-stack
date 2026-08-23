@@ -66,6 +66,11 @@ import logging
 import uuid
 from typing import Any, Optional
 
+try:
+    from etl.sql_types import as_text_array
+except ImportError:                        # rag-api imports etl as a top-level pkg
+    from sql_types import as_text_array    # type: ignore
+
 __all__ = ["bridge_credential_findings", "vault_credential_type", "BRIDGE_PROVIDER"]
 
 log = logging.getLogger("credential_bridge")
@@ -124,9 +129,14 @@ _STATUS_TO_VAULT = {
 _ALWAYS_PRIVILEGED = {"root", "administrator"}
 
 _NOTE_NO_SECRET = (
-    "Verified valid by credential testing; the secret itself was NOT retained "
-    "(parse_brutus stores only masked passwords in metadata.audit), so "
-    "credential_value is empty by design rather than by omission."
+    "Verified valid by credential testing. No secret was captured for this "
+    "account, so credential_value is empty — a re-verification run records the "
+    "account without re-recovering the password."
+)
+_NOTE_WITH_SECRET = (
+    "Verified valid by credential testing; the recovered secret IS stored in "
+    "credential_value, in PLAINTEXT, so follow-on attacks can use it. Anyone "
+    "with read access to this table has the credential."
 )
 
 
@@ -190,6 +200,7 @@ def bridge_credential_findings(cur,
                cf.port, cf.protocol, cf.username,
                COALESCE(cf.source, 'brutus') AS source,
                cf.secret_type, cf.auth_type, cf.status, cf.valid_cred,
+               cf.secret_value,
                -- Resolve the service by ADDRESS, falling back from the finding's
                -- own port_id, which is NULL on every row that exists today:
                -- parse_brutus looks the port up under the finding's asset_id, and
@@ -229,12 +240,18 @@ def bridge_credential_findings(cur,
                 "host": host,
                 "username": username,
                 "secret_type": f["secret_type"],
+                "secret_value": f.get("secret_value"),
                 "status": f["status"],
                 "engagement_id": f["engagement_id"] or engagement_id,
                 "services": [],
                 "port_ids": [],
                 "finding_ids": [],
             }
+        # Any one of an account's findings may be the one that captured the
+        # password (a re-verification run often does not), so take the first
+        # non-None rather than whichever row happened to create the group.
+        if acct.get("secret_value") is None and f.get("secret_value") is not None:
+            acct["secret_value"] = f["secret_value"]
         svc = (f["protocol"] or "tcp", int(f["port"]))
         if svc not in acct["services"]:
             acct["services"].append(svc)
@@ -254,6 +271,7 @@ def bridge_credential_findings(cur,
             "username": acct["username"],
             "domain": host,          # identifier becomes username@host
             "credential_type": vault_credential_type(acct["secret_type"]),
+            "credential_value": acct.get("secret_value"),
             "status": _vault_status(acct["status"]),
             "engagement_id": acct["engagement_id"],
             "grants_access_to": acct["port_ids"],
@@ -262,7 +280,9 @@ def bridge_credential_findings(cur,
             "identity_identifier": f"{acct['username']}@{host}",
             "is_admin": uname_lc in _ALWAYS_PRIVILEGED,
             "notes": (f"Valid on {', '.join(services)} at {host} "
-                      f"(source: {source}). {_NOTE_NO_SECRET}"),
+                      f"(source: {source}). "
+                      + (_NOTE_WITH_SECRET if acct.get("secret_value") is not None
+                         else _NOTE_NO_SECRET)),
         })
     proposals.sort(key=lambda p: (p["domain"], p["username"]))
 
@@ -292,6 +312,14 @@ def bridge_credential_findings(cur,
     # first version of the endpoint reported "4 accounts, 0 upserted, 4 errors".
     use_savepoint = not getattr(getattr(cur, "connection", None), "autocommit", False)
     for p in proposals:
+        # Declared as a list so the SQL type guard can PROVE the uuid[] feed;
+        # a bare p["grants_access_to"] is opaque to it, and CLAUDE.md prefers
+        # declaring the type over wrapping the value at the call site.
+        #
+        # Passed as-is rather than `grants or None`: an EMPTY array is a true
+        # statement ("proven on no resolvable port"), a NULL is "unknown", and
+        # `x or None` is not a shape the guard can prove either.
+        grants = as_text_array(p["grants_access_to"])
         try:
             if use_savepoint:
                 cur.execute("SAVEPOINT cred_bridge_sp")
@@ -300,19 +328,25 @@ def bridge_credential_findings(cur,
                     (engagement_id, username, domain, credential_type,
                      credential_value, source, source_entity_id, status,
                      grants_access_to, notes)
-                VALUES (%s::uuid, %s, %s, %s, NULL, %s, %s::uuid, %s, %s::uuid[], %s)
+                VALUES (%s::uuid, %s, %s, %s, %s, %s, %s::uuid, %s, %s::uuid[], %s)
                 -- ux_credvault_source_entity is PARTIAL; the WHERE clause must be
                 -- repeated verbatim or Postgres refuses the ON CONFLICT outright.
                 ON CONFLICT (source, source_entity_id) WHERE source_entity_id IS NOT NULL
                   DO UPDATE SET status           = EXCLUDED.status,
                                 credential_type  = EXCLUDED.credential_type,
+                                -- COALESCE, not assignment: a re-run whose
+                                -- findings lack the password must not erase a
+                                -- secret already captured.
+                                credential_value = COALESCE(EXCLUDED.credential_value,
+                                                            credential_vault.credential_value),
                                 -- a later scan can prove MORE services; never fewer
                                 grants_access_to = EXCLUDED.grants_access_to,
                                 notes            = EXCLUDED.notes,
                                 updated_at       = now()
             """, (p["engagement_id"], p["username"], p["domain"],
-                  p["credential_type"], p["source"], p["source_entity_id"],
-                  p["status"], p["grants_access_to"] or None, p["notes"]))
+                  p["credential_type"], p["credential_value"], p["source"],
+                  p["source_entity_id"], p["status"],
+                  grants, p["notes"]))
             creds += 1
 
             upsert_identity(

@@ -558,9 +558,23 @@ if [[ -n "$DASH" ]]; then
   # container or an uninstalled model shows up as "fewer recommendations" rather
   # than as an error. Reported as a warning, not a failure — deterministic-only
   # is a valid way to run this.
-  CAP_JSON=$(docker exec "$DASH" curl -sk "https://127.0.0.1/api/scan-recommendations/capacity" 2>/dev/null || true)
-  if [[ -z "$CAP_JSON" ]]; then
-    CAP_JSON=$(docker exec scan-recommender curl -sk "https://127.0.0.1:8013/next_scan/capacity" 2>/dev/null || true)
+  # ONE probe, direct. The old primary leg went through the dashboard at
+  # /api/scan-recommendations/capacity -- a route NO service declares. It
+  # returned {"detail":"Not Found"}, which is not empty, so the `-z` test below
+  # never fired and the working fallback was unreachable. The check then warned
+  # "scan-recommender may be down" about a service answering 200 with
+  # engagement_scan_limit and reachable:true. A dead leg that MASKS a live one is
+  # worse than a missing check: it trains the operator to ignore the output.
+  #
+  # CLAUDE.md: "A fallback leg is an endpoint. Verify every leg or delete it."
+  # Deleted, because nothing else in the repo ever called that path.
+  CAP_JSON=$(docker exec scan-recommender curl -sk --max-time 15 \
+      "https://127.0.0.1:8013/next_scan/capacity" 2>/dev/null || true)
+  if ! echo "$CAP_JSON" | grep -q '"engagement_scan_limit"'; then
+    # Retry over plain HTTP once: TLS on this port is the norm, but a dev
+    # container may serve http and a wrong-scheme miss should not read as down.
+    CAP_JSON=$(docker exec scan-recommender curl -s --max-time 15 \
+        "http://127.0.0.1:8013/next_scan/capacity" 2>/dev/null || true)
   fi
   if echo "$CAP_JSON" | grep -q '"engagement_scan_limit"'; then
     LIMIT=$(echo "$CAP_JSON" | grep -o '"engagement_scan_limit":[[:space:]]*[0-9]*' | grep -o '[0-9]*$')

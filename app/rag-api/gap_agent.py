@@ -117,10 +117,17 @@ RECON_CATEGORIES = {
 
 def _get_targets(cur, engagement_id: str) -> list[dict]:
     """Fetch scope targets for the engagement."""
+    # Exclude the placeholder sentinel. scope_targets can hold a row with an
+    # EMPTY target and source '__placeholder__' so a named scope can exist before
+    # it has any targets — it is deliberate, not dirt, but it is not a target.
+    # Without this the gap analysis reports coverage for '' as though it were a
+    # host, which reads as a real uncovered target the operator should chase.
     cur.execute("""
         SELECT target, target_type, name
         FROM scope_targets
         WHERE engagement_id = %s
+          AND btrim(COALESCE(target, '')) <> ''
+          AND source IS DISTINCT FROM '__placeholder__'
         ORDER BY target_type, target
     """, (engagement_id,))
     return [dict(r) for r in cur.fetchall()]

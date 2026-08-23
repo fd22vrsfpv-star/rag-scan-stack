@@ -81,7 +81,21 @@ def parse_brutus(path: str, profile: str = "upload", job_id: str = None, secret_
                         cur.execute("SELECT id FROM ports WHERE asset_id=%s AND port=%s", (asset_id, int(port)))
                         prow = cur.fetchone()
                         if prow: port_id = str(prow["id"])
-                    # Insert - do NOT store password.
+                    # The recovered secret IS stored, in PLAINTEXT, by operator
+                    # decision: a password nobody can read is useless for the
+                    # lateral movement this phase exists to enable. See the
+                    # CAUTION on credential_findings.secret_value in
+                    # db_init/ensure_all_tables.sql for what that implies.
+                    #
+                    # Not logged here. nmap_scanner/nmap-api.py already prints
+                    # valid credentials at INFO for the operator's job log; adding
+                    # a second copy in the ingest log widens the blast radius of
+                    # a shipped log bundle for no extra information.
+                    secret_value = rec.get("password")
+                    if secret_value is not None:
+                        secret_value = str(secret_value)
+                        # An empty password is a REAL finding (anonymous FTP), so
+                        # "" is stored as-is and only a missing key becomes NULL.
                     # Metadata captures the audit trail when present:
                     #   - job_id : ties row back to the scan
                     #   - audit  : per-attempt list (users tried, passwords
@@ -98,25 +112,38 @@ def parse_brutus(path: str, profile: str = "upload", job_id: str = None, secret_
                     if rec_audit:
                         meta["audit"] = rec_audit
                     cur.execute("""
-                        INSERT INTO credential_findings (id, asset_id, port_id, ip, port, protocol, username, valid_cred, auth_type, secret_type, source, metadata, discovered_at, status)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, true, %s, %s, 'brutus', %s, now(), 'valid')
-                        -- Re-testing a known credential is a re-verification,
-                        -- not a new finding. Requires uq_credential_findings_identity.
+                        INSERT INTO credential_findings (id, asset_id, port_id, ip, port, protocol, username, valid_cred, auth_type, secret_type, source, metadata, secret_value, discovered_at, status)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, true, %s, %s, 'brutus', %s, %s, now(), 'valid')
+                        -- NOTE: this clause is UNREACHABLE in the deployed
+                        -- schema. trg_credential_findings_dedup is a BEFORE
+                        -- INSERT trigger that updates the existing row and
+                        -- RETURNs NULL, so the statement is cancelled before any
+                        -- conflict can be raised — an INSERT of a known
+                        -- credential reports "INSERT 0 0". The re-verification
+                        -- (including carrying a newly recovered secret_value onto
+                        -- the existing row) therefore happens IN THE TRIGGER, and
+                        -- that is the place to change it.
                         --
-                        -- The COALESCE must match that index EXPRESSION exactly.
-                        -- auth_type is nullable, and a NULL makes rows non-equal
-                        -- for a unique index — so before this was coalesced, two
-                        -- runs that produced a NULL auth_type stored two rows for
-                        -- one account instead of re-verifying the first.
+                        -- Kept rather than deleted because it is the correct
+                        -- fallback if the trigger is ever dropped, and because
+                        -- uq_credential_findings_identity still exists: the
+                        -- COALESCE must match that index EXPRESSION exactly, since
+                        -- auth_type is nullable and a NULL makes rows non-equal
+                        -- for a unique index.
                         ON CONFLICT (ip, port, username, COALESCE(auth_type, ''))
                           DO UPDATE SET
                             valid_cred       = EXCLUDED.valid_cred,
                             status           = EXCLUDED.status,
                             last_verified_at = now(),
                             metadata         = COALESCE(EXCLUDED.metadata,
-                                                        credential_findings.metadata)
+                                                        credential_findings.metadata),
+                            -- Never overwrite a stored secret with a NULL: a
+                            -- re-verification run that did not capture the
+                            -- password must not erase the one we already have.
+                            secret_value     = COALESCE(EXCLUDED.secret_value,
+                                                        credential_findings.secret_value)
                     """, (str(uuid.uuid4()), asset_id, port_id, ip, int(port), protocol, username,
-                          secret_type, secret_type, json.dumps(meta)))
+                          secret_type, secret_type, json.dumps(meta), secret_value))
                     stats["credentials_found"] += 1
                     cur.execute("RELEASE SAVEPOINT rec_sp")
                 except Exception as e:

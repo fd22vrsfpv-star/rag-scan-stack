@@ -193,6 +193,20 @@ fi
 # run, so this should be zero; a non-zero count means a merge was refused.
 # Addresses with two DIFFERENT hostnames are excluded — those are virtual hosts
 # and are meant to stay separate.
+# credential_findings.secret_value — the recovered password. Without it the
+# bridge writes a NULL credential_value and every follow-on attack has an
+# account name and nothing to authenticate with.
+HAS_SECRET_VALUE=$(docker exec rag-postgres psql -U app -d scans -tAc \
+    "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='credential_findings' AND column_name='secret_value');" 2>/dev/null)
+if [[ "$HAS_SECRET_VALUE" == "t" ]]; then
+    echo "✓ credential_findings.secret_value present"
+elif [[ "$HAS_SECRET_VALUE" == "f" ]]; then
+    echo "❌ credential_findings.secret_value missing - recovered passwords cannot be stored"
+    MISSING=$((MISSING + 1))
+else
+    echo "⚠  credential_findings.secret_value check skipped (could not query)"
+fi
+
 SPLIT_ASSETS=$(docker exec rag-postgres psql -U app -d scans -tAc \
     "SELECT count(*) FROM (SELECT ip FROM assets GROUP BY ip HAVING count(*) > 1 AND count(DISTINCT NULLIF(btrim(hostname), '')) <= 1) d;" 2>/dev/null)
 if [[ -z "$SPLIT_ASSETS" ]]; then
