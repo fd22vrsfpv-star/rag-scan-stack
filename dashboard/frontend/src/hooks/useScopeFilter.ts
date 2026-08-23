@@ -1,6 +1,5 @@
 import { useMemo, useCallback } from 'react'
-import { useEngagementScopeTargets } from '@/api/engagements'
-import { useUIStore } from '@/stores/ui'
+import { useScope } from '@/api/scope'
 
 /**
  * Returns a filter function that checks if a hostname/IP/URL matches a scope.
@@ -8,8 +7,12 @@ import { useUIStore } from '@/stores/ui'
  * When scopeName is empty, returns a passthrough (everything matches).
  */
 export function useScopeFilter(scopeName: string) {
-  const engagementId = useUIStore(s => s.selectedEngagementId)
-  const { data: scopeData } = useEngagementScopeTargets(engagementId ?? undefined, scopeName || undefined)
+  // useScope, NOT useEngagementScopeTargets: it tries the engagement-scoped
+  // endpoint and falls back to the global one when that returns nothing. The
+  // scope dropdown is global, so it can offer a scope the selected engagement
+  // does not own -- and the engagement-only lookup then returned zero targets,
+  // which this hook read as "nothing matches" and emptied the table.
+  const { data: scopeData } = useScope(scopeName)
 
   // Build a serializable key so useMemo/useCallback properly invalidate
   const targetsList = useMemo(() => {

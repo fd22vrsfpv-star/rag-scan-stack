@@ -2051,6 +2051,87 @@ class ScanTools:
 # Async Scan Tools (non-blocking)
 # ===============================
 
+# ── Authorization gate ──────────────────────────────────────────────────────
+# The agent decides for itself which hosts to scan, so this module needs the
+# gate more than most — and it had none. It could not have one until now:
+# autogen-agents had no ./etl mount and could not import etl.scope_gate at all.
+# The mount is added in docker-compose.yml alongside ./common.
+#
+# Gated at _make_request, the single chokepoint every dispatch method funnels
+# through, and keyed on the TARGETS IN THE PAYLOAD rather than on the method
+# name. That way a new start_* method is covered the day it is written, and a
+# status poll — which carries no target — passes straight through.
+try:
+    from etl.scope_gate import enforce_target_scope
+    _SCOPE_GATE_OK = True
+    _SCOPE_GATE_ERROR = ""
+except Exception as _scope_exc:            # pragma: no cover - deployment problem
+    _SCOPE_GATE_OK = False
+    _SCOPE_GATE_ERROR = str(_scope_exc)
+
+# Payload keys that name a host. Values may be a string, a comma-separated
+# string, or a list; all three shapes appear across the start_* methods.
+_TARGET_KEYS = ("ip", "ips", "target", "targets", "host", "hosts",
+                "domain", "domains", "url", "urls", "rhosts")
+
+
+# Bound by the shared ceiling rather than a private number. Only calls that
+# carry a target take a slot — a status poll must not consume scan capacity.
+try:
+    from common.tool_job import async_scan_slot, MAX_CONCURRENT_SCANS
+    _SLOTS_OK = True
+    _SLOTS_ERROR = ""
+except Exception as _slot_exc:             # pragma: no cover - deployment problem
+    _SLOTS_OK = False
+    _SLOTS_ERROR = str(_slot_exc)
+    MAX_CONCURRENT_SCANS = 0
+
+    from contextlib import asynccontextmanager as _acm
+
+    @_acm
+    async def async_scan_slot(job_id: str = "", label: str = "scan", timeout=None):
+        raise RuntimeError(
+            f"scan slot pool unavailable ({_SLOTS_ERROR}) — check the "
+            "./common:/app/common mount on autogen-agents")
+        yield  # pragma: no cover
+
+
+def _payload_targets(payload) -> list:
+    out = []
+    if not isinstance(payload, dict):
+        return out
+    for key in _TARGET_KEYS:
+        val = payload.get(key)
+        if val is None:
+            continue
+        items = val if isinstance(val, (list, tuple, set)) else [val]
+        for item in items:
+            for part in str(item).replace(",", " ").split():
+                part = part.strip()
+                if part:
+                    out.append(part)
+    return out
+
+
+def _scope_refusal_for_payload(operation: str, payload) -> "str | None":
+    """Refusal string when any target in the payload is out of scope.
+
+    Every target is checked, not just the first: one authorised host in a list
+    is not authorisation for the rest.
+    """
+    targets = _payload_targets(payload)
+    if not targets:
+        return None
+    if not _SCOPE_GATE_OK:
+        return (f"scope gate unavailable ({_SCOPE_GATE_ERROR}) — refusing "
+                f"{operation}; check the ./etl:/app/etl mount on autogen-agents")
+    for t in targets:
+        refusal = enforce_target_scope(t, operation)
+        if refusal:
+            return refusal
+    return None
+
+
 class AsyncScanTools:
     """
     Async version of ScanTools for non-blocking operations.
@@ -2086,6 +2167,22 @@ class AsyncScanTools:
 
     async def _make_request(self, method: str, url: str, operation: str, **kwargs) -> Dict:
         """Make async HTTP request with error handling"""
+        refusal = _scope_refusal_for_payload(operation, kwargs.get("json")
+                                             or kwargs.get("params"))
+        if refusal:
+            logger.warning("REFUSED %s: %s", operation, refusal)
+            return {"error": "out_of_scope", "operation": operation,
+                    "url": url, "detail": refusal}
+
+        # A call that names a host is a scan; hold a slot for it. A status poll
+        # carries no target and must not consume scan capacity.
+        if _payload_targets(kwargs.get("json") or kwargs.get("params")):
+            async with async_scan_slot(job_id=operation, label="agent-scan"):
+                return await self._request_slotted(method, url, operation, **kwargs)
+        return await self._request_slotted(method, url, operation, **kwargs)
+
+    async def _request_slotted(self, method: str, url: str, operation: str, **kwargs) -> Dict:
+        """Body of _make_request, after the scope gate and inside a scan slot."""
         client = await self.get_client()
         request_id = f"{operation}_{int(time.time()*1000)}"
 

@@ -913,6 +913,37 @@ def run_masscan_nmap(
     background_tasks.add_task(_background_run_masscan_nmap, job_id, targets, ports, rate, interface)
     return {"id": job_id, "status": "queued"}
 
+# ── Scan dispatch: scope gate and volume bound ──────────────────────────────
+# /jobs/masscan-nmap/upload takes a FILE of targets and fans them out to the
+# nmap scanner. It had neither check: an uploaded list could name any host, and
+# nothing consulted the engagement ceiling.
+#
+# The ceiling comes from the same env var common/tool_job.py reads. `common/` is
+# not mounted into rag-api, so the COUNTER cannot be shared with it — the number
+# is, and the bound is per process. Same honest limitation tool_job documents.
+_MAX_CONCURRENT_SCANS = int(os.environ.get("MAX_CONCURRENT_SCANS", "5"))
+_api_scan_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_SCANS)
+
+
+def _enforce_scan_scope(targets, command: str = ""):
+    """Refusal string when ANY target is out of scope, else None. Fails closed.
+
+    One authorised host in an uploaded list is not authorisation for the rest,
+    so every entry is checked rather than the first.
+    """
+    try:
+        from etl.scope_gate import enforce_target_scope
+    except Exception as e:                     # pragma: no cover - deployment
+        return (f"scope gate unavailable ({type(e).__name__}: {e}) — refusing "
+                "to dispatch; check the ./etl mount on rag-api")
+    for t in (targets or []):
+        refusal = enforce_target_scope(str(t), command)
+        if refusal:
+            log.warning("REFUSED dispatch for %s: %s", t, refusal)
+            return refusal
+    return None
+
+
 @app.post("/jobs/masscan-nmap/upload")
 def masscan_nmap_upload(
     file: UploadFile = File(..., description="Text file with newline/comma separated IPs/CIDRs; supports # comments"),
@@ -935,6 +966,34 @@ def masscan_nmap_upload(
     targets = _parse_targets_text(content, whitelist=whitelist, blacklist=blacklist)
     if not targets:
         raise HTTPException(status_code=400, detail="No valid targets after applying filters")
+
+    # Scope gate BEFORE the job row is created, so a refused upload does not
+    # leave a phantom job and task behind for the operator to chase. Every
+    # target is checked: this endpoint takes a FILE, so one line naming an
+    # unauthorised host is enough, and the whitelist/blacklist above are
+    # convenience filters, not an authorization boundary.
+    _refusal = _enforce_scan_scope(targets, f"masscan-nmap upload ({ports})")
+    if _refusal:
+        raise HTTPException(403, _refusal)
+
+    # Shed rather than queue: this is a synchronous handler, and a client that
+    # waits behind a long semaphore times out while the work still counts as
+    # admitted. CLAUDE.md: return 429 fast.
+    if not _api_scan_slots.acquire(blocking=False):
+        raise HTTPException(
+            429, f"{_MAX_CONCURRENT_SCANS} concurrent scans already in flight "
+                 "(MAX_CONCURRENT_SCANS) — nothing was dispatched, retry when "
+                 "one finishes.")
+    try:
+        return _masscan_nmap_upload_slotted(
+            targets, ports, rate, interface, idempotency_key, whitelist, blacklist)
+    finally:
+        _api_scan_slots.release()
+
+
+def _masscan_nmap_upload_slotted(targets, ports, rate, interface,
+                                 idempotency_key, whitelist, blacklist):
+    """Body of the upload handler, after the scope gate and holding a slot."""
 
     # Create job and running pipeline task
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:

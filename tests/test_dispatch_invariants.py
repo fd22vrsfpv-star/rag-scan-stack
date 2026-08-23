@@ -86,16 +86,6 @@ _ROOTS = (
 # Each carries WHY it is tolerated for now. Shrink this list; do not grow it.
 
 SCOPE_DEBT = {
-    "app/rag-api/api.py":
-        "job-creation endpoints fan out to the scanner services",
-    "autogen_agents/autogen_service.py":
-        "sends traffic to a supplied target without a scope check",
-    "autogen_agents/mcp_server.py":
-        "sends traffic to a supplied target without a scope check",
-    "autogen_agents/scan_tools.py":
-        "sends traffic to a supplied target without a scope check",
-    "dashboard/bff/routers/nodes.py":
-        "remote-node execution path",
 }
 
 # Flagged by the detector, but these do NOT send traffic to an engagement
@@ -108,6 +98,13 @@ SCOPE_DEBT = {
 # unnecessary — the gate fails closed, and neither destination is ever in an
 # engagement scope, so every call would be refused.
 LIMIT_NOT_APPLICABLE = {
+    "autogen_agents/autogen_service.py":
+        "does not initiate scans itself — it orchestrates and reports. The slot "
+        "is taken in scan_tools.py, where the dispatch actually happens; taking "
+        "one here too would double-count a single scan.",
+    "autogen_agents/mcp_server.py":
+        "does not initiate scans — it forwards an MCP tool call to the "
+        "autogen-agents API. The slot is held downstream in scan_tools.py.",
     "osint_runner/service_enum_cli.py":
         "runs on a REMOTE NODE, uploaded there by node_manager, with neither "
         "common/ nor a database — there is no shared semaphore to consult. The "
@@ -127,6 +124,17 @@ LIMIT_NOT_APPLICABLE = {
 }
 
 GATE_NOT_APPLICABLE = {
+    "autogen_agents/autogen_service.py":
+        "orchestration front door. Every .post goes to the configured Azure LLM "
+        "endpoint (a health-check ping), to {service_url}/jobs/{id}/restart on "
+        "OUR OWN scanner services by job id, or to rag-api "
+        "(/scans/update-status, /webhooks/emit). No operator-supplied host. The "
+        "scanning it drives goes through scan_tools.py, which IS gated.",
+    "autogen_agents/mcp_server.py":
+        "MCP front door. Its posts go to {LOG_API_URL}/logs/ingest and "
+        "{LOG_API_URL}/pentest — the autogen-agents API itself — and the "
+        "argument it forwards is a free-text `target_description`, not a host. "
+        "The work lands in autogen_service and then scan_tools.py, gated there.",
     "app/rag-api/health_router.py":
         "checks OUR OWN containers. `url` is built from the hardcoded "
         "service_ports/docker_service_names maps and the name is whitelisted "
@@ -151,14 +159,6 @@ GATE_NOT_APPLICABLE = {
 }
 
 LIMIT_DEBT = {
-    "app/rag-api/api.py":
-        "job-creation endpoints fan out to the scanner services",
-    "autogen_agents/autogen_service.py":
-        "initiates scans without consulting the shared limit",
-    "autogen_agents/mcp_server.py":
-        "initiates scans without consulting the shared limit",
-    "autogen_agents/scan_tools.py":
-        "initiates scans without consulting the shared limit",
 }
 
 
@@ -313,9 +313,15 @@ def test_not_applicable_entries_carry_evidence_not_a_shrug():
                 f"{name}[{rel}] needs the evidence, not a shrug: got {why!r}")
             # It has to say either what it talks to instead, or where the real
             # gate/slot is.
+            # Each keyword marks a claim a reader can CHECK: what it talks to
+            # instead, or where the real gate/slot lives. "downstream" is as
+            # specific as "upstream" — an orchestration front door whose work
+            # lands in a gated module is exempt for a verifiable reason, and the
+            # original list simply had not met that shape yet.
             assert any(k in why.lower() for k in (
-                "own container", "llm", "upstream", "transport", "already holds",
-                "does not initiate", "local", "hardcoded", "never operator")), (
+                "own container", "llm", "upstream", "downstream", "transport",
+                "already holds", "does not initiate", "local", "hardcoded",
+                "never operator", "api itself")), (
                 f"{name}[{rel}] does not say why it is exempt: {why!r}")
 
 
