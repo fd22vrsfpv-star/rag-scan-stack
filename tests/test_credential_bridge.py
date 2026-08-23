@@ -145,29 +145,31 @@ def test_upsert_repeats_the_partial_index_predicate():
 
 
 @pytest.mark.unit
-def test_the_masked_password_is_never_written_as_a_credential():
-    """parse_brutus keeps only masked passwords ('msf*****').
+def test_the_credential_value_comes_from_the_stored_secret_only():
+    """The secret IS stored now — but only the real one.
 
-    Copying one into credential_value would be worse than a NULL: a downstream
-    tool would treat it as usable and every auth attempt would fail invisibly.
+    This test used to require `credential_value` be a literal NULL, because
+    parse_brutus kept nothing but MASKED passwords and writing a mask in would
+    have been worse than an empty column: a downstream tool would treat
+    "msf*****" as usable and every authentication attempt would fail for a reason
+    nobody could see.
+
+    The operator then chose to store the real password
+    (credential_findings.secret_value), so the column is now fed — from that
+    column and nothing else. The masked audit must never become its source.
     """
     src = open(os.path.join(REPO, "etl", "credential_bridge.py"),
                encoding="utf-8").read()
-    # Check the VALUES clause specifically. Asserting "NULL" appears anywhere in
-    # the statement is vacuous — the ON CONFLICT predicate says IS NOT NULL, so
-    # that assertion survives replacing the NULL with a bound parameter.
-    insert = src.split("INSERT INTO credential_vault", 1)[1].split("\"\"\"", 1)[0]
-    cols = insert.split("(", 1)[1].split(")", 1)[0].replace("\n", " ").split(",")
-    cols = [c.strip() for c in cols]
-    values = insert.split("VALUES (", 1)[1].split(")", 1)[0].split(",")
-    values = [v.strip() for v in values]
-    assert len(cols) == len(values), \
-        f"{len(cols)} columns but {len(values)} values in the vault insert"
-    assert values[cols.index("credential_value")] == "NULL", (
-        "credential_value is bound to a parameter instead of a literal NULL — "
-        "the only thing available to bind is a masked password")
-    assert "password_masked" not in src and "passwords_tried_masked" not in src, \
-        "the bridge is reading masked password material out of metadata.audit"
+    assert "cf.secret_value" in src, \
+        "the bridge no longer reads the recovered secret off the finding"
+    assert '"credential_value": acct.get("secret_value")' in src, \
+        "credential_value is not fed from the stored secret"
+    assert "password_masked" not in src and "passwords_tried_masked" not in src, (
+        "the bridge is reading MASKED password material out of metadata.audit — "
+        "a mask stored as a credential is a plausible lie, worse than a NULL")
+    # And a re-run without a password must not erase one already stored.
+    assert "COALESCE(EXCLUDED.credential_value" in src, \
+        "credential_value is assigned rather than COALESCEd on conflict"
 
 
 @pytest.mark.unit

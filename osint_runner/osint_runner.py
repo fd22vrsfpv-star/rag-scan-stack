@@ -3532,14 +3532,34 @@ def _ingest_gowitness_jsonl(jsonl_path: str, screenshot_dir: str, job_id: str) -
                                     resolved_ip = "0.0.0.0"
                                 import uuid as _uuid
                                 _aid = str(_uuid.uuid4())
-                                cur.execute("""INSERT INTO assets (id, ip, hostname)
-                                              VALUES (%s, %s::inet, %s)
-                                              ON CONFLICT (ip, COALESCE(hostname, '')) DO UPDATE SET last_seen = now()
-                                              RETURNING id""",
-                                            (_aid, resolved_ip, hostname))
-                                r = cur.fetchone()
-                                if r:
-                                    asset_id = str(r["id"])
+                                # ADOPT a nameless row for this address before inserting a sibling.
+                                # ON CONFLICT on (ip, COALESCE(hostname,'')) treats (ip, '') and
+                                # (ip, 'name') as DIFFERENT rows, so this is the one raw insert site
+                                # left that can still split one host into two asset rows -- with its
+                                # ports on one and its findings on the other. Refuses to adopt when the
+                                # address already has another named row, which would attach this data to
+                                # an unrelated virtual host. Mirrors etl/asset_utils.ensure_asset.
+                                cur.execute("""
+                                    UPDATE assets a SET hostname = %s, last_seen = now()
+                                     WHERE a.ip = %s::inet
+                                       AND COALESCE(NULLIF(btrim(a.hostname), ''), '') = ''
+                                       AND NOT EXISTS (SELECT 1 FROM assets b
+                                                        WHERE b.ip = a.ip AND b.id <> a.id
+                                                          AND COALESCE(NULLIF(btrim(b.hostname), ''), '') <> '')
+                                    RETURNING a.id
+                                """, (hostname, resolved_ip))
+                                _adopted = cur.fetchone()
+                                if _adopted:
+                                    asset_id = str(_adopted["id"])
+                                else:
+                                    cur.execute("""INSERT INTO assets (id, ip, hostname)
+                                                  VALUES (%s, %s::inet, %s)
+                                                  ON CONFLICT (ip, COALESCE(hostname, '')) DO UPDATE SET last_seen = now()
+                                                  RETURNING id""",
+                                                (_aid, resolved_ip, hostname))
+                                    r = cur.fetchone()
+                                    if r:
+                                        asset_id = str(r["id"])
                     except Exception:
                         pass
 

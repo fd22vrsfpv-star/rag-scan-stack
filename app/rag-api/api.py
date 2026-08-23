@@ -1563,7 +1563,12 @@ def list_all_credentials(
         cur.execute(f"""
             SELECT id, host(ip)::text as ip, port, protocol, username, valid_cred,
                    auth_type, secret_type, severity, banner, source, status,
-                   discovered_at, last_verified_at, duration_ms, metadata, created_at
+                   discovered_at, last_verified_at, duration_ms, metadata,
+                   -- The recovered secret, in PLAINTEXT. Returned on
+                   -- purpose: the operator's next step is to authenticate
+                   -- with it, and a credential they cannot read is a
+                   -- credential they cannot use. Authenticated endpoint.
+                   secret_value, created_at
             FROM credential_findings
             {where}
             ORDER BY created_at DESC
@@ -13488,6 +13493,43 @@ def _export_order_column(cur, table: str) -> Optional[str]:
     return None
 
 
+def _export_web_findings(cur, include_inventory: bool,
+                         collapse_problems: bool, limit: int = 50000) -> list:
+    """web_findings for /export/data, honouring the same two switches the
+    findings search and the SARIF export honour.
+
+    DISTINCT ON keys on COALESCE(infrastructure_fingerprint, id::text), never on
+    the fingerprint alone: it is NULL for every ungroupable row, and in Postgres
+    a DISTINCT ON over a NULL key folds ALL of them into one row — which would
+    silently drop hundreds of unrelated findings from the export.
+    """
+    where = "WHERE 1=1"
+    if not include_inventory:
+        where += " AND COALESCE(record_kind, 'finding') = 'finding'"
+    if collapse_problems:
+        sql = f"""
+            SELECT * FROM (
+                SELECT DISTINCT ON (COALESCE(infrastructure_fingerprint, id::text)) *
+                  FROM public.web_findings
+                  {where}
+                 ORDER BY COALESCE(infrastructure_fingerprint, id::text),
+                          public.severity_rank(severity) DESC, last_seen DESC
+            ) collapsed
+            ORDER BY public.severity_rank(severity) DESC, last_seen DESC
+            LIMIT %s
+        """
+    else:
+        sql = f"""
+            SELECT * FROM public.web_findings
+            {where}
+            ORDER BY last_seen DESC
+            LIMIT %s
+        """
+    cur.execute(sql, [limit])
+    cols = [d[0] for d in cur.description]
+    return [{c: _serialize_value(r[c]) for c in cols} for r in cur.fetchall()]
+
+
 def _export_table_rows(cur, table: str, limit: int = 50000) -> list:
     """Generic SELECT * from a table or view, with safe serialization."""
     order_col = _export_order_column(cur, table)
@@ -13570,6 +13612,7 @@ def export_sarif(
     severity: Optional[List[str]] = Query(None),
     source: Optional[List[str]] = Query(None),
     collapse_problems: bool = Query(False, description="Emit one SARIF result per underlying problem, with a location per affected virtual host, instead of one result per host"),
+    include_inventory: bool = Query(False, description="Include crawl inventory (record_kind='inventory') as SARIF results. Off by default: it was 746 of 787 results, drowning the 41 real findings"),
     limit: int = Query(5000, ge=1, le=50000),
     authorized: bool = Depends(auth),
 ):
@@ -13632,6 +13675,13 @@ def export_sarif(
             FROM web_findings WHERE 1=1
         """
         web_params = []
+        if not include_inventory:
+            # 746 of 787 SARIF results were katana crawl rows — the inventory the
+            # record_kind column exists to separate. /findings/search filters them
+            # and reported 94 findings while this export emitted 787, so the same
+            # engagement looked like two different engagements depending on which
+            # artefact the reader opened.
+            web_sql += " AND COALESCE(record_kind, 'finding') = 'finding'"
         if severity:
             web_sql += " AND severity = ANY(%s)"
             web_params.append(severity)
@@ -13641,6 +13691,36 @@ def export_sarif(
         web_sql += f" ORDER BY first_seen DESC LIMIT {int(limit)}"
         cur.execute(web_sql, web_params)
         web_rows = cur.fetchall()
+
+        # --- Collect credential findings ---
+        # Omitted entirely until now: there was no `brutus` run in the output, so
+        # a verified credential — arguably the most actionable thing a pentest
+        # produces — never appeared in a SARIF report at all.
+        cred_sql = """
+            SELECT id, host(ip)::text AS ip, port, protocol, username,
+                   secret_type, severity, source, fingerprint, discovered_at,
+                   secret_value IS NOT NULL AS has_secret
+              FROM credential_findings WHERE valid_cred IS TRUE
+        """
+        cred_params: list = []
+        if severity:
+            cred_sql += " AND severity = ANY(%s)"
+            cred_params.append(severity)
+        if source:
+            cred_sql += " AND COALESCE(source, 'brutus') = ANY(%s)"
+            cred_params.append(source)
+        cred_sql += f" ORDER BY discovered_at DESC NULLS LAST LIMIT {int(limit)}"
+        cur.execute(cred_sql, cred_params)
+        cred_rows = cur.fetchall()
+
+        # --- Collect playwright findings ---
+        cur.execute(f"""
+            SELECT id, url, finding_type, severity, description, evidence,
+                   created_at
+              FROM playwright_findings
+             ORDER BY created_at DESC LIMIT {int(limit)}
+        """)
+        pw_rows = cur.fetchall()
 
     # Group by tool for SARIF runs
     tool_results: dict = {}
@@ -13760,6 +13840,57 @@ def export_sarif(
 
         tool_results[tool_name]["results"].append(result)
 
+    # Process credential findings
+    for row in cred_rows:
+        tool_name = row.get("source") or "brutus"
+        tool_results.setdefault(tool_name, {"rules": {}, "results": []})
+        rule_id = f"credential/{row.get('secret_type') or 'password'}"
+        tool_results[tool_name]["rules"].setdefault(rule_id, {
+            "id": rule_id,
+            "shortDescription": {"text": "Valid credential accepted by a service"},
+        })
+        # The secret itself is deliberately NOT in the message. A SARIF file is
+        # made to be handed to other tooling and CI, which is a wider audience
+        # than the database; has_secret says whether one is stored to look up.
+        result = {
+            "ruleId": rule_id,
+            "level": sev_map.get((row.get("severity") or "").lower(), "note"),
+            "message": {"text": (f"Valid credential: {row.get('username')} on "
+                                 f"{row.get('protocol')}://{row.get('ip')}:{row.get('port')}")},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {
+                        "uri": f"{row.get('protocol')}://{row.get('ip')}:{row.get('port')}"},
+                }
+            }],
+            "properties": {
+                "username": row.get("username"),
+                "service": row.get("protocol"),
+                "port": row.get("port"),
+                "secret_stored": bool(row.get("has_secret")),
+            },
+        }
+        if row.get("fingerprint"):
+            result["fingerprints"] = {"finding/v1": row["fingerprint"]}
+        tool_results[tool_name]["results"].append(result)
+
+    # Process playwright findings
+    for row in pw_rows:
+        tool_name = "playwright"
+        tool_results.setdefault(tool_name, {"rules": {}, "results": []})
+        rule_id = row.get("finding_type") or "playwright/finding"
+        tool_results[tool_name]["rules"].setdefault(rule_id, {
+            "id": rule_id, "shortDescription": {"text": rule_id},
+        })
+        tool_results[tool_name]["results"].append({
+            "ruleId": rule_id,
+            "level": sev_map.get((row.get("severity") or "").lower(), "note"),
+            "message": {"text": row.get("description") or rule_id},
+            "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": row.get("url") or "unknown"}}}],
+            "properties": {"evidence": row.get("evidence")},
+        })
+
     # Build SARIF runs
     for tool_name, data in tool_results.items():
         run = {
@@ -13787,6 +13918,8 @@ def export_data(
     categories: str = Query(
         "assets,findings,infrastructure,recon,credentials,params,exploits,screenshots",
         description="Comma-separated categories"),
+    include_inventory: bool = Query(False, description="Include crawl inventory (record_kind='inventory') in web_findings. Off by default, matching /findings/search and /export/sarif"),
+    collapse_problems: bool = Query(False, description="One web_findings row per underlying problem instead of one per virtual host"),
     authorized: bool = Depends(auth),
 ):
     """
@@ -13812,7 +13945,15 @@ def export_data(
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         for tbl in tables_to_query:
             try:
-                rows = _export_table_rows(cur, tbl)
+                # web_findings is the only table where inventory and virtual-host
+                # duplication apply. Until now /export/data had neither control,
+                # so the same engagement read as 779 rows here and 94 in
+                # /findings/search — three export paths, three different answers.
+                if tbl == "web_findings":
+                    rows = _export_web_findings(cur, include_inventory,
+                                                collapse_problems)
+                else:
+                    rows = _export_table_rows(cur, tbl)
                 data[tbl] = rows
                 counts[tbl] = len(rows)
             except Exception:

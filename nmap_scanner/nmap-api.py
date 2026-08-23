@@ -3377,6 +3377,12 @@ def _run_credential_check_async(
                                 "port":     int(port_n) if port_n is not None else 0,
                                 "protocol": service,
                                 "username": cred.get("username", ""),
+                                # The recovered password. This producer used to
+                                # drop it, so parse_brutus had nothing to store
+                                # even once it gained a column for it — the
+                                # plaintext was logged one screen up and then
+                                # thrown away.
+                                "password": cred.get("password", ""),
                                 "success":  True,
                                 "audit":    chk_audit,
                             }))
