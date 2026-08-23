@@ -83,10 +83,29 @@ SERVICES = {
 # correct — they are exempt from being checkable HERE, and belong to the live
 # smoke sweep instead.
 PROXY_DYNAMIC = {
-    ("maintenance.py", "/cleanup/{}"): "cleanup kind chosen by caller; targets /cleanup/<kind> literals",
-    ("scans.py", "/ingest/{}"): "parser name is the path segment",
-    ("targeted_recon.py", "/ingest/{}"): "parser name is the path segment",
-    ("nodes.py", "/{}"): "entire upstream path forwarded verbatim from the request",
+    # The ONE genuinely unenumerable case: a pass-through forwarder that relays
+    # whatever path the request carried. There is no finite set to check against,
+    # so it belongs to the live smoke sweep and nowhere else.
+    ("nodes.py", "/{}"): "generic forwarder — relays the request path verbatim to "
+                         "node-manager, so there is no finite set of upstream "
+                         "paths to enumerate. Covered by the live sweep.",
+}
+
+# Dynamic path segments that ARE enumerable, and are therefore CHECKED rather
+# than exempted (see test_dynamic_segments_resolve).
+#
+# These three used to sit in PROXY_DYNAMIC, which meant "we cannot verify this
+# here". That was true of the string but not of the values: each segment comes
+# from a constant set in the same file, and every member of that set has to
+# resolve to a declared upstream route. Exempting them hid the question rather
+# than answering it — a CLEANUP_CATEGORIES entry with no matching /cleanup/<kind>
+# route would have 404'd forever with nothing to catch it.
+#
+#   module -> (constant name, path template, how to read the segments)
+DYNAMIC_SEGMENT_SOURCES = {
+    ("maintenance.py", "/cleanup/{}"): ("CLEANUP_CATEGORIES", "keys"),
+    ("scans.py", "/ingest/{}"): ("CLOUD_IMPORT_ROUTES", "values"),
+    ("targeted_recon.py", "/ingest/{}"): ("TOOL_OUTPUT_MAP", "ingest-field"),
 }
 
 # Known-bad upstream paths that still ship. RATCHETS: a new one fails by name,
@@ -287,6 +306,10 @@ def test_upstream_paths_exist(declared, calls):
             continue  # service directory absent from this checkout
         if (name, path) in PROXY_DYNAMIC:
             continue
+        # Checked by test_dynamic_segments_resolve against the real segment set
+        # instead of being exempted here.
+        if (name, path) in DYNAMIC_SEGMENT_SOURCES:
+            continue
         if _matches(method, path, declared[attr]):
             continue
         if PROXY_DEBT.get((name, method, path)):
@@ -368,3 +391,76 @@ def _main():
 if __name__ == "__main__":
     import sys
     sys.exit(_main())
+
+
+def _read_constant(module_file: str, name: str):
+    """literal_eval a module-level constant out of a BFF router."""
+    path = os.path.join(REPO, "dashboard", "bff", "routers", module_file)
+    if not os.path.exists(path):
+        return None
+    for node in ast.walk(ast.parse(open(path, encoding="utf-8").read())):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if getattr(t, "id", "") == name:
+                    try:
+                        return ast.literal_eval(node.value)
+                    except Exception:
+                        return None
+    return None
+
+
+def test_dynamic_segments_resolve(declared):
+    """Every value a dynamic path segment can take must resolve upstream.
+
+    These calls build their path at runtime, so the static matcher skips them —
+    but the segment comes from a constant set in the same file, and each member
+    has to name a route some service declares. Exempting them (as PROXY_DYNAMIC
+    did) hid the question instead of answering it: a CLEANUP_CATEGORIES entry
+    with no matching /cleanup/<kind> route would 404 forever, and the only
+    symptom is a maintenance action that silently does nothing.
+    """
+    if not declared.get("rag_api_url"):
+        pytest.skip("rag-api routes not readable from this checkout")
+
+    missing = []
+    checked = 0
+    for (module_file, template), (const, how) in DYNAMIC_SEGMENT_SOURCES.items():
+        raw = _read_constant(module_file, const)
+        assert raw is not None, (
+            f"{module_file}: could not read {const} — this test would pass "
+            "vacuously, which is worse than the exemption it replaced")
+        if how == "keys":
+            segments = list(raw)
+        elif how == "values":
+            segments = list(raw.values())
+        else:  # ingest-field: {tool: {"ingest": <segment or None>}}
+            segments = [v.get("ingest") for v in raw.values()
+                        if isinstance(v, dict) and v.get("ingest")]
+        assert segments, f"{module_file}: {const} produced no segments to check"
+        for seg in segments:
+            checked += 1
+            path = template.replace("{}", str(seg))
+            if not _matches("POST", path, declared["rag_api_url"]):
+                missing.append(f"{module_file}: POST {path} (from {const})")
+
+    assert checked >= 20, (
+        f"only {checked} dynamic segments checked — the constant sets shrank or "
+        "were misread, and this guard is close to vacuous")
+    assert not missing, (
+        f"{len(missing)} dynamic upstream path(s) name a route no service "
+        "declares:\n  " + "\n  ".join(sorted(missing)))
+
+
+def test_the_only_remaining_dynamic_exemption_is_the_generic_forwarder():
+    """PROXY_DYNAMIC is now a one-entry list, and it should stay that way.
+
+    A new entry means someone chose to exempt a call instead of enumerating its
+    segments. If the segments genuinely cannot be enumerated, say why in the
+    reason; if they can, add the source to DYNAMIC_SEGMENT_SOURCES.
+    """
+    assert set(PROXY_DYNAMIC) == {("nodes.py", "/{}")}, (
+        f"PROXY_DYNAMIC gained entries: {sorted(set(PROXY_DYNAMIC) - {('nodes.py', '/{}')})} "
+        "— enumerate the segments in DYNAMIC_SEGMENT_SOURCES instead of exempting them")
+    for key, why in PROXY_DYNAMIC.items():
+        assert "enumerate" in why.lower() or "verbatim" in why.lower(), (
+            f"{key} does not explain why its segments cannot be enumerated: {why!r}")
