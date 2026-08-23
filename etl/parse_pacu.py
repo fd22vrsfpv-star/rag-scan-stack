@@ -136,21 +136,54 @@ def parse_pacu(path: str, profile: str = "upload", job_id: str = None):
                     if secret_key:
                         cred_value = f"{access_key}:{secret_key}"
 
+                    # credential_vault, not credential_findings.
+                    #
+                    # This used to write (target, finding_type, data) into
+                    # credential_findings — the recon_findings shape, and three
+                    # columns that table does not have — so every insert raised
+                    # UndefinedColumn and this parser had never stored a row.
+                    #
+                    # credential_findings is also the wrong table on its merits:
+                    # its ip, port and username are all NOT NULL, and an AWS
+                    # access key has no host or port. credential_vault is built
+                    # for exactly this — username/credential_type/source plus a
+                    # cloud_metadata jsonb.
+                    #
+                    # source_entity_id is a DETERMINISTIC uuid5 of the access key
+                    # id, because the key id IS the credential's identity. That
+                    # makes ux_credvault_source_entity a real dedup key, so a
+                    # re-import updates rather than duplicating. The WHERE
+                    # predicate has to be repeated: the index is PARTIAL, and
+                    # ON CONFLICT must match it exactly or Postgres refuses with
+                    # "no unique or exclusion constraint matching".
+                    entity_id = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                               f"pacu:aws-access-key:{access_key}"))
                     cur.execute("""
-                        INSERT INTO credential_findings
-                            (id, target, source, finding_type, data, severity)
-                        VALUES (%s, %s, 'pacu', 'aws_credential', %s, 'high')
-                        ON CONFLICT DO NOTHING
+                        INSERT INTO credential_vault
+                            (id, username, credential_type, credential_value,
+                             source, source_entity_id, status, cloud_metadata, notes)
+                        VALUES (%s, %s, %s, %s, 'pacu', %s, 'active', %s, %s)
+                        ON CONFLICT (source, source_entity_id)
+                          WHERE source_entity_id IS NOT NULL
+                          DO UPDATE SET
+                            credential_value = EXCLUDED.credential_value,
+                            cloud_metadata   = EXCLUDED.cloud_metadata,
+                            updated_at       = now()
                     """, (
-                        str(uuid.uuid4()), user_name,
+                        str(uuid.uuid4()), user_name, cred_type, cred_value,
+                        entity_id,
                         Json({
                             "access_key_id": access_key,
                             "has_secret": bool(secret_key),
                             "has_session_token": bool(session_token),
-                            "credential_type": cred_type,
                             "user_name": user_name,
                             "account_id": data.get("account_id", ""),
                         }),
+                        # Stored in the clear, which is the operator's stated
+                        # choice for this tool. Flagged here so it is visible at
+                        # the point of storage rather than only in a doc.
+                        "CAUTION: credential material is stored unencrypted in "
+                        "this database. Restrict access accordingly.",
                     ))
                     stats["credentials_inserted"] += 1
                     cur.execute("RELEASE SAVEPOINT rec_sp")

@@ -140,28 +140,22 @@ SQL_WORDS = {
 #
 # Each key is (relative path, table, column).
 SQL_DEBT = {
-    ("etl/parse_subdomain_takeover.py", "recon_findings", "scan_id"):
-        "parser writes a bespoke shape; recon_findings keeps payload in data jsonb",
-    ("etl/parse_subdomain_takeover.py", "recon_findings", "domain"):
-        "same INSERT — needs a schema-mapping decision, not a rename",
-    ("etl/parse_subdomain_takeover.py", "recon_findings", "subdomain"):
-        "same INSERT",
-    ("etl/parse_subdomain_takeover.py", "recon_findings", "title"):
-        "same INSERT",
-    ("etl/parse_subdomain_takeover.py", "recon_findings", "description"):
-        "same INSERT",
-    ("etl/parse_subdomain_takeover.py", "recon_findings", "evidence_data"):
-        "same INSERT",
-    ("etl/parse_subdomain_takeover.py", "recon_findings", "discovered_at"):
-        "same INSERT",
-    ("etl/parse_subdomain_takeover.py", "recon_findings", "metadata"):
-        "same INSERT",
-    ("etl/parse_pacu.py", "credential_findings", "target"):
-        "pacu findings need mapping onto ip/port/username/secret_type",
-    ("etl/parse_pacu.py", "credential_findings", "finding_type"):
-        "same INSERT",
-    ("etl/parse_pacu.py", "credential_findings", "data"):
-        "same INSERT — credential_findings uses metadata jsonb",
+    # EMPTY.
+    #
+    # Held 11 entries: etl/parse_subdomain_takeover.py wrote 8 columns
+    # recon_findings does not have, and etl/parse_pacu.py wrote 3 that
+    # credential_findings does not have. Neither parser had EVER stored a row —
+    # every insert raised UndefinedColumn inside a try/except that counted it as
+    # one error among many.
+    #
+    # Both needed a schema-mapping decision rather than a rename:
+    #   * takeover findings -> recon_findings(source, finding_type='subdomain_
+    #     takeover', target, data jsonb, severity, tags)
+    #   * pacu AWS keys -> credential_vault, because credential_findings.ip,
+    #     .port and .username are all NOT NULL and an access key has no host
+    #
+    # Add an entry only with a reason, and delete it the moment it is fixed —
+    # test_no_stale_sql_debt enforces that.
 }
 
 
