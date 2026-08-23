@@ -51,6 +51,36 @@ INTERESTING_FIELDS = {
 }
 
 
+# ── Authorization gate ──────────────────────────────────────────────────────
+# This module downloads every "interesting file" a crawl turned up. Those paths
+# come from page content, so an absolute URL on a page can point at a host the
+# engagement never authorised — a page that links to an internal file server is
+# enough to make this fetch from it. The gate is applied per URL, after the
+# relative paths are resolved, because that is the point at which the real
+# destination host is known.
+try:
+    from etl.scope_gate import enforce_target_scope
+    _SCOPE_GATE_OK = True
+    _SCOPE_GATE_ERROR = ""
+except Exception as _scope_exc:            # pragma: no cover - deployment problem
+    _SCOPE_GATE_OK = False
+    _SCOPE_GATE_ERROR = str(_scope_exc)
+
+
+def _scope_refusal_for_url(url, context: str = ""):
+    """Refusal string when this URL must NOT be fetched, else None. Fails closed."""
+    if not _SCOPE_GATE_OK:
+        return (f"scope gate unavailable ({_SCOPE_GATE_ERROR}) — refusing to "
+                "download; check the ./etl:/app/etl mount on playwright-scanner")
+    try:
+        host = urlparse(str(url or "")).hostname
+    except Exception as exc:
+        return f"could not parse a host out of {url!r} ({exc}) — refusing"
+    if not host:
+        return f"no host in {url!r} — refusing rather than guessing"
+    return enforce_target_scope(host, context or str(url))
+
+
 async def extract_file_metadata(
     interesting_files: List[Dict],
     page_url: str,
@@ -111,6 +141,11 @@ async def extract_file_metadata(
 
 async def _download_and_extract(url: str, path: str, page=None) -> Optional[Dict]:
     """Download a single file and run exiftool on it."""
+    refusal = _scope_refusal_for_url(url, f"metadata download {path}")
+    if refusal:
+        logger.warning("REFUSED metadata download %s: %s", url, refusal)
+        return None
+
     tmp_path = None
     try:
         # Download via Playwright context (uses same cookies/auth)

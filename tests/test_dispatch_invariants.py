@@ -81,8 +81,6 @@ _ROOTS = (
 SCOPE_DEBT = {
     "app/rag-api/api.py":
         "job-creation endpoints fan out to the scanner services",
-    "app/rag-api/health_router.py":
-        "sends traffic to a supplied target without a scope check",
     "autogen_agents/autogen_service.py":
         "sends traffic to a supplied target without a scope check",
     "autogen_agents/mcp_server.py":
@@ -95,37 +93,60 @@ SCOPE_DEBT = {
         "remote-node execution path",
     "dashboard/bff/services/pipeline_orchestrator.py":
         "drives multi-stage scans; the gate belongs at stage dispatch",
-    "exploit_runner/script_executor.py":
-        "sends traffic to a supplied target without a scope check",
+    "scan_recommender/scan_recommender.py":
+        "auto-execute dispatches tools straight from recommendations",
+}
+
+# Flagged by the detector, but these do NOT send traffic to an engagement
+# target. They are separated from SCOPE_DEBT deliberately: leaving them there
+# labelled "sends traffic to a supplied target without a scope check" states
+# something untrue about the code, and it inflates the debt count so the
+# entries that DO need a gate are harder to see.
+#
+# Adding a scope gate to the first two would be actively harmful, not merely
+# unnecessary — the gate fails closed, and neither destination is ever in an
+# engagement scope, so every call would be refused.
+LIMIT_NOT_APPLICABLE = {
+    "app/rag-api/health_router.py":
+        "does not initiate scans — it polls our own containers' /health.",
+    "scan_recommender/exploits_rag.py":
+        "does not initiate scans — LLM calls plus a local searchsploit/git pull.",
+    "playwright_scanner/metadata_extractor.py":
+        "runs INSIDE a playwright scan that already holds a slot. Taking a second "
+        "one would double-count a single scan and can deadlock the pool at the "
+        "ceiling. Its scope gate IS present, per URL.",
     "node_manager/ssh_manager.py":
-        "SSH transport. Its `host` argument is the NODE, not the scan target, so "
-        "gating on it would check the wrong value and give false confidence. The "
-        "target-level gate is upstream in node_manager.remote_scan",
+        "SSH transport, not a scan initiator; remote_scan holds the slot around "
+        "the whole dispatch, so bounding here too would double-count one scan.",
+}
+
+GATE_NOT_APPLICABLE = {
+    "app/rag-api/health_router.py":
+        "checks OUR OWN containers. `url` is built from the hardcoded "
+        "service_ports/docker_service_names maps and the name is whitelisted "
+        "(unknown -> 400), so the destination is never operator-supplied. Our "
+        "own services are correctly absent from any engagement scope, so a "
+        "gate here would refuse every health check.",
+    "scan_recommender/exploits_rag.py":
+        "its requests.post calls go to _azure_embed_url()/_azure_chat_url() — "
+        "the configured LLM endpoint — and its subprocess calls are `git pull` "
+        "on the local exploitdb checkout and `searchsploit`. Nothing here "
+        "contacts a scan target.",
+    "node_manager/ssh_manager.py":
+        "SSH transport. Its `host` argument is the NODE, not the scan target, "
+        "so gating on it would check the wrong value and give false "
+        "confidence. The target-level gate is upstream in "
+        "node_manager.remote_scan.",
     "osint_runner/service_enum_cli.py":
         "NOT shipped in the osint-runner image; node_manager uploads it to a "
         "remote node and runs it there with no etl/ and no database, so an "
         "etl-based gate would fail closed and kill email/dns/service enum. "
-        "Gated upstream in node_manager.remote_scan instead",
-    "playwright_scanner/metadata_extractor.py":
-        "sends traffic to a supplied target without a scope check",
-    "playwright_scanner/playwright_scanner.py":
-        "sends traffic to a supplied target without a scope check",
-    "scan_recommender/exploits_rag.py":
-        "sends traffic to a supplied target without a scope check",
-    "scan_recommender/scan_recommender.py":
-        "auto-execute dispatches tools straight from recommendations",
-    "web_scanner/scan_pipeline.py":
-        "sends traffic to a supplied target without a scope check",
+        "Gated upstream in node_manager.remote_scan instead.",
 }
 
 LIMIT_DEBT = {
-    "node_manager/ssh_manager.py":
-        "SSH transport, not a scan initiator; remote_scan holds the slot around "
-        "the whole dispatch, so bounding here too would double-count one scan",
     "app/rag-api/api.py":
         "job-creation endpoints fan out to the scanner services",
-    "app/rag-api/health_router.py":
-        "initiates scans without consulting the shared limit",
     "autogen_agents/autogen_service.py":
         "initiates scans without consulting the shared limit",
     "autogen_agents/mcp_server.py":
@@ -136,19 +157,9 @@ LIMIT_DEBT = {
         "drives multi-stage scans; the gate belongs at stage dispatch",
     "dashboard/bff/services/tool_executor.py":
         "runs tools for the pipeline; needs the same gate as routers/assets.py",
-    "exploit_runner/script_executor.py":
-        "initiates scans without consulting the shared limit",
     "nmap_scanner/cred_checker.py":
         "initiates scans without consulting the shared limit",
     "osint_runner/service_enum_cli.py":
-        "initiates scans without consulting the shared limit",
-    "playwright_scanner/metadata_extractor.py":
-        "initiates scans without consulting the shared limit",
-    "playwright_scanner/playwright_scanner.py":
-        "initiates scans without consulting the shared limit",
-    "scan_recommender/exploits_rag.py":
-        "initiates scans without consulting the shared limit",
-    "web_scanner/scan_pipeline.py":
         "initiates scans without consulting the shared limit",
 }
 
@@ -237,7 +248,7 @@ def test_no_new_ungated_dispatchers(dispatchers):
     """Every traffic-initiating module passes the scope gate, or is known debt."""
     ungated = {rel for rel, code in dispatchers.items()
                if not any(m in code for m in _SCOPE_MARKERS)}
-    new = sorted(ungated - set(SCOPE_DEBT))
+    new = sorted(ungated - set(SCOPE_DEBT) - set(GATE_NOT_APPLICABLE))
     assert not new, (
         "these modules can send traffic to a host without a scope check:\n  "
         + "\n  ".join(new)
@@ -250,7 +261,7 @@ def test_no_new_unbounded_scan_initiators(dispatchers):
     """Every scan initiator respects the engagement limit, or is known debt."""
     unbounded = {rel for rel, code in dispatchers.items()
                  if not any(m in code for m in _LIMIT_MARKERS)}
-    new = sorted(unbounded - set(LIMIT_DEBT))
+    new = sorted(unbounded - set(LIMIT_DEBT) - set(LIMIT_NOT_APPLICABLE))
     assert not new, (
         "these modules initiate scans without consulting MAX_CONCURRENT_SCANS:\n  "
         + "\n  ".join(new)
@@ -277,12 +288,51 @@ def test_debt_lists_do_not_contain_resolved_entries(dispatchers):
 def test_debt_entries_reference_real_files():
     """A stale path in the debt list silently exempts nothing (or worse, hides a
     renamed module that lost its gate)."""
-    for rel in list(SCOPE_DEBT) + list(LIMIT_DEBT):
+    for rel in (list(SCOPE_DEBT) + list(LIMIT_DEBT)
+                + list(GATE_NOT_APPLICABLE) + list(LIMIT_NOT_APPLICABLE)):
         assert os.path.exists(os.path.join(REPO, rel)), f"debt entry no longer exists: {rel}"
 
 
+def test_not_applicable_entries_carry_evidence_not_a_shrug():
+    """The two NOT_APPLICABLE lists must not become SCOPE_DEBT by another name.
+
+    A debt entry says "this needs a gate and does not have one". A
+    not-applicable entry claims something stronger — that there is no target to
+    gate, or that the gate is genuinely elsewhere — and that claim has to be
+    checkable by a reader. So the reason must be substantive and must NOT reuse
+    the generic debt phrasing, which would turn the list into a way to make a
+    real violation disappear.
+    """
+    generic = ("sends traffic to a supplied target without a scope check",
+               "initiates scans without consulting the shared limit")
+    for name, table in (("GATE_NOT_APPLICABLE", GATE_NOT_APPLICABLE),
+                        ("LIMIT_NOT_APPLICABLE", LIMIT_NOT_APPLICABLE)):
+        for rel, why in table.items():
+            assert why.strip() not in generic, (
+                f"{name}[{rel}] reuses the generic debt reason — that is a "
+                "violation being reclassified, not an exemption")
+            assert len(why) > 60, (
+                f"{name}[{rel}] needs the evidence, not a shrug: got {why!r}")
+            # It has to say either what it talks to instead, or where the real
+            # gate/slot is.
+            assert any(k in why.lower() for k in (
+                "own container", "llm", "upstream", "transport", "already holds",
+                "does not initiate", "local", "hardcoded", "never operator")), (
+                f"{name}[{rel}] does not say why it is exempt: {why!r}")
+
+
+def test_a_module_cannot_be_in_both_a_debt_and_an_exemption_list():
+    """Otherwise the same file reads as both "needs a gate" and "does not"."""
+    both_scope = set(SCOPE_DEBT) & set(GATE_NOT_APPLICABLE)
+    both_limit = set(LIMIT_DEBT) & set(LIMIT_NOT_APPLICABLE)
+    assert not both_scope, f"in SCOPE_DEBT and GATE_NOT_APPLICABLE: {both_scope}"
+    assert not both_limit, f"in LIMIT_DEBT and LIMIT_NOT_APPLICABLE: {both_limit}"
+
+
 def test_every_debt_entry_has_a_reason():
-    for rel, why in list(SCOPE_DEBT.items()) + list(LIMIT_DEBT.items()):
+    for rel, why in (list(SCOPE_DEBT.items()) + list(LIMIT_DEBT.items())
+                     + list(GATE_NOT_APPLICABLE.items())
+                     + list(LIMIT_NOT_APPLICABLE.items())):
         assert why and len(why) > 15, f"{rel} needs a real reason, got {why!r}"
 
 

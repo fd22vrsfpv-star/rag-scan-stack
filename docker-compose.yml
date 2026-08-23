@@ -223,7 +223,11 @@ services:
       # Ollama — used by cloud_triage_agent, takeover_hunter, vault_import_agent.
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       OLLAMA_BASE_URL: ${OLLAMA_URL:-http://ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:26b}
+      # gemma4:31b, matching scan-recommender and .env. The previous default
+      # named gemma4:26b, which is not a tag anyone here has — a request for
+      # an absent model returns an error, so a fresh install with no .env
+      # override would look broken rather than misconfigured.
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
     command: uvicorn api:app --host 0.0.0.0 --port 8000 --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
     # depends_on: [wait-for-db]  # removed — wait-for-db is local-db profile only
     ports: ["8000:8000"]
@@ -425,6 +429,11 @@ services:
     volumes:
       - ./web_reports:/reports
       - ./etl:/scanner/etl
+      # shared scan-slot semaphore (common/tool_job.py) — bounds this
+      # service by MAX_CONCURRENT_SCANS instead of a private number.
+      # /scanner, NOT /app: this image's code lives in /scanner and its etl
+      # mount goes there too, so /app/common would not be importable.
+      - ./common:/scanner/common:ro
       - ./scan_results:/scan_results
       - ./scan_audit:/scan_audit
       - ./scan_audit/audit_writer.py:/scanner/audit_writer.py:ro
@@ -664,7 +673,11 @@ services:
       API_KEY: ${API_KEY:-changeme}
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       OLLAMA_BASE_URL: ${OLLAMA_URL:-http://ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:26b}
+      # gemma4:31b, matching scan-recommender and .env. The previous default
+      # named gemma4:26b, which is not a tag anyone here has — a request for
+      # an absent model returns an error, so a fresh install with no .env
+      # override would look broken rather than misconfigured.
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
       NEWS_AGENT_MODEL: ${NEWS_AGENT_MODEL:-gemma4:26b}
       NEWS_AUTO_FETCH: ${NEWS_AUTO_FETCH:-1}
       NEWS_FETCH_INTERVAL_HOURS: ${NEWS_FETCH_INTERVAL_HOURS:-24}
@@ -944,6 +957,9 @@ services:
       - "8014:8014"
     volumes:
       - ./etl:/app/etl:ro                             # shared scope gate (etl/scope_gate.py)
+      # shared scan-slot semaphore (common/tool_job.py) — bounds this
+      # service by MAX_CONCURRENT_SCANS instead of a private number
+      - ./common:/app/common:ro
       - ./playwright_screenshots:/screenshots
       - ./playwright_reports:/reports
     # SHM size needed for Chromium to avoid crashes
@@ -1351,6 +1367,9 @@ services:
       - "8017:8017"
     volumes:
       - ./etl:/app/etl:ro                             # shared scope gate (etl/scope_gate.py)
+      # shared scan-slot semaphore (common/tool_job.py) — bounds this
+      # service by MAX_CONCURRENT_SCANS instead of a private number
+      - ./common:/app/common:ro
       - ./exploitdb:/opt/exploitdb:ro
       - ./modified_exploits:/app/modified_exploits
     # Minimal capabilities for network access

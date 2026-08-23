@@ -131,7 +131,7 @@ class TestNiktoUrlBuilding:
 
 # ── Ingest against a real DB, always rolled back ────────────────────────────
 DB_DSN = os.environ.get(
-    "TEST_DB_DSN", "postgresql://app:app@127.0.0.1:5432/scans"
+    "TEST_DB_DSN", "postgresql://app:app@127.0.0.1:5433/scans"
 )
 
 

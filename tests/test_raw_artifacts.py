@@ -23,6 +23,7 @@ DB tests skip cleanly when no rag-postgres is reachable.
 """
 import hashlib
 import os
+import re
 import sys
 import uuid
 
@@ -153,13 +154,18 @@ DSN = os.environ.get(
 )
 
 
+def _redact(dsn: str) -> str:
+    """Never put a live password in test output — skip messages reach CI logs."""
+    return re.sub(r"://([^:/@]+):[^@]*@", r"://\1:***@", dsn or "")
+
+
 @pytest.fixture(scope="module")
 def conn():
     psycopg2 = pytest.importorskip("psycopg2")
     try:
         c = psycopg2.connect(DSN, connect_timeout=3)
     except Exception as e:                      # pragma: no cover
-        pytest.skip(f"no database at {DSN}: {type(e).__name__}")
+        pytest.skip(f"no database at {_redact(DSN)}: {type(e).__name__}")
     c.autocommit = True
     yield c
     c.close()

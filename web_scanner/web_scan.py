@@ -230,7 +230,12 @@ class JobTracker:
                 # Keep progress.stage in sync with top-level stage
                 if "stage" in kwargs and "progress" in self.jobs[job_id]:
                     self.jobs[job_id]["progress"]["stage"] = kwargs["stage"]
-                if self.jobs[job_id].get("status") in ("completed", "failed", "stopped"):
+                # 'blocked' is terminal too — a scope refusal will never proceed,
+                # so it must survive a restart like any other final state.
+                # Without it a refused job silently reverts to whatever was in
+                # memory, and the operator loses the reason it never ran.
+                if self.jobs[job_id].get("status") in ("completed", "failed",
+                                                       "stopped", "blocked"):
                     self._persist(job_id)
 
     def push_command(self, job_id: str, stage: str, command: str):

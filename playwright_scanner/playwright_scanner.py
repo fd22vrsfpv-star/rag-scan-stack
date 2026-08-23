@@ -111,6 +111,59 @@ zap_bridge = ZAPBridge() if USE_ZAP else None
 
 
 # Pydantic models
+# ── Authorization gate ──────────────────────────────────────────────────────
+# This service drives a real browser at whatever URL it is handed, across FOUR
+# entry points — /scan, /auth/capture, /poc and /crawl — and none of them
+# checked the engagement scope. /poc is the sharpest: it injects an attack
+# payload into a URL and loads it.
+#
+# The gate takes a HOST, so the hostname is extracted from the URL. A URL whose
+# host cannot be parsed is refused rather than passed through: an unparseable
+# target is "cannot check", and cannot-check must never read as authorised.
+try:
+    from etl.scope_gate import enforce_target_scope
+    _SCOPE_GATE_OK = True
+    _SCOPE_GATE_ERROR = ""
+except Exception as _scope_exc:            # pragma: no cover - deployment problem
+    _SCOPE_GATE_OK = False
+    _SCOPE_GATE_ERROR = str(_scope_exc)
+
+
+# Bound by the shared ceiling rather than a private number. Each browser session
+# is one scan's worth of load; see the per-service note in common/tool_job.py.
+try:
+    from common.tool_job import async_scan_slot, MAX_CONCURRENT_SCANS
+    _SLOTS_OK = True
+    _SLOTS_ERROR = ""
+except Exception as _slot_exc:             # pragma: no cover - deployment problem
+    _SLOTS_OK = False
+    _SLOTS_ERROR = str(_slot_exc)
+    MAX_CONCURRENT_SCANS = 0
+
+    from contextlib import asynccontextmanager as _acm
+
+    @_acm
+    async def async_scan_slot(job_id: str = "", label: str = "scan", timeout=None):
+        raise RuntimeError(
+            f"scan slot pool unavailable ({_SLOTS_ERROR}) — check the "
+            "./common:/app/common mount on playwright-scanner")
+        yield  # pragma: no cover
+
+
+def _scope_refusal_for_url(url, context: str = ""):
+    """Refusal string when this URL must NOT be fetched, else None. Fails closed."""
+    if not _SCOPE_GATE_OK:
+        return (f"scope gate unavailable ({_SCOPE_GATE_ERROR}) — refusing to "
+                "browse; check the ./etl:/app/etl mount on playwright-scanner")
+    try:
+        host = urlparse(str(url or "")).hostname
+    except Exception as exc:
+        return f"could not parse a host out of {url!r} ({exc}) — refusing"
+    if not host:
+        return f"no host in {url!r} — refusing rather than guessing"
+    return enforce_target_scope(host, context or str(url))
+
+
 class ScanRequest(BaseModel):
     url: HttpUrl = Field(..., description="Target URL to scan")
     browser: Optional[str] = Field("chromium", description="Browser type: chromium, firefox, or webkit")
@@ -151,6 +204,26 @@ async def perform_scan(scan_request: ScanRequest, scan_id: uuid.UUID):
         scan_request: Scan configuration
         scan_id: UUID of the scan record
     """
+    refusal = _scope_refusal_for_url(scan_request.url, f"playwright scan {scan_request.url}")
+    if refusal:
+        logger.warning("REFUSED playwright scan of %s: %s", scan_request.url, refusal)
+        # 'blocked', not 'failed': a refusal is a decision, and an operator
+        # reading "failed" would retry it. CLAUDE.md — blocked items must be
+        # labelled, not silently dropped.
+        update_playwright_scan(scan_id=scan_id, status="blocked",
+                               errors=[{"error": refusal, "blocked": "out_of_scope"}])
+        emit_webhook_event("playwright_scan_blocked", "playwright", {
+            "scan_id": str(scan_id), "url": str(scan_request.url),
+            "reason": refusal,
+        })
+        return
+
+    async with async_scan_slot(job_id=str(scan_id), label="playwright"):
+        await _perform_scan_slotted(scan_request, scan_id)
+
+
+async def _perform_scan_slotted(scan_request: ScanRequest, scan_id: uuid.UUID):
+    """Body of perform_scan(), inside the scope gate and a scan slot."""
     browser = None
     context = None
     page = None
@@ -719,6 +792,11 @@ async def capture_auth_token(req: AuthCaptureRequest):
     - client_credentials: POST to token URL with client_id/secret, return access_token
     - intercept: Launch browser, navigate to login_url, monitor network for tokens
     """
+    refusal = _scope_refusal_for_url(req.login_url, f"auth capture {req.mode}")
+    if refusal:
+        logger.warning("REFUSED auth capture at %s: %s", req.login_url, refusal)
+        raise HTTPException(403, refusal)
+
     if req.mode == "client_credentials":
         return await _capture_client_credentials(req)
     elif req.mode == "intercept":
@@ -881,6 +959,11 @@ async def execute_poc(req: PoCRequest):
         response_body: first 2000 chars of page content
         dom_changes: summary of DOM changes if detected
     """
+    refusal = _scope_refusal_for_url(req.url, f"poc {req.injection_point} {req.url}")
+    if refusal:
+        logger.warning("REFUSED poc against %s: %s", req.url, refusal)
+        raise HTTPException(403, refusal)
+
     import asyncio
     from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
 
@@ -1112,6 +1195,16 @@ async def _perform_crawl(job_id: str, req: CrawlRequest):
     All traffic goes through ZAP proxy so ZAP builds its site tree.
     Returns discovered URLs for downstream pipeline stages.
     """
+    # Every seed, not just req.url: a single unchecked seed_urls entry is a
+    # complete bypass of the gate on req.url.
+    for _u in [req.url, *(req.seed_urls or [])]:
+        refusal = _scope_refusal_for_url(_u, f"crawl seed {_u}")
+        if refusal:
+            logger.warning("REFUSED crawl seed %s: %s", _u, refusal)
+            _crawl_jobs[job_id] = {"status": "blocked", "error": refusal,
+                                   "pages_visited": 0, "urls_found": 0}
+            return
+
     from urllib.parse import urlparse, urljoin
     from collections import deque
 

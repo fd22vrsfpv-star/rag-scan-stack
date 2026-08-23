@@ -1009,6 +1009,97 @@ def masscan_nmap_upload(
 
     return {"id": job_id, "ok": ok, "targets": len(targets), "nmap_tasks_enqueued": created_tasks, "scanner": resp}
 
+class JobCreateBody(BaseModel):
+    type: str
+    params: Dict[str, Any] = {}
+    idempotency_key: Optional[str] = None
+    engagement_id: Optional[str] = None
+
+
+@app.post("/jobs", tags=["Jobs"])
+def create_job(body: JobCreateBody, authorized: bool = Depends(auth)):
+    """Record a job so its tasks can be tracked, and return its id.
+
+    This inserts a row. It does NOT dispatch anything and sends no traffic —
+    /jobs/nmap-from-masscan is the dispatcher, and it is what carries the scope
+    and concurrency obligations. So there is no gate here: there is nothing to
+    gate until something is actually run.
+
+    `idempotency_key` deduplicates retries. jobs_idempotency_key_key is a plain
+    UNIQUE index (not partial), so a NULL key is unconstrained and every
+    keyless call creates a new job — which is the right behaviour for a caller
+    that did not ask for dedup.
+
+    The lifecycle this feeds has been implemented in /jobs/nmap-from-masscan
+    since it was written — job -> running, a 'pipeline' task, finished_tasks
+    incremented on success. Only the two endpoints that create and read the
+    rows were missing, so tests/test_phase0_jobs.py has been failing against a
+    404 (masked until now: those tests could never reach a database).
+    """
+    eid = body.engagement_id or _resolve_engagement_id(None)
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        if body.idempotency_key:
+            cur.execute("SELECT id, status FROM jobs WHERE idempotency_key = %s",
+                        (body.idempotency_key,))
+            row = cur.fetchone()
+            if row:
+                return {"id": str(row["id"]), "status": row["status"], "dedup": True}
+        try:
+            cur.execute("""
+                INSERT INTO jobs (type, params, idempotency_key, engagement_id)
+                VALUES (%s, %s::jsonb, %s, %s::uuid)
+                RETURNING id, status
+            """, (body.type, json.dumps(body.params or {}),
+                  body.idempotency_key, eid))
+            row = cur.fetchone()
+        except psycopg2.errors.UniqueViolation:
+            # Two concurrent calls with the same key: the loser reads the winner
+            # rather than 500ing. Without this the SELECT above is a race, not a
+            # guarantee.
+            conn.rollback()
+            cur.execute("SELECT id, status FROM jobs WHERE idempotency_key = %s",
+                        (body.idempotency_key,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(500, "job insert conflicted but no row found")
+            return {"id": str(row["id"]), "status": row["status"], "dedup": True}
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("job_created", "jobs", {
+            "job_id": str(row["id"]), "type": body.type,
+            "engagement_id": eid, "idempotent": bool(body.idempotency_key),
+        })
+    except Exception:
+        pass
+    return {"id": str(row["id"]), "status": row["status"], "dedup": False}
+
+
+@app.get("/jobs/{job_id}/tasks", tags=["Jobs"])
+def list_job_tasks(job_id: str, authorized: bool = Depends(auth)):
+    """The tasks belonging to one job, oldest first."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            cur.execute("""
+                SELECT id, job_id, type, target_host, target_port, proto, status,
+                       attempt, last_error, created_at, started_at, finished_at
+                  FROM tasks WHERE job_id = %s::uuid
+                 ORDER BY created_at, id
+            """, (job_id,))
+        except psycopg2.errors.InvalidTextRepresentation:
+            raise HTTPException(404, f"Job not found: {job_id}")
+        rows = cur.fetchall()
+    items = [{
+        "id": str(r["id"]), "job_id": str(r["job_id"]), "type": r["type"],
+        "target_host": str(r["target_host"]) if r["target_host"] else None,
+        "target_port": r["target_port"], "proto": r["proto"],
+        "status": r["status"], "attempt": r["attempt"], "last_error": r["last_error"],
+        "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+        "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
+    } for r in rows]
+    return {"count": len(items), "items": items}
+
+
 @app.post("/jobs/nmap-from-masscan")
 def nmap_from_masscan(authorized: bool = Depends(auth), job_id: Optional[str] = Query(None)):
     # Delegate to the external nmap_scanner service and optionally manage job lifecycle
@@ -3401,6 +3492,66 @@ def _already_ran(cur, scanner: str, target: str, script: str) -> dict:
             "last_at": newest["completed_at"].isoformat() if newest["completed_at"] else None}
 
 
+class ArtifactDrainRequest(BaseModel):
+    limit: int = 10
+    tool: Optional[str] = None
+    model: Optional[str] = None
+    requeue_stale_minutes: int = 30
+
+
+@app.post("/artifacts/drain", tags=["Artifacts"])
+def drain_artifact_queue(req: ArtifactDrainRequest, authorized: bool = Depends(auth)):
+    """Run the LLM pass over a batch of pending artifacts.
+
+    The queue had every server-side piece and no consumer, so it only grew: 274
+    pending, one row stuck in 'processing' since it was claimed, and the cleanup
+    job's own warning says such rows "will never age out".
+
+    This is on-demand rather than a standing loop because the LLM pass is an
+    ENRICHMENT — artifact_actions.suggest_actions() already works on raw text and
+    treats llm_result as optional — so the operator decides when to spend model
+    time. Also requeues rows abandoned in 'processing', which is what makes
+    claiming recoverable at all.
+    """
+    import artifact_consumer
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            result = artifact_consumer.process_batch(
+                cur, limit=req.limit, tool=req.tool, model=req.model,
+                requeue_stale_minutes=req.requeue_stale_minutes)
+            depth = artifact_consumer.queue_depth(cur)
+        except Exception as e:
+            log.exception("drain_artifact_queue failed")
+            raise HTTPException(500, f"artifact drain failed: {type(e).__name__}: {e}")
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("artifact_batch_processed", "artifact_consumer", {
+            "claimed": result.get("claimed"), "done": result.get("done"),
+            "parked": result.get("parked"),
+            "requeued_stale": result.get("requeued_stale"),
+            "model": result.get("model"), "queue_depth": depth,
+        })
+    except Exception:
+        pass
+    return {"ok": True, **result, "queue_depth": depth}
+
+
+@app.post("/artifacts/requeue-stale", tags=["Artifacts"])
+def requeue_stale_artifacts(older_than_minutes: int = Query(30, ge=1),
+                            authorized: bool = Depends(auth)):
+    """Return artifacts abandoned in 'processing' to 'pending'.
+
+    A claimed row whose worker died is invisible to both sides: not pending so
+    nothing retries it, not done so nothing reports it. Separate from /drain so
+    an operator can recover the queue without spending any model time.
+    """
+    import artifact_consumer
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        n = artifact_consumer.requeue_stale(cur, older_than_minutes)
+        depth = artifact_consumer.queue_depth(cur)
+    return {"ok": True, "requeued": n, "queue_depth": depth}
+
+
 @app.get("/artifacts/{artifact_id}/actions", tags=["Artifacts"])
 def get_artifact_actions(artifact_id: str, authorized: bool = Depends(auth)):
     """Possible follow-on actions derived from this artifact's raw output.
@@ -4862,7 +5013,11 @@ def get_job_results(job_id: str, authorized: bool = Depends(auth)):
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         try:
             cur.execute(
+                # total_tasks/finished_tasks are maintained by
+                # /jobs/nmap-from-masscan but were never returned, so a caller
+                # could not see progress it was already recording.
                 "SELECT id, type, params, result, progress, status, error, "
+                "total_tasks, finished_tasks, "
                 "started_at, finished_at, created_at "
                 "FROM jobs WHERE id=%s::uuid",
                 (job_id,),
@@ -4882,6 +5037,8 @@ def get_job_results(job_id: str, authorized: bool = Depends(auth)):
         "progress": row["progress"],
         "status": row["status"],
         "error": row["error"],
+        "total_tasks": row["total_tasks"],
+        "finished_tasks": row["finished_tasks"],
         "started_at": row["started_at"].isoformat() if row["started_at"] else None,
         "finished_at": row["finished_at"].isoformat() if row["finished_at"] else None,
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
@@ -13217,6 +13374,10 @@ import hashlib
 EXPORT_CATEGORIES = {
     "assets":      ["assets", "ports"],
     "findings":    ["vulns", "web_findings", "playwright_findings"],
+    # The infrastructure rollup: one row per shared problem rather than one per
+    # virtual host. Until now nothing but a test read this view, so a report of
+    # 778 web findings gave no way to see that they collapse to 13 problems.
+    "infrastructure": ["v_infrastructure_findings"],
     "recon":       ["recon_findings"],
     "credentials": ["credential_findings"],
     "params":      ["discovered_params"],
@@ -13248,9 +13409,31 @@ def _serialize_value(val):
     return str(val)
 
 
+# Views and a few tables have no created_at, and an unconditional
+# `ORDER BY created_at` turns adding one to an export category into a 500.
+# Resolved from the catalog rather than hard-coded per table.
+_EXPORT_ORDER_PREFERENCE = ("created_at", "last_seen", "discovered_at",
+                            "first_seen", "updated_at")
+
+
+def _export_order_column(cur, table: str) -> Optional[str]:
+    cur.execute("""
+        SELECT column_name FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = %s
+    """, (table,))
+    have = {r[0] if not isinstance(r, dict) else r["column_name"]
+            for r in cur.fetchall()}
+    for col in _EXPORT_ORDER_PREFERENCE:
+        if col in have:
+            return col
+    return None
+
+
 def _export_table_rows(cur, table: str, limit: int = 50000) -> list:
-    """Generic SELECT * from a table with safe serialization."""
-    cur.execute(f"SELECT * FROM {table} ORDER BY created_at DESC LIMIT %s", [limit])
+    """Generic SELECT * from a table or view, with safe serialization."""
+    order_col = _export_order_column(cur, table)
+    order_sql = f"ORDER BY {order_col} DESC" if order_col else ""
+    cur.execute(f"SELECT * FROM {table} {order_sql} LIMIT %s", [limit])
     cols = [desc[0] for desc in cur.description]
     rows = []
     for row in cur.fetchall():
@@ -13542,8 +13725,9 @@ def export_sarif(
 @app.get("/export/data", tags=["Export"])
 def export_data(
     format: str = Query("json", description="Export format: json, csv, nessus"),
-    categories: str = Query("assets,findings,recon,credentials,params,exploits,screenshots",
-                            description="Comma-separated categories"),
+    categories: str = Query(
+        "assets,findings,infrastructure,recon,credentials,params,exploits,screenshots",
+        description="Comma-separated categories"),
     authorized: bool = Depends(auth),
 ):
     """

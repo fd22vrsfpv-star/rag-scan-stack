@@ -14,6 +14,7 @@ katana wrote 32,218 rows for 630. Every guard below is the thing that stops that
 returning.
 """
 import os
+import re
 import uuid
 
 import pytest
@@ -26,12 +27,17 @@ DSN = os.environ.get(
 )
 
 
+def _redact(dsn: str) -> str:
+    """Never put a live password in test output — skip messages reach CI logs."""
+    return re.sub(r"://([^:/@]+):[^@]*@", r"://\1:***@", dsn or "")
+
+
 @pytest.fixture(scope="module")
 def conn():
     try:
         c = psycopg2.connect(DSN, connect_timeout=3)
     except Exception as e:                      # pragma: no cover
-        pytest.skip(f"no database at {DSN}: {type(e).__name__}")
+        pytest.skip(f"no database at {_redact(DSN)}: {type(e).__name__}")
     c.autocommit = True
     yield c
     c.close()

@@ -484,6 +484,20 @@ UPDATE public.credential_findings cf
                 ORDER BY (p2.proto = 'tcp') DESC, p2.last_seen DESC NULLS LAST, p2.id
                 LIMIT 1);
 
+-- A scan refused by the scope gate is 'blocked', not 'failed'.
+--
+-- CLAUDE.md: "Blocked items MUST be labelled in the UI, not silently dropped."
+-- Folding a refusal into 'failed' invites a retry of something that will never
+-- be allowed to run. The CREATE TABLE above predates the gate, so the value is
+-- added here for databases that already exist.
+DO $PWB$ BEGIN
+    ALTER TABLE public.playwright_scans
+        DROP CONSTRAINT IF EXISTS playwright_scans_status_check;
+    ALTER TABLE public.playwright_scans
+        ADD CONSTRAINT playwright_scans_status_check
+        CHECK (status IN ('queued','running','completed','failed','blocked'));
+EXCEPTION WHEN undefined_table THEN NULL; END $PWB$;
+
 -- 6. Prevent recurrence. NOT VALID so a pre-existing violation can never block
 --    this migration; steps 1 and 5 have already cleared them.
 DO $NORM$ BEGIN
@@ -847,7 +861,7 @@ CREATE TABLE IF NOT EXISTS public.playwright_scans (
     asset_id     uuid REFERENCES public.assets(id) ON DELETE CASCADE,
     url          text NOT NULL,
     status       text NOT NULL DEFAULT 'queued'
-                 CHECK (status IN ('queued','running','completed','failed')),
+                 CHECK (status IN ('queued','running','completed','failed','blocked')),
     start_time   timestamptz,
     end_time     timestamptz,
     browser      text DEFAULT 'chromium',
@@ -4599,7 +4613,14 @@ SELECT
     min(w.port)                                       AS port,
     min(w.name)                                       AS name,
     min(w.issue_type)                                 AS issue_type,
-    max(w.severity)                                   AS severity,
+    -- WORST severity, not the lexically largest. max() on text ranks
+    -- 'medium' above 'critical' and 'high', so a group that mixes them
+    -- under-reported its own severity — silently, and in the dangerous
+    -- direction. Every group in this deployment happened to be
+    -- single-severity, so nothing showed it. public.severity_rank() is
+    -- the one scale the whole stack shares.
+    (array_agg(w.severity ORDER BY public.severity_rank(w.severity) DESC,
+                                   w.severity))[1]     AS severity,
     count(*)                                          AS finding_count,
     count(DISTINCT a.id)                              AS affected_asset_count,
     array_agg(DISTINCT coalesce(a.hostname, host(a.ip))
