@@ -1882,6 +1882,44 @@ EXCEPTION WHEN OTHERS THEN NULL; END $$;
 CREATE INDEX IF NOT EXISTS idx_web_findings_record_kind
     ON public.web_findings(record_kind);
 
+-- ── One numeric severity scale, in SQL ─────────────────────────────────────
+--
+-- Severity ordering was hand-written as a CASE expression in five places in
+-- api.py alone, in three different conventions (ELSE 0, ELSE 4, ELSE 5, ELSE 7;
+-- critical as 1 or as 5). Two of them also collapsed `low` and `info` together.
+--
+-- Higher = more severe, so `ORDER BY severity_rank(severity) DESC` reads the way
+-- it sounds and an unknown value sorts LAST instead of first — which is the bug
+-- the ascending copies had, since ELSE 7 put garbage above critical when someone
+-- reversed the direction.
+--
+-- Must match etl/severity.py and the frontend's SEVERITY_RANK exactly;
+-- tests/test_severity_scale.py pins all three to one case table.
+--
+-- IMMUTABLE so it can be used in an index and so the planner can fold it.
+CREATE OR REPLACE FUNCTION public.severity_rank(sev text)
+RETURNS integer
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    SELECT CASE lower(btrim(coalesce(sev, '')))
+        WHEN 'critical' THEN 6
+        WHEN 'high'     THEN 5
+        WHEN 'medium'   THEN 4
+        WHEN 'low'      THEN 3
+        WHEN 'info'     THEN 2
+        -- 'recon' is the pre-2026-08-22 name for 'info' and ranks identically,
+        -- so rows written before that migration sort correctly rather than
+        -- falling to unknown.
+        WHEN 'recon'    THEN 2
+        -- A failed scan is not a finding about the target; ranking it above
+        -- informational output would push real results down.
+        WHEN 'error'    THEN 1
+        ELSE 0
+    END
+$$;
+
 -- ── Collapse the 'recon' severity into 'info' ──────────────────────────────
 --
 -- The two were functionally identical. Measured before removing it:
