@@ -80,3 +80,33 @@ def test_a_placeholder_scope_row_cannot_match_everything():
     src = open(os.path.join(REPO, HOOK), encoding="utf-8").read()
     assert ".filter(Boolean)" in src, \
         "empty scope targets are no longer filtered out; '' would be a wildcard"
+
+
+@pytest.mark.unit
+def test_scope_targets_fall_back_to_the_global_lookup():
+    """The scope DROPDOWN is global; the target lookup was engagement-only.
+
+    useScopeNames returns the global scope list when no engagement is selected,
+    so the dropdown can offer a scope the selected engagement does not own. The
+    engagement-scoped target lookup then returned zero targets, and
+    useScopeFilter reads "no targets" as "nothing matches" — so selecting the
+    `msf` scope emptied the Assets table rather than showing 192.168.1.150.
+    """
+    api = open(os.path.join(REPO, "dashboard/frontend/src/api/scope.ts"),
+               encoding="utf-8").read()
+    fn = api.split("export function useScope(", 1)[1].split("export function", 1)[0]
+    assert "scoped?.targets?.length" in fn, (
+        "useScope no longer falls back when the engagement-scoped lookup is "
+        "empty — a scope from another engagement hides every row")
+    assert "/scope?name=" in fn, "the global scope endpoint is gone"
+
+    hook = open(os.path.join(REPO, HOOK), encoding="utf-8").read()
+    assert "useScope(scopeName)" in hook, \
+        "useScopeFilter no longer uses the falling-back lookup"
+    # Comments stripped: the hook explains the bug by NAMING the old hook, and a
+    # naive substring check reads that prose as the defect it documents. Fourth
+    # time this trap has fired in this repo.
+    hook_code = "\n".join(l.split("//", 1)[0] for l in hook.splitlines())
+    assert "useEngagementScopeTargets" not in hook_code, (
+        "useScopeFilter is back on the engagement-only lookup, which returns "
+        "nothing for a scope the selected engagement does not own")

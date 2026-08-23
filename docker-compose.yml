@@ -1086,6 +1086,11 @@ services:
     ports:
       - "8015:8015"
     volumes:
+      # shared scope gate (etl/scope_gate.py) and scan-slot ceiling
+      # (common/tool_job.py). /app is this image's working dir and is
+      # already on sys.path, so both import without any PYTHONPATH change.
+      - ./etl:/app/etl:ro
+      - ./common:/app/common:ro
       - ./autogen_logs:/app/logs
       - ./autogen_cache:/app/cache
       - ./scan_sessions:/app/scan_sessions

@@ -342,6 +342,35 @@ async def scan_through_node(node_id: str, req: NodeScanRequest):
     for item in raw:
         targets.extend(t.strip() for t in str(item).split(",") if t.strip())
 
+    # Scope gate, placed HERE because both dispatch branches below — remote
+    # command execution on an SSH host, and the SOCKS-proxied path — read this
+    # same list. Gating one branch would leave the other open, and the remote-exec
+    # branch is the one where nothing in this stack ever sees the traffic.
+    #
+    # target_url/target_urls are folded in: the model accepts them, they are NOT
+    # part of `targets`, and a URL-shaped scan would otherwise skip the check.
+    _url_raw = (req.target_urls or []) + ([req.target_url] if req.target_url else [])
+    _to_check = list(targets) + [str(u).strip() for u in _url_raw if str(u).strip()]
+    if _to_check:
+        try:
+            from scope_guard import scope_rows_for, refusal_for
+            _rows, _src = scope_rows_for(req.engagement_id)
+            for _t in _to_check:
+                # host_in_scope wants a host; refusal_for handles URL forms and
+                # also inspects the command string, so pass the raw value.
+                _refusal = refusal_for(_t, _rows, f"{req.scan_type} via node {node_id}")
+                if _refusal:
+                    log.warning("REFUSED node scan %s for %s: %s",
+                                req.scan_type, _t, _refusal)
+                    raise HTTPException(403, _refusal)
+        except HTTPException:
+            raise
+        except Exception as _e:
+            # Fail closed: "cannot check" must never look like "authorised".
+            raise HTTPException(
+                403, f"scope could not be evaluated ({type(_e).__name__}: {_e}) "
+                     "— refusing to dispatch through the node")
+
     # Raw-socket scans or no-proxy scans on SSH nodes → route as remote command execution
     if (req.scan_type in _RAW_SOCKET_SCANS or req.scan_type in _NO_PROXY_SCANS) and node_type == "ssh":
         remote_type = _REMOTE_SCAN_MAP.get(req.scan_type)
