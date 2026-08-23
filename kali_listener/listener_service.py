@@ -2020,6 +2020,201 @@ async def check_tools(tools: str):
     return {"ok": True, "found": found, "missing": missing, "total": len(names)}
 
 
+class ToolVerifyRequest(BaseModel):
+    """Commands to verify. `command` may still contain {placeholders}."""
+    commands: List[Dict[str, str]] = Field(
+        ..., description="[{tool, command}] — command may contain {target}/{port}")
+    timeout: int = Field(default=15, ge=3, le=60,
+                         description="Per-command probe timeout in seconds")
+    capture_help: bool = Field(
+        default=False,
+        description="Also capture each distinct tool's own --help, so the real "
+                    "accepted options are recorded rather than assumed")
+
+
+# ── Command verification ────────────────────────────────────────────────────
+#
+# Confirms a command's OPTIONS and CALL PATH at runtime, which no static check
+# can do. It exists because gobuster failed 20 of 20 runs on a wordlist path
+# absent from this image, and dnsrecon ran 19 times against a hardcoded
+# `example.com` — both invisible to pytest, to the container healthcheck, and to
+# any report, because a broken invocation and an empty result look identical.
+#
+# HOW: substitute a DEAD LOOPBACK target, run the command, and classify the
+# failure. The three modes are cleanly distinguishable in practice:
+#
+#   flag provided but not defined   -> the options are wrong
+#   ... does not exist              -> a path in the command is missing
+#   connection refused / timeout    -> options accepted, call path works
+#
+# SAFETY. This is a self-test, not a dispatch surface, and it is deliberately
+# built so it cannot become one:
+#   * the probe target is HARDCODED loopback; no caller-supplied host reaches it
+#   * it runs its own subprocess and never goes through /tools/execute, so it
+#     cannot launder a command past the scope gate
+#   * a command with no {target} placeholder CANNOT be redirected to loopback, so
+#     it is reported unverifiable rather than run — running it might touch
+#     something real
+#   * anything whose substituted form still names a non-loopback host is refused
+_PROBE_HOST = "127.0.0.1"
+_PROBE_PORT = "1"          # reserved, nothing listens
+_PROBE_SUBS = {
+    "{target}": _PROBE_HOST, "{port}": _PROBE_PORT,
+    "{domain}": "localhost", "{product}": "probe", "{version}": "0",
+}
+_BAD_OPTION_MARKERS = (
+    "not defined", "incorrect usage", "unrecognized option", "unrecognised option",
+    "invalid option", "unknown flag", "unknown option", "unknown argument",
+    "no such option", "usage:", "invalid argument",
+)
+_MISSING_PATH_MARKERS = ("does not exist", "no such file", "cannot open",
+                         "not found or not readable", "can't open")
+_REACHED_NETWORK_MARKERS = (
+    "connection refused", "connect failed", "couldn't connect", "could not connect",
+    "timed out", "timeout", "no route to host", "network is unreachable",
+    "connection reset", "refused", "unreachable", "no response",
+)
+
+
+def _classify_probe(out: str) -> tuple:
+    """(verdict, detail) from a probe's combined output. Order matters.
+
+    Bad options are checked FIRST: a tool that rejects its flags never reaches
+    the filesystem or the network, so a later marker would misattribute it.
+    """
+    low = (out or "").lower()
+    for m in _BAD_OPTION_MARKERS:
+        if m in low:
+            return "bad_option", m
+    for m in _MISSING_PATH_MARKERS:
+        if m in low:
+            return "missing_path", m
+    for m in _REACHED_NETWORK_MARKERS:
+        if m in low:
+            return "ok", m
+    # Ran, said nothing recognisable, did not complain about its own arguments.
+    return "ok", "no diagnostic output"
+
+
+@app.post("/tools/verify")
+async def verify_tool_commands(request: ToolVerifyRequest):
+    """Verify each command's binary, paths, options and call path.
+
+    Returns one result per command with a verdict:
+      ok            — options accepted and the call path works
+      bad_option    — the tool rejected its own arguments
+      missing_path  — a file the command names is absent from this image
+      no_binary     — the tool is not installed here
+      interactive   — no commands/input supplied; it would exit 0 saying nothing
+      unverifiable  — no {target} to redirect, so probing it might hit something real
+    """
+    results = []
+    for entry in request.commands[:200]:
+        tool = (entry.get("tool") or "").strip()
+        cmd = (entry.get("command") or "").strip()
+        if not tool or not cmd:
+            continue
+
+        rec = {"tool": tool, "command": cmd}
+
+        if not re.match(r"^[a-zA-Z0-9_.-]+$", tool):
+            rec.update(verdict="no_binary", detail="tool name is not a bare token")
+            results.append(rec); continue
+
+        which = await asyncio.create_subprocess_exec(
+            "which", tool, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE)
+        await which.communicate()
+        if which.returncode != 0:
+            rec.update(verdict="no_binary", detail=f"{tool} is not installed here")
+            results.append(rec); continue
+
+        # A session with nothing to do exits 0 and reports nothing — 78 lftp runs
+        # and 43 ftp runs looked like "found nothing".
+        if tool in ("lftp", "ftp", "telnet", "mysql", "psql") and not re.search(
+                r"(-e\s|-c\s|<<|printf|echo\s|\|)", cmd):
+            rec.update(verdict="interactive",
+                       detail="no commands or stdin supplied; would exit 0 silently")
+            results.append(rec); continue
+
+        if "{target}" not in cmd:
+            rec.update(verdict="unverifiable",
+                       detail="no {target} to redirect to loopback; not probed "
+                              "because it might contact something real")
+            results.append(rec); continue
+
+        probe = cmd
+        for ph, val in _PROBE_SUBS.items():
+            probe = probe.replace(ph, val)
+        leftover = re.findall(r"\{[a-z_]+\}", probe)
+        if leftover:
+            rec.update(verdict="unverifiable",
+                       detail=f"unsubstitutable placeholder(s) {sorted(set(leftover))}")
+            results.append(rec); continue
+        # Belt and braces: after substitution the command must not name a host
+        # other than loopback, or this endpoint becomes a way to send traffic.
+        for host in re.findall(r"(?:https?://|@)([A-Za-z0-9_.-]+)", probe):
+            if host not in (_PROBE_HOST, "localhost"):
+                rec.update(verdict="unverifiable",
+                           detail=f"probe would contact {host}, not loopback")
+                break
+        if rec.get("verdict"):
+            results.append(rec); continue
+
+        rec["probe"] = probe
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                probe, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT)
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(),
+                                                timeout=request.timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                rec.update(verdict="ok", detail="timed out against a dead port — "
+                                                "options accepted")
+                results.append(rec); continue
+            text = (out or b"").decode("utf-8", "replace")
+            verdict, detail = _classify_probe(text)
+            rec.update(verdict=verdict, detail=detail,
+                       output_head=text[:300], exit_code=proc.returncode)
+        except Exception as e:                 # pragma: no cover
+            rec.update(verdict="unverifiable", detail=f"{type(e).__name__}: {e}")
+        results.append(rec)
+
+    # The tool's OWN statement of its options, captured rather than assumed.
+    # --help formats vary wildly (gobuster nests flags under subcommands, hydra
+    # prints its own layout), which is exactly why grepping help text to validate
+    # a flag is unreliable and the loopback probe above is the real check. This
+    # is for the record: it tells a reader which options the installed build
+    # actually offers.
+    helps = {}
+    if request.capture_help:
+        for tool in sorted({r["tool"] for r in results
+                            if r["verdict"] != "no_binary"}):
+            for flag in ("--help", "-h"):
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        tool, flag, stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT)
+                    out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+                except Exception:
+                    continue
+                text = (out or b"").decode("utf-8", "replace").strip()
+                if text:
+                    helps[tool] = text[:4000]
+                    break
+
+    counts = {}
+    for r in results:
+        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+    broken = [r for r in results
+              if r["verdict"] in ("bad_option", "missing_path", "no_binary",
+                                  "interactive")]
+    return {"ok": not broken, "checked": len(results), "counts": counts,
+            "broken": broken, "results": results, "help": helps}
+
+
 @app.post("/tools/install")
 async def install_tool(request: ToolInstallRequest):
     """Install a single tool in this Kali container.  Uses the registry's
