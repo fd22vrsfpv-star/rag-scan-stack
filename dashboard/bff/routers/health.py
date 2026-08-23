@@ -584,22 +584,6 @@ async def diagnostics_session_bundle(session_id: Optional[str] = None, hours: in
         for scan in scans_list:
             scan["scanner_logs"] = scanner_logs_map.get(scan.get("job_id", ""), [])
 
-    # Compute failure trace
-    failure_trace = _compute_failure_trace(session_info, scans_list, autogen_logs, health_info, watchdog_info, wh_events)
-
-    # Compute duration
-    duration_seconds = None
-    if not session_info.get("_error"):
-        created = session_info.get("started_at") or session_info.get("created_at")
-        ended = session_info.get("ended_at") or session_info.get("end_time")
-        if created and ended:
-            try:
-                t0 = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                t1 = datetime.fromisoformat(ended.replace("Z", "+00:00"))
-                duration_seconds = round((t1 - t0).total_seconds(), 1)
-            except (ValueError, TypeError):
-                pass
-
     # Filter webhook events to session timeframe
     wh_events = []
     if not webhook_events.get("_error"):
@@ -622,6 +606,28 @@ async def diagnostics_session_bundle(session_id: Optional[str] = None, hours: in
                 wh_events = raw_events[:50]
         else:
             wh_events = raw_events[:50]
+
+    # Compute failure trace.
+    #
+    # This call sits AFTER the wh_events block on purpose: it was 16 lines
+    # above it, so `wh_events` was referenced before assignment and
+    # /api/diagnostics/session-bundle returned 500 unconditionally, every
+    # time, for as long as it has existed. Nothing caught it because a
+    # parameterless GET only fails a live sweep, not any static check.
+    failure_trace = _compute_failure_trace(session_info, scans_list, autogen_logs, health_info, watchdog_info, wh_events)
+
+    # Compute duration
+    duration_seconds = None
+    if not session_info.get("_error"):
+        created = session_info.get("started_at") or session_info.get("created_at")
+        ended = session_info.get("ended_at") or session_info.get("end_time")
+        if created and ended:
+            try:
+                t0 = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                t1 = datetime.fromisoformat(ended.replace("Z", "+00:00"))
+                duration_seconds = round((t1 - t0).total_seconds(), 1)
+            except (ValueError, TypeError):
+                pass
 
     return {
         "session": {

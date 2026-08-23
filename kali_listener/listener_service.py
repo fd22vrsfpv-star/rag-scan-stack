@@ -1796,6 +1796,26 @@ async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: B
         logger.warning(f"REFUSED {request.tool} on {request.target}: {scope_error}")
         raise HTTPException(status_code=403, detail=f"Out of scope — {scope_error}")
 
+    # An unresolved {placeholder} must never reach a shell.
+    #
+    # This is the execution chokepoint and it had no such check, while the
+    # artifact-actions queue path in rag-api already refuses to queue a command
+    # containing one ("an unresolved command cannot run"). The gap mattered as
+    # soon as the DNS/whois templates in knowledge/service_tools.yaml stopped
+    # hardcoding `example.com` and started naming {domain}: without this, an
+    # engagement with no domain in scope would run `dnsrecon -d {domain}`
+    # literally. Previously it ran against example.com — 19 for 19 — producing
+    # output about someone else's domain and telling the operator nothing.
+    unresolved = re.findall(r"\{[a-z_]+\}", request.command or "")
+    if unresolved:
+        logger.warning("REFUSED %s on %s: unresolved placeholder(s) %s",
+                       request.tool, request.target, unresolved)
+        raise HTTPException(
+            status_code=400,
+            detail=(f"command still contains {', '.join(sorted(set(unresolved)))} — "
+                    "fill it in before running. An unresolved command cannot "
+                    "produce meaningful output."))
+
     # Validate tool token shape (no shell metacharacters in the tool name).
     tool_lower = request.tool.lower()
     if not re.match(r'^[a-zA-Z0-9_.-]+$', tool_lower):

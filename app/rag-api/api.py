@@ -668,17 +668,27 @@ def get_db(autocommit: bool = False):
             pass
         # If the connection broke mid-request (server-side disconnect), don't
         # recycle it — close it so the pool allocates a fresh one next time.
+        #
+        # `if/else`, NOT an early `return`. A `return` inside `finally` DISCARDS
+        # the exception that was propagating, so a request whose connection died
+        # mid-flight carried on past its own `with get_db()` block as though it
+        # had succeeded. The visible symptom was
+        #     UnboundLocalError: local variable 'result' referenced before assignment
+        # from a handler whose try/except had raised HTTPException and had that
+        # raise silently thrown away. All 360 `with get_db()` call sites in this
+        # file were exposed; the ones that assign nothing before the block would
+        # have returned a plausible-looking partial result instead of an error.
         if conn.closed:
             _discard_conn(pool, conn)
-            return
-        try:
-            pool.putconn(conn)
-        except Exception:
-            # If putconn fails (e.g., closed conn), close hard
+        else:
             try:
-                conn.close()
+                pool.putconn(conn)
             except Exception:
-                pass
+                # If putconn fails (e.g., closed conn), close hard
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
 def ensure_phase0_schema():
     # Create jobs/tasks tables if they're missing so Phase 0 endpoints work without manual migration
@@ -3597,6 +3607,46 @@ def drain_artifact_queue(req: ArtifactDrainRequest, authorized: bool = Depends(a
         })
     except Exception:
         pass
+    return {"ok": True, **result, "queue_depth": depth}
+
+
+class ArtifactSkipRedundantRequest(BaseModel):
+    dry_run: bool = True
+    limit: int = 5000
+
+
+@app.post("/artifacts/skip-redundant", tags=["Artifacts"])
+def skip_redundant_artifacts(req: ArtifactSkipRedundantRequest,
+                             authorized: bool = Depends(auth)):
+    """Mark pending artifacts skipped when a dedicated parser already read them.
+
+    Costs no model time. The tool list is DERIVED from etl/parse_*.py rather than
+    hard-coded, so adding a parser takes effect without editing this endpoint —
+    and an unreadable parser directory means skip NOTHING, never skip everything.
+
+    Rows are kept: /export/burp and /export/har read artifact content, and
+    'skipped' is reversible via /artifacts/{id}/processed.
+    """
+    import artifact_consumer
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            result = artifact_consumer.skip_redundant(
+                cur, dry_run=req.dry_run, limit=req.limit)
+            depth = artifact_consumer.queue_depth(cur)
+        except Exception as e:
+            log.exception("skip_redundant_artifacts failed")
+            raise HTTPException(500, f"skip failed: {type(e).__name__}: {e}")
+    if not req.dry_run and result.get("skipped"):
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("artifact_batch_skipped", "artifact_consumer", {
+                "skipped": result.get("skipped"),
+                "candidates": result.get("candidates"),
+                "by_tool": result.get("by_tool"),
+                "queue_depth": depth,
+            })
+        except Exception:
+            pass
     return {"ok": True, **result, "queue_depth": depth}
 
 
