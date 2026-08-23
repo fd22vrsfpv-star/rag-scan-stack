@@ -5494,7 +5494,18 @@ def search_findings(
             NULL::text as engagement_id,
             NULL::text as problem_id,
             1 as affects_hosts,
-            'finding'::text as record_kind,
+            -- INVENTORY, not a finding. "port 2121 runs ProFTPD 1.3.1" is an
+            -- observation about the target, not a weakness in it — the same
+            -- distinction that moved 746 katana crawl rows out of this view.
+            -- These 40 rows were the entire remaining gap between
+            -- /findings/search (94) and /export/sarif (54): the same engagement
+            -- described two ways depending on which artefact you opened.
+            --
+            -- Not hidden: include_inventory=true brings them back, the Ports and
+            -- Assets views read the `ports` table directly, and CVE matching
+            -- still consumes the service/product/version from it. They just stop
+            -- padding a findings count and a severity facet.
+            'inventory'::text as record_kind,
             'portscan' as finding_source
         FROM ports pt
         LEFT JOIN assets a ON a.id = pt.asset_id
@@ -5758,7 +5769,12 @@ def search_findings(
         UNION ALL
         SELECT 'playwright' as source, pf.severity FROM playwright_findings pf
         UNION ALL
-        SELECT 'portscan' as source, 'info'::text as severity FROM ports WHERE is_open = true
+        -- Mirrors the main query's ports branch, which is now inventory. Without
+        -- the same gate the facet would render a `portscan` chip with 40 that
+        -- returns nothing when clicked -- exactly the katana bug this comment
+        -- block warns about two branches up.
+        SELECT 'portscan' as source, 'info'::text as severity FROM ports
+         WHERE is_open = true AND %(include_inventory)s
         UNION ALL
         -- Must mirror the credential branch in the main query above, including
         -- the valid_cred gate. If these two drift, the severity facet counts
