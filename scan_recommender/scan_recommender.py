@@ -918,8 +918,31 @@ _auto_exec_slots = threading.BoundedSemaphore(SCAN_LIMIT)
 _auto_exec_skipped = {"n": 0}
 
 
+def _auto_exec_scope_refusal(ip: str, command: str = ""):
+    """Refusal string when this host must not be auto-scanned, else None.
+
+    Auto-execute is the one path that dispatches with NO operator in the loop —
+    a recommendation is generated and a tool fires at the host. It was bounded
+    by the engagement scan limit but never checked against the engagement SCOPE,
+    so volume was capped and authorization was not.
+
+    Fails closed: an unimportable gate refuses rather than dispatching.
+    """
+    try:
+        from etl.scope_gate import enforce_target_scope
+    except Exception as e:                     # pragma: no cover - deployment
+        return (f"scope gate unavailable ({type(e).__name__}: {e}) — refusing "
+                "auto-execute; check the ./etl mount on scan-recommender")
+    return enforce_target_scope(str(ip or ""), command)
+
+
 def _dispatch_auto_execute(ip: str, service: str, port: int):
     """Fire-and-forget call to kali-listener's /tools/execute-recommended."""
+    refusal = _auto_exec_scope_refusal(ip, f"auto-execute {service}/{port}")
+    if refusal:
+        logger.warning("REFUSED auto-execute for %s:%s/%s: %s",
+                       ip, port, service, refusal)
+        return
     if not _auto_exec_slots.acquire(blocking=False):
         _auto_exec_skipped["n"] += 1
         if _auto_exec_skipped["n"] % 20 == 1:

@@ -156,7 +156,7 @@ export default function FindingsExplorer() {
   const globalScope = useUIStore(s => s.selectedScopeName)
   const engagementId = useUIStore(s => s.selectedEngagementId)
   const [scopeFilter, setScopeFilter] = useState(globalScope || '')
-  const { matchesScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilter)
+  const { matchesScope, matchesAnyScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilter)
   const [searchParams] = useSearchParams()
   // Seed the host filter from a deep link (e.g. the Attack Map "Findings" link
   // passes ?ip=<host>). Applied once on mount via the lazy initializer.
@@ -204,7 +204,8 @@ export default function FindingsExplorer() {
   const allFindings = useMemo(() => (data?.pages ?? []).flatMap(p => p.findings ?? []), [data])
   const findings = useMemo(() => {
     if (!isScopeFiltering) return allFindings
-    return allFindings.filter(f => matchesScope(f.hostname || f.ip || f.url || ''))
+    // Every identity, not the first non-empty one — see matchesAnyScope.
+    return allFindings.filter(f => matchesAnyScope(f.hostname, f.ip, f.url))
   }, [allFindings, isScopeFiltering, matchesScope])
   // total = server-side count for the active filter set (respects severity/source/status).
   const serverTotal = data?.pages?.[0]?.total ?? 0

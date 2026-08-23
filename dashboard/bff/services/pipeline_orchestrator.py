@@ -53,18 +53,34 @@ DEFAULT_PARALLEL = {
     STAGE_ANALYSIS: 3,
 }
 
-MAX_PIPELINE_CONCURRENT = int(os.environ.get("MAX_PIPELINE_CONCURRENT", "20"))
+# The pipeline used a private ceiling of 20, four times the engagement's own
+# MAX_CONCURRENT_SCANS default of 5 — CLAUDE.md: "No component invents a private
+# concurrency number." It is now the MINIMUM of the two, so a pipeline can be
+# tuned DOWN with its own knob but can never exceed what the operator set for
+# the engagement.
+_PIPELINE_OWN_CAP = int(os.environ.get("MAX_PIPELINE_CONCURRENT", "20"))
+
+
+def _pipeline_concurrency() -> int:
+    """Read at call time, so a runtime set_max_concurrent() is respected."""
+    from routers.scans import get_max_concurrent
+    return max(1, min(_PIPELINE_OWN_CAP, get_max_concurrent()))
 
 POLL_INTERVAL = float(os.environ.get("PIPELINE_POLL_INTERVAL", "5"))
 
 
 class HostProgress:
-    __slots__ = ("host", "stage", "status", "jobs", "ports", "services", "urls")
+    # `error` carries a scope refusal. Without it in __slots__ the assignment in
+    # _dispatch raises AttributeError, and the refusal that was supposed to be
+    # visible becomes a crash instead.
+    __slots__ = ("host", "stage", "status", "jobs", "ports", "services", "urls",
+                 "error")
 
     def __init__(self, host: str):
         self.host = host
         self.stage = STAGE_PASSIVE
-        self.status = "pending"      # pending | running | done | failed
+        self.status = "pending"      # pending | running | done | failed | blocked
+        self.error: str | None = None
         self.jobs: list[str] = []    # job_ids currently in-flight for this host
         self.ports: list[int] = []   # open ports from discovery
         self.services: list[dict] = []  # (port, service, banner) from nmap
@@ -75,11 +91,24 @@ class HostProgress:
             "stage": self.stage,
             "stage_name": STAGE_NAMES.get(self.stage, "unknown"),
             "status": self.status,
+            # Surfaced, not just stored: a blocked host that looks identical to a
+            # pending one reads as a bug when it never progresses.
+            "error": self.error,
             "jobs": self.jobs,
             "ports_found": len(self.ports),
             "services_found": len(self.services),
             "urls_found": len(self.urls),
         }
+
+
+def _stage_refusal(host: str, engagement_id: str | None, command: str = ""):
+    """Refusal string when this host must not be scanned, else None. Fails closed."""
+    try:
+        from scope_guard import scope_rows_for, refusal_for
+        rows, _src = scope_rows_for(engagement_id)
+        return refusal_for(host, rows, command)
+    except Exception as e:
+        return f"scope could not be evaluated ({type(e).__name__}: {e})"
 
 
 class PipelineOrchestrator:
@@ -157,6 +186,22 @@ class PipelineOrchestrator:
         """Submit a scan via BFF /api/scans/{type} and return job_id."""
         if self._stopped:
             return None
+        # Gate at STAGE DISPATCH. /api/scans/{type} checks scope too, so this is
+        # defence in depth — but the orchestrator is what decides which hosts get
+        # driven through six stages, and a refusal here stops five more dispatches
+        # rather than being rejected six times downstream. It also means a host
+        # dropped from the scope mid-pipeline stops being scanned at the next
+        # stage instead of running to completion.
+        refusal = _stage_refusal(host, self.engagement_id, f"{scan_type} {host}")
+        if refusal:
+            log.warning("[pipeline:%s] REFUSED %s for %s: %s",
+                        self.pipeline_id[:8], scan_type, host, refusal)
+            hp = self.hosts.get(host)
+            if hp is not None:
+                hp.status = "blocked"
+                hp.error = refusal
+            return None
+
         proxy = self._next_proxy()
         if proxy:
             params["proxy"] = proxy
@@ -218,7 +263,7 @@ class PipelineOrchestrator:
         return count
 
     async def _wait_for_slot(self) -> None:
-        while self._pipeline_active_count() >= MAX_PIPELINE_CONCURRENT and not self._stopped:
+        while self._pipeline_active_count() >= _pipeline_concurrency() and not self._stopped:
             await asyncio.sleep(1)
 
     # ── Stage implementations ────────────────────────────────────────────
@@ -324,7 +369,7 @@ class PipelineOrchestrator:
             await asyncio.sleep(0.5)
 
             # Stages 1-4: per-host progression
-            sem = asyncio.Semaphore(MAX_PIPELINE_CONCURRENT)
+            sem = asyncio.Semaphore(_pipeline_concurrency())
 
             async def run_host(host: str) -> None:
                 async with sem:

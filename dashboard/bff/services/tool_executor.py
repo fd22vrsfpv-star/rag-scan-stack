@@ -1,5 +1,6 @@
 """Execute tool calls against backend services."""
 
+import asyncio          # scan-slot semaphore, see _scan_semaphore()
 import logging
 import os
 import httpx
@@ -404,6 +405,33 @@ def _scope_refusal(name: str, arguments: dict) -> dict | None:
     }
 
 
+# ── Scan-volume bound ───────────────────────────────────────────────────────
+# Only SCAN_TOOLS consume a slot. Bounding EVERY tool call by
+# MAX_CONCURRENT_SCANS would refuse read-only calls like get_assets the moment
+# scans are saturated, which breaks the UI without protecting anything.
+#
+# SHED, DO NOT QUEUE (CLAUDE.md): the LLM tool loop has its own timeout, and a
+# call admitted now and abandoned later wastes the work twice. A structured
+# at-capacity error is something the model can read and retry, in the same shape
+# as the allowlist and scope refusals.
+_scan_slots: dict[int, "asyncio.Semaphore"] = {}
+
+
+def _scan_semaphore() -> "asyncio.Semaphore":
+    """Semaphore sized by the CURRENT engagement limit.
+
+    Keyed by size so a runtime set_max_concurrent() takes effect instead of
+    being frozen at import time. In-flight holders of an old semaphore drain
+    naturally; the alternative — resizing in place — has no safe primitive.
+    """
+    from routers.scans import get_max_concurrent
+    size = max(1, get_max_concurrent())
+    sem = _scan_slots.get(size)
+    if sem is None:
+        sem = _scan_slots[size] = asyncio.Semaphore(size)
+    return sem
+
+
 async def execute_tool(name: str, arguments: dict, allowed_tools: list[str] | None = None) -> dict:
     """Execute a tool call and return the result.
 
@@ -431,6 +459,34 @@ async def execute_tool(name: str, arguments: dict, allowed_tools: list[str] | No
     if _refusal:
         log.warning("tool %s refused: %s", name, _refusal.get("targets"))
         return _refusal
+
+    # Scope first, then volume: an out-of-scope call must be refused whether or
+    # not there is capacity, and must not consume a slot to find that out.
+    if name in SCAN_TOOLS or name == "start_scan_pipeline":
+        sem = _scan_semaphore()
+        if sem.locked() and sem._value <= 0:      # noqa: SLF001 - no public probe
+            from routers.scans import get_max_concurrent
+            log.warning("tool %s shed: %s scans already in flight", name,
+                        get_max_concurrent())
+            return {
+                "error": "at_capacity",
+                "tool": name,
+                "limit": get_max_concurrent(),
+                "message": (f"REFUSED: {get_max_concurrent()} concurrent scans "
+                            "already in flight (MAX_CONCURRENT_SCANS). Nothing "
+                            "was dispatched — retry when one finishes."),
+            }
+        async with sem:
+            return await _execute_tool_inner(name, arguments, allowed_tools,
+                                             settings, headers)
+    return await _execute_tool_inner(name, arguments, allowed_tools,
+                                     settings, headers)
+
+
+async def _execute_tool_inner(name: str, arguments: dict,
+                              allowed_tools: list[str] | None,
+                              settings, headers) -> dict:
+    """The body of execute_tool, after the scope and volume gates."""
 
     # Layer-3 hardening: per-request allowlist. Refuse anything outside it
     # — including unknown tool names that would otherwise fall through to

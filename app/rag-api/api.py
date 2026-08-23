@@ -17254,6 +17254,108 @@ class FeedbackBody(BaseModel):
     notes: Optional[str] = None
 
 
+class RescopeRequest(BaseModel):
+    dry_run: bool = True
+    limit: int = 500
+
+
+@app.post("/follow-ups/rescope", tags=["Follow-Ups"])
+def rescope_follow_ups(req: RescopeRequest, authorized: bool = Depends(auth)):
+    """Re-evaluate quarantined follow-ups against the CURRENT scope.
+
+    Why this is needed: `_is_out_of_scope_target` fails closed, which is right at
+    discovery time — but the quarantine was never revisited. Its own docstring
+    says "the caller quarantines rather than deletes, so this is recoverable",
+    and nothing recovered it.
+
+    Two ways a row ends up wrongly quarantined:
+
+      * it was discovered before the scope was configured (correct then, wrong
+        now), or
+      * its `target` was the literal string "unknown", because the rule engine's
+        target resolver only looked at target/url/ip and rules like
+        sensitive_parameter select `url_pattern`. Scope matching then treated
+        "unknown" as a hostname and refused it, so "we do not know the target"
+        became "the target is out of scope". Fixed in rule_engine._row_target;
+        this repairs the rows already stored.
+
+    The target is recovered from the SOURCE ROW where possible and only then from
+    the title, because a title is display text and parsing it is a guess.
+    Nothing is ever moved INTO quarantine here: a row that is genuinely
+    out-of-scope keeps its label.
+    """
+    import re as _re
+    from osint_agent import _is_out_of_scope_target
+
+    label = "[OUT-OF-SCOPE] "
+    fixed, checked, still_oos = [], 0, 0
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT f.id, f.title, f.target, f.tags, f.finding_id, f.finding_source,
+                   f.engagement_id,
+                   dp.url_pattern              AS dp_url,
+                   wf.url                      AS wf_url,
+                   host(av.ip)                 AS vuln_ip
+              FROM follow_up_items f
+              LEFT JOIN discovered_params dp ON dp.id = f.finding_id
+              LEFT JOIN web_findings wf      ON wf.id = f.finding_id
+              LEFT JOIN vulns v              ON v.id  = f.finding_id
+              LEFT JOIN assets av            ON av.id = v.asset_id
+             WHERE f.title LIKE %s
+             ORDER BY f.created_at
+             LIMIT %s
+        """, (label + "%", req.limit))
+        rows = cur.fetchall()
+
+        for r in rows:
+            checked += 1
+            bare = (r["target"] or "").strip()
+            recovered = None
+            for cand in (r["dp_url"], r["wf_url"], r["vuln_ip"]):
+                if cand and str(cand).strip():
+                    recovered = str(cand).strip()
+                    break
+            if not recovered and (not bare or bare.lower() == "unknown"):
+                # Last resort: the row's own title. A URL first, then a bare IPv4.
+                m = _re.search(r"https?://[^\s\"']+", r["title"] or "")
+                if not m:
+                    m = _re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", r["title"] or "")
+                recovered = m.group(0) if m else None
+            target = recovered or bare
+            if not target or target.lower() == "unknown":
+                still_oos += 1
+                continue
+            if _is_out_of_scope_target(target, cur, r["engagement_id"]):
+                still_oos += 1
+                continue
+
+            new_title = r["title"][len(label):] if r["title"].startswith(label) else r["title"]
+            new_tags = [t for t in (r["tags"] or [])
+                        if t not in ("out-of-scope", "unknown-scope")]
+            fixed.append({"id": str(r["id"]), "target": target,
+                          "title": new_title, "was_target": r["target"]})
+            if not req.dry_run:
+                cur.execute("""
+                    UPDATE follow_up_items
+                       SET title = %s, target = %s, tags = %s::text[],
+                           updated_at = now()
+                     WHERE id = %s
+                """, (new_title, target, new_tags, r["id"]))
+
+    if not req.dry_run and fixed:
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("follow_ups_rescoped", "osint_agent", {
+                "checked": checked, "corrected": len(fixed),
+                "still_out_of_scope": still_oos,
+            })
+        except Exception:
+            pass
+    return {"ok": True, "dry_run": req.dry_run, "checked": checked,
+            "corrected": len(fixed), "still_out_of_scope": still_oos,
+            "items": fixed}
+
+
 @app.get("/follow-ups/stats", tags=["Follow-Ups"])
 def follow_up_stats(
     engagement_id: Optional[str] = Query(None),

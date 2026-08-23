@@ -372,7 +372,7 @@ function FindingsTab() {
   const [expandedDomains, setExpandedDomains] = useState<Set<string>>(new Set())
   const globalScope = useUIStore(s => s.selectedScopeName)
   const [scopeFilterVal, setScopeFilterVal] = useState(globalScope || '')
-  const { matchesScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilterVal)
+  const { matchesScope, matchesAnyScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilterVal)
 
   // Sync with global engagement scope
   useEffect(() => {
@@ -396,7 +396,8 @@ function FindingsTab() {
   const allFindings = data?.findings ?? []
   const findings = useMemo(() => {
     if (!isScopeFiltering) return allFindings
-    return allFindings.filter(f => matchesScope(f.target || f.hostname || ''))
+    // Every identity, not the first non-empty one — see matchesAnyScope.
+    return allFindings.filter(f => matchesAnyScope(f.target, f.hostname))
   }, [allFindings, isScopeFiltering, matchesScope])
   const total = isScopeFiltering ? findings.length : (data?.total ?? 0)
 

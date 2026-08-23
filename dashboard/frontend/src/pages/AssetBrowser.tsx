@@ -581,7 +581,7 @@ export default function AssetBrowser() {
   const globalScope = useUIStore(s => s.selectedScopeName)
   const selectedEngagementId = useUIStore(s => s.selectedEngagementId)
   const [scopeFilter, setScopeFilter] = useState(globalScope || '')
-  const { matchesScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilter)
+  const { matchesScope, matchesAnyScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilter)
   const [portsFilter, setPortsFilter] = useState<'all' | 'with-ports' | 'no-ports'>('all')
   // 'all' (default) | 'hosts-only' (hide cloud-import placeholders) | 'cloud-only'
   // Cloud-import assets use synthetic IPs (127.0.1.1, 127.0.0.1) or cloud import tags,
@@ -656,7 +656,8 @@ export default function AssetBrowser() {
           return false
         }
 
-        return matchesScope(a.hostname || a.ip || '')
+        // Both identities: the scope may name either the hostname or the IP.
+        return matchesAnyScope(a.hostname, a.ip)
       })
     }
 
