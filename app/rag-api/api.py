@@ -12976,6 +12976,92 @@ def list_wordlists(authorized: bool = Depends(auth)):
         r["created_at"] = r["created_at"].isoformat() if r.get("created_at") else None
     return {"ok": True, "wordlists": rows}
 
+@app.post("/wordlists/build-target", tags=["Wordlists"])
+def build_target_wordlists(target: str = Query(...),
+                           port: int = Query(None),
+                           service: str = Query(""),
+                           include_curated: bool = Query(True),
+                           write: bool = Query(True),
+                           _: bool = Depends(auth)):
+    """Build the candidate lists for one target/service, ordered by priority.
+
+    Composition, cheapest and most likely first:
+      1. usernames discovered ON THIS HOST — enum4linux-ng found 35
+      2. the documented default pair for the SERVICE
+      3. the username as its own password — how msfadmin:msfadmin works, and a
+         pair the generic 25-entry shortlist could never produce
+      4. the generic curated shortlist, as the tail
+
+    Order is priority because hydra reads the file top to bottom: a pair that is
+    going to be found is found in the first few hundred attempts rather than
+    after the generic tail. Every entry carries its provenance so a recovered
+    credential can be traced back to the evidence that suggested it.
+
+    Scope-gated: building a list for a host names that host, and an
+    out-of-scope target must not be prepared for attack any more than scanned.
+    """
+    import sys as _sys
+    if "/app" not in _sys.path:
+        _sys.path.insert(0, "/app")
+    from etl.scope_gate import check_dispatch, load_dispatch_scope
+    import target_wordlists as tw
+
+    with get_db() as conn, conn.cursor() as cur:
+        scope_rows, scope_source = load_dispatch_scope(cur, None)
+        if scope_source == "unavailable":
+            raise HTTPException(503, "scope could not be loaded — refusing")
+        refusal = check_dispatch(target, scope_rows)
+        if refusal:
+            raise HTTPException(403, f"Out of scope — {refusal}")
+        built = tw.build_lists(cur, target, port=port, service_hint=service,
+                               include_curated=include_curated)
+
+    paths = {}
+    if write:
+        try:
+            paths = tw.write_lists(built)
+        except OSError as e:
+            raise HTTPException(500, f"could not write lists: {e}")
+        # Register so the lists appear alongside every other selectable option.
+        with get_db() as conn, conn.cursor() as cur:
+            for kind in ("users", "passwords"):
+                path = paths.get(kind)
+                if not path:
+                    continue
+                cur.execute("""
+                    INSERT INTO wordlists (name, path, source, list_type,
+                                           line_count, size_bytes, description)
+                    VALUES (%s,%s,'generated',%s,%s,%s,%s)
+                    ON CONFLICT (path) DO UPDATE
+                       SET line_count = EXCLUDED.line_count,
+                           size_bytes = EXCLUDED.size_bytes,
+                           description = EXCLUDED.description
+                """, (os.path.basename(path), path,
+                      "usernames" if kind == "users" else "passwords",
+                      paths.get(f"{kind}_lines"),
+                      os.path.getsize(path) if os.path.exists(path) else None,
+                      f"generated for {target}"
+                      f"{'/' + (built.get('service') or '') if built.get('service') else ''}"
+                      f" — {built['counts']['discovered_usernames']} discovered usernames"))
+            conn.commit()
+
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("target_wordlists_built", "wordlists", {
+            "target": target, "service": built.get("service"), "port": port,
+            **built["counts"], "paths": paths})
+    except Exception:
+        pass
+
+    # The candidate count is reported so the operator sees what the listener's
+    # guard will judge BEFORE dispatching, rather than after a refusal.
+    return {"ok": True, **{k: v for k, v in built.items()
+                           if k not in ("user_provenance", "password_provenance")},
+            "provenance": {"users": built["user_provenance"],
+                           "passwords": built["password_provenance"]},
+            "paths": paths}
+
+
 @app.post("/wordlists/discover", tags=["Wordlists"])
 def discover_image_wordlists(curated_only: bool = Query(False),
                              min_lines: int = Query(2, ge=1),
