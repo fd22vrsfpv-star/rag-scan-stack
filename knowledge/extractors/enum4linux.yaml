@@ -1,0 +1,132 @@
+# enum4linux (the original Perl script, NOT enum4linux-ng).
+#
+# 47 stored runs on this engagement, every one `captured_uninterpreted`. Its
+# output format is completely different from enum4linux-ng's YAML-ish blocks, so
+# the -ng spec does not read it — which is why 47 of the 95 uninterpreted
+# executions were this tool.
+#
+# Every pattern below is taken from real captured output against 192.168.1.150.
+tool: enum4linux
+description: SMB/RPC enumeration (classic Perl) — users with RIDs, shares, null session.
+enabled: true
+max_chars: 40000
+
+deterministic:
+  workgroup:
+    pattern: '^\[\+\] Got domain/workgroup name:\s*(\S+)'
+  domain_name:
+    pattern: '^Domain Name:\s*(\S+)'
+  domain_sid:
+    pattern: '^Domain Sid:\s*(.+)$'
+  os_version:
+    pattern: 'os version\s*:\s*(\S+)'
+  server_type:
+    pattern: 'server type\s*:\s*(\S+)'
+  # `allows sessions using username '', password ''` — an accepted null session.
+  # No capture group on purpose: presence IS the value.
+  null_session:
+    pattern: "allows sessions using username '', password ''"
+    type: boolean
+  # `user:[games] rid:[0x3f2]` — the classic format, one per line.
+  users:
+    pattern: '^user:\[([^\]]+)\]'
+    capture: all
+    type: list
+  groups:
+    pattern: '^group:\[([^\]]+)\]'
+    capture: all
+    type: list
+  # The share table is `Sharename  Type  Comment`, tab-indented. Only Disk rows
+  # are real shares; IPC rows are service endpoints.
+  shares:
+    pattern: '^\s+(\S+)\s+Disk\s'
+    capture: all
+    type: list
+
+schema:
+  users:
+    type: list
+    description: usernames from the `user:[name] rid:[0x..]` lines
+  groups:
+    type: list
+    description: group names from `group:[name]` lines
+  shares:
+    type: list
+    description: Disk share names only, not IPC endpoints
+  writable_shares:
+    type: list
+    description: shares where the Writing column is OK rather than N/A
+  workgroup:
+    type: string
+  domain_name:
+    type: string
+  domain_sid:
+    type: string
+    description: "(NULL SID) means a workgroup, not a domain"
+  os_version:
+    type: string
+  server_type:
+    type: string
+  null_session:
+    type: boolean
+    description: true when an empty username and password were accepted
+
+prompt: |
+  Extract structured facts from enum4linux (classic Perl) output.
+
+  Read the whole output. Formats to expect:
+    - `user:[name] rid:[0x3f2]`   one per line, collect every name
+    - `group:[name] rid:[..]`
+    - a `Sharename  Type  Comment` table; only rows whose Type is `Disk` are
+      real shares. `IPC$` and `ADMIN$` are IPC service endpoints.
+    - `//host/share  Mapping: OK Listing: OK Writing: N/A` — a share is writable
+      only when Writing says OK.
+
+  Do not treat a section banner, a column header, or a row of dashes as data.
+  `N/A` and `(NULL SID)` are absences, not values.
+
+examples:
+  - output: |
+      [+] Got domain/workgroup name: WORKGROUP
+      [+] Server 192.168.1.150 allows sessions using username '', password ''
+      Domain Name: WORKGROUP
+      Domain Sid: (NULL SID)
+      	os version      :	4.9
+      	Sharename       Type      Comment
+      	print$          Disk      Printer Drivers
+      	tmp             Disk      oh noes!
+      	IPC$            IPC       IPC Service
+      user:[root] rid:[0x3e8]
+      user:[daemon] rid:[0x3ea]
+    extract: |
+      {"workgroup": "WORKGROUP", "null_session": true,
+       "domain_name": "WORKGROUP", "domain_sid": "(NULL SID)",
+       "os_version": "4.9", "shares": ["print$", "tmp"],
+       "users": ["root", "daemon"]}
+
+notable:
+  # Ids are CANONICAL and shared with the other SMB extractors, so
+  # three tools finding the same null session produce one
+  # finding_type from three sources — one problem with three
+  # confirmations, not three problems.
+  - id: smb_null_session
+    when: null_session == true
+    severity: high
+    title: SMB null session accepted (unauthenticated enumeration)
+    detail: >
+      The server accepted an empty username and password, so users, groups and
+      shares can be enumerated with no credentials at all.
+  - id: smb_users_enumerated
+    when: len(users) > 0
+    severity: medium
+    title: "{users} usernames enumerated over SMB"
+    detail: >
+      A confirmed username list removes the guessing half of a credential
+      attack. These belong in the vault as spray candidates.
+  - id: smb_shares_enumerated
+    when: len(shares) > 0
+    severity: medium
+    title: "{shares} SMB disk share(s) enumerated"
+    detail: >
+      Share names and comments disclose host layout and software versions.
+      Each one is a candidate for anonymous read and write testing.

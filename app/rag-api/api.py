@@ -18602,6 +18602,43 @@ def run_post_review_endpoint(
     return {"ok": True, **report}
 
 
+@app.post("/agent/post-review/ingest-facts", tags=["Post Review"])
+def ingest_extracted_facts_endpoint(
+    dry_run: bool = Query(True, description="Report what would be stored, store nothing"),
+    limit: int = Query(4000, ge=1, le=20000),
+    target: str = Query(None),
+    _: bool = Depends(auth),
+):
+    """Store extracted facts as findings with a real type and severity.
+
+    The `ingest` remedy the review has been reporting. 100 executions were
+    `captured_uninterpreted`: their text was in the database, but only inside
+    generic `tool_output` / `tool_table_row` rows with `key_values` empty — 94.2%
+    of `recon_findings`. Nothing said "SMBv1 is enabled", so nothing could filter
+    or triage it.
+
+    Defaults to a dry run, because this writes findings that will appear in
+    reports and exports.
+    """
+    from post_review_agent import ingest_extracted_facts
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            result = ingest_extracted_facts(cur, dry_run=dry_run, limit=limit,
+                                            target=target)
+        except Exception as e:
+            raise HTTPException(500, f"fact ingestion failed: {e}")
+    if not dry_run and result.get("inserted"):
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("extracted_facts_ingested", "post_review_agent", {
+                "inserted": result["inserted"], "facts_found": result["facts_found"],
+                "by_severity": result["by_severity"], "target": target,
+            })
+        except Exception:
+            pass
+    return {"ok": True, **result}
+
+
 @app.get("/agent/post-review/executions/{execution_id}", tags=["Post Review"])
 def get_reviewed_execution(execution_id: str, _: bool = Depends(auth)):
     """One execution in FULL, for display: output, return code, options, analysis.
