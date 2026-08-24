@@ -4531,6 +4531,84 @@ def list_identities(
             "results": [_serialize(r) for r in rows]}
 
 
+@app.post("/identities/import-enumerated", tags=["Identities"])
+def import_enumerated_identities_endpoint(
+    dry_run: bool = Query(True), target: str = Query(None),
+    limit: int = Query(2000, ge=1, le=20000), _: bool = Depends(auth)):
+    """Record enumerated usernames as identities with no credential yet.
+
+    35 accounts were enumerated on 192.168.1.150 through an SMB null session and
+    the only durable record was raw tool text — the vault held four names, all of
+    them ones a password had already been found for.
+
+    Stored with `status='unknown'`: enumeration proves the account EXISTS, not
+    that it can be used. A working login is what proves 'active', and a re-import
+    never downgrades one that has been proven.
+    """
+    import sys as _sys
+    if "/app" not in _sys.path:
+        _sys.path.insert(0, "/app")
+    import target_wordlists as tw
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            result = tw.import_enumerated_identities(
+                cur, dry_run=dry_run, target=target, limit=limit)
+        except Exception as e:
+            raise HTTPException(500, f"identity import failed: {e}")
+    if not dry_run and result.get("inserted"):
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("enumerated_identities_imported", "identities", {
+                "inserted": result["inserted"], "updated": result["updated"],
+                "found": result["found"], "hosts": result["hosts"]})
+        except Exception:
+            pass
+    return {"ok": True, **result}
+
+
+@app.get("/identities/credential-state", tags=["Identities"])
+def identities_credential_state(
+    state: str = Query(None, description="username_only | password_stored | password_verified"),
+    host: str = Query(None), limit: int = Query(500, ge=1, le=5000),
+    _: bool = Depends(auth)):
+    """Discovered accounts and whether a password is known for each.
+
+    Reads `v_identity_credential_state`, which DERIVES the answer by joining the
+    vault and the verified findings. Deliberately not a stored flag: that goes
+    stale the moment a password is cracked, and a stale flag would send the
+    operator to re-attack an account already owned — or skip one still open.
+
+    `state=username_only` is the spray list: enumerated, no password yet.
+    """
+    where, params = ["1=1"], []
+    if state:
+        where.append("credential_state = %s")
+        params.append(state)
+    if host:
+        where.append("host = %s")
+        params.append(host)
+    params.append(limit)
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT identity_id::text, provider, identifier, username, host,
+                   principal_type, status, sources, tags, credential_state,
+                   has_credential, vault_entries, verified_findings,
+                   first_seen, last_seen
+              FROM v_identity_credential_state
+             WHERE {' AND '.join(where)}
+             ORDER BY has_credential, username
+             LIMIT %s
+        """, params)
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.execute("""
+            SELECT credential_state, count(*) AS n
+              FROM v_identity_credential_state GROUP BY 1
+        """)
+        counts = {r["credential_state"]: r["n"] for r in cur.fetchall()}
+    return {"ok": True, "identities": rows, "returned": len(rows),
+            "counts_by_state": counts}
+
+
 @app.get("/identities/groups", tags=["Identities"])
 def identities_groups(
     search: Optional[str] = Query(None, description="Substring filter on group name (case-insensitive)"),

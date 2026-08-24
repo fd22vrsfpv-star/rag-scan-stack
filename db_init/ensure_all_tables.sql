@@ -3499,6 +3499,60 @@ CREATE INDEX IF NOT EXISTS idx_post_review_created ON post_review_reports(create
 -- Without this index, POST /wordlists/discover's ON CONFLICT (path) raises
 -- "no unique or exclusion constraint matching the ON CONFLICT specification".
 CREATE UNIQUE INDEX IF NOT EXISTS ux_wordlists_path ON public.wordlists(path);
+
+-- v_identity_credential_state — "which discovered accounts have no password yet"
+--
+-- DERIVED, never stored. A stored `has_credential` flag goes stale the moment a
+-- password is cracked or a spray succeeds, and a stale flag here would send the
+-- operator to re-attack an account already owned — or skip one still open.
+--
+-- `identities.status` is an ACCOUNT-state field (active/disabled/unknown/deleted)
+-- and cannot express credential knowledge, which is why this is a separate axis:
+--   status='unknown' + no credential  -> enumerated only, never authenticated
+--   status='active'  + credential     -> a login that worked
+--
+-- Matching is on username AND host, because a username is only meaningful with
+-- the host it was enumerated on. `identities.domain` holds that host for locally
+-- discovered principals (the bridge writes `user@host` into identifier and the
+-- host into domain).
+CREATE OR REPLACE VIEW public.v_identity_credential_state AS
+SELECT i.id                AS identity_id,
+       i.provider,
+       i.identifier,
+       i.display_name      AS username,
+       i.domain            AS host,
+       i.principal_type,
+       i.status,
+       i.sources,
+       i.tags,
+       i.first_seen,
+       i.last_seen,
+       COALESCE(cv.n, 0)   AS vault_entries,
+       COALESCE(cf.n, 0)   AS verified_findings,
+       (COALESCE(cv.n, 0) + COALESCE(cf.n, 0)) > 0 AS has_credential,
+       CASE
+         WHEN COALESCE(cf.n, 0) > 0 THEN 'password_verified'
+         WHEN COALESCE(cv.n, 0) > 0 THEN 'password_stored'
+         ELSE 'username_only'
+       END                 AS credential_state
+  FROM public.identities i
+  LEFT JOIN (
+        SELECT lower(btrim(username)) AS u, count(*) AS n
+          FROM public.credential_vault
+         WHERE COALESCE(username, '') <> ''
+           AND COALESCE(credential_value, cracked_value, '') <> ''
+         GROUP BY 1
+  ) cv ON cv.u = lower(btrim(i.display_name))
+  LEFT JOIN (
+        SELECT lower(btrim(username)) AS u, host(ip) AS h, count(*) AS n
+          FROM public.credential_findings
+         WHERE COALESCE(username, '') <> ''
+         GROUP BY 1, 2
+  ) cf ON cf.u = lower(btrim(i.display_name))
+      AND cf.h = i.domain;
+
+CREATE INDEX IF NOT EXISTS idx_identities_domain ON public.identities(domain)
+    WHERE domain IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_post_review_engagement ON post_review_reports(engagement_id)
     WHERE engagement_id IS NOT NULL;
 
