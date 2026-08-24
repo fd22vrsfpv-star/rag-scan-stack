@@ -328,6 +328,53 @@ def _fill_command(template, row):
     return _PLACEHOLDER_TOKEN.sub(sub, template or ""), sorted(set(missing))
 
 
+def _pick_catalogue_command(candidates, row):
+    """The catalogue command for the ROW's service, not merely its tool.
+
+    `candidates[0]` was used here, and the catalogue lists hydra once per
+    service. So a VNC hydra timeout was re-proposed with the SSH template —
+    `ssh://192.168.1.150:5900` — pointing an SSH attack at the VNC port. It
+    looked right because the tool name matched.
+
+    Matching is on evidence in the row: the protocol the original command used,
+    then the row's `service`. If nothing matches, return None and keep the
+    historical command rather than guessing which service was meant.
+    """
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    old_cmd = (row.get("command") or "").lower()
+    service = (row.get("service") or "").strip().lower()
+    port = row.get("port")
+
+    # The scheme the failing command itself used is the strongest signal, then
+    # medusa/ncrack's `-M <module>` form, which carries the same information
+    # without a URL — missing it left the medusa proposal falling back to its
+    # historical command, which still named rockyou.
+    scheme = re.search(r"\b([a-z0-9-]+)://", old_cmd)
+    # old_cmd is already lowercased, so the flag must be matched lowercase too:
+    # searching for "-M" in a lowercased string never matches, which is why the
+    # medusa proposal fell through to the verbatim-command net.
+    module = re.search(r"-m\s+([a-z0-9-]+)", old_cmd)
+    tokens = [t for t in (scheme.group(1) if scheme else None,
+                          module.group(1) if module else None,
+                          service) if t]
+
+    for token in tokens:
+        for cand in candidates:
+            low = cand.lower()
+            if f"{token}://" in low or f"-m {token}" in low or f" {token} " in low:
+                return cand
+    # A port in the candidate is weaker but still evidence, not a guess.
+    if port:
+        for cand in candidates:
+            if f":{port}" in cand:
+                return cand
+    return None
+
+
 def _cause_is_fixed(tool, command, catalogue):
     """True when the catalogue no longer emits the command that failed.
 
@@ -416,9 +463,18 @@ def classify_execution(row, catalogue=None):
                     else f"{len(output)} bytes")
 
     meta = CATEGORIES[category]
-    fixed = bool(catalogue) \
-        and category in ("broken_invocation", "silent_no_op", "placeholder_target") \
-        and _cause_is_fixed(tool, command, catalogue)
+    # Two different questions, previously conflated:
+    #
+    #  superseded — the catalogue no longer emits the command that ran. True for
+    #    ANY category, and it decides which command a re-run should use. A hydra
+    #    timeout whose recorded command still names rockyou must not be
+    #    re-proposed verbatim: that reruns the 243,854,783-candidate invocation
+    #    the catalogue has already replaced.
+    #  cause_fixed — superseded AND the failure was an invocation defect, so the
+    #    remedy changes from "fix the command" to "run it again".
+    superseded = bool(catalogue) and _cause_is_fixed(tool, command, catalogue)
+    fixed = superseded and category in ("broken_invocation", "silent_no_op",
+                                        "placeholder_target")
     return {
         "category": category,
         # A repaired catalogue turns "fix the command" into "run it again".
@@ -427,6 +483,7 @@ def classify_execution(row, catalogue=None):
         "why": meta["why"],
         "evidence": evidence,
         "cause_fixed": fixed,
+        "command_superseded": superseded,
     }
 
 
@@ -711,6 +768,10 @@ def find_stuck_recommendations(cur, stale_hours=6):
 # reproduces the failure.
 _RERUN_REMEDIES = ("rerun", "rerun_scoped")
 
+# Tools whose re-run must never reuse the historical command.
+_BRUTE_TOOLS = {"hydra", "medusa", "ncrack", "crowbar",
+                "patator", "brutus"}
+
 
 def propose_reruns(cur, catalogue=None, limit=100, dry_run=True,
                    engagement_id=None):
@@ -781,10 +842,43 @@ def propose_reruns(cur, catalogue=None, limit=100, dry_run=True,
         # exists — re-proposing the historical command would re-run the bug.
         current = catalogue.get(row["tool"]) or []
         missing = []
-        if verdict["cause_fixed"] and current:
-            script, missing = _fill_command(current[0], row)
+        chosen = _pick_catalogue_command(current, row) \
+            if verdict.get("command_superseded") else None
+        if chosen:
+            # Whatever went wrong, run what we would run TODAY — for THIS service.
+            script, missing = _fill_command(chosen, row)
+        elif row["tool"] in _BRUTE_TOOLS and verdict.get("command_superseded"):
+            # Never re-propose a credential attack verbatim. The historical
+            # command is the one that ran rockyou for 15,875 hours; if no current
+            # template can be matched to this service, that is a catalogue gap to
+            # report, not a command to run again.
+            needs_input.append({
+                "tool": row["tool"], "target": target,
+                "template": row["command"],
+                "missing": ["catalogue_template_for_service"],
+                "category": verdict["category"],
+                "reason": ("the recorded command is superseded but no current "
+                           "template matches this service — re-running it "
+                           "verbatim would repeat the oversized attack")})
+            continue
         else:
             script = row["command"]
+        # {user_list}/{password_list} are filled from the database, not from the
+        # execution row, so _fill_command cannot resolve them and would withhold
+        # every brute-force proposal as "needs_input". Resolved here instead, and
+        # the result carries the per-target lists: 35 discovered usernames plus
+        # the service defaults, rather than the generic shortlist.
+        try:
+            import target_wordlists as _tw
+            if _tw.needs_lists(script):
+                resolved = _tw.resolve_command(
+                    cur, script, target, port=row.get("port"),
+                    service_hint=row.get("service") or "")
+                script = resolved["command"]
+                missing = [m for m in missing
+                           if m not in ("user_list", "password_list")]
+        except Exception:
+            pass    # leave the placeholder; it is then withheld, never dispatched
         if missing:
             # Withheld, not dropped: an unfillable placeholder is reported so
             # "why was this never re-run" has an answer.

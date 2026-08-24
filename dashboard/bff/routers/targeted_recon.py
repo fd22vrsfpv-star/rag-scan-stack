@@ -52,7 +52,11 @@ SAFE_TOOLS = {
 # Default wordlist paths (must match service_tools.yaml defaults)
 _WORDLIST_DEFAULTS = {
     "wordlist_usernames": "/usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt",
-    "wordlist_passwords": "/usr/share/wordlists/rockyou.txt",
+    # Was rockyou.txt (14,344,399 lines). Paired with the 17-name userlist that
+    # is 243,854,783 candidates — 15,875 hours at the observed rate — which the
+    # listener's candidate-space guard now refuses outright.
+    "wordlist_passwords": ("/usr/share/wordlists/seclists/Passwords/"
+                           "Common-Credentials/top-passwords-shortlist.txt"),
     "wordlist_dirs": "/usr/share/wordlists/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt",
     "wordlist_subdomains": "/usr/share/wordlists/seclists/Discovery/DNS/subdomains-top1million-5000.txt",
 }

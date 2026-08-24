@@ -58,16 +58,50 @@ def test_hydra_commands_ignore_a_stale_restore_file():
 
 
 @pytest.mark.unit
-def test_the_short_password_list_is_the_one_that_exists():
+def test_no_default_names_a_wordlist_absent_from_the_image():
     """A default naming an absent file is the gobuster wordlist bug again.
 
-    The 10-million-password lists are NOT in the image; only the shortlist and
-    default-passwords are. Verified against the running container below.
+    The 10-million-password lists are NOT in this image; only the shortlist and
+    default-passwords are.
+
+    The catalogue itself no longer names any password list: brute-force commands
+    carry `{password_list}`, resolved per target from discovered usernames plus
+    service defaults. So the static filename now lives in the FALLBACK constants,
+    and that is where it has to be checked — asserting on the catalogue would
+    pass forever on a file nobody reads.
     """
     src = open(CATALOGUE, encoding="utf-8").read()
-    assert "top-passwords-shortlist.txt" in src
     assert "10-million-password-list" not in src, \
-        "names a seclists file that is not installed in this image"
+        "the catalogue names a seclists file that is not installed in this image"
+
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(REPO, "app", "rag-api"))
+    tw = pytest.importorskip("target_wordlists")
+    assert "top-passwords-shortlist.txt" in tw.STATIC_PASSWORD_LIST
+    assert "top-usernames-shortlist.txt" in tw.STATIC_USER_LIST
+    assert "10-million-password-list" not in tw.STATIC_PASSWORD_LIST
+
+    # The BFF keeps its own copy, because it has neither the etl mount nor a
+    # database. Two copies of a path need pinning or they drift.
+    bff = open(os.path.join(REPO, "dashboard", "bff", "routers", "assets.py"),
+               encoding="utf-8").read()
+    assert "top-passwords-shortlist.txt" in bff, \
+        "the BFF's local fallback no longer names the short list"
+
+
+@pytest.mark.unit
+def test_brute_force_commands_carry_the_list_placeholders():
+    """The substitution: a static path here means the discovered usernames — 35
+    of them on this host — are never used."""
+    import re as _re
+    src = open(CATALOGUE, encoding="utf-8").read()
+    brute = [m.group(1) for m in _re.finditer(r'command:\s*"([^"]+)"', src)
+             if m.group(1).split() and m.group(1).split()[0]
+             in ("hydra", "medusa", "ncrack", "crowbar", "patator")]
+    assert brute, "no brute-force commands found at all"
+    assert all("{password_list}" in c or "{user_list}" in c for c in brute), \
+        f"a brute-force command names a static list: " \
+        f"{[c[:70] for c in brute if '{password_list}' not in c and '{user_list}' not in c]}"
 
 
 # ── the guard, executed ─────────────────────────────────────────────────────
