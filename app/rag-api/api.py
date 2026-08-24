@@ -18321,6 +18321,73 @@ def get_gap_schedule(engagement_id: str, _: bool = Depends(auth)):
         return {"schedule": {"enabled": False, "interval_minutes": 30, "auto_fill": True}}
 
 
+@app.post("/agent/post-review", tags=["Post Review"])
+def run_post_review_endpoint(
+    queue_reruns: bool = Query(False, description="Insert the proposed re-runs "
+                               "as pending recommendations (never dispatches)"),
+    since_days: int = Query(None, ge=1, le=365),
+    target: str = Query(None),
+    engagement_id: str = Query(None),
+    _: bool = Depends(auth),
+):
+    """Review executed work: classify every execution and find what was missed.
+
+    Synchronous on purpose — the report IS the answer, and a background task
+    that returns `{"queued": true}` would make the operator poll for the thing
+    they just asked for. 1348 executions classify in about two seconds.
+
+    `queue_reruns=true` writes PENDING recommendations. It never dispatches;
+    a human still presses Run, and every proposed target passes the scope gate
+    first, with refusals reported rather than dropped.
+    """
+    from post_review_agent import run_post_review
+    try:
+        report = run_post_review(
+            triggered_by="api", since_days=since_days, target=target,
+            queue_reruns=queue_reruns, engagement_id=engagement_id)
+    except Exception as e:
+        raise HTTPException(500, f"post review failed: {e}")
+    return {"ok": True, **report}
+
+
+@app.get("/agent/post-review/reports", tags=["Post Review"])
+def list_post_review_reports(limit: int = Query(20, ge=1, le=200),
+                             engagement_id: str = Query(None),
+                             _: bool = Depends(auth)):
+    """Recent post-review reports, newest first (summary only, not the body)."""
+    where, params = ["1=1"], []
+    if engagement_id:
+        where.append("engagement_id = %s")
+        params.append(engagement_id)
+    params.append(limit)
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT id::text, engagement_id::text, status, executions_reviewed,
+                   issues_found, reruns_queued, created_at, completed_at,
+                   triggered_by, report -> 'summary' AS summary
+            FROM post_review_reports
+            WHERE {' AND '.join(where)}
+            ORDER BY created_at DESC LIMIT %s
+        """, params)
+        return {"reports": [dict(r) for r in cur.fetchall()]}
+
+
+@app.get("/agent/post-review/reports/{report_id}", tags=["Post Review"])
+def get_post_review_report(report_id: str, _: bool = Depends(auth)):
+    """One post-review report, in full."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT id::text, engagement_id::text, status, report,
+                   executions_reviewed, issues_found, reruns_queued,
+                   created_at, completed_at, triggered_by
+            FROM post_review_reports WHERE id = %s
+        """, (report_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "report not found")
+    return {"report": dict(row)}
+
+
 @app.get("/nodes", tags=["Nodes"])
 def list_nodes(_: bool = Depends(auth)):
     """List remote nodes (for Burp extension and external integrations)."""

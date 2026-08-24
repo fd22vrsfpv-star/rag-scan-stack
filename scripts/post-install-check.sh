@@ -77,6 +77,8 @@ EXPECTED_TABLES=(
   service_prompts
   # TIER 25: Virtual-host finding groups (one problem, N affected vhosts)
   finding_group_state
+  # TIER 26: Post-execution review (app/rag-api/post_review_agent.py)
+  post_review_reports
 )
 
 for table in "${EXPECTED_TABLES[@]}"; do
