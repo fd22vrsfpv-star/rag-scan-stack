@@ -92,6 +92,33 @@ def test_every_notable_predicate_references_a_schema_field():
                 f"which is not in its schema")
 
 
+@pytest.mark.unit
+def test_the_same_condition_uses_one_canonical_finding_type():
+    """Three tools finding the same null session must be ONE finding_type.
+
+    They were `smb_null_session`, `e4l_null_session` and
+    `e4l_classic_null_session` — so `recon_findings` would have shown one
+    problem as three, and a severity filter would have counted it three times.
+    `source` already records which tool confirmed it.
+    """
+    specs, _ = es.load_specs(SPEC_DIR, force=True)
+    ids = set()
+    for spec in specs.values():
+        ids |= {r["id"] for r in spec.get("notable") or []}
+    banned = [i for i in ids if i.startswith("e4l_")]
+    assert not banned, (
+        f"tool-specific ids for shared SMB conditions: {banned} — use the "
+        "canonical smb_* name so three confirmations read as one problem")
+    # And the canonical names must match the Python extractor's, which is the
+    # other half of the same vocabulary.
+    import output_analysis as oa
+    py_ids = {n["id"] for n in oa.extract_smb(
+        "SMB h 445 X [*] Unix (name:A) (domain:B) (signing:False) (SMBv1:True)\n"
+        "SMB h 445 X [+] B\\: \n")["notable"]}
+    assert "smb_null_session" in py_ids
+    assert "smb_v1_enabled" in py_ids and "smb_signing_disabled" in py_ids
+
+
 # ── the predicate grammar ───────────────────────────────────────────────────
 
 @pytest.mark.unit
@@ -202,8 +229,8 @@ def test_the_null_session_finding_fires_on_real_output():
     spec = es.spec_for("enum4linux-ng", SPEC_DIR)
     notable = es.notable_from(spec, es.run_deterministic(spec, E4L))
     ids = {n["id"] for n in notable}
-    assert "e4l_null_session" in ids, ids
-    assert "e4l_users_enumerated" in ids
+    assert "smb_null_session" in ids, ids
+    assert "smb_users_enumerated" in ids
     high = [n for n in notable if n["severity"] == "high"]
     assert high, "the null session must be high severity"
 
@@ -212,7 +239,7 @@ def test_the_null_session_finding_fires_on_real_output():
 def test_title_interpolation_uses_the_count_not_the_list():
     spec = es.spec_for("enum4linux-ng", SPEC_DIR)
     notable = es.notable_from(spec, es.run_deterministic(spec, E4L))
-    users = [n for n in notable if n["id"] == "e4l_users_enumerated"][0]
+    users = [n for n in notable if n["id"] == "smb_users_enumerated"][0]
     assert users["title"].startswith("3 usernames"), users["title"]
 
 

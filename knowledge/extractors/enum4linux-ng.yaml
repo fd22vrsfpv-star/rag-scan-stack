@@ -121,28 +121,32 @@ examples:
        "users": ["root", "daemon"]}
 
 notable:
-  - id: e4l_null_session
+  # Ids are CANONICAL and shared with the other SMB extractors, so
+  # three tools finding the same null session produce one
+  # finding_type from three sources — one problem with three
+  # confirmations, not three problems.
+  - id: smb_null_session
     when: null_session == true
     severity: high
     title: SMB null session accepted (unauthenticated enumeration)
     detail: >
       An empty username and password authenticated, so users, groups and shares
       can be enumerated with no credentials at all.
-  - id: e4l_users_enumerated
+  - id: smb_users_enumerated
     when: len(users) > 0
     severity: medium
     title: "{users} usernames enumerated over SMB"
     detail: >
       A confirmed username list removes the guessing half of a credential
       attack. These belong in the vault as spray candidates.
-  - id: e4l_smb1_only
+  - id: smb_v1_enabled
     when: smb1_only == true
     severity: medium
     title: SMB 1.0 is the only supported dialect
     detail: >
       SMBv1 is deprecated and carries known remote-code-execution families.
       No modern dialect is offered, so this cannot be mitigated by negotiation.
-  - id: e4l_signing_not_required
+  - id: smb_signing_disabled
     when: signing_required == false
     severity: medium
     title: SMB signing is not required

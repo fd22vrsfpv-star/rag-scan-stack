@@ -450,3 +450,129 @@ def test_queued_proposals_carry_their_evidence(live):
         pytest.skip("rag-postgres not reachable")
     assert int(out.stdout.strip()) == 0, \
         "a queued proposal is missing its category, evidence or prior execution id"
+
+
+# ── the ingest remedy: extracted facts become real findings ─────────────────
+
+def _psql(sql):
+    try:
+        out = subprocess.run(
+            ["docker", "exec", "rag-postgres", "psql", "-U", "app", "-d", "scans",
+             "-tAc", sql], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def test_ingest_facts_endpoint_is_dry_by_default(live):
+    """It writes findings that appear in reports and exports, so the default
+    must not write."""
+    import json
+    body = _curl("POST", "/agent/post-review/ingest-facts")
+    assert body, "endpoint returned nothing"
+    d = json.loads(body)
+    assert d.get("ok") is True, d
+    assert d["dry_run"] is True
+    assert d["inserted"] == 0, "a dry run inserted rows"
+    assert d["facts_found"] > 0, "no facts extracted at all"
+
+
+def test_the_facts_reached_recon_findings_with_a_real_type(live):
+    """94.2% of recon_findings was `tool_output` / `tool_table_row` with
+    key_values EMPTY — text stored, meaning never recorded. Nothing said
+    "SMBv1 is enabled", so nothing could filter or sort it."""
+    got = _psql("SELECT count(*) FROM recon_findings WHERE finding_type "
+                "NOT IN ('tool_output','tool_table_row','tool_finding')")
+    if got is None:
+        pytest.skip("rag-postgres not reachable")
+    assert int(got) >= 12, (
+        f"only {got} interpreted findings — the ingest pass has not run, or "
+        "regressed back to generic dumps")
+
+
+def test_the_high_severity_smb_facts_are_stored(live):
+    """The motivating case: a null session and a world-writable share."""
+    for ftype in ("smb_null_session", "smb_writable_share"):
+        got = _psql("SELECT count(*) FROM recon_findings WHERE finding_type = "
+                    f"'{ftype}' AND severity = 'high'")
+        if got is None:
+            pytest.skip("rag-postgres not reachable")
+        assert int(got) > 0, f"{ftype} is not stored as a high-severity finding"
+
+
+def test_one_condition_is_one_finding_type_across_tools(live):
+    """crackmapexec, enum4linux and enum4linux-ng all find the same null
+    session. That must be ONE finding_type with three sources, or a severity
+    filter counts one problem three times."""
+    got = _psql("SELECT count(DISTINCT source) FROM recon_findings "
+                "WHERE finding_type = 'smb_null_session'")
+    if got is None:
+        pytest.skip("rag-postgres not reachable")
+    assert int(got) >= 2, (
+        "smb_null_session has one source; the per-tool ids have come back")
+
+
+def test_ingest_is_idempotent(live):
+    """`trg_recon_findings_dedup` is BEFORE INSERT and RETURNs NULL on a
+    duplicate, so an INSERT reports zero rows and ON CONFLICT is unreachable.
+    Novelty must therefore be checked BEFORE inserting."""
+    import json
+    before = _psql("SELECT count(*) FROM recon_findings")
+    if before is None:
+        pytest.skip("rag-postgres not reachable")
+    d = json.loads(_curl("POST", "/agent/post-review/ingest-facts?dry_run=false"))
+    after = _psql("SELECT count(*) FROM recon_findings")
+    assert d["inserted"] == 0, f"re-running inserted {d['inserted']} duplicate rows"
+    assert int(after) == int(before), \
+        f"recon_findings grew {before} -> {after} on a repeat run"
+    assert d["already_stored"] > 0, "nothing was recognised as already stored"
+
+
+def test_the_payload_carries_no_volatile_field(live):
+    """`data` is part of the dedup fingerprint
+    (md5('recon|'||source||'|'||finding_type||'|'||target||'|'||data::text)),
+    so an execution id or a per-run counter inside it forks the fingerprint on
+    every pass and the index stores both copies."""
+    got = _psql("SELECT count(*) FROM recon_findings "
+                "WHERE finding_type LIKE 'smb_%' AND ("
+                " data ? 'execution_id' OR data ? 'execution_ids' "
+                " OR data ? 'seen_in' OR data ? 'started_at')")
+    if got is None:
+        pytest.skip("rag-postgres not reachable")
+    assert int(got) == 0, \
+        "a volatile key is inside the fingerprinted payload"
+
+
+def test_no_bare_username_was_written_to_the_vault(live):
+    """A deliberate decision, not an omission.
+
+    credential_vault.credential_type has no username-only value and status no
+    "unverified", so 35 bare names would have to be stored as an `active`
+    credential of type `other` — which is not what they are. The names already
+    reach the generated wordlists via target_wordlists.harvest_usernames.
+    """
+    got = _psql("SELECT count(*) FROM credential_vault "
+                "WHERE credential_type = 'other' AND "
+                "(credential_value IS NULL OR credential_value = '')")
+    if got is None:
+        pytest.skip("rag-postgres not reachable")
+    assert int(got) == 0, (
+        f"{got} username-only rows in credential_vault — these are spray "
+        "candidates, not credentials")
+
+
+def test_the_summary_reports_storage_honestly(live):
+    """`high_or_worse_unstored` read 5 after all five had been ingested, because
+    it was derived from output alone and never asked the database. A metric
+    named "unstored" that cannot tell is worse than no metric."""
+    import json
+    d = json.loads(_curl("POST", "/agent/post-review"))
+    s = d["summary"]
+    assert s["notable_facts_stored"] + s["notable_facts_unstored"] \
+        == s["notable_facts_in_output"], "the storage split does not add up"
+    for n in d["notable_in_output"]:
+        assert "stored" in n, "a fact carries no storage state"
+    unstored_high = [n for n in d["notable_in_output"]
+                     if not n["stored"] and n["severity"] in ("critical", "high")]
+    assert len(unstored_high) == s["high_or_worse_unstored"], \
+        "the headline count disagrees with the list it summarises"

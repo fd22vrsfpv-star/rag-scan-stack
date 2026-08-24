@@ -239,17 +239,44 @@ def analyse_output(tool, output, exit_code=None):
         if n:
             indicators[name] = n
 
-    extracted, notable = {}, []
+    extracted, notable, spec_used = {}, [], None
     fn = EXTRACTORS.get((tool or "").strip().lower())
     if fn and text.strip():
         try:
             extracted = fn(text)
-            notable = extracted.get("notable", [])
+            notable = list(extracted.get("notable", []))
         except Exception as exc:            # noqa: BLE001
             extracted = {"error": f"{type(exc).__name__}: {exc}"}
 
+    # YAML extraction specs, for the tools no Python extractor covers.
+    #
+    # These two mechanisms were built separately and never joined, which is why
+    # enum4linux-ng's 48 stored runs reported ZERO facts while a spec with four
+    # notable rules sat in knowledge/extractors/ being read by nothing but the
+    # username harvester. 95 of the 100 uninterpreted executions were
+    # enum4linux/enum4linux-ng for exactly this reason.
+    #
+    # Deterministic regexes only here: an LLM pass belongs in the artifact queue,
+    # not inside a function called once per execution in a review loop.
+    if text.strip():
+        try:
+            import extractor_specs as _es
+            spec = _es.spec_for(tool)
+            if spec:
+                spec_used = spec.get("_source_file")
+                fields = _es.run_deterministic(spec, text)
+                if fields:
+                    extracted.setdefault("fields", {}).update(fields)
+                    seen = {n.get("id") for n in notable}
+                    for n in _es.notable_from(spec, fields):
+                        if n["id"] not in seen:
+                            seen.add(n["id"])
+                            notable.append(n)
+        except Exception as exc:            # noqa: BLE001
+            extracted.setdefault("spec_error", f"{type(exc).__name__}: {exc}")
+
     has_facts = bool(notable) or bool(extracted.get("shares")) \
-        or bool(extracted.get("facts"))
+        or bool(extracted.get("facts")) or bool(extracted.get("fields"))
     if has_facts or indicators:
         verdict = "results_found"
     elif EMPTY_MARKERS.search(text):
@@ -266,6 +293,7 @@ def analyse_output(tool, output, exit_code=None):
         "extracted": extracted,
         "notable": notable,
         "notable_count": len(notable),
+        "spec": spec_used,
         "output_bytes": len(text),
         # An LLM pass is worth spending only where rules found nothing but
         # there is clearly something to read.

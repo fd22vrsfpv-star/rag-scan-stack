@@ -605,8 +605,22 @@ def review_executions(cur, since_days=None, target=None, catalogue=None):
     # twelfth copy, and tests/test_severity_scale.py exists because the last
     # eleven disagreed with each other.
     from etl.severity import severity_rank
+
+    # Whether each fact has actually LANDED. Without this the summary reported
+    # "5 high or worse unstored" after they had all been ingested, because the
+    # count was derived from output alone and never asked the database. A metric
+    # named "unstored" that cannot tell is worse than no metric.
+    for n in notable_index.values():
+        cur.execute("""
+            SELECT 1 FROM recon_findings
+             WHERE lower(source) = lower(%s) AND finding_type = %s
+               AND target = %s LIMIT 1
+        """, (n["tool"], n["id"], n.get("target") or ""))
+        n["stored"] = cur.fetchone() is not None
+
     notable = sorted(notable_index.values(),
-                     key=lambda n: (-severity_rank(n["severity"]), -n["seen_in"]))
+                     key=lambda n: (n["stored"], -severity_rank(n["severity"]),
+                                    -n["seen_in"]))
     return {"executions_reviewed": reviewed, "groups": ordered,
             "notable_in_output": notable}
 
@@ -999,9 +1013,16 @@ def run_post_review(triggered_by="manual", since_days=None, target=None,
                     "results_not_ingested": len(not_ingested),
                     "notable_facts_in_output": len(
                         executions.get("notable_in_output", [])),
+                    "notable_facts_stored": sum(
+                        1 for n in executions.get("notable_in_output", [])
+                        if n.get("stored")),
+                    "notable_facts_unstored": sum(
+                        1 for n in executions.get("notable_in_output", [])
+                        if not n.get("stored")),
                     "high_or_worse_unstored": sum(
                         1 for n in executions.get("notable_in_output", [])
-                        if n["severity"] in ("critical", "high")),
+                        if n["severity"] in ("critical", "high")
+                        and not n.get("stored")),
                     "stuck_recommendations": len(stuck),
                     "reruns_proposed": reruns.get("proposed", 0),
                     "reruns_queued": reruns.get("inserted", 0),
@@ -1047,3 +1068,118 @@ def run_post_review(triggered_by="manual", since_days=None, target=None,
                 conn.close()
             except Exception:
                 pass
+
+
+# ── ingest: turn extracted facts into findings anybody can query ────────────
+
+def ingest_extracted_facts(cur, dry_run=True, limit=4000, target=None):
+    """Write extracted facts to `recon_findings` with a REAL finding_type.
+
+    This is the `ingest` remedy. Until now extraction and storage were never
+    joined: 100 executions were `captured_uninterpreted` — the text was in the
+    database, but only inside generic `tool_output` / `tool_table_row` rows with
+    `key_values` EMPTY, which is 94.2% of that table. Nothing said "SMBv1 is
+    enabled", so nothing could filter, sort or triage it.
+
+    Each fact becomes one row whose `finding_type` IS the fact id
+    (`smb_null_session`, `e4l_users_enumerated`, ...) and whose severity is the
+    one the extractor assigned.
+
+    THE PAYLOAD MUST BE STABLE. `trg_recon_findings_dedup` fingerprints
+    md5('recon|'||source||'|'||finding_type||'|'||target||'|'||data::text), so
+    anything volatile in `data` forks the fingerprint on every run and the unique
+    index stores both copies. That is why execution ids and per-run counts are
+    NOT in the payload, and why it is serialised with sort_keys.
+
+    The trigger is BEFORE INSERT and RETURNs NULL on a duplicate, so an INSERT
+    reports zero rows and `ON CONFLICT` would be unreachable. Novelty is
+    therefore checked BEFORE inserting, on the natural key.
+
+    Usernames are deliberately NOT written to `credential_vault`. Its
+    `credential_type` has no username-only value and `status` no "unverified",
+    so 35 bare names would have to be stored as an `active` credential of type
+    `other` — which is not what they are, and pollutes the credentials view. The
+    names already reach the generated wordlists through
+    `target_wordlists.harvest_usernames`, so nothing is lost by leaving them out.
+    """
+    from output_analysis import analyse_output
+    from psycopg2.extras import Json
+
+    where, params = ["octet_length(COALESCE(output, '')) > 0"], []
+    if target:
+        where.append("target = %s")
+        params.append(target)
+    params.append(int(limit))
+    cur.execute(f"""
+        SELECT id, tool, target, port, exit_code, COALESCE(output, '') AS output
+          FROM tool_executions
+         WHERE {' AND '.join(where)}
+         ORDER BY started_at DESC
+         LIMIT %s
+    """, params)
+    rows = [dict(r) for r in cur.fetchall()]
+
+    seen_keys, planned, skipped_no_target = {}, [], 0
+    for r in rows:
+        tgt = (r.get("target") or "").strip()
+        if not tgt:
+            # recon_findings.target identifies the finding; without it the row
+            # cannot be attributed or deduped, so it is counted rather than
+            # stored under a guessed host.
+            skipped_no_target += 1
+            continue
+        analysis = analyse_output(r["tool"], r["output"], r.get("exit_code"))
+        for fact in analysis["notable"]:
+            key = (r["tool"].lower(), fact["id"], tgt)
+            if key in seen_keys:
+                continue
+            seen_keys[key] = True
+            planned.append({
+                "source": r["tool"], "finding_type": fact["id"], "target": tgt,
+                "severity": fact["severity"],
+                "data": {
+                    "fact_id": fact["id"], "title": fact["title"],
+                    "detail": (fact.get("detail") or "").strip(),
+                    "evidence": (fact.get("evidence") or "")[:400],
+                    "tool": r["tool"],
+                },
+            })
+
+    new, existing = [], []
+    for p in planned:
+        cur.execute("""
+            SELECT 1 FROM recon_findings
+             WHERE lower(source) = lower(%s) AND finding_type = %s AND target = %s
+             LIMIT 1
+        """, (p["source"], p["finding_type"], p["target"]))
+        (existing if cur.fetchone() else new).append(p)
+
+    inserted = 0
+    if not dry_run:
+        for p in new:
+            cur.execute("""
+                INSERT INTO recon_findings
+                       (source, finding_type, target, data, severity)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (p["source"], p["finding_type"], p["target"],
+                  Json(p["data"], dumps=lambda o: json.dumps(o, sort_keys=True)),
+                  p["severity"]))
+            inserted += 1
+        cur.connection.commit()
+
+    from etl.severity import severity_rank
+    by_sev = {}
+    for p in planned:
+        by_sev[p["severity"]] = by_sev.get(p["severity"], 0) + 1
+    return {
+        "executions_read": len(rows),
+        "facts_found": len(planned),
+        "new": len(new),
+        "already_stored": len(existing),
+        "inserted": inserted,
+        "dry_run": dry_run,
+        "skipped_no_target": skipped_no_target,
+        "by_severity": dict(sorted(by_sev.items(),
+                                   key=lambda kv: -severity_rank(kv[0]))),
+        "sample": sorted(new, key=lambda p: -severity_rank(p["severity"]))[:12],
+    }
