@@ -3474,6 +3474,28 @@ CREATE TABLE IF NOT EXISTS public.gap_analysis_reports (
 CREATE INDEX IF NOT EXISTS idx_gap_reports_engagement ON gap_analysis_reports(engagement_id);
 CREATE INDEX IF NOT EXISTS idx_gap_reports_created ON gap_analysis_reports(created_at DESC);
 
+-- post_review_reports — review of work that RAN (see app/rag-api/post_review_agent.py)
+--
+-- engagement_id is NULLABLE here, unlike gap_analysis_reports: tool_executions
+-- carries no engagement_id column, so a review is stack-wide by default. Making
+-- it NOT NULL would force a false attribution onto every stored report.
+CREATE TABLE IF NOT EXISTS public.post_review_reports (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id       uuid REFERENCES public.engagements(id) ON DELETE CASCADE,
+    status              text NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+    report              jsonb NOT NULL DEFAULT '{}',
+    executions_reviewed integer NOT NULL DEFAULT 0,
+    issues_found        integer NOT NULL DEFAULT 0,
+    reruns_queued       integer NOT NULL DEFAULT 0,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    completed_at        timestamptz,
+    triggered_by        text DEFAULT 'manual'
+);
+CREATE INDEX IF NOT EXISTS idx_post_review_created ON post_review_reports(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_post_review_engagement ON post_review_reports(engagement_id)
+    WHERE engagement_id IS NOT NULL;
+
 -- ============================================================================
 -- TIER 14: Burp Follow-Up Queue
 -- Queue of follow-up findings destined for import into Burp Suite via
