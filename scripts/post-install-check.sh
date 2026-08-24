@@ -81,12 +81,27 @@ EXPECTED_TABLES=(
   post_review_reports
 )
 
+# Views that reports and the spray list depend on. A missing view fails only when
+# a page queries it, which reads as "no results" rather than "not installed".
+EXPECTED_VIEWS=(
+  v_identity_credential_state
+)
+
 for table in "${EXPECTED_TABLES[@]}"; do
   result=$(docker exec rag-postgres psql -U app -d scans -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema='public' AND table_name='$table')" 2>/dev/null)
   if [[ "$result" == "t" ]]; then
     pass "$table"
   else
     fail "$table — table missing"
+  fi
+done
+
+for view in "${EXPECTED_VIEWS[@]}"; do
+  result=$(docker exec rag-postgres psql -U app -d scans -tAc "SELECT EXISTS (SELECT FROM pg_views WHERE schemaname='public' AND viewname='$view')" 2>/dev/null)
+  if [[ "$result" == "t" ]]; then
+    pass "$view (view)"
+  else
+    fail "$view (view) — view missing"
   fi
 done
 

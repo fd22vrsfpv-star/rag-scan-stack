@@ -68,9 +68,18 @@ def _curated_path(kind: str) -> Optional[str]:
 # list that wastes attempts on garbage — the same class of error as a share
 # called "Permissions".
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9._$@\\-]{1,64}$")
+# Header cells and sentinels — never account names.
+#
+# `user` was in this set and that was WRONG: it is a real local account on this
+# engagement's target, with a VERIFIED password already in the vault. Including
+# it here rejected a known-good username from the identity list and from every
+# generated wordlist. A word being a plausible column header does not make it an
+# implausible account name, and "user" is one of the most common accounts there
+# is. Only strings that cannot be an account name belong here.
 _NOT_USERNAMES = {
-    "username", "user", "name", "account", "login", "password", "share",
-    "permissions", "remark", "null", "none", "true", "false", "unknown",
+    "username", "usernames", "name", "account", "login", "password",
+    "share", "sharename", "permissions", "remark", "comment",
+    "null", "none", "true", "false", "unknown", "n/a",
 }
 
 
@@ -119,7 +128,8 @@ def harvest_usernames(cur, target: str) -> Dict[str, List[str]]:
     inside `tool_executions.output`. Deterministic regexes only — no model call —
     so this is cheap enough to run on every build and yields the same list twice.
     """
-    found: Dict[str, List[str]] = {"vault": [], "findings": [], "extracted": []}
+    found: Dict[str, List[str]] = {"vault": [], "findings": [], "identities": [],
+                                   "extracted": []}
 
     # credential_vault has NO host column, so these are engagement-wide rather
     # than host-scoped. That is the right behaviour for a spray candidate — a
@@ -138,6 +148,20 @@ def harvest_usernames(cur, target: str) -> Dict[str, List[str]]:
     """, (target,))
     found["findings"] = [r[0] if not isinstance(r, dict) else r["username"]
                          for r in cur.fetchall()]
+
+    # Identities — the DURABLE record. `extracted` below re-derives the same
+    # names from raw output, which works only while that output is still stored;
+    # once artifacts are pruned or skipped, this is the source that survives.
+    try:
+        cur.execute("""
+            SELECT DISTINCT display_name FROM identities
+             WHERE COALESCE(display_name, '') <> ''
+               AND (domain = %s OR identifier ILIKE '%%@' || %s)
+        """, (target, target))
+        found["identities"] = [r[0] if not isinstance(r, dict)
+                               else r["display_name"] for r in cur.fetchall()]
+    except Exception:
+        pass    # a missing identities table must not empty the list
 
     # Re-derive from output. This is the 35.
     try:
@@ -194,7 +218,7 @@ def build_lists(cur, target: str, port=None, service_hint: str = "",
 
     harvested = harvest_usernames(cur, target)
     discovered = []
-    for key in ("findings", "vault", "extracted"):
+    for key in ("findings", "vault", "identities", "extracted"):
         discovered.extend(harvested.get(key) or [])
 
     users, u_prov = [], {}
@@ -327,3 +351,130 @@ def resolve_command(cur, command: str, target: str, port=None,
     return {"command": out, "changed": out != command, "source": source,
             "paths": paths, "problem": problem,
             "counts": built["counts"] if source == "generated" else None}
+
+
+# ── enumerated accounts as durable identities ──────────────────────────────
+
+def import_enumerated_identities(cur, dry_run=True, target=None, limit=2000):
+    """Record enumerated usernames as identities with no credential yet.
+
+    enum4linux and enum4linux-ng enumerated 35 accounts on 192.168.1.150 through
+    a null session, and the only durable record was the raw text: the vault held
+    four names, all of them ones a password had already been found for. Every
+    later question — "which accounts have we not tried?", "spray this list" —
+    had to re-parse tool output to get an answer.
+
+    `identities` is the right home: a registry of principals, independent of
+    whether a credential is known. Two deliberate choices:
+
+    * **status='unknown'**, not 'active'. The column is an ACCOUNT-state field
+      (active/disabled/unknown/deleted) and enumeration proves only that the
+      account exists — not that it can be used. A working login is what proves
+      'active', which is what the credential bridge sets.
+    * **status is never downgraded.** Re-importing must not turn a
+      proven-'active' account back into 'unknown', so the upsert keeps the
+      stronger value.
+
+    Whether a password is known is NOT stored here. `v_identity_credential_state`
+    derives it by joining the vault and the verified findings, because a stored
+    flag goes stale the moment a password is cracked — and a stale flag would
+    send the operator to re-attack an account already owned.
+
+    No scope gate: this records hosts we have ALREADY scanned, from output
+    already in the database. It sends no traffic and proposes nothing. The
+    forward-looking path — building an attack list — is gated, in
+    `/wordlists/build-target`.
+    """
+    where, params = ["octet_length(COALESCE(output, '')) > 0",
+                     "COALESCE(target, '') <> ''"], []
+    if target:
+        where.append("target = %s")
+        params.append(target)
+    params.append(int(limit))
+    cur.execute(f"""
+        SELECT tool, target, port, service, COALESCE(output, '') AS output
+          FROM tool_executions
+         WHERE {' AND '.join(where)}
+         ORDER BY started_at DESC
+         LIMIT %s
+    """, params)
+    rows = [dict(r) if isinstance(r, dict) else
+            {"tool": r[0], "target": r[1], "port": r[2], "service": r[3],
+             "output": r[4]} for r in cur.fetchall()]
+
+    try:
+        import extractor_specs as es
+    except ImportError:
+        return {"error": "extractor_specs unavailable", "found": 0}
+
+    # (host, username) -> {tools, services}
+    accounts = {}
+    for r in rows:
+        spec = es.spec_for(r["tool"])
+        if not spec:
+            continue
+        fields = es.run_deterministic(spec, r["output"])
+        for name in (fields.get("users") or []):
+            name = (name or "").strip()
+            if not _plausible_username(name):
+                continue
+            slot = accounts.setdefault((r["target"], name),
+                                       {"tools": set(), "services": set()})
+            slot["tools"].add(r["tool"])
+            if r.get("service") and r.get("port"):
+                slot["services"].add(f"{r['service']}/{r['port']}")
+
+    planned = []
+    for (host, name), meta in sorted(accounts.items()):
+        planned.append({
+            "provider": "local",
+            "identifier": f"{name}@{host}",
+            "display_name": name,
+            "host": host,
+            "sources": sorted(meta["tools"]),
+            "tags": sorted({f"host:{host}"} | {f"service:{s}"
+                                               for s in meta["services"]}
+                           | {"discovery:enumerated"}),
+        })
+
+    inserted = updated = 0
+    if not dry_run and planned:
+        from psycopg2.extras import Json
+        for p in planned:
+            cur.execute("""
+                INSERT INTO identities
+                    (provider, identifier, display_name, principal_type,
+                     status, domain, sources, tags, first_seen, last_seen, raw)
+                VALUES (%s, %s, %s, 'user', 'unknown', %s, %s, %s,
+                        now(), now(), %s)
+                ON CONFLICT (provider, lower(identifier)) DO UPDATE
+                   SET last_seen = now(),
+                       updated_at = now(),
+                       -- Never downgrade a proven-active account.
+                       status = CASE WHEN identities.status = 'active'
+                                     THEN identities.status
+                                     ELSE EXCLUDED.status END,
+                       sources = (SELECT array_agg(DISTINCT s ORDER BY s)
+                                    FROM unnest(COALESCE(identities.sources,
+                                                         ARRAY[]::text[])
+                                                || EXCLUDED.sources) s),
+                       tags    = (SELECT array_agg(DISTINCT t ORDER BY t)
+                                    FROM unnest(COALESCE(identities.tags,
+                                                         ARRAY[]::text[])
+                                                || EXCLUDED.tags) t)
+                RETURNING (xmax = 0) AS inserted
+            """, (p["provider"], p["identifier"], p["display_name"], p["host"],
+                  p["sources"], p["tags"],
+                  Json({"host": p["host"], "discovered_by": p["sources"],
+                        "discovery": "smb_rpc_enumeration"})))
+            got = cur.fetchone()
+            if got is not None:
+                was_new = got["inserted"] if isinstance(got, dict) else got[0]
+                inserted += 1 if was_new else 0
+                updated += 0 if was_new else 1
+        cur.connection.commit()
+
+    return {"executions_read": len(rows), "found": len(planned),
+            "inserted": inserted, "updated": updated, "dry_run": dry_run,
+            "hosts": sorted({p["host"] for p in planned}),
+            "sample": planned[:15]}
