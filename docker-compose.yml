@@ -1477,6 +1477,7 @@ services:
     volumes:
       - ./etl:/app/etl:ro                             # shared scope gate (etl/scope_gate.py)
       - ./common:/app/common:ro                        # shared scan-slot ceiling (common/tool_job.py)
+      - ${WORDLISTS_DIR:-./wordlists}:/wordlists:ro    # generated per-target user/password lists (target_wordlists.py)
       - ./certs:/certs:ro
     cap_add:
       - NET_RAW
