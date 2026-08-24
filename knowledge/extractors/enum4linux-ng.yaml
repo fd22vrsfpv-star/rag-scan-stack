@@ -1,0 +1,151 @@
+# enum4linux-ng — SMB/RPC enumeration.
+#
+# 47 stored runs, 9.5 KB each, ALL captured_uninterpreted: the text reached
+# recon_findings only as finding_type='tool_table_row' with key_values EMPTY.
+# One run discloses 35 usernames through a null session, SMB1-only dialects,
+# signing not required, the FQDN and the Samba version. None of it was queryable.
+#
+# The regexes below are taken from that real output. Everything they resolve is
+# never sent to a model — cheaper, and stable across runs so a finding's
+# fingerprint cannot fork.
+tool: enum4linux-ng
+aliases: [enum4linux_ng]
+description: SMB/RPC enumeration — users, groups, shares, dialects, OS, policy.
+enabled: true
+
+# Output is ~9.5 KB and the user list sits at the END, so the consumer's default
+# 12,000-char window would clip it on a larger domain.
+max_chars: 40000
+
+deterministic:
+  fqdn:
+    pattern: '^FQDN:\s*(\S+)'
+  dns_domain:
+    pattern: '^DNS domain:\s*(\S+)'
+  netbios_name:
+    pattern: '^NetBIOS computer name:\s*(\S+)'
+  workgroup:
+    pattern: '^\[\+\] (?:Got domain/workgroup name|Domain):\s*(\S+)'
+  os:
+    pattern: '^OS:\s*(.+)$'
+  smb1_only:
+    pattern: '^SMB1 only:\s*(true|false)'
+    type: boolean
+  signing_required:
+    pattern: '^SMB signing required:\s*(true|false)'
+    type: boolean
+  null_session:
+    pattern: "Server allows authentication via username '' and password ''"
+    type: boolean
+  user_count:
+    pattern: 'we have (\d+) user\(s\) total'
+    type: number
+  users:
+    pattern: '^\s+username:\s*(\S+)'
+    capture: all
+    type: list
+
+schema:
+  users:
+    type: list
+    description: every username enumerated, as plain strings
+  user_count:
+    type: number
+    description: total users reported by the tool
+  groups:
+    type: list
+    description: local/domain group names
+  shares:
+    type: list
+    description: share names, if the run enumerated them
+  os:
+    type: string
+    description: OS and software version string
+  fqdn:
+    type: string
+    description: fully qualified domain name
+  dns_domain:
+    type: string
+  netbios_name:
+    type: string
+  workgroup:
+    type: string
+    description: workgroup or domain name
+  smb1_only:
+    type: boolean
+    description: true when SMB 1.0 is the only supported dialect
+  signing_required:
+    type: boolean
+    description: false means SMB signing is NOT enforced
+  null_session:
+    type: boolean
+    description: true when empty username and password authenticated
+  password_policy:
+    type: object
+    description: min length, complexity, lockout, if reported
+
+prompt: |
+  Extract structured facts from enum4linux-ng output. This is SMB/RPC
+  enumeration of a single host. Report only what the text states.
+
+  Read the whole output: the user list appears near the END, after the OS and
+  RPC sections. A line like "we have 35 user(s) total" is followed by entries
+  of the form "'1000':" then "  username: root". Collect every username.
+
+  Do not treat a section banner ("=== Users via RPC ===") or a table header as
+  data. "not supported" and "(null)" are absences, not values.
+
+examples:
+  - output: |
+      [+] Got domain/workgroup name: WORKGROUP
+      SMB 1.0: true
+      SMB1 only: true
+      SMB signing required: false
+      NetBIOS computer name: METASPLOITABLE
+      DNS domain: localdomain
+      FQDN: metasploitable.localdomain
+      [+] Server allows authentication via username '' and password ''
+      OS: Linux/Unix (Samba 3.0.20-Debian)
+      [+] After merging user results we have 2 user(s) total:
+      '1000':
+        username: root
+        name: root
+      '1002':
+        username: daemon
+        name: daemon
+    extract: |
+      {"workgroup": "WORKGROUP", "smb1_only": true, "signing_required": false,
+       "netbios_name": "METASPLOITABLE", "dns_domain": "localdomain",
+       "fqdn": "metasploitable.localdomain", "null_session": true,
+       "os": "Linux/Unix (Samba 3.0.20-Debian)", "user_count": 2,
+       "users": ["root", "daemon"]}
+
+notable:
+  - id: e4l_null_session
+    when: null_session == true
+    severity: high
+    title: SMB null session accepted (unauthenticated enumeration)
+    detail: >
+      An empty username and password authenticated, so users, groups and shares
+      can be enumerated with no credentials at all.
+  - id: e4l_users_enumerated
+    when: len(users) > 0
+    severity: medium
+    title: "{users} usernames enumerated over SMB"
+    detail: >
+      A confirmed username list removes the guessing half of a credential
+      attack. These belong in the vault as spray candidates.
+  - id: e4l_smb1_only
+    when: smb1_only == true
+    severity: medium
+    title: SMB 1.0 is the only supported dialect
+    detail: >
+      SMBv1 is deprecated and carries known remote-code-execution families.
+      No modern dialect is offered, so this cannot be mitigated by negotiation.
+  - id: e4l_signing_not_required
+    when: signing_required == false
+    severity: medium
+    title: SMB signing is not required
+    detail: >
+      Unsigned SMB permits relay and man-in-the-middle against authenticated
+      sessions.

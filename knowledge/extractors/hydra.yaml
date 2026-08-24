@@ -1,0 +1,130 @@
+# hydra — online password attack.
+#
+# 48 stored runs. What the output actually says is not "it failed" but something
+# far more useful, and nothing read it:
+#
+#   [DATA] max 16 tasks per 1 server, overall 16 tasks, 243854783 login tries
+#          (l:17/p:14344399), ~15240924 tries per task
+#   [STATUS] 256.00 tries/min, 256 tries in 00:01h, 243854527 to do in 15875:57h
+#   0 of 1 target completed, 0 valid password found
+#   [INFO] Writing restore file because 2 server scans could not be completed
+#
+# 243.8 MILLION candidates at 256 tries/min is 15,875 HOURS. The run was never
+# going to finish, and the timeout that killed it was recorded as if the target
+# had simply held. Worse, the restore file it leaves makes the NEXT invocation
+# stop and prompt — which is where several of the exit-255 failures came from.
+#
+# So the finding here is about the INVOCATION, not the target.
+tool: hydra
+aliases: [medusa, ncrack]
+description: Online password attack — recovered credentials, and whether the run was survivable.
+enabled: true
+
+deterministic:
+  valid_found:
+    pattern: '(\d+) valid password(?:s)? found'
+    type: number
+  total_tries:
+    pattern: 'overall \d+ tasks, (\d+) login tries'
+    type: number
+  rate_per_min:
+    pattern: '([\d.]+) tries/min'
+    type: number
+  remaining_hours:
+    pattern: 'to do in (\d+):\d+h'
+    type: number
+  restore_file_written:
+    pattern: 'Writing restore file|session file .* was written'
+    type: boolean
+  targets_completed:
+    pattern: '(\d+) of \d+ target(?:s)? completed'
+    type: number
+
+schema:
+  credentials:
+    type: list
+    description: >
+      recovered pairs, each an object with host, port, service, login, password.
+      Only pairs the output states as found — never a candidate that was tried.
+  valid_found:
+    type: number
+    description: count of valid passwords the tool reports
+  total_tries:
+    type: number
+    description: total candidate count for the run
+  rate_per_min:
+    type: number
+    description: observed attempt rate
+  remaining_hours:
+    type: number
+    description: hours the tool estimates remain
+  restore_file_written:
+    type: boolean
+    description: true if a restore/session file was left behind
+  targets_completed:
+    type: number
+  service:
+    type: string
+    description: the protocol attacked, e.g. ftp, ssh, smb
+
+prompt: |
+  Extract results from an online password-attack tool (hydra, medusa, ncrack).
+
+  Two separate things matter, and the second is usually the real result:
+
+  1. Credentials actually RECOVERED. A line of the form
+     "[21][ftp] host: 1.2.3.4   login: user   password: pass"
+     is a recovered pair. A candidate being tried is NOT a result. If the
+     output says "0 valid password found", `credentials` is an empty list.
+
+  2. Whether the run could ever have finished. Read the [DATA] and [STATUS]
+     lines for the candidate count, the observed rate and the estimated hours
+     remaining.
+
+  Never invent a password. If no pair is stated, return an empty list.
+
+examples:
+  - output: |
+      [DATA] max 16 tasks per 1 server, overall 16 tasks, 243854783 login tries (l:17/p:14344399), ~15240924 tries per task
+      [DATA] attacking ftp://192.168.1.150:21/
+      [STATUS] 256.00 tries/min, 256 tries in 00:01h, 243854527 to do in 15875:57h, 16 active
+      0 of 1 target completed, 0 valid password found
+      [INFO] Writing restore file because 2 server scans could not be completed
+    extract: |
+      {"credentials": [], "valid_found": 0, "total_tries": 243854783,
+       "rate_per_min": 256.0, "remaining_hours": 15875,
+       "restore_file_written": true, "targets_completed": 0, "service": "ftp"}
+  - output: |
+      [21][ftp] host: 192.168.1.150   login: msfadmin   password: msfadmin
+      1 of 1 target successfully completed, 1 valid password found
+    extract: |
+      {"credentials": [{"host": "192.168.1.150", "port": 21, "service": "ftp",
+                        "login": "msfadmin", "password": "msfadmin"}],
+       "valid_found": 1, "targets_completed": 1, "service": "ftp"}
+
+notable:
+  - id: hydra_credentials_recovered
+    when: len(credentials) > 0
+    severity: critical
+    title: "{credentials} credential pair(s) recovered"
+    detail: >
+      A working credential is the highest-value result this tool produces. It
+      belongs in the vault, and it opens follow-on enumeration on every service
+      that accepts the same pair.
+  - id: hydra_run_cannot_finish
+    when: remaining_hours > 24
+    severity: medium
+    title: "Attack could not finish — {remaining_hours}h remaining at observed rate"
+    detail: >
+      The candidate list is far too large for the achieved rate, so the run was
+      always going to be killed by the deadline. A timeout here says nothing
+      about the target's password strength. Narrow the wordlist or raise the
+      task count before reading anything into the result.
+  - id: hydra_restore_file_left
+    when: restore_file_written == true
+    severity: low
+    title: A restore file was left behind
+    detail: >
+      hydra stops and prompts when it finds an existing restore file, so the
+      NEXT invocation fails unless it passes -I or the file is removed. Several
+      exit-255 failures in this stack came from exactly this.
