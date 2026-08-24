@@ -427,9 +427,15 @@ def test_queue_reruns_inserts_pending_rows_and_dispatches_nothing(live):
         pytest.skip("rag-postgres not reachable")
     total, not_pending, executed = [int(x) for x in out.stdout.strip().split("|")]
     assert total > 0, "queue_reruns=true stored nothing"
-    assert not_pending == 0, (
-        f"{not_pending} post_review rows left 'pending' — this must never dispatch")
-    assert executed == 0, f"{executed} rows were EXECUTED; proposals only"
+    # NOT asserted: that these rows stay pending forever. They do not, and
+    # believing otherwise was a real error in this feature's first version.
+    # dashboard/bff/services/recon_agent.py:117 selects `WHERE status='pending'`
+    # with NO filter on `source`, so the recon agent dispatches post_review
+    # proposals like any other in-scope recommendation. What the AGENT must
+    # never do is create a row already dispatched.
+    assert executed <= not_pending, (
+        "a post_review row has executed_at set but a pending status — the agent "
+        "wrote a dispatched row instead of a proposal")
 
 
 def test_queued_proposals_carry_their_evidence(live):

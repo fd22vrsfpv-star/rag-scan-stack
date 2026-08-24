@@ -18350,6 +18350,89 @@ def run_post_review_endpoint(
     return {"ok": True, **report}
 
 
+@app.get("/agent/post-review/executions/{execution_id}", tags=["Post Review"])
+def get_reviewed_execution(execution_id: str, _: bool = Depends(auth)):
+    """One execution in FULL, for display: output, return code, options, analysis.
+
+    The stored report deliberately carries no output — 1,348 full outputs is a
+    2.2 MB row — so this is where the complete text lives. It returns the whole
+    output untruncated, the return code, the parsed flags the tool was actually
+    called with, and what the analysis extracted from it.
+    """
+    from post_review_agent import _parse_options, classify_execution, \
+        option_signature, _catalogue_commands
+    from output_analysis import analyse_output
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT id::text, tool, command, target, port, service, status,
+                   exit_code, COALESCE(output, '') AS output,
+                   COALESCE(error, '')  AS error,
+                   octet_length(COALESCE(output, '')) AS output_bytes,
+                   started_at, completed_at, parsed_results
+            FROM tool_executions WHERE id = %s
+        """, (execution_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "execution not found")
+    r = dict(row)
+    verdict = classify_execution(r, _catalogue_commands())
+    opts = _parse_options(r["command"])
+    analysis = analyse_output(r["tool"], r["output"], r.get("exit_code"))
+    return {
+        "execution": r,
+        "return_code": r.get("exit_code"),
+        "options": {"argv0": opts["argv0"], "subcommands": opts["subcommands"],
+                    "flags": {k: (True if v is True else str(v))
+                              for k, v in opts["flags"].items()},
+                    "positional": opts["positional"],
+                    "signature": option_signature(r["command"]),
+                    "pipeline": opts["pipeline"], "parse_ok": opts["parse_ok"]},
+        "classification": verdict,
+        "analysis": analysis,
+    }
+
+
+@app.get("/agent/post-review/invocations", tags=["Post Review"])
+def post_review_invocations(tool: str = Query(None), limit: int = Query(200, ge=1, le=2000),
+                            _: bool = Depends(auth)):
+    """Return code x option signature, per tool — which invocation form works.
+
+    nmap alone spans four exit codes across 27 command forms and 379 runs, so
+    "nmap failed" was never a usable statement. Grouping by the flag NAMES (not
+    their values) collapses those into comparable forms.
+    """
+    from post_review_agent import option_signature
+    from output_analysis import analyse_output
+    where, params = ["1=1"], []
+    if tool:
+        where.append("tool = %s")
+        params.append(tool)
+    params.append(limit)
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT tool, command, exit_code, status,
+                   COALESCE(output, '') AS output
+            FROM tool_executions
+            WHERE {' AND '.join(where)}
+            ORDER BY started_at DESC LIMIT %s
+        """, params)
+        rows = [dict(r) for r in cur.fetchall()]
+    matrix = {}
+    for r in rows:
+        sig = option_signature(r["command"])
+        ec = "null" if r["exit_code"] is None else str(r["exit_code"])
+        v = analyse_output(r["tool"], r["output"], r["exit_code"])["verdict"]
+        key = (r["tool"], sig)
+        slot = matrix.setdefault(key, {
+            "tool": r["tool"], "options": sig, "runs": 0,
+            "return_codes": {}, "output_verdicts": {}, "example_command": r["command"]})
+        slot["runs"] += 1
+        slot["return_codes"][ec] = slot["return_codes"].get(ec, 0) + 1
+        slot["output_verdicts"][v] = slot["output_verdicts"].get(v, 0) + 1
+    out = sorted(matrix.values(), key=lambda m: (m["tool"], -m["runs"]))
+    return {"invocations": out, "forms": len(out), "executions_read": len(rows)}
+
+
 @app.get("/agent/post-review/reports", tags=["Post Review"])
 def list_post_review_reports(limit: int = Query(20, ge=1, le=200),
                              engagement_id: str = Query(None),
