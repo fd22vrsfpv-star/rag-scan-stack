@@ -179,6 +179,89 @@ def _jsonify(obj):
     return obj
 
 
+# ── how the command was actually called ─────────────────────────────────────
+
+def _parse_options(command):
+    """Structured view of an invocation: subcommands, flags, values, target.
+
+    `exit_code` alone says a run failed; it cannot say WHICH invocation failed,
+    and the raw command string cannot be grouped or aggregated. Extracting the
+    flag set makes "which options correlate with which return code" a question
+    with an answer — nmap has 4 distinct exit codes across 27 command forms and
+    379 runs, so that question was previously unanswerable.
+
+    Shell-aware only as far as it needs to be: a pipeline is reduced to the
+    segment that actually runs the tool, because `printf ... | ftp -n host` is
+    an ftp invocation, not a printf one.
+    """
+    import shlex
+    raw = (command or "").strip()
+    if not raw:
+        return {"argv0": None, "subcommands": [], "flags": {}, "flag_names": [],
+                "positional": [], "pipeline": False, "parse_ok": False}
+
+    pipeline = bool(re.search(r"[|;]|&&", raw))
+    segment = raw
+    if pipeline:
+        parts = [s.strip() for s in re.split(r"\||;|&&", raw) if s.strip()]
+        # Prefer the segment naming a real binary over the one feeding it input.
+        segment = next((s for s in parts
+                        if not re.match(r"^(printf|echo|cat|yes)\b", s)), parts[-1])
+    try:
+        tokens = shlex.split(segment)
+        parse_ok = True
+    except ValueError:
+        # Unbalanced quotes: fall back to whitespace so a weird command still
+        # yields something, flagged so nobody treats it as exact.
+        tokens = segment.split()
+        parse_ok = False
+    if not tokens:
+        return {"argv0": None, "subcommands": [], "flags": {}, "flag_names": [],
+                "positional": [], "pipeline": pipeline, "parse_ok": parse_ok}
+
+    argv0, rest = tokens[0], tokens[1:]
+    subcommands, flags, positional = [], {}, []
+    seen_flag = False
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok.startswith("-") and tok != "-":
+            seen_flag = True
+            if "=" in tok:
+                name, val = tok.split("=", 1)
+                flags[name] = val
+            else:
+                nxt = rest[i + 1] if i + 1 < len(rest) else None
+                if nxt is not None and not nxt.startswith("-"):
+                    flags[tok] = nxt
+                    i += 1
+                else:
+                    flags[tok] = True     # a bare switch
+            seen_flag = True
+        elif not seen_flag:
+            # Leading bare words are subcommands (`gobuster dir`, `crackmapexec smb`)
+            subcommands.append(tok)
+        else:
+            positional.append(tok)
+        i += 1
+
+    return {"argv0": argv0, "subcommands": subcommands, "flags": flags,
+            "flag_names": sorted(flags), "positional": positional,
+            "pipeline": pipeline, "parse_ok": parse_ok}
+
+
+def option_signature(command):
+    """A groupable key for an invocation form: subcommands + flag NAMES.
+
+    Values are deliberately excluded — `-p 80` and `-p 443` are the same
+    invocation form aimed at different things, and folding them together is
+    what lets 379 nmap runs collapse into a handful of comparable forms.
+    """
+    o = _parse_options(command)
+    parts = list(o["subcommands"]) + o["flag_names"]
+    return " ".join(parts) if parts else "(no options)"
+
+
 def _catalogue_commands(path=CATALOGUE):
     """{tool: [command, ...]} from knowledge/service_tools.yaml.
 
@@ -371,9 +454,12 @@ def review_executions(cur, since_days=None, target=None, catalogue=None):
     if target:
         where.append("target = %s")
         params.append(target)
+    # FULL output, not a prefix. The crackmapexec share table begins ~1 KB in,
+    # so a 400-byte read reported "no results" on output that named five shares.
+    # 2.2 MB across the whole table, largest row 165 KB — affordable.
     cur.execute(f"""
-        SELECT id, tool, command, target, port, status, exit_code,
-               left(COALESCE(output, ''), 400) AS output,
+        SELECT id, tool, command, target, port, service, status, exit_code,
+               COALESCE(output, '')            AS output,
                COALESCE(error, '')             AS error,
                octet_length(COALESCE(output, '')) AS output_bytes,
                started_at
@@ -382,44 +468,90 @@ def review_executions(cur, since_days=None, target=None, catalogue=None):
         ORDER BY started_at DESC
     """, params)
 
-    groups, reviewed = {}, 0
+    from output_analysis import analyse_output
+
+    groups, reviewed, notable_index = {}, 0, {}
     for row in cur.fetchall():
         r = dict(row)
-        # classify_execution reads `output` for emptiness; the SELECT truncates
-        # to 400 bytes, which cannot turn a non-empty output into an empty one.
         verdict = classify_execution(r, catalogue)
+        analysis = analyse_output(r["tool"], r["output"], r.get("exit_code"))
         reviewed += 1
+        # Security facts sitting in output. Indexed by (id, tool, target) so the
+        # report can answer "what did we already see and never store".
+        for n in analysis["notable"]:
+            key = (n["id"], r["tool"], r.get("target") or "")
+            slot = notable_index.setdefault(key, {
+                "id": n["id"], "tool": r["tool"], "target": r.get("target"),
+                "severity": n["severity"], "title": n["title"],
+                "detail": n.get("detail"), "evidence": n.get("evidence"),
+                "seen_in": 0, "execution_ids": []})
+            slot["seen_in"] += 1
+            if len(slot["execution_ids"]) < 5:
+                slot["execution_ids"].append(str(r["id"]))
         g = groups.setdefault(verdict["category"], {
             "category": verdict["category"],
             "remedy": verdict["remedy"],
             "actionable": verdict["actionable"],
             "why": verdict["why"],
             "count": 0, "cause_fixed": 0, "tools": {}, "examples": [],
+            "exit_codes": {}, "output_verdicts": {}, "invocations": {},
         })
         g["count"] += 1
         if verdict["cause_fixed"]:
             g["cause_fixed"] += 1
+        # The return code as its own dimension: "failed" is not one thing, and
+        # nmap alone spans four exit codes across 27 command forms.
+        ec = "null" if r.get("exit_code") is None else str(r["exit_code"])
+        g["exit_codes"][ec] = g["exit_codes"].get(ec, 0) + 1
+        g["output_verdicts"][analysis["verdict"]] = \
+            g["output_verdicts"].get(analysis["verdict"], 0) + 1
+        sig = f"{r['tool']} {option_signature(r['command'])}"
+        inv = g["invocations"].setdefault(sig, {"signature": sig, "count": 0,
+                                               "exit_codes": {}})
+        inv["count"] += 1
+        inv["exit_codes"][ec] = inv["exit_codes"].get(ec, 0) + 1
         t = g["tools"].setdefault(r["tool"], {"count": 0, "targets": set()})
         t["count"] += 1
         if r.get("target"):
             t["targets"].add(r["target"])
         if len(g["examples"]) < 3:
+            opts = _parse_options(r["command"])
             g["examples"].append({
+                # Full output is served per-execution by
+                # GET /agent/post-review/executions/{id} rather than embedded —
+                # 1,348 full outputs would be a 2.2 MB report row.
                 "execution_id": str(r["id"]), "tool": r["tool"],
                 "target": r.get("target"), "command": r["command"],
+                "exit_code": r.get("exit_code"),
+                "options": {"subcommands": opts["subcommands"],
+                            "flags": {k: (True if v is True else str(v))
+                                      for k, v in opts["flags"].items()},
+                            "signature": option_signature(r["command"])},
                 "evidence": verdict["evidence"],
+                "output_verdict": analysis["verdict"],
+                "output_bytes": r.get("output_bytes"),
+                "notable_count": analysis["notable_count"],
                 "cause_fixed": verdict["cause_fixed"],
                 "started_at": r["started_at"].isoformat() if r.get("started_at") else None,
             })
 
     for g in groups.values():
+        g["invocations"] = sorted(g["invocations"].values(),
+                                  key=lambda i: -i["count"])[:12]
         g["tools"] = [
             {"tool": k, "count": v["count"], "targets": sorted(v["targets"])[:10]}
             for k, v in sorted(g["tools"].items(), key=lambda kv: -kv[1]["count"])
         ]
     ordered = sorted(groups.values(),
                      key=lambda g: (not g["actionable"], -g["count"]))
-    return {"executions_reviewed": reviewed, "groups": ordered}
+    # etl/severity.py is THE scale — a hand-written order here would be the
+    # twelfth copy, and tests/test_severity_scale.py exists because the last
+    # eleven disagreed with each other.
+    from etl.severity import severity_rank
+    notable = sorted(notable_index.values(),
+                     key=lambda n: (-severity_rank(n["severity"]), -n["seen_in"]))
+    return {"executions_reviewed": reviewed, "groups": ordered,
+            "notable_in_output": notable}
 
 
 def find_unparsed_output(cur, limit=50):
@@ -450,6 +582,103 @@ def find_unparsed_output(cur, limit=50):
     for r in rows:
         r["bytes"] = int(r["bytes"] or 0)
     return rows
+
+
+def find_results_not_ingested(cur, limit=100):
+    """Output that HAS results, where nothing attributable to that tool landed.
+
+    This is the check the earlier `find_unparsed_output` could not make. That
+    one asked "is there a raw_artifact"; this asks "did the findings reach a
+    table anybody queries", which is the question that matters.
+
+    Attribution uses the columns that actually record a tool:
+    `web_findings.source`, `vulns.script` (stored as `tool:rule`),
+    `credential_findings.source` and `recon_findings.source`.
+
+    Three states, not two, because the interesting one sits in the middle:
+
+      interpreted            a findings row with a REAL type and severity
+      captured_uninterpreted the text is in the database, but only inside a
+                             generic `tool_output` / `tool_table_row` dump with
+                             `key_values` empty — nothing says what it means, so
+                             it cannot be filtered, sorted or triaged
+      absent                 no row references it at all
+
+    Two earlier versions of this check were wrong in opposite directions. The
+    first counted a `raw_artifacts` blob as success and reported zero gaps. The
+    second used tool-level attribution — "does ANY row have source='crackmapexec'"
+    — which marked all 51 crackmapexec runs as landed on the strength of 10
+    generic dumps. Both hid the motivating case.
+
+    The real number: **94.2% of recon_findings (98 of 104) are generic dumps**,
+    from 17 tools. The stack captures text and calls it a finding.
+
+    The motivating case: one crackmapexec run disclosed SMBv1 enabled, signing
+    disabled, an accepted null session, five shares (one WRITABLE), the hostname
+    and the Samba version. Zero rows were stored for any of it.
+    """
+    from output_analysis import analyse_output
+    cur.execute("""
+        SELECT te.id, te.tool, te.target, te.port, te.exit_code, te.command,
+               COALESCE(te.output, '') AS output,
+               octet_length(COALESCE(te.output, '')) AS output_bytes,
+               EXISTS (SELECT 1 FROM web_findings wf
+                        WHERE lower(wf.source) = lower(te.tool)) AS in_web,
+               EXISTS (SELECT 1 FROM vulns v
+                        WHERE v.script ILIKE te.tool || '%') AS in_vulns,
+               EXISTS (SELECT 1 FROM credential_findings cf
+                        WHERE lower(cf.source) = lower(te.tool)
+                          AND host(cf.ip) = te.target) AS in_creds,
+               -- INTERPRETED only: a generic dump is not an interpretation.
+               EXISTS (SELECT 1 FROM recon_findings rf
+                        WHERE lower(rf.source) = lower(te.tool)
+                          AND rf.target = te.target
+                          AND rf.finding_type NOT IN
+                              ('tool_output', 'tool_table_row', 'tool_finding')) AS in_recon,
+               EXISTS (SELECT 1 FROM recon_findings rf2
+                        WHERE lower(rf2.source) = lower(te.tool)
+                          AND rf2.target = te.target
+                          AND rf2.finding_type IN
+                              ('tool_output', 'tool_table_row', 'tool_finding')) AS dumped,
+               EXISTS (SELECT 1 FROM raw_artifacts ra
+                        WHERE ra.tool = te.tool
+                          AND COALESCE(ra.target, '') = COALESCE(te.target, '')) AS raw_stored
+        FROM tool_executions te
+        WHERE octet_length(COALESCE(te.output, '')) > 0
+        ORDER BY octet_length(COALESCE(te.output, '')) DESC
+    """)
+    gaps = []
+    for row in cur.fetchall():
+        r = dict(row)
+        a = analyse_output(r["tool"], r["output"], r.get("exit_code"))
+        if a["verdict"] != "results_found":
+            continue
+        # A findings row with real meaning. A generic dump does not count.
+        if any((r["in_web"], r["in_vulns"], r["in_creds"], r["in_recon"])):
+            continue
+        state = "captured_uninterpreted" if (r["dumped"] or r["raw_stored"]) \
+            else "absent"
+        gaps.append({
+            "execution_id": str(r["id"]), "tool": r["tool"],
+            "target": r.get("target"), "port": r.get("port"),
+            "exit_code": r.get("exit_code"),
+            "options": option_signature(r["command"]),
+            "output_bytes": r["output_bytes"],
+            "state": state,
+            "raw_artifact_stored": r["raw_stored"],
+            "generic_dump_stored": r["dumped"],
+            "indicators": a["indicators"],
+            "notable_count": a["notable_count"],
+            "notable": [{"id": n["id"], "severity": n["severity"],
+                         "title": n["title"]} for n in a["notable"]],
+        })
+        if len(gaps) >= limit:
+            break
+    from etl.severity import severity_rank
+    gaps.sort(key=lambda g: (
+        -max([severity_rank(n["severity"]) for n in g["notable"]] or [0]),
+        -g["notable_count"], -g["output_bytes"]))
+    return gaps
 
 
 def find_stuck_recommendations(cur, stale_hours=6):
@@ -487,8 +716,20 @@ def propose_reruns(cur, catalogue=None, limit=100, dry_run=True,
                    engagement_id=None):
     """Queue one pending recommendation per (tool, target) worth re-running.
 
-    Deliberately NOT a dispatch. Rows land `status='pending'`,
-    `source='post_review'`, and wait for a human to press Run.
+    This function does not dispatch: rows land `status='pending'`,
+    `source='post_review'`.
+
+    But "pending" is NOT inert in this stack, and assuming it was is an error
+    worth recording. `dashboard/bff/services/recon_agent.py:117` selects
+    `WHERE sr.status = 'pending'` with **no filter on `source`**, so the recon
+    agent picks these up and dispatches them like any other in-scope
+    recommendation. One gobuster proposal was dispatched 29 minutes after being
+    queued — and recorded `completed` with NO row in `tool_executions`, because
+    the auto-execute path is fire-and-forget and never collects its output.
+
+    Whether that is correct is an operator decision, not a code default: these
+    targets did pass the scope gate and the scans had already been authorised
+    and attempted once. There is currently NO flag to hold them for approval.
 
     Every proposal still goes through the scope gate: a proposal naming an
     out-of-scope host is an authorization defect whether or not it executes,
@@ -638,6 +879,7 @@ def run_post_review(triggered_by="manual", since_days=None, target=None,
             executions = review_executions(cur, since_days=since_days,
                                            target=target, catalogue=catalogue)
             unparsed = find_unparsed_output(cur)
+            not_ingested = find_results_not_ingested(cur)
             stuck = find_stuck_recommendations(cur)
             reruns = propose_reruns(cur, catalogue=catalogue,
                                    dry_run=not queue_reruns,
@@ -649,6 +891,8 @@ def run_post_review(triggered_by="manual", since_days=None, target=None,
                 "catalogue_tools": len(catalogue),
                 "executions": executions,
                 "unparsed_output": unparsed,
+                "results_not_ingested": not_ingested,
+                "notable_in_output": executions.get("notable_in_output", []),
                 "stuck_recommendations": stuck,
                 "reruns": reruns,
                 "summary": {
@@ -658,6 +902,12 @@ def run_post_review(triggered_by="manual", since_days=None, target=None,
                         g["count"] for g in executions["groups"]
                         if g["category"] == "empty_result"),
                     "unparsed_tools": len(unparsed),
+                    "results_not_ingested": len(not_ingested),
+                    "notable_facts_in_output": len(
+                        executions.get("notable_in_output", [])),
+                    "high_or_worse_unstored": sum(
+                        1 for n in executions.get("notable_in_output", [])
+                        if n["severity"] in ("critical", "high")),
                     "stuck_recommendations": len(stuck),
                     "reruns_proposed": reruns.get("proposed", 0),
                     "reruns_queued": reruns.get("inserted", 0),
@@ -671,7 +921,7 @@ def run_post_review(triggered_by="manual", since_days=None, target=None,
                        issues_found=%s, reruns_queued=%s, completed_at=now()
                  WHERE id=%s
             """, (Json(report), executions["executions_reviewed"],
-                  actionable + len(unparsed) + len(stuck),
+                  actionable + len(unparsed) + len(stuck) + len(not_ingested),
                   reruns.get("inserted", 0), report_id))
             conn.commit()
 
