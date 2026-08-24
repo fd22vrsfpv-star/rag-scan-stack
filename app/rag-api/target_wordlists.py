@@ -267,3 +267,63 @@ def write_lists(built: dict, out_dir: str = None) -> dict:
         paths[kind] = path
         paths[f"{kind}_lines"] = len(entries)
     return paths
+
+
+# ── substitution ────────────────────────────────────────────────────────────
+
+# Placeholders a brute-force command may carry. The listener REFUSES any
+# unresolved {placeholder}, so every one of these must be filled before dispatch
+# — which is fail-safe (it declines rather than running something wrong) but
+# still a broken dispatch, so resolution must never simply give up.
+USER_LIST_TOKEN = "{user_list}"
+PASSWORD_LIST_TOKEN = "{password_list}"
+
+# Where the resolver falls back to. These are the STATIC curated lists inside
+# kali-listener, so a fallback still runs 17 x 25 = 425 candidates rather than
+# rockyou's 243,854,783. Never fall back to a list that cannot finish.
+STATIC_USER_LIST = ("/usr/share/wordlists/seclists/Usernames/"
+                    "top-usernames-shortlist.txt")
+STATIC_PASSWORD_LIST = ("/usr/share/wordlists/seclists/Passwords/"
+                        "Common-Credentials/top-passwords-shortlist.txt")
+
+
+def needs_lists(command: str) -> bool:
+    return bool(command) and (USER_LIST_TOKEN in command
+                              or PASSWORD_LIST_TOKEN in command)
+
+
+def resolve_command(cur, command: str, target: str, port=None,
+                    service_hint: str = "", build: bool = True) -> dict:
+    """Fill {user_list}/{password_list} with real, readable paths.
+
+    Prefers freshly built per-target lists — 35 discovered usernames and the
+    service's own defaults, with the username-as-password rule that produces
+    msfadmin:msfadmin. Falls back to the STATIC short lists if building fails,
+    never to a list that cannot finish, and never leaves a placeholder for the
+    listener to refuse.
+
+    The `source` field says which happened, because a silent fallback would hide
+    that the discovered usernames — the entire point — were not used.
+    """
+    if not needs_lists(command):
+        return {"command": command, "changed": False, "source": "not_needed",
+                "paths": {}}
+
+    paths, source, problem = {}, "static_fallback", None
+    if build:
+        try:
+            built = build_lists(cur, target, port=port, service_hint=service_hint)
+            written = write_lists(built)
+            paths = {"users": written["users"], "passwords": written["passwords"]}
+            source = "generated"
+        except Exception as exc:            # noqa: BLE001
+            problem = f"{type(exc).__name__}: {exc}"
+
+    if source != "generated":
+        paths = {"users": STATIC_USER_LIST, "passwords": STATIC_PASSWORD_LIST}
+
+    out = command.replace(USER_LIST_TOKEN, paths["users"]) \
+                 .replace(PASSWORD_LIST_TOKEN, paths["passwords"])
+    return {"command": out, "changed": out != command, "source": source,
+            "paths": paths, "problem": problem,
+            "counts": built["counts"] if source == "generated" else None}

@@ -12976,6 +12976,50 @@ def list_wordlists(authorized: bool = Depends(auth)):
         r["created_at"] = r["created_at"].isoformat() if r.get("created_at") else None
     return {"ok": True, "wordlists": rows}
 
+@app.post("/wordlists/resolve-command", tags=["Wordlists"])
+def resolve_command_wordlists(body: dict, _: bool = Depends(auth)):
+    """Fill {user_list}/{password_list} in a command with readable paths.
+
+    The BFF cannot import `etl/` (no such mount on pentest-dashboard) and has no
+    database, so rather than duplicate this logic there — and need an agreement
+    test to keep two copies honest — the dispatcher asks here.
+
+    Falls back to the STATIC short lists if building fails: 17 x 25 = 425
+    candidates, never rockyou's 243,854,783, and never a leftover placeholder for
+    the listener to refuse. `source` reports which path was taken, because a
+    silent fallback would hide that the discovered usernames were not used.
+    """
+    command = (body or {}).get("command") or ""
+    target = (body or {}).get("target") or ""
+    port = (body or {}).get("port")
+    service = (body or {}).get("service") or ""
+    if not command:
+        raise HTTPException(400, "command is required")
+
+    import sys as _sys
+    if "/app" not in _sys.path:
+        _sys.path.insert(0, "/app")
+    import target_wordlists as tw
+
+    if not tw.needs_lists(command):
+        return {"ok": True, "command": command, "changed": False,
+                "source": "not_needed"}
+    if not target:
+        raise HTTPException(400, "target is required to build per-target lists")
+
+    from etl.scope_gate import check_dispatch, load_dispatch_scope
+    with get_db() as conn, conn.cursor() as cur:
+        scope_rows, scope_source = load_dispatch_scope(cur, None)
+        if scope_source == "unavailable":
+            raise HTTPException(503, "scope could not be loaded — refusing")
+        refusal = check_dispatch(target, scope_rows)
+        if refusal:
+            raise HTTPException(403, f"Out of scope — {refusal}")
+        result = tw.resolve_command(cur, command, target, port=port,
+                                    service_hint=service)
+    return {"ok": True, **result}
+
+
 @app.post("/wordlists/build-target", tags=["Wordlists"])
 def build_target_wordlists(target: str = Query(...),
                            port: int = Query(None),

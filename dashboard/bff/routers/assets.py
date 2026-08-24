@@ -774,9 +774,13 @@ _MANUAL_COMMANDS = {
     # resource — wordlists / template sets: what to USE them with
     "seclists": ("gobuster dir -u http://{target} -w "
                  "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt"),
-    "wordlists": ("hydra -L /usr/share/seclists/Usernames/top-usernames-shortlist.txt "
-                  "-P /usr/share/wordlists/rockyou.txt {target} <service>"),
-    "rockyou": "hydra -l <user> -P /usr/share/wordlists/rockyou.txt {target} <service>",
+    "wordlists": ("hydra -I -L {user_list} -P {password_list} "
+                  "{target} <service>"),
+    # rockyou is 14,344,399 lines: paired with any userlist it exceeds the
+    # listener's candidate-space limit and is refused, so the hint that used to
+    # name it here pointed operators at a command that cannot run.
+    "rockyou": ("hydra -I -l <user> -P {password_list} {target} <service>   "
+                "# rockyou itself is refused: 14.3M candidates cannot finish"),
     "nuclei-templates": "nuclei -u http://{target} -t /root/nuclei-templates/ -severity high,critical",
 }
 
@@ -1857,6 +1861,54 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
 
         return result
 
+    # The fallback lists, if rag-api cannot be reached. STATIC and SHORT:
+    # 17 x 25 = 425 candidates. Never rockyou's 14,344,399 — a fallback that
+    # cannot finish is worse than a refusal, because it looks like a scan.
+    _STATIC_USER_LIST = ("/usr/share/wordlists/seclists/Usernames/"
+                         "top-usernames-shortlist.txt")
+    _STATIC_PASSWORD_LIST = ("/usr/share/wordlists/seclists/Passwords/"
+                             "Common-Credentials/top-passwords-shortlist.txt")
+
+    async def _resolve_brute_lists(command: str, rec, ip: str) -> tuple:
+        """Fill {user_list}/{password_list} before the unresolved-placeholder check.
+
+        rag-api builds the per-target lists because it has the database: 35
+        usernames discovered on this host, the service's documented defaults, and
+        the username-as-password rule that produces msfadmin:msfadmin. The BFF
+        cannot do that itself — no `etl` mount, no database — so it asks rather
+        than keeping a second copy of the logic.
+
+        Returns (command, source). `source` is reported so a silent fallback
+        cannot hide that the discovered usernames were not used.
+        """
+        if not command or ("{user_list}" not in command
+                           and "{password_list}" not in command):
+            return command, None
+        s = get_settings()
+        try:
+            async with httpx.AsyncClient(timeout=180, verify=False) as c:
+                r = await c.post(
+                    f"{s.rag_api_url}/wordlists/resolve-command",
+                    json={"command": command, "target": ip,
+                          "port": rec.get("port"),
+                          "service": rec.get("service") or ""},
+                    headers={"x-api-key": s.api_key, **engagement_headers()},
+                )
+            if r.status_code == 200:
+                body = r.json()
+                if body.get("command"):
+                    return body["command"], body.get("source") or "generated"
+            elif r.status_code == 403:
+                # Out of scope is an AUTHORISATION answer, not a lookup failure.
+                # Falling back here would substitute paths for a host we have
+                # just been told not to touch.
+                return command, "refused_out_of_scope"
+        except Exception as e:                       # noqa: BLE001
+            log.warning("brute list resolve failed for %s: %s", ip, e)
+        return (command.replace("{user_list}", _STATIC_USER_LIST)
+                       .replace("{password_list}", _STATIC_PASSWORD_LIST),
+                "static_fallback")
+
     def _fill_placeholders(command: str, rec) -> tuple:
         """Substitute {target}/{ip}/{port}/{service} in a recommendation's script.
 
@@ -1886,7 +1938,16 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
 
     async def _dispatch_via_kali(rec, scanner, ip, result):
         """Route tool execution to the internal Kali container."""
-        command, _unresolved = _fill_placeholders(rec.get("script") or "", rec)
+        command, _list_source = await _resolve_brute_lists(
+            rec.get("script") or "", rec, ip)
+        if _list_source == "refused_out_of_scope":
+            result["status"] = "skipped"
+            result["detail"] = (f"{ip} is not in the configured scope — refusing "
+                                f"to prepare or run a credential attack against it")
+            return result
+        if _list_source:
+            result["wordlist_source"] = _list_source
+        command, _unresolved = _fill_placeholders(command, rec)
         if _unresolved:
             result["status"] = "skipped"
             result["detail"] = (f"command still contains {', '.join(sorted(set(_unresolved)))} "
@@ -1897,7 +1958,19 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             port = rec.get("port") or ""
             service = rec.get("service") or ""
             if scanner in ("hydra", "medusa", "ncrack"):
-                command = f"{scanner} -l admin -P /usr/share/wordlists/rockyou.txt {service}://{ip}:{port}" if port else f"{scanner} -l admin -P /usr/share/wordlists/rockyou.txt ssh://{ip}"
+                # Was `-l admin -P rockyou.txt`: 14,344,399 candidates against a
+                # single guessed username, which the listener's candidate-space
+                # guard now refuses outright. Built through the placeholders
+                # instead, so this default gets the discovered usernames too.
+                where = f"{service}://{ip}:{port}" if port else f"ssh://{ip}"
+                flags = "-I " if scanner == "hydra" else ""
+                command = (f"{scanner} {flags}-L {{user_list}} "
+                           f"-P {{password_list}} {where}")
+                command, _fb = await _resolve_brute_lists(command, rec, ip)
+                if _fb == "refused_out_of_scope":
+                    result["status"] = "skipped"
+                    result["detail"] = f"{ip} is not in the configured scope"
+                    return result
             elif scanner == "ssh-audit":
                 command = f"ssh-audit {ip}"
             elif scanner in ("showmount",):
