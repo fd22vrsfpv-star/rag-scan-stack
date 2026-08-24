@@ -4,6 +4,7 @@ Handles nc/socat listeners and captures callback connections.
 """
 
 import os
+import shlex
 import re
 import time        # scope gate: cache TTL (module-level; there is a
                    # function-local `import time` elsewhere, which does NOT
@@ -1773,6 +1774,147 @@ async def clear_logs():
 
 # --- Tool Execution Endpoints ---
 
+# ── candidate-space guard for online password attacks ───────────────────────
+#
+# Every hydra/medusa/ncrack command in knowledge/service_tools.yaml named
+# rockyou.txt — 14,344,399 passwords. With a 17-name userlist that is
+# 243,854,783 candidates, and hydra said so itself:
+#
+#   [DATA] overall 16 tasks, 243854783 login tries (l:17/p:14344399)
+#   [STATUS] 256.00 tries/min, 243854527 to do in 15875:57h
+#
+# 15,875 HOURS. Every one of those 48 runs was killed by the deadline and
+# recorded as a scan that found nothing — so a hopeless invocation and a host
+# with strong passwords produced identical evidence. Nothing warned before
+# dispatch; this does.
+#
+# Counting is done HERE because this is where the files are: the listener can
+# read the wordlists, the recommender cannot.
+CANDIDATE_WARN = int(os.environ.get("CANDIDATE_SPACE_WARN", "50000"))
+CANDIDATE_REFUSE = int(os.environ.get("CANDIDATE_SPACE_REFUSE", "1000000"))
+
+# -L/-U take a userlist, -P a password list, -C a combo file. Single-value
+# forms (-l, -p, --user) count as one.
+_LIST_FLAGS = {"-L": "users", "-U": "users", "-P": "passwords",
+               "-C": "combos", "--userlist": "users", "--passwords": "passwords"}
+_SINGLE_FLAGS = {"-l": "users", "-p": "passwords", "--user": "users",
+                 "--pass": "passwords"}
+_BRUTE_TOOLS = {"hydra", "medusa", "ncrack", "crowbar", "patator", "brutus"}
+
+_linecount_cache = {}
+
+# Lists worth offering as defaults. This is a FILTER, not a promise: a name here
+# appears only if the file is actually present, so an absent one is simply not
+# offered. Verified present in this image today: top-passwords-shortlist.txt
+# (25), best110.txt (110), default-passwords.txt (2,875),
+# top-usernames-shortlist.txt (17). The other three are not installed here.
+# Never let a DEFAULT name an absent file — that was the gobuster bug, where
+# 20 of 20 runs failed on /usr/share/wordlists/dirb/common.txt.
+_CURATED_LISTS = {
+    "top-passwords-shortlist.txt",          # 25 — the default
+    "default-passwords.txt",                # 2,875
+    "top-usernames-shortlist.txt",          # 17 — the default
+    "unix_users.txt",
+    "best110.txt",
+    "darkweb2017-top100.txt",
+    "probable-v2-top1575.txt",
+}
+
+
+def _count_lines(path):
+    """Lines in a wordlist, cached on (size, mtime).
+
+    Returns None when the file cannot be read — an unknown count must not be
+    treated as zero, because zero would silently pass the guard.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (path, st.st_size, int(st.st_mtime))
+    if key in _linecount_cache:
+        return _linecount_cache[key]
+    try:
+        with open(path, "rb") as fh:
+            n = sum(1 for _ in fh)
+    except OSError:
+        return None
+    _linecount_cache[key] = n
+    return n
+
+
+def estimate_candidate_space(tool, command):
+    """(estimate, detail) for a brute-force command, or (None, detail).
+
+    None means "not a brute-force tool" or "cannot tell" — never a silent zero.
+    """
+    if (tool or "").strip().lower() not in _BRUTE_TOOLS:
+        return None, {"reason": "not a brute-force tool"}
+    try:
+        tokens = shlex.split(command or "")
+    except ValueError:
+        tokens = (command or "").split()
+
+    counts = {"users": None, "passwords": None, "combos": None}
+    files = {}
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+        if tok in _LIST_FLAGS and nxt and not nxt.startswith("-"):
+            kind = _LIST_FLAGS[tok]
+            n = _count_lines(nxt)
+            files[kind] = {"path": nxt, "lines": n}
+            counts[kind] = n
+            i += 2
+            continue
+        if tok in _SINGLE_FLAGS and nxt and not nxt.startswith("-"):
+            counts[_SINGLE_FLAGS[tok]] = 1
+            i += 2
+            continue
+        i += 1
+
+    if counts["combos"] is not None:
+        est = counts["combos"]
+    elif counts["users"] is None and counts["passwords"] is None:
+        return None, {"reason": "no wordlist arguments found", "files": files}
+    else:
+        # An unspecified side is 1, not 0: hydra with only -P still tries every
+        # password against the implied single user.
+        est = (counts["users"] or 1) * (counts["passwords"] or 1)
+
+    unreadable = [k for k, v in files.items() if v.get("lines") is None]
+    return est, {"counts": counts, "files": files, "unreadable": unreadable}
+
+
+def check_candidate_space(tool, command, force=False):
+    """(refusal_or_None, warning_or_None). Volume judgement, not authorisation.
+
+    CLAUDE.md: an override overrules the platform's SUPPRESSION judgement, never
+    the operator's AUTHORIZATION. Candidate volume is suppression, so `force`
+    may pass it — unlike the scope gate, which force must never pass.
+    """
+    est, detail = estimate_candidate_space(tool, command)
+    if est is None:
+        return None, None
+    rate = 256.0            # observed tries/min in this stack
+    hours = est / rate / 60.0
+    human = (f"{est:,} candidates"
+             + (f" ({detail['counts'].get('users') or 1} users x "
+                f"{detail['counts'].get('passwords') or 1} passwords)"
+                if not detail["counts"].get("combos") else "")
+             + f" — about {hours:,.0f}h at the observed {rate:.0f} tries/min")
+    if est >= CANDIDATE_REFUSE and not force:
+        return (f"{human}. Refusing: this cannot finish inside any timeout, and "
+                f"a run killed by the deadline looks identical to a target that "
+                f"held. Use a short password list and a discovered-user list, "
+                f"or pass force to override."), None
+    if est >= CANDIDATE_WARN:
+        return None, (f"{human}. This is likely to be killed by the deadline; "
+                      f"its result will not mean the passwords are strong.")
+    return None, None
+
+
 @app.post("/tools/execute", response_model=ToolExecutionResponse)
 async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: BackgroundTasks):
     """
@@ -1815,6 +1957,25 @@ async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: B
             detail=(f"command still contains {', '.join(sorted(set(unresolved)))} — "
                     "fill it in before running. An unresolved command cannot "
                     "produce meaningful output."))
+
+    # Candidate-space guard. AFTER scope (authorisation first, always) and after
+    # the placeholder check, because counting the wordlists in an unresolved
+    # command would be meaningless.
+    cs_refusal, cs_warning = check_candidate_space(
+        request.tool, request.command, force=bool(getattr(request, "force", False)))
+    if cs_refusal:
+        logger.warning("REFUSED %s on %s: %s", request.tool, request.target,
+                       cs_refusal)
+        _emit_webhook_sync("brute_force_refused_oversized", {
+            "tool": request.tool, "target": request.target,
+            "command": request.command[:400], "reason": cs_refusal})
+        raise HTTPException(status_code=400, detail=cs_refusal)
+    if cs_warning:
+        logger.warning("OVERSIZED %s on %s: %s", request.tool, request.target,
+                       cs_warning)
+        _emit_webhook_sync("brute_force_oversized_warning", {
+            "tool": request.tool, "target": request.target,
+            "command": request.command[:400], "warning": cs_warning})
 
     # Validate tool token shape (no shell metacharacters in the tool name).
     tool_lower = request.tool.lower()
@@ -1985,6 +2146,95 @@ async def get_tool_execution(exec_id: str):
         completed_at=ex["completed_at"].isoformat() if ex.get("completed_at") else None,
         duration_seconds=duration
     )
+
+
+@app.get("/wordlists/inventory")
+async def wordlist_inventory(max_files: int = 2000, min_lines: int = 2,
+                            curated_only: bool = False):
+    """Wordlists that exist IN THIS IMAGE, with real line counts.
+
+    The `wordlists` table only ever saw rag-api's host-mounted /wordlists, so it
+    held two rows — while every brute-force command in the catalogue names
+    /usr/share/wordlists/..., a path that exists ONLY here. The operator could
+    not select from the lists actually in use because nothing had ever looked.
+
+    Line counts come from the same `_count_lines` the candidate-space guard
+    uses, so a list's advertised size and the size the guard enforces on cannot
+    disagree.
+
+    `size_verdict` is advisory and derived from the guard's own thresholds:
+      safe      usable as a default
+      large     will warn when paired with a userlist
+      hopeless  refused outright; 934h+ at the observed rate
+    """
+    roots = [
+        "/usr/share/wordlists/seclists/Passwords/Common-Credentials",
+        "/usr/share/wordlists/seclists/Passwords/Default-Credentials",
+        "/usr/share/wordlists/seclists/Usernames",
+        "/usr/share/wordlists",
+        "/wordlists",
+    ]
+    seen, out = set(), []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            for name in sorted(files):
+                if not name.endswith((".txt", ".lst")):
+                    continue
+                path = os.path.join(dirpath, name)
+                if path in seen:
+                    continue
+                seen.add(path)
+                lines = _count_lines(path)
+                if lines is None or lines < min_lines:
+                    # seclists ships ~370 single-line per-vendor credential
+                    # files. They are real, but as selectable OPTIONS they bury
+                    # the handful anyone actually wants. min_lines=1 returns them.
+                    continue
+                # FILENAME wins over directory. Reading the directory first
+                # labelled every `*_default-users.txt` under
+                # Passwords/Default-Credentials as a password list.
+                fn, low = name.lower(), path.lower()
+                if "user" in fn:
+                    kind = "usernames"
+                elif "pass" in fn or "cred" in fn or "rockyou" in fn:
+                    kind = "passwords"
+                elif "username" in low:
+                    kind = "usernames"
+                elif "password" in low or "credential" in low:
+                    kind = "passwords"
+                else:
+                    kind = "other"
+                # Paired against a 17-name userlist, the guard warns at
+                # CANDIDATE_WARN and refuses at CANDIDATE_REFUSE.
+                if lines * 17 >= CANDIDATE_REFUSE:
+                    verdict = "hopeless"
+                elif lines * 17 >= CANDIDATE_WARN:
+                    verdict = "large"
+                else:
+                    verdict = "safe"
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    size = None
+                curated = name in _CURATED_LISTS
+                if curated_only and not curated:
+                    continue
+                out.append({"name": name, "path": path, "list_type": kind,
+                            "line_count": lines, "size_bytes": size,
+                            "size_verdict": verdict, "curated": curated})
+                if len(out) >= max_files:
+                    break
+            if len(out) >= max_files:
+                break
+        if len(out) >= max_files:
+            break
+    # Curated first, then smallest — the order an operator picks from.
+    out.sort(key=lambda w: (not w["curated"], w["list_type"], w["line_count"]))
+    return {"ok": True, "count": len(out), "truncated": len(out) >= max_files,
+            "thresholds": {"warn": CANDIDATE_WARN, "refuse": CANDIDATE_REFUSE},
+            "wordlists": out}
 
 
 @app.get("/tools/allowed")

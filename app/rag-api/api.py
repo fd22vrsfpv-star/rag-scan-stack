@@ -12976,6 +12976,128 @@ def list_wordlists(authorized: bool = Depends(auth)):
         r["created_at"] = r["created_at"].isoformat() if r.get("created_at") else None
     return {"ok": True, "wordlists": rows}
 
+@app.post("/wordlists/discover", tags=["Wordlists"])
+def discover_image_wordlists(curated_only: bool = Query(False),
+                             min_lines: int = Query(2, ge=1),
+                             _: bool = Depends(auth)):
+    """Register the wordlists that exist inside kali-listener.
+
+    The registry held TWO rows because `_auto_register_host_files` only ever
+    looked at rag-api's host-mounted /wordlists — while every brute-force
+    command in the catalogue names /usr/share/wordlists/..., which exists only
+    in the listener image. So the operator could not select from the lists
+    actually in use, and the one they were given by default was rockyou.
+
+    Line counts come from the listener, the same source the candidate-space
+    guard enforces on, so an advertised size and an enforced size cannot differ.
+    """
+    import httpx as _hx
+    base = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    try:
+        with _hx.Client(verify=False, timeout=120) as c:
+            resp = c.get(f"{base}/wordlists/inventory",
+                         params={"curated_only": curated_only,
+                                 "min_lines": min_lines, "max_files": 2000})
+            resp.raise_for_status()
+            body = resp.json()
+    except Exception as e:
+        raise HTTPException(502, f"could not read listener wordlist inventory: {e}")
+
+    rows = body.get("wordlists") or []
+    # `name` is UNIQUE and seclists ships the same basename in several
+    # directories, so a bare basename would raise on the second one. Only the
+    # colliding names are qualified, and by parent directory, so the common case
+    # stays readable and the result is deterministic.
+    from collections import Counter
+    basename_counts = Counter(w["name"] for w in rows)
+    for w in rows:
+        if basename_counts[w["name"]] > 1:
+            parent = os.path.basename(os.path.dirname(w["path"]))
+            w["_store_name"] = f"{parent}/{w['name']}"
+        else:
+            w["_store_name"] = w["name"]
+
+    added = updated = failed = 0
+    problems = []
+    with get_db() as conn, conn.cursor() as cur:
+        for w in rows:
+            # A savepoint per row: one name collision with a pre-existing host
+            # row must not abort the whole batch.
+            cur.execute("SAVEPOINT wl")
+            try:
+                cur.execute("""
+                INSERT INTO wordlists (name, path, source, list_type,
+                                       line_count, size_bytes, description)
+                VALUES (%s,%s,'image:kali-listener',%s,%s,%s,%s)
+                ON CONFLICT (path) DO UPDATE
+                   SET line_count = EXCLUDED.line_count,
+                       size_bytes = EXCLUDED.size_bytes,
+                       list_type  = EXCLUDED.list_type,
+                       description = EXCLUDED.description
+                    RETURNING (xmax = 0) AS inserted
+                """, (w["_store_name"], w["path"], w["list_type"],
+                      w["line_count"], w.get("size_bytes"),
+                      f"size_verdict={w['size_verdict']}"
+                      + (" curated" if w.get("curated") else "")))
+                got = cur.fetchone()
+                cur.execute("RELEASE SAVEPOINT wl")
+                if got is not None:
+                    was_new = got["inserted"] if isinstance(got, dict) else got[0]
+                    if was_new:
+                        added += 1
+                    else:
+                        updated += 1
+            except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT wl")
+                # The batch-level disambiguation cannot see PRE-EXISTING rows:
+                # rockyou.txt was already registered from the host mount at a
+                # different path, so the image copy collided on `name`. Retry
+                # once, parent-qualified.
+                parent = os.path.basename(os.path.dirname(w["path"]))
+                retry_name = f"{parent}/{w['name']}"
+                if retry_name == w["_store_name"]:
+                    failed += 1
+                    if len(problems) < 10:
+                        problems.append(f"{w['path']}: {type(e).__name__}: {e}")
+                    continue
+                cur.execute("SAVEPOINT wl2")
+                try:
+                    cur.execute("""
+                        INSERT INTO wordlists (name, path, source, list_type,
+                                               line_count, size_bytes, description)
+                        VALUES (%s,%s,'image:kali-listener',%s,%s,%s,%s)
+                        ON CONFLICT (path) DO UPDATE
+                           SET line_count = EXCLUDED.line_count,
+                               size_bytes = EXCLUDED.size_bytes,
+                               list_type  = EXCLUDED.list_type
+                        RETURNING (xmax = 0) AS inserted
+                    """, (retry_name, w["path"], w["list_type"], w["line_count"],
+                          w.get("size_bytes"),
+                          f"size_verdict={w['size_verdict']}"))
+                    got = cur.fetchone()
+                    cur.execute("RELEASE SAVEPOINT wl2")
+                    if got is not None:
+                        was_new = got["inserted"] if isinstance(got, dict) else got[0]
+                        added += 1 if was_new else 0
+                        updated += 0 if was_new else 1
+                except Exception as e2:
+                    cur.execute("ROLLBACK TO SAVEPOINT wl2")
+                    failed += 1
+                    if len(problems) < 10:
+                        problems.append(f"{w['path']}: {type(e2).__name__}: {e2}")
+        conn.commit()
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("wordlists_discovered", "wordlists", {
+            "seen": len(rows), "added": added, "updated": updated,
+            "curated_only": curated_only})
+    except Exception:
+        pass
+    return {"ok": True, "seen": len(rows), "added": added, "updated": updated,
+            "failed": failed, "problems": problems,
+            "thresholds": body.get("thresholds")}
+
+
 @app.post("/wordlists/upload", tags=["Wordlists"])
 def upload_wordlist(
     file: UploadFile = File(...),

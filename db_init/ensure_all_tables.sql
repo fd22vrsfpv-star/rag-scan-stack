@@ -3493,6 +3493,12 @@ CREATE TABLE IF NOT EXISTS public.post_review_reports (
     triggered_by        text DEFAULT 'manual'
 );
 CREATE INDEX IF NOT EXISTS idx_post_review_created ON post_review_reports(created_at DESC);
+
+-- wordlists.path is the real identity of a list; `name` (already UNIQUE) is only
+-- its basename, and seclists ships the same basename in several directories.
+-- Without this index, POST /wordlists/discover's ON CONFLICT (path) raises
+-- "no unique or exclusion constraint matching the ON CONFLICT specification".
+CREATE UNIQUE INDEX IF NOT EXISTS ux_wordlists_path ON public.wordlists(path);
 CREATE INDEX IF NOT EXISTS idx_post_review_engagement ON post_review_reports(engagement_id)
     WHERE engagement_id IS NOT NULL;
 
