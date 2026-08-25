@@ -1704,8 +1704,29 @@ def get_asset_scan_parameters(ip: str, keys: str = Query(None),
     by_prov = {}
     for v in values.values():
         by_prov[v["provenance"]] = by_prov.get(v["provenance"], 0) + 1
+
+    # Consumers that turn these values into guidance, surfaced beside the values
+    # they came from so the operator sees the conclusion and its evidence
+    # together rather than having to join them by hand.
+    advice = []
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            waf = sp.web_scan_advice(cur, ip)
+            if waf:
+                advice.append({"topic": "scan_aggressiveness", **waf})
+        except Exception:                   # noqa: BLE001
+            pass
+        for svc in sorted(sp.DOMAIN_AUTH_SERVICES):
+            try:
+                length, why = sp.min_password_length(cur, ip, svc)
+            except Exception:               # noqa: BLE001
+                continue
+            if length:
+                advice.append({"topic": "wordlist_selection", "service": svc,
+                               "min_password_length": length, "advice": why})
+                break
     return {"ok": True, "host": ip, "parameters": values,
-            "counts_by_provenance": by_prov}
+            "counts_by_provenance": by_prov, "advice": advice}
 
 
 @app.post("/assets/{ip}/parameters", tags=["Assets"])
