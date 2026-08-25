@@ -2699,8 +2699,29 @@ async def _remote_scan_bounded(node_id: str, req):
         if not targets:
             raise HTTPException(400, "No valid IP targets after DNS resolution")
 
-    # Append targets
-    cmd.extend(targets)
+    # Pre-dispatch validation (shared module — see common/dispatch_validation.py,
+    # also used by other dispatch paths). Catches an empty target set and
+    # single-vs-multi arity BEFORE the tool runs.
+    from common.dispatch_validation import validate_dispatch
+    _val = validate_dispatch(req.scan_type, targets)
+    if not _val.ok:
+        raise HTTPException(400, _val.reason)
+
+    # Append targets positionally ONLY when the template does not already place
+    # them via a placeholder ({domain}/{target}/{targets}). service-enum uses
+    # "--domain {domain}"; appending the target list again dumps it as stray
+    # positionals (service_enum_cli.py: "unrecognized arguments: ...").
+    _has_placeholder = any(
+        ("{domain}" in p or "{target}" in p or "{targets}" in p) for p in tmpl["cmd"])
+    if not _has_placeholder:
+        cmd.extend(targets)
+    elif len(_val.fanout) > 1 and not tmpl.get("_per_target"):
+        # Single-arity template given N targets: it only placed the first. The
+        # download+ingest fan-out is not wired on this path yet, so refuse loudly
+        # rather than silently scanning only targets[0].
+        raise HTTPException(400,
+            f"{req.scan_type} accepts a single target per run, but {len(targets)} "
+            f"were provided ({', '.join(targets[:5])}). Dispatch one target per job.")
 
     # Append extra args if provided
     if req.extra_args:
@@ -4409,7 +4430,7 @@ async def create_do_droplet(req: DOCreateRequest):
             # Start tunnel in async loop
             import asyncio
             loop = asyncio.new_event_loop()
-            tunnel = SSHTunnel(node_id=node_id, host=ip, user="root", ssh_port=22,
+            tunnel = SSHTunnel(node_id=node_id, name=req.name, host=ip, user="root", ssh_port=22,
                                key_file=ssh_key, socks_port=socks_port)
             result = loop.run_until_complete(ssh_manager.start_tunnel(tunnel))
             loop.close()
@@ -5087,7 +5108,7 @@ async def create_ec2_instance(req: AWSCreateRequest):
         resp = ec2_client.describe_security_groups(GroupNames=[sg_name])
         sg_id = resp["SecurityGroups"][0]["GroupId"]
     except ClientError:
-        resp = ec2_client.create_security_group(GroupName=sg_name, Description="Pentest scan node — SSH access")
+        resp = ec2_client.create_security_group(GroupName=sg_name, Description="Pentest scan node - SSH access")
         sg_id = resp["GroupId"]
         ec2_client.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[
             {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "SSH"}]},
@@ -5176,7 +5197,7 @@ async def create_ec2_instance(req: AWSCreateRequest):
 
             import asyncio
             loop = asyncio.new_event_loop()
-            tunnel = SSHTunnel(node_id=node_id, host=ip, user="ubuntu", ssh_port=22,
+            tunnel = SSHTunnel(node_id=node_id, name=req.name, host=ip, user="ubuntu", ssh_port=22,
                                key_file=ssh_key, socks_port=socks_port)
             result = loop.run_until_complete(ssh_manager.start_tunnel(tunnel))
             loop.close()

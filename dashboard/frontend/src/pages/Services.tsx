@@ -320,6 +320,20 @@ export default function Services() {
     fetchDbMode()
   }, [])
 
+  // Active LLM backend (Settings -> LLM Tuning). Marks local (ollama/vllm) vs
+  // remote (openai/azure/anthropic) so the operator can see at a glance which
+  // model the stack is actually using.
+  const [llmInfo, setLlmInfo] = useState<{ backend: string; model: string; remote: boolean } | null>(null)
+  useEffect(() => {
+    apiFetch<Record<string, string>>('/settings/llm').then(d => {
+      const backend = (d.backend || d.env_backend || 'ollama').toLowerCase()
+      const model = backend === 'openai' ? d.openai_model
+        : backend === 'azure' ? d.azure_model
+        : backend === 'anthropic' ? d.anthropic_model : ''
+      setLlmInfo({ backend, model: model || '', remote: ['openai', 'azure', 'anthropic'].includes(backend) })
+    }).catch(() => setLlmInfo(null))
+  }, [])
+
   const getStatus = (key?: string) => {
     if (!key || !health?.services) return undefined
     return health.services[key]?.status
@@ -350,6 +364,15 @@ export default function Services() {
         <div className="flex items-center gap-2">
           <h2 className="text-lg font-semibold">Services</h2>
           <span className="text-[10px] text-muted-foreground font-mono">Build {BUILD_VERSION}</span>
+          {llmInfo && (
+            <span
+              className={"text-[10px] px-2 py-0.5 rounded-full font-mono " +
+                (llmInfo.remote ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground")}
+              title="Active LLM backend (Settings → LLM Tuning)"
+            >
+              LLM: {llmInfo.remote ? 'remote' : 'local'} · {llmInfo.backend}{llmInfo.model ? ` · ${llmInfo.model}` : ''}
+            </span>
+          )}
         </div>
       </div>
 
