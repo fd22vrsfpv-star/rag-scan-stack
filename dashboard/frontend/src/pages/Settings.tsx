@@ -233,7 +233,6 @@ function GeneralTab() {
   const [exploitProxy, setExploitProxy] = useState(store.exploitProxy)
   const [exploitProxyEnabled, setExploitProxyEnabled] = useState(store.exploitProxyEnabled)
   const [chatSystemPrompt, setChatSystemPrompt] = useState(store.chatSystemPrompt)
-  const [llmBackend, setLlmBackend] = useState(store.llmBackend)
   const [saved, setSaved] = useState(false)
   const [proxyTest, setProxyTest] = useState<'idle' | 'testing' | 'ok' | 'fail'>('idle')
   const [proxyTestMsg, setProxyTestMsg] = useState('')
@@ -251,7 +250,6 @@ function GeneralTab() {
       exploitProxy,
       exploitProxyEnabled,
       chatSystemPrompt,
-      llmBackend,
     })
     setSaved(true)
     setTimeout(() => setSaved(false), 2000)
@@ -542,9 +540,6 @@ function GeneralTab() {
           </div>
         </div>
       </div>
-
-      {/* LLM Backend */}
-      <LlmBackendSection backend={llmBackend} onBackendChange={setLlmBackend} />
 
       {/* Node Cleanup Maintenance */}
       <NodeCleanupSection />
@@ -3748,6 +3743,7 @@ function LLMTuningTab() {
   const [draft, setDraft] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
   const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
+  const [llmBackend, setLlmBackend] = useState('')  // provider/model selector (self-populates from server)
 
   const load = async () => {
     try {
@@ -3804,6 +3800,12 @@ function LLMTuningTab() {
 
   return (
     <div className="space-y-4">
+      {/* Provider / model / API-key selection (moved here from the General tab) */}
+      <LlmBackendSection backend={llmBackend} onBackendChange={setLlmBackend} />
+
+      <div className="border-t border-border pt-4">
+        <h3 className="text-sm font-semibold mb-1">Generation Parameters</h3>
+      </div>
       <div className="text-xs text-muted-foreground space-y-1">
         <p><strong>These settings control how the AI generates responses.</strong> Lower temperature and top_p reduce hallucination (making things up). Higher values produce more creative but less reliable output.</p>
         <p>Changes take effect within 60 seconds. All backends (Ollama, OpenAI, Anthropic, Azure) respect temperature + top_p. Ollama additionally uses top_k, repeat_penalty, num_ctx, and seed.</p>
