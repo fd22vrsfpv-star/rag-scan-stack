@@ -324,3 +324,184 @@ def test_deterministic_fields_are_marked_settled_in_the_prompt():
                              already={"users": ["root"]})
     assert "settled" in prompt.lower()
     assert "root" in prompt
+
+
+# ── netexec: SMB enumeration and the password policy ───────────────────────
+
+NXC_PASSPOL = """SMB    192.168.1.150   445    METASPLOITABLE   [*] Unix (name:METASPLOITABLE) (domain:localdomain) (signing:False) (SMBv1:True)
+SMB    192.168.1.150   445    METASPLOITABLE   [+] localdomain\\:
+SMB    192.168.1.150   445    METASPLOITABLE   Dumping password info for domain: METASPLOITABLE
+SMB    192.168.1.150   445    METASPLOITABLE   Minimum password length: 5
+SMB    192.168.1.150   445    METASPLOITABLE   Password History Length: None
+SMB    192.168.1.150   445    METASPLOITABLE      Domain Password Complex: 0
+SMB    192.168.1.150   445    METASPLOITABLE   Maximum password age: Not Set
+SMB    192.168.1.150   445    METASPLOITABLE   Locked Account Duration: 30 minutes
+SMB    192.168.1.150   445    METASPLOITABLE   Account Lockout Threshold: None
+"""
+
+
+@pytest.mark.unit
+def test_netexec_resolves_under_both_names():
+    es.load_specs(SPEC_DIR, force=True)
+    assert es.spec_for("netexec", SPEC_DIR)
+    assert es.spec_for("nxc", SPEC_DIR), "the nxc alias does not resolve"
+
+
+@pytest.mark.unit
+def test_the_password_policy_is_extracted():
+    spec = es.spec_for("netexec", SPEC_DIR)
+    got = es.run_deterministic(spec, NXC_PASSPOL)
+    assert got["lockout_threshold"] == "None"
+    assert got["password_complexity"] == "0"
+    assert got["min_password_length"] == "5"
+    assert got["lockout_duration"] == "30 minutes"
+
+
+@pytest.mark.unit
+def test_no_lockout_threshold_is_a_high_severity_finding():
+    """The line that decides whether spraying is safe.
+
+    No threshold means an online attack cannot lock anyone out, so the
+    4,100-candidate list is safe to run. A threshold of 3 would make the same
+    list an account-lockout denial of service. Nothing was reading it.
+    """
+    spec = es.spec_for("netexec", SPEC_DIR)
+    notable = es.notable_from(spec, es.run_deterministic(spec, NXC_PASSPOL))
+    by = {n["id"]: n for n in notable}
+    assert "smb_no_lockout_threshold" in by, by
+    assert by["smb_no_lockout_threshold"]["severity"] == "high"
+    assert "smb_no_password_complexity" in by
+
+
+@pytest.mark.unit
+def test_a_configured_lockout_is_not_flagged():
+    """THE false positive: a host that DOES lock out must not be reported as if
+    it did not — that would invite a spray that locks out every account."""
+    policy = NXC_PASSPOL.replace("Account Lockout Threshold: None",
+                                 "Account Lockout Threshold: 3")
+    spec = es.spec_for("netexec", SPEC_DIR)
+    got = es.run_deterministic(spec, policy)
+    assert got["lockout_threshold"] == "3"
+    ids = {n["id"] for n in es.notable_from(spec, got)}
+    assert "smb_no_lockout_threshold" not in ids, \
+        "a host WITH a lockout threshold was reported as having none"
+
+
+@pytest.mark.unit
+def test_enforced_complexity_is_not_flagged():
+    policy = NXC_PASSPOL.replace("Domain Password Complex: 0",
+                                 "Domain Password Complex: 1")
+    spec = es.spec_for("netexec", SPEC_DIR)
+    ids = {n["id"] for n in es.notable_from(spec, es.run_deterministic(spec, policy))}
+    assert "smb_no_password_complexity" not in ids
+
+
+@pytest.mark.unit
+def test_the_python_extractor_and_the_spec_merge_for_netexec():
+    """netexec is covered by BOTH: extract_smb reads its host-info and share
+    table, the spec adds the password policy. Results merge, deduped by id."""
+    import output_analysis as oa
+    # analyse_output resolves specs through the loader's DEFAULT directory,
+    # which is the container path /knowledge/extractors and does not exist on a
+    # host checkout. Point the loader at this repo's specs for the duration.
+    original = es.SPEC_DIR
+    es.SPEC_DIR = SPEC_DIR
+    es.load_specs(SPEC_DIR, force=True)
+    try:
+        a = oa.analyse_output("netexec", NXC_PASSPOL, 0)
+    finally:
+        es.SPEC_DIR = original
+        es.load_specs(force=True)
+    ids = {n["id"] for n in a["notable"]}
+    assert "smb_null_session" in ids, "the Python SMB extractor did not run"
+    assert "smb_no_lockout_threshold" in ids, "the YAML spec did not run"
+    assert len(ids) == len(a["notable"]), "a finding id was emitted twice"
+
+
+@pytest.mark.unit
+def test_the_catalogue_offers_netexec_for_smb():
+    """crackmapexec is no longer developed; netexec is its successor."""
+    import re as _re
+    path = os.path.join(REPO, "knowledge", "service_tools.yaml")
+    src = open(path, encoding="utf-8").read()
+    cmds = [m.group(1) for m in _re.finditer(r'command:\s*"(netexec[^"]+)"', src)]
+    assert cmds, "no netexec commands in the catalogue"
+    flags = {f for c in cmds for f in _re.findall(r"--[a-z-]+", c)}
+    # Verified present in /usr/bin/netexec in this image.
+    for f in ("--shares", "--users", "--pass-pol"):
+        assert f in flags, f"{f} is not offered: {sorted(flags)}"
+    for c in cmds:
+        assert c.startswith("netexec smb "), \
+            f"non-smb netexec command needs its own verification: {c}"
+
+
+# ── informational findings that carry testing parameters ───────────────────
+
+@pytest.mark.unit
+def test_the_password_policy_is_recorded_as_an_informational_finding():
+    """Not every fact worth storing is a defect.
+
+    A password policy is a set of PARAMETERS that constrain credential testing.
+    Only the "bad" values were becoming findings, so `min length 5`,
+    `lockout duration 30 minutes` and `history None` were extracted and then
+    dropped — while being exactly what a later decision needs.
+    """
+    from etl.severity import severity_rank
+    spec = es.spec_for("netexec", SPEC_DIR)
+    notable = es.notable_from(spec, es.run_deterministic(spec, NXC_PASSPOL))
+    by = {n["id"]: n for n in notable}
+    assert "smb_password_policy" in by, by.keys()
+    policy = by["smb_password_policy"]
+    assert policy["severity"] == "info"
+    assert severity_rank("info") > 0, "info is not on the shared severity scale"
+
+
+@pytest.mark.unit
+def test_the_policy_values_are_machine_readable_not_only_prose():
+    """`params` exists so a later decision reads a VALUE, rather than parsing it
+    back out of a sentence."""
+    spec = es.spec_for("netexec", SPEC_DIR)
+    notable = es.notable_from(spec, es.run_deterministic(spec, NXC_PASSPOL))
+    policy = [n for n in notable if n["id"] == "smb_password_policy"][0]
+    params = policy.get("params") or {}
+    assert params.get("lockout_threshold") == "None"
+    assert params.get("min_password_length") == "5"
+    assert params.get("lockout_duration") == "30 minutes"
+    assert params.get("password_history") == "None"
+
+
+@pytest.mark.unit
+def test_the_policy_fires_even_when_nothing_is_wrong():
+    """A host with a GOOD policy still has parameters worth recording."""
+    good = (NXC_PASSPOL.replace("Account Lockout Threshold: None",
+                                "Account Lockout Threshold: 5")
+                       .replace("Domain Password Complex: 0",
+                                "Domain Password Complex: 1"))
+    spec = es.spec_for("netexec", SPEC_DIR)
+    notable = es.notable_from(spec, es.run_deterministic(spec, good))
+    ids = {n["id"] for n in notable}
+    assert "smb_password_policy" in ids, "the policy is only recorded when it is bad"
+    assert "smb_no_lockout_threshold" not in ids
+    policy = [n for n in notable if n["id"] == "smb_password_policy"][0]
+    assert policy["params"]["lockout_threshold"] == "5"
+
+
+@pytest.mark.unit
+def test_a_rule_without_params_carries_none():
+    """The key must be absent, not an empty dict, so it never enters a
+    fingerprinted payload as noise."""
+    spec = es.spec_for("netexec", SPEC_DIR)
+    notable = es.notable_from(spec, es.run_deterministic(spec, NXC_PASSPOL))
+    plain = [n for n in notable if n["id"] == "smb_no_lockout_threshold"][0]
+    assert "params" not in plain
+
+
+@pytest.mark.unit
+def test_a_missing_field_renders_as_unknown_not_the_word_none():
+    """`str(None)` in a title reads as though the tool reported "None", which is
+    a REAL value in this output ("Account Lockout Threshold: None")."""
+    spec = es.spec_for("netexec", SPEC_DIR)
+    sparse = "SMB h 445 X   Account Lockout Threshold: None\n"
+    notable = es.notable_from(spec, es.run_deterministic(spec, sparse))
+    policy = [n for n in notable if n["id"] == "smb_password_policy"][0]
+    assert "unknown" in policy["title"], policy["title"]

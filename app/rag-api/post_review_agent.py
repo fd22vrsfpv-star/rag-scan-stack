@@ -83,7 +83,13 @@ CATEGORIES = {
     "output_despite_failure": {
         "remedy": "ingest",
         "actionable": True,
-        "why": "a non-zero exit that still produced real output; the result exists but was discarded",
+        "why": ("a non-zero exit that still produced real output. Check "
+                "results_not_ingested before acting: that list checks ATTRIBUTION "
+                "and is the authority on whether the data actually landed. "
+                "ssh-audit's 17 rows appear here because it exits 3 when it FINDS "
+                "something — their 23 vulns rows were parsed long ago, so the "
+                "remedy for those is the exit-code semantics "
+                "(kali_listener TOOL_SUCCESS_EXIT_CODES), not re-ingestion"),
     },
     "failed_other": {
         "remedy": "triage",
@@ -1142,6 +1148,13 @@ def ingest_extracted_facts(cur, dry_run=True, limit=4000, target=None):
                     "detail": (fact.get("detail") or "").strip(),
                     "evidence": (fact.get("evidence") or "")[:400],
                     "tool": r["tool"],
+                    # Declared parameters, stored machine-readable. These are
+                    # testing INPUTS — a lockout window, a minimum length — that
+                    # later decisions read directly rather than parsing out of a
+                    # title. They are inside the fingerprinted payload on
+                    # purpose: a changed policy IS a different fact and should
+                    # surface as one rather than silently overwrite the old.
+                    **({"params": fact["params"]} if fact.get("params") else {}),
                 },
             })
 

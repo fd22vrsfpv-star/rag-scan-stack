@@ -370,7 +370,16 @@ def validate_result(spec: dict, result: dict):
 
 
 def notable_from(spec: dict, extracted: dict) -> List[dict]:
-    """Findings the spec declares, for the facts that were extracted."""
+    """Findings the spec declares, for the facts that were extracted.
+
+    A rule may declare `params: [field, ...]`. Those field VALUES are carried on
+    the finding and stored with it, machine-readable rather than embedded in a
+    sentence. That matters for informational findings: an SMB password policy is
+    not a defect to fix, it is a set of parameters that CONSTRAIN testing —
+    minimum length, history depth, lockout duration — and a later decision
+    ("is a spray safe here?", "how long is the lockout window?") needs the value,
+    not prose about it.
+    """
     out = []
     for rule in spec.get("notable") or []:
         try:
@@ -383,9 +392,15 @@ def notable_from(spec: dict, extracted: dict) -> List[dict]:
             val = extracted.get(field)
             if isinstance(val, list):
                 val = len(val)
-            title = title.replace("{" + field + "}", str(val))
-        out.append({"id": rule["id"], "severity": rule["severity"],
-                    "title": title, "detail": rule.get("detail", ""),
-                    "source": "extractor_spec",
-                    "spec": spec.get("_source_file")})
+            title = title.replace("{" + field + "}",
+                                  "unknown" if val is None else str(val))
+        fact = {"id": rule["id"], "severity": rule["severity"],
+                "title": title, "detail": rule.get("detail", ""),
+                "source": "extractor_spec",
+                "spec": spec.get("_source_file")}
+        params = {f: extracted[f] for f in (rule.get("params") or [])
+                  if f in extracted}
+        if params:
+            fact["params"] = params
+        out.append(fact)
     return out

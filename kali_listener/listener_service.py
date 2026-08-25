@@ -1309,8 +1309,12 @@ async def _execute_tool_bounded(exec_id: str, tool: str, command: str, timeout: 
             # Parse output
             parsed_results = parse_tool_output(tool, output)
 
-            # Update database
-            status = "completed" if exit_code == 0 else "failed"
+            # Update database.
+            #
+            # Not `exit_code == 0`: ssh-audit exits 3 when it FINDS something,
+            # so 17 successful audits carrying 9 KB of results each were stored
+            # as failures. See TOOL_SUCCESS_EXIT_CODES.
+            status = "completed" if is_success_exit(tool, exit_code) else "failed"
             db_update_tool_execution(
                 exec_id, status, exit_code, output, error, parsed_results
             )
@@ -1790,6 +1794,40 @@ async def clear_logs():
 #
 # Counting is done HERE because this is where the files are: the listener can
 # read the wordlists, the recommender cannot.
+# ── per-tool exit-code semantics ────────────────────────────────────────────
+#
+# `status = "completed" if exit_code == 0 else "failed"` is wrong for security
+# tools that use the exit code to report WHAT THEY FOUND.
+#
+# ssh-audit is the measured case: 17 stored executions exited 3 carrying
+# 8.9-9.5 KB of output, and 23 `vulns` rows were parsed out of them — a
+# successful audit recorded as a failure. Verified against this image:
+#
+#     ssh-audit -n 192.168.1.150   -> exit 3, 9,530 bytes   (findings present)
+#     ssh-audit -n 127.0.0.1       -> exit 1,    80 bytes   (connection refused)
+#
+# So 3 means "issues found" and 1 means a real failure. Only 0 and 3 are success.
+#
+# ADD ONLY MEASURED ENTRIES. A guessed exit code here silently reclassifies real
+# failures as successes, which is worse than the bug it fixes: a failure that
+# reads as a result is invisible, while a result that reads as a failure at least
+# shows up in the review. Record the measurement in a comment beside the entry.
+TOOL_SUCCESS_EXIT_CODES = {
+    "ssh-audit": {0, 3},
+}
+
+
+def is_success_exit(tool, exit_code):
+    """True when this exit code means the tool did its job.
+
+    Defaults to the universal rule (0 only) for anything not measured.
+    """
+    if exit_code is None:
+        return False
+    allowed = TOOL_SUCCESS_EXIT_CODES.get((tool or "").strip().lower(), {0})
+    return exit_code in allowed
+
+
 CANDIDATE_WARN = int(os.environ.get("CANDIDATE_SPACE_WARN", "50000"))
 CANDIDATE_REFUSE = int(os.environ.get("CANDIDATE_SPACE_REFUSE", "1000000"))
 

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 import httpx
@@ -1126,6 +1127,51 @@ async def reorder_recommendations(body: ReorderRequest):
     }
 
 
+def msf_module_port(rec):
+    """The MODULE's port, not the port of the service that triggered the rec.
+
+    16 of 36 metasploit dispatches went out with a contradictory RPORT.
+    `exploit/multi/misc/java_rmi_server` carries port 1099 in its own metadata
+    and was dispatched `RPORT=21` — an RMI exploit aimed at FTP — because the
+    row's `port` column holds the TRIGGER port, while the recommender records
+    the module's own service and port under `extra.high_value`.
+
+    Returns None when nothing is known, so the caller still falls back to
+    resolving the port from the database.
+    """
+    extra = rec.get("extra") or {}
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except Exception:
+            extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+    high = extra.get("high_value")
+    if isinstance(high, dict) and high.get("port"):
+        return high["port"]
+    if extra.get("port"):
+        return extra["port"]
+    return rec.get("port")
+
+
+def msf_job_identifier(data, rec):
+    """A usable identifier for a dispatch, in order of preference.
+
+    An auxiliary or scanner module starts a JOB and never creates a session, so
+    `session_id` is None for most dispatches. The old code fell back to the
+    literal string "msf", which gave all 36 queued recommendations the same
+    non-identifier — nothing could correlate a dispatch with its result, and none
+    of them ever produced a recorded execution.
+    """
+    data = data or {}
+    for key in ("job_id", "session_id"):
+        value = data.get(key)
+        if value not in (None, "", "msf"):
+            return str(value)
+    return str(rec.get("id"))          # unique, unlike "msf"
+
+
 @router.post("/api/scan-recommendations/run")
 async def run_scan_recommendations(body: RunRecommendationsRequest):
     """
@@ -1656,7 +1702,16 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                             row = cur.fetchone()
                             return row[0] if row else None
 
-                    msf_port = rec.get("port")
+                    # The MODULE's port, not the port of whatever service
+                    # triggered the recommendation.
+                    #
+                    # 16 of 36 dispatches went out with a contradictory RPORT:
+                    # `exploit/multi/misc/java_rmi_server` carries port 1099 in
+                    # its own metadata and was dispatched RPORT=21, i.e. an RMI
+                    # exploit aimed at FTP. The recommender records the module's
+                    # service and port under extra.high_value; the row's `port`
+                    # column is the trigger, which is not the same thing.
+                    msf_port = msf_module_port(rec)
                     if msf_port is None:
                         try:
                             msf_port = await asyncio.to_thread(_resolve_port)
@@ -1688,7 +1743,14 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                                                 f"container{' via ' + proxy_url if proxy_url else ''}: "
                                                 f"{'success' if ok else 'no session/failed'}")
                             await _mark_rec_dispatched(
-                                rec_id=rec["id"], job_id=str(data.get("session_id") or "msf"),
+                                # job_id first: an auxiliary module starts a job
+                                # and never creates a session. Falling back to
+                                # the literal "msf" gave all 36 dispatches the
+                                # same non-identifier, so no result could ever be
+                                # correlated back. The rec id is the last resort
+                                # because it is at least unique.
+                                rec_id=rec["id"],
+                                job_id=msf_job_identifier(data, rec),
                                 ip=ip, port=msf_port, service=rec.get("service"),
                                 scanner=scanner, node_id=None,
                                 command=f"msf {module} RHOSTS={ip}"
