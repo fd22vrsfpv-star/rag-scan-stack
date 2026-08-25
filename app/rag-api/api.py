@@ -5631,6 +5631,48 @@ def search_findings(
         FROM credential_findings cf
         LEFT JOIN assets a ON a.id = cf.asset_id
         WHERE cf.valid_cred = true
+
+        UNION ALL
+
+        -- Service-enum recon (email + DNS infrastructure: spf/dmarc/dkim,
+        -- nameservers, dns_records). ONLY these finding sources — the bulk
+        -- subdomain/dnsx enumeration stays in the Recon Explorer, not here.
+        SELECT
+            rf.id::text,
+            rf.source,
+            rf.asset_id::text,
+            COALESCE(host(a.ip)::text, rf.target, '') as ip,
+            COALESCE(a.hostname, rf.target) as hostname,
+            NULL::int as port,
+            NULL::text as url,
+            rf.severity,
+            rf.finding_type as title,
+            LEFT(rf.data::text, 500) as evidence,
+            ARRAY[]::text[] as cve,
+            ARRAY[]::text[] as cwe,
+            NULL::numeric as cvss,
+            NULL::text as method,
+            NULL::text as description,
+            NULL::text as solution,
+            NULL::text as reference,
+            NULL::text as confidence,
+            COALESCE(rf.tags, ARRAY[]::text[]) as tags,
+            rf.created_at,
+            NULL::text as workflow_status,
+            NULL::text as assigned_to,
+            NULL::text as verified_by,
+            NULL::timestamptz as verified_at,
+            NULL::text as tester_notes,
+            NULL::text as original_severity,
+            NULL::boolean as report_ready,
+            rf.engagement_id::text,
+            rf.fingerprint as problem_id,
+            1 as affects_hosts,
+            'finding'::text as record_kind,
+            'recon' as finding_source
+        FROM recon_findings rf
+        LEFT JOIN assets a ON a.id = rf.asset_id
+        WHERE rf.source IN ('email-enum', 'dns-enum')
     )
     SELECT * FROM unified
     """
