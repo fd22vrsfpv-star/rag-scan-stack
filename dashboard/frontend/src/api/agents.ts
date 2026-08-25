@@ -21,6 +21,15 @@ export interface AgentInfo {
   enabled_engagements?: number
   last_dispatch?: string | null
   gaps_found?: number | null
+  // Artifact LLM Review agent
+  queue_pending?: number
+  queue_processing?: number
+  queue_done?: number
+  queue_failed?: number
+  queue_total?: number
+  // Pre-Validation agent
+  sessions_validated?: number
+  unsupported_claims?: number
 }
 
 export interface GapRecommendation {
@@ -81,6 +90,32 @@ export function useAgentsStatus() {
     queryFn: () => apiFetch<{ agents: AgentInfo[] }>('/agents/status'),
     refetchInterval: POLL.NORMAL,
     placeholderData: (prev) => prev as any,
+  })
+}
+
+export interface DrainResult {
+  ok: boolean
+  claimed?: number
+  done?: number
+  parked?: number
+  requeued_stale?: number
+  model?: string
+  queue_depth?: Record<string, unknown>
+}
+
+export function useDrainArtifacts() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (limit: number = 20) =>
+      apiFetch<DrainResult>('/artifacts/drain', {
+        method: 'POST',
+        body: JSON.stringify({ limit }),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['agents-status'] })
+      qc.invalidateQueries({ queryKey: ['artifacts'] })
+      qc.invalidateQueries({ queryKey: ['artifact-stats'] })
+    },
   })
 }
 

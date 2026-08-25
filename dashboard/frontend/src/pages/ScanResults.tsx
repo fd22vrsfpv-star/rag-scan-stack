@@ -223,7 +223,7 @@ function Select({ value, onChange, options, placeholder }: {
 /** Detail view: the complete output, plus what to do next. */
 function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
   const { data: artifact, isLoading } = useArtifact(id)
-  const [tab, setTab] = useState<'output' | 'actions'>('output')
+  const [tab, setTab] = useState<'review' | 'output' | 'actions'>('review')
   const { data: actions, isLoading: actionsLoading, refetch } = useArtifactActions(id)
   const [copied, setCopied] = useState(false)
 
@@ -286,6 +286,9 @@ function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
           </div>
 
           <div className="flex gap-1 mt-3">
+            <TabButton active={tab === 'review'} onClick={() => setTab('review')}
+                       icon={<Sparkles className="w-4 h-4" />} label="LLM Review"
+                       badge={artifact?.llm_status} />
             <TabButton active={tab === 'output'} onClick={() => setTab('output')}
                        icon={<FileText className="w-4 h-4" />} label="Raw Output"
                        badge={artifact ? formatBytes(artifact.byte_size) : undefined} />
@@ -298,6 +301,8 @@ function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
         <div className="p-4">
           {isLoading ? (
             <div className="p-8 text-center"><Loader2 className="w-5 h-5 animate-spin mx-auto text-gray-500" /></div>
+          ) : tab === 'review' ? (
+            <ReviewPanel artifact={artifact} />
           ) : tab === 'output' ? (
             <div className="space-y-3">
               <div className="flex items-center gap-2 flex-wrap text-xs text-gray-400">
@@ -324,6 +329,106 @@ function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
           )}
         </div>
       </div>
+    </div>
+  )
+}
+
+/** The LLM enrichment pass over one artifact: its summary of what the raw
+ *  output actually shows. Stored in raw_artifacts.llm_result by the artifact
+ *  consumer (/artifacts/drain). Answers "what did the review find?" without
+ *  making the operator read the raw bytes. */
+function ReviewPanel({ artifact }: { artifact?: import('@/api/artifacts').Artifact }) {
+  if (!artifact) return null
+  const status = artifact.llm_status
+  const r = (artifact.llm_result || {}) as Record<string, any>
+  const summary: string = typeof r.summary === 'string' ? r.summary : ''
+  const asList = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.trim()) : []
+  const findings = asList(r.findings)
+  const services = asList(r.services)
+  const nextSteps = asList(r.next_steps)
+  const confidence: string | undefined = typeof r.confidence === 'string' ? r.confidence : undefined
+  const meta = (r._meta || {}) as Record<string, any>
+
+  if (status === 'pending' || status === 'processing') {
+    return (
+      <div className="p-6 text-center space-y-2">
+        <Clock className="w-6 h-6 mx-auto text-yellow-400" />
+        <p className="text-sm text-gray-300">
+          {status === 'processing' ? 'Review in progress…' : 'Not reviewed yet.'}
+        </p>
+        <p className="text-xs text-gray-500 max-w-md mx-auto">
+          Run the LLM review pass from the <span className="text-gray-300">AI Agents → Artifact LLM Review → Process Queue</span> button.
+          The review summarises this output so you don't have to read the raw bytes.
+        </p>
+      </div>
+    )
+  }
+  if (status === 'skipped') {
+    return (
+      <div className="p-6 space-y-2">
+        <div className="flex items-center gap-2 text-gray-400"><AlertTriangle className="w-4 h-4" /> Skipped</div>
+        <p className="text-xs text-gray-500">{artifact.llm_error || 'This artifact was skipped by the review pass.'}</p>
+      </div>
+    )
+  }
+  if (status === 'failed') {
+    return (
+      <div className="p-6 space-y-2">
+        <div className="flex items-center gap-2 text-red-400"><AlertTriangle className="w-4 h-4" /> Review failed</div>
+        <pre className="text-xs text-red-300/80 whitespace-pre-wrap break-words bg-black border border-red-900/40 rounded p-2">{artifact.llm_error || 'unknown error'}</pre>
+      </div>
+    )
+  }
+  if (!summary && !findings.length && !services.length && !nextSteps.length) {
+    return <div className="p-6 text-sm text-gray-500">Reviewed, but the model returned nothing of interest.</div>
+  }
+
+  const confTone = confidence === 'high' ? 'text-green-400 border-green-500/30 bg-green-500/10'
+    : confidence === 'low' ? 'text-red-400 border-red-500/30 bg-red-500/10'
+    : 'text-yellow-400 border-yellow-500/30 bg-yellow-500/10'
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-2 flex-wrap text-xs">
+        {confidence && <span className={cn('px-2 py-0.5 rounded border', confTone)}>confidence: {confidence}</span>}
+        {artifact.llm_model && <Meta label="Model" value={artifact.llm_model} mono />}
+        {typeof meta.latency_ms === 'number' && <Meta label="Latency" value={`${meta.latency_ms} ms`} />}
+        {artifact.llm_processed_at && <Meta label="Reviewed" value={new Date(artifact.llm_processed_at).toLocaleString()} />}
+      </div>
+
+      {summary && (
+        <div className="bg-gray-900/60 border border-gray-800 rounded p-3">
+          <p className="text-sm text-gray-200">{summary}</p>
+        </div>
+      )}
+
+      <ReviewList title="Findings" items={findings} icon={<AlertTriangle className="w-4 h-4 text-amber-400" />} tone="text-amber-300" />
+      <ReviewList title="Services / versions" items={services} icon={<Braces className="w-4 h-4 text-blue-400" />} tone="text-blue-300" />
+      <ReviewList title="Suggested next steps" items={nextSteps} icon={<ChevronRight className="w-4 h-4 text-green-400" />} tone="text-green-300" />
+
+      <p className="text-[11px] text-gray-600">
+        Runnable follow-ons (with a Queue button) are on the <span className="text-gray-400">Follow-On Actions</span> tab.
+      </p>
+    </div>
+  )
+}
+
+function ReviewList({ title, items, icon, tone }: {
+  title: string; items: string[]; icon: React.ReactNode; tone: string
+}) {
+  if (!items.length) return null
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center gap-1.5 text-xs font-semibold text-gray-300">{icon} {title} <span className="text-gray-600">({items.length})</span></div>
+      <ul className="space-y-1">
+        {items.map((it, i) => (
+          <li key={i} className={cn('text-sm flex gap-2', tone)}>
+            <span className="text-gray-600 select-none">•</span>
+            <span className="text-gray-200">{it}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   )
 }

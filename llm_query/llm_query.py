@@ -33,6 +33,38 @@ OPENAI_API_BASE = os.environ.get("OPENAI_API_BASE", "https://api.openai.com")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 
+# Live config: dashboard Settings -> LLM Tuning (DB llm.*) over env. See
+# llm_settings.py. _refresh_llm_globals() repopulates the constants above from
+# the resolver before each request (via middleware), so the GUI drives this
+# proxy without a container recreate.
+try:
+    from llm_settings import get_llm_settings
+except Exception:
+    get_llm_settings = None
+
+
+def _refresh_llm_globals():
+    if get_llm_settings is None:
+        return
+    global LLM_BACKEND, OPENAI_API_BASE, OPENAI_MODEL, OPENAI_API_KEY
+    global AZURE_ENDPOINT, AZURE_MODEL, AZURE_API_KEY, AZURE_API_VERSION
+    global ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+    try:
+        s = get_llm_settings()
+    except Exception:
+        return
+    LLM_BACKEND = (s.get("backend") or LLM_BACKEND).lower()
+    OPENAI_API_BASE = s.get("openai_api_base") or OPENAI_API_BASE
+    OPENAI_MODEL = s.get("openai_model") or OPENAI_MODEL
+    OPENAI_API_KEY = s.get("openai_api_key") or OPENAI_API_KEY
+    AZURE_ENDPOINT = s.get("azure_endpoint") or AZURE_ENDPOINT
+    AZURE_MODEL = s.get("azure_model") or AZURE_MODEL
+    AZURE_API_KEY = s.get("azure_api_key") or AZURE_API_KEY
+    AZURE_API_VERSION = s.get("azure_api_version") or AZURE_API_VERSION
+    ANTHROPIC_API_KEY = s.get("anthropic_api_key") or ANTHROPIC_API_KEY
+    ANTHROPIC_MODEL = s.get("anthropic_model") or ANTHROPIC_MODEL
+
+
 # ---------- App ----------
 app = FastAPI(title="LLM Query (Ollama Proxy)")
 app.add_middleware(
@@ -42,6 +74,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _llm_settings_mw(request, call_next):
+    # Pull the latest LLM settings (DB over env) before handling each request.
+    try:
+        _refresh_llm_globals()
+    except Exception:
+        pass
+    return await call_next(request)
+
 
 router = APIRouter(prefix="/ollama")
 
@@ -121,10 +164,28 @@ def _json_get(url: str) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
 
 # ---------- Azure Helpers ----------
 
+def _azure_is_foundry(base: str) -> bool:
+    """True for a Microsoft Foundry OpenAI-compatible endpoint (…/openai/v1)."""
+    b = base.lower()
+    return (".services.ai.azure.com" in b or "/openai/v1" in b
+            or b.rstrip("/").endswith("/openai"))
+
+
+def _azure_foundry_root(base: str) -> str:
+    """Resource root for a Foundry endpoint, however it was typed
+    (…, …/openai, …/openai/v1, …/openai/v1/chat/completions)."""
+    import re
+    return re.sub(r'(/openai)?(/v1)?(/chat/completions|/embeddings)?/?$', '',
+                  base.rstrip('/'), flags=re.I).rstrip('/')
+
+
 def _azure_chat_url(model: Optional[str] = None) -> str:
     """Build Azure chat completions URL based on endpoint pattern."""
     base = AZURE_ENDPOINT.rstrip("/")
     mdl = model or AZURE_MODEL
+    if _azure_is_foundry(base):
+        # OpenAI-compatible: model goes in the body (see _azure_json_post).
+        return f"{_azure_foundry_root(base)}/openai/v1/chat/completions"
     if ".models.ai.azure.com" in base:
         return f"{base}/v1/chat/completions"
     return f"{base}/openai/deployments/{mdl}/chat/completions?api-version={AZURE_API_VERSION}"
@@ -134,6 +195,8 @@ def _azure_embed_url(model: Optional[str] = None) -> str:
     """Build Azure embeddings URL."""
     base = AZURE_ENDPOINT.rstrip("/")
     mdl = model or AZURE_MODEL
+    if _azure_is_foundry(base):
+        return f"{_azure_foundry_root(base)}/openai/v1/embeddings"
     if ".models.ai.azure.com" in base:
         return f"{base}/v1/embeddings"
     return f"{base}/openai/deployments/{mdl}/embeddings?api-version={AZURE_API_VERSION}"
@@ -145,6 +208,11 @@ def _azure_headers() -> Dict[str, str]:
 
 def _azure_json_post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """POST to Azure endpoint with API key auth."""
+    # OpenAI-compatible Azure endpoints (Foundry /openai/v1, models.ai.azure.com)
+    # take the model in the BODY; classic deployment URLs carry it in the path
+    # (their URL ends with ?api-version=…, so this correctly skips them).
+    if url.endswith("/chat/completions"):
+        payload = {**payload, "model": AZURE_MODEL}
     try:
         r = requests.post(url, json=payload, headers=_azure_headers(), timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
@@ -306,7 +374,7 @@ def health():
             url = _azure_chat_url()
             r = requests.post(
                 url,
-                json={"messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
+                json={"model": AZURE_MODEL, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
                 headers=_azure_headers(), timeout=10,
             )
             r.raise_for_status()
@@ -646,6 +714,25 @@ def root_health():
 # Mount router
 
 app.include_router(router)
+
+# Native Ollama API paths (/api/*) so llm_query is a DROP-IN Ollama replacement:
+# a client that points its Ollama base at http://llm_query:8002 gets its
+# /api/generate, /api/tags, /api/chat, /api/embeddings translated to the
+# configured backend (ollama/openai/azure). This lets the rag-api agents run on
+# the selected backend (e.g. DeepSeek) instead of hitting Ollama directly.
+api_router = APIRouter(prefix="/api")
+
+def _proxy_version():
+    return {"version": f"llm_query-proxy-{LLM_BACKEND}"}
+
+api_router.add_api_route("/version", _proxy_version, methods=["GET"])
+api_router.add_api_route("/tags", tags, methods=["GET"])
+api_router.add_api_route("/ps", ps, methods=["GET"])
+api_router.add_api_route("/generate", generate, methods=["POST"])
+api_router.add_api_route("/chat", chat, methods=["POST"])
+api_router.add_api_route("/embeddings", embeddings, methods=["POST"])
+api_router.add_api_route("/embed", embeddings, methods=["POST"])
+app.include_router(api_router)
 
 # ---------- Local dev ----------
 if __name__ == "__main__":

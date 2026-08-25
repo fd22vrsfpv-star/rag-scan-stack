@@ -52,6 +52,13 @@ class AutoQueueSetting(BaseModel):
     enabled: bool
 
 
+class DrainRequest(BaseModel):
+    limit: int = 10
+    tool: Optional[str] = None
+    model: Optional[str] = None
+    requeue_stale_minutes: int = 30
+
+
 class ProcessedRequest(BaseModel):
     llm_status: str = "done"
     llm_model: Optional[str] = None
@@ -114,6 +121,28 @@ async def set_auto_queue(req: AutoQueueSetting):
     s = get_settings()
     async with httpx.AsyncClient(timeout=LIST_TIMEOUT) as c:
         resp = await c.post(f"{s.rag_api_url}/artifacts/auto-queue",
+                            json=req.model_dump(), headers=_hdrs())
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+# The LLM pass over a batch can be slow (model time per artifact), so this gets
+# a generous timeout. Declared BEFORE /{artifact_id} — FastAPI matches in
+# definition order, and 'drain' must not be swallowed by the UUID route.
+DRAIN_TIMEOUT = 300
+
+
+@router.post("/api/artifacts/drain")
+async def drain_queue(req: DrainRequest):
+    """Run the LLM enrichment pass over a batch of pending artifacts.
+
+    Thin proxy to rag-api /artifacts/drain, whose consumer claims pending rows,
+    calls the configured LLM backend, and marks them done/failed. Also requeues
+    rows abandoned in 'processing'."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=DRAIN_TIMEOUT) as c:
+        resp = await c.post(f"{s.rag_api_url}/artifacts/drain",
                             json=req.model_dump(), headers=_hdrs())
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)

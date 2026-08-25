@@ -36,6 +36,35 @@ OPENAI_API_BASE = os.environ.get("OPENAI_API_BASE", "https://api.openai.com")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 
+# Live config: dashboard Settings -> LLM Tuning (DB llm.*) over env. See
+# llm_settings.py; _refresh_llm_globals() runs before each request (middleware).
+try:
+    from llm_settings import get_llm_settings
+except Exception:
+    get_llm_settings = None
+
+
+def _refresh_llm_globals():
+    if get_llm_settings is None:
+        return
+    global LLM_BACKEND, OPENAI_API_BASE, OPENAI_MODEL, OPENAI_API_KEY
+    global AZURE_ENDPOINT, AZURE_MODEL, AZURE_API_KEY, AZURE_API_VERSION
+    global ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+    try:
+        s = get_llm_settings()
+    except Exception:
+        return
+    LLM_BACKEND = (s.get("backend") or LLM_BACKEND).lower()
+    OPENAI_API_BASE = s.get("openai_api_base") or OPENAI_API_BASE
+    OPENAI_MODEL = s.get("openai_model") or OPENAI_MODEL
+    OPENAI_API_KEY = s.get("openai_api_key") or OPENAI_API_KEY
+    AZURE_ENDPOINT = s.get("azure_endpoint") or AZURE_ENDPOINT
+    AZURE_MODEL = s.get("azure_model") or AZURE_MODEL
+    AZURE_API_KEY = s.get("azure_api_key") or AZURE_API_KEY
+    AZURE_API_VERSION = s.get("azure_api_version") or AZURE_API_VERSION
+    ANTHROPIC_API_KEY = s.get("anthropic_api_key") or ANTHROPIC_API_KEY
+    ANTHROPIC_MODEL = s.get("anthropic_model") or ANTHROPIC_MODEL
+
 DB_HOST = os.environ.get("DB_HOST", "rag-postgres")
 DB_PORT = os.environ.get("DB_PORT", "5432")
 DB_NAME = os.environ.get("DB_NAME", "scans")
@@ -1356,8 +1385,14 @@ def _ollama_nonstream_generate(prompt: str, model: str, endpoint: str,
 def _azure_chat_url(endpoint: str, model: str, api_version: str) -> str:
     """Build Azure chat completions URL based on endpoint pattern."""
     base = endpoint.rstrip("/")
-    if ".models.ai.azure.com" in base:
-        # AI Foundry serverless — OpenAI-compatible
+    low = base.lower()
+    if ".services.ai.azure.com" in low or "/openai/v1" in low or low.rstrip("/").endswith("/openai"):
+        # Microsoft Foundry OpenAI-compatible endpoint — model goes in the body.
+        import re
+        root = re.sub(r'(/openai)?(/v1)?(/chat/completions)?/?$', '', base, flags=re.I).rstrip("/")
+        return f"{root}/openai/v1/chat/completions"
+    if ".models.ai.azure.com" in low:
+        # AI Foundry model-inference — OpenAI-compatible
         return f"{base}/v1/chat/completions"
     # Azure OpenAI
     return f"{base}/openai/deployments/{model}/chat/completions?api-version={api_version}"
@@ -1372,6 +1407,9 @@ def _azure_generate(prompt: str, json_mode: bool = False,
     """Call Azure chat completions and return the assistant message content."""
     url = _azure_chat_url(AZURE_ENDPOINT, AZURE_MODEL, AZURE_API_VERSION)
     payload: Dict[str, Any] = {
+        # `model` is required by OpenAI-compatible Foundry endpoints and ignored
+        # by classic Azure deployment URLs.
+        "model": AZURE_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.7,
         "max_tokens": 2048,
@@ -1690,6 +1728,18 @@ Rules:
 
 # ---- FastAPI ----
 app = FastAPI(title="Scan Recommender")
+
+
+@app.middleware("http")
+async def _llm_settings_mw(request, call_next):
+    # Pull the latest LLM settings (DB over env) before handling each request.
+    try:
+        _refresh_llm_globals()
+    except Exception:
+        pass
+    return await call_next(request)
+
+
 router = APIRouter()
 # added to include the python for searchsploit
 app.include_router(rag_router)

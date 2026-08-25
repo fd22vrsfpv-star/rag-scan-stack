@@ -5808,6 +5808,48 @@ def search_findings(
         FROM credential_findings cf
         LEFT JOIN assets a ON a.id = cf.asset_id
         WHERE cf.valid_cred = true
+
+        UNION ALL
+
+        -- Service-enum recon (email + DNS infrastructure: spf/dmarc/dkim,
+        -- nameservers, dns_records). ONLY these finding sources — the bulk
+        -- subdomain/dnsx enumeration stays in the Recon Explorer, not here.
+        SELECT
+            rf.id::text,
+            rf.source,
+            rf.asset_id::text,
+            COALESCE(host(a.ip)::text, rf.target, '') as ip,
+            COALESCE(a.hostname, rf.target) as hostname,
+            NULL::int as port,
+            NULL::text as url,
+            rf.severity,
+            rf.finding_type as title,
+            LEFT(rf.data::text, 500) as evidence,
+            ARRAY[]::text[] as cve,
+            ARRAY[]::text[] as cwe,
+            NULL::numeric as cvss,
+            NULL::text as method,
+            NULL::text as description,
+            NULL::text as solution,
+            NULL::text as reference,
+            NULL::text as confidence,
+            COALESCE(rf.tags, ARRAY[]::text[]) as tags,
+            rf.created_at,
+            NULL::text as workflow_status,
+            NULL::text as assigned_to,
+            NULL::text as verified_by,
+            NULL::timestamptz as verified_at,
+            NULL::text as tester_notes,
+            NULL::text as original_severity,
+            NULL::boolean as report_ready,
+            rf.engagement_id::text,
+            rf.fingerprint as problem_id,
+            1 as affects_hosts,
+            'finding'::text as record_kind,
+            'recon' as finding_source
+        FROM recon_findings rf
+        LEFT JOIN assets a ON a.id = rf.asset_id
+        WHERE rf.source IN ('email-enum', 'dns-enum')
     )
     SELECT * FROM unified
     """
@@ -15161,6 +15203,26 @@ def _list_available_models() -> List[str]:
     return []
 
 
+def _effective_backend_model():
+    """If the LLM proxy resolves to a REMOTE backend (openai/azure/anthropic),
+    return (model_name, backend). The proxy overrides any per-agent model with
+    this, so it is what every agent actually runs on. Returns (None, None) for a
+    local Ollama backend, where per-agent model overrides genuinely apply."""
+    try:
+        base = (os.environ.get("OLLAMA_BASE_URL")
+                or os.environ.get("OLLAMA_URL")
+                or "http://host.docker.internal:11434").rstrip("/")
+        resp = requests.get(f"{base}/api/tags", timeout=5, verify=False)
+        if resp.status_code == 200:
+            for m in resp.json().get("models", []):
+                b = (m.get("backend") or "").lower()
+                if b and b not in ("ollama", "local"):
+                    return m.get("name"), b
+    except Exception:
+        pass
+    return None, None
+
+
 @app.get("/settings/agent-models", tags=["Settings"])
 def get_agent_models(_: bool = Depends(auth)):
     """Return registered agents with their currently-resolved model + the list
@@ -15174,6 +15236,8 @@ def get_agent_models(_: bool = Depends(auth)):
                 overrides[k] = r["value"]
     except Exception:
         pass
+
+    eff_model, eff_backend = _effective_backend_model()
 
     agents = []
     for spec in AGENT_MODEL_REGISTRY:
@@ -15189,6 +15253,12 @@ def get_agent_models(_: bool = Depends(auth)):
             if not current:
                 current = spec["default"]
                 source = "default"
+        # A remote backend (openai/azure/anthropic) overrides every agent's model
+        # at the llm_query proxy, so report the model actually used, not the
+        # (ignored) local env value.
+        if eff_model:
+            current = eff_model
+            source = f"backend:{eff_backend}"
         agents.append({
             "id": spec["id"], "name": spec["name"], "description": spec["description"],
             "current_model": current, "source": source, "default_model": spec["default"],
@@ -19160,6 +19230,84 @@ def get_agents_status(_: bool = Depends(auth)):
             "id": "cloud-triage-agent", "name": "Cloud Triage Agent",
             "type": "on-demand", "status": "error",
             "description": "Re-ranks open cloud recommendations by attack-chain order and produces a top-3 next-actions plan",
+        })
+
+    # 7. Artifact LLM Review Agent — services the raw_artifacts LLM-review queue.
+    #    The consumer + /artifacts/drain already exist; this surfaces the queue so
+    #    an operator can see the backlog and process it from the AI Agents page.
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT count(*) FILTER (WHERE llm_status = 'pending')    AS pending,
+                       count(*) FILTER (WHERE llm_status = 'processing') AS processing,
+                       count(*) FILTER (WHERE llm_status = 'done')       AS done,
+                       count(*) FILTER (WHERE llm_status = 'failed')     AS failed,
+                       count(*)                                          AS total,
+                       max(llm_processed_at)                             AS last_run
+                  FROM raw_artifacts
+            """)
+            a = cur.fetchone() or {}
+            pending = int(a.get("pending") or 0)
+            processing = int(a.get("processing") or 0)
+            agents.append({
+                "id": "artifact-review", "name": "Artifact LLM Review",
+                "type": "on-demand",
+                "status": "running" if processing > 0 else "idle",
+                "description": "Runs the LLM enrichment pass over raw scan output pending review, then extracts follow-on actions",
+                "queue_pending": pending,
+                "queue_processing": processing,
+                "queue_done": int(a.get("done") or 0),
+                "queue_failed": int(a.get("failed") or 0),
+                "queue_total": int(a.get("total") or 0),
+                "last_run": a["last_run"].isoformat() if a.get("last_run") else None,
+            })
+    except Exception:
+        agents.append({
+            "id": "artifact-review", "name": "Artifact LLM Review",
+            "type": "on-demand", "status": "error",
+            "description": "Runs the LLM enrichment pass over raw scan output pending review, then extracts follow-on actions",
+        })
+
+    # 8. Pre-Validation Agent — verifies agent/LLM factual claims (ports, CVEs,
+    #    services, hosts) against what the scans actually recorded, BEFORE those
+    #    claims are trusted. Deterministic (regex + SQL) via scan-recommender
+    #    /kb/agent-output/verify; autogen runs it per-session and persists the
+    #    outcome to agent_sessions.metadata->'claim_validation'.
+    try:
+        r = _fast_get("https://scan-recommender:8013/health")
+        reachable = bool(r and r.status_code == 200)
+        validated = unsupported = 0
+        last_val = None
+        try:
+            with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT count(*) FILTER (WHERE metadata ? 'claim_validation') AS validated,
+                           COALESCE(SUM((metadata->'claim_validation'->>'unsupported_count')::int)
+                                    FILTER (WHERE metadata ? 'claim_validation'), 0) AS unsupported,
+                           MAX(updated_at) FILTER (WHERE metadata ? 'claim_validation') AS last_run
+                      FROM agent_sessions
+                """)
+                v = cur.fetchone() or {}
+                validated = int(v.get("validated") or 0)
+                unsupported = int(v.get("unsupported") or 0)
+                last_val = v.get("last_run")
+        except Exception:
+            pass
+        agents.append({
+            "id": "pre-validation", "name": "Pre-Validation Agent",
+            "type": "continuous", "status": "running" if reachable else "unreachable",
+            "description": "Verifies agent/LLM claims (ports, CVEs, services, hosts) against recorded scan data before findings are trusted",
+            "service_port": 8013,
+            "sessions_validated": validated,
+            "unsupported_claims": unsupported,
+            "last_run": last_val.isoformat() if last_val else None,
+        })
+    except Exception:
+        agents.append({
+            "id": "pre-validation", "name": "Pre-Validation Agent",
+            "type": "continuous", "status": "error",
+            "description": "Verifies agent/LLM claims against recorded scan data before findings are trusted",
+            "service_port": 8013,
         })
 
     return {"agents": agents}
