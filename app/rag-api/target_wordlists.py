@@ -435,7 +435,26 @@ def import_enumerated_identities(cur, dry_run=True, target=None, limit=2000):
         if not spec:
             continue
         fields = es.run_deterministic(spec, r["output"])
-        for name in (fields.get("users") or []):
+        # Read the spec's FEED declaration rather than a hardcoded field name.
+        #
+        # This looked only at a field called `users`, so smtp-user-enum's
+        # `valid_users` — 4 confirmed accounts on this host — could never reach
+        # identities no matter how good the extractor was. A profile now says
+        # where its output goes (`feeds: identities`) and this follows it, so a
+        # new tool needs no change here.
+        names = []
+        try:
+            for action in es.follow_on_from(spec, fields,
+                                            {"target": r["target"]}):
+                if action.get("feeds") == "identities":
+                    for value in (action.get("feed_values") or []):
+                        if isinstance(value, str):
+                            names.append(value)
+        except Exception:
+            pass
+        if not names:
+            names = list(fields.get("users") or [])
+        for name in names:
             name = (name or "").strip()
             if not _plausible_username(name):
                 continue

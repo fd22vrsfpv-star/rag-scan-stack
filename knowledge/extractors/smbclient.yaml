@@ -117,3 +117,28 @@ notable:
     detail: >
       The client fell back to SMB1 and the server honoured it, so the deprecated
       dialect is still available.
+
+follow_on:
+  # ONE ACTION PER SHARE — the capability a text regex cannot express.
+  #
+  # The old rule engine matched "shares were found" and proposed a generic
+  # command, because a regex over raw text has no handle on the share NAMES it
+  # matched. The extractor already knows them, so `for_each` turns each into its
+  # own command: `//target/tmp`, `//target/opt`.
+  #
+  # It iterates `shares`, which holds Disk rows only — IPC$ and ADMIN$ are in
+  # `ipc_endpoints` and are service endpoints, not browsable shares, so they
+  # produce no action at all.
+  - id: browse_share
+    when: len(shares) > 0
+    for_each: shares
+    scanner: smbclient
+    script: "smbclient //{target}/{item} -N -c 'ls'"
+    title: "List the contents of //{target}/{item}"
+    category: smb
+    priority: 20
+    auto_queue: true
+    rationale: >
+      The share is known to exist and the null session is known to be accepted,
+      so listing it needs no credential and says immediately whether anything
+      readable is exposed.

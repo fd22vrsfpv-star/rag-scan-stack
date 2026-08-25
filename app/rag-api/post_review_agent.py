@@ -1212,3 +1212,113 @@ def ingest_extracted_facts(cur, dry_run=True, limit=4000, target=None):
                                    key=lambda kv: -severity_rank(kv[0]))),
         "sample": sorted(new, key=lambda p: -severity_rank(p["severity"]))[:12],
     }
+
+
+# ── which tools still have no analysis profile ─────────────────────────────
+
+# States that mean the OUTPUT IS AN ERROR, not data. A tool in one of these
+# needs its run fixed or repeated — writing an extractor for it would be work
+# spent parsing failure messages.
+_FAILED_CATEGORIES = {
+    "interrupted", "timed_out", "crashed", "broken_invocation",
+    "silent_no_op", "placeholder_target", "failed_other",
+}
+
+
+def analysis_coverage(cur, limit_tools=40):
+    """Which tools produce output nothing interprets — and which merely failed.
+
+    The rollout order for analysis profiles, chosen by evidence instead of an
+    audit. 103 catalogue tools have a handful of extraction specs between them,
+    so the question is never "write them all" but "which one next".
+
+    THREE STATES THAT LOOK IDENTICAL in every other view:
+
+      no_profile   output carries results and nothing understands them.
+                   Write a profile.
+      run_failed   the output IS the failure — a connection refused, an
+                   unresolved placeholder, a crash. dig is 22 of 22 of these:
+                   an extractor for it would parse error strings and learn
+                   nothing. Those runs need repeating, which the re-run
+                   proposals already cover.
+      banner_only  the tool spoke only to identify itself. Nothing to extract.
+
+    Collapsing the first two is how a queue of "182 unexplained runs" becomes a
+    backlog nobody can prioritise: a third of it is not extraction work at all.
+    """
+    from output_analysis import analyse_output
+    try:
+        import extractor_specs as es
+        profiled = {t.lower() for t in (es.load_specs()[0] or {})}
+    except Exception:                       # noqa: BLE001
+        profiled = set()
+    parsers = set()
+    try:
+        from artifact_consumer import tools_with_parsers
+        parsers = {t.lower() for t in tools_with_parsers()}
+    except Exception:                       # noqa: BLE001
+        pass
+
+    catalogue = _catalogue_commands()
+    cur.execute("""
+        SELECT tool, target, port, exit_code, status,
+               COALESCE(output, '') AS output, COALESCE(error, '') AS error,
+               command, octet_length(COALESCE(output, '')) AS output_bytes
+          FROM tool_executions
+         WHERE octet_length(COALESCE(output, '')) > 0
+    """)
+    tools = {}
+    for row in cur.fetchall():
+        r = dict(row)
+        name = (r["tool"] or "").strip()
+        slot = tools.setdefault(name.lower(), {
+            "tool": name, "runs": 0, "has_profile": name.lower() in profiled,
+            "has_parser": name.lower() in parsers,
+            "in_catalogue": name in catalogue,
+            "states": {}, "unexplained_bytes": 0, "facts": 0})
+        slot["runs"] += 1
+        verdict = classify_execution(r, catalogue)
+        analysis = analyse_output(r["tool"], r["output"], r.get("exit_code"))
+        slot["facts"] += analysis["notable_count"]
+
+        if verdict["category"] in _FAILED_CATEGORIES:
+            state = "run_failed"
+        elif analysis["verdict"] == "banner_only":
+            state = "banner_only"
+        elif analysis["verdict"] == "unclear":
+            state = "no_profile"
+            slot["unexplained_bytes"] += r["output_bytes"]
+        else:
+            state = "interpreted"
+        slot["states"][state] = slot["states"].get(state, 0) + 1
+
+    rows = list(tools.values())
+    for slot in rows:
+        slot["dominant_state"] = max(slot["states"].items(),
+                                     key=lambda kv: kv[1])[0]
+    needs = [s for s in rows if s["states"].get("no_profile")]
+    needs.sort(key=lambda s: (-s["unexplained_bytes"], -s["runs"]))
+
+    return {
+        "tools_seen": len(rows),
+        "tools_with_profile": sum(1 for s in rows if s["has_profile"]),
+        "tools_with_parser": sum(1 for s in rows if s["has_parser"]),
+        "catalogue_tools": len(catalogue),
+        "totals": {
+            state: sum(s["states"].get(state, 0) for s in rows)
+            for state in ("interpreted", "no_profile", "run_failed", "banner_only")
+        },
+        "unexplained_bytes": sum(s["unexplained_bytes"] for s in rows),
+        # The answer to "which profile next".
+        "write_a_profile_next": [
+            {k: s[k] for k in ("tool", "runs", "unexplained_bytes",
+                               "has_profile", "has_parser", "in_catalogue",
+                               "states")}
+            for s in needs[:limit_tools]
+        ],
+        # Reported separately so it is never mistaken for extraction work.
+        "failing_not_unparsed": sorted(
+            [{"tool": s["tool"], "runs": s["states"]["run_failed"]}
+             for s in rows if s["dominant_state"] == "run_failed"],
+            key=lambda s: -s["runs"])[:limit_tools],
+    }

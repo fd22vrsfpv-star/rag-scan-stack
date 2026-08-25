@@ -47,6 +47,17 @@ SPEC_DIR = os.environ.get("EXTRACTOR_SPEC_DIR", "/knowledge/extractors")
 _REQUIRED = ("tool", "schema", "prompt")
 _TYPES = ("string", "number", "boolean", "list", "object")
 
+# Where a follow-on's RESULT goes when it produces data rather than running a
+# command. Each name must already have a consumer — a sink nothing reads is a
+# declaration that looks like plumbing and moves nothing.
+#
+#   identities      target_wordlists.import_enumerated_identities()
+#   wordlists       /wordlists/build-target (harvests from identities)
+#   ports           the ports table, for services a port scan missed
+#   scan_parameters knowledge/scan_parameters.yaml sources
+#   findings        recon_findings, via post_review_agent.ingest_extracted_facts
+FEED_SINKS = {"identities", "wordlists", "ports", "scan_parameters", "findings"}
+
 _cache: Dict[str, Any] = {"signature": None, "specs": {}}
 
 
@@ -82,6 +93,39 @@ def signature(spec_dir: str = None) -> Optional[str]:
     return h.hexdigest()[:16]
 
 
+def _apply_class(spec: dict, classes: dict) -> dict:
+    """Merge a class template under a tool's own spec.
+
+    The TOOL wins on every key it declares. Merging is one level deep for the
+    mapping sections (`schema`, `deterministic`) and additive for the rule lists
+    (`notable`, `follow_on`), with a tool's rule replacing the class rule of the
+    same id — so a class can ship a sensible default that one tool overrides
+    without copying the rest.
+    """
+    name = spec.get("class")
+    if not name or name not in classes:
+        return spec
+    tmpl = classes[name] or {}
+    merged = dict(spec)
+    for section in ("schema", "deterministic"):
+        base = dict(tmpl.get(section) or {})
+        base.update(spec.get(section) or {})
+        if base:
+            merged[section] = base
+    for section in ("notable", "follow_on"):
+        own = list(spec.get(section) or [])
+        own_ids = {r.get("id") for r in own}
+        inherited = [r for r in (tmpl.get(section) or [])
+                     if r.get("id") not in own_ids]
+        if own or inherited:
+            merged[section] = inherited + own
+    for key in ("prompt", "description", "max_chars"):
+        if not merged.get(key) and tmpl.get(key):
+            merged[key] = tmpl[key]
+    merged["_class"] = name
+    return merged
+
+
 def _validate_spec(spec: dict, path: str) -> List[str]:
     problems = []
     for key in _REQUIRED:
@@ -107,6 +151,42 @@ def _validate_spec(spec: dict, path: str) -> List[str]:
             problems.append(
                 f"{os.path.basename(path)}: rule {rule.get('id')!r} has an "
                 f"unparsable 'when': {pred!r}")
+
+    schema_fields = set(schema)
+    for rule in spec.get("follow_on") or []:
+        name = os.path.basename(path)
+        if not rule.get("id"):
+            problems.append(f"{name}: follow_on rule missing 'id'")
+        pred = rule.get("when")
+        if not pred or _parse_predicate(pred) is None:
+            problems.append(
+                f"{name}: follow_on {rule.get('id')!r} has an unparsable "
+                f"'when': {pred!r}")
+        # A rule must either run something or feed something. One that does
+        # neither is a declaration with no effect, which reads as coverage.
+        if not rule.get("script") and not rule.get("feeds"):
+            problems.append(
+                f"{name}: follow_on {rule.get('id')!r} has neither 'script' "
+                f"nor 'feeds' — it would do nothing")
+        if rule.get("script") and not rule.get("scanner"):
+            problems.append(
+                f"{name}: follow_on {rule.get('id')!r} has a script but no "
+                f"'scanner'; the dispatcher routes on scanner")
+        if rule.get("feeds") and rule["feeds"] not in FEED_SINKS:
+            problems.append(
+                f"{name}: follow_on {rule.get('id')!r} feeds "
+                f"{rule['feeds']!r}, which nothing consumes. Known sinks: "
+                f"{', '.join(sorted(FEED_SINKS))}")
+        each = rule.get("for_each")
+        if each:
+            if each not in schema_fields:
+                problems.append(
+                    f"{name}: follow_on {rule.get('id')!r} iterates "
+                    f"{each!r}, which is not in the schema")
+            elif (schema.get(each) or {}).get("type") != "list":
+                problems.append(
+                    f"{name}: follow_on {rule.get('id')!r} iterates {each!r}, "
+                    f"which is not a list")
     return problems
 
 
@@ -127,7 +207,23 @@ def load_specs(spec_dir: str = None, force: bool = False):
     except ImportError:
         return {}, ["pyyaml is not installed; extraction specs cannot be read"]
 
-    specs, problems = {}, []
+    # Class templates first: they carry the shape shared by a family of tools
+    # (a credential attack always reports recovered pairs and a rate), so a
+    # per-tool spec supplies only the patterns that differ.
+    classes = {}
+    class_file = os.path.join(spec_dir, "_classes.yaml")
+    if os.path.exists(class_file):
+        try:
+            with open(class_file, encoding="utf-8") as fh:
+                classes = (yaml.safe_load(fh) or {}).get("classes") or {}
+        except Exception as exc:            # noqa: BLE001
+            problems_early = [f"_classes.yaml: {type(exc).__name__}: {exc}"]
+        else:
+            problems_early = []
+    else:
+        problems_early = []
+
+    specs, problems = {}, list(problems_early)
     for path in _spec_files(spec_dir):
         try:
             with open(path, encoding="utf-8") as fh:
@@ -141,6 +237,7 @@ def load_specs(spec_dir: str = None, force: bool = False):
         if bad:
             problems.extend(bad)
             continue
+        doc = _apply_class(doc, classes)
         doc["_source_file"] = os.path.basename(path)
         doc["_signature"] = sig
         for name in [doc["tool"]] + list(doc.get("aliases") or []):
@@ -403,4 +500,110 @@ def notable_from(spec: dict, extracted: dict) -> List[dict]:
         if params:
             fact["params"] = params
         out.append(fact)
+    return out
+
+
+# ── follow-on actions ───────────────────────────────────────────────────────
+
+def _fill_action_script(script: str, values: dict) -> str:
+    """Substitute {field} and {item} from extracted values.
+
+    A placeholder that cannot be filled is LEFT IN PLACE, exactly as
+    `artifact_actions.suggest_actions` does: the caller then marks the action
+    `needs_input`, and a command that cannot run as written must never queue.
+    Guessing a value is worse than an incomplete command, because a wrong port
+    looks runnable.
+    """
+    out = script or ""
+    for field in re.findall(r"\{(\w+)\}", out):
+        if field not in values:
+            continue
+        val = values[field]
+        if isinstance(val, (list, tuple, set)):
+            continue                        # a list is for for_each, not a scalar
+        if val is None or isinstance(val, bool):
+            continue
+        out = out.replace("{" + field + "}", str(val))
+    return out
+
+
+def follow_on_from(spec: dict, extracted: dict, context: dict = None) -> List[dict]:
+    """Actions a tool's OWN OUTPUT implies, fired on extracted fields.
+
+    This is the half that was missing. `knowledge/artifact_rules/builtin.yaml`
+    re-parsed raw text with a second pattern set to propose commands, so an
+    action could never use an extracted VALUE — the extractor knew the share was
+    called `tmp` and the rule could only say "shares were found". With
+    `for_each: shares` the same fact becomes `smbclient //target/tmp`.
+
+    Emits the shape `artifact_actions.suggest_actions()` already returns, so
+    `_insert_recommendation`, the auto-queue contract and the UI are unchanged.
+
+    `feeds` actions carry no script: their result is DATA going to a sink
+    (identities, wordlists, ports), not a command for a human to run.
+    """
+    context = dict(context or {})
+    values = {**extracted, **context}
+    out = []
+    for rule in spec.get("follow_on") or []:
+        try:
+            if not evaluate_predicate(rule.get("when", ""), extracted):
+                continue
+        except Exception:                   # noqa: BLE001
+            continue
+
+        each_field = rule.get("for_each")
+        items = [None]
+        if each_field:
+            raw = extracted.get(each_field)
+            if not isinstance(raw, (list, tuple)):
+                continue
+            items = list(raw)
+            if not items:
+                continue
+
+        for item in items:
+            local = dict(values)
+            if item is not None:
+                local["item"] = item
+            script = _fill_action_script(rule.get("script", ""), local)
+            title = _fill_action_script(rule.get("title", rule["id"]), local)
+            # Same rule as artifact_actions: an unresolved placeholder means the
+            # action cannot run as written, so it is offered but never queued.
+            needs_input = bool(rule.get("needs_input")) or "{" in script
+            # Written out rather than a conditional expression: `A or B if C
+            # else D` binds as `(A or B) if C else D`, which is not what it
+            # looks like and is a trap for the next reader.
+            if rule.get("evidence"):
+                evidence = rule["evidence"]
+            elif item is not None:
+                evidence = f"{each_field}={item}"
+            else:
+                evidence = f"matched: {rule.get('when')}"
+            action = {
+                "id": rule["id"] + (f":{item}" if item is not None else ""),
+                "category": rule.get("category") or spec.get("class") or "general",
+                "title": title,
+                "scanner": rule.get("scanner"),
+                "script": script or None,
+                "rationale": rule.get("rationale", ""),
+                "priority": int(rule.get("priority", 50)),
+                "evidence": evidence,
+                "needs_input": needs_input if script else False,
+                "auto_queue": bool(rule.get("auto_queue")) and not needs_input
+                              and bool(script),
+                "source": "analysis_profile",
+                "spec": spec.get("_source_file"),
+            }
+            if rule.get("feeds"):
+                action["feeds"] = rule["feeds"]
+                action["feed_field"] = rule.get("feed_field") or each_field
+                action["feed_values"] = (
+                    extracted.get(action["feed_field"])
+                    if action["feed_field"] else None)
+                # A data feed is not a command a human runs.
+                action["auto_queue"] = False
+                action["needs_input"] = False
+            out.append(action)
+    out.sort(key=lambda a: (-a["priority"], a["id"]))
     return out
