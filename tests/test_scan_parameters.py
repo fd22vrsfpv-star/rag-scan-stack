@@ -371,3 +371,172 @@ def test_post_review_withholds_the_ssh_proposal(live):
     assert not ssh_hydra, (
         f"{len(ssh_hydra)} hydra ssh proposal(s) queued against a host whose "
         "MACs hydra cannot negotiate")
+
+
+# ── consumer: brute_force_safety (account lockout) ─────────────────────────
+
+def _listener(probe):
+    try:
+        out = subprocess.run(["docker", "exec", "kali-listener", "python3", "-c",
+                              "import importlib.util\n"
+                              "s=importlib.util.spec_from_file_location('kl','/app/listener_service.py')\n"
+                              "m=importlib.util.module_from_spec(s)\n"
+                              "try: s.loader.exec_module(m)\n"
+                              "except SystemExit: pass\n" + probe],
+                             capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        pytest.skip("kali-listener not reachable")
+    if out.returncode != 0:
+        pytest.skip(f"listener probe failed: {out.stderr[-200:]}")
+    return out.stdout
+
+
+U = "/wordlists/generated/users_192.168.1.150_smb.txt"
+P = "/wordlists/generated/passwords_192.168.1.150_smb.txt"
+
+
+def test_a_spray_that_would_lock_every_account_is_refused():
+    """Volume and lockout are DIFFERENT safety questions and only the first was
+    ever asked. 50 users x 82 passwords finishes in 16 minutes AND locks out all
+    50 accounts against a threshold of 3."""
+    out = _listener(
+        f"m._lockout_cache={{'192.168.1.150':'3'}}\n"
+        f"r,w=m.check_account_lockout('hydra','hydra -L {U} -P {P} smb://192.168.1.150','192.168.1.150')\n"
+        "print('REFUSED', bool(r))\n")
+    assert "REFUSED True" in out, out
+
+
+def test_a_threshold_larger_than_the_list_is_allowed():
+    out = _listener(
+        f"m._lockout_cache={{'192.168.1.150':'200'}}\n"
+        f"r,w=m.check_account_lockout('hydra','hydra -L {U} -P {P} smb://192.168.1.150','192.168.1.150')\n"
+        "print('REFUSED', bool(r), 'WARNED', bool(w))\n")
+    assert "REFUSED False" in out and "WARNED False" in out, out
+
+
+def test_a_measured_absence_of_lockout_is_allowed():
+    """'None' is a measured answer, not a missing one."""
+    for value in ("None", "Not Set", "0"):
+        out = _listener(
+            f"m._lockout_cache={{'192.168.1.150':{value!r}}}\n"
+            f"r,w=m.check_account_lockout('hydra','hydra -L {U} -P {P} smb://192.168.1.150','192.168.1.150')\n"
+            "print('REFUSED', bool(r), 'WARNED', bool(w))\n")
+        assert "REFUSED False" in out and "WARNED False" in out, f"{value}: {out}"
+
+
+def test_an_unmeasured_policy_warns_rather_than_refusing():
+    """Refusing every brute force against a host nobody ran --pass-pol on would
+    block real work on a guess. The warning names the command that resolves it."""
+    out = _listener(
+        "m._lockout_cache={'10.99.99.99': None}\n"
+        f"r,w=m.check_account_lockout('hydra','hydra -L {U} -P {P} smb://10.99.99.99','10.99.99.99')\n"
+        "print('REFUSED', bool(r), 'WARNED', bool(w))\n"
+        "print('MENTIONS', 'pass-pol' in (w or ''))\n")
+    assert "REFUSED False" in out and "WARNED True" in out, out
+    assert "MENTIONS True" in out, "the warning does not say how to resolve it"
+
+
+def test_a_non_domain_service_is_not_gated_by_the_domain_policy():
+    """ftp and web logins are frequently LOCAL accounts the domain policy never
+    touches; gating them would refuse work for no reason."""
+    out = _listener(
+        "m._lockout_cache={'192.168.1.150':'3'}\n"
+        f"r,w=m.check_account_lockout('hydra','hydra -L {U} -P {P} ftp://192.168.1.150:21','192.168.1.150')\n"
+        "print('REFUSED', bool(r), 'WARNED', bool(w))\n")
+    assert "REFUSED False" in out and "WARNED False" in out, out
+
+
+def test_force_overrides_the_lockout_gate():
+    """Volume and lockout are SUPPRESSION judgements, so force may pass them —
+    unlike the scope gate, which runs first and force must never pass."""
+    out = _listener(
+        "m._lockout_cache={'192.168.1.150':'3'}\n"
+        f"r,w=m.check_account_lockout('hydra','hydra -L {U} -P {P} smb://192.168.1.150','192.168.1.150',force=True)\n"
+        "print('REFUSED', bool(r))\n")
+    assert "REFUSED False" in out, out
+
+
+def test_listener_lockout_matches_the_parameter_store(live):
+    """CLAUDE.md: duplicated logic needs an agreement test. Both sides read from
+    the REAL deployment, not a re-typed copy."""
+    out = _listener("print('LOCKOUT', repr(m.observed_lockout_threshold('192.168.1.150')))\n")
+    listener_value = out.split("LOCKOUT", 1)[1].strip().strip("'\"")
+    store = live["parameters"]["smb_lockout_threshold"]["value"]
+    assert listener_value == str(store), (
+        f"listener says {listener_value!r}, the parameter store says {store!r}")
+
+
+# ── consumer: wordlist_selection ────────────────────────────────────────────
+
+def test_impossible_passwords_are_dropped_for_a_domain_service(live):
+    """A domain enforcing 5 characters cannot have a 1-character password, and
+    against a lockout threshold a guaranteed miss still burns an attempt."""
+    body = _curl("POST", "/wordlists/build-target?target=192.168.1.150&port=445&service=smb")
+    if not body:
+        pytest.skip("rag-api not reachable")
+    d = json.loads(body)
+    assert d["min_password_length"] == 5, d.get("min_password_length_reason")
+    assert d["passwords_dropped_below_minimum"] > 0, "nothing was filtered"
+    assert min(len(p) for p in d["passwords"]) >= 5, "a short password survived"
+
+
+def test_a_local_account_service_is_not_filtered(live):
+    """THE false positive: an empty password is a real ftp and mysql finding, and
+    the domain policy does not govern those accounts."""
+    body = _curl("POST", "/wordlists/build-target?target=192.168.1.150&port=21&service=ftp")
+    if not body:
+        pytest.skip("rag-api not reachable")
+    d = json.loads(body)
+    assert d["min_password_length"] is None, d["min_password_length_reason"]
+    assert d["passwords_dropped_below_minimum"] == 0
+    assert "" in d["passwords"], "the blank ftp password was filtered away"
+
+
+# ── consumer: scan_aggressiveness ───────────────────────────────────────────
+
+@pytest.mark.unit
+def test_a_detected_waf_produces_advice(sp, monkeypatch):
+    monkeypatch.setattr(sp, "effective", lambda *a, **k: {
+        "waf_present": {"value": True, "provenance": "observed"},
+        "waf_product": {"value": "Cloudflare", "provenance": "observed"}})
+    got = sp.web_scan_advice(None, "h")
+    assert got and got["waf"] is True
+    assert "Cloudflare" in got["advice"]
+    assert got["suggested_threads"] < 10
+
+
+@pytest.mark.unit
+def test_no_waf_produces_no_advice(sp, monkeypatch):
+    """192.168.1.150 has no WAF, so silence is the correct output here."""
+    monkeypatch.setattr(sp, "effective", lambda *a, **k: {
+        "waf_present": {"value": False, "provenance": "observed"}})
+    assert sp.web_scan_advice(None, "h") is None
+
+
+@pytest.mark.unit
+def test_an_unmeasured_waf_produces_no_advice(sp, monkeypatch):
+    monkeypatch.setattr(sp, "effective", lambda *a, **k: {
+        "waf_present": {"value": None, "provenance": "default"}})
+    assert sp.web_scan_advice(None, "h") is None
+
+
+@pytest.mark.unit
+def test_the_waf_advice_does_not_rewrite_the_command(sp, monkeypatch):
+    """Advisory on purpose: silently changing an operator's thread count makes
+    the scan behave differently from the command they read."""
+    monkeypatch.setattr(sp, "effective", lambda *a, **k: {
+        "waf_present": {"value": True, "provenance": "observed"},
+        "waf_product": {"value": "None", "provenance": "observed"}})
+    got = sp.web_scan_advice(None, "h")
+    assert "command" not in got and "script" not in got
+
+
+def test_advice_is_surfaced_beside_the_values(live):
+    """The operator should see the conclusion and its evidence together."""
+    body = _curl("GET", "/assets/192.168.1.150/parameters", timeout=120)
+    if not body:
+        pytest.skip("rag-api not reachable")
+    d = json.loads(body)
+    assert "advice" in d
+    topics = {a["topic"] for a in d["advice"]}
+    assert "wordlist_selection" in topics, d["advice"]

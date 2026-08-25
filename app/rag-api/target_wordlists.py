@@ -251,9 +251,30 @@ def build_lists(cur, target: str, port=None, service_hint: str = "",
     if curated_pw_path:
         add(_read_list(curated_pw_path), passwords, p_prov, "curated")
 
+    # Drop candidates the domain cannot accept. A guaranteed miss still burns
+    # an attempt, and against a lockout threshold attempts are the scarce thing.
+    dropped, min_len, min_why = [], None, None
+    try:
+        import scan_parameters as _sp
+        min_len, min_why = _sp.min_password_length(cur, target, svc or "")
+    except Exception:
+        min_len = None
+    if min_len:
+        keep = []
+        for pw in passwords:
+            if len(pw) < min_len:
+                dropped.append(pw)
+                p_prov.pop(pw, None)
+            else:
+                keep.append(pw)
+        passwords = keep
+
     return {
         "target": target, "port": port, "service": svc,
         "users": users, "passwords": passwords,
+        "min_password_length": min_len,
+        "min_password_length_reason": min_why,
+        "passwords_dropped_below_minimum": len(dropped),
         "user_provenance": u_prov, "password_provenance": p_prov,
         "counts": {
             "users": len(users), "passwords": len(passwords),

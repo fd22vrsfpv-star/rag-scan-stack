@@ -1980,6 +1980,102 @@ def observed_rate_per_min(target):
     return rate
 
 
+# Lockout policy for the per-account limit.
+#
+# Like observed_rate_per_min above, this duplicates a source declared in
+# knowledge/scan_parameters.yaml because rag-api's module is not mounted here.
+# Pinned by tests/test_scan_parameters.py::test_listener_lockout_matches_the_parameter_store.
+#
+# Two different safety questions, and only the first was ever asked:
+#   total volume        can this finish?           -> candidate count
+#   per-account tries   will this lock accounts?   -> passwords per user
+# A 50-user x 82-password list is 4,100 candidates and finishes in 16 minutes.
+# Against a domain with a lockout threshold of 3 it also locks out all 50
+# accounts. Small and fast is not the same as safe.
+_lockout_cache = {}
+
+
+def observed_lockout_threshold(target):
+    """('None'|digits|None) — the domain lockout threshold last observed.
+
+    None means never measured, which is NOT the same as no lockout.
+    """
+    if not target:
+        return None
+    if target in _lockout_cache:
+        return _lockout_cache[target]
+    value = None
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT data->'params'->>'lockout_threshold'
+                      FROM recon_findings
+                     WHERE finding_type = 'smb_password_policy' AND target = %s
+                       AND data->'params'->>'lockout_threshold' IS NOT NULL
+                     ORDER BY created_at DESC LIMIT 1
+                """, (target,))
+                row = cur.fetchone()
+                if row:
+                    value = row[0]
+        finally:
+            conn.close()
+    except Exception:                       # noqa: BLE001
+        value = None
+    _lockout_cache[target] = value
+    return value
+
+
+# Services whose logins are governed by the SMB/domain account policy. An ftp or
+# a web login is frequently a local account the domain policy never touches, so
+# applying the threshold there would refuse work for no reason.
+_DOMAIN_AUTH_HINTS = ("smb://", "winrm://", "rdp://", "mssql://", "ldap://",
+                      "-m smb", "-m winrm", "-m rdp")
+
+
+def check_account_lockout(tool, command, target, force=False):
+    """(refusal, warning) for locking accounts out, independent of volume.
+
+    Unknown policy WARNS rather than refuses. Refusing every brute-force against
+    a host nobody has run `--pass-pol` on would block real work on a guess; the
+    warning names the command that resolves it. Flip the marked branch to refuse
+    if this engagement wants fail-closed.
+    """
+    if (tool or "").strip().lower() not in _BRUTE_TOOLS:
+        return None, None
+    low = (command or "").lower()
+    if not any(h in low for h in _DOMAIN_AUTH_HINTS):
+        return None, None
+
+    est, detail = estimate_candidate_space(tool, command)
+    if est is None:
+        return None, None
+    per_account = (detail.get("counts") or {}).get("passwords") or 1
+
+    threshold = observed_lockout_threshold(target)
+    if threshold is None:
+        # <-- fail-closed switch: return a refusal here instead.
+        return None, (
+            f"lockout policy for {target} has never been measured, and this "
+            f"would try {per_account} password(s) per account. Run "
+            f"`netexec smb {target} -u '' -p '' --pass-pol` first to find out "
+            f"whether that locks every account out.")
+    if str(threshold).strip().lower() in ("none", "0", "not set", "disabled"):
+        return None, None                    # measured: no lockout enforced
+    try:
+        limit = int(str(threshold).strip())
+    except ValueError:
+        return None, None
+    if per_account >= limit and not force:
+        return (f"lockout threshold on {target} is {limit} and this would try "
+                f"{per_account} password(s) per account — it would lock out "
+                f"every account in the userlist rather than find a credential. "
+                f"Use at most {max(1, limit - 1)} passwords per account, or "
+                f"pass force."), None
+    return None, None
+
+
 def check_candidate_space(tool, command, force=False, target=None):
     """(refusal_or_None, warning_or_None). Volume judgement, not authorisation.
 
@@ -2062,6 +2158,23 @@ async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: B
         request.tool, request.command,
         force=bool(getattr(request, "force", False)),
         target=request.target)
+    lk_refusal, lk_warning = check_account_lockout(
+        request.tool, request.command, request.target,
+        force=bool(getattr(request, "force", False)))
+    if lk_refusal:
+        logger.warning("REFUSED %s on %s: %s", request.tool, request.target,
+                       lk_refusal)
+        _emit_webhook_sync("brute_force_refused_lockout", {
+            "tool": request.tool, "target": request.target,
+            "command": request.command[:400], "reason": lk_refusal})
+        raise HTTPException(status_code=400, detail=lk_refusal)
+    if lk_warning:
+        logger.warning("LOCKOUT-UNKNOWN %s on %s: %s", request.tool,
+                       request.target, lk_warning)
+        _emit_webhook_sync("brute_force_lockout_unknown", {
+            "tool": request.tool, "target": request.target,
+            "warning": lk_warning})
+
     if cs_refusal:
         logger.warning("REFUSED %s on %s: %s", request.tool, request.target,
                        cs_refusal)

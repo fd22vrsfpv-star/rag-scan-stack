@@ -315,3 +315,67 @@ def ssh_brute_force_viable(cur, host: str, tool: str, command: str,
               f"would fail at key exchange and be recorded as finding nothing. "
               f"Use {_SSH_FALLBACK_TOOL}, which was measured to negotiate with "
               f"this server.")
+
+
+# Services whose logins are governed by the SMB/domain account policy. An ftp or
+# web login is frequently a LOCAL account the domain policy never touches, so
+# applying the minimum length there would drop candidates that are perfectly
+# valid — including the empty password, which is a real ftp/mysql finding.
+DOMAIN_AUTH_SERVICES = {"smb", "winrm", "rdp", "mssql", "ldap", "netbios"}
+
+
+def min_password_length(cur, host: str, service: str = "",
+                        vocab_path: str = None):
+    """(length, why) for filtering a password list, or (None, why-not).
+
+    A domain enforcing a 5-character minimum cannot have a 1-character password,
+    so every shorter candidate is a guaranteed miss — and against a lockout
+    threshold, a guaranteed miss still burns an attempt.
+    """
+    svc = (service or "").strip().lower()
+    if svc not in DOMAIN_AUTH_SERVICES:
+        return None, (f"{svc or 'this service'} is not governed by the domain "
+                      f"account policy")
+    try:
+        v = effective(cur, host, ["smb_min_password_length"], vocab_path)
+        got = v.get("smb_min_password_length") or {}
+    except Exception:                       # noqa: BLE001
+        return None, "parameter lookup failed"
+    if got.get("provenance") == "default":
+        return None, "minimum password length never measured on this host"
+    try:
+        length = int(str(got.get("value")).strip())
+    except (TypeError, ValueError):
+        return None, f"minimum length reads {got.get('value')!r}, not a number"
+    if length <= 0:
+        return None, "no minimum length enforced"
+    return length, (f"domain enforces a {length}-character minimum "
+                    f"({got.get('provenance')} via {got.get('tool')})")
+
+
+def web_scan_advice(cur, host: str, vocab_path: str = None):
+    """Advisory for web scanning when a WAF is in front of the target.
+
+    Returns None when there is nothing to say. Deliberately ADVISORY: silently
+    rewriting an operator's thread count would make a scan behave differently
+    from the command they read, and a WAF changes what results MEAN as much as
+    how fast to go — blocked requests come back as 403 and look like findings.
+    """
+    try:
+        v = effective(cur, host, ["waf_present", "waf_product"], vocab_path)
+    except Exception:                       # noqa: BLE001
+        return None
+    present = (v.get("waf_present") or {})
+    if present.get("provenance") == "default" or not present.get("value"):
+        return None
+    product = (v.get("waf_product") or {}).get("value")
+    named = f" ({product})" if product and str(product).lower() != "none" else ""
+    return {
+        "waf": True, "product": product,
+        "suggested_threads": 5,
+        "advice": (f"a WAF{named} is in front of {host}. Blocked requests come "
+                   f"back as 403 and read like findings, and a high thread count "
+                   f"invites an IP ban that ends the engagement's access. "
+                   f"Lower concurrency and treat directory-brute results as "
+                   f"unreliable until confirmed by hand."),
+    }
