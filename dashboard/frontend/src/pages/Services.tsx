@@ -475,7 +475,7 @@ export default function Services() {
       {/* ── GPU Tab ──────────────────────────────────────────── */}
       {activeTab === 'gpu' && (
         <div className="space-y-6">
-          <OllamaStatusCard ollama={ollama} />
+          <OllamaStatusCard ollama={ollama} remote={!!llmInfo?.remote} model={llmInfo?.model} />
         </div>
       )}
 
@@ -687,7 +687,7 @@ function ServiceProfilesCard() {
   )
 }
 
-function OllamaStatusCard({ ollama }: { ollama?: import('@/api/reports').OllamaStatus }) {
+function OllamaStatusCard({ ollama, remote, model }: { ollama?: import('@/api/reports').OllamaStatus; remote?: boolean; model?: string }) {
   const [loadingModel, setLoadingModel] = useState<string | null>(null)
   const [pullInput, setPullInput] = useState('')
   const [pulling, setPulling] = useState(false)
@@ -700,6 +700,25 @@ function OllamaStatusCard({ ollama }: { ollama?: import('@/api/reports').OllamaS
   const globalModel = activeModelData?.model ?? chatModel
 
   if (!ollama) return null
+
+  // Remote backend (openai/azure/anthropic): local model management — GPU/VRAM,
+  // load/unload/pull — doesn't apply. Show a compact note instead of the Ollama
+  // controls (the model is chosen in Settings → LLM Tuning).
+  if (remote) {
+    return (
+      <div className="bg-card border border-border rounded-lg p-4">
+        <h3 className="text-sm font-semibold mb-2 flex items-center gap-2">
+          <Cpu className="h-4 w-4" />
+          LLM Backend
+        </h3>
+        <p className="text-xs text-muted-foreground">
+          Using a remote backend{model ? <> — <span className="text-primary font-mono">{model}</span></> : null}.
+          Local Ollama model management (load / unload / pull, GPU/VRAM) doesn't apply.
+          Change the model in <strong>Settings → LLM Tuning</strong>.
+        </p>
+      </div>
+    )
+  }
 
   const gpu = ollama.gpu
   const vramUsedPct = gpu ? Math.round((gpu.vram_used_mb / gpu.vram_total_mb) * 100) : 0
