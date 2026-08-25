@@ -176,6 +176,33 @@ async def delete_subdomains(request: Request):
         return safe_json(resp)
 
 
+@router.get("/api/assets/{ip}/parameters")
+async def asset_scan_parameters(ip: str, request: Request):
+    """Per-host values that influence testing, for the Assets view."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=60) as c:
+        resp = await c.get(
+            f"{s.rag_api_url}/assets/{ip}/parameters",
+            params=dict(request.query_params),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
+@router.post("/api/assets/{ip}/parameters")
+async def declare_asset_scan_parameter(ip: str, request: Request):
+    """Declare an operator override for a per-host testing parameter."""
+    s = get_settings()
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=60) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/assets/{ip}/parameters",
+            json=body,
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
 @router.get("/api/assets/{ip}/credentials")
 async def asset_credentials(ip: str):
     s = get_settings()

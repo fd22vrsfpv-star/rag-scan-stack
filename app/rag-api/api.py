@@ -1677,6 +1677,84 @@ def delete_credential(cid: str, authorized: bool = Depends(auth)):
     return {"ok": True, "deleted": cid}
 
 
+@app.get("/assets/{ip}/parameters", tags=["Assets"])
+def get_asset_scan_parameters(ip: str, keys: str = Query(None),
+                              _: bool = Depends(auth)):
+    """Discovered values for this host that influence how it is tested.
+
+    Three layers, and the response always says which one a value came from:
+      declared  — what the operator stated (scan_parameters)
+      observed  — read from findings and tool output, with the tool named
+      default   — never observed here
+
+    That provenance is load-bearing. A consumer that cannot tell a measured
+    value from a default will read "we never checked" as "no lockout", which is
+    exactly the mistake this layer exists to prevent.
+    """
+    import sys as _sys
+    if "/app" not in _sys.path:
+        _sys.path.insert(0, "/app")
+    import scan_parameters as sp
+    wanted = [k.strip() for k in (keys or "").split(",") if k.strip()] or None
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            values = sp.effective(cur, ip, wanted)
+        except Exception as e:
+            raise HTTPException(500, f"parameter lookup failed: {e}")
+    by_prov = {}
+    for v in values.values():
+        by_prov[v["provenance"]] = by_prov.get(v["provenance"], 0) + 1
+    return {"ok": True, "host": ip, "parameters": values,
+            "counts_by_provenance": by_prov}
+
+
+@app.post("/assets/{ip}/parameters", tags=["Assets"])
+def declare_asset_scan_parameter(ip: str, body: dict, _: bool = Depends(auth)):
+    """Declare a value for this host, overriding what was observed.
+
+    For what no tool can discover: "treat the lockout as 5 because the client
+    said so", "never spray this host". Observed values are never written here —
+    they are read from findings, so a re-scan cannot be contradicted by a stale
+    copy.
+    """
+    key = (body or {}).get("key")
+    if not key:
+        raise HTTPException(400, "key is required")
+    import sys as _sys
+    if "/app" not in _sys.path:
+        _sys.path.insert(0, "/app")
+    import scan_parameters as sp
+    vocab = sp.load_vocabulary()
+    if vocab and key not in vocab:
+        raise HTTPException(
+            400, f"unknown parameter {key!r}. Declared keys: "
+                 f"{', '.join(sorted(vocab))}. Add it to "
+                 f"knowledge/scan_parameters.yaml first, so something can "
+                 f"actually consume it.")
+    value = (body or {}).get("value")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            INSERT INTO scan_parameters
+                   (scope_type, scope_value, key, value, note, declared_by)
+            VALUES ('host', %s, %s, %s, %s, %s)
+            ON CONFLICT (scope_type, scope_value, key) DO UPDATE
+               SET value = EXCLUDED.value, note = EXCLUDED.note,
+                   declared_by = EXCLUDED.declared_by, updated_at = now()
+            RETURNING id::text, (xmax = 0) AS inserted
+        """, (ip, key, None if value is None else str(value),
+              (body or {}).get("note"), (body or {}).get("declared_by")))
+        row = cur.fetchone()
+        conn.commit()
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("scan_parameter_declared", "scan_parameters", {
+            "host": ip, "key": key, "value": value})
+    except Exception:
+        pass
+    return {"ok": True, "host": ip, "key": key, "value": value,
+            "created": bool(row and row["inserted"])}
+
+
 @app.get("/assets/{ip}/credentials", tags=["Assets"])
 def get_asset_credentials(ip: str, authorized: bool = Depends(auth)):
     """Get all credential findings for an asset by IP."""

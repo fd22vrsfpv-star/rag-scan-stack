@@ -3553,6 +3553,37 @@ SELECT i.id                AS identity_id,
 
 CREATE INDEX IF NOT EXISTS idx_identities_domain ON public.identities(domain)
     WHERE domain IS NOT NULL;
+
+-- scan_parameters — values the OPERATOR declares, and nothing else.
+--
+-- Discovered values are NOT stored here. They live in recon_findings with their
+-- provenance and history, and are read from there; copying them into a table
+-- would go stale the moment a re-scan disagrees, which is the same trap avoided
+-- with v_identity_credential_state.
+--
+-- This table holds only what no tool can discover: "treat the lockout as 5",
+-- "never spray this host", "assume 20 attempts a minute". The effective value a
+-- scan should use is `declared if present, else observed, else the default in
+-- knowledge/scan_parameters.yaml` — resolved in app/rag-api/scan_parameters.py
+-- rather than duplicated into SQL, so the vocabulary lives in exactly one place.
+CREATE TABLE IF NOT EXISTS public.scan_parameters (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    scope_type   text NOT NULL DEFAULT 'host'
+                 CHECK (scope_type IN ('global', 'host', 'service')),
+    -- '' for global, so the unique index constrains it: a NULL here would let
+    -- unlimited duplicate global declarations through.
+    scope_value  text NOT NULL DEFAULT '',
+    key          text NOT NULL,
+    value        text,
+    note         text,
+    declared_by  text,
+    engagement_id uuid REFERENCES public.engagements(id) ON DELETE CASCADE,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_scan_parameters_scope_key
+    ON public.scan_parameters(scope_type, scope_value, key);
+CREATE INDEX IF NOT EXISTS idx_scan_parameters_key ON public.scan_parameters(key);
 CREATE INDEX IF NOT EXISTS idx_post_review_engagement ON post_review_reports(engagement_id)
     WHERE engagement_id IS NOT NULL;
 

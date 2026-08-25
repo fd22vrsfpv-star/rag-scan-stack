@@ -79,6 +79,8 @@ EXPECTED_TABLES=(
   finding_group_state
   # TIER 26: Post-execution review (app/rag-api/post_review_agent.py)
   post_review_reports
+  # TIER 27: Operator-declared scan parameters (app/rag-api/scan_parameters.py)
+  scan_parameters
 )
 
 # Views that reports and the spray list depend on. A missing view fails only when

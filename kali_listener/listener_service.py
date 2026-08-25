@@ -1828,6 +1828,11 @@ def is_success_exit(tool, exit_code):
     return exit_code in allowed
 
 
+# Used only when no rate has been measured against the host. Deliberately NOT
+# 256: that was the fastest rate ever observed here, so it made every unmeasured
+# estimate the best case.
+DEFAULT_RATE_PER_MIN = float(os.environ.get("DEFAULT_RATE_PER_MIN", "60"))
+
 CANDIDATE_WARN = int(os.environ.get("CANDIDATE_SPACE_WARN", "50000"))
 CANDIDATE_REFUSE = int(os.environ.get("CANDIDATE_SPACE_REFUSE", "1000000"))
 
@@ -1925,7 +1930,57 @@ def estimate_candidate_space(tool, command):
     return est, {"counts": counts, "files": files, "unreadable": unreadable}
 
 
-def check_candidate_space(tool, command, force=False):
+# Rate lookup for the time estimate.
+#
+# This duplicates the `observed_rate_per_min` source declared in
+# knowledge/scan_parameters.yaml, because rag-api's scan_parameters module is
+# not mounted here. CLAUDE.md requires duplicated logic to be pinned: the
+# agreement test is
+# tests/test_scan_parameters.py::test_listener_rate_matches_the_parameter_store.
+#
+# `min` on purpose. Measured hydra rates on this engagement were 16 (telnet),
+# 22, 116 and 256 (ftp) — a 16x spread — and the constant below WAS 256, the
+# best case. At 16/min a 4,100-candidate list takes 4.3 hours, not the 16
+# minutes the guard reported.
+_RATE_RE = re.compile(r"([0-9.]+) tries/min")
+_rate_cache = {}
+
+
+def observed_rate_per_min(target):
+    """Slowest rate actually achieved against this host, or None if unmeasured."""
+    if not target:
+        return None
+    if target in _rate_cache:
+        return _rate_cache[target]
+    rate = None
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COALESCE(output, '') FROM tool_executions
+                     WHERE target = %s AND tool = 'hydra'
+                       AND octet_length(COALESCE(output, '')) > 0
+                     ORDER BY started_at DESC LIMIT 100
+                """, (target,))
+                values = []
+                for (output,) in cur.fetchall():
+                    for m in _RATE_RE.findall(output):
+                        try:
+                            values.append(float(m))
+                        except ValueError:
+                            continue
+                if values:
+                    rate = min(values)
+        finally:
+            conn.close()
+    except Exception:                       # noqa: BLE001
+        rate = None
+    _rate_cache[target] = rate
+    return rate
+
+
+def check_candidate_space(tool, command, force=False, target=None):
     """(refusal_or_None, warning_or_None). Volume judgement, not authorisation.
 
     CLAUDE.md: an override overrules the platform's SUPPRESSION judgement, never
@@ -1935,13 +1990,17 @@ def check_candidate_space(tool, command, force=False):
     est, detail = estimate_candidate_space(tool, command)
     if est is None:
         return None, None
-    rate = 256.0            # observed tries/min in this stack
+    # Measured for THIS host when we have it. The old constant 256 was the
+    # fastest rate ever seen here, so every estimate was the best case.
+    measured = observed_rate_per_min(target)
+    rate = measured if measured else DEFAULT_RATE_PER_MIN
     hours = est / rate / 60.0
+    how = "measured on this host" if measured else "assumed, never measured here"
     human = (f"{est:,} candidates"
              + (f" ({detail['counts'].get('users') or 1} users x "
                 f"{detail['counts'].get('passwords') or 1} passwords)"
                 if not detail["counts"].get("combos") else "")
-             + f" — about {hours:,.0f}h at the observed {rate:.0f} tries/min")
+             + f" — about {hours:,.0f}h at {rate:.0f} tries/min ({how})")
     if est >= CANDIDATE_REFUSE and not force:
         return (f"{human}. Refusing: this cannot finish inside any timeout, and "
                 f"a run killed by the deadline looks identical to a target that "
@@ -2000,7 +2059,9 @@ async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: B
     # the placeholder check, because counting the wordlists in an unresolved
     # command would be meaningless.
     cs_refusal, cs_warning = check_candidate_space(
-        request.tool, request.command, force=bool(getattr(request, "force", False)))
+        request.tool, request.command,
+        force=bool(getattr(request, "force", False)),
+        target=request.target)
     if cs_refusal:
         logger.warning("REFUSED %s on %s: %s", request.tool, request.target,
                        cs_refusal)
