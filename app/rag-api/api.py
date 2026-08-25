@@ -18597,6 +18597,84 @@ def get_agents_status(_: bool = Depends(auth)):
             "description": "Re-ranks open cloud recommendations by attack-chain order and produces a top-3 next-actions plan",
         })
 
+    # 7. Artifact LLM Review Agent — services the raw_artifacts LLM-review queue.
+    #    The consumer + /artifacts/drain already exist; this surfaces the queue so
+    #    an operator can see the backlog and process it from the AI Agents page.
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT count(*) FILTER (WHERE llm_status = 'pending')    AS pending,
+                       count(*) FILTER (WHERE llm_status = 'processing') AS processing,
+                       count(*) FILTER (WHERE llm_status = 'done')       AS done,
+                       count(*) FILTER (WHERE llm_status = 'failed')     AS failed,
+                       count(*)                                          AS total,
+                       max(llm_processed_at)                             AS last_run
+                  FROM raw_artifacts
+            """)
+            a = cur.fetchone() or {}
+            pending = int(a.get("pending") or 0)
+            processing = int(a.get("processing") or 0)
+            agents.append({
+                "id": "artifact-review", "name": "Artifact LLM Review",
+                "type": "on-demand",
+                "status": "running" if processing > 0 else "idle",
+                "description": "Runs the LLM enrichment pass over raw scan output pending review, then extracts follow-on actions",
+                "queue_pending": pending,
+                "queue_processing": processing,
+                "queue_done": int(a.get("done") or 0),
+                "queue_failed": int(a.get("failed") or 0),
+                "queue_total": int(a.get("total") or 0),
+                "last_run": a["last_run"].isoformat() if a.get("last_run") else None,
+            })
+    except Exception:
+        agents.append({
+            "id": "artifact-review", "name": "Artifact LLM Review",
+            "type": "on-demand", "status": "error",
+            "description": "Runs the LLM enrichment pass over raw scan output pending review, then extracts follow-on actions",
+        })
+
+    # 8. Pre-Validation Agent — verifies agent/LLM factual claims (ports, CVEs,
+    #    services, hosts) against what the scans actually recorded, BEFORE those
+    #    claims are trusted. Deterministic (regex + SQL) via scan-recommender
+    #    /kb/agent-output/verify; autogen runs it per-session and persists the
+    #    outcome to agent_sessions.metadata->'claim_validation'.
+    try:
+        r = _fast_get("https://scan-recommender:8013/health")
+        reachable = bool(r and r.status_code == 200)
+        validated = unsupported = 0
+        last_val = None
+        try:
+            with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT count(*) FILTER (WHERE metadata ? 'claim_validation') AS validated,
+                           COALESCE(SUM((metadata->'claim_validation'->>'unsupported_count')::int)
+                                    FILTER (WHERE metadata ? 'claim_validation'), 0) AS unsupported,
+                           MAX(updated_at) FILTER (WHERE metadata ? 'claim_validation') AS last_run
+                      FROM agent_sessions
+                """)
+                v = cur.fetchone() or {}
+                validated = int(v.get("validated") or 0)
+                unsupported = int(v.get("unsupported") or 0)
+                last_val = v.get("last_run")
+        except Exception:
+            pass
+        agents.append({
+            "id": "pre-validation", "name": "Pre-Validation Agent",
+            "type": "continuous", "status": "running" if reachable else "unreachable",
+            "description": "Verifies agent/LLM claims (ports, CVEs, services, hosts) against recorded scan data before findings are trusted",
+            "service_port": 8013,
+            "sessions_validated": validated,
+            "unsupported_claims": unsupported,
+            "last_run": last_val.isoformat() if last_val else None,
+        })
+    except Exception:
+        agents.append({
+            "id": "pre-validation", "name": "Pre-Validation Agent",
+            "type": "continuous", "status": "error",
+            "description": "Verifies agent/LLM claims against recorded scan data before findings are trusted",
+            "service_port": 8013,
+        })
+
     return {"agents": agents}
 
 
