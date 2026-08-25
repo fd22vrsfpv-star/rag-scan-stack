@@ -14732,6 +14732,26 @@ def _list_available_models() -> List[str]:
     return []
 
 
+def _effective_backend_model():
+    """If the LLM proxy resolves to a REMOTE backend (openai/azure/anthropic),
+    return (model_name, backend). The proxy overrides any per-agent model with
+    this, so it is what every agent actually runs on. Returns (None, None) for a
+    local Ollama backend, where per-agent model overrides genuinely apply."""
+    try:
+        base = (os.environ.get("OLLAMA_BASE_URL")
+                or os.environ.get("OLLAMA_URL")
+                or "http://host.docker.internal:11434").rstrip("/")
+        resp = requests.get(f"{base}/api/tags", timeout=5, verify=False)
+        if resp.status_code == 200:
+            for m in resp.json().get("models", []):
+                b = (m.get("backend") or "").lower()
+                if b and b not in ("ollama", "local"):
+                    return m.get("name"), b
+    except Exception:
+        pass
+    return None, None
+
+
 @app.get("/settings/agent-models", tags=["Settings"])
 def get_agent_models(_: bool = Depends(auth)):
     """Return registered agents with their currently-resolved model + the list
@@ -14745,6 +14765,8 @@ def get_agent_models(_: bool = Depends(auth)):
                 overrides[k] = r["value"]
     except Exception:
         pass
+
+    eff_model, eff_backend = _effective_backend_model()
 
     agents = []
     for spec in AGENT_MODEL_REGISTRY:
@@ -14760,6 +14782,12 @@ def get_agent_models(_: bool = Depends(auth)):
             if not current:
                 current = spec["default"]
                 source = "default"
+        # A remote backend (openai/azure/anthropic) overrides every agent's model
+        # at the llm_query proxy, so report the model actually used, not the
+        # (ignored) local env value.
+        if eff_model:
+            current = eff_model
+            source = f"backend:{eff_backend}"
         agents.append({
             "id": spec["id"], "name": spec["name"], "description": spec["description"],
             "current_model": current, "source": source, "default_model": spec["default"],

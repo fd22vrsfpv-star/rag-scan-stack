@@ -715,6 +715,25 @@ def root_health():
 
 app.include_router(router)
 
+# Native Ollama API paths (/api/*) so llm_query is a DROP-IN Ollama replacement:
+# a client that points its Ollama base at http://llm_query:8002 gets its
+# /api/generate, /api/tags, /api/chat, /api/embeddings translated to the
+# configured backend (ollama/openai/azure). This lets the rag-api agents run on
+# the selected backend (e.g. DeepSeek) instead of hitting Ollama directly.
+api_router = APIRouter(prefix="/api")
+
+def _proxy_version():
+    return {"version": f"llm_query-proxy-{LLM_BACKEND}"}
+
+api_router.add_api_route("/version", _proxy_version, methods=["GET"])
+api_router.add_api_route("/tags", tags, methods=["GET"])
+api_router.add_api_route("/ps", ps, methods=["GET"])
+api_router.add_api_route("/generate", generate, methods=["POST"])
+api_router.add_api_route("/chat", chat, methods=["POST"])
+api_router.add_api_route("/embeddings", embeddings, methods=["POST"])
+api_router.add_api_route("/embed", embeddings, methods=["POST"])
+app.include_router(api_router)
+
 # ---------- Local dev ----------
 if __name__ == "__main__":
     # Run: OLLAMA_URL=http://localhost:11434 uvicorn llm_query:app --host 0.0.0.0 --port 8000
