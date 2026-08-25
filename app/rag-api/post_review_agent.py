@@ -906,6 +906,22 @@ def propose_reruns(cur, catalogue=None, limit=100, dry_run=True,
                                 "template": current[0], "missing": missing,
                                 "category": verdict["category"]})
             continue
+        # A proposal that cannot possibly succeed is not worth an operator's
+        # click. hydra cannot negotiate SSH with a server offering only legacy
+        # MACs, so those proposals are withheld with the reason rather than
+        # queued to fail.
+        try:
+            import scan_parameters as _sp
+            futile = _sp.ssh_brute_force_viable(cur, target, row["tool"],
+                                                script or "")
+        except Exception:
+            futile = None
+        if futile:
+            needs_input.append({
+                "tool": row["tool"], "target": target, "template": script,
+                "missing": ["compatible_ssh_mac"],
+                "category": verdict["category"], "reason": futile})
+            continue
         refusal = check_dispatch(target, scope_rows, command=script or "")
         if refusal:
             refusals.append({"tool": row["tool"], "target": target,
