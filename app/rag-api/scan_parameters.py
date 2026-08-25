@@ -112,15 +112,25 @@ def _observe_from_executions(cur, host: str, spec: dict, source: dict):
          LIMIT 100
     """, (host, source.get("tool")))
     try:
-        rx = re.compile(source.get("pattern", ""))
+        # MULTILINE, like extractor_specs.run_deterministic. Tool output is
+        # line-oriented and these patterns are line-anchored: without re.M a
+        # `^` only matches the start of the whole blob, so `^\(mac\)` found 0
+        # of the 7 MAC lines and the parameter silently fell back to its default.
+        rx = re.compile(source.get("pattern", ""), re.M)
     except re.error:
         return None
+    as_list = spec.get("type") == "list"
     values, tool, when = [], None, None
     for row in cur.fetchall():
         output = row["output"] if isinstance(row, dict) else row[1]
         for m in rx.findall(output):
+            text = m if isinstance(m, str) else (m[0] if m else "")
+            if as_list:
+                if text.strip():
+                    values.append(text.strip())
+                continue
             try:
-                values.append(float(m if isinstance(m, str) else m[0]))
+                values.append(float(text))
             except (TypeError, ValueError):
                 continue
         if values and tool is None:
@@ -129,6 +139,18 @@ def _observe_from_executions(cur, host: str, spec: dict, source: dict):
     if not values:
         return None
     how = (spec.get("aggregate") or "max").lower()
+    if spec.get("type") == "list":
+        # Distinct, order preserved. An algorithm list is a SET of capabilities,
+        # not something to aggregate to one number.
+        seen, uniq = set(), []
+        for v in values:
+            if v not in seen:
+                seen.add(v)
+                uniq.append(v)
+        return {"value": uniq, "tool": tool,
+                "observed_at": when.isoformat() if when else None,
+                "via": f"tool_executions[{source.get('tool')}] "
+                       f"{len(uniq)} distinct match(es)"}
     picked = {"min": min, "max": max}.get(how, max)(values)
     return {"value": picked, "tool": tool,
             "observed_at": when.isoformat() if when else None,
@@ -212,3 +234,84 @@ def effective(cur, host: str, keys: List[str] = None,
         out[key]["description"] = spec.get("description")
         out[key]["why"] = spec.get("why")
     return out
+
+
+# ── consumers ───────────────────────────────────────────────────────────────
+#
+# A parameter is only worth storing when something reads it. These are small and
+# specific on purpose: a generic "apply parameters to scans" engine would be one
+# that applies none.
+
+# hydra's client-side MAC list, taken from the error it produced against this
+# host — measured, not assumed:
+#
+#   kex error : no match for method mac algo client->server:
+#     server [hmac-md5, hmac-sha1, umac-64@openssh.com, hmac-ripemd160,
+#             hmac-ripemd160@openssh.com, hmac-sha1-96, hmac-md5-96],
+#     client [hmac-sha2-256-etm@openssh.com, hmac-sha2-512-etm@openssh.com,
+#             hmac-sha2-256, hmac-sha2-512]
+#
+# This varies with the libssh build hydra was compiled against, which is why an
+# EMPTY server list means "we do not know" and nothing is withheld. Suppressing
+# work we cannot prove is futile would be the worse error: a withheld scan that
+# would have worked is invisible, while a failed one at least shows up.
+HYDRA_SSH_CLIENT_MACS = {
+    "hmac-sha2-256-etm@openssh.com", "hmac-sha2-512-etm@openssh.com",
+    "hmac-sha2-256", "hmac-sha2-512",
+}
+
+# HYDRA ONLY, and that restriction is itself measured.
+#
+# The first version of this check also covered medusa and ncrack on the
+# assumption that they share hydra's crypto constraints. They do not — medusa
+# against the SAME host completed a full ACCOUNT CHECK where hydra died at key
+# exchange:
+#
+#   medusa -h 192.168.1.150 -U u -P p -M ssh
+#   ACCOUNT CHECK: [ssh] Host: 192.168.1.150 User: root Password: x   (exit 0)
+#
+# So medusa is the working SSH tool on legacy-MAC hosts, and withholding it
+# would have suppressed the one thing that does work. Add a tool here only after
+# measuring it fail.
+_SSH_BRUTE_TOOLS = {"hydra"}
+
+# Measured to negotiate successfully with legacy-MAC servers, so it is worth
+# naming in the refusal rather than leaving the operator with nothing.
+_SSH_FALLBACK_TOOL = "medusa"
+
+
+def ssh_brute_force_viable(cur, host: str, tool: str, command: str,
+                           vocab_path: str = None):
+    """None when an SSH credential attack can proceed, else why it cannot.
+
+    hydra could not negotiate SSH with this host AT ALL — the server offers only
+    legacy MACs and modern hydra offers only SHA2 ones. Every SSH brute-force
+    proposal against it was therefore dead on arrival, and would have been
+    recorded as a scan that found nothing: indistinguishable from a host with
+    strong passwords.
+
+    Only claims futility when BOTH lists are known and disjoint.
+    """
+    if (tool or "").strip().lower() not in _SSH_BRUTE_TOOLS:
+        return None
+    text = (command or "").lower()
+    if "ssh://" not in text and "-m ssh" not in text and " ssh " not in text:
+        return None
+    try:
+        v = effective(cur, host, ["ssh_mac_algorithms"], vocab_path)
+        server = v.get("ssh_mac_algorithms") or {}
+    except Exception:                       # noqa: BLE001
+        return None
+    macs = server.get("value") or []
+    if not macs or server.get("provenance") == "default":
+        return None                          # never measured: do not suppress
+    if set(macs) & HYDRA_SSH_CLIENT_MACS:
+        return None                          # a shared MAC exists; it can connect
+    return (f"{tool} cannot negotiate SSH with {host}: the server offers only "
+            f"{', '.join(sorted(macs)[:4])}"
+            + (" ..." if len(macs) > 4 else "")
+            + f" and {tool} requires one of "
+              f"{', '.join(sorted(HYDRA_SSH_CLIENT_MACS)[:2])} ... — the run "
+              f"would fail at key exchange and be recorded as finding nothing. "
+              f"Use {_SSH_FALLBACK_TOOL}, which was measured to negotiate with "
+              f"this server.")

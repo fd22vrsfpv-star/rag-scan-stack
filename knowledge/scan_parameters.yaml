@@ -107,6 +107,22 @@ parameters:
         finding_type: ssh_config
         path: banner
 
+  ssh_mac_algorithms:
+    type: list
+    default: []
+    description: MAC algorithms the SSH server offers.
+    influences: [tool_compatibility]
+    why: >
+      hydra could not negotiate SSH with this host at all — "kex error : no match
+      for method mac algo client->server". The server offers only legacy MACs
+      (hmac-md5, hmac-sha1, hmac-ripemd160 ...) while modern hydra offers only
+      SHA2 ones, so every SSH brute-force proposal against it is dead on arrival
+      and would be recorded as a scan that found nothing.
+    sources:
+      - kind: execution_regex
+        tool: ssh-audit
+        pattern: '^\(mac\)\s+(\S+)'
+
   # ── web ───────────────────────────────────────────────────────────────────
   waf_present:
     type: boolean

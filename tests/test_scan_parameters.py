@@ -246,3 +246,128 @@ def test_an_unmeasured_host_does_not_inherit_the_best_case():
     assert float(parts[1]) < 256, \
         f"the unmeasured default is {parts[1]} — back to the best case"
     assert parts[2] == "None", "an unmeasured host reported a measured rate"
+
+
+# ── the ssh consumer ────────────────────────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def sp():
+    return pytest.importorskip("scan_parameters",
+                               reason="scan_parameters not importable")
+
+
+def test_the_server_mac_list_is_observed(live):
+    """Seven MACs, matching exactly what hydra reported as the server's list."""
+    v = live["parameters"].get("ssh_mac_algorithms")
+    assert v and v["provenance"] == "observed", v
+    macs = v["value"]
+    assert isinstance(macs, list) and len(macs) >= 5, macs
+    assert "hmac-md5" in macs and "hmac-sha1" in macs, macs
+
+
+@pytest.mark.unit
+def test_a_line_anchored_pattern_matches_every_line(sp):
+    """`^\\(mac\\)` found 0 of 7 MAC lines without re.M, so the parameter
+    silently fell back to its default.
+
+    Asserted on BEHAVIOUR, not on the source. An earlier version checked that
+    the string "re.M" appeared in the function, which the explanatory comment
+    above the call satisfied all by itself — it passed a sabotage that removed
+    the flag.
+    """
+    class _Cur:
+        def execute(self, *a, **k):
+            pass
+
+        def fetchall(self):
+            return [("ssh-audit",
+                     "(mac) hmac-md5\n(mac) hmac-sha1\n(mac) umac-64\n",
+                     None)]
+
+    got = sp._observe_from_executions(
+        _Cur(), "h", {"type": "list"},
+        {"kind": "execution_regex", "tool": "ssh-audit",
+         "pattern": r"^\(mac\)\s+(\S+)"})
+    assert got is not None, "a line-anchored pattern matched nothing"
+    assert got["value"] == ["hmac-md5", "hmac-sha1", "umac-64"], got["value"]
+
+
+@pytest.mark.unit
+def test_hydra_ssh_is_withheld_when_no_mac_is_shared(sp, monkeypatch):
+    """The measured failure: 'kex error : no match for method mac algo'."""
+    legacy = {"value": ["hmac-md5", "hmac-sha1", "hmac-ripemd160"],
+              "provenance": "observed"}
+    monkeypatch.setattr(sp, "effective",
+                        lambda *a, **k: {"ssh_mac_algorithms": legacy})
+    why = sp.ssh_brute_force_viable(None, "h", "hydra", "hydra -L u -P p ssh://h:22")
+    assert why and "cannot negotiate" in why
+
+
+@pytest.mark.unit
+def test_medusa_is_never_withheld(sp, monkeypatch):
+    """THE over-reach in the first version of this check.
+
+    It covered medusa and ncrack on the assumption they share hydra's crypto
+    constraints. Measured against the same host, medusa completed a full ACCOUNT
+    CHECK where hydra died at key exchange — so withholding it would have
+    suppressed the one SSH tool that works here.
+    """
+    legacy = {"value": ["hmac-md5", "hmac-sha1"], "provenance": "observed"}
+    monkeypatch.setattr(sp, "effective",
+                        lambda *a, **k: {"ssh_mac_algorithms": legacy})
+    for tool, cmd in (("medusa", "medusa -h h -U u -P p -M ssh"),
+                      ("ncrack", "ncrack -p 22 --user root -P p h")):
+        assert sp.ssh_brute_force_viable(None, "h", tool, cmd) is None, \
+            f"{tool} was withheld on hydra's measurement"
+
+
+@pytest.mark.unit
+def test_the_refusal_names_a_tool_that_works(sp, monkeypatch):
+    legacy = {"value": ["hmac-md5"], "provenance": "observed"}
+    monkeypatch.setattr(sp, "effective",
+                        lambda *a, **k: {"ssh_mac_algorithms": legacy})
+    why = sp.ssh_brute_force_viable(None, "h", "hydra", "hydra ssh://h:22")
+    assert "medusa" in why, "the refusal leaves the operator with no alternative"
+
+
+@pytest.mark.unit
+def test_a_shared_mac_means_it_can_connect(sp, monkeypatch):
+    modern = {"value": ["hmac-sha2-256", "hmac-md5"], "provenance": "observed"}
+    monkeypatch.setattr(sp, "effective",
+                        lambda *a, **k: {"ssh_mac_algorithms": modern})
+    assert sp.ssh_brute_force_viable(None, "h", "hydra",
+                                     "hydra -L u -P p ssh://h:22") is None
+
+
+@pytest.mark.unit
+def test_an_unmeasured_host_is_never_withheld(sp, monkeypatch):
+    """Suppressing work we cannot prove futile is the worse error: a withheld
+    scan that would have worked is invisible, a failed one shows up."""
+    for state in ({"value": [], "provenance": "default"},
+                  {"value": None, "provenance": "default"}):
+        monkeypatch.setattr(sp, "effective",
+                            lambda *a, **k: {"ssh_mac_algorithms": state})
+        assert sp.ssh_brute_force_viable(None, "h", "hydra",
+                                         "hydra ssh://h:22") is None
+
+
+@pytest.mark.unit
+def test_non_ssh_commands_are_untouched(sp, monkeypatch):
+    legacy = {"value": ["hmac-md5"], "provenance": "observed"}
+    monkeypatch.setattr(sp, "effective",
+                        lambda *a, **k: {"ssh_mac_algorithms": legacy})
+    for cmd in ("hydra -L u -P p ftp://h:21", "hydra -L u -P p telnet://h:23"):
+        assert sp.ssh_brute_force_viable(None, "h", "hydra", cmd) is None
+
+
+def test_post_review_withholds_the_ssh_proposal(live):
+    """End to end: the proposal list must not offer a run that cannot connect."""
+    body = _curl("POST", "/agent/post-review", timeout=600)
+    if not body:
+        pytest.skip("post-review did not run")
+    d = json.loads(body)
+    ssh_hydra = [p for p in d["reruns"]["proposals"]
+                 if p["tool"] == "hydra" and "ssh://" in (p["script"] or "")]
+    assert not ssh_hydra, (
+        f"{len(ssh_hydra)} hydra ssh proposal(s) queued against a host whose "
+        "MACs hydra cannot negotiate")
