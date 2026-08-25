@@ -1,0 +1,116 @@
+# netexec / nxc — SMB enumeration, and specifically the PASSWORD POLICY.
+#
+# `output_analysis.extract_smb` already reads netexec's host-info and share table
+# (it shares crackmapexec's line format), and this spec adds what that Python
+# extractor does not cover: `--pass-pol`.
+#
+# Both run and their results merge, deduped by finding id — which is why the ids
+# here that overlap use the SAME canonical names as every other SMB extractor.
+#
+# Why the policy matters more than it looks: measured on this engagement,
+#
+#     Account Lockout Threshold: None
+#     Domain Password Complex: 0
+#
+# No lockout threshold means an online password attack cannot lock anyone out,
+# so the 4,100-candidate spray list is safe to run. A threshold of 3 would make
+# the same list an account-lockout denial of service. That single line decides
+# whether the credential work is safe, and nothing was reading it.
+tool: netexec
+aliases: [nxc]
+description: SMB enumeration and password policy over a null session.
+enabled: true
+max_chars: 20000
+
+deterministic:
+  lockout_threshold:
+    pattern: 'Account Lockout Threshold:\s*(\S+)'
+  lockout_duration:
+    pattern: 'Locked Account Duration:\s*(.+?)\s*$'
+  min_password_length:
+    pattern: 'Minimum password length:\s*(\S+)'
+  password_complexity:
+    pattern: 'Domain Password Complex:\s*(\S+)'
+  password_history:
+    pattern: 'Password History Length:\s*(\S+)'
+  max_password_age:
+    pattern: 'Maximum password age:\s*(.+?)\s*$'
+
+schema:
+  lockout_threshold:
+    type: string
+    description: "bad-password count before lockout; 'None' means no lockout at all"
+  lockout_duration:
+    type: string
+  min_password_length:
+    type: string
+  password_complexity:
+    type: string
+    description: "'0' means complexity is NOT enforced"
+  password_history:
+    type: string
+  max_password_age:
+    type: string
+
+prompt: |
+  Extract the SMB password policy from netexec (nxc) `--pass-pol` output.
+
+  Report the values exactly as printed. `None` and `Not Set` are real answers
+  meaning the setting is absent — do not convert them to 0, and do not invent a
+  value for a line that is not present.
+
+  `Account Lockout Threshold: None` means no lockout is enforced at all.
+
+examples:
+  - output: |
+      SMB    192.168.1.150   445    METASPLOITABLE   Minimum password length: None
+      SMB    192.168.1.150   445    METASPLOITABLE   Domain Password Complex: 0
+      SMB    192.168.1.150   445    METASPLOITABLE   Account Lockout Threshold: None
+      SMB    192.168.1.150   445    METASPLOITABLE   Locked Account Duration: 30 minutes
+    extract: |
+      {"min_password_length": "None", "password_complexity": "0",
+       "lockout_threshold": "None", "lockout_duration": "30 minutes"}
+
+notable:
+  # INFORMATIONAL, and deliberately so. A password policy is not a defect to
+  # fix; it is the set of parameters that CONSTRAIN credential testing. Recorded
+  # as a finding because it must be trackable and re-readable — "how long is the
+  # lockout window?" and "is a spray safe here?" are answered from these values,
+  # and `params` keeps them machine-readable instead of buried in a sentence.
+  #
+  # It fires whenever a policy was read at all, not only when something is wrong.
+  - id: smb_password_policy
+    when: lockout_threshold
+    severity: info
+    title: >-
+      SMB password policy — min length {min_password_length}, complexity
+      {password_complexity}, lockout threshold {lockout_threshold}, lockout
+      duration {lockout_duration}, history {password_history}
+    detail: >
+      Testing parameters, not a defect. The lockout threshold decides whether an
+      online attack is safe to run at all; the lockout duration sets the pace if
+      one is enforced; the minimum length and complexity bound which wordlists
+      are worth trying at all.
+    params:
+      - lockout_threshold
+      - lockout_duration
+      - min_password_length
+      - password_complexity
+      - password_history
+      - max_password_age
+  - id: smb_no_lockout_threshold
+    when: lockout_threshold == 'None'
+    severity: high
+    title: No SMB account lockout threshold
+    detail: >
+      Bad-password attempts are unlimited, so an online password attack cannot
+      lock anyone out — and nothing rate-limits guessing. This is what makes a
+      spray safe to run here; with a threshold set, the same list would be an
+      account-lockout denial of service instead.
+  - id: smb_no_password_complexity
+    when: password_complexity == '0'
+    severity: medium
+    title: SMB password complexity is not enforced
+    detail: >
+      The domain does not require mixed character classes, so short dictionary
+      passwords are permitted and a small wordlist has a real chance.

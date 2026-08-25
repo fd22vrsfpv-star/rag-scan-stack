@@ -576,3 +576,26 @@ def test_the_summary_reports_storage_honestly(live):
                      if not n["stored"] and n["severity"] in ("critical", "high")]
     assert len(unstored_high) == s["high_or_worse_unstored"], \
         "the headline count disagrees with the list it summarises"
+
+
+def test_informational_parameters_are_stored_machine_readable(live):
+    """An informational finding's params must land as queryable jsonb.
+
+    "Is a spray safe on this host?" is answered by reading
+    data->'params'->>'lockout_threshold', not by parsing a title.
+    """
+    got = _psql("SELECT data->'params'->>'lockout_threshold' "
+                "FROM recon_findings WHERE finding_type='smb_password_policy' "
+                "LIMIT 1")
+    if got is None:
+        pytest.skip("rag-postgres not reachable")
+    assert got, "the password policy finding carries no params"
+    assert got == "None", f"lockout_threshold reads {got!r}"
+
+
+def test_the_policy_finding_is_informational_not_a_defect(live):
+    got = _psql("SELECT severity FROM recon_findings "
+                "WHERE finding_type='smb_password_policy' LIMIT 1")
+    if got is None:
+        pytest.skip("rag-postgres not reachable")
+    assert got == "info", f"the policy is stored as {got!r}, not info"

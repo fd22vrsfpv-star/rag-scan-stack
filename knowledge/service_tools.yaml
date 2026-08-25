@@ -405,6 +405,26 @@ services:
       - name: crackmapexec
         purpose: SMB authentication and enumeration
         command: "crackmapexec smb {target} -u '' -p '' --shares"
+      # netexec is the maintained successor to crackmapexec, which is no longer
+      # developed. Same output shape, so the existing SMB extractor reads it
+      # unchanged and its findings land under the SAME canonical types
+      # (smb_null_session, smb_v1_enabled, smb_writable_share) as a further
+      # confirming source. Flags verified against /usr/bin/netexec in this image.
+      - name: netexec
+        purpose: SMB share enumeration over a null session
+        command: "netexec smb {target} -u '' -p '' --shares"
+      - name: netexec
+        purpose: SMB user enumeration over a null session
+        command: "netexec smb {target} -u '' -p '' --users"
+      - name: netexec
+        purpose: SMB group enumeration
+        command: "netexec smb {target} -u '' -p '' --groups"
+      - name: netexec
+        purpose: SMB password policy (lockout threshold before any spraying)
+        command: "netexec smb {target} -u '' -p '' --pass-pol"
+      - name: netexec
+        purpose: SMB user enumeration by RID brute force
+        command: "netexec smb {target} -u '' -p '' --rid-brute"
       - name: impacket-smbclient
         purpose: Python SMB client
         command: "impacket-smbclient {target}"
