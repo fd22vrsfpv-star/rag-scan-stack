@@ -221,8 +221,12 @@ services:
       EXPLOITDB_CSV: /exploitdb/files_exploits.csv
       NEWS_RUNNER_URL: ${NEWS_RUNNER_URL:-http://news-runner:8028}
       # Ollama — used by cloud_triage_agent, takeover_hunter, vault_import_agent.
+      # OLLAMA_BASE_URL points at the llm_query proxy (a drop-in Ollama that
+      # exposes /api/* and translates to the CONFIGURED backend), so these agents
+      # run on the selected LLM (e.g. DeepSeek) instead of hitting Ollama direct.
+      # OLLAMA_URL stays at real Ollama for anything that needs raw Ollama.
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
-      OLLAMA_BASE_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://llm_query:8002}
       # gemma4:31b, matching scan-recommender and .env. The previous default
       # named gemma4:26b, which is not a tag anyone here has — a request for
       # an absent model returns an error, so a fresh install with no .env
@@ -2193,7 +2197,10 @@ services:
       EXPLOIT_RUNNER_URL: https://exploit-runner:8017
       SCAN_RECOMMENDER_URL: https://scan-recommender:8013
       AUTOGEN_URL: https://autogen-agents:8015
-      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      # The 'Ollama LLM Server' panel reads settings.ollama_url — point it at the
+      # llm_query proxy so it reflects the CONFIGURED backend (e.g. DeepSeek)
+      # instead of the raw (possibly-down) local Ollama.
+      OLLAMA_URL: ${DASHBOARD_OLLAMA_URL:-http://llm_query:8002}
       BRUTUS_RUNNER_URL: https://brutus-runner:8025
       PLAYWRIGHT_SCANNER_URL: https://playwright-scanner:8014
       ZAP_URL: http://zap:8090
