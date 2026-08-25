@@ -32,9 +32,26 @@ def _get_active_model_from_db() -> str | None:
     return None
 
 
+try:
+    from llm_settings import get_llm_settings
+except Exception:
+    get_llm_settings = None
+
+
+def _llm(key: str, default: str = "") -> str:
+    """Resolved LLM setting (dashboard DB over env), or `default` if unavailable."""
+    if get_llm_settings is None:
+        return default
+    try:
+        val = get_llm_settings().get(key)
+        return val if val else default
+    except Exception:
+        return default
+
+
 def get_llm_backend() -> str:
-    """Get configured LLM backend: 'ollama', 'vllm', or 'azure'"""
-    return os.environ.get("LLM_BACKEND", "ollama").lower()
+    """Get configured LLM backend: 'ollama', 'vllm', 'azure', 'openai', ..."""
+    return _llm("backend", os.environ.get("LLM_BACKEND", "ollama")).lower()
 
 
 def get_vllm_config(
@@ -133,10 +150,27 @@ def get_azure_config(
     Returns:
         List of LLM config dictionaries
     """
-    model = model or os.environ.get("AZURE_MODEL", "gpt-4o")
-    base_url = base_url or os.environ.get("AZURE_ENDPOINT")
-    api_key = api_key or os.environ.get("AZURE_API_KEY")
-    api_version = api_version or os.environ.get("AZURE_API_VERSION", "2024-08-01-preview")
+    model = model or _llm("azure_model", os.environ.get("AZURE_MODEL", "gpt-4o"))
+    base_url = base_url or _llm("azure_endpoint", os.environ.get("AZURE_ENDPOINT", "")) or None
+    api_key = api_key or _llm("azure_api_key", os.environ.get("AZURE_API_KEY", "")) or None
+    api_version = api_version or _llm("azure_api_version", os.environ.get("AZURE_API_VERSION", "2024-08-01-preview"))
+
+    # Microsoft Foundry OpenAI-compatible endpoint (…/openai/v1): autogen must
+    # drive it as an openai client (model in body, no api-version), not azure.
+    _b = (base_url or "").lower()
+    if base_url and (".services.ai.azure.com" in _b or "/openai/v1" in _b
+                     or _b.rstrip("/").endswith("/openai")):
+        import re
+        root = re.sub(r'(/openai)?(/v1)?(/chat/completions)?/?$', '',
+                      base_url.rstrip('/'), flags=re.I).rstrip('/')
+        return [{
+            "model": model,
+            "api_type": "openai",
+            "base_url": f"{root}/openai/v1",
+            "api_key": api_key,
+            "temperature": temperature,
+            "timeout": timeout,
+        }]
 
     return [{
         "model": model,
@@ -156,9 +190,9 @@ def get_openai_config(
     timeout: int = DEFAULT_LLM_TIMEOUT
 ) -> List[Dict]:
     """Get OpenAI configuration for Autogen agents."""
-    model = model or os.environ.get("OPENAI_MODEL", "gpt-4o")
-    api_key = api_key or os.environ.get("OPENAI_API_KEY")
-    base_url = os.environ.get("OPENAI_API_BASE", "https://api.openai.com")
+    model = model or _llm("openai_model", os.environ.get("OPENAI_MODEL", "gpt-4o"))
+    api_key = api_key or _llm("openai_api_key", os.environ.get("OPENAI_API_KEY", "")) or None
+    base_url = _llm("openai_api_base", os.environ.get("OPENAI_API_BASE", "https://api.openai.com"))
 
     return [{
         "model": model,

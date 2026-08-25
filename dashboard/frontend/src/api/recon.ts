@@ -311,8 +311,8 @@ export function useServiceEnumFindings(domain: string | null) {
   return useQuery({
     queryKey: ['service-enum-findings', domain],
     queryFn: async () => {
-      const email = await apiFetch<{ findings: any[] }>(`/recon/search?source=email-enum&target=${domain}&limit=20`)
-      const dns = await apiFetch<{ findings: any[] }>(`/recon/search?source=dns-enum&target=${domain}&limit=20`)
+      const email = await apiFetch<{ findings: any[] }>(`/recon?source=email-enum&target=${domain}&limit=20`)
+      const dns = await apiFetch<{ findings: any[] }>(`/recon?source=dns-enum&target=${domain}&limit=20`)
       return { email: email.findings ?? [], dns: dns.findings ?? [] }
     },
     enabled: !!domain,

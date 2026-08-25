@@ -772,7 +772,7 @@ async def update_tool(tool_id: str):
 # ---------- LLM Backend Settings ----------
 
 _LLM_KEYS = [
-    "llm.backend", "llm.openai_api_key", "llm.openai_model",
+    "llm.backend", "llm.openai_api_key", "llm.openai_model", "llm.openai_base_url",
     "llm.anthropic_api_key", "llm.anthropic_model",
     "llm.azure_api_key", "llm.azure_endpoint", "llm.azure_model",
 ]
@@ -805,6 +805,7 @@ class LlmSettingsBody(BaseModel):
     backend: Optional[str] = None
     openai_api_key: Optional[str] = None
     openai_model: Optional[str] = None
+    openai_base_url: Optional[str] = None
     anthropic_api_key: Optional[str] = None
     anthropic_model: Optional[str] = None
     azure_api_key: Optional[str] = None
@@ -819,7 +820,8 @@ async def save_llm_settings(body: LlmSettingsBody):
     updates = {}
     mapping = [
         ("backend", "llm.backend"), ("openai_api_key", "llm.openai_api_key"),
-        ("openai_model", "llm.openai_model"), ("anthropic_api_key", "llm.anthropic_api_key"),
+        ("openai_model", "llm.openai_model"), ("openai_base_url", "llm.openai_base_url"),
+        ("anthropic_api_key", "llm.anthropic_api_key"),
         ("anthropic_model", "llm.anthropic_model"), ("azure_api_key", "llm.azure_api_key"),
         ("azure_endpoint", "llm.azure_endpoint"), ("azure_model", "llm.azure_model"),
     ]
@@ -827,6 +829,10 @@ async def save_llm_settings(body: LlmSettingsBody):
         for field, key in mapping:
             val = getattr(body, field, None)
             if val is not None:
+                # Strip stray whitespace (a leading/trailing space in an endpoint
+                # produces "URL missing an 'http://' protocol" at request time).
+                if isinstance(val, str):
+                    val = val.strip()
                 resp = await c.put(f"{s.rag_api_url}/settings/config/{key}",
                                    headers={"x-api-key": s.api_key, **engagement_headers()}, json={"value": val})
                 if resp.status_code < 400:
@@ -857,8 +863,13 @@ async def test_llm_backend(body: dict):
             if backend == "openai":
                 api_key = keys.get("openai_api_key") or os.environ.get("OPENAI_API_KEY", "")
                 model = keys.get("openai_model") or os.environ.get("OPENAI_MODEL", "gpt-4o")
+                base = (keys.get("openai_base_url")
+                        or os.environ.get("OPENAI_API_BASE", "https://api.openai.com")).rstrip("/")
+                if not base.startswith(("http://", "https://")):
+                    return {"ok": False, "backend": backend,
+                            "error": f"Base URL must start with http:// or https:// (got: {base!r})"}
                 resp = await c.post(
-                    f"{os.environ.get('OPENAI_API_BASE', 'https://api.openai.com')}/v1/chat/completions",
+                    f"{base}/v1/chat/completions",
                     headers={"Authorization": f"Bearer {api_key}"},
                     json={"model": model, "messages": [{"role": "user", "content": "Reply with OK"}], "max_tokens": 5},
                 )
@@ -884,12 +895,23 @@ async def test_llm_backend(body: dict):
                 endpoint = keys.get("azure_endpoint") or os.environ.get("AZURE_ENDPOINT", "")
                 model = keys.get("azure_model") or os.environ.get("AZURE_MODEL", "gpt-4o")
                 base = endpoint.rstrip("/")
-                if ".models.ai.azure.com" in base:
+                if not base.startswith(("http://", "https://")):
+                    return {"ok": False, "backend": backend,
+                            "error": "Azure Endpoint is empty or missing http(s)://."}
+                low = base.lower()
+                payload = {"messages": [{"role": "user", "content": "Reply with OK"}], "max_tokens": 5}
+                if ".services.ai.azure.com" in low or "/openai/v1" in low or low.rstrip("/").endswith("/openai"):
+                    # Foundry OpenAI-compatible: model in body, no api-version.
+                    import re as _re
+                    root = _re.sub(r'(/openai)?(/v1)?(/chat/completions)?/?$', '', base, flags=_re.I).rstrip("/")
+                    url = f"{root}/openai/v1/chat/completions"
+                    payload["model"] = model
+                elif ".models.ai.azure.com" in low:
                     url = f"{base}/v1/chat/completions"
+                    payload["model"] = model
                 else:
                     url = f"{base}/openai/deployments/{model}/chat/completions?api-version={os.environ.get('AZURE_API_VERSION', '2024-08-01-preview')}"
-                resp = await c.post(url, headers={"api-key": api_key},
-                                    json={"messages": [{"role": "user", "content": "Reply with OK"}], "max_tokens": 5})
+                resp = await c.post(url, headers={"api-key": api_key}, json=payload)
                 resp.raise_for_status()
                 return {"ok": True, "backend": backend, "model": model,
                         "response": resp.json()["choices"][0]["message"]["content"]}
@@ -904,6 +926,76 @@ async def test_llm_backend(body: dict):
         return {"ok": False, "backend": backend, "error": f"HTTP {e.response.status_code}: {e.response.text[:300]}"}
     except Exception as e:
         return {"ok": False, "backend": backend, "error": str(e)}
+
+
+@router.get("/api/settings/llm/models")
+async def list_llm_models(backend: Optional[str] = None):
+    """List selectable model IDs for the given/configured backend (best effort).
+
+    Populates the Model autocomplete in the LLM Tuning tab. ALWAYS returns a
+    `models` list (possibly empty) — the field stays free-text, so a failure here
+    just means no suggestions, never a broken form. For openai it queries the
+    endpoint's OpenAI-compatible `/v1/models`; for ollama, `/api/tags`.
+    """
+    s = get_settings()
+    keys: dict = {}
+    async with httpx.AsyncClient(timeout=10) as c:
+        for key in _LLM_KEYS:
+            try:
+                resp = await c.get(f"{s.rag_api_url}/settings/config/{key}",
+                                   headers={"x-api-key": s.api_key, **engagement_headers()})
+                if resp.status_code == 200:
+                    keys[key.replace("llm.", "")] = resp.json().get("value", "")
+            except Exception:
+                pass
+    backend = (backend or keys.get("backend") or os.environ.get("LLM_BACKEND", "ollama")).lower()
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            if backend == "openai":
+                base = (keys.get("openai_base_url")
+                        or os.environ.get("OPENAI_API_BASE", "https://api.openai.com")).rstrip("/")
+                api_key = keys.get("openai_api_key") or os.environ.get("OPENAI_API_KEY", "")
+                if not base.startswith(("http://", "https://")):
+                    return {"ok": False, "backend": backend, "models": [],
+                            "error": "Base URL missing http(s)://"}
+                resp = await c.get(f"{base}/v1/models", headers={"Authorization": f"Bearer {api_key}"})
+                resp.raise_for_status()
+                data = resp.json().get("data", [])
+                models = sorted({m.get("id") for m in data if isinstance(m, dict) and m.get("id")},
+                                key=str.lower)
+                return {"ok": True, "backend": backend, "models": models}
+            if backend == "azure":
+                endpoint = (keys.get("azure_endpoint") or os.environ.get("AZURE_ENDPOINT", "")).rstrip("/")
+                api_key = keys.get("azure_api_key") or os.environ.get("AZURE_API_KEY", "")
+                low = endpoint.lower()
+                if not endpoint.startswith(("http://", "https://")):
+                    return {"ok": False, "backend": backend, "models": [],
+                            "error": "Azure Endpoint missing http(s)://"}
+                if ".services.ai.azure.com" in low or "/openai/v1" in low or low.rstrip("/").endswith("/openai"):
+                    import re as _re
+                    root = _re.sub(r'(/openai)?(/v1)?/?$', '', endpoint, flags=_re.I).rstrip("/")
+                    resp = await c.get(f"{root}/openai/v1/models", headers={"api-key": api_key})
+                elif ".models.ai.azure.com" in low:
+                    resp = await c.get(f"{endpoint}/v1/models", headers={"api-key": api_key})
+                else:
+                    resp = await c.get(
+                        f"{endpoint}/openai/deployments?api-version={os.environ.get('AZURE_API_VERSION', '2024-08-01-preview')}",
+                        headers={"api-key": api_key})
+                resp.raise_for_status()
+                data = resp.json().get("data", [])
+                models = sorted({m.get("id") for m in data if isinstance(m, dict) and m.get("id")},
+                                key=str.lower)
+                return {"ok": True, "backend": backend, "models": models}
+            if backend == "ollama":
+                base = os.environ.get("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+                resp = await c.get(f"{base}/api/tags")
+                resp.raise_for_status()
+                models = sorted({m.get("name") for m in resp.json().get("models", []) if m.get("name")},
+                                key=str.lower)
+                return {"ok": True, "backend": backend, "models": models}
+            return {"ok": True, "backend": backend, "models": []}
+    except Exception as e:
+        return {"ok": False, "backend": backend, "models": [], "error": str(e)}
 
 
 # ── Scan timeouts (long-running port scans) ──

@@ -3178,6 +3178,10 @@ def run_amass(req: AmassReq, background_tasks: BackgroundTasks):
     short = job_id[:8]
     output_prefix = str(REPORT_DIR / f"amass_{short}")
     output_file = output_prefix + ".json"
+    # Write the domains to a targets file so the scope gate can validate them.
+    # amass takes domains via -d flags, but the gate reads the file — without it
+    # the gate does open('') and fails closed ("targets file '' is unreadable").
+    targets_file = _write_targets_file(req.domains)
 
     # amass v4: -d domain (one per flag), -o output prefix
     cmd = ["amass", "enum"]
@@ -3190,7 +3194,7 @@ def run_amass(req: AmassReq, background_tasks: BackgroundTasks):
     env = _build_proxy_env(req.proxy)
     _job_tracker.update_progress(job_id, targets_count=len(req.domains))
     # amass writes output_prefix.json automatically
-    background_tasks.add_task(_run_tool_job, job_id, "amass", cmd, "", output_file, env=env, no_ingest=req.no_ingest)
+    background_tasks.add_task(_run_tool_job, job_id, "amass", cmd, targets_file, output_file, env=env, no_ingest=req.no_ingest)
     return {"ok": True, "job_id": job_id, "status": "queued", "status_url": f"/jobs/{job_id}"}
 
 
@@ -3608,14 +3612,14 @@ def _ingest_gowitness_jsonl(jsonl_path: str, screenshot_dir: str, job_id: str) -
                     cur.execute("""
                         INSERT INTO recon_findings
                         (id, asset_id, source, finding_type, target, data, severity)
-                        VALUES (gen_random_uuid(), %s, 'gowitness', 'screenshot', %s, %s, 'recon')
+                        VALUES (gen_random_uuid(), %s, 'gowitness', 'screenshot', %s, %s, 'info')
                     """, (asset_id, target_host or url, json.dumps(finding_data)))
 
                     # Also insert into web_findings for findings explorer
                     cur.execute("""
                         INSERT INTO web_findings
                         (id, asset_id, url, source, status_code, name, severity, evidence, method, refs)
-                        VALUES (gen_random_uuid(), %s, %s, 'gowitness', %s, %s, 'recon', %s, 'GET', %s)
+                        VALUES (gen_random_uuid(), %s, %s, 'gowitness', %s, %s, 'info', %s, 'GET', %s)
                     """, (asset_id, url, status_code, title or None, evidence,
                           json.dumps(refs) if refs else None))
 

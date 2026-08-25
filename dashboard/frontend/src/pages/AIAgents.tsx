@@ -4,6 +4,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/api/client'
 import {
   useAgentsStatus, useGapReport, useTriggerGapAnalysis, useAutoFillGaps,
+  useDrainArtifacts,
   type AgentInfo, type GapReport, type GapTargetDetail,
 } from '@/api/agents'
 import { useUIStore } from '@/stores/ui'
@@ -11,6 +12,7 @@ import { cn } from '@/lib/utils'
 import {
   Bot, Cpu, Search, Shield, Loader2, Play, ExternalLink,
   CheckCircle2, XCircle, RefreshCw, Zap, Settings, Clock, Cloud,
+  FileSearch, ShieldCheck,
 } from 'lucide-react'
 
 const AGENT_ICONS: Record<string, typeof Bot> = {
@@ -20,6 +22,8 @@ const AGENT_ICONS: Record<string, typeof Bot> = {
   'recon-agent': RefreshCw,
   'gap-agent': Zap,
   'cloud-triage-agent': Cloud,
+  'artifact-review': FileSearch,
+  'pre-validation': ShieldCheck,
 }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -44,6 +48,8 @@ const AGENT_LINKS: Record<string, string> = {
   'recon-agent': '/engagements',
   'gap-agent': '/engagements',
   'cloud-triage-agent': '/cloud-posture',
+  'artifact-review': '/scans/results',
+  'pre-validation': '/agent-sessions',
 }
 
 const CATEGORY_ORDER = [
@@ -124,6 +130,7 @@ function AgentCard({ agent, engagementId }: { agent: AgentInfo; engagementId: st
   const autoFill = useAutoFillGaps()
   const runOsint = useRunOsintScan()
   const runRecon = useRunReconAgentNow(engagementId)
+  const drain = useDrainArtifacts()
   const link = AGENT_LINKS[agent.id]
 
   const handleCardClick = () => {
@@ -183,6 +190,42 @@ function AgentCard({ agent, engagementId }: { agent: AgentInfo; engagementId: st
             {agent.gaps_found} gap{agent.gaps_found !== 1 ? 's' : ''} found
           </span>
         )}
+        {/* Artifact LLM Review queue */}
+        {agent.id === 'artifact-review' && (
+          <>
+            <span className={cn('px-1.5 py-0.5 rounded border',
+              (agent.queue_pending ?? 0) > 0 ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' : 'bg-green-500/10 text-green-400 border-green-500/20'
+            )}>
+              {agent.queue_pending ?? 0} pending review
+            </span>
+            {(agent.queue_processing ?? 0) > 0 && (
+              <span className="px-1.5 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20">
+                {agent.queue_processing} processing
+              </span>
+            )}
+            <span className="px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20">
+              {agent.queue_done ?? 0}/{agent.queue_total ?? 0} reviewed
+            </span>
+            {(agent.queue_failed ?? 0) > 0 && (
+              <span className="px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-500/20">
+                {agent.queue_failed} failed
+              </span>
+            )}
+          </>
+        )}
+        {/* Pre-Validation claim checks */}
+        {agent.id === 'pre-validation' && (
+          <>
+            <span className="px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20">
+              {agent.sessions_validated ?? 0} session{(agent.sessions_validated ?? 0) !== 1 ? 's' : ''} validated
+            </span>
+            <span className={cn('px-1.5 py-0.5 rounded border',
+              (agent.unsupported_claims ?? 0) > 0 ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' : 'bg-green-500/10 text-green-400 border-green-500/20'
+            )}>
+              {agent.unsupported_claims ?? 0} unsupported claim{(agent.unsupported_claims ?? 0) !== 1 ? 's' : ''}
+            </span>
+          </>
+        )}
         {agent.last_run && (
           <span className="text-muted-foreground flex items-center gap-0.5">
             <Clock className="h-2.5 w-2.5" />
@@ -212,6 +255,17 @@ function AgentCard({ agent, engagementId }: { agent: AgentInfo; engagementId: st
           >
             {runRecon.isPending ? <Loader2 className="h-2.5 w-2.5 animate-spin" /> : <Play className="h-2.5 w-2.5" />}
             Run Now
+          </button>
+        )}
+        {agent.id === 'artifact-review' && (
+          <button
+            onClick={() => drain.mutate(20)}
+            disabled={drain.isPending || (agent.queue_pending ?? 0) === 0}
+            className="flex items-center gap-1 px-2 py-1 text-[10px] rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white"
+            title={(agent.queue_pending ?? 0) === 0 ? 'Queue is empty' : 'Run the LLM review pass over up to 20 pending artifacts'}
+          >
+            {drain.isPending ? <Loader2 className="h-2.5 w-2.5 animate-spin" /> : <Play className="h-2.5 w-2.5" />}
+            Process Queue{(agent.queue_pending ?? 0) > 0 ? ` (${agent.queue_pending})` : ''}
           </button>
         )}
         {agent.id === 'gap-agent' && engagementId && (
@@ -249,6 +303,16 @@ function AgentCard({ agent, engagementId }: { agent: AgentInfo; engagementId: st
         {(agent.id === 'recon-agent' || agent.id === 'gap-agent') && (
           <a href="/engagements" className="flex items-center gap-1 px-2 py-1 text-[10px] rounded bg-muted hover:bg-muted/80 border border-border">
             <Settings className="h-2.5 w-2.5" /> Configure
+          </a>
+        )}
+        {agent.id === 'artifact-review' && (
+          <a href="/scans/results" className="flex items-center gap-1 px-2 py-1 text-[10px] rounded bg-muted hover:bg-muted/80 border border-border">
+            <ExternalLink className="h-2.5 w-2.5" /> Scan Results
+          </a>
+        )}
+        {agent.id === 'pre-validation' && (
+          <a href="/agent-sessions" className="flex items-center gap-1 px-2 py-1 text-[10px] rounded bg-muted hover:bg-muted/80 border border-border">
+            <ExternalLink className="h-2.5 w-2.5" /> Sessions
           </a>
         )}
       </div>
