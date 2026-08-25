@@ -1,0 +1,78 @@
+# smtp-user-enum — SMTP account enumeration via VRFY/EXPN/RCPT.
+#
+# 17 stored runs, none interpreted. The output states plainly which accounts
+# exist on the host:
+#
+#     192.168.1.150: user exists
+#     192.168.1.150: mysql exists
+#     192.168.1.150: ftp exists
+#     4 results.
+#
+# Those are real local accounts, and they are exactly the input the credential
+# path is short of. The SMB route already proved the loop end to end — 36
+# enumerated names became identities and then the generated wordlists — and this
+# is the same loop on a different service.
+tool: smtp-user-enum
+class: user_enumeration
+description: SMTP account enumeration — which local accounts the mail server admits to.
+enabled: true
+max_chars: 20000
+
+deterministic:
+  # `<host>: <name> exists`. The trailing " exists" is what makes this a RESULT
+  # rather than an attempt: smtp-user-enum prints nothing for names it tried and
+  # the server rejected.
+  valid_users:
+    pattern: '^\S+:\s+(\S+)\s+exists\s*$'
+    capture: all
+    type: list
+  result_count:
+    pattern: '^(\d+)\s+results?\.'
+    type: number
+  mode:
+    pattern: '^Mode\s*\.+\s*(\S+)'
+
+schema:
+  valid_users:
+    type: list
+    description: account names the server confirmed exist
+  result_count:
+    type: number
+    description: the tool's own count of results
+  mode:
+    type: string
+    description: VRFY, EXPN or RCPT — how existence was proven
+
+prompt: |
+  Extract the account names this SMTP enumeration proved to exist.
+
+  A line reads `<host>: <name> exists`. Only those are results. Names that were
+  tried and rejected are not printed at all, and the header block listing the
+  usernames FILE is configuration, not output — never read account names from it.
+
+examples:
+  - output: |
+      Mode ..................... VRFY
+      Usernames file ........... /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt
+      192.168.1.150: user exists
+      192.168.1.150: mysql exists
+      192.168.1.150: ftp exists
+      ######## Scan completed ########
+      4 results.
+    extract: |
+      {"mode": "VRFY", "valid_users": ["user", "mysql", "ftp"], "result_count": 4}
+
+follow_on:
+  # users_to_identities is inherited from the user_enumeration class.
+  - id: spray_enumerated_smtp_users
+    when: len(valid_users) > 0
+    scanner: hydra
+    script: "hydra -I -L {user_list} -P {password_list} smtp://{target}:{port}"
+    title: Spray the enumerated SMTP accounts
+    category: credentials
+    priority: 25
+    rationale: >
+      The accounts are confirmed to exist, so a spray against them is aimed
+      rather than speculative. {user_list} and {password_list} resolve to the
+      per-target generated lists, which will already contain these names once
+      they reach identities.

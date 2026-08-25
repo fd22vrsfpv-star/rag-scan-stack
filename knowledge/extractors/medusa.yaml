@@ -1,0 +1,78 @@
+# medusa — online password attack.
+#
+# 6 stored runs, 92 KB, the largest block of output nothing interpreted. All 6
+# are `ACCOUNT CHECK` lines and ZERO `ACCOUNT FOUND`: they ran against
+# rockyou (14,344,391 candidates) and were killed long before finishing.
+#
+# The distinction the extractor must hold is exactly that:
+#     ACCOUNT CHECK  a candidate being TRIED   -> not a result
+#     ACCOUNT FOUND  a credential RECOVERED    -> the result
+# Reading a CHECK line as a hit would report 6 credential discoveries where
+# there were none.
+tool: medusa
+class: credential_attack
+description: Online password attack — recovered pairs, and whether the run could finish.
+enabled: true
+max_chars: 40000
+
+deterministic:
+  # The whole line is captured: it names the module, host, user and password
+  # together, and splitting it into four patterns would risk pairing a user from
+  # one line with a password from another.
+  credentials:
+    pattern: 'ACCOUNT FOUND:\s*(.+?)\s*$'
+    capture: all
+    type: list
+  # `(1 of 14344391 complete)` — the candidate space the run was given.
+  candidates_total:
+    pattern: '\(\d+ of (\d+) complete\)'
+    type: number
+    aggregate: max
+  module:
+    pattern: 'ACCOUNT (?:CHECK|FOUND):\s*\[(\w+)\]'
+  errors:
+    pattern: '^ERROR:\s*\[(\S+?)\]'
+    capture: all
+    type: list
+
+schema:
+  credentials:
+    type: list
+    description: recovered pairs — ACCOUNT FOUND lines only, never ACCOUNT CHECK
+  candidates_total:
+    type: number
+    description: total candidates the run was given
+  module:
+    type: string
+    description: the medusa module used, e.g. ssh or ftp
+  errors:
+    type: list
+    description: module errors, e.g. telnet failing to find a logon prompt
+
+prompt: |
+  Extract results from medusa output.
+
+  `ACCOUNT FOUND: [ssh] Host: h User: root Password: toor` is a RECOVERED
+  credential. `ACCOUNT CHECK: ...` is a candidate being tried and is NOT a
+  result — reading one as a hit invents a credential that was never found.
+
+  `ERROR: [telnet.mod] Failed to identify logon prompt` means the module could
+  not run at all, which is different from finding nothing.
+
+examples:
+  - output: |
+      2026-08-19 21:59:49 ACCOUNT CHECK: [ssh] Host: 192.168.1.150 (1 of 1, 0 complete) User: root (1 of 17, 0 complete) Password: 123456 (1 of 14344391 complete)
+      2026-08-19 22:10:02 ACCOUNT FOUND: [ssh] Host: 192.168.1.150 User: msfadmin Password: msfadmin [SUCCESS]
+    extract: |
+      {"module": "ssh", "candidates_total": 14344391,
+       "credentials": ["[ssh] Host: 192.168.1.150 User: msfadmin Password: msfadmin [SUCCESS]"]}
+
+notable:
+  - id: medusa_module_failed
+    when: len(errors) > 0
+    severity: low
+    title: "medusa module error: {errors}"
+    detail: >
+      The module could not run — medusa's telnet module exits 0 in about a
+      second having failed to find a logon prompt, which reads exactly like a
+      fast, clean, empty result.

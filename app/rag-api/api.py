@@ -18779,6 +18779,25 @@ def run_post_review_endpoint(
     return {"ok": True, **report}
 
 
+@app.get("/agent/post-review/analysis-coverage", tags=["Post Review"])
+def analysis_coverage_endpoint(limit_tools: int = Query(40, ge=1, le=200),
+                               _: bool = Depends(auth)):
+    """Which tools produce output nothing interprets — and which merely failed.
+
+    The rollout order for analysis profiles, chosen by evidence rather than an
+    audit. `write_a_profile_next` is ranked by unexplained bytes;
+    `failing_not_unparsed` is reported separately because those runs need
+    repeating, not an extractor — dig is 22 of 22 connection failures, and a dig
+    extractor would parse error strings and learn nothing.
+    """
+    from post_review_agent import analysis_coverage
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            return {"ok": True, **analysis_coverage(cur, limit_tools=limit_tools)}
+        except Exception as e:
+            raise HTTPException(500, f"coverage report failed: {e}")
+
+
 @app.post("/agent/post-review/ingest-facts", tags=["Post Review"])
 def ingest_extracted_facts_endpoint(
     dry_run: bool = Query(True, description="Report what would be stored, store nothing"),
