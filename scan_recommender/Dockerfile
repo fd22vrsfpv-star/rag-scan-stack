@@ -7,6 +7,7 @@ WORKDIR /app
 
 # Copy the current directory contents into the container at /app
 COPY scan_recommender.py /app/scan_recommender.py
+COPY llm_settings.py      /app/llm_settings.py
 COPY exploits_rag.py      /app/exploits_rag.py
 COPY multi_app.py         /app/multi_app.py
 COPY log_manager.py       /app/log_manager.py

@@ -1701,6 +1701,9 @@ services:
         OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
         OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
         OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-300}
+        # DB access so the LLM settings resolver can read dashboard llm.* config
+        # (Settings -> LLM Tuning). Reaches the DB via the rag-postgres alias.
+        DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
         # LLM Backend + Azure/OpenAI/Anthropic settings
         LLM_BACKEND: ${LLM_BACKEND:-ollama}
         AZURE_API_KEY: ${AZURE_API_KEY:-}

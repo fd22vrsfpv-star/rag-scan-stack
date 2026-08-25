@@ -3280,15 +3280,37 @@ function LlmBackendSection({ backend, onBackendChange }: { backend: string; onBa
   const [apiKey, setApiKey] = useState('')
   const [model, setModel] = useState('')
   const [azureEndpoint, setAzureEndpoint] = useState('')
+  const [openaiBaseUrl, setOpenaiBaseUrl] = useState('')
   const [testResult, setTestResult] = useState<{ ok: boolean; response?: string; error?: string } | null>(null)
   const [testing, setTesting] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [availableModels, setAvailableModels] = useState<string[]>([])
+  const [modelsLoading, setModelsLoading] = useState(false)
+  const [modelsError, setModelsError] = useState('')
+
+  // Fetch selectable models for a backend (best effort — the field stays free-text).
+  const loadModels = async (b: string) => {
+    if (!b || b === 'default') { setAvailableModels([]); setModelsError(''); return }
+    setModelsLoading(true); setModelsError('')
+    try {
+      const res = await apiFetch<{ ok: boolean; models: string[]; error?: string }>(
+        `/settings/llm/models?backend=${encodeURIComponent(b)}`)
+      setAvailableModels(res.models || [])
+      if (!res.ok && res.error) setModelsError(res.error)
+    } catch (e: any) {
+      setAvailableModels([]); setModelsError(String(e?.message || e))
+    }
+    setModelsLoading(false)
+  }
 
   // Load current settings from server
   useEffect(() => {
     apiFetch<Record<string, string>>('/settings/llm').then(data => {
       setLlmSettings(data)
-      if (!backend && data.backend) {
+      // The saved DB config is the source of truth — always reflect it on load,
+      // otherwise the dropdown shows a stale persisted default (e.g. ollama)
+      // even though a different backend is configured server-side.
+      if (data.backend) {
         onBackendChange(data.backend)
       }
     }).catch(() => {})
@@ -3298,6 +3320,7 @@ function LlmBackendSection({ backend, onBackendChange }: { backend: string; onBa
   useEffect(() => {
     if (backend === 'openai') {
       setModel(llmSettings.openai_model || 'gpt-4o')
+      setOpenaiBaseUrl(llmSettings.openai_base_url || '')
     } else if (backend === 'anthropic') {
       setModel(llmSettings.anthropic_model || 'claude-sonnet-4-20250514')
     } else if (backend === 'azure') {
@@ -3306,6 +3329,7 @@ function LlmBackendSection({ backend, onBackendChange }: { backend: string; onBa
     }
     setApiKey('')  // never prefill keys
     setTestResult(null)
+    loadModels(backend)  // populate the Model autocomplete for this backend
   }, [backend, llmSettings])
 
   const handleSaveKeys = async () => {
@@ -3315,6 +3339,7 @@ function LlmBackendSection({ backend, onBackendChange }: { backend: string; onBa
       if (backend === 'openai') {
         if (apiKey) body.openai_api_key = apiKey
         body.openai_model = model
+        body.openai_base_url = openaiBaseUrl
       } else if (backend === 'anthropic') {
         if (apiKey) body.anthropic_api_key = apiKey
         body.anthropic_model = model
@@ -3376,16 +3401,37 @@ function LlmBackendSection({ backend, onBackendChange }: { backend: string; onBa
           </select>
         </div>
 
-        {/* Model */}
+        {/* Model — free-text with autocomplete from the backend's model list */}
         {needsApiKey && (
           <div>
-            <label className="block text-xs text-muted-foreground mb-1">Model</label>
+            <div className="flex items-center justify-between mb-1">
+              <label className="block text-xs text-muted-foreground">Model</label>
+              <button
+                type="button"
+                onClick={() => loadModels(backend)}
+                className="text-[10px] text-primary hover:underline disabled:opacity-50"
+                disabled={modelsLoading}
+              >
+                {modelsLoading ? 'Loading…' : `↻ Refresh${availableModels.length ? ` (${availableModels.length})` : ''}`}
+              </button>
+            </div>
             <input
+              list="llm-model-options"
               value={model}
               onChange={e => setModel(e.target.value)}
               className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border font-mono"
               placeholder={backend === 'anthropic' ? 'claude-sonnet-4-20250514' : 'gpt-4o'}
             />
+            <datalist id="llm-model-options">
+              {availableModels.map(m => <option key={m} value={m} />)}
+            </datalist>
+            <p className="text-[10px] text-muted-foreground mt-1">
+              {modelsError
+                ? `Could not list models (${modelsError}) — type the exact deployment name.`
+                : availableModels.length
+                  ? 'Start typing to filter, or enter any deployment name.'
+                  : 'Type the exact deployment name (Save your key/base URL first, then ↻ Refresh to list).'}
+            </p>
           </div>
         )}
 
@@ -3399,6 +3445,24 @@ function LlmBackendSection({ backend, onBackendChange }: { backend: string; onBa
               className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border font-mono"
               placeholder="https://your-resource.openai.azure.com"
             />
+          </div>
+        )}
+
+        {/* OpenAI Base URL — for OpenAI-compatible endpoints (e.g. Azure AI Foundry v1) */}
+        {backend === 'openai' && (
+          <div>
+            <label className="block text-xs text-muted-foreground mb-1">Base URL (optional)</label>
+            <input
+              value={openaiBaseUrl}
+              onChange={e => setOpenaiBaseUrl(e.target.value)}
+              className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border font-mono"
+              placeholder="https://api.openai.com"
+            />
+            <p className="text-[10px] text-muted-foreground mt-1">
+              OpenAI-compatible endpoint. The stack appends <code>/v1/chat/completions</code>.
+              For Azure AI Foundry, use the resource base ending in <code>/openai</code>
+              (e.g. <code>https://rt3ai.services.ai.azure.com/openai</code>).
+            </p>
           </div>
         )}
 
