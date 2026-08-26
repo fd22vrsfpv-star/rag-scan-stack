@@ -1,6 +1,6 @@
 from typing import Optional
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 from config import get_settings
 from engagement import engagement_headers
@@ -59,6 +59,45 @@ async def follow_up_stats(engagement_id: Optional[str] = Query(None)):
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
+
+
+@router.get("/api/follow-ups/export")
+async def export_follow_ups(
+    format: str = Query("csv"),
+    status: Optional[str] = Query(None),
+    exclude_status: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    priority: Optional[str] = Query(None),
+    flagged_by: Optional[str] = Query(None),
+    engagement_id: Optional[str] = Query(None),
+    rule_id: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+):
+    """Download follow-ups in csv/json/md/urls. Filters mirror the list view, so
+    the current on-screen filter set exports exactly. Streams the file through
+    with the upstream's Content-Disposition (filename carries rule + timestamp)."""
+    s = get_settings()
+    params = {"format": format}
+    for k, v in (("status", status), ("exclude_status", exclude_status),
+                 ("severity", severity), ("priority", priority),
+                 ("flagged_by", flagged_by), ("engagement_id", engagement_id),
+                 ("rule_id", rule_id), ("search", search)):
+        if v:
+            params[k] = v
+    async with httpx.AsyncClient(timeout=120) as c:
+        resp = await c.get(
+            f"{s.rag_api_url}/follow-ups/export",
+            params=params,
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return Response(
+            content=resp.content,
+            media_type=resp.headers.get("content-type", "application/octet-stream"),
+            headers={"Content-Disposition":
+                     resp.headers.get("content-disposition", "attachment")},
+        )
 
 
 @router.get("/api/follow-ups/group-ids")

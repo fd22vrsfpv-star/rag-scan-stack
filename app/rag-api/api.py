@@ -17973,6 +17973,171 @@ def list_follow_ups(
     return {"follow_ups": rows}
 
 
+def _derive_follow_up_url(target: Optional[str], detail: dict) -> str:
+    """Best-effort URL for a follow-up host. Generic across rules: honours an
+    already-URL target, otherwise builds from host + the linked finding's port."""
+    t = (target or "").strip()
+    if not t:
+        return ""
+    if t.lower().startswith(("http://", "https://")):
+        return t
+    host = t.split("/")[0]
+    port = str((detail or {}).get("port") or "").strip()
+    if port in ("80", ""):
+        return f"http://{host}" if port == "80" else f"https://{host}"
+    if port == "443":
+        return f"https://{host}"
+    return f"https://{host}:{port}"
+
+
+@app.get("/follow-ups/export", tags=["Follow-Ups"])
+def export_follow_ups(
+    format: str = Query("csv", description="csv | json | md | urls"),
+    status: Optional[str] = Query(None),
+    exclude_status: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    priority: Optional[str] = Query(None),
+    flagged_by: Optional[str] = Query(None),
+    engagement_id: Optional[str] = Query(None),
+    rule_id: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    _: bool = Depends(auth),
+):
+    """Export follow-up items in a chosen format, enriched with the linked
+    finding's detail. Filters mirror GET /follow-ups exactly, so any view an
+    operator can build in the UI can be exported. Generic across rules — cert,
+    CVE, exposed-admin all flow through the same path; rule-specific detail rides
+    along in `detail_json` (CSV/JSON) rather than in bespoke columns.
+
+    Formats: csv (flat rows), json (enriched objects), md (grouped report),
+    urls (one derived URL per line, de-duplicated)."""
+    from fastapi import Response
+    fmt = (format or "csv").lower()
+    if fmt not in ("csv", "json", "md", "urls"):
+        raise HTTPException(400, "format must be csv | json | md | urls")
+
+    clauses, params = [], []
+    for col, val in (("status", status), ("severity", severity), ("priority", priority),
+                     ("flagged_by", flagged_by), ("rule_id", rule_id)):
+        if val:
+            clauses.append(f"{col} = %s"); params.append(val)
+    if exclude_status:
+        clauses.append("status != %s"); params.append(exclude_status)
+    if engagement_id:
+        clauses.append("engagement_id = %s::uuid"); params.append(engagement_id)
+    if search:
+        clauses.append("(title ILIKE %s OR target ILIKE %s OR reason ILIKE %s OR rule_id ILIKE %s)")
+        params.extend([f"%{search}%"] * 4)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT * FROM follow_up_items {where}
+            ORDER BY rule_id,
+                CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                              WHEN 'medium' THEN 2 ELSE 3 END,
+                target
+        """, params)
+        rows = [dict(r) for r in cur.fetchall()]
+
+        # Enrich recon-sourced items with their tlsx/dns/etc finding detail.
+        recon_ids = [r["finding_id"] for r in rows
+                     if r.get("finding_source") == "recon" and r.get("finding_id")]
+        detail_by_id = {}
+        if recon_ids:
+            cur.execute("SELECT id::text, data FROM recon_findings WHERE id = ANY(%s::uuid[])",
+                        ([str(i) for i in recon_ids],))
+            for r in cur.fetchall():
+                d = r["data"]
+                if isinstance(d, str):
+                    try:
+                        d = json.loads(d)
+                    except Exception:
+                        d = {}
+                detail_by_id[r["id"]] = d or {}
+
+    enriched = []
+    for r in rows:
+        detail = detail_by_id.get(str(r.get("finding_id")), {}) if r.get("finding_id") else {}
+        enriched.append({
+            "follow_up_id": str(r["id"]),
+            "rule_id": r.get("rule_id") or "",
+            "title": r.get("title") or "",
+            "host": r.get("target") or "",
+            "url": _derive_follow_up_url(r.get("target"), detail),
+            "severity": r.get("severity") or "",
+            "priority": r.get("priority") or "",
+            "status": r.get("status") or "",
+            "reason": r.get("reason") or "",
+            "flagged_by": r.get("flagged_by") or "",
+            "assigned_to": r.get("assigned_to") or "",
+            "confidence": r.get("confidence"),
+            "tags": r.get("tags") or [],
+            "created_at": r["created_at"].isoformat() if r.get("created_at") else "",
+            "finding_source": r.get("finding_source") or "",
+            "finding_id": str(r["finding_id"]) if r.get("finding_id") else "",
+            "detail": detail,
+        })
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    tag = (rule_id or "all").replace("/", "_")
+    fname = f"follow-ups-{tag}-{stamp}"
+
+    if fmt == "json":
+        return Response(json.dumps({"count": len(enriched), "follow_ups": enriched}, default=str),
+                        media_type="application/json",
+                        headers={"Content-Disposition": f'attachment; filename="{fname}.json"'})
+
+    if fmt == "urls":
+        seen, lines = set(), []
+        for e in enriched:
+            u = e["url"]
+            if u and u not in seen:
+                seen.add(u); lines.append(u)
+        return Response("\n".join(lines) + ("\n" if lines else ""),
+                        media_type="text/plain",
+                        headers={"Content-Disposition": f'attachment; filename="{fname}-urls.txt"'})
+
+    if fmt == "csv":
+        import csv as _csv
+        import io as _io
+        buf = _io.StringIO()
+        cols = ["follow_up_id", "rule_id", "title", "host", "url", "severity",
+                "priority", "status", "reason", "flagged_by", "assigned_to",
+                "confidence", "tags", "created_at", "finding_source",
+                "finding_id", "detail_json"]
+        w = _csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for e in enriched:
+            row = dict(e)
+            row["tags"] = ",".join(e["tags"]) if isinstance(e["tags"], list) else (e["tags"] or "")
+            row["detail_json"] = json.dumps(e["detail"], default=str) if e["detail"] else ""
+            row.pop("detail", None)
+            w.writerow(row)
+        return Response(buf.getvalue(), media_type="text/csv",
+                        headers={"Content-Disposition": f'attachment; filename="{fname}.csv"'})
+
+    # md — grouped by rule_id
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for e in enriched:
+        groups[e["rule_id"] or "(no rule)"].append(e)
+    lines = [f"# Follow-ups export ({len(enriched)} items)", "",
+             f"Generated {stamp} UTC" + (f" · engagement {engagement_id}" if engagement_id else ""), ""]
+    for rid in sorted(groups):
+        g = groups[rid]
+        lines.append(f"## {rid} — {len(g)} item(s)")
+        lines.append("")
+        lines.append("| Host | URL | Severity | Reason |")
+        lines.append("|---|---|---|---|")
+        for e in g:
+            reason = (e["reason"] or "").replace("|", "\\|")
+            lines.append(f"| {e['host']} | {e['url']} | {e['severity']} | {reason} |")
+        lines.append("")
+    return Response("\n".join(lines), media_type="text/markdown",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}.md"'})
+
+
 @app.post("/follow-ups", tags=["Follow-Ups"])
 def create_follow_up(body: FollowUpCreate, _: bool = Depends(auth)):
     """Create a follow-up item (manual or agent-created)."""
