@@ -15756,6 +15756,106 @@ def delete_engagement_scope(eid: str, scope_name: str, _: bool = Depends(auth)):
     return {"ok": True, "deleted": deleted, "scope": scope_name}
 
 
+class MarkCustomerSitesBody(BaseModel):
+    targets: List[str] = []
+    scope_name: str = "customer_scope"
+
+
+# Reserved buckets that are NOT part of the scanned scope; mirrored in the recon
+# agent's RESERVED_NONSCANNABLE (dashboard/bff/services/recon_agent.py).
+_RESERVED_SCOPES = ("customer_scope", "excluded", "not_in_scope")
+
+
+@app.post("/engagements/{eid}/scope/mark-customer-sites", tags=["Engagements"])
+def mark_customer_sites(eid: str, body: MarkCustomerSitesBody, _: bool = Depends(auth)):
+    """Move hosts into the engagement's `customer_scope` (out of the scanned scope).
+
+    Per-host BY DESIGN: we host customers on SHARED domains (e.g. convio.net), so a
+    domain-pattern rule would wrongly exclude our own infra. For each target this:
+      1. removes it from the scanned engagement scopes (e.g. `blackbaud`);
+      2. files it under `customer_scope` (engagement-scoped, UI-visible);
+      3. also records it in the global `not_in_scope` list (dispatch-gate safety);
+      4. captures a scope_decision for learning — but deliberately does NOT distil a
+         `*.domain` rule (that would nuke the shared domain);
+      5. resolves the matching customer-site follow-ups.
+    The recon agent skips `customer_scope`, so scanning of these hosts stops.
+    """
+    scope_name = (body.scope_name or "customer_scope").strip() or "customer_scope"
+    targets = [str(t).strip() for t in (body.targets or []) if str(t).strip()]
+    if not targets:
+        raise HTTPException(400, "no targets provided")
+
+    moved = resolved = 0
+    from_scopes: dict = {}
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # Ensure the bucket exists so it shows in the engagement's scope list.
+        cur.execute("""
+            INSERT INTO scope_targets (engagement_id, name, target, target_type, source)
+            VALUES (%s::uuid, %s, %s, 'domain', %s)
+            ON CONFLICT (engagement_id, name, target) DO NOTHING
+        """, (eid, scope_name, _SCOPE_PLACEHOLDER_TARGET, _SCOPE_PLACEHOLDER_SOURCE))
+
+        for t in targets:
+            ttype = _classify_target(t)
+            # Remember origin scope for the decision record.
+            cur.execute("""
+                SELECT name FROM scope_targets
+                 WHERE engagement_id = %s::uuid AND target = %s
+                   AND name NOT IN %s LIMIT 1
+            """, (eid, t, _RESERVED_SCOPES))
+            r = cur.fetchone()
+            from_scopes[t] = r["name"] if r else "unscoped"
+
+            # 1. remove from the scanned engagement scopes
+            cur.execute("""
+                DELETE FROM scope_targets
+                 WHERE engagement_id = %s::uuid AND target = %s AND name NOT IN %s
+            """, (eid, t, _RESERVED_SCOPES))
+            # 2. file under customer_scope (engagement-scoped, visible)
+            cur.execute("""
+                INSERT INTO scope_targets (engagement_id, name, target, target_type, source)
+                VALUES (%s::uuid, %s, %s, %s, 'customer-site-exclude')
+                ON CONFLICT (engagement_id, name, target) DO NOTHING
+            """, (eid, scope_name, t, ttype))
+            moved += 1
+            # 3. secondary safety: global not_in_scope (NULL engagement_id — guard by
+            #    NOT EXISTS because a unique index does not dedupe NULL columns).
+            cur.execute("""
+                INSERT INTO scope_targets (name, target, target_type, source)
+                SELECT 'not_in_scope', %s, %s, 'customer-site-exclude'
+                 WHERE NOT EXISTS (
+                    SELECT 1 FROM scope_targets
+                     WHERE engagement_id IS NULL AND name = 'not_in_scope' AND target = %s)
+            """, (t, ttype, t))
+            # 5. resolve matching customer-site follow-ups
+            cur.execute("""
+                UPDATE follow_up_items
+                   SET status = 'resolved', resolved_at = now(), updated_at = now()
+                 WHERE target = %s
+                   AND rule_id IN ('customer_hosted_site', 'customer_hosted_site_cname')
+                   AND status NOT IN ('resolved', 'dismissed')
+            """, (t,))
+            resolved += cur.rowcount
+
+        # 4. record decisions for learning — NO _distill (per-host only).
+        for t in targets:
+            try:
+                _capture_scope_decisions([t], from_scopes.get(t, "unscoped"), scope_name, cur)
+            except Exception as e:
+                logging.warning(f"scope decision capture failed for {t}: {e}")
+        conn.commit()
+
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("customer_scope_excluded", "scope", {
+            "engagement_id": eid, "scope": scope_name, "moved": moved,
+            "resolved_follow_ups": resolved, "targets": targets[:50]})
+    except Exception:
+        pass
+    return {"ok": True, "engagement_id": eid, "scope": scope_name,
+            "moved": moved, "resolved_follow_ups": resolved}
+
+
 class ScopeRename(BaseModel):
     new_name: str
 
@@ -18314,7 +18414,7 @@ def follow_ups_grouped(
             cur.execute(f"""
                 SELECT
                     CASE
-                        WHEN title LIKE 'Vulnerable: %% on %%' THEN trim(split_part(title, ' on ', 1))
+                        WHEN title LIKE '%% on %%' THEN trim(split_part(title, ' on ', 1))
                         WHEN title LIKE '%% \u2014 %%' THEN trim(split_part(title, ' \u2014 ', 1))
                         WHEN title LIKE '%% -- %%' THEN trim(split_part(title, ' -- ', 1))
                         WHEN title LIKE '%% \u2013 %%' THEN trim(split_part(title, ' \u2013 ', 1))

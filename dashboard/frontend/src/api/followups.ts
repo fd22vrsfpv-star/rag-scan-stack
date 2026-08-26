@@ -265,6 +265,24 @@ export function useSubmitFeedback() {
   })
 }
 
+/** Move selected follow-up targets into the engagement's customer_scope (out of
+ *  the scanned scope). Per-host — safe on shared domains. */
+export function useMarkCustomerSites() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ eid, targets }: { eid: string; targets: string[] }) =>
+      apiFetch<{ ok: boolean; moved: number; resolved_follow_ups: number; scope: string }>(
+        `/engagements/${eid}/scope/mark-customer-sites`,
+        { method: 'POST', body: JSON.stringify({ targets }) },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['follow-ups'] })
+      qc.invalidateQueries({ queryKey: ['recon-domains'] })
+      qc.invalidateQueries({ queryKey: ['scope'] })
+    },
+  })
+}
+
 // ── Agent Hooks ──
 
 export function useAgentRules() {

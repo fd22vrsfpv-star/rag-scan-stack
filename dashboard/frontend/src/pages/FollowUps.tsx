@@ -6,7 +6,7 @@ import {
   useBulkUpdateFollowUps, useSendToBurpQueue, useBurpQueueStats,
   useAgentRules, useAgentStats, useTriggerAgentScan, useToggleAgentRule,
   useReloadRules, useTestRule, useCreateAdhocRule, useDeleteRule, useAgentRule,
-  downloadFollowUpsExport,
+  downloadFollowUpsExport, useMarkCustomerSites,
   type FollowUpItem, type FollowUpGroup, type RuleTestResult, type ExportFormat,
 } from '@/api/followups'
 // ScanRecommendationsPanel was extracted from this file into a shared
@@ -83,6 +83,7 @@ export default function FollowUps() {
   const sendToBurp = useSendToBurpQueue()
   const { data: burpQueueStats } = useBurpQueueStats()
   const excludeFromScope = useExcludeFromScope()
+  const markCustomer = useMarkCustomerSites()
   const addToScope = useAddToScope()
   const { data: scopeData } = useScopeNames()
   const scopeNames = (scopeData?.names ?? []).map((n: any) => typeof n === 'string' ? n : n.name) as string[]
@@ -127,7 +128,10 @@ export default function FollowUps() {
   const extractFindingName = (title: string) => {
     const t = title || 'Untitled'
     // Software CVE titles: group by product+version (before " on ")
-    if (t.startsWith('Vulnerable: ') && t.includes(' on ')) {
+    // Strip " on <host>" for ANY finding (not just "Vulnerable:") so
+    // "Missing headers on https://host/" groups under "Missing headers".
+    // MUST match the server's group_key CASE in api.py follow_ups_grouped.
+    if (t.includes(' on ')) {
       return t.slice(0, t.indexOf(' on ')).trim()
     }
     // Try em dash first (most common in agent-generated titles)
@@ -276,6 +280,18 @@ export default function FollowUps() {
     if (!unique.length) return
     excludeFromScope.mutate({ targets: unique, source: 'follow-up-bulk' })
     handleBulkAction('dismiss')
+  }
+  const handleMarkCustomerSites = () => {
+    if (!engagementId) { alert('Select an engagement first'); return }
+    const targets = items
+      .filter(i => selectedIds.has(i.id) && i.target)
+      .map(i => i.target!)
+    const unique = [...new Set(targets)]
+    if (!unique.length) return
+    markCustomer.mutate(
+      { eid: engagementId, targets: unique },
+      { onSuccess: () => setSelectedIds(new Set()) },
+    )
   }
   const handleAddToScope = (scopeName: string) => {
     const targets = items
@@ -728,6 +744,13 @@ export default function FollowUps() {
               <option key={s} value={s}>{s}</option>
             ))}
           </select>
+          {engagementId && (
+            <button onClick={handleMarkCustomerSites} disabled={markCustomer.isPending}
+              title="Move selected hosts into this engagement's customer_scope (out of the scanned scope). Per-host — safe on shared domains like convio.net."
+              className="h-6 px-2 text-[11px] rounded border border-purple-500/30 bg-purple-500/10 text-purple-400 hover:bg-purple-500/20">
+              {markCustomer.isPending ? 'Marking...' : 'Mark customer site (OOS)'}
+            </button>
+          )}
           <button onClick={() => handleSendToBurp()} disabled={sendToBurp.isPending}
             title="Queue selected findings for import in Burp Suite's RagScanBridge extension"
             className="h-6 px-2 text-[11px] rounded border border-orange-500/30 bg-orange-500/10 text-orange-400 hover:bg-orange-500/20 flex items-center gap-1">
@@ -1587,7 +1610,10 @@ function GroupItems({ groupKey, groupBy, total, statusFilter, excludeStatus, sel
   const extractFinding = (title: string) => {
     const t = title || ''
     // Software CVE: "Vulnerable: IIS 10.0 on 1.2.3.4 — CVE-..." → "Vulnerable: IIS 10.0"
-    if (t.startsWith('Vulnerable: ') && t.includes(' on ')) {
+    // Strip " on <host>" for ANY finding (not just "Vulnerable:") so
+    // "Missing headers on https://host/" groups under "Missing headers".
+    // MUST match the server's group_key CASE in api.py follow_ups_grouped.
+    if (t.includes(' on ')) {
       return t.slice(0, t.indexOf(' on ')).trim()
     }
     for (const sep of [' \u2014 ', ' -- ', ' \u2013 ']) {

@@ -138,6 +138,65 @@ def check_expired_cert(row, _rule):
     return False
 
 
+def check_customer_hosted_cert(row, _rule):
+    """Flag a host whose TLS cert is for a DIFFERENT registrable domain.
+
+    We host customers' live sites on our shared domains (e.g. *-live.convio.net).
+    A customer that brings its own cert presents one whose CN/SAN is the CUSTOMER's
+    registrable domain, not ours — e.g. host hopeli-live.convio.net serving a cert
+    for connect.hopeoflifeintl.org. That mismatch is a high-precision "this is a
+    customer site, not our infra" signal. Fail closed: no host-domain, no cert
+    names, or the host domain matching ANY cert domain -> not flagged.
+    """
+    from scope_classifier import registrable_domain
+    data = row.get("data") if isinstance(row.get("data"), dict) else {}
+    host_dom = registrable_domain((row.get("target") or "").strip())
+    if not host_dom:
+        return False  # IP or blank host — cannot compare registrable domains
+    cn = (data.get("subject_cn") or "").strip()
+    sans = data.get("subject_an") or []
+    if isinstance(sans, str):
+        sans = [sans]
+    names = [n for n in ([cn] + [str(s).strip() for s in sans]) if n]
+    # registrable_domain() already handles wildcard labels ("*.x.com" -> "x.com").
+    cert_domains = {d for d in (registrable_domain(n) for n in names) if d}
+    if not cert_domains or host_dom in cert_domains:
+        return False
+    row["cert_cn"] = cn or names[0]
+    row["owner_domain"] = registrable_domain(cn) or sorted(cert_domains)[0]
+    row["host_domain"] = host_dom
+    row["signal"] = "tls_cert_mismatch"
+    return True
+
+
+def check_customer_hosted_cname(row, _rule):
+    """Flag a host that CNAMEs across registrable domains — a customer alias.
+
+    Secondary signal to the cert check: a DNS CNAME whose target is a different
+    registrable domain than the host indicates customer/third-party ownership on
+    one side. Fail closed on IPs/blanks/same-domain.
+    """
+    from scope_classifier import registrable_domain
+    data = row.get("data") if isinstance(row.get("data"), dict) else {}
+    host_dom = registrable_domain((row.get("target") or "").strip())
+    if not host_dom:
+        return False
+    rec = data.get("record") or data.get("cname") or []
+    if isinstance(rec, str):
+        rec = [rec]
+    for t in rec:
+        if not t:
+            continue
+        tdom = registrable_domain(str(t).strip())
+        if tdom and tdom != host_dom:
+            row["cname_target"] = str(t).strip()
+            row["owner_domain"] = tdom
+            row["host_domain"] = host_dom
+            row["signal"] = "dns_cname_cross_domain"
+            return True
+    return False
+
+
 def check_self_signed_plus_service(row, _rule):
     """Check self-signed cert on high-value HTTPS ports."""
     data = row.get("data") if isinstance(row.get("data"), dict) else {}
@@ -1011,6 +1070,8 @@ def check_valuable_external_login(row, _rule):
 PYTHON_MATCH_FUNCTIONS = {
     "check_self_signed": check_self_signed,
     "check_expired_cert": check_expired_cert,
+    "check_customer_hosted_cert": check_customer_hosted_cert,
+    "check_customer_hosted_cname": check_customer_hosted_cname,
     "check_self_signed_plus_service": check_self_signed_plus_service,
     "check_weak_creds": check_weak_creds,
     "check_open_redirect_web": check_open_redirect_web,
@@ -1507,6 +1568,15 @@ class RuleEngine:
                     "software_link": f"/assets?tab=software&search={row.get('product', '')}",
                     "source": "rule_engine",
                 }
+
+            # Generic metadata passthrough: a rule can declare `metadata_keys` and
+            # any row values a python match-function set (e.g. owner_domain, signal)
+            # ride along into follow_up_items.metadata — no per-rule code needed.
+            meta_keys = rule.get("metadata_keys")
+            if meta_keys:
+                extra = {k: row.get(k) for k in meta_keys if row.get(k) is not None}
+                if extra:
+                    metadata = {**(metadata or {}), **extra}
 
             results.append({
                 "rule_id": rule_id,

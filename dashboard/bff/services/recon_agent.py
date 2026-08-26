@@ -51,6 +51,11 @@ BASE_INTERVAL = float(os.environ.get("RECON_AGENT_BASE_INTERVAL", "30"))
 # the same process needs no TLS.
 BFF_INTERNAL_URL = os.environ.get("BFF_INTERNAL_URL", "http://127.0.0.1:8050")
 
+# Scope names the agent must NEVER scan: hosts moved here are deliberately
+# out-of-authorization (customer sites, operator exclusions). Kept separate from
+# 'unknown_scope', which stays scannable until triaged.
+RESERVED_NONSCANNABLE = {"customer_scope", "excluded", "not_in_scope"}
+
 # Seed-stage discovery pipeline.
 #
 # Stages 0-2 (whois → dnsx → nmap) are the discovery seed that produces the
@@ -490,6 +495,8 @@ class ReconAgent:
                 )
                 if resp.status_code == 200:
                     for scope in resp.json().get("scopes", []):
+                        if scope["name"] in RESERVED_NONSCANNABLE:
+                            continue  # never scan customer/excluded buckets
                         if allowed_scopes and scope["name"] not in allowed_scopes:
                             continue
                         r2 = await c.get(
