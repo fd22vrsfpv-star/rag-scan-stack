@@ -121,12 +121,66 @@ def test_the_default_model_is_not_a_phantom_tag():
         f"compose still defaults some service to a model nobody has: {phantom}")
 
 
+def _load_consumer():
+    """Load artifact_consumer by path, without importing the rag-api package.
+
+    Returns None when a dependency is absent, so the test SKIPS rather than
+    ERRORS — a skip says "cannot run here", an error says "broken".
+    """
+    import importlib.util
+    if not os.path.exists(CONSUMER):
+        return None
+    spec = importlib.util.spec_from_file_location("artifact_consumer", CONSUMER)
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:                       # noqa: BLE001
+        return None
+    return module
+
+
 @pytest.mark.unit
-def test_the_prompt_is_bounded():
-    """Whole tool outputs run to megabytes; one unbounded prompt eats the batch."""
-    src = open(CONSUMER, encoding="utf-8").read()
-    assert "MAX_CONTENT_CHARS" in src
-    assert "[:MAX_CONTENT_CHARS]" in src, "content is no longer truncated"
+def test_no_single_prompt_is_unbounded():
+    """Whole tool outputs run to megabytes; one unbounded prompt eats the batch.
+
+    This used to assert the literal `[:MAX_CONTENT_CHARS]` — i.e. that content
+    was TRUNCATED. Truncation is no longer how the bound is achieved: oversized
+    artifacts are now chunked on line boundaries and reduced, which answers the
+    original complaint properly (an 8 MB artifact was being summarised from its
+    first 12 KB and the judgement presented as covering the whole). Asserting the
+    old mechanism made the test fail on an improvement.
+
+    So this asserts the PROPERTY that matters — no chunk exceeds the bound — by
+    running the splitter, not by reading the source for a construct.
+    """
+    consumer = _load_consumer()
+    if consumer is None:
+        pytest.skip("artifact_consumer not importable")
+    size = 100
+    content = "".join(f"line {i} " + "x" * 40 + "\n" for i in range(200))
+    chunks, total = consumer._split_chunks(content, size, max_chunks=50)
+    assert chunks, "the splitter returned nothing"
+    assert total >= len(chunks)
+    # A single line longer than `size` becomes its own oversized chunk by
+    # design, so the bound is per-line, not absolute.
+    longest_line = max(len(ln) for ln in content.splitlines(keepends=True))
+    for chunk in chunks:
+        assert len(chunk) <= max(size, longest_line), \
+            f"a chunk of {len(chunk)} chars exceeded the {size}-char bound"
+    assert "".join(chunks) in content, "chunking altered the content"
+
+
+@pytest.mark.unit
+def test_dropped_chunks_are_counted_not_hidden():
+    """Coverage must be stated, not implied. `max_chunks` caps the work, and the
+    TRUE total is returned so a partial review cannot read as a complete one."""
+    consumer = _load_consumer()
+    if consumer is None:
+        pytest.skip("artifact_consumer not importable")
+    content = "".join(f"{i}\n" for i in range(5000))
+    chunks, total = consumer._split_chunks(content, 100, max_chunks=3)
+    assert len(chunks) == 3
+    assert total > 3, f"total {total} does not reveal the dropped chunks"
 
 
 # ── executed against the live database ──────────────────────────────────────

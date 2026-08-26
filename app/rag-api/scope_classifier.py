@@ -102,6 +102,17 @@ class ScopeClassifier:
 
         return result  # may be low-confidence rule match or None
 
+    def classify_rules_only(self, target: str, context: Optional[dict] = None) -> Optional[ScopeSuggestion]:
+        """Rule-only classification — no embedder, no DB round-trip per host.
+
+        This is the fast path for bulk work (classifying thousands of discovered
+        hosts at ingest). `classify_target` adds embedding-similarity, which costs
+        one embedder call per host and is wrong to run 5,000 times in a loop.
+        """
+        if not self._loaded:
+            self.load_rules()
+        return self._check_rules(target, context or {})
+
     def _check_rules(self, target: str, context: dict) -> Optional[ScopeSuggestion]:
         """Evaluate deterministic rules against target + context."""
         for rule in self._yaml_rules:
@@ -256,3 +267,205 @@ def get_classifier() -> ScopeClassifier:
     if _classifier_instance is None:
         _classifier_instance = ScopeClassifier()
     return _classifier_instance
+
+
+# ── Self-learning: turn seed scope + accepted decisions into reusable rules ──
+#
+# The point of these helpers is that a classification made ONCE — by a human
+# seeding scope, or by the LLM/similarity path judging one host — becomes a
+# deterministic `scope_classification_rules` row. Every later host that fits the
+# same pattern is then a rule hit (fnmatch, no model), so the expensive path is
+# never walked twice for the same shape. This is the "make a tool you can reuse
+# without going back to the LLM" requirement, made concrete.
+
+# A small set of multi-label public suffixes so `foo.co.uk` distils to
+# `example.co.uk`, not `co.uk`. Not exhaustive — the common ones a pentest hits.
+_MULTI_TLDS = {
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "co.jp", "co.nz", "co.za",
+    "com.au", "com.br", "com.cn", "com.mx", "co.in", "co.kr",
+}
+
+
+def registrable_domain(host: str) -> Optional[str]:
+    """Best-effort registrable domain (eTLD+1). Returns None for IPs/blanks."""
+    if not host:
+        return None
+    h = host.strip().lower().rstrip(".")
+    if not h or "/" in h:
+        return None
+    try:
+        ip_address(h)
+        return None  # an IP has no registrable domain
+    except ValueError:
+        pass
+    labels = h.split(".")
+    if len(labels) < 2:
+        return None
+    last2 = ".".join(labels[-2:])
+    if last2 in _MULTI_TLDS and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return last2
+
+
+def target_type_of(host: str) -> str:
+    """Classify a bare target as ip / cidr / domain — matches scope_targets CHECK."""
+    t = (host or "").strip().lower()
+    if "/" in t and any(c.isdigit() for c in t.split("/")[-1]):
+        return "cidr"
+    try:
+        ip_address(t)
+        return "ip"
+    except ValueError:
+        return "domain"
+
+
+def generate_seed_rules(cur, engagement_id: str) -> int:
+    """Create auto_apply domain_pattern rules from an engagement's manual seeds.
+
+    Every operator-entered domain seed (blackbaud.com, convio.net, …) becomes a
+    `*.{domain}` rule mapped to that seed's scope name, so newly discovered
+    subdomains classify deterministically. Idempotent: a rule with the same
+    (name, scope_name, pattern) is not recreated.
+    """
+    cur.execute(
+        """SELECT DISTINCT name, target FROM scope_targets
+            WHERE engagement_id = %s::uuid AND target_type = 'domain'
+              AND target <> '' AND COALESCE(source, '') NOT LIKE 'auto-%%'""",
+        (engagement_id,),
+    )
+    seeds = cur.fetchall()
+    created = 0
+    for row in seeds:
+        scope_name = row["name"] if isinstance(row, dict) else row[0]
+        dom = (row["target"] if isinstance(row, dict) else row[1]).strip().lower().rstrip(".")
+        if not dom:
+            continue
+        pattern = f"*.{dom}"
+        rule_name = f"auto:{pattern}->{scope_name}"
+        cur.execute(
+            """SELECT 1 FROM scope_classification_rules
+                WHERE name = %s AND scope_name = %s AND rule_type = 'domain_pattern'
+                  AND conditions->>'pattern' = %s""",
+            (rule_name, scope_name, pattern),
+        )
+        if cur.fetchone():
+            continue
+        cur.execute(
+            """INSERT INTO scope_classification_rules
+                 (id, name, scope_name, priority, enabled, rule_type, conditions,
+                  auto_apply, engagement_id)
+               VALUES (gen_random_uuid(), %s, %s, 50, true, 'domain_pattern',
+                       %s::jsonb, true, %s::uuid)""",
+            (rule_name, scope_name, json.dumps({"pattern": pattern, "seed": dom}),
+             engagement_id),
+        )
+        created += 1
+    return created
+
+
+# Recon tools whose findings' `target` column is a hostname worth scoping.
+_HOST_SOURCES = ("subfinder", "dnsx", "httpx", "amass", "assetfinder", "tlsx",
+                 "gowitness", "whatweb", "dns-enum")
+
+
+def classify_and_assign_engagement(cur, engagement_id: str,
+                                   unknown_scope: str = "unknown_scope",
+                                   limit: Optional[int] = None) -> dict:
+    """Assign every discovered host to a scope UNDER this engagement.
+
+    In-scope (a rule matches) → that rule's scope name, source 'auto-classified'.
+    No match → `unknown_scope`, source 'auto-discovery'. Both carry
+    engagement_id, which is the whole point: engagement-less scope rows are
+    invisible to the Recon Agent, so classifying without stamping the engagement
+    left everything unscannable. In-scope hosts also get their asset stamped so
+    findings show under the engagement.
+    """
+    clf = get_classifier()
+    clf.load_rules(cur)
+
+    lim = f"LIMIT {int(limit)}" if limit else ""
+    cur.execute(
+        f"""SELECT t AS target FROM (
+              SELECT DISTINCT target t FROM recon_findings
+                WHERE source = ANY(%s) AND target IS NOT NULL AND target <> ''
+              UNION
+              SELECT DISTINCT hostname t FROM assets
+                WHERE hostname IS NOT NULL AND hostname <> ''
+            ) x
+            WHERE t NOT IN (SELECT target FROM scope_targets
+                             WHERE engagement_id = %s::uuid)
+            {lim}""",
+        (list(_HOST_SOURCES), engagement_id),
+    )
+    hosts = [r["target"] if isinstance(r, dict) else r[0] for r in cur.fetchall()]
+
+    in_scope = unknown = 0
+    per_scope: dict = {}
+    for h in hosts:
+        sug = clf.classify_rules_only(h, {})
+        if sug and sug.confidence >= 0.9:
+            scope, src = sug.scope, "auto-classified"
+            in_scope += 1
+            per_scope[scope] = per_scope.get(scope, 0) + 1
+        else:
+            scope, src = unknown_scope, "auto-discovery"
+            unknown += 1
+        cur.execute(
+            """INSERT INTO scope_targets (id, engagement_id, name, target,
+                                          target_type, source)
+               VALUES (gen_random_uuid(), %s::uuid, %s, %s, %s, %s)
+               ON CONFLICT (engagement_id, name, target) DO NOTHING""",
+            (engagement_id, scope, h, target_type_of(h), src),
+        )
+
+    # Findings-by-engagement: stamp assets for hosts we just put in a REAL scope
+    # (not the unknown bucket). The Recon Agent reads scope_targets, but the
+    # findings UI reads assets.engagement_id.
+    cur.execute(
+        """UPDATE assets a SET engagement_id = %s::uuid
+            WHERE a.engagement_id IS NULL
+              AND a.hostname IN (SELECT target FROM scope_targets
+                                  WHERE engagement_id = %s::uuid AND name <> %s)""",
+        (engagement_id, engagement_id, unknown_scope),
+    )
+    assets_stamped = cur.rowcount
+
+    return {"candidates": len(hosts), "in_scope": in_scope, "unknown": unknown,
+            "by_scope": per_scope, "assets_stamped": assets_stamped}
+
+
+def distill_rule_from_decision(cur, target: str, scope: str,
+                               engagement_id: Optional[str] = None,
+                               method: str = "manual") -> Optional[str]:
+    """Persist a reusable rule from a one-off classification (LLM/similarity/manual).
+
+    A host judged in-scope by the model or a human implies its whole registrable
+    domain is in scope, so we create a `*.{registrable}` auto_apply rule. The
+    next host under that domain is then a deterministic rule hit — the model is
+    never asked again for the same shape. Idempotent by (name, scope, pattern).
+    Returns the pattern created, or None when nothing worth distilling (an IP,
+    or a rule that already exists).
+    """
+    reg = registrable_domain(target)
+    if not reg or not scope or scope == "unknown_scope":
+        return None
+    pattern = f"*.{reg}"
+    rule_name = f"learned:{pattern}->{scope}"
+    cur.execute(
+        """SELECT 1 FROM scope_classification_rules
+            WHERE name = %s AND scope_name = %s AND rule_type = 'domain_pattern'
+              AND conditions->>'pattern' = %s""",
+        (rule_name, scope, pattern),
+    )
+    if cur.fetchone():
+        return None
+    cur.execute(
+        """INSERT INTO scope_classification_rules
+             (id, name, scope_name, priority, enabled, rule_type, conditions,
+              auto_apply, engagement_id)
+           VALUES (gen_random_uuid(), %s, %s, 60, true, 'domain_pattern',
+                   %s::jsonb, true, %s::uuid)""",
+        (rule_name, scope, json.dumps({"pattern": pattern, "learned_from": target,
+                                       "via": method}), engagement_id),
+    )
+    return pattern
