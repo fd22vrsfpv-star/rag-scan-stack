@@ -15799,27 +15799,50 @@ class MarkCustomerSitesBody(BaseModel):
 _RESERVED_SCOPES = ("customer_scope", "excluded", "not_in_scope")
 
 
+def _bg_capture_customer_decisions(targets: list, scope_name: str):
+    """Best-effort scope_decisions capture (embeds per-host recon context). Runs
+    AFTER the response as a background task — it is ~0.16s/host, so a large
+    selection would otherwise block the request past the client timeout and look
+    like a hang. Learning-only; the scope move already committed."""
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            for t in targets:
+                try:
+                    _capture_scope_decisions([t], "customer-site", scope_name, cur)
+                except Exception:
+                    pass
+            conn.commit()
+    except Exception as e:
+        logging.warning(f"bg customer scope decisions failed: {e}")
+
+
 @app.post("/engagements/{eid}/scope/mark-customer-sites", tags=["Engagements"])
-def mark_customer_sites(eid: str, body: MarkCustomerSitesBody, _: bool = Depends(auth)):
+def mark_customer_sites(eid: str, body: MarkCustomerSitesBody,
+                        background_tasks: BackgroundTasks, _: bool = Depends(auth)):
     """Move hosts into the engagement's `customer_scope` (out of the scanned scope).
 
     Per-host BY DESIGN: we host customers on SHARED domains (e.g. convio.net), so a
-    domain-pattern rule would wrongly exclude our own infra. For each target this:
-      1. removes it from the scanned engagement scopes (e.g. `blackbaud`);
-      2. files it under `customer_scope` (engagement-scoped, UI-visible);
-      3. also records it in the global `not_in_scope` list (dispatch-gate safety);
-      4. captures a scope_decision for learning — but deliberately does NOT distil a
-         `*.domain` rule (that would nuke the shared domain);
-      5. resolves the matching customer-site follow-ups.
-    The recon agent skips `customer_scope`, so scanning of these hosts stops.
+    domain-pattern rule would wrongly exclude our own infra. All DB work is done in
+    BULK (single statements over the whole target list) so marking a whole group of
+    hundreds of hosts returns in ~a second instead of looping per host:
+      1. removes them from the scanned engagement scopes (e.g. `blackbaud`);
+      2. files them under `customer_scope` (engagement-scoped, UI-visible);
+      3. records them in the global `not_in_scope` list (dispatch-gate safety);
+      4. resolves the matching customer-site follow-ups + tags the assets.
+    The per-host scope_decisions (learning; embeds recon context, ~0.16s each) are
+    captured in a BACKGROUND task so they never block the request — and deliberately
+    NOT distilled into a `*.domain` rule (that would nuke the shared domain). The
+    recon agent skips `customer_scope`, so scanning of these hosts stops.
     """
+    from psycopg2.extras import execute_values
     scope_name = (body.scope_name or "customer_scope").strip() or "customer_scope"
-    targets = [str(t).strip() for t in (body.targets or []) if str(t).strip()]
+    seen: set = set()
+    targets = [t for t in (str(x).strip() for x in (body.targets or []))
+               if t and not (t in seen or seen.add(t))]
     if not targets:
         raise HTTPException(400, "no targets provided")
+    tt = {t: _classify_target(t) for t in targets}
 
-    moved = resolved = 0
-    from_scopes: dict = {}
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         # Ensure the bucket exists so it shows in the engagement's scope list.
         cur.execute("""
@@ -15828,56 +15851,37 @@ def mark_customer_sites(eid: str, body: MarkCustomerSitesBody, _: bool = Depends
             ON CONFLICT (engagement_id, name, target) DO NOTHING
         """, (eid, scope_name, _SCOPE_PLACEHOLDER_TARGET, _SCOPE_PLACEHOLDER_SOURCE))
 
-        for t in targets:
-            ttype = _classify_target(t)
-            # Remember origin scope for the decision record.
-            cur.execute("""
-                SELECT name FROM scope_targets
-                 WHERE engagement_id = %s::uuid AND target = %s
-                   AND name NOT IN %s LIMIT 1
-            """, (eid, t, _RESERVED_SCOPES))
-            r = cur.fetchone()
-            from_scopes[t] = r["name"] if r else "unscoped"
-
-            # 1. remove from the scanned engagement scopes
-            cur.execute("""
-                DELETE FROM scope_targets
-                 WHERE engagement_id = %s::uuid AND target = %s AND name NOT IN %s
-            """, (eid, t, _RESERVED_SCOPES))
-            # 2. file under customer_scope (engagement-scoped, visible)
-            cur.execute("""
-                INSERT INTO scope_targets (engagement_id, name, target, target_type, source)
-                VALUES (%s::uuid, %s, %s, %s, 'customer-site-exclude')
-                ON CONFLICT (engagement_id, name, target) DO NOTHING
-            """, (eid, scope_name, t, ttype))
-            moved += 1
-            # 3. secondary safety: global not_in_scope (NULL engagement_id — guard by
-            #    NOT EXISTS because a unique index does not dedupe NULL columns).
-            cur.execute("""
-                INSERT INTO scope_targets (name, target, target_type, source)
-                SELECT 'not_in_scope', %s, %s, 'customer-site-exclude'
-                 WHERE NOT EXISTS (
-                    SELECT 1 FROM scope_targets
-                     WHERE engagement_id IS NULL AND name = 'not_in_scope' AND target = %s)
-            """, (t, ttype, t))
-            # 5. resolve matching customer-site follow-ups
-            cur.execute("""
-                UPDATE follow_up_items
-                   SET status = 'resolved', resolved_at = now(), updated_at = now()
-                 WHERE target = %s
-                   AND rule_id IN ('customer_hosted_site', 'customer_hosted_site_cname')
-                   AND status NOT IN ('resolved', 'dismissed')
-            """, (t,))
-            resolved += cur.rowcount
-
-        # 4. record decisions for learning — NO _distill (per-host only).
-        for t in targets:
-            try:
-                _capture_scope_decisions([t], from_scopes.get(t, "unscoped"), scope_name, cur)
-            except Exception as e:
-                logging.warning(f"scope decision capture failed for {t}: {e}")
-        # 5b. durable 'customer-site' tag on the asset so a Customer badge renders
-        #     in every host view.
+        # 1. bulk remove from the scanned engagement scopes
+        cur.execute("""
+            DELETE FROM scope_targets
+             WHERE engagement_id = %s::uuid AND target = ANY(%s) AND name NOT IN %s
+        """, (eid, targets, _RESERVED_SCOPES))
+        # 2. bulk file under customer_scope
+        execute_values(cur,
+            "INSERT INTO scope_targets (engagement_id, name, target, target_type, source) "
+            "VALUES %s ON CONFLICT (engagement_id, name, target) DO NOTHING",
+            [(eid, scope_name, t, tt[t], 'customer-site-exclude') for t in targets],
+            template="(%s::uuid, %s, %s, %s, %s)")
+        moved = len(targets)
+        # 3. secondary safety: global not_in_scope. Delete-then-insert because a
+        #    unique index does not dedupe NULL-engagement rows.
+        cur.execute("""DELETE FROM scope_targets
+                        WHERE engagement_id IS NULL AND name = 'not_in_scope'
+                          AND target = ANY(%s)""", (targets,))
+        execute_values(cur,
+            "INSERT INTO scope_targets (name, target, target_type, source) VALUES %s",
+            [(t, tt[t]) for t in targets],
+            template="('not_in_scope', %s, %s, 'customer-site-exclude')")
+        # 4. bulk resolve matching customer-site follow-ups
+        cur.execute("""
+            UPDATE follow_up_items
+               SET status = 'resolved', resolved_at = now(), updated_at = now()
+             WHERE target = ANY(%s)
+               AND rule_id IN ('customer_hosted_site', 'customer_hosted_site_cname')
+               AND status NOT IN ('resolved', 'dismissed')
+        """, (targets,))
+        resolved = cur.rowcount
+        # 5. durable 'customer-site' tag on the assets (badge source).
         try:
             cur.execute("""
                 UPDATE assets SET tags = (
@@ -15888,6 +15892,9 @@ def mark_customer_sites(eid: str, body: MarkCustomerSitesBody, _: bool = Depends
         except Exception as e:
             logging.warning(f"customer-site asset tag failed: {e}")
         conn.commit()
+
+    # Learning decisions run after the response (slow per-host embed).
+    background_tasks.add_task(_bg_capture_customer_decisions, targets, scope_name)
 
     try:
         from webhooks import emit_webhook
