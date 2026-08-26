@@ -18077,6 +18077,7 @@ def export_follow_ups(
             "finding_source": r.get("finding_source") or "",
             "finding_id": str(r["finding_id"]) if r.get("finding_id") else "",
             "detail": detail,
+            "metadata": r.get("metadata") or {},
         })
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -18111,8 +18112,10 @@ def export_follow_ups(
         for e in enriched:
             row = dict(e)
             row["tags"] = ",".join(e["tags"]) if isinstance(e["tags"], list) else (e["tags"] or "")
-            row["detail_json"] = json.dumps(e["detail"], default=str) if e["detail"] else ""
+            _d = e["detail"] or e.get("metadata") or {}
+            row["detail_json"] = json.dumps(_d, default=str) if _d else ""
             row.pop("detail", None)
+            row.pop("metadata", None)
             w.writerow(row)
         return Response(buf.getvalue(), media_type="text/csv",
                         headers={"Content-Disposition": f'attachment; filename="{fname}.csv"'})
