@@ -11,6 +11,28 @@ from utils import safe_json
 router = APIRouter()
 
 
+class WhoisAgentBody(BaseModel):
+    engagement_id: Optional[str] = None
+    stale_days: int = 90
+    limit: int = 1000
+    dispatch: bool = True
+
+
+@router.post("/api/whois-agent/run")
+async def run_whois_agent(body: WhoisAgentBody = WhoisAgentBody()):
+    """Passive WHOIS collection across all scopes + discovered owner domains."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=60) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/whois-agent/run",
+            json=body.dict(),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, resp.text)
+    return safe_json(resp)
+
+
 @router.get("/api/recon-agent/{eid}")
 async def get_agent_state(eid: str):
     s = get_settings()
