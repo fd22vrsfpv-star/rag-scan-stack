@@ -12657,6 +12657,40 @@ def _capture_scope_decisions(targets: list, from_scope: str, to_scope: str, cur)
               embedding if embedding else None))
 
 
+def _move_target_to_scope(cur, target: str, scope: str, engagement_id=None):
+    """Move one target out of unknown_scope into `scope`, keeping engagement_id.
+
+    Uses the current unique index (engagement_id, name, target) — the legacy
+    (name, target) constraint every older INSERT still names was dropped by the
+    schema migration, so those ON CONFLICTs now raise. When engagement_id is
+    unknown, inherit it from the row we are moving so the Recon Agent can see it.
+    """
+    from scope_classifier import target_type_of
+    if not engagement_id:
+        cur.execute("SELECT engagement_id FROM scope_targets WHERE target = %s "
+                    "AND engagement_id IS NOT NULL LIMIT 1", (target,))
+        row = cur.fetchone()
+        engagement_id = (row["engagement_id"] if isinstance(row, dict) else row[0]) if row else None
+    cur.execute("DELETE FROM scope_targets WHERE name = 'unknown_scope' AND target = %s "
+                "AND (engagement_id = %s::uuid OR %s IS NULL)",
+                (target, engagement_id, engagement_id))
+    cur.execute(
+        """INSERT INTO scope_targets (id, engagement_id, name, target, target_type, source)
+           VALUES (gen_random_uuid(), %s::uuid, %s, %s, %s, 'auto-classified')
+           ON CONFLICT (engagement_id, name, target) DO NOTHING""",
+        (engagement_id, scope, target, target_type_of(target)))
+
+
+def _distill(cur, target: str, scope: str, engagement_id=None, method="manual"):
+    """Best-effort rule distillation; never raises into the request path."""
+    try:
+        from scope_classifier import distill_rule_from_decision
+        return distill_rule_from_decision(cur, target, scope, engagement_id, method)
+    except Exception as e:
+        logging.warning(f"rule distillation failed for {target}->{scope}: {e}")
+        return None
+
+
 @app.post("/scope/move", tags=["Scope"])
 def move_scope_targets(body: dict, authorized: bool = Depends(auth)):
     """Move targets from one scope to another. Body: {from_scope, to_scope, targets: [str]}
@@ -12871,23 +12905,22 @@ def accept_suggestion(suggestion_id: str, authorized: bool = Depends(auth)):
 
         target = sug["target"]
         scope = sug["suggested_scope"]
+        eid = sug.get("engagement_id")
 
-        # Move target
-        cur.execute("DELETE FROM scope_targets WHERE name = 'unknown_scope' AND target = %s", (target,))
-        cur.execute("""
-            INSERT INTO scope_targets (id, name, target, target_type, source)
-            VALUES (gen_random_uuid(), %s, %s, 'domain', 'auto-classified')
-            ON CONFLICT (name, target) DO NOTHING
-        """, (scope, target))
+        # Move target within THIS engagement (engagement_id is what makes the
+        # Recon Agent see it; the old name-only conflict target no longer exists).
+        _move_target_to_scope(cur, target, scope, eid)
 
-        # Record decision
+        # Record decision, and distil a reusable rule so the next host under this
+        # domain is a deterministic hit — the model is not asked twice.
         _capture_scope_decisions([target], "unknown_scope", scope, cur)
+        learned = _distill(cur, target, scope, eid, sug.get("method") or "similarity")
 
         # Mark suggestion accepted
         cur.execute("UPDATE scope_suggestions SET status = 'accepted', reviewed_at = now() WHERE id = %s", (suggestion_id,))
         conn.commit()
 
-    return {"ok": True, "target": target, "scope": scope}
+    return {"ok": True, "target": target, "scope": scope, "learned_rule": learned}
 
 
 @app.post("/scope/suggestions/{suggestion_id}/reject", tags=["Scope Classification"])
@@ -12923,17 +12956,57 @@ def bulk_accept_suggestions(body: dict, authorized: bool = Depends(auth)):
         for sug in cur.fetchall():
             target = sug["target"]
             scope = sug["suggested_scope"]
-            cur.execute("DELETE FROM scope_targets WHERE name = 'unknown_scope' AND target = %s", (target,))
-            cur.execute("""
-                INSERT INTO scope_targets (id, name, target, target_type, source)
-                VALUES (gen_random_uuid(), %s, %s, 'domain', 'auto-classified')
-                ON CONFLICT (name, target) DO NOTHING
-            """, (scope, target))
+            _move_target_to_scope(cur, target, scope, sug.get("engagement_id"))
             _capture_scope_decisions([target], "unknown_scope", scope, cur)
+            _distill(cur, target, scope, sug.get("engagement_id"), sug.get("method") or "similarity")
             cur.execute("UPDATE scope_suggestions SET status = 'accepted', reviewed_at = now() WHERE id = %s", (sug["id"],))
             accepted += 1
         conn.commit()
     return {"ok": True, "accepted": accepted, "min_confidence": min_conf}
+
+
+class AutoClassifyBody(BaseModel):
+    generate_rules: bool = True
+    limit: Optional[int] = None
+    unknown_scope: str = "unknown_scope"
+
+
+@app.post("/engagements/{engagement_id}/scope/auto-classify", tags=["Scope Classification"])
+def engagement_auto_classify(engagement_id: str, body: AutoClassifyBody = None,
+                             authorized: bool = Depends(auth)):
+    """Assign every discovered host to a scope UNDER this engagement, deterministically.
+
+    Two steps, both LLM-free:
+      1. generate_seed_rules — turns each operator-entered domain seed into a
+         `*.{domain}` auto_apply rule (self-learning: the seed you typed becomes
+         a reusable classifier).
+      2. classify_and_assign_engagement — matches every discovered host against
+         those rules. In-scope hosts land in the matched scope; the rest land in
+         `unknown_scope`. BOTH carry engagement_id, so the Recon Agent scans the
+         in-scope set and the unknown bucket is there for triage.
+
+    Reusable across every recon tool — it reads recon_findings/assets, not any
+    single tool's output.
+    """
+    from scope_classifier import generate_seed_rules, classify_and_assign_engagement
+    body = body or AutoClassifyBody()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT id, name FROM engagements WHERE id = %s::uuid", (engagement_id,))
+        eng = cur.fetchone()
+        if not eng:
+            raise HTTPException(404, f"engagement {engagement_id} not found")
+        rules_created = generate_seed_rules(cur, engagement_id) if body.generate_rules else 0
+        result = classify_and_assign_engagement(
+            cur, engagement_id, unknown_scope=body.unknown_scope, limit=body.limit)
+        conn.commit()
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("scope_auto_classified", "scope_classifier", {
+            "engagement_id": engagement_id, "rules_created": rules_created, **result})
+    except Exception:
+        pass
+    return {"ok": True, "engagement_id": engagement_id,
+            "rules_created": rules_created, **result}
 
 
 @app.get("/scope/classification-rules", tags=["Scope Classification"])
@@ -18327,6 +18400,174 @@ def list_follow_ups(
         """, params)
         rows = cur.fetchall()
     return {"follow_ups": rows}
+
+
+def _derive_follow_up_url(target: Optional[str], detail: dict) -> str:
+    """Best-effort URL for a follow-up host. Generic across rules: honours an
+    already-URL target, otherwise builds from host + the linked finding's port."""
+    t = (target or "").strip()
+    if not t:
+        return ""
+    if t.lower().startswith(("http://", "https://")):
+        return t
+    host = t.split("/")[0]
+    port = str((detail or {}).get("port") or "").strip()
+    if port in ("80", ""):
+        return f"http://{host}" if port == "80" else f"https://{host}"
+    if port == "443":
+        return f"https://{host}"
+    return f"https://{host}:{port}"
+
+
+@app.get("/follow-ups/export", tags=["Follow-Ups"])
+def export_follow_ups(
+    format: str = Query("csv", description="csv | json | md | urls"),
+    status: Optional[str] = Query(None),
+    exclude_status: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    priority: Optional[str] = Query(None),
+    flagged_by: Optional[str] = Query(None),
+    engagement_id: Optional[str] = Query(None),
+    rule_id: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    _: bool = Depends(auth),
+):
+    """Export follow-up items in a chosen format, enriched with the linked
+    finding's detail. Filters mirror GET /follow-ups exactly, so any view an
+    operator can build in the UI can be exported. Generic across rules — cert,
+    CVE, exposed-admin all flow through the same path; rule-specific detail rides
+    along in `detail_json` (CSV/JSON) rather than in bespoke columns.
+
+    Formats: csv (flat rows), json (enriched objects), md (grouped report),
+    urls (one derived URL per line, de-duplicated)."""
+    from fastapi import Response
+    fmt = (format or "csv").lower()
+    if fmt not in ("csv", "json", "md", "urls"):
+        raise HTTPException(400, "format must be csv | json | md | urls")
+
+    clauses, params = [], []
+    for col, val in (("status", status), ("severity", severity), ("priority", priority),
+                     ("flagged_by", flagged_by), ("rule_id", rule_id)):
+        if val:
+            clauses.append(f"{col} = %s"); params.append(val)
+    if exclude_status:
+        clauses.append("status != %s"); params.append(exclude_status)
+    if engagement_id:
+        clauses.append("engagement_id = %s::uuid"); params.append(engagement_id)
+    if search:
+        clauses.append("(title ILIKE %s OR target ILIKE %s OR reason ILIKE %s OR rule_id ILIKE %s)")
+        params.extend([f"%{search}%"] * 4)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT * FROM follow_up_items {where}
+            ORDER BY rule_id,
+                CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                              WHEN 'medium' THEN 2 ELSE 3 END,
+                target
+        """, params)
+        rows = [dict(r) for r in cur.fetchall()]
+
+        # Enrich recon-sourced items with their tlsx/dns/etc finding detail.
+        recon_ids = [r["finding_id"] for r in rows
+                     if r.get("finding_source") == "recon" and r.get("finding_id")]
+        detail_by_id = {}
+        if recon_ids:
+            cur.execute("SELECT id::text, data FROM recon_findings WHERE id = ANY(%s::uuid[])",
+                        ([str(i) for i in recon_ids],))
+            for r in cur.fetchall():
+                d = r["data"]
+                if isinstance(d, str):
+                    try:
+                        d = json.loads(d)
+                    except Exception:
+                        d = {}
+                detail_by_id[r["id"]] = d or {}
+
+    enriched = []
+    for r in rows:
+        detail = detail_by_id.get(str(r.get("finding_id")), {}) if r.get("finding_id") else {}
+        enriched.append({
+            "follow_up_id": str(r["id"]),
+            "rule_id": r.get("rule_id") or "",
+            "title": r.get("title") or "",
+            "host": r.get("target") or "",
+            "url": _derive_follow_up_url(r.get("target"), detail),
+            "severity": r.get("severity") or "",
+            "priority": r.get("priority") or "",
+            "status": r.get("status") or "",
+            "reason": r.get("reason") or "",
+            "flagged_by": r.get("flagged_by") or "",
+            "assigned_to": r.get("assigned_to") or "",
+            "confidence": r.get("confidence"),
+            "tags": r.get("tags") or [],
+            "created_at": r["created_at"].isoformat() if r.get("created_at") else "",
+            "finding_source": r.get("finding_source") or "",
+            "finding_id": str(r["finding_id"]) if r.get("finding_id") else "",
+            "detail": detail,
+            "metadata": r.get("metadata") or {},
+        })
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    tag = (rule_id or "all").replace("/", "_")
+    fname = f"follow-ups-{tag}-{stamp}"
+
+    if fmt == "json":
+        return Response(json.dumps({"count": len(enriched), "follow_ups": enriched}, default=str),
+                        media_type="application/json",
+                        headers={"Content-Disposition": f'attachment; filename="{fname}.json"'})
+
+    if fmt == "urls":
+        seen, lines = set(), []
+        for e in enriched:
+            u = e["url"]
+            if u and u not in seen:
+                seen.add(u); lines.append(u)
+        return Response("\n".join(lines) + ("\n" if lines else ""),
+                        media_type="text/plain",
+                        headers={"Content-Disposition": f'attachment; filename="{fname}-urls.txt"'})
+
+    if fmt == "csv":
+        import csv as _csv
+        import io as _io
+        buf = _io.StringIO()
+        cols = ["follow_up_id", "rule_id", "title", "host", "url", "severity",
+                "priority", "status", "reason", "flagged_by", "assigned_to",
+                "confidence", "tags", "created_at", "finding_source",
+                "finding_id", "detail_json"]
+        w = _csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for e in enriched:
+            row = dict(e)
+            row["tags"] = ",".join(e["tags"]) if isinstance(e["tags"], list) else (e["tags"] or "")
+            _d = e["detail"] or e.get("metadata") or {}
+            row["detail_json"] = json.dumps(_d, default=str) if _d else ""
+            row.pop("detail", None)
+            row.pop("metadata", None)
+            w.writerow(row)
+        return Response(buf.getvalue(), media_type="text/csv",
+                        headers={"Content-Disposition": f'attachment; filename="{fname}.csv"'})
+
+    # md — grouped by rule_id
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for e in enriched:
+        groups[e["rule_id"] or "(no rule)"].append(e)
+    lines = [f"# Follow-ups export ({len(enriched)} items)", "",
+             f"Generated {stamp} UTC" + (f" · engagement {engagement_id}" if engagement_id else ""), ""]
+    for rid in sorted(groups):
+        g = groups[rid]
+        lines.append(f"## {rid} — {len(g)} item(s)")
+        lines.append("")
+        lines.append("| Host | URL | Severity | Reason |")
+        lines.append("|---|---|---|---|")
+        for e in g:
+            reason = (e["reason"] or "").replace("|", "\\|")
+            lines.append(f"| {e['host']} | {e['url']} | {e['severity']} | {reason} |")
+        lines.append("")
+    return Response("\n".join(lines), media_type="text/markdown",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}.md"'})
 
 
 @app.post("/follow-ups", tags=["Follow-Ups"])
