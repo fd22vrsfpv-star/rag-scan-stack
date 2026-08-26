@@ -54,7 +54,7 @@ BFF_INTERNAL_URL = os.environ.get("BFF_INTERNAL_URL", "http://127.0.0.1:8050")
 # Scope names the agent must NEVER scan: hosts moved here are deliberately
 # out-of-authorization (customer sites, operator exclusions). Kept separate from
 # 'unknown_scope', which stays scannable until triaged.
-RESERVED_NONSCANNABLE = {"customer_scope", "excluded", "not_in_scope"}
+RESERVED_NONSCANNABLE = {"customer_scope", "customer", "excluded", "not_in_scope"}
 
 # Seed-stage discovery pipeline.
 #
