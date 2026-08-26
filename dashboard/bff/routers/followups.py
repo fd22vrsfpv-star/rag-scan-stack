@@ -61,6 +61,27 @@ async def follow_up_stats(engagement_id: Optional[str] = Query(None)):
         return safe_json(resp)
 
 
+class MarkCustomerSitesBody(BaseModel):
+    targets: list[str] = []
+    scope_name: str = "customer_scope"
+
+
+@router.post("/api/engagements/{eid}/scope/mark-customer-sites")
+async def mark_customer_sites(eid: str, body: MarkCustomerSitesBody):
+    """Move selected follow-up targets into the engagement's customer_scope
+    (out of the scanned scope). Thin proxy to rag-api."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=120) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/engagements/{eid}/scope/mark-customer-sites",
+            json=body.model_dump(),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
 @router.get("/api/follow-ups/export")
 async def export_follow_ups(
     format: str = Query("csv"),

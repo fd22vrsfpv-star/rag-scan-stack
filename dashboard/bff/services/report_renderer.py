@@ -187,6 +187,22 @@ _COLUMN_SCHEMAS = {
         ("Severity", "severity"),
         ("Status", ("item", "status")),
     ],
+    "customer_hosted_site": [
+        ("Host", ("item", "host")),
+        ("Cert CN", ("metadata", "cert_cn")),
+        ("Owner Domain", ("metadata", "owner_domain")),
+        ("Signal", ("metadata", "signal")),
+        ("Severity", "severity"),
+        ("Status", ("item", "status")),
+    ],
+    "customer_hosted_site_cname": [
+        ("Host", ("item", "host")),
+        ("CNAME Target", ("metadata", "cname_target")),
+        ("Owner Domain", ("metadata", "owner_domain")),
+        ("Signal", ("metadata", "signal")),
+        ("Severity", "severity"),
+        ("Status", ("item", "status")),
+    ],
 }
 
 
