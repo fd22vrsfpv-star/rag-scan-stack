@@ -63,14 +63,28 @@ MAX_ATTEMPTS = int(os.environ.get("ARTIFACT_LLM_MAX_ATTEMPTS", "3"))
 # entire batch's time budget.
 MAX_CONTENT_CHARS = int(os.environ.get("ARTIFACT_LLM_MAX_CHARS", "12000"))
 
-# Above this size an artifact is SKIPPED rather than truncated.
+# Above MAX_CONTENT_CHARS an artifact is CHUNKED (line-aware) and reviewed piece
+# by piece, then the per-chunk summaries are reduced into one — rather than
+# truncated to the first 12 KB or skipped outright.
 #
 # Truncation is fine for a 40 KB nmap run: the head really is where the structure
-# is. It is not fine for the 8.0 MB and 7.7 MB katana crawls sitting in this
-# queue — summarising their first 12 KB produces a confident statement about
-# 0.15% of the file, and nothing downstream can tell that from a summary of the
-# whole. A skip with a reason is honest; a sampled summary is not.
+# is. It is NOT fine for a 350 KB subfinder list or an 8 MB katana crawl —
+# summarising their first 12 KB produces a confident statement about a few
+# percent of the file, and nothing downstream can tell that from a summary of the
+# whole. Chunking reviews the whole thing; when even chunking would exceed
+# MAX_CHUNKS the coverage is stated honestly in _meta rather than implied
+# complete. MAX_ARTIFACT_BYTES is retained for compatibility but no longer skips.
 MAX_ARTIFACT_BYTES = int(os.environ.get("ARTIFACT_LLM_MAX_BYTES", str(256 * 1024)))
+
+# Chunk size = MAX_CONTENT_CHARS. Cap the number of chunks so one huge artifact
+# cannot spend the whole batch's model budget; beyond the cap, coverage is
+# reported (chunks_processed/total_chunks) instead of silently dropped.
+MAX_CHUNKS = int(os.environ.get("ARTIFACT_LLM_MAX_CHUNKS", "12"))
+
+# Truly pathological inputs (multi-MB) are line-subsampled to this ceiling before
+# chunking, and the fact is recorded in _meta. Never skipped, never silent.
+ABSOLUTE_MAX_BYTES = int(os.environ.get("ARTIFACT_LLM_ABSOLUTE_MAX_BYTES",
+                                        str(4 * 1024 * 1024)))
 
 # Tools whose output already has a dedicated parser, so the structured data is in
 # the database and an LLM pass re-derives it. Discovered from the FILESYSTEM
@@ -154,6 +168,99 @@ def _call_llm(prompt: str, model: str) -> tuple[str, dict]:
         "latency_ms": latency_ms,
         "prompt_tokens": data.get("prompt_eval_count", 0),
         "completion_tokens": data.get("eval_count", 0),
+    }
+
+
+def _split_chunks(content: str, size: int, max_chunks: int) -> tuple[list, int]:
+    """Split content into ~`size`-char pieces on LINE boundaries.
+
+    Line-aware so JSONL records (subfinder/dnsx emit one host per line) are never
+    cut mid-record. Returns (chunks_to_process, total_chunks): only the first
+    `max_chunks` are returned, but the TRUE total is reported so coverage can be
+    stated honestly rather than implied complete. A single line longer than
+    `size` becomes its own oversized chunk instead of blocking the split.
+    """
+    if len(content) <= size:
+        return [content], 1
+    chunks, cur_lines, cur_len = [], [], 0
+    for ln in content.splitlines(keepends=True):
+        if cur_lines and cur_len + len(ln) > size:
+            chunks.append("".join(cur_lines))
+            cur_lines, cur_len = [], 0
+        cur_lines.append(ln)
+        cur_len += len(ln)
+    if cur_lines:
+        chunks.append("".join(cur_lines))
+    total = len(chunks)
+    return chunks[:max_chunks], total
+
+
+def _review_content(content, tool, target, port, command, model, part=None):
+    """One LLM summarise call over a piece of content. Returns (parsed, meta)."""
+    header = ""
+    if part:
+        header = (f"NOTE: this is part {part[0]} of {part[1]} of a larger output; "
+                  "summarise THIS part only.\n\n")
+    prompt = header + _PROMPT.format(
+        tool=tool, target=target or "unknown",
+        port=f":{port}" if port else "",
+        command=(command or "")[:400], content=content)
+    resp, meta = _call_llm(prompt, model)
+    parsed = _extract_json(resp)
+    if parsed is None:
+        raise ValueError("model returned no parsable JSON object")
+    return parsed, meta
+
+
+def _dedup_cap(items, cap=40) -> list:
+    out, seen = [], set()
+    for it in items or []:
+        s = str(it).strip()
+        k = s.lower()
+        if s and k not in seen:
+            seen.add(k)
+            out.append(s)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _merge_chunk_results(parts: list, total_chunks: int, metas: list) -> dict:
+    """Reduce per-chunk summaries into one llm_result (the reduce of map-reduce).
+
+    Findings/services/next_steps are unioned and de-duplicated; the summary is
+    prefixed with the coverage actually achieved; confidence is the WEAKEST of
+    the chunks (a strong claim from one chunk does not carry the whole file).
+    """
+    findings, services, next_steps, summaries, confs = [], [], [], [], []
+    for p in parts:
+        findings += p.get("findings") or []
+        services += p.get("services") or []
+        next_steps += p.get("next_steps") or []
+        if p.get("summary"):
+            summaries.append(str(p["summary"]).strip())
+        if p.get("confidence"):
+            confs.append(str(p["confidence"]).lower())
+    order = {"high": 3, "medium": 2, "low": 1}
+    conf = min(confs, key=lambda c: order.get(c, 2)) if confs else "low"
+    processed = len(parts)
+    coverage = round(100.0 * processed / max(1, total_chunks), 1)
+    head = (f"[reviewed {processed}/{total_chunks} chunks, {coverage}% of output] "
+            if total_chunks > 1 else "")
+    return {
+        "summary": (head + " ".join(summaries[:processed]))[:1500],
+        "findings": _dedup_cap(findings),
+        "services": _dedup_cap(services),
+        "next_steps": _dedup_cap(next_steps),
+        "confidence": conf,
+        "_meta": {
+            "model": metas[0].get("model") if metas else None,
+            "chunked": True,
+            "chunks_processed": processed,
+            "total_chunks": total_chunks,
+            "coverage_pct": coverage,
+            "latency_ms": sum(m.get("latency_ms", 0) for m in metas),
+        },
     }
 
 
@@ -250,41 +357,50 @@ def process_batch(cur, limit: int = 10, tool: Optional[str] = None,
     done = failed = parked = 0
     errors: list = []
 
-    oversized = 0
+    chunked = 0
     no_target = 0
     for r in rows:
         aid = str(r["id"])
         raw = r["content"] or ""
-        if len(raw) > MAX_ARTIFACT_BYTES:
-            cur.execute("""
-                UPDATE raw_artifacts
-                   SET llm_status = 'skipped', llm_processed_at = now(),
-                       llm_error = %s
-                 WHERE id = %s
-            """, (f"skipped: {len(raw)} bytes exceeds ARTIFACT_LLM_MAX_BYTES="
-                  f"{MAX_ARTIFACT_BYTES}. Summarising the first "
-                  f"{MAX_CONTENT_CHARS} chars would describe "
-                  f"{100.0 * MAX_CONTENT_CHARS / max(1, len(raw)):.2f}% of the "
-                  "file as though it were the whole.", aid))
-            oversized += 1
-            _commit(cur)
-            continue
+
+        # Multi-MB pathological inputs are line-subsampled to the ceiling BEFORE
+        # chunking (never skipped), and the truncation is recorded in _meta.
+        subsampled = False
+        if len(raw) > ABSOLUTE_MAX_BYTES:
+            kept, total_len = [], 0
+            for ln in raw.splitlines(keepends=True):
+                if total_len + len(ln) > ABSOLUTE_MAX_BYTES:
+                    break
+                kept.append(ln)
+                total_len += len(ln)
+            raw = "".join(kept) if kept else raw[:ABSOLUTE_MAX_BYTES]
+            subsampled = True
+
         if not (r["target"] or "").strip():
             # Recorded, not hidden: without a target the overlap check
             # (_already_ran) and scope attribution cannot run on this artifact,
             # so its pass is not equivalent to the others in the batch.
             no_target += 1
-        content = raw[:MAX_CONTENT_CHARS]
-        prompt = _PROMPT.format(
-            tool=r["tool"], target=r["target"] or "unknown",
-            port=f":{r['port']}" if r["port"] else "",
-            command=(r["command"] or "")[:400], content=content)
+
         try:
-            raw, meta = _call_llm(prompt, chosen)
-            parsed = _extract_json(raw)
-            if parsed is None:
-                raise ValueError("model returned no parsable JSON object")
-            parsed["_meta"] = meta
+            chunks, total_chunks = _split_chunks(raw, MAX_CONTENT_CHARS, MAX_CHUNKS)
+            if total_chunks == 1:
+                parsed, meta = _review_content(
+                    chunks[0], r["tool"], r["target"], r["port"], r["command"], chosen)
+                parsed["_meta"] = meta
+            else:
+                # Map: summarise each chunk. Reduce: merge into one result.
+                part_results, metas = [], []
+                for i, ch in enumerate(chunks):
+                    p, m = _review_content(
+                        ch, r["tool"], r["target"], r["port"], r["command"], chosen,
+                        part=(i + 1, total_chunks))
+                    part_results.append(p)
+                    metas.append(m)
+                parsed = _merge_chunk_results(part_results, total_chunks, metas)
+                chunked += 1
+            if subsampled:
+                parsed.setdefault("_meta", {})["subsampled_to_bytes"] = ABSOLUTE_MAX_BYTES
             cur.execute("""
                 UPDATE raw_artifacts
                    SET llm_status = 'done', llm_result = %s::jsonb,
@@ -320,7 +436,8 @@ def process_batch(cur, limit: int = 10, tool: Optional[str] = None,
         "done": done,
         "retryable_failures": failed,
         "parked": parked,
-        "skipped_oversized": oversized,
+        "chunked": chunked,
+        "skipped_oversized": 0,  # retained for response-shape compatibility
         "no_target": no_target,
         "requeued_stale": requeued,
         "model": chosen,
