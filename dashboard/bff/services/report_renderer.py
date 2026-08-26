@@ -179,6 +179,14 @@ _COLUMN_SCHEMAS = {
         ("Severity", "severity"),
         ("Status", ("item", "status")),
     ],
+    "software_known_cve": [
+        ("Host", ("item", "host")),
+        ("Product", ("metadata", "product")),
+        ("Version", ("metadata", "version")),
+        ("CVEs", ("metadata", "cve_ids")),
+        ("Severity", "severity"),
+        ("Status", ("item", "status")),
+    ],
 }
 
 
@@ -186,7 +194,12 @@ def _cell(item: dict, spec) -> dict:
     if spec == "severity":
         return {"value": (item.get("severity") or "info"), "sev": True}
     source, key = spec
-    src = item.get("detail") or {} if source == "detail" else item
+    if source == "detail":
+        src = item.get("detail") or {}
+    elif source == "metadata":
+        src = item.get("metadata") or {}
+    else:
+        src = item
     val = src.get(key)
     if isinstance(val, (list, tuple)):
         val = ", ".join(str(x) for x in val)
