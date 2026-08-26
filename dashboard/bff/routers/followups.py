@@ -73,21 +73,42 @@ async def export_follow_ups(
     rule_id: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
 ):
-    """Download follow-ups in csv/json/md/urls. Filters mirror the list view, so
-    the current on-screen filter set exports exactly. Streams the file through
-    with the upstream's Content-Disposition (filename carries rule + timestamp)."""
+    """Download follow-ups in csv/json/md/urls/pdf. Filters mirror the list view,
+    so the current on-screen filter set exports exactly. csv/json/md/urls stream
+    straight through from rag-api; pdf is rendered here (WeasyPrint lives in the
+    BFF) from the enriched JSON."""
     s = get_settings()
-    params = {"format": format}
-    for k, v in (("status", status), ("exclude_status", exclude_status),
-                 ("severity", severity), ("priority", priority),
-                 ("flagged_by", flagged_by), ("engagement_id", engagement_id),
-                 ("rule_id", rule_id), ("search", search)):
-        if v:
-            params[k] = v
+    filters = {k: v for k, v in (
+        ("status", status), ("exclude_status", exclude_status),
+        ("severity", severity), ("priority", priority),
+        ("flagged_by", flagged_by), ("engagement_id", engagement_id),
+        ("rule_id", rule_id), ("search", search)) if v}
+
+    # PDF is built in the BFF: fetch the enriched JSON, render grouped-by-rule.
+    if format == "pdf":
+        async with httpx.AsyncClient(timeout=120) as c:
+            resp = await c.get(
+                f"{s.rag_api_url}/follow-ups/export",
+                params={**filters, "format": "json"},
+                headers={"x-api-key": s.api_key, **engagement_headers()},
+            )
+            if resp.status_code >= 400:
+                raise HTTPException(resp.status_code, resp.text)
+        items = resp.json().get("follow_ups", [])
+        filter_line = " · ".join(f"{k}={v}" for k, v in filters.items()) or "all follow-ups"
+        try:
+            from services.report_renderer import render_follow_ups_pdf
+            pdf = render_follow_ups_pdf(items, filter_line=filter_line)
+        except Exception as e:
+            raise HTTPException(500, f"PDF render failed: {type(e).__name__}: {e}")
+        fname = f"follow-ups-{(rule_id or 'all')}-report.pdf"
+        return Response(content=pdf, media_type="application/pdf",
+                        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
     async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.get(
             f"{s.rag_api_url}/follow-ups/export",
-            params=params,
+            params={**filters, "format": format},
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         if resp.status_code >= 400:

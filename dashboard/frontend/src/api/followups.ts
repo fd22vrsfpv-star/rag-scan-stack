@@ -2,7 +2,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch, apiUrl } from './client'
 import { POLL } from '@/lib/polling'
 
-export type ExportFormat = 'csv' | 'urls' | 'md' | 'json'
+export type ExportFormat = 'pdf' | 'csv' | 'urls' | 'md' | 'json'
 
 export interface FollowUpExportFilters {
   status?: string
