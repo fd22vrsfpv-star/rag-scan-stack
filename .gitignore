@@ -198,3 +198,7 @@ logs/
 wordlists/*
 !wordlists/.gitkeep
 certs/ca-bundle.crt
+
+# Generated report/export artifacts (PDF/CSV/URL lists from the export endpoints
+# and ad-hoc extracts). Deliverables, not source.
+exports/
