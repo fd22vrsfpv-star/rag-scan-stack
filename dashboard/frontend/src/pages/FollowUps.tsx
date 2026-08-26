@@ -752,8 +752,8 @@ export default function FollowUps() {
           No follow-up items yet. Run the agent or add items manually.
         </div>
       ) : (
-        <div className="border border-border rounded-lg overflow-hidden">
-          <table className="w-full text-xs">
+        <div className="border border-border rounded-lg overflow-x-auto">
+          <table className="w-full min-w-[960px] text-xs">
             <thead className="bg-muted/50">
               <tr>
                 <th className="px-2 py-2 w-8">
