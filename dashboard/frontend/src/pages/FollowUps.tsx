@@ -6,7 +6,8 @@ import {
   useBulkUpdateFollowUps, useSendToBurpQueue, useBurpQueueStats,
   useAgentRules, useAgentStats, useTriggerAgentScan, useToggleAgentRule,
   useReloadRules, useTestRule, useCreateAdhocRule, useDeleteRule, useAgentRule,
-  type FollowUpItem, type FollowUpGroup, type RuleTestResult,
+  downloadFollowUpsExport,
+  type FollowUpItem, type FollowUpGroup, type RuleTestResult, type ExportFormat,
 } from '@/api/followups'
 // ScanRecommendationsPanel was extracted from this file into a shared
 // component so the top-level /recommendations page can render it too.
@@ -17,7 +18,7 @@ import { useScopeNames, useAddToScope } from '@/api/scope'
 import { useUIStore } from '@/stores/ui'
 import {
   Flag, Plus, X, CheckCircle, XCircle, Clock, AlertTriangle, Loader2,
-  ChevronRight, ChevronDown, Bot, RefreshCw, Eye, Trash2, Play, Wand2, RotateCcw, Pencil, ExternalLink, Send,
+  ChevronRight, ChevronDown, Bot, RefreshCw, Eye, Trash2, Play, Wand2, RotateCcw, Pencil, ExternalLink, Send, Download,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { SEVERITY_BG } from '@/lib/constants'
@@ -47,6 +48,8 @@ export default function FollowUps() {
   const [selected, setSelected] = useState<FollowUpItem | null>(null)
   const [showCreate, setShowCreate] = useState(false)
   const [showRules, setShowRules] = useState(false)
+  const [showExport, setShowExport] = useState(false)
+  const [exporting, setExporting] = useState<ExportFormat | null>(null)
   const [showAdhoc, setShowAdhoc] = useState(false)
   const [editRuleId, setEditRuleId] = useState<string | null>(null)
   const [testResults, setTestResults] = useState<RuleTestResult | null>(null)
@@ -239,6 +242,25 @@ export default function FollowUps() {
       })
     }
   }
+  const handleExport = async (fmt: ExportFormat) => {
+    setExporting(fmt)
+    setShowExport(false)
+    try {
+      await downloadFollowUpsExport(fmt, {
+        status: filters.status,
+        exclude_status: excludeStatus,
+        severity: filters.severity,
+        priority: filters.priority,
+        flagged_by: filters.flagged_by,
+        engagement_id: activeEngagementId,
+        search: searchFilter || filters.search,
+      })
+    } catch (e) {
+      alert(`Export failed: ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setExporting(null)
+    }
+  }
   const handleBulkUpdate = (fields: { status?: string; priority?: string; notes?: string }) => {
     const ids = Array.from(selectedIds)
     if (!ids.length) return
@@ -314,6 +336,41 @@ export default function FollowUps() {
           >
             Rules ({rules.length})
           </button>
+          <div className="relative">
+            <button
+              onClick={() => setShowExport(v => !v)}
+              disabled={!!exporting}
+              title="Export the current follow-ups view (honours the active filters)"
+              className="h-7 px-3 text-xs rounded border border-border bg-background hover:bg-accent flex items-center gap-1"
+            >
+              {exporting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Download className="h-3 w-3" />}
+              Export <ChevronDown className="h-3 w-3" />
+            </button>
+            {showExport && (
+              <>
+                <div className="fixed inset-0 z-10" onClick={() => setShowExport(false)} />
+                <div className="absolute right-0 mt-1 z-20 w-44 rounded border border-border bg-background shadow-lg py-1 text-xs">
+                  {([
+                    ['csv', 'CSV (full detail)'],
+                    ['urls', 'URL list (.txt)'],
+                    ['md', 'Markdown (by rule)'],
+                    ['json', 'JSON'],
+                  ] as [ExportFormat, string][]).map(([fmt, label]) => (
+                    <button
+                      key={fmt}
+                      onClick={() => handleExport(fmt)}
+                      className="w-full text-left px-3 py-1.5 hover:bg-accent flex items-center gap-2"
+                    >
+                      <Download className="h-3 w-3 text-muted-foreground" /> {label}
+                    </button>
+                  ))}
+                  <div className="border-t border-border mt-1 pt-1 px-3 py-1 text-[10px] text-muted-foreground">
+                    Exports the filtered view ({items.length} shown)
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
           <button
             onClick={() => setShowCreate(true)}
             className="h-7 px-3 text-xs rounded bg-primary text-primary-foreground hover:bg-primary/90 flex items-center gap-1"

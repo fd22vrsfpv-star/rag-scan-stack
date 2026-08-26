@@ -1,6 +1,46 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { apiFetch } from './client'
+import { apiFetch, apiUrl } from './client'
 import { POLL } from '@/lib/polling'
+
+export type ExportFormat = 'csv' | 'urls' | 'md' | 'json'
+
+export interface FollowUpExportFilters {
+  status?: string
+  exclude_status?: string
+  severity?: string
+  priority?: string
+  flagged_by?: string
+  engagement_id?: string
+  rule_id?: string
+  search?: string
+}
+
+/** Download the current follow-ups view as a file. Filters mirror the list, so
+ *  what's on screen is what exports. Streams through the BFF (which adds auth);
+ *  filename comes from the server's Content-Disposition. */
+export async function downloadFollowUpsExport(
+  format: ExportFormat, filters: FollowUpExportFilters = {},
+): Promise<void> {
+  const params = new URLSearchParams({ format })
+  for (const [k, v] of Object.entries(filters)) if (v) params.set(k, String(v))
+  const eid = (() => { try { return localStorage.getItem('selected-engagement') } catch { return null } })()
+  const resp = await fetch(apiUrl(`/follow-ups/export?${params}`), {
+    headers: eid ? { 'X-Engagement-Id': eid } : {},
+  })
+  if (!resp.ok) throw new Error(`Export ${resp.status}: ${await resp.text()}`)
+  const blob = await resp.blob()
+  const cd = resp.headers.get('content-disposition') || ''
+  const m = cd.match(/filename="?([^"]+)"?/)
+  const filename = m ? m[1] : `follow-ups.${format === 'urls' ? 'txt' : format}`
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
 
 export interface FollowUpItem {
   id: string
