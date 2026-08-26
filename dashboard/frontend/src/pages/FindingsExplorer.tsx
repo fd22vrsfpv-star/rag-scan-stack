@@ -1211,7 +1211,7 @@ function FindingDetailPanel({
 
         {/* Core finding info */}
         <div className="grid grid-cols-2 gap-2 text-xs">
-          {finding.hostname && <div className="col-span-2"><span className="text-muted-foreground">Hostname:</span> <span className="font-mono">{finding.hostname}</span></div>}
+          {finding.hostname && <div className="col-span-2"><span className="text-muted-foreground">Hostname:</span> <span className="font-mono">{finding.hostname}</span> <CustomerBadge host={finding.hostname} className="ml-1" /></div>}
           <div><span className="text-muted-foreground">IP:</span> <span className="font-mono">{cleanIp(finding.ip)}</span></div>
           <div><span className="text-muted-foreground">Port:</span> {finding.port}</div>
           {finding.cve && <div><span className="text-muted-foreground">CVE:</span> {finding.cve}</div>}
