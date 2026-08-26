@@ -18,6 +18,7 @@ import { useCreateFollowUp, useCreateAdhocRule } from '@/api/followups'
 import { useAssetPorts, useAssetVulns } from '@/api/assets'
 import { SeverityBadge } from '@/components/common/SeverityBadge'
 import { SourceBadge } from '@/components/common/SourceBadge'
+import { CustomerBadge } from '@/components/common/CustomerBadge'
 import { SEVERITY_LEVELS, PREDEFINED_TAGS, TAG_COLORS, TAG_COLOR_DEFAULT } from '@/lib/constants'
 import type { Finding, WorkflowStatus } from '@/lib/types'
 import { X, ThumbsUp, ThumbsDown, Check, ChevronRight, ChevronDown, Upload, MessageSquare, Swords, Tag, Crosshair, Zap, Loader2, Globe, Trash2, Flag } from 'lucide-react'
@@ -644,6 +645,7 @@ export default function FindingsExplorer() {
                             <td className="px-3 py-2">
                               <span className="text-xs font-mono">{displayHost(f)}</span>
                               {f.ip && f.hostname && <span className="text-[10px] text-muted-foreground ml-1">{cleanIp(f.ip)}</span>}
+                              <CustomerBadge host={displayHost(f)} className="ml-1" />
                             </td>
                             <td className="px-3 py-2 text-xs font-mono">{f.port ?? ''}</td>
                             <td className="px-3 py-2"><SourceBadge source={f.source} /></td>

@@ -13,6 +13,7 @@ import { useScopeNames, useAddToScope } from '@/api/scope'
 import { useUIStore } from '@/stores/ui'
 import { DataTable } from '@/components/common/DataTable'
 import { SeverityBadge } from '@/components/common/SeverityBadge'
+import { CustomerBadge } from '@/components/common/CustomerBadge'
 import { SourceBadge } from '@/components/common/SourceBadge'
 import { ScopeFilter } from '@/components/common/ScopeFilter'
 import { useScopeFilter } from '@/hooks/useScopeFilter'
@@ -789,7 +790,10 @@ function FindingsTab() {
                         onClick={() => setSelected(f)}
                       >
                         <td className="px-3 py-1.5"></td>
-                        <td className="px-3 py-1.5 pl-8 font-mono text-xs">{f.target}</td>
+                        <td className="px-3 py-1.5 pl-8 font-mono text-xs">
+                          {f.target}
+                          <CustomerBadge host={f.target} className="ml-1" />
+                        </td>
                         <td className="px-3 py-1.5">
                           <span className="px-1.5 py-0.5 rounded text-[10px] bg-muted border border-border">{f.finding_type}</span>
                         </td>

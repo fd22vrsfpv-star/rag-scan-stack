@@ -307,6 +307,24 @@ export function useReconDomainOverview(domain: string | null) {
   })
 }
 
+// ── Customer-owned hosts (indicator source) ─────────────────────────────
+
+export interface CustomerHostInfo {
+  owner_domain?: string
+  registrant_org?: string
+  confirmed?: boolean
+}
+
+/** Hosts detected as customer-owned (cert/CNAME mismatch) or moved to
+ *  customer_scope. One cached fetch feeds the <CustomerBadge> everywhere. */
+export function useCustomerHosts() {
+  return useQuery({
+    queryKey: ['customer-hosts'],
+    queryFn: () => apiFetch<{ count: number; hosts: Record<string, CustomerHostInfo> }>('/recon/customer-hosts'),
+    staleTime: 60000,
+  })
+}
+
 export function useServiceEnumFindings(domain: string | null) {
   return useQuery({
     queryKey: ['service-enum-findings', domain],

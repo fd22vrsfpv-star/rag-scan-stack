@@ -8839,6 +8839,39 @@ def _extract_parent_domain(target: str) -> str:
     return host
 
 
+@app.get("/recon/customer-hosts", tags=["Recon"])
+def recon_customer_hosts(_: bool = Depends(auth)):
+    """Hosts detected as customer-owned (TLS cert / CNAME registrable-domain
+    mismatch) or moved to `customer_scope`. Single source for the "Customer"
+    indicator rendered across the UI (Recon Explorer, Findings, Services)."""
+    out: dict = {}
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT target, metadata->>'owner_domain' AS owner,
+                   metadata->>'registrant_org' AS org
+              FROM follow_up_items
+             WHERE rule_id IN ('customer_hosted_site','customer_hosted_site_cname')
+               AND target IS NOT NULL AND target <> ''
+        """)
+        for r in cur.fetchall():
+            h = (r["target"] or "").strip().lower()
+            if not h:
+                continue
+            e = out.setdefault(h, {})
+            if r["owner"] and not e.get("owner_domain"):
+                e["owner_domain"] = r["owner"]
+            if r["org"] and not e.get("registrant_org"):
+                e["registrant_org"] = r["org"]
+        # Operator-confirmed customer sites (moved to customer_scope).
+        cur.execute("SELECT DISTINCT target FROM scope_targets "
+                    "WHERE name = 'customer_scope' AND target <> ''")
+        for r in cur.fetchall():
+            h = (r["target"] or "").strip().lower()
+            if h:
+                out.setdefault(h, {})["confirmed"] = True
+    return {"count": len(out), "hosts": out}
+
+
 @app.get("/recon/domains", tags=["Recon"])
 def list_recon_domains(
     search: Optional[str] = Query(None, description="Filter domains (ILIKE)"),
@@ -15843,6 +15876,17 @@ def mark_customer_sites(eid: str, body: MarkCustomerSitesBody, _: bool = Depends
                 _capture_scope_decisions([t], from_scopes.get(t, "unscoped"), scope_name, cur)
             except Exception as e:
                 logging.warning(f"scope decision capture failed for {t}: {e}")
+        # 5b. durable 'customer-site' tag on the asset so a Customer badge renders
+        #     in every host view.
+        try:
+            cur.execute("""
+                UPDATE assets SET tags = (
+                    SELECT array_agg(DISTINCT x)
+                      FROM unnest(COALESCE(tags,'{}'::text[]) || ARRAY['customer-site']) x)
+                 WHERE lower(hostname) = ANY(%s)
+            """, ([t.lower() for t in targets],))
+        except Exception as e:
+            logging.warning(f"customer-site asset tag failed: {e}")
         conn.commit()
 
     try:
