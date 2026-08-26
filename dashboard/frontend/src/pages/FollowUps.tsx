@@ -306,11 +306,11 @@ export default function FollowUps() {
   return (
     <div className="space-y-4">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-start justify-between gap-2 flex-wrap">
         <h2 className="text-lg font-semibold flex items-center gap-2">
           <Flag className="h-5 w-5" /> Follow-Up Panel
         </h2>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap justify-end">
           <a
             href="/exploits"
             className="h-7 px-3 text-xs rounded border border-orange-500/50 bg-orange-500/10 text-orange-400 hover:bg-orange-500/20 flex items-center gap-1.5 font-medium"
