@@ -867,7 +867,10 @@ function FindingsTab() {
               <span className="text-xs text-muted-foreground">{selected.finding_type}</span>
               {selected.severity && <SeverityBadge severity={selected.severity} />}
             </div>
-            <h4 className="text-sm font-medium font-mono">{selected.target}</h4>
+            <div className="flex items-center gap-2 flex-wrap">
+              <h4 className="text-sm font-medium font-mono">{selected.target}</h4>
+              <CustomerBadge host={selected.target || selected.hostname} />
+            </div>
             <div className="grid grid-cols-2 gap-2 text-xs">
               {selected.resolved_ip && (
                 <div><span className="text-muted-foreground">Resolved IP:</span> <span className="font-mono">{selected.resolved_ip}</span></div>
@@ -1265,6 +1268,7 @@ function DomainOverviewTab() {
                 <button onClick={() => setDrilldownDomain(null)} className="text-primary hover:underline font-mono">{selectedDomain}</button>
                 <ChevronRight className="h-3 w-3 text-muted-foreground" />
                 <span className="font-mono font-medium">{drilldownDomain}</span>
+                <CustomerBadge host={drilldownDomain} />
               </div>
             )}
             <DomainDetail overview={overview} onSubdomainClick={(sub) => setDrilldownDomain(sub)} parentDomain={drilldownDomain ? selectedDomain : undefined} />
