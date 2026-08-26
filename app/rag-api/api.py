@@ -15856,6 +15856,122 @@ def mark_customer_sites(eid: str, body: MarkCustomerSitesBody, _: bool = Depends
             "moved": moved, "resolved_follow_ups": resolved}
 
 
+class WhoisAgentBody(BaseModel):
+    engagement_id: Optional[str] = None
+    stale_days: int = 90
+    limit: int = 1000
+    dispatch: bool = True
+
+
+def _gather_whois_domains(cur, engagement_id: Optional[str] = None) -> set:
+    """Distinct registrable domains worth a WHOIS across ALL scopes + discovered
+    owner domains. IPs are dropped (registrable_domain returns None)."""
+    from scope_classifier import registrable_domain
+    doms: set = set()
+    if engagement_id:
+        cur.execute("SELECT DISTINCT target FROM scope_targets "
+                    "WHERE target <> '' AND engagement_id = %s::uuid", (engagement_id,))
+    else:
+        cur.execute("SELECT DISTINCT target FROM scope_targets WHERE target <> ''")
+    for r in cur.fetchall():
+        rd = registrable_domain((r["target"] or "").strip())
+        if rd:
+            doms.add(rd)
+    # discovered customer owner domains (from the customer-site follow-ups)
+    cur.execute("""SELECT DISTINCT metadata->>'owner_domain' od FROM follow_up_items
+                    WHERE rule_id IN ('customer_hosted_site','customer_hosted_site_cname')
+                      AND metadata->>'owner_domain' IS NOT NULL
+                      AND metadata->>'owner_domain' <> ''""")
+    for r in cur.fetchall():
+        if r["od"]:
+            doms.add(r["od"].strip().lower())
+    return doms
+
+
+@app.post("/whois-agent/run", tags=["ReconAgent"])
+def whois_agent_run(body: WhoisAgentBody = None, _: bool = Depends(auth)):
+    """Standing WHOIS collector — passive registrant lookup for EVERY scope +
+    discovered owner domain, not just in-scope hosts.
+
+    WHOIS is a public-registry lookup with no traffic to the target host, so it is
+    safe (host-scan authorisation rules do not apply) for the out-of-scope
+    customer/owner domains that the recon agent's scope-gated whois never reaches.
+    Two idempotent phases:
+      1. dispatch WHOIS (via osint-runner, passive) for domains with no fresh
+         record (older than `stale_days` or missing);
+      2. copy registrant org/country from the whois recon_finding into each
+         customer-site follow-up's metadata (what the report renders).
+    """
+    import httpx as _hx
+    from datetime import timedelta as _timedelta
+    from scope_classifier import registrable_domain
+    body = body or WhoisAgentBody()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        domains = _gather_whois_domains(cur, body.engagement_id)
+        # existing whois coverage, keyed by registrable domain (keep the newest)
+        cur.execute("SELECT target, created_at FROM recon_findings WHERE source = 'whois'")
+        have: dict = {}
+        for r in cur.fetchall():
+            reg = registrable_domain((r["target"] or "").strip()) or (r["target"] or "").strip().lower()
+            if reg and (reg not in have or (r["created_at"] and have[reg] and r["created_at"] > have[reg])):
+                have[reg] = r["created_at"]
+        cutoff = datetime.now(timezone.utc) - _timedelta(days=max(1, body.stale_days))
+        missing = sorted(d for d in domains
+                         if d not in have or (have[d] and have[d] < cutoff))
+        missing = missing[:max(1, body.limit)]
+
+        dispatched = 0
+        if body.dispatch and missing:
+            osint_url = os.environ.get("OSINT_RUNNER_URL", "https://osint-runner:8024")
+            try:
+                rr = _hx.post(f"{osint_url}/jobs/whois", json={"targets": missing},
+                              headers={"x-api-key": API_KEY}, verify=False, timeout=30)
+                if rr.status_code < 400:
+                    dispatched = len(missing)
+                else:
+                    log.warning("whois dispatch HTTP %s: %s", rr.status_code, rr.text[:200])
+            except Exception as e:
+                log.warning("whois dispatch failed: %s", e)
+
+        # Enrich customer follow-ups from whatever whois we already have.
+        cur.execute("SELECT target, data FROM recon_findings WHERE source = 'whois'")
+        wmap: dict = {}
+        for r in cur.fetchall():
+            d = r["data"] if isinstance(r["data"], dict) else {}
+            reg = registrable_domain((r["target"] or "").strip()) or (r["target"] or "").strip().lower()
+            org = (d.get("org") or d.get("registrant_org") or d.get("registrant_organization") or "").strip()
+            country = (d.get("registrant_country") or d.get("country") or "").strip()
+            registrar = (d.get("registrar") or "").strip()
+            created = (d.get("creation_date") or d.get("created") or "").strip()
+            # WHOIS registrant org is often GDPR-redacted; registrar + created are
+            # usually present, so capture them too for attribution context.
+            if reg and (org or country or registrar or created):
+                wmap[reg] = {"registrant_org": org, "registrant_country": country,
+                             "registrar": registrar, "whois_created": created,
+                             "whois_enriched": "1"}
+        enriched = 0
+        for od, w in wmap.items():
+            cur.execute("""
+                UPDATE follow_up_items
+                   SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb, updated_at = now()
+                 WHERE rule_id IN ('customer_hosted_site','customer_hosted_site_cname')
+                   AND metadata->>'owner_domain' = %s
+                   AND COALESCE(metadata->>'whois_enriched','') = ''
+            """, (Json(w), od))
+            enriched += cur.rowcount
+        conn.commit()
+
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("whois_agent_run", "whois-agent", {
+            "domains": len(domains), "dispatched": dispatched,
+            "enriched_follow_ups": enriched})
+    except Exception:
+        pass
+    return {"ok": True, "domains": len(domains), "with_whois": len(have),
+            "dispatched": dispatched, "enriched_follow_ups": enriched}
+
+
 class ScopeRename(BaseModel):
     new_name: str
 
@@ -19649,6 +19765,39 @@ def get_agents_status(_: bool = Depends(auth)):
             "type": "continuous", "status": "error",
             "description": "Verifies agent/LLM claims against recorded scan data before findings are trusted",
             "service_port": 8013,
+        })
+
+    # 9. WHOIS Collection Agent — passive registrant lookup across ALL scopes +
+    #    discovered owner domains (not just in-scope hosts, since whois is public).
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            domains = _gather_whois_domains(cur)
+            cur.execute("SELECT DISTINCT target, max(created_at) last FROM recon_findings "
+                        "WHERE source = 'whois' GROUP BY target")
+            from scope_classifier import registrable_domain as _rd
+            have = set()
+            last_run = None
+            for r in cur.fetchall():
+                reg = _rd((r["target"] or "").strip()) or (r["target"] or "").strip().lower()
+                if reg:
+                    have.add(reg)
+                if r["last"] and (last_run is None or r["last"] > last_run):
+                    last_run = r["last"]
+            covered = len(domains & have)
+            agents.append({
+                "id": "whois-agent", "name": "WHOIS Collection",
+                "type": "on-demand", "status": "idle",
+                "description": "Passive WHOIS/registrant lookup for every scope + discovered owner domain (identifies who owns customer sites)",
+                "coverage_total": len(domains),
+                "coverage_completed": covered,
+                "coverage_pending": max(0, len(domains) - covered),
+                "last_run": last_run.isoformat() if last_run else None,
+            })
+    except Exception:
+        agents.append({
+            "id": "whois-agent", "name": "WHOIS Collection",
+            "type": "on-demand", "status": "error",
+            "description": "Passive WHOIS/registrant lookup for every scope + discovered owner domain",
         })
 
     return {"agents": agents}

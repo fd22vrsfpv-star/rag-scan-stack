@@ -12,7 +12,7 @@ import { cn } from '@/lib/utils'
 import {
   Bot, Cpu, Search, Shield, Loader2, Play, ExternalLink,
   CheckCircle2, XCircle, RefreshCw, Zap, Settings, Clock, Cloud,
-  FileSearch, ShieldCheck,
+  FileSearch, ShieldCheck, Globe,
 } from 'lucide-react'
 
 const AGENT_ICONS: Record<string, typeof Bot> = {
@@ -24,6 +24,7 @@ const AGENT_ICONS: Record<string, typeof Bot> = {
   'cloud-triage-agent': Cloud,
   'artifact-review': FileSearch,
   'pre-validation': ShieldCheck,
+  'whois-agent': Globe,
 }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -75,6 +76,18 @@ function useRunOsintScan() {
   return useMutation({
     mutationFn: () => apiFetch<{ ok: boolean }>('/agent/scan', { method: 'POST', body: JSON.stringify({}) }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['agents-status'] }),
+  })
+}
+
+function useRunWhoisAgent() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () => apiFetch<{ ok: boolean; domains: number; dispatched: number; enriched_follow_ups: number }>(
+      '/whois-agent/run', { method: 'POST', body: JSON.stringify({}) }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['agents-status'] })
+      qc.invalidateQueries({ queryKey: ['follow-ups'] })
+    },
   })
 }
 
@@ -131,6 +144,7 @@ function AgentCard({ agent, engagementId }: { agent: AgentInfo; engagementId: st
   const runOsint = useRunOsintScan()
   const runRecon = useRunReconAgentNow(engagementId)
   const drain = useDrainArtifacts()
+  const runWhois = useRunWhoisAgent()
   const link = AGENT_LINKS[agent.id]
 
   const handleCardClick = () => {
@@ -254,6 +268,17 @@ function AgentCard({ agent, engagementId }: { agent: AgentInfo; engagementId: st
             className="flex items-center gap-1 px-2 py-1 text-[10px] rounded bg-blue-600 hover:bg-blue-500 text-white"
           >
             {runRecon.isPending ? <Loader2 className="h-2.5 w-2.5 animate-spin" /> : <Play className="h-2.5 w-2.5" />}
+            Run Now
+          </button>
+        )}
+        {agent.id === 'whois-agent' && (
+          <button
+            onClick={() => runWhois.mutate()}
+            disabled={runWhois.isPending}
+            className="flex items-center gap-1 px-2 py-1 text-[10px] rounded bg-blue-600 hover:bg-blue-500 text-white"
+            title="Collect passive WHOIS/registrant data for all scope + discovered owner domains"
+          >
+            {runWhois.isPending ? <Loader2 className="h-2.5 w-2.5 animate-spin" /> : <Play className="h-2.5 w-2.5" />}
             Run Now
           </button>
         )}
