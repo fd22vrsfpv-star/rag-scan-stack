@@ -13,8 +13,8 @@
 
    # Copy the llm_query.py script to the container
    COPY llm_query.py /app/llm_query.py
-   # Shared LLM settings resolver (dashboard DB llm.* over env)
-   COPY llm_settings.py /app/llm_settings.py
+   # llm_settings now comes from the ./common bind mount as
+   # `common.llm_settings` — one copy, not four. See common/llm_settings.py.
 
    # Expose the port the app will run on
    ENV OLLAMA_URL=http://ollama:11434

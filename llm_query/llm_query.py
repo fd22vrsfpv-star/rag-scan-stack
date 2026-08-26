@@ -38,7 +38,7 @@ ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 # the resolver before each request (via middleware), so the GUI drives this
 # proxy without a container recreate.
 try:
-    from llm_settings import get_llm_settings
+    from common.llm_settings import get_llm_settings
 except Exception:
     get_llm_settings = None
 
