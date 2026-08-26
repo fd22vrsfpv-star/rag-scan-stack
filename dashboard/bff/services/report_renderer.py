@@ -104,52 +104,47 @@ FOLLOW_UPS_TEMPLATE = Template("""
 <head>
 <meta charset="utf-8">
 <style>
-  @page { size: A4; margin: 2cm; }
-  body { font-family: 'Helvetica Neue', Arial, sans-serif; color: #1a1a2e; font-size: 11pt; line-height: 1.5; }
-  h1 { color: #e94560; border-bottom: 3px solid #e94560; padding-bottom: 8px; font-size: 22pt; }
-  h2 { color: #16213e; border-bottom: 1px solid #ccc; padding-bottom: 4px; margin-top: 24px; }
-  .meta { color: #666; font-size: 9pt; margin-bottom: 20px; }
-  .severity-critical { color: #fff; background: #dc2626; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
-  .severity-high { color: #fff; background: #ea580c; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
-  .severity-medium { color: #000; background: #facc15; padding: 2px 8px; border-radius: 4px; }
-  .severity-low { color: #fff; background: #2563eb; padding: 2px 8px; border-radius: 4px; }
-  .severity-info { color: #fff; background: #6b7280; padding: 2px 8px; border-radius: 4px; }
-  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 8.5pt; table-layout: fixed; }
-  th { background: #16213e; color: #fff; padding: 6px; text-align: left; }
-  td { padding: 5px 6px; border-bottom: 1px solid #e5e7eb; word-wrap: break-word; overflow-wrap: break-word; }
+  @page { size: A4 landscape; margin: 1.4cm; }
+  body { font-family: 'Helvetica Neue', Arial, sans-serif; color: #1a1a2e; font-size: 10pt; line-height: 1.4; }
+  h1 { color: #e94560; border-bottom: 3px solid #e94560; padding-bottom: 8px; font-size: 20pt; }
+  h2 { color: #16213e; border-bottom: 1px solid #ccc; padding-bottom: 4px; margin-top: 22px; }
+  .meta { color: #666; font-size: 9pt; margin-bottom: 16px; }
+  .severity-critical { color: #fff; background: #dc2626; padding: 1px 6px; border-radius: 4px; font-weight: bold; }
+  .severity-high { color: #fff; background: #ea580c; padding: 1px 6px; border-radius: 4px; font-weight: bold; }
+  .severity-medium { color: #000; background: #facc15; padding: 1px 6px; border-radius: 4px; }
+  .severity-low { color: #fff; background: #2563eb; padding: 1px 6px; border-radius: 4px; }
+  .severity-info { color: #fff; background: #6b7280; padding: 1px 6px; border-radius: 4px; }
+  table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 8pt; table-layout: auto; }
+  th { background: #16213e; color: #fff; padding: 5px 6px; text-align: left; }
+  td { padding: 4px 6px; border-bottom: 1px solid #e5e7eb; word-break: break-word; overflow-wrap: anywhere; }
   tr:nth-child(even) { background: #f8f9fa; }
-  .stats-grid { display: flex; gap: 12px; margin: 16px 0; flex-wrap: wrap; }
-  .stat-card { background: #f1f5f9; border-radius: 8px; padding: 12px; flex: 1; text-align: center; min-width: 90px; }
-  .stat-value { font-size: 20pt; font-weight: bold; color: #16213e; }
+  .stats-grid { display: flex; gap: 12px; margin: 14px 0; flex-wrap: wrap; }
+  .stat-card { background: #f1f5f9; border-radius: 8px; padding: 10px; flex: 1; text-align: center; min-width: 80px; }
+  .stat-value { font-size: 18pt; font-weight: bold; color: #16213e; }
   .stat-label { font-size: 8pt; color: #666; }
   .rule-count { color: #666; font-weight: normal; font-size: 11pt; }
-  .footer { text-align: center; color: #999; font-size: 8pt; margin-top: 40px; border-top: 1px solid #ccc; padding-top: 8px; }
+  .footer { text-align: center; color: #999; font-size: 8pt; margin-top: 30px; border-top: 1px solid #ccc; padding-top: 8px; }
 </style>
 </head>
 <body>
 <h1>{{ title }}</h1>
-<div class="meta">Generated: {{ timestamp }}{% if filter_line %} | {{ filter_line }}{% endif %} | {{ items|length }} item(s)</div>
+<div class="meta">Generated: {{ timestamp }}{% if filter_line %} | {{ filter_line }}{% endif %} | {{ total }} item(s)</div>
 
 <div class="stats-grid">
-  <div class="stat-card"><div class="stat-value">{{ items|length }}</div><div class="stat-label">Total</div></div>
+  <div class="stat-card"><div class="stat-value">{{ total }}</div><div class="stat-label">Total</div></div>
   {% for sev, count in sev_counts.items() %}
   <div class="stat-card"><div class="stat-value">{{ count }}</div><div class="stat-label"><span class="severity-{{ sev }}">{{ sev|upper }}</span></div></div>
   {% endfor %}
 </div>
 
-{% for rule, rows in groups %}
-<h2>{{ rule }} <span class="rule-count">&mdash; {{ rows|length }} item(s)</span></h2>
+{% for g in groups %}
+<h2>{{ g.rule }} <span class="rule-count">&mdash; {{ g.rows|length }} item(s)</span></h2>
 <table>
-  <colgroup><col style="width:26%"><col style="width:30%"><col style="width:10%"><col style="width:10%"><col style="width:24%"></colgroup>
-  <tr><th>Host</th><th>URL</th><th>Severity</th><th>Status</th><th>Detail</th></tr>
-  {% for r in rows %}
-  <tr>
-    <td>{{ r.get('host','') }}</td>
-    <td>{{ r.get('url','') }}</td>
-    <td><span class="severity-{{ r.get('severity','info') }}">{{ (r.get('severity') or 'info')|upper }}</span></td>
-    <td>{{ r.get('status','') }}</td>
-    <td>{{ r.get('reason','') }}</td>
-  </tr>
+  <tr>{% for h in g.headers %}<th>{{ h }}</th>{% endfor %}</tr>
+  {% for row in g.rows %}
+  <tr>{% for cell in row %}
+    <td>{% if cell.sev %}<span class="severity-{{ cell.value|lower }}">{{ cell.value|upper }}</span>{% else %}{{ cell.value }}{% endif %}</td>
+  {% endfor %}</tr>
   {% endfor %}
 </table>
 {% endfor %}
@@ -160,12 +155,52 @@ FOLLOW_UPS_TEMPLATE = Template("""
 """)
 
 
+# Per-rule column schemas. Each column is (header, spec) where spec is either the
+# literal "severity" (rendered as a badge) or a (source, key) tuple: source is
+# "item" (top-level enriched field) or "detail" (the linked finding's data). Rules
+# without a schema fall back to _DEFAULT_COLUMNS. This is how the report breaks out
+# rule-specific fields (cert expiry/issuer/serial) into their own columns while
+# staying generic for every other rule.
+_DEFAULT_COLUMNS = [
+    ("Host", ("item", "host")),
+    ("URL", ("item", "url")),
+    ("Severity", "severity"),
+    ("Status", ("item", "status")),
+    ("Detail", ("item", "reason")),
+]
+_COLUMN_SCHEMAS = {
+    "expired_cert": [
+        ("Host", ("item", "host")),
+        ("Expired On", ("detail", "not_after")),
+        ("Valid From", ("detail", "not_before")),
+        ("Issuer", ("detail", "issuer")),
+        ("Subject CN", ("detail", "subject_cn")),
+        ("Serial", ("detail", "serial")),
+        ("Severity", "severity"),
+        ("Status", ("item", "status")),
+    ],
+}
+
+
+def _cell(item: dict, spec) -> dict:
+    if spec == "severity":
+        return {"value": (item.get("severity") or "info"), "sev": True}
+    source, key = spec
+    src = item.get("detail") or {} if source == "detail" else item
+    val = src.get(key)
+    if isinstance(val, (list, tuple)):
+        val = ", ".join(str(x) for x in val)
+    return {"value": "" if val is None else str(val), "sev": False}
+
+
 def render_follow_ups_pdf(items: list[dict], filter_line: str = "",
                           title: str = "Follow-ups Report") -> bytes:
     """Render enriched follow-up items to a grouped-by-rule PDF.
 
     Input is the same shape GET /follow-ups/export?format=json returns, so the
-    report reflects exactly the filtered view the operator exported."""
+    report reflects exactly the filtered view the operator exported. Columns are
+    chosen PER RULE (see _COLUMN_SCHEMAS) so cert fields (expiry/issuer/serial)
+    get their own columns, while unknown rules keep the generic layout."""
     from collections import defaultdict
     from weasyprint import HTML
 
@@ -176,19 +211,26 @@ def render_follow_ups_pdf(items: list[dict], filter_line: str = "",
         grouped[it.get("rule_id") or "(no rule)"].append(it)
         sev = (it.get("severity") or "info").lower()
         sev_counts[sev] = sev_counts.get(sev, 0) + 1
-    # Rules ordered by their most severe item, then size.
+
     def _rule_key(kv):
         rule, rows = kv
         worst = min((sev_order.get((r.get("severity") or "info").lower(), 5) for r in rows), default=5)
         return (worst, -len(rows), rule)
-    groups = sorted(grouped.items(), key=_rule_key)
+
+    groups = []
+    for rule, rows_items in sorted(grouped.items(), key=_rule_key):
+        schema = _COLUMN_SCHEMAS.get(rule, _DEFAULT_COLUMNS)
+        headers = [h for h, _ in schema]
+        rows = [[_cell(it, spec) for _, spec in schema] for it in rows_items]
+        groups.append({"rule": rule, "headers": headers, "rows": rows})
+
     sev_counts = {k: sev_counts[k] for k in sorted(sev_counts, key=lambda s: sev_order.get(s, 5))}
 
     html = FOLLOW_UPS_TEMPLATE.render(
         title=title,
         timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         filter_line=filter_line,
-        items=items,
+        total=len(items),
         groups=groups,
         sev_counts=sev_counts,
     )
