@@ -351,6 +351,7 @@ export default function FollowUps() {
                 <div className="fixed inset-0 z-10" onClick={() => setShowExport(false)} />
                 <div className="absolute right-0 mt-1 z-20 w-44 rounded border border-border bg-background shadow-lg py-1 text-xs">
                   {([
+                    ['pdf', 'PDF report (by rule)'],
                     ['csv', 'CSV (full detail)'],
                     ['urls', 'URL list (.txt)'],
                     ['md', 'Markdown (by rule)'],
