@@ -895,6 +895,7 @@ services:
     networks:
       - agents_net
     volumes:
+      - ./common:/app/common:ro    # shared llm_settings resolver (one copy, see common/llm_settings.py)
       - ./etl:/app/etl:ro                             # shared scope gate (etl/scope_gate.py)
       - searchsploit-data:/var/lib/searchsploit
       - ./knowledge:/knowledge:ro
@@ -1694,6 +1695,8 @@ services:
         context: ./llm_query
         dockerfile: Dockerfile
       container_name: llm_query
+      volumes:
+        - ./common:/app/common:ro    # shared llm_settings resolver (one copy, see common/llm_settings.py)
       restart: unless-stopped
       logging:
         driver: json-file

@@ -33,7 +33,7 @@ def _get_active_model_from_db() -> str | None:
 
 
 try:
-    from llm_settings import get_llm_settings
+    from common.llm_settings import get_llm_settings
 except Exception:
     get_llm_settings = None
 

@@ -6,10 +6,24 @@ never actually controlled them. This resolver merges the DB settings OVER the
 env defaults, so a change in the GUI takes effect (within CACHE_TTL) without an
 edit to `.env` or a container recreate.
 
-Copied VERBATIM into each service that needs it (llm_query, scan_recommender,
-autogen_agents) because `common/` is not mounted into all of them. The copies
-are kept byte-identical by tests/test_llm_settings_agreement.py — edit
-common/llm_settings.py and re-copy, do not edit one copy alone.
+THIS IS THE ONLY COPY. It used to be duplicated verbatim into llm_query,
+scan_recommender and autogen_agents because `common/` was not mounted into all
+of them, with a test keeping the four byte-identical. That is the arrangement
+`common/Dockerfile` exists to prevent: it records that `validation.py` once
+lived in seven places and one had drifted with a real fix stranded in it.
+
+The three services now bind-mount `./common` and import
+`from common.llm_settings import get_llm_settings`, so there is one file to edit.
+
+NOTE the import is soft at every call site (`except Exception: get_llm_settings
+= None`), which means a broken import does not crash the service — it silently
+falls back to env-only and the Settings → LLM Tuning GUI stops controlling that
+service. tests/test_llm_settings_agreement.py therefore executes the import
+INSIDE each container rather than trusting that the file is present.
+
+No site-specific values belong here. Every `*_api_key` defaults to `""`; the
+only URLs are the public vendor endpoint and the `ollama`/`vllm` service names.
+Real endpoints and keys come from `app_settings` (DB) or the environment.
 
 Never raises: a DB hiccup falls back to env/defaults so it cannot take the LLM
 path down.
