@@ -42,6 +42,15 @@ log = logging.getLogger("recon_agent")
 
 BASE_INTERVAL = float(os.environ.get("RECON_AGENT_BASE_INTERVAL", "30"))
 
+# The recon agent dispatches by calling the BFF's OWN API — a loopback self-call.
+# Target uvicorn directly over plain HTTP on the internal port. nginx on :443
+# serves a self-signed dashboard.crt that is NOT the stack CA, so httpx (which
+# verifies) could never validate a loopback `https://127.0.0.1:443` call: EVERY
+# dispatch failed with `CERTIFICATE_VERIFY_FAILED: self-signed certificate`, the
+# agent recorded 0 dispatched and marked coverage failed. A loopback call into
+# the same process needs no TLS.
+BFF_INTERNAL_URL = os.environ.get("BFF_INTERNAL_URL", "http://127.0.0.1:8050")
+
 # Seed-stage discovery pipeline.
 #
 # Stages 0-2 (whois → dnsx → nmap) are the discovery seed that produces the
@@ -615,7 +624,6 @@ class ReconAgent:
 
                 # Dispatch scan — route through tunnel if configured
                 try:
-                    bff_port = os.environ.get("BFF_PORT", "443")
                     # Pick proxy: round-robin tunnels > explicit single > none
                     scan_proxy = None
                     if tunnel_proxies:
@@ -667,7 +675,7 @@ class ReconAgent:
                         if web_profile and scan_type in WEB_PROFILE_SCANS:
                             payload["web_profile"] = web_profile
                         resp = await c.post(
-                            f"https://127.0.0.1:{bff_port}/api/scans/{scan_type}",
+                            f"{BFF_INTERNAL_URL}/api/scans/{scan_type}",
                             json=payload,
                             headers={**headers, "Content-Type": "application/json"},
                         )
@@ -880,7 +888,6 @@ class ReconAgent:
                         kb_node_id = tool_node_ids[self._tool_node_idx % len(tool_node_ids)]
                         self._tool_node_idx += 1
 
-                    bff_port = os.environ.get("BFF_PORT", "443")
                     payload = {"ids": [r["id"] for r in recs_to_dispatch]}
                     if kb_proxy:
                         payload["proxy"] = kb_proxy
@@ -898,7 +905,7 @@ class ReconAgent:
                         # on this background task.
                         async with httpx.AsyncClient(timeout=120) as c:
                             resp = await c.post(
-                                f"https://127.0.0.1:{bff_port}/api/scan-recommendations/run",
+                                f"{BFF_INTERNAL_URL}/api/scan-recommendations/run",
                                 json=payload,
                                 headers={
                                     **headers,
