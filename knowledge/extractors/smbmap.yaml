@@ -1,0 +1,118 @@
+# smbmap — SMB share enumeration WITH per-share permissions.
+#
+# smbclient lists shares; smbmap adds the permission on each, which is the part
+# that decides what to do next. The table is:
+#
+#     Disk                          Permissions     Comment
+#     ----                          -----------     -------
+#     ADMIN$                        NO ACCESS       Remote Admin
+#     C$                            READ, WRITE     Default share
+#     tmp                           READ ONLY       oh noes!
+#
+# The finding ids are CANONICAL and shared with the smbclient/enum4linux
+# extractors, so this is a further confirming source for a known condition, and
+# `writable_shares` is the new capability those text-only tools could not state.
+tool: smbmap
+description: SMB share enumeration with permissions — readable and WRITABLE shares.
+enabled: true
+max_chars: 20000
+
+deterministic:
+  # Only rows carrying a permission token are shares. The header ("Permissions")
+  # and the dashes row carry none, so they cannot match — structural, no denylist.
+  shares:
+    pattern: '^\s+(\S+)\s+(?:NO ACCESS|READ ONLY|READ, WRITE|WRITE ONLY)\b'
+    capture: all
+    type: list
+  # READ matches both `READ ONLY` and `READ, WRITE`.
+  readable_shares:
+    pattern: '^\s+(\S+)\s+READ'
+    capture: all
+    type: list
+  writable_shares:
+    pattern: '^\s+(\S+)\s+(?:READ, WRITE|WRITE ONLY)\b'
+    capture: all
+    type: list
+  # smbmap prints this banner when it authenticated as guest/anonymous.
+  guest_session:
+    pattern: '\[\+\]\s+Guest session'
+    type: boolean
+
+schema:
+  shares:
+    type: list
+    description: all share names that carry a permission token
+  readable_shares:
+    type: list
+    description: shares with READ ONLY or READ, WRITE
+  writable_shares:
+    type: list
+    description: shares with READ, WRITE or WRITE ONLY
+  guest_session:
+    type: boolean
+    description: true when smbmap connected as guest/anonymous
+
+prompt: |
+  Extract facts from `smbmap` output. The share table is
+  `Disk  Permissions  Comment`; every data row is
+  `<share>  <permission>  <comment>` where permission is one of
+  `NO ACCESS`, `READ ONLY`, `READ, WRITE`, `WRITE ONLY`.
+
+  Report all shares, the readable ones, and the WRITABLE ones separately — a
+  writable share is the actionable result. `[+] Guest session` means the
+  connection was unauthenticated. Never treat the header or the dashes row as a
+  share.
+
+examples:
+  - output: |
+      [+] Guest session   	IP: 192.168.1.150:445	Name: target
+      	Disk                          Permissions     Comment
+      	----                          -----------     -------
+      	ADMIN$                        NO ACCESS       Remote Admin
+      	C$                            READ, WRITE     Default share
+      	tmp                           READ ONLY       oh noes!
+    extract: |
+      {"guest_session": true,
+       "shares": ["ADMIN$", "C$", "tmp"],
+       "readable_shares": ["C$", "tmp"],
+       "writable_shares": ["C$"]}
+
+notable:
+  - id: smb_guest_session
+    when: guest_session == true
+    severity: high
+    title: SMB guest/anonymous session accepted
+    detail: >
+      smbmap connected without credentials, so the share layout and every
+      permission below was read by an unauthenticated caller.
+  - id: smb_shares_enumerated
+    when: len(shares) > 0
+    severity: medium
+    title: "{shares} SMB share(s) enumerated with permissions"
+    detail: >
+      Share names, comments and access levels disclose host layout and are the
+      map for anonymous read/write testing.
+  - id: smb_writable_share
+    when: len(writable_shares) > 0
+    severity: high
+    title: "{writable_shares} WRITABLE SMB share(s)"
+    detail: >
+      A writable share is a direct path to file drop — a web root, a startup
+      folder or a config directory that accepts an attacker-controlled file.
+    params: [writable_shares]
+
+follow_on:
+  # One recursive listing per readable share — the extractor holds the share
+  # NAME, so each command is complete and auto-queues.
+  - id: recurse_readable_share
+    when: len(readable_shares) > 0
+    for_each: readable_shares
+    scanner: smbmap
+    script: "smbmap -H {target} -r {item}"
+    title: "Recursively list //{target}/{item}"
+    category: smb
+    priority: 20
+    auto_queue: true
+    rationale: >
+      The share is known readable, so a recursive listing needs no new access
+      and immediately shows whether anything sensitive is exposed.

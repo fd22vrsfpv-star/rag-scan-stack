@@ -1,0 +1,129 @@
+# snmpwalk — SNMP tree walk with a community string.
+#
+# There was no profile for SNMP, so every snmpwalk run landed as a generic
+# `tool_output` dump. The single most important fact snmpwalk states is implicit:
+# if it returned ANY OID assignment at all, the community string it used was
+# ACCEPTED — an unauthenticated information disclosure. Everything else (system
+# description, contact, running processes, installed software) is the disclosed
+# data itself.
+#
+# Every assignment line is `MIB::name.index = TYPE: value`. `responded` has no
+# capture group on purpose: the presence of one typed assignment IS the value.
+tool: snmpwalk
+aliases: [snmp-walk]
+description: SNMP walk — a response proves the community string was accepted (info disclosure).
+enabled: true
+max_chars: 40000
+
+deterministic:
+  # Any typed assignment means the agent answered, so the community was valid.
+  responded:
+    pattern: '=\s+(?:STRING|INTEGER|IpAddress|OID|Timeticks|Gauge32|Counter32|Counter64|Hex-STRING):'
+    type: boolean
+  sys_descr:
+    pattern: 'sysDescr\.0 = STRING:\s*(.+?)\s*$'
+  sys_name:
+    pattern: 'sysName\.0 = STRING:\s*(.+?)\s*$'
+  sys_contact:
+    pattern: 'sysContact\.0 = STRING:\s*(.+?)\s*$'
+  sys_location:
+    pattern: 'sysLocation\.0 = STRING:\s*(.+?)\s*$'
+  # HOST-RESOURCES-MIB::hrSWRunName.<pid> = STRING: "process"
+  running_processes:
+    pattern: 'hrSWRunName\.\d+ = STRING:\s*"?([^"\r\n]+?)"?\s*$'
+    capture: all
+    type: list
+  # HOST-RESOURCES-MIB::hrSWInstalledName.<n> = STRING: "package"
+  installed_software:
+    pattern: 'hrSWInstalledName\.\d+ = STRING:\s*"?([^"\r\n]+?)"?\s*$'
+    capture: all
+    type: list
+
+schema:
+  responded:
+    type: boolean
+    description: true when the agent returned data, proving the community was accepted
+  sys_descr:
+    type: string
+    description: sysDescr.0 — OS/device banner
+  sys_name:
+    type: string
+  sys_contact:
+    type: string
+  sys_location:
+    type: string
+  running_processes:
+    type: list
+    description: process names from hrSWRunName
+  installed_software:
+    type: list
+    description: package names from hrSWInstalledName
+
+prompt: |
+  Extract facts from `snmpwalk` output. Each data line is
+  `MIB::name.index = TYPE: value`.
+
+  The most important fact is IMPLICIT: if the output contains ANY typed
+  assignment, the community string the run used was ACCEPTED — set `responded`
+  true. A run that only prints `Timeout` or `No Such Object` did not respond.
+
+  Collect the system banner (sysDescr.0), sysName/sysContact/sysLocation, and
+  the running processes and installed software when the HOST-RESOURCES MIB is
+  present. Do not treat a MIB name or an index as a value.
+
+examples:
+  - output: |
+      SNMPv2-MIB::sysDescr.0 = STRING: Linux target 4.19.0-6-amd64 #1 SMP x86_64
+      SNMPv2-MIB::sysName.0 = STRING: target
+      SNMPv2-MIB::sysContact.0 = STRING: admin@example.com
+      HOST-RESOURCES-MIB::hrSWRunName.1 = STRING: "systemd"
+      HOST-RESOURCES-MIB::hrSWRunName.842 = STRING: "sshd"
+      HOST-RESOURCES-MIB::hrSWInstalledName.7 = STRING: "openssl-1.1.1"
+    extract: |
+      {"responded": true,
+       "sys_descr": "Linux target 4.19.0-6-amd64 #1 SMP x86_64",
+       "sys_name": "target", "sys_contact": "admin@example.com",
+       "running_processes": ["systemd", "sshd"],
+       "installed_software": ["openssl-1.1.1"]}
+
+notable:
+  - id: snmp_community_accepted
+    when: responded == true
+    severity: high
+    title: SNMP community string accepted (unauthenticated read)
+    detail: >
+      The agent returned data, so the community string used is valid and the
+      SNMP tree is readable without authentication. Running processes, installed
+      software, ARP/route tables and interface details are all exposed.
+  - id: snmp_system_disclosed
+    when: sys_descr
+    severity: info
+    title: "SNMP disclosed system banner on {target}"
+    detail: >
+      sysDescr identifies the OS and often the exact kernel/build, which narrows
+      version-specific follow-on directly.
+    params: [sys_descr, sys_name, sys_contact, sys_location]
+  - id: snmp_processes_disclosed
+    when: len(running_processes) > 0
+    severity: low
+    title: "{running_processes} running process(es) disclosed over SNMP"
+    detail: >
+      The process list names the software actually running, including services a
+      port scan did not reach and their command context.
+    params: [running_processes]
+
+follow_on:
+  # A community is known-good; enumerate the local user table (the classic
+  # Windows SNMP disclosure). `{community}` is not an extracted field, so it is
+  # left unfilled — the action is offered with needs_input and never auto-queued,
+  # because a wrong community reads as runnable but is not.
+  - id: snmp_enumerate_users
+    when: responded == true
+    scanner: snmpwalk
+    script: "snmpwalk -v2c -c {community} {target} 1.3.6.1.4.1.77.1.2.25"
+    title: "Enumerate the SNMP user account table on {target}"
+    category: snmp
+    priority: 20
+    rationale: >
+      The agent already answered, so the LanManager user MIB (1.3.6.1.4.1.77)
+      is worth walking — on Windows it discloses local account names directly.

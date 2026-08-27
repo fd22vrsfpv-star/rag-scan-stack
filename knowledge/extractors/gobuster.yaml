@@ -1,0 +1,72 @@
+# gobuster — content/DNS/vhost brute forcing.
+#
+# gobuster runs are high-volume and landed as generic dumps. The result is
+# simply the list of things it FOUND, in whichever mode ran:
+#
+#   dir  :  /admin                (Status: 301) [Size: 178] [--> /admin/]
+#   dns  :  Found: dev.example.com
+#   vhost:  Found: admin.example.com (Status: 200) [Size: 4321]
+#
+# Both a path list and a subdomain list are captured; a run is only ever one
+# mode, so the other pattern simply matches nothing.
+tool: gobuster
+description: Directory/DNS/vhost brute forcing — the paths and hostnames it discovered.
+enabled: true
+max_chars: 40000
+
+deterministic:
+  # dir mode: a result line starts with the path and carries a Status.
+  found_paths:
+    pattern: '^(/\S*)\s+\(Status:\s*\d+\)'
+    capture: all
+    type: list
+  # dns/vhost mode: `Found: <name>`.
+  found_hosts:
+    pattern: '^Found:\s+(\S+)'
+    capture: all
+    type: list
+
+schema:
+  found_paths:
+    type: list
+    description: discovered URL paths (dir mode)
+  found_hosts:
+    type: list
+    description: discovered subdomains or vhosts (dns/vhost mode)
+
+prompt: |
+  Extract what `gobuster` discovered. In dir mode each result line is
+  `/<path>  (Status: <code>) [Size: <n>]` — collect the paths. In dns/vhost
+  mode each result line is `Found: <name>` — collect the hostnames.
+
+  Report only result lines. Progress output, the banner, and the settings block
+  at the top are not results.
+
+examples:
+  - output: |
+      ===============================================================
+      Gobuster v3.6
+      ===============================================================
+      /admin                (Status: 301) [Size: 178] [--> /admin/]
+      /index.php            (Status: 200) [Size: 1234]
+      /backup               (Status: 200) [Size: 4096]
+    extract: |
+      {"found_paths": ["/admin", "/index.php", "/backup"]}
+
+notable:
+  - id: gobuster_paths_found
+    when: len(found_paths) > 0
+    severity: info
+    title: "{found_paths} path(s) discovered by content brute force"
+    detail: >
+      Each path is a reachable endpoint the site did not link — admin panels,
+      backups and config files surface here and are candidates for manual review.
+    params: [found_paths]
+  - id: gobuster_hosts_found
+    when: len(found_hosts) > 0
+    severity: info
+    title: "{found_hosts} subdomain/vhost(s) discovered"
+    detail: >
+      Each name is an additional host or virtual host to fold into scope review
+      and, once authorised, its own recon pass.
+    params: [found_hosts]
