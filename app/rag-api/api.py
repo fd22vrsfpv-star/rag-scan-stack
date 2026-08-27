@@ -19466,29 +19466,39 @@ def list_extractor_learned(status: Optional[str] = None, tool: Optional[str] = N
     clause = ("WHERE " + " AND ".join(where)) if where else ""
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(f"SELECT id::text, tool, kind, rule, status, confidence, source, "
-                    f"created_at, approved_at FROM extractor_learned {clause} "
+                    f"reviewed_by, created_at, approved_at FROM extractor_learned {clause} "
                     f"ORDER BY tool, kind, created_at DESC", params)
         rows = [dict(r) for r in cur.fetchall()]
     return {"count": len(rows), "learned": rows}
 
 
 @app.post("/extractors/learned/{rule_id}/{action}", tags=["Extractors"])
-def review_extractor_learned(rule_id: str, action: str, _: bool = Depends(auth)):
+def review_extractor_learned(rule_id: str, action: str,
+                             x_operator: str = Header("operator", alias="X-Operator"),
+                             _: bool = Depends(auth)):
     """Approve (activate) or reject a proposed learned rule (e.g. a finding rule).
-    Approving a notable makes it fire on future extractions."""
+    Approving a notable makes it fire on future extractions. Records the actor
+    (reviewed_by) and emits an `extractor_rule_reviewed` audit event."""
     if action not in ("approve", "reject"):
         raise HTTPException(400, "action must be approve or reject")
     new_status = "active" if action == "approve" else "rejected"
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("UPDATE extractor_learned SET status = %s, "
+        cur.execute("UPDATE extractor_learned SET status = %s, reviewed_by = %s, "
                     "approved_at = CASE WHEN %s = 'active' THEN now() ELSE approved_at END "
                     "WHERE id = %s::uuid RETURNING id::text, tool, kind, status",
-                    (new_status, new_status, rule_id))
+                    (new_status, x_operator, new_status, rule_id))
         row = cur.fetchone()
         if not row:
             raise HTTPException(404, f"learned rule {rule_id} not found")
         conn.commit()
-    return {"ok": True, **dict(row)}
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("extractor_rule_reviewed", "extractors", {
+            "rule_id": rule_id, "action": action, "actor": x_operator,
+            "tool": row["tool"], "kind": row["kind"], "status": row["status"]})
+    except Exception:
+        pass
+    return {"ok": True, "actor": x_operator, **dict(row)}
 
 
 @app.post("/extractors/export", tags=["Extractors"])
@@ -19554,16 +19564,18 @@ def list_agent_flags(status: Optional[str] = None, engagement_id: Optional[str] 
     params.append(max(1, min(limit, 1000)))
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(f"SELECT id::text, flagging_agent, target_agent, engagement_id::text, "
-                    f"flag_type, data, status, created_at, acted_at FROM agent_flags "
+                    f"flag_type, data, status, acted_by, created_at, acted_at FROM agent_flags "
                     f"{clause} ORDER BY created_at DESC LIMIT %s", params)
         rows = [dict(r) for r in cur.fetchall()]
     return {"count": len(rows), "flags": rows}
 
 
 @app.post("/agent-flags/{flag_id}/approve", tags=["Agent Feedback"])
-def approve_agent_flag(flag_id: str, _: bool = Depends(auth)):
+def approve_agent_flag(flag_id: str,
+                       x_operator: str = Header("operator", alias="X-Operator"),
+                       _: bool = Depends(auth)):
     """Approve a flag → enqueue a scan_recommendation (recon agent dispatches it
-    through the scope gate). Records the outcome on the flag."""
+    through the scope gate). Records the actor + emits an audit event."""
     import agent_flags as af
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT id, engagement_id, data, status FROM agent_flags WHERE id = %s::uuid",
@@ -19572,22 +19584,36 @@ def approve_agent_flag(flag_id: str, _: bool = Depends(auth)):
         if not flag:
             raise HTTPException(404, f"flag {flag_id} not found")
         outcome = af.enqueue_from_flag(cur, flag)
-        cur.execute("UPDATE agent_flags SET status = %s, acted_at = now() WHERE id = %s::uuid",
-                    (outcome["status"], flag_id))
+        cur.execute("UPDATE agent_flags SET status = %s, acted_by = %s, acted_at = now() "
+                    "WHERE id = %s::uuid", (outcome["status"], x_operator, flag_id))
         conn.commit()
-    return {"ok": True, "flag_id": flag_id, **outcome}
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("agent_flag_reviewed", "agent-flags", {
+            "flag_id": flag_id, "action": "approve", "actor": x_operator, **outcome})
+    except Exception:
+        pass
+    return {"ok": True, "flag_id": flag_id, "actor": x_operator, **outcome}
 
 
 @app.post("/agent-flags/{flag_id}/dismiss", tags=["Agent Feedback"])
-def dismiss_agent_flag(flag_id: str, _: bool = Depends(auth)):
+def dismiss_agent_flag(flag_id: str,
+                       x_operator: str = Header("operator", alias="X-Operator"),
+                       _: bool = Depends(auth)):
     with get_db() as conn, conn.cursor() as cur:
-        cur.execute("UPDATE agent_flags SET status = 'dismissed', acted_at = now() "
-                    "WHERE id = %s::uuid", (flag_id,))
+        cur.execute("UPDATE agent_flags SET status = 'dismissed', acted_by = %s, acted_at = now() "
+                    "WHERE id = %s::uuid", (x_operator, flag_id))
         n = cur.rowcount
         conn.commit()
     if not n:
         raise HTTPException(404, f"flag {flag_id} not found")
-    return {"ok": True, "flag_id": flag_id, "status": "dismissed"}
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("agent_flag_reviewed", "agent-flags", {
+            "flag_id": flag_id, "action": "dismiss", "actor": x_operator})
+    except Exception:
+        pass
+    return {"ok": True, "flag_id": flag_id, "status": "dismissed", "actor": x_operator}
 
 
 @app.post("/agent-flags/drain", tags=["Agent Feedback"])
