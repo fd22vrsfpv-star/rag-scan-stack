@@ -39,16 +39,13 @@ export interface Artifact {
   /** Present only on the single-artifact fetch. */
   content?: string
   // ── Per-artifact analysis summary (list endpoint only) ──
-  /** Findings this run produced (linked by job_id). */
-  finding_count?: number | null
-  /** Distinct targets across those findings — 1 for a single-host tool. */
-  finding_targets?: number | null
-  /** The one target, when finding_targets === 1. */
-  finding_target_sample?: string | null
-  /** Host parsed from the output when no finding target exists (e.g. the host a
-   *  failed crawl attempted). */
-  attempted_host?: string | null
-  /** { info: 40, high: 1, … } */
+  /** Records in THIS file (JSONL lines / JSON array length), computed at ingest.
+   *  The honest per-file item count — not a job-wide findings join. */
+  item_count?: number | null
+  /** Primary host parsed from the file's content (or the host a failed run
+   *  attempted). */
+  content_host?: string | null
+  /** { info: 40, high: 1, … } — scoped to this tool within the job. */
   severity_counts?: Record<string, number> | null
   /** Command outcome, distinct from the LLM review status (llm_status). */
   outcome?: 'ok' | 'empty' | 'error' | null

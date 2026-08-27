@@ -176,14 +176,14 @@ export default function ScanResults() {
             </thead>
             <tbody>
               {data.artifacts.map(a => {
-                const nTargets = a.finding_targets || 0
-                // A failed run has no finding target; fall back to the host it
-                // attempted (parsed from the output) so the row still names it.
-                const targetLabel = nTargets > 1 ? `${nTargets} hosts`
-                  : (a.finding_target_sample || a.attempted_host || a.target || '—')
-                const attemptedOnly = nTargets === 0 && !a.finding_target_sample && !!a.attempted_host
+                const items = a.item_count ?? 0
+                // Single-item files name their host; a bulk file (many records)
+                // shows its OWN item count — not a job-wide host tally.
+                const targetLabel = items > 1 ? `${items} items`
+                  : (a.content_host || a.target || '—')
+                const attemptedOnly = a.outcome === 'error' && items <= 1 && !!a.content_host
                 const outcome = a.outcome || undefined
-                const showSummary = (a.finding_count || 0) > 0 || outcome === 'error'
+                const showSummary = items > 0 || outcome === 'error'
                 const open = () => setSelectedId(a.id)
                 return (
                   <Fragment key={a.id}>
@@ -267,7 +267,7 @@ export default function ScanResults() {
  *  severities — or, for a failed command, that it produced none. */
 function SummaryLine({ a }: { a: import('@/api/artifacts').Artifact }) {
   const sev = a.severity_counts || {}
-  const n = a.finding_count || 0
+  const n = a.item_count ?? 0
   const chips = SEV_ORDER.filter(s => sev[s]).map(s => (
     <span key={s} className={cn('whitespace-nowrap', SEV_COLOR[s])}>{sev[s]} {s}</span>
   ))
@@ -277,8 +277,8 @@ function SummaryLine({ a }: { a: import('@/api/artifacts').Artifact }) {
       {a.outcome === 'error' ? (
         <span className="text-red-400 flex items-center gap-1">
           <AlertTriangle className="w-3 h-3" /> run failed
-          {n > 0 ? <span className="text-gray-500">· {n} item{n === 1 ? '' : 's'} extracted before failure</span>
-                 : <span className="text-gray-500">· no items extracted</span>}
+          {n > 0 ? <span className="text-gray-500">· {n} item{n === 1 ? '' : 's'} in file</span>
+                 : <span className="text-gray-500">· no items</span>}
         </span>
       ) : (
         <>

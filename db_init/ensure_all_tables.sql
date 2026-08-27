@@ -5119,6 +5119,10 @@ CREATE TABLE IF NOT EXISTS public.raw_artifacts (
     source           text DEFAULT 'unknown',
     -- Operator-supplied label for a manually uploaded artifact ("what is this").
     note             text,
+    -- Records in THIS file (JSONL lines / JSON array length / non-blank lines),
+    -- computed at ingest. The per-artifact item count — NOT a job-wide findings
+    -- join, which over-counts when tools share a job_id.
+    item_count       integer,
     content_format   text DEFAULT 'text',
     native_json      boolean DEFAULT false,
     content          text NOT NULL,
@@ -5139,8 +5143,9 @@ CREATE TABLE IF NOT EXISTS public.raw_artifacts (
         llm_status IN ('pending','processing','done','failed','skipped'))
 );
 
--- Backfill for databases created before `note` existed (idempotent).
+-- Backfill for databases created before these columns existed (idempotent).
 ALTER TABLE public.raw_artifacts ADD COLUMN IF NOT EXISTS note text;
+ALTER TABLE public.raw_artifacts ADD COLUMN IF NOT EXISTS item_count integer;
 
 ALTER TABLE public.raw_artifacts
     DROP CONSTRAINT IF EXISTS raw_artifacts_scan_id_fkey;
