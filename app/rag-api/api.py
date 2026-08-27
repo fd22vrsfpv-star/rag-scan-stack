@@ -3529,6 +3529,12 @@ def list_artifacts(llm_status: Optional[str] = None, tool: Optional[str] = None,
         r"(socks|proxy).{0,40}(eof|refus|timeout|error)|failed after [0-9]+ attempt|"
         r"failed due to|connection refused|could not resolve|no route to host|"
         r"i/o timeout|context deadline exceeded|unreachable|unresponsive|timed out")
+    # A FAILED run produces no findings, so it has no finding-derived target — but
+    # the host it ATTEMPTED is in the output. Pull it from a bounded prefix so the
+    # row still names what was tried (katana's `"endpoint":"https://host"`, else
+    # the first URL). Used only as a fallback when no finding target exists.
+    params["hostpat1"] = r'"endpoint"\s*:\s*"https?://([^/"]+)'
+    params["hostpat2"] = r'https?://([^/"\s]+)'
     # Per-artifact analysis summary: the findings this artifact's run produced,
     # linked by job_id (recon_findings stamps data->>'job_id'; artifacts carry
     # job_id). Gives the row a target (findings hold it, the artifact does not)
@@ -3547,7 +3553,11 @@ def list_artifacts(llm_status: Optional[str] = None, tool: Optional[str] = None,
                            (llm_status = 'failed'
                             OR left(content, 6000) ~* %(failre)s
                             OR left(COALESCE(llm_result::text, ''), 6000) ~* %(failre)s
-                           ) AS cmd_error
+                           ) AS cmd_error,
+                           COALESCE(
+                             substring(left(content, 4000) from %(hostpat1)s),
+                             substring(left(content, 4000) from %(hostpat2)s)
+                           ) AS attempted_host
                       FROM raw_artifacts {clause}
                      ORDER BY created_at DESC
                      LIMIT %(limit)s OFFSET %(offset)s) ra

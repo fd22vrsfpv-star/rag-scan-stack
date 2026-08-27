@@ -177,10 +177,11 @@ export default function ScanResults() {
             <tbody>
               {data.artifacts.map(a => {
                 const nTargets = a.finding_targets || 0
-                const targetLabel = nTargets === 1 && a.finding_target_sample
-                  ? a.finding_target_sample
-                  : nTargets > 1 ? `${nTargets} hosts`
-                  : (a.target || '—')
+                // A failed run has no finding target; fall back to the host it
+                // attempted (parsed from the output) so the row still names it.
+                const targetLabel = nTargets > 1 ? `${nTargets} hosts`
+                  : (a.finding_target_sample || a.attempted_host || a.target || '—')
+                const attemptedOnly = nTargets === 0 && !a.finding_target_sample && !!a.attempted_host
                 const outcome = a.outcome || undefined
                 const showSummary = (a.finding_count || 0) > 0 || outcome === 'error'
                 const open = () => setSelectedId(a.id)
@@ -190,7 +191,13 @@ export default function ScanResults() {
                         className={cn('border-t border-gray-800 hover:bg-gray-800/40 cursor-pointer',
                                       showSummary && 'border-b-0')}>
                       <td className="px-3 py-2 font-mono align-top">{a.tool}</td>
-                      <td className="px-3 py-2 text-gray-300 align-top">{targetLabel}</td>
+                      <td className="px-3 py-2 align-top">
+                        <span className={cn(attemptedOnly ? 'text-gray-400 italic' : 'text-gray-300')}
+                              title={attemptedOnly ? 'attempted host — the run produced no findings' : undefined}>
+                          {targetLabel}
+                        </span>
+                        {attemptedOnly && <span className="text-gray-600 text-xs ml-1">(attempted)</span>}
+                      </td>
                       <td className="px-3 py-2 align-top">
                         <span className="inline-flex items-center gap-1 text-xs">
                           {a.native_json
