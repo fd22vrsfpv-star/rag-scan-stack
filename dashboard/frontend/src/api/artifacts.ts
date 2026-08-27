@@ -38,6 +38,19 @@ export interface Artifact {
   created_at: string
   /** Present only on the single-artifact fetch. */
   content?: string
+  // ── Per-artifact analysis summary (list endpoint only) ──
+  /** Findings this run produced (linked by job_id). */
+  finding_count?: number | null
+  /** Distinct targets across those findings — 1 for a single-host tool. */
+  finding_targets?: number | null
+  /** The one target, when finding_targets === 1. */
+  finding_target_sample?: string | null
+  /** { info: 40, high: 1, … } */
+  severity_counts?: Record<string, number> | null
+  /** Command outcome, distinct from the LLM review status (llm_status). */
+  outcome?: 'ok' | 'empty' | 'error' | null
+  /** True when the output/review carries a failure signature. */
+  cmd_error?: boolean | null
 }
 
 export interface ArtifactList {
