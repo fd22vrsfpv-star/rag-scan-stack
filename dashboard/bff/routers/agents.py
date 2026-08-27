@@ -83,6 +83,23 @@ async def export_extractors(tool: Optional[str] = None):
         return safe_json(resp)
 
 
+@router.get("/api/agent-activity")
+async def agent_activity(limit: int = 120, event_type: Optional[str] = None,
+                         status: Optional[str] = None):
+    """Cross-agent action timeline: proxy the webhook event-log (every agent
+    action emits an event via /webhooks/emit), newest first."""
+    s = get_settings()
+    params: dict = {"limit": max(1, min(limit, 200))}
+    if event_type:
+        params["event_type"] = event_type
+    if status:
+        params["status"] = status
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/webhooks/events", params=params,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
 @router.post("/api/extractors/analyze")
 async def analyze_extractor(body: dict):
     """Preview what a profile extracts from an artifact, and optionally send it to
