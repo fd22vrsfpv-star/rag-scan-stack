@@ -162,4 +162,27 @@ def distill_artifact(cur, tool: str, raw: str, target: str = "", port=None,
         """, (tool, json.dumps(notable), artifact_id))
         if cur.rowcount:
             result["proposed_notable"].append(notable["id"])
+
+    # Coverage check: after learning, is there STILL substantial output that no
+    # pattern consumed? That is content outside the schema — the author never
+    # anticipated it. Raise a coverage_gap flag (deduped) so it's visible/actionable.
+    try:
+        cov = es.coverage(spec, raw)
+        result["coverage"] = cov
+        if cov["residual_lines"] >= 4 and cov["coverage_pct"] < 85:
+            cur.execute("""SELECT 1 FROM agent_flags WHERE flag_type='coverage_gap'
+                           AND flagging_agent='extractor-coverage'
+                           AND data->>'tool'=%s AND status='pending' LIMIT 1""", (tool,))
+            if not cur.fetchone():
+                import agent_flags as _af
+                _af.flag_for_agent(
+                    cur, "extractor-coverage", "coverage_gap",
+                    {"tool": tool, "target": target, "coverage_pct": cov["coverage_pct"],
+                     "uncovered_lines": cov["residual_lines"],
+                     "residual_sample": cov["residual_sample"][:10],
+                     "reason": f"{cov['residual_lines']} line(s) of {tool} output "
+                               f"({100 - cov['coverage_pct']:.0f}%) match no extractor pattern"})
+                result["coverage_gap_flagged"] = True
+    except Exception as e:
+        log.warning("coverage check failed for %s: %s", tool, e)
     return result

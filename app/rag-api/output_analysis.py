@@ -258,6 +258,7 @@ def analyse_output(tool, output, exit_code=None):
     #
     # Deterministic regexes only here: an LLM pass belongs in the artifact queue,
     # not inside a function called once per execution in a review loop.
+    cover = None
     if text.strip():
         try:
             import extractor_specs as _es
@@ -272,6 +273,9 @@ def analyse_output(tool, output, exit_code=None):
                         if n["id"] not in seen:
                             seen.add(n["id"])
                             notable.append(n)
+                # How much of the output the patterns did NOT consume — the
+                # signal that this tool emitted something uncovered.
+                cover = _es.coverage(spec, text)
         except Exception as exc:            # noqa: BLE001
             extracted.setdefault("spec_error", f"{type(exc).__name__}: {exc}")
 
@@ -294,6 +298,11 @@ def analyse_output(tool, output, exit_code=None):
         "notable": notable,
         "notable_count": len(notable),
         "spec": spec_used,
+        "coverage": cover,
+        # A profiled tool whose patterns left substantial residual has emitted
+        # something the profile does not cover — worth a new pattern.
+        "uncovered": bool(cover and cover["residual_lines"] >= 4
+                          and cover["coverage_pct"] < 85),
         "output_bytes": len(text),
         # An LLM pass is worth spending only where rules found nothing but
         # there is clearly something to read.
