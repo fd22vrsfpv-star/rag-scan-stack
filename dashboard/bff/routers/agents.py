@@ -23,6 +23,66 @@ async def agents_status():
         return safe_json(resp)
 
 
+# ── Agent Feedback channel (agent_flags) ───────────────────────────────
+
+@router.get("/api/agent-flags")
+async def list_agent_flags(status: Optional[str] = None, engagement_id: Optional[str] = None):
+    s = get_settings()
+    params = {k: v for k, v in (("status", status), ("engagement_id", engagement_id)) if v}
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/agent-flags", params=params,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.post("/api/agent-flags/{flag_id}/{action}")
+async def act_agent_flag(flag_id: str, action: str):
+    if action not in ("approve", "dismiss"):
+        raise HTTPException(400, "action must be approve or dismiss")
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.post(f"{s.rag_api_url}/agent-flags/{flag_id}/{action}",
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+# ── Self-adapting extractors (extractor_learned) ────────────────────────
+
+@router.get("/api/extractors/learned")
+async def list_extractors_learned(status: Optional[str] = None, tool: Optional[str] = None):
+    s = get_settings()
+    params = {k: v for k, v in (("status", status), ("tool", tool)) if v}
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/extractors/learned", params=params,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.post("/api/extractors/learned/{rule_id}/{action}")
+async def review_extractor_learned(rule_id: str, action: str):
+    if action not in ("approve", "reject"):
+        raise HTTPException(400, "action must be approve or reject")
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.post(f"{s.rag_api_url}/extractors/learned/{rule_id}/{action}",
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.post("/api/extractors/export")
+async def export_extractors(tool: Optional[str] = None):
+    s = get_settings()
+    params = {"tool": tool} if tool else {}
+    async with httpx.AsyncClient(timeout=TIMEOUT_LONG) as c:
+        resp = await c.post(f"{s.rag_api_url}/extractors/export", params=params,
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
 # ── Gap Analysis ───────────────────────────────────────────────────────
 
 @router.post("/api/gap-analysis/{eid}")
