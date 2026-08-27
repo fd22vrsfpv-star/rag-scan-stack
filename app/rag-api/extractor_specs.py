@@ -491,6 +491,59 @@ def run_deterministic(spec: dict, output: str) -> Dict[str, Any]:
     return got
 
 
+# ── coverage: what the patterns did NOT consume ─────────────────────────────
+# Lines that are noise, not uncovered data: separators, progress bars, tool
+# banners, timestamps. Residual after removing these is genuinely unexplained.
+_COVERAGE_NOISE = re.compile(
+    r"^(?:[-=_*#~.\s]+|\[[*+\-!i]\].*|\d{1,2}:\d{2}(?::\d{2})?.*|"
+    r"(?:starting|running|scanning|progress|elapsed|done|finished|completed)\b.*|"
+    r"v?\d+\.\d+(?:\.\d+)?\s*$)", re.IGNORECASE)
+
+
+def coverage(spec: dict, output: str) -> Dict[str, Any]:
+    """How much of the output the deterministic patterns actually consumed, and
+    the residual — the non-trivial lines NO pattern matched. Substantial residual
+    is the signal that the tool emitted something the profile does not cover yet
+    (a new field/finding the author never anticipated), which is exactly what a
+    schema-field diff cannot see. Line-granular and approximate on purpose: it is
+    a screening signal, not a parser."""
+    text = output or ""
+    lines = text.splitlines()
+    matched: set = set()
+    for decl in (spec.get("deterministic") or {}).values():
+        pattern = decl.get("pattern") if isinstance(decl, dict) else decl
+        if not pattern:
+            continue
+        try:
+            rx = re.compile(pattern, re.M | re.I)
+        except re.error:
+            continue
+        for m in rx.finditer(text):
+            first = text.count("\n", 0, m.start())
+            last = text.count("\n", 0, m.end())
+            for i in range(first, last + 1):
+                matched.add(i)
+    residual, substantive = [], 0
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if not s or i in matched:
+            continue
+        if _COVERAGE_NOISE.match(s):
+            continue
+        substantive += 1
+        if len(residual) < 25:
+            residual.append(s[:200])
+    total = sum(1 for ln in lines if ln.strip())
+    cov_pct = round(100.0 * (1 - substantive / total), 1) if total else 100.0
+    return {
+        "total_lines": total,
+        "matched_lines": len(matched),
+        "residual_lines": substantive,
+        "coverage_pct": cov_pct,
+        "residual_sample": residual,
+    }
+
+
 # ── prompt + result validation ──────────────────────────────────────────────
 
 def build_prompt(spec: dict, tool: str, target: str, port, command: str,
