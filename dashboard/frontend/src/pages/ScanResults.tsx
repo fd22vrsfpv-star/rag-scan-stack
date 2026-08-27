@@ -1,14 +1,14 @@
 import { useState, useMemo, useEffect, useRef } from 'react'
 import {
   useArtifacts, useArtifactStats, useArtifact, useArtifactActions,
-  useQueueActions, useAutoQueueSetting, useSetAutoQueue, formatBytes,
+  useQueueActions, useAutoQueueSetting, useSetAutoQueue, useUploadArtifact, formatBytes,
   type ArtifactAction, type CustomAction,
 } from '@/api/artifacts'
 import { useAnalyzeExtractor, type ExtractorAnalyze } from '@/api/agents'
 import {
   FileText, Braces, Loader2, Search, X, Copy, Check, Download, Play,
   AlertTriangle, CheckCircle2, Clock, Zap, RefreshCw, ChevronRight, Sparkles,
-  Pencil, Plus, Bot, RotateCcw, Wand2, Lightbulb, ArrowRight,
+  Pencil, Plus, Bot, RotateCcw, Wand2, Lightbulb, ArrowRight, Upload,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -55,6 +55,7 @@ export default function ScanResults() {
   const [filters, setFilters] = useState<{ tool?: string; target?: string; llm_status?: string; content_format?: string }>({})
   const [page, setPage] = useState(0)
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [showUpload, setShowUpload] = useState(false)
   const PAGE_SIZE = 25
 
   const { data, isLoading } = useArtifacts({ ...filters, limit: PAGE_SIZE, offset: page * PAGE_SIZE })
@@ -124,7 +125,11 @@ export default function ScanResults() {
             <X className="w-3 h-3" /> Clear
           </button>
         )}
-        <div className="ml-auto text-xs text-gray-500">
+        <button onClick={() => setShowUpload(true)}
+                className="ml-auto px-3 py-1.5 bg-blue-600/80 hover:bg-blue-600 rounded text-sm flex items-center gap-1.5">
+          <Upload className="w-4 h-4" /> Upload output
+        </button>
+        <div className="text-xs text-gray-500">
           {data ? `${data.total} result${data.total === 1 ? '' : 's'}` : ''}
         </div>
       </div>
@@ -196,6 +201,12 @@ export default function ScanResults() {
       )}
 
       {selectedId && <DetailDrawer id={selectedId} onClose={() => setSelectedId(null)} />}
+      {showUpload && (
+        <UploadModal
+          onClose={() => setShowUpload(false)}
+          onUploaded={(id) => { setShowUpload(false); setSelectedId(id) }}
+        />
+      )}
     </div>
   )
 }
@@ -222,6 +233,120 @@ function Select({ value, onChange, options, placeholder }: {
 }
 
 /** Detail view: the complete output, plus what to do next. */
+/** Upload a scan output file for analysis. The operator names the tool that
+ *  produced it and (optionally) a note for what it is; the file text is read in
+ *  the browser and stored as a raw artifact. On success we open it straight on
+ *  the Extract & Learn tab so it can be analysed / taught immediately. */
+function UploadModal({ onClose, onUploaded }: { onClose: () => void; onUploaded: (id: string) => void }) {
+  const upload = useUploadArtifact()
+  const [tool, setTool] = useState('')
+  const [target, setTarget] = useState('')
+  const [note, setNote] = useState('')
+  const [content, setContent] = useState('')
+  const [fileName, setFileName] = useState('')
+  const [err, setErr] = useState<string | null>(null)
+
+  async function pickFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0]
+    if (!f) return
+    setErr(null)
+    try {
+      const text = await f.text()
+      setContent(text)
+      setFileName(f.name)
+      // Offer a tool name from the filename stem if the operator hasn't typed one.
+      if (!tool) {
+        const stem = f.name.replace(/\.[^.]+$/, '').split(/[._-]/)[0]
+        if (stem) setTool(stem.toLowerCase())
+      }
+    } catch (e: any) { setErr(`Could not read file: ${e?.message || e}`) }
+  }
+
+  async function submit() {
+    setErr(null)
+    if (!tool.trim()) { setErr('Tool name is required.'); return }
+    if (!content.trim()) { setErr('Choose a file or paste the output.'); return }
+    try {
+      const res = await upload.mutateAsync({
+        tool: tool.trim(), content,
+        target: target.trim() || undefined,
+        note: note.trim() || undefined,
+        command: fileName ? `upload:${fileName}` : undefined,
+      })
+      onUploaded(res.artifact_id)
+    } catch (e: any) { setErr(String(e?.message || e)) }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-gray-950 border border-gray-800 rounded-lg w-full max-w-2xl max-h-[90vh] overflow-y-auto"
+           onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between border-b border-gray-800 p-4">
+          <h2 className="text-lg font-semibold flex items-center gap-2">
+            <Upload className="w-5 h-5 text-blue-400" /> Upload output for analysis
+          </h2>
+          <button onClick={onClose} className="text-gray-500 hover:text-white"><X className="w-5 h-5" /></button>
+        </div>
+
+        <div className="p-4 space-y-4">
+          <p className="text-xs text-gray-400">
+            Bring in output captured elsewhere. It's stored like any scan result — then you can
+            open <span className="text-gray-300">Extract &amp; Learn</span> to see what's extracted
+            and teach new rules, or process it in the LLM review queue.
+          </p>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-xs text-gray-400 space-y-1">
+              <span>Tool name <span className="text-red-400">*</span></span>
+              <input value={tool} onChange={e => setTool(e.target.value)}
+                     placeholder="e.g. snmpwalk, smbmap, gobuster"
+                     className="w-full bg-black border border-gray-700 rounded px-2 py-1.5 text-sm text-gray-200 font-mono" />
+            </label>
+            <label className="text-xs text-gray-400 space-y-1">
+              <span>Target (optional)</span>
+              <input value={target} onChange={e => setTarget(e.target.value)}
+                     placeholder="e.g. 10.0.0.5 or host.example.com"
+                     className="w-full bg-black border border-gray-700 rounded px-2 py-1.5 text-sm text-gray-200 font-mono" />
+            </label>
+          </div>
+
+          <label className="text-xs text-gray-400 space-y-1 block">
+            <span>Note — what is this? (optional)</span>
+            <input value={note} onChange={e => setNote(e.target.value)}
+                   placeholder="e.g. SNMP walk of the DMZ jump host, community 'public'"
+                   className="w-full bg-black border border-gray-700 rounded px-2 py-1.5 text-sm text-gray-200" />
+          </label>
+
+          <div className="space-y-1">
+            <div className="flex items-center gap-2 text-xs text-gray-400">
+              <label className="px-2 py-1.5 bg-gray-800 hover:bg-gray-700 rounded cursor-pointer flex items-center gap-1.5">
+                <FileText className="w-3.5 h-3.5" /> Choose file
+                <input type="file" className="hidden" onChange={pickFile} />
+              </label>
+              {fileName && <span className="text-gray-300 font-mono truncate">{fileName}</span>}
+              {content && <span className="ml-auto text-gray-500">{formatBytes(new Blob([content]).size)}</span>}
+            </div>
+            <textarea value={content} onChange={e => { setContent(e.target.value); if (!fileName) setFileName('') }}
+                      placeholder="…or paste the raw tool output here"
+                      className="w-full h-40 bg-black border border-gray-700 rounded p-2 text-xs font-mono text-gray-200 placeholder:text-gray-600 resize-y" />
+          </div>
+
+          {err && <div className="text-xs text-red-300 bg-black border border-red-900/40 rounded p-2 break-words">{err}</div>}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 border-t border-gray-800 p-4">
+          <button onClick={onClose} className="px-3 py-1.5 text-sm text-gray-400 hover:text-white">Cancel</button>
+          <button onClick={submit} disabled={upload.isPending}
+                  className="px-3 py-1.5 bg-blue-600/80 hover:bg-blue-600 disabled:opacity-50 rounded text-sm flex items-center gap-2">
+            {upload.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+            {upload.isPending ? 'Uploading…' : 'Upload & open'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
   const { data: artifact, isLoading } = useArtifact(id)
   const [tab, setTab] = useState<'review' | 'output' | 'actions' | 'learn'>('review')
@@ -279,6 +404,11 @@ function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
               <p className="text-sm text-gray-400 truncate">{artifact?.target}</p>
               {artifact?.command && (
                 <p className="text-xs text-gray-600 font-mono mt-1 truncate">$ {artifact.command}</p>
+              )}
+              {artifact?.note && (
+                <p className="text-xs text-blue-300/80 mt-1 flex items-center gap-1">
+                  <Lightbulb className="w-3 h-3 shrink-0" /> {artifact.note}
+                </p>
               )}
             </div>
             <button onClick={onClose} className="text-gray-500 hover:text-white">
