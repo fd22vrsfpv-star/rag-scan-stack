@@ -38,6 +38,7 @@ Coverage gaps ("this service was never scanned at all") belong to `gap_agent`
 and are deliberately not re-derived here. This module reviews work that RAN.
 """
 import json
+import logging
 import os
 import re
 import uuid
@@ -1094,6 +1095,60 @@ def run_post_review(triggered_by="manual", since_days=None, target=None,
 
 # ── ingest: turn extracted facts into findings anybody can query ────────────
 
+def _rag_ingest_analysis(findings: list) -> int:
+    """Push a per-(tool,target) analysis summary into the RAG vector store via
+    scan_recommender /rag/service-docs/ingest (doc_kind='tool_analysis'), so the
+    deterministic analysis is retrievable by scan_recommender/agents through
+    /rag/ask. Best-effort; deduped by the endpoint's sha256 cache."""
+    import os
+    import requests
+    import urllib3
+    urllib3.disable_warnings()
+    url = os.environ.get("SCAN_RECOMMENDER_URL", "https://scan-recommender:8013").rstrip("/")
+    # scan-recommender serves TLS; a stray http:// in the env yields a
+    # RemoteDisconnected (plain HTTP to a TLS port), so normalise the scheme.
+    if url.startswith("http://scan-recommender"):
+        url = "https://" + url[len("http://"):]
+    key = os.environ.get("API_KEY", "changeme")
+    log = logging.getLogger("post_review_agent")
+    groups: dict = {}
+    for p in findings:
+        groups.setdefault((p["source"], p["target"]), []).append(p)
+    sent = 0
+    for (tool, tgt), facts in groups.items():
+        lines = [f"# {tool} analysis — {tgt}", ""]
+        for f in facts:
+            d = f.get("data") or {}
+            detail = (d.get("detail") or "").strip()
+            lines.append(f"- [{f['severity']}] {d.get('title', f['finding_type'])}"
+                         + (f": {detail}" if detail else ""))
+        # The ingest endpoint requires a scope (service/port/tech). Scope by the
+        # tool as `tech`, plus any port/service a fact carries, so retrieval can
+        # target it.
+        body = {"title": f"Analysis: {tool} on {tgt}", "content": "\n".join(lines),
+                "doc_kind": "tool_analysis", "tech": tool}
+        for f in facts:
+            d = f.get("data") or {}
+            if d.get("port"):
+                try:
+                    body["port"] = int(d["port"]); break
+                except (TypeError, ValueError):
+                    pass
+        for f in facts:
+            if (f.get("data") or {}).get("service"):
+                body["service"] = f["data"]["service"]; break
+        try:
+            r = requests.post(f"{url}/rag/service-docs/ingest", json=body,
+                              headers={"x-api-key": key}, verify=False, timeout=30)
+            if r.status_code < 400:
+                sent += 1
+            else:
+                log.warning("rag ingest %s/%s HTTP %s", tool, tgt, r.status_code)
+        except Exception as e:
+            log.warning("rag ingest %s/%s failed: %s", tool, tgt, e)
+    return sent
+
+
 def ingest_extracted_facts(cur, dry_run=True, limit=4000, target=None):
     """Write extracted facts to `recon_findings` with a REAL finding_type.
 
@@ -1184,6 +1239,7 @@ def ingest_extracted_facts(cur, dry_run=True, limit=4000, target=None):
         (existing if cur.fetchone() else new).append(p)
 
     inserted = 0
+    rag_ingested = 0
     if not dry_run:
         for p in new:
             cur.execute("""
@@ -1195,6 +1251,12 @@ def ingest_extracted_facts(cur, dry_run=True, limit=4000, target=None):
                   p["severity"]))
             inserted += 1
         cur.connection.commit()
+        # Feed the structured analysis into the RAG vector store so
+        # scan_recommender/agents can retrieve it (doc_kind='tool_analysis').
+        try:
+            rag_ingested = _rag_ingest_analysis(new)
+        except Exception as e:
+            logging.getLogger("post_review_agent").warning("rag ingest failed: %s", e)
 
     from etl.severity import severity_rank
     by_sev = {}
@@ -1206,6 +1268,7 @@ def ingest_extracted_facts(cur, dry_run=True, limit=4000, target=None):
         "new": len(new),
         "already_stored": len(existing),
         "inserted": inserted,
+        "rag_ingested": rag_ingested,
         "dry_run": dry_run,
         "skipped_no_target": skipped_no_target,
         "by_severity": dict(sorted(by_sev.items(),
