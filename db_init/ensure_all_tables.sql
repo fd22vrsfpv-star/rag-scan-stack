@@ -2738,6 +2738,7 @@ CREATE TABLE IF NOT EXISTS public.extractor_learned (
     confidence        numeric,
     source            text NOT NULL DEFAULT 'distilled',
     sample_artifact_id uuid,
+    reviewed_by       text,               -- audit: who approved/rejected
     created_at        timestamptz DEFAULT now(),
     updated_at        timestamptz DEFAULT now(),
     approved_at       timestamptz
@@ -2767,6 +2768,7 @@ CREATE TABLE IF NOT EXISTS public.agent_flags (
     data            jsonb NOT NULL DEFAULT '{}'::jsonb,
     status          text NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending','acknowledged','acted','dismissed')),
+    acted_by        text,               -- audit: who approved/dismissed
     created_at      timestamptz DEFAULT now(),
     acted_at        timestamptz
 );

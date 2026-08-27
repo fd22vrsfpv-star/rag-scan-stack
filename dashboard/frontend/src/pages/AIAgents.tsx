@@ -4,7 +4,8 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/api/client'
 import {
   useAgentsStatus, useGapReport, useTriggerGapAnalysis, useAutoFillGaps,
-  useDrainArtifacts,
+  useDrainArtifacts, useAgentFlags, useActAgentFlag,
+  useLearnedExtractors, useReviewExtractor, useExportExtractors,
   type AgentInfo, type GapReport, type GapTargetDetail,
 } from '@/api/agents'
 import { useUIStore } from '@/stores/ui'
@@ -12,7 +13,7 @@ import { cn } from '@/lib/utils'
 import {
   Bot, Cpu, Search, Shield, Loader2, Play, ExternalLink,
   CheckCircle2, XCircle, RefreshCw, Zap, Settings, Clock, Cloud,
-  FileSearch, ShieldCheck, Globe,
+  FileSearch, ShieldCheck, Globe, MessageSquare, Wand2,
 } from 'lucide-react'
 
 const AGENT_ICONS: Record<string, typeof Bot> = {
@@ -128,9 +129,148 @@ export default function AIAgents() {
         </div>
       )}
 
+      <AgentFlagsPanel />
+      <LearnedExtractorsPanel />
+
       {selectedEngagement && (
         <GapAnalysisPanel engagementId={selectedEngagement} />
       )}
+    </div>
+  )
+}
+
+
+function AgentFlagsPanel() {
+  const { data } = useAgentFlags()
+  const act = useActAgentFlag()
+  const flags = data?.flags ?? []
+  const pending = flags.filter(f => f.status === 'pending')
+  const recent = flags.filter(f => f.status !== 'pending').slice(0, 8)
+  if (!flags.length) return null
+  return (
+    <div className="bg-card border border-border rounded-lg p-3 space-y-2">
+      <h3 className="text-sm font-semibold flex items-center gap-2">
+        <MessageSquare className="h-4 w-4" /> Agent Feedback — flags for review
+        {pending.length > 0 && (
+          <span className="px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-400 text-[10px]">{pending.length} pending</span>
+        )}
+      </h3>
+      <p className="text-[11px] text-muted-foreground">
+        One agent flags something worth another run. Approving queues a scope-gated follow-up scan; every action is audited (who + when).
+      </p>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[720px] text-xs">
+          <thead className="text-muted-foreground">
+            <tr className="border-b border-border">
+              <th className="text-left py-1 px-2">From</th><th className="text-left px-2">Type</th>
+              <th className="text-left px-2">Target</th><th className="text-left px-2">Scanner</th>
+              <th className="text-left px-2">Reason</th><th className="text-left px-2">Status</th>
+              <th className="text-right px-2">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {[...pending, ...recent].map(f => (
+              <tr key={f.id} className="border-b border-border/40">
+                <td className="py-1 px-2 font-mono">{f.flagging_agent}</td>
+                <td className="px-2">{f.flag_type}</td>
+                <td className="px-2 font-mono truncate max-w-[180px]" title={f.data?.target}>{f.data?.target || '—'}</td>
+                <td className="px-2">{f.data?.scanner || '—'}</td>
+                <td className="px-2 truncate max-w-[200px]" title={f.data?.reason}>{f.data?.reason || '—'}</td>
+                <td className="px-2">
+                  <span className={cn('px-1.5 py-0.5 rounded text-[10px]',
+                    f.status === 'pending' ? 'bg-amber-500/10 text-amber-400'
+                    : f.status === 'acted' ? 'bg-green-500/10 text-green-400'
+                    : 'bg-muted text-muted-foreground')}>{f.status}</span>
+                  {f.acted_by && <span className="ml-1 text-[10px] text-muted-foreground">by {f.acted_by}</span>}
+                </td>
+                <td className="px-2 text-right">
+                  {f.status === 'pending' && (
+                    <span className="inline-flex gap-1">
+                      <button onClick={() => act.mutate({ id: f.id, action: 'approve' })} disabled={act.isPending}
+                        className="px-2 py-0.5 text-[10px] rounded bg-green-600 hover:bg-green-500 text-white">Approve</button>
+                      <button onClick={() => act.mutate({ id: f.id, action: 'dismiss' })} disabled={act.isPending}
+                        className="px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">Dismiss</button>
+                    </span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+
+function LearnedExtractorsPanel() {
+  const { data } = useLearnedExtractors()
+  const review = useReviewExtractor()
+  const exp = useExportExtractors()
+  const rows = data?.learned ?? []
+  const proposed = rows.filter(r => r.status === 'proposed')
+  const active = rows.filter(r => r.status === 'active')
+  if (!rows.length) return null
+  return (
+    <div className="bg-card border border-border rounded-lg p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold flex items-center gap-2">
+          <Wand2 className="h-4 w-4" /> Learned Extractors
+          {proposed.length > 0 && (
+            <span className="px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-400 text-[10px]">{proposed.length} to review</span>
+          )}
+          <span className="px-1.5 py-0.5 rounded-full bg-green-500/10 text-green-400 text-[10px]">{active.length} active</span>
+        </h3>
+        <button onClick={() => exp.mutate(undefined)} disabled={exp.isPending}
+          className="h-6 px-2 text-[10px] rounded border border-border hover:bg-accent">
+          {exp.isPending ? 'Exporting…' : 'Export active → YAML'}
+        </button>
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        Deterministic regex rules are auto-applied (read-only); proposed FINDING rules fire only after you approve. Actions are audited.
+      </p>
+      {exp.data?.yaml && Object.keys(exp.data.yaml).length > 0 && (
+        <pre className="bg-black border border-border rounded p-2 text-[10px] font-mono max-h-48 overflow-auto whitespace-pre-wrap">
+          {Object.values(exp.data.yaml).join('\n---\n')}
+        </pre>
+      )}
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[720px] text-xs">
+          <thead className="text-muted-foreground">
+            <tr className="border-b border-border">
+              <th className="text-left py-1 px-2">Tool</th><th className="text-left px-2">Kind</th>
+              <th className="text-left px-2">Rule</th><th className="text-left px-2">Status</th>
+              <th className="text-right px-2">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {[...proposed, ...active.slice(0, 20)].map(r => (
+              <tr key={r.id} className="border-b border-border/40">
+                <td className="py-1 px-2 font-mono">{r.tool}</td>
+                <td className="px-2">{r.kind}</td>
+                <td className="px-2 font-mono truncate max-w-[320px]" title={JSON.stringify(r.rule)}>
+                  {r.rule?.id || Object.keys(r.rule || {}).join(', ')}
+                </td>
+                <td className="px-2">
+                  <span className={cn('px-1.5 py-0.5 rounded text-[10px]',
+                    r.status === 'active' ? 'bg-green-500/10 text-green-400' : 'bg-amber-500/10 text-amber-400')}>{r.status}</span>
+                  {r.reviewed_by && <span className="ml-1 text-[10px] text-muted-foreground">by {r.reviewed_by}</span>}
+                </td>
+                <td className="px-2 text-right">
+                  {r.status === 'proposed' && (
+                    <span className="inline-flex gap-1">
+                      <button onClick={() => review.mutate({ id: r.id, action: 'approve' })} disabled={review.isPending}
+                        className="px-2 py-0.5 text-[10px] rounded bg-green-600 hover:bg-green-500 text-white">Approve</button>
+                      <button onClick={() => review.mutate({ id: r.id, action: 'reject' })} disabled={review.isPending}
+                        className="px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">Reject</button>
+                    </span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }

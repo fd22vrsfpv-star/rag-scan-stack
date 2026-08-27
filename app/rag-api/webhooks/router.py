@@ -521,6 +521,9 @@ _ALL_EVENT_TYPES = [
     "stage_started", "stage_completed", "stage_failed",
     "finding_high", "finding_critical", "finding_exploitable",
     "ingest_completed",
+    # Audit trail for operator/agent review actions (self-adapting extractors +
+    # agent-to-agent feedback). Captured in webhook_events as an append-only log.
+    "extractor_rule_reviewed", "agent_flag_reviewed", "agent_flag",
 ]
 
 

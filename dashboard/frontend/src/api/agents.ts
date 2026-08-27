@@ -216,3 +216,83 @@ export function useModelPerformanceWarning() {
     staleTime: 30000, // Cache for 30s to avoid repeated calls
   })
 }
+
+// ── Review queues (agent flags + learned extractors) ──────────────────────
+// The dashboard identifies its actions as 'dashboard' for the audit trail; the
+// backend stamps acted_by/reviewed_by and emits an *_reviewed webhook event.
+const ACTOR_HEADER = { 'X-Operator': 'dashboard' }
+
+export interface AgentFlag {
+  id: string
+  flagging_agent: string
+  target_agent?: string | null
+  engagement_id?: string | null
+  flag_type: string
+  data: Record<string, any>
+  status: 'pending' | 'acknowledged' | 'acted' | 'dismissed'
+  acted_by?: string | null
+  created_at: string
+  acted_at?: string | null
+}
+
+export function useAgentFlags(status?: string) {
+  const params = status ? `?status=${status}` : ''
+  return useQuery({
+    queryKey: ['agent-flags', status ?? 'all'],
+    queryFn: () => apiFetch<{ count: number; flags: AgentFlag[] }>(`/agent-flags${params}`),
+    refetchInterval: POLL.NORMAL,
+  })
+}
+
+export function useActAgentFlag() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, action }: { id: string; action: 'approve' | 'dismiss' }) =>
+      apiFetch<{ ok: boolean; status?: string; reason?: string }>(
+        `/agent-flags/${id}/${action}`, { method: 'POST', headers: ACTOR_HEADER }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['agent-flags'] })
+      qc.invalidateQueries({ queryKey: ['agents-status'] })
+    },
+  })
+}
+
+export interface LearnedExtractor {
+  id: string
+  tool: string
+  kind: 'deterministic' | 'notable' | 'follow_on'
+  rule: Record<string, any>
+  status: 'active' | 'proposed' | 'rejected'
+  confidence?: number | null
+  source: string
+  reviewed_by?: string | null
+  created_at: string
+  approved_at?: string | null
+}
+
+export function useLearnedExtractors(status?: string) {
+  const params = status ? `?status=${status}` : ''
+  return useQuery({
+    queryKey: ['extractors-learned', status ?? 'all'],
+    queryFn: () => apiFetch<{ count: number; learned: LearnedExtractor[] }>(`/extractors/learned${params}`),
+    refetchInterval: POLL.SLOW,
+  })
+}
+
+export function useReviewExtractor() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, action }: { id: string; action: 'approve' | 'reject' }) =>
+      apiFetch<{ ok: boolean; status: string }>(
+        `/extractors/learned/${id}/${action}`, { method: 'POST', headers: ACTOR_HEADER }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['extractors-learned'] }),
+  })
+}
+
+export function useExportExtractors() {
+  return useMutation({
+    mutationFn: (tool?: string) =>
+      apiFetch<{ ok: boolean; tools: string[]; yaml: Record<string, string> }>(
+        `/extractors/export${tool ? `?tool=${tool}` : ''}`, { method: 'POST' }),
+  })
+}
