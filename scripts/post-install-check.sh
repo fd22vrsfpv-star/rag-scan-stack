@@ -256,14 +256,14 @@ else
   warn "scan_recommendations.priority check skipped (no DB connection helper available)"
 fi
 
-# raw_artifacts.note — operator label for manually uploaded artifacts (Scan Results → Upload output)
-HAS_ARTIFACT_NOTE=$(_run_sql "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='raw_artifacts' AND column_name='note')")
-if [[ "$HAS_ARTIFACT_NOTE" == "t" ]]; then
-  pass "raw_artifacts.note column present"
-elif [[ "$HAS_ARTIFACT_NOTE" == "f" ]]; then
-  fail "raw_artifacts.note missing — run ./scripts/ensure_db_schema.sh"
+# raw_artifacts.note / item_count — upload label + per-file item count (Scan Results)
+HAS_ARTIFACT_COLS=$(_run_sql "SELECT (count(*) = 2)::text FROM information_schema.columns WHERE table_name='raw_artifacts' AND column_name IN ('note','item_count')")
+if [[ "$HAS_ARTIFACT_COLS" == "true" ]]; then
+  pass "raw_artifacts.note + item_count columns present"
+elif [[ "$HAS_ARTIFACT_COLS" == "false" ]]; then
+  fail "raw_artifacts.note/item_count missing — run ./scripts/ensure_db_schema.sh"
 else
-  warn "raw_artifacts.note check skipped (no DB connection helper available)"
+  warn "raw_artifacts.note/item_count check skipped (no DB connection helper available)"
 fi
 
 # idx_assets_engagement_ip — G3 discovery scan-loop hot lookup

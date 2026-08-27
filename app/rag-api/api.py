@@ -1889,6 +1889,34 @@ def get_open_ports(
 ARTIFACT_MAX_BYTES = int(os.environ.get("ARTIFACT_MAX_BYTES", str(64 * 1024 * 1024)))
 
 
+def _count_items(content: str, fmt: str) -> int:
+    """How many records THIS file holds — the honest per-artifact item count.
+
+    A job-wide findings join over-counts badly: tools share a job_id, so a 514-byte
+    crtsh file inherited a sibling dnsx run's 1996 hosts. The file itself is the
+    source of truth: JSONL lines, a JSON array's length (or a wrapped list), else
+    non-blank lines. Computed once at ingest so the list never rescans 64 MB rows."""
+    s = content or ""
+    if not s.strip():
+        return 0
+    if fmt == "jsonl":
+        return sum(1 for ln in s.splitlines() if ln.strip())
+    if fmt == "json":
+        try:
+            v = json.loads(s)
+        except Exception:
+            v = None
+        if isinstance(v, list):
+            return len(v)
+        if isinstance(v, dict):
+            for k in ("results", "data", "findings", "hosts", "subdomains",
+                      "ports", "urls", "items"):
+                if isinstance(v.get(k), list):
+                    return len(v[k])
+            return 1
+    return sum(1 for ln in s.splitlines() if ln.strip())
+
+
 def _store_artifact_row(*, tool: str, content: str, command: str = None,
                         target: str = None, port: int = None, service: str = None,
                         exec_id: str = None, job_id: str = None, scan_id: str = None,
@@ -1899,14 +1927,15 @@ def _store_artifact_row(*, tool: str, content: str, command: str = None,
     upload chokepoint so the two paths cannot drift apart."""
     sha = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
     fmt = content_format or _detect_content_format(content)
+    item_count = _count_items(content, fmt)
     with get_db() as conn, conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO raw_artifacts
                 (engagement_id, tool, command, target, port, service, exec_id,
-                 job_id, scan_id, source, note, content_format, native_json, content,
-                 content_sha256, byte_size)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 job_id, scan_id, source, note, item_count, content_format,
+                 native_json, content, content_sha256, byte_size)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (tool, COALESCE(target,''), content_sha256) DO UPDATE
                SET last_seen    = now(),
                    occurrences  = raw_artifacts.occurrences + 1,
@@ -1914,11 +1943,12 @@ def _store_artifact_row(*, tool: str, content: str, command: str = None,
                    job_id       = COALESCE(EXCLUDED.job_id, raw_artifacts.job_id),
                    scan_id      = COALESCE(EXCLUDED.scan_id, raw_artifacts.scan_id),
                    command      = COALESCE(EXCLUDED.command, raw_artifacts.command),
-                   note         = COALESCE(EXCLUDED.note, raw_artifacts.note)
+                   note         = COALESCE(EXCLUDED.note, raw_artifacts.note),
+                   item_count   = EXCLUDED.item_count
             RETURNING id, (xmax = 0) AS inserted, occurrences
             """,
             (engagement_id, tool, command, target, port, service, exec_id, job_id,
-             scan_id, source, note, fmt, native_json, content, sha,
+             scan_id, source, note, item_count, fmt, native_json, content, sha,
              len(content.encode("utf-8", "replace"))),
         )
         row = cur.fetchone()
@@ -3513,8 +3543,8 @@ def list_artifacts(llm_status: Optional[str] = None, tool: Optional[str] = None,
         params["target"] = f"%{target}%"
     clause = ("WHERE " + " AND ".join(where)) if where else ""
     cols = ("id, tool, command, target, port, service, exec_id, job_id, scan_id, "
-            "source, note, content_format, native_json, content_sha256, byte_size, "
-            "first_seen, last_seen, occurrences, llm_status, llm_model, "
+            "source, note, item_count, content_format, native_json, content_sha256, "
+            "byte_size, first_seen, last_seen, occurrences, llm_status, llm_model, "
             "llm_processed_at, llm_attempts, llm_error, created_at")
     if include_content:
         cols += ", content"
@@ -3529,25 +3559,26 @@ def list_artifacts(llm_status: Optional[str] = None, tool: Optional[str] = None,
         r"(socks|proxy).{0,40}(eof|refus|timeout|error)|failed after [0-9]+ attempt|"
         r"failed due to|connection refused|could not resolve|no route to host|"
         r"i/o timeout|context deadline exceeded|unreachable|unresponsive|timed out")
-    # A FAILED run produces no findings, so it has no finding-derived target — but
-    # the host it ATTEMPTED is in the output. Pull it from a bounded prefix so the
-    # row still names what was tried (katana's `"endpoint":"https://host"`, else
-    # the first URL). Used only as a fallback when no finding target exists.
-    params["hostpat1"] = r'"endpoint"\s*:\s*"https?://([^/"]+)'
+    # The file's primary host, pulled from a bounded prefix so a single-record
+    # file names its subject and a failed run names what it attempted. Covers the
+    # common JSON host fields (dnsx `host`, crtsh `common_name`, subfinder
+    # `input`, katana `endpoint` URL), else the first URL.
+    params["hostpat1"] = (r'"(?:host|input|url|endpoint|common_name|name_value|'
+                          r'domain|subdomain|fqdn)"\s*:\s*"(?:https?://)?([^"/,\s]+)')
     params["hostpat2"] = r'https?://([^/"\s]+)'
-    # Per-artifact analysis summary: the findings this artifact's run produced,
-    # linked by job_id (recon_findings stamps data->>'job_id'; artifacts carry
-    # job_id). Gives the row a target (findings hold it, the artifact does not)
-    # and a severity breakdown. LATERAL so only the page's rows aggregate; the
-    # functional index idx_recon_findings_job_id keeps each lookup cheap.
+    # Per-artifact summary. The item COUNT is the file's own record count
+    # (item_count, computed at ingest) — a job_id findings join over-counts,
+    # because tools share a job_id (a 514-byte crtsh file inherited a sibling
+    # dnsx run's 1996 hosts). Severity is still drawn from findings but scoped to
+    # THIS tool within the job so it cannot bleed. content_host names the file's
+    # primary/attempted host. LATERAL so only the page's rows aggregate.
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(f"SELECT count(*) n FROM raw_artifacts {clause}", params)
         total = cur.fetchone()["n"]
         cur.execute(f"""
-            SELECT ra.*, s.finding_count, s.finding_targets,
-                   s.finding_target_sample, s.severity_counts,
+            SELECT ra.*, s.severity_counts,
                    CASE WHEN ra.cmd_error THEN 'error'
-                        WHEN COALESCE(s.finding_count, 0) = 0 THEN 'empty'
+                        WHEN COALESCE(ra.item_count, 0) = 0 THEN 'empty'
                         ELSE 'ok' END AS outcome
               FROM (SELECT {cols},
                            (llm_status = 'failed'
@@ -3557,21 +3588,17 @@ def list_artifacts(llm_status: Optional[str] = None, tool: Optional[str] = None,
                            COALESCE(
                              substring(left(content, 4000) from %(hostpat1)s),
                              substring(left(content, 4000) from %(hostpat2)s)
-                           ) AS attempted_host
+                           ) AS content_host
                       FROM raw_artifacts {clause}
                      ORDER BY created_at DESC
                      LIMIT %(limit)s OFFSET %(offset)s) ra
               LEFT JOIN LATERAL (
-                  SELECT count(*)::int AS finding_count,
-                         count(DISTINCT f.target)::int AS finding_targets,
-                         (array_agg(DISTINCT f.target))[1] AS finding_target_sample,
-                         (SELECT jsonb_object_agg(severity, c)
+                  SELECT (SELECT jsonb_object_agg(severity, c)
                             FROM (SELECT severity, count(*) c
                                     FROM recon_findings f2
                                    WHERE f2.data->>'job_id' = ra.job_id
+                                     AND f2.source = ra.tool
                                    GROUP BY severity) x) AS severity_counts
-                    FROM recon_findings f
-                   WHERE f.data->>'job_id' = ra.job_id
               ) s ON ra.job_id IS NOT NULL
              ORDER BY ra.created_at DESC
         """, params)
