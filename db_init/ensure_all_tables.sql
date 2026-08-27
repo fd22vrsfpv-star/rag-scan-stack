@@ -2721,6 +2721,58 @@ CREATE TRIGGER trg_detection_rule_state_updated
   BEFORE UPDATE ON public.detection_rule_state
   FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
 
+-- Self-adapting extractor overlay. When the LLM analysis pass extracts something
+-- a tool's deterministic profile (knowledge/extractors/{tool}.yaml) missed, the
+-- distiller (app/rag-api/extractor_learn.py) authors a stable regex ONCE and
+-- stores it here; extractor_specs.load_specs() merges ACTIVE rows onto the tool's
+-- spec so future runs extract it deterministically — no model. 'deterministic'
+-- rows auto-apply (read-only); 'notable'/'follow_on' rows start 'proposed' and
+-- fire only once approved. POST /extractors/export writes approved rows to YAML.
+CREATE TABLE IF NOT EXISTS public.extractor_learned (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tool              text NOT NULL,
+    kind              text NOT NULL CHECK (kind IN ('deterministic','notable','follow_on')),
+    rule              jsonb NOT NULL,
+    status            text NOT NULL DEFAULT 'proposed'
+                      CHECK (status IN ('active','proposed','rejected')),
+    confidence        numeric,
+    source            text NOT NULL DEFAULT 'distilled',
+    sample_artifact_id uuid,
+    created_at        timestamptz DEFAULT now(),
+    updated_at        timestamptz DEFAULT now(),
+    approved_at       timestamptz
+);
+-- One learned rule per (tool, kind, rule shape) — re-distilling the same shape
+-- is a no-op rather than a duplicate.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_extractor_learned_tool_kind_rule
+  ON public.extractor_learned (tool, kind, md5(rule::text));
+CREATE INDEX IF NOT EXISTS idx_extractor_learned_tool_status
+  ON public.extractor_learned (tool, status);
+DROP TRIGGER IF EXISTS trg_extractor_learned_updated ON public.extractor_learned;
+CREATE TRIGGER trg_extractor_learned_updated
+  BEFORE UPDATE ON public.extractor_learned
+  FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+
+-- Agent-to-agent feedback channel. One agent flags something interesting (a
+-- finding worth another run, a coverage gap); a coordinator turns approved flags
+-- into scan_recommendations (which the recon agent dispatches through the scope
+-- gate). See app/rag-api/agent_flags.py.
+CREATE TABLE IF NOT EXISTS public.agent_flags (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    flagging_agent  text NOT NULL,
+    target_agent    text,
+    engagement_id   uuid REFERENCES public.engagements(id) ON DELETE CASCADE,
+    flag_type       text NOT NULL
+                    CHECK (flag_type IN ('interesting_finding','needs_rescan','coverage_gap')),
+    data            jsonb NOT NULL DEFAULT '{}'::jsonb,
+    status          text NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','acknowledged','acted','dismissed')),
+    created_at      timestamptz DEFAULT now(),
+    acted_at        timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_agent_flags_status ON public.agent_flags (status);
+CREATE INDEX IF NOT EXISTS idx_agent_flags_engagement ON public.agent_flags (engagement_id);
+
 -- ============================================================================
 -- TIER 11: API Collections + Test Sessions (Swagger/OpenAPI Ingestion)
 -- ============================================================================

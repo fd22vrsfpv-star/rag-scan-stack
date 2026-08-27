@@ -19413,6 +19413,112 @@ def ingest_extracted_facts_endpoint(
     return {"ok": True, **result}
 
 
+# ── Self-adapting extractors (extractor_learned overlay) ────────────────────
+
+class ExtractorLearnBody(BaseModel):
+    artifact_id: Optional[str] = None
+    tool: Optional[str] = None
+    output: Optional[str] = None
+    model: Optional[str] = None
+
+
+@app.post("/extractors/learn", tags=["Extractors"])
+def extractors_learn(body: ExtractorLearnBody, _: bool = Depends(auth)):
+    """Distil deterministic extractors from one artifact: values the model fills
+    but the tool's regexes miss become ACTIVE regex rules (extracted code-only
+    next time); a matching finding rule is PROPOSED for review."""
+    import extractor_learn
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        tool = (body.tool or "").strip()
+        raw = body.output or ""
+        target, port, command = "", None, ""
+        if body.artifact_id:
+            cur.execute("SELECT tool, content, target, port, command FROM raw_artifacts WHERE id = %s",
+                        (body.artifact_id,))
+            a = cur.fetchone()
+            if not a:
+                raise HTTPException(404, f"artifact {body.artifact_id} not found")
+            tool = tool or a["tool"]
+            raw = raw or (a["content"] or "")
+            target, port, command = a.get("target") or "", a.get("port"), a.get("command") or ""
+        if not tool or not raw.strip():
+            raise HTTPException(400, "provide artifact_id, or tool + output")
+        try:
+            result = extractor_learn.distill_artifact(
+                cur, tool, raw, target=target, port=port, command=command,
+                model=body.model, artifact_id=body.artifact_id)
+            conn.commit()
+        except Exception as e:
+            log.exception("extractor distill failed")
+            raise HTTPException(500, f"distill failed: {type(e).__name__}: {e}")
+    return {"ok": True, **result}
+
+
+@app.get("/extractors/learned", tags=["Extractors"])
+def list_extractor_learned(status: Optional[str] = None, tool: Optional[str] = None,
+                           _: bool = Depends(auth)):
+    """List learned extractor rules (deterministic auto-active; notable proposed)."""
+    where, params = [], []
+    if status:
+        where.append("status = %s"); params.append(status)
+    if tool:
+        where.append("tool = %s"); params.append(tool)
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"SELECT id::text, tool, kind, rule, status, confidence, source, "
+                    f"created_at, approved_at FROM extractor_learned {clause} "
+                    f"ORDER BY tool, kind, created_at DESC", params)
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"count": len(rows), "learned": rows}
+
+
+@app.post("/extractors/learned/{rule_id}/{action}", tags=["Extractors"])
+def review_extractor_learned(rule_id: str, action: str, _: bool = Depends(auth)):
+    """Approve (activate) or reject a proposed learned rule (e.g. a finding rule).
+    Approving a notable makes it fire on future extractions."""
+    if action not in ("approve", "reject"):
+        raise HTTPException(400, "action must be approve or reject")
+    new_status = "active" if action == "approve" else "rejected"
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("UPDATE extractor_learned SET status = %s, "
+                    "approved_at = CASE WHEN %s = 'active' THEN now() ELSE approved_at END "
+                    "WHERE id = %s::uuid RETURNING id::text, tool, kind, status",
+                    (new_status, new_status, rule_id))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"learned rule {rule_id} not found")
+        conn.commit()
+    return {"ok": True, **dict(row)}
+
+
+@app.post("/extractors/export", tags=["Extractors"])
+def export_extractor_learned(tool: Optional[str] = None, _: bool = Depends(auth)):
+    """Render ACTIVE learned rules as YAML per tool, for committing into
+    knowledge/extractors/{tool}.yaml. Returns the YAML (the spec dir is a
+    read-only mount at runtime, so the operator commits the returned blocks)."""
+    import yaml as _yaml
+    where, params = ["status = 'active'"], []
+    if tool:
+        where.append("tool = %s"); params.append(tool)
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"SELECT tool, kind, rule FROM extractor_learned "
+                    f"WHERE {' AND '.join(where)} ORDER BY tool, kind", params)
+        rows = cur.fetchall()
+    by_tool: dict = {}
+    for r in rows:
+        t = by_tool.setdefault(r["tool"], {"tool": r["tool"], "deterministic": {},
+                                           "notable": [], "follow_on": []})
+        if r["kind"] == "deterministic":
+            t["deterministic"].update(r["rule"])
+        else:
+            t[r["kind"]].append(r["rule"])
+    out = {}
+    for t, spec in by_tool.items():
+        spec = {k: v for k, v in spec.items() if v}
+        out[t] = _yaml.safe_dump(spec, sort_keys=False, allow_unicode=True)
+    return {"ok": True, "tools": list(out), "yaml": out}
+
+
 @app.get("/agent/post-review/executions/{execution_id}", tags=["Post Review"])
 def get_reviewed_execution(execution_id: str, _: bool = Depends(auth)):
     """One execution in FULL, for display: output, return code, options, analysis.

@@ -40,6 +40,7 @@ DESIGN
 import hashlib
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 SPEC_DIR = os.environ.get("EXTRACTOR_SPEC_DIR", "/knowledge/extractors")
@@ -91,6 +92,85 @@ def signature(spec_dir: str = None) -> Optional[str]:
         except OSError:
             h.update(b"<unreadable>")
     return h.hexdigest()[:16]
+
+
+# ── self-adapting overlay (extractor_learned) ───────────────────────────────
+# ACTIVE learned rules merge onto each tool's disk spec so a shape the LLM found
+# once is extracted deterministically forever. Checked at most every _OVERLAY_TTL
+# seconds (mirrors llm_settings) so spec_for() stays cheap; folded into the cache
+# signature so a new/approved learned rule invalidates cached extractions.
+_OVERLAY_TTL = 30.0
+_overlay_cache: Dict[str, Any] = {"sig": None, "rows": {}, "checked_at": 0.0}
+
+
+def _load_overlay():
+    """(sig, {tool: {deterministic:{}, notable:[], follow_on:[]}}) from ACTIVE
+    extractor_learned rows. Best-effort: returns ('', {}) if the DB is unreachable
+    so extraction always falls back to the on-disk profiles."""
+    now = time.time()
+    if now - _overlay_cache["checked_at"] < _OVERLAY_TTL:
+        return _overlay_cache["sig"], _overlay_cache["rows"]
+    dsn = os.environ.get("DB_DSN")
+    if not dsn:
+        _overlay_cache.update(sig="", rows={}, checked_at=now)
+        return "", {}
+    try:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        conn = psycopg2.connect(dsn)
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT count(*) n, COALESCE(max(updated_at)::text,'') m "
+                            "FROM extractor_learned WHERE status='active'")
+                r = cur.fetchone()
+                sig = f"{r['n']}:{r['m']}"
+                cur.execute("SELECT tool, kind, rule FROM extractor_learned WHERE status='active'")
+                rows: Dict[str, Any] = {}
+                for row in cur.fetchall():
+                    t = (row["tool"] or "").strip().lower()
+                    if not t:
+                        continue
+                    d = rows.setdefault(t, {"deterministic": {}, "notable": [], "follow_on": []})
+                    rule = row["rule"] if isinstance(row["rule"], dict) else {}
+                    if row["kind"] == "deterministic":
+                        d["deterministic"].update(rule)
+                    elif row["kind"] in ("notable", "follow_on"):
+                        d[row["kind"]].append(rule)
+        finally:
+            conn.close()
+        _overlay_cache.update(sig=sig, rows=rows, checked_at=now)
+        return sig, rows
+    except Exception:
+        _overlay_cache.update(sig="", rows={}, checked_at=now)
+        return "", {}
+
+
+def _merge_overlay(spec: dict, ov: dict) -> dict:
+    """Merge a tool's ACTIVE learned rules onto its spec (learned augments; the
+    disk spec's own id wins on a collision)."""
+    merged = dict(spec)
+    if ov.get("deterministic"):
+        base = dict(merged.get("deterministic") or {})
+        for k, v in ov["deterministic"].items():
+            base.setdefault(k, v)     # disk field definition wins
+        merged["deterministic"] = base
+    for section in ("notable", "follow_on"):
+        add = ov.get(section) or []
+        if add:
+            own = list(merged.get(section) or [])
+            own_ids = {r.get("id") for r in own}
+            merged[section] = own + [r for r in add if r.get("id") not in own_ids]
+    merged["_has_learned"] = True
+    return merged
+
+
+def _synth_spec(tool: str, ov: dict) -> dict:
+    """Minimal spec for a tool that has ONLY learned rules (no disk profile)."""
+    return {"tool": tool, "schema": {}, "prompt": "",
+            "deterministic": dict(ov.get("deterministic") or {}),
+            "notable": list(ov.get("notable") or []),
+            "follow_on": list(ov.get("follow_on") or []),
+            "_synth_from_learned": True}
 
 
 def _apply_class(spec: dict, classes: dict) -> dict:
@@ -198,8 +278,12 @@ def load_specs(spec_dir: str = None, force: bool = False):
     broken file is visible instead of silently absent.
     """
     spec_dir = spec_dir or SPEC_DIR
-    sig = signature(spec_dir)
-    if not force and sig is not None and _cache["signature"] == sig:
+    disk_sig = signature(spec_dir)
+    overlay_sig, overlay = _load_overlay()
+    # Combined key: disk profiles + the ACTIVE learned overlay. Either changing
+    # invalidates cached extractions.
+    sig = f"{disk_sig}|{overlay_sig}"
+    if not force and disk_sig is not None and _cache["signature"] == sig:
         return _cache["specs"], _cache.get("problems", [])
 
     try:
@@ -242,6 +326,22 @@ def load_specs(spec_dir: str = None, force: bool = False):
         doc["_signature"] = sig
         for name in [doc["tool"]] + list(doc.get("aliases") or []):
             specs[str(name).strip().lower()] = doc
+
+    # Merge the ACTIVE learned overlay: augment matching disk specs, and
+    # synthesize a minimal spec for tools that have ONLY learned rules.
+    for tool_key, ov in (overlay or {}).items():
+        base = specs.get(tool_key)
+        if base is not None:
+            merged = _merge_overlay(base, ov)
+            merged["_signature"] = sig
+            for k, v in list(specs.items()):
+                if v is base:
+                    specs[k] = merged
+        else:
+            syn = _synth_spec(tool_key, ov)
+            syn["_signature"] = sig
+            specs[tool_key] = syn
+
     _cache.update({"signature": sig, "specs": specs, "problems": problems})
     return specs, problems
 
