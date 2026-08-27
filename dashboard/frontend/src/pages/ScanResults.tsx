@@ -1,13 +1,14 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import {
   useArtifacts, useArtifactStats, useArtifact, useArtifactActions,
   useQueueActions, useAutoQueueSetting, useSetAutoQueue, formatBytes,
   type ArtifactAction, type CustomAction,
 } from '@/api/artifacts'
+import { useAnalyzeExtractor, type ExtractorAnalyze } from '@/api/agents'
 import {
   FileText, Braces, Loader2, Search, X, Copy, Check, Download, Play,
   AlertTriangle, CheckCircle2, Clock, Zap, RefreshCw, ChevronRight, Sparkles,
-  Pencil, Plus, Bot, RotateCcw,
+  Pencil, Plus, Bot, RotateCcw, Wand2, Lightbulb, ArrowRight,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -223,7 +224,7 @@ function Select({ value, onChange, options, placeholder }: {
 /** Detail view: the complete output, plus what to do next. */
 function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
   const { data: artifact, isLoading } = useArtifact(id)
-  const [tab, setTab] = useState<'review' | 'output' | 'actions'>('review')
+  const [tab, setTab] = useState<'review' | 'output' | 'actions' | 'learn'>('review')
   const { data: actions, isLoading: actionsLoading, refetch } = useArtifactActions(id)
   const [copied, setCopied] = useState(false)
 
@@ -295,6 +296,8 @@ function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
             <TabButton active={tab === 'actions'} onClick={() => setTab('actions')}
                        icon={<Zap className="w-4 h-4" />} label="Follow-On Actions"
                        badge={actions ? String(actions.counts.total) : undefined} />
+            <TabButton active={tab === 'learn'} onClick={() => setTab('learn')}
+                       icon={<Wand2 className="w-4 h-4" />} label="Extract & Learn" />
           </div>
         </div>
 
@@ -324,11 +327,188 @@ function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
                 {pretty}
               </pre>
             </div>
+          ) : tab === 'learn' ? (
+            <LearnPanel artifact={artifact} />
           ) : (
             <ActionsPanel id={id} actions={actions} loading={actionsLoading} onRefresh={() => refetch()} />
           )}
         </div>
       </div>
+    </div>
+  )
+}
+
+/** Extract & Learn — turn a scan's raw output into reusable extraction rules.
+ *
+ *  Shows what the deterministic profile pulls out of this artifact RIGHT NOW
+ *  (code-only, no model), then lets the reviewer point the LLM at "anything new
+ *  to focus on". Whatever the LLM extracts that the regexes missed becomes an
+ *  ACTIVE deterministic rule (extracted for free next time) plus a PROPOSED
+ *  finding rule for review in AI Agents → Learned Extractors. This is the
+ *  "I see something worth extracting" → "the tool learns it" loop. */
+function LearnPanel({ artifact }: { artifact?: import('@/api/artifacts').Artifact }) {
+  const analyze = useAnalyzeExtractor()
+  const [view, setView] = useState<ExtractorAnalyze | null>(null)
+  const [focus, setFocus] = useState('')
+  const [learning, setLearning] = useState(false)
+  const [learned, setLearned] = useState<ExtractorAnalyze['learn'] | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const previewedFor = useRef<string | null>(null)
+
+  // Preview (learn=false) once per artifact: no model call, no writes.
+  useEffect(() => {
+    if (!artifact?.id || previewedFor.current === artifact.id) return
+    previewedFor.current = artifact.id
+    setView(null); setLearned(null); setErr(null); setFocus('')
+    analyze.mutateAsync({ artifact_id: artifact.id, learn: false })
+      .then(setView).catch(e => setErr(String(e?.message || e)))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [artifact?.id])
+
+  async function runLearn() {
+    if (!artifact?.id) return
+    setLearning(true); setErr(null); setLearned(null)
+    try {
+      const r = await analyze.mutateAsync({
+        artifact_id: artifact.id, learn: true, focus: focus.trim() || undefined,
+      })
+      setView(r); setLearned(r.learn ?? null)
+    } catch (e: any) { setErr(String(e?.message || e)) }
+    finally { setLearning(false) }
+  }
+
+  const det = view?.deterministic || {}
+  const detKeys = Object.keys(det)
+  const cov = view?.coverage
+  const focusRes = learned?.focus
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-start gap-2 text-xs text-gray-400 bg-fuchsia-500/5 border border-fuchsia-500/20 rounded p-3">
+        <Wand2 className="w-4 h-4 text-fuchsia-400 shrink-0 mt-0.5" />
+        <p>See what the extractor pulls from this output today, then point the LLM at anything
+           it's missing. What it learns becomes a reusable deterministic rule — no model needed
+           next time — and a proposed finding you approve in <span className="text-gray-300">AI Agents → Learned Extractors</span>.</p>
+      </div>
+
+      {/* What is extracted normally */}
+      <section className="space-y-2">
+        <div className="flex items-center gap-2 text-sm font-medium">
+          <Braces className="w-4 h-4 text-green-400" /> Extracted normally (code-only)
+          {view && (
+            <span className="text-xs text-gray-500 font-normal">
+              {view.has_profile ? `profile: ${view.source_file}` : 'no profile yet'}
+            </span>
+          )}
+        </div>
+        {!view && !err ? (
+          <div className="p-4 text-center"><Loader2 className="w-4 h-4 animate-spin mx-auto text-gray-500" /></div>
+        ) : !view?.has_profile ? (
+          <p className="text-xs text-gray-500 bg-black border border-gray-800 rounded p-3">
+            No extractor profile for <span className="font-mono text-gray-300">{view?.tool}</span> yet.
+            Use the box below to teach one from this output — the first thing it learns creates the profile.
+          </p>
+        ) : detKeys.length === 0 ? (
+          <p className="text-xs text-gray-500 bg-black border border-gray-800 rounded p-3">
+            The profile matched no fields in this particular output.
+          </p>
+        ) : (
+          <div className="bg-black border border-gray-800 rounded divide-y divide-gray-900">
+            {detKeys.map(k => (
+              <div key={k} className="flex gap-3 px-3 py-1.5 text-xs">
+                <span className="font-mono text-fuchsia-300 shrink-0 w-40 truncate">{k}</span>
+                <span className="font-mono text-gray-300 break-all">
+                  {Array.isArray((det as any)[k]) ? ((det as any)[k] as any[]).join(', ') : String((det as any)[k])}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+        {cov && (
+          <div className="flex items-center gap-2 text-xs text-gray-500">
+            <div className="h-1.5 flex-1 bg-gray-800 rounded overflow-hidden">
+              <div className="h-full bg-green-500/60" style={{ width: `${cov.coverage_pct}%` }} />
+            </div>
+            <span>{cov.coverage_pct}% covered · {cov.residual_lines} line(s) unexplained</span>
+          </div>
+        )}
+      </section>
+
+      {/* Focus + learn */}
+      <section className="space-y-2">
+        <div className="flex items-center gap-2 text-sm font-medium">
+          <Lightbulb className="w-4 h-4 text-yellow-400" /> Anything new to focus on?
+        </div>
+        <textarea
+          value={focus} onChange={e => setFocus(e.target.value)}
+          placeholder="Optional: name what you want extracted, e.g. 'the SMB signing requirement' or 'the certificate serial number'. Leave blank to let the LLM fill any gaps in the profile's schema."
+          className="w-full h-20 bg-black border border-gray-800 rounded p-2 text-xs font-mono text-gray-200 placeholder:text-gray-600 resize-y" />
+        <button onClick={runLearn} disabled={learning || !view}
+                className="px-3 py-1.5 bg-fuchsia-600/80 hover:bg-fuchsia-600 disabled:opacity-50 rounded text-sm flex items-center gap-2">
+          {learning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+          {learning ? 'Sending to LLM…' : 'Send to LLM & Learn'}
+        </button>
+      </section>
+
+      {err && (
+        <div className="text-xs text-red-300 bg-black border border-red-900/40 rounded p-2 break-words">{err}</div>
+      )}
+
+      {/* Learn results */}
+      {learned && (
+        <section className="space-y-2">
+          <div className="flex items-center gap-2 text-sm font-medium">
+            <CheckCircle2 className="w-4 h-4 text-green-400" /> Result
+          </div>
+          {focusRes && (
+            <div className={cn('text-xs rounded p-2 border',
+              focusRes.found ? 'bg-green-500/5 border-green-500/20' : 'bg-gray-800/40 border-gray-700')}>
+              {focusRes.found ? (
+                <div className="flex items-start gap-2">
+                  <ArrowRight className="w-3 h-3 text-green-400 mt-0.5 shrink-0" />
+                  <span>
+                    Focus <span className="font-mono text-gray-200">"{focusRes.requested}"</span> →
+                    field <span className="font-mono text-fuchsia-300">{focusRes.field}</span>
+                    {focusRes.already_covered
+                      ? ' — already covered by an existing rule.'
+                      : focusRes.learned ? ' — learned as a new deterministic rule.' : ' — extracted, but no stable regex could be authored.'}
+                    {focusRes.value != null && (
+                      <span className="block text-gray-400 mt-0.5 font-mono break-all">
+                        value: {Array.isArray(focusRes.value) ? (focusRes.value as any[]).join(', ') : String(focusRes.value)}
+                      </span>)}
+                  </span>
+                </div>
+              ) : (
+                <span className="text-gray-400">Focus <span className="font-mono">"{focusRes.requested}"</span> was not found in this output{focusRes.error ? ` (${focusRes.error})` : '.'}</span>
+              )}
+            </div>
+          )}
+          <div className="grid grid-cols-3 gap-2 text-xs">
+            <ResultStat label="Rules learned" value={learned.learned.length} tone="text-green-400" />
+            <ResultStat label="Findings proposed" value={learned.proposed_notable.length} tone="text-yellow-400" />
+            <ResultStat label="Skipped" value={learned.skipped.length} tone="text-gray-400" />
+          </div>
+          {learned.learned.length > 0 && (
+            <p className="text-xs text-gray-400">
+              New deterministic field(s): <span className="font-mono text-fuchsia-300">{learned.learned.join(', ')}</span>.
+              These extract for free from now on. Approve the proposed finding(s) in{' '}
+              <span className="text-gray-300">AI Agents → Learned Extractors</span>, then Export to write them into the tool's YAML.
+            </p>
+          )}
+          {learned.learned.length === 0 && !focusRes?.found && (
+            <p className="text-xs text-gray-500">Nothing new to learn — the profile already covers this output.</p>
+          )}
+        </section>
+      )}
+    </div>
+  )
+}
+
+function ResultStat({ label, value, tone }: { label: string; value: number; tone: string }) {
+  return (
+    <div className="bg-black border border-gray-800 rounded p-2 text-center">
+      <div className={cn('text-lg font-semibold', tone)}>{value}</div>
+      <div className="text-gray-500">{label}</div>
     </div>
   )
 }

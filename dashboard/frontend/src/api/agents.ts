@@ -296,3 +296,56 @@ export function useExportExtractors() {
         `/extractors/export${tool ? `?tool=${tool}` : ''}`, { method: 'POST' }),
   })
 }
+
+// ── Extract & Learn (analyze one artifact / scan raw output) ──────────────
+export interface ExtractorFocusResult {
+  requested: string
+  found: boolean
+  field?: string
+  value?: unknown
+  learned?: boolean
+  already_covered?: boolean
+  error?: string
+}
+export interface ExtractorLearnResult {
+  tool: string
+  learned: string[]
+  proposed_notable: string[]
+  skipped: string[]
+  focus?: ExtractorFocusResult | null
+  coverage?: { coverage_pct: number; residual_lines: number; residual_sample: string[] }
+}
+export interface ExtractorAnalyze {
+  ok: boolean
+  tool: string
+  has_profile: boolean
+  source_file?: string | null
+  schema: string[]
+  deterministic: Record<string, unknown>
+  coverage?: { coverage_pct: number; residual_lines: number; residual_sample: string[] } | null
+  learn?: ExtractorLearnResult
+}
+export interface AnalyzeRequest {
+  artifact_id?: string
+  tool?: string
+  output?: string
+  focus?: string
+  learn?: boolean
+  model?: string
+}
+
+/** Preview extraction (learn=false) or send to the LLM to distil rules
+ *  (learn=true). On a learn run, refresh the learned-rules review queue. */
+export function useAnalyzeExtractor() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (req: AnalyzeRequest) =>
+      apiFetch<ExtractorAnalyze>('/extractors/analyze', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req),
+      }),
+    onSuccess: (_data, vars) => {
+      if (vars.learn) qc.invalidateQueries({ queryKey: ['extractors-learned'] })
+    },
+  })
+}

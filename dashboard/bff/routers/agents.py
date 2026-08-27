@@ -83,6 +83,19 @@ async def export_extractors(tool: Optional[str] = None):
         return safe_json(resp)
 
 
+@router.post("/api/extractors/analyze")
+async def analyze_extractor(body: dict):
+    """Preview what a profile extracts from an artifact, and optionally send it to
+    the LLM to distil new rules (learn=true, may take a while → long timeout)."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_LONG) as c:
+        resp = await c.post(f"{s.rag_api_url}/extractors/analyze", json=body,
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
 # ── Gap Analysis ───────────────────────────────────────────────────────
 
 @router.post("/api/gap-analysis/{eid}")
