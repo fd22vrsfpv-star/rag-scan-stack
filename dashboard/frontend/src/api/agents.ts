@@ -297,6 +297,26 @@ export function useExportExtractors() {
   })
 }
 
+// ── Agent activity timeline (webhook event-log) ───────────────────────────
+export interface AgentActivityEvent {
+  id: string
+  event_type: string
+  payload: Record<string, any>
+  status: string
+  created_at: string
+}
+
+/** Cross-agent action timeline — every agent action emits an event. */
+export function useAgentActivity(eventType?: string) {
+  const qs = new URLSearchParams({ limit: '120' })
+  if (eventType) qs.set('event_type', eventType)
+  return useQuery({
+    queryKey: ['agent-activity', eventType ?? 'all'],
+    queryFn: () => apiFetch<{ events: AgentActivityEvent[]; total: number }>(`/agent-activity?${qs.toString()}`),
+    refetchInterval: POLL.NORMAL,
+  })
+}
+
 // ── Extract & Learn (analyze one artifact / scan raw output) ──────────────
 export interface ExtractorFocusResult {
   requested: string

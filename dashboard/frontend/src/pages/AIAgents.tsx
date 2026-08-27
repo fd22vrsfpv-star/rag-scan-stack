@@ -6,6 +6,7 @@ import {
   useAgentsStatus, useGapReport, useTriggerGapAnalysis, useAutoFillGaps,
   useDrainArtifacts, useAgentFlags, useActAgentFlag,
   useLearnedExtractors, useReviewExtractor, useExportExtractors,
+  useAgentActivity,
   type AgentInfo, type GapReport, type GapTargetDetail,
 } from '@/api/agents'
 import { useUIStore } from '@/stores/ui'
@@ -13,7 +14,7 @@ import { cn } from '@/lib/utils'
 import {
   Bot, Cpu, Search, Shield, Loader2, Play, ExternalLink,
   CheckCircle2, XCircle, RefreshCw, Zap, Settings, Clock, Cloud,
-  FileSearch, ShieldCheck, Globe, MessageSquare, Wand2,
+  FileSearch, ShieldCheck, Globe, MessageSquare, Wand2, Activity, ChevronDown, ChevronRight,
 } from 'lucide-react'
 
 const AGENT_ICONS: Record<string, typeof Bot> = {
@@ -131,10 +132,97 @@ export default function AIAgents() {
 
       <AgentFlagsPanel />
       <LearnedExtractorsPanel />
+      <ActivityTimelinePanel />
 
       {selectedEngagement && (
         <GapAnalysisPanel engagementId={selectedEngagement} />
       )}
+    </div>
+  )
+}
+
+
+/** A short relative time like "3m", "2h", "5d". */
+function relTime(iso: string): string {
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000)
+  if (s < 60) return `${Math.floor(s)}s`
+  if (s < 3600) return `${Math.floor(s / 60)}m`
+  if (s < 86400) return `${Math.floor(s / 3600)}h`
+  return `${Math.floor(s / 86400)}d`
+}
+
+/** event_type is `<agent>_<action>` (e.g. katana_scan_completed). Split on the
+ *  first token that starts the action verb so the agent reads clearly. */
+function splitEventType(t: string): { agent: string; action: string } {
+  const m = t.match(/^(.*?)_((?:scan|agent_flag|artifact|batch|rule|pipeline|recon|ingest|extractor).*)$/)
+  if (m) return { agent: m[1], action: m[2] }
+  const i = t.indexOf('_')
+  return i > 0 ? { agent: t.slice(0, i), action: t.slice(i + 1) } : { agent: t, action: '' }
+}
+
+/** Pull a compact one-liner from the event payload. */
+function eventSummary(p: Record<string, any> | undefined): string {
+  if (!p) return ''
+  const out: string[] = []
+  for (const k of ['target', 'tool', 'scan_type', 'host', 'count', 'skipped',
+                   'claimed', 'done', 'queue_depth', 'actor', 'flag_type', 'reason']) {
+    const v = p[k]
+    if (v != null && typeof v !== 'object' && String(v) !== '') out.push(`${k}=${v}`)
+    if (out.length >= 4) break
+  }
+  return out.join(' · ')
+}
+
+/** Cross-agent action timeline — every agent action emits a webhook event, and
+ *  the event-log sink records them all. This is the one place to see what
+ *  happened across every agent, newest first. */
+function ActivityTimelinePanel() {
+  const { data, isLoading } = useAgentActivity()
+  const [filter, setFilter] = useState('')
+  const [expanded, setExpanded] = useState<string | null>(null)
+  const events = data?.events ?? []
+  const shown = filter
+    ? events.filter(e => e.event_type.toLowerCase().includes(filter.toLowerCase()))
+    : events
+  if (!isLoading && !events.length) return null
+  return (
+    <div className="bg-card border border-border rounded-lg p-3 space-y-2">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <h3 className="text-sm font-semibold flex items-center gap-2">
+          <Activity className="h-4 w-4" /> Agent Activity — timeline
+          {data && <span className="px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground text-[10px]">{data.total} events</span>}
+        </h3>
+        <input value={filter} onChange={e => setFilter(e.target.value)}
+          placeholder="filter e.g. katana, agent_flag, scan_completed"
+          className="h-6 px-2 text-[11px] rounded border border-border bg-background w-64" />
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        Every agent action emits an event; this is the cross-agent trace, newest first. Click a row for the full payload.
+      </p>
+      <div className="max-h-[28rem] overflow-y-auto divide-y divide-border/40">
+        {shown.map(e => {
+          const { agent, action } = splitEventType(e.event_type)
+          const open = expanded === e.id
+          return (
+            <div key={e.id} className="py-1.5">
+              <div className="flex items-start gap-2 cursor-pointer" onClick={() => setExpanded(open ? null : e.id)}>
+                {open ? <ChevronDown className="h-3 w-3 mt-0.5 text-muted-foreground shrink-0" />
+                      : <ChevronRight className="h-3 w-3 mt-0.5 text-muted-foreground shrink-0" />}
+                <span className="text-[10px] text-muted-foreground w-8 shrink-0 text-right tabular-nums" title={new Date(e.created_at).toLocaleString()}>{relTime(e.created_at)}</span>
+                <span className="text-[11px] font-mono text-primary shrink-0">{agent}</span>
+                <span className="text-[11px] font-mono text-muted-foreground shrink-0">{action}</span>
+                <span className="text-[11px] text-muted-foreground truncate">{eventSummary(e.payload)}</span>
+              </div>
+              {open && (
+                <pre className="ml-5 mt-1 bg-black border border-border rounded p-2 text-[10px] font-mono max-h-56 overflow-auto whitespace-pre-wrap">
+                  {JSON.stringify(e.payload, null, 2)}
+                </pre>
+              )}
+            </div>
+          )
+        })}
+        {!shown.length && <p className="text-[11px] text-muted-foreground py-4 text-center">No events match “{filter}”.</p>}
+      </div>
     </div>
   )
 }
