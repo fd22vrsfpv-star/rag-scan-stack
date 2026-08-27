@@ -45,6 +45,9 @@ export interface Artifact {
   finding_targets?: number | null
   /** The one target, when finding_targets === 1. */
   finding_target_sample?: string | null
+  /** Host parsed from the output when no finding target exists (e.g. the host a
+   *  failed crawl attempted). */
+  attempted_host?: string | null
   /** { info: 40, high: 1, … } */
   severity_counts?: Record<string, number> | null
   /** Command outcome, distinct from the LLM review status (llm_status). */
