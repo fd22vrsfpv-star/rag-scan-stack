@@ -19454,6 +19454,66 @@ def extractors_learn(body: ExtractorLearnBody, _: bool = Depends(auth)):
     return {"ok": True, **result}
 
 
+class ExtractorAnalyzeBody(BaseModel):
+    artifact_id: Optional[str] = None
+    tool: Optional[str] = None
+    output: Optional[str] = None
+    focus: Optional[str] = None          # "anything new to focus on" from the operator
+    learn: bool = False                  # false = preview only (no LLM, no writes)
+    model: Optional[str] = None
+
+
+@app.post("/extractors/analyze", tags=["Extractors"])
+def extractors_analyze(body: ExtractorAnalyzeBody, _: bool = Depends(auth)):
+    """Show what the deterministic profile extracts from an artifact NOW, and —
+    when `learn` is set — send it to the LLM to distil new reusable rules,
+    optionally directed by a `focus` hint the operator typed.
+
+    `learn=false` is a pure preview: no model call, no writes. `learn=true`
+    authors ACTIVE deterministic rules for anything the regexes miss and PROPOSES
+    matching finding rules for review (see /extractors/learned)."""
+    import extractor_specs as es
+    import extractor_learn
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        tool = (body.tool or "").strip()
+        raw = body.output or ""
+        target, port, command = "", None, ""
+        if body.artifact_id:
+            cur.execute("SELECT tool, content, target, port, command FROM raw_artifacts WHERE id = %s",
+                        (body.artifact_id,))
+            a = cur.fetchone()
+            if not a:
+                raise HTTPException(404, f"artifact {body.artifact_id} not found")
+            tool = tool or a["tool"]
+            raw = raw or (a["content"] or "")
+            target, port, command = a.get("target") or "", a.get("port"), a.get("command") or ""
+        if not tool or not raw.strip():
+            raise HTTPException(400, "provide artifact_id, or tool + output")
+
+        spec = es.spec_for(tool)
+        deterministic = es.run_deterministic(spec, raw) if spec else {}
+        coverage = es.coverage(spec, raw) if spec else None
+        out = {
+            "ok": True, "tool": tool,
+            "has_profile": bool(spec),
+            "source_file": (spec or {}).get("_source_file"),
+            "schema": list((spec or {}).get("schema") or {}),
+            "deterministic": deterministic,   # what is extracted normally, code-only
+            "coverage": coverage,
+        }
+        if body.learn:
+            try:
+                out["learn"] = extractor_learn.distill_artifact(
+                    cur, tool, raw, target=target, port=port, command=command,
+                    model=body.model, artifact_id=body.artifact_id, focus=body.focus)
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                log.exception("extractor analyze/learn failed")
+                raise HTTPException(500, f"learn failed: {type(e).__name__}: {e}")
+    return out
+
+
 @app.get("/extractors/learned", tags=["Extractors"])
 def list_extractor_learned(status: Optional[str] = None, tool: Optional[str] = None,
                            _: bool = Depends(auth)):
