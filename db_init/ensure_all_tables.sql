@@ -875,6 +875,9 @@ CREATE INDEX IF NOT EXISTS idx_recon_findings_finding_type ON public.recon_findi
 CREATE INDEX IF NOT EXISTS idx_recon_findings_target ON public.recon_findings(target);
 CREATE INDEX IF NOT EXISTS idx_recon_findings_asset_id ON public.recon_findings(asset_id);
 CREATE INDEX IF NOT EXISTS idx_recon_findings_created_at ON public.recon_findings(created_at DESC);
+-- Links a raw_artifact (which carries job_id) to the findings its run produced,
+-- for the Scan Results per-artifact summary (target + severity counts).
+CREATE INDEX IF NOT EXISTS idx_recon_findings_job_id ON public.recon_findings ((data->>'job_id'));
 
 -- ===============================
 -- Playwright tables

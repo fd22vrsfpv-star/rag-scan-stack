@@ -3519,11 +3519,52 @@ def list_artifacts(llm_status: Optional[str] = None, tool: Optional[str] = None,
     if include_content:
         cols += ", content"
     params.update({"limit": max(1, min(limit, 500)), "offset": max(0, offset)})
+    # A tool run can FAIL and still be archived and LLM-reviewed — a katana crawl
+    # that hit "SOCKS proxy EOF" is a 'done' review of a failed command. The
+    # review status (llm_status) must not read as the command outcome, so derive
+    # `outcome` (ok|empty|error) from the failure signature in the output or the
+    # review text, and the finding count. Bounded to a prefix so a 64 MB artifact
+    # is not fully scanned per list poll.
+    params["failre"] = (
+        r"(socks|proxy).{0,40}(eof|refus|timeout|error)|failed after [0-9]+ attempt|"
+        r"failed due to|connection refused|could not resolve|no route to host|"
+        r"i/o timeout|context deadline exceeded|unreachable|unresponsive|timed out")
+    # Per-artifact analysis summary: the findings this artifact's run produced,
+    # linked by job_id (recon_findings stamps data->>'job_id'; artifacts carry
+    # job_id). Gives the row a target (findings hold it, the artifact does not)
+    # and a severity breakdown. LATERAL so only the page's rows aggregate; the
+    # functional index idx_recon_findings_job_id keeps each lookup cheap.
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(f"SELECT count(*) n FROM raw_artifacts {clause}", params)
         total = cur.fetchone()["n"]
-        cur.execute(f"SELECT {cols} FROM raw_artifacts {clause} "
-                    f"ORDER BY created_at DESC LIMIT %(limit)s OFFSET %(offset)s", params)
+        cur.execute(f"""
+            SELECT ra.*, s.finding_count, s.finding_targets,
+                   s.finding_target_sample, s.severity_counts,
+                   CASE WHEN ra.cmd_error THEN 'error'
+                        WHEN COALESCE(s.finding_count, 0) = 0 THEN 'empty'
+                        ELSE 'ok' END AS outcome
+              FROM (SELECT {cols},
+                           (llm_status = 'failed'
+                            OR left(content, 6000) ~* %(failre)s
+                            OR left(COALESCE(llm_result::text, ''), 6000) ~* %(failre)s
+                           ) AS cmd_error
+                      FROM raw_artifacts {clause}
+                     ORDER BY created_at DESC
+                     LIMIT %(limit)s OFFSET %(offset)s) ra
+              LEFT JOIN LATERAL (
+                  SELECT count(*)::int AS finding_count,
+                         count(DISTINCT f.target)::int AS finding_targets,
+                         (array_agg(DISTINCT f.target))[1] AS finding_target_sample,
+                         (SELECT jsonb_object_agg(severity, c)
+                            FROM (SELECT severity, count(*) c
+                                    FROM recon_findings f2
+                                   WHERE f2.data->>'job_id' = ra.job_id
+                                   GROUP BY severity) x) AS severity_counts
+                    FROM recon_findings f
+                   WHERE f.data->>'job_id' = ra.job_id
+              ) s ON ra.job_id IS NOT NULL
+             ORDER BY ra.created_at DESC
+        """, params)
         rows = [dict(r) for r in cur.fetchall()]
     return {"total": total, "limit": params["limit"], "offset": params["offset"],
             "artifacts": rows}

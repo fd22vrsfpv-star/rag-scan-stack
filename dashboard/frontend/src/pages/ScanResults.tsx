@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useRef } from 'react'
+import { useState, useMemo, useEffect, useRef, Fragment } from 'react'
 import {
   useArtifacts, useArtifactStats, useArtifact, useArtifactActions,
   useQueueActions, useAutoQueueSetting, useSetAutoQueue, useUploadArtifact, formatBytes,
@@ -31,6 +31,22 @@ const STATUS_BADGE: Record<string, string> = {
   done: 'bg-green-500/15 text-green-400 border-green-500/30',
   failed: 'bg-red-500/15 text-red-400 border-red-500/30',
   skipped: 'bg-gray-500/15 text-gray-400 border-gray-500/30',
+}
+
+/** Command outcome — whether the TOOL RUN succeeded, distinct from whether the
+ *  LLM reviewed it. A failed crawl that was reviewed is llm_status=done (green)
+ *  but outcome=error (red): the review finished, the command did not. */
+const OUTCOME_BADGE: Record<string, string> = {
+  ok:    'bg-green-500/15 text-green-400 border-green-500/30',
+  empty: 'bg-gray-500/15 text-gray-400 border-gray-500/30',
+  error: 'bg-red-500/15 text-red-400 border-red-500/30',
+}
+const OUTCOME_LABEL: Record<string, string> = { ok: 'ok', empty: 'no items', error: 'error' }
+
+const SEV_ORDER = ['critical', 'high', 'medium', 'low', 'info']
+const SEV_COLOR: Record<string, string> = {
+  critical: 'text-red-400', high: 'text-orange-400', medium: 'text-yellow-400',
+  low: 'text-blue-400', info: 'text-gray-400',
 }
 
 const CATEGORY_COLOR: Record<string, string> = {
@@ -159,32 +175,61 @@ export default function ScanResults() {
               </tr>
             </thead>
             <tbody>
-              {data.artifacts.map(a => (
-                <tr key={a.id}
-                    onClick={() => setSelectedId(a.id)}
-                    className="border-t border-gray-800 hover:bg-gray-800/40 cursor-pointer">
-                  <td className="px-3 py-2 font-mono">{a.tool}</td>
-                  <td className="px-3 py-2 text-gray-300">{a.target || '—'}</td>
-                  <td className="px-3 py-2">
-                    <span className="inline-flex items-center gap-1 text-xs">
-                      {a.native_json
-                        ? <><Braces className="w-3 h-3 text-green-400" /><span className="text-green-400">{a.content_format}</span></>
-                        : <span className="text-gray-400">{a.content_format}</span>}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2 text-right text-gray-400">{formatBytes(a.byte_size)}</td>
-                  <td className="px-3 py-2 text-right text-gray-400">{a.occurrences}</td>
-                  <td className="px-3 py-2">
-                    <span className={cn('px-1.5 py-0.5 rounded border text-xs', STATUS_BADGE[a.llm_status])}>
-                      {a.llm_status}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2 text-gray-500 text-xs">
-                    {new Date(a.last_seen).toLocaleString()}
-                  </td>
-                  <td className="px-3 py-2 text-gray-600"><ChevronRight className="w-4 h-4" /></td>
-                </tr>
-              ))}
+              {data.artifacts.map(a => {
+                const nTargets = a.finding_targets || 0
+                const targetLabel = nTargets === 1 && a.finding_target_sample
+                  ? a.finding_target_sample
+                  : nTargets > 1 ? `${nTargets} hosts`
+                  : (a.target || '—')
+                const outcome = a.outcome || undefined
+                const showSummary = (a.finding_count || 0) > 0 || outcome === 'error'
+                const open = () => setSelectedId(a.id)
+                return (
+                  <Fragment key={a.id}>
+                    <tr onClick={open}
+                        className={cn('border-t border-gray-800 hover:bg-gray-800/40 cursor-pointer',
+                                      showSummary && 'border-b-0')}>
+                      <td className="px-3 py-2 font-mono align-top">{a.tool}</td>
+                      <td className="px-3 py-2 text-gray-300 align-top">{targetLabel}</td>
+                      <td className="px-3 py-2 align-top">
+                        <span className="inline-flex items-center gap-1 text-xs">
+                          {a.native_json
+                            ? <><Braces className="w-3 h-3 text-green-400" /><span className="text-green-400">{a.content_format}</span></>
+                            : <span className="text-gray-400">{a.content_format}</span>}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 text-right text-gray-400 align-top">{formatBytes(a.byte_size)}</td>
+                      <td className="px-3 py-2 text-right text-gray-400 align-top">{a.occurrences}</td>
+                      <td className="px-3 py-2 align-top">
+                        <div className="flex items-center gap-1.5">
+                          {outcome && (
+                            <span className={cn('px-1.5 py-0.5 rounded border text-xs', OUTCOME_BADGE[outcome])}
+                                  title="Command outcome — did the tool run succeed?">
+                              {OUTCOME_LABEL[outcome]}
+                            </span>
+                          )}
+                          <span className={cn('px-1.5 py-0.5 rounded border text-xs', STATUS_BADGE[a.llm_status])}
+                                title="Processing — LLM review status">
+                            {a.llm_status}
+                          </span>
+                        </div>
+                      </td>
+                      <td className="px-3 py-2 text-gray-500 text-xs align-top">
+                        {new Date(a.last_seen).toLocaleString()}
+                      </td>
+                      <td className="px-3 py-2 text-gray-600 align-top"><ChevronRight className="w-4 h-4" /></td>
+                    </tr>
+                    {showSummary && (
+                      <tr onClick={open} className="hover:bg-gray-800/40 cursor-pointer">
+                        <td></td>
+                        <td colSpan={7} className="px-3 pb-2 pt-0">
+                          <SummaryLine a={a} />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                )
+              })}
             </tbody>
           </table>
         )}
@@ -206,6 +251,34 @@ export default function ScanResults() {
           onClose={() => setShowUpload(false)}
           onUploaded={(id) => { setShowUpload(false); setSelectedId(id) }}
         />
+      )}
+    </div>
+  )
+}
+
+/** The per-item second line: how many findings the run produced and their
+ *  severities — or, for a failed command, that it produced none. */
+function SummaryLine({ a }: { a: import('@/api/artifacts').Artifact }) {
+  const sev = a.severity_counts || {}
+  const n = a.finding_count || 0
+  const chips = SEV_ORDER.filter(s => sev[s]).map(s => (
+    <span key={s} className={cn('whitespace-nowrap', SEV_COLOR[s])}>{sev[s]} {s}</span>
+  ))
+  return (
+    <div className="flex items-center gap-2 text-xs text-gray-500 flex-wrap">
+      <ChevronRight className="w-3 h-3 text-gray-700 shrink-0" />
+      {a.outcome === 'error' ? (
+        <span className="text-red-400 flex items-center gap-1">
+          <AlertTriangle className="w-3 h-3" /> run failed
+          {n > 0 ? <span className="text-gray-500">· {n} item{n === 1 ? '' : 's'} extracted before failure</span>
+                 : <span className="text-gray-500">· no items extracted</span>}
+        </span>
+      ) : (
+        <>
+          <span className="text-gray-400">{n} item{n === 1 ? '' : 's'} found &amp; added</span>
+          {chips.length > 0 && <span className="text-gray-700">·</span>}
+          <span className="flex items-center gap-2">{chips}</span>
+        </>
       )}
     </div>
   )
