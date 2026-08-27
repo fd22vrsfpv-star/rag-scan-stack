@@ -411,6 +411,23 @@ def process_batch(cur, limit: int = 10, tool: Optional[str] = None,
             # Per row, for the same reason: the next model call must not start
             # with an open transaction behind it.
             _commit(cur)
+            # Self-adapting: if this tool has an extractor profile, learn a
+            # deterministic regex for anything the model filled that the profile
+            # missed — so the next run of this tool needs no model. Best-effort;
+            # only fires for profiled tools (most recon tools have none → skipped
+            # fast). Disable with ARTIFACT_DISTILL=0.
+            if os.environ.get("ARTIFACT_DISTILL", "1") == "1" and (r["tool"] or "").strip():
+                try:
+                    import extractor_specs as _es
+                    import extractor_learn as _el
+                    if _es.spec_for(r["tool"]):
+                        _el.distill_artifact(cur, r["tool"], raw,
+                                             target=(r["target"] or ""), port=r["port"],
+                                             command=(r["command"] or ""), model=chosen,
+                                             artifact_id=aid)
+                        _commit(cur)
+                except Exception as e:
+                    log.warning("distill hook failed for %s: %s", aid, e)
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
             # Park it once it has had its chances, so it stops re-entering the
