@@ -19519,6 +19519,106 @@ def export_extractor_learned(tool: Optional[str] = None, _: bool = Depends(auth)
     return {"ok": True, "tools": list(out), "yaml": out}
 
 
+# ── Agent-to-agent feedback channel (agent_flags) ───────────────────────────
+
+class AgentFlagBody(BaseModel):
+    flagging_agent: str
+    flag_type: str = "interesting_finding"
+    data: Dict[str, Any] = {}
+    engagement_id: Optional[str] = None
+    target_agent: Optional[str] = None
+
+
+@app.post("/agent-flags", tags=["Agent Feedback"])
+def create_agent_flag(body: AgentFlagBody, _: bool = Depends(auth)):
+    """An agent flags something interesting that may warrant another run."""
+    import agent_flags as af
+    if body.flag_type not in ("interesting_finding", "needs_rescan", "coverage_gap"):
+        raise HTTPException(400, "flag_type must be interesting_finding|needs_rescan|coverage_gap")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        fid = af.flag_for_agent(cur, body.flagging_agent, body.flag_type, body.data,
+                                engagement_id=body.engagement_id, target_agent=body.target_agent)
+        conn.commit()
+    return {"ok": True, "flag_id": fid}
+
+
+@app.get("/agent-flags", tags=["Agent Feedback"])
+def list_agent_flags(status: Optional[str] = None, engagement_id: Optional[str] = None,
+                     limit: int = 200, _: bool = Depends(auth)):
+    where, params = [], []
+    if status:
+        where.append("status = %s"); params.append(status)
+    if engagement_id:
+        where.append("engagement_id = %s::uuid"); params.append(engagement_id)
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    params.append(max(1, min(limit, 1000)))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"SELECT id::text, flagging_agent, target_agent, engagement_id::text, "
+                    f"flag_type, data, status, created_at, acted_at FROM agent_flags "
+                    f"{clause} ORDER BY created_at DESC LIMIT %s", params)
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"count": len(rows), "flags": rows}
+
+
+@app.post("/agent-flags/{flag_id}/approve", tags=["Agent Feedback"])
+def approve_agent_flag(flag_id: str, _: bool = Depends(auth)):
+    """Approve a flag → enqueue a scan_recommendation (recon agent dispatches it
+    through the scope gate). Records the outcome on the flag."""
+    import agent_flags as af
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT id, engagement_id, data, status FROM agent_flags WHERE id = %s::uuid",
+                    (flag_id,))
+        flag = cur.fetchone()
+        if not flag:
+            raise HTTPException(404, f"flag {flag_id} not found")
+        outcome = af.enqueue_from_flag(cur, flag)
+        cur.execute("UPDATE agent_flags SET status = %s, acted_at = now() WHERE id = %s::uuid",
+                    (outcome["status"], flag_id))
+        conn.commit()
+    return {"ok": True, "flag_id": flag_id, **outcome}
+
+
+@app.post("/agent-flags/{flag_id}/dismiss", tags=["Agent Feedback"])
+def dismiss_agent_flag(flag_id: str, _: bool = Depends(auth)):
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE agent_flags SET status = 'dismissed', acted_at = now() "
+                    "WHERE id = %s::uuid", (flag_id,))
+        n = cur.rowcount
+        conn.commit()
+    if not n:
+        raise HTTPException(404, f"flag {flag_id} not found")
+    return {"ok": True, "flag_id": flag_id, "status": "dismissed"}
+
+
+@app.post("/agent-flags/drain", tags=["Agent Feedback"])
+def drain_agent_flags(auto: bool = False, min_confidence: float = 0.9,
+                      limit: int = 50, _: bool = Depends(auth)):
+    """Coordinator: turn pending flags into scan_recommendations. With auto=false
+    (default) this is a no-op reminder; with auto=true it acts on high-confidence
+    in-scope flags (data.confidence >= min_confidence). All still scope-gated at
+    dispatch."""
+    import agent_flags as af
+    acted = acknowledged = 0
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT id, engagement_id, data, status FROM agent_flags "
+                    "WHERE status = 'pending' ORDER BY created_at LIMIT %s",
+                    (max(1, min(limit, 500)),))
+        flags = cur.fetchall()
+        for flag in flags:
+            data = flag["data"] if isinstance(flag["data"], dict) else {}
+            if not auto:
+                continue
+            if float(data.get("confidence", 0) or 0) < min_confidence:
+                continue
+            outcome = af.enqueue_from_flag(cur, flag)
+            cur.execute("UPDATE agent_flags SET status = %s, acted_at = now() WHERE id = %s",
+                        (outcome["status"], flag["id"]))
+            acted += outcome["status"] == "acted"
+            acknowledged += outcome["status"] == "acknowledged"
+        conn.commit()
+    return {"ok": True, "pending": len(flags), "acted": acted, "acknowledged": acknowledged}
+
+
 @app.get("/agent/post-review/executions/{execution_id}", tags=["Post Review"])
 def get_reviewed_execution(execution_id: str, _: bool = Depends(auth)):
     """One execution in FULL, for display: output, return code, options, analysis.
@@ -19955,6 +20055,30 @@ def get_agents_status(_: bool = Depends(auth)):
             "id": "whois-agent", "name": "WHOIS Collection",
             "type": "on-demand", "status": "error",
             "description": "Passive WHOIS/registrant lookup for every scope + discovered owner domain",
+        })
+
+    # 10. Agent Feedback channel — one agent flags interesting things; approving a
+    #     flag enqueues a scope-gated scan_recommendation.
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT count(*) FILTER (WHERE status='pending') pending, "
+                        "count(*) FILTER (WHERE status='acted') acted, "
+                        "max(created_at) last FROM agent_flags")
+            a = cur.fetchone() or {}
+            pend = int(a.get("pending") or 0)
+            agents.append({
+                "id": "agent-feedback", "name": "Agent Feedback",
+                "type": "on-demand", "status": "running" if pend > 0 else "idle",
+                "description": "Inter-agent channel: flags interesting findings for review; approving one queues a scope-gated follow-up scan",
+                "queue_pending": pend,
+                "queue_done": int(a.get("acted") or 0),
+                "last_run": a["last"].isoformat() if a.get("last") else None,
+            })
+    except Exception:
+        agents.append({
+            "id": "agent-feedback", "name": "Agent Feedback",
+            "type": "on-demand", "status": "error",
+            "description": "Inter-agent channel for flagging interesting findings",
         })
 
     return {"agents": agents}
