@@ -1893,7 +1893,8 @@ def _store_artifact_row(*, tool: str, content: str, command: str = None,
                         target: str = None, port: int = None, service: str = None,
                         exec_id: str = None, job_id: str = None, scan_id: str = None,
                         source: str = "unknown", content_format: str = None,
-                        native_json: bool = False, engagement_id: str = None) -> dict:
+                        native_json: bool = False, engagement_id: str = None,
+                        note: str = None) -> dict:
     """Insert or dedupe one artifact. Shared by the HTTP endpoint and the
     upload chokepoint so the two paths cannot drift apart."""
     sha = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
@@ -1903,20 +1904,21 @@ def _store_artifact_row(*, tool: str, content: str, command: str = None,
             """
             INSERT INTO raw_artifacts
                 (engagement_id, tool, command, target, port, service, exec_id,
-                 job_id, scan_id, source, content_format, native_json, content,
+                 job_id, scan_id, source, note, content_format, native_json, content,
                  content_sha256, byte_size)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (tool, COALESCE(target,''), content_sha256) DO UPDATE
                SET last_seen    = now(),
                    occurrences  = raw_artifacts.occurrences + 1,
                    exec_id      = COALESCE(EXCLUDED.exec_id, raw_artifacts.exec_id),
                    job_id       = COALESCE(EXCLUDED.job_id, raw_artifacts.job_id),
                    scan_id      = COALESCE(EXCLUDED.scan_id, raw_artifacts.scan_id),
-                   command      = COALESCE(EXCLUDED.command, raw_artifacts.command)
+                   command      = COALESCE(EXCLUDED.command, raw_artifacts.command),
+                   note         = COALESCE(EXCLUDED.note, raw_artifacts.note)
             RETURNING id, (xmax = 0) AS inserted, occurrences
             """,
             (engagement_id, tool, command, target, port, service, exec_id, job_id,
-             scan_id, source, fmt, native_json, content, sha,
+             scan_id, source, note, fmt, native_json, content, sha,
              len(content.encode("utf-8", "replace"))),
         )
         row = cur.fetchone()
@@ -3258,6 +3260,8 @@ class RawArtifactRequest(BaseModel):
     content_format: Optional[str] = None
     native_json: bool = False
     engagement_id: Optional[str] = None
+    # Operator label for a manually uploaded artifact ("what is this for").
+    note: Optional[str] = None
 
 
 class ArtifactProcessedRequest(BaseModel):
@@ -3310,7 +3314,7 @@ def ingest_raw_artifact(req: RawArtifactRequest, authorized: bool = Depends(auth
         tool=req.tool, content=content, command=req.command, target=req.target,
         port=req.port, service=req.service, exec_id=req.exec_id, job_id=req.job_id,
         scan_id=req.scan_id, source=req.source, content_format=req.content_format,
-        native_json=req.native_json, engagement_id=req.engagement_id)
+        native_json=req.native_json, engagement_id=req.engagement_id, note=req.note)
     artifact_id, inserted, occurrences = res["artifact_id"], res["inserted"], res["occurrences"]
     fmt, sha = res["content_format"], res["sha256"]
 
@@ -3509,7 +3513,7 @@ def list_artifacts(llm_status: Optional[str] = None, tool: Optional[str] = None,
         params["target"] = f"%{target}%"
     clause = ("WHERE " + " AND ".join(where)) if where else ""
     cols = ("id, tool, command, target, port, service, exec_id, job_id, scan_id, "
-            "source, content_format, native_json, content_sha256, byte_size, "
+            "source, note, content_format, native_json, content_sha256, byte_size, "
             "first_seen, last_seen, occurrences, llm_status, llm_model, "
             "llm_processed_at, llm_attempts, llm_error, created_at")
     if include_content:

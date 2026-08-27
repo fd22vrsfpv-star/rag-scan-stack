@@ -20,6 +20,8 @@ export interface Artifact {
   job_id: string | null
   scan_id: string | null
   source: string
+  /** Operator label for a manually uploaded artifact ("what is this"). */
+  note?: string | null
   content_format: string
   native_json: boolean
   content_sha256: string
@@ -130,6 +132,39 @@ export function useArtifact(id: string | null) {
     queryKey: ['artifact', id],
     queryFn: () => apiFetch<Artifact>(`/artifacts/${id}`),
     enabled: !!id,
+  })
+}
+
+export interface UploadArtifactPayload {
+  tool: string
+  content: string
+  target?: string
+  note?: string
+  command?: string
+}
+export interface UploadArtifactResult {
+  ok: boolean
+  artifact_id: string
+  inserted: boolean
+  occurrences: number
+  content_format: string
+}
+
+/** Upload a scan output file for analysis. The file text is read client-side and
+ *  stored as a raw artifact (source='manual-upload') that then behaves like any
+ *  other — Extract & Learn, drain, follow-on actions. */
+export function useUploadArtifact() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: UploadArtifactPayload) =>
+      apiFetch<UploadArtifactResult>('/ingest/raw-artifact', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['artifacts'] })
+      qc.invalidateQueries({ queryKey: ['artifact-stats'] })
+    },
   })
 }
 

@@ -5114,6 +5114,8 @@ CREATE TABLE IF NOT EXISTS public.raw_artifacts (
     job_id           text,
     scan_id          uuid,
     source           text DEFAULT 'unknown',
+    -- Operator-supplied label for a manually uploaded artifact ("what is this").
+    note             text,
     content_format   text DEFAULT 'text',
     native_json      boolean DEFAULT false,
     content          text NOT NULL,
@@ -5133,6 +5135,9 @@ CREATE TABLE IF NOT EXISTS public.raw_artifacts (
     CONSTRAINT raw_artifacts_llm_status_check CHECK (
         llm_status IN ('pending','processing','done','failed','skipped'))
 );
+
+-- Backfill for databases created before `note` existed (idempotent).
+ALTER TABLE public.raw_artifacts ADD COLUMN IF NOT EXISTS note text;
 
 ALTER TABLE public.raw_artifacts
     DROP CONSTRAINT IF EXISTS raw_artifacts_scan_id_fkey;
