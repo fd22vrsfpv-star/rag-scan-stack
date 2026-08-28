@@ -106,6 +106,11 @@ DYNAMIC_SEGMENT_SOURCES = {
     ("maintenance.py", "/cleanup/{}"): ("CLEANUP_CATEGORIES", "keys"),
     ("scans.py", "/ingest/{}"): ("CLOUD_IMPORT_ROUTES", "values"),
     ("targeted_recon.py", "/ingest/{}"): ("TOOL_OUTPUT_MAP", "ingest-field"),
+    # Two placeholders: the leading {} is the flag id (left as a placeholder,
+    # which is how declared routes are normalised) and the trailing one is the
+    # action being enumerated. Substitution fills the LAST {} for exactly this
+    # case.
+    ("agents.py", "/agent-flags/{}/{}"): ("AGENT_FLAG_ACTIONS", "members"),
 }
 
 # Known-bad upstream paths that still ship. RATCHETS: a new one fails by name,
@@ -433,13 +438,20 @@ def test_dynamic_segments_resolve(declared):
             segments = list(raw)
         elif how == "values":
             segments = list(raw.values())
+        elif how == "members":  # a flat tuple/list of segment values
+            segments = list(raw)
         else:  # ingest-field: {tool: {"ingest": <segment or None>}}
             segments = [v.get("ingest") for v in raw.values()
                         if isinstance(v, dict) and v.get("ingest")]
         assert segments, f"{module_file}: {const} produced no segments to check"
         for seg in segments:
             checked += 1
-            path = template.replace("{}", str(seg))
+            # Fill the LAST placeholder, not every one: a template with two
+            # placeholders (id + enumerated segment) would otherwise get the
+            # segment substituted into the id position as well. Identical to
+            # .replace() for the single-placeholder templates.
+            head, _, tail = template.rpartition("{}")
+            path = head + str(seg) + tail
             if not _matches("POST", path, declared["rag_api_url"]):
                 missing.append(f"{module_file}: POST {path} (from {const})")
 

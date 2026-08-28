@@ -251,3 +251,281 @@ their own cutover (scan/analyze/exploit are the remaining increments).
 **Next decision:** Phase 4 — flip default `AGENT_ENGINE=langgraph` behind a canary,
 cut scan/analyze over, wire `interrupt()` for exploit approval, add the langgraph
 checkpoint tables to db_init + health check, then retire the AutoGen scaffolding.
+
+## 13. Phase 4 RESULTS — default flipped, scan/analyze cut over, HITL landed (2026-08-28) ✅
+
+### What changed
+- **Default engine is now LangGraph.** `DEFAULT_AGENT_ENGINE = "langgraph"` in
+  `autogen_service.py`, `AGENT_ENGINE: ${AGENT_ENGINE:-langgraph}` in
+  `docker-compose.yml`, `AGENT_ENGINE=langgraph` in `.env` / `.env.example`.
+- **AutoGen is the fallback for one release, and the canary is per session.**
+  `POST /pentest {"engine": "autogen"}` pins ONE session to either engine with no
+  restart and no shared state; the *resolved* engine is persisted in the session
+  `configuration`, so a run stays correctly labelled after the default moves (an
+  A/B comparison where past runs relabel themselves is worthless). A resumed
+  session inherits its parent's engine. `GET /pentest/engine` reports the
+  resolved engine plus whether each engine is loadable.
+- **scan + analyze are now LLM agents** (same `create_react_agent` pattern as
+  recon), each with its own toolset and a deterministic fallback. The
+  `auto_execute` contract is enforced by the **toolset, not the prompt**: with it
+  off the scan agent is handed no `start_*` tool at all. `SCAN_TOOLS_DISPATCH`
+  deliberately excludes credential brute force (`start_brutus`,
+  `start_credential_check`) so an unattended session's blast radius is
+  enumeration only.
+- **Human-in-the-loop exploit approval via native `interrupt()`** (opt-in:
+  `enable_exploit_phase`, `LANGGRAPH_EXPLOIT_PHASE`, off by default because a
+  session with it on *parks* until a human answers). Three nodes, not one:
+  `exploit_plan` (LLM, read-only + `queue_exploit_for_approval`) →
+  `exploit_approval` (`interrupt()` only) → `exploit_exec`. The split is
+  load-bearing: **a node containing `interrupt()` re-runs from its start on
+  resume**, so any side effect in front of the pause would happen twice (a
+  duplicate queued exploit, a second LLM bill).
+  New routes: `GET /pentest/{id}/pending-approval` (reads the *checkpoint*, so it
+  is correct after a restart) and `POST /pentest/{id}/approve`
+  (`Command(resume=…)` continues the SAME session — no new row, no
+  `parent_session_id`, no replay).
+- **New session status `awaiting_approval`** — added to the `agent_sessions`
+  CHECK in `db_init/ensure_all_tables.sql`, `create_agent_tables.sql`,
+  `setup_alldb.sql` and the runtime self-heal migration in `db_utils.py`. It is
+  deliberately NOT `active`: the watchdog only inspects `active`, so a parked
+  session is no longer mistaken for a stall and "recovered".
+- **Checkpoint tables are now declared**, not runtime magic:
+  `db_init/create_langgraph_checkpoint_tables.sql` (+ the same block in
+  `ensure_all_tables.sql`), asserted by `scripts/post-install-check.sh`,
+  `scripts/ensure_db_schema.sh` and rag-api `health_router.py`. DDL is copied
+  verbatim from `langgraph.checkpoint.postgres.base.MIGRATIONS`, and
+  `checkpoint_migrations` is left **empty on purpose** — the library reads
+  `MAX(v)` to decide what to apply and every migration is idempotent, so empty
+  means "re-apply all" (correct). Seeding versions would make it SKIP work.
+- **UI**: `awaiting_approval` gets a pulsing purple dot and an "awaiting
+  approval" badge, is filed under LIVE sessions (not history — that is how an
+  approval sits unnoticed), and gets an approval banner with the candidate,
+  Approve & run / Decline, and a link to Pending Exploits. The launch form gained
+  an **Engine** selector and an **Exploit phase** checkbox; the session detail
+  shows which engine the run used.
+
+### Parity gaps found and closed (these would have broken on the flip)
+1. **`scan_tracker.set_session()` was never called.** Every LangGraph session
+   therefore had an empty `/scans` view, and `port_profile` / `web_profile` were
+   accepted by the API and silently ignored — the operator's port scope simply
+   did not apply.
+2. **No LLM metrics.** `llm_request_metrics` is fed by a monkeypatch on AutoGen's
+   `OpenAIWrapper.create`, which a LangChain client never goes through — so
+   flipping the default would have emptied the cost/latency dashboards.
+   Replaced with a LangChain callback handler writing the identical row shape.
+   *Verified:* 16 rows for one live session with per-agent attribution, tokens,
+   latency, tool names, and an `is_error=True` row for a 429.
+3. **Every webhook event was being dropped.** `_ALL_EVENT_TYPES` on the
+   `event-log` webhook is an **allow-list**, not a catch-all. `/webhooks/emit`
+   answered 200 and the events were discarded, so the Agent Activity timeline
+   showed nothing for any LangGraph session — Phase 1's "webhooks 200" was true
+   and misleading. The nine `langgraph_*` types are now in the list
+   (`app/rag-api/webhooks/router.py`, applied on startup so existing installs
+   self-heal). *Verified:* 11 events on the timeline for one park+resume run, all
+   `status=delivered`, tagged `engine=langgraph`.
+4. **The AutoGen fallback could not start a session at all.** Phase 4's premise
+   is "AutoGen stays available for one release", so this had to be true rather
+   than assumed. It was not: `POST /pentest {"engine":"autogen"}` failed with
+   *"Pre-flight check failed: Azure endpoint or API key not configured"*.
+   Cause (pre-existing, nothing to do with LangGraph): the active backend moved
+   into the dashboard DB, so `get_llm_backend()` answers `azure` from the DB
+   while `check_azure_sync()` still reads the raw `AZURE_ENDPOINT` /
+   `AZURE_API_KEY` env vars — both **empty** here. The DB config
+   (`DeepSeek-V4-Flash` at `https://rt3ai.services.ai.azure.com/openai/v1`) was
+   fine, and the LangGraph engine used it happily, which is exactly why nobody
+   noticed. Fixed with `check_resolved_llm_sync()`: ping the config the agents
+   are actually built from, fall back to the env-var checks only when it
+   resolves nothing, and treat a **429 as healthy** (rate-limited means
+   reachable and authorised; refusing to start does strictly less than starting
+   and letting the session's own retries handle it).
+   *Verified:* `LLM check passed (azure): DeepSeek-V4-Flash healthy at
+   https://rt3ai.services.ai.azure.com/openai/v1`, then a real AutoGen GroupChat
+   session ran to `completed` with 5 messages.
+5. **The analyze phase was silently truncated.** `recursion_limit` counts graph
+   super-steps and one tool-using turn costs TWO, so the old budget of 14 was
+   ~7 tool rounds. Analyze made 10 calls on its first live run and returned
+   LangGraph's "Sorry, need more steps to process this request." in place of an
+   analysis — which reads like a model refusal. Budgets are now per phase
+   (`PHASE_STEP_BUDGET`) and a truncated answer is labelled `[TRUNCATED …]`
+   instead of being stored as the phase's conclusion.
+
+### Verified live (observed, quoted)
+- `GET /pentest/engine` and the BFF proxy:
+  `{"engine":"langgraph","default":"langgraph","env_AGENT_ENGINE":"langgraph",…,"availability":{"langgraph":{"available":true},"autogen":{"available":true}}}`
+- **A real LLM session on the new default** (`321ac742…`, exploit phase on,
+  `auto_execute=false`): recon ran a 3-call tool loop, analyze a 10-call loop,
+  scan fell back on a 429, and exploit planning skipped the gate rather than
+  parking on a candidate that was never queued — every fallback behaved as
+  designed and the session completed.
+- **Park + resume, end to end, across processes.** The graph parked with
+  `status=awaiting_approval`, **6 Postgres checkpoints**, the payload in session
+  metadata; the *service* process then read that interrupt back through
+  `GET /api/agent-sessions/{id}/pending-approval` (written by a different
+  process — the durability proof). `approved=true` with no `pending_exploit_id`
+  → **400**. Decline → resumed to `completed` with
+  `operator exploit decision: approved=False`, and the summary still showed the
+  earlier phases' real tool counts, i.e. **nothing was replayed**. Approve with a
+  well-formed but non-existent id → reached the real gated body and reported
+  `{"ok": false, "error": "Exploit not found"}`, proving the wiring without
+  firing an exploit.
+- Endpoint status codes: malformed uuid **400**, unknown session **404**,
+  not-parked session **409**, live session pending-approval **200**.
+- `agent_sessions_status_check` on the live DB now includes
+  `'awaiting_approval'` (runtime migration self-healed it).
+
+### Tests
+- `tests/test_langgraph_phases.py` — 20 cases. Reads the phase tool-name sets out
+  of `langgraph_engine.py` with `ast` instead of importing it, so the guard runs
+  on a bare checkout rather than skipping everywhere. Covers: every phase tool
+  exists in the AutoGen roster; no read-only phase holds a dispatcher; the scan
+  phase excludes brute force; **`execute_approved_exploit` appears in no toolset
+  and is called from exactly one function (`exploit_exec`)**; the default engine
+  and the compose/.env defaults agree; and the real graph parks, resumes
+  approved, resumes declined, never parks with the phase off, and never parks
+  with no candidate.
+  **Sabotage-proven, all three restored:** `start_nmap_scan` into
+  `SCAN_TOOLS_READONLY` → RED; `execute_approved_exploit` into
+  `EXPLOIT_PLAN_TOOLS` → RED; `interrupt()` replaced by a plain return → RED.
+- Green: `test_dispatch_invariants`, `test_langgraph_tool_parity`,
+  `test_proxy_contracts`, `test_route_contracts`, `test_fstring_placeholders`.
+- **Fixed a pre-existing red baseline** (failing on HEAD before this work):
+  `test_proxy_contracts::test_upstream_paths_exist` flagged
+  `/agent-flags/{}/{}` because the action segment was an inline tuple. Named it
+  `AGENT_FLAG_ACTIONS` and moved it into `DYNAMIC_SEGMENT_SOURCES`, so both
+  actions are now *checked* against declared upstream routes rather than
+  exempted. `PROXY_DYNAMIC` stays a one-entry list.
+
+### Still open (carried forward, none introduced here)
+- **AutoGen is not yet removed.** `pyautogen`, the watchdog, recovery and
+  `/nudge` all remain — that is the one-release fallback window, and the tests
+  pin `"autogen" in VALID_AGENT_ENGINES` so it cannot be dropped by accident.
+  Retiring it is the next increment.
+- **`get_scan_recommendations` still 500s** — scan-recommender's `/rag/ask`
+  embeds via `ollama:11434`, and there is no ollama container in this
+  deployment (`Failed to resolve 'ollama'`). Pre-existing; affects AutoGen too.
+  The `embedder` service is up and healthy, so the fix is repointing
+  `scan_recommender/exploits_rag.py`'s embedding backend — a separate change.
+- **DeepSeek-V4-Flash rate-limits (429) in centralus** under sustained use. The
+  per-phase fallbacks absorb it, but a session that hits it loses that phase's
+  reasoning. A higher-quota deployment or a second backend would fix it.
+- ~~A full AutoGen GroupChat session has still not been re-run on openai
+  3.5.0~~ — **done in Phase 4.** Session `ab8de451…` ran on `engine=autogen`,
+  pre-flight passed, GroupChat produced 5 messages, status `completed`. The
+  Phase 3 concern (openai 1.x → 3.x breaking AutoGen) is now closed by an actual
+  session, not just an import check.
+- Native `interrupt()` now covers exploit approval; `/nudge` and the
+  `parent_session_id` resume path are still the mechanism for the AutoGen engine.
+
+## 14. Phase 5 RESULTS — AutoGen RETIRED (2026-08-28) ✅
+The migration is complete. `pyautogen` is gone and nothing imports `autogen`.
+
+### Removed
+| What | Where | Lines |
+|---|---|---|
+| `PentestTeam`, GroupChat, custom speaker selection | `pentest_agents.py` (deleted) | 1231 |
+| AutoGen session runner (build team → GroupChat → poll `groupchat.messages` → interpret `_termination_reason`) | `autogen_service.py::run_pentest_session_sync` | 570 |
+| Agent factories (`create_assistant_agent`, `create_user_proxy_agent`, `register_function_to_agent`, `create_group_chat`, `create_group_chat_manager`) | `agent_config.py` | 157 |
+| `_patched_create` / `install_llm_metrics_patch` (monkeypatch on `OpenAIWrapper.create`) | `llm_metrics.py` | 122 |
+| `attempt_session_recovery` | `autogen_service.py` | 113 |
+| `POST /pentest/{id}/nudge` | `autogen_service.py` | 31 |
+| `pyautogen==0.2.18` | `requirements.txt` | — |
+
+`run_pentest_session_sync` survives as a ~15-line delegator so every call site
+still works. `SYSTEM_MESSAGES` and every `get_*_config()` in `agent_config.py`
+stay — the prompts feed the `/prompts` endpoints and the configs are what
+`langgraph_engine._chat_model()` reads.
+
+**Stall recovery is gone; stall detection is not.** Recovery appended a nudge to
+`groupchat.messages` and hoped speaker selection picked it up. There is no such
+loop in a StateGraph, and the deterministic edges remove the failure mode it
+existed for. The watchdog still labels a session that stops making progress, and
+still monitors scan jobs — that half was never AutoGen-specific.
+
+### The load-bearing problem, and how it was solved
+The tool roster existed **only as a side effect of building AutoGen agents**:
+`langgraph_tools` had to regex `pentest_agents.py` for
+`register_for_llm(name=...)` calls and resolve each callable out of that module's
+namespace. Deleting AutoGen would have deleted the tool surface with it.
+
+**`autogen_agents/tool_registry.py`** is the replacement — one declarative
+`ToolSpec(name, description, func)` list, generated from the 60 registrations
+(49 distinct tools) so nothing was lost. Verified against the old roster while
+both existed: **49 names identical, and `lt.TOOL_FUNCS[n] is tr.TOOL_FUNCS[n]`
+for all 49** — the same callable objects, not lookalikes.
+
+It also fixed two things the parse could not:
+- **Descriptions.** The regex recovered the tool NAME but not the curated
+  `description`, so `langgraph_tools` substituted `inspect.getdoc(fn)`. The
+  description is what the model reads when choosing a tool, so LangGraph agents
+  had been choosing from Python docstrings while the tuned text sat unused.
+- **A third copy of the roster.** `mcp_tools_bridge.NATIVE_TOOL_NAMES` was
+  hand-maintained and had drifted **both ways**: it listed `start_nikto_scan`,
+  which no tool provides (so a real MCP tool of that name would have been skipped
+  as a "native duplicate"), and omitted `get_attack_vectors` and
+  `start_subdomain_takeover`, which an MCP server could therefore shadow —
+  replacing a scope-gated local body with a remote one. Derived from the registry
+  now.
+
+### Features the AutoGen path owned, ported before deleting it
+Retiring AutoGen without these would have silently removed working
+functionality — the same class of gap Phase 4 found five of:
+1. **`_finalize_session`** — flow summary, claim validation, KB recommendation
+   drain, scan persistence, tracker cleanup. Now called from the LangGraph engine
+   in both the success and failure paths (a failed run is when it matters most).
+2. **`collect_session_outputs`** — the run's scans + transcript + report written
+   to a session directory. The engine had no transcript list to hand it, so one is
+   kept alongside the DB writes. *Verified:* `scan_sessions/phase5-retire-proof_40f00a8d/`
+   contains `conversation.json` (8091 bytes), `final_report.md`, `manifest.json`.
+3. **`metadata.scans` / `scan_summary`** from the scan tracker, which the
+   dashboard's per-session scan panel reads.
+4. **`auto_run_recommendations`** — accepted by the engine's entry point and then
+   *ignored*, so a session launched with it on left its KB recommendations at
+   `status='pending'` forever.
+5. **The operator prompt config.** `PentestTeam` overlaid the active
+   `prompt_configs` row onto `SYSTEM_MESSAGES`; the engine had hardcoded prompts,
+   so retiring AutoGen would have turned every saved prompt customisation into a
+   store-only setting. The engine now APPENDS the operator prompt to the phase
+   default rather than replacing it — the defaults carry the safety contract
+   (which tools exist, that a read-only phase must not dispatch, that the agent
+   must never execute an exploit), and a prompt field should not be able to talk
+   an agent out of those.
+
+### Verified live (observed, quoted)
+- `pip show pyautogen` → `WARNING: Package(s) not found`; `import autogen` →
+  `ModuleNotFoundError`; `import autogen_service` → OK.
+- `GET /pentest/engine` → `{"engine":"langgraph","valid":["langgraph"],"retired":["autogen"],…}`
+- A request pinning the retired engine is **warned and run on LangGraph**, not
+  failed: `Agent engine 'autogen' (from request) was RETIRED in migration Phase 5
+  — pyautogen is no longer installed. Running 'langgraph' instead.` Session
+  `40f00a8d…` completed.
+- Ported lifecycle confirmed on that session: metadata carried
+  `['claim_validation', 'engine', 'phase', 'scan_flow_summary', 'scan_summary',
+  'scans', 'steps', 'total_messages']` — `scan_flow_summary` and
+  `claim_validation` had never appeared on a LangGraph session before.
+
+### Tests
+- **`tests/test_tool_registry.py`** (new, 9 cases) replaces
+  `test_langgraph_tool_parity.py` (deleted — there is nothing left to be at parity
+  with). Guards: the registry declares ≥49 tools (a hard number, because it is now
+  the ONLY declaration and a silent shrink is otherwise invisible); names unique;
+  every tool has an LLM-facing description; every spec resolves to a callable;
+  every spec is wrapped for LangGraph; the wrapper carries the *registry*
+  description, not a docstring; `NATIVE_TOOL_NAMES` is derived, not re-hardcoded;
+  and **no module imports `autogen` and `pyautogen` is not in requirements**.
+  **Sabotage-proven ×3:** blanked a description → RED; re-hardcoded
+  `NATIVE_TOOL_NAMES` → RED; re-added `import autogen` → RED.
+- `tests/test_langgraph_phases.py` updated: the roster comes from the registry
+  via `ast`, and `test_langgraph_is_the_only_engine` now asserts `autogen` is NOT
+  selectable (a selectable engine whose dependency is uninstalled would fail at
+  import time inside a background thread) while still being *recognised* as
+  retired.
+- Full suite: **1226 passed, 361 skipped**, and the same 5 pre-existing
+  environmental failures as before this work (see `tests/README.md`).
+
+### Deliberately NOT done
+- **The service, container and directory keep the `autogen` name.** Renaming
+  would churn `docker-compose.yml`, the TLS cert SAN (`DNS:autogen-agents`), the
+  BFF's `autogen_url` setting, ~20 docs and every operator's muscle memory, for
+  no functional gain. The docs now say plainly that the name is historical.
+- `MAX_CONCURRENT_SCANS` / scope gate / webhook contracts: untouched, because the
+  tool bodies never moved.

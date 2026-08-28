@@ -41,12 +41,27 @@ class StartSessionRequest(BaseModel):
     enable_recon_agent: Optional[bool] = None
     # Dispatch still-pending KB recommendations when the session ends.
     auto_run_recommendations: Optional[bool] = None
+    # Orchestration engine for this session: 'langgraph' (default) or 'autogen'
+    # (legacy GroupChat, kept one release). This is the canary control — pin one
+    # session to either engine without restarting anything. Omit for the
+    # service-wide AGENT_ENGINE default.
+    engine: Optional[str] = None
+    # LangGraph only: add the exploit phase, which PAUSES the session on a
+    # durable interrupt until an operator answers /approve.
+    enable_exploit_phase: Optional[bool] = None
 
 
 class ResumeRequest(BaseModel):
     max_rounds: int = 200
     additional_instructions: Optional[str] = None
     proxy: Optional[str] = None  # SOCKS proxy URL — switch or keep proxy
+
+
+class ApprovalRequest(BaseModel):
+    """Operator answer to a paused LangGraph approval interrupt."""
+    approved: bool
+    pending_exploit_id: Optional[str] = None
+    note: Optional[str] = None
 
 
 @router.get("/api/agent-sessions")
@@ -68,6 +83,54 @@ async def start_session(req: StartSessionRequest):
     async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.post(
             f"{s.autogen_url}/pentest",
+            json=req.model_dump(),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.get("/api/agent-sessions/engine")
+async def get_agent_engine():
+    """Which orchestration engine new sessions use (LangGraph vs legacy AutoGen).
+
+    Declared BEFORE /api/agent-sessions/{session_id}: FastAPI matches in
+    declaration order, so after the parameterised route "engine" would be read
+    as a session id and 400 on the uuid parse.
+    """
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=30) as c:
+        resp = await c.get(
+            f"{s.autogen_url}/pentest/engine",
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.get("/api/agent-sessions/{session_id}/pending-approval")
+async def get_pending_approval(session_id: str):
+    """What a paused LangGraph session is waiting for (read from its checkpoint)."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=30) as c:
+        resp = await c.get(
+            f"{s.autogen_url}/pentest/{session_id}/pending-approval",
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.post("/api/agent-sessions/{session_id}/approve")
+async def approve_session_step(session_id: str, req: ApprovalRequest):
+    """Answer the approval interrupt; the session continues from its checkpoint."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=60) as c:
+        resp = await c.post(
+            f"{s.autogen_url}/pentest/{session_id}/approve",
             json=req.model_dump(),
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )

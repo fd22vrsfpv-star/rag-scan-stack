@@ -185,13 +185,28 @@ class ScopeClassifier:
         ctx_text = " ".join(parts)
 
         try:
-            resp = _req.post(f"{EMBEDDER_URL}/embed", json={"text": ctx_text}, timeout=5)
+            # app/embedder's contract is {"texts": [...]} -> {"embeddings": [[...]]}.
+            # This used to send {"text": ...} and read ["embedding"], so the
+            # request was a 422 and the response key never existed — the except
+            # swallowed it and returned None every single time. That is why
+            # scope_decisions accumulated 1151 rows with 0 embeddings while
+            # looking like a working classifier.
+            resp = _req.post(f"{EMBEDDER_URL}/embed", json={"texts": [ctx_text]},
+                             timeout=10)
             if resp.status_code != 200:
+                logger.warning("embedder returned HTTP %s for scope embedding: %s",
+                            resp.status_code, resp.text[:200])
                 return None
-            embedding = resp.json().get("embedding")
+            vectors = resp.json().get("embeddings") or []
+            embedding = vectors[0] if vectors else None
             if not embedding:
+                logger.warning("embedder returned no vector for scope embedding")
                 return None
-        except Exception:
+        except Exception as e:
+            # Logged, not silent: a permanently unreachable embedder previously
+            # looked identical to "nothing similar found".
+            logger.warning("scope embedding failed via %s: %s: %s",
+                           EMBEDDER_URL, type(e).__name__, e)
             return None
 
         # Search for similar decisions

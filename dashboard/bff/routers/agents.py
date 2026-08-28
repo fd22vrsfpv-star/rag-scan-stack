@@ -35,10 +35,18 @@ async def list_agent_flags(status: Optional[str] = None, engagement_id: Optional
         return safe_json(resp)
 
 
+# The actions /api/agent-flags/{flag_id}/{action} forwards. A module-level
+# constant rather than an inline tuple so tests/test_proxy_contracts.py can
+# enumerate them and prove each one resolves to a declared rag-api route
+# (DYNAMIC_SEGMENT_SOURCES). Before this the guard could not read the second
+# path segment and reported the call as an upstream that no service declares.
+AGENT_FLAG_ACTIONS = ("approve", "dismiss")
+
+
 @router.post("/api/agent-flags/{flag_id}/{action}")
 async def act_agent_flag(flag_id: str, action: str):
-    if action not in ("approve", "dismiss"):
-        raise HTTPException(400, "action must be approve or dismiss")
+    if action not in AGENT_FLAG_ACTIONS:
+        raise HTTPException(400, f"action must be one of {AGENT_FLAG_ACTIONS}")
     s = get_settings()
     async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(f"{s.rag_api_url}/agent-flags/{flag_id}/{action}",

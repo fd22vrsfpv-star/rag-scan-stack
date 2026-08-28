@@ -272,10 +272,20 @@ services:
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
       EMBED_MODEL: ${EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+    # TLS, like every other service. certs/server.crt ALREADY carries
+    # `DNS:embedder` in its SAN — the intent was always https — but the command
+    # override and the certs mount were missing, so the embedder served plain
+    # HTTP while all four callers used EMBEDDER_URL=https://embedder:8030. Every
+    # embed call failed with `SSLError WRONG_VERSION_NUMBER`, which is why
+    # scope_decisions held 1151 rows and 0 embeddings and why /rag/ask could
+    # never embed a question.
+    command: uvicorn main:app --host 0.0.0.0 --port 8030 --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
+    volumes:
+      - ./certs:/certs:ro
     ports: ["8030:8030"]
     networks: [agents_net]
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8030/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8030/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -300,6 +310,11 @@ services:
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
       EMBED_MODEL: ${EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+    # Same TLS wiring as the CPU embedder — it takes over the `embedder`
+    # network alias, so callers' https:// URLs must work here too.
+    command: uvicorn main:app --host 0.0.0.0 --port 8030 --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
+    volumes:
+      - ./certs:/certs:ro
     ports: ["8031:8030"]
     networks:
       agents_net:
@@ -313,7 +328,7 @@ services:
               count: all
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8030/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8030/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -865,6 +880,15 @@ services:
       OLLAMA_BASE_URL: ${OLLAMA_URL:-http://ollama:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
       CHAT_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
+      # Embeddings are resolved SEPARATELY from LLM_BACKEND: the chat model
+      # (DeepSeek-V4-Flash) cannot embed, and Azure AI Services has no
+      # /embeddings route for it. `auto` picks Azure only when AZURE_EMBED_MODEL
+      # is explicitly set, else the app/embedder service, else ollama.
+      # Before this, /rag/ask embedded against `ollama:11434` in a deployment
+      # with no ollama container, so get_scan_recommendations was permanently
+      # broken for both agent engines.
+      EMBED_BACKEND: ${EMBED_BACKEND:-auto}
+      EMBEDDER_URL: ${EMBEDDER_URL:-https://embedder:8030}
       TOOL_KB_PATH: "/knowledge/service_tools.yaml"
       PLAYBOOK_DIR: "/knowledge/playbooks"
       KALI_LISTENER_URL: "https://kali-listener:8019"
@@ -1023,8 +1047,20 @@ services:
       SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       API_KEY: ${API_KEY:-changeme}
-      # Orchestration backend: 'autogen' (default) | 'langgraph' (migration Phase 1).
-      AGENT_ENGINE: ${AGENT_ENGINE:-autogen}
+      # Orchestration backend for the AI agent sessions.
+      # 'langgraph' is the DEFAULT as of migration Phase 4 (deterministic
+      # StateGraph + durable Postgres checkpoints); 'autogen' is the legacy
+      # GroupChat, kept as the fallback for one release. See
+      # Docs/LANGGRAPH_MIGRATION_PLAN.md. To fall back stack-wide set
+      # AGENT_ENGINE=autogen in .env; to compare a single session, POST
+      # /pentest with {"engine": "autogen"} — no restart needed.
+      AGENT_ENGINE: ${AGENT_ENGINE:-langgraph}
+      # LangGraph exploit phase. Off by default ON PURPOSE: with it on, a
+      # session PAUSES at status='awaiting_approval' until an operator answers
+      # POST /pentest/{id}/approve, so enabling it stack-wide would leave
+      # unattended sessions parked. Turn it on per session with
+      # {"enable_exploit_phase": true}.
+      LANGGRAPH_EXPLOIT_PHASE: ${LANGGRAPH_EXPLOIT_PHASE:-false}
       # LLM Backend: "ollama", "vllm", "azure", "openai", or "anthropic"
       LLM_BACKEND: ${LLM_BACKEND:-ollama}
       # Ollama settings (default)

@@ -152,9 +152,41 @@ Columns worth knowing about:
 ### Integration (1)
 - `zap_sessions` - ZAP proxy session tracking
 
-### Agent System (2)
-- `agent_sessions` - Multi-agent scan sessions
+### Agent System (6)
+- `agent_sessions` - Multi-agent scan sessions.
+  `status` is constrained: `active`, `completed`, `failed`, `stopped`, `stalled`,
+  `awaiting_approval`. **Any write of a value outside that list raises** — the
+  CHECK is declared in `db_init/ensure_all_tables.sql`,
+  `db_init/create_agent_tables.sql`, `db_init/setup_alldb.sql` and the runtime
+  self-heal migration in `autogen_agents/db_utils.py::ensure_schema`; all four
+  must be changed together.
+  `awaiting_approval` means the LangGraph session is parked on a durable
+  `interrupt()` waiting for an operator to answer
+  `POST /pentest/{id}/approve`. It is deliberately NOT `active`, because the
+  session watchdog only inspects `active` and would otherwise mark a
+  legitimately-paused session as stalled.
 - `agent_messages` - Agent conversation history
+
+#### LangGraph durable checkpoints (4)
+Library-managed by `langgraph-checkpoint-postgres` — `PostgresSaver.setup()`
+creates and migrates them on every agent-session start and resume. Declared in
+`db_init/create_langgraph_checkpoint_tables.sql` (and mirrored in
+`ensure_all_tables.sql`) so a fresh install has them before the first session,
+and asserted by `scripts/post-install-check.sh`, `scripts/ensure_db_schema.sh`
+and rag-api's `health_router.py`.
+
+- `checkpoints` - one row per graph super-step; `thread_id` **is** the agent
+  session id. This is what makes a paused session survive a restart.
+- `checkpoint_blobs` - channel values too large to inline
+- `checkpoint_writes` - pending writes per task
+- `checkpoint_migrations` - the library's own schema version
+
+> **Do not seed `checkpoint_migrations`.** The library reads `MAX(v)` to decide
+> which migrations to apply, and every migration is idempotent — so an empty
+> table means "re-apply all", which is correct. Seeding version rows would make
+> it SKIP migrations it has not actually run, which is how a hand-mirrored
+> schema silently drifts from the library's.
+
 
 ### Supporting Tables (6)
 - `port_observation` - Detailed port scan data

@@ -1,7 +1,7 @@
 """
 LLM Request Metrics Instrumentation
 
-Monkey-patches autogen's OpenAIWrapper.create() to capture per-request metrics:
+Captures per-request LLM metrics for agent sessions:
 - Wall-clock latency
 - Token counts (prompt, completion, total)
 - Tool call detection
@@ -20,8 +20,6 @@ from contextlib import contextmanager
 
 logger = logging.getLogger("llm_metrics")
 
-_patch_applied = False
-_original_create = None
 
 
 class LLMMetricsContext:
@@ -93,126 +91,20 @@ class LLMMetricsContext:
             logger.error(f"[LLMMetrics] Failed to flush metrics: {e}")
 
 
-def _patched_create(self, *args, **kwargs):
-    """Wrapper around OpenAIWrapper.create() that captures metrics."""
-    session_id = LLMMetricsContext.get_current_session()
-    if not session_id:
-        return _original_create(self, *args, **kwargs)
-
-    # Extract model name
-    model_name = "unknown"
-    try:
-        if hasattr(self, '_config_list') and self._config_list:
-            model_name = self._config_list[0].get("model", "unknown")
-    except Exception:
-        pass
-
-    # Extract agent name from messages
-    agent_name = None
-    messages = kwargs.get("messages") or (args[1] if len(args) > 1 else None)
-    if messages:
-        try:
-            for msg in reversed(messages):
-                if isinstance(msg, dict) and msg.get("name"):
-                    agent_name = msg["name"]
-                    break
-        except Exception:
-            pass
-
-    start_time = time.time()
-    is_error = False
-    error_message = None
-    response = None
-
-    try:
-        response = _original_create(self, *args, **kwargs)
-        return response
-    except Exception as e:
-        is_error = True
-        error_message = f"{type(e).__name__}: {str(e)[:500]}"
-        raise
-    finally:
-        latency_ms = (time.time() - start_time) * 1000
-
-        # Extract token counts
-        prompt_tokens = None
-        completion_tokens = None
-        total_tokens = None
-        has_tool_calls = False
-        tool_call_count = 0
-        tool_names = []
-
-        if response is not None:
-            try:
-                usage = getattr(response, 'usage', None)
-                if usage is None and hasattr(response, 'model_extra'):
-                    usage = response.model_extra.get('usage')
-                if usage:
-                    prompt_tokens = getattr(usage, 'prompt_tokens', None) or (usage.get('prompt_tokens') if isinstance(usage, dict) else None)
-                    completion_tokens = getattr(usage, 'completion_tokens', None) or (usage.get('completion_tokens') if isinstance(usage, dict) else None)
-                    total_tokens = getattr(usage, 'total_tokens', None) or (usage.get('total_tokens') if isinstance(usage, dict) else None)
-            except Exception:
-                pass
-
-            try:
-                choices = getattr(response, 'choices', None)
-                if choices and len(choices) > 0:
-                    message = getattr(choices[0], 'message', None)
-                    if message:
-                        tc = getattr(message, 'tool_calls', None)
-                        if tc:
-                            has_tool_calls = True
-                            tool_call_count = len(tc)
-                            for call in tc:
-                                fn = getattr(call, 'function', None)
-                                if fn:
-                                    name = getattr(fn, 'name', None)
-                                    if name:
-                                        tool_names.append(name)
-            except Exception:
-                pass
-
-        import json
-        metric = {
-            "session_id": session_id,
-            "agent_name": agent_name,
-            "model_name": model_name,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-            "latency_ms": round(latency_ms, 2),
-            "has_tool_calls": has_tool_calls,
-            "tool_call_count": tool_call_count,
-            "tool_names": tool_names if tool_names else None,
-            "is_error": is_error,
-            "error_message": error_message,
-            "request_params": json.dumps({"model": model_name}),
-        }
-
-        try:
-            LLMMetricsContext.record_request(metric)
-        except Exception as rec_err:
-            logger.error(f"[LLMMetrics] Failed to record metric: {rec_err}")
-
-
-def install_llm_metrics_patch():
-    """Install the monkey-patch on OpenAIWrapper.create(). Idempotent."""
-    global _patch_applied, _original_create
-
-    if _patch_applied:
-        logger.info("[LLMMetrics] Patch already installed, skipping")
-        return
-
-    try:
-        from autogen.oai.client import OpenAIWrapper
-    except ImportError:
-        logger.warning("[LLMMetrics] autogen.oai.client not available, skipping patch")
-        return
-
-    _original_create = OpenAIWrapper.create
-    OpenAIWrapper.create = _patched_create
-    _patch_applied = True
-    logger.info("LLM metrics instrumentation installed successfully")
+# ===============================
+# AutoGen monkeypatch — REMOVED
+# ===============================
+# `_patched_create()` and `install_llm_metrics_patch()` lived here. They wrapped
+# `autogen.oai.client.OpenAIWrapper.create` to capture per-request latency,
+# tokens and tool calls. AutoGen is retired
+# (Docs/LANGGRAPH_MIGRATION_PLAN.md, Phase 5), and a LangChain client never goes
+# through that wrapper — which is exactly why flipping the engine default would
+# have silently emptied the LLM cost/latency dashboards.
+#
+# The replacement is `langgraph_engine.metrics_callback()`, a LangChain callback
+# handler that writes the SAME `llm_request_metrics` row shape through
+# `LLMMetricsContext.record_request` above. Keep the two row shapes identical:
+# the table, its indexes and every dashboard query are unchanged.
 
 
 @contextmanager

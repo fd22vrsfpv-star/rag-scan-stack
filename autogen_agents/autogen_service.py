@@ -29,11 +29,6 @@ retry_logger = logging.getLogger("autogen_service.retry")
 # Set up session logger for pentest sessions (will be captured by log_manager)
 session_logger = logging.getLogger("pentest_sessions")
 
-from pentest_agents import (
-    PentestTeam,
-    create_pentest_groupchat,
-    create_pentest_manager,
-)
 from db_utils import (
     create_agent_session,
     update_agent_session,
@@ -59,7 +54,7 @@ from feedback_db import (
 from log_manager import get_log_handler, setup_log_capture
 from exploit_watcher import get_exploit_watcher, start_exploit_watcher
 from scan_tools import scan_tracker, get_session_scan_status
-from llm_metrics import install_llm_metrics_patch, LLMMetricsContext
+from llm_metrics import LLMMetricsContext
 from report_generator import (
     db_get_report_summary,
     db_get_vulnerabilities_by_severity,
@@ -391,11 +386,11 @@ async def check_service_health(service_name: str, url: str, timeout: int = 3) ->
         return False, f"{service_name} check failed: {str(e)}"
 
 
-# Install LLM metrics instrumentation (monkey-patches OpenAIWrapper.create)
-try:
-    install_llm_metrics_patch()
-except Exception as e:
-    logging.getLogger("autogen_service").error(f"Failed to install LLM metrics patch: {e}")
+# LLM metrics used to be captured here by monkeypatching AutoGen's
+# OpenAIWrapper.create. With AutoGen retired there is nothing to patch: the
+# LangGraph engine writes the same llm_request_metrics rows through a LangChain
+# callback (langgraph_engine.metrics_callback), so the table and every dashboard
+# that reads it are unchanged.
 
 # FastAPI app
 app = FastAPI(
@@ -440,6 +435,41 @@ class PentestRequest(BaseModel):
     proxy: Optional[str] = Field(None, description="SOCKS proxy URL for routing scans through a remote node (e.g., 'socks5://node-manager:10001')")
     port_profile: Optional[str] = Field(None, description="Named port scope from knowledge/port_profiles.yaml (top-100, top-1000, web, redteam-targeted, all). Omit to use the scanner agent's built-in quick-then-deep policy.")
     web_profile: Optional[str] = Field(None, description="Named web scan depth from knowledge/web_profiles.yaml (quick, standard, deep, api, passive-web). Omit to use each web tool's own defaults.")
+    engine: Optional[str] = Field(
+        None,
+        description=(
+            "Orchestration engine for THIS session: 'langgraph' (default) or "
+            "'autogen' (the legacy GroupChat, kept as a fallback for one release "
+            "per Docs/LANGGRAPH_MIGRATION_PLAN.md). Omit to use the AGENT_ENGINE "
+            "env default. This is the canary control: an operator can pin a "
+            "single session to either engine without restarting the service."
+        ),
+    )
+    enable_exploit_phase: Optional[bool] = Field(
+        None,
+        description=(
+            "LangGraph engine only. Adds the exploit phase after analysis: the "
+            "agent queues ONE best-evidenced candidate for approval, then the "
+            "graph PAUSES on a durable interrupt until the operator answers "
+            "POST /pentest/{id}/approve. Off unless set (LANGGRAPH_EXPLOIT_PHASE "
+            "env default) — a session with it on will sit at "
+            "status='awaiting_approval' until a human acts."
+        ),
+    )
+
+
+class ApprovalRequest(BaseModel):
+    """The operator's answer to a paused LangGraph approval interrupt."""
+    approved: bool = Field(..., description="True to execute the queued exploit, False to decline and go to the report.")
+    pending_exploit_id: Optional[str] = Field(
+        None,
+        description=(
+            "The pending_exploits row to execute. REQUIRED when approved=true — "
+            "without it there is nothing to execute and the graph records the "
+            "approval as a no-op rather than guessing which exploit was meant."
+        ),
+    )
+    note: Optional[str] = Field(None, description="Operator note recorded on the session timeline.")
 
 
 class ResumeRequest(BaseModel):
@@ -601,117 +631,15 @@ active_sessions: Dict[str, Dict] = {}
 
 
 # ===============================
-# Session Recovery
+# Session Recovery — REMOVED
 # ===============================
-
-async def attempt_session_recovery(
-    session_id: str,
-    session_name: str,
-    message_count: int
-) -> bool:
-    """
-    Attempt to recover a stalled session by sending a nudge message.
-
-    For pyautogen GroupChat, stalls typically occur when the speaker selection
-    gets stuck after tool execution. Recovery strategies:
-    1. If session is in active_sessions, try to inject a continuation message
-    2. Log the recovery attempt for debugging
-
-    Args:
-        session_id: The session UUID as string
-        session_name: Human-readable session name
-        message_count: Current message count in the session
-
-    Returns:
-        True if recovery was initiated successfully, False otherwise
-    """
-    import sys
-    import contextlib
-
-    watchdog_logger.info(f"[{session_id[:8]}] Attempting session recovery...")
-
-    # Check if session is still in active_sessions (has live objects)
-    if session_id not in active_sessions:
-        watchdog_logger.warning(
-            f"[{session_id[:8]}] Session not in active_sessions - cannot recover. "
-            f"The session task may have already completed or crashed."
-        )
-        return False
-
-    session_data = active_sessions[session_id]
-    team = session_data.get("team")
-    groupchat = session_data.get("groupchat")
-    manager = session_data.get("manager")
-
-    if not all([team, groupchat, manager]):
-        watchdog_logger.warning(
-            f"[{session_id[:8]}] Session missing required objects (team/groupchat/manager)"
-        )
-        return False
-
-    try:
-        # Strategy: Send a continuation/nudge message to wake up the GroupChat
-        # This works by asking the coordinator to continue the conversation
-
-        nudge_messages = [
-            "Please continue with the penetration testing workflow. "
-            "If you were waiting for scan results, check if any scans have completed. "
-            "Coordinator, please direct the next steps.",
-
-            "The conversation appears to have paused. "
-            "Scanner or Analyzer, please report on any pending or completed operations. "
-            "Coordinator, please coordinate the next action.",
-
-            "Resuming penetration test workflow. "
-            "What is the current status? Please continue with the assessment."
-        ]
-
-        # Use different nudge messages for different recovery attempts
-        attempt_num = session_recovery_attempts.get(session_id, 0)
-        nudge_message = nudge_messages[attempt_num % len(nudge_messages)]
-
-        # Log the nudge message to the database
-        add_agent_message(
-            session_id=uuid.UUID(session_id),
-            agent_name="Watchdog",
-            role="system",
-            content=f"[AUTO-RECOVERY] {nudge_message}"
-        )
-
-        watchdog_logger.info(
-            f"[{session_id[:8]}] Nudge message logged. "
-            f"Note: pyautogen GroupChat recovery requires the main chat loop to process this."
-        )
-
-        # For pyautogen, we can try to append a message to the groupchat
-        # This may help if the chat loop is still running but stuck on speaker selection
-        if hasattr(groupchat, 'messages') and hasattr(manager, 'send'):
-            try:
-                # Add a system message to the groupchat to nudge it
-                recovery_msg = {
-                    "role": "user",
-                    "name": "Admin",
-                    "content": nudge_message
-                }
-                groupchat.messages.append(recovery_msg)
-                watchdog_logger.info(f"[{session_id[:8]}] Injected nudge message into groupchat")
-                return True
-
-            except Exception as inject_error:
-                watchdog_logger.warning(
-                    f"[{session_id[:8]}] Failed to inject message into groupchat: {inject_error}"
-                )
-
-        # If direct injection didn't work, the recovery message is at least logged
-        # The session may need manual intervention or restart
-        return True
-
-    except Exception as e:
-        watchdog_logger.error(f"[{session_id[:8]}] Recovery attempt failed: {e}")
-        import traceback
-        watchdog_logger.error(traceback.format_exc())
-        return False
-
+# `attempt_session_recovery()` lived here. It recovered a stalled session by
+# appending a nudge message to `groupchat.messages` and hoping AutoGen's speaker
+# selection picked it up. There is no speaker-selection loop in a StateGraph, so
+# there is nothing to nudge — and the deterministic edges remove the stall class
+# the recovery existed for. Retired with AutoGen
+# (Docs/LANGGRAPH_MIGRATION_PLAN.md, Phase 5). The watchdog still DETECTS a
+# stalled session and labels it; it no longer pretends it can revive one.
 
 # ===============================
 # Session Watchdog
@@ -791,83 +719,48 @@ async def session_watchdog():
                         # Session has stalled!
                         recovery_attempts = session_recovery_attempts.get(session_id, 0)
 
-                        # Check if auto-recovery is enabled and we have attempts remaining
-                        if SESSION_AUTO_RECOVERY_ENABLED and recovery_attempts < SESSION_MAX_RECOVERY_ATTEMPTS:
-                            # Attempt recovery
-                            watchdog_logger.warning(
-                                f"[{session_id[:8]}] SESSION STALLED - attempting recovery "
-                                f"(attempt {recovery_attempts + 1}/{SESSION_MAX_RECOVERY_ATTEMPTS}). "
-                                f"Stall time: {stall_time:.0f}s, Messages: {current_count}"
+                        # Stall DETECTION is still worth having: a session whose
+                        # LLM call never returns makes no progress and should be
+                        # labelled rather than left looking active.
+                        #
+                        # Stall RECOVERY is gone with AutoGen. It worked by
+                        # appending a nudge message to `groupchat.messages` and
+                        # hoping the speaker-selection loop picked it up — there
+                        # is no such loop to nudge in a StateGraph, and the
+                        # deterministic edges remove the failure mode the
+                        # recovery existed for. See
+                        # Docs/LANGGRAPH_MIGRATION_PLAN.md §5.1.
+                        watchdog_logger.warning(
+                            f"[{session_id[:8]}] SESSION STALLED - no progress for "
+                            f"{stall_time:.0f}s, messages: {current_count}. Marking stalled."
+                        )
+                        try:
+                            update_agent_session(
+                                session_id=uuid.UUID(session_id),
+                                status="stalled",
+                                summary=f"Session stalled - no progress for {stall_time:.0f} seconds. "
+                                       f"Last message count: {current_count}. "
+                                       f"Resume it to continue from where it stopped."
                             )
 
-                            try:
-                                # Try to recover the session
-                                recovery_success = await attempt_session_recovery(
-                                    session_id=session_id,
-                                    session_name=session_name,
-                                    message_count=current_count
-                                )
+                            # Remove from active_sessions dict
+                            if session_id in active_sessions:
+                                del active_sessions[session_id]
 
-                                if recovery_success:
-                                    # Reset activity tracking to give session time to respond
-                                    session_last_activity[session_id] = now
-                                    session_recovery_attempts[session_id] = recovery_attempts + 1
-                                    watchdog_logger.info(
-                                        f"[{session_id[:8]}] Recovery initiated - waiting for response"
-                                    )
-                                else:
-                                    # Recovery failed - increment attempt counter
-                                    session_recovery_attempts[session_id] = recovery_attempts + 1
-                                    watchdog_logger.warning(
-                                        f"[{session_id[:8]}] Recovery attempt failed"
-                                    )
+                            # Clean up tracking
+                            if session_id in session_last_activity:
+                                del session_last_activity[session_id]
+                            if session_id in session_last_message_count:
+                                del session_last_message_count[session_id]
+                            if session_id in session_recovery_attempts:
+                                del session_recovery_attempts[session_id]
+                            if session_id in session_heartbeats:
+                                del session_heartbeats[session_id]
 
-                            except Exception as e:
-                                watchdog_logger.error(f"[{session_id[:8]}] Recovery error: {e}")
-                                session_recovery_attempts[session_id] = recovery_attempts + 1
+                            watchdog_logger.info(f"[{session_id[:8]}] Session marked as stalled and cleaned up")
 
-                        else:
-                            # Max recovery attempts reached or auto-recovery disabled
-                            if recovery_attempts >= SESSION_MAX_RECOVERY_ATTEMPTS:
-                                watchdog_logger.error(
-                                    f"[{session_id[:8]}] SESSION STALLED - max recovery attempts "
-                                    f"({SESSION_MAX_RECOVERY_ATTEMPTS}) exhausted. Marking as stalled."
-                                )
-                            else:
-                                watchdog_logger.warning(
-                                    f"[{session_id[:8]}] SESSION STALLED (auto-recovery disabled). "
-                                    f"No progress for {stall_time:.0f}s"
-                                )
-
-                            # Mark session as stalled
-                            try:
-                                update_agent_session(
-                                    session_id=uuid.UUID(session_id),
-                                    status="stalled",
-                                    summary=f"Session stalled - no progress for {stall_time:.0f} seconds. "
-                                           f"Recovery attempts: {recovery_attempts}/{SESSION_MAX_RECOVERY_ATTEMPTS}. "
-                                           f"Last message count: {current_count}. "
-                                           f"This may be due to a GroupChat speaker selection issue."
-                                )
-
-                                # Remove from active_sessions dict
-                                if session_id in active_sessions:
-                                    del active_sessions[session_id]
-
-                                # Clean up tracking
-                                if session_id in session_last_activity:
-                                    del session_last_activity[session_id]
-                                if session_id in session_last_message_count:
-                                    del session_last_message_count[session_id]
-                                if session_id in session_recovery_attempts:
-                                    del session_recovery_attempts[session_id]
-                                if session_id in session_heartbeats:
-                                    del session_heartbeats[session_id]
-
-                                watchdog_logger.info(f"[{session_id[:8]}] Session marked as stalled and cleaned up")
-
-                            except Exception as e:
-                                watchdog_logger.error(f"[{session_id[:8]}] Failed to mark session as stalled: {e}")
+                        except Exception as e:
+                            watchdog_logger.error(f"[{session_id[:8]}] Failed to mark session as stalled: {e}")
 
                     elif stall_time >= session_timeout / 2:
                         # Session is approaching stall threshold - log warning
@@ -1904,6 +1797,48 @@ def _finalize_session(session_id, auto_run_recommendations) -> None:
     active_sessions.pop(sid, None)
 
 
+# Phase 4 flipped the default engine to LangGraph; Phase 5 RETIRED AutoGen
+# (Docs/LANGGRAPH_MIGRATION_PLAN.md). `pyautogen` is gone from requirements and
+# nothing imports `autogen`, so "langgraph" is the only engine there is.
+#
+# The `engine` request field and AGENT_ENGINE env var are KEPT rather than
+# deleted, for two reasons: existing callers, saved launch presets and scripts
+# still send them, and an operator who sets AGENT_ENGINE=autogen deserves a
+# warning in the log rather than a 500 or — worse — silence.
+DEFAULT_AGENT_ENGINE = "langgraph"
+VALID_AGENT_ENGINES = ("langgraph",)
+# Accepted at the API and answered with a warning, not an error.
+RETIRED_AGENT_ENGINES = ("autogen",)
+
+
+def resolve_agent_engine(requested: Optional[str] = None) -> str:
+    """Which engine runs a session. Always "langgraph" now.
+
+    A retired or unknown value is logged and overridden rather than honoured:
+    running a different engine than the caller asked for while saying nothing is
+    how an A/B comparison becomes a lie, and failing the request outright would
+    break launch presets saved before the retirement.
+    """
+    for source, value in (("request", requested),
+                          ("AGENT_ENGINE", os.environ.get("AGENT_ENGINE"))):
+        v = (value or "").strip().lower()
+        if not v:
+            continue
+        if v in VALID_AGENT_ENGINES:
+            return v
+        if v in RETIRED_AGENT_ENGINES:
+            session_logger.warning(
+                "Agent engine %r (from %s) was RETIRED in migration Phase 5 — "
+                "pyautogen is no longer installed. Running %r instead.",
+                v, source, DEFAULT_AGENT_ENGINE)
+        else:
+            session_logger.warning(
+                "Ignoring unknown agent engine %r from %s; using %r (valid: %s)",
+                v, source, DEFAULT_AGENT_ENGINE, ", ".join(VALID_AGENT_ENGINES))
+        return DEFAULT_AGENT_ENGINE
+    return DEFAULT_AGENT_ENGINE
+
+
 def run_pentest_session_sync(
     session_id: uuid.UUID,
     target_description: str,
@@ -1916,499 +1851,50 @@ def run_pentest_session_sync(
     port_profile: Optional[str] = None,
     web_profile: Optional[str] = None,
     auto_run_recommendations: Optional[bool] = None,
+    engine: Optional[str] = None,
+    exploit_phase: Optional[bool] = None,
 ):
-    """
-    Synchronous version of run_pentest_session that runs in a thread pool.
-    This prevents blocking the FastAPI event loop.
-    Status polling operations don't count towards max_rounds.
+    """Run a pentest session. Delegates to the LangGraph engine.
+
+    This used to be ~570 lines of AutoGen GroupChat orchestration: build a
+    PentestTeam, wire a GroupChat + GroupChatManager, poll `groupchat.messages`
+    on a flusher thread, and interpret `_termination_reason` afterwards. All of
+    it was retired with AutoGen (Docs/LANGGRAPH_MIGRATION_PLAN.md, Phase 5); the
+    LangGraph engine carries the whole lifecycle, including the parts that used
+    to live only here (session output collection, scan metadata, and
+    `_finalize_session`).
+
+    `engine` is kept in the signature so callers that pass it still work; the
+    only accepted value is now "langgraph" (see resolve_agent_engine).
 
     Args:
         session_id: Session UUID
         target_description: Description of target
-        initial_task: Initial task for agents
-        max_rounds: Maximum conversation rounds
+        initial_task: Initial task for the agents
+        max_rounds: Retained for API compatibility; the graph's phases are
+            deterministic, so it bounds nothing. Reported unchanged in the
+            session configuration.
         resume_context: Optional context from a parent session being resumed
-        auto_execute_scans: Whether agents should auto-execute scans or just recommend
+        auto_execute_scans: Whether the scan phase may dispatch, or only plan.
+            Enforced by the phase's TOOLSET, not by a prompt.
         proxy: SOCKS proxy URL for routing scans through a remote node
         port_profile: Named port scope applied to every discovery scan this
-            session runs (see knowledge/port_profiles.yaml). None keeps the
-            scanner agent's built-in quick-then-deep policy.
-        web_profile: Named web scan depth applied to this session's web tools
-            (see knowledge/web_profiles.yaml). None keeps each tool's defaults.
+            session runs (see knowledge/port_profiles.yaml).
+        web_profile: Named web scan depth for this session's web tools.
+        auto_run_recommendations: Dispatch KB recommendations the session
+            generated but never acted on, when it ends.
+        exploit_phase: Add the human-approved exploit phase. The session PAUSES
+            on a durable interrupt until an operator answers /approve.
     """
-    # AGENT_ENGINE selects the orchestration backend behind this same API
-    # (Docs/LANGGRAPH_MIGRATION_PLAN.md). Default 'autogen' keeps current
-    # behaviour; 'langgraph' routes to the deterministic StateGraph engine, which
-    # reuses the same scan_tools (scope gate intact) and writes to the same
-    # agent_sessions/agent_messages tables so every read route is unchanged.
-    if os.environ.get("AGENT_ENGINE", "autogen").strip().lower() == "langgraph":
-        from langgraph_engine import run_langgraph_session_sync
-        return run_langgraph_session_sync(
-            session_id, target_description, initial_task, max_rounds,
-            resume_context, session_name, auto_execute_scans, proxy,
-            port_profile, web_profile, auto_run_recommendations)
-
-    import sys
-    import contextlib
-    import httpx as sync_httpx
-
-    def check_ollama_sync(timeout: int = 5) -> tuple[bool, str]:
-        """Synchronous Ollama health check"""
-        ollama_url = os.environ.get("OLLAMA_URL", "http://ollama:11434")
-        try:
-            with sync_httpx.Client(timeout=timeout, verify=False) as client:
-                response = client.get(f"{ollama_url}/api/tags")
-                if response.status_code != 200:
-                    return False, f"Ollama returned status {response.status_code}"
-                data = response.json()
-                models = data.get("models", [])
-                if not models:
-                    return False, "No models available in Ollama"
-                return True, f"Ollama healthy with {len(models)} model(s) available"
-        except sync_httpx.ConnectError:
-            return False, f"Cannot connect to Ollama at {ollama_url}"
-        except sync_httpx.TimeoutException:
-            return False, f"Ollama connection timeout after {timeout}s"
-        except Exception as e:
-            return False, f"Ollama health check failed: {type(e).__name__}: {str(e)}"
-
-    def check_azure_sync(timeout: int = 5) -> tuple[bool, str]:
-        """Synchronous Azure health check"""
-        endpoint = os.environ.get("AZURE_ENDPOINT", "")
-        api_key = os.environ.get("AZURE_API_KEY", "")
-        model = os.environ.get("AZURE_MODEL", "gpt-4o")
-        api_version = os.environ.get("AZURE_API_VERSION", "2024-08-01-preview")
-        if not endpoint or not api_key:
-            return False, "Azure endpoint or API key not configured"
-        base = endpoint.rstrip("/")
-        if ".models.ai.azure.com" in base:
-            url = f"{base}/v1/chat/completions"
-        else:
-            url = f"{base}/openai/deployments/{model}/chat/completions?api-version={api_version}"
-        headers = {"api-key": api_key, "Content-Type": "application/json"}
-        payload = {"messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}
-        try:
-            with sync_httpx.Client(timeout=timeout, verify=False) as client:
-                response = client.post(url, json=payload, headers=headers)
-                if response.status_code == 200:
-                    return True, f"Azure ({model}) healthy"
-                else:
-                    return False, f"Azure returned status {response.status_code}"
-        except sync_httpx.ConnectError:
-            return False, f"Cannot connect to Azure at {endpoint}"
-        except sync_httpx.TimeoutException:
-            return False, f"Azure connection timeout after {timeout}s"
-        except Exception as e:
-            return False, f"Azure health check failed: {type(e).__name__}: {str(e)}"
-
-    try:
-        # Pre-flight health checks (synchronous)
-        session_logger.info(f"[{session_id}] Running pre-flight health checks...")
-
-        from agent_config import get_llm_backend
-        backend = get_llm_backend()
-
-        if backend == "azure":
-            llm_healthy, llm_msg = check_azure_sync(timeout=5)
-        else:
-            llm_healthy, llm_msg = check_ollama_sync(timeout=5)
-
-        if not llm_healthy:
-            error_msg = f"Pre-flight check failed: {llm_msg}"
-            session_logger.error(f"[{session_id}] {error_msg}")
-            raise RuntimeError(error_msg)
-
-        session_logger.info(f"[{session_id}] LLM check passed ({backend}): {llm_msg}")
-
-        # Create the pentest team
-        # Note: PentestTeam creation itself might make Ollama calls
-        # If it fails, the retry logic in the health check should have already
-        # warmed up the connection
-        # Set thread-local proxy so all scan tool calls in this session use it
-        if proxy:
-            from scan_tools import set_session_proxy
-            set_session_proxy(proxy)
-            session_logger.info(f"[{session_id}] Proxy configured: {proxy}")
-
-        # Detect passive-only profile from task description
-        task_lower = initial_task.lower()
-        passive_only = (
-            "passive reconnaissance only" in task_lower
-            or "no active scanning" in task_lower
-            or "passive recon only" in task_lower
-            or "passive-only" in task_lower
-        )
-        if passive_only:
-            session_logger.info(f"[{session_id}] Detected PASSIVE-ONLY profile — active scan tools will be blocked")
-
-        session_logger.info(
-            f"[{session_id}] Initializing PentestTeam (passive_only={passive_only}, "
-            f"port_profile={port_profile or 'agent-default'}, "
-            f"web_profile={web_profile or 'tool-default'})..."
-        )
-        team = PentestTeam(passive_only=passive_only, port_profile=port_profile,
-                           web_profile=web_profile)
-        session_logger.info(
-            f"[{session_id}] PentestTeam initialized successfully"
-            + (f" (prompt config: {team.prompt_config_name})" if team.prompt_config_name else "")
-        )
-
-        # Track which model was selected (for A/B testing analysis)
-        if team.selected_model != "default":
-            session_logger.info(f"[{session_id}] A/B test: using model '{team.selected_model}'")
-            update_agent_session(
-                session_id=session_id,
-                metadata={"grpo_model": team.selected_model}
-            )
-
-        # Create group chat
-        groupchat = create_pentest_groupchat(team, max_round=max_rounds)
-
-        # Create manager
-        manager = create_pentest_manager(groupchat)
-
-        # Store in active sessions
-        active_sessions[str(session_id)] = {
-            "team": team,
-            "groupchat": groupchat,
-            "manager": manager,
-            "messages": []
-        }
-
-        # Real-time message flusher: polls groupchat.messages every 2s
-        # and writes new ones to the database so the dashboard can stream them live
-        import threading
-        _seen_msg_count = [0]
-        _flush_stop = threading.Event()
-
-        def _live_message_hook():
-            """Flush any new groupchat messages to the database."""
-            msgs = groupchat.messages if hasattr(groupchat, 'messages') else []
-            new_msgs = msgs[_seen_msg_count[0]:]
-            for msg in new_msgs:
-                agent_name = msg.get('name', 'Unknown')
-                role = msg.get('role', 'assistant')
-                content = msg.get('content', '')
-                metadata = {}
-
-                # Detect tool calls in the message
-                tool_calls = msg.get('tool_calls')
-                if tool_calls:
-                    metadata['message_type'] = 'tool_call'
-                    metadata['tool_calls'] = [
-                        {
-                            'function': tc.get('function', {}).get('name', 'unknown'),
-                            'arguments': tc.get('function', {}).get('arguments', ''),
-                            'id': tc.get('id', ''),
-                        }
-                        for tc in tool_calls
-                    ]
-                    # Generate synthetic content for messages with tool_calls but empty content
-                    if not content:
-                        tool_names = [tc.get('function', {}).get('name', 'unknown') for tc in tool_calls]
-                        content = f"[Tool call: {', '.join(tool_names)}]"
-
-                # Detect tool results
-                elif role == 'tool' or (content and content.startswith('Response from calling tool')):
-                    metadata['message_type'] = 'tool_result'
-
-                if content:
-                    add_agent_message(
-                        session_id=session_id,
-                        agent_name=agent_name,
-                        role=role,
-                        content=content,
-                        metadata=metadata if metadata else None
-                    )
-            _seen_msg_count[0] = len(msgs)
-
-        def _flush_loop():
-            while not _flush_stop.is_set():
-                try:
-                    _live_message_hook()
-                except Exception as e:
-                    session_logger.warning(f"[{session_id}] Message flush error: {e}")
-                _flush_stop.wait(2)
-
-        flush_thread = threading.Thread(target=_flush_loop, daemon=True, name=f"msg-flush-{session_id}")
-        flush_thread.start()
-
-        # Set up scan tracking context for this session. The port profile is
-        # resolved here so every scan tool this session calls inherits the
-        # operator's selected scope without the LLM having to pass port ranges.
-        scan_tracker.set_session(str(session_id), port_profile=port_profile,
-                                 web_profile=web_profile)
-        LLMMetricsContext.set_session(str(session_id))
-        session_logger.info(
-            f"[{session_id}] Scan tracker context initialized"
-            + (f" (port scope: {port_profile})" if port_profile else "")
-            + (f" (web scope: {web_profile})" if web_profile else "")
-        )
-
-        # Construct initial message with context
-        resume_block = f"{resume_context}\n\n" if resume_context else ""
-
-        # For fresh sessions (not resumed), check for existing data on this target
-        existing_data_block = ""
-        if not resume_context:
-            try:
-                from db_utils import build_existing_target_context
-                existing_ctx = build_existing_target_context(target_description)
-                if existing_ctx:
-                    existing_data_block = f"{existing_ctx}\n\n"
-                    session_logger.info(f"[{session_id}] Found existing target data, injecting into context")
-            except Exception as e:
-                session_logger.warning(f"[{session_id}] Failed to query existing target data: {e}")
-        auto_exec_block = ""
-        if auto_execute_scans:
-            auto_exec_block = """
-IMPORTANT: Auto-execute mode is ENABLED. Scanner agent: you MUST immediately call the scan tools (start_full_scan, start_pipeline_scan, start_smb_vuln_scan, start_credential_check) yourself when the Coordinator assigns scanning tasks. Do NOT just describe what scans to run — actually invoke the tool functions to start them.
-"""
-        else:
-            auto_exec_block = """
-Note: Auto-execute mode is DISABLED. Scanner agent: describe and recommend scans but wait for explicit approval before executing them.
-"""
-        initial_message = f"""{resume_block}{existing_data_block}Target: {target_description}
-
-SCOPE ENFORCEMENT — MANDATORY:
-The ONLY authorized target(s) for this engagement: {target_description}
-- ALL scan tools (start_full_scan, start_masscan, start_nmap_scan, start_pipeline_scan, start_nuclei_scan, start_web_scan, start_credential_check, start_udp_scan, start_deep_port_scan, start_smb_vuln_scan, start_playwright_scan, start_nikto_scan, start_katana, start_httpx_probe, start_naabu) MUST ONLY target {target_description}.
-- Do NOT scan, probe, or interact with any IP address, hostname, or URL that is not explicitly listed above.
-- When query tools (query_assets, get_open_ports, search_findings) return data for hosts outside the authorized scope, IGNORE those results entirely — do not scan them, analyze them, or include them in reports.
-- Violating scope is a critical engagement rule breach. If in doubt, restrict to the declared target.
-
-Task: {initial_task}
-{auto_exec_block}
-Please coordinate as a team to complete this penetration testing task.
-
-Coordinator, please start by analyzing the target and assigning initial tasks to the team members.
-"""
-
-        # Log initial message
-        add_agent_message(
-            session_id=session_id,
-            agent_name="System",
-            role="user",
-            content=initial_message
-        )
-
-        # Log session start
-        session_logger.info(f"[{session_id}] Starting pentest conversation (max_rounds={max_rounds})")
-        session_logger.info(f"[{session_id}] Target: {target_description}")
-
-        # Start the conversation with retry on premature termination
-        # If the LLM fails mid-conversation, autogen may exit the chat loop
-        # after very few rounds. We retry up to 2 times to recover.
-        MAX_CHAT_RETRIES = 2
-        for _chat_attempt in range(1 + MAX_CHAT_RETRIES):
-            with contextlib.redirect_stdout(sys.stderr):
-                team.coordinator.initiate_chat(
-                    manager,
-                    message=initial_message if _chat_attempt == 0 else (
-                        "The previous conversation round ended prematurely due to an error. "
-                        "Please continue the penetration test from where we left off. "
-                        "Check get_session_scan_status() for completed scans and proceed with the next phase."
-                    ),
-                    clear_history=(_chat_attempt == 0)
-                )
-
-            # Check if conversation ended prematurely (very few rounds used)
-            rounds_used = getattr(groupchat, '_real_round', len(groupchat.messages) if hasattr(groupchat, 'messages') else 0)
-            termination_reason = getattr(groupchat, '_termination_reason', 'unknown')
-            premature = (
-                rounds_used < 5
-                and 'failure' in str(termination_reason).lower()
-                and _chat_attempt < MAX_CHAT_RETRIES
-            )
-            if premature:
-                session_logger.warning(
-                    f"[{session_id}] Chat ended prematurely after {rounds_used} rounds "
-                    f"(reason: {termination_reason}), retrying ({_chat_attempt + 1}/{MAX_CHAT_RETRIES})..."
-                )
-                import time as _time
-                _time.sleep(3)
-                continue
-            break
-
-        # Stop the live message flusher and do a final flush
-        _flush_stop.set()
-        flush_thread.join(timeout=5)
-        _live_message_hook()
-
-        # Log conversation completion
-        message_count = len(groupchat.messages) if hasattr(groupchat, 'messages') else 0
-        termination_reason = getattr(groupchat, '_termination_reason', 'unknown')
-        session_logger.info(
-            f"[{session_id}] Conversation completed: {message_count} messages, "
-            f"termination_reason={termination_reason}"
-        )
-
-        # Auto-capture agent outputs as unrated feedback for GRPO training
-        try:
-            captured = capture_session_outputs(session_id)
-            if captured:
-                session_logger.info(f"[{session_id}] Auto-captured {len(captured)} feedback entries for GRPO")
-        except Exception as capture_err:
-            session_logger.warning(f"[{session_id}] Feedback auto-capture failed: {capture_err}")
-
-        # Detect if rounds were exhausted vs. natural completion
-        rounds_used = getattr(groupchat, '_real_round', 0)
-        rounds_exhausted = rounds_used >= max_rounds
-
-        # Detect premature termination (agent failure, not natural end)
-        agent_failure = 'failure' in termination_reason or 'failed' in termination_reason
-
-        if rounds_exhausted:
-            add_agent_message(
-                session_id=session_id,
-                agent_name="System",
-                role="system",
-                content=f"Session reached the maximum of {max_rounds} rounds. "
-                        f"You can resume with additional rounds to continue scanning and analysis."
-            )
-        elif agent_failure:
-            add_agent_message(
-                session_id=session_id,
-                agent_name="System",
-                role="system",
-                content=f"Session ended due to agent failure: {termination_reason}. "
-                        f"You can resume the session to continue."
-            )
-
-        # Generate summary from the last reporter message if available
-        summary = None
-        if hasattr(groupchat, 'messages'):
-            # Look for reporter's final summary
-            for msg in reversed(groupchat.messages):
-                if msg.get('name') == 'Reporter':
-                    summary = msg.get('content', '')[:500]  # First 500 chars
-                    break
-
-        # Get final scan tracking status before clearing context
-        scan_status = scan_tracker.get_session_status(str(session_id))
-        scans_metadata = scan_status.get("scans", []) if isinstance(scan_status, dict) else []
-
-        if rounds_exhausted:
-            final_status = "rounds_exhausted"
-        elif agent_failure:
-            final_status = "agent_failure"
-        else:
-            final_status = "completed"
-
-        # Update session with scan tracking data
-        update_agent_session(
-            session_id=session_id,
-            status=final_status,
-            summary=summary,
-            metadata={
-                "total_messages": len(groupchat.messages) if hasattr(groupchat, 'messages') else 0,
-                "max_rounds": max_rounds,
-                "rounds_used": rounds_used,
-                "rounds_exhausted": rounds_exhausted,
-                "termination_reason": termination_reason,
-                "scans": scans_metadata,
-                "scan_summary": scan_status.get("summary") if isinstance(scan_status, dict) else None
-            }
-        )
-
-        # Log completion
-        session_logger.info(f"[{session_id}] Session {final_status}: {rounds_used}/{max_rounds} rounds used")
-        if summary:
-            session_logger.info(f"[{session_id}] Summary: {summary[:200]}...")
-
-        # Collect session outputs to disk
-        try:
-            from session_collector import collect_session_outputs
-            full_report = None
-            if hasattr(groupchat, 'messages'):
-                for msg in reversed(groupchat.messages):
-                    if msg.get('name') == 'Reporter':
-                        full_report = msg.get('content', '')
-                        break
-            output_dir = collect_session_outputs(
-                session_id=str(session_id),
-                session_name=session_name,
-                scans_metadata=scans_metadata,
-                session_started_at=getattr(scan_tracker._local, 'started_at', '') or '',
-                conversation_messages=list(groupchat.messages) if hasattr(groupchat, 'messages') else [],
-                final_report=full_report,
-            )
-            if output_dir:
-                session_logger.info(f"[{session_id}] Session outputs saved to {output_dir}")
-        except Exception as collect_err:
-            session_logger.warning(f"[{session_id}] Output collection failed: {collect_err}")
-
-        # Teardown (flow summary, claim validation, KB drain, persist, cleanup)
-        # is handled by _finalize_session in the `finally` below, so it runs on
-        # the error paths too.
-
-    except RuntimeError as e:
-        # Stop the live message flusher if it was started
-        if '_flush_stop' in dir():
-            _flush_stop.set()
-        # Pre-flight check failures or other runtime errors
-        error_msg = str(e)
-
-        # Persist scan data before updating status
-        scan_status = scan_tracker.get_session_status(str(session_id))
-        scans_metadata = scan_status.get("scans", []) if isinstance(scan_status, dict) else []
-        scan_tracker.persist_to_db(str(session_id))
-
-        update_agent_session(
-            session_id=session_id,
-            status="failed",
-            summary=f"Service Unavailable: {error_msg}",
-            metadata={"scans": scans_metadata, "scan_summary": scan_status.get("summary") if isinstance(scan_status, dict) else None}
-        )
-        # Cleanup deliberately NOT done here — _finalize_session in the
-        # `finally` owns it. Cleaning up here would discard the scan registry
-        # before the flow summary could be built from it.
-
-        session_logger.error(f"[{session_id}] Session failed pre-flight checks: {e}")
-
-    except Exception as e:
-        # Stop the live message flusher if it was started
-        if '_flush_stop' in dir():
-            _flush_stop.set()
-        # Generic errors with more detail
-        error_type = type(e).__name__
-        error_msg = str(e)
-
-        # Try to identify the service from the error message
-        service_hint = ""
-        if "ollama" in error_msg.lower():
-            service_hint = " (Ollama LLM service may be unavailable)"
-        elif "database" in error_msg.lower() or "postgres" in error_msg.lower():
-            service_hint = " (Database connection issue)"
-        elif "scanner" in error_msg.lower():
-            service_hint = " (Scanner service issue)"
-
-        # Persist scan data before updating status
-        scan_status = scan_tracker.get_session_status(str(session_id))
-        scans_metadata = scan_status.get("scans", []) if isinstance(scan_status, dict) else []
-        scan_tracker.persist_to_db(str(session_id))
-
-        update_agent_session(
-            session_id=session_id,
-            status="failed",
-            summary=f"Error ({error_type}): {error_msg}{service_hint}",
-            metadata={"scans": scans_metadata, "scan_summary": scan_status.get("summary") if isinstance(scan_status, dict) else None}
-        )
-        # Cleanup deliberately NOT done here — _finalize_session in the
-        # `finally` owns it. Cleaning up here would discard the scan registry
-        # before the flow summary could be built from it.
-
-        import traceback
-        session_logger.error(f"[{session_id}] Session failed with {error_type}: {e}")
-        session_logger.error(f"[{session_id}] Traceback: {traceback.format_exc()}")
-
-    finally:
-        # Runs on success, RuntimeError and Exception alike. Reporting a failed
-        # session is the case this exists for.
-        _finalize_session(session_id, auto_run_recommendations)
+    resolve_agent_engine(engine)  # validates + warns on an unknown value
+    from langgraph_engine import run_langgraph_session_sync
+    return run_langgraph_session_sync(
+        session_id, target_description, initial_task, max_rounds,
+        resume_context, session_name, auto_execute_scans, proxy,
+        port_profile, web_profile, auto_run_recommendations,
+        exploit_phase=exploit_phase)
 
 
-# API Endpoints
 @app.get("/health")
 async def health():
     """
@@ -2509,6 +1995,10 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
 
     try:
         # Create session in database
+        # The resolved engine is persisted, not just the requested one: a
+        # session that ran on autogen must still say so after AGENT_ENGINE is
+        # flipped, or the A/B comparison the canary exists for is unreadable.
+        engine = resolve_agent_engine(request.engine)
         session_id = create_agent_session(
             request.session_name,
             request.target_description,
@@ -2519,6 +2009,8 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
                 "proxy": request.proxy,
                 "port_profile": request.port_profile,
                 "web_profile": request.web_profile,
+                "engine": engine,
+                "enable_exploit_phase": bool(request.enable_exploit_phase),
             }
         )
 
@@ -2551,13 +2043,15 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
                 request.port_profile,
                 request.web_profile,
                 request.auto_run_recommendations,
+                engine,
+                request.enable_exploit_phase,
             )
         )
 
         return PentestResponse(
             session_id=str(session_id),
             status="running",
-            message="Pentest session started successfully"
+            message=f"Pentest session started successfully (engine={engine})"
         )
 
     except Exception as e:
@@ -2589,6 +2083,18 @@ async def resume_pentest(session_id: str, request: ResumeRequest):
 
     # Only allow resuming non-active sessions
     resumable = {'failed', 'stalled', 'stopped', 'completed', 'rounds_exhausted', 'agent_failure'}
+    if parent['status'] == 'awaiting_approval':
+        # This session is not stuck — it is parked on a durable interrupt waiting
+        # for a human decision. Resuming it as a NEW session would abandon the
+        # checkpoint and re-run the phases already done, so name the right route.
+        raise HTTPException(
+            status_code=409,
+            detail=f"Session {session_id} is paused awaiting operator approval. "
+                   f"Answer it with POST /pentest/{session_id}/approve "
+                   '{"approved": true|false, "pending_exploit_id": "<uuid>"} — '
+                   "that continues the SAME session from its Postgres checkpoint. "
+                   f"See GET /pentest/{session_id}/pending-approval for what is pending."
+        )
     if parent['status'] not in resumable:
         raise HTTPException(
             status_code=400,
@@ -2635,6 +2141,10 @@ async def resume_pentest(session_id: str, request: ResumeRequest):
             "initial_task": original_task,
             "parent_session_id": str(parent_uuid),
             "proxy": proxy,
+            # Inherit the parent's engine: a resume that silently switches
+            # engines is not a resume of the same test.
+            "engine": resolve_agent_engine(config.get('engine')),
+            "enable_exploit_phase": bool(config.get('enable_exploit_phase')),
         }
     )
 
@@ -2668,6 +2178,11 @@ async def resume_pentest(session_id: str, request: ResumeRequest):
             f"{parent_name}-resumed",
             auto_execute,
             proxy,
+            config.get('port_profile'),
+            config.get('web_profile'),
+            None,  # auto_run_recommendations
+            resolve_agent_engine(config.get('engine')),
+            bool(config.get('enable_exploit_phase')),
         )
     )
 
@@ -2796,6 +2311,36 @@ async def get_watchdog_status():
                 for job_id, info in scan_job_tracking.items()
             ]
         }
+    }
+
+
+@app.get("/pentest/engine")
+async def get_agent_engine():
+    """Which orchestration engine new sessions use, and whether each is loadable.
+
+    Declared BEFORE /pentest/{session_id} on purpose: FastAPI matches in
+    declaration order, so after the parameterised route this path would be
+    swallowed as a session id. tests/test_route_contracts.py enforces that.
+    """
+    resolved = resolve_agent_engine(None)
+    availability = {}
+    for name, module in (("langgraph", "langgraph_engine"),):
+        try:
+            __import__(module)
+            availability[name] = {"available": True, "error": None}
+        except Exception as e:  # noqa: BLE001
+            availability[name] = {"available": False, "error": f"{type(e).__name__}: {e}"[:200]}
+    return {
+        "engine": resolved,
+        "default": DEFAULT_AGENT_ENGINE,
+        "env_AGENT_ENGINE": os.environ.get("AGENT_ENGINE") or None,
+        "valid": list(VALID_AGENT_ENGINES),
+        "retired": list(RETIRED_AGENT_ENGINES),
+        "retired_note": ("AutoGen was retired in migration Phase 5; pyautogen is "
+                         "not installed. Requests naming it are logged and run on "
+                         "langgraph."),
+        "exploit_phase_default": os.environ.get("LANGGRAPH_EXPLOIT_PHASE") or None,
+        "availability": availability,
     }
 
 
@@ -3334,35 +2879,114 @@ async def delete_session_endpoint(session_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/pentest/{session_id}/nudge")
-async def nudge_session(session_id: str):
-    """
-    Attempt to nudge a stalled session by resetting its watchdog timer.
+# `POST /pentest/{id}/nudge` was here. It reset the watchdog timer so a stalled
+# GroupChat could be given more time. Retired with AutoGen: a StateGraph either
+# is executing a node or is parked on an interrupt, and the durable answer to
+# "keep going" is POST /pentest/{id}/approve, which resumes from the Postgres
+# checkpoint. Nothing called it — the BFF declared no proxy and the frontend had
+# no hook, so removing it breaks no caller.
 
-    This can be used to give a session more time if it's legitimately
-    processing a long operation.
+
+@app.get("/pentest/{session_id}/pending-approval")
+async def get_session_pending_approval(session_id: str):
+    """What a LangGraph session is paused on, read from its Postgres checkpoint.
+
+    Answers from the checkpoint rather than in-process state, so it is correct
+    even after a restart — which is the whole point of the durable checkpointer.
     """
     try:
         session_uuid = uuid.UUID(session_id)
-        session = get_agent_session(session_uuid)
-
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-
-        # Reset the watchdog timer for this session
-        now = datetime.utcnow()
-        session_last_activity[session_id] = now
-
-        return {
-            "session_id": session_id,
-            "message": "Session watchdog timer reset",
-            "new_stall_deadline": (now + timedelta(seconds=SESSION_STALL_TIMEOUT)).isoformat()
-        }
-
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid session ID format")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+    session = get_agent_session(session_uuid)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    try:
+        from langgraph_engine import get_pending_approval
+    except Exception as e:  # noqa: BLE001
+        # Surfaced, not swallowed: a missing langgraph install must not read as
+        # "nothing is pending" on a session that is genuinely parked.
+        raise HTTPException(
+            status_code=503,
+            detail=f"LangGraph engine unavailable, cannot read the checkpoint: {e}")
+
+    pending = get_pending_approval(session_uuid)
+    return {
+        "session_id": session_id,
+        "status": session.get("status"),
+        "engine": (session.get("configuration") or {}).get("engine"),
+        "awaiting_approval": bool(pending),
+        "pending": pending,
+        "answer_with": f"POST /pentest/{session_id}/approve",
+    }
+
+
+@app.post("/pentest/{session_id}/approve")
+async def approve_session_step(session_id: str, request: ApprovalRequest):
+    """Answer a paused LangGraph approval interrupt and continue the SAME session.
+
+    This is the operator's authorization, so there is no override: a session that
+    is not actually parked cannot be "approved" into running an exploit, and an
+    approval carrying no pending_exploit_id executes nothing. `Command(resume=…)`
+    continues the graph from its Postgres checkpoint — no new session row, no
+    replay of the phases already done.
+    """
+    import asyncio
+
+    try:
+        session_uuid = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid session ID format")
+
+    session = get_agent_session(session_uuid)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    try:
+        from langgraph_engine import get_pending_approval, resume_langgraph_session_sync
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"LangGraph engine unavailable: {e}")
+
+    pending = get_pending_approval(session_uuid)
+    if not pending:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Session {session_id} is not paused on an approval "
+                   f"(status='{session.get('status')}'). Nothing to approve.")
+
+    if request.approved and not request.pending_exploit_id:
+        # Fail loudly rather than resuming into a no-op the operator would read
+        # as "approved and executed".
+        raise HTTPException(
+            status_code=400,
+            detail="approved=true requires pending_exploit_id (the pending_exploits "
+                   "row to execute). List candidates with GET /api/exploits/pending.")
+
+    session_logger.info(
+        "[%s] Operator approval: approved=%s pending_exploit_id=%s",
+        session_id, request.approved, request.pending_exploit_id)
+
+    asyncio.create_task(
+        asyncio.to_thread(
+            resume_langgraph_session_sync,
+            session_uuid,
+            bool(request.approved),
+            request.pending_exploit_id,
+            request.note,
+        )
+    )
+
+    return {
+        "session_id": session_id,
+        "approved": bool(request.approved),
+        "pending_exploit_id": request.pending_exploit_id,
+        "status": "resuming",
+        "message": ("Approved — resuming from the Postgres checkpoint and executing "
+                    "the approved exploit." if request.approved else
+                    "Declined — resuming from the Postgres checkpoint straight to the report."),
+    }
 
 
 # Log Viewing Endpoints

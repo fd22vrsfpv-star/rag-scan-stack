@@ -67,7 +67,7 @@ def ensure_schema():
             session_name        text NOT NULL,
             target_description  text NOT NULL,
             status              text NOT NULL DEFAULT 'active'
-                                CHECK (status IN ('active','completed','failed','stopped','stalled')),
+                                CHECK (status IN ('active','completed','failed','stopped','stalled','awaiting_approval')),
             configuration       jsonb DEFAULT '{}'::jsonb,
             summary             text,
             metadata            jsonb DEFAULT '{}'::jsonb,
@@ -231,7 +231,7 @@ def ensure_schema():
         DO $$ BEGIN
             ALTER TABLE agent_sessions DROP CONSTRAINT IF EXISTS agent_sessions_status_check;
             ALTER TABLE agent_sessions ADD CONSTRAINT agent_sessions_status_check
-                CHECK (status IN ('active','completed','failed','stopped','stalled'));
+                CHECK (status IN ('active','completed','failed','stopped','stalled','awaiting_approval'));
         EXCEPTION WHEN undefined_table THEN NULL;
         END $$
         """,

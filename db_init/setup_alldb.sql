@@ -1536,7 +1536,7 @@ BEGIN
       session_name        text NOT NULL,
       target_description  text NOT NULL,
       status              text NOT NULL DEFAULT 'active'
-                          CHECK (status IN ('active','completed','failed','stopped','stalled')),
+                          CHECK (status IN ('active','completed','failed','stopped','stalled','awaiting_approval')),
       configuration       jsonb DEFAULT '{}'::jsonb,  -- Agent configuration
       summary             text,  -- Final summary of the session
       metadata            jsonb DEFAULT '{}'::jsonb,  -- Additional metadata

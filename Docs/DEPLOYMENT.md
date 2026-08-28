@@ -23,7 +23,9 @@ The RAG Scan Stack is a comprehensive penetration testing platform with 16+ micr
 - **Network Scanning**: Nmap, Masscan
 - **Web Security**: Gobuster, OWASP ZAP, Playwright
 - **Vulnerability Scanning**: Nuclei
-- **AI Orchestration**: AutoGen multi-agent system
+- **AI Orchestration**: LangGraph multi-agent sessions (durable Postgres
+  checkpoints, human-approved exploit step). AutoGen was retired — see
+  Docs/LANGGRAPH_MIGRATION_PLAN.md.
 - **API Gateway**: Kong for unified access
 - **Database**: PostgreSQL with pgvector for RAG capabilities
 

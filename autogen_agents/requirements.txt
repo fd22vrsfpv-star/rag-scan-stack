@@ -5,7 +5,9 @@ psycopg2-binary==2.9.9
 asyncpg>=0.29.0
 httpx==0.27.2
 h2==4.1.0
-pyautogen==0.2.18
+# pyautogen==0.2.18 — REMOVED (Docs/LANGGRAPH_MIGRATION_PLAN.md Phase 5).
+# The agent orchestration is LangGraph; nothing imports `autogen` any more.
+# `openai` below stays: langchain-openai depends on it.
 openai>=1.3,<4
 python-dotenv==1.0.0
 mcp==1.17.0
