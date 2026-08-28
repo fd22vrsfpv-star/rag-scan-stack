@@ -1,6 +1,6 @@
 # RAG Scan Stack
 
-Turnkey stack to ingest **Masscan** results, run **Nmap** enrichment (-sV + useful scripts), perform **web scans** (Gobuster + ZAP), **Nuclei**, and **Playwright browser security testing**, with **AI-powered multi-agent orchestration** via **Autogen**, storing normalized results in **Postgres (pgvector)**. Exposes FastAPI services for ingestion, queries, and autonomous pentesting.
+Turnkey stack to ingest **Masscan** results, run **Nmap** enrichment (-sV + useful scripts), perform **web scans** (Gobuster + ZAP), **Nuclei**, and **Playwright browser security testing**, with **AI-powered multi-agent orchestration** via **LangGraph**, storing normalized results in **Postgres (pgvector)**. Exposes FastAPI services for ingestion, queries, and autonomous pentesting.
 
 ## Quick Start (Single Command)
 
@@ -217,9 +217,14 @@ curl http://localhost:8014/scan/550e8400-e29b-41d4-a716-446655440000
 curl "http://localhost:8014/scan/550e8400-e29b-41d4-a716-446655440000/findings?severity=high"
 ```
 
-### Autogen Multi-Agent System (Port: 8015)
+### AI Agent Sessions — LangGraph (Port: 8015)
 
-**Swagger Documentation:** [Autogen Agents Swagger](http://localhost:8015/docs)
+Orchestration is LangGraph (`langgraph_engine.py`). The service, container and
+directory keep the historical `autogen` name; AutoGen itself was retired in
+migration Phase 5 (Docs/LANGGRAPH_MIGRATION_PLAN.md) and `pyautogen` is no
+longer installed.
+
+**Swagger Documentation:** [Agent Service Swagger](http://localhost:8015/docs)
 
 **Full Documentation:** [Autogen Agents README](autogen_agents/README.md)
 

@@ -15,6 +15,13 @@ was serving `/jobs/katana`, `/jobs/naabu` and `/jobs/tlsx` with the binaries
 installed. **Check this table before adding a tool to `MANUAL_TOOLS` or leaving it
 unmapped.**
 
+> **Different question, different file.** This document is about dispatching a
+> `scan_recommendations` row to a service endpoint. *Which tools an AI agent may
+> call* is a separate surface, declared in `autogen_agents/tool_registry.py`
+> (49 tools: name, LLM-facing description, callable) and guarded by
+> `tests/test_tool_registry.py`. The bodies there route through the same
+> services listed below.
+
 ## Inventory
 
 Taken from each service's actual `@app.post("/jobs/...")` routes.

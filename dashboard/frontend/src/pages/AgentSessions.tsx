@@ -12,6 +12,8 @@ import {
   useResumeSession,
   useDeleteSession,
   useClearSessionHistory,
+  usePendingApproval,
+  useApproveSession,
 } from '@/api/agentSessions'
 import type { AgentSession, AgentMessage, SessionScan } from '@/api/agentSessions'
 import { useModelPerformanceWarning } from '@/api/agents'
@@ -21,7 +23,7 @@ import { StatusDot } from '@/components/common/StatusDot'
 import { JsonViewer } from '@/components/common/JsonViewer'
 import { ModelPerformanceWarningModal } from '@/components/common/ModelPerformanceWarningModal'
 import { cn } from '@/lib/utils'
-import { ArrowLeft, Plus, Square, Play, X, Wrench, Terminal, ChevronDown, ChevronRight, ExternalLink, Trash2, Shield, Crosshair, Wifi, Puzzle, AlertTriangle, ListChecks } from 'lucide-react'
+import { ArrowLeft, Plus, Square, Play, X, Wrench, Terminal, ChevronDown, ChevronRight, ExternalLink, Trash2, Shield, Crosshair, Wifi, Puzzle, AlertTriangle, ListChecks, PauseCircle, Check, Ban } from 'lucide-react'
 import { useScanDefaultsStore } from '@/stores/scanDefaults'
 import { useNodes } from '@/api/nodes'
 import { usePortProfiles } from '@/api/portProfiles'
@@ -543,6 +545,14 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const canStop = session?.status === 'active'
   const isRoundsExhausted = session?.status === 'rounds_exhausted'
   const isAgentFailure = session?.status === 'agent_failure'
+  // Paused on a LangGraph approval interrupt. NOT a stall: the graph is
+  // checkpointed in Postgres and resumes from this exact point once answered,
+  // which is why /resume (a new child session) is the wrong control here.
+  const isAwaitingApproval = session?.status === 'awaiting_approval'
+  const { data: pendingApproval } = usePendingApproval(sessionId, isAwaitingApproval)
+  const approveSession = useApproveSession()
+  const [approveExploitId, setApproveExploitId] = useState('')
+  const [approveNote, setApproveNote] = useState('')
 
   const handleResume = () => {
     const selectedNode = resumeOnlineNodes.find(n => n.id === resumeNodeId)
@@ -594,14 +604,18 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                       ? 'bg-orange-500/10 text-orange-500'
                       : session.status === 'rounds_exhausted'
                         ? 'bg-yellow-500/10 text-yellow-500'
-                        : 'bg-yellow-500/10 text-yellow-500',
+                        : session.status === 'awaiting_approval'
+                          ? 'bg-purple-500/10 text-purple-400'
+                          : 'bg-yellow-500/10 text-yellow-500',
             )}
           >
             {session.status === 'rounds_exhausted'
               ? 'needs more rounds'
               : session.status === 'agent_failure'
                 ? 'agent failed — resumable'
-                : session.status}
+                : session.status === 'awaiting_approval'
+                  ? 'awaiting approval'
+                  : session.status}
           </span>
         )}
       </div>
@@ -622,6 +636,26 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
               <span className="text-muted-foreground">Auto Execute: </span>
               <span>{(session.auto_execute_scans ?? session.configuration?.auto_execute_scans) ? 'Yes' : 'No'}</span>
             </div>
+            {/* Which engine this session actually ran on. Persisted per session,
+                so a run stays labelled after the service default is flipped —
+                without it an A/B comparison is unreadable. */}
+            {session.configuration?.engine && (
+              <div>
+                <span className="text-muted-foreground">Engine: </span>
+                <span className={cn(
+                  'font-mono text-xs px-1.5 py-0.5 rounded',
+                  session.configuration.engine === 'langgraph'
+                    ? 'bg-blue-500/10 text-blue-400'
+                    : 'bg-muted text-muted-foreground',
+                )}>{session.configuration.engine}</span>
+              </div>
+            )}
+            {session.configuration?.enable_exploit_phase && (
+              <div>
+                <span className="text-muted-foreground">Exploit phase: </span>
+                <span className="text-purple-400">on (needs approval)</span>
+              </div>
+            )}
             {session.configuration?.proxy && (
               <div className="flex items-center gap-1.5">
                 <Wifi className="h-3 w-3 text-blue-400" />
@@ -639,6 +673,83 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
           {session.error && (
             <p className="text-xs text-red-500">Error: {typeof session.error === 'string' ? session.error : JSON.stringify(session.error)}</p>
           )}
+        </div>
+      )}
+
+      {/* Awaiting-approval banner.
+          A paused session MUST be labelled, not left looking like a running
+          one: the graph does nothing at all until this is answered, and a
+          silent pause is indistinguishable from a hang. */}
+      {isAwaitingApproval && (
+        <div className="bg-purple-500/10 border border-purple-500/30 rounded-lg px-4 py-3 space-y-3">
+          <div className="flex items-start gap-3">
+            <PauseCircle className="h-5 w-5 text-purple-400 shrink-0 mt-0.5" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium text-purple-400">
+                Paused — waiting for your approval
+              </p>
+              <p className="text-xs text-muted-foreground">
+                The graph is checkpointed in Postgres and resumes from this exact
+                point. Nothing has been executed.
+              </p>
+              {pendingApproval?.pending?.candidate && (
+                <pre className="mt-2 text-xs bg-background/60 border border-border rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap">
+                  {pendingApproval.pending.candidate}
+                </pre>
+              )}
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              value={approveExploitId}
+              onChange={e => setApproveExploitId(e.target.value)}
+              placeholder="pending_exploit_id (required to approve)"
+              className="flex-1 min-w-[18rem] px-2 py-1.5 bg-background border border-border rounded-md text-xs font-mono"
+            />
+            <input
+              value={approveNote}
+              onChange={e => setApproveNote(e.target.value)}
+              placeholder="note (optional)"
+              className="flex-1 min-w-[10rem] px-2 py-1.5 bg-background border border-border rounded-md text-xs"
+            />
+            <button
+              onClick={() => approveSession.mutate({
+                id: sessionId,
+                approved: true,
+                pending_exploit_id: approveExploitId.trim(),
+                note: approveNote || undefined,
+              })}
+              disabled={!approveExploitId.trim() || approveSession.isPending}
+              title={approveExploitId.trim()
+                ? 'Execute the queued exploit and continue'
+                : 'Enter the pending_exploit_id to approve'}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-purple-600 text-white rounded-md text-sm hover:bg-purple-700 disabled:opacity-50"
+            >
+              <Check className="h-3.5 w-3.5" /> Approve &amp; run
+            </button>
+            <button
+              onClick={() => approveSession.mutate({
+                id: sessionId,
+                approved: false,
+                note: approveNote || undefined,
+              })}
+              disabled={approveSession.isPending}
+              className="flex items-center gap-1.5 px-3 py-1.5 border border-border rounded-md text-sm hover:bg-muted disabled:opacity-50"
+            >
+              <Ban className="h-3.5 w-3.5" /> Decline
+            </button>
+          </div>
+          {approveSession.isError && (
+            <p className="text-xs text-red-500">
+              {(approveSession.error as Error)?.message ?? 'Approval failed'}
+            </p>
+          )}
+          <Link
+            to="/exploits"
+            className="inline-flex items-center gap-1 text-xs text-purple-400 hover:underline"
+          >
+            <ExternalLink className="h-3 w-3" /> Find the id in Pending Exploits
+          </Link>
         </div>
       )}
 
@@ -1030,6 +1141,13 @@ function SessionList() {
     initial_task: SESSION_PROFILES[DEFAULT_PROFILE].task,
     max_rounds: 200,
     auto_execute_scans: true,
+    // '' = use the service default (AGENT_ENGINE), which is the only engine
+    // there is now. Kept as a field because the API still accepts it and saved
+    // launch presets may carry one.
+    engine: '',
+    // Off by default: with it on the session pauses for an approval, so an
+    // operator who walks away comes back to a parked session.
+    enable_exploit_phase: false,
   })
 
   // Node + scope selector data
@@ -1048,8 +1166,12 @@ function SessionList() {
   }, [activeScope, scopeData])
 
   const sessions: AgentSession[] = data?.sessions ?? []
-  const active = sessions.filter(s => s.status === 'active')
-  const history = sessions.filter(s => s.status !== 'active')
+  // A session paused on an approval interrupt is LIVE, not history: it is
+  // waiting on the operator and resumes the moment it is answered. Filing it
+  // under history is how an approval sits unnoticed for hours.
+  const LIVE_STATUSES = ['active', 'awaiting_approval']
+  const active = sessions.filter(s => LIVE_STATUSES.includes(s.status))
+  const history = sessions.filter(s => !LIVE_STATUSES.includes(s.status))
 
   const handleScopeClear = () => {
     setActiveScope('')
@@ -1067,8 +1189,14 @@ function SessionList() {
 
     // port_profile is omitted entirely when unset, so the scanner agent keeps
     // its built-in quick (1-1000+web) then deep (1001-65535) policy.
+    // engine: '' means "no override" — sending the key at all would make the
+    // service treat an empty string as a choice. There is no selector any more,
+    // but the field survives so a saved launch preset carrying an engine still
+    // forwards it (the service warns and runs LangGraph if it is the retired one).
+    const { engine, ...formRest } = form
     const sessionData = {
-      ...form, proxy,
+      ...formRest, proxy,
+      ...(engine ? { engine } : {}),
       ...(portProfile ? { port_profile: portProfile } : {}),
       ...(webProfile ? { web_profile: webProfile } : {}),
     }
@@ -1103,6 +1231,8 @@ function SessionList() {
           initial_task: SESSION_PROFILES[DEFAULT_PROFILE].task,
           max_rounds: 200,
           auto_execute_scans: true,
+          engine: '',
+          enable_exploit_phase: false,
         })
       },
     })
@@ -1262,6 +1392,11 @@ function SessionList() {
                 ))}
               </select>
             </div>
+            {/* The engine selector is gone: AutoGen was retired, so LangGraph is
+                the only engine. Offering a second option that the service
+                warns about and then silently overrides would be a control that
+                claims to do something it does not — worse than no control.
+                GET /api/agent-sessions/engine reports what is running. */}
             <label className="flex items-center gap-2 text-sm pb-1">
               <input
                 type="checkbox"
@@ -1270,6 +1405,18 @@ function SessionList() {
                 className="rounded border-border"
               />
               Auto Execute Scans
+            </label>
+            <label
+              className="flex items-center gap-2 text-sm pb-1"
+              title="LangGraph only. Adds the exploit phase: one candidate is queued and the session PAUSES until you approve it."
+            >
+              <input
+                type="checkbox"
+                checked={form.enable_exploit_phase}
+                onChange={e => setForm(f => ({ ...f, enable_exploit_phase: e.target.checked }))}
+                className="rounded border-border"
+              />
+              Exploit phase <span className="text-xs text-muted-foreground">(pauses for approval)</span>
             </label>
           </div>
           {/* Remote proxy node */}
@@ -1388,14 +1535,18 @@ function SessionList() {
                         ? 'text-orange-500'
                         : s.status === 'rounds_exhausted'
                           ? 'text-yellow-500'
-                          : 'text-yellow-500',
+                          : s.status === 'awaiting_approval'
+                            ? 'text-purple-400'
+                            : 'text-yellow-500',
                 )}
               >
                 {s.status === 'rounds_exhausted'
                   ? 'needs more rounds'
                   : s.status === 'agent_failure'
                     ? 'agent failed'
-                    : s.status}
+                    : s.status === 'awaiting_approval'
+                      ? 'awaiting approval'
+                      : s.status}
               </span>
               <span className="text-xs text-muted-foreground">{timeAgo(s.end_time || s.updated_at || s.created_at)}</span>
               <button

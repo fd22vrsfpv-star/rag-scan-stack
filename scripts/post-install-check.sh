@@ -37,6 +37,10 @@ EXPECTED_TABLES=(
   # TIER 7: Agent / LLM
   agent_sessions agent_messages agent_tool_calls
   session_scan_metrics llm_request_metrics prompt_configs
+  # LangGraph durable checkpoints (AGENT_ENGINE=langgraph). Library-managed by
+  # PostgresSaver.setup(), but declared in db_init so a fresh install has them
+  # before the first agent session — assert them like any other table.
+  checkpoints checkpoint_blobs checkpoint_writes checkpoint_migrations
   # TIER 8: Exploit management
   pending_exploits exploit_results exploit_chunks
   msf_modules active_listeners exploit_callbacks tool_executions

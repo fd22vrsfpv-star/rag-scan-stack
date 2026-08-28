@@ -101,6 +101,11 @@ CRITICAL_TABLES=(
     "agent_tool_calls"
     "session_scan_metrics"
     "llm_request_metrics"
+    # LangGraph durable checkpoints (AGENT_ENGINE=langgraph)
+    "checkpoints"
+    "checkpoint_blobs"
+    "checkpoint_writes"
+    "checkpoint_migrations"
     "jobs"
     "tasks"
     "pending_exploits"

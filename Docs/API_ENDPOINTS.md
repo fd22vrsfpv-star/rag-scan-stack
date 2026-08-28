@@ -137,10 +137,27 @@ curl -X POST http://localhost:8014/scan \
 **Endpoints**:
 - `GET /health` - Health check
 - `GET /docs` - Interactive Swagger UI documentation
-- `POST /pentest` - Start a multi-agent penetration testing session
+- `POST /pentest` - Start a multi-agent penetration testing session.
+  Body options relevant to the engine (Docs/LANGGRAPH_MIGRATION_PLAN.md):
+  `engine` (`langgraph` default | `autogen` legacy fallback — pins THIS session,
+  no restart needed) and `enable_exploit_phase` (LangGraph only; the session
+  PAUSES at `status=awaiting_approval` until an operator answers).
 - `GET /pentest/{session_id}` - Get pentest session status
 - `GET /pentest/{session_id}/messages` - Get conversation messages
 - `GET /sessions` - List all pentest sessions
+- `GET /pentest/engine` - Resolved orchestration engine for new sessions, the
+  env/default it came from, and whether each engine is loadable. Declared before
+  `/pentest/{session_id}` or the path would be read as a session id.
+- `GET /pentest/{session_id}/pending-approval` - What a paused LangGraph session
+  is waiting for, read from its **Postgres checkpoint** (so it is correct after a
+  service restart). `awaiting_approval: false` for a session that is not parked.
+- `POST /pentest/{session_id}/approve` - Answer the approval interrupt and
+  continue the SAME session from its checkpoint (`Command(resume=…)`) — no new
+  session row, no replay of completed phases.
+  Body: `{"approved": bool, "pending_exploit_id": "<uuid>", "note": "..."}`.
+  `approved=true` **requires** `pending_exploit_id` (400 without it: an approval
+  that executes nothing would read as "approved and run"). 400 malformed id,
+  404 unknown session, 409 session not parked on an approval.
 
 **🎉 NEW: Diagnostic Log Viewing**:
 - `GET /logs/ui` - **Web interface for viewing diagnostic logs** (recommended)

@@ -24,7 +24,15 @@ echo "✓ PostgreSQL is ready"
 # BOUNDED: a crashed/absent Ollama must never hang startup — after ~60s we start
 # anyway and let the app resolve the effective backend at request time
 # (dashboard DB llm.* over env).
-if [ "${LLM_BACKEND:-ollama}" = "ollama" ]; then
+# Second condition: does the Ollama hostname even resolve? LLM_BACKEND is an
+# ENV var, but the effective backend lives in the dashboard DB — so a stack
+# running Azure/DeepSeek still shows LLM_BACKEND=ollama here and paid the full
+# 60s penalty on EVERY restart, waiting for a container that does not exist.
+# A DNS check costs milliseconds and skips the wait when there is nothing there.
+_ollama_name="$(printf '%s' "${OLLAMA_HOST:-http://ollama:11434}" | sed -E 's#^[a-zA-Z]+://##; s#[:/].*$##')"
+if [ "${LLM_BACKEND:-ollama}" = "ollama" ] && ! getent hosts "$_ollama_name" >/dev/null 2>&1; then
+    echo "Ollama host '${_ollama_name}' does not resolve - skipping Ollama wait"
+elif [ "${LLM_BACKEND:-ollama}" = "ollama" ]; then
     echo "Waiting for Ollama (up to 60s)..."
     _tries=0
     until curl -s "${OLLAMA_HOST}/api/tags" > /dev/null 2>&1; do

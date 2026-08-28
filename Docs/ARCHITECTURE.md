@@ -361,9 +361,29 @@ Off by default; run against **local** models so engagement data never leaves the
   form a feedback loop logged to `rag_query_log` / `rag_feedback` (migrations in
   `scan_recommender/migrations/`). Default gen model: `mistral:latest`; `LLM_BACKEND` selects
   Ollama/vLLM.
-- **`autogen_agents/` (8015)** — Microsoft AutoGen multi-agent pentest teams (`pentest_agents.py`
-  `PentestTeam`, group chat + custom speaker selection), an A/B LLM config, MCP tool discovery, and a
-  `passive_only` mode. Ships its own `mcp_server.py`/`mcp_tools_bridge.py` and report generator.
+- **`autogen_agents/` (8015)** — the AI agent service. The directory and container keep the
+  `autogen` name for continuity (compose, the cert SAN and the BFF's `autogen_url` all reference
+  it), but the orchestration is **LangGraph**, not AutoGen — see
+  Docs/LANGGRAPH_MIGRATION_PLAN.md.
+  - **`langgraph_engine.py`** — a `StateGraph` per session, one durable run per
+    `thread_id = session_id`. Deterministic supervisor edges
+    (recon → scan → analyze → [exploit] → report) rather than LLM speaker selection, which is
+    what removed the GroupChat stall class. recon/scan/analyze are `create_react_agent` LLM
+    agents over per-phase toolsets; each has a deterministic fallback so a rate-limited model
+    never hard-fails a session.
+  - **`tool_registry.py`** — the single source of truth for the 49 tools an LLM may call
+    (`name`, LLM-facing `description`, callable). `langgraph_tools.py` wraps them for
+    `ToolNode`; `mcp_tools_bridge.NATIVE_TOOL_NAMES` derives from it. Bodies live in
+    `scan_tools.py`, so the scope gate and `MAX_CONCURRENT_SCANS` apply identically however a
+    tool is called.
+  - **Human-in-the-loop** — the opt-in exploit phase queues ONE candidate and then parks on a
+    native `interrupt()`; the session sits at `status='awaiting_approval'` with its state in
+    Postgres (`checkpoints`, `checkpoint_blobs`, `checkpoint_writes`) until an operator answers
+    `POST /pentest/{id}/approve`, which resumes the SAME session with no replay.
+  - Also ships the A/B LLM config, MCP tool discovery (`mcp_server.py`/`mcp_tools_bridge.py`),
+    a `passive_only` mode and the report generator.
+  - **Retired here:** `pyautogen`, `PentestTeam`, the GroupChat + custom speaker selection,
+    stall *recovery* and `POST /pentest/{id}/nudge`. Stall *detection* remains.
 
 Every recommendation is a reviewable OPSEC timeline entry; every action is audited.
 

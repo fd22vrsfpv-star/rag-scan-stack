@@ -1200,7 +1200,7 @@ CREATE TABLE IF NOT EXISTS public.agent_sessions (
     session_name       text NOT NULL,
     target_description text NOT NULL,
     status             text NOT NULL DEFAULT 'active'
-                       CHECK (status IN ('active','completed','failed','stopped','stalled')),
+                       CHECK (status IN ('active','completed','failed','stopped','stalled','awaiting_approval')),
     configuration      jsonb DEFAULT '{}'::jsonb,
     summary            text,
     metadata           jsonb DEFAULT '{}'::jsonb,
@@ -1225,6 +1225,61 @@ CREATE TABLE IF NOT EXISTS public.agent_messages (
 CREATE INDEX IF NOT EXISTS idx_agent_messages_session_id ON public.agent_messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_agent_messages_agent_name ON public.agent_messages(agent_name);
 CREATE INDEX IF NOT EXISTS idx_agent_messages_created_at ON public.agent_messages(created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- LangGraph durable checkpoints (AGENT_ENGINE=langgraph)
+--
+-- Library-managed by langgraph-checkpoint-postgres (PostgresSaver.setup(), run
+-- on every langgraph session start/resume). Declared here so a fresh install
+-- has them up front and the health check can assert them. DDL copied verbatim
+-- from langgraph.checkpoint.postgres.base.MIGRATIONS.
+--
+-- checkpoint_migrations is intentionally left EMPTY: the library reads MAX(v)
+-- to decide what to apply, and every migration is idempotent, so an empty table
+-- means "re-apply all" (correct). Seeding versions would make it SKIP work.
+-- Mirrored in db_init/create_langgraph_checkpoint_tables.sql — keep in sync.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.checkpoint_migrations (
+    v INTEGER PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS public.checkpoints (
+    thread_id TEXT NOT NULL,
+    checkpoint_ns TEXT NOT NULL DEFAULT '',
+    checkpoint_id TEXT NOT NULL,
+    parent_checkpoint_id TEXT,
+    type TEXT,
+    checkpoint JSONB NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}',
+    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.checkpoint_blobs (
+    thread_id TEXT NOT NULL,
+    checkpoint_ns TEXT NOT NULL DEFAULT '',
+    channel TEXT NOT NULL,
+    version TEXT NOT NULL,
+    type TEXT NOT NULL,
+    blob BYTEA,
+    PRIMARY KEY (thread_id, checkpoint_ns, channel, version)
+);
+
+CREATE TABLE IF NOT EXISTS public.checkpoint_writes (
+    thread_id TEXT NOT NULL,
+    checkpoint_ns TEXT NOT NULL DEFAULT '',
+    checkpoint_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    channel TEXT NOT NULL,
+    type TEXT,
+    blob BYTEA NOT NULL,
+    task_path TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
+);
+
+CREATE INDEX IF NOT EXISTS checkpoints_thread_id_idx ON public.checkpoints(thread_id);
+CREATE INDEX IF NOT EXISTS checkpoint_blobs_thread_id_idx ON public.checkpoint_blobs(thread_id);
+CREATE INDEX IF NOT EXISTS checkpoint_writes_thread_id_idx ON public.checkpoint_writes(thread_id);
 
 -- session_scan_metrics
 CREATE TABLE IF NOT EXISTS public.session_scan_metrics (

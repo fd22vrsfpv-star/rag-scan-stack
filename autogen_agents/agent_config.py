@@ -6,7 +6,6 @@ Configures Autogen agents to use Ollama or vLLM for local LLM inference
 import os
 import logging
 from typing import Dict, List, Optional
-import autogen
 
 log = logging.getLogger("agent_config")
 
@@ -331,163 +330,20 @@ def get_ab_test_config(
         return get_llm_config(temperature=temperature, timeout=timeout), "default"
 
 
-def create_assistant_agent(
-    name: str,
-    system_message: str,
-    llm_config: Optional[Dict] = None,
-    human_input_mode: str = "NEVER",
-    max_consecutive_auto_reply: int = 10,
-    code_execution_config: Optional[Dict] = None
-) -> autogen.AssistantAgent:
-    """
-    Create an Autogen AssistantAgent with Ollama configuration
+# ===============================
+# AutoGen agent factories — REMOVED
+# ===============================
+# create_assistant_agent / create_user_proxy_agent / register_function_to_agent /
+# create_group_chat / create_group_chat_manager lived here. They were thin
+# wrappers over `autogen.AssistantAgent`, `autogen.UserProxyAgent` and
+# `autogen.GroupChat`, used only by pentest_agents.PentestTeam, and went with it
+# when AutoGen was retired (Docs/LANGGRAPH_MIGRATION_PLAN.md, Phase 5).
+#
+# What stays: every get_*_config() above (they resolve the ACTIVE LLM backend
+# from the dashboard DB and are what langgraph_engine._chat_model() reads), and
+# SYSTEM_MESSAGES below (the operator-editable agent prompts, served and saved by
+# the /prompts endpoints and now consumed by the LangGraph engine).
 
-    Args:
-        name: Agent name
-        system_message: System prompt defining agent's role
-        llm_config: LLM configuration (uses Ollama if None)
-        human_input_mode: "ALWAYS", "NEVER", or "TERMINATE"
-        max_consecutive_auto_reply: Maximum auto-replies
-        code_execution_config: Code execution settings
-
-    Returns:
-        Configured AssistantAgent
-    """
-    if llm_config is None:
-        llm_config = {
-            "config_list": get_llm_config(),
-            "cache_seed": None,  # Disable caching for dynamic responses
-        }
-
-    agent = autogen.AssistantAgent(
-        name=name,
-        system_message=system_message,
-        llm_config=llm_config,
-        human_input_mode=human_input_mode,
-        max_consecutive_auto_reply=max_consecutive_auto_reply,
-        code_execution_config=code_execution_config or False,
-    )
-
-    return agent
-
-
-def create_user_proxy_agent(
-    name: str = "UserProxy",
-    system_message: str = "A human admin.",
-    human_input_mode: str = "NEVER",
-    max_consecutive_auto_reply: int = 10,
-    code_execution_config: Optional[Dict] = None
-) -> autogen.UserProxyAgent:
-    """
-    Create an Autogen UserProxyAgent for executing actions
-
-    Args:
-        name: Agent name
-        system_message: System prompt
-        human_input_mode: Input mode
-        max_consecutive_auto_reply: Maximum auto-replies
-        code_execution_config: Code execution settings
-
-    Returns:
-        Configured UserProxyAgent
-    """
-    if code_execution_config is None:
-        code_execution_config = {
-            "work_dir": "/app/cache",
-            "use_docker": False,
-            "timeout": 300,
-            "last_n_messages": 3,
-        }
-
-    agent = autogen.UserProxyAgent(
-        name=name,
-        system_message=system_message,
-        human_input_mode=human_input_mode,
-        max_consecutive_auto_reply=max_consecutive_auto_reply,
-        code_execution_config=code_execution_config,
-    )
-
-    return agent
-
-
-def register_function_to_agent(
-    agent: autogen.ConversableAgent,
-    func,
-    name: str,
-    description: str
-):
-    """
-    Register a custom function as a tool for an agent
-
-    Args:
-        agent: Agent to register function to
-        func: Python function to register
-        name: Function name
-        description: Function description for the LLM
-    """
-    agent.register_function(
-        function_map={name: func}
-    )
-
-
-def create_group_chat(
-    agents: List[autogen.Agent],
-    max_round: int = 20,
-    admin_name: str = "Admin",
-    speaker_selection_method: str = "auto"
-) -> autogen.GroupChat:
-    """
-    Create a group chat for multi-agent collaboration
-
-    Args:
-        agents: List of agents to include
-        max_round: Maximum conversation rounds
-        admin_name: Name of admin agent
-        speaker_selection_method: "auto", "manual", or "round_robin"
-
-    Returns:
-        GroupChat instance
-    """
-    groupchat = autogen.GroupChat(
-        agents=agents,
-        messages=[],
-        max_round=max_round,
-        speaker_selection_method=speaker_selection_method,
-        allow_repeat_speaker=False
-    )
-
-    return groupchat
-
-
-def create_group_chat_manager(
-    groupchat: autogen.GroupChat,
-    llm_config: Optional[Dict] = None
-) -> autogen.GroupChatManager:
-    """
-    Create a manager for a group chat
-
-    Args:
-        groupchat: GroupChat instance
-        llm_config: LLM configuration (uses Ollama if None)
-
-    Returns:
-        GroupChatManager instance
-    """
-    if llm_config is None:
-        llm_config = {
-            "config_list": get_llm_config(),
-            "cache_seed": None,
-        }
-
-    manager = autogen.GroupChatManager(
-        groupchat=groupchat,
-        llm_config=llm_config
-    )
-
-    return manager
-
-
-# Language requirement to add to all agents
 ENGLISH_ONLY = """
 LANGUAGE REQUIREMENT: You MUST respond in English ONLY.
 - NEVER use Chinese (中文), Thai (ไทย), or any non-English language

@@ -1,77 +1,77 @@
-"""LangGraph tool surface — Phase 2 of the AutoGen → LangGraph migration.
+"""LangGraph tool surface — LangChain-wrapped tools for `ToolNode` / react agents.
 
-Single source of truth: the tools the AutoGen agents register via
-`agent.register_for_llm(name=...)(func)` in `pentest_agents.py`. Rather than
-hand-maintaining a parallel list (which would silently drift), this module PARSES
-those registrations and resolves each callable from the `pentest_agents`
-namespace, then wraps them as LangChain `StructuredTool`s for LangGraph nodes /
-`ToolNode`.
+Single source of truth: `tool_registry.TOOL_SPECS`. This module only wraps those
+specs; it does not decide what exists.
 
-Because the surface is DERIVED from the AutoGen source, parity is by
-construction; `tests/test_langgraph_tool_parity.py` fails the build if the two
-ever diverge (a tool added to AutoGen but not resolvable here, or vice-versa).
+History worth keeping, because it explains two bugs:
 
-Tool BODIES are unchanged — the scope gate, concurrency and webhook contracts are
-identical whether a tool is called by AutoGen or LangGraph.
+  * Until AutoGen was retired, the roster existed only as a side effect of
+    building AutoGen agents, so this module PARSED `pentest_agents.py` for
+    `register_for_llm(name=...)` calls and resolved each callable out of that
+    module's namespace. Parity was "by construction", but the construction was a
+    regex over another module's source — and deleting AutoGen would have deleted
+    the tool surface along with it.
+  * That parsing recovered the tool NAME but not the curated `description`, so
+    the wrapper substituted `inspect.getdoc(fn)`. The description is what the
+    model reads when deciding which tool to call, so LangGraph agents were
+    choosing tools from Python docstrings while the tuned text sat unused in
+    `pentest_agents.py`. Reading the registry fixes that: one description, used
+    by every consumer.
+
+Tool BODIES are unchanged — the scope gate, MAX_CONCURRENT_SCANS and webhook
+contracts do not depend on which framework wraps them.
 """
 from __future__ import annotations
 
-import importlib
-import inspect
-import pathlib
-import re
 from typing import Callable, Dict, List
 
-# `register_for_llm(name="tool")( ... )(the_callable)` — anchored on the `)(`
-# decorator-application so a `)` inside a description can't end the match early.
-_REG_RE = re.compile(
-    r'register_for_llm\(\s*name="([a-z_0-9]+)".*?\)\(\s*([\w.]+)\s*\)',
-    re.DOTALL,
+from tool_registry import (  # noqa: F401  (re-exported for existing callers)
+    DISPATCH_TOOL_NAMES,
+    TOOL_BY_NAME,
+    TOOL_FUNCS,
+    TOOL_NAMES,
+    TOOL_SPECS,
+    ToolSpec,
 )
 
 
-def _resolve(mod, dotted: str):
-    obj = mod
-    for part in dotted.split("."):
-        obj = getattr(obj, part, None)
-        if obj is None:
-            return None
-    return obj
+# name -> why it could not be wrapped. Empty in a healthy build.
+_UNWRAPPABLE: Dict[str, str] = {}
 
 
-def canonical_tool_funcs() -> Dict[str, Callable]:
-    """{name: callable} for every tool the AutoGen agents register.
+def build_langgraph_tools() -> List[object]:
+    """Wrap every registry spec as a LangChain StructuredTool.
 
-    Parsed from pentest_agents.py and resolved from that module's namespace, so
-    it is exactly the AutoGen roster — the same functions, the same bodies."""
-    pa = importlib.import_module("pentest_agents")
-    src = pathlib.Path(pa.__file__).read_text(encoding="utf-8")
-    out: Dict[str, Callable] = {}
-    for name, expr in _REG_RE.findall(src):
-        fn = _resolve(pa, expr)
-        if callable(fn):
-            out[name] = fn
-    return out
-
-
-def build_langgraph_tools() -> List["object"]:
-    """Wrap the canonical tools as LangChain StructuredTools for LangGraph."""
+    A spec whose signature cannot be introspected is COLLECTED, not silently
+    dropped: `unwrappable_tools()` reports it and `tests/test_tool_registry.py`
+    fails on it. Dropping one quietly is how a phase's toolset shrinks to
+    nothing while every check still passes.
+    """
     from langchain_core.tools import StructuredTool
-    tools = []
-    for name, fn in canonical_tool_funcs().items():
+    tools: List[object] = []
+    for spec in TOOL_SPECS:
         try:
             tools.append(StructuredTool.from_function(
-                fn, name=name,
-                description=(inspect.getdoc(fn) or name).strip()[:400]))
-        except Exception:
-            # A tool whose signature can't be introspected is reported by the
-            # parity test as uncovered rather than silently dropped.
-            pass
+                spec.func, name=spec.name, description=spec.description[:1000]))
+        except Exception as e:  # noqa: BLE001
+            _UNWRAPPABLE[spec.name] = f"{type(e).__name__}: {e}"
     return tools
 
 
-# Built once at import. TOOL_FUNCS is the authoritative name→callable map;
-# LANGGRAPH_TOOLS is the LangChain-wrapped surface for binding to a ToolNode.
-TOOL_FUNCS: Dict[str, Callable] = canonical_tool_funcs()
-TOOL_NAMES: List[str] = sorted(TOOL_FUNCS)
+def unwrappable_tools() -> Dict[str, str]:
+    """Registry tools that exist but cannot be exposed to an LLM, and why."""
+    return dict(_UNWRAPPABLE)
+
+
 LANGGRAPH_TOOLS = build_langgraph_tools()
+
+
+def tools_named(names) -> List[object]:
+    """The wrapped tools whose names are in `names`.
+
+    Filtering by name means a typo yields FEWER tools rather than an error, so
+    every caller's name set is pinned by tests/test_langgraph_phases.py against
+    the registry.
+    """
+    wanted = set(names)
+    return [t for t in LANGGRAPH_TOOLS if getattr(t, "name", None) in wanted]

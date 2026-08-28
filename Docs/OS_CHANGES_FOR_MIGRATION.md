@@ -1,5 +1,69 @@
 # OS Changes for Migration
 
+## 2026-08-28 (part 2) — embedder TLS mount is the one thing to mirror
+
+### Files Changed
+`docker-compose.yml` (embedder + embedder-gpu), `scan_recommender/*`,
+`app/rag-api/scope_classifier.py`, `autogen_agents/*`. Full list in
+Docs/CHANGES_MADE.md (2026-08-28 part 2).
+
+### Platforms Affected
+**One real item, plus notes.**
+
+1. **The `embedder` service now needs `./certs:/certs:ro` and a `command:`
+   override to serve TLS** — it had neither and served plain HTTP while every
+   caller used `https://embedder:8030`. Any platform-specific compose file that
+   REPLACES the embedder service definition (rather than merging into it) must
+   carry both, or embeddings break again with
+   `SSLError WRONG_VERSION_NUMBER`. Today `docker-compose.mac.yml` and
+   `docker-compose.azure.yml` do not touch `embedder`, so they inherit the base
+   definition and need no edit — verify that before a port.
+   The same applies to `embedder-gpu`, which takes over the `embedder` network
+   alias under the `gpu` profile.
+
+2. **`EMBED_BACKEND` / `EMBEDDER_URL` are new base-compose env vars.** Defaults
+   (`auto`, `https://embedder:8030`) are correct for every platform. A mac/Windows
+   `.env` copied from an older `.env.example` falls back to them.
+
+3. **The mac/azure overlays exist because Ollama runs natively there.** That is
+   exactly the situation the embeddings bug came from on Linux: the code assumed
+   `ollama:11434` was reachable. `EMBED_BACKEND=auto` no longer assumes it, and
+   the scan-recommender entrypoint now checks whether the ollama hostname
+   resolves before waiting 60s for it. A native-Ollama host WILL resolve its
+   configured `OLLAMA_HOST`, so the wait still happens there — intended.
+
+4. **AutoGen retirement needs no OS-specific work.** No new mounts, ports or
+   paths; `pyautogen` simply leaves `autogen_agents/requirements.txt`, which every
+   platform builds from.
+
+## 2026-08-28 — LangGraph Phase 4 (default engine flip): no OS-specific work
+
+### Files Changed
+`docker-compose.yml`, `.env`, `.env.example`, `autogen_agents/*`,
+`dashboard/*`, `app/rag-api/webhooks/router.py`, `db_init/*`, `scripts/*`.
+See Docs/CHANGES_MADE.md (2026-08-28) for the full list.
+
+### Platforms Affected
+**None differentially.** Logged for completeness, with three notes for a port:
+
+1. **New env vars are base-compose only.** `AGENT_ENGINE` (default now
+   `langgraph`) and `LANGGRAPH_EXPLOIT_PHASE` (default `false`) live in
+   `docker-compose.yml`'s autogen-agents `environment:` block.
+   `docker-compose.mac.yml` and `docker-compose.azure.yml` override only
+   `depends_on` plus a few extra env keys, so the base values merge through —
+   there is nothing to mirror. A mac/windows `.env` copied from an older
+   `.env.example` simply falls back to the compose defaults.
+2. **No new mounts, ports or host paths.** The LangGraph checkpoint tables live
+   in the same `scans` Postgres the stack already uses; the checkpointer is a
+   library, not a service.
+3. **Windows/macOS note on the ollama dependency.** The mac and azure overlays
+   exist because Ollama runs natively rather than as a container. Unrelated to
+   this change, but the `get_scan_recommendations` 500 seen during Phase 4
+   verification is exactly that class of problem on Linux too:
+   `scan_recommender/exploits_rag.py` embeds via `OLLAMA_HOST` and there is no
+   ollama container in this deployment. A port should point it at the
+   `embedder` service instead of assuming ollama is reachable.
+
 ## 2026-08-11 (part 3) — walkthrough converter: no OS-specific work
 
 ### Files Changed

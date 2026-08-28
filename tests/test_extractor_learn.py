@@ -76,8 +76,8 @@ import os, json, psycopg2, extractor_specs as es
 c=psycopg2.connect(os.environ["DB_DSN"]); c.autocommit=True; cur=c.cursor()
 TOOL="pytest-learn-tool"
 cur.execute("DELETE FROM extractor_learned WHERE tool=%s",(TOOL,))
-cur.execute("""INSERT INTO extractor_learned (tool,kind,rule,status,source)
-  VALUES (%s,'deterministic',%s::jsonb,'active','distilled')""",
+cur.execute('''INSERT INTO extractor_learned (tool,kind,rule,status,source)
+  VALUES (%s,'deterministic',%s::jsonb,'active','distilled')''',
   (TOOL, json.dumps({"widget": {"pattern": r"widget=(\w+)", "capture":"first","type":"string"}})))
 try:
     es._overlay_cache["checked_at"]=0.0
