@@ -1936,6 +1936,18 @@ def run_pentest_session_sync(
         web_profile: Named web scan depth applied to this session's web tools
             (see knowledge/web_profiles.yaml). None keeps each tool's defaults.
     """
+    # AGENT_ENGINE selects the orchestration backend behind this same API
+    # (Docs/LANGGRAPH_MIGRATION_PLAN.md). Default 'autogen' keeps current
+    # behaviour; 'langgraph' routes to the deterministic StateGraph engine, which
+    # reuses the same scan_tools (scope gate intact) and writes to the same
+    # agent_sessions/agent_messages tables so every read route is unchanged.
+    if os.environ.get("AGENT_ENGINE", "autogen").strip().lower() == "langgraph":
+        from langgraph_engine import run_langgraph_session_sync
+        return run_langgraph_session_sync(
+            session_id, target_description, initial_task, max_rounds,
+            resume_context, session_name, auto_execute_scans, proxy,
+            port_profile, web_profile, auto_run_recommendations)
+
     import sys
     import contextlib
     import httpx as sync_httpx
