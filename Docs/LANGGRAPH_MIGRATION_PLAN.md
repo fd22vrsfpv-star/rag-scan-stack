@@ -188,6 +188,30 @@ Engine behind the same API, flag-gated, autogen-agents rebuilt (durable).
   `checkpoint_migrations`). They are library-managed; a fresh install self-heals
   on first langgraph session. Document in db_init when langgraph becomes default.
 
-**Next decision:** Phase 2 — wrap all 92 tools as LangGraph tools + a parity test
-(the set of dispatched endpoints must match AutoGen for a fixed scenario), then
-Phase 3 (cut recon over first) and richer supervisor routing.
+**Next decision:** Phase 2 — wrap all tools as LangGraph tools + a parity test,
+then Phase 3 (cut recon over first) and richer supervisor routing.
+
+## 11. Phase 2 RESULTS — DONE (2026-08-27) ✅
+Tool surface parity. (Correction: the AutoGen roster is **49** distinct
+`register_for_llm` tools, not the ~92 estimated earlier — that count included
+duplicate registrations across agents + non-tool matches.)
+- **`autogen_agents/langgraph_tools.py`** — the LangGraph tool surface is
+  DERIVED from the AutoGen registrations (parses `register_for_llm(name=...)(fn)`
+  in pentest_agents.py and resolves each callable from that module's namespace),
+  then wraps them as LangChain `StructuredTool`s. Parity is by construction — the
+  two cannot drift. Verified: **49/49** tools resolved, 49 LangChain-wrapped, 0
+  unresolved (incl. the mismatched-name ones: `list_pending_exploits` →
+  `list_pending_exploits_tool`, `search_msf_modules` → `search_msf_modules_tool`).
+- **`tests/test_langgraph_tool_parity.py`** — executable guard. Skips cleanly
+  without the autogen deps. **Sabotage-proven:** injecting a parsed-but-
+  unresolvable AutoGen tool turns it RED
+  (`LangGraph cannot provide these AutoGen tools: ['fake_tool_xyz']`); clean →
+  2 passed.
+- Tool BODIES unchanged, so scope gate / concurrency / webhooks are identical
+  regardless of which engine calls a tool. `langgraph_tools` isn't runtime-
+  imported by the engine yet (that's Phase 3), so no rebuild was required; it
+  bakes into the image on the next build.
+
+**Next decision:** Phase 3 — bind `LANGGRAPH_TOOLS` to an LLM `ToolNode`, give the
+supervisor real routing, and cut the read-only recon flow over first on redteam3
+with a dispatched-endpoint comparison vs AutoGen.
