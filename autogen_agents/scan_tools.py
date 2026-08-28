@@ -1726,7 +1726,11 @@ class ScanTools:
 
     def get_web_findings(self, limit: int = 100) -> Dict:
         """
-        Get web findings from database
+        Get web findings from database.
+
+        There is no `/web_findings` endpoint (it 404s); the unified
+        `/findings/search` is the source of truth and it spans the web tools via
+        the `source` filter (zap / gobuster / playwright).
 
         Args:
             limit: Maximum number of results
@@ -1734,13 +1738,18 @@ class ScanTools:
         Returns:
             Dictionary with web findings
         """
-        return self._make_request(
+        resp = self._make_request(
             method="GET",
-            url=f"{self.rag_api_url}/web_findings",
+            url=f"{self.rag_api_url}/findings/search",
             operation=f"Query web findings (limit={limit})",
             headers=self.headers,
-            params={"limit": limit}
+            params={"source": ["zap", "gobuster", "playwright"], "limit": limit},
         )
+        # The unified endpoint returns `results`; alias it to `findings` so the
+        # get_web_findings() wrapper's target/source post-filtering still applies.
+        if isinstance(resp, dict) and "results" in resp and "findings" not in resp:
+            resp["findings"] = resp["results"]
+        return resp
 
     def check_system_status(self) -> Dict:
         """
