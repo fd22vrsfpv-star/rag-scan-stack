@@ -6,7 +6,7 @@ asyncpg>=0.29.0
 httpx==0.27.2
 h2==4.1.0
 pyautogen==0.2.18
-openai==1.10.0
+openai>=1.3,<4
 python-dotenv==1.0.0
 mcp==1.17.0
 sse-starlette==1.8.2
@@ -15,6 +15,7 @@ jinja2>=3.1.2
 pyyaml>=6.0
 
 # LangGraph migration (Phase 0 spike) — supervisor orchestration + Postgres checkpointing
-langgraph
+langgraph>=1,<2
 langgraph-checkpoint-postgres
 psycopg[binary]
+langchain-openai
