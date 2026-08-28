@@ -1023,6 +1023,8 @@ services:
       SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       API_KEY: ${API_KEY:-changeme}
+      # Orchestration backend: 'autogen' (default) | 'langgraph' (migration Phase 1).
+      AGENT_ENGINE: ${AGENT_ENGINE:-autogen}
       # LLM Backend: "ollama", "vllm", "azure", "openai", or "anthropic"
       LLM_BACKEND: ${LLM_BACKEND:-ollama}
       # Ollama settings (default)

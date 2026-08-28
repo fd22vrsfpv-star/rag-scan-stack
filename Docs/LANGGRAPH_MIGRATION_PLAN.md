@@ -159,3 +159,35 @@ langgraph-checkpoint-postgres, psycopg[binary]; added to
 **Next decision:** approve Phase 1 (introduce `AGENT_ENGINE` flag + the graph
 behind the existing `/pentest*` routes via an adapter). Rebuild autogen-agents
 then.
+
+## 10. Phase 1 RESULTS — DONE (2026-08-27) ✅
+Engine behind the same API, flag-gated, autogen-agents rebuilt (durable).
+- **`AGENT_ENGINE` flag** (`autogen` default | `langgraph`): env in
+  `docker-compose.yml`; branch at the top of
+  `autogen_service.run_pentest_session_sync` delegates to the LangGraph engine.
+  Default unchanged → current users see no difference.
+- **`langgraph_engine.py`** — deterministic supervisor `StateGraph`
+  (recon → scan → analyze → report). Reuses `scan_tools` bodies unchanged
+  (scope gate intact); writes to the SAME `agent_sessions`/`agent_messages`
+  tables via db_utils; checkpoints to Postgres (thread_id = session_id); emits
+  webhooks (`langgraph_session_started/_phase_completed/_completed`, tagged
+  `engine=langgraph`).
+- **Verified live** (auto_execute=False, in-container end-to-end): session
+  active→**completed**; **5 messages** (Coordinator/Reconnaissance/Scanner/
+  Analyzer/Reporter) so `/sessions`, `/messages`, `/pentest/{id}` and the UI
+  render it identically; real tools fired (query_assets, query_open_ports,
+  get_scan_recommendations, query_vulnerabilities — all 200); **6 Postgres
+  checkpoints**; webhooks 200. A `get_web_findings` 404 (pre-existing tool-path
+  bug) was caught by the defensive `_tool` wrapper without crashing the graph.
+- **Durability:** langgraph 1.2.11 + langgraph-checkpoint-postgres +
+  psycopg[binary] baked into the autogen-agents image; service healthy on
+  default `autogen`.
+- **Note (carry to Phase 3):** `PostgresSaver.setup()` (called on each langgraph
+  session start, idempotent) auto-creates the checkpoint tables
+  (`checkpoints`, `checkpoint_blobs`, `checkpoint_writes`,
+  `checkpoint_migrations`). They are library-managed; a fresh install self-heals
+  on first langgraph session. Document in db_init when langgraph becomes default.
+
+**Next decision:** Phase 2 — wrap all 92 tools as LangGraph tools + a parity test
+(the set of dispatched endpoints must match AutoGen for a fixed scenario), then
+Phase 3 (cut recon over first) and richer supervisor routing.
