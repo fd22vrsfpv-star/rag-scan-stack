@@ -131,3 +131,31 @@ class SessionState(TypedDict):
 Approve Phase 0 (the spike: add the dep, 3-node graph, prove tools + scope gate +
 checkpoint on `redteam3`). It's reversible and touches only the autogen-agents
 service. Everything after is gated on the spike's results.
+
+## 9. Phase 0 RESULTS — DONE (2026-08-27) ✅
+`autogen_agents/langgraph_spike.py` (standalone, not wired in). Ran in the
+autogen-agents container against the live stack. All three proofs PASS:
+- **Tools fire:** `scan_tools.query_assets(limit=5)` returned 2535 chars of live
+  asset data through the UNCHANGED tool body from a LangGraph node.
+- **Scope gate holds:** a node attempting `nmap 203.0.113.99` (TEST-NET-3) was
+  REFUSED — "target 203.0.113.99 is not in the configured scope" — via the same
+  `enforce_target_scope` the AutoGen tools use. No new ungated path.
+- **Checkpoint/resume:** `PostgresSaver` persisted the run (5 checkpoints for the
+  thread); the graph interrupted before `report`, then a second
+  `invoke(None, cfg)` resumed from the Postgres checkpoint by `thread_id` and
+  completed. This is the native replacement for manual message persistence +
+  `parent_session_id`.
+
+Install validated clean in the container: langgraph 1.2.11,
+langgraph-checkpoint-postgres, psycopg[binary]; added to
+`autogen_agents/requirements.txt` for the Phase 1 rebuild. Notes:
+- `PostgresSaver.setup()` creates library-managed tables (`checkpoints`,
+  `checkpoint_blobs`, `checkpoint_writes`, `checkpoint_migrations`). When
+  productionised in Phase 1 these must be added to `db_init/*` + the health check.
+- The spike used the ephemeral in-container install; the requirements change takes
+  effect on the next autogen-agents rebuild (deferred to Phase 1 to avoid
+  disrupting the running agent service).
+
+**Next decision:** approve Phase 1 (introduce `AGENT_ENGINE` flag + the graph
+behind the existing `/pentest*` routes via an adapter). Rebuild autogen-agents
+then.

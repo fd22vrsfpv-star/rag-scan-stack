@@ -13,3 +13,8 @@ sse-starlette==1.8.2
 tenacity==8.2.3
 jinja2>=3.1.2
 pyyaml>=6.0
+
+# LangGraph migration (Phase 0 spike) — supervisor orchestration + Postgres checkpointing
+langgraph
+langgraph-checkpoint-postgres
+psycopg[binary]
