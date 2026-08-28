@@ -215,3 +215,39 @@ duplicate registrations across agents + non-tool matches.)
 **Next decision:** Phase 3 — bind `LANGGRAPH_TOOLS` to an LLM `ToolNode`, give the
 supervisor real routing, and cut the read-only recon flow over first on redteam3
 with a dispatched-endpoint comparison vs AutoGen.
+
+## 12. Phase 3 RESULTS — recon cutover DONE (2026-08-27) ✅
+The recon phase is now a real LLM agent; the other phases stay deterministic until
+their own cutover (scan/analyze/exploit are the remaining increments).
+- **`_chat_model()`** targets the SAME active backend AutoGen uses (`get_llm_config`
+  → **DeepSeek-V4-Flash via Azure `/openai/v1`**), handling `openai` and `azure`
+  api types.
+- **Recon node = `create_react_agent`** (LLM ↔ `ToolNode`) over a **read-only**
+  subset (10 tools: query_assets/open_ports/vulnerabilities/web_findings/
+  search_all_findings/attack_vectors/credential_findings/exploitdb/system_status/
+  active_jobs — NO `start_*`). Deterministic fallback if the LLM errors, so a
+  session never hard-fails.
+- **Proven live on redteam3:** the agent ran a multi-turn tool loop
+  (`query_assets`, `query_open_ports`, `search_all_findings`×3, `get_attack_vectors`)
+  and produced a genuine recon summary (1,828 assets across AWS/Azure/on-prem, key
+  hosts + ports). Fallback also proven: on a `429 RateLimitReached` the session
+  completed via deterministic recon with real data.
+- **Dependency resolution:** langgraph 1.x → langchain-core 1.x → langchain-openai
+  → openai≥3. Relaxed `openai==1.10.0` to `openai>=1.3,<4`; verified AutoGen 0.2.18
+  `OpenAIWrapper` builds and its completion API surface is intact on openai 3.5.0
+  (the 1.x→3.x change didn't touch AutoGen's path). langgraph pinned `<2` so
+  `create_react_agent` stays valid. autogen-agents rebuilt; healthy on default
+  `autogen`.
+- **Pre-existing bugs surfaced (NOT introduced here, affect AutoGen too):**
+  (a) `get_scan_recommendations` → 500: scan-recommender `/rag/ask` calls
+  `…/openai/v1/embeddings` which 404s (Azure DeepSeek has no embeddings route) —
+  dropped from the recon toolset; (b) DeepSeek-V4-Flash has a low rate limit in
+  centralus (429 under sustained testing) — the fallback handles it.
+- **Not yet done (carry forward):** a full AutoGen GroupChat *session* was not
+  re-run on openai 3.5.0 (rate limits + quota) — verified at import/client level
+  only; the supervisor still routes deterministically (recon is the only LLM
+  phase); scan/analyze/exploit cutover + `interrupt()`/nudge wiring remain.
+
+**Next decision:** Phase 4 — flip default `AGENT_ENGINE=langgraph` behind a canary,
+cut scan/analyze over, wire `interrupt()` for exploit approval, add the langgraph
+checkpoint tables to db_init + health check, then retire the AutoGen scaffolding.

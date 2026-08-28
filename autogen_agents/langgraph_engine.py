@@ -32,6 +32,49 @@ from db_utils import add_agent_message, update_agent_session
 ENGINE_NAME = "langgraph"
 _MSG_CAP = 4000
 
+# Phase 3: the recon phase is a real LLM agent (LLM ↔ ToolNode) over a READ-ONLY
+# tool subset — no start_* dispatch, so the cutover contacts nothing new. The
+# other phases stay deterministic until their own cutover.
+_RECON_TOOL_NAMES = {
+    "query_assets", "query_open_ports", "query_vulnerabilities",
+    "get_web_findings", "search_all_findings", "get_attack_vectors",
+    "check_system_status", "get_session_scan_status", "get_all_active_jobs",
+    "query_credential_findings", "query_exploitdb",
+}
+_RECON_SYSTEM = (
+    "You are the Reconnaissance agent in a penetration-testing platform. Use ONLY "
+    "the read-only tools provided to enumerate what is already known about the "
+    "target: discovered assets, open ports, existing vulnerabilities and web "
+    "findings. Do NOT attempt to launch scans. When you have gathered enough, "
+    "reply with a concise reconnaissance summary (assets, notable ports/services, "
+    "and the most important existing findings)."
+)
+
+
+def _chat_model():
+    """A LangChain chat model targeting the SAME active backend AutoGen uses
+    (get_llm_config resolves dashboard-DB over env: Azure DeepSeek here)."""
+    from agent_config import get_llm_config
+    cfg = (get_llm_config() or [{}])[0]
+    at = (cfg.get("api_type") or "openai").lower()
+    model, base_url, api_key = cfg.get("model"), cfg.get("base_url"), cfg.get("api_key")
+    temperature = cfg.get("temperature", 0.1)
+    timeout = cfg.get("timeout", 120)
+    if at == "azure":
+        from langchain_openai import AzureChatOpenAI
+        return AzureChatOpenAI(azure_endpoint=base_url, api_key=api_key,
+                               api_version=cfg.get("api_version"),
+                               azure_deployment=model, temperature=temperature,
+                               timeout=timeout, max_retries=1)
+    from langchain_openai import ChatOpenAI
+    return ChatOpenAI(model=model, base_url=base_url, api_key=api_key,
+                      temperature=temperature, timeout=timeout, max_retries=1)
+
+
+def _recon_tools():
+    import langgraph_tools as lt
+    return [t for t in lt.LANGGRAPH_TOOLS if getattr(t, "name", None) in _RECON_TOOL_NAMES]
+
 
 # ── state ────────────────────────────────────────────────────────────────────
 class PentestState(TypedDict):
@@ -83,15 +126,54 @@ def _tool(fn, *args, **kwargs) -> str:
 
 
 # ── nodes ────────────────────────────────────────────────────────────────────
-def recon(state: PentestState) -> dict:
+def _recon_deterministic(state: PentestState, note: str = "") -> dict:
+    """Phase-1 read-only recon — the fallback if the LLM agent is unavailable, so
+    a session never hard-fails on an LLM/tool error."""
     sid = state["session_id"]
     assets = _tool(scan_tools.query_assets, limit=25)
     ports = _tool(scan_tools.query_open_ports, limit=50)
-    _msg(sid, "Reconnaissance", f"Assets:\n{assets[:1500]}\n\nOpen ports:\n{ports[:1500]}")
-    _emit("langgraph_phase_completed", sid, {"phase": "recon"})
+    _msg(sid, "Reconnaissance",
+         f"{note}Assets:\n{assets[:1400]}\n\nOpen ports:\n{ports[:1400]}")
     return {"phase": "scan",
-            "findings": [f"recon: {len(assets)}+{len(ports)} chars of asset/port data"],
-            "log": ["recon: query_assets + query_open_ports"]}
+            "findings": ["recon(deterministic)"],
+            "log": [f"recon deterministic{' — ' + note if note else ''}"]}
+
+
+def recon(state: PentestState) -> dict:
+    """Phase 3 cutover: a real LLM agent (LLM ↔ ToolNode) over read-only tools."""
+    sid = state["session_id"]
+    try:
+        # create_react_agent moves to langchain.agents.create_agent in langgraph
+        # v2; requirements pin langgraph<2 so this stays valid. Swap when we add
+        # the langchain meta-package.
+        from langgraph.prebuilt import create_react_agent
+        agent = create_react_agent(_chat_model(), _recon_tools(), prompt=_RECON_SYSTEM)
+        task = (f"Target: {state['target'][:300]}\nTask: {state['task'][:300]}\n"
+                "Enumerate the known assets, open ports and existing findings, "
+                "then summarize.")
+        out = agent.invoke({"messages": [("user", task)]},
+                           {"recursion_limit": 14})
+        msgs = out.get("messages", [])
+        tools_used, final = [], ""
+        for m in msgs:
+            for c in (getattr(m, "tool_calls", None) or []):
+                tools_used.append(c.get("name"))
+        for m in reversed(msgs):
+            if getattr(m, "type", None) == "ai" and (getattr(m, "content", "") or "").strip():
+                final = m.content
+                break
+        used = sorted({t for t in tools_used if t})
+        _msg(sid, "Reconnaissance",
+             f"[LLM recon] tools used: {', '.join(used) or 'none'}\n\n{final[:1800]}")
+        _emit("langgraph_phase_completed", sid,
+              {"phase": "recon", "mode": "llm", "tools_used": used})
+        return {"phase": "scan",
+                "findings": [f"recon(llm): {len(tools_used)} tool call(s), {len(used)} distinct"],
+                "log": [f"recon(llm): {used}"]}
+    except Exception as e:  # noqa: BLE001
+        _emit("langgraph_phase_completed", sid,
+              {"phase": "recon", "mode": "fallback", "error": str(e)[:200]})
+        return _recon_deterministic(state, note=f"[LLM recon unavailable: {e}] ")
 
 
 def scan(state: PentestState) -> dict:
