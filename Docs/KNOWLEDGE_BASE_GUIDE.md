@@ -342,49 +342,62 @@ will steer real scans with apparent authority.
 | Export corpus | `POST /rag/training/export` | JSONL in `./datasets` for `grpo_trainer` |
 | Retrieval quality | `POST /rag/eval/run` | nDCG / MRR / recall over a query set |
 
-### Does it LEARN? Not today — audited 2026-08-29
+### Does it learn? Partly — two loops closed 2026-08-29
 
-An honest reading, because "RAG + feedback + training export" reads like a
-learning system and only one of those three is wired to the runtime.
+**Closed: retrieval now learns from operator feedback.**
+`_apply_feedback_ranking` re-ranks the candidate pool by
+`similarity + weight * tanh(net_votes / scale)`, where net votes come from
+`helpful_chunk_ids` / `unhelpful_chunk_ids` in `rag_feedback`. Three properties,
+each pinned by `tests/test_rag_feedback_ranking.py`:
 
-**What genuinely improves recommendations: adding documents.** Ingesting the 12
-methodology playbooks took `get_scan_recommendations` from *"no indexed corpus"*
-to grounded answers citing `smb_methodology.md` and `ssh_methodology.md` with
-concrete commands. That is improvement-by-ingestion, and it works.
+- **No feedback => identical behaviour.** Every adjustment is 0 and the sort is
+  stable, so an install that has never rated anything is unaffected.
+- **Bounded.** The adjustment is squashed through `tanh` and capped at
+  `_FEEDBACK_WEIGHT` (0.08), so votes reorder near-ties and cannot pin an
+  unrelated chunk to the top.
+- **Inspectable.** Rows carry `feedback_votes`, `feedback_adj` and
+  `ranked_score`, and the three add up.
 
-**What does not happen: learning from outcomes.** Three loops, all open:
+Demonstrated live: for *"smb enumeration on port 445"* the order was
+`[64, 67, 65, 40]`; after three upvotes on 40 and three downvotes on 64 it became
+`[64, 67, 40, 65]` — chunk 40 (sim 0.4112) overtook chunk 65 (sim 0.4173), while
+chunk 64 kept first place despite the downvotes because its 0.11 similarity lead
+is beyond the cap. Both the learning and the bound, in one observation.
+Writing feedback invalidates the 30s cache, so a rating takes effect on the next
+query rather than up to half a minute later.
 
-1. **Retrieval ignores feedback.** `exploits_rag._retrieve` ranks purely by
-   cosine similarity (`1 - (embedding <=> q)`). No boost, no re-rank, no rating
-   input. Rate a chunk down and the next identical query returns it in the same
-   position.
-2. **`rag_feedback` is write-only at runtime.** It is read by exactly three
-   things — the feedback stats endpoint, the training export, and the eval
-   harness — none of which sit on the query path.
-3. **Nothing consumes the training export.** `grpo-trainer` is behind
-   `--profile training`, no container has ever been created, and `./datasets`
-   is empty. GRPO fine-tuning is the only component that could actually learn,
-   and it has never run.
+**Closed: ingested knowledge now reaches the recommendation prompt.**
+`_get_training_context()` pinned `source_repo='training'` AND required a
+service/port/tech scope, while `_retrieve`'s unscoped top-up was skipped
+whenever `source_repos` was set. Methodology playbooks are
+`source_repo='knowledge_base'` with no service/port tags, so it returned `""` on
+every call — knowledge reached `/rag/ask` and never reached the one place it
+would change a scan. The top-up now respects `source_repos` instead of being
+skipped by it, and both corpora are searched.
 
-**The tables say the same thing.** As audited: `rag_feedback` 0 rows,
-`scan_tool_feedback` 0, `scan_recommendations` 0, `service_prompts` 0,
-`rag_eval_runs` 0. So no feedback has ever been given, no operator rule has ever
-been written, and no evaluation has ever run — meaning nothing is measuring
-whether recommendations improve either.
+A similarity floor keeps that honest. Every playbook title ends in "Penetration
+Testing Methodology", so a query built from the same words scores 0.3–0.5
+against all of them on boilerplate alone. Measured on the 12-playbook corpus:
+matched `smb` 0.648 / `ssh` 0.672 / `mysql` 0.666 against unmatched `ipp` 0.490 /
+`finger` 0.473 / `cups-printing` 0.314. `TRAINING_CONTEXT_MIN_SIM` defaults to
+**0.55**, which separates them — at the original 0.25 a `finger` scan got Web
+Methodology pasted into its prompt at 0.473, which is worse than no context
+because it is confidently wrong. Six services against twelve documents is a
+small sample: **re-measure as the corpus grows.**
 
-**One live path is easy to miss.** `_get_training_context()` DOES feed retrieved
-documents into the recommendation prompt — but it filters on
-`source_repo='training'` **and** a service/port/tech scope. All 73 current chunks
-are `source_repo='knowledge_base'` with no service/port scoping, so it returns
-`""` on every call. Documents ingested as playbooks reach `/rag/ask`; they do
-**not** reach the per-service recommendation prompt. Use
-`POST /rag/service-docs/ingest` (Layer 4) for that, and tag service/port.
+**Still open: no model is trained.** `grpo-trainer` remains behind
+`--profile training`, has never been built, and `./datasets` is empty. What is
+now closed is *preference learning at retrieval time* — the system learns which
+chunks operators find useful and reorders accordingly. It does not fine-tune
+weights, and nothing here claims it does.
 
-**What "closing the loop" would take**, in increasing order of effort: write
-`scan_tool_feedback` rules (immediate effect, already wired); ingest Layer 4
-training docs scoped to a service/port (feeds the recommendation prompt);
-run `POST /rag/eval/run` to get a baseline worth improving against; then, and
-only then, the GRPO export/train cycle.
+**Still open: nothing measures improvement.** `rag_eval_runs` is empty, so there
+is no baseline to compare against. Run `POST /rag/eval/run` before and after a
+batch of feedback if you want evidence rather than a plausible mechanism.
+
+**To get value today**, in increasing effort: rate retrievals (immediate effect
+now); write `scan_tool_feedback` rules (immediate, already wired); ingest Layer-4
+docs tagged with service/port so they beat generic playbooks; then evaluate.
 
 ---
 

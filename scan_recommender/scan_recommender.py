@@ -718,6 +718,26 @@ def _build_guidance_block(
     return "\n".join(lines)
 
 
+# Minimum similarity for a chunk to be pasted into the recommendation prompt.
+#
+# Set from measurement, not taste. Every playbook title ends in "Penetration
+# Testing Methodology", so a query built from the same words scores ~0.3-0.5
+# against ALL of them on boilerplate alone — a service with no playbook still
+# pulls one. Measured against the 12-playbook corpus (MiniLM-L6-v2):
+#
+#     matched     smb 0.648   ssh 0.672   mysql 0.666
+#     unmatched   ipp 0.490   finger 0.473   cups-printing 0.314
+#
+# 0.55 separates them. At 0.25 a `finger` scan got Web Methodology pasted into
+# its prompt at 0.473 — worse than no context, because it is confidently wrong.
+#
+# NOTE this is 6 services against 12 documents. Re-measure as the corpus grows;
+# TRAINING_CONTEXT_MIN_SIM overrides it without a rebuild. Dropping the
+# boilerplate from the query instead was tried and is WORSE (ssh then matches
+# the Metasploitable guide at 0.459 rather than SSH Methodology at 0.672).
+_TRAINING_CONTEXT_MIN_SIM = float(os.getenv("TRAINING_CONTEXT_MIN_SIM", "0.55"))
+
+
 def _get_training_context(service: Optional[str], port: Optional[int], top_k: int = 3,
                           tech: Optional[List[str]] = None) -> str:
     """Retrieved per-service/port/tech training documents, or '' when unavailable.
@@ -729,22 +749,36 @@ def _get_training_context(service: Optional[str], port: Optional[int], top_k: in
     if not service and not port and not tech_list:
         return ""
     try:
-        from exploits_rag import _embed, _retrieve, TRAINING_SOURCE_REPO
+        from exploits_rag import (_embed, _retrieve, TRAINING_SOURCE_REPO,
+                                  KNOWLEDGE_SOURCE_REPO)
         query = " ".join(filter(None, [
             service or "", f"port {port}" if port else "",
             " ".join(tech_list), "penetration testing methodology",
         ])).strip()
+        # Both corpora, not just 'training'. This function pinned
+        # source_repos=['training'] AND required a service/port/tech scope, so on
+        # an install whose knowledge is methodology playbooks — ingested as
+        # source_repo='knowledge_base', with no service/port tags — pass 1
+        # matched nothing and pass 2 was skipped (it is skipped whenever
+        # source_repos is set). It returned "" on every call, so ingested
+        # knowledge reached /rag/ask and never reached the recommendation
+        # prompt, which is the one place it would change a scan.
         hits = _retrieve(
             _embed(query), top_k,
             service=service, port=port, tech=tech_list or None,
-            source_repos=[TRAINING_SOURCE_REPO],
+            source_repos=[TRAINING_SOURCE_REPO, KNOWLEDGE_SOURCE_REPO],
         )
     except Exception as e:
         logger.debug("training context retrieval failed: %s", e)
         return ""
+    # Similarity floor. Widening the corpora means a weak match can now be
+    # returned where nothing was before, and pasting an unrelated playbook into
+    # every recommendation prompt is worse than pasting nothing.
+    hits = [h for h in hits
+            if float(h.get("ranked_score", h.get("sim") or 0.0)) >= _TRAINING_CONTEXT_MIN_SIM]
     if not hits:
         return ""
-    lines = ["", "TRAINING CONTEXT (operator-provided knowledge for this service/port):"]
+    lines = ["", "KNOWLEDGE CONTEXT (ingested methodology for this service/port):"]
     for h in hits:
         header = h.get("section_header") or h.get("title") or "note"
         lines.append(f"- [{header}] {(h.get('chunk') or '')[:600].strip()}")
