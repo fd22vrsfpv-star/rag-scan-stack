@@ -40,10 +40,12 @@ import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
-# The roster size when AutoGen was retired. Not a style rule: the registry is the
-# ONLY place the surface is declared now, so a silent shrink is invisible without
-# a number to compare against. Raise it deliberately when tools are added.
-MIN_TOOLS = 49
+# Floor for the roster size. Not a style rule: the registry is the ONLY place the
+# surface is declared now, so a silent shrink is invisible without a number to
+# compare against. Raise it deliberately when tools are added.
+#   49 = the roster when AutoGen was retired
+#   50 = + get_tool_recommendations (structured, agent-actionable tests)
+MIN_TOOLS = 50
 
 
 def _agent_dir() -> pathlib.Path:
