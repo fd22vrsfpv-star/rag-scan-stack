@@ -1234,7 +1234,6 @@ def _enforce_db_mode_loop():
             # Backstop for _watch_for_local_postgres: the event stream is the
             # fast path, this catches anything it missed (stream drop, a
             # container that was already running at startup).
-            tags = c.image.tags or []
             if _is_local_postgres(c):
                 logger.warning(
                     "[db-mode-enforcer] mode=%s but local rag-postgres re-appeared (%s, %s) — removing.",
