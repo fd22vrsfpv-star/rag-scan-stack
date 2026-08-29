@@ -342,6 +342,50 @@ will steer real scans with apparent authority.
 | Export corpus | `POST /rag/training/export` | JSONL in `./datasets` for `grpo_trainer` |
 | Retrieval quality | `POST /rag/eval/run` | nDCG / MRR / recall over a query set |
 
+### Does it LEARN? Not today — audited 2026-08-29
+
+An honest reading, because "RAG + feedback + training export" reads like a
+learning system and only one of those three is wired to the runtime.
+
+**What genuinely improves recommendations: adding documents.** Ingesting the 12
+methodology playbooks took `get_scan_recommendations` from *"no indexed corpus"*
+to grounded answers citing `smb_methodology.md` and `ssh_methodology.md` with
+concrete commands. That is improvement-by-ingestion, and it works.
+
+**What does not happen: learning from outcomes.** Three loops, all open:
+
+1. **Retrieval ignores feedback.** `exploits_rag._retrieve` ranks purely by
+   cosine similarity (`1 - (embedding <=> q)`). No boost, no re-rank, no rating
+   input. Rate a chunk down and the next identical query returns it in the same
+   position.
+2. **`rag_feedback` is write-only at runtime.** It is read by exactly three
+   things — the feedback stats endpoint, the training export, and the eval
+   harness — none of which sit on the query path.
+3. **Nothing consumes the training export.** `grpo-trainer` is behind
+   `--profile training`, no container has ever been created, and `./datasets`
+   is empty. GRPO fine-tuning is the only component that could actually learn,
+   and it has never run.
+
+**The tables say the same thing.** As audited: `rag_feedback` 0 rows,
+`scan_tool_feedback` 0, `scan_recommendations` 0, `service_prompts` 0,
+`rag_eval_runs` 0. So no feedback has ever been given, no operator rule has ever
+been written, and no evaluation has ever run — meaning nothing is measuring
+whether recommendations improve either.
+
+**One live path is easy to miss.** `_get_training_context()` DOES feed retrieved
+documents into the recommendation prompt — but it filters on
+`source_repo='training'` **and** a service/port/tech scope. All 73 current chunks
+are `source_repo='knowledge_base'` with no service/port scoping, so it returns
+`""` on every call. Documents ingested as playbooks reach `/rag/ask`; they do
+**not** reach the per-service recommendation prompt. Use
+`POST /rag/service-docs/ingest` (Layer 4) for that, and tag service/port.
+
+**What "closing the loop" would take**, in increasing order of effort: write
+`scan_tool_feedback` rules (immediate effect, already wired); ingest Layer 4
+training docs scoped to a service/port (feeds the recommendation prompt);
+run `POST /rag/eval/run` to get a baseline worth improving against; then, and
+only then, the GRPO export/train cycle.
+
 ---
 
 ## Reference
