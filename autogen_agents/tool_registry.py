@@ -64,6 +64,22 @@ TOOL_SPECS: List[ToolSpec] = [
         func=scan_tools.get_scan_recommendations,
     ),
     ToolSpec(
+        name="get_tool_recommendations",
+        description=(
+            "Get the CONCRETE tests to run against a discovered service, as "
+            "structured data. Pass service and/or port. Returns tools[] with "
+            "ready command templates ({target} placeholder), metasploit[] "
+            "modules, nuclei_tags[], common_vulns[] and rag_context (ingested "
+            "methodology for that service). Prefer this over "
+            "get_scan_recommendations when you know the service/port and need "
+            "to decide what to actually run — that one answers a free-text "
+            "question with a paragraph, this one returns the commands. Service "
+            "aliases resolve, so https/http-proxy/ssl-http all return the web "
+            "guidance and microsoft-ds returns SMB."
+        ),
+        func=scan_tools.get_tool_recommendations,
+    ),
+    ToolSpec(
         name="get_attack_vectors",
         description=(
             "Get the prioritized attack vector map: findings mapped to MITRE ATT&CK "

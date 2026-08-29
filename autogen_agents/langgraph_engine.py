@@ -70,6 +70,10 @@ RECON_TOOLS = _READ_ONLY | {"get_passive_recon_plan"}
 
 # Scan planning is read-only; dispatch is added ONLY when auto_execute is on.
 SCAN_TOOLS_READONLY = {
+    # get_tool_recommendations is the actionable one: structured tools +
+    # command templates + the ingested methodology for the service, which is
+    # what turns "there is an https port" into "run these specific tests".
+    "get_tool_recommendations",
     "get_scan_recommendations", "get_passive_recon_plan", "query_assets",
     "query_open_ports", "get_session_scan_status", "get_all_active_jobs",
 }
@@ -86,7 +90,8 @@ SCAN_TOOLS_DISPATCH = {
     "start_smb_vuln_scan", "start_full_scan",
 }
 
-ANALYZE_TOOLS = _READ_ONLY | {"match_vuln_to_exploits", "search_msf_modules"}
+ANALYZE_TOOLS = _READ_ONLY | {"match_vuln_to_exploits", "search_msf_modules",
+                              "get_tool_recommendations"}
 
 # Exploit PLANNING is read-only + the queue-for-approval call, which only writes
 # a pending_exploits row. Execution is a separate node, reached only after the
@@ -111,11 +116,18 @@ _SCAN_SYSTEM_PLAN = (
     "OFF for this session, so you must NOT launch anything — you have no dispatch "
     "tools. Use the read-only tools to work out what SHOULD be scanned next and "
     "reply with a prioritised, concrete scan plan (tool, target, ports/scope, and "
-    "why) that the operator can run manually."
+    "why) that the operator can run manually. For each open service worth "
+    "testing, call get_tool_recommendations(service, port) — it returns the "
+    "specific tools, command templates, nuclei tags and methodology for that "
+    "service, so your plan can name real commands instead of generalities."
 )
 _SCAN_SYSTEM_DISPATCH = (
     "You are the Scanner agent in a penetration-testing platform. auto_execute is "
     "ON, so you may launch discovery and enumeration scans with the start_* tools. "
+    "Before choosing, call get_tool_recommendations(service, port) for the "
+    "services you found — it returns the specific tools, command templates and "
+    "methodology for each, which is how you pick the right scan rather than a "
+    "generic one. "
     "Rules: launch only against the session's target; prefer one or two scans that "
     "add the most information over a broad sweep; never launch the same scan twice; "
     "a tool that answers 'not in the configured scope' is REFUSED — do not retry it "
@@ -485,6 +497,17 @@ def scan(state: PentestState) -> dict:
                                  recursion_limit=(24 if auto
                                                   else PHASE_STEP_BUDGET["Scanner"]))
         dispatched = sorted({t for t in used if t.startswith("start_")})
+        # Append the deterministic plan regardless of what the model produced.
+        # Observed twice on one afternoon: the scan agent was rate-limited (429)
+        # and fell back, then on the retry it ran fine, never called
+        # get_tool_recommendations, and answered "No results yet for redteam3
+        # specifically". Concrete tests should not depend on the model choosing
+        # to ask for them — the open services are already known, so the plan is
+        # cheap and always groundable.
+        plan_text, planned = _build_test_plan()
+        if planned:
+            final = (f"{final}\n\n---\nConcrete tests for the "
+                     f"{planned} discovered service(s):\n\n{plan_text}")
         res = _phase_result(sid, "Scanner", "scan", "analyze", final, used)
         res["log"] = [f"scan(llm): dispatched={dispatched} tools={sorted(set(used))}"]
         _emit("langgraph_scan_dispatched", sid,
@@ -496,18 +519,177 @@ def scan(state: PentestState) -> dict:
         return _scan_deterministic(state, note=f"[LLM scan unavailable: {e}] ")
 
 
+# Services that ARE TLS by definition. Note what is absent: port numbers.
+# Transport is a property of the connection, not of the port — TLS turns up on
+# 8443, 9443, 10443 and arbitrary ports, and plaintext turns up on 443.
+# Web-ish service names, for deciding whether "probe both schemes" advice makes
+# sense. Mirrors the http family in scan_recommender/exploits_rag.py.
+_SERVICE_FAMILIES_WEB = {
+    "http", "https", "http-proxy", "http-alt", "https-alt", "ssl/http", "www",
+    "http-mgmt", "webcache",
+}
+
+_TLS_SERVICE_NAMES = {
+    "https", "https-alt", "imaps", "smtps", "ldaps", "ftps", "pop3s", "nntps",
+    "ircs", "dot", "sips", "telnets", "rdps", "ssl/http",
+}
+
+
+def _tls_state(service: str, product: str = "", banner: str = "") -> str:
+    """'yes' or 'unknown' — never inferred from the port number.
+
+    Deliberately has no port heuristic. This dataset holds 260 rows recorded as
+    `http` on port 443 (Apache, Azure Application Gateway, Cloudflare) with NO
+    tunnel or TLS field captured anywhere in the row, and 0 rows whose banner
+    mentions tls/ssl. So the port would be the only "evidence" available, and it
+    is exactly the assumption that produces `nikto -h http://host:443` against a
+    TLS listener — a command that fails and tells the operator nothing.
+
+    'unknown' is an honest answer that the plan can act on (probe both), where a
+    guess is not.
+    """
+    svc = (service or "").strip().lower()
+    if "ssl" in svc or "tls" in svc:
+        return "yes"
+    if svc in _TLS_SERVICE_NAMES:
+        return "yes"
+    blob = f"{product or ''} {banner or ''}".lower()
+    if "ssl" in blob or "tls" in blob:
+        return "yes"
+    return "unknown"
+
+
+# How many distinct (service, port) pairs the deterministic planner will build
+# tests for. Bounded because each one is an HTTP call to the recommender.
+_DETERMINISTIC_PLAN_LIMIT = 8
+
+
+def _build_test_plan(_unused_target: str = "") -> "tuple[str, int]":
+    """Concrete, runnable tests for the services already discovered.
+
+    Returns (plan_text, service_count). No LLM: the platform already knows the
+    open services, and get_tool_recommendations returns the tools, command
+    templates, nuclei tags and ingested methodology for each. That is enough to
+    write the plan.
+
+    The `{target}` placeholder is filled from the PORT ROW's ip, never from the
+    session's target_description. The description is a human label — filling it
+    in produced `sslscan redteam3 web hosts:443`, which reads like a command and
+    cannot be run. Each row already carries the host the service was found on.
+    """
+    hosts: dict = {}
+    plan = []
+    try:
+        ports = json.loads(_tool(scan_tools.query_open_ports, limit=100))
+        items = ports.get("items") or []
+    except Exception:  # noqa: BLE001
+        items = []
+
+    # Group by (service, port), remembering one real host and how many share it.
+    for row in items:
+        svc = (row.get("service") or "").strip().lower()
+        port, ip = row.get("port"), row.get("ip")
+        if not svc or not ip:
+            continue
+        entry = hosts.setdefault((svc, port), {"ip": ip, "count": 0, "tls": "unknown"})
+        entry["count"] += 1
+        # Any row in the group proving TLS proves it for the group.
+        if _tls_state(svc, row.get("product"), row.get("banner")) == "yes":
+            entry["tls"] = "yes"
+
+    for (svc, port), info in list(hosts.items())[:_DETERMINISTIC_PLAN_LIMIT]:
+        target = info["ip"]
+        tls = info["tls"]
+        try:
+            rec = json.loads(_tool(scan_tools.get_tool_recommendations,
+                                   service=svc, port=port))
+        except Exception:  # noqa: BLE001
+            continue
+        tools = rec.get("tools") or []
+        if not tools and not rec.get("nuclei_tags"):
+            continue
+        extra = (f" ({info['count']} hosts; example {target})"
+                 if info["count"] > 1 else f" ({target})")
+        lines = [f"### {svc}/{port} — {rec.get('description') or svc}{extra}"]
+        for t in tools[:4]:
+            cmd = (t.get("command") or "").replace("{target}", target)
+            lines.append(f"  - {t.get('name')}: {t.get('purpose')}\n    $ {cmd}")
+        if rec.get("nuclei_tags"):
+            lines.append(f"  - nuclei tags: {', '.join(rec['nuclei_tags'][:8])}")
+        for m in (rec.get("metasploit") or [])[:2]:
+            lines.append(f"  - msf: {m.get('module')} — {m.get('purpose')}")
+        if rec.get("common_vulns"):
+            lines.append(f"  - watch for: {'; '.join(rec['common_vulns'][:4])}")
+
+        # Transport is its own axis. The commands above came from the service
+        # name, which does not say whether the connection is wrapped in TLS —
+        # and the port does not say it either. Where TLS is confirmed or merely
+        # possible, name the TLS tooling explicitly rather than letting a plan
+        # go out that only probes one scheme.
+        web = svc in _SERVICE_FAMILIES_WEB
+        if tls == "yes":
+            lines.append(
+                f"  - transport: TLS (from the service name/banner). Use "
+                f"https:// for web tooling and run the TLS checks: "
+                f"sslscan {target}:{port} / testssl.sh {target}:{port} / "
+                f"sslyze {target}:{port}")
+        elif web:
+            lines.append(
+                f"  - transport: UNCONFIRMED — nothing in the record says "
+                f"whether this is TLS, and the port is not evidence. Probe both "
+                f"before committing: "
+                f"curl -sI http://{target}:{port}/ and "
+                f"curl -skI https://{target}:{port}/ ; if TLS answers, redo the "
+                f"web commands above with https:// and add "
+                f"sslscan {target}:{port} / testssl.sh {target}:{port}")
+        else:
+            lines.append(
+                f"  - transport: not established as TLS. If this service can be "
+                f"TLS-wrapped (many are, on any port), confirm with "
+                f"`openssl s_client -connect {target}:{port}` and add "
+                f"testssl.sh {target}:{port} when it negotiates")
+        plan.append("\n".join(lines))
+
+    return "\n\n".join(plan), len(plan)
+
+
 def _scan_deterministic(state: PentestState, note: str = "") -> dict:
-    """Recommendations-only scan fallback. Never dispatches: an LLM outage is not
-    a reason to fire scans nobody chose."""
+    """Build a concrete test plan WITHOUT an LLM. Never dispatches.
+
+    This used to ask get_scan_recommendations (free text -> a paragraph) and
+    paste the paragraph. When the model is rate-limited — which is exactly when
+    this path runs — that paragraph was often "I cannot determine the specific
+    services", i.e. the fallback produced nothing usable at the moment it
+    mattered most.
+
+    The platform already knows the open services; it does not need a model to
+    list them. So walk the discovered (service, port) pairs and ask
+    get_tool_recommendations for each: that returns the tools, ready command
+    templates, nuclei tags and the ingested methodology for that service. The
+    result is an actionable test plan an operator (or the next agent phase) can
+    run, produced deterministically and with no LLM involved.
+    """
     sid = state["session_id"]
-    ctx = f"target={state['target'][:200]} task={state['task'][:200]}"
-    recs = _tool(scan_tools.get_scan_recommendations, ctx)
-    _msg(sid, "Scanner", f"{note}Recommendations:\n{recs[:2000]}\n\n"
-                         "Dispatch: skipped (deterministic fallback recommends only).")
-    _emit("langgraph_phase_completed", sid, {"phase": "scan", "mode": "fallback"})
+    plan_text, planned = _build_test_plan()
+
+    if planned:
+        body = (f"{note}Test plan built from {planned} discovered service(s) "
+                f"— no LLM required.\n\n" + plan_text)
+        summary = f"scan(deterministic): {planned} service(s) planned"
+    else:
+        # Nothing discovered yet, so fall back to the free-text recommender.
+        ctx = f"target={state['target'][:200]} task={state['task'][:200]}"
+        body = (f"{note}No open services on record to plan against yet.\n\n"
+                f"{_tool(scan_tools.get_scan_recommendations, ctx)[:1500]}")
+        summary = "scan(deterministic): no services, asked the recommender"
+
+    _msg(sid, "Scanner", body[:_MSG_CAP] +
+         "\n\nDispatch: skipped (deterministic planner recommends only).")
+    _emit("langgraph_phase_completed", sid,
+          {"phase": "scan", "mode": "fallback", "services_planned": planned})
     return {"phase": "analyze",
-            "findings": ["scan(deterministic): recommendations only"],
-            "log": ["scan deterministic: get_scan_recommendations"]}
+            "findings": [summary],
+            "log": [f"scan deterministic: planned {planned} service(s)"]}
 
 
 def analyze(state: PentestState) -> dict:

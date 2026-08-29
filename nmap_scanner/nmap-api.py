@@ -391,6 +391,24 @@ def _trigger_subfinder_for_domains(targets: List[str], job_id: str = None):
         logging.debug(f"{tag}Subfinder auto-trigger failed: {e}")
 
 
+def _nmap_service_name(svc) -> "str | None":
+    """Service name with nmap's tunnel prefix applied.
+
+    `<service name="http" tunnel="ssl"/>` becomes `ssl/http`, which is exactly
+    what nmap itself displays. Returns the bare name when there is no tunnel,
+    so nothing changes for plaintext services.
+    """
+    if svc is None:
+        return None
+    name = svc.get("name")
+    if not name:
+        return None
+    tunnel = (svc.get("tunnel") or "").strip().lower()
+    if tunnel and not name.lower().startswith(f"{tunnel}/"):
+        return f"{tunnel}/{name}"
+    return name
+
+
 def _parse_nmap_xml_summary(xml_path):
     """Extract hosts, ports, services, and scripts from nmap XML into a dict."""
     import xml.etree.ElementTree as ET
@@ -418,9 +436,25 @@ def _parse_nmap_xml_summary(xml_path):
                 "port": int(port.get("portid", 0)),
                 "protocol": port.get("protocol"),
                 "state": (port.find("state") or {}).get("state") if port.find("state") is not None else None,
-                "service": svc.get("name") if svc is not None else None,
+                # nmap records TLS in a SEPARATE `tunnel` attribute:
+                #   <service name="http" tunnel="ssl" .../>
+                # Dropping it stored those listeners as plain `http`, and since
+                # the transport is not a property of the port number there was
+                # then NO evidence anywhere that the connection was wrapped —
+                # 260 rows in this deployment sat as `http` on 443 (Apache,
+                # Azure Application Gateway, Cloudflare) with nothing to say
+                # otherwise. Downstream that produces `nikto -h http://host:443`
+                # against a TLS listener.
+                #
+                # Stored using nmap's OWN display convention, `ssl/http`, rather
+                # than a new column: it is what `nmap` prints, it needs no schema
+                # change, and every existing consumer already handles it — the
+                # http service family includes `ssl/http`, and the recommender
+                # resolves it to https.
+                "service": _nmap_service_name(svc),
                 "product": svc.get("product") if svc is not None else None,
                 "version": svc.get("version") if svc is not None else None,
+                "tunnel": svc.get("tunnel") if svc is not None else None,
             }
             scripts = []
             for script in port.findall("script"):

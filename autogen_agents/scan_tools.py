@@ -3822,6 +3822,38 @@ def get_scan_recommendations(context: str) -> str:
     return json.dumps(result, indent=2)
 
 
+def get_tool_recommendations(service: str = None, port: int = None) -> str:
+    """
+    Get the CONCRETE tests to run against a discovered service, as structured
+    data rather than prose.
+
+    This is the tool to call when you have a service/port and need to decide what
+    to actually run. Unlike get_scan_recommendations, which answers a free-text
+    question with a paragraph, this returns machine-readable fields:
+
+      - tools[]        each with name, purpose and a ready `command` template
+                       containing a {target} placeholder
+      - metasploit[]   module paths with their purpose
+      - nuclei_tags[]  tags to pass to a nuclei scan
+      - common_vulns[] what typically goes wrong with this service
+      - rag_context    ingested methodology for this service (playbooks and any
+                       operator-supplied training documents)
+
+    Service aliases are resolved, so `https`, `http-proxy` and `ssl/http` all
+    return the web guidance, and `microsoft-ds` returns the SMB guidance.
+
+    Args:
+        service: Service name from the scan (e.g. 'https', 'smb', 'mysql')
+        port: Port number. Supply either or both; the port infers the service
+              when the name is unknown.
+
+    Returns JSON string. Use the `command` templates to decide which start_*
+    tool to dispatch and with what parameters.
+    """
+    result = get_scan_tools().get_tool_recommendations(service=service, port=port)
+    return json.dumps(result, indent=2)
+
+
 def get_attack_vectors(limit: int = 15, min_risk: float = 0.0) -> str:
     """
     Get the prioritized attack vector map: findings mapped to MITRE ATT&CK
