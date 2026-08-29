@@ -341,6 +341,69 @@ async def check_azure_health(timeout: int = 5) -> tuple[bool, str]:
         return False, f"Azure health check failed: {type(e).__name__}: {str(e)}"
 
 
+def resolved_llm_probe() -> "tuple[str, dict, dict] | None":
+    """(url, headers, payload) for a minimal chat completion against the ACTIVE
+    backend, or None if the resolved config is unusable.
+
+    `get_llm_config()` reads the dashboard DB first and env second. The env-only
+    checks (`check_azure_health` / `check_ollama_health`) therefore answer a
+    different question than the one that matters: here `get_llm_backend()` says
+    "azure" from the DB while AZURE_ENDPOINT and AZURE_API_KEY are both EMPTY,
+    so those checks reported "Azure endpoint or API key not configured" for a
+    backend that works perfectly. That disabled the whole session pre-flight,
+    and left /health advertising ok=false indefinitely.
+    """
+    try:
+        from agent_config import get_llm_config
+        cfg = (get_llm_config() or [{}])[0]
+    except Exception:
+        return None
+    base_url = (cfg.get("base_url") or "").rstrip("/")
+    model = cfg.get("model") or ""
+    if not base_url or not model:
+        return None
+    api_key = cfg.get("api_key") or ""
+    if (cfg.get("api_type") or "openai").lower() == "azure" and cfg.get("api_version"):
+        url = f"{base_url}/openai/deployments/{model}/chat/completions?api-version={cfg['api_version']}"
+        headers = {"api-key": api_key, "Content-Type": "application/json"}
+    else:
+        # OpenAI-compatible (incl. Azure AI Services /openai/v1 and Ollama /v1):
+        # the model goes in the body, not the path.
+        url = f"{base_url}/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    return url, headers, {"model": model, "max_tokens": 1,
+                          "messages": [{"role": "user", "content": "ping"}]}
+
+
+def interpret_llm_probe(status_code: int, body: str, model_hint: str = "") -> tuple[bool, str]:
+    """Shared verdict for a probe response.
+
+    A 429 counts as HEALTHY: rate-limited means reachable and authorised, and
+    refusing to start a session does strictly less than starting one and letting
+    its own retries and per-phase fallbacks handle the throttle.
+    """
+    if status_code == 200:
+        return True, f"{model_hint} healthy".strip()
+    if status_code == 429:
+        return True, f"{model_hint} reachable but rate limited (429)".strip()
+    return False, f"{model_hint} returned status {status_code}: {body[:160]}".strip()
+
+
+async def check_resolved_llm_health(timeout: int = 5) -> "tuple[bool, str] | None":
+    """Async probe of the resolved backend. None => nothing usable resolved, so
+    the caller should fall back to the env-var checks rather than guess."""
+    target = resolved_llm_probe()
+    if target is None:
+        return None
+    url, headers, payload = target
+    try:
+        async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
+            r = await client.post(url, json=payload, headers=headers)
+        return interpret_llm_probe(r.status_code, r.text, payload["model"])
+    except Exception as e:  # noqa: BLE001
+        return False, f"{payload['model']} unreachable: {type(e).__name__}: {e}"
+
+
 async def check_llm_health(timeout: int = 5, with_retry: bool = False) -> tuple[bool, str]:
     """
     Check LLM health based on configured backend (ollama, vllm, or azure).
@@ -350,6 +413,12 @@ async def check_llm_health(timeout: int = 5, with_retry: bool = False) -> tuple[
     """
     from agent_config import get_llm_backend
     backend = get_llm_backend()
+
+    # Check what the agents ACTUALLY use before falling back to the env-only
+    # checks below. See resolved_llm_probe() for why this order matters.
+    resolved = await check_resolved_llm_health(timeout)
+    if resolved is not None:
+        return resolved
 
     if backend == "azure":
         return await check_azure_health(timeout)
@@ -1910,19 +1979,25 @@ async def health():
 
     llm_healthy, llm_msg = await check_llm_health(timeout=3)
 
-    if backend == "azure":
-        llm_dep_info = {
-            "healthy": llm_healthy,
-            "message": llm_msg,
-            "endpoint": os.environ.get("AZURE_ENDPOINT", ""),
-            "model": os.environ.get("AZURE_MODEL", "gpt-4o"),
-        }
-    else:
-        llm_dep_info = {
-            "healthy": llm_healthy,
-            "message": llm_msg,
-            "url": os.environ.get("OLLAMA_URL", "http://ollama:11434"),
-        }
+    # Report the endpoint/model that were actually PROBED. Reading them from env
+    # here contradicted the verdict beside them: the check resolves the dashboard
+    # DB config, so /health showed `endpoint: ""` and `model: "gpt-4o"` next to
+    # "DeepSeek-V4-Flash healthy" — two different backends in one object.
+    try:
+        from agent_config import get_llm_config
+        _cfg = (get_llm_config() or [{}])[0]
+    except Exception:
+        _cfg = {}
+    llm_dep_info = {
+        "healthy": llm_healthy,
+        "message": llm_msg,
+        "endpoint": _cfg.get("base_url") or os.environ.get("AZURE_ENDPOINT", ""),
+        "model": _cfg.get("model") or os.environ.get("AZURE_MODEL", ""),
+        "api_type": _cfg.get("api_type"),
+        "resolved_from": "dashboard-db" if _cfg.get("base_url") else "env",
+    }
+    if backend not in ("azure", "openai") and not _cfg.get("base_url"):
+        llm_dep_info["url"] = os.environ.get("OLLAMA_URL", "http://ollama:11434")
 
     health_data = {
         "ok": llm_healthy,
@@ -1935,9 +2010,22 @@ async def health():
         }
     }
 
-    # Return 503 if critical dependencies are down
-    status_code = 200 if llm_healthy else 503
-    return health_data if status_code == 200 else (health_data, status_code)
+    # Always a dict, always HTTP 200. Two deliberate decisions:
+    #
+    # 1. This used to `return (health_data, 503)` when a dependency was down.
+    #    FastAPI does NOT read a returned tuple as (body, status) — it
+    #    serialised it as a JSON ARRAY and still answered 200. So the intended
+    #    503 never happened, and every consumer got `[{...}, 503]` instead of an
+    #    object. That broke /api/diagnostics/session-bundle with
+    #    `AttributeError: 'list' object has no attribute 'get'` on every call.
+    # 2. Actually answering 503 would be worse than the bug: the Dockerfile
+    #    HEALTHCHECK is `curl -f /health`, so an LLM outage would mark the
+    #    CONTAINER unhealthy and block everything gated on it — while the
+    #    service is still serving /sessions, /messages and /report perfectly
+    #    well. Degradation belongs in the body, not in a status code that takes
+    #    the container down.
+    health_data["status"] = "healthy" if llm_healthy else "degraded"
+    return health_data
 
 
 @app.get("/health/system")

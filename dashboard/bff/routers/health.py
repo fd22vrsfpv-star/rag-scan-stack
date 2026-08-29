@@ -48,6 +48,20 @@ SERVICE_MAP = {
 }
 
 
+# Per-service probe timeout. The default of 2s is right for a service whose
+# /health is a liveness ping, and WRONG for one that does real work: rag-api's
+# /health takes ~4.2s (it inspects tables and dependencies), so it timed out on
+# every single call and the dashboard showed the stack's most important service
+# as permanently "unreachable". httpx.ReadTimeout also stringifies to "", which
+# is why the entry carried an empty `error` and nobody could tell why.
+#
+# Raising the default instead would make one dead service stall the whole
+# gather; overriding per service keeps the common case fast.
+DEFAULT_PROBE_TIMEOUT = 2
+SERVICE_TIMEOUTS = {
+    "rag_api": 8,
+}
+
 _health_cache: dict = {"data": None, "ts": 0}
 _HEALTH_CACHE_TTL = 10  # seconds
 
@@ -68,8 +82,9 @@ async def health(bust: bool = False):
 
     async def check(name: str, attr: str, path: str):
         url = getattr(settings, attr) + path
+        probe_timeout = SERVICE_TIMEOUTS.get(name, DEFAULT_PROBE_TIMEOUT)
         try:
-            async with httpx.AsyncClient(timeout=2) as client:
+            async with httpx.AsyncClient(timeout=probe_timeout) as client:
                 resp = await client.get(url, headers={"x-api-key": settings.api_key, **engagement_headers()})
                 if name in RESPOND_ONLY:
                     results[name] = {"status": "healthy", "code": resp.status_code}
@@ -112,7 +127,15 @@ async def health(bust: bool = False):
                             pass
                     results[name] = entry
         except Exception as e:
-            results[name] = {"status": "unreachable", "error": str(e)}
+            # str(httpx.ReadTimeout) is EMPTY, so the entry used to read
+            # `"error": ""` — true, useless, and the reason a 2s timeout against
+            # a 4.2s endpoint went unnoticed for so long. Always say what
+            # happened and what the budget was.
+            detail = str(e) or type(e).__name__
+            results[name] = {
+                "status": "unreachable",
+                "error": f"{type(e).__name__}: {detail} (timeout={probe_timeout}s)",
+            }
 
     async def check_tcp(name: str, host_attr: str, port_attr: str):
         host = getattr(settings, host_attr)
@@ -224,6 +247,19 @@ async def health(bust: bool = False):
     # configured mode is actually remote; otherwise local-mode installs get a
     # false "dual postgres" conflict warning.
     remote_mode = db_mode in ("remote", "remote_direct")
+
+    # In a remote DB mode there is deliberately no local rag-postgres container,
+    # so its "stopped" result is the EXPECTED state — not a core failure. Left
+    # unmarked it made overall health permanently "degraded" and reported the
+    # platform's database as down while remote_postgres was healthy and serving
+    # every query. Mark it optional and say why, rather than hiding the entry:
+    # an operator switching back to local mode still needs to see it.
+    if remote_mode and "postgres" in results:
+        results["postgres"]["optional"] = True
+        results["postgres"]["note"] = (
+            f"not applicable in db_mode={db_mode} — the active database is "
+            "`remote_postgres`; no local container is expected"
+        )
 
     # Tag the db_tunnel entry with proxy type
     if "db_tunnel" in results:
@@ -559,6 +595,18 @@ async def diagnostics_session_bundle(session_id: Optional[str] = None, hours: in
             _safe_get(client, f"{settings.rag_api_url}/webhooks/events", params={"limit": 100}),
         )
 
+        # Every payload below is dereferenced with .get(). A service answering
+        # with a JSON array (autogen's /health did exactly that) would otherwise
+        # 500 the whole bundle — the one endpoint whose job is to explain a
+        # broken stack. webhook_events is left alone: it is genuinely
+        # list-or-dict and already handled with isinstance checks below.
+        session_info = _as_mapping(session_info)
+        scans_info = _as_mapping(scans_info)
+        messages_info = _as_mapping(messages_info)
+        autogen_logs = _as_mapping(autogen_logs)
+        watchdog_info = _as_mapping(watchdog_info)
+        health_info = _as_mapping(health_info)
+
         # Fetch scanner-specific logs for each scan job
         scans_list = scans_info.get("scans", []) if not scans_info.get("_error") else []
         scanner_log_tasks = []
@@ -651,8 +699,31 @@ async def diagnostics_session_bundle(session_id: Optional[str] = None, hours: in
     }
 
 
+def _as_mapping(value):
+    """Coerce a service payload to a dict, whatever shape it arrived in.
+
+    autogen-agents' /health used to `return (health_data, 503)`. FastAPI does not
+    read a returned tuple as (body, status) — it serialised it as a JSON ARRAY,
+    so this function received a LIST and `health.get("_error")` raised
+    `AttributeError: 'list' object has no attribute 'get'`, making
+    /api/diagnostics/session-bundle 500 on every session. The service side is
+    fixed, but the coercion stays: a diagnostics bundle exists to explain a
+    broken stack, so it must not be the thing that breaks on an odd payload.
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, dict):
+                return item
+    return {}
+
+
 def _compute_failure_trace(session, scans, autogen_logs, health, watchdog, webhook_events=None):
     """Analyze the diagnostic data and produce a failure summary with root cause hints."""
+    session = _as_mapping(session)
+    health = _as_mapping(health)
+    watchdog = _as_mapping(watchdog)
     trace = {
         "has_failures": False,
         "session_error": None,

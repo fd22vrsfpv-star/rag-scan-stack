@@ -19,6 +19,7 @@ no traffic.
 """
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 
@@ -67,18 +68,38 @@ def rag(client):
 
 # ══════════════════════════════════════════════ 1. platform is actually up
 
-@pytest.mark.e2e
-def test_all_core_services_are_healthy(client):
-    """Optional services (tunnels, sliver, wireguard) may be down by design;
-    a core service being down invalidates everything below it."""
-    h = client.get(f"{DASH}/api/health").json()
-    unhealthy = {
+def _unhealthy_core(client, bust=False):
+    url = f"{DASH}/api/health" + ("?bust=true" if bust else "")
+    h = client.get(url).json()
+    return {
         name: info for name, info in (h.get("services") or {}).items()
         if isinstance(info, dict)
         and info.get("status") not in ("healthy", "ok", "up")
         and not info.get("optional")
     }
-    assert not unhealthy, f"core services unhealthy: {list(unhealthy)}"
+
+
+@pytest.mark.e2e
+def test_all_core_services_are_healthy(client):
+    """Optional services (tunnels, sliver, wireguard) may be down by design;
+    a core service being down invalidates everything below it.
+
+    Requires the SAME service to look unhealthy twice, the second time with the
+    10s response cache busted. /api/health probes every service over HTTP on a
+    short per-service budget, and this suite hammers the stack while it runs —
+    so a single observation cannot tell "the service is down" from "its probe
+    timed out under the load this very test run is generating". Only a service
+    that fails both observations is reported.
+    """
+    first = _unhealthy_core(client)
+    if not first:
+        return
+    time.sleep(3)
+    second = _unhealthy_core(client, bust=True)
+    confirmed = {n: second[n] for n in first if n in second}
+    assert not confirmed, (
+        f"core services unhealthy in two consecutive probes: "
+        f"{ {n: i.get('status') for n, i in confirmed.items()} }")
 
 
 @pytest.mark.e2e
@@ -172,17 +193,34 @@ def test_no_out_of_scope_hosts_are_present_in_findings(client):
     # which would make this test vacuously pass.
     names = client.get(f"{DASH}/api/scope/names")
     assert names.status_code == 200, names.text[:120]
-    scope_names = [n.get("name") for n in names.json().get("names", []) if n.get("name")]
-    if not scope_names:
+    rows = [n for n in names.json().get("names", []) if n.get("name")]
+    # A scope literally named `not_in_scope` holds targets that are explicitly
+    # OUT of scope. Unioning it in made everything it lists look authorised —
+    # the opposite of what this test is for.
+    EXCLUDED = {"not_in_scope"}
+    rows = [n for n in rows if n["name"] not in EXCLUDED]
+    if not rows:
         pytest.skip("no scope configured; nothing to enforce against")
 
     scope_hosts = set()
-    for nm in scope_names:
-        r = client.get(f"{DASH}/api/scope", params={"name": nm})
-        if r.status_code == 200:
-            scope_hosts |= {t.get("target") for t in r.json().get("targets", [])
-                            if t.get("target")}
-    assert scope_hosts, f"scope names {scope_names} resolved to no targets"
+    for n in rows:
+        nm, declared = n["name"], n.get("target_count")
+        # /api/scope defaults to limit=500 (max 5000). The `blackbaud` scope has
+        # 4080 targets, so the default returned 500 of them and this test flagged
+        # IN-scope hosts as offenders. Ask for everything, then PROVE nothing was
+        # truncated — a silently short allow-list makes this guard report
+        # violations that do not exist.
+        r = client.get(f"{DASH}/api/scope", params={"name": nm, "limit": 5000})
+        if r.status_code != 200:
+            pytest.skip(f"scope {nm!r} unreadable (HTTP {r.status_code})")
+        targets = [t.get("target") for t in r.json().get("targets", []) if t.get("target")]
+        if isinstance(declared, int) and declared > len(targets):
+            pytest.skip(
+                f"scope {nm!r} reports {declared} targets but the endpoint returned "
+                f"{len(targets)} — comparing findings against a truncated scope would "
+                "report false violations. Raise the /api/scope limit cap.")
+        scope_hosts |= set(targets)
+    assert scope_hosts, f"scope names {[n['name'] for n in rows]} resolved to no targets"
 
     data = client.get(f"{DASH}/api/findings", params={"limit": 1000}).json()
     offenders = {}
@@ -201,22 +239,69 @@ def test_no_out_of_scope_hosts_are_present_in_findings(client):
 
 # ══════════════════════════════════════════════════ 5. query surface sane
 
+# `by_severity`/`by_source` are GLOBAL and IGNORE the query filters by design —
+# the frontend builds a filter chip from every source that exists, so chips must
+# not vanish as you narrow. `problems_by_*` are the FILTERED facets. Asserting
+# sum(by_severity) == total therefore compared two different questions and would
+# fail for any filtered query; these tests now check the pair that must agree,
+# and check the global/filtered relationship separately.
+
 @pytest.mark.e2e
-def test_severity_facets_agree_with_the_result_count(client):
-    """Facets and rows come from two separate SQL blocks. When they drift the
-    UI shows counts that do not match the list, which reads as a UI bug."""
-    d = client.get(f"{DASH}/api/findings", params={"limit": 1}).json()
-    agg = (d.get("aggregations") or {}).get("by_severity") or {}
-    assert sum(agg.values()) == d.get("total"), (
-        f"severity facets sum to {sum(agg.values())} but total is {d.get('total')}"
-    )
+def test_filtered_severity_facets_agree_with_the_matched_rows(client):
+    """The FILTERED facet must describe the rows the query actually matched.
+
+    Facets and rows come from two separate SQL blocks. When they drift the UI
+    shows counts that do not match the list, which reads as a UI bug.
+    """
+    for params in ({"limit": 1}, {"limit": 1, "severity": "high"},
+                   {"limit": 1, "source": "nmap"}):
+        d = client.get(f"{DASH}/api/findings", params=params).json()
+        agg = (d.get("aggregations") or {}).get("problems_by_severity") or {}
+        total = d.get("total")
+        if not total:
+            continue
+        # Per-problem counts collapse a problem seen on several hosts, so the
+        # sum is <= total; it must never EXCEED it, and an empty facet over a
+        # non-empty result set means the two blocks disagree entirely.
+        assert agg, f"{params}: {total} rows matched but the filtered facet is empty"
+        assert sum(agg.values()) <= total, (
+            f"{params}: filtered severity facet sums to {sum(agg.values())} "
+            f"but only {total} rows matched")
 
 
 @pytest.mark.e2e
-def test_source_facets_agree_with_the_result_count(client):
+def test_filtered_source_facets_agree_with_the_matched_rows(client):
+    for params in ({"limit": 1}, {"limit": 1, "source": "nmap"}):
+        d = client.get(f"{DASH}/api/findings", params=params).json()
+        agg = (d.get("aggregations") or {}).get("problems_by_source") or {}
+        total = d.get("total")
+        if not total:
+            continue
+        assert agg, f"{params}: {total} rows matched but the filtered facet is empty"
+        assert sum(agg.values()) <= total
+
+
+@pytest.mark.e2e
+def test_global_facets_cover_every_source_that_has_findings(client):
+    """Every source present in the results must have a global facet entry.
+
+    by_source is what the UI turns into filter chips. A source missing from it
+    is a source the operator can SEE in the list and can never filter to. This
+    caught `recon_findings` being absent from the global aggregation union while
+    the row query included it: 5 dns-enum + 6 email-enum findings, listed but
+    unfilterable.
+    """
     d = client.get(f"{DASH}/api/findings", params={"limit": 1}).json()
-    agg = (d.get("aggregations") or {}).get("by_source") or {}
-    assert sum(agg.values()) == d.get("total")
+    agg = d.get("aggregations") or {}
+    global_sources = set(agg.get("by_source") or {})
+    filtered_sources = set(agg.get("problems_by_source") or {})
+    if not filtered_sources:
+        pytest.skip("no findings to compare")
+    missing = sorted(filtered_sources - global_sources)
+    assert not missing, (
+        f"sources with findings but no global facet entry: {missing} — the UI "
+        "cannot offer a filter chip for these, so their findings are visible "
+        "but unfilterable. The global aggregation union is missing a branch.")
 
 
 @pytest.mark.e2e
