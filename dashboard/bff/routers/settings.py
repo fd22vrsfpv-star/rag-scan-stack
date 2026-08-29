@@ -473,13 +473,20 @@ async def preflight_remote():
 
 
 @router.get("/api/settings/database/compare")
-async def compare_databases():
-    """Compare local and remote database row counts and timestamps."""
+async def compare_databases(start_local: bool = False):
+    """Compare local and remote database row counts and timestamps.
+
+    `start_local` defaults to FALSE: in a remote mode, starting the local
+    Postgres to read its stats hands it the `rag-postgres` network alias, and
+    every service then resolves that name to a second, SSL-less database. A bare
+    GET reports local stats as unavailable instead of disrupting the stack.
+    """
     s = get_settings()
     try:
         async with httpx.AsyncClient(timeout=120) as c:
             resp = await c.get(
                 f"{s.container_logs_url}/db/compare",
+                params={"start_local": str(bool(start_local)).lower()},
                 timeout=110,
             )
             return safe_json(resp)

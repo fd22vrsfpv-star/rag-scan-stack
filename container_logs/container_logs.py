@@ -716,6 +716,101 @@ def _write_db_config(config: dict):
         json_module.dump(payload, f, indent=2)
 
 
+# Labels for the dynamically-created DB proxy.
+#
+# Deliberately NOT the com.docker.compose.* labels: this container cannot live
+# in docker-compose.yml (its command is built from db-config.json at runtime),
+# so claiming compose ownership would make `docker compose up --remove-orphans`
+# DELETE the stack's entire database path. These labels give the same
+# discoverability without that hazard:
+#     docker ps --filter label=com.rag-scan-stack.role=db-proxy
+_DB_PROXY_LABELS_BASE = {
+    "com.rag-scan-stack.role": "db-proxy",
+    "com.rag-scan-stack.managed-by": "container-logs",
+    "com.rag-scan-stack.network-alias": "rag-postgres",
+}
+
+
+def _db_proxy_labels(mode: str, remote_host: str, remote_port) -> dict:
+    """Labels naming what this proxy is and where it points.
+
+    Without them the container is anonymous: `docker ps` shows an `alpine:3.20`
+    running `/bin/sh -c ...` with no indication that it IS the database path for
+    every service in the stack, and no record of which host it forwards to.
+    """
+    return {
+        **_DB_PROXY_LABELS_BASE,
+        "com.rag-scan-stack.db-mode": str(mode),
+        "com.rag-scan-stack.remote-host": str(remote_host),
+        "com.rag-scan-stack.remote-port": str(remote_port),
+    }
+
+
+class _SkipLocalStats(Exception):
+    """Internal signal: report remote stats only, without starting anything."""
+
+
+def _holds_rag_postgres_alias(container) -> bool:
+    """True if this container answers to `rag-postgres` on agents_net.
+
+    The alias — not the container name — is what every service resolves, so it
+    is the thing worth policing.
+    """
+    try:
+        nets = container.attrs.get("NetworkSettings", {}).get("Networks", {}) or {}
+        for net_name, info in nets.items():
+            if net_name != "agents_net":
+                continue
+            if "rag-postgres" in (info.get("Aliases") or []):
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def _strip_rag_postgres_alias(container) -> bool:
+    """Re-attach `container` to agents_net WITHOUT the rag-postgres alias.
+
+    `docker compose up -d rag-postgres` always applies the service name as a
+    network alias, so merely starting the local database in remote mode makes it
+    a second answer for `rag-postgres` — and since pgvector ships with ssl=off
+    while remote_direct requires SSL, a share of every service's connections
+    fails with "server does not support SSL". Callers that need the local DB for
+    a moment (e.g. /db/compare) reach it by IP, so the alias buys them nothing
+    and costs the whole stack correctness.
+    """
+    try:
+        net = docker_client.networks.get("agents_net")
+        net.disconnect(container, force=True)
+        net.connect(container)  # no aliases
+        container.reload()
+        logger.info("[db-alias] removed the rag-postgres alias from %s", container.name)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[db-alias] could not strip alias from %s: %s", container.name, e)
+        return False
+
+
+def _detach_from_default_bridge(container) -> None:
+    """Leave the default bridge network.
+
+    `containers.run()` with no `network=` attaches to the default bridge, and
+    the agents_net connect that follows ADDS a second interface rather than
+    replacing it. A container that proxies the database has no reason to sit on
+    a network shared with every unrelated container on the host.
+    """
+    try:
+        bridge = docker_client.networks.get("bridge")
+        bridge.disconnect(container)
+        logger.info("[db-proxy] detached rag-db-tunnel from the default bridge network")
+    except docker.errors.NotFound:
+        pass
+    except Exception as e:  # noqa: BLE001
+        # Not fatal: the proxy works either way, and failing the switch over
+        # network tidiness would be a worse trade.
+        logger.warning("[db-proxy] could not detach from the default bridge: %s", e)
+
+
 def _ensure_remote_tunnel(config: dict = None) -> dict:
     """Create the SSH tunnel container if not already running.
 
@@ -785,6 +880,7 @@ def _ensure_remote_tunnel(config: dict = None) -> dict:
             command=["/bin/sh", "-c", ssh_cmd],
             detach=True,
             restart_policy={"Name": "unless-stopped"},
+            labels=_db_proxy_labels("remote", remote_host, remote_port),
             volumes={host_ssh_keys: {"bind": "/ssh-keys", "mode": "ro"}},
             healthcheck={
                 "Test": ["CMD-SHELL", "nc -z 127.0.0.1 5432 || exit 1"],
@@ -809,6 +905,13 @@ def _ensure_remote_tunnel(config: dict = None) -> dict:
             tunnel.reload()
             h = tunnel.attrs.get("State", {}).get("Health", {}).get("Status", "")
             if h == "healthy":
+                # Only NOW drop the default bridge. Both variants `apk add`
+                # their forwarder on first start, which needs outbound
+                # internet, and detaching while that download is in flight
+                # leaves the container stuck fetching an APKINDEX forever —
+                # taking the database path down with it. Waiting for healthy
+                # means the install has already finished.
+                _detach_from_default_bridge(tunnel)
                 return {"ok": True}
             if tunnel.status != "running":
                 logs = tunnel.logs(tail=20).decode(errors="replace")
@@ -871,6 +974,11 @@ def _ensure_remote_direct(config: dict = None) -> dict:
     except docker.errors.NotFound:
         return {"ok": False, "error": "Docker network 'agents_net' not found"}
 
+    # NOTE: this installs socat on EVERY container recreate, so rebuilding the
+    # database path requires working outbound internet and a reachable Alpine
+    # CDN. A prebuilt image (alpine/socat) would remove that dependency; left
+    # as-is here because changing the image is a bigger change than this fix,
+    # and it is recorded in Docs/CHANGES_MADE.md as a known fragility.
     socat_cmd = (
         f"apk add --no-cache socat && "
         f"exec socat TCP-LISTEN:5432,fork,reuseaddr TCP:{remote_host}:{remote_port}"
@@ -882,6 +990,7 @@ def _ensure_remote_direct(config: dict = None) -> dict:
             command=["/bin/sh", "-c", socat_cmd],
             detach=True,
             restart_policy={"Name": "unless-stopped"},
+            labels=_db_proxy_labels("remote_direct", remote_host, remote_port),
             healthcheck={
                 "Test": ["CMD-SHELL", "nc -z 127.0.0.1 5432 || exit 1"],
                 "Interval": 10_000_000_000,
@@ -905,6 +1014,13 @@ def _ensure_remote_direct(config: dict = None) -> dict:
             proxy.reload()
             h = proxy.attrs.get("State", {}).get("Health", {}).get("Status", "")
             if h == "healthy":
+                # Only NOW drop the default bridge. Both variants `apk add`
+                # their forwarder on first start, which needs outbound
+                # internet, and detaching while that download is in flight
+                # leaves the container stuck fetching an APKINDEX forever —
+                # taking the database path down with it. Waiting for healthy
+                # means the install has already finished.
+                _detach_from_default_bridge(proxy)
                 return {"ok": True, "type": "direct"}
             if proxy.status != "running":
                 logs = proxy.logs(tail=20).decode(errors="replace")
@@ -971,6 +1087,104 @@ def _auto_start_db():
         logger.error("[auto-start-db] Failed to start: %s", result.get("error"))
 
 
+def _is_local_postgres(container) -> bool:
+    """True for the real pgvector/postgres image — never our socat/ssh sidecar,
+    which shares the `rag-postgres` ALIAS but not the name or the image."""
+    tags = container.image.tags or []
+    return any("pgvector" in t or "/postgres" in t for t in tags)
+
+
+def _watch_for_local_postgres():
+    """Remove a local Postgres the moment it starts, while remote mode is active.
+
+    WHY THIS IS NOT JUST THE 60s LOOP
+    ---------------------------------
+    Both the local `rag-postgres` container and the `rag-db-tunnel` sidecar can
+    hold the `rag-postgres` network ALIAS on agents_net at the same time. Docker's
+    embedded DNS then round-robins between them, so a share of every service's
+    connections lands on the LOCAL database instead of the remote one.
+
+    The observed symptom is
+        connection to server at "rag-postgres" (a.b.c.d), port 5432 failed:
+        server does not support SSL, but SSL was required
+    because `pgvector/pgvector:pg16` ships with `ssl = off` while remote_direct
+    mode sets `sslmode=require` in DB_DSN. Reproduced exactly: a throwaway
+    pgvector container answered with that message, and with sslmode=prefer it
+    connected happily.
+
+    That second half is the part that matters. The SSL error is not the danger —
+    it is the ACCIDENTAL PROTECTION. With sslmode=require the split brain fails
+    closed and noisily; without it, services would silently read and write the
+    WRONG DATABASE for as long as both containers exist. Do not "fix" this by
+    relaxing sslmode.
+
+    The 60s enforcement loop closed that window eventually; a daemon restart
+    brings the local container back via `restart: unless-stopped`, so "eventually"
+    meant up to a minute of split-brain on every reboot. Watching the Docker
+    event stream reacts in milliseconds. The loop stays as a backstop for when
+    this stream drops.
+    """
+    import time  # module-level `time` is not imported here; match the loop's style
+    while True:
+        try:
+            for event in docker_client.events(
+                    decode=True, filters={"event": "start", "type": "container"}):
+                name = (event.get("Actor", {}).get("Attributes", {}) or {}).get("name", "")
+                if name != "rag-postgres":
+                    continue
+                config = _read_db_config()
+                mode = config.get("mode", "local")
+                if mode not in ("remote", "remote_direct"):
+                    continue
+                try:
+                    c = docker_client.containers.get("rag-postgres")
+                except docker.errors.NotFound:
+                    continue
+                if not _is_local_postgres(c):
+                    continue
+                c.reload()
+                if not _holds_rag_postgres_alias(c):
+                    # Running but aliasless — /db/compare starts it that way on
+                    # purpose to read local stats by IP. Harmless: nothing
+                    # resolves to it, so leave it alone.
+                    logger.info(
+                        "[db-mode-watcher] local rag-postgres started without the "
+                        "alias — leaving it (it cannot intercept any service).")
+                    continue
+                # It holds the alias: DNS now round-robins between this SSL-less
+                # local database and the tunnel, so a share of the stack's queries
+                # would hit the WRONG database. Take the alias away rather than
+                # killing it outright — whoever started it may still need it, and
+                # removing the alias is enough to make it safe.
+                logger.warning(
+                    "[db-mode-watcher] local rag-postgres started WITH the "
+                    "rag-postgres alias while mode=%s — stripping the alias now.",
+                    mode)
+                # The start event fires BEFORE the network attachment is
+                # complete, so the first disconnect can fail with "container is
+                # not connected to network agents_net". Retry briefly rather
+                # than destroying a container another code path just started.
+                stripped = False
+                for _try in range(5):
+                    c.reload()
+                    if not _holds_rag_postgres_alias(c):
+                        stripped = True  # someone else already handled it
+                        break
+                    if _strip_rag_postgres_alias(c):
+                        stripped = True
+                        break
+                    time.sleep(0.4)
+                if not stripped:
+                    logger.warning("[db-mode-watcher] alias strip failed after "
+                                   "retries — removing the container instead.")
+                    _remove_container("rag-postgres", stop_timeout=0)
+        except Exception as e:  # noqa: BLE001
+            # The stream drops on daemon restarts; back off and re-attach rather
+            # than losing the watcher for the life of the process.
+            logger.warning("[db-mode-watcher] event stream ended (%s); reattaching in 10s", e)
+            time.sleep(10)
+
+
 def _enforce_db_mode_loop():
     """Periodically re-assert remote-mode invariants.
 
@@ -988,15 +1202,40 @@ def _enforce_db_mode_loop():
             mode = config.get("mode", "local")
             if mode not in ("remote", "remote_direct"):
                 continue
+            # Invariant 1: the proxy that OWNS the rag-postgres alias must be
+            # running. The loop used to check only invariant 2 (no local
+            # postgres) and `continue`d when there was nothing to remove — so a
+            # tunnel that had been `docker rm`'d, or that exited in a way its
+            # restart policy could not recover, was never rebuilt. Every service
+            # in the stack loses its database in that state, and the only thing
+            # that would fix it was restarting container-logs.
+            try:
+                proxy = docker_client.containers.get("rag-db-tunnel")
+                proxy_ok = proxy.status == "running"
+            except docker.errors.NotFound:
+                proxy = None
+                proxy_ok = False
+            if not proxy_ok:
+                logger.warning(
+                    "[db-mode-enforcer] mode=%s but rag-db-tunnel is %s — recreating.",
+                    mode, proxy.status if proxy is not None else "missing",
+                )
+                result = (_ensure_remote_direct(config) if mode == "remote_direct"
+                          else _ensure_remote_tunnel(config))
+                if not result.get("ok"):
+                    logger.error("[db-mode-enforcer] proxy recreate failed: %s",
+                                 result.get("error"))
+
+            # Invariant 2: no local postgres stealing the alias.
             try:
                 c = docker_client.containers.get("rag-postgres")
             except docker.errors.NotFound:
                 continue
-            # Only target the real pgvector image — never touch our own
-            # rag-db-tunnel sidecar (which uses an alpine/socat image and has
-            # the rag-postgres alias, but a different container name).
+            # Backstop for _watch_for_local_postgres: the event stream is the
+            # fast path, this catches anything it missed (stream drop, a
+            # container that was already running at startup).
             tags = c.image.tags or []
-            if any("pgvector" in t or "/postgres" in t for t in tags):
+            if _is_local_postgres(c):
                 logger.warning(
                     "[db-mode-enforcer] mode=%s but local rag-postgres re-appeared (%s, %s) — removing.",
                     mode, tags[0] if tags else "?", c.status,
@@ -1017,7 +1256,19 @@ try:
 except Exception as e:
     logger.error("[auto-start-db] Unexpected error: %s", e)
 
-# Spawn the periodic enforcer in a daemon thread (won't block shutdown).
+# Two daemon threads, deliberately (neither blocks shutdown):
+#   * the event watcher reacts in milliseconds to a local Postgres starting,
+#     which is what actually closes the split-brain window;
+#   * the 60s loop is the backstop, and is also what re-creates a missing
+#     rag-db-tunnel.
+try:
+    import threading
+    threading.Thread(target=_watch_for_local_postgres, name="db-mode-watcher",
+                     daemon=True).start()
+    logger.info("[db-mode-watcher] background thread started (docker event stream)")
+except Exception as e:
+    logger.error("[db-mode-watcher] failed to start: %s", e)
+
 try:
     import threading
     threading.Thread(target=_enforce_db_mode_loop, name="db-mode-enforcer",
@@ -1288,12 +1539,19 @@ def toggle_remote_db(body: RemoteDbToggleBody):
         return {"ok": False, "error": str(e)}
 
 
-def _remove_container(name: str, stop: bool = True):
-    """Remove a container by name, optionally stopping it first."""
+def _remove_container(name: str, stop: bool = True, stop_timeout: int = 10):
+    """Remove a container by name, optionally stopping it first.
+
+    `stop_timeout` is the grace period before SIGKILL. The default 10s is right
+    for an orderly teardown; pass 0 when the container must stop NOW because it
+    is actively doing harm — a rogue local Postgres holding the `rag-postgres`
+    alias is serving a share of the stack's queries against the WRONG database
+    for every second it stays up, and there is nothing worth flushing.
+    """
     try:
         c = docker_client.containers.get(name)
         if stop and c.status == "running":
-            c.stop(timeout=10)
+            c.stop(timeout=stop_timeout)
         c.remove(force=True)
         return True
     except docker.errors.NotFound:
@@ -2173,11 +2431,21 @@ def sync_schema_to_remote():
 
 
 @app.get("/db/compare")
-def compare_databases():
+def compare_databases(start_local: bool = False):
     """Compare local and remote database row counts and timestamps.
 
     Connects to both databases and returns side-by-side stats for all sync tables.
     If in local mode, starts a temporary tunnel for the remote query.
+
+    `start_local` (default FALSE) — in a remote mode the local Postgres is
+    normally stopped, and this endpoint used to START it to read local stats.
+    That made a GET stand up a database, and `docker compose up -d rag-postgres`
+    hands it the `rag-postgres` network ALIAS: every service in the stack then
+    resolves that name to a second, SSL-less database and a share of their
+    connections fail with "server does not support SSL, but SSL was required".
+    A bare GET — which is what the endpoint sweep and any curious operator
+    does — now reports local stats as unavailable instead of disrupting the
+    stack. Pass start_local=true to opt into the old behaviour.
     """
     import time
 
@@ -2202,8 +2470,30 @@ def compare_databases():
         local_host = None
         try:
             c = docker_client.containers.get("rag-postgres")
+            if c.status != "running" and not start_local:
+                logger.info("[db/compare] local postgres is stopped and "
+                            "start_local=false — reporting remote stats only.")
+                local_host = None
+                raise _SkipLocalStats()
             if c.status != "running":
                 try:
+                    # Strip the alias before starting AND again after. Neither
+                    # is sufficient, and the measurements say so:
+                    #
+                    #   start then strip : 129 failures / 1417 attempts (~9%)
+                    #   strip then start : 133 failures / 1396 attempts (~9%)
+                    #   never start it   : 0 failures / 712 attempts
+                    #
+                    # Docker RE-APPLIES a compose-declared service's name as a
+                    # network alias every time the container starts, so there is
+                    # no ordering that avoids the window. Starting this container
+                    # in a remote mode is inherently disruptive: for a few
+                    # seconds `rag-postgres` resolves to an SSL-less local
+                    # database and a share of the stack's connections fail.
+                    #
+                    # That is why start_local defaults to FALSE. These strips
+                    # shorten the window; they do not close it.
+                    _strip_rag_postgres_alias(c)
                     c.start()
                     started_local_pg = True
                     for _ in range(10):
@@ -2211,6 +2501,10 @@ def compare_databases():
                         if c.status == "running":
                             break
                         time.sleep(2)
+                    # Re-assert: a start can restore the compose-declared alias.
+                    c.reload()
+                    if _holds_rag_postgres_alias(c):
+                        _strip_rag_postgres_alias(c)
                     time.sleep(3)
                 except Exception as start_err:
                     logging.warning(f"[db/compare] Could not start local postgres: {start_err}")
@@ -2232,18 +2526,32 @@ def compare_databases():
                         if ip:
                             local_host = ip
                             break
+        except _SkipLocalStats:
+            pass
         except docker.errors.NotFound:
-            # Need to create local postgres via compose
-            try:
-                result = subprocess.run(
-                    ["docker", "compose", "-p", COMPOSE_PROJECT,
-                     "-f", os.path.join(PROJECT_DIR, "docker-compose.yml"),
-                     "up", "-d", "rag-postgres"],
-                    capture_output=True, text=True, timeout=60, cwd=PROJECT_DIR,
-                )
-                started_local_pg = True
-                time.sleep(8)
+            # No local postgres container at all. Creating one is a heavier side
+            # effect than starting a stopped one, so it is gated the same way.
+            if not start_local:
+                logger.info("[db/compare] no local postgres container and "
+                            "start_local=false — reporting remote stats only.")
+                local_host = None
+            else:
                 try:
+                    subprocess.run(
+                        ["docker", "compose", "-p", COMPOSE_PROJECT,
+                         "-f", os.path.join(PROJECT_DIR, "docker-compose.yml"),
+                         "up", "-d", "rag-postgres"],
+                        capture_output=True, text=True, timeout=60, cwd=PROJECT_DIR,
+                    )
+                    started_local_pg = True
+                    # compose attaches it to agents_net WITH the service-name
+                    # alias; strip it before anything can resolve to it.
+                    try:
+                        _strip_rag_postgres_alias(
+                            docker_client.containers.get("rag-postgres"))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    time.sleep(8)
                     c = docker_client.containers.get("rag-postgres")
                     c.reload()
                     nets = c.attrs.get("NetworkSettings", {}).get("Networks", {})
@@ -2252,10 +2560,8 @@ def compare_databases():
                         if ip:
                             local_host = ip
                             break
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[db/compare] could not create local postgres: %s", e)
 
     local_stats: dict
     if local_host:
@@ -2386,13 +2692,23 @@ def compare_databases():
         except Exception:
             pass
 
-    return {
+    result = {
         "ok": True,
         "mode": mode,
         "local": local_stats,
         "remote": remote_stats,
         "comparison": comparison,
     }
+    if started_local_pg:
+        result["warning"] = (
+            "Starting the local Postgres in a remote mode briefly gives it the "
+            "`rag-postgres` network alias (Docker re-applies a compose service's "
+            "name on every start), so for a few seconds some services resolve "
+            "that name to the local, SSL-less database and their connections "
+            "fail with 'server does not support SSL'. Measured at roughly 9% of "
+            "connection attempts for the duration. Omit start_local to avoid it."
+        )
+    return result
 
 
 if __name__ == "__main__":
