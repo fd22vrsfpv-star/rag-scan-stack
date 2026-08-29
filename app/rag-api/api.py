@@ -6120,6 +6120,16 @@ def search_findings(
         UNION ALL
         SELECT 'playwright' as source, pf.severity FROM playwright_findings pf
         UNION ALL
+        -- recon_findings was MISSING from this union while the main query
+        -- included it, so `dns-enum` (5) and `email-enum` (6) rows counted
+        -- toward `total` but appeared in NO global facet. The frontend builds
+        -- its source filter chips from by_source precisely so a chip never
+        -- vanishes as you narrow the filter — so those 11 findings were listed
+        -- but could not be filtered to, ever. Same WHERE as the main query's
+        -- recon branch; if that gate changes, change it here too.
+        SELECT rf.source, rf.severity FROM recon_findings rf
+         WHERE rf.source IN ('email-enum', 'dns-enum')
+        UNION ALL
         -- Mirrors the main query's ports branch, which is now inventory. Without
         -- the same gate the facet would render a `portscan` chip with 40 that
         -- returns nothing when clicked -- exactly the katana bug this comment

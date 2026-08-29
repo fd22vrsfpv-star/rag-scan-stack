@@ -47,16 +47,51 @@ def results(smoke):
             lambda p: smoke.probe(BASE, p, 20, os.environ.get("API_KEY")), paths))
 
 
+# Endpoints that are legitimately slow — they do real work — and sit close
+# enough to the sweep's 20s budget to flap. They are reported by
+# test_slow_endpoints_are_declared, NOT counted as 5xx: a timeout says "this is
+# slower than the budget", a 500 says "this is broken", and merging the two made
+# a genuine 500 (session-bundle) look like the same class of problem as an
+# endpoint that simply takes 13 seconds.
+#
+# Measured 2026-08-28: /api/diagnostics/errors ~19.6s,
+# /api/settings/database/compare ~13.0s. Both return 200.
+KNOWN_SLOW = {
+    "/api/diagnostics/errors":
+        "aggregates error logs across every service; ~19.6s measured",
+    "/api/settings/database/compare":
+        "compares local and remote schemas over the DB link; ~13.0s measured",
+}
+
+
 def test_no_endpoint_returns_5xx(smoke, results):
     """A 5xx is the endpoint being broken, not the request being wrong.
 
     4xx is explicitly fine: many of these require parameters and correctly
-    reject a bare GET.
+    reject a bare GET. Timeouts (status 0) are NOT counted here — see
+    KNOWN_SLOW and test_slow_endpoints_are_declared.
     """
     bad = [(p, s, b[:160]) for p, s, b in results
-           if (s == 0 or s >= 500) and p not in smoke.EXPECTED_5XX]
+           if s >= 500 and p not in smoke.EXPECTED_5XX]
     assert not bad, "failing endpoints:\n  " + "\n  ".join(
         f"{s} {p} — {b}" for p, s, b in bad)
+
+
+def test_slow_endpoints_are_declared(smoke, results):
+    """An endpoint that cannot answer inside the sweep's budget is a real
+    problem — just a different one from a 500.
+
+    Undeclared timeouts fail: a newly-slow endpoint is a regression worth
+    seeing, and letting timeouts pass silently is how a broken endpoint hides.
+    Declared ones are tolerated and named, so the list stays reviewable.
+    """
+    timed_out = [(p, b[:120]) for p, s, b in results
+                 if s == 0 and p not in smoke.EXPECTED_5XX]
+    undeclared = [(p, b) for p, b in timed_out if p not in KNOWN_SLOW]
+    assert not undeclared, (
+        "endpoints that did not answer within the sweep budget and are not in "
+        "KNOWN_SLOW:\n  " + "\n  ".join(f"{p} — {b}" for p, b in undeclared)
+        + "\n\nEither make them faster or declare them with a measured time.")
 
 
 def test_the_sweep_actually_probed_something(results):
