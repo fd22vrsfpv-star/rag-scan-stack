@@ -395,6 +395,47 @@ weights, and nothing here claims it does.
 is no baseline to compare against. Run `POST /rag/eval/run` before and after a
 batch of feedback if you want evidence rather than a plausible mechanism.
 
+### Service families — one doc, every alias
+
+Retrieval used to scope on `lower(service) = lower(?)`, so a doc filed under
+`http` was invisible to an `https` query even though, for testing purposes, they
+are the same service over a different transport. `_SERVICE_FAMILIES` in
+`exploits_rag.py` groups the aliases:
+
+| canonical | members |
+|---|---|
+| `http` | http, https, http-proxy, http-alt, https-alt, ssl/http, www, http-mgmt, webcache |
+| `smb` | smb, microsoft-ds, netbios-ssn, cifs |
+| `mysql` | mysql, mariadb |
+| `mssql` | ms-sql-s, mssql, ms-sql |
+| `ldap` | ldap, ldapssl, ldaps |
+| `rdp` | rdp, ms-wbt-server |
+
+Two mechanisms, because scoped and unscoped documents are found differently:
+
+- **Scoped docs** — the SQL scope matches the whole family, so ONE tagged
+  document answers every alias. Tag with whichever name you like.
+- **Unscoped playbooks** — matched on wording, so the canonical name is added to
+  the query text. Measured: the SMB playbook scored 0.648 for a query saying
+  "smb" and 0.506 for "microsoft-ds" — the latter below the floor, so the same
+  service got guidance or not depending only on how nmap fingerprinted it.
+
+**Keep families tight.** A scoped hit bypasses the similarity floor, so a wide
+family pastes one service's guidance into an unrelated service's prompt.
+`tests/test_service_families.py` fails if a family exceeds 10 members, if two
+families overlap, or if a canonical name is not a member of its own family.
+
+### The similarity floor applies to UNSCOPED matches only
+
+Applying it to scoped documents was wrong, and measurably so. The HTB web
+cheatsheet is bash commands; a recommendation query is prose, so it scored
+**0.30** — below the 0.55 floor — and was dropped, having already displaced the
+playbook that would have passed. `http/80` ended up with no context at all while
+`https/443` got a playbook. A document an operator tagged `service=http`,
+retrieved for an http query, is relevant *by construction*: they asserted that
+when they tagged it. Only rows that matched on embedding distance alone have to
+clear the bar.
+
 **To get value today**, in increasing effort: rate retrievals (immediate effect
 now); write `scan_tool_feedback` rules (immediate, already wired); ingest Layer-4
 docs tagged with service/port so they beat generic playbooks; then evaluate.

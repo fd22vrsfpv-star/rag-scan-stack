@@ -738,7 +738,7 @@ def _build_guidance_block(
 _TRAINING_CONTEXT_MIN_SIM = float(os.getenv("TRAINING_CONTEXT_MIN_SIM", "0.55"))
 
 
-def _get_training_context(service: Optional[str], port: Optional[int], top_k: int = 3,
+def _get_training_context(service: Optional[str], port: Optional[int], top_k: int = 5,
                           tech: Optional[List[str]] = None) -> str:
     """Retrieved per-service/port/tech training documents, or '' when unavailable.
 
@@ -750,9 +750,16 @@ def _get_training_context(service: Optional[str], port: Optional[int], top_k: in
         return ""
     try:
         from exploits_rag import (_embed, _retrieve, TRAINING_SOURCE_REPO,
-                                  KNOWLEDGE_SOURCE_REPO)
+                                  KNOWLEDGE_SOURCE_REPO, service_canonical)
+        # Include the family's canonical name alongside whatever nmap reported.
+        # Unscoped playbooks are matched on wording, so "microsoft-ds" alone
+        # scored 0.506 against the SMB playbook (under the floor, dropped) while
+        # "smb" scored 0.648. Naming both costs two tokens and stops the same
+        # service being served or not served depending on how it was fingerprinted.
+        canon = service_canonical(service) if service else ""
         query = " ".join(filter(None, [
-            service or "", f"port {port}" if port else "",
+            service or "", canon if canon and canon != (service or "").lower() else "",
+            f"port {port}" if port else "",
             " ".join(tech_list), "penetration testing methodology",
         ])).strip()
         # Both corpora, not just 'training'. This function pinned
@@ -771,11 +778,22 @@ def _get_training_context(service: Optional[str], port: Optional[int], top_k: in
     except Exception as e:
         logger.debug("training context retrieval failed: %s", e)
         return ""
-    # Similarity floor. Widening the corpora means a weak match can now be
-    # returned where nothing was before, and pasting an unrelated playbook into
-    # every recommendation prompt is worse than pasting nothing.
+    # Similarity floor — for UNSCOPED matches only.
+    #
+    # The floor exists to stop generic prose being pasted into the prompt for an
+    # unrelated service (a `finger` scan pulling Web Methodology at 0.473).
+    # Applying it to service-scoped docs too was wrong, and measurably so: an
+    # operator-tagged HTB web cheatsheet retrieved for an `http` query scored
+    # 0.30 — because it is bash commands and the query is prose — so it was
+    # dropped, AND it had already displaced the playbook that would have passed.
+    # http/80 ended up with NO context at all while https/443 got the playbook.
+    #
+    # A doc tagged service=http, retrieved for an http query, is relevant by
+    # construction: the operator asserted that when they tagged it. Only rows
+    # that matched on embedding distance alone have to clear the bar.
     hits = [h for h in hits
-            if float(h.get("ranked_score", h.get("sim") or 0.0)) >= _TRAINING_CONTEXT_MIN_SIM]
+            if h.get("match") == "scoped"
+            or float(h.get("ranked_score", h.get("sim") or 0.0)) >= _TRAINING_CONTEXT_MIN_SIM]
     if not hits:
         return ""
     lines = ["", "KNOWLEDGE CONTEXT (ingested methodology for this service/port):"]
