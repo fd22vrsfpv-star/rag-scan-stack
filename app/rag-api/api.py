@@ -12549,6 +12549,23 @@ def get_scope(
     }
 
 
+def _infer_target_type(target: str) -> str:
+    """Classify a bare scope target as ip | cidr | domain.
+
+    Mirrors the auto-discovery path's rule so the two agree. A wrong-but-present
+    type is still better than NULL, which the gate cannot match at all.
+    """
+    t = (target or "").strip()
+    if "/" in t and any(c.isdigit() for c in t.split("/")[-1]):
+        return "cidr"
+    try:
+        import ipaddress
+        ipaddress.ip_address(t)
+        return "ip"
+    except ValueError:
+        return "domain"
+
+
 @app.post("/scope/add", tags=["Scope"])
 def add_to_scope(
     body: dict,
@@ -12560,29 +12577,40 @@ def add_to_scope(
     if not targets:
         raise HTTPException(status_code=400, detail="No targets provided")
 
+    # Attach to the active engagement if one is set. Storing an engagement's
+    # target under engagement_id IS NULL put it in the GLOBAL list only, so the
+    # engagement-scoped gate (load_engagement_scope) never saw it — a target you
+    # authorised for THIS engagement was invisible to the dispatcher for it.
+    eid = _validate_engagement_uuid(_resolve_engagement_id(body.get("engagement_id")))
+
     added = 0
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         for t in targets:
             target_val = t.get("target", "").strip()
             if not target_val:
                 continue
-            # Idempotent insert for the GLOBAL scope list (engagement_id IS NULL).
-            # The legacy UNIQUE(name,target) was dropped in favor of
-            # UNIQUE(engagement_id,name,target) (see ensure_all_tables.sql), so
-            # ON CONFLICT (name,target) no longer matches a constraint. Guard on
-            # the NULL-engagement row set instead.
+            # target_type is what the scope GATE matches on (is_in_scope keys off
+            # it: 'ip' exact, 'cidr' network, 'domain'/'url' suffix). An INSERT
+            # that left it NULL — which is what happened when a caller sent only
+            # {"target": ...} — stored a row that matched no branch and was
+            # therefore silently OUT of scope while looking present in the list.
+            # Infer it when the caller did not supply it, using the same rule the
+            # auto-discovery path uses below.
+            ttype = (t.get("target_type") or "").strip().lower() or _infer_target_type(target_val)
             cur.execute(
-                """INSERT INTO scope_targets (name, target, target_type, source)
-                   SELECT %s, %s, %s, %s
+                """INSERT INTO scope_targets (name, target, target_type, source, engagement_id)
+                   SELECT %s, %s, %s, %s, %s
                    WHERE NOT EXISTS (
                        SELECT 1 FROM scope_targets
-                       WHERE engagement_id IS NULL AND name = %s AND target = %s
+                       WHERE target = %s AND name = %s
+                         AND engagement_id IS NOT DISTINCT FROM %s
                    )""",
-                [name, target_val, t.get("target_type"), t.get("source"), name, target_val],
+                [name, target_val, ttype, t.get("source"), eid,
+                 target_val, name, eid],
             )
             added += cur.rowcount
         conn.commit()
-    return {"ok": True, "name": name, "added": added}
+    return {"ok": True, "name": name, "added": added, "engagement_id": eid}
 
 
 @app.delete("/scope/targets", tags=["Scope"])
