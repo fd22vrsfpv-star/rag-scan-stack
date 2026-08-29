@@ -395,16 +395,11 @@ checkpoint tables to db_init + health check, then retire the AutoGen scaffolding
   actions are now *checked* against declared upstream routes rather than
   exempted. `PROXY_DYNAMIC` stays a one-entry list.
 
-### Still open (carried forward, none introduced here)
-- **AutoGen is not yet removed.** `pyautogen`, the watchdog, recovery and
-  `/nudge` all remain — that is the one-release fallback window, and the tests
-  pin `"autogen" in VALID_AGENT_ENGINES` so it cannot be dropped by accident.
-  Retiring it is the next increment.
-- **`get_scan_recommendations` still 500s** — scan-recommender's `/rag/ask`
-  embeds via `ollama:11434`, and there is no ollama container in this
-  deployment (`Failed to resolve 'ollama'`). Pre-existing; affects AutoGen too.
-  The `embedder` service is up and healthy, so the fix is repointing
-  `scan_recommender/exploits_rag.py`'s embedding backend — a separate change.
+### Still open — as written at the END OF PHASE 4. Superseded; see §14 and below.
+- ~~**AutoGen is not yet removed.**~~ Retired in Phase 5 (§14).
+- ~~**`get_scan_recommendations` still 500s.**~~ Fixed 2026-08-28: embeddings now
+  resolve via `EMBED_BACKEND` independently of `LLM_BACKEND`, and the embedder
+  serves TLS. Returns grounded answers with cited playbook sources.
 - **DeepSeek-V4-Flash rate-limits (429) in centralus** under sustained use. The
   per-phase fallbacks absorb it, but a session that hits it loses that phase's
   reasoning. A higher-quota deployment or a second backend would fix it.
