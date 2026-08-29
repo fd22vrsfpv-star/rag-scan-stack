@@ -58,9 +58,12 @@ def results(smoke):
 # /api/settings/database/compare ~13.0s. Both return 200.
 KNOWN_SLOW = {
     "/api/diagnostics/errors":
-        "aggregates error logs across every service; ~19.6s measured",
-    "/api/settings/database/compare":
-        "compares local and remote schemas over the DB link; ~13.0s measured",
+        "reads `docker logs` for ~30 containers; ~19.6s measured",
+    # /api/settings/database/compare used to sit here at ~13s. It was slow
+    # because a bare GET STARTED the local Postgres to read its stats — which
+    # also handed that container the `rag-postgres` network alias and made a
+    # share of the whole stack's DB connections fail. It now defaults to
+    # start_local=false and answers in ~1.3s.
 }
 
 

@@ -66,6 +66,23 @@ _health_cache: dict = {"data": None, "ts": 0}
 _HEALTH_CACHE_TTL = 10  # seconds
 
 
+@router.get("/api/healthz")
+async def liveness():
+    """Is THIS container alive? Nothing else.
+
+    The container healthcheck used to curl /api/health, which probes ~20 upstream
+    services concurrently and takes as long as the slowest one. That made the
+    dashboard container report UNHEALTHY whenever an upstream was merely slow —
+    the wrong question for a container healthcheck, and it flapped as soon as the
+    rag-api probe budget was raised to match that service's real 4.2s /health.
+
+    Reaching this handler proves nginx is serving and the BFF process is alive,
+    which is exactly what this container is responsible for. Upstream health has
+    its own endpoint, and its own page.
+    """
+    return {"ok": True, "service": "pentest-dashboard"}
+
+
 @router.get("/api/health")
 async def health(bust: bool = False):
     import time as _time

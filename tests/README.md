@@ -123,24 +123,33 @@ Two guards were made honest rather than lenient:
   `test_all_core_services_are_healthy` now needs the same service to fail two
   consecutive observations, the second with the response cache busted.
 
-### Known intermittent, under full-suite load
+### Previously intermittent — root-caused and fixed (2026-08-29)
 
-`/api/tools/executions` returned 500 once during a full-suite run:
+`/api/tools/executions` and `/api/wg/peers` used to 500 during full-suite runs
+with `server does not support SSL, but SSL was required`. It was **not load and
+not TLS** — a concurrency ramp through the tunnel showed 0 failures at 60
+simultaneous connections.
 
+The sweep itself caused it. `GET /api/settings/database/compare` **started the
+local Postgres** to read its stats, and `docker compose up -d rag-postgres`
+gives that container the `rag-postgres` network alias. Docker DNS then
+round-robins between the SSL-less local database and the remote tunnel, so a
+share of every service's connections failed — hence "intermittent", and hence
+only under the sweep.
+
+Fixed by defaulting that endpoint to `start_local=false`, plus a Docker event
+watcher that strips the alias from any local Postgres that claims it. Two
+consecutive full-suite runs are clean.
+
+**If you see this error again**, do not look at load or at the endpoint that
+reported it. Run:
+
+```bash
+docker exec autogen-agents getent hosts rag-postgres   # more than one IP = split brain
+docker ps --filter label=com.rag-scan-stack.role=db-proxy
 ```
-connection to server at "rag-postgres" (172.18.0.32), port 5432 failed:
-server does not support SSL, but SSL was required
-```
 
-Three isolated runs of the smoke module afterwards were clean, so it is
-load-dependent, not endpoint-specific. Root cause is the remote-DB data path,
-not `kali-listener`: `rag-postgres` is a network alias owned by
-**`rag-db-tunnel`**, a `socat TCP-LISTEN:5432,fork` forwarder to the remote
-host, and `DB_DSN` carries `sslmode=require`. Under concurrency a connection can
-be accepted and dropped before SSL negotiation, which libpq reports as "server
-does not support SSL". The same error appears in `exploit_watcher`'s log.
-
-**`rag-db-tunnel` is not declared in `docker-compose.yml`** — it is created by
-the Settings DB-mode switch. So the remote-DB data path depends on a container
-no compose file describes, which is worth fixing before it is worth chasing the
-intermittent 500.
+`rag-postgres` must resolve to exactly one address: the `rag-db-tunnel` sidecar.
+Note that `sslmode=require` is what makes this fail LOUDLY — without it the
+stack would silently use the wrong database. Do not relax it to make the error
+go away.

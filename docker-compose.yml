@@ -50,6 +50,24 @@ services:
     volumes:
       - searchsploit-data:/var/lib/searchsploit
     networks: [ agents_net ]
+  # ── Where the database actually lives ──────────────────────────────────
+  # In LOCAL mode it is this container. In `remote` / `remote_direct` mode
+  # (db-config.json) it is NOT: a sidecar named `rag-db-tunnel` takes over the
+  # `rag-postgres` NETWORK ALIAS on agents_net and forwards to the remote
+  # Postgres — SSH tunnel for `remote`, `socat` TCP forward for `remote_direct`.
+  #
+  # That sidecar is deliberately NOT declared here. Its command is built from
+  # db-config.json at runtime (host, port, key, mode), which a static compose
+  # service cannot express, and giving it com.docker.compose.* labels would let
+  # `docker compose up --remove-orphans` delete the stack's entire database
+  # path. It is created and kept alive by container_logs.py
+  # (`_ensure_remote_tunnel` / `_ensure_remote_direct`, `_auto_start_db` on
+  # startup, `_enforce_db_mode_loop` every 60s) and is labelled for discovery:
+  #
+  #     docker ps --filter label=com.rag-scan-stack.role=db-proxy
+  #
+  # In remote mode this local service must stay DOWN — container-logs removes it
+  # if it reappears, because it would steal the alias from the sidecar.
   rag-postgres:
     image: pgvector/pgvector:pg16
     container_name: rag-postgres
@@ -2306,7 +2324,11 @@ services:
       - "3002:443"
       - "3001:80"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:443/api/health || curl -f http://127.0.0.1:80/api/health || exit 1"]
+      # /api/healthz, NOT /api/health: the latter probes every upstream service
+      # and is as slow as the slowest one, so it marked this container unhealthy
+      # for other services' latency. Liveness here means nginx is serving and the
+      # BFF process is up.
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:443/api/healthz || curl -f http://127.0.0.1:80/api/healthz || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 10
