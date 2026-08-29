@@ -20,7 +20,36 @@ NMAP_BATCH_TIMEOUT = int(os.environ.get("NMAP_BATCH_TIMEOUT", "3600"))
 def _safe_name(s: str) -> str:
     return re.sub(r'[^0-9A-Za-z._-]+', '_', s)
 
+# FAILS CLOSED: this module subprocesses `nmap -sV` straight at a host, so it IS
+# a dispatcher under CLAUDE.md and must pass the scope gate. If the gate cannot
+# be imported we enrich NOTHING, because a missing bind-mount must not be
+# indistinguishable from "everything is authorised". Same contract, and the same
+# shared matcher, as nmap_scanner/cred_checker.py.
+try:
+    from etl.scope_gate import load_dispatch_scope, is_in_scope
+    _SCOPE_GATE_OK = True
+    _SCOPE_GATE_ERROR = ""
+except Exception as _scope_exc:      # pragma: no cover - deployment problem
+    _SCOPE_GATE_OK = False
+    _SCOPE_GATE_ERROR = str(_scope_exc)
+
+
 def get_open_ports_by_host():
+    """Hosts to enrich — IN-SCOPE ONLY.
+
+    This walks every open port in the database, NOT the targets of the job that
+    called it. That is a deliberate design (enrichment fills in service detail
+    wherever it is missing), but it means a job dispatched for one host reaches
+    every host on record — so the scope check cannot live at the caller, it has
+    to live here.
+
+    Found in practice: `start_nmap_scan(ip_address='3.225.93.164', ports='443')`
+    masscanned that one host and then enriched 349, none of which had passed a
+    gate for that dispatch. They all happened to be in scope, so no unauthorised
+    traffic left — but "happened to be" is not an authorisation control, and the
+    moment the ports table holds a host the scope does not cover (an import, a
+    narrowed scope, an older engagement) it would be scanned silently.
+    """
     with psycopg2.connect(DB_DSN) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
             SELECT host(a.ip)::text AS ip, array_agg(p.port ORDER BY p.port) AS ports
@@ -28,7 +57,37 @@ def get_open_ports_by_host():
             WHERE COALESCE(p.is_open, true)
             GROUP BY host(a.ip) HAVING COUNT(*) > 0
         """ )
-        return cur.fetchall()
+        rows = cur.fetchall()
+
+        if not _SCOPE_GATE_OK:
+            logger.error(
+                "[nmap_enrichment] scope gate unavailable (%s) — refusing to "
+                "enrich any host. Fix the etl/ mount rather than removing this "
+                "check.", _SCOPE_GATE_ERROR)
+            return []
+
+        scope_rows = load_dispatch_scope(cur)
+        if not scope_rows:
+            logger.error(
+                "[nmap_enrichment] no scope configured — refusing to enrich. An "
+                "unconfigured scope is a setup problem, not permission to scan "
+                "everything on record.")
+            return []
+
+    allowed, refused = [], []
+    for row in rows:
+        (allowed if is_in_scope(row["ip"], scope_rows) else refused).append(row)
+    if refused:
+        # Named, not silently dropped: a host that is skipped for authorisation
+        # reasons is something the operator needs to see.
+        logger.warning(
+            "[nmap_enrichment] %d host(s) on record are OUT of the configured "
+            "scope and will not be enriched: %s%s",
+            len(refused), ", ".join(r["ip"] for r in refused[:10]),
+            " ..." if len(refused) > 10 else "")
+    logger.info("[nmap_enrichment] %d host(s) in scope, %d refused",
+                len(allowed), len(refused))
+    return allowed
 
 def run_nmap_batch(ip, ports, batch_idx):
     safe_ip = _safe_name(ip)

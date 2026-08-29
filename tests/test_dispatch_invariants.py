@@ -78,6 +78,13 @@ _ROOTS = (
     # traffic — never appeared in either debt list. A blind spot in the audit is
     # worse than a debt entry, because the debt entry is at least visible.
     "node_manager",
+    # `app/rag-api` above covers only ONE subdirectory of app/. app/
+    # run_masscan_nmap.py subprocesses `nmap -sV` at every host on record and
+    # was therefore invisible to this audit — the same blind spot the
+    # node_manager comment describes, one directory over. Scanning `app` covers
+    # rag-api too; the entry above is kept because removing it would make this
+    # tuple read as though rag-api had been dropped.
+    "app",
 )
 
 # ── Known debt ────────────────────────────────────────────────────────────
@@ -105,6 +112,14 @@ LIMIT_NOT_APPLICABLE = {
     "autogen_agents/mcp_server.py":
         "does not initiate scans — it forwards an MCP tool call to the "
         "autogen-agents API. The slot is held downstream in scan_tools.py.",
+    "app/run_masscan_nmap.py":
+        "the slot is held UPSTREAM: this runs inside a nmap_scanner job that "
+        "was already admitted at /jobs/masscan-then-nmap, so taking a second "
+        "one would double-count a single scan. It also scans strictly serially "
+        "— one nmap subprocess at a time, no thread pool, no asyncio (the "
+        "module contains no concurrency primitives), so it cannot amplify "
+        "concurrency however long it runs. It IS gated for SCOPE, which is the "
+        "invariant that does apply: get_open_ports_by_host() fails closed.",
     "osint_runner/service_enum_cli.py":
         "runs on a REMOTE NODE, uploaded there by node_manager, with neither "
         "common/ nor a database — there is no shared semaphore to consult. The "
