@@ -1594,6 +1594,17 @@ def create_security_test(
         return str(cur.fetchone()[0])
 
 
+# The assertion clause vocabulary the evaluator understands. Exposed so other
+# agent-container code (test_synth) can validate synthesized assertions against
+# the SAME set. Kept identical to app/rag-api/security_tests._CLAUSE_KEYS;
+# tests/test_security_tests.py pins the evaluators to one case table.
+CLAUSE_KEYS = {
+    "expect_exit_code", "expect_substring", "expect_not_substring",
+    "expect_regex", "expect_status", "expect_shell", "expect_screenshot",
+    "min_output_bytes",
+}
+
+
 def _eval_assertion_local(assertion, *, exit_code=None, output=None,
                           http_status=None, has_shell=False, has_screenshot=False):
     """A minimal copy of app/rag-api/security_tests.evaluate_assertion so the
@@ -1605,9 +1616,7 @@ def _eval_assertion_local(assertion, *, exit_code=None, output=None,
     out = output or ""
     if not ((exit_code is not None) or out or has_shell or has_screenshot):
         return "error", {"_reason": "run did not complete"}, "run did not complete"
-    keys = {"expect_exit_code", "expect_substring", "expect_not_substring",
-            "expect_regex", "expect_status", "expect_shell", "expect_screenshot",
-            "min_output_bytes"}
+    keys = CLAUSE_KEYS
     clauses = {k: v for k, v in a.items() if k in keys}
     evald, fails = {}, []
     def rec(k, ok, d):

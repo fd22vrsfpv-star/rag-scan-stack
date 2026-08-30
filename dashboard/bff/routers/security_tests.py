@@ -161,3 +161,52 @@ async def run_security_test(test_id: str, body: SecurityTestRunReq):
         # Preserve the upstream status code: an IMPACTFUL re-run answers 202
         # (requires_approval) rather than 200, and the UI/tests key on that.
         return JSONResponse(status_code=resp.status_code, content=safe_json(resp))
+
+
+class BurpExportReq(BaseModel):
+    format: Optional[str] = "har"  # "har" (Burp Import) | "request" (Repeater)
+
+
+@router.post("/api/security-tests/{test_id}/export-burp")
+async def export_test_burp(test_id: str, body: BurpExportReq):
+    """Export one custom test/payload as Burp-ingestible HAR or raw request."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=30) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/security-tests/{test_id}/export-burp",
+            json=body.model_dump(exclude_none=True),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.post("/api/agent-sessions/{session_id}/security-tests/export-burp")
+async def export_session_tests_burp(session_id: str, body: BurpExportReq):
+    """Export ALL of a session's custom tests as one Burp-ingestible HAR."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=30) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/agent-sessions/{session_id}/security-tests/export-burp",
+            json=body.model_dump(exclude_none=True),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.post("/api/security-tests/{test_id}/send-to-burp")
+async def send_test_to_burp(test_id: str):
+    """Push a custom test into the live Burp import queue (same queue the operator
+    already imports follow-ups from)."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=30) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/security-tests/{test_id}/send-to-burp",
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)

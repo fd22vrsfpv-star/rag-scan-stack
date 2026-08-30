@@ -2466,6 +2466,63 @@ async def get_agent_engine():
     }
 
 
+class SynthesizeTestRequest(BaseModel):
+    issue_type: Optional[str] = None
+    cwe: Optional[str] = None
+    name: Optional[str] = None
+    url: Optional[str] = None
+    target: Optional[str] = None
+    session_id: Optional[str] = None
+    persist: bool = True
+
+
+@app.post("/synthesize-test")
+async def synthesize_test(req: SynthesizeTestRequest):
+    """LLM-author a CUSTOM security test for one web finding (prototype of the
+    'move past straight tools' direction).
+
+    Matches the finding to its WSTG guidance, asks the RESOLVED LLM backend to
+    write a concrete command + machine-checkable assertion, then FAIL-SAFE
+    classifies the synthesized command (the model's own opinion cannot upgrade a
+    test into the safe lane). A safe candidate is persisted (enabled) and re-runs
+    through the scope-gated executor; an impactful candidate is returned for
+    approval and NOT persisted (the security_tests lane check needs a
+    pending_exploit_id). This never executes anything.
+    """
+    import json as _json
+    import scan_tools
+    import test_synth
+    import db_utils as _db
+    guidance, matched = "", None
+    try:
+        g = _json.loads(scan_tools.get_wstg_guidance(
+            issue_type=req.issue_type, cwe=req.cwe, name=req.name,
+            target=req.target, url=req.url))
+        guidance = g.get("guidance") or ""
+        matched = (g.get("entry") or {}).get("wstg_id") if g.get("matched") else None
+    except Exception:  # noqa: BLE001
+        pass
+    finding = {"issue_type": req.issue_type, "cwe": req.cwe, "name": req.name,
+               "url": req.url, "target": req.target}
+    out = test_synth.synthesize(finding, guidance)
+    if not out.get("ok"):
+        raise HTTPException(502, out.get("error") or "synthesis failed")
+    spec = out["spec"]
+    persisted_id = None
+    if req.persist and spec["tier"] == "safe":
+        try:
+            persisted_id = _db.create_security_test(
+                name=spec["name"], tier="safe", category=spec["category"],
+                target_ip=((req.target or "").split(":")[0] or None),
+                command=spec["command"], tool=spec["tool"],
+                assertion=spec["assertion"], created_by_session=req.session_id)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(500, f"persist failed: {e}")
+    return {"ok": True, "spec": spec, "matched_wstg": matched,
+            "persisted_id": persisted_id,
+            "requires_approval": spec["tier"] == "impactful"}
+
+
 @app.post("/pentest/cleanup")
 async def cleanup_old_sessions_endpoint(
     older_than_hours: int = Query(default=24, ge=1, description="Delete sessions older than this many hours"),

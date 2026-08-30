@@ -24,6 +24,9 @@ import {
   useToggleSecurityTest,
   useWstgGuides,
   useCreateSecurityTest,
+  useExportTestBurp,
+  useSendTestToBurp,
+  useSynthesizeTest,
 } from '@/api/securityTests'
 import type { SecurityTest, WstgGuide } from '@/api/securityTests'
 import { apiFetch } from '@/api/client'
@@ -1106,6 +1109,8 @@ function SecurityTestRow({ test, sessionId }: { test: SecurityTest; sessionId?: 
   const [notice, setNotice] = useState<string | null>(null)
   const runTest = useRunSecurityTest(sessionId)
   const toggleTest = useToggleSecurityTest(sessionId)
+  const exportBurp = useExportTestBurp()
+  const sendBurp = useSendTestToBurp()
 
   const onRun = () => {
     setNotice(null)
@@ -1164,6 +1169,25 @@ function SecurityTestRow({ test, sessionId }: { test: SecurityTest; sessionId?: 
           >
             {runTest.isPending ? 'Running…' : 'Re-run'}
           </button>
+          <button
+            onClick={() => exportBurp.mutate({ id: test.id, format: 'har' })}
+            disabled={exportBurp.isPending}
+            className="px-2 py-1 text-xs rounded border border-border hover:bg-accent/40 disabled:opacity-50"
+            title="Download a Burp-ingestible HAR of this test's request"
+          >
+            HAR
+          </button>
+          <button
+            onClick={() => sendBurp.mutate(test.id, {
+              onSuccess: (d) => setNotice(d?.message ?? 'Queued for Burp'),
+              onError: (e) => setNotice((e as Error)?.message ?? 'Send to Burp failed'),
+            })}
+            disabled={sendBurp.isPending}
+            className="px-2 py-1 text-xs rounded border border-orange-500/40 text-orange-400 hover:bg-orange-500/10 disabled:opacity-50"
+            title="Push this test's request into the live Burp import queue"
+          >
+            {sendBurp.isPending ? '…' : 'Send to Burp'}
+          </button>
         </div>
       </div>
       {notice && (
@@ -1187,6 +1211,7 @@ function CustomPayloadForm({ sessionId }: { sessionId?: string }) {
   const [open, setOpen] = useState(false)
   const { data: guidesData } = useWstgGuides()
   const create = useCreateSecurityTest(sessionId)
+  const synth = useSynthesizeTest(sessionId)
   const guides = guidesData?.entries ?? []
 
   const blank = {
@@ -1284,9 +1309,39 @@ function CustomPayloadForm({ sessionId }: { sessionId?: string }) {
             <input className={inp} placeholder="pending_exploit_id (required for impactful)" value={f.pending_exploit_id} onChange={e => setF(v => ({ ...v, pending_exploit_id: e.target.value }))} />
           )}
           {msg && <p className="text-xs text-amber-400">{msg}</p>}
-          <button onClick={submit} disabled={create.isPending} className="px-3 py-1.5 text-sm rounded bg-primary text-primary-foreground disabled:opacity-50">
-            {create.isPending ? 'Creating…' : 'Create test'}
-          </button>
+          <div className="flex items-center gap-2">
+            <button onClick={submit} disabled={create.isPending} className="px-3 py-1.5 text-sm rounded bg-primary text-primary-foreground disabled:opacity-50">
+              {create.isPending ? 'Creating…' : 'Create test'}
+            </button>
+            <button
+              onClick={() => {
+                setMsg(null)
+                synth.mutate({
+                  issue_type: f.category || f.name, name: f.name,
+                  target: f.target_ip ? (f.target_port ? `${f.target_ip}:${f.target_port}` : f.target_ip) : undefined,
+                  persist: false,
+                }, {
+                  onSuccess: (d) => {
+                    if (!d.spec) { setMsg('AI could not synthesize a test'); return }
+                    const a = d.spec.assertion || {}
+                    setF(v => ({
+                      ...v, name: v.name || d.spec!.name, tier: d.spec!.tier,
+                      category: d.spec!.category, tool: d.spec!.tool, command: d.spec!.command,
+                      expect_substring: Array.isArray((a as any).expect_substring) ? (a as any).expect_substring.join(', ') : v.expect_substring,
+                      expect_regex: typeof (a as any).expect_regex === 'string' ? (a as any).expect_regex : v.expect_regex,
+                    }))
+                    setMsg(`AI drafted a ${d.spec.tier} test${d.matched_wstg ? ` (WSTG ${d.matched_wstg.join(',')})` : ''}. Review the payload, then Create.`)
+                  },
+                  onError: (e) => setMsg((e as Error)?.message ?? 'Synthesis failed'),
+                })
+              }}
+              disabled={synth.isPending}
+              className="px-3 py-1.5 text-sm rounded border border-primary/50 text-primary hover:bg-primary/10 disabled:opacity-50"
+              title="Let the LLM author a custom payload + assertion from the finding + WSTG guidance"
+            >
+              {synth.isPending ? 'Synthesizing…' : '✨ Synthesize with AI'}
+            </button>
+          </div>
         </div>
       )}
     </div>
