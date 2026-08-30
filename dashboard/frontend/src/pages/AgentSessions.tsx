@@ -1218,6 +1218,7 @@ function CustomPayloadForm({ sessionId }: { sessionId?: string }) {
     name: '', tier: 'safe' as 'safe' | 'impactful', category: '', tool: '',
     command: '', target_ip: '', target_port: '', target_service: '',
     pending_exploit_id: '', expect_substring: '', expect_regex: '', wstg_id: '',
+    cve: '',
   }
   const [f, setF] = useState(blank)
   const [msg, setMsg] = useState<string | null>(null)
@@ -1299,7 +1300,10 @@ function CustomPayloadForm({ sessionId }: { sessionId?: string }) {
             <input className={inp} placeholder="port" value={f.target_port} onChange={e => setF(v => ({ ...v, target_port: e.target.value }))} />
             <input className={inp} placeholder="service" value={f.target_service} onChange={e => setF(v => ({ ...v, target_service: e.target.value }))} />
           </div>
-          <input className={inp} placeholder="tool (e.g. curl, nuclei, sqlmap)" value={f.tool} onChange={e => setF(v => ({ ...v, tool: e.target.value }))} />
+          <div className="grid grid-cols-2 gap-2">
+            <input className={inp} placeholder="tool (e.g. curl, nuclei, sqlmap)" value={f.tool} onChange={e => setF(v => ({ ...v, tool: e.target.value }))} />
+            <input className={inp} placeholder="CVE for ExploitDB (e.g. CVE-2021-41773)" value={f.cve} onChange={e => setF(v => ({ ...v, cve: e.target.value }))} />
+          </div>
           <textarea className={cn(inp, 'font-mono h-20')} placeholder="command / payload — this is what runs" value={f.command} onChange={e => setF(v => ({ ...v, command: e.target.value }))} />
           <div className="grid grid-cols-2 gap-2">
             <input className={inp} placeholder="expect substring(s), comma-sep" value={f.expect_substring} onChange={e => setF(v => ({ ...v, expect_substring: e.target.value }))} />
@@ -1318,6 +1322,7 @@ function CustomPayloadForm({ sessionId }: { sessionId?: string }) {
                 setMsg(null)
                 synth.mutate({
                   issue_type: f.category || f.name, name: f.name,
+                  cve: f.cve.trim() || undefined,
                   target: f.target_ip ? (f.target_port ? `${f.target_ip}:${f.target_port}` : f.target_ip) : undefined,
                   persist: false,
                 }, {
@@ -1330,7 +1335,7 @@ function CustomPayloadForm({ sessionId }: { sessionId?: string }) {
                       expect_substring: Array.isArray((a as any).expect_substring) ? (a as any).expect_substring.join(', ') : v.expect_substring,
                       expect_regex: typeof (a as any).expect_regex === 'string' ? (a as any).expect_regex : v.expect_regex,
                     }))
-                    setMsg(`AI drafted a ${d.spec.tier} test${d.matched_wstg ? ` (WSTG ${d.matched_wstg.join(',')})` : ''}. Review the payload, then Create.`)
+                    setMsg(`AI drafted a ${d.spec.tier} test${d.matched_wstg ? ` (WSTG ${d.matched_wstg.join(',')})` : ''}${d.matched_exploitdb ? ` (EDB-${d.matched_exploitdb})` : ''}. Review the payload, then Create.`)
                   },
                   onError: (e) => setMsg((e as Error)?.message ?? 'Synthesis failed'),
                 })

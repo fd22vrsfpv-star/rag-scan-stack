@@ -303,6 +303,8 @@ class SynthesizeTestRequest(BaseModel):
     name: Optional[str] = None
     url: Optional[str] = None
     target: Optional[str] = None
+    cve: Optional[str] = None
+    edb_id: Optional[str] = None
     session_id: Optional[str] = None
     persist: bool = True
 

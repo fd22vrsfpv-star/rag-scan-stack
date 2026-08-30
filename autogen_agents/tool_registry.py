@@ -89,6 +89,17 @@ TOOL_SPECS: List[ToolSpec] = [
         func=scan_tools.get_wstg_guidance,
     ),
     ToolSpec(
+        name="get_exploitdb_guidance",
+        description=(
+            "Read ExploitDB writeups/PoCs relevant to a finding, to build a test "
+            "from them. Search by CVE (best), free text, or a specific EDB id; "
+            "returns matching entries plus the top writeup's text. READ-ONLY — "
+            "reads the local exploit DB, runs nothing. Guidance for synthesizing "
+            "a test (most ExploitDB-derived tests are impactful, approval-gated)."
+        ),
+        func=scan_tools.get_exploitdb_guidance,
+    ),
+    ToolSpec(
         name="get_tool_recommendations",
         description=(
             "Get the CONCRETE tests to run against a discovered service, as "

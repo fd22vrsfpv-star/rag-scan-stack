@@ -202,16 +202,18 @@ export interface SynthesizedTest {
     tier: 'safe' | 'impactful'; assertion: Record<string, unknown>; rationale: string
   } | null
   matched_wstg?: string[] | null
+  matched_exploitdb?: string | null
   persisted_id?: string | null
   requires_approval?: boolean
 }
 
 /** LLM-author a custom test for a finding (prototype). Safe candidates are
- *  persisted; impactful come back requires_approval. */
+ *  persisted; impactful come back requires_approval. Pass `cve` to pull an
+ *  ExploitDB writeup as extra guidance. */
 export function useSynthesizeTest(sessionId?: string) {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (vars: { issue_type?: string; cwe?: string; name?: string; url?: string; target?: string; persist?: boolean }) =>
+    mutationFn: (vars: { issue_type?: string; cwe?: string; name?: string; url?: string; target?: string; cve?: string; edb_id?: string; persist?: boolean }) =>
       apiFetch<SynthesizedTest>('/synthesize-test', {
         method: 'POST',
         body: JSON.stringify({ ...vars, session_id: sessionId }),
