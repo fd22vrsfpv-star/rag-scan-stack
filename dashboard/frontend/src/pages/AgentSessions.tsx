@@ -1514,6 +1514,7 @@ function SessionList() {
     // safe ones and pause for approval on impactful ones. Off by default.
     enable_surface_test_phase: false,
     surface_target_host: '',
+    enable_test_synthesis: false,
   })
 
   // Node + scope selector data
@@ -1605,6 +1606,7 @@ function SessionList() {
           enable_exploit_phase: false,
           enable_surface_test_phase: false,
           surface_target_host: '',
+          enable_test_synthesis: false,
         })
       },
     })
@@ -1810,6 +1812,20 @@ function SessionList() {
                 placeholder="Target host/IP (optional — else highest-risk host)"
                 className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border outline-none focus:border-primary"
               />
+            )}
+            {form.enable_surface_test_phase && (
+              <label
+                className="flex items-center gap-2 text-sm pb-1"
+                title="LLM-author a custom test per web finding (WSTG + ExploitDB guidance) instead of the fixed map command. Falls back to the map; impactful tests still need approval."
+              >
+                <input
+                  type="checkbox"
+                  checked={form.enable_test_synthesis}
+                  onChange={e => setForm(f => ({ ...f, enable_test_synthesis: e.target.checked }))}
+                  className="rounded border-border"
+                />
+                Synthesize custom tests <span className="text-xs text-muted-foreground">(AI-authored per finding)</span>
+              </label>
             )}
           </div>
           {/* Remote proxy node */}

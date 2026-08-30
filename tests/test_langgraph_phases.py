@@ -648,3 +648,43 @@ def test_surface_event_types_are_in_the_allowlist():
                "langgraph_surface_test_executed", "langgraph_surface_test_completed",
                "langgraph_surface_decision"):
         assert f'"{ev}"' in src, f"{ev} missing from _ALL_EVENT_TYPES — it will be dropped"
+
+
+# ── 7. opt-in LLM synthesis in the surface phase ─────────────────────────────
+# Synthesis authors a custom command per finding. Two properties keep it safe
+# and non-breaking: it must be OPT-IN with a deterministic fallback, and its
+# module (test_synth) imports the engine, so the engine must import it LAZILY
+# (inside a function) or the process dies on an import cycle at startup.
+
+def test_build_surface_tests_takes_a_synthesize_flag():
+    src = _engine_src()
+    assert re.search(r"def _build_surface_tests\(host[^)]*synthesize", src), (
+        "_build_surface_tests must accept a `synthesize` flag — synthesis is "
+        "opt-in, never the unconditional default")
+
+
+def test_test_synth_is_imported_lazily_not_at_module_top():
+    """test_synth imports langgraph_engine; if the engine imported test_synth at
+    module level it would be a circular import that crashes startup. Every
+    `import test_synth` must sit INSIDE a function."""
+    tree = ast.parse(_engine_src())
+    for node in tree.body:  # module-level statements only
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = [a.name for a in getattr(node, "names", [])]
+            mod = getattr(node, "module", None)
+            assert "test_synth" not in names and mod != "test_synth", (
+                "test_synth is imported at module top of langgraph_engine — that "
+                "is a circular import; import it lazily inside the function")
+
+
+def test_synthesis_helper_fails_safe_to_none():
+    """_synthesize_finding_test must swallow failures and return None so the
+    caller falls back to the deterministic map — synthesis can never break the
+    phase. Checked structurally: the function body is wrapped in try/except."""
+    tree = ast.parse(_engine_src())
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "_synthesize_finding_test"), None)
+    assert fn is not None, "_synthesize_finding_test missing"
+    assert any(isinstance(b, ast.Try) for b in fn.body), (
+        "_synthesize_finding_test must wrap its body in try/except and return "
+        "None on failure (deterministic fallback)")

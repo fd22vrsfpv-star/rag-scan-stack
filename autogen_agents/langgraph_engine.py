@@ -330,6 +330,7 @@ class PentestState(TypedDict):
     exploit_decision: Optional[dict]
     # Surface-test phase (opt-in, independent of exploit_phase).
     surface_test_phase: bool
+    surface_synthesize: Optional[bool]
     surface_target_request: Optional[str]
     surface_target: Optional[str]
     surface_tests: Optional[list]
@@ -887,6 +888,55 @@ _SAFE_TOOL_HINTS = {
 # Cap per host — this is a single-host exhaustive sweep, not the cross-host
 # _DETERMINISTIC_PLAN_LIMIT that bounds recommender calls across many hosts.
 _SURFACE_TEST_LIMIT = int(os.environ.get("SURFACE_TEST_LIMIT", "24"))
+# Opt-in LLM synthesis in the surface phase: author a custom test per web finding
+# instead of the fixed WSTG-map command. Bounded (one LLM call each) and it falls
+# back to the deterministic map on any failure, so it never blocks the phase.
+_SYNTH_TESTS_DEFAULT = os.environ.get("LANGGRAPH_SYNTH_TESTS", "").lower() in ("1", "true", "yes")
+_SURFACE_SYNTH_LIMIT = int(os.environ.get("SURFACE_SYNTH_LIMIT", "8"))
+
+
+def _synthesize_finding_test(finding: dict, guidance: str, ip, port):
+    """Opt-in: LLM-author a custom test for one web finding, FAIL-SAFE classified
+    (test_synth.synthesize re-classifies the synthesized command). Pulls an
+    ExploitDB writeup too when the finding carries a CVE. Returns a candidate test
+    dict, or None on ANY failure so the caller falls back to the fixed map.
+
+    test_synth is imported lazily (it imports this module) — safe at call time,
+    a cycle at module load."""
+    try:
+        import test_synth
+        cwe = finding.get("cwe")
+        cve = None
+        if isinstance(cwe, list):
+            cve = next((c for c in cwe if str(c).upper().startswith("CVE-")), None)
+        elif str(cwe or "").upper().startswith("CVE-"):
+            cve = cwe
+        g = guidance or ""
+        if cve:
+            try:
+                ed = json.loads(scan_tools.get_exploitdb_guidance(cve=cve))
+                if ed.get("matched"):
+                    g = (g + "\n\n=== ExploitDB ===\n" + (ed.get("guidance") or ""))[:8000]
+            except Exception:  # noqa: BLE001
+                pass
+        out = test_synth.synthesize(finding, g)
+        if not out.get("ok"):
+            return None
+        spec = out["spec"]
+        cmd = spec.get("command")
+        if not cmd:
+            return None
+        tier, cat = spec.get("tier"), spec.get("category")
+        return {
+            "name": f"AI:{cat} @ {finding.get('url') or finding.get('target')}",
+            "host": ip, "service": "http", "port": port, "tool": _tool_head(cmd),
+            "command": cmd, "category": cat, "tier": tier,
+            "assertion": spec.get("assertion") or {},
+            "exploit_ref": ({"source": "synth", "module": (spec.get("name") or "ai-test"),
+                             "purpose": spec.get("rationale")} if tier == "impactful" else None),
+        }
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _host_of(raw) -> "str | None":
@@ -958,7 +1008,7 @@ def _surface_categories_for(svc: str, tls: str) -> "list[tuple[str,str]]":
     return out
 
 
-def _build_surface_tests(host: str) -> list:
+def _build_surface_tests(host: str, synthesize: bool = None) -> list:
     """Deterministic (no LLM) custom tests for ONE host's surface.
 
     Reuses query_open_ports(target=host) + get_tool_recommendations per service.
@@ -1046,7 +1096,9 @@ def _build_surface_tests(host: str) -> list:
     except Exception:  # noqa: BLE001
         findings = []
 
+    synth_on = _SYNTH_TESTS_DEFAULT if synthesize is None else bool(synthesize)
     seen_wstg = set()
+    synth_count = 0
     for f in findings:
         if len(tests) >= _SURFACE_TEST_LIMIT:
             break
@@ -1067,18 +1119,34 @@ def _build_surface_tests(host: str) -> list:
         except Exception:  # noqa: BLE001
             g = {}
         ent = g.get("entry") if g.get("matched") else None
+        # One test per (class, target) — a scan reports the same class many
+        # times; prove it once. Keyed by the WSTG class when matched, else the
+        # finding type (so synthesis for unmatched findings still de-dups).
+        key = ((ent.get("id") if ent else None) or str(issue or "").lower(), fip, fport)
+        if key in seen_wstg:
+            continue
+        seen_wstg.add(key)
+
+        # OPT-IN synthesis: author a CUSTOM test for this finding instead of the
+        # fixed map command. Bounded by _SURFACE_SYNTH_LIMIT; on any failure we
+        # fall through to the deterministic map test below. The synthesized tier
+        # is already fail-safe (test_synth), and impactful synth tests carry a
+        # 'synth' exploit_ref so surface_plan queues them for human approval.
+        if synth_on and synth_count < _SURFACE_SYNTH_LIMIT:
+            fd = {"issue_type": issue, "name": fname, "cwe": cwe,
+                  "url": furl, "target": tgt}
+            st = _synthesize_finding_test(fd, g.get("guidance") or "", fip, fport)
+            if st:
+                tests.append(st)
+                synth_count += 1
+                continue
+
         if not ent:
             continue
         cmd = ent.get("command_rendered") or ent.get("command")
         cat = ent.get("category")
         wid = ent.get("wstg_id")
         wid_s = ",".join(wid) if isinstance(wid, list) else str(wid or "")
-        # One test per (wstg-class, target) — a scan often reports the same class
-        # many times; we prove it once.
-        key = (ent.get("id"), fip, fport)
-        if key in seen_wstg:
-            continue
-        seen_wstg.add(key)
         impactful_ref = (ent.get("tier") == "impactful"
                          or cat in _IMPACTFUL_CATEGORIES)
         tier = _classify(cat, cmd or "", has_exploit_ref=impactful_ref)
@@ -1118,7 +1186,7 @@ def surface_plan(state: PentestState) -> dict:
                 "surface_tests": [], "pending_surface_tests": [],
                 "findings": ["surface: no target"], "log": ["surface: no target"]}
 
-    candidates = _build_surface_tests(host)
+    candidates = _build_surface_tests(host, synthesize=state.get("surface_synthesize"))
     import db_utils
     eng = (get_agent_session(_sid(sid)) or {}).get("configuration", {})
     engagement_id = eng.get("engagement_id") if isinstance(eng, dict) else None
@@ -1567,6 +1635,7 @@ def run_langgraph_session_sync(
     exploit_phase: Optional[bool] = None,
     surface_test_phase: Optional[bool] = None,
     surface_target: Optional[str] = None,
+    synthesize_tests: Optional[bool] = None,
 ):
     """Drop-in LangGraph replacement for the AutoGen session runner."""
     from llm_metrics import LLMMetricsContext
@@ -1615,6 +1684,7 @@ def run_langgraph_session_sync(
                 "auto_execute": bool(auto_execute_scans),
                 "exploit_phase": bool(exploit_phase),
                 "surface_test_phase": bool(surface_test_phase),
+                "surface_synthesize": synthesize_tests,
                 "surface_target_request": surface_target,
                 "surface_target": None, "surface_tests": None,
                 "surface_safe_results": None, "pending_surface_tests": None,
