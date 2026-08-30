@@ -22,8 +22,13 @@ import {
   useSecurityTestRuns,
   useRunSecurityTest,
   useToggleSecurityTest,
+  useWstgGuides,
+  useCreateSecurityTest,
+  useExportTestBurp,
+  useSendTestToBurp,
+  useSynthesizeTest,
 } from '@/api/securityTests'
-import type { SecurityTest } from '@/api/securityTests'
+import type { SecurityTest, WstgGuide } from '@/api/securityTests'
 import { apiFetch } from '@/api/client'
 import { useScopeNames, useScope } from '@/api/scope'
 import { StatusDot } from '@/components/common/StatusDot'
@@ -1104,6 +1109,8 @@ function SecurityTestRow({ test, sessionId }: { test: SecurityTest; sessionId?: 
   const [notice, setNotice] = useState<string | null>(null)
   const runTest = useRunSecurityTest(sessionId)
   const toggleTest = useToggleSecurityTest(sessionId)
+  const exportBurp = useExportTestBurp()
+  const sendBurp = useSendTestToBurp()
 
   const onRun = () => {
     setNotice(null)
@@ -1162,6 +1169,25 @@ function SecurityTestRow({ test, sessionId }: { test: SecurityTest; sessionId?: 
           >
             {runTest.isPending ? 'Running…' : 'Re-run'}
           </button>
+          <button
+            onClick={() => exportBurp.mutate({ id: test.id, format: 'har' })}
+            disabled={exportBurp.isPending}
+            className="px-2 py-1 text-xs rounded border border-border hover:bg-accent/40 disabled:opacity-50"
+            title="Download a Burp-ingestible HAR of this test's request"
+          >
+            HAR
+          </button>
+          <button
+            onClick={() => sendBurp.mutate(test.id, {
+              onSuccess: (d) => setNotice(d?.message ?? 'Queued for Burp'),
+              onError: (e) => setNotice((e as Error)?.message ?? 'Send to Burp failed'),
+            })}
+            disabled={sendBurp.isPending}
+            className="px-2 py-1 text-xs rounded border border-orange-500/40 text-orange-400 hover:bg-orange-500/10 disabled:opacity-50"
+            title="Push this test's request into the live Burp import queue"
+          >
+            {sendBurp.isPending ? '…' : 'Send to Burp'}
+          </button>
         </div>
       </div>
       {notice && (
@@ -1181,27 +1207,175 @@ function SecurityTestRow({ test, sessionId }: { test: SecurityTest; sessionId?: 
   )
 }
 
-function SecurityTestsPanel({ sessionId, tests }: { sessionId?: string; tests: SecurityTest[] }) {
-  if (tests.length === 0) {
-    return (
-      <p className="text-sm text-muted-foreground text-center py-8">
-        No security tests generated. Launch a session with the attack-surface test
-        phase enabled and point it at a target host.
-      </p>
-    )
+function CustomPayloadForm({ sessionId }: { sessionId?: string }) {
+  const [open, setOpen] = useState(false)
+  const { data: guidesData } = useWstgGuides()
+  const create = useCreateSecurityTest(sessionId)
+  const synth = useSynthesizeTest(sessionId)
+  const guides = guidesData?.entries ?? []
+
+  const blank = {
+    name: '', tier: 'safe' as 'safe' | 'impactful', category: '', tool: '',
+    command: '', target_ip: '', target_port: '', target_service: '',
+    pending_exploit_id: '', expect_substring: '', expect_regex: '', wstg_id: '',
+    cve: '',
   }
+  const [f, setF] = useState(blank)
+  const [msg, setMsg] = useState<string | null>(null)
+
+  const applyGuide = (id: string) => {
+    const g = guides.find(x => x.id === id)
+    if (!g) { setF(v => ({ ...v, wstg_id: '' })); return }
+    const a = g.assertion || {}
+    setF(v => ({
+      ...v,
+      wstg_id: id,
+      name: v.name || `WSTG ${(g.wstg_id || []).join(',')} ${g.category}`,
+      tier: g.tier, category: g.category, tool: g.tool, command: g.command,
+      expect_substring: Array.isArray((a as any).expect_substring) ? (a as any).expect_substring.join(', ') : '',
+      expect_regex: typeof (a as any).expect_regex === 'string' ? (a as any).expect_regex : '',
+    }))
+  }
+
+  const submit = () => {
+    setMsg(null)
+    const assertion: Record<string, unknown> = {}
+    if (f.expect_substring.trim())
+      assertion.expect_substring = f.expect_substring.split(',').map(s => s.trim()).filter(Boolean)
+    if (f.expect_regex.trim()) assertion.expect_regex = f.expect_regex.trim()
+    if (f.tier === 'impactful' && !f.pending_exploit_id.trim()) {
+      setMsg('Impactful tests need a pending_exploit_id (create/approve the exploit first). Safe tests run through the scope-gated executor.')
+      return
+    }
+    create.mutate({
+      name: f.name.trim() || 'custom-test',
+      tier: f.tier,
+      category: f.category.trim() || undefined,
+      target_ip: f.target_ip.trim() || undefined,
+      target_port: f.target_port ? Number(f.target_port) : undefined,
+      target_service: f.target_service.trim() || undefined,
+      tool: f.tool.trim() || undefined,
+      command: f.command.trim() || undefined,
+      assertion: Object.keys(assertion).length ? assertion : undefined,
+      pending_exploit_id: f.pending_exploit_id.trim() || undefined,
+    }, {
+      onSuccess: () => { setMsg('Created. Re-run it below (safe runs immediately; impactful needs approval).'); setF(blank) },
+      onError: (e) => setMsg((e as Error)?.message ?? 'Create failed'),
+    })
+  }
+
+  const inp = 'w-full bg-muted rounded-md px-2 py-1 text-sm border border-border outline-none focus:border-primary'
+  return (
+    <div className="border border-border rounded-md">
+      <button onClick={() => setOpen(o => !o)} className="w-full px-3 py-2 flex items-center gap-2 text-sm font-medium hover:bg-accent/30">
+        <Plus className="h-4 w-4 text-primary" />
+        Create custom payload test
+        <ChevronDown className={cn('h-3.5 w-3.5 ml-auto text-muted-foreground transition-transform', open ? 'rotate-180' : '')} />
+      </button>
+      {open && (
+        <div className="border-t border-border p-3 space-y-2">
+          {guides.length > 0 && (
+            <label className="block text-xs text-muted-foreground">
+              Start from a WSTG guide (optional)
+              <select className={inp} value={f.wstg_id} onChange={e => applyGuide(e.target.value)}>
+                <option value="">— blank —</option>
+                {guides.map(g => (
+                  <option key={g.id} value={g.id}>
+                    {(g.wstg_id || []).join(',')} · {g.category} ({g.tier})
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <input className={inp} placeholder="Test name" value={f.name} onChange={e => setF(v => ({ ...v, name: e.target.value }))} />
+          <div className="grid grid-cols-2 gap-2">
+            <select className={inp} value={f.tier} onChange={e => setF(v => ({ ...v, tier: e.target.value as 'safe' | 'impactful' }))}>
+              <option value="safe">safe (runs gated)</option>
+              <option value="impactful">impactful (needs approval)</option>
+            </select>
+            <input className={inp} placeholder="category (e.g. sqli_detect)" value={f.category} onChange={e => setF(v => ({ ...v, category: e.target.value }))} />
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            <input className={inp} placeholder="target IP" value={f.target_ip} onChange={e => setF(v => ({ ...v, target_ip: e.target.value }))} />
+            <input className={inp} placeholder="port" value={f.target_port} onChange={e => setF(v => ({ ...v, target_port: e.target.value }))} />
+            <input className={inp} placeholder="service" value={f.target_service} onChange={e => setF(v => ({ ...v, target_service: e.target.value }))} />
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <input className={inp} placeholder="tool (e.g. curl, nuclei, sqlmap)" value={f.tool} onChange={e => setF(v => ({ ...v, tool: e.target.value }))} />
+            <input className={inp} placeholder="CVE for ExploitDB (e.g. CVE-2021-41773)" value={f.cve} onChange={e => setF(v => ({ ...v, cve: e.target.value }))} />
+          </div>
+          <textarea className={cn(inp, 'font-mono h-20')} placeholder="command / payload — this is what runs" value={f.command} onChange={e => setF(v => ({ ...v, command: e.target.value }))} />
+          <div className="grid grid-cols-2 gap-2">
+            <input className={inp} placeholder="expect substring(s), comma-sep" value={f.expect_substring} onChange={e => setF(v => ({ ...v, expect_substring: e.target.value }))} />
+            <input className={inp} placeholder="expect regex" value={f.expect_regex} onChange={e => setF(v => ({ ...v, expect_regex: e.target.value }))} />
+          </div>
+          {f.tier === 'impactful' && (
+            <input className={inp} placeholder="pending_exploit_id (required for impactful)" value={f.pending_exploit_id} onChange={e => setF(v => ({ ...v, pending_exploit_id: e.target.value }))} />
+          )}
+          {msg && <p className="text-xs text-amber-400">{msg}</p>}
+          <div className="flex items-center gap-2">
+            <button onClick={submit} disabled={create.isPending} className="px-3 py-1.5 text-sm rounded bg-primary text-primary-foreground disabled:opacity-50">
+              {create.isPending ? 'Creating…' : 'Create test'}
+            </button>
+            <button
+              onClick={() => {
+                setMsg(null)
+                synth.mutate({
+                  issue_type: f.category || f.name, name: f.name,
+                  cve: f.cve.trim() || undefined,
+                  target: f.target_ip ? (f.target_port ? `${f.target_ip}:${f.target_port}` : f.target_ip) : undefined,
+                  persist: false,
+                }, {
+                  onSuccess: (d) => {
+                    if (!d.spec) { setMsg('AI could not synthesize a test'); return }
+                    const a = d.spec.assertion || {}
+                    setF(v => ({
+                      ...v, name: v.name || d.spec!.name, tier: d.spec!.tier,
+                      category: d.spec!.category, tool: d.spec!.tool, command: d.spec!.command,
+                      expect_substring: Array.isArray((a as any).expect_substring) ? (a as any).expect_substring.join(', ') : v.expect_substring,
+                      expect_regex: typeof (a as any).expect_regex === 'string' ? (a as any).expect_regex : v.expect_regex,
+                    }))
+                    setMsg(`AI drafted a ${d.spec.tier} test${d.matched_wstg ? ` (WSTG ${d.matched_wstg.join(',')})` : ''}${d.matched_exploitdb ? ` (EDB-${d.matched_exploitdb})` : ''}. Review the payload, then Create.`)
+                  },
+                  onError: (e) => setMsg((e as Error)?.message ?? 'Synthesis failed'),
+                })
+              }}
+              disabled={synth.isPending}
+              className="px-3 py-1.5 text-sm rounded border border-primary/50 text-primary hover:bg-primary/10 disabled:opacity-50"
+              title="Let the LLM author a custom payload + assertion from the finding + WSTG guidance"
+            >
+              {synth.isPending ? 'Synthesizing…' : '✨ Synthesize with AI'}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function SecurityTestsPanel({ sessionId, tests }: { sessionId?: string; tests: SecurityTest[] }) {
   const safe = tests.filter(t => t.tier === 'safe').length
   const impactful = tests.length - safe
   return (
     <div className="space-y-2">
-      <div className="flex items-center gap-4 text-xs">
-        <span className="text-muted-foreground">Total: <span className="text-foreground font-medium">{tests.length}</span></span>
-        <span className="text-blue-400">Safe: {safe}</span>
-        <span className="text-red-400">Impactful: {impactful}</span>
-      </div>
-      {tests.map(t => (
-        <SecurityTestRow key={t.id} test={t} sessionId={sessionId} />
-      ))}
+      <CustomPayloadForm sessionId={sessionId} />
+      {tests.length === 0 ? (
+        <p className="text-sm text-muted-foreground text-center py-6">
+          No agent-generated tests yet. Launch a session with the attack-surface
+          test phase and a target host — or create a custom payload above.
+        </p>
+      ) : (
+        <>
+          <div className="flex items-center gap-4 text-xs">
+            <span className="text-muted-foreground">Total: <span className="text-foreground font-medium">{tests.length}</span></span>
+            <span className="text-blue-400">Safe: {safe}</span>
+            <span className="text-red-400">Impactful: {impactful}</span>
+          </div>
+          {tests.map(t => (
+            <SecurityTestRow key={t.id} test={t} sessionId={sessionId} />
+          ))}
+        </>
+      )}
     </div>
   )
 }
@@ -1340,6 +1514,8 @@ function SessionList() {
     // safe ones and pause for approval on impactful ones. Off by default.
     enable_surface_test_phase: false,
     surface_target_host: '',
+    enable_test_synthesis: false,
+    enable_auto_exploit: false,
   })
 
   // Node + scope selector data
@@ -1431,6 +1607,8 @@ function SessionList() {
           enable_exploit_phase: false,
           enable_surface_test_phase: false,
           surface_target_host: '',
+          enable_test_synthesis: false,
+          enable_auto_exploit: false,
         })
       },
     })
@@ -1636,6 +1814,34 @@ function SessionList() {
                 placeholder="Target host/IP (optional — else highest-risk host)"
                 className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border outline-none focus:border-primary"
               />
+            )}
+            {form.enable_surface_test_phase && (
+              <label
+                className="flex items-center gap-2 text-sm pb-1"
+                title="LLM-author a custom test per web finding (WSTG + ExploitDB guidance) instead of the fixed map command. Falls back to the map; impactful tests still need approval."
+              >
+                <input
+                  type="checkbox"
+                  checked={form.enable_test_synthesis}
+                  onChange={e => setForm(f => ({ ...f, enable_test_synthesis: e.target.checked }))}
+                  className="rounded border-border"
+                />
+                Synthesize custom tests <span className="text-xs text-muted-foreground">(AI-authored per finding)</span>
+              </label>
+            )}
+            {form.enable_surface_test_phase && (
+              <label
+                className="flex items-center gap-2 text-sm pb-1 text-orange-400"
+                title="Fire queued impactful tests automatically (no approval click), capturing proof. The scope gate still refuses any out-of-scope target. Use only inside an authorised engagement."
+              >
+                <input
+                  type="checkbox"
+                  checked={form.enable_auto_exploit}
+                  onChange={e => setForm(f => ({ ...f, enable_auto_exploit: e.target.checked }))}
+                  className="rounded border-border"
+                />
+                Auto-exploit in scope <span className="text-xs text-orange-400/70">(no approval — scope gate still enforced)</span>
+              </label>
             )}
           </div>
           {/* Remote proxy node */}

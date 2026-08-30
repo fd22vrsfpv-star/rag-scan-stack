@@ -3945,6 +3945,96 @@ def analyze_attack_surface(target_host: str = None, limit: int = 8) -> str:
     }, indent=2)
 
 
+def get_wstg_guidance(issue_type: str = None, cwe: str = None, name: str = None,
+                      nuclei_tags: str = None, target: str = None,
+                      url: str = None) -> str:
+    """Look up the OWASP WSTG-guided test for a SPECIFIC web finding.
+
+    Given a finding's type / CWE / name / nuclei tags, returns the matched WSTG
+    test spec (tier, category, tool, command, structured assertion) plus the
+    WSTG "how to test" methodology prose. READ-ONLY — it dispatches nothing;
+    it tells you HOW to prove the finding. Use it to turn a web finding into a
+    concrete, provable security test (then create/queue that test via the normal
+    gated path).
+
+    Args:
+        issue_type: the finding's type/category text (e.g. "SQL Injection").
+        cwe: comma-separated CWE ids (e.g. "CWE-89").
+        name: the finding's name/title.
+        nuclei_tags: comma-separated nuclei tags (e.g. "xss,sqli").
+        target: host or host:port, fills the command's {target}.
+        url: the finding's URL, fills the command's {url} (falls back to target).
+
+    Returns JSON: {matched, entry:{wstg_id, tier, category, tool, command,
+    command_rendered, assertion, wstg_note}, guidance}.
+    """
+    st = get_scan_tools()
+    params = {k: v for k, v in {
+        "issue_type": issue_type, "cwe": cwe, "name": name,
+        "nuclei_tags": nuclei_tags, "target": target, "url": url,
+    }.items() if v}
+    try:
+        r = st.client.get(f"{st.rag_api_url}/rag/wstg", params=params,
+                          headers=st.headers)
+        return json.dumps(r.json(), indent=2)
+    except Exception as e:
+        return json.dumps({"matched": False, "error": str(e)})
+
+
+def get_exploitdb_guidance(cve: str = None, query: str = None,
+                           edb_id: str = None, limit: int = 8) -> str:
+    """Read ExploitDB writeups relevant to a finding, to build a test from them.
+
+    Searches the local ExploitDB index by CVE (preferred), free text, or a
+    specific EDB id, and returns the matching entries plus the top match's
+    writeup/PoC text. READ-ONLY — it reads the local exploit database; it runs
+    nothing. Use it as guidance for synthesizing a security test (most
+    ExploitDB-derived tests are impactful and stay approval-gated).
+
+    Args:
+        cve: a CVE id (e.g. "CVE-2021-41773") — the most precise key.
+        query: free-text (product/keyword) when there is no CVE.
+        edb_id: fetch one specific ExploitDB entry by id.
+        limit: max entries to list.
+
+    Returns JSON: {matched, count, results[{edb_id, description, type, platform,
+    cve, file}], top:{edb_id, poc_excerpt}, guidance}.
+    """
+    st = get_scan_tools()
+    base = os.environ.get("EXPLOIT_RUNNER_URL", "https://exploit-runner:8017")
+    try:
+        if edb_id:
+            r = st.client.get(f"{base}/exploitdb/{edb_id}", params={"with_poc": True},
+                              headers=st.headers)
+            row = r.json()
+            results = [row]
+            poc = row.get("poc") or ""
+        else:
+            r = st.client.get(f"{base}/exploitdb/search",
+                              params={"cve": cve, "q": query, "limit": limit,
+                                      "with_poc": True},
+                              headers=st.headers)
+            data = r.json()
+            results = data.get("results") or []
+            poc = (results[0].get("poc") if results else "") or ""
+        if not results:
+            return json.dumps({"matched": False, "count": 0, "results": [],
+                               "guidance": ""})
+        top = results[0]
+        guidance = (
+            f"ExploitDB EDB-{top.get('edb_id')} ({top.get('type')}/{top.get('platform')}): "
+            f"{top.get('description')}\nCVE: {', '.join(top.get('cve') or []) or 'n/a'}\n\n"
+            f"{poc[:6000]}")
+        slim = [{k: e.get(k) for k in ("edb_id", "description", "type",
+                                       "platform", "cve", "file")} for e in results]
+        return json.dumps({"matched": True, "count": len(results), "results": slim,
+                           "top": {"edb_id": top.get("edb_id"),
+                                   "poc_excerpt": poc[:2000]},
+                           "guidance": guidance}, indent=2)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"matched": False, "error": str(e)})
+
+
 def get_tool_recommendations(service: str = None, port: int = None) -> str:
     """
     Get the CONCRETE tests to run against a discovered service, as structured

@@ -7323,6 +7323,165 @@ def security_test_run(test_id: str, body: SecurityTestRunReq,
             "result_summary": r["result_summary"], "tool_execution_id": exec_id}
 
 
+# ── WSTG finding->test guidance ───────────────────────────────────────────────
+# Single source of truth for turning a web finding into a WSTG-guided test spec.
+# The agent tool get_wstg_guidance and the surface-test phase both call these,
+# so the finding->test map logic lives ONLY in app/rag-api/wstg.py.
+
+def _wstg_guidance_text(wstg_ids, *, max_chars=4000):
+    """Concatenate the ingested WSTG prose for the given WSTG-IDs (from the
+    doc_kind='wstg' corpus in exploit_chunks), matched by id in the title."""
+    if not wstg_ids:
+        return ""
+    parts = []
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        for wid in wstg_ids:
+            cur.execute(
+                """SELECT chunk FROM public.exploit_chunks
+                    WHERE doc_kind = 'wstg' AND title ILIKE %s
+                    ORDER BY chunk_id LIMIT 6""",
+                (f"%{wid}%",),
+            )
+            rows = cur.fetchall()
+            if rows:
+                parts.append("\n".join(r["chunk"] for r in rows))
+    text = "\n\n---\n\n".join(parts)
+    return text[:max_chars]
+
+
+@app.get("/rag/wstg", tags=["WSTG"])
+def wstg_match(
+    issue_type: Optional[str] = Query(default=None),
+    cwe: Optional[str] = Query(default=None, description="comma-separated CWE ids"),
+    name: Optional[str] = Query(default=None),
+    nuclei_tags: Optional[str] = Query(default=None, description="comma-separated"),
+    target: Optional[str] = Query(default=None),
+    url: Optional[str] = Query(default=None),
+    authorized: bool = Depends(auth),
+):
+    """Match a web finding to a WSTG-guided test spec.
+
+    Returns {matched, entry, guidance}: `entry` is the map row (wstg_id, tier,
+    category, tool, command, assertion, wstg_note) with `command` rendered when
+    a target/url is supplied; `guidance` is the WSTG 'how to test' prose.
+    """
+    import wstg as _wstg
+    cwes = [c.strip() for c in (cwe or "").split(",") if c.strip()]
+    tags = [t.strip() for t in (nuclei_tags or "").split(",") if t.strip()]
+    entry = _wstg.match_finding(issue_type=issue_type, cwe=cwes, name=name,
+                                nuclei_tags=tags)
+    if not entry:
+        return {"matched": False, "entry": None, "guidance": ""}
+    out = dict(entry)
+    if target or url:
+        out["command_rendered"] = _wstg.render_command(entry, target=target or url, url=url)
+    return {"matched": True, "entry": out,
+            "guidance": _wstg_guidance_text(entry.get("wstg_id", []))}
+
+
+@app.get("/rag/wstg/guides", tags=["WSTG"])
+def wstg_guides(authorized: bool = Depends(auth)):
+    """List every finding class the map covers (for the custom-payload UI)."""
+    import wstg as _wstg
+    entries = _wstg.load_map().get("entries", [])
+    return {"count": len(entries), "entries": [
+        {"id": e.get("id"), "wstg_id": e.get("wstg_id"), "tier": e.get("tier"),
+         "category": e.get("category"), "tool": e.get("tool"),
+         "command": e.get("command"), "assertion": e.get("assertion"),
+         "wstg_note": e.get("wstg_note")}
+        for e in entries]}
+
+
+@app.get("/rag/wstg/{wstg_id}", tags=["WSTG"])
+def wstg_guide(wstg_id: str, authorized: bool = Depends(auth)):
+    """Fetch the ingested WSTG 'how to test' prose for one WSTG-ID."""
+    text = _wstg_guidance_text([wstg_id], max_chars=12000)
+    if not text:
+        raise HTTPException(404, f"no ingested WSTG doc for {wstg_id}")
+    return {"wstg_id": wstg_id, "guidance": text}
+
+
+# ── Security-test -> Burp Suite export ────────────────────────────────────────
+# A custom test/payload is only useful once it is in the tester's manual tool.
+# Emit HAR (Burp: Import) or a raw HTTP request (Burp: Repeater paste).
+
+@app.post("/security-tests/{test_id}/export-burp", tags=["Security Tests"])
+def security_test_export_burp(test_id: str, request: dict = None,
+                              authorized: bool = Depends(auth)):
+    """Export one security test as Burp-ingestible HAR (default) or raw request."""
+    import burp_export
+    fmt = (request or {}).get("format", "har")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM public.security_tests WHERE id = %s::uuid", (test_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, f"security_test not found: {test_id}")
+    data, filename, content_type = burp_export.export_test(dict(row), fmt)
+    return {"success": True, "data": data, "filename": filename,
+            "content_type": content_type, "format": fmt}
+
+
+@app.post("/agent-sessions/{session_id}/security-tests/export-burp", tags=["Security Tests"])
+def session_security_tests_export_burp(session_id: str, request: dict = None,
+                                       authorized: bool = Depends(auth)):
+    """Export ALL of a session's security tests as one Burp-ingestible HAR."""
+    import burp_export
+    fmt = (request or {}).get("format", "har")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT id, name, tier, category, tool, command, assertion,
+                      target_ip, target_port, target_service
+                 FROM public.security_tests WHERE created_by_session = %s::uuid
+                ORDER BY created_at""",
+            (session_id,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    if not rows:
+        raise HTTPException(404, "no security tests for this session")
+    data, filename, content_type = burp_export.export_tests(rows, fmt)
+    return {"success": True, "data": data, "filename": filename,
+            "content_type": content_type, "format": fmt, "count": len(rows)}
+
+
+@app.post("/security-tests/{test_id}/send-to-burp", tags=["Security Tests"])
+def security_test_send_to_burp(test_id: str, authorized: bool = Depends(auth)):
+    """Push a custom test into the SAME Burp import queue the operator already
+    uses for follow-ups (burp_followup_queue), so it can be sent to a live Burp
+    exactly like any other queued item. Reuses the request builder used for the
+    HAR export; queued as finding_source='security_test' (no follow_up needed)."""
+    import burp_export
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM public.security_tests WHERE id = %s::uuid", (test_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"security_test not found: {test_id}")
+        t = dict(row)
+        req, comment = burp_export._req_for_test(t)
+        request_raw = burp_export.to_raw_request(req, comment)
+        cur.execute(
+            """INSERT INTO public.burp_followup_queue
+                 (follow_up_id, title, url, target, severity, finding_source,
+                  finding_id, method, request_raw, description, status, queued_at)
+               VALUES (NULL, %s, %s, %s, %s, 'security_test', %s::uuid, %s, %s, %s,
+                       'pending', now())
+               RETURNING id""",
+            (t.get("name") or "custom test", req["url"],
+             str(t.get("target_ip") or "") or None,
+             ("high" if t.get("tier") == "impactful" else "info"),
+             test_id, req["method"], request_raw,
+             f"WSTG custom test ({t.get('category')}, {t.get('tier')})"),
+        )
+        qid = cur.fetchone()["id"]
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("burp_queue_items_added", "rag-api",
+                     {"source": "security_test", "test_id": test_id, "count": 1})
+    except Exception:  # webhook emission must never fail the queue insert
+        pass
+    return {"ok": True, "queue_id": str(qid), "url": req["url"],
+            "message": "queued for Burp — import from the Burp queue"}
+
+
 @app.post("/cleanup/exploits", tags=["Maintenance"])
 def cleanup_exploits(
     dry_run: bool = Query(default=False),

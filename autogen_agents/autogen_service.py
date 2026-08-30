@@ -546,6 +546,28 @@ class PentestRequest(BaseModel):
             "refuses out-of-scope dispatch."
         ),
     )
+    enable_test_synthesis: Optional[bool] = Field(
+        None,
+        description=(
+            "Surface-test phase only. Instead of the fixed WSTG-map command, the "
+            "LLM AUTHORS a custom test per web finding (bounded; falls back to the "
+            "map on any failure). Synthesized tests are fail-safe classified and "
+            "impactful ones still require approval. Off unless set "
+            "(LANGGRAPH_SYNTH_TESTS env default)."
+        ),
+    )
+    enable_auto_exploit: Optional[bool] = Field(
+        None,
+        description=(
+            "Surface-test phase only. AUTO-EXPLOIT: fire queued impactful tests "
+            "WITHOUT the human approval interrupt, capturing proof (the assertion "
+            "evaluated against the exploit output). The scope gate is NOT "
+            "bypassed — every dispatch still passes the exploit-runner's "
+            "fail-closed scope gate, so an out-of-scope target is refused, never "
+            "run. Off unless set (LANGGRAPH_AUTO_EXPLOIT env default). Use only "
+            "within an authorised engagement."
+        ),
+    )
 
 
 class ApprovalRequest(BaseModel):
@@ -1945,6 +1967,8 @@ def run_pentest_session_sync(
     exploit_phase: Optional[bool] = None,
     surface_test_phase: Optional[bool] = None,
     surface_target: Optional[str] = None,
+    synthesize_tests: Optional[bool] = None,
+    auto_exploit: Optional[bool] = None,
 ):
     """Run a pentest session. Delegates to the LangGraph engine.
 
@@ -1986,7 +2010,9 @@ def run_pentest_session_sync(
         port_profile, web_profile, auto_run_recommendations,
         exploit_phase=exploit_phase,
         surface_test_phase=surface_test_phase,
-        surface_target=surface_target)
+        surface_target=surface_target,
+        synthesize_tests=synthesize_tests,
+        auto_exploit=auto_exploit)
 
 
 @app.get("/health")
@@ -2126,6 +2152,8 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
                 "enable_exploit_phase": bool(request.enable_exploit_phase),
                 "enable_surface_test_phase": bool(request.enable_surface_test_phase),
                 "surface_target_host": request.surface_target_host,
+                "enable_test_synthesis": bool(request.enable_test_synthesis),
+                "enable_auto_exploit": bool(request.enable_auto_exploit),
             }
         )
 
@@ -2162,6 +2190,8 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
                 request.enable_exploit_phase,
                 request.enable_surface_test_phase,
                 request.surface_target_host,
+                request.enable_test_synthesis,
+                request.enable_auto_exploit,
             )
         )
 
@@ -2264,6 +2294,8 @@ async def resume_pentest(session_id: str, request: ResumeRequest):
             "enable_exploit_phase": bool(config.get('enable_exploit_phase')),
             "enable_surface_test_phase": bool(config.get('enable_surface_test_phase')),
             "surface_target_host": config.get('surface_target_host'),
+            "enable_test_synthesis": bool(config.get('enable_test_synthesis')),
+            "enable_auto_exploit": bool(config.get('enable_auto_exploit')),
         }
     )
 
@@ -2304,6 +2336,8 @@ async def resume_pentest(session_id: str, request: ResumeRequest):
             bool(config.get('enable_exploit_phase')),
             bool(config.get('enable_surface_test_phase')),
             config.get('surface_target_host'),
+            bool(config.get('enable_test_synthesis')),
+            bool(config.get('enable_auto_exploit')),
         )
     )
 
@@ -2462,8 +2496,83 @@ async def get_agent_engine():
                          "langgraph."),
         "exploit_phase_default": os.environ.get("LANGGRAPH_EXPLOIT_PHASE") or None,
         "surface_test_phase_default": os.environ.get("LANGGRAPH_SURFACE_TEST_PHASE") or None,
+        "test_synthesis_default": os.environ.get("LANGGRAPH_SYNTH_TESTS") or None,
+        "auto_exploit_default": os.environ.get("LANGGRAPH_AUTO_EXPLOIT") or None,
         "availability": availability,
     }
+
+
+class SynthesizeTestRequest(BaseModel):
+    issue_type: Optional[str] = None
+    cwe: Optional[str] = None
+    name: Optional[str] = None
+    url: Optional[str] = None
+    target: Optional[str] = None
+    cve: Optional[str] = None          # pull an ExploitDB writeup as extra guidance
+    edb_id: Optional[str] = None       # or a specific ExploitDB entry
+    session_id: Optional[str] = None
+    persist: bool = True
+
+
+@app.post("/synthesize-test")
+async def synthesize_test(req: SynthesizeTestRequest):
+    """LLM-author a CUSTOM security test for one web finding (prototype of the
+    'move past straight tools' direction).
+
+    Matches the finding to its WSTG guidance, asks the RESOLVED LLM backend to
+    write a concrete command + machine-checkable assertion, then FAIL-SAFE
+    classifies the synthesized command (the model's own opinion cannot upgrade a
+    test into the safe lane). A safe candidate is persisted (enabled) and re-runs
+    through the scope-gated executor; an impactful candidate is returned for
+    approval and NOT persisted (the security_tests lane check needs a
+    pending_exploit_id). This never executes anything.
+    """
+    import json as _json
+    import scan_tools
+    import test_synth
+    import db_utils as _db
+    guidance, matched, edb_used = "", None, None
+    try:
+        g = _json.loads(scan_tools.get_wstg_guidance(
+            issue_type=req.issue_type, cwe=req.cwe, name=req.name,
+            target=req.target, url=req.url))
+        guidance = g.get("guidance") or ""
+        matched = (g.get("entry") or {}).get("wstg_id") if g.get("matched") else None
+    except Exception:  # noqa: BLE001
+        pass
+    # ExploitDB writeup as additional guidance when a CVE/EDB id is supplied (or a
+    # CVE was passed in `cwe`). Most ExploitDB-derived tests are real exploits, so
+    # they will fail-safe classify impactful and stay approval-gated.
+    if req.cve or req.edb_id or (req.cwe and req.cwe.upper().startswith("CVE-")):
+        try:
+            ed = _json.loads(scan_tools.get_exploitdb_guidance(
+                cve=req.cve or (req.cwe if (req.cwe or "").upper().startswith("CVE-") else None),
+                edb_id=req.edb_id))
+            if ed.get("matched"):
+                edb_used = (ed.get("top") or {}).get("edb_id")
+                guidance = (guidance + "\n\n=== ExploitDB writeup ===\n"
+                            + (ed.get("guidance") or ""))[:8000]
+        except Exception:  # noqa: BLE001
+            pass
+    finding = {"issue_type": req.issue_type, "cwe": req.cve or req.cwe,
+               "name": req.name, "url": req.url, "target": req.target}
+    out = test_synth.synthesize(finding, guidance)
+    if not out.get("ok"):
+        raise HTTPException(502, out.get("error") or "synthesis failed")
+    spec = out["spec"]
+    persisted_id = None
+    if req.persist and spec["tier"] == "safe":
+        try:
+            persisted_id = _db.create_security_test(
+                name=spec["name"], tier="safe", category=spec["category"],
+                target_ip=((req.target or "").split(":")[0] or None),
+                command=spec["command"], tool=spec["tool"],
+                assertion=spec["assertion"], created_by_session=req.session_id)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(500, f"persist failed: {e}")
+    return {"ok": True, "spec": spec, "matched_wstg": matched,
+            "matched_exploitdb": edb_used, "persisted_id": persisted_id,
+            "requires_approval": spec["tier"] == "impactful"}
 
 
 @app.post("/pentest/cleanup")

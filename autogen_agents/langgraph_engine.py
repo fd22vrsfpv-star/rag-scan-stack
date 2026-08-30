@@ -330,6 +330,8 @@ class PentestState(TypedDict):
     exploit_decision: Optional[dict]
     # Surface-test phase (opt-in, independent of exploit_phase).
     surface_test_phase: bool
+    surface_synthesize: Optional[bool]
+    surface_auto_exploit: Optional[bool]
     surface_target_request: Optional[str]
     surface_target: Optional[str]
     surface_tests: Optional[list]
@@ -863,6 +865,11 @@ def report(state: PentestState) -> dict:
 _SAFE_CATEGORIES = {
     "version_probe", "nuclei_detect", "tls_check", "lfi_read", "sqli_detect",
     "dir_enum", "banner", "http_probe", "cert_check",
+    # WSTG finding-driven SAFE detection probes (curl/nuclei/sslscan only). Each
+    # confirms a specific web finding without changing data or running code;
+    # anything that does is IMPACTFUL (rce/sqli_dump/cred_bruteforce/upload/…).
+    "xss_detect", "ssti_detect", "ssrf_detect", "xxe_detect", "redirect_check",
+    "header_check", "cookie_check", "cors_check", "error_check", "method_check",
 }
 _IMPACTFUL_CATEGORIES = {
     "rce", "shell", "msf_exploit", "file_write", "upload", "cred_bruteforce",
@@ -882,6 +889,55 @@ _SAFE_TOOL_HINTS = {
 # Cap per host — this is a single-host exhaustive sweep, not the cross-host
 # _DETERMINISTIC_PLAN_LIMIT that bounds recommender calls across many hosts.
 _SURFACE_TEST_LIMIT = int(os.environ.get("SURFACE_TEST_LIMIT", "24"))
+# Opt-in LLM synthesis in the surface phase: author a custom test per web finding
+# instead of the fixed WSTG-map command. Bounded (one LLM call each) and it falls
+# back to the deterministic map on any failure, so it never blocks the phase.
+_SYNTH_TESTS_DEFAULT = os.environ.get("LANGGRAPH_SYNTH_TESTS", "").lower() in ("1", "true", "yes")
+_SURFACE_SYNTH_LIMIT = int(os.environ.get("SURFACE_SYNTH_LIMIT", "8"))
+
+
+def _synthesize_finding_test(finding: dict, guidance: str, ip, port):
+    """Opt-in: LLM-author a custom test for one web finding, FAIL-SAFE classified
+    (test_synth.synthesize re-classifies the synthesized command). Pulls an
+    ExploitDB writeup too when the finding carries a CVE. Returns a candidate test
+    dict, or None on ANY failure so the caller falls back to the fixed map.
+
+    test_synth is imported lazily (it imports this module) — safe at call time,
+    a cycle at module load."""
+    try:
+        import test_synth
+        cwe = finding.get("cwe")
+        cve = None
+        if isinstance(cwe, list):
+            cve = next((c for c in cwe if str(c).upper().startswith("CVE-")), None)
+        elif str(cwe or "").upper().startswith("CVE-"):
+            cve = cwe
+        g = guidance or ""
+        if cve:
+            try:
+                ed = json.loads(scan_tools.get_exploitdb_guidance(cve=cve))
+                if ed.get("matched"):
+                    g = (g + "\n\n=== ExploitDB ===\n" + (ed.get("guidance") or ""))[:8000]
+            except Exception:  # noqa: BLE001
+                pass
+        out = test_synth.synthesize(finding, g)
+        if not out.get("ok"):
+            return None
+        spec = out["spec"]
+        cmd = spec.get("command")
+        if not cmd:
+            return None
+        tier, cat = spec.get("tier"), spec.get("category")
+        return {
+            "name": f"AI:{cat} @ {finding.get('url') or finding.get('target')}",
+            "host": ip, "service": "http", "port": port, "tool": _tool_head(cmd),
+            "command": cmd, "category": cat, "tier": tier,
+            "assertion": spec.get("assertion") or {},
+            "exploit_ref": ({"source": "synth", "module": (spec.get("name") or "ai-test"),
+                             "purpose": spec.get("rationale")} if tier == "impactful" else None),
+        }
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _host_of(raw) -> "str | None":
@@ -953,7 +1009,7 @@ def _surface_categories_for(svc: str, tls: str) -> "list[tuple[str,str]]":
     return out
 
 
-def _build_surface_tests(host: str) -> list:
+def _build_surface_tests(host: str, synthesize: bool = None) -> list:
     """Deterministic (no LLM) custom tests for ONE host's surface.
 
     Reuses query_open_ports(target=host) + get_tool_recommendations per service.
@@ -1028,6 +1084,84 @@ def _build_surface_tests(host: str) -> list:
                                 "purpose": m.get("purpose")},
             })
 
+    # WSTG finding-driven tests: turn each of the host's WEB findings into the
+    # OWASP-WSTG-guided test that proves it. The map (rag-api /rag/wstg) keys a
+    # finding by issue_type / CWE / nuclei tag / name to a tier+category+command+
+    # assertion. Safe probes run in the autonomous lane; impactful ones carry a
+    # 'wstg' exploit_ref so surface_plan queues them for the SAME human approval
+    # as any other impactful test. `_classify` still fails safe on top of this.
+    try:
+        web = json.loads(_tool(scan_tools.get_web_findings, target=host, limit=100))
+        findings = (web.get("findings") or web.get("web_findings")
+                    or web.get("items") or [])
+    except Exception:  # noqa: BLE001
+        findings = []
+
+    synth_on = _SYNTH_TESTS_DEFAULT if synthesize is None else bool(synthesize)
+    seen_wstg = set()
+    synth_count = 0
+    for f in findings:
+        if len(tests) >= _SURFACE_TEST_LIMIT:
+            break
+        issue = f.get("issue_type") or f.get("finding_type") or f.get("name")
+        fname = f.get("name") or f.get("title")
+        cwe = f.get("cwe")
+        cwe_s = ",".join(cwe) if isinstance(cwe, list) else (str(cwe) if cwe else None)
+        tags = f.get("tags")
+        nuc = ",".join(t for t in tags if isinstance(t, str)) if isinstance(tags, list) else None
+        furl = f.get("url")
+        fip = f.get("ip") or f.get("host") or host
+        fport = f.get("port")
+        tgt = f"{fip}:{fport}" if fport else str(fip)
+        try:
+            g = json.loads(scan_tools.get_wstg_guidance(
+                issue_type=issue, cwe=cwe_s, name=fname, nuclei_tags=nuc,
+                target=tgt, url=furl))
+        except Exception:  # noqa: BLE001
+            g = {}
+        ent = g.get("entry") if g.get("matched") else None
+        # One test per (class, target) — a scan reports the same class many
+        # times; prove it once. Keyed by the WSTG class when matched, else the
+        # finding type (so synthesis for unmatched findings still de-dups).
+        key = ((ent.get("id") if ent else None) or str(issue or "").lower(), fip, fport)
+        if key in seen_wstg:
+            continue
+        seen_wstg.add(key)
+
+        # OPT-IN synthesis: author a CUSTOM test for this finding instead of the
+        # fixed map command. Bounded by _SURFACE_SYNTH_LIMIT; on any failure we
+        # fall through to the deterministic map test below. The synthesized tier
+        # is already fail-safe (test_synth), and impactful synth tests carry a
+        # 'synth' exploit_ref so surface_plan queues them for human approval.
+        if synth_on and synth_count < _SURFACE_SYNTH_LIMIT:
+            fd = {"issue_type": issue, "name": fname, "cwe": cwe,
+                  "url": furl, "target": tgt}
+            st = _synthesize_finding_test(fd, g.get("guidance") or "", fip, fport)
+            if st:
+                tests.append(st)
+                synth_count += 1
+                continue
+
+        if not ent:
+            continue
+        cmd = ent.get("command_rendered") or ent.get("command")
+        cat = ent.get("category")
+        wid = ent.get("wstg_id")
+        wid_s = ",".join(wid) if isinstance(wid, list) else str(wid or "")
+        impactful_ref = (ent.get("tier") == "impactful"
+                         or cat in _IMPACTFUL_CATEGORIES)
+        tier = _classify(cat, cmd or "", has_exploit_ref=impactful_ref)
+        tests.append({
+            "name": f"WSTG {wid_s} {cat} @ {furl or tgt}",
+            "host": fip, "service": "http", "port": fport,
+            "tool": _tool_head(cmd or ""),
+            "command": cmd, "category": cat, "tier": tier,
+            "assertion": ent.get("assertion") or {},
+            "exploit_ref": ({"source": "wstg", "module": wid_s,
+                             "purpose": ent.get("wstg_note")}
+                            if tier == "impactful" else None),
+        })
+
     return tests
 
 
@@ -1053,7 +1187,7 @@ def surface_plan(state: PentestState) -> dict:
                 "surface_tests": [], "pending_surface_tests": [],
                 "findings": ["surface: no target"], "log": ["surface: no target"]}
 
-    candidates = _build_surface_tests(host)
+    candidates = _build_surface_tests(host, synthesize=state.get("surface_synthesize"))
     import db_utils
     eng = (get_agent_session(_sid(sid)) or {}).get("configuration", {})
     engagement_id = eng.get("engagement_id") if isinstance(eng, dict) else None
@@ -1270,6 +1404,74 @@ def surface_exec(state: PentestState) -> dict:
             "log": [f"surface_exec: {pending_id}"]}
 
 
+def _exec_one_impactful(sid, pending_id, test):
+    """Execute ONE queued impactful test through the SAME scope-gated runner
+    (execute_approved_exploit -> exploit-runner, which fails CLOSED on an
+    out-of-scope target — so auto-firing can never reach a host outside scope),
+    then record PROOF: the run's assertion is evaluated against the exploit
+    output, so a test passes only when it actually demonstrated impact. Returns
+    the run status ('pass'|'fail'|'error') or None."""
+    import db_utils
+    result = _tool(scan_tools.execute_approved_exploit, pending_id)
+    if not test:
+        return None
+    try:
+        import psycopg2
+        from db_utils import get_db_dsn
+        with psycopg2.connect(get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute("SELECT id, success, output FROM public.exploit_results "
+                        "WHERE pending_exploit_id=%s::uuid ORDER BY executed_at DESC LIMIT 1",
+                        (pending_id,))
+            r = cur.fetchone()
+        er_id, success, out = (str(r[0]), r[1], r[2]) if r else (None, False, result)
+        rec = db_utils.record_test_run(
+            test["test_id"], "impactful", command_run=test.get("command"),
+            output=(out or "")[:20000], exploit_result_id=er_id,
+            has_shell=bool(success), triggered_by="agent",
+            triggered_by_session=sid)
+        return rec.get("status")
+    except Exception as e:  # noqa: BLE001
+        _msg(sid, "SurfaceTester", f"[auto-exploit record failed for {pending_id}: {e}]")
+        return None
+
+
+def surface_auto_exec(state: PentestState) -> dict:
+    """AUTO-EXPLOIT (opt-in): fire every queued impactful test WITHOUT the human
+    approval interrupt, capturing proof. The scope gate is NOT bypassed — each
+    dispatch still goes through execute_approved_exploit -> the exploit-runner's
+    scope gate, which refuses any out-of-scope target; those are recorded as
+    blocked, never executed. This node has side effects and NO interrupt, so it
+    replaces surface_approval only when auto-exploit is enabled."""
+    sid = state["session_id"]
+    pending = state.get("pending_surface_tests") or []
+    _msg(sid, "SurfaceTester",
+         f"[AUTO-EXPLOIT] firing {len(pending)} queued impactful test(s) "
+         "through the scope gate (out-of-scope is refused, not run).")
+    proved, results = 0, []
+    for t in pending:
+        pid = t.get("pending_exploit_id")
+        if not pid:
+            continue
+        status = _exec_one_impactful(sid, pid, t)
+        results.append({"test": t["name"], "status": status})
+        if status == "pass":
+            proved += 1
+        _emit("langgraph_surface_test_completed", sid,
+              {"executed": True, "auto": True, "pending_exploit_id": str(pid),
+               "status": status})
+    _msg(sid, "SurfaceTester",
+         f"[AUTO-EXPLOIT] {proved}/{len(results)} impactful test(s) PROVED "
+         "(assertion held on the exploit output).")
+    _emit("langgraph_surface_decision", sid,
+          {"approved": True, "auto_exploit": True, "proved": proved,
+           "total": len(results)})
+    return {"phase": "surface_onward",
+            "surface_decision": {"approved": True, "auto_exploit": True,
+                                 "proved": proved, "total": len(results)},
+            "findings": [f"surface_auto_exec: {proved}/{len(results)} proved"],
+            "log": [f"surface_auto_exec: {proved}/{len(results)} proved"]}
+
+
 # ── graph ────────────────────────────────────────────────────────────────────
 def _surface_onward(state: PentestState) -> str:
     """After the surface phase, chain into the exploit phase if it too is opted
@@ -1293,8 +1495,11 @@ def _after_surface_plan(state: PentestState) -> str:
 
 
 def _after_surface_safe(state: PentestState) -> str:
-    # Gate only when impactful tests are queued; otherwise chain onward.
+    # No impactful tests -> chain onward. Otherwise: auto-exploit (fire through
+    # the scope gate, no human pause) when opted in, else the human approval gate.
     if state.get("pending_surface_tests"):
+        if state.get("surface_auto_exploit"):
+            return "surface_auto_exec"
         return "surface_approval"
     return _surface_onward(state)
 
@@ -1325,6 +1530,7 @@ def build_graph(checkpointer=None):
     g.add_node("surface_safe_exec", surface_safe_exec)
     g.add_node("surface_approval", surface_approval)
     g.add_node("surface_exec", surface_exec)
+    g.add_node("surface_auto_exec", surface_auto_exec)
     g.add_node("report", report)
     g.add_edge(START, "recon")
     g.add_edge("recon", "scan")
@@ -1339,7 +1545,10 @@ def build_graph(checkpointer=None):
                              "exploit_plan": "exploit_plan", "report": "report"})
     g.add_conditional_edges("surface_safe_exec", _after_surface_safe,
                             {"surface_approval": "surface_approval",
+                             "surface_auto_exec": "surface_auto_exec",
                              "exploit_plan": "exploit_plan", "report": "report"})
+    g.add_conditional_edges("surface_auto_exec", _surface_onward,
+                            {"exploit_plan": "exploit_plan", "report": "report"})
     g.add_conditional_edges("surface_approval", _after_surface_approval,
                             {"surface_exec": "surface_exec",
                              "exploit_plan": "exploit_plan", "report": "report"})
@@ -1502,6 +1711,8 @@ def run_langgraph_session_sync(
     exploit_phase: Optional[bool] = None,
     surface_test_phase: Optional[bool] = None,
     surface_target: Optional[str] = None,
+    synthesize_tests: Optional[bool] = None,
+    auto_exploit: Optional[bool] = None,
 ):
     """Drop-in LangGraph replacement for the AutoGen session runner."""
     from llm_metrics import LLMMetricsContext
@@ -1550,6 +1761,8 @@ def run_langgraph_session_sync(
                 "auto_execute": bool(auto_execute_scans),
                 "exploit_phase": bool(exploit_phase),
                 "surface_test_phase": bool(surface_test_phase),
+                "surface_synthesize": synthesize_tests,
+                "surface_auto_exploit": auto_exploit,
                 "surface_target_request": surface_target,
                 "surface_target": None, "surface_tests": None,
                 "surface_safe_results": None, "pending_surface_tests": None,
