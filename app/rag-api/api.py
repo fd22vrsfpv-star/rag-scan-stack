@@ -7323,6 +7323,84 @@ def security_test_run(test_id: str, body: SecurityTestRunReq,
             "result_summary": r["result_summary"], "tool_execution_id": exec_id}
 
 
+# ── WSTG finding->test guidance ───────────────────────────────────────────────
+# Single source of truth for turning a web finding into a WSTG-guided test spec.
+# The agent tool get_wstg_guidance and the surface-test phase both call these,
+# so the finding->test map logic lives ONLY in app/rag-api/wstg.py.
+
+def _wstg_guidance_text(wstg_ids, *, max_chars=4000):
+    """Concatenate the ingested WSTG prose for the given WSTG-IDs (from the
+    doc_kind='wstg' corpus in exploit_chunks), matched by id in the title."""
+    if not wstg_ids:
+        return ""
+    parts = []
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        for wid in wstg_ids:
+            cur.execute(
+                """SELECT chunk FROM public.exploit_chunks
+                    WHERE doc_kind = 'wstg' AND title ILIKE %s
+                    ORDER BY chunk_id LIMIT 6""",
+                (f"%{wid}%",),
+            )
+            rows = cur.fetchall()
+            if rows:
+                parts.append("\n".join(r["chunk"] for r in rows))
+    text = "\n\n---\n\n".join(parts)
+    return text[:max_chars]
+
+
+@app.get("/rag/wstg", tags=["WSTG"])
+def wstg_match(
+    issue_type: Optional[str] = Query(default=None),
+    cwe: Optional[str] = Query(default=None, description="comma-separated CWE ids"),
+    name: Optional[str] = Query(default=None),
+    nuclei_tags: Optional[str] = Query(default=None, description="comma-separated"),
+    target: Optional[str] = Query(default=None),
+    url: Optional[str] = Query(default=None),
+    authorized: bool = Depends(auth),
+):
+    """Match a web finding to a WSTG-guided test spec.
+
+    Returns {matched, entry, guidance}: `entry` is the map row (wstg_id, tier,
+    category, tool, command, assertion, wstg_note) with `command` rendered when
+    a target/url is supplied; `guidance` is the WSTG 'how to test' prose.
+    """
+    import wstg as _wstg
+    cwes = [c.strip() for c in (cwe or "").split(",") if c.strip()]
+    tags = [t.strip() for t in (nuclei_tags or "").split(",") if t.strip()]
+    entry = _wstg.match_finding(issue_type=issue_type, cwe=cwes, name=name,
+                                nuclei_tags=tags)
+    if not entry:
+        return {"matched": False, "entry": None, "guidance": ""}
+    out = dict(entry)
+    if target or url:
+        out["command_rendered"] = _wstg.render_command(entry, target=target or url, url=url)
+    return {"matched": True, "entry": out,
+            "guidance": _wstg_guidance_text(entry.get("wstg_id", []))}
+
+
+@app.get("/rag/wstg/guides", tags=["WSTG"])
+def wstg_guides(authorized: bool = Depends(auth)):
+    """List every finding class the map covers (for the custom-payload UI)."""
+    import wstg as _wstg
+    entries = _wstg.load_map().get("entries", [])
+    return {"count": len(entries), "entries": [
+        {"id": e.get("id"), "wstg_id": e.get("wstg_id"), "tier": e.get("tier"),
+         "category": e.get("category"), "tool": e.get("tool"),
+         "command": e.get("command"), "assertion": e.get("assertion"),
+         "wstg_note": e.get("wstg_note")}
+        for e in entries]}
+
+
+@app.get("/rag/wstg/{wstg_id}", tags=["WSTG"])
+def wstg_guide(wstg_id: str, authorized: bool = Depends(auth)):
+    """Fetch the ingested WSTG 'how to test' prose for one WSTG-ID."""
+    text = _wstg_guidance_text([wstg_id], max_chars=12000)
+    if not text:
+        raise HTTPException(404, f"no ingested WSTG doc for {wstg_id}")
+    return {"wstg_id": wstg_id, "guidance": text}
+
+
 @app.post("/cleanup/exploits", tags=["Maintenance"])
 def cleanup_exploits(
     dry_run: bool = Query(default=False),

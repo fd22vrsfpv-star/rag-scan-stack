@@ -3945,6 +3945,42 @@ def analyze_attack_surface(target_host: str = None, limit: int = 8) -> str:
     }, indent=2)
 
 
+def get_wstg_guidance(issue_type: str = None, cwe: str = None, name: str = None,
+                      nuclei_tags: str = None, target: str = None,
+                      url: str = None) -> str:
+    """Look up the OWASP WSTG-guided test for a SPECIFIC web finding.
+
+    Given a finding's type / CWE / name / nuclei tags, returns the matched WSTG
+    test spec (tier, category, tool, command, structured assertion) plus the
+    WSTG "how to test" methodology prose. READ-ONLY — it dispatches nothing;
+    it tells you HOW to prove the finding. Use it to turn a web finding into a
+    concrete, provable security test (then create/queue that test via the normal
+    gated path).
+
+    Args:
+        issue_type: the finding's type/category text (e.g. "SQL Injection").
+        cwe: comma-separated CWE ids (e.g. "CWE-89").
+        name: the finding's name/title.
+        nuclei_tags: comma-separated nuclei tags (e.g. "xss,sqli").
+        target: host or host:port, fills the command's {target}.
+        url: the finding's URL, fills the command's {url} (falls back to target).
+
+    Returns JSON: {matched, entry:{wstg_id, tier, category, tool, command,
+    command_rendered, assertion, wstg_note}, guidance}.
+    """
+    st = get_scan_tools()
+    params = {k: v for k, v in {
+        "issue_type": issue_type, "cwe": cwe, "name": name,
+        "nuclei_tags": nuclei_tags, "target": target, "url": url,
+    }.items() if v}
+    try:
+        r = st.client.get(f"{st.rag_api_url}/rag/wstg", params=params,
+                          headers=st.headers)
+        return json.dumps(r.json(), indent=2)
+    except Exception as e:
+        return json.dumps({"matched": False, "error": str(e)})
+
+
 def get_tool_recommendations(service: str = None, port: int = None) -> str:
     """
     Get the CONCRETE tests to run against a discovered service, as structured

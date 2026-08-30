@@ -76,6 +76,19 @@ TOOL_SPECS: List[ToolSpec] = [
         func=scan_tools.analyze_attack_surface,
     ),
     ToolSpec(
+        name="get_wstg_guidance",
+        description=(
+            "Look up the OWASP WSTG-guided test for a SPECIFIC web finding. "
+            "Pass the finding's issue_type / cwe / name / nuclei_tags (and "
+            "optionally target + url) and get back the matched WSTG test spec "
+            "(tier, category, tool, command, structured assertion) plus the "
+            "'how to test' methodology prose. READ-ONLY — it dispatches nothing; "
+            "it tells you HOW to prove a web finding so you can build a concrete "
+            "security test for it."
+        ),
+        func=scan_tools.get_wstg_guidance,
+    ),
+    ToolSpec(
         name="get_tool_recommendations",
         description=(
             "Get the CONCRETE tests to run against a discovered service, as "

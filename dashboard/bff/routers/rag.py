@@ -370,3 +370,55 @@ async def delete_service_doc(doc_id: int):
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, _detail(resp))
         return safe_json(resp)
+
+
+# ── WSTG finding->test guidance (upstream: rag-api, which owns the map) ────────
+
+@router.get("/api/rag/wstg/guides")
+async def wstg_guides():
+    """List the finding classes the WSTG map covers (drives the custom-payload UI).
+
+    Declared BEFORE /api/rag/wstg/{wstg_id} so 'guides' is not swallowed as an id.
+    """
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.get(f"{s.rag_api_url}/rag/wstg/guides",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _detail(resp))
+        return safe_json(resp)
+
+
+@router.get("/api/rag/wstg")
+async def wstg_match(
+    issue_type: Optional[str] = Query(default=None),
+    cwe: Optional[str] = Query(default=None),
+    name: Optional[str] = Query(default=None),
+    nuclei_tags: Optional[str] = Query(default=None),
+    target: Optional[str] = Query(default=None),
+    url: Optional[str] = Query(default=None),
+):
+    """Match a web finding to a WSTG-guided test spec + 'how to test' prose."""
+    s = get_settings()
+    params = {k: v for k, v in {
+        "issue_type": issue_type, "cwe": cwe, "name": name,
+        "nuclei_tags": nuclei_tags, "target": target, "url": url,
+    }.items() if v is not None}
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.get(f"{s.rag_api_url}/rag/wstg", params=params,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _detail(resp))
+        return safe_json(resp)
+
+
+@router.get("/api/rag/wstg/{wstg_id}")
+async def wstg_guide(wstg_id: str):
+    """Fetch the ingested WSTG 'how to test' prose for one WSTG-ID."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.get(f"{s.rag_api_url}/rag/wstg/{wstg_id}",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _detail(resp))
+        return safe_json(resp)
