@@ -259,3 +259,214 @@ entries:
     assertion:
       expect_regex: "(?i)(default-login|valid credentials|logged in)"
     wstg_note: "WSTG-ATHN-02: authenticating with a default pair proves access — gated."
+
+  # ── Extended coverage (batch 2) ──────────────────────────────────────────
+  - id: ldap_injection
+    wstg_id: [WSTG-INPV-06]
+    match:
+      issue_type: [ldap injection]
+      cwe: [CWE-90]
+      nuclei_tags: [ldap]
+      name_contains: [ldap injection]
+    tier: safe
+    category: nuclei_detect
+    tool: nuclei
+    command: "nuclei -u {url} -tags ldap -silent"
+    assertion:
+      expect_regex: "\\[[a-z0-9-]+\\]"
+    wstg_note: "WSTG-INPV-06: injected LDAP metacharacters alter the filter/response."
+
+  - id: xpath_injection
+    wstg_id: [WSTG-INPV-09]
+    match:
+      issue_type: [xpath injection]
+      cwe: [CWE-643]
+      nuclei_tags: [xpath]
+      name_contains: [xpath injection]
+    tier: safe
+    category: nuclei_detect
+    tool: nuclei
+    command: "nuclei -u {url} -tags xpath -silent"
+    assertion:
+      expect_regex: "\\[[a-z0-9-]+\\]"
+    wstg_note: "WSTG-INPV-09: an injected XPath expression changes the returned node set."
+
+  - id: crlf_injection
+    wstg_id: [WSTG-INPV-15]
+    match:
+      issue_type: [http response splitting, crlf injection, crlf]
+      cwe: [CWE-113, CWE-93]
+      nuclei_tags: [crlf]
+      name_contains: [response splitting, crlf]
+    tier: safe
+    category: nuclei_detect
+    tool: nuclei
+    command: "nuclei -u {url} -tags crlf -silent"
+    assertion:
+      expect_regex: "\\[[a-z0-9-]+\\]"
+    wstg_note: "WSTG-INPV-15: an injected CRLF adds a header/response the server reflects."
+
+  - id: host_header_injection
+    wstg_id: [WSTG-INPV-17]
+    match:
+      issue_type: [host header injection, host header]
+      cwe: [CWE-644]
+      nuclei_tags: [host-header-injection]
+      name_contains: [host header]
+    tier: safe
+    category: nuclei_detect
+    tool: nuclei
+    command: "nuclei -u {url} -tags host-header-injection -silent"
+    assertion:
+      expect_regex: "\\[[a-z0-9-]+\\]"
+    wstg_note: "WSTG-INPV-17: an attacker-controlled Host header is reflected into a link/redirect."
+
+  - id: http_methods
+    wstg_id: [WSTG-CONF-06, WSTG-INPV-03]
+    match:
+      issue_type: [http methods, dangerous http method, put method enabled, trace method, http verb tampering]
+      cwe: [CWE-650]
+      nuclei_tags: [http-method]
+      name_contains: [http method, put method, trace method, verb tampering]
+    tier: safe
+    category: method_check
+    tool: curl
+    command: "curl -sk -o /dev/null -D - -X OPTIONS {url}"
+    assertion:
+      expect_regex: "(?i)allow:.*(PUT|DELETE|TRACE|CONNECT|PATCH)"
+    wstg_note: "WSTG-CONF-06/INPV-03: an Allow header exposing PUT/DELETE/TRACE = writable/verb-tampering surface."
+
+  - id: server_fingerprint
+    wstg_id: [WSTG-INFO-02]
+    match:
+      issue_type: [server version disclosure, banner disclosure, software version disclosure, technology disclosure]
+      cwe: [CWE-200]
+      nuclei_tags: [tech, fingerprint]
+      name_contains: [server version, x-powered-by, version disclosure]
+    tier: safe
+    category: header_check
+    tool: curl
+    command: "curl -sk -o /dev/null -D - {url}"
+    assertion:
+      expect_regex: "(?i)(server:.*[0-9]|x-powered-by:)"
+    wstg_note: "WSTG-INFO-02: a Server/X-Powered-By version banner fingerprints the stack."
+
+  - id: metafiles_disclosure
+    wstg_id: [WSTG-INFO-03]
+    match:
+      issue_type: [robots.txt, sitemap, metafile disclosure, information leakage]
+      cwe: [CWE-200]
+      nuclei_tags: [metafiles]
+      name_contains: [robots.txt, sitemap, metafile]
+    tier: safe
+    category: dir_enum
+    tool: curl
+    command: "curl -sk {url}/robots.txt"
+    assertion:
+      expect_regex: "(?i)(disallow:|user-agent:|sitemap:)"
+    wstg_note: "WSTG-INFO-03: robots.txt / sitemap reveal hidden paths worth testing."
+
+  - id: exposed_files
+    wstg_id: [WSTG-CONF-04]
+    match:
+      issue_type: [exposed file, backup file, git exposure, env file, config exposure, source disclosure]
+      cwe: [CWE-538, CWE-540]
+      nuclei_tags: [exposure, backup, files]
+      name_contains: [.git, .env, backup, exposed]
+    tier: safe
+    category: nuclei_detect
+    tool: nuclei
+    command: "nuclei -u {url} -tags exposure,backup,files -silent"
+    assertion:
+      expect_regex: "\\[[a-z0-9-]+\\]"
+    wstg_note: "WSTG-CONF-04: reachable .git/.env/backup files leak source or secrets."
+
+  - id: csrf
+    wstg_id: [WSTG-SESS-05]
+    match:
+      issue_type: [csrf, cross site request forgery, missing anti-csrf token]
+      cwe: [CWE-352]
+      nuclei_tags: [csrf]
+      name_contains: [csrf, request forgery]
+    tier: safe
+    category: nuclei_detect
+    tool: nuclei
+    command: "nuclei -u {url} -tags csrf -silent"
+    assertion:
+      expect_regex: "\\[[a-z0-9-]+\\]"
+    wstg_note: "WSTG-SESS-05: a state-changing form with no anti-CSRF token / SameSite cookie."
+
+  - id: jwt_issues
+    wstg_id: [WSTG-SESS-10]
+    match:
+      issue_type: [jwt, json web token, weak jwt, none algorithm]
+      cwe: [CWE-347]
+      nuclei_tags: [jwt]
+      name_contains: [jwt, json web token]
+    tier: safe
+    category: nuclei_detect
+    tool: nuclei
+    command: "nuclei -u {url} -tags jwt -silent"
+    assertion:
+      expect_regex: "\\[[a-z0-9-]+\\]"
+    wstg_note: "WSTG-SESS-10: alg=none / weak-secret / unverified-signature JWT handling."
+
+  - id: graphql_introspection
+    wstg_id: [WSTG-APIT-99]
+    match:
+      issue_type: [graphql introspection, graphql, api introspection]
+      cwe: [CWE-200]
+      nuclei_tags: [graphql]
+      name_contains: [graphql, introspection]
+    tier: safe
+    category: http_probe
+    tool: curl
+    command: "curl -sk -H 'Content-Type: application/json' -d '{\"query\":\"{__schema{queryType{name}}}\"}' {url}"
+    assertion:
+      expect_regex: "(?i)(__schema|queryType|__type)"
+    wstg_note: "WSTG-APIT-99: a live introspection response exposes the full GraphQL schema."
+
+  - id: clickjacking
+    wstg_id: [WSTG-CLNT-09]
+    match:
+      issue_type: [clickjacking, ui redressing, missing frame protection]
+      cwe: [CWE-1021]
+      nuclei_tags: [clickjacking]
+      name_contains: [clickjacking, frameable]
+    tier: safe
+    category: header_check
+    tool: curl
+    command: "curl -sk -o /dev/null -D - {url}"
+    assertion:
+      expect_not_substring: ["X-Frame-Options", "frame-ancestors"]
+    wstg_note: "WSTG-CLNT-09: no X-Frame-Options / frame-ancestors CSP = framing/clickjacking exposure."
+
+  - id: insecure_deserialization
+    wstg_id: [WSTG-INPV-23]
+    match:
+      issue_type: [insecure deserialization, deserialization, object injection]
+      cwe: [CWE-502]
+      nuclei_tags: [deserialization]
+      name_contains: [deserialization, object injection]
+    tier: impactful
+    category: deserialization
+    tool: nuclei
+    command: "nuclei -u {url} -tags deserialization -severity high,critical -silent"
+    assertion:
+      expect_regex: "(?i)(deserial|object injection|uid=[0-9])"
+    wstg_note: "WSTG-INPV-23: a crafted serialized object executing on deserialization proves RCE — gated."
+
+  - id: malicious_file_upload
+    wstg_id: [WSTG-BUSL-08, WSTG-BUSL-09]
+    match:
+      issue_type: [unrestricted file upload, malicious file upload, file upload, webshell upload]
+      cwe: [CWE-434]
+      nuclei_tags: [fileupload, upload]
+      name_contains: [file upload, upload of]
+    tier: impactful
+    category: upload
+    tool: nuclei
+    command: "nuclei -u {url} -tags fileupload -severity high,critical -silent"
+    assertion:
+      expect_regex: "(?i)(upload|webshell|command execution)"
+    wstg_note: "WSTG-BUSL-08/09: uploading an executable/served file that runs proves impact — gated."
