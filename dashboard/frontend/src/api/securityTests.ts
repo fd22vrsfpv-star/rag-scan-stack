@@ -161,3 +161,64 @@ export function useCreateSecurityTest(sessionId?: string) {
     },
   })
 }
+
+function triggerDownload(filename: string, data: string, type: string) {
+  const blob = new Blob([data], { type: type || 'application/octet-stream' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+/** Download a test as a Burp-ingestible HAR (or raw request) file. */
+export function useExportTestBurp() {
+  return useMutation({
+    mutationFn: (vars: { id: string; format?: 'har' | 'request' }) =>
+      apiFetch<{ data: string; filename: string; content_type: string }>(
+        `/security-tests/${vars.id}/export-burp`,
+        { method: 'POST', body: JSON.stringify({ format: vars.format ?? 'har' }) },
+      ),
+    onSuccess: (d) => triggerDownload(d.filename, d.data, d.content_type),
+  })
+}
+
+/** Push a test into the live Burp import queue. */
+export function useSendTestToBurp() {
+  return useMutation({
+    mutationFn: (id: string) =>
+      apiFetch<{ ok: boolean; queue_id: string; url: string; message: string }>(
+        `/security-tests/${id}/send-to-burp`, { method: 'POST' }),
+  })
+}
+
+export interface SynthesizedTest {
+  ok: boolean
+  spec: {
+    name: string; tool: string; command: string; category: string
+    tier: 'safe' | 'impactful'; assertion: Record<string, unknown>; rationale: string
+  } | null
+  matched_wstg?: string[] | null
+  persisted_id?: string | null
+  requires_approval?: boolean
+}
+
+/** LLM-author a custom test for a finding (prototype). Safe candidates are
+ *  persisted; impactful come back requires_approval. */
+export function useSynthesizeTest(sessionId?: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (vars: { issue_type?: string; cwe?: string; name?: string; url?: string; target?: string; persist?: boolean }) =>
+      apiFetch<SynthesizedTest>('/synthesize-test', {
+        method: 'POST',
+        body: JSON.stringify({ ...vars, session_id: sessionId }),
+      }),
+    onSuccess: (d) => {
+      if (d.persisted_id && sessionId)
+        qc.invalidateQueries({ queryKey: ['security-tests', 'session', sessionId] })
+    },
+  })
+}

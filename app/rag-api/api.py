@@ -7401,6 +7401,87 @@ def wstg_guide(wstg_id: str, authorized: bool = Depends(auth)):
     return {"wstg_id": wstg_id, "guidance": text}
 
 
+# ── Security-test -> Burp Suite export ────────────────────────────────────────
+# A custom test/payload is only useful once it is in the tester's manual tool.
+# Emit HAR (Burp: Import) or a raw HTTP request (Burp: Repeater paste).
+
+@app.post("/security-tests/{test_id}/export-burp", tags=["Security Tests"])
+def security_test_export_burp(test_id: str, request: dict = None,
+                              authorized: bool = Depends(auth)):
+    """Export one security test as Burp-ingestible HAR (default) or raw request."""
+    import burp_export
+    fmt = (request or {}).get("format", "har")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM public.security_tests WHERE id = %s::uuid", (test_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, f"security_test not found: {test_id}")
+    data, filename, content_type = burp_export.export_test(dict(row), fmt)
+    return {"success": True, "data": data, "filename": filename,
+            "content_type": content_type, "format": fmt}
+
+
+@app.post("/agent-sessions/{session_id}/security-tests/export-burp", tags=["Security Tests"])
+def session_security_tests_export_burp(session_id: str, request: dict = None,
+                                       authorized: bool = Depends(auth)):
+    """Export ALL of a session's security tests as one Burp-ingestible HAR."""
+    import burp_export
+    fmt = (request or {}).get("format", "har")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT id, name, tier, category, tool, command, assertion,
+                      target_ip, target_port, target_service
+                 FROM public.security_tests WHERE created_by_session = %s::uuid
+                ORDER BY created_at""",
+            (session_id,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    if not rows:
+        raise HTTPException(404, "no security tests for this session")
+    data, filename, content_type = burp_export.export_tests(rows, fmt)
+    return {"success": True, "data": data, "filename": filename,
+            "content_type": content_type, "format": fmt, "count": len(rows)}
+
+
+@app.post("/security-tests/{test_id}/send-to-burp", tags=["Security Tests"])
+def security_test_send_to_burp(test_id: str, authorized: bool = Depends(auth)):
+    """Push a custom test into the SAME Burp import queue the operator already
+    uses for follow-ups (burp_followup_queue), so it can be sent to a live Burp
+    exactly like any other queued item. Reuses the request builder used for the
+    HAR export; queued as finding_source='security_test' (no follow_up needed)."""
+    import burp_export
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM public.security_tests WHERE id = %s::uuid", (test_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"security_test not found: {test_id}")
+        t = dict(row)
+        req, comment = burp_export._req_for_test(t)
+        request_raw = burp_export.to_raw_request(req, comment)
+        cur.execute(
+            """INSERT INTO public.burp_followup_queue
+                 (follow_up_id, title, url, target, severity, finding_source,
+                  finding_id, method, request_raw, description, status, queued_at)
+               VALUES (NULL, %s, %s, %s, %s, 'security_test', %s::uuid, %s, %s, %s,
+                       'pending', now())
+               RETURNING id""",
+            (t.get("name") or "custom test", req["url"],
+             str(t.get("target_ip") or "") or None,
+             ("high" if t.get("tier") == "impactful" else "info"),
+             test_id, req["method"], request_raw,
+             f"WSTG custom test ({t.get('category')}, {t.get('tier')})"),
+        )
+        qid = cur.fetchone()["id"]
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("burp_queue_items_added", "rag-api",
+                     {"source": "security_test", "test_id": test_id, "count": 1})
+    except Exception:  # webhook emission must never fail the queue insert
+        pass
+    return {"ok": True, "queue_id": str(qid), "url": req["url"],
+            "message": "queued for Burp — import from the Burp queue"}
+
+
 @app.post("/cleanup/exploits", tags=["Maintenance"])
 def cleanup_exploits(
     dry_run: bool = Query(default=False),

@@ -295,3 +295,30 @@ async def list_agent_mcp_tools():
             return safe_json(resp)
     except Exception as e:
         return {"error": str(e), "total_discovered": 0}
+
+
+class SynthesizeTestRequest(BaseModel):
+    issue_type: Optional[str] = None
+    cwe: Optional[str] = None
+    name: Optional[str] = None
+    url: Optional[str] = None
+    target: Optional[str] = None
+    session_id: Optional[str] = None
+    persist: bool = True
+
+
+@router.post("/api/synthesize-test")
+async def synthesize_test(req: SynthesizeTestRequest):
+    """LLM-author a custom security test for one web finding (upstream: autogen,
+    which holds the resolved LLM backend). Safe candidates are persisted and
+    re-runnable; impactful ones come back requires_approval and are not run."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=120) as c:
+        resp = await c.post(
+            f"{s.autogen_url}/synthesize-test",
+            json=req.model_dump(),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
