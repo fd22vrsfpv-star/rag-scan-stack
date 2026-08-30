@@ -56,6 +56,9 @@ class StartSessionRequest(BaseModel):
     # The ONE host/IP the surface-test phase enumerates. Omit to auto-pick the
     # highest-risk host. Must be in scope.
     surface_target_host: Optional[str] = None
+    # Surface-test phase: LLM-author a custom test per web finding instead of the
+    # fixed WSTG-map command (falls back to the map; impactful still gated).
+    enable_test_synthesis: Optional[bool] = None
 
 
 class ResumeRequest(BaseModel):

@@ -70,9 +70,10 @@ def classify_synth(category: str, command: str, llm_tier: str) -> str:
                      command or "", has_exploit_ref=False)
 
 
-_PROMPT = """You are a senior penetration tester. Write ONE concrete, MINIMAL \
-security test that PROVES the web finding below, following the OWASP WSTG \
-methodology provided.
+_PROMPT = """You are a senior penetration tester. If a finding can be exploited, \
+PROVE it by exploiting it — do not stop at detection. Write ONE concrete, \
+MINIMAL command that DEMONSTRATES the impact of the web finding below, following \
+the OWASP WSTG / ExploitDB methodology provided.
 
 Finding:
   type: {issue_type}
@@ -81,16 +82,25 @@ Finding:
   target: {target}
   url: {url}
 
-WSTG methodology (how to test):
+Methodology (how to test / exploit):
 {guidance}
 
 Rules:
+- Prefer the test that DEMONSTRATES exploitation over one that merely detects: \
+read a canary file (e.g. /etc/passwd) for traversal/LFI, echo a unique marker \
+for RCE/SSTI/injection, retrieve the proof the vulnerability yields. Detection \
+is the fallback only when a proof-of-impact command is not possible.
 - The command must be a single shell command using ONLY: curl, nuclei, sslscan, \
-sqlmap (detection only), httpx, wget, gobuster, ffuf, whatweb, nikto, dig.
-- Prefer a SAFE, read-only detection probe. Mark tier "impactful" ONLY if the \
-command changes data, writes files, dumps a database, or executes code.
+sqlmap, httpx, wget, gobuster, ffuf, whatweb, nikto, dig. Do NOT use an \
+interactive shell, reverse shell, file-write, or DB-dump — the goal is to PROVE \
+impact with a benign, reproducible marker, not to damage the target.
+- Mark tier "impactful" whenever the command demonstrates code execution, file \
+read/traversal, injection, or any state change; "safe" only for pure read-only \
+detection. (An impactful test is NOT run autonomously — it is queued for the \
+operator's approval and fires once authorised, so bias toward proving impact.)
 - The assertion must be machine-checkable using ONLY these keys: \
-{clause_keys}. Choose the observable that distinguishes vulnerable from not.
+{clause_keys}. Pick the observable that proves exploitation succeeded (e.g. the \
+canary content, the echoed marker).
 - Use {{url}} / {{target}} placeholders if you don't have a concrete value.
 
 Reply with ONLY this JSON (no prose):
