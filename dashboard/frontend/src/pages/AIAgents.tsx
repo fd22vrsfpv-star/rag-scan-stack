@@ -4,6 +4,9 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/api/client'
 import {
   useAgentsStatus, useGapReport, useTriggerGapAnalysis, useAutoFillGaps,
+  useDrainArtifacts, useAgentFlags, useActAgentFlag,
+  useLearnedExtractors, useReviewExtractor, useExportExtractors,
+  useAgentActivity,
   type AgentInfo, type GapReport, type GapTargetDetail,
 } from '@/api/agents'
 import { useUIStore } from '@/stores/ui'
@@ -11,6 +14,7 @@ import { cn } from '@/lib/utils'
 import {
   Bot, Cpu, Search, Shield, Loader2, Play, ExternalLink,
   CheckCircle2, XCircle, RefreshCw, Zap, Settings, Clock, Cloud,
+  FileSearch, ShieldCheck, Globe, MessageSquare, Wand2, Activity, ChevronDown, ChevronRight,
 } from 'lucide-react'
 
 const AGENT_ICONS: Record<string, typeof Bot> = {
@@ -20,6 +24,9 @@ const AGENT_ICONS: Record<string, typeof Bot> = {
   'recon-agent': RefreshCw,
   'gap-agent': Zap,
   'cloud-triage-agent': Cloud,
+  'artifact-review': FileSearch,
+  'pre-validation': ShieldCheck,
+  'whois-agent': Globe,
 }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -44,6 +51,8 @@ const AGENT_LINKS: Record<string, string> = {
   'recon-agent': '/engagements',
   'gap-agent': '/engagements',
   'cloud-triage-agent': '/cloud-posture',
+  'artifact-review': '/scans/results',
+  'pre-validation': '/agent-sessions',
 }
 
 const CATEGORY_ORDER = [
@@ -69,6 +78,18 @@ function useRunOsintScan() {
   return useMutation({
     mutationFn: () => apiFetch<{ ok: boolean }>('/agent/scan', { method: 'POST', body: JSON.stringify({}) }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['agents-status'] }),
+  })
+}
+
+function useRunWhoisAgent() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () => apiFetch<{ ok: boolean; domains: number; dispatched: number; enriched_follow_ups: number }>(
+      '/whois-agent/run', { method: 'POST', body: JSON.stringify({}) }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['agents-status'] })
+      qc.invalidateQueries({ queryKey: ['follow-ups'] })
+    },
   })
 }
 
@@ -109,9 +130,235 @@ export default function AIAgents() {
         </div>
       )}
 
+      <AgentFlagsPanel />
+      <LearnedExtractorsPanel />
+      <ActivityTimelinePanel />
+
       {selectedEngagement && (
         <GapAnalysisPanel engagementId={selectedEngagement} />
       )}
+    </div>
+  )
+}
+
+
+/** A short relative time like "3m", "2h", "5d". */
+function relTime(iso: string): string {
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000)
+  if (s < 60) return `${Math.floor(s)}s`
+  if (s < 3600) return `${Math.floor(s / 60)}m`
+  if (s < 86400) return `${Math.floor(s / 3600)}h`
+  return `${Math.floor(s / 86400)}d`
+}
+
+/** event_type is `<agent>_<action>` (e.g. katana_scan_completed). Split on the
+ *  first token that starts the action verb so the agent reads clearly. */
+function splitEventType(t: string): { agent: string; action: string } {
+  const m = t.match(/^(.*?)_((?:scan|agent_flag|artifact|batch|rule|pipeline|recon|ingest|extractor).*)$/)
+  if (m) return { agent: m[1], action: m[2] }
+  const i = t.indexOf('_')
+  return i > 0 ? { agent: t.slice(0, i), action: t.slice(i + 1) } : { agent: t, action: '' }
+}
+
+/** Pull a compact one-liner from the event payload. */
+function eventSummary(p: Record<string, any> | undefined): string {
+  if (!p) return ''
+  const out: string[] = []
+  for (const k of ['target', 'tool', 'scan_type', 'host', 'count', 'skipped',
+                   'claimed', 'done', 'queue_depth', 'actor', 'flag_type', 'reason']) {
+    const v = p[k]
+    if (v != null && typeof v !== 'object' && String(v) !== '') out.push(`${k}=${v}`)
+    if (out.length >= 4) break
+  }
+  return out.join(' · ')
+}
+
+/** Cross-agent action timeline — every agent action emits a webhook event, and
+ *  the event-log sink records them all. This is the one place to see what
+ *  happened across every agent, newest first. */
+function ActivityTimelinePanel() {
+  const { data, isLoading } = useAgentActivity()
+  const [filter, setFilter] = useState('')
+  const [expanded, setExpanded] = useState<string | null>(null)
+  const events = data?.events ?? []
+  const shown = filter
+    ? events.filter(e => e.event_type.toLowerCase().includes(filter.toLowerCase()))
+    : events
+  if (!isLoading && !events.length) return null
+  return (
+    <div className="bg-card border border-border rounded-lg p-3 space-y-2">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <h3 className="text-sm font-semibold flex items-center gap-2">
+          <Activity className="h-4 w-4" /> Agent Activity — timeline
+          {data && <span className="px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground text-[10px]">{data.total} events</span>}
+        </h3>
+        <input value={filter} onChange={e => setFilter(e.target.value)}
+          placeholder="filter e.g. katana, agent_flag, scan_completed"
+          className="h-6 px-2 text-[11px] rounded border border-border bg-background w-64" />
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        Every agent action emits an event; this is the cross-agent trace, newest first. Click a row for the full payload.
+      </p>
+      <div className="max-h-[28rem] overflow-y-auto divide-y divide-border/40">
+        {shown.map(e => {
+          const { agent, action } = splitEventType(e.event_type)
+          const open = expanded === e.id
+          return (
+            <div key={e.id} className="py-1.5">
+              <div className="flex items-start gap-2 cursor-pointer" onClick={() => setExpanded(open ? null : e.id)}>
+                {open ? <ChevronDown className="h-3 w-3 mt-0.5 text-muted-foreground shrink-0" />
+                      : <ChevronRight className="h-3 w-3 mt-0.5 text-muted-foreground shrink-0" />}
+                <span className="text-[10px] text-muted-foreground w-8 shrink-0 text-right tabular-nums" title={new Date(e.created_at).toLocaleString()}>{relTime(e.created_at)}</span>
+                <span className="text-[11px] font-mono text-primary shrink-0">{agent}</span>
+                <span className="text-[11px] font-mono text-muted-foreground shrink-0">{action}</span>
+                <span className="text-[11px] text-muted-foreground truncate">{eventSummary(e.payload)}</span>
+              </div>
+              {open && (
+                <pre className="ml-5 mt-1 bg-black border border-border rounded p-2 text-[10px] font-mono max-h-56 overflow-auto whitespace-pre-wrap">
+                  {JSON.stringify(e.payload, null, 2)}
+                </pre>
+              )}
+            </div>
+          )
+        })}
+        {!shown.length && <p className="text-[11px] text-muted-foreground py-4 text-center">No events match “{filter}”.</p>}
+      </div>
+    </div>
+  )
+}
+
+
+function AgentFlagsPanel() {
+  const { data } = useAgentFlags()
+  const act = useActAgentFlag()
+  const flags = data?.flags ?? []
+  const pending = flags.filter(f => f.status === 'pending')
+  const recent = flags.filter(f => f.status !== 'pending').slice(0, 8)
+  if (!flags.length) return null
+  return (
+    <div className="bg-card border border-border rounded-lg p-3 space-y-2">
+      <h3 className="text-sm font-semibold flex items-center gap-2">
+        <MessageSquare className="h-4 w-4" /> Agent Feedback — flags for review
+        {pending.length > 0 && (
+          <span className="px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-400 text-[10px]">{pending.length} pending</span>
+        )}
+      </h3>
+      <p className="text-[11px] text-muted-foreground">
+        One agent flags something worth another run. Approving queues a scope-gated follow-up scan; every action is audited (who + when).
+      </p>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[720px] text-xs">
+          <thead className="text-muted-foreground">
+            <tr className="border-b border-border">
+              <th className="text-left py-1 px-2">From</th><th className="text-left px-2">Type</th>
+              <th className="text-left px-2">Target</th><th className="text-left px-2">Scanner</th>
+              <th className="text-left px-2">Reason</th><th className="text-left px-2">Status</th>
+              <th className="text-right px-2">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {[...pending, ...recent].map(f => (
+              <tr key={f.id} className="border-b border-border/40">
+                <td className="py-1 px-2 font-mono">{f.flagging_agent}</td>
+                <td className="px-2">{f.flag_type}</td>
+                <td className="px-2 font-mono truncate max-w-[180px]" title={f.data?.target}>{f.data?.target || '—'}</td>
+                <td className="px-2">{f.data?.scanner || '—'}</td>
+                <td className="px-2 truncate max-w-[200px]" title={f.data?.reason}>{f.data?.reason || '—'}</td>
+                <td className="px-2">
+                  <span className={cn('px-1.5 py-0.5 rounded text-[10px]',
+                    f.status === 'pending' ? 'bg-amber-500/10 text-amber-400'
+                    : f.status === 'acted' ? 'bg-green-500/10 text-green-400'
+                    : 'bg-muted text-muted-foreground')}>{f.status}</span>
+                  {f.acted_by && <span className="ml-1 text-[10px] text-muted-foreground">by {f.acted_by}</span>}
+                </td>
+                <td className="px-2 text-right">
+                  {f.status === 'pending' && (
+                    <span className="inline-flex gap-1">
+                      <button onClick={() => act.mutate({ id: f.id, action: 'approve' })} disabled={act.isPending}
+                        className="px-2 py-0.5 text-[10px] rounded bg-green-600 hover:bg-green-500 text-white">Approve</button>
+                      <button onClick={() => act.mutate({ id: f.id, action: 'dismiss' })} disabled={act.isPending}
+                        className="px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">Dismiss</button>
+                    </span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+
+function LearnedExtractorsPanel() {
+  const { data } = useLearnedExtractors()
+  const review = useReviewExtractor()
+  const exp = useExportExtractors()
+  const rows = data?.learned ?? []
+  const proposed = rows.filter(r => r.status === 'proposed')
+  const active = rows.filter(r => r.status === 'active')
+  if (!rows.length) return null
+  return (
+    <div className="bg-card border border-border rounded-lg p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold flex items-center gap-2">
+          <Wand2 className="h-4 w-4" /> Learned Extractors
+          {proposed.length > 0 && (
+            <span className="px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-400 text-[10px]">{proposed.length} to review</span>
+          )}
+          <span className="px-1.5 py-0.5 rounded-full bg-green-500/10 text-green-400 text-[10px]">{active.length} active</span>
+        </h3>
+        <button onClick={() => exp.mutate(undefined)} disabled={exp.isPending}
+          className="h-6 px-2 text-[10px] rounded border border-border hover:bg-accent">
+          {exp.isPending ? 'Exporting…' : 'Export active → YAML'}
+        </button>
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        Deterministic regex rules are auto-applied (read-only); proposed FINDING rules fire only after you approve. Actions are audited.
+      </p>
+      {exp.data?.yaml && Object.keys(exp.data.yaml).length > 0 && (
+        <pre className="bg-black border border-border rounded p-2 text-[10px] font-mono max-h-48 overflow-auto whitespace-pre-wrap">
+          {Object.values(exp.data.yaml).join('\n---\n')}
+        </pre>
+      )}
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[720px] text-xs">
+          <thead className="text-muted-foreground">
+            <tr className="border-b border-border">
+              <th className="text-left py-1 px-2">Tool</th><th className="text-left px-2">Kind</th>
+              <th className="text-left px-2">Rule</th><th className="text-left px-2">Status</th>
+              <th className="text-right px-2">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {[...proposed, ...active.slice(0, 20)].map(r => (
+              <tr key={r.id} className="border-b border-border/40">
+                <td className="py-1 px-2 font-mono">{r.tool}</td>
+                <td className="px-2">{r.kind}</td>
+                <td className="px-2 font-mono truncate max-w-[320px]" title={JSON.stringify(r.rule)}>
+                  {r.rule?.id || Object.keys(r.rule || {}).join(', ')}
+                </td>
+                <td className="px-2">
+                  <span className={cn('px-1.5 py-0.5 rounded text-[10px]',
+                    r.status === 'active' ? 'bg-green-500/10 text-green-400' : 'bg-amber-500/10 text-amber-400')}>{r.status}</span>
+                  {r.reviewed_by && <span className="ml-1 text-[10px] text-muted-foreground">by {r.reviewed_by}</span>}
+                </td>
+                <td className="px-2 text-right">
+                  {r.status === 'proposed' && (
+                    <span className="inline-flex gap-1">
+                      <button onClick={() => review.mutate({ id: r.id, action: 'approve' })} disabled={review.isPending}
+                        className="px-2 py-0.5 text-[10px] rounded bg-green-600 hover:bg-green-500 text-white">Approve</button>
+                      <button onClick={() => review.mutate({ id: r.id, action: 'reject' })} disabled={review.isPending}
+                        className="px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">Reject</button>
+                    </span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }
@@ -124,6 +371,8 @@ function AgentCard({ agent, engagementId }: { agent: AgentInfo; engagementId: st
   const autoFill = useAutoFillGaps()
   const runOsint = useRunOsintScan()
   const runRecon = useRunReconAgentNow(engagementId)
+  const drain = useDrainArtifacts()
+  const runWhois = useRunWhoisAgent()
   const link = AGENT_LINKS[agent.id]
 
   const handleCardClick = () => {
@@ -183,6 +432,42 @@ function AgentCard({ agent, engagementId }: { agent: AgentInfo; engagementId: st
             {agent.gaps_found} gap{agent.gaps_found !== 1 ? 's' : ''} found
           </span>
         )}
+        {/* Artifact LLM Review queue */}
+        {agent.id === 'artifact-review' && (
+          <>
+            <span className={cn('px-1.5 py-0.5 rounded border',
+              (agent.queue_pending ?? 0) > 0 ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' : 'bg-green-500/10 text-green-400 border-green-500/20'
+            )}>
+              {agent.queue_pending ?? 0} pending review
+            </span>
+            {(agent.queue_processing ?? 0) > 0 && (
+              <span className="px-1.5 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20">
+                {agent.queue_processing} processing
+              </span>
+            )}
+            <span className="px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20">
+              {agent.queue_done ?? 0}/{agent.queue_total ?? 0} reviewed
+            </span>
+            {(agent.queue_failed ?? 0) > 0 && (
+              <span className="px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-500/20">
+                {agent.queue_failed} failed
+              </span>
+            )}
+          </>
+        )}
+        {/* Pre-Validation claim checks */}
+        {agent.id === 'pre-validation' && (
+          <>
+            <span className="px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20">
+              {agent.sessions_validated ?? 0} session{(agent.sessions_validated ?? 0) !== 1 ? 's' : ''} validated
+            </span>
+            <span className={cn('px-1.5 py-0.5 rounded border',
+              (agent.unsupported_claims ?? 0) > 0 ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' : 'bg-green-500/10 text-green-400 border-green-500/20'
+            )}>
+              {agent.unsupported_claims ?? 0} unsupported claim{(agent.unsupported_claims ?? 0) !== 1 ? 's' : ''}
+            </span>
+          </>
+        )}
         {agent.last_run && (
           <span className="text-muted-foreground flex items-center gap-0.5">
             <Clock className="h-2.5 w-2.5" />
@@ -212,6 +497,28 @@ function AgentCard({ agent, engagementId }: { agent: AgentInfo; engagementId: st
           >
             {runRecon.isPending ? <Loader2 className="h-2.5 w-2.5 animate-spin" /> : <Play className="h-2.5 w-2.5" />}
             Run Now
+          </button>
+        )}
+        {agent.id === 'whois-agent' && (
+          <button
+            onClick={() => runWhois.mutate()}
+            disabled={runWhois.isPending}
+            className="flex items-center gap-1 px-2 py-1 text-[10px] rounded bg-blue-600 hover:bg-blue-500 text-white"
+            title="Collect passive WHOIS/registrant data for all scope + discovered owner domains"
+          >
+            {runWhois.isPending ? <Loader2 className="h-2.5 w-2.5 animate-spin" /> : <Play className="h-2.5 w-2.5" />}
+            Run Now
+          </button>
+        )}
+        {agent.id === 'artifact-review' && (
+          <button
+            onClick={() => drain.mutate(20)}
+            disabled={drain.isPending || (agent.queue_pending ?? 0) === 0}
+            className="flex items-center gap-1 px-2 py-1 text-[10px] rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white"
+            title={(agent.queue_pending ?? 0) === 0 ? 'Queue is empty' : 'Run the LLM review pass over up to 20 pending artifacts'}
+          >
+            {drain.isPending ? <Loader2 className="h-2.5 w-2.5 animate-spin" /> : <Play className="h-2.5 w-2.5" />}
+            Process Queue{(agent.queue_pending ?? 0) > 0 ? ` (${agent.queue_pending})` : ''}
           </button>
         )}
         {agent.id === 'gap-agent' && engagementId && (
@@ -249,6 +556,16 @@ function AgentCard({ agent, engagementId }: { agent: AgentInfo; engagementId: st
         {(agent.id === 'recon-agent' || agent.id === 'gap-agent') && (
           <a href="/engagements" className="flex items-center gap-1 px-2 py-1 text-[10px] rounded bg-muted hover:bg-muted/80 border border-border">
             <Settings className="h-2.5 w-2.5" /> Configure
+          </a>
+        )}
+        {agent.id === 'artifact-review' && (
+          <a href="/scans/results" className="flex items-center gap-1 px-2 py-1 text-[10px] rounded bg-muted hover:bg-muted/80 border border-border">
+            <ExternalLink className="h-2.5 w-2.5" /> Scan Results
+          </a>
+        )}
+        {agent.id === 'pre-validation' && (
+          <a href="/agent-sessions" className="flex items-center gap-1 px-2 py-1 text-[10px] rounded bg-muted hover:bg-muted/80 border border-border">
+            <ExternalLink className="h-2.5 w-2.5" /> Sessions
           </a>
         )}
       </div>

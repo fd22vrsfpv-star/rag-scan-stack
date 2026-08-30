@@ -1,4 +1,7 @@
-FROM python:3.12-slim
+# Shared modules (validation, sql_utils, structured_logger, tool_job) come
+# from this base — see common/Dockerfile. Build it first with
+# scripts/build-base-image.sh; compose does not order builds by FROM.
+FROM rag-common:latest
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl nmap wget masscan git tini netcat-openbsd hydra proxychains4 && \
     rm -rf /var/lib/apt/lists/*
@@ -23,7 +26,9 @@ COPY app/run_masscan_nmap.py /app/app/run_masscan_nmap.py
 
 # Minimal API exposing the job
 COPY nmap_scanner/nmap-api.py /app/nmap-api.py
-COPY nmap_scanner/validation.py /app/validation.py
+# validation.py now comes from the rag-common base image; the per-service
+# copy was deleted. Seven copies existed and one had drifted with a real
+# fix stranded in it.
 COPY nmap_scanner/log_manager.py /app/log_manager.py
 COPY nmap_scanner/cred_checker.py /app/cred_checker.py
 # Install vulscan and vulners NSE scripts for vulnerability scanning

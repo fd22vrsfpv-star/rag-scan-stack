@@ -92,6 +92,89 @@ def web_fingerprint(
     return _md5(key)
 
 
+def infrastructure_fingerprint(
+    ip: Optional[str],
+    port: Optional[int],
+    name: Optional[str],
+    issue_type: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Group a web finding by the underlying problem on a HOST, across virtual hosts.
+
+    `web_fingerprint` hashes the URL, which contains the hostname, so a
+    server-level problem on shared hosting produces one row per vhost:
+
+        https://app1.example.com/ Missing X-Frame-Options -> 8c50801b...
+        https://app2.example.com/ Missing X-Frame-Options -> 8a47f0ca...
+
+    This is the companion key that deliberately EXCLUDES the hostname, so those
+    two rows share one infrastructure fingerprint. Per-vhost rows are kept —
+    this groups, it never merges — which is what makes a heuristic key safe
+    here: a wrong grouping is cosmetic, not data loss.
+
+    The URL PATH is excluded too, and that is the load-bearing choice. A missing
+    security header is reported once per crawled URL, so including the path
+    would yield one small group per path (/, /login, /about) instead of the
+    single "missing header on this host:port" line a report wants. The cost is
+    that two same-named app-level findings at different paths also group; name
+    plus issue_type is specific enough that this is rare, and the per-vhost rows
+    are still there. If it proves too loose, adding the path back is a one-line
+    change — whereas tightening after people rely on loose groups would break
+    their reports.
+
+    Returns None when the finding cannot be grouped:
+      * no IP (the host is unknown, so "same host" is unanswerable)
+      * blank name AND blank issue_type — katana crawl rows look like this
+        (746 of 779 in one deployment), and grouping them would put every
+        discovered URL on a host into one meaningless bucket.
+    """
+    ip_str = (ip or "").strip()
+    if not ip_str:
+        return None
+
+    name_str = (name or "").strip().lower()
+    issue_str = (issue_type or "").strip().lower()
+    if not name_str and not issue_str:
+        return None
+
+    port_str = str(port) if port else "0"
+    key = f"infra|{ip_str}|{port_str}|{name_str}|{issue_str}"
+    return _md5(key)
+
+
+def credential_fingerprint(
+    ip: Optional[str],
+    port: Optional[int],
+    username: Optional[str],
+    auth_type: Optional[str] = None,
+) -> str:
+    """
+    Generate fingerprint for a credential finding.
+
+    Strategy: hash(ip | port | username | auth_type) — one row per account.
+
+    Re-testing a known credential is a re-verification, not a new finding, so
+    `valid_cred` and `status` are deliberately EXCLUDED: a credential that
+    stopped working is the same account, and hashing its outcome would create a
+    second row every time the result flipped.
+
+    `auth_type` is coalesced rather than left NULL because the table's unique
+    index does the same. In Postgres a NULL makes rows non-equal, so a nullable
+    column in a uniqueness key silently stops constraining anything.
+
+    Username is lower-cased: SMB, FTP and HTTP basic auth all treat the account
+    name case-insensitively, and 'Administrator' vs 'administrator' is one
+    account, not two.
+    """
+    ip_str = (ip or "").strip()
+    port_str = str(port) if port else "0"
+    user_str = (username or "").strip().lower()
+    auth_str = (auth_type or "").strip().lower()
+
+    key = f"cred|{ip_str}|{port_str}|{user_str}|{auth_str}"
+    return _md5(key)
+
+
 def recon_fingerprint(
     source: Optional[str],
     finding_type: Optional[str],

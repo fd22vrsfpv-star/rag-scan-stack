@@ -23,43 +23,43 @@ mcp = FastMCP("pentest-scanning", host="0.0.0.0", port=9017, stateless_http=True
 
 
 @mcp.tool()
-async def start_masscan(target: Annotated[str, Field(description="IP address or CIDR range, e.g. '192.168.1.0/24'")], ports: Annotated[str, Field(description="Port range, e.g. '1-1000', '1-65535', '22,80,443'")] = "1-1000", rate: Annotated[int, Field(description="Packets per second")] = 1000) -> str:
+async def start_masscan(target: Annotated[str, Field(description="IP address or CIDR range, e.g. '192.168.1.0/24'")], ports: Annotated[Optional[str], Field(description="Port range. OMIT this to get the server default: nmap's top-1000 (the 1000 most commonly OPEN ports) for nmap scans, full range for masscan discovery. Do NOT pass '1-1000' — that is the first 1000 port NUMBERS and misses mysql 3306, postgresql 5432, vnc 5900, tomcat 8180. Pass a value only for a genuinely specific scope, e.g. '22,80,443'.")] = None, rate: Annotated[int, Field(description="Packets per second")] = 1000) -> str:
     """Start fast Masscan port discovery. Use this FIRST for quick port enumeration.
 
     Args:
         target: IP address or CIDR range (e.g., '192.168.1.0/24')
-        ports: Port range (e.g., '1-1000', '1-65535', '22,80,443')
+        ports: Omit for the top-1000 default. Never pass '1-1000'.
         rate: Packets per second (default: 1000)
     """
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as client:
-        resp = await client.post(f"{NMAP_URL}/jobs/masscan-only", json={"targets": [target], "ports": ports, "rate": rate})
+        resp = await client.post(f"{NMAP_URL}/jobs/masscan-only", json={"targets": [target], "rate": rate, **({"ports": ports} if ports else {})})
         return json.dumps(resp.json() if resp.status_code == 200 else {"error": resp.text}, indent=2)
 
 
 @mcp.tool()
-async def start_nmap_scan(target: Annotated[str, Field(description="IP address, hostname, or CIDR range")], ports: Annotated[str, Field(description="Port range, e.g. '22,80,443' or '1-1000'")] = "1-1000") -> str:
+async def start_nmap_scan(target: Annotated[str, Field(description="IP address, hostname, or CIDR range")], ports: Annotated[Optional[str], Field(description="Port range. OMIT this to get the server default: nmap's top-1000 (the 1000 most commonly OPEN ports) for nmap scans, full range for masscan discovery. Do NOT pass '1-1000' — that is the first 1000 port NUMBERS and misses mysql 3306, postgresql 5432, vnc 5900, tomcat 8180. Pass a value only for a genuinely specific scope, e.g. '22,80,443'.")] = None) -> str:
     """Start Nmap scan with service detection. Run AFTER masscan finds open ports.
 
     Args:
         target: IP address, hostname, or CIDR range
-        ports: Port range (e.g., '22,80,443' or '1-1000')
+        ports: Omit for the top-1000 default. Never pass '1-1000'.
     """
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as client:
-        resp = await client.post(f"{NMAP_URL}/jobs/masscan-then-nmap", json={"targets": [target], "ports": ports, "rate": 1000})
+        resp = await client.post(f"{NMAP_URL}/jobs/masscan-then-nmap", json={"targets": [target], "rate": 1000, **({"ports": ports} if ports else {})})
         return json.dumps(resp.json() if resp.status_code == 200 else {"error": resp.text}, indent=2)
 
 
 @mcp.tool()
-async def start_naabu(targets: Annotated[list[str], Field(description="List of IPs or CIDR ranges")], ports: Annotated[str, Field(description="Port specification, e.g. '80,443' or '1-1000'")] = "1-1000", rate: Annotated[int, Field(description="Packets per second")] = 1000) -> str:
+async def start_naabu(targets: Annotated[list[str], Field(description="List of IPs or CIDR ranges")], ports: Annotated[Optional[str], Field(description="Port range. OMIT this to get the server default: nmap's top-1000 (the 1000 most commonly OPEN ports) for nmap scans, full range for masscan discovery. Do NOT pass '1-1000' — that is the first 1000 port NUMBERS and misses mysql 3306, postgresql 5432, vnc 5900, tomcat 8180. Pass a value only for a genuinely specific scope, e.g. '22,80,443'.")] = None, rate: Annotated[int, Field(description="Packets per second")] = 1000) -> str:
     """Fast port scan using Naabu (alternative to Masscan).
 
     Args:
         targets: List of IPs or CIDR ranges
-        ports: Port specification (e.g., '80,443', '1-1000')
+        ports: Omit for the top-1000 default. Never pass '1-1000'.
         rate: Packets per second
     """
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as client:
-        resp = await client.post(f"{PD_RUNNER_URL}/jobs/naabu", json={"targets": targets, "ports": ports, "rate": rate})
+        resp = await client.post(f"{PD_RUNNER_URL}/jobs/naabu", json={"targets": targets, "rate": rate, **({"ports": ports} if ports else {})})
         return json.dumps(resp.json() if resp.status_code == 200 else {"error": resp.text}, indent=2)
 
 

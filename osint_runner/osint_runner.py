@@ -15,6 +15,9 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, UploadFile, 
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 import uvicorn, requests
+# Shared job runner, delivered by the rag-common base image
+# (common/tool_job.py). Both runners previously carried their own copy.
+from tool_job import run_tool_job
 
 logging.basicConfig(level=logging.INFO)
 
@@ -452,112 +455,78 @@ def _build_proxy_env(proxy: str = None) -> dict:
     return env
 
 
-def _run_tool_job(job_id: str, tool: str, cmd: list, targets_file: str, output_file: str, ingest_as: str = None, env: dict = None, no_ingest: bool = False):
-    """Generic background job runner for OSINT tools."""
+# ── Scope gate ────────────────────────────────────────────────────────────
+# Shared implementation from etl/scope_gate.py (bind-mounted at /runner/etl).
+# This runner writes its targets to a FILE and hands the path to the tool, so
+# the file is what actually decides where packets go — that is what gets
+# checked, not just the request arguments.
+try:
+    from etl.scope_gate import check_targets_file, load_dispatch_scope
+    SCOPE_GATE_AVAILABLE = True
+except Exception as _scope_err:                 # pragma: no cover
+    SCOPE_GATE_AVAILABLE = False
+    logging.error("scope gate UNAVAILABLE (%s) — jobs will be refused. "
+                  "Check the ./etl:/runner/etl mount.", _scope_err)
+
+
+def _scope_refusal_for_targets(targets_file: str):
+    """Refusal string when a targets file is out of scope, else None.
+
+    Fails CLOSED: an unavailable gate or unreadable scope refuses the job. A
+    scanner that cannot tell whether it is authorised must not scan.
+    """
+    if not SCOPE_GATE_AVAILABLE:
+        return "scope gate unavailable (etl/scope_gate not importable) — refusing"
     try:
-        import time as _time
-        _t0 = _time.time()
-        cmd_str = " ".join(cmd)
-        _job_tracker.update_job(job_id, status="running", started_at=datetime.now().isoformat())
-        _job_tracker.push_command(job_id, tool, cmd_str)
-        _job_tracker.update_progress(job_id, stage="running")
+        _c = conn()
+        try:
+            with _c.cursor() as cur:
+                rows, _src = load_dispatch_scope(cur)
+        finally:
+            _c.close()
+    except Exception as exc:
+        return f"scope could not be read ({exc}) — refusing"
+    return check_targets_file(targets_file, rows)
 
-        emit_webhook_event("scan_started", tool, {"job_id": job_id, "scan_type": tool})
-        write_audit("scan_started", tool, "osint_runner", {
-            "job_id": job_id, "execution_mode": "local", "command": cmd_str,
-        })
 
-        logging.info(f"[{job_id}] Running {tool}: {cmd_str}")
-        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, env=env)
+def _after_tool_success(job_id: str, tool: str, output_file: str, findings_count: int):
+    """Follow-on work once a tool has succeeded, passed to the shared runner.
 
-        if cp.returncode not in (0, 1):
-            raise RuntimeError(f"{tool} exit {cp.returncode}: {cp.stderr[:500]}")
+    Lives here rather than in common/tool_job.py because it is specific to this
+    service: a subfinder run that found hosts should immediately resolve them.
+    Best-effort by contract — the runner swallows failures, so a follow-on
+    cannot fail a job that actually worked.
+    """
+    if tool != "subfinder" or findings_count <= 0:
+        return
+    results = _read_jsonl(output_file)
+    hosts = [r.get("host", "").strip() for r in results if r.get("host", "").strip()]
+    hosts = hosts[:500]          # cap so one large sweep cannot flood dnsx
+    if not hosts:
+        return
+    logging.info(f"[{job_id}] Auto-triggering dnsx for {len(hosts)} subdomains")
+    requests.post("http://localhost:8024/jobs/dnsx", json={"domains": hosts}, timeout=10)
 
-        # Count results
-        findings_count = 0
-        raw_output = ""
-        if os.path.exists(output_file):
-            with open(output_file) as f:
-                content = f.read()
-                findings_count = sum(1 for line in content.splitlines() if line.strip())
-                raw_output = content[:10000]
-        _job_tracker.update_progress(job_id, findings_count=findings_count)
 
-        # Ingest (skip if no_ingest / test mode)
-        ing = None
-        if no_ingest:
-            logging.info(f"[{job_id}] no_ingest=true, skipping ingestion")
-        else:
-            _job_tracker.update_progress(job_id, stage="ingesting")
-            ingest_tool = ingest_as or tool
-            ingest_source = tool if ingest_as and ingest_as != tool else None
-            ing = _ingest_results(ingest_tool, output_file, job_id=job_id, source=ingest_source)
+def _run_tool_job(job_id: str, tool: str, cmd: list, targets_file: str, output_file: str, ingest_as: str = None, env: dict = None, no_ingest: bool = False):
+    """Run one tool job. The implementation is shared — see common/tool_job.py.
 
-        duration_s = round(_time.time() - _t0, 2)
-        _job_tracker.update_progress(job_id, stage="done")
-        result_data = {
-            "ok": True, "findings_count": findings_count,
-            "report": output_file, "ingest": ing,
-            "command": cmd_str,
-            "duration_s": duration_s,
-            "no_ingest": no_ingest,
-        }
-        if no_ingest:
-            result_data["raw_output"] = raw_output
-            result_data["stdout"] = cp.stdout[-2000:] if cp.stdout else None
-            result_data["stderr"] = cp.stderr[-2000:] if cp.stderr else None
-        else:
-            result_data["stdout"] = cp.stdout[-500:] if cp.stdout else None
-            result_data["stderr"] = cp.stderr[-500:] if cp.stderr else None
-        _job_tracker.update_job(
-            job_id, status="completed",
-            result=result_data,
-            completed_at=datetime.now().isoformat(),
-        )
-        emit_webhook_event("scan_completed", tool, {"job_id": job_id, "findings_count": findings_count})
-        write_audit("scan_completed", tool, "osint_runner", {
-            "job_id": job_id, "findings_count": findings_count,
-            "duration_s": duration_s, "command": cmd_str,
-        })
-
-        # Save session results
-        if not no_ingest:
-            _save_session_results(job_id, tool, "osint-runner", [output_file],
-                              metadata={"findings_count": findings_count})
-
-        # Auto-trigger dnsx after subfinder completes with findings
-        if tool == "subfinder" and findings_count > 0:
-            try:
-                results = _read_jsonl(output_file)
-                hosts = [r.get("host", "").strip() for r in results if r.get("host", "").strip()]
-                hosts = hosts[:500]  # Cap at 500 to avoid overload
-                if hosts:
-                    logging.info(f"[{job_id}] Auto-triggering dnsx for {len(hosts)} subdomains")
-                    requests.post(
-                        "http://localhost:8024/jobs/dnsx",
-                        json={"domains": hosts},
-                        timeout=10,
-                    )
-            except Exception as e:
-                logging.debug(f"[{job_id}] dnsx auto-trigger failed (non-fatal): {e}")
-
-    except Exception as e:
-        _job_tracker.update_job(job_id, status="failed", error=str(e),
-                                result={"command": cmd_str, "error": str(e)},
-                                completed_at=datetime.now().isoformat())
-        _job_tracker.update_progress(job_id, stage="failed")
-        emit_webhook_event("scan_failed", tool, {"job_id": job_id, "error": str(e)})
-        write_audit("scan_failed", tool, "osint_runner", {
-            "job_id": job_id, "error": str(e),
-        })
-        logging.error(f"[{job_id}] {tool} failed: {e}")
-    finally:
-        # Cleanup targets file
-        if targets_file and os.path.exists(targets_file):
-            try:
-                os.remove(targets_file)
-            except OSError:
-                pass
+    This module previously carried its own copy. The two copies had drifted,
+    with improvements stranded in one of them, so the shared version is the
+    union and this service gains whatever it was missing.
+    """
+    run_tool_job(
+        job_id=job_id, tool=tool, cmd=cmd, targets_file=targets_file,
+        output_file=output_file, ingest_as=ingest_as, env=env, no_ingest=no_ingest,
+        service_name="osint_runner", session_label="osint-runner",
+        job_tracker=_job_tracker,
+        emit_webhook_event=emit_webhook_event,
+        write_audit=write_audit,
+        ingest_results=_ingest_results,
+        scope_refusal=_scope_refusal_for_targets,
+        save_session_results=_save_session_results,
+        on_success=_after_tool_success,
+    )
 
 
 # ===============================
@@ -3209,6 +3178,10 @@ def run_amass(req: AmassReq, background_tasks: BackgroundTasks):
     short = job_id[:8]
     output_prefix = str(REPORT_DIR / f"amass_{short}")
     output_file = output_prefix + ".json"
+    # Write the domains to a targets file so the scope gate can validate them.
+    # amass takes domains via -d flags, but the gate reads the file — without it
+    # the gate does open('') and fails closed ("targets file '' is unreadable").
+    targets_file = _write_targets_file(req.domains)
 
     # amass v4: -d domain (one per flag), -o output prefix
     cmd = ["amass", "enum"]
@@ -3221,7 +3194,7 @@ def run_amass(req: AmassReq, background_tasks: BackgroundTasks):
     env = _build_proxy_env(req.proxy)
     _job_tracker.update_progress(job_id, targets_count=len(req.domains))
     # amass writes output_prefix.json automatically
-    background_tasks.add_task(_run_tool_job, job_id, "amass", cmd, "", output_file, env=env, no_ingest=req.no_ingest)
+    background_tasks.add_task(_run_tool_job, job_id, "amass", cmd, targets_file, output_file, env=env, no_ingest=req.no_ingest)
     return {"ok": True, "job_id": job_id, "status": "queued", "status_url": f"/jobs/{job_id}"}
 
 
@@ -3449,9 +3422,26 @@ def _ingest_gowitness_jsonl(jsonl_path: str, screenshot_dir: str, job_id: str) -
     from urllib.parse import urlparse as _up
 
     ingested = 0
+    # Bound here, not inside the cursor block: the summary below runs after
+    # the try/finally and would NameError if an exception fired first.
+    _out_of_scope = 0
     try:
         conn = _pg.connect(DB_DSN)
         with conn.cursor(cursor_factory=_RDC) as cur:
+            # Ingest scope gate, loaded ONCE for the whole file.
+            #
+            # gowitness screenshots whatever URL list it is handed, and that list
+            # comes from discovery which can wander off-target — the same way a
+            # katana crawl produced findings for twitter.com and wikipedia.
+            #
+            # Imported at the top of the function, not inside the record loop: the
+            # first version ran load_ingest_scope() per record, which is a database
+            # round trip for every screenshot (563 on one real run), and swallowed
+            # ImportError so a broken import silently disabled the gate — the wrong
+            # direction to fail for something that exists to keep third-party hosts
+            # out of an engagement.
+            from etl.scope_gate import load_ingest_scope, host_in_scope
+            _enf, _rows = load_ingest_scope(cur)
             with open(jsonl_path) as f:
                 for line in f:
                     line = line.strip()
@@ -3546,14 +3536,34 @@ def _ingest_gowitness_jsonl(jsonl_path: str, screenshot_dir: str, job_id: str) -
                                     resolved_ip = "0.0.0.0"
                                 import uuid as _uuid
                                 _aid = str(_uuid.uuid4())
-                                cur.execute("""INSERT INTO assets (id, ip, hostname)
-                                              VALUES (%s, %s::inet, %s)
-                                              ON CONFLICT (ip, COALESCE(hostname, '')) DO UPDATE SET last_seen = now()
-                                              RETURNING id""",
-                                            (_aid, resolved_ip, hostname))
-                                r = cur.fetchone()
-                                if r:
-                                    asset_id = str(r["id"])
+                                # ADOPT a nameless row for this address before inserting a sibling.
+                                # ON CONFLICT on (ip, COALESCE(hostname,'')) treats (ip, '') and
+                                # (ip, 'name') as DIFFERENT rows, so this is the one raw insert site
+                                # left that can still split one host into two asset rows -- with its
+                                # ports on one and its findings on the other. Refuses to adopt when the
+                                # address already has another named row, which would attach this data to
+                                # an unrelated virtual host. Mirrors etl/asset_utils.ensure_asset.
+                                cur.execute("""
+                                    UPDATE assets a SET hostname = %s, last_seen = now()
+                                     WHERE a.ip = %s::inet
+                                       AND COALESCE(NULLIF(btrim(a.hostname), ''), '') = ''
+                                       AND NOT EXISTS (SELECT 1 FROM assets b
+                                                        WHERE b.ip = a.ip AND b.id <> a.id
+                                                          AND COALESCE(NULLIF(btrim(b.hostname), ''), '') <> '')
+                                    RETURNING a.id
+                                """, (hostname, resolved_ip))
+                                _adopted = cur.fetchone()
+                                if _adopted:
+                                    asset_id = str(_adopted["id"])
+                                else:
+                                    cur.execute("""INSERT INTO assets (id, ip, hostname)
+                                                  VALUES (%s, %s::inet, %s)
+                                                  ON CONFLICT (ip, COALESCE(hostname, '')) DO UPDATE SET last_seen = now()
+                                                  RETURNING id""",
+                                                (_aid, resolved_ip, hostname))
+                                    r = cur.fetchone()
+                                    if r:
+                                        asset_id = str(r["id"])
                     except Exception:
                         pass
 
@@ -3592,18 +3602,24 @@ def _ingest_gowitness_jsonl(jsonl_path: str, screenshot_dir: str, job_id: str) -
                     except Exception:
                         pass
 
+                    # Skip anything outside the engagement scope: no finding, no
+                    # web_findings row, and no screenshot_metadata row either.
+                    if not host_in_scope(target_host or url, _enf, _rows):
+                        _out_of_scope += 1
+                        continue
+
                     # Insert into recon_findings (OSINT Explorer source)
                     cur.execute("""
                         INSERT INTO recon_findings
                         (id, asset_id, source, finding_type, target, data, severity)
-                        VALUES (gen_random_uuid(), %s, 'gowitness', 'screenshot', %s, %s, 'recon')
+                        VALUES (gen_random_uuid(), %s, 'gowitness', 'screenshot', %s, %s, 'info')
                     """, (asset_id, target_host or url, json.dumps(finding_data)))
 
                     # Also insert into web_findings for findings explorer
                     cur.execute("""
                         INSERT INTO web_findings
                         (id, asset_id, url, source, status_code, name, severity, evidence, method, refs)
-                        VALUES (gen_random_uuid(), %s, %s, 'gowitness', %s, %s, 'recon', %s, 'GET', %s)
+                        VALUES (gen_random_uuid(), %s, %s, 'gowitness', %s, %s, 'info', %s, 'GET', %s)
                     """, (asset_id, url, status_code, title or None, evidence,
                           json.dumps(refs) if refs else None))
 
@@ -3644,6 +3660,9 @@ def _ingest_gowitness_jsonl(jsonl_path: str, screenshot_dir: str, job_id: str) -
             conn.close()
         except Exception:
             pass
+    if _out_of_scope:
+        logging.info("[gowitness] skipped %d out-of-scope URL(s) — not recorded "
+                     "as findings", _out_of_scope)
     return ingested
 
 

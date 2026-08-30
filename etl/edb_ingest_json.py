@@ -22,6 +22,23 @@ def parse_entry(e):
     # ID may be int or str; ensure int edb_id
     edb_id = int(e.get("ID") or e.get("id") or e.get("Exploit-ID") or 0)
     file_path = e.get("Path") or e.get("File") or e.get("path") or ""
+
+    # Current searchsploit JSON exports only {"Title", "URL"} per entry — no ID
+    # and no Path. Every row therefore came out with edb_id 0, was dropped by the
+    # `row[0] > 0` filter below, and the ingest reported a cheerful
+    # {"ok": true, "processed": 0} while doing nothing. 47,109 exploits were
+    # sitting in the source file.
+    #
+    # The id is in the URL: https://www.exploit-db.com/exploits/49712
+    url = e.get("URL") or e.get("url") or ""
+    if not edb_id and url:
+        m = re.search(r"/exploits?/(\d+)", url)
+        if m:
+            edb_id = int(m.group(1))
+    # file_path is NOT NULL in edb.exploits; the URL is the only locator this
+    # export provides.
+    if not file_path:
+        file_path = url
     title = e.get("Title") or e.get("Description") or e.get("title") or ""
     date_str = e.get("Date") or e.get("date") or ""
     date_published = None

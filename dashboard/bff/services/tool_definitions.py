@@ -859,7 +859,7 @@ def _discover_sse_server_tools(server_name: str, sse_url: str) -> list[dict]:
         def sse_listener():
             """Background thread: reads SSE events and pushes JSON-RPC responses."""
             try:
-                with httpx.Client(verify=False, timeout=30) as sse_client:
+                with httpx.Client(timeout=30) as sse_client:
                     with connect_sse(sse_client, "GET", sse_url) as event_source:
                         for event in event_source.iter_sse():
                             if stop_event.is_set():
@@ -896,7 +896,7 @@ def _discover_sse_server_tools(server_name: str, sse_url: str) -> list[dict]:
 
         message_url = data
 
-        with httpx.Client(verify=False, timeout=10) as client:
+        with httpx.Client(timeout=10) as client:
             # Initialize (response comes via SSE stream)
             client.post(
                 message_url,

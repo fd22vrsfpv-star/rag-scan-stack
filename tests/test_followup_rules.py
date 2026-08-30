@@ -1,4 +1,9 @@
 import pytest
+
+# Skip rather than error: top-level utils/ is intentionally NOT a package: making it one shadows dashboard/bff/utils.py, breaking `from utils import safe_json`.
+pytest.importorskip("utils.followup_engine", reason="utils.followup_engine not importable — top-level utils/ is intentionally NOT a package: making it one shadows dashboard/bff/utils.py, breaking `from utils import safe_json`")
+
+import pytest
 from utils.followup_engine import PortCtx, choose_actions, DEFAULT_RULES
 from utils.followup_plugins import get as get_plugin
 

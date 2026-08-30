@@ -4,6 +4,7 @@ Provides function interfaces to all scanning services
 """
 
 import os
+from urllib.parse import urlparse
 import httpx as _httpx
 import json
 
@@ -89,7 +90,54 @@ except Exception as _pp_err:      # PortProfileError, missing file, bad YAML
         DEFAULT_QUICK_PORTS_PROFILE, _pp_err, _LEGACY_QUICK_PORTS,
     )
     DEFAULT_QUICK_PORTS = _LEGACY_QUICK_PORTS
-DEFAULT_DEEP_SCAN_PORTS = os.environ.get("DEEP_SCAN_PORTS", "1001-65535")
+# Deep follow-up sweep — masscan over the FULL range, not "everything above 1000".
+#
+# 1001-65535 was the correct complement back when the quick pass was the
+# sequential range 1-1000: the two together tiled 1-65535 exactly once. That is
+# no longer true. The quick pass is now nmap's frequency-ranked top-1000, whose
+# members are scattered across the whole range (3306, 5432, 5900, 8180, 49152…),
+# so 1001-65535 both re-probes ports the quick pass already covered AND leaves a
+# hole: the ~600 low ports below 1001 that are not in the top-1000 list would
+# never be scanned by either pass.
+#
+# masscan over 1-65535 closes the hole. It is a SYN sweep at `rate` pps, so the
+# cost is a function of the rate, not of which subrange is asked for, and the
+# overlap with the quick pass is deduplicated downstream at ingest.
+DEFAULT_DEEP_SCAN_PORTS = os.environ.get("DEEP_SCAN_PORTS", "1-65535")
+
+# Sequential low ranges an LLM reaches for when it means "the common ports".
+# They are not the common ports — they are the first N port NUMBERS, which is
+# why the quick default moved to the frequency-ranked profile. Callers that pass
+# one of these are upgraded rather than obeyed; see _upgrade_sequential_quick_ports.
+_SEQUENTIAL_LOW_RANGES = {"1-1000", "0-1000", "1-1024", "0-1024"}
+
+
+def _upgrade_sequential_quick_ports(ports: str) -> str:
+    """Map a sequential low range onto the frequency-ranked quick default.
+
+    `start_full_scan(quick_ports=...)` is LLM-callable, and the model reaches for
+    "1-1000" because that phrasing is everywhere in scanning lore. Defaulting the
+    parameter is not enough — an explicitly-passed 1-1000 sails straight past a
+    `if not quick_ports` check and silently reinstates the exact scope the
+    top-1000 profile exists to replace, missing mysql/postgresql/vnc/tomcat.
+
+    Only exact sequential low ranges are upgraded (optionally carrying the
+    configured high web-port suffix, which is how the legacy default was built).
+    Anything else — a real operator selection, a single port, a custom list — is
+    left untouched.
+    """
+    if not ports:
+        return ports
+    candidate = ports.strip()
+    if candidate in _SEQUENTIAL_LOW_RANGES or candidate == _LEGACY_QUICK_PORTS:
+        logger.info(
+            "Upgrading quick_ports=%r to the top-1000 profile: a sequential low "
+            "range is the first 1000 port NUMBERS, not the 1000 most commonly "
+            "open ports, and misses mysql/postgresql/vnc/tomcat",
+            candidate,
+        )
+        return DEFAULT_QUICK_PORTS
+    return candidate
 
 
 def _is_known_port_scope(ports: str) -> bool:
@@ -432,6 +480,335 @@ class SessionScanTracker:
             "by_type": by_type,
         }
 
+    # Result keys worth surfacing per tool. A scan that "completed" having found
+    # nothing is a materially different outcome from one that found 40 things, and
+    # the existing summary counted both as simply "completed".
+    _RESULT_KEYS = (
+        "total_valid_credentials", "vulnerabilities_found", "findings_count",
+        "paths_found", "urls_scanned", "urls_discovered", "pages_crawled",
+        "ports_found", "open_ports", "screenshots", "alerts", "inserted",
+        "total", "count",
+    )
+
+    @classmethod
+    def _result_highlights(cls, result: Any) -> Dict[str, Any]:
+        """Pull countable outcomes out of a tool's result blob, flattened one level."""
+        out: Dict[str, Any] = {}
+        if not isinstance(result, dict):
+            return out
+        for k in cls._RESULT_KEYS:
+            if isinstance(result.get(k), (int, float)):
+                out[k] = result[k]
+        for section in ("stages", "ingest", "stats", "result"):
+            sub = result.get(section)
+            if isinstance(sub, dict):
+                for k in cls._RESULT_KEYS:
+                    if isinstance(sub.get(k), (int, float)) and k not in out:
+                        out[k] = sub[k]
+
+        # Several tools report findings as LISTS, not counts — full-scan's
+        # ports_discovered is {"quick": [...], "full": [...]}, and all_open_ports
+        # is a bare list. Without this a full scan that found 25 ports reported
+        # "produced nothing", which is the exact false negative this summary
+        # exists to prevent.
+        for key in ("all_open_ports", "ports_found", "open_ports", "urls", "findings"):
+            v = result.get(key)
+            if isinstance(v, list) and v and key not in out:
+                out[key] = len(v)
+        pd = result.get("ports_discovered")
+        if isinstance(pd, dict):
+            for sub_key, v in pd.items():
+                if isinstance(v, list) and v:
+                    out[f"ports_{sub_key}"] = len(v)
+                elif isinstance(v, (int, float)) and v:
+                    out[f"ports_{sub_key}"] = v
+        return out
+
+    @classmethod
+    def _kb_coverage(cls, targets: List[str], types_run: List[str]) -> Dict[str, Any]:
+        """Did the run act on what the knowledge base recommended?
+
+        The flow summary was otherwise pure telemetry — counts of what happened,
+        with no reference to anything the system had learned. That answers "what
+        ran" but not "did it run what the KB said to run", which for a RAG-driven
+        scanner is the question worth asking.
+
+        scan_recommendations is populated per discovered (ip, service) by the
+        post-ingest recommender: `source='rules'` rows come from the KB, other
+        sources (e.g. 'ollama') come from the model. Cross-referencing them
+        against the scan types that actually ran turns the summary into a coverage
+        report — and surfaces recommendations that were generated and then ignored,
+        which is invisible everywhere else.
+
+        Degrades to {"available": False} on any DB problem: this is reporting, and
+        must never be the reason a session teardown fails.
+        """
+        db_dsn = os.environ.get(
+            "DB_DSN", "dbname=scans user=app password=app host=rag-postgres port=5432")
+        try:
+            import psycopg2
+            from psycopg2.extras import RealDictCursor
+            with psycopg2.connect(db_dsn) as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    if targets:
+                        cur.execute(
+                            "SELECT scanner, service, source, status, priority, "
+                            "       target_kind "
+                            "FROM scan_recommendations "
+                            "WHERE host(ip)::text = ANY(%s)", (list(targets),))
+                    else:
+                        cur.execute(
+                            "SELECT scanner, service, source, status, priority, "
+                            "       target_kind "
+                            "FROM scan_recommendations")
+                    rows = [dict(r) for r in cur.fetchall()]
+        except Exception as e:
+            logger.warning("KB coverage lookup failed: %s", e)
+            return {"available": False, "reason": str(e)[:200]}
+
+        # 'resource' recommendations are inputs (wordlists, template sets), not
+        # scans. Counting them would make coverage unreachable by construction:
+        # they can never be "acted on", so every run would report them as
+        # recommended-but-never-done forever. Reported separately as
+        # prerequisites instead.
+        prerequisites = sorted({(r.get("scanner") or "?") for r in rows
+                                if (r.get("target_kind") or "service") == "resource"})
+        non_dispatchable = sorted({(r.get("scanner") or "?") for r in rows
+                                   if (r.get("target_kind") or "service") in ("artifact", "range")})
+        rows = [r for r in rows if (r.get("target_kind") or "service") == "service"]
+
+        if not rows:
+            return {"available": True, "recommendations": 0,
+                    "prerequisites": prerequisites,
+                    "not_yet_dispatchable": non_dispatchable,
+                    "note": "no dispatchable KB recommendations for these targets"}
+
+        ran = {str(t).lower() for t in types_run}
+
+        # Which SCAN TYPES satisfy a recommended SCANNER. Substring matching is not
+        # good enough: "nmap" does not appear in "full_scan", so a full scan — which
+        # IS an nmap scan — was reported as "nmap recommended x48, never run".
+        # A coverage report that wrongly accuses is worse than none, so the mapping
+        # is explicit. Recommenders naming a tool the stack has no scan type for
+        # (metasploit, enum4linux) correctly stay uncovered — that is a real gap,
+        # not a matching artefact.
+        SATISFIED_BY = {
+            "nmap": {"nmap", "full_scan", "masscan-then-nmap", "nmap-tcp",
+                     "deep_port_scan", "nmap-udp", "udp_scan"},
+            "masscan": {"masscan", "full_scan", "masscan-then-nmap", "deep_port_scan"},
+            "naabu": {"naabu", "full_scan"},
+            "nuclei": {"nuclei", "pipeline", "web"},
+            "gobuster": {"gobuster", "pipeline", "web"},
+            "nikto": {"nikto", "pipeline", "web"},
+            "katana": {"katana", "pipeline", "web"},
+            "zap": {"zap", "pipeline", "web"},
+            "playwright": {"playwright", "pipeline", "web"},
+            "hydra": {"credential-check", "credential_check", "brutus"},
+            "smbmap": {"smb-vuln-scan", "smb_vuln_scan"},
+            "enum4linux": {"smb-vuln-scan", "smb_vuln_scan"},
+            "crackmapexec": {"credential-check", "smb-vuln-scan"},
+        }
+
+        def _acted(scanner: str) -> bool:
+            sc = (scanner or "").lower()
+            if sc in ran:
+                return True
+            return bool(SATISFIED_BY.get(sc, set()) & ran)
+
+        by_source, by_scanner = {}, {}
+        acted = 0
+        for r in rows:
+            src = r.get("source") or "unknown"
+            by_source[src] = by_source.get(src, 0) + 1
+            sc = r.get("scanner") or "unknown"
+            e = by_scanner.setdefault(sc, {"recommended": 0, "acted_on": False,
+                                           "top_priority": None})
+            e["recommended"] += 1
+            pr = r.get("priority")
+            if isinstance(pr, int) and (e["top_priority"] is None or pr > e["top_priority"]):
+                e["top_priority"] = pr
+            if _acted(sc):
+                e["acted_on"] = True
+                acted += 1
+
+        ignored = sorted(
+            ({"scanner": k, **v} for k, v in by_scanner.items() if not v["acted_on"]),
+            key=lambda x: (-(x["top_priority"] or 0), -x["recommended"]),
+        )
+        return {
+            "available": True,
+            "recommendations": len(rows),
+            "by_source": by_source,           # 'rules' = KB, others = model
+            "acted_on": acted,
+            "ignored": len(rows) - acted,
+            "coverage_pct": round(100.0 * acted / len(rows), 1),
+            "recommended_but_never_run": ignored[:15],
+            "pending_status_count": sum(1 for r in rows if (r.get("status") or "") == "pending"),
+            # Kept out of the coverage maths on purpose — see above.
+            "prerequisites": prerequisites,
+            "not_yet_dispatchable": non_dispatchable,
+        }
+
+    @classmethod
+    def load_scans_from_db(cls, session_id: str) -> List[Dict[str, Any]]:
+        """Rebuild the scan list from session_scan_metrics.
+
+        The in-memory registry is discarded by cleanup_session(), so anything
+        that needs the flow AFTER a session ends — notably the post-teardown
+        refresh, which exists because scans are often still running when the
+        session finishes — has to read it back from the database.
+
+        Returns the same shape build_flow_summary() expects from the registry.
+        Ordered by started_at so flow_order stays the real execution order.
+        """
+        db_dsn = os.environ.get(
+            "DB_DSN",
+            "dbname=scans user=app password=app host=rag-postgres port=5432")
+        rows: List[Dict[str, Any]] = []
+        try:
+            import psycopg2
+            from psycopg2.extras import RealDictCursor
+            with psycopg2.connect(db_dsn) as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(
+                        """SELECT scan_type, job_id, status, started_at,
+                                  completed_at, duration_seconds, params,
+                                  result_summary
+                             FROM session_scan_metrics
+                            WHERE session_id = %s::uuid
+                            ORDER BY started_at NULLS LAST, id""",
+                        (str(session_id),),
+                    )
+                    for r in cur.fetchall():
+                        rows.append({
+                            "type": r["scan_type"],
+                            "job_id": r["job_id"],
+                            "status": r["status"],
+                            "started_at": (r["started_at"].isoformat()
+                                           if r["started_at"] else None),
+                            "completed_at": (r["completed_at"].isoformat()
+                                             if r["completed_at"] else None),
+                            "duration_seconds": (float(r["duration_seconds"])
+                                                 if r["duration_seconds"] is not None
+                                                 else None),
+                            "params": r["params"] or {},
+                            "result_summary": r["result_summary"] or None,
+                        })
+        except Exception as e:
+            logger.warning("[SessionScanTracker] load_scans_from_db failed for %s: %s",
+                           session_id, e)
+        return rows
+
+    @classmethod
+    def build_flow_summary(cls, session_id: str = None,
+                           scans: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """End-of-session report: what each SCAN TYPE actually did, in order.
+
+        _generate_summary only ever answered "how many finished". That cannot tell
+        an operator whether the engagement did its job: a session where nuclei ran
+        and found nothing looks identical to one where nuclei never produced a
+        usable result, and a failed stage is invisible once the count says
+        "completed". This reconstructs the flow per type — sequence, targets,
+        durations, what each produced, and why anything failed.
+        """
+        session_id = session_id or cls.get_current_session()
+        if scans is None:
+            # Default source is the live registry. Callers running AFTER
+            # cleanup_session() must pass scans explicitly (see
+            # load_scans_from_db) — the registry is empty by then and this would
+            # silently report a session with no scans at all.
+            data = cls.get_session_status(session_id) or {}
+            scans = data.get("scans", []) or []
+        else:
+            # `data` is still needed below for the `totals` block. Synthesise it
+            # from the supplied scans so the DB-sourced path produces the same
+            # shape as the registry path.
+            data = {"session_id": session_id, "scans": scans}
+
+        by_type: Dict[str, Any] = {}
+        for idx, scan in enumerate(scans, start=1):
+            st = scan.get("type") or "unknown"
+            entry = by_type.setdefault(st, {
+                "scan_type": st, "runs": 0, "completed": 0, "failed": 0,
+                "running": 0, "targets": [], "total_duration_seconds": 0.0,
+                "results": {}, "failures": [], "sequence": [],
+            })
+            entry["runs"] += 1
+            status = (scan.get("status") or "unknown").lower()
+            if status in ("completed", "failed", "running"):
+                entry[status] += 1
+
+            params = scan.get("params") or {}
+            for key in ("targets", "target", "target_url", "ip_address", "targets_list"):
+                v = params.get(key)
+                if not v:
+                    continue
+                for t in (v if isinstance(v, (list, tuple)) else [v]):
+                    t = str(t)
+                    if t not in entry["targets"]:
+                        entry["targets"].append(t)
+
+            dur = scan.get("duration_seconds")
+            if isinstance(dur, (int, float)):
+                entry["total_duration_seconds"] += float(dur)
+
+            highlights = cls._result_highlights(scan.get("result_summary"))
+            for k, v in highlights.items():
+                entry["results"][k] = entry["results"].get(k, 0) + v
+
+            if status == "failed":
+                res = scan.get("result_summary")
+                why = (res.get("error") if isinstance(res, dict) else None) or "no error recorded"
+                entry["failures"].append({"job_id": scan.get("job_id"), "error": str(why)[:300]})
+
+            entry["sequence"].append({
+                "step": idx,
+                "job_id": scan.get("job_id"),
+                "status": status,
+                "started_at": scan.get("started_at"),
+                "duration_seconds": dur,
+                "produced": highlights or None,
+            })
+
+        for e in by_type.values():
+            e["total_duration_seconds"] = round(e["total_duration_seconds"], 1)
+            # "completed but produced nothing" is the case worth surfacing: it reads
+            # as success everywhere else and is usually where a broken tool hides.
+            e["produced_nothing"] = (
+                e["completed"] > 0 and not any(v for v in e["results"].values())
+            )
+
+        ordered = [s.get("type") for s in scans]
+        seen, flow = set(), []
+        for t in ordered:
+            if t and t not in seen:
+                seen.add(t)
+                flow.append(t)
+
+        all_targets = sorted({t for e in by_type.values() for t in e["targets"]})
+        # Strip URLs down to hosts so they match scan_recommendations.ip.
+        hosts = sorted({
+            (urlparse(t if "://" in t else "//" + t).hostname or t)
+            for t in all_targets
+        })
+
+        return {
+            "session_id": session_id,
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "kb_coverage": cls._kb_coverage(hosts, flow),
+            "scan_types_run": len(by_type),
+            "total_scans": len(scans),
+            "flow_order": flow,
+            "totals": cls._generate_summary(data),
+            "by_scan_type": [by_type[k] for k in sorted(by_type)],
+            "types_that_produced_nothing": sorted(
+                k for k, v in by_type.items() if v["produced_nothing"]
+            ),
+            "types_with_failures": sorted(
+                k for k, v in by_type.items() if v["failures"]
+            ),
+        }
+
     @classmethod
     def get_running_scans(cls, session_id: str = None) -> List[Dict[str, Any]]:
         """Get all running scans for the current (or specified) session."""
@@ -524,11 +901,35 @@ class SessionScanTracker:
             cur = conn.cursor()
             for scan in scans:
                 cur.execute(
+                    # UPSERT on (session_id, job_id).
+                    #
+                    # This was `ON CONFLICT DO NOTHING` with no matching unique
+                    # constraint — the table's only key is PRIMARY KEY (id) — so
+                    # nothing ever conflicted and every call INSERTED AGAIN. The
+                    # live table held 104 rows for 75 distinct jobs, including one
+                    # job with 6 copies carrying two different statuses.
+                    #
+                    # It also meant a scan persisted while still `running` could
+                    # never be corrected to `completed`: the update was silently
+                    # dropped, leaving rows permanently stuck mid-flight. That
+                    # makes this table unusable as the source for rebuilding a
+                    # flow summary after the in-memory registry is gone.
+                    #
+                    # Requires the unique index added in
+                    # db_init/ensure_all_tables.sql.
                     """INSERT INTO session_scan_metrics
                        (session_id, scan_type, scan_phase, job_id, status,
                         started_at, completed_at, duration_seconds, params, result_summary)
                        VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                       ON CONFLICT DO NOTHING""",
+                       ON CONFLICT (session_id, job_id) DO UPDATE SET
+                           status           = EXCLUDED.status,
+                           completed_at     = COALESCE(EXCLUDED.completed_at,
+                                                       session_scan_metrics.completed_at),
+                           duration_seconds = COALESCE(EXCLUDED.duration_seconds,
+                                                       session_scan_metrics.duration_seconds),
+                           result_summary   = COALESCE(EXCLUDED.result_summary,
+                                                       session_scan_metrics.result_summary),
+                           scan_phase       = EXCLUDED.scan_phase""",
                     (
                         session_id,
                         scan.get("type"),
@@ -824,13 +1225,19 @@ class ScanTools:
 
         Args:
             targets: List of IP addresses or CIDRs (e.g., ["192.168.1.0/24", "10.0.0.1"])
-            ports: Port range (e.g., "1-65535" or "80,443,8080")
+            ports: Port range. Defaults to nmap's top-1000. Do NOT pass "1-1000" —
+                   that is the first 1000 port NUMBERS, not the 1000 most commonly
+                   open ports, and it will be upgraded to the top-1000 anyway.
             rate: Scan rate in packets per second (default 1000)
             interface: Network interface to use (default "eth0")
 
         Returns:
             Dictionary with scan job information
         """
+        # Same upgrade start_full_scan applies. This is the choke point every
+        # wrapper funnels through, so an LLM-passed sequential low range is
+        # caught here regardless of which tool it called.
+        ports = _upgrade_sequential_quick_ports(ports)
         return self._make_request(
             method="POST",
             url=f"{self.nmap_url}/jobs/masscan-only",
@@ -858,7 +1265,9 @@ class ScanTools:
 
         Args:
             ip_address: Target IP address or CIDR (e.g., "192.168.1.1" or "10.0.0.0/24")
-            ports: Port range (e.g., "1-1000" or "80,443,8080")
+            ports: Port range. Defaults to nmap's top-1000. Do NOT pass "1-1000" —
+                   that is the first 1000 port NUMBERS, not the 1000 most commonly
+                   open ports, and it will be upgraded to the top-1000 anyway.
             service_detection: Enable service version detection (-sV flag)
             version_intensity: Service detection intensity 0-9 (9=aggressive)
             enable_scripts: Enable NSE scripts for banner grabbing and vulnerability detection
@@ -867,6 +1276,10 @@ class ScanTools:
         Returns:
             Dictionary with scan job information
         """
+        # Same upgrade start_full_scan applies. This is the choke point every
+        # wrapper funnels through, so an LLM-passed sequential low range is
+        # caught here regardless of which tool it called.
+        ports = _upgrade_sequential_quick_ports(ports)
         return self._make_request(
             method="POST",
             url=f"{self.nmap_url}/jobs/masscan-then-nmap",
@@ -925,7 +1338,7 @@ class ScanTools:
         self,
         targets: List[str],
         quick_ports: str = DEFAULT_QUICK_PORTS,
-        full_ports: str = "1001-65535",
+        full_ports: str = DEFAULT_DEEP_SCAN_PORTS,
         rate: int = 1000,
         interface: str = "eth0",
         run_smb_vuln_scan: bool = False,
@@ -935,9 +1348,14 @@ class ScanTools:
         Start a comprehensive full port scan with parallel phases.
 
         This runs a phased scanning approach for maximum coverage:
-        - Phase 1: Quick masscan (ports 1-1000)
-        - Phase 2: PARALLEL - Nmap on Phase 1 ports + Masscan (ports 1001-65535)
+        - Phase 1: Quick masscan over nmap's top-1000 (frequency-ranked)
+        - Phase 2: PARALLEL - Nmap on Phase 1 ports + Masscan over 1-65535
         - Phase 3: Nmap service detection on Phase 2 ports
+
+        Phase 2 sweeps the full range rather than 1001-65535: the quick pass is
+        frequency-ranked and its members are scattered across the whole range, so
+        "everything above 1000" is no longer its complement and would leave the
+        low ports outside the top-1000 unscanned by either phase.
 
         Discovers high-value ports often missed by limited scans:
         - 1099 (Java RMI), 1524 (Bindshell), 3306 (MySQL)
@@ -946,8 +1364,8 @@ class ScanTools:
 
         Args:
             targets: List of IP addresses or CIDRs
-            quick_ports: Ports for quick initial scan (default "1-1000")
-            full_ports: Ports for full scan (default "1001-65535")
+            quick_ports: Ports for quick initial scan (default: nmap top-1000)
+            full_ports: Ports for the follow-up sweep (default "1-65535")
             rate: Masscan rate in packets per second
             interface: Network interface to use
             run_smb_vuln_scan: Run SMB vulnerability scan if 139/445 found
@@ -1308,7 +1726,11 @@ class ScanTools:
 
     def get_web_findings(self, limit: int = 100) -> Dict:
         """
-        Get web findings from database
+        Get web findings from database.
+
+        There is no `/web_findings` endpoint (it 404s); the unified
+        `/findings/search` is the source of truth and it spans the web tools via
+        the `source` filter (zap / gobuster / playwright).
 
         Args:
             limit: Maximum number of results
@@ -1316,13 +1738,18 @@ class ScanTools:
         Returns:
             Dictionary with web findings
         """
-        return self._make_request(
+        resp = self._make_request(
             method="GET",
-            url=f"{self.rag_api_url}/web_findings",
+            url=f"{self.rag_api_url}/findings/search",
             operation=f"Query web findings (limit={limit})",
             headers=self.headers,
-            params={"limit": limit}
+            params={"source": ["zap", "gobuster", "playwright"], "limit": limit},
         )
+        # The unified endpoint returns `results`; alias it to `findings` so the
+        # get_web_findings() wrapper's target/source post-filtering still applies.
+        if isinstance(resp, dict) and "results" in resp and "findings" not in resp:
+            resp["findings"] = resp["results"]
+        return resp
 
     def check_system_status(self) -> Dict:
         """
@@ -1521,7 +1948,11 @@ class ScanTools:
         )
 
     def start_naabu(self, targets: List[str], ports: str = DEFAULT_QUICK_PORTS, rate: int = 1000) -> Dict:
-        """Start fast port scanning with naabu."""
+        """Start fast port scanning with naabu. Defaults to nmap's top-1000."""
+        # Same upgrade start_full_scan applies. This is the choke point every
+        # wrapper funnels through, so an LLM-passed sequential low range is
+        # caught here regardless of which tool it called.
+        ports = _upgrade_sequential_quick_ports(ports)
         return self._make_request(
             method="POST", url=f"{self.pd_runner_url}/jobs/naabu",
             operation=f"Naabu scan of {', '.join(targets[:3])}",
@@ -1629,6 +2060,87 @@ class ScanTools:
 # Async Scan Tools (non-blocking)
 # ===============================
 
+# ── Authorization gate ──────────────────────────────────────────────────────
+# The agent decides for itself which hosts to scan, so this module needs the
+# gate more than most — and it had none. It could not have one until now:
+# autogen-agents had no ./etl mount and could not import etl.scope_gate at all.
+# The mount is added in docker-compose.yml alongside ./common.
+#
+# Gated at _make_request, the single chokepoint every dispatch method funnels
+# through, and keyed on the TARGETS IN THE PAYLOAD rather than on the method
+# name. That way a new start_* method is covered the day it is written, and a
+# status poll — which carries no target — passes straight through.
+try:
+    from etl.scope_gate import enforce_target_scope
+    _SCOPE_GATE_OK = True
+    _SCOPE_GATE_ERROR = ""
+except Exception as _scope_exc:            # pragma: no cover - deployment problem
+    _SCOPE_GATE_OK = False
+    _SCOPE_GATE_ERROR = str(_scope_exc)
+
+# Payload keys that name a host. Values may be a string, a comma-separated
+# string, or a list; all three shapes appear across the start_* methods.
+_TARGET_KEYS = ("ip", "ips", "target", "targets", "host", "hosts",
+                "domain", "domains", "url", "urls", "rhosts")
+
+
+# Bound by the shared ceiling rather than a private number. Only calls that
+# carry a target take a slot — a status poll must not consume scan capacity.
+try:
+    from common.tool_job import async_scan_slot, MAX_CONCURRENT_SCANS
+    _SLOTS_OK = True
+    _SLOTS_ERROR = ""
+except Exception as _slot_exc:             # pragma: no cover - deployment problem
+    _SLOTS_OK = False
+    _SLOTS_ERROR = str(_slot_exc)
+    MAX_CONCURRENT_SCANS = 0
+
+    from contextlib import asynccontextmanager as _acm
+
+    @_acm
+    async def async_scan_slot(job_id: str = "", label: str = "scan", timeout=None):
+        raise RuntimeError(
+            f"scan slot pool unavailable ({_SLOTS_ERROR}) — check the "
+            "./common:/app/common mount on autogen-agents")
+        yield  # pragma: no cover
+
+
+def _payload_targets(payload) -> list:
+    out = []
+    if not isinstance(payload, dict):
+        return out
+    for key in _TARGET_KEYS:
+        val = payload.get(key)
+        if val is None:
+            continue
+        items = val if isinstance(val, (list, tuple, set)) else [val]
+        for item in items:
+            for part in str(item).replace(",", " ").split():
+                part = part.strip()
+                if part:
+                    out.append(part)
+    return out
+
+
+def _scope_refusal_for_payload(operation: str, payload) -> "str | None":
+    """Refusal string when any target in the payload is out of scope.
+
+    Every target is checked, not just the first: one authorised host in a list
+    is not authorisation for the rest.
+    """
+    targets = _payload_targets(payload)
+    if not targets:
+        return None
+    if not _SCOPE_GATE_OK:
+        return (f"scope gate unavailable ({_SCOPE_GATE_ERROR}) — refusing "
+                f"{operation}; check the ./etl:/app/etl mount on autogen-agents")
+    for t in targets:
+        refusal = enforce_target_scope(t, operation)
+        if refusal:
+            return refusal
+    return None
+
+
 class AsyncScanTools:
     """
     Async version of ScanTools for non-blocking operations.
@@ -1664,6 +2176,22 @@ class AsyncScanTools:
 
     async def _make_request(self, method: str, url: str, operation: str, **kwargs) -> Dict:
         """Make async HTTP request with error handling"""
+        refusal = _scope_refusal_for_payload(operation, kwargs.get("json")
+                                             or kwargs.get("params"))
+        if refusal:
+            logger.warning("REFUSED %s: %s", operation, refusal)
+            return {"error": "out_of_scope", "operation": operation,
+                    "url": url, "detail": refusal}
+
+        # A call that names a host is a scan; hold a slot for it. A status poll
+        # carries no target and must not consume scan capacity.
+        if _payload_targets(kwargs.get("json") or kwargs.get("params")):
+            async with async_scan_slot(job_id=operation, label="agent-scan"):
+                return await self._request_slotted(method, url, operation, **kwargs)
+        return await self._request_slotted(method, url, operation, **kwargs)
+
+    async def _request_slotted(self, method: str, url: str, operation: str, **kwargs) -> Dict:
+        """Body of _make_request, after the scope gate and inside a scan slot."""
         client = await self.get_client()
         request_id = f"{operation}_{int(time.time()*1000)}"
 
@@ -2378,7 +2906,10 @@ def start_masscan(targets: str = None, target: str = None, ports: str = DEFAULT_
     Args:
         targets: Comma-separated list of IPs or CIDRs (e.g., "192.168.1.0/24,10.0.0.1")
         target: Alias for targets (single IP also works)
-        ports: Port range (e.g., "1-1000" or "80,443,8080")
+        ports: Port range. Omit it — the default is nmap's top-1000, the 1000 most
+               commonly OPEN ports. Do NOT pass "1-1000": that is the first 1000 port
+               NUMBERS, which misses mysql 3306, postgresql 5432, vnc 5900 and tomcat
+               8180. Pass a value only for a genuinely specific scope (e.g. "80,443").
         rate: Scan rate in packets per second
 
     Returns JSON string with job information.
@@ -2409,7 +2940,10 @@ def start_nmap_scan(ip_address: str, ports: str = DEFAULT_QUICK_PORTS, service_d
 
     Args:
         ip_address: Target IP address or CIDR
-        ports: Port range (e.g., "1-1000" or "80,443,8080")
+        ports: Port range. Omit it — the default is nmap's top-1000, the 1000 most
+               commonly OPEN ports. Do NOT pass "1-1000": that is the first 1000 port
+               NUMBERS, which misses mysql 3306, postgresql 5432, vnc 5900 and tomcat
+               8180. Pass a value only for a genuinely specific scope (e.g. "80,443").
         service_detection: Enable service version detection (-sV flag)
         version_intensity: Service detection intensity 0-9 (9=aggressive)
         enable_scripts: Enable NSE scripts for banner grabbing and vulnerability detection
@@ -2482,19 +3016,25 @@ def start_full_scan(
     """
     Start a quick port scan with service detection.
 
-    Default: scans ports 1-1000 + high WEB_PORTS from settings with service detection (~2-3 min).
-    After this completes, run web scans on discovered HTTP ports, then start_deep_port_scan.
+    Default: nmap's top-1000 (the 1000 most commonly OPEN ports, frequency-ranked)
+    plus any high WEB_PORTS from settings, with service detection. A full-range
+    masscan follow-up over 1-65535 is scheduled automatically and runs in parallel,
+    so you do NOT need to call start_deep_port_scan afterwards.
+
+    Do not pass quick_ports="1-1000". That is the first 1000 port NUMBERS, not the
+    1000 most commonly open ports — it misses mysql 3306, postgresql 5432, vnc 5900
+    and tomcat 8180. It will be upgraded to the top-1000 profile anyway.
 
     Phases:
-    1. Quick masscan on specified ports
-    2. Nmap service detection on discovered ports (+ full masscan if full_ports is set)
-    3. Service detection on any additional ports (if full_ports was set)
+    1. Quick masscan over the top-1000
+    2. Nmap service detection on discovered ports, in PARALLEL with a masscan over 1-65535
+    3. Service detection on any additional ports found in phase 2
 
     Args:
         targets: Comma-separated string of IPs or CIDRs (e.g. "192.168.1.150")
         target: Alias for targets
-        quick_ports: Ports for quick scan (default from WEB_PORTS setting)
-        full_ports: Ports for deep scan (default "" = skip, use start_deep_port_scan later)
+        quick_ports: Ports for quick scan (default: nmap top-1000 + high WEB_PORTS)
+        full_ports: Ports for the follow-up sweep (default: automatic, 1-65535)
         rate: Masscan rate in packets per second
         run_smb_vuln_scan: Run SMB vuln scan if 139/445 found (default False - decide after reviewing results)
         run_credential_check: Run credential checking on auth services (default False - decide after reviewing results)
@@ -2513,6 +3053,11 @@ def start_full_scan(
     # Guard against LLM passing null/None/empty for optional params
     if not quick_ports:
         quick_ports = DEFAULT_QUICK_PORTS
+    else:
+        # An explicitly-passed sequential low range is upgraded, not obeyed —
+        # defaulting the parameter alone never fixed this, because the model
+        # passes "1-1000" outright.
+        quick_ports = _upgrade_sequential_quick_ports(quick_ports)
     if rate is None:
         rate = 1000
 
@@ -2528,7 +3073,7 @@ def start_full_scan(
         )
         quick_ports = session_scope
         # A session scope already defines the full sweep; a second deep pass
-        # over 1001-65535 would rescan ports the operator either asked for
+        # over the full range would rescan ports the operator either asked for
         # (profile 'all') or deliberately excluded.
         full_ports = ""
 
@@ -2540,6 +3085,28 @@ def start_full_scan(
         full_ports = ""
     if full_ports is None:
         full_ports = ""
+
+    # Full-range follow-up is now automatic rather than a separate call the model
+    # had to remember to make.  It ran as Phase 2 in parallel with the Phase 1
+    # nmap enrichment, so scheduling it here costs no extra wall-clock — whereas
+    # leaving it to a later start_deep_port_scan meant that whenever the model
+    # skipped that step (or the session ended first) the engagement silently
+    # shipped with only top-1000 coverage.
+    #
+    # Not applied when the operator picked a session scope: that selection
+    # already defines the sweep, and widening it back to 1-65535 would ignore a
+    # deliberately narrow (e.g. redteam-targeted) choice.  The session-scope
+    # branch above clears full_ports for exactly this reason.
+    # Also skipped when the quick pass IS the full range — start_deep_port_scan
+    # delegates here with quick_ports=1-65535, and without this it would queue a
+    # second identical sweep behind the first.
+    _quick_is_full_range = quick_ports.strip() in (DEFAULT_DEEP_SCAN_PORTS, "1-65535", "0-65535")
+    if not full_ports and not session_scope and not _quick_is_full_range:
+        full_ports = DEFAULT_DEEP_SCAN_PORTS
+        logger.info(
+            "Scheduling the full-range masscan follow-up (%s) alongside the "
+            "top-1000 quick pass", full_ports,
+        )
 
     result = get_scan_tools().start_full_scan(
         target_list,
@@ -2575,10 +3142,14 @@ def start_deep_port_scan(
     rate: int = 1000
 ) -> str:
     """
-    Start a deep port scan covering ports 1001-65535.
+    Start a deep port scan covering the full range, 1-65535.
 
-    Run this AFTER web scans have completed. Uses the same backend as start_full_scan
-    but targets only the remaining high ports (1001-65535) with service detection.
+    USUALLY UNNECESSARY: start_full_scan now schedules this sweep automatically as
+    its phase 2. Call this only to re-sweep a target whose full scan predates that
+    change, or when you deliberately skipped the full scan.
+
+    Uses the same backend as start_full_scan, with the full range as the discovery
+    pass and service detection on whatever it finds.
 
     Args:
         targets: Comma-separated string of IPs or CIDRs (e.g. "192.168.1.150")
@@ -2592,7 +3163,7 @@ def start_deep_port_scan(
         return json.dumps({"error": "No target specified. Use 'targets' parameter with a string like '192.168.1.150'."})
 
     # When the operator pinned a port scope for this session, the quick scan
-    # already covered exactly the ports they asked for.  A 1001-65535 sweep here
+    # already covered exactly the ports they asked for.  A full-range sweep here
     # would either duplicate that work (profile 'all') or scan ports they
     # deliberately excluded — so decline instead, and say why.
     session_scope = scan_tracker.get_port_scope()
@@ -2604,7 +3175,7 @@ def start_deep_port_scan(
             "reason": (
                 f"This session runs with the '{profile_id}' port scope "
                 f"({count_profile_ports(session_scope)} ports), which start_full_scan "
-                f"already covered. A deep 1001-65535 sweep would go outside the "
+                f"already covered. A deep 1-65535 sweep would go outside the "
                 f"operator's selected scope. Do NOT retry this tool — move on to "
                 f"analysing results or running service-specific follow-up scans."
             ),
@@ -3130,7 +3701,10 @@ def start_naabu(targets: str = None, target: str = None, ports: str = DEFAULT_QU
     Args:
         targets: Comma-separated list of IPs or CIDRs (e.g., "192.168.1.0/24,10.0.0.1")
         target: Alias for targets
-        ports: Port range (e.g., "1-1000" or "80,443,8080")
+        ports: Port range. Omit it — the default is nmap's top-1000, the 1000 most
+               commonly OPEN ports. Do NOT pass "1-1000": that is the first 1000 port
+               NUMBERS, which misses mysql 3306, postgresql 5432, vnc 5900 and tomcat
+               8180. Pass a value only for a genuinely specific scope (e.g. "80,443").
         rate: Scan rate in packets per second
 
     Returns JSON string with job information.
@@ -3245,6 +3819,161 @@ def get_scan_recommendations(context: str) -> str:
     Returns JSON string with recommendations.
     """
     result = get_scan_tools().get_scan_recommendations(context)
+    return json.dumps(result, indent=2)
+
+
+def run_custom_test(tool: str, command: str, target: str, port: int = None,
+                    service: str = None, timeout: int = 300) -> str:
+    """Run ONE allowlisted, scope-gated security-test command and capture evidence.
+
+    DELIBERATELY NOT registered as an agent tool. It takes an arbitrary command
+    string, and handing that to a react-agent would let the model launder any
+    command through the gate — strictly more dangerous than the fixed start_*
+    dispatchers. It is called ONLY deterministically from the surface-test safe
+    lane. Keeping it off every LLM toolset preserves the property that the
+    toolset, not the prompt, enforces what can be dispatched.
+
+    It only POSTs to kali-listener /tools/execute, which independently enforces
+    the scope gate (fail-closed; scans the command for out-of-scope IP literals),
+    the tool allowlist (Metasploit excluded), the dangerous-char filter, and
+    MAX_CONCURRENT_SCANS. No local subprocess, no target pre-filtering — the slot
+    and the scope decision are held at that endpoint.
+
+    Returns JSON: {ok, exec_id, status_code} on dispatch, or an error shape. The
+    caller polls /tools/executions/{exec_id} for the terminal result + evidence.
+    """
+    import httpx as _hx
+    base = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    payload = {"tool": tool, "command": command, "target": target,
+               "port": port, "service": service, "timeout": timeout}
+    try:
+        with _hx.Client(verify=False, timeout=timeout + 30) as c:
+            r = c.post(f"{base}/tools/execute", json=payload)
+        body = {}
+        if r.headers.get("content-type", "").startswith("application/json"):
+            body = r.json()
+        return json.dumps({
+            "ok": r.status_code < 400,
+            "status_code": r.status_code,
+            "exec_id": body.get("exec_id") or body.get("execution_id"),
+            "detail": None if r.status_code < 400 else r.text[:400],
+            **({k: v for k, v in body.items() if k not in ("exec_id", "execution_id")}),
+        })
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "status_code": 0,
+                           "error": f"{type(e).__name__}: {e}"})
+
+
+def get_execution_status(exec_id: str) -> str:
+    """Read one kali-listener tool execution (status, exit_code, output,
+    parsed_results) — the terminal evidence for a safe security-test run.
+    Read-only GET; returns JSON string, or an error shape."""
+    import httpx as _hx
+    base = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    try:
+        with _hx.Client(verify=False, timeout=30) as c:
+            r = c.get(f"{base}/tools/executions/{exec_id}")
+        if r.status_code != 200:
+            return json.dumps({"ok": False, "status_code": r.status_code})
+        return json.dumps(r.json())
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+def analyze_attack_surface(target_host: str = None, limit: int = 8) -> str:
+    """Enumerate one host's full attack surface as structured JSON.
+
+    Composes the MITRE-mapped attack vectors, the host's open ports/services,
+    its web findings, and per-service tool/methodology recommendations (including
+    ingested attack-path knowledge) into one summary an agent can turn into
+    concrete tests.
+
+    Args:
+        target_host: The host/IP to analyze. When omitted, the highest-risk host
+            from the attack-vector map is used.
+        limit: Max (service, port) pairs to expand recommendations for.
+
+    Returns a JSON string: {target, vectors[], services[{service, port,
+    recommendations}], web_findings_count}.
+    """
+    st = get_scan_tools()
+    host = (target_host or "").strip() or None
+
+    def _j(fn, **kw):
+        try:
+            return json.loads(fn(**kw))
+        except Exception:
+            return {}
+
+    # get_attack_vectors is a module-level tool; call it for the ranked list.
+    try:
+        av = json.loads(get_attack_vectors(limit=limit, min_risk=0.0))
+        vlist = av.get("vectors") or []
+    except Exception:
+        vlist = []
+
+    if not host and vlist:
+        raw = str(vlist[0].get("target") or "")
+        # normalize a target that may be a host, url, or "service on host"
+        import re as _re
+        m = _re.search(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}", raw)
+        host = m.group(0) if m else (raw.split("//")[-1].split("/")[0].split(":")[0] or None)
+
+    ports = _j(query_open_ports, target=host, limit=100) if host else {}
+    items = ports.get("items") or []
+    web = _j(get_web_findings, target=host, limit=100) if host else {}
+    web_items = web.get("items") or web.get("findings") or []
+
+    seen, services = set(), []
+    for row in items:
+        svc = (row.get("service") or "").strip().lower()
+        prt = row.get("port")
+        if not svc or (svc, prt) in seen:
+            continue
+        seen.add((svc, prt))
+        if len(services) >= limit:
+            break
+        rec = _j(get_tool_recommendations, service=svc, port=prt)
+        services.append({"service": svc, "port": prt, "ip": row.get("ip"),
+                         "recommendations": rec})
+
+    return json.dumps({
+        "target": host,
+        "vectors": vlist[:limit],
+        "services": services,
+        "web_findings_count": len(web_items),
+    }, indent=2)
+
+
+def get_tool_recommendations(service: str = None, port: int = None) -> str:
+    """
+    Get the CONCRETE tests to run against a discovered service, as structured
+    data rather than prose.
+
+    This is the tool to call when you have a service/port and need to decide what
+    to actually run. Unlike get_scan_recommendations, which answers a free-text
+    question with a paragraph, this returns machine-readable fields:
+
+      - tools[]        each with name, purpose and a ready `command` template
+                       containing a {target} placeholder
+      - metasploit[]   module paths with their purpose
+      - nuclei_tags[]  tags to pass to a nuclei scan
+      - common_vulns[] what typically goes wrong with this service
+      - rag_context    ingested methodology for this service (playbooks and any
+                       operator-supplied training documents)
+
+    Service aliases are resolved, so `https`, `http-proxy` and `ssl/http` all
+    return the web guidance, and `microsoft-ds` returns the SMB guidance.
+
+    Args:
+        service: Service name from the scan (e.g. 'https', 'smb', 'mysql')
+        port: Port number. Supply either or both; the port infers the service
+              when the name is unknown.
+
+    Returns JSON string. Use the `command` templates to decide which start_*
+    tool to dispatch and with what parameters.
+    """
+    result = get_scan_tools().get_tool_recommendations(service=service, port=port)
     return json.dumps(result, indent=2)
 
 
@@ -4043,7 +4772,7 @@ def _enrich_with_follow_ups(result: dict, job_id: str) -> dict:
         # Deep port discovery — run after vuln scans to find services on high ports
         has_high_ports = any(p > 1000 for p in ports if p not in (8080, 8443))
         if not has_high_ports:
-            follow_ups.append(f"AFTER vuln scans + cred checks: start_deep_port_scan(targets='{target_ip}') — discover services on ports 1001-65535, then run nuclei on any new findings")
+            follow_ups.append(f"AFTER vuln scans + cred checks: review the phase-2 full-range (1-65535) masscan results from start_full_scan, then run nuclei on any newly discovered services")
 
         # Operator guidance goes FIRST: the groups above are generic defaults
         # derived from port numbers alone, while these rules were authored (often
@@ -4404,7 +5133,7 @@ def get_session_scan_status(session_id: str = None) -> str:
                 "started_at": "...",
                 "completed_at": "...",
                 "duration_seconds": 45,
-                "params": {"targets": ["192.168.1.150"], "ports": "1-1000"}
+                "params": {"targets": ["192.168.1.150"], "ports": "<top-1000>"}
             },
             {
                 "type": "nmap",

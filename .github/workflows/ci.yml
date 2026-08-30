@@ -23,3 +23,51 @@ jobs:
       - name: Byte-compile python
         run: |
           python -m compileall -q etl app scanner nuclei
+      - name: Check shared module drift
+        run: |
+          python3 scripts/check_shared_code.py --list
+      - name: Run test suite
+        run: |
+          pip install -r tests/requirements.txt
+          # DB-backed and service-backed tests skip cleanly without them.
+          pytest tests/ -q
+      - name: Check shell script syntax
+        run: |
+          # scripts/cleanup-old-files.sh sat unparseable at HEAD — a stray
+          # 'fi' — so scheduled cleanup could never have run. Nothing
+          # checked, because the script is only invoked from cron.
+          fail=0
+          for f in $(git ls-files '*.sh'); do
+            bash -n "$f" || { echo "SYNTAX ERROR: $f"; fail=1; }
+          done
+          exit $fail
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          # 22, not 20: vitest 4 declares ^20 || ^22 || >=24 and development
+          # here runs on 26, so pinning the oldest supported line maximises the
+          # local/CI gap for no benefit. 22 is LTS and explicitly supported by
+          # both vite and vitest.
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: dashboard/frontend/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit -p tsconfig.json
+      # Was NOT run here, which is why 19 failing tests sat unnoticed on a clean
+      # tree: zustand's persist middleware died because jsdom exposes no
+      # localStorage, so every store test failed before asserting anything.
+      # Fixed in src/test/setup.ts; wiring the suite in is what keeps it fixed.
+      - name: Unit tests
+        run: npm test
+      - name: Build
+        run: npm run build

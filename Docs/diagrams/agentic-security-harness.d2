@@ -1,0 +1,233 @@
+# Agentic Security Harness — Landscape
+#
+# Where autonomy is granted, where it is CONSTRAINED, and how the loop closes.
+# Every control shown was verified present in code, not assumed.
+#
+# Render (theme 0 is the neutral LIGHT theme — see the style.fill note below,
+# theme 200 is dark and made the plain-text title and legend unreadable):
+#   d2 --layout elk --theme 0 Docs/diagrams/agentic-security-harness.d2 \
+#      Docs/diagrams/agentic-security-harness.svg
+#   rsvg-convert -f png -o Docs/diagrams/agentic-security-harness.png \
+#      Docs/diagrams/agentic-security-harness.svg
+
+direction: right
+
+# Light canvas, set explicitly.
+#
+# theme 200 is a DARK theme — its background is rgb(30,30,46). The shapes here
+# carry explicit light fills so they looked fine, which hid the problem: the
+# title and legend are plain text with no fill behind them, so near-black text
+# was being drawn on a near-black canvas and was invisible. It read as "the
+# legend is missing from the PNG".
+#
+# Fixing the canvas rather than the text keeps the dark-on-light contrast that
+# every other label depends on.
+style.fill: "#ffffff"
+
+# High-contrast typography.
+#
+# d2's defaults render 16px labels, which on a 5356px-wide canvas is ~0.3% of the
+# width — unreadable at fit-to-screen and marginal when projected. Near-black text
+# on the light fills gives the strongest contrast ratio available here (dark-on-
+# light beats any coloured-text scheme), and the sizes below hold up both zoomed
+# out and on a slide.
+**.style.font-size: 26
+**.style.font-color: "#0b0b0c"
+(** -> **)[*].style.font-size: 22
+(** -> **)[*].style.font-color: "#111827"
+(** -> **)[*].style.bold: true
+
+title: "Agentic Security Harness — Landscape\nAutonomy flows left to right.  Red = enforcement · Purple = agent-output validation" {
+  near: top-center
+  shape: text
+  # Native text, NOT |md|: markdown blocks become foreignObject, which librsvg
+  # and most non-browser SVG renderers drop entirely.
+  style: {font-size: 42; bold: true; font-color: "#0b0b0c"}
+}
+
+# ─────────────────────────────────────── who decides what to run
+decide: "DECIDE — autonomy" {
+  style: {fill: "#eef4ff"; stroke: "#3b5bdb"; stroke-width: 2; font-size: 40; bold: true}
+
+  operator: "Operator (dashboard UI)" {
+    style: {fill: "#f8f9fa"; stroke-dash: 3}
+  }
+  session: "AI agent session\n(autogen-agents)" {
+    style.fill: "#dbe4ff"
+    tooltip: "Multi-agent pentest session — Scanner / Recon / Analyzer roles"
+  }
+  recon: "Recon agent\n(continuous, BFF)" {
+    style.fill: "#dbe4ff"
+    tooltip: "Timer loop per engagement; drains the KB recommendation queue"
+  }
+  mcp: "MCP + Open WebUI\nsurfaces" {
+    style.fill: "#dbe4ff"
+    tooltip: "mcp-server, mcp-streamable, mcpo, open-webui — LLM-callable tools"
+  }
+  kb: "Recommender\n(scan-recommender)" {
+    style.fill: "#dbe4ff"
+    tooltip: "KB rules + LLM; emits scan_recommendations per (ip, service)"
+  }
+}
+
+# ─────────────────────────────────────── the guardrails
+control: "CONSTRAIN — enforcement plane" {
+  style: {fill: "#fff5f5"; stroke: "#c92a2a"; stroke-width: 3; font-size: 40; bold: true}
+
+  scope_bff: "Scope gate\nBFF /api/scans/*" {
+    style: {fill: "#ffc9c9"; stroke: "#c92a2a"; bold: true}
+    tooltip: "403 before any packet — covers the dashboard path"
+  }
+  scope_scanner: "Scope gate\nscanner validate_inputs" {
+    style: {fill: "#ffc9c9"; stroke: "#c92a2a"; bold: true}
+    tooltip: "Where every path converges. Added after a real agent scan bypassed the BFF entirely"
+  }
+  matcher: "etl/scope_gate\nfail-closed matcher" {
+    style: {fill: "#ffe3e3"; stroke: "#c92a2a"}
+    tooltip: "One implementation, three call sites. ip/cidr/domain/url, default-DENY, host-only"
+  }
+  kind: "target_kind guard" {
+    style: {fill: "#ffc9c9"; stroke: "#c92a2a"; bold: true}
+    tooltip: "service | artifact | range | resource — non-service refused with a reason, not fired at an IP"
+  }
+  approval: "Exploit approval queue" {
+    style: {fill: "#ffc9c9"; stroke: "#c92a2a"; bold: true}
+    tooltip: "Metasploit is never auto-exploited — queued for human approval"
+  }
+  claims: "Agent-output validation\n(claims vs recorded data)" {
+    # Grape, deliberately NOT the red used for scope enforcement. This control
+    # answers a different question: scope asks "may we touch this host?", this
+    # asks "did the agent tell the truth about what it found?". Same plane,
+    # different failure mode, so it gets its own colour.
+    style: {fill: "#f3d9fa"; stroke: "#ae3ec9"; stroke-width: 3; bold: true}
+    tooltip: "Regex + SQL, deterministic. Catches FABRICATED ports/CVEs/hosts. Unsupported can also mean ingestion broke"
+  }
+  tls: "CA trust bundle" {
+    style: {fill: "#ffe3e3"; stroke: "#c92a2a"}
+    tooltip: "Public roots + the stack's self-signed cert, 14 services. Verification stays ON"
+  }
+}
+
+# ─────────────────────────────────────── what actually touches the target
+execute: "EXECUTE — scanners" {
+  style: {fill: "#f4fce3"; stroke: "#5c940d"; stroke-width: 2; font-size: 40; bold: true}
+
+  nmap: "nmap_scanner" {
+    style.fill: "#e9fac8"
+    tooltip: "Phase 1 top-1000 then Phase 2 full 1-65535 in parallel; phase 2 found 3632 distccd"
+  }
+  web: "web-scanner + ZAP" {
+    style.fill: "#e9fac8"
+    tooltip: "ZAP -Xmx3g under a 6g cap; zap.sh reads only the cgroup v1 path"
+  }
+  pd: "pd-runner" {
+    style.fill: "#e9fac8"
+    tooltip: "httpx, naabu, katana, tlsx, whatweb, ffuf"
+  }
+  osint: "osint-runner" {style.fill: "#e9fac8"}
+  nuclei: "nuclei-runner" {style.fill: "#e9fac8"}
+  brutus: "brutus-runner" {style.fill: "#e9fac8"}
+  pw: "playwright-scanner" {style.fill: "#e9fac8"}
+  kali: "kali-listener\n(CLI-only fallback)" {
+    style: {fill: "#e9fac8"; stroke-dash: 3}
+    tooltip: "Allowlisted CLI tools — the fallback, not the default"
+  }
+  msf: "exploit-runner\n+ metasploit" {
+    style.fill: "#e9fac8"
+    tooltip: "msfrpcd over RPC; credentials must match on BOTH sides"
+  }
+}
+
+target: "Authorized target\n(engagement scope)" {
+  # Explicit size, larger than the glob: this is the terminus every control
+  # exists to protect, so it should read first. It previously carried an
+  # inherited 18px — the smallest text on the diagram, on its most important box.
+  style: {fill: "#fff9db"; stroke: "#e67700"; stroke-width: 4; bold: true; font-size: 34}
+}
+
+# ─────────────────────────────────────── memory
+know: "REMEMBER — knowledge + state" {
+  style: {fill: "#f3f0ff"; stroke: "#6741d9"; stroke-width: 2; font-size: 40; bold: true}
+
+  pg: "rag-postgres" {
+    style.fill: "#e5dbff"
+    tooltip: "assets, ports, vulns, findings, scope_targets, engagements, scan_recommendations, follow_up_items"
+  }
+  kbfiles: "knowledge/*.yaml\n+ service_prompts" {
+    style.fill: "#e5dbff"
+    tooltip: "port_profiles, web_profiles — single source of truth for scope presets"
+  }
+  vec: "embedder + ollama / vllm" {style.fill: "#e5dbff"}
+  grpo: "grpo-trainer (feedback)" {style: {fill: "#e5dbff"; stroke-dash: 3}}
+}
+
+# ─────────────────────────────────────── what the human gets back
+report: "REPORT — back to the human" {
+  style: {fill: "#e6fcf5"; stroke: "#087f5b"; stroke-width: 2; font-size: 40; bold: true}
+
+  flow: "Scan-flow summary\n(per scan type)" {
+    style.fill: "#c3fae8"
+    tooltip: "Per type: runs, targets, duration, what it PRODUCED, failures. produced_nothing flags silent breakage"
+  }
+  coverage: "KB coverage" {
+    style.fill: "#c3fae8"
+    tooltip: "Acted-on vs ignored recommendations by source; 'resource' kind excluded from the denominator"
+  }
+  manual: "Manual follow-ups\n(with the command)" {
+    style.fill: "#c3fae8"
+    tooltip: "Anything needing a human gets a runnable command, wired to the real target"
+  }
+  hooks: "Webhooks" {style: {fill: "#c3fae8"; stroke-dash: 3}}
+}
+
+# ── decide → control ──────────────────────────────────────────────
+decide.operator -> decide.session: "starts"
+decide.operator -> control.scope_bff: "UI scan"
+decide.session -> control.scope_scanner: "dispatches direct" {style: {stroke: "#c92a2a"; stroke-width: 2}}
+decide.mcp -> control.scope_scanner: "dispatches direct" {style: {stroke: "#c92a2a"; stroke-width: 2}}
+decide.recon -> control.kind: "drains queue"
+decide.kb -> know.pg: "writes recommendations" {style.stroke-dash: 3}
+know.pg -> decide.recon: "pending queue" {style.stroke-dash: 3}
+
+control.scope_bff -> control.scope_scanner
+control.kind -> control.scope_scanner: "service kind only"
+control.kind -> report.manual: "artifact / range / resource" {style.stroke: "#087f5b"}
+control.kind -> control.approval: "metasploit"
+control.matcher -> control.scope_bff {style.stroke-dash: 4}
+control.matcher -> control.scope_scanner {style.stroke-dash: 4}
+
+# ── control → execute ─────────────────────────────────────────────
+control.scope_scanner -> execute.nmap
+control.scope_scanner -> execute.web
+control.scope_scanner -> execute.pd
+control.scope_scanner -> execute.osint
+control.scope_scanner -> execute.nuclei
+control.scope_scanner -> execute.brutus
+control.scope_scanner -> execute.pw
+control.scope_scanner -> execute.kali
+control.approval -> execute.msf: "human approved" {style: {stroke: "#c92a2a"; stroke-width: 2}}
+control.tls -> execute: "all peer calls verify" {style: {stroke-dash: 4; stroke: "#c92a2a"}}
+
+execute -> target: "packets" {style: {stroke: "#e67700"; stroke-width: 3}}
+
+# ── execute → know → report ───────────────────────────────────────
+execute -> know.pg: "ingest findings"
+know.pg -> decide.kb: "post-ingest trigger" {style.stroke-dash: 3}
+know.kbfiles -> control.matcher: "scope presets" {style.stroke-dash: 4}
+know.vec -> decide.kb {style.stroke-dash: 3}
+control.claims -> report.flow: "verdicts: supported / unsupported" {style: {stroke: "#ae3ec9"; stroke-width: 3}}
+know.pg -> control.claims: "what was actually recorded" {style: {stroke: "#ae3ec9"; stroke-width: 3; stroke-dash: 3}}
+decide.session -> control.claims: "what the agents claimed" {style: {stroke: "#ae3ec9"; stroke-width: 3}}
+know.pg -> report.flow
+know.pg -> report.coverage
+know.pg -> know.grpo {style.stroke-dash: 3}
+report.flow -> decide.operator: "end of session"
+report.coverage -> decide.operator
+report.manual -> decide.operator: "run by hand"
+report.hooks -> decide.operator: "Slack / n8n"
+
+legend: "READING THIS\n\nRED — enforcement. Every route to a packet crosses the scanner scope gate.\nPURPLE — agent-output validation: claimed ports / CVEs / hosts checked against\n         what the scans actually recorded. \"Unsupported\" means not found in the\n         data, which can equally mean ingestion broke — read it beside the flow\n         summary's produced counts.\nGREEN — reporting and manual follow-ups.  ORANGE — packets to the target.\nDASHED — knowledge / feedback, not a dispatch path.\n\nThe scanner gate exists because a real agent scan bypassed the BFF one entirely.\ntarget_kind splits recommendations that cannot be automated into manual\nfollow-ups WITH the command, instead of failing silently." {
+  near: bottom-center
+  shape: text
+  style: {font-size: 24; font-color: "#0b0b0c"}
+}

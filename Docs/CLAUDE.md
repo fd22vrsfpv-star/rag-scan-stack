@@ -105,6 +105,7 @@ Provide a lightweight web UI:
 
 ### Quality
 - Unit tests for parsers and fingerprinting
+- Save the unit tests so that they can be run indpendantly
 - Minimal linting + formatting
 - Clear error messages and logging
 - Sample data fixtures and a “quickstart”
@@ -113,12 +114,180 @@ Provide a lightweight web UI:
 - Any new database elements need added to the health check scripts
 - Audit any newly delievered features to ensure a complete and stable implementation is provided. This includes ensuring that api endpoints are fully functional and defined correctly
 - Any new feature that performs actions (scans, agent cycles, pipeline stages, etc.) MUST emit webhook events via `POST /webhooks/emit` so external tools (Slack, n8n, etc.) can subscribe. Use descriptive event_type names (e.g. `recon_agent_scan_dispatched`, `pipeline_stage_completed`). Include relevant context (engagement_id, target, scan_type, counts) in the data payload.
+## Enforced invariants
+
+Each rule below names the test that FAILS when it is violated. A rule with no
+enforcing test is a suggestion, and suggestions do not survive contact with a
+large change. Add the test in the same commit as the rule.
+
+### Authorization gates
+- Every code path that sends traffic to a host MUST pass the scope gate before
+  dispatch. **Fail closed**: no configured scope means nothing runs, because the
+  alternative is treating an unconfigured scope as permission to scan anything.
+- Override flags (`force`, retry, "run anyway") overrule the platform's
+  *suppression* judgement, NEVER the operator's *authorization*. A forced
+  out-of-scope dispatch must still be refused.
+- Blocked items MUST be labelled in the UI, not silently dropped. A blocked item
+  that looks identical to a runnable one reads as a bug when it does nothing.
+- When gate logic must be duplicated (e.g. the BFF cannot import
+  `etl/scope_gate.py`), add an agreement test pinning both implementations to a
+  shared case table.
+- *Enforced by:* `tests/test_dispatch_invariants.py::test_no_new_ungated_dispatchers`,
+  `tests/test_dispatch_scope.py::test_bff_and_scope_gate_agree`.
+- *Why:* dispatch had no scope check at all, and 14 recommendations targeting
+  third-party addresses were queued against this engagement — several already
+  executed.
+
+### Scan volume
+- Any component that initiates OR triggers a scan MUST bound itself by
+  `MAX_CONCURRENT_SCANS`. No component invents a private concurrency number.
+- This includes indirect triggers: an endpoint that auto-executes tools as a
+  side effect is a scan initiator.
+- **Shed, do not queue.** Return 429 fast rather than accepting work that will
+  time out. Client timeouts MUST cover the worst *admitted* latency at the
+  limit — admitting a request and then abandoning it wastes the work twice.
+- *Enforced by:* `tests/test_dispatch_invariants.py::test_no_new_unbounded_scan_initiators`.
+- *Why:* `/next_scan` ran once per open port per scan and auto-executed tools
+  whose output triggered more calls. The loop fed itself until dispatches timed
+  out and were recorded as failures for scans that had actually started.
+
+### Tests
+- Every endpoint MUST have a test that **executes** it. `ast.parse` passing,
+  imports succeeding, and containers reporting healthy are NOT verification.
+- A guard test MUST be **sabotage-proven**: reintroduce the bug, watch the test
+  fail, restore. A guard that cannot fail is worse than none, because it is
+  mistaken for coverage.
+- Fixtures come from **real captured tool output**, not invented shapes.
+- Tests run standalone (`pytest tests/test_x.py`) and **skip** cleanly when
+  infrastructure or an optional dependency is missing. A skip says "cannot run
+  here"; an error says "broken", and mixing them hides real breakage.
+- Keep the suite **green**. A permanently red baseline means a new failure is
+  invisible. If a test cannot pass, skip it with a reason or fix it — do not
+  leave it failing.
+- "Verified" in a summary means observed output, quoted. Not "should work".
+- *Enforced by:* `tests/test_fstring_placeholders.py` (runtime-only defects that
+  pass every static check), `tests/test_recommendation_listing.py` (endpoints
+  must actually execute).
+- *Why:* a brace placeholder inside an f-string SQL comment made every
+  recommendations query raise `NameError`. `ast.parse` passed, the module
+  imported, the container was healthy, and the page silently returned zero rows
+  — no test had ever executed that query.
+
+### Endpoint coverage
+Coverage is **tiered by what can actually fail**, because there are ~1,150
+distinct endpoints and a case per endpoint is not realistic. Every endpoint sits
+in exactly one tier, and the tier decides the obligation:
+
+- **Thin proxy** (one upstream call): no hand-written test. The upstream path
+  MUST resolve to a route some service declares. 68% of BFF routes are these,
+  so one generic check covers them all.
+- **Parameterless GET**: covered by the live sweep automatically. No work when
+  adding one.
+- **Parameterised GET**: MUST have a sample value the sweep can substitute —
+  add to `SAMPLE_FROM` (resolved live from a list endpoint, preferred) or
+  `SAMPLE_STATIC` (a safe literal). Routes with no sample are reported as
+  *unsampled*, never silently skipped.
+- **Mutating or logic-bearing** (POST/PUT/PATCH/DELETE, or any handler with real
+  logic): MUST ship an executing test **in the same commit**. This is a forward
+  ratchet — backfill by risk (dispatch, auth, exploit, cleanup first), not by
+  sweep.
+
+Two rules that cut across all tiers:
+- **A fallback leg is an endpoint.** Verify every leg or delete it. A dead
+  primary with a working fallback is a wasted round-trip on every call; two dead
+  legs is an endpoint that can never work, and both look healthy from outside.
+- **`except: pass` around an HTTP call hides a 404 forever.** If a call may
+  legitimately fail, handle that case explicitly and surface it. Silence here
+  turns a broken endpoint into "it returned zero results".
+- **Every SQL column must exist on its table.** A query naming a column the
+  table lacks passes import, passes `ast.parse`, reports a healthy container,
+  and 500s only when that path executes. Postgres reports only the *first* bad
+  column, so **check the whole statement against the DDL**, never just the one
+  in the traceback. New tables/columns MUST be declared in `db_init/*.sql` (or
+  a runtime `CREATE TABLE`/`ALTER TABLE` the schema parser can see) or every
+  query against them is skipped rather than checked.
+- **A column's TYPE matters as much as its name.** `text[]` rejects a bare
+  string (`malformed array literal: "CWE-79"`) and `jsonb` rejects a bare dict
+  (`can't adapt type 'dict'`). Checked for `INSERT` columns and `UPDATE ... SET`
+  assignments alike. Where the shape cannot be proven — a bare `d.get("k")` is
+  opaque — the feed MUST be declared in `ARRAY_UNVERIFIED`; new undeclared ones
+  fail by name, so the class stays caught even where inference cannot reach.
+- **Prefer declaring a type over wrapping a value.** The guard reads Pydantic
+  field annotations, parameter annotations, `-> list` returns, module-level
+  constants, local assignments and the `x or []` idiom. That resolved 18 of the
+  original 19 unprovable array feeds *without touching a call site*. Reach for
+  `etl/sql_types.as_text_array()` when the shape genuinely is unknown at the
+  call site — not to restate a signature that already promises a list. Add new
+  normalisers to `LIST_SAFE_FUNCS` or their call sites stay unprovable.
+- **A partial unique index is easy to get wrong twice.** In Postgres a NULL in
+  any indexed column makes rows non-equal, so uniqueness does not constrain
+  NULL-bearing rows at all. `COALESCE` the nullable columns instead of adding a
+  `WHERE` predicate, and remember that any `ON CONFLICT` MUST repeat the index
+  expression **exactly** or every insert raises "no unique or exclusion
+  constraint matching the ON CONFLICT specification".
+- **Dedup logic duplicated in SQL needs an agreement test.** `etl/fingerprint.py`
+  and the `vulns_dedup` / `web_findings_dedup` triggers both compute the
+  fingerprint; the triggers fill it for the ~19 insert sites that supply none.
+  If they drift, the same finding gets two fingerprints and the unique index
+  stores both. Pin them to a shared case table, and exercise the SQL side
+  through the REAL trigger — a re-typed copy of the expression only tests the
+  copy.
+- **A unique index permits unlimited NULLs.** A NULL fingerprint is an
+  unconstrained row that bypasses dedup entirely, so the triggers that fill it
+  are load-bearing, not a convenience.
+- *Enforced by:* `tests/test_proxy_contracts.py::test_upstream_paths_exist`
+  (upstream paths + `PROXY_DYNAMIC`/`PROXY_DEBT` ratchets),
+  `tests/test_sql_columns.py::test_every_sql_column_exists` (qualified
+  references + `INSERT` column lists, with the `SQL_DEBT` ratchet),
+  `tests/test_sql_columns.py::test_sql_param_types_are_compatible` and
+  `::test_unprovable_array_feeds_are_declared` (INSERT + UPDATE parameter types,
+  `ARRAY_UNVERIFIED` ratchet), `tests/test_sql_types.py` (the normaliser's own
+  contract, incl. that its names still match `LIST_SAFE_FUNCS`),
+  `tests/test_fingerprint.py` (unit cases + Python↔SQL trigger agreement),
+  `tests/test_endpoint_smoke.py` and `scripts/smoke_endpoints.py` (live sweep,
+  bare + parameterised), `tests/test_route_contracts.py` (declaration order,
+  shadowing).
+- *Why:* Burp import POSTed every finding to `/findings/web`, a route no service
+  has ever declared, inside `except Exception: pass` — so it reported
+  `{"ok": true, "imported": 0}` while storing nothing. `/api/exploits/pending`
+  had a dead primary AND a dead fallback and returned `{"detail":"Not Found"}`
+  forever. `/scope/{name}/analysis` selected `dp.method` and `dp.location` when
+  the columns are `http_method` and `param_location`. Containers were healthy,
+  the suite was green, the OpenAPI schema listed every one, and 361 proxies had
+  never had their far end checked.
+
+  The SQL guard's first run found **20** more, the worst being seven in
+  `build_existing_target_context()` — whose caller logs the failure as a
+  *warning*, so every agent session silently lost the "here is what we already
+  know about this target" block and re-ran scans whose data was already in the
+  database. Fixing it recovered 6,391 characters of context: 64 ports, 58
+  vulns, 778 web findings. Two ingest paths also wrote to columns that do not
+  exist, so Censys-discovered services and Playwright's ZAP findings were never
+  stored at all.
+
+  `uq_credential_findings_identity` was partial on `username IS NOT NULL` — dead,
+  since username is NOT NULL — while the genuinely nullable `auth_type` went
+  unconstrained. Two identical inserts with a NULL `auth_type` both stored; with
+  `auth_type='password'` the second was correctly rejected. Now
+  `COALESCE(auth_type, '')`, with `etl/parse_brutus.py`'s `ON CONFLICT` updated
+  to match the expression exactly.
+
+### Known-debt lists
+`tests/test_dispatch_invariants.py` carries `SCOPE_DEBT` and `LIMIT_DEBT`,
+`tests/test_proxy_contracts.py` carries `PROXY_DYNAMIC` and `PROXY_DEBT`, and
+`tests/test_sql_columns.py` carries `SQL_DEBT` and `ARRAY_UNVERIFIED`:
+modules that violate the rules above today, each with a reason. They exist to
+make the debt visible while keeping the suite green, and they RATCHET — a new
+violation fails by name, and a resolved entry must be deleted (a separate test
+enforces that). Shrink these lists; do not grow them without a stated reason.
+
 ## Out-of-scope / constraints
 
 - Focus on defensible engineering: parsing, normalization, reporting, workflow support.
 
 ## Implementation rules (Claude Code behavior)
-- Work on ONE file at a time, sequentially.
+#- Work on no more then one file at a time, sequentially.
+- Work on no more then three files at a time. 
 - After each change: summarize what changed and why.
 - If changes would need to be mirrored in osx or windows, log them in:
   Docs/OS_CHANGES_FOR_MIGRATION.md (date, files changed, platforms, old→new, notes).
@@ -134,7 +303,7 @@ When implementing features, always provide:
 - Next steps checklist
 - Ensure that new changes will be included in future clean builds installation scripts.
 - Ensure that all files required for the build are included in the containers and rebuild as required.
-Do NOT use background agents or background tasks. Do NOT split into multiple agents. Process files ONE AT A TIME, sequentially. Update the user regularly on each step."
+#Do NOT use background agents or background tasks. Do NOT split into multiple agents. Process files ONE AT A TIME, sequentially. Update the user regularly on each step."
 
 Every time you make a change to an app that would also need to be applied , log it in Docs/CHANGES_MADE.md. Include: date, files changed, which platforms it applies to, what specifically changed (old to new values, code snippets if helpful), any notes about platform-specific adaptations completed and/or needed."
 

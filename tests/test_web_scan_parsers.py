@@ -1,4 +1,10 @@
-"""Web scan report parser tests (Nikto + ZAP file import).
+"""
+NOTE: _parse_xml/_parse_json now require enforce_scope and scope_rows.
+# Scope is passed EXPLICITLY as False/None here because these tests exercise
+parsing, not authorisation. The parameters are required rather than defaulted on
+purpose: host_in_scope(..., enforce=False, ...) returns True, so a default would
+let a forgotten call site disable the gate silently instead of failing.
+Web scan report parser tests (Nikto + ZAP file import).
 
 Format detection is tested with no DB at all. The ingest tests need a real
 Postgres — they run against the live `scans` DB inside a transaction that is
@@ -125,7 +131,7 @@ class TestNiktoUrlBuilding:
 
 # ── Ingest against a real DB, always rolled back ────────────────────────────
 DB_DSN = os.environ.get(
-    "TEST_DB_DSN", "postgresql://app:app@127.0.0.1:5432/scans"
+    "TEST_DB_DSN", "postgresql://app:app@127.0.0.1:5433/scans"
 )
 
 
@@ -154,7 +160,7 @@ def _stats():
 class TestNiktoIngest:
     def test_xml_inserts_expected_rows(self, rollback_cur):
         st = _stats()
-        nikto._parse_xml(f"{FIXTURES}/sample_nikto.xml", rollback_cur, st, dedupe=False)
+        nikto._parse_xml(f"{FIXTURES}/sample_nikto.xml", rollback_cur, st, dedupe=False, enforce_scope=False, scope_rows=None)
         assert st["errors"] == []
         assert st["inserted"] == 3
         # One of each rung of the ladder.
@@ -164,7 +170,7 @@ class TestNiktoIngest:
 
     def test_json_inserts_expected_rows(self, rollback_cur):
         st = _stats()
-        nikto._parse_json(f"{FIXTURES}/sample_nikto.json", rollback_cur, st, dedupe=False)
+        nikto._parse_json(f"{FIXTURES}/sample_nikto.json", rollback_cur, st, dedupe=False, enforce_scope=False, scope_rows=None)
         assert st["errors"] == []
         assert st["inserted"] == 3
         assert st["by_severity"].get("medium") == 1   # backup file / source disclosure
@@ -172,7 +178,7 @@ class TestNiktoIngest:
 
     def test_rows_land_with_correct_source_and_url(self, rollback_cur):
         st = _stats()
-        nikto._parse_xml(f"{FIXTURES}/sample_nikto.xml", rollback_cur, st, dedupe=False)
+        nikto._parse_xml(f"{FIXTURES}/sample_nikto.xml", rollback_cur, st, dedupe=False, enforce_scope=False, scope_rows=None)
         rollback_cur.execute(
             "SELECT url, source, severity FROM web_findings "
             "WHERE source = 'nikto' AND url LIKE 'http://10.0.0.5%' ORDER BY url"
@@ -184,7 +190,7 @@ class TestNiktoIngest:
 
     def test_severity_reason_is_persisted(self, rollback_cur):
         st = _stats()
-        nikto._parse_xml(f"{FIXTURES}/sample_nikto.xml", rollback_cur, st, dedupe=False)
+        nikto._parse_xml(f"{FIXTURES}/sample_nikto.xml", rollback_cur, st, dedupe=False, enforce_scope=False, scope_rows=None)
         # Scope to this fixture's own URLs. The DB legitimately holds nikto rows
         # from real scans, and an unscoped query picks one of those instead.
         rollback_cur.execute(
@@ -196,8 +202,8 @@ class TestNiktoIngest:
 
     def test_dedupe_suppresses_a_second_pass(self, rollback_cur):
         first, second = _stats(), _stats()
-        nikto._parse_xml(f"{FIXTURES}/sample_nikto.xml", rollback_cur, first, dedupe=True)
-        nikto._parse_xml(f"{FIXTURES}/sample_nikto.xml", rollback_cur, second, dedupe=True)
+        nikto._parse_xml(f"{FIXTURES}/sample_nikto.xml", rollback_cur, first, dedupe=True, enforce_scope=False, scope_rows=None)
+        nikto._parse_xml(f"{FIXTURES}/sample_nikto.xml", rollback_cur, second, dedupe=True, enforce_scope=False, scope_rows=None)
         assert first["inserted"] == 3
         assert second["inserted"] == 0
         assert second["skipped_duplicate"] == 3
@@ -207,7 +213,7 @@ class TestZapFileIngest:
     def test_json_expands_instances_into_rows(self, rollback_cur):
         """One alert with 2 instances must become 2 findings, not 1."""
         st = _stats()
-        zapf._parse_json(f"{FIXTURES}/sample_zap.json", rollback_cur, st, dedupe=False)
+        zapf._parse_json(f"{FIXTURES}/sample_zap.json", rollback_cur, st, dedupe=False, enforce_scope=False, scope_rows=None)
         assert st["errors"] == []
         assert st["inserted"] == 3          # 2 SQLi instances + 1 header alert
         assert st["by_severity"].get("high") == 2
@@ -215,7 +221,7 @@ class TestZapFileIngest:
 
     def test_false_positive_alert_is_skipped(self, rollback_cur):
         st = _stats()
-        zapf._parse_json(f"{FIXTURES}/sample_zap.json", rollback_cur, st, dedupe=False)
+        zapf._parse_json(f"{FIXTURES}/sample_zap.json", rollback_cur, st, dedupe=False, enforce_scope=False, scope_rows=None)
         assert st["skipped_false_positive"] == 1
         rollback_cur.execute(
             "SELECT count(*) FROM web_findings WHERE url = 'http://10.0.0.9/fp'"
@@ -224,7 +230,7 @@ class TestZapFileIngest:
 
     def test_xml_inserts_and_maps_severity(self, rollback_cur):
         st = _stats()
-        zapf._parse_xml(f"{FIXTURES}/sample_zap.xml", rollback_cur, st, dedupe=False)
+        zapf._parse_xml(f"{FIXTURES}/sample_zap.xml", rollback_cur, st, dedupe=False, enforce_scope=False, scope_rows=None)
         assert st["errors"] == []
         assert st["inserted"] == 2
         assert st["by_severity"].get("high") == 1
@@ -232,7 +238,7 @@ class TestZapFileIngest:
 
     def test_cwe_and_description_are_persisted(self, rollback_cur):
         st = _stats()
-        zapf._parse_json(f"{FIXTURES}/sample_zap.json", rollback_cur, st, dedupe=False)
+        zapf._parse_json(f"{FIXTURES}/sample_zap.json", rollback_cur, st, dedupe=False, enforce_scope=False, scope_rows=None)
         rollback_cur.execute(
             "SELECT cwe, description, solution FROM web_findings "
             "WHERE source='zap' AND name='SQL Injection' LIMIT 1"
@@ -244,8 +250,8 @@ class TestZapFileIngest:
 
     def test_dedupe_suppresses_a_second_pass(self, rollback_cur):
         first, second = _stats(), _stats()
-        zapf._parse_json(f"{FIXTURES}/sample_zap.json", rollback_cur, first, dedupe=True)
-        zapf._parse_json(f"{FIXTURES}/sample_zap.json", rollback_cur, second, dedupe=True)
+        zapf._parse_json(f"{FIXTURES}/sample_zap.json", rollback_cur, first, dedupe=True, enforce_scope=False, scope_rows=None)
+        zapf._parse_json(f"{FIXTURES}/sample_zap.json", rollback_cur, second, dedupe=True, enforce_scope=False, scope_rows=None)
         assert second["inserted"] == 0
         assert second["skipped_duplicate"] == first["inserted"]
 

@@ -16,7 +16,12 @@ from utils import safe_json
 router = APIRouter()
 log = logging.getLogger("maintenance")
 
-CLEANUP_CATEGORIES = {"findings", "jobs", "sessions", "scans", "assets", "recommendations", "exploits", "followups", "engagements"}
+CLEANUP_CATEGORIES = {"findings", "jobs", "sessions", "scans", "assets", "recommendations",
+                      "exploits", "followups", "engagements",
+                      # Added with their endpoints. Neither was reachable from the
+                      # UI, and the scheduled script that would have called them
+                      # did not parse, so nothing ran either one.
+                      "tool-executions", "artifacts"}
 
 # Paths for file-based exports (mounted volumes)
 SCREENSHOTS_DIR = Path("/osint_reports/screenshots")
@@ -59,7 +64,7 @@ def _dir_stats(root: Path, extensions: set | None = None) -> dict:
 @router.get("/api/maintenance/stats")
 async def maintenance_stats():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/maintenance/stats",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -73,7 +78,7 @@ async def analyze_nodes():
     s = get_settings()
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             # Get nodes
             nodes_resp = await client.get(f"{s.tunnel_manager_url}/nodes")
             nodes_resp.raise_for_status()
@@ -119,7 +124,7 @@ async def cleanup_nodes(cleanup_options: dict):
     results = {"success": [], "failed": [], "summary": ""}
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=60) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             # Get current analysis
             analysis_resp = await client.get("http://localhost:8050/api/maintenance/nodes/analysis")
             analysis_resp.raise_for_status()
@@ -216,6 +221,13 @@ async def cleanup_category(
     status: Optional[str] = Query(default=None),
     dry_run: bool = Query(default=False),
     sources: Optional[str] = Query(default=None),
+    # Category-specific. Forwarded only when supplied, so adding them here does
+    # not change the request any existing category receives.
+    stale_after_hours: Optional[int] = Query(default=None, ge=1),
+    older_than_days: Optional[int] = Query(default=None, ge=1),
+    delete_older_than_days: Optional[int] = Query(default=None, ge=1),
+    keep_unprocessed: Optional[bool] = Query(default=None),
+    keep_with_findings: Optional[bool] = Query(default=None),
 ):
     if category not in CLEANUP_CATEGORIES:
         raise HTTPException(400, f"Unknown category: {category}")
@@ -228,8 +240,15 @@ async def cleanup_category(
         params["status"] = status
     if sources is not None:
         params["sources"] = sources
+    for name, val in (("stale_after_hours", stale_after_hours),
+                      ("older_than_days", older_than_days),
+                      ("delete_older_than_days", delete_older_than_days),
+                      ("keep_unprocessed", keep_unprocessed),
+                      ("keep_with_findings", keep_with_findings)):
+        if val is not None:
+            params[name] = val
 
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(
             f"{s.rag_api_url}/cleanup/{category}",
             params=params,
@@ -245,7 +264,7 @@ async def cleanup_category(
 @router.post("/api/followups/bulk-update")
 async def followups_bulk_update(body: dict):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(
             f"{s.rag_api_url}/followups/bulk-update",
             json=body,
@@ -348,7 +367,7 @@ async def audit_log_rotate():
     try:
         import asyncio
         s = get_settings()
-        async with httpx.AsyncClient(verify=False, timeout=5) as c:
+        async with httpx.AsyncClient(timeout=5) as c:
             await c.post(
                 f"{s.rag_api_url}/webhooks/emit",
                 json={
@@ -475,7 +494,7 @@ async def export_data(
 
     if not any_files:
         # Backwards compatible: proxy to rag-api as before
-        async with httpx.AsyncClient(verify=False, timeout=120) as c:
+        async with httpx.AsyncClient(timeout=120) as c:
             resp = await c.get(
                 f"{s.rag_api_url}/export/data",
                 params={"format": format, "categories": categories},
@@ -493,7 +512,7 @@ async def export_data(
 
     # ---- Build ZIP with DB data + requested file sections ----
     # Always fetch DB data as JSON for the data.json envelope
-    async with httpx.AsyncClient(verify=False, timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.get(
             f"{s.rag_api_url}/export/data",
             params={"format": "json", "categories": categories},
@@ -566,7 +585,7 @@ async def import_data(file: UploadFile = File(...)):
     # Detect ZIP vs legacy JSON
     if not content[:4] == ZIP_MAGIC:
         # Legacy JSON import — proxy to rag-api
-        async with httpx.AsyncClient(verify=False, timeout=120) as c:
+        async with httpx.AsyncClient(timeout=120) as c:
             resp = await c.post(
                 f"{s.rag_api_url}/import/data",
                 files={"file": (file.filename or "import.json", content, "application/json")},
@@ -595,7 +614,7 @@ async def import_data(file: UploadFile = File(...)):
     # 1. Import data.json → rag-api
     if "data.json" in names:
         data_bytes = zf.read("data.json")
-        async with httpx.AsyncClient(verify=False, timeout=120) as c:
+        async with httpx.AsyncClient(timeout=120) as c:
             resp = await c.post(
                 f"{s.rag_api_url}/import/data",
                 files={"file": ("data.json", data_bytes, "application/json")},
@@ -612,7 +631,7 @@ async def import_data(file: UploadFile = File(...)):
         rel_path = sf[len("screenshots/"):]  # strip prefix
         file_bytes = zf.read(sf)
         try:
-            async with httpx.AsyncClient(verify=False, timeout=30) as c:
+            async with httpx.AsyncClient(timeout=30) as c:
                 resp = await c.put(
                     f"{s.osint_runner_url}/screenshots/upload/{rel_path}",
                     files={"file": (os.path.basename(rel_path), file_bytes, "image/png")},
@@ -664,7 +683,7 @@ async def analyze_nodes():
     s = get_settings()
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             # Get nodes
             nodes_resp = await client.get(f"{s.tunnel_manager_url}/nodes")
             nodes_resp.raise_for_status()
@@ -710,7 +729,7 @@ async def cleanup_nodes(cleanup_options: dict):
     results = {"success": [], "failed": [], "summary": ""}
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=60) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             # Get current analysis
             analysis_resp = await client.get("http://localhost:8050/api/maintenance/nodes/analysis")
             analysis = analysis_resp.json()

@@ -1,6 +1,7 @@
 from typing import Optional, Any
 import os
 import re
+import time
 import json
 import logging
 import pathlib
@@ -14,6 +15,15 @@ from config import get_settings
 from engagement import engagement_headers
 from polling import register_job, active_jobs, _persist, pending_queue
 from timeouts import TIMEOUT_NORMAL, TIMEOUT_SCAN
+# Scope matching is delegated to the shared fail-closed matcher rather than
+# reimplemented here — a third copy of ip/cidr/domain/url semantics is exactly
+# how the three of them drift apart.
+try:
+    from etl.scope_gate import is_in_scope as _is_in_scope, _host_from_url as _host_only
+except ImportError:  # etl/ not mounted (older compose) — gate degrades to inactive
+    _is_in_scope = None
+    _host_only = None
+
 from services.port_profiles import (
     PortProfileError,
     list_profiles as list_port_profiles,
@@ -110,7 +120,7 @@ def _is_local_blocked() -> bool:
         import httpx as _hx
         s = get_settings()
         r = _hx.get(f"{s.rag_api_url}/settings/config/block_local_scans",
-                     headers={"x-api-key": s.api_key, **engagement_headers()}, verify=False, timeout=3)
+                     headers={"x-api-key": s.api_key, **engagement_headers()}, timeout=3)
         val = r.json().get("value", "") if r.status_code == 200 else ""
         _block_local_cache["val"] = val.lower() in ("1", "true", "yes")
         _block_local_cache["ts"] = now
@@ -246,6 +256,20 @@ def _normalize_ports(p: dict) -> None:
 # so a --top-ports string reaching these routes produces a broken command line.
 # Use a named port profile instead; profiles always resolve to explicit ranges.
 _MASSCAN_BACKED_SCANS = {"masscan", "full", "nmap", "nmap-tcp"}
+
+
+def _default_quick_ports() -> str:
+    """The top-1000 profile, for routes that need a literal default port string.
+
+    Degrades to the sequential range rather than raising: a missing /knowledge
+    mount should not turn every naabu dispatch into a 500. The degraded scope is
+    the old behaviour, and /api/port-profiles already reports `degraded: true`
+    for the operator, so this does not hide the condition.
+    """
+    try:
+        return resolve_port_profile("top-1000", None)
+    except Exception:
+        return "1-1000"
 
 
 def _apply_port_profile(scan_type: str, p: dict) -> None:
@@ -415,6 +439,12 @@ SCAN_ROUTES = {
         # Only sent when a port profile resolved one (see _apply_port_profile);
         # otherwise omitted so the scanner's DEFAULT_QUICK_PORTS still applies.
         "quick_ports": p.get("quick_ports") or None,
+        # An operator-selected port profile defines the whole sweep, so suppress
+        # the scanner's default full-range follow-up: widening a deliberately
+        # narrow choice (e.g. redteam-targeted) back out to 1-65535 would scan
+        # exactly what they excluded. With no profile, this is omitted and the
+        # scanner's DEFAULT_DEEP_SCAN_PORTS follow-up runs.
+        "full_ports": "" if p.get("quick_ports") else None,
         "timeout_seconds": _coerce_int(p.get("timeout_seconds")),
     }.items() if v is not None}),
     "masscan": ("nmap_scanner_url", "/jobs/masscan-only", lambda p: {k: v for k, v in {
@@ -435,7 +465,10 @@ SCAN_ROUTES = {
         "http_proxy": _inject_burp_proxy(p).get("http_proxy"),
     }.items() if v is not None}),
     "httpx": ("pd_runner_url", "/jobs/httpx", lambda p: {**{"targets": _ensure_target_list(p), "ports": p.get("ports"), "tech_detect": True}, **({} if not _inject_burp_proxy(p).get("http_proxy") else {"http_proxy": p["http_proxy"]})}),
-    "naabu": ("pd_runner_url", "/jobs/naabu", lambda p: {"targets": _ensure_target_list(p), "ports": p.get("ports", "1-1000"), "rate": p.get("rate", 1000)}),
+    # Default resolves the top-1000 profile rather than the sequential 1-1000 that
+    # used to be hardcoded here — same reasoning as every other port default. The
+    # helper falls back to the literal range only if knowledge/ is unreadable.
+    "naabu": ("pd_runner_url", "/jobs/naabu", lambda p: {"targets": _ensure_target_list(p), "ports": p.get("ports") or _default_quick_ports(), "rate": p.get("rate", 1000)}),
     "katana": ("pd_runner_url", "/jobs/katana", lambda p: {k: v for k, v in {
         "targets": _ensure_target_list(p), "depth": p.get("depth", 3), "js_crawl": True,
         "xhr_extraction": p.get("xhr_extraction", True), "form_extraction": p.get("form_extraction", True),
@@ -754,7 +787,7 @@ async def launch_pipeline(req: PipelineRequest):
     s = get_settings()
 
     # 1. Create pipeline record in rag-api
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(
             f"{s.rag_api_url}/pipelines",
             json=req.dict(),
@@ -771,7 +804,7 @@ async def launch_pipeline(req: PipelineRequest):
     config = req.config or {}
     if config.get("use_tunnels"):
         try:
-            async with httpx.AsyncClient(verify=False, timeout=5) as c:
+            async with httpx.AsyncClient(timeout=5) as c:
                 nr = await c.get(f"{s.tunnel_manager_url}/nodes", headers={"x-api-key": s.api_key, **engagement_headers()})
                 if nr.status_code == 200:
                     for node in (nr.json().get("nodes") or []):
@@ -808,7 +841,7 @@ async def list_pipelines(engagement_id: Optional[str] = None, status: Optional[s
         params["engagement_id"] = engagement_id
     if status:
         params["status"] = status
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/pipelines", params=params,
                            headers={"x-api-key": s.api_key, **engagement_headers()})
     return safe_json(resp)
@@ -817,7 +850,7 @@ async def list_pipelines(engagement_id: Optional[str] = None, status: Optional[s
 @router.get("/api/pipelines/{pipeline_id}")
 async def get_pipeline(pipeline_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/pipelines/{pipeline_id}",
                            headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code >= 400:
@@ -833,7 +866,7 @@ async def list_pipeline_jobs(pipeline_id: str, stage: Optional[int] = None, host
         params["stage"] = stage
     if host:
         params["host"] = host
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/pipelines/{pipeline_id}/jobs",
                            params=params, headers={"x-api-key": s.api_key, **engagement_headers()})
     return safe_json(resp)
@@ -847,7 +880,7 @@ async def stop_pipeline(pipeline_id: str):
     if orch:
         orch.stop()
     # Mark in DB
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(f"{s.rag_api_url}/pipelines/{pipeline_id}/stop",
                             headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code >= 400:
@@ -953,7 +986,7 @@ async def scan_limits():
     agent_active = 0
     try:
         settings = get_settings()
-        async with httpx.AsyncClient(verify=False, timeout=5) as client:
+        async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(
                 f"{settings.autogen_url}/pentest/sessions",
                 headers={"x-api-key": settings.api_key, **engagement_headers()},
@@ -1057,7 +1090,7 @@ async def _detect_scope_for_target(target: str, api_key: str, rag_api_url: str) 
     if not hostname:
         return None
     try:
-        async with httpx.AsyncClient(verify=False, timeout=5) as c:
+        async with httpx.AsyncClient(timeout=5) as c:
             resp = await c.get(
                 f"{rag_api_url}/scope/classify/{hostname}",
                 headers={"x-api-key": api_key, **engagement_headers()},
@@ -1076,7 +1109,7 @@ async def _detect_scope_for_target(target: str, api_key: str, rag_api_url: str) 
 async def _resolve_scope_targets(scope_name: str, api_key: str, rag_api_url: str) -> list[str]:
     """Fetch web-targetable hostnames from a named scope."""
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15) as c:
             resp = await c.get(
                 f"{rag_api_url}/scope",
                 params={"name": scope_name, "limit": 2000},
@@ -1116,7 +1149,7 @@ async def nmap_resume(req: NmapResumeReq):
     s = get_settings()
     service_url = s.nmap_scanner_url
     payload = {k: v for k, v in req.dict().items() if v is not None}
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_SCAN) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_SCAN) as c:
         resp = await c.post(
             f"{service_url}/jobs/nmap-resume",
             json=payload,
@@ -1134,10 +1167,186 @@ async def nmap_resume(req: NmapResumeReq):
     return data
 
 
+# ---------------------------------------------------------------- scope gate
+# An out-of-scope SCAN is an authorization problem, not a tidiness one: it sends
+# packets at a host nobody agreed we could touch. Crawled links are the realistic
+# route in — a target page linking to www.owasp.org / irongeek.com / java.sun.com
+# turns into a follow-up, and a follow-up turns into a dispatched scan.
+#
+# Default-deny WHEN A SCOPE EXISTS. When scope_targets is empty there is nothing
+# to authorize against, and refusing every scan would make the tool unusable, so
+# the request proceeds with a loud warning + webhook rather than silently. Set
+# SCAN_SCOPE_ENFORCE=strict to refuse instead — the right setting for an
+# engagement where scope has been entered deliberately.
+_SCOPE_CACHE: dict = {"rows": None, "at": 0.0}
+_SCOPE_TTL = 30.0
+
+
+async def _load_scope_rows() -> list:
+    """[(target, target_type)] from rag-api, briefly cached. [] means no scope."""
+    now = time.monotonic()
+    if _SCOPE_CACHE["rows"] is not None and (now - _SCOPE_CACHE["at"]) < _SCOPE_TTL:
+        return _SCOPE_CACHE["rows"]
+    s = get_settings()
+    rows: list = []
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            # GET /scope defaults to name="default" and returns ONLY that named
+            # scope. This operator's scope is named "msf", so a bare call came
+            # back empty and the gate sat silently inactive while real scope
+            # existed. Authorization must not depend on which name was used, so
+            # enumerate every scope name and union them.
+            hdr = {"x-api-key": s.api_key}
+            names = ["default"]
+            rn = await c.get(f"{s.rag_api_url}/scope/names", headers=hdr)
+            if rn.status_code == 200:
+                found = [n.get("name") for n in (rn.json().get("names") or []) if n.get("name")]
+                if found:
+                    names = found
+            for nm in names:
+                r = await c.get(f"{s.rag_api_url}/scope",
+                                params={"name": nm, "limit": 5000}, headers=hdr)
+                if r.status_code != 200:
+                    continue
+                payload = r.json()
+                items = payload if isinstance(payload, list) else (
+                    payload.get("targets") or payload.get("scope") or payload.get("items") or [])
+                # Drop placeholder/blank entries defensively. rag-api filters
+                # them now, but this gate decides whether to REFUSE scans: a
+                # scope whose only row is a placeholder would read as "scope
+                # exists", match nothing, and 403 every scan. Belt and braces on
+                # the side that fails safe.
+                rows += [
+                    (i.get("target"), i.get("target_type"))
+                    for i in items
+                    if isinstance(i, dict)
+                    and (i.get("target") or "").strip()
+                    and i.get("source") != "__placeholder__"
+                ]
+    except Exception as e:
+        # Do NOT fail closed here: a rag-api hiccup must not block an operator's
+        # scan. The empty list falls through to the warn-and-allow path below,
+        # which is logged, so the condition is visible rather than silent.
+        log.warning("scope load failed (%s) — scope gate cannot enforce this request", e)
+    _SCOPE_CACHE["rows"], _SCOPE_CACHE["at"] = rows, now
+    return rows
+
+
+def _scan_targets_of(req) -> list:
+    """Every host this request would put packets on."""
+    out = []
+    for field in ("target", "targets", "target_url", "target_urls", "ip_address"):
+        v = getattr(req, field, None)
+        if not v:
+            continue
+        for item in (v if isinstance(v, (list, tuple)) else [v]):
+            h = _host_only(str(item))
+            if h:
+                out.append(h)
+    return out
+
+
+try:
+    from scope_guard import host_in_scope as _shared_host_in_scope
+except Exception:                                # pragma: no cover
+    _shared_host_in_scope = None
+
+
+async def _host_aliases(host: str) -> set:
+    """Observed ip<->hostname pairings for `host`, from rag-api's assets."""
+    aliases = {host}
+    if host in ("localhost", "127.0.0.1", "::1"):
+        aliases |= {"localhost", "127.0.0.1", "::1"}
+    s = get_settings()
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{s.rag_api_url}/assets", params={"limit": 5000},
+                            headers={"x-api-key": s.api_key})
+            if r.status_code == 200:
+                for a in (r.json().get("assets") or []):
+                    ip = str(a.get("ip") or "").strip().lower()
+                    hn = _host_only(str(a.get("hostname") or "")) if _host_only else ""
+                    if host in (ip, hn):
+                        aliases |= {x for x in (ip, hn) if x}
+    except Exception as e:
+        log.warning("alias lookup failed for %r: %s", host, e)
+    return aliases
+
+
+async def _enforce_scan_scope(scan_type: str, req) -> None:
+    """Refuse a scan whose target is not in scope. No-op when no scope exists."""
+    if _is_in_scope is None or _host_only is None or _shared_host_in_scope is None:
+        # etl/ not mounted — the matcher is unavailable.
+        #
+        # This used to RETURN, which let every scan through: a missing volume
+        # silently disabled the gate, which is indistinguishable from having no
+        # gate at all. Every other gate in the stack refuses when it cannot
+        # check, so this one does too.
+        log.error("scope gate UNAVAILABLE (etl/scope_gate not importable) — "
+                  "refusing. Add ./etl:/app/bff/etl:ro to pentest-dashboard.")
+        raise HTTPException(
+            503,
+            "Scan refused: the scope gate is unavailable (etl/scope_gate not "
+            "importable). This is a deployment problem, not a scope problem — "
+            "check the ./etl mount on pentest-dashboard.")
+    hosts = _scan_targets_of(req)
+    if not hosts:
+        return
+    scope_rows = await _load_scope_rows()
+    # Fail CLOSED by default. This used to default to "warn": with no scope
+    # configured, every scan was permitted and only a log line recorded it —
+    # the opposite of every other gate in the stack (kali-listener, the BFF
+    # dispatcher, tool_executor all refuse when scope is empty). An
+    # unconfigured scope is a setup mistake, and treating it as permission to
+    # scan anything is how unauthorised traffic happens.
+    # Set SCAN_SCOPE_ENFORCE=warn to restore the old permissive behaviour.
+    mode = os.environ.get("SCAN_SCOPE_ENFORCE", "strict").strip().lower()
+
+    if not scope_rows:
+        if mode == "strict":
+            raise HTTPException(
+                403,
+                "Scan refused: SCAN_SCOPE_ENFORCE=strict but no scope is defined. "
+                "Add targets via POST /scope/add before scanning.",
+            )
+        log.warning(
+            "scope gate INACTIVE for %s %s — no scope_targets defined. Add scope via "
+            "POST /scope/add to enforce; set SCAN_SCOPE_ENFORCE=strict to refuse instead.",
+            scan_type, hosts[:5],
+        )
+        return
+
+    # A host can be in scope under a different identity: scope lists 127.0.0.1 but
+    # the request says "localhost", or scope lists a hostname the scan already
+    # resolved to an IP. rag-api owns the observed ip<->hostname pairings, so ask
+    # it rather than guessing — and never resolve DNS live, which would let an
+    # attacker-controlled record talk its way into scope.
+    blocked = []
+    for h in hosts:
+        # Delegate to the shared gate so this router, the recommendation
+        # dispatcher and kali-listener reach the SAME verdict. This path used to
+        # be the only one that resolved aliases, so a host in scope under its
+        # other observed identity was accepted here and refused everywhere else.
+        if _shared_host_in_scope(h, scope_rows):
+            continue
+        blocked.append(h)
+    if blocked:
+        log.warning("scope gate BLOCKED %s for out-of-scope host(s): %s", scan_type, blocked)
+        raise HTTPException(
+            403,
+            f"Scan refused — out of scope: {', '.join(blocked)}. "
+            f"These hosts are not in the engagement scope. Add them via POST /scope/add "
+            f"if authorized, or scan an in-scope target.",
+        )
+
+
 @router.post("/api/scans/{scan_type}")
 async def launch_scan(scan_type: str, req: ScanRequest):
     if scan_type not in SCAN_ROUTES:
         raise HTTPException(400, f"Unknown scan type: {scan_type}")
+
+    # Authorization boundary — refuse out-of-scope targets before any packet.
+    await _enforce_scan_scope(scan_type, req)
 
     # Resolve any named port profile into an explicit `ports` string up front,
     # so all three transform call sites below (and every scan type) inherit it.
@@ -1223,7 +1432,7 @@ async def launch_scan(scan_type: str, req: ScanRequest):
                 if req.proxy:
                     payload["proxy"] = req.proxy
                 try:
-                    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_SCAN) as c:
+                    async with httpx.AsyncClient(timeout=TIMEOUT_SCAN) as c:
                         resp = await c.post(f"{service_url}{path}", json=payload,
                                             headers={"x-api-key": s.api_key, **engagement_headers()})
                         if resp.status_code < 400:
@@ -1285,7 +1494,7 @@ async def launch_scan(scan_type: str, req: ScanRequest):
     if req.no_ingest:
         payload["no_ingest"] = True
 
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_SCAN) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_SCAN) as c:
         resp = await c.post(
             f"{service_url}{path}",
             json=payload,
@@ -1318,7 +1527,7 @@ async def launch_scan(scan_type: str, req: ScanRequest):
                 evidence_parts.append(f"ports={req.ports}")
             if req.severity:
                 evidence_parts.append(f"severity={req.severity}")
-            async with httpx.AsyncClient(verify=False, timeout=5) as note_client:
+            async with httpx.AsyncClient(timeout=5) as note_client:
                 await note_client.post(
                     f"{s.rag_api_url}/findings/note",
                     json={
@@ -1337,7 +1546,14 @@ async def launch_scan(scan_type: str, req: ScanRequest):
 
 
 @router.get("/api/scans")
-async def list_scans(engagement_id: Optional[str] = None):
+async def list_scans(
+    engagement_id: Optional[str] = None,
+    limit: Optional[int] = Query(None, ge=1, le=1000,
+                                 description="Page size. Omit to return everything (default)."),
+    offset: int = Query(0, ge=0, description="Rows to skip, for paging."),
+    kind: Optional[str] = Query(None,
+                                description="Filter by kind, e.g. 'tool' for kali tool runs."),
+):
     """Return all tracked jobs, merged with autogen agent scans and recent audit log entries.
 
     When ``engagement_id`` is provided, only scans belonging to that engagement
@@ -1374,7 +1590,7 @@ async def list_scans(engagement_id: Optional[str] = None):
     # Merge in scans from active autogen agent sessions
     try:
         settings = get_settings()
-        async with httpx.AsyncClient(verify=False, timeout=5) as client:
+        async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(
                 f"{settings.autogen_url}/pentest/sessions",
                 headers={"x-api-key": settings.api_key, **engagement_headers()},
@@ -1575,7 +1791,92 @@ async def list_scans(engagement_id: Optional[str] = None):
         except Exception:
             pass
 
-    return {"jobs": jobs}
+    # ── Kali tool executions ──────────────────────────────────────────────
+    #
+    # Tools dispatched from a recommendation (crackmapexec, smbclient,
+    # enum4linux, smbmap, ...) run in the kali-listener and are recorded in
+    # tool_executions. They never touched active_jobs, the autogen session list
+    # or audit.jsonl, so none of them appeared here — a tester who ran
+    # crackmapexec saw no scan, no progress and no history, which is
+    # indistinguishable from it never having run.
+    #
+    # Merged last and keyed by execution id so it cannot collide with a job_id
+    # from the sources above.
+    _tool_total = 0
+    try:
+        from db import get_db
+        with get_db() as _c, _c.cursor() as _cur:
+            # Fetch enough to satisfy the requested window rather than a fixed
+            # 200. The other sources are already in `jobs` and are small, but
+            # they can be NEWER than some tool rows and so occupy slots in the
+            # merged ordering — fetching only offset+limit would drop tool rows
+            # that belong on the page. Adding len(jobs) covers that worst case.
+            _cap = (offset + limit + len(jobs)) if limit else 1000
+            # True total, independent of the fetch window. Deriving `total` from
+            # the merged list made it grow with the page number (364 at offset 0,
+            # 414 at offset 50) because the cap itself grows with offset — a
+            # "total" that changes as you page is worse than none, since a UI
+            # computes its page count from it.
+            _cur.execute("SELECT count(*) FROM tool_executions")
+            _tool_total = _cur.fetchone()[0] or 0
+            _cur.execute(
+                """SELECT id, tool, target, port, service, status,
+                          started_at, completed_at, exit_code,
+                          length(coalesce(output, '')) AS out_len
+                     FROM tool_executions
+                    ORDER BY started_at DESC NULLS LAST
+                    LIMIT %s""",
+                (_cap,),
+            )
+            for r in _cur.fetchall():
+                (_id, _tool, _target, _port, _svc, _status,
+                 _start, _end, _exit, _outlen) = r
+                jobs.append({
+                    "job_id": str(_id),
+                    "type": _tool,
+                    "kind": "tool",           # distinguishes these from scanner jobs
+                    "status": _status or "unknown",
+                    "target": _target,
+                    "created_at": _start.isoformat() if _start else None,
+                    "completed_at": _end.isoformat() if _end else None,
+                    "service_url": "kali-listener",
+                    # Output size is the honest signal for a CLI tool: exit 0 with
+                    # nothing captured is the shape of a tool that ran and told
+                    # you nothing.
+                    "last_data": {"exit_code": _exit, "output_bytes": _outlen,
+                                  "port": _port, "service": _svc},
+                })
+    except Exception as _e:
+        log.debug(f"tool_executions merge skipped: {_e}")
+
+    if kind:
+        jobs = [j for j in jobs if (j.get("kind") or "") == kind]
+
+    # Sort newest-first across every source so a page means something. Rows with
+    # no timestamp sort last rather than crashing the comparison.
+    jobs.sort(key=lambda j: (j.get("created_at") or ""), reverse=True)
+
+    # non-tool sources are fully materialised; tool rows are windowed, so the
+    # honest total is (everything else) + (all tool executions).
+    _non_tool = len([j for j in jobs if (j.get("kind") or "") != "tool"])
+    total = _non_tool + (_tool_total)
+    if kind == "tool":
+        total = _tool_total
+    elif kind:
+        total = len(jobs)
+    # `limit` is opt-in. Defaulting it on would silently truncate existing
+    # callers — useScanCount counts running/queued across the WHOLE list, so a
+    # default page size would quietly under-report active scans.
+    if limit is not None:
+        jobs = jobs[offset:offset + limit]
+
+    return {
+        "jobs": jobs,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "returned": len(jobs),
+    }
 
 
 @router.delete("/api/scans/{job_id}")
@@ -1665,15 +1966,64 @@ async def get_scan(job_id: str):
         for attr in ["nmap_scanner_url", "web_scanner_url", "nuclei_url", "pd_runner_url", "osint_runner_url", "brutus_runner_url", "kali_listener_url"]:
             try:
                 url = getattr(s, attr)
-                async with httpx.AsyncClient(verify=False, timeout=5) as c:
+                async with httpx.AsyncClient(timeout=5) as c:
                     resp = await c.get(f"{url}/jobs/{job_id}", headers={"x-api-key": s.api_key, **engagement_headers()})
                     if resp.status_code == 200:
                         return safe_json(resp)
             except Exception:
                 continue
+
+        # Kali tool executions.
+        #
+        # These now appear in the scans LIST (merged from tool_executions), so a
+        # click through to the detail view has to resolve too — otherwise every
+        # tool run in the monitor is a 404, which is worse than not listing them
+        # at all. They have no /jobs/{id} on any scanner because they never went
+        # through a scanner service.
+        #
+        # The captured stdout is returned as `output`: for a CLI tool that IS the
+        # result, and without it the detail page can say a tool completed while
+        # showing nothing it produced.
+        try:
+            from db import get_db
+            with get_db() as _c, _c.cursor() as _cur:
+                _cur.execute(
+                    """SELECT id, tool, command, target, port, service, status,
+                              exit_code, output, error, parsed_results,
+                              started_at, completed_at
+                         FROM tool_executions WHERE id = %s::uuid""",
+                    (job_id,),
+                )
+                _r = _cur.fetchone()
+            if _r:
+                (_id, _tool, _cmd, _target, _port, _svc, _status, _exit,
+                 _out, _err, _parsed, _start, _end) = _r
+                return {
+                    "job_id": str(_id),
+                    "type": _tool,
+                    "kind": "tool",
+                    "status": _status or "unknown",
+                    "target": _target,
+                    "port": _port,
+                    "service": _svc,
+                    "command": _cmd,
+                    "exit_code": _exit,
+                    "created_at": _start.isoformat() if _start else None,
+                    "completed_at": _end.isoformat() if _end else None,
+                    "service_url": "kali-listener",
+                    "output": _out or "",
+                    "error": _err,
+                    "parsed_results": _parsed,
+                    "summary": (_out or "").strip().splitlines()[-1][:300] if _out else "",
+                }
+        except HTTPException:
+            raise
+        except Exception as _e:
+            log.debug(f"tool_executions detail lookup failed for {job_id}: {_e}")
+
         raise HTTPException(404, "Job not found")
 
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{service_url}/jobs/{job_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -1704,7 +2054,7 @@ async def stop_scan(job_id: str):
     info = active_jobs.get(job_id)
     if not info:
         raise HTTPException(404, "Job not tracked")
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{info['service_url']}/jobs/{job_id}/stop",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -1722,7 +2072,7 @@ async def resume_scan(job_id: str):
     info = active_jobs.get(job_id)
     if not info:
         raise HTTPException(404, "Job not tracked")
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(
             f"{info['service_url']}/jobs/{job_id}/resume",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -1746,7 +2096,7 @@ async def nmap_resume_info(job_id: str):
     info = active_jobs.get(job_id)
     if not info:
         raise HTTPException(404, "Job not tracked")
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(
             f"{info['service_url']}/jobs/{job_id}/nmap-resume-info",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -1782,7 +2132,7 @@ async def cloud_import(
     s = get_settings()
     content = await file.read()
     data = {"engagement_id": engagement_id} if engagement_id else None
-    async with httpx.AsyncClient(verify=False, timeout=300) as c:
+    async with httpx.AsyncClient(timeout=300) as c:
         resp = await c.post(
             f"{s.rag_api_url}/ingest/{ingest_path}",
             files={"file": (file.filename, content, file.content_type or "application/octet-stream")},
@@ -1828,7 +2178,7 @@ async def cloud_import_status(job_id: str):
     """Poll the status of an async cloud-import job (e.g. MicroBurst).
     Proxies rag-api GET /jobs/{job_id}; returns status, progress, result, error."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/jobs/{job_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},

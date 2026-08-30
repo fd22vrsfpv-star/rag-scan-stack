@@ -97,6 +97,12 @@ def _infer_severity(text: str) -> tuple:
     return "info", "default"
 
 
+try:
+    from scope_gate import load_ingest_scope, host_in_scope
+except ImportError:  # pragma: no cover — etl/ may already be on PYTHONPATH
+    from etl.scope_gate import load_ingest_scope, host_in_scope
+
+
 def extract_ip_from_url(url: str) -> Optional[str]:
     """Pull a literal IPv4 host out of a URL, if it is one."""
     m = re.match(r"https?://([^/:]+)", url or "")
@@ -166,7 +172,8 @@ def _build_url(host: str, port: str, uri: str, explicit: str = "") -> str:
 
 
 def _insert_item(cur, stats: dict, dedupe: bool, *, url: str, message: str,
-                 method: str, osvdb: str, item_id: str, host_ip: str) -> None:
+                 method: str, osvdb: str, item_id: str, host_ip: str,
+                 enforce_scope: bool, scope_rows) -> None:
     """Insert one Nikto item as a web_finding."""
     if not url:
         stats["skipped_no_url"] += 1
@@ -192,6 +199,13 @@ def _insert_item(cur, stats: dict, dedupe: bool, *, url: str, message: str,
     if item_id:
         tags["nikto_id"] = item_id
 
+    # Ingest scope gate, before the savepoint so a skip needs no rollback.
+    # nikto follows redirects, so a scan pointed at one host can report findings
+    # against wherever it was sent.
+    if not host_in_scope(url, enforce_scope, scope_rows):
+        stats["out_of_scope"] = stats.get("out_of_scope", 0) + 1
+        return
+
     finding_id = str(uuid.uuid4())
     try:
         cur.execute("SAVEPOINT nikto_sp")
@@ -200,6 +214,10 @@ def _insert_item(cur, stats: dict, dedupe: bool, *, url: str, message: str,
               (id, asset_id, url, source, issue_type, name, severity, evidence,
                method, refs, tags, first_seen, last_seen, fingerprint)
             VALUES (%s, %s, %s, 'nikto', 'nikto', %s, %s, %s, %s, %s, %s, now(), now(), %s)
+            ON CONFLICT (fingerprint) DO UPDATE SET
+                last_seen = now(),
+                severity  = EXCLUDED.severity,
+                evidence  = COALESCE(EXCLUDED.evidence, web_findings.evidence)
         """, (
             finding_id, asset_id, url, name, severity,
             (message or "")[:2000] or None,
@@ -223,7 +241,8 @@ def _insert_item(cur, stats: dict, dedupe: bool, *, url: str, message: str,
         stats["errors"].append(str(e))
 
 
-def _parse_xml(filepath: str, cur, stats: dict, dedupe: bool) -> None:
+def _parse_xml(filepath: str, cur, stats: dict, dedupe: bool,
+               enforce_scope: bool, scope_rows) -> None:
     """Stream a Nikto XML report. iterparse keeps memory flat on big scans."""
     host = port = host_ip = ""
     for event, elem in iterparse(filepath, events=("start", "end")):
@@ -245,11 +264,13 @@ def _parse_xml(filepath: str, cur, stats: dict, dedupe: bool) -> None:
             osvdb=elem.get("osvdbid") or "",
             item_id=elem.get("id") or "",
             host_ip=host_ip,
+            enforce_scope=enforce_scope, scope_rows=scope_rows,
         )
         elem.clear()
 
 
-def _parse_json(filepath: str, cur, stats: dict, dedupe: bool) -> None:
+def _parse_json(filepath: str, cur, stats: dict, dedupe: bool,
+                enforce_scope: bool, scope_rows) -> None:
     """Parse a Nikto JSON report.
 
     Nikto has shipped this as both a single object and a list of host objects
@@ -275,6 +296,7 @@ def _parse_json(filepath: str, cur, stats: dict, dedupe: bool) -> None:
                 osvdb=str(vuln.get("OSVDB") or vuln.get("osvdb") or ""),
                 item_id=str(vuln.get("id") or ""),
                 host_ip=host_ip,
+                enforce_scope=enforce_scope, scope_rows=scope_rows,
             )
 
 
@@ -309,14 +331,15 @@ def parse_nikto(filepath: str, profile: str = "cli", dedupe: bool = True) -> Dic
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor() as cur:
+            _enforce_scope, _scope_rows = load_ingest_scope(cur)
             if fmt == "xml":
                 try:
-                    _parse_xml(filepath, cur, stats, dedupe)
+                    _parse_xml(filepath, cur, stats, dedupe, _enforce_scope, _scope_rows)
                 except ParseError as e:
                     raise ValueError(f"Malformed Nikto XML: {e}") from e
             else:
                 try:
-                    _parse_json(filepath, cur, stats, dedupe)
+                    _parse_json(filepath, cur, stats, dedupe, _enforce_scope, _scope_rows)
                 except json.JSONDecodeError as e:
                     raise ValueError(f"Malformed Nikto JSON: {e}") from e
         conn.commit()

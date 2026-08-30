@@ -48,8 +48,39 @@ SERVICE_MAP = {
 }
 
 
+# Per-service probe timeout. The default of 2s is right for a service whose
+# /health is a liveness ping, and WRONG for one that does real work: rag-api's
+# /health takes ~4.2s (it inspects tables and dependencies), so it timed out on
+# every single call and the dashboard showed the stack's most important service
+# as permanently "unreachable". httpx.ReadTimeout also stringifies to "", which
+# is why the entry carried an empty `error` and nobody could tell why.
+#
+# Raising the default instead would make one dead service stall the whole
+# gather; overriding per service keeps the common case fast.
+DEFAULT_PROBE_TIMEOUT = 2
+SERVICE_TIMEOUTS = {
+    "rag_api": 8,
+}
+
 _health_cache: dict = {"data": None, "ts": 0}
 _HEALTH_CACHE_TTL = 10  # seconds
+
+
+@router.get("/api/healthz")
+async def liveness():
+    """Is THIS container alive? Nothing else.
+
+    The container healthcheck used to curl /api/health, which probes ~20 upstream
+    services concurrently and takes as long as the slowest one. That made the
+    dashboard container report UNHEALTHY whenever an upstream was merely slow —
+    the wrong question for a container healthcheck, and it flapped as soon as the
+    rag-api probe budget was raised to match that service's real 4.2s /health.
+
+    Reaching this handler proves nginx is serving and the BFF process is alive,
+    which is exactly what this container is responsible for. Upstream health has
+    its own endpoint, and its own page.
+    """
+    return {"ok": True, "service": "pentest-dashboard"}
 
 
 @router.get("/api/health")
@@ -68,8 +99,9 @@ async def health(bust: bool = False):
 
     async def check(name: str, attr: str, path: str):
         url = getattr(settings, attr) + path
+        probe_timeout = SERVICE_TIMEOUTS.get(name, DEFAULT_PROBE_TIMEOUT)
         try:
-            async with httpx.AsyncClient(verify=False, timeout=2) as client:
+            async with httpx.AsyncClient(timeout=probe_timeout) as client:
                 resp = await client.get(url, headers={"x-api-key": settings.api_key, **engagement_headers()})
                 if name in RESPOND_ONLY:
                     results[name] = {"status": "healthy", "code": resp.status_code}
@@ -112,7 +144,15 @@ async def health(bust: bool = False):
                             pass
                     results[name] = entry
         except Exception as e:
-            results[name] = {"status": "unreachable", "error": str(e)}
+            # str(httpx.ReadTimeout) is EMPTY, so the entry used to read
+            # `"error": ""` — true, useless, and the reason a 2s timeout against
+            # a 4.2s endpoint went unnoticed for so long. Always say what
+            # happened and what the budget was.
+            detail = str(e) or type(e).__name__
+            results[name] = {
+                "status": "unreachable",
+                "error": f"{type(e).__name__}: {detail} (timeout={probe_timeout}s)",
+            }
 
     async def check_tcp(name: str, host_attr: str, port_attr: str):
         host = getattr(settings, host_attr)
@@ -130,7 +170,7 @@ async def health(bust: bool = False):
     async def check_container(name: str, container_name: str):
         """Check if a Docker container is running via the container-logs service."""
         try:
-            async with httpx.AsyncClient(verify=False, timeout=2) as client:
+            async with httpx.AsyncClient(timeout=2) as client:
                 resp = await client.get(
                     f"{settings.container_logs_url}/services/status"
                 )
@@ -154,7 +194,7 @@ async def health(bust: bool = False):
     async def check_local_postgres():
         """Check local rag-postgres container status via fast single-container endpoint."""
         try:
-            async with httpx.AsyncClient(verify=False, timeout=3) as client:
+            async with httpx.AsyncClient(timeout=3) as client:
                 resp = await client.get(f"{settings.container_logs_url}/container/rag-postgres/status")
                 if resp.status_code == 200:
                     c = resp.json()
@@ -178,7 +218,7 @@ async def health(bust: bool = False):
         """Check remote Postgres via a fast DB health query."""
         try:
             # Fast check: ask rag-api's /health/quick (already connects to DB)
-            async with httpx.AsyncClient(verify=False, timeout=3) as client:
+            async with httpx.AsyncClient(timeout=3) as client:
                 resp = await client.get(
                     f"{settings.rag_api_url}/health/db-pool",
                     headers={"x-api-key": settings.api_key, **engagement_headers()},
@@ -209,7 +249,7 @@ async def health(bust: bool = False):
     db_mode = "local"  # default
     db_proxy_type = "ssh_tunnel"  # default
     try:
-        async with httpx.AsyncClient(verify=False, timeout=2) as client:
+        async with httpx.AsyncClient(timeout=2) as client:
             db_cfg = await client.get(f"{settings.container_logs_url}/db/config")
             if db_cfg.status_code == 200:
                 db_mode = db_cfg.json().get("mode", "local") or "local"
@@ -224,6 +264,19 @@ async def health(bust: bool = False):
     # configured mode is actually remote; otherwise local-mode installs get a
     # false "dual postgres" conflict warning.
     remote_mode = db_mode in ("remote", "remote_direct")
+
+    # In a remote DB mode there is deliberately no local rag-postgres container,
+    # so its "stopped" result is the EXPECTED state — not a core failure. Left
+    # unmarked it made overall health permanently "degraded" and reported the
+    # platform's database as down while remote_postgres was healthy and serving
+    # every query. Mark it optional and say why, rather than hiding the entry:
+    # an operator switching back to local mode still needs to see it.
+    if remote_mode and "postgres" in results:
+        results["postgres"]["optional"] = True
+        results["postgres"]["note"] = (
+            f"not applicable in db_mode={db_mode} — the active database is "
+            "`remote_postgres`; no local container is expected"
+        )
 
     # Tag the db_tunnel entry with proxy type
     if "db_tunnel" in results:
@@ -282,7 +335,7 @@ async def db_pool_status():
     """Proxy to rag-api /health/db-pool — live Postgres connection pool stats."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             resp = await c.get(
                 f"{s.rag_api_url}/health/db-pool",
                 headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -300,7 +353,7 @@ async def llm_metrics(limit: int = 50, caller: str = None, model: str = None):
     params = {"limit": limit}
     if caller: params["caller"] = caller
     if model: params["model"] = model
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.rag_api_url}/metrics/models/requests",
                            params=params, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -309,7 +362,7 @@ async def llm_metrics(limit: int = 50, caller: str = None, model: str = None):
 @router.get("/api/llm/summary")
 async def llm_summary(days: int = 7):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.rag_api_url}/metrics/llm/summary",
                            params={"days": days}, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -320,7 +373,7 @@ async def services_status():
     """Get running status of all managed containers grouped by profile."""
     settings = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(f"{settings.container_logs_url}/services/status")
             return safe_json(resp)
     except Exception as e:
@@ -332,7 +385,7 @@ async def control_profile(action: str, profile: str):
     """Start or stop all containers in a profile."""
     settings = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=60) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(f"{settings.container_logs_url}/services/{action}/{profile}")
             return safe_json(resp)
     except Exception as e:
@@ -344,7 +397,7 @@ async def control_container(action: str, container_name: str):
     """Start or stop a single container."""
     settings = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=60) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
                 f"{settings.container_logs_url}/services/{action}/container/{container_name}"
             )
@@ -358,7 +411,7 @@ async def container_logs(container_name: str, tail: int = 100, since_minutes: in
     """Get recent logs for a specific container."""
     settings = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
                 f"{settings.container_logs_url}/logs/{container_name}",
                 params={"tail": tail, "since": f"{since_minutes}m"},
@@ -385,7 +438,7 @@ async def ollama_diagnostics():
     settings = get_settings()
     result = {"status": "unreachable", "models": [], "running": [], "version": None, "gpu": None}
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             # Version
             try:
                 resp = await client.get(f"{settings.ollama_url}/api/version")
@@ -438,7 +491,7 @@ async def diagnostics_errors(tail: int = 200, since_minutes: int = 30):
     """Scan all container logs for recent errors."""
     settings = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=60) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.get(
                 f"{settings.container_logs_url}/diagnostics/errors",
                 params={"tail": tail, "since_minutes": since_minutes},
@@ -477,7 +530,7 @@ async def diagnostics_recent_sessions(hours: int = Query(8, ge=1, le=72)):
     """List agent sessions from the last N hours for the diagnostic selector."""
     settings = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 f"{settings.autogen_url}/pentest/sessions",
                 headers={"x-api-key": settings.api_key, **engagement_headers()},
@@ -547,7 +600,7 @@ async def diagnostics_session_bundle(session_id: Optional[str] = None, hours: in
             log.error(f"diagnostic bundle fetch failed: {url} — {type(e).__name__}: {e}")
             return {"_error": f"{type(e).__name__}: {e}", "_url": url}
 
-    async with httpx.AsyncClient(verify=False, timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15) as client:
         (session_info, scans_info, messages_info,
          autogen_logs, watchdog_info, health_info, webhook_events) = await asyncio.gather(
             _safe_get(client, f"{settings.autogen_url}/pentest/{session_id}"),
@@ -558,6 +611,18 @@ async def diagnostics_session_bundle(session_id: Optional[str] = None, hours: in
             _safe_get(client, f"{settings.autogen_url}/health"),
             _safe_get(client, f"{settings.rag_api_url}/webhooks/events", params={"limit": 100}),
         )
+
+        # Every payload below is dereferenced with .get(). A service answering
+        # with a JSON array (autogen's /health did exactly that) would otherwise
+        # 500 the whole bundle — the one endpoint whose job is to explain a
+        # broken stack. webhook_events is left alone: it is genuinely
+        # list-or-dict and already handled with isinstance checks below.
+        session_info = _as_mapping(session_info)
+        scans_info = _as_mapping(scans_info)
+        messages_info = _as_mapping(messages_info)
+        autogen_logs = _as_mapping(autogen_logs)
+        watchdog_info = _as_mapping(watchdog_info)
+        health_info = _as_mapping(health_info)
 
         # Fetch scanner-specific logs for each scan job
         scans_list = scans_info.get("scans", []) if not scans_info.get("_error") else []
@@ -584,22 +649,6 @@ async def diagnostics_session_bundle(session_id: Optional[str] = None, hours: in
         for scan in scans_list:
             scan["scanner_logs"] = scanner_logs_map.get(scan.get("job_id", ""), [])
 
-    # Compute failure trace
-    failure_trace = _compute_failure_trace(session_info, scans_list, autogen_logs, health_info, watchdog_info, wh_events)
-
-    # Compute duration
-    duration_seconds = None
-    if not session_info.get("_error"):
-        created = session_info.get("started_at") or session_info.get("created_at")
-        ended = session_info.get("ended_at") or session_info.get("end_time")
-        if created and ended:
-            try:
-                t0 = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                t1 = datetime.fromisoformat(ended.replace("Z", "+00:00"))
-                duration_seconds = round((t1 - t0).total_seconds(), 1)
-            except (ValueError, TypeError):
-                pass
-
     # Filter webhook events to session timeframe
     wh_events = []
     if not webhook_events.get("_error"):
@@ -623,6 +672,28 @@ async def diagnostics_session_bundle(session_id: Optional[str] = None, hours: in
         else:
             wh_events = raw_events[:50]
 
+    # Compute failure trace.
+    #
+    # This call sits AFTER the wh_events block on purpose: it was 16 lines
+    # above it, so `wh_events` was referenced before assignment and
+    # /api/diagnostics/session-bundle returned 500 unconditionally, every
+    # time, for as long as it has existed. Nothing caught it because a
+    # parameterless GET only fails a live sweep, not any static check.
+    failure_trace = _compute_failure_trace(session_info, scans_list, autogen_logs, health_info, watchdog_info, wh_events)
+
+    # Compute duration
+    duration_seconds = None
+    if not session_info.get("_error"):
+        created = session_info.get("started_at") or session_info.get("created_at")
+        ended = session_info.get("ended_at") or session_info.get("end_time")
+        if created and ended:
+            try:
+                t0 = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                t1 = datetime.fromisoformat(ended.replace("Z", "+00:00"))
+                duration_seconds = round((t1 - t0).total_seconds(), 1)
+            except (ValueError, TypeError):
+                pass
+
     return {
         "session": {
             **(session_info if not session_info.get("_error") else {}),
@@ -645,8 +716,31 @@ async def diagnostics_session_bundle(session_id: Optional[str] = None, hours: in
     }
 
 
+def _as_mapping(value):
+    """Coerce a service payload to a dict, whatever shape it arrived in.
+
+    autogen-agents' /health used to `return (health_data, 503)`. FastAPI does not
+    read a returned tuple as (body, status) — it serialised it as a JSON ARRAY,
+    so this function received a LIST and `health.get("_error")` raised
+    `AttributeError: 'list' object has no attribute 'get'`, making
+    /api/diagnostics/session-bundle 500 on every session. The service side is
+    fixed, but the coercion stays: a diagnostics bundle exists to explain a
+    broken stack, so it must not be the thing that breaks on an odd payload.
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, dict):
+                return item
+    return {}
+
+
 def _compute_failure_trace(session, scans, autogen_logs, health, watchdog, webhook_events=None):
     """Analyze the diagnostic data and produce a failure summary with root cause hints."""
+    session = _as_mapping(session)
+    health = _as_mapping(health)
+    watchdog = _as_mapping(watchdog)
     trace = {
         "has_failures": False,
         "session_error": None,
@@ -793,7 +887,7 @@ async def system_check():
     # ── 1. Database schema checks ──
     db_checks = []
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15) as client:
             # Get table list from rag-api
             resp = await client.get(
                 f"{settings.rag_api_url}/health/database",
@@ -847,7 +941,7 @@ async def system_check():
 
     # Check critical views and columns via direct rag-api query
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
                 f"{settings.rag_api_url}/health/sql/check-schema",
                 headers={"x-api-key": settings.api_key, **engagement_headers()},
@@ -903,13 +997,13 @@ async def system_check():
                 "warning" if any(c["status"] == "warning" for c in db_checks) else "fail"
     results["database"] = {"status": db_status, "checks": db_checks}
 
-    # ── 2. Service connectivity (HTTPS with verify=False) ──
+    # ── 2. Service connectivity (HTTPS, verification ON via /certs bundle) ──
     svc_results = {}
 
     async def _check_service(name, attr, path):
         url = getattr(settings, attr, "") + path
         try:
-            async with httpx.AsyncClient(verify=False, timeout=5) as client:
+            async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.get(url, headers={"x-api-key": settings.api_key, **engagement_headers()})
                 svc_results[name] = {
                     "status": "pass" if resp.status_code == 200 else "warning",
@@ -945,33 +1039,33 @@ async def system_check():
             e2e_tests.append({"test": name, "status": "fail", "error": str(e)[:150]})
 
     async def test_db_query():
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(f"{settings.rag_api_url}/assets?limit=1",
                             headers={"x-api-key": settings.api_key, **engagement_headers()})
             return {"detail": f"Query returned {r.status_code}"}
 
     async def test_scan_recommender():
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(f"{settings.scan_recommender_url}/recommendations?limit=1",
                             headers={"x-api-key": settings.api_key, **engagement_headers()})
             return {"detail": f"Recommendations endpoint: {r.status_code}"}
 
     async def test_webhook_delivery():
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(f"{settings.rag_api_url}/webhooks",
                             headers={"x-api-key": settings.api_key, **engagement_headers()})
             count = len(r.json()) if r.status_code == 200 and isinstance(r.json(), list) else 0
             return {"detail": f"{count} webhooks registered"}
 
     async def test_exploit_search():
-        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15) as c:
             r = await c.get(f"{settings.scan_recommender_url}/rag/search/enhanced",
                             params={"query": "test", "service": "http"},
                             headers={"x-api-key": settings.api_key, **engagement_headers()})
             return {"detail": f"Exploit search: {r.status_code}"}
 
     async def test_ollama():
-        async with httpx.AsyncClient(verify=False, timeout=5) as c:
+        async with httpx.AsyncClient(timeout=5) as c:
             r = await c.get(f"{settings.ollama_url}/api/tags")
             models = len(r.json().get("models", [])) if r.status_code == 200 else 0
             return {"detail": f"Ollama: {models} models available"}
@@ -980,7 +1074,7 @@ async def system_check():
         """Test a list of (name, port) MCP servers, return result dict."""
         ok = []
         failed = []
-        async with httpx.AsyncClient(verify=False, timeout=8) as c:
+        async with httpx.AsyncClient(timeout=8) as c:
             for name, port in server_list:
                 try:
                     r = await c.post(
@@ -1013,7 +1107,7 @@ async def system_check():
     ]
 
     async def _test_single_mcp(name, port):
-        async with httpx.AsyncClient(verify=False, timeout=8) as c:
+        async with httpx.AsyncClient(timeout=8) as c:
             r = await c.post(
                 f"http://mcp-streamable:{port}/mcp",
                 json={"jsonrpc": "2.0", "id": 0, "method": "initialize",
@@ -1036,7 +1130,7 @@ async def system_check():
 
         # Burp MCP proxy runs on a separate host (not mcp-streamable)
         try:
-            async with httpx.AsyncClient(verify=False, timeout=5) as c:
+            async with httpx.AsyncClient(timeout=5) as c:
                 r = await c.get("http://burp-mcp-proxy:9876/", timeout=3)
                 if r.status_code == 200:
                     ok.append("burpsuite-pro")
@@ -1105,7 +1199,7 @@ async def system_check():
         })
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=5) as client:
+        async with httpx.AsyncClient(timeout=5) as client:
             # Detect platform from container environment
             resp = await client.get(
                 f"{settings.container_logs_url}/health",
@@ -1120,7 +1214,7 @@ async def system_check():
         # Detect Docker Desktop (macOS/Windows) — masscan raw sockets won't work
         # Check if masscan fallback was used in nmap
         try:
-            async with httpx.AsyncClient(verify=False, timeout=5) as client:
+            async with httpx.AsyncClient(timeout=5) as client:
                 r = await client.get(f"{settings.nmap_scanner_url}/logs",
                                      params={"search": "fallback", "limit": 5},
                                      headers={"x-api-key": settings.api_key, **engagement_headers()})
@@ -1207,7 +1301,7 @@ async def system_check():
 
         # WSL2-specific advisories
         try:
-            async with httpx.AsyncClient(verify=False, timeout=3) as client:
+            async with httpx.AsyncClient(timeout=3) as client:
                 # Check kernel version for WSL detection
                 r = await client.get(f"{settings.container_logs_url}/health")
                 if r.status_code == 200:
@@ -1247,7 +1341,9 @@ async def system_check():
                    "  1. Mount certs volume: ./certs:/certs:ro\n"
                    "  2. Add SSL env vars: SSL_CERTFILE=/certs/server.crt, SSL_KEYFILE=/certs/server.key\n"
                    "  3. Start uvicorn with: --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt\n"
-                   "  4. All httpx/requests calls must use verify=False\n"
+                   "  4. Internal HTTPS calls verify against /certs/ca-bundle.crt;\n"
+                   "     do NOT reinstate verify=False - regenerate the bundle\n"
+                   "     with scripts/generate-ca-bundle.sh instead\n"
                    "  5. Health checks: curl -fk https://127.0.0.1:PORT/health",
         })
 
@@ -1284,7 +1380,7 @@ async def system_fix():
 
     # 1. Run ensure_all_tables.sql via rag-api container
     try:
-        async with httpx.AsyncClient(verify=False, timeout=60) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             # Ask rag-api to apply schema (it has DB access)
             resp = await client.post(
                 f"{settings.rag_api_url}/health/sql/apply-schema",
@@ -1333,7 +1429,7 @@ async def ollama_status():
     base = settings.ollama_url
     result: dict = {"gpu": None, "loaded_models": [], "available_models": [], "version": None}
 
-    async with httpx.AsyncClient(verify=False, timeout=10) as client:
+    async with httpx.AsyncClient(timeout=10) as client:
         # Version
         try:
             resp = await client.get(f"{base}/api/version")
@@ -1389,7 +1485,7 @@ async def ollama_status():
     # GPU info: try NVIDIA first (container-logs/nvidia-smi), fall back to Apple Silicon
     gpu_data = None
     try:
-        async with httpx.AsyncClient(verify=False, timeout=5) as client:
+        async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get("https://container-logs:8018/gpu")
             if resp.status_code == 200:
                 gpu_data = resp.json().get("gpu")
@@ -1438,7 +1534,7 @@ async def ollama_model_load(body: ModelAction):
     settings = get_settings()
     base = settings.ollama_url
     try:
-        async with httpx.AsyncClient(verify=False, timeout=120) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 f"{base}/api/generate",
                 json={"model": body.name, "prompt": "", "keep_alive": "10m"},
@@ -1456,7 +1552,7 @@ async def ollama_model_unload(body: ModelAction):
     settings = get_settings()
     base = settings.ollama_url
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{base}/api/generate",
                 json={"model": body.name, "prompt": "", "keep_alive": 0},
@@ -1474,7 +1570,7 @@ async def ollama_model_pull(body: ModelAction):
     settings = get_settings()
     base = settings.ollama_url
     try:
-        async with httpx.AsyncClient(verify=False, timeout=600) as client:
+        async with httpx.AsyncClient(timeout=600) as client:
             resp = await client.post(
                 f"{base}/api/pull",
                 json={"name": body.name, "stream": False},
@@ -1491,7 +1587,7 @@ async def get_active_model():
     """Get the active model name from app_settings (used by all services)."""
     settings = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=5) as client:
+        async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(
                 f"{settings.rag_api_url}/settings/config/ollama_active_model",
                 headers={"x-api-key": settings.api_key, **engagement_headers()},
@@ -1509,7 +1605,7 @@ async def set_active_model(body: ModelAction):
     """Set the active model globally (persisted to DB, used by all services)."""
     settings = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=5) as client:
+        async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.put(
                 f"{settings.rag_api_url}/settings/config/ollama_active_model",
                 headers={"x-api-key": settings.api_key, "Content-Type": "application/json", **engagement_headers()},

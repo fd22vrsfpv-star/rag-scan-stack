@@ -1,0 +1,56 @@
+# Customer-hosted live sites — detect third-party/customer sites hosted on our
+# own shared domains (e.g. *-live.convio.net) so they can be marked out of scope.
+#
+# We host many customers' production sites on our domains. Scanning them is out of
+# authorization. These rules flag them from recon data already collected; an
+# operator then reviews and moves them into the engagement's `customer_scope`
+# bucket (Follow-ups → "Mark out-of-scope (customer site)"). Deterministic, no LLM.
+#
+# Signals (see app/rag-api/rule_engine.py):
+#   - check_customer_hosted_cert : host registrable-domain != TLS cert CN/SAN domain
+#   - check_customer_hosted_cname: host registrable-domain != DNS CNAME target domain
+
+- id: customer_hosted_site
+  name: "Customer-Hosted Site (TLS cert mismatch)"
+  type: simple
+  enabled: true
+  severity: info
+  confidence: 0.9
+  description: "Host serves a TLS certificate for a different registrable domain — a customer site on our shared domain, likely out of scope."
+  title_template: "Customer-hosted site — {target}"
+  reason_template: "TLS cert is for {owner_domain} (customer), not {host_domain} — likely an out-of-scope customer site"
+  finding_source: recon
+  tags: [customer-site, out-of-scope-candidate, third-party]
+  metadata_keys: [cert_cn, owner_domain, host_domain, signal]
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: tlsx
+    time_column: created_at
+  match:
+    type: python
+    function: check_customer_hosted_cert
+
+- id: customer_hosted_site_cname
+  name: "Customer-Hosted Site (CNAME cross-domain)"
+  type: simple
+  enabled: true
+  severity: info
+  confidence: 0.75
+  description: "Host CNAMEs to a different registrable domain — possible customer/third-party alias, likely out of scope."
+  title_template: "Customer-hosted site (CNAME) — {target}"
+  reason_template: "{host_domain} CNAMEs to {owner_domain} ({cname_target}) — possible out-of-scope customer alias"
+  finding_source: recon
+  tags: [customer-site, out-of-scope-candidate, third-party]
+  metadata_keys: [cname_target, owner_domain, host_domain, signal]
+  query:
+    table: recon_findings
+    columns: [id, target, data]
+    where:
+      source: dnsx
+      finding_type: dns_cname
+    time_column: created_at
+  match:
+    type: python
+    function: check_customer_hosted_cname

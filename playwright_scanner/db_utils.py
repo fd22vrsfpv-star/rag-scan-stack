@@ -50,6 +50,16 @@ def get_or_create_asset(ip: str, hostname: Optional[str] = None) -> uuid.UUID:
             if hostname is None:
                 hostname = ip
 
+    # A hostname equal to the IP carries no information, and it is NOT harmless:
+    # the unique index is ix_assets_ip_hostname(ip, COALESCE(hostname, '')), so
+    # hostname='192.168.1.150' and hostname=NULL are two different rows for one
+    # host. Ports hang off asset_id, so the host's ports were duplicated once
+    # per asset row — 99 port rows for 59 real (ip, proto, port) tuples.
+    #
+    # Enforced in the schema too, by CHECK assets_hostname_not_ip.
+    if hostname and hostname == resolved_ip:
+        hostname = None
+
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         # Look up by hostname first (exact match), then by IP+hostname combo
         if hostname:
@@ -74,6 +84,49 @@ def get_or_create_asset(ip: str, hostname: Optional[str] = None) -> uuid.UUID:
             cur.execute("UPDATE assets SET last_seen = now() WHERE id = %s", (row['id'],))
             conn.commit()
             return row['id']
+
+        # A nameless row for this address is this host before its name was known,
+        # NOT a virtual host. Adopt it instead of inserting a sibling; the exact
+        # combo lookup above misses it, which is how one machine became two asset
+        # rows with its ports on one and its findings on the other. Mirrors
+        # etl/asset_utils.ensure_asset — keep the two in step.
+        if hostname:
+            cur.execute(
+                """
+                UPDATE assets a SET hostname = %s, last_seen = now()
+                 WHERE a.ip = %s::inet
+                   AND COALESCE(NULLIF(btrim(a.hostname), ''), '') = ''
+                   AND NOT EXISTS (
+                        SELECT 1 FROM assets b
+                         WHERE b.ip = a.ip AND b.id <> a.id
+                           AND COALESCE(NULLIF(btrim(b.hostname), ''), '') <> '')
+                RETURNING a.id
+                """,
+                (hostname, resolved_ip)
+            )
+            row = cur.fetchone()
+            if row:
+                conn.commit()
+                return row['id']
+        else:
+            # An IP-only observation belongs to the single named row when there
+            # is exactly one; with several names it cannot pick, so it falls
+            # through and creates the nameless anchor.
+            cur.execute(
+                """
+                SELECT a.id FROM assets a
+                 WHERE a.ip = %s::inet
+                   AND (SELECT count(DISTINCT NULLIF(btrim(b.hostname), ''))
+                          FROM assets b WHERE b.ip = a.ip) = 1
+                 LIMIT 1
+                """,
+                (resolved_ip,)
+            )
+            row = cur.fetchone()
+            if row:
+                cur.execute("UPDATE assets SET last_seen = now() WHERE id = %s", (row['id'],))
+                conn.commit()
+                return row['id']
 
         # Create new asset (unique on ip + hostname)
         cur.execute(

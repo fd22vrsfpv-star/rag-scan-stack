@@ -14,6 +14,10 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
+
+# text[] columns reject a bare string ('malformed array literal'), so
+# array feeds from parsed documents go through this. See etl/sql_types.py.
+from etl.sql_types import as_text_array
 from psycopg2.pool import ThreadedConnectionPool
 from contextlib import contextmanager
 import threading
@@ -485,9 +489,22 @@ async def get_scan_results(job_id: str, x_api_key: str = Header(...), db_dsn=DB_
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid X-API-Key")
 
+    # The scan runs recorded under this job. This used to query `scan_results`,
+    # a table that has never existed in db_init — so every call 500'd with
+    # `relation "scan_results" does not exist`. The real per-job record is
+    # `scan_runs` (one row per tool run, keyed by job_id), with its findings in
+    # `scan_run_findings` (run_id -> finding). Returned shape is unchanged
+    # ({job_id, results}) so any consumer of the documented contract still works.
     try:
         with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute("SELECT * FROM scan_results WHERE job_id = %s", (job_id,))
+            cursor.execute(
+                """SELECT id, tool, target, job_id, profile, started_at,
+                          finished_at, finding_count, metadata
+                     FROM scan_runs
+                    WHERE job_id = %s
+                    ORDER BY started_at DESC""",
+                (job_id,),
+            )
             results = cursor.fetchall()
         return {"job_id": job_id, "results": results}
     except Exception as e:
@@ -664,17 +681,27 @@ def get_db(autocommit: bool = False):
             pass
         # If the connection broke mid-request (server-side disconnect), don't
         # recycle it — close it so the pool allocates a fresh one next time.
+        #
+        # `if/else`, NOT an early `return`. A `return` inside `finally` DISCARDS
+        # the exception that was propagating, so a request whose connection died
+        # mid-flight carried on past its own `with get_db()` block as though it
+        # had succeeded. The visible symptom was
+        #     UnboundLocalError: local variable 'result' referenced before assignment
+        # from a handler whose try/except had raised HTTPException and had that
+        # raise silently thrown away. All 360 `with get_db()` call sites in this
+        # file were exposed; the ones that assign nothing before the block would
+        # have returned a plausible-looking partial result instead of an error.
         if conn.closed:
             _discard_conn(pool, conn)
-            return
-        try:
-            pool.putconn(conn)
-        except Exception:
-            # If putconn fails (e.g., closed conn), close hard
+        else:
             try:
-                conn.close()
+                pool.putconn(conn)
             except Exception:
-                pass
+                # If putconn fails (e.g., closed conn), close hard
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
 def ensure_phase0_schema():
     # Create jobs/tasks tables if they're missing so Phase 0 endpoints work without manual migration
@@ -909,6 +936,37 @@ def run_masscan_nmap(
     background_tasks.add_task(_background_run_masscan_nmap, job_id, targets, ports, rate, interface)
     return {"id": job_id, "status": "queued"}
 
+# ── Scan dispatch: scope gate and volume bound ──────────────────────────────
+# /jobs/masscan-nmap/upload takes a FILE of targets and fans them out to the
+# nmap scanner. It had neither check: an uploaded list could name any host, and
+# nothing consulted the engagement ceiling.
+#
+# The ceiling comes from the same env var common/tool_job.py reads. `common/` is
+# not mounted into rag-api, so the COUNTER cannot be shared with it — the number
+# is, and the bound is per process. Same honest limitation tool_job documents.
+_MAX_CONCURRENT_SCANS = int(os.environ.get("MAX_CONCURRENT_SCANS", "5"))
+_api_scan_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_SCANS)
+
+
+def _enforce_scan_scope(targets, command: str = ""):
+    """Refusal string when ANY target is out of scope, else None. Fails closed.
+
+    One authorised host in an uploaded list is not authorisation for the rest,
+    so every entry is checked rather than the first.
+    """
+    try:
+        from etl.scope_gate import enforce_target_scope
+    except Exception as e:                     # pragma: no cover - deployment
+        return (f"scope gate unavailable ({type(e).__name__}: {e}) — refusing "
+                "to dispatch; check the ./etl mount on rag-api")
+    for t in (targets or []):
+        refusal = enforce_target_scope(str(t), command)
+        if refusal:
+            log.warning("REFUSED dispatch for %s: %s", t, refusal)
+            return refusal
+    return None
+
+
 @app.post("/jobs/masscan-nmap/upload")
 def masscan_nmap_upload(
     file: UploadFile = File(..., description="Text file with newline/comma separated IPs/CIDRs; supports # comments"),
@@ -931,6 +989,34 @@ def masscan_nmap_upload(
     targets = _parse_targets_text(content, whitelist=whitelist, blacklist=blacklist)
     if not targets:
         raise HTTPException(status_code=400, detail="No valid targets after applying filters")
+
+    # Scope gate BEFORE the job row is created, so a refused upload does not
+    # leave a phantom job and task behind for the operator to chase. Every
+    # target is checked: this endpoint takes a FILE, so one line naming an
+    # unauthorised host is enough, and the whitelist/blacklist above are
+    # convenience filters, not an authorization boundary.
+    _refusal = _enforce_scan_scope(targets, f"masscan-nmap upload ({ports})")
+    if _refusal:
+        raise HTTPException(403, _refusal)
+
+    # Shed rather than queue: this is a synchronous handler, and a client that
+    # waits behind a long semaphore times out while the work still counts as
+    # admitted. CLAUDE.md: return 429 fast.
+    if not _api_scan_slots.acquire(blocking=False):
+        raise HTTPException(
+            429, f"{_MAX_CONCURRENT_SCANS} concurrent scans already in flight "
+                 "(MAX_CONCURRENT_SCANS) — nothing was dispatched, retry when "
+                 "one finishes.")
+    try:
+        return _masscan_nmap_upload_slotted(
+            targets, ports, rate, interface, idempotency_key, whitelist, blacklist)
+    finally:
+        _api_scan_slots.release()
+
+
+def _masscan_nmap_upload_slotted(targets, ports, rate, interface,
+                                 idempotency_key, whitelist, blacklist):
+    """Body of the upload handler, after the scope gate and holding a slot."""
 
     # Create job and running pipeline task
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -1004,6 +1090,97 @@ def masscan_nmap_upload(
         conn.commit()
 
     return {"id": job_id, "ok": ok, "targets": len(targets), "nmap_tasks_enqueued": created_tasks, "scanner": resp}
+
+class JobCreateBody(BaseModel):
+    type: str
+    params: Dict[str, Any] = {}
+    idempotency_key: Optional[str] = None
+    engagement_id: Optional[str] = None
+
+
+@app.post("/jobs", tags=["Jobs"])
+def create_job(body: JobCreateBody, authorized: bool = Depends(auth)):
+    """Record a job so its tasks can be tracked, and return its id.
+
+    This inserts a row. It does NOT dispatch anything and sends no traffic —
+    /jobs/nmap-from-masscan is the dispatcher, and it is what carries the scope
+    and concurrency obligations. So there is no gate here: there is nothing to
+    gate until something is actually run.
+
+    `idempotency_key` deduplicates retries. jobs_idempotency_key_key is a plain
+    UNIQUE index (not partial), so a NULL key is unconstrained and every
+    keyless call creates a new job — which is the right behaviour for a caller
+    that did not ask for dedup.
+
+    The lifecycle this feeds has been implemented in /jobs/nmap-from-masscan
+    since it was written — job -> running, a 'pipeline' task, finished_tasks
+    incremented on success. Only the two endpoints that create and read the
+    rows were missing, so tests/test_phase0_jobs.py has been failing against a
+    404 (masked until now: those tests could never reach a database).
+    """
+    eid = body.engagement_id or _resolve_engagement_id(None)
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        if body.idempotency_key:
+            cur.execute("SELECT id, status FROM jobs WHERE idempotency_key = %s",
+                        (body.idempotency_key,))
+            row = cur.fetchone()
+            if row:
+                return {"id": str(row["id"]), "status": row["status"], "dedup": True}
+        try:
+            cur.execute("""
+                INSERT INTO jobs (type, params, idempotency_key, engagement_id)
+                VALUES (%s, %s::jsonb, %s, %s::uuid)
+                RETURNING id, status
+            """, (body.type, json.dumps(body.params or {}),
+                  body.idempotency_key, eid))
+            row = cur.fetchone()
+        except psycopg2.errors.UniqueViolation:
+            # Two concurrent calls with the same key: the loser reads the winner
+            # rather than 500ing. Without this the SELECT above is a race, not a
+            # guarantee.
+            conn.rollback()
+            cur.execute("SELECT id, status FROM jobs WHERE idempotency_key = %s",
+                        (body.idempotency_key,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(500, "job insert conflicted but no row found")
+            return {"id": str(row["id"]), "status": row["status"], "dedup": True}
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("job_created", "jobs", {
+            "job_id": str(row["id"]), "type": body.type,
+            "engagement_id": eid, "idempotent": bool(body.idempotency_key),
+        })
+    except Exception:
+        pass
+    return {"id": str(row["id"]), "status": row["status"], "dedup": False}
+
+
+@app.get("/jobs/{job_id}/tasks", tags=["Jobs"])
+def list_job_tasks(job_id: str, authorized: bool = Depends(auth)):
+    """The tasks belonging to one job, oldest first."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            cur.execute("""
+                SELECT id, job_id, type, target_host, target_port, proto, status,
+                       attempt, last_error, created_at, started_at, finished_at
+                  FROM tasks WHERE job_id = %s::uuid
+                 ORDER BY created_at, id
+            """, (job_id,))
+        except psycopg2.errors.InvalidTextRepresentation:
+            raise HTTPException(404, f"Job not found: {job_id}")
+        rows = cur.fetchall()
+    items = [{
+        "id": str(r["id"]), "job_id": str(r["job_id"]), "type": r["type"],
+        "target_host": str(r["target_host"]) if r["target_host"] else None,
+        "target_port": r["target_port"], "proto": r["proto"],
+        "status": r["status"], "attempt": r["attempt"], "last_error": r["last_error"],
+        "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+        "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
+    } for r in rows]
+    return {"count": len(items), "items": items}
+
 
 @app.post("/jobs/nmap-from-masscan")
 def nmap_from_masscan(authorized: bool = Depends(auth), job_id: Optional[str] = Query(None)):
@@ -1409,7 +1586,12 @@ def list_all_credentials(
         cur.execute(f"""
             SELECT id, host(ip)::text as ip, port, protocol, username, valid_cred,
                    auth_type, secret_type, severity, banner, source, status,
-                   discovered_at, last_verified_at, duration_ms, metadata, created_at
+                   discovered_at, last_verified_at, duration_ms, metadata,
+                   -- The recovered secret, in PLAINTEXT. Returned on
+                   -- purpose: the operator's next step is to authenticate
+                   -- with it, and a credential they cannot read is a
+                   -- credential they cannot use. Authenticated endpoint.
+                   secret_value, created_at
             FROM credential_findings
             {where}
             ORDER BY created_at DESC
@@ -1508,6 +1690,105 @@ def delete_credential(cid: str, authorized: bool = Depends(auth)):
     return {"ok": True, "deleted": cid}
 
 
+@app.get("/assets/{ip}/parameters", tags=["Assets"])
+def get_asset_scan_parameters(ip: str, keys: str = Query(None),
+                              _: bool = Depends(auth)):
+    """Discovered values for this host that influence how it is tested.
+
+    Three layers, and the response always says which one a value came from:
+      declared  — what the operator stated (scan_parameters)
+      observed  — read from findings and tool output, with the tool named
+      default   — never observed here
+
+    That provenance is load-bearing. A consumer that cannot tell a measured
+    value from a default will read "we never checked" as "no lockout", which is
+    exactly the mistake this layer exists to prevent.
+    """
+    import sys as _sys
+    if "/app" not in _sys.path:
+        _sys.path.insert(0, "/app")
+    import scan_parameters as sp
+    wanted = [k.strip() for k in (keys or "").split(",") if k.strip()] or None
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            values = sp.effective(cur, ip, wanted)
+        except Exception as e:
+            raise HTTPException(500, f"parameter lookup failed: {e}")
+    by_prov = {}
+    for v in values.values():
+        by_prov[v["provenance"]] = by_prov.get(v["provenance"], 0) + 1
+
+    # Consumers that turn these values into guidance, surfaced beside the values
+    # they came from so the operator sees the conclusion and its evidence
+    # together rather than having to join them by hand.
+    advice = []
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            waf = sp.web_scan_advice(cur, ip)
+            if waf:
+                advice.append({"topic": "scan_aggressiveness", **waf})
+        except Exception:                   # noqa: BLE001
+            pass
+        for svc in sorted(sp.DOMAIN_AUTH_SERVICES):
+            try:
+                length, why = sp.min_password_length(cur, ip, svc)
+            except Exception:               # noqa: BLE001
+                continue
+            if length:
+                advice.append({"topic": "wordlist_selection", "service": svc,
+                               "min_password_length": length, "advice": why})
+                break
+    return {"ok": True, "host": ip, "parameters": values,
+            "counts_by_provenance": by_prov, "advice": advice}
+
+
+@app.post("/assets/{ip}/parameters", tags=["Assets"])
+def declare_asset_scan_parameter(ip: str, body: dict, _: bool = Depends(auth)):
+    """Declare a value for this host, overriding what was observed.
+
+    For what no tool can discover: "treat the lockout as 5 because the client
+    said so", "never spray this host". Observed values are never written here —
+    they are read from findings, so a re-scan cannot be contradicted by a stale
+    copy.
+    """
+    key = (body or {}).get("key")
+    if not key:
+        raise HTTPException(400, "key is required")
+    import sys as _sys
+    if "/app" not in _sys.path:
+        _sys.path.insert(0, "/app")
+    import scan_parameters as sp
+    vocab = sp.load_vocabulary()
+    if vocab and key not in vocab:
+        raise HTTPException(
+            400, f"unknown parameter {key!r}. Declared keys: "
+                 f"{', '.join(sorted(vocab))}. Add it to "
+                 f"knowledge/scan_parameters.yaml first, so something can "
+                 f"actually consume it.")
+    value = (body or {}).get("value")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            INSERT INTO scan_parameters
+                   (scope_type, scope_value, key, value, note, declared_by)
+            VALUES ('host', %s, %s, %s, %s, %s)
+            ON CONFLICT (scope_type, scope_value, key) DO UPDATE
+               SET value = EXCLUDED.value, note = EXCLUDED.note,
+                   declared_by = EXCLUDED.declared_by, updated_at = now()
+            RETURNING id::text, (xmax = 0) AS inserted
+        """, (ip, key, None if value is None else str(value),
+              (body or {}).get("note"), (body or {}).get("declared_by")))
+        row = cur.fetchone()
+        conn.commit()
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("scan_parameter_declared", "scan_parameters", {
+            "host": ip, "key": key, "value": value})
+    except Exception:
+        pass
+    return {"ok": True, "host": ip, "key": key, "value": value,
+            "created": bool(row and row["inserted"])}
+
+
 @app.get("/assets/{ip}/credentials", tags=["Assets"])
 def get_asset_credentials(ip: str, authorized: bool = Depends(auth)):
     """Get all credential findings for an asset by IP."""
@@ -1583,6 +1864,8 @@ def get_open_ports(
                    p.product, p.version, p.banner,
                    a.os,
                    COALESCE(COUNT(DISTINCT v.id), 0)::int AS finding_count,
+                   -- public.severity_rank() — one scale for the whole stack
+                   -- (etl/severity.py). This was a hand-written descending CASE.
                    CASE MAX(
                        CASE v.severity
                            WHEN 'critical' THEN 5
@@ -1612,7 +1895,115 @@ def get_open_ports(
         rows = cur.fetchall()
     return {"count": len(rows), "total": total, "limit": limit, "offset": offset, "items": rows}
 
-def _save_upload_to_tmp(file: UploadFile) -> str:
+# Upload archiving cap. Scan uploads are normally KBs to a few MB; this exists
+# so a pathological file cannot be read into memory whole. Exceeding it is
+# logged loudly and marked in the stored content rather than passing silently,
+# because this table is meant to be the source of truth.
+ARTIFACT_MAX_BYTES = int(os.environ.get("ARTIFACT_MAX_BYTES", str(64 * 1024 * 1024)))
+
+
+def _count_items(content: str, fmt: str) -> int:
+    """How many records THIS file holds — the honest per-artifact item count.
+
+    A job-wide findings join over-counts badly: tools share a job_id, so a 514-byte
+    crtsh file inherited a sibling dnsx run's 1996 hosts. The file itself is the
+    source of truth: JSONL lines, a JSON array's length (or a wrapped list), else
+    non-blank lines. Computed once at ingest so the list never rescans 64 MB rows."""
+    s = content or ""
+    if not s.strip():
+        return 0
+    if fmt == "jsonl":
+        return sum(1 for ln in s.splitlines() if ln.strip())
+    if fmt == "json":
+        try:
+            v = json.loads(s)
+        except Exception:
+            v = None
+        if isinstance(v, list):
+            return len(v)
+        if isinstance(v, dict):
+            for k in ("results", "data", "findings", "hosts", "subdomains",
+                      "ports", "urls", "items"):
+                if isinstance(v.get(k), list):
+                    return len(v[k])
+            return 1
+    return sum(1 for ln in s.splitlines() if ln.strip())
+
+
+def _store_artifact_row(*, tool: str, content: str, command: str = None,
+                        target: str = None, port: int = None, service: str = None,
+                        exec_id: str = None, job_id: str = None, scan_id: str = None,
+                        source: str = "unknown", content_format: str = None,
+                        native_json: bool = False, engagement_id: str = None,
+                        note: str = None) -> dict:
+    """Insert or dedupe one artifact. Shared by the HTTP endpoint and the
+    upload chokepoint so the two paths cannot drift apart."""
+    sha = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
+    fmt = content_format or _detect_content_format(content)
+    item_count = _count_items(content, fmt)
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO raw_artifacts
+                (engagement_id, tool, command, target, port, service, exec_id,
+                 job_id, scan_id, source, note, item_count, content_format,
+                 native_json, content, content_sha256, byte_size)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (tool, COALESCE(target,''), content_sha256) DO UPDATE
+               SET last_seen    = now(),
+                   occurrences  = raw_artifacts.occurrences + 1,
+                   exec_id      = COALESCE(EXCLUDED.exec_id, raw_artifacts.exec_id),
+                   job_id       = COALESCE(EXCLUDED.job_id, raw_artifacts.job_id),
+                   scan_id      = COALESCE(EXCLUDED.scan_id, raw_artifacts.scan_id),
+                   command      = COALESCE(EXCLUDED.command, raw_artifacts.command),
+                   note         = COALESCE(EXCLUDED.note, raw_artifacts.note),
+                   item_count   = EXCLUDED.item_count
+            RETURNING id, (xmax = 0) AS inserted, occurrences
+            """,
+            (engagement_id, tool, command, target, port, service, exec_id, job_id,
+             scan_id, source, note, item_count, fmt, native_json, content, sha,
+             len(content.encode("utf-8", "replace"))),
+        )
+        row = cur.fetchone()
+    return {"artifact_id": str(row[0]), "inserted": bool(row[1]),
+            "occurrences": row[2], "content_format": fmt, "sha256": sha}
+
+
+def _archive_upload(path: str, tool: str, job_id: str = None,
+                    engagement_id: str = None) -> None:
+    """Archive an uploaded scan file verbatim.
+
+    This is where the SCANNER SERVICES get covered. pd_runner, nmap_scanner,
+    osint_runner and brutus_runner all deliver results by POSTing a file to
+    /ingest/<tool>, so their output never passed through the kali-listener path
+    that archived stdout — it was parsed into findings and the original file
+    deleted. Archiving here catches every one of them at a single point rather
+    than editing each service.
+
+    Never raises: the parse that follows is what the caller asked for, and
+    losing the archive copy must not fail an otherwise good ingest.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            raw = fh.read(ARTIFACT_MAX_BYTES)
+        content = raw.decode("utf-8", "replace")
+        if size > ARTIFACT_MAX_BYTES:
+            logger.warning("artifact %s from %s is %d bytes; archived first %d",
+                           os.path.basename(path), tool, size, ARTIFACT_MAX_BYTES)
+            content += (f"\n\n=== TRUNCATED BY ARTIFACT_MAX_BYTES: stored "
+                        f"{ARTIFACT_MAX_BYTES} of {size} bytes ===\n")
+        res = _store_artifact_row(tool=tool, content=content, source="upload",
+                                  job_id=job_id, engagement_id=engagement_id,
+                                  command=f"upload:{os.path.basename(path)}")
+        logger.info("archived %s upload (%d bytes) -> %s new=%s",
+                    tool, size, res["artifact_id"], res["inserted"])
+    except Exception as e:
+        logger.warning("upload archive failed for tool=%s: %s", tool, e)
+
+
+def _save_upload_to_tmp(file: UploadFile, tool: str = None, job_id: str = None,
+                        engagement_id: str = None) -> str:
     """Persist an upload to a private temp path.
 
     The filename is attacker-controlled (it comes from the multipart headers),
@@ -1626,6 +2017,11 @@ def _save_upload_to_tmp(file: UploadFile) -> str:
     tmp_path = f"/tmp/{uuid.uuid4().hex}_{safe[:120]}"
     with open(tmp_path, "wb") as buffer:
         buffer.write(file.file.read())
+    # Archive before parsing. Callers that name their tool get the complete
+    # uploaded file preserved; the parse below is lossy and the temp file is
+    # unlinked immediately after it.
+    if tool:
+        _archive_upload(tmp_path, tool, job_id=job_id, engagement_id=engagement_id)
     return tmp_path
 
 def _parse_targets_text(content: str, whitelist: Optional[List[str]], blacklist: Optional[List[str]]) -> List[str]:
@@ -1846,13 +2242,25 @@ def _dispatch_recommender_for_ports(rows) -> int:
         if row.get("banner"):
             params["banner"] = row["banner"]
         try:
-            requests.get(
+            _resp = requests.get(
                 f"{scan_rec_url}/next_scan",
                 params=params,
                 headers=_outgoing_runner_headers(),
                 timeout=60,
                 verify=False,
             )
+            # 429 = the recommender shed this deliberately because it is at
+            # capacity. Continuing the loop would queue dozens more requests
+            # into a service that just said "not now", which is how it got
+            # saturated in the first place. Stop this pass; these ports keep
+            # their "no recommendation yet" state and the next ingest (or
+            # exploit_watcher's poll) picks them up.
+            if _resp is not None and _resp.status_code == 429:
+                logger.info(
+                    "recommender at capacity — stopping this pass after %d of %d "
+                    "port(s); remaining ports will be retried on a later cycle",
+                    dispatched, len(rows))
+                break
             dispatched += 1
         except Exception as e:
             logger.debug(
@@ -1920,7 +2328,7 @@ def ingest_nmap(
     target: str = None,
     authorized: bool = Depends(auth)
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="nmap", job_id=job_id)
     try:
         from etl.parse_nmap import parse_nmap
         stats = parse_nmap(path, profile="api-upload", job_id=job_id, target=target)
@@ -1936,7 +2344,7 @@ def ingest_nessus(
     target: str = None,
     authorized: bool = Depends(auth),
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="nessus", job_id=job_id)
     try:
         from etl.parse_nessus import parse_nessus
         stats = parse_nessus(path, profile="api-upload", job_id=job_id, target=target)
@@ -1952,7 +2360,7 @@ def ingest_nuclei(
     target: str = None,
     authorized: bool = Depends(auth)
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="nuclei", job_id=job_id)
     try:
         from etl.parse_nuclei import parse_nuclei
         stats = parse_nuclei(path, profile="api-upload", job_id=job_id, target=target)
@@ -1963,7 +2371,7 @@ def ingest_nuclei(
 
 @app.post("/ingest/burp")
 def ingest_burp(file: UploadFile = File(...), authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="burp")
     try:
         from etl.parse_burp import parse_burp
         stats = parse_burp(path, profile="api-upload")
@@ -1979,7 +2387,7 @@ def ingest_zap_report(file: UploadFile = File(...), authorized: bool = Depends(a
     Distinct from the live-ZAP path in etl/parse_zap.py, which pulls alerts from
     a running ZAP's API. This accepts a report file produced anywhere.
     """
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="zap")
     try:
         from etl.parse_zap_file import parse_zap_file
         stats = parse_zap_file(path, profile="api-upload")
@@ -1994,7 +2402,7 @@ def ingest_zap_report(file: UploadFile = File(...), authorized: bool = Depends(a
 @app.post("/ingest/nikto")
 def ingest_nikto(file: UploadFile = File(...), authorized: bool = Depends(auth)):
     """Ingest a Nikto report (XML or JSON)."""
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="nikto")
     try:
         from etl.parse_nikto import parse_nikto
         stats = parse_nikto(path, profile="api-upload")
@@ -2059,7 +2467,7 @@ def ingest_web_scan(
     One endpoint rather than making the operator pick the right one — the
     per-tool endpoints remain available for scripted use.
     """
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="web-scan")
     try:
         detected = (tool or "").strip().lower() or _detect_web_scan_tool(path)
         if not detected:
@@ -2114,7 +2522,7 @@ def ingest_web_scan(
 
 @app.post("/ingest/masscan")
 def ingest_masscan(file: UploadFile = File(...), authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="masscan")
     try:
         from etl.parse_masscan import parse_masscan
         stats = parse_masscan(path, profile="upload")
@@ -2128,7 +2536,7 @@ def dedupe_masscan(file: UploadFile = File(...), authorized: bool = Depends(auth
     """
     Accept a Masscan -oJ JSON file and return a deduplicated list of host:port pairs.
     """
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="dedupe")
     try:
         items: List[Dict[str, Any]] = []
         pairs = set()
@@ -2170,7 +2578,7 @@ def dedupe_masscan(file: UploadFile = File(...), authorized: bool = Depends(auth
 @app.post("/ingest/subfinder")
 def ingest_subfinder(file: UploadFile = File(...), job_id: str = None,
                      engagement_id: Optional[str] = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="subfinder", job_id=job_id, engagement_id=engagement_id)
     try:
         from etl.parse_subfinder import parse_subfinder
         # Resolve engagement from the explicit param or the X-Engagement-Id
@@ -2183,7 +2591,7 @@ def ingest_subfinder(file: UploadFile = File(...), job_id: str = None,
 
 @app.post("/ingest/httpx")
 def ingest_httpx(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="httpx", job_id=job_id)
     try:
         from etl.parse_httpx import parse_httpx
         stats = parse_httpx(path, profile="api-upload", job_id=job_id)
@@ -2193,7 +2601,7 @@ def ingest_httpx(file: UploadFile = File(...), job_id: str = None, authorized: b
 
 @app.post("/ingest/whatweb")
 def ingest_whatweb(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="whatweb", job_id=job_id)
     try:
         from etl.parse_whatweb import parse_whatweb
         stats = parse_whatweb(path, profile="api-upload", job_id=job_id)
@@ -2203,7 +2611,7 @@ def ingest_whatweb(file: UploadFile = File(...), job_id: str = None, authorized:
 
 @app.post("/ingest/wafw00f")
 def ingest_wafw00f(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="wafw00f", job_id=job_id)
     try:
         from etl.parse_wafw00f import parse_wafw00f
         stats = parse_wafw00f(path, profile="api-upload", job_id=job_id)
@@ -2213,7 +2621,7 @@ def ingest_wafw00f(file: UploadFile = File(...), job_id: str = None, authorized:
 
 @app.post("/ingest/naabu")
 def ingest_naabu(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="naabu", job_id=job_id)
     try:
         from etl.parse_naabu import parse_naabu
         stats = parse_naabu(path, profile="api-upload", job_id=job_id)
@@ -2223,7 +2631,7 @@ def ingest_naabu(file: UploadFile = File(...), job_id: str = None, authorized: b
 
 @app.post("/ingest/katana")
 def ingest_katana(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="katana", job_id=job_id)
     try:
         from etl.parse_katana import parse_katana
         stats = parse_katana(path, profile="api-upload", job_id=job_id)
@@ -2233,10 +2641,17 @@ def ingest_katana(file: UploadFile = File(...), job_id: str = None, authorized: 
 
 @app.post("/ingest/brutus")
 def ingest_brutus(file: UploadFile = File(...), job_id: str = None, secret_type: str = "password", authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="brutus", job_id=job_id)
     try:
         from etl.parse_brutus import parse_brutus
         stats = parse_brutus(path, profile="api-upload", job_id=job_id, secret_type=secret_type)
+        # Verified credentials are only useful once they reach the vault and the
+        # identity directory — every consumer (the Users page's has_credential
+        # badge, /identities/{id}, the MCP credential tools) reads those, not
+        # credential_findings. Non-fatal: a bridge failure must not lose the
+        # ingest that already succeeded.
+        if stats.get("credentials_found"):
+            _run_credential_bridge(job_id=job_id)
         return {"ok": True, "stats": stats}
     finally:
         os.remove(path)
@@ -2244,7 +2659,7 @@ def ingest_brutus(file: UploadFile = File(...), job_id: str = None, secret_type:
 @app.post("/ingest/dnsx")
 def ingest_dnsx(file: UploadFile = File(...), job_id: str = None,
                 engagement_id: Optional[str] = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="dnsx", job_id=job_id, engagement_id=engagement_id)
     try:
         from etl.parse_dnsx import parse_dnsx
         # Resolve engagement (explicit param or X-Engagement-Id header) so
@@ -2257,7 +2672,7 @@ def ingest_dnsx(file: UploadFile = File(...), job_id: str = None,
 
 @app.post("/ingest/tlsx")
 def ingest_tlsx(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="tlsx", job_id=job_id)
     try:
         from etl.parse_tlsx import parse_tlsx
         stats = parse_tlsx(path, profile="api-upload", job_id=job_id)
@@ -2267,7 +2682,7 @@ def ingest_tlsx(file: UploadFile = File(...), job_id: str = None, authorized: bo
 
 @app.post("/ingest/crtsh")
 def ingest_crtsh(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="crtsh", job_id=job_id)
     try:
         from etl.parse_crtsh import parse_crtsh
         stats = parse_crtsh(path, profile="api-upload", job_id=job_id)
@@ -2278,7 +2693,7 @@ def ingest_crtsh(file: UploadFile = File(...), job_id: str = None, authorized: b
 @app.post("/ingest/cloud-tenant")
 def ingest_cloud_tenant(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
     """JSONL of cloud-tenant discovery results — one record per (domain, provider) pair."""
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="cloud-tenant", job_id=job_id)
     try:
         from etl.parse_cloud_tenant import parse_cloud_tenant
         stats = parse_cloud_tenant(path, profile="api-upload", job_id=job_id)
@@ -2807,7 +3222,7 @@ def news_stats(authorized: bool = Depends(auth)):
 
 @app.post("/ingest/recon")
 def ingest_recon(file: UploadFile = File(...), source: str = "recon", job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="recon", job_id=job_id)
     try:
         from etl.parse_recon import parse_recon
         stats = parse_recon(path, source=source, profile="api-upload", job_id=job_id)
@@ -2824,6 +3239,12 @@ class ToolOutputRequest(BaseModel):
     service: Optional[str] = None
     job_id: Optional[str] = None
     engagement_id: Optional[str] = None
+    # Set by callers that already POSTed to /ingest/raw-artifact themselves
+    # (kali-listener does). Without it the same bytes get archived twice per
+    # execution and `occurrences` counts round-trips instead of re-scans.
+    archived: bool = False
+    command: Optional[str] = None
+    source: Optional[str] = None
 
 
 @app.post("/ingest/tool-output", tags=["Ingest"])
@@ -2834,6 +3255,19 @@ def ingest_tool_output(req: ToolOutputRequest, authorized: bool = Depends(auth))
     Tries (in order): JSON parsing, table parsing, CVE extraction,
     URL extraction, key-value extraction, raw text fallback.
     """
+    # Archive first, parse second. Structuring is lossy by design (8 KB of
+    # evidence per finding); if the parser chokes on an unfamiliar format the
+    # complete output must still survive for later analysis.
+    if not req.archived:
+        try:
+            ingest_raw_artifact(RawArtifactRequest(
+                tool=req.tool_name, content=req.stdout, command=req.command,
+                target=req.target, port=req.port, service=req.service,
+                job_id=req.job_id, engagement_id=req.engagement_id,
+                source=req.source or "ingest"), authorized=True)
+        except Exception as e:
+            logger.warning("raw artifact archive failed for tool=%s: %s", req.tool_name, e)
+
     from etl.parse_tool_output import structure_tool_output
     stats = structure_tool_output(
         stdout=req.stdout,
@@ -2847,9 +3281,726 @@ def ingest_tool_output(req: ToolOutputRequest, authorized: bool = Depends(auth))
     return {"ok": True, "stats": stats}
 
 
+# ── Raw artifact store ────────────────────────────────────────────────────
+#
+# Complete, untruncated tool output, kept for post-analysis and LLM
+# processing. Everything else in the pipeline is lossy on purpose (findings
+# keep 8 KB of evidence, ingest truncates at 200 KB); this is the source of
+# truth those are derived from.
+
+class RawArtifactRequest(BaseModel):
+    tool: str
+    content: str
+    command: Optional[str] = None
+    target: Optional[str] = None
+    port: Optional[int] = None
+    service: Optional[str] = None
+    exec_id: Optional[str] = None
+    job_id: Optional[str] = None
+    scan_id: Optional[str] = None
+    source: str = "unknown"
+    # Omit to auto-detect from the content itself.
+    content_format: Optional[str] = None
+    native_json: bool = False
+    engagement_id: Optional[str] = None
+    # Operator label for a manually uploaded artifact ("what is this for").
+    note: Optional[str] = None
+
+
+class ArtifactProcessedRequest(BaseModel):
+    llm_status: str = "done"          # done | failed | skipped
+    llm_model: Optional[str] = None
+    llm_result: Optional[dict] = None
+    llm_error: Optional[str] = None
+
+
+def _detect_content_format(text: str) -> str:
+    """Classify a payload so a downstream LLM knows how to read it.
+
+    JSONL is checked before JSON: a stream of per-line objects (nuclei -jsonl)
+    is not valid JSON as a whole, so json.loads() alone would file it as text
+    and lose the fact that it is machine-readable.
+    """
+    s = (text or "").strip()
+    if not s:
+        return "empty"
+    if s[0] == "<":
+        return "xml"
+    if s[0] in "{[":
+        try:
+            json.loads(s)
+            return "json"
+        except Exception:
+            pass
+    lines = [ln for ln in s.splitlines() if ln.strip()][:20]
+    if lines and all(ln.lstrip()[:1] == "{" for ln in lines):
+        try:
+            for ln in lines:
+                json.loads(ln)
+            return "jsonl"
+        except Exception:
+            pass
+    return "text"
+
+
+@app.post("/ingest/raw-artifact", tags=["Ingest"])
+def ingest_raw_artifact(req: RawArtifactRequest, authorized: bool = Depends(auth)):
+    """Persist one tool's complete output verbatim.
+
+    Deduped on (tool, target, sha256) so re-running an unchanged scan bumps
+    last_seen/occurrences instead of re-queuing identical bytes for the LLM.
+    A repeat deliberately does NOT reset llm_status — the content was already
+    analysed, and paying to analyse the same bytes again is waste.
+    """
+    content = req.content or ""
+    res = _store_artifact_row(
+        tool=req.tool, content=content, command=req.command, target=req.target,
+        port=req.port, service=req.service, exec_id=req.exec_id, job_id=req.job_id,
+        scan_id=req.scan_id, source=req.source, content_format=req.content_format,
+        native_json=req.native_json, engagement_id=req.engagement_id, note=req.note)
+    artifact_id, inserted, occurrences = res["artifact_id"], res["inserted"], res["occurrences"]
+    fmt, sha = res["content_format"], res["sha256"]
+
+    # Auto-queue follow-ups for genuinely new output only. A repeat is
+    # byte-identical by definition, so re-proposing the same actions would just
+    # churn the queue.
+    auto_queued = []
+    if inserted and req.target and _auto_queue_enabled():
+        try:
+            with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+                auto_queued = _auto_queue_actions(cur, {
+                    "id": artifact_id, "content": content, "tool": req.tool,
+                    "target": req.target, "port": req.port, "service": req.service,
+                    "engagement_id": req.engagement_id})
+            if auto_queued:
+                logger.info("auto-queued %d follow-up(s) from %s output on %s",
+                            len(auto_queued), req.tool, req.target)
+        except Exception as e:
+            # Never fail a store because suggestion queuing failed — the
+            # artifact is the durable thing; proposals can be regenerated.
+            logger.warning("auto-queue failed for artifact %s: %s", artifact_id, e)
+
+    try:
+        from webhooks import emit_webhook
+        if auto_queued:
+            emit_webhook("artifact_actions_queued", req.tool, {
+                "artifact_id": artifact_id, "target": req.target,
+                "queued": len(auto_queued), "queued_by": "auto",
+                "action_ids": [q["action_id"] for q in auto_queued],
+                "engagement_id": req.engagement_id,
+            })
+        emit_webhook("raw_artifact_stored", req.tool, {
+            "artifact_id": artifact_id, "tool": req.tool, "target": req.target,
+            "bytes": len(content), "content_format": fmt,
+            "native_json": req.native_json, "new": inserted,
+            "engagement_id": req.engagement_id,
+        })
+    except Exception:
+        pass  # Never fail a store because the webhook fan-out did.
+    return {"ok": True, "artifact_id": artifact_id, "new": inserted,
+            "occurrences": occurrences, "content_format": fmt, "sha256": sha,
+            "auto_queued": auto_queued}
+
+
+def _insert_recommendation(cur, art: dict, action: dict, queued_by: str,
+                           engagement_id=None):
+    """Insert one follow-on action as a pending scan recommendation.
+
+    Both the manual and automatic paths go through here so a queued action is
+    indistinguishable downstream except for `extra.queued_by` — same dispatcher,
+    same force-run override, same UI.
+    """
+    cur.execute("""
+        INSERT INTO scan_recommendations
+            (ip, service, scanner, action, script, source, priority,
+             status, engagement_id, extra)
+        VALUES (%s,%s,%s,%s,%s,'artifact',%s,'pending',%s,%s)
+        ON CONFLICT (fingerprint) DO UPDATE
+           SET updated_at = now(),
+               extra = scan_recommendations.extra || EXCLUDED.extra
+        RETURNING id, status, (xmax = 0) AS inserted
+    """, (art["target"], art["service"], action["scanner"], action["title"],
+          action["script"], action["priority"],
+          engagement_id or art.get("engagement_id"),
+          Json({"artifact_id": str(art["id"]), "rule_id": action["id"],
+                "rationale": action.get("rationale"), "evidence": action.get("evidence"),
+                "origin_tool": art["tool"], "suggestion_source": action.get("source", "rules"),
+                "queued_by": queued_by})))
+    return cur.fetchone()
+
+
+def _auto_queue_actions(cur, art: dict) -> list:
+    """Queue the actions whose rules opted into auto_queue.
+
+    Queued, never run. Dispatching a scan without a human is a different and
+    much larger decision than proposing one, so these land as 'pending' and wait
+    for someone to press Run — the audit trail shows what was proposed and by
+    what evidence before anything touches the target.
+    """
+    from artifact_actions import suggest_actions
+    actions = [a for a in suggest_actions(
+        content=art["content"], tool=art["tool"], target=art["target"] or "",
+        port=art.get("port"), service=art.get("service") or "")
+        if a.get("auto_queue")]
+    queued = []
+    for a in actions:
+        row = _insert_recommendation(cur, art, a, "auto")
+        if row["inserted"]:
+            queued.append({"action_id": a["id"], "recommendation_id": str(row["id"]),
+                           "scanner": a["scanner"], "priority": a["priority"]})
+    return queued
+
+
+def _auto_queue_enabled() -> bool:
+    """Global kill switch, persisted in app_settings.
+
+    Defaults ON because the queue is inert until a human runs something. Turning
+    it off stops new proposals appearing without touching anything queued.
+    """
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT value FROM app_settings WHERE key = 'artifact_auto_queue'")
+            row = cur.fetchone()
+        return (row[0] or "").strip().lower() != "false" if row else True
+    except Exception:
+        return True
+
+
+class AutoQueueSetting(BaseModel):
+    enabled: bool
+
+
+@app.get("/artifacts/auto-queue", tags=["Artifacts"])
+def get_auto_queue_setting(authorized: bool = Depends(auth)):
+    """Whether high-confidence follow-ups are queued automatically on store.
+
+    Also reports which rules opt in, and any rule-file errors — a broken YAML
+    silently disables every suggestion, which is indistinguishable from "this
+    output had no follow-ups" unless it is surfaced.
+    """
+    from artifact_actions import load_rules
+    rules, errors = load_rules()
+    return {
+        "enabled": _auto_queue_enabled(),
+        "auto_queue_rules": sorted(r["id"] for r in rules if r.get("auto_queue")),
+        "rules_loaded": len(rules),
+        "rule_errors": errors,
+    }
+
+
+@app.post("/artifacts/auto-queue", tags=["Artifacts"])
+def set_auto_queue_setting(req: AutoQueueSetting, authorized: bool = Depends(auth)):
+    """Turn automatic queuing on or off. Never affects already-queued items."""
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO app_settings (key, value, category)
+            VALUES ('artifact_auto_queue', %s, 'artifacts')
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+        """, ("true" if req.enabled else "false",))
+    return {"ok": True, "enabled": req.enabled}
+
+
+@app.get("/artifacts/stats", tags=["Artifacts"])
+def artifact_stats(authorized: bool = Depends(auth)):
+    """Queue depth by processing state, plus totals."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT llm_status, count(*) n, sum(byte_size) bytes "
+                    "FROM raw_artifacts GROUP BY llm_status")
+        by_status = {r["llm_status"]: {"count": r["n"], "bytes": int(r["bytes"] or 0)}
+                     for r in cur.fetchall()}
+        cur.execute("SELECT count(*) n, sum(byte_size) bytes, count(DISTINCT tool) tools "
+                    "FROM raw_artifacts")
+        tot = cur.fetchone()
+    # A queue that only fills is indistinguishable from one being worked, unless
+    # the age of the oldest pending item is visible. Nothing in this stack
+    # consumes /artifacts/claim by default — post-processing is external.
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT min(created_at) AS oldest,
+                   extract(epoch FROM (now() - min(created_at)))/3600 AS age_hours,
+                   count(*) AS n
+              FROM raw_artifacts WHERE llm_status = 'pending'
+        """)
+        q = cur.fetchone() or {}
+    queue = {"pending": int(q.get("n") or 0),
+             "oldest_pending": q["oldest"].isoformat() if q.get("oldest") else None,
+             "oldest_pending_age_hours": round(float(q["age_hours"]), 1) if q.get("age_hours") else None}
+    if queue["pending"] and (queue["oldest_pending_age_hours"] or 0) > 24:
+        queue["warning"] = (
+            "the oldest pending artifact is over 24h old — no consumer appears to "
+            "be claiming work. Retention also skips unprocessed artifacts, so the "
+            "store will grow without bound until something drains this.")
+
+    return {"by_status": by_status, "total": tot["n"],
+            "total_bytes": int(tot["bytes"] or 0), "distinct_tools": tot["tools"],
+            "queue": queue}
+
+
+@app.get("/artifacts", tags=["Artifacts"])
+def list_artifacts(llm_status: Optional[str] = None, tool: Optional[str] = None,
+                   target: Optional[str] = None, source: Optional[str] = None,
+                   content_format: Optional[str] = None,
+                   include_content: bool = False,
+                   limit: int = 50, offset: int = 0,
+                   authorized: bool = Depends(auth)):
+    """List artifacts. Content is omitted unless asked for — these rows are
+    deliberately large, and a listing that inlined them would be unusable."""
+    where, params = [], {}
+    for col, val in (("llm_status", llm_status), ("tool", tool),
+                     ("source", source), ("content_format", content_format)):
+        if val:
+            where.append(f"{col} = %({col})s")
+            params[col] = val
+    if target:
+        where.append("target ILIKE %(target)s")
+        params["target"] = f"%{target}%"
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    cols = ("id, tool, command, target, port, service, exec_id, job_id, scan_id, "
+            "source, note, item_count, content_format, native_json, content_sha256, "
+            "byte_size, first_seen, last_seen, occurrences, llm_status, llm_model, "
+            "llm_processed_at, llm_attempts, llm_error, created_at")
+    if include_content:
+        cols += ", content"
+    params.update({"limit": max(1, min(limit, 500)), "offset": max(0, offset)})
+    # A tool run can FAIL and still be archived and LLM-reviewed — a katana crawl
+    # that hit "SOCKS proxy EOF" is a 'done' review of a failed command. The
+    # review status (llm_status) must not read as the command outcome, so derive
+    # `outcome` (ok|empty|error) from the failure signature in the output or the
+    # review text, and the finding count. Bounded to a prefix so a 64 MB artifact
+    # is not fully scanned per list poll.
+    params["failre"] = (
+        r"(socks|proxy).{0,40}(eof|refus|timeout|error)|failed after [0-9]+ attempt|"
+        r"failed due to|connection refused|could not resolve|no route to host|"
+        r"i/o timeout|context deadline exceeded|unreachable|unresponsive|timed out")
+    # The file's primary host, pulled from a bounded prefix so a single-record
+    # file names its subject and a failed run names what it attempted. Covers the
+    # common JSON host fields (dnsx `host`, crtsh `common_name`, subfinder
+    # `input`, katana `endpoint` URL), else the first URL.
+    params["hostpat1"] = (r'"(?:host|input|url|endpoint|common_name|name_value|'
+                          r'domain|subdomain|fqdn)"\s*:\s*"(?:https?://)?([^"/,\s]+)')
+    params["hostpat2"] = r'https?://([^/"\s]+)'
+    # Per-artifact summary. The item COUNT is the file's own record count
+    # (item_count, computed at ingest) — a job_id findings join over-counts,
+    # because tools share a job_id (a 514-byte crtsh file inherited a sibling
+    # dnsx run's 1996 hosts). Severity is still drawn from findings but scoped to
+    # THIS tool within the job so it cannot bleed. content_host names the file's
+    # primary/attempted host. LATERAL so only the page's rows aggregate.
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"SELECT count(*) n FROM raw_artifacts {clause}", params)
+        total = cur.fetchone()["n"]
+        cur.execute(f"""
+            SELECT ra.*, s.severity_counts,
+                   CASE WHEN ra.cmd_error THEN 'error'
+                        WHEN COALESCE(ra.item_count, 0) = 0 THEN 'empty'
+                        ELSE 'ok' END AS outcome
+              FROM (SELECT {cols},
+                           (llm_status = 'failed'
+                            OR left(content, 6000) ~* %(failre)s
+                            OR left(COALESCE(llm_result::text, ''), 6000) ~* %(failre)s
+                           ) AS cmd_error,
+                           COALESCE(
+                             substring(left(content, 4000) from %(hostpat1)s),
+                             substring(left(content, 4000) from %(hostpat2)s)
+                           ) AS content_host
+                      FROM raw_artifacts {clause}
+                     ORDER BY created_at DESC
+                     LIMIT %(limit)s OFFSET %(offset)s) ra
+              LEFT JOIN LATERAL (
+                  SELECT (SELECT jsonb_object_agg(severity, c)
+                            FROM (SELECT severity, count(*) c
+                                    FROM recon_findings f2
+                                   WHERE f2.data->>'job_id' = ra.job_id
+                                     AND f2.source = ra.tool
+                                   GROUP BY severity) x) AS severity_counts
+              ) s ON ra.job_id IS NOT NULL
+             ORDER BY ra.created_at DESC
+        """, params)
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"total": total, "limit": params["limit"], "offset": params["offset"],
+            "artifacts": rows}
+
+
+@app.post("/artifacts/claim", tags=["Artifacts"])
+def claim_artifacts(limit: int = 5, tool: Optional[str] = None,
+                    llm_model: Optional[str] = None,
+                    authorized: bool = Depends(auth)):
+    """Atomically claim pending artifacts for LLM processing.
+
+    FOR UPDATE SKIP LOCKED means two workers running concurrently take
+    disjoint batches instead of both processing the same rows. Claimed rows
+    move to 'processing'; the caller must report back via
+    /artifacts/{id}/processed (or they stay claimed and can be requeued).
+    """
+    params = {"limit": max(1, min(limit, 100)), "model": llm_model}
+    tool_clause = ""
+    if tool:
+        tool_clause = "AND tool = %(tool)s"
+        params["tool"] = tool
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"""
+            UPDATE raw_artifacts SET llm_status = 'processing',
+                                     llm_attempts = llm_attempts + 1,
+                                     llm_model = COALESCE(%(model)s, llm_model)
+             WHERE id IN (SELECT id FROM raw_artifacts
+                           WHERE llm_status = 'pending' {tool_clause}
+                           ORDER BY created_at
+                           LIMIT %(limit)s FOR UPDATE SKIP LOCKED)
+            RETURNING id, tool, command, target, port, service, exec_id, job_id,
+                      scan_id, source, content_format, native_json, byte_size,
+                      occurrences, llm_attempts, content
+        """, params)
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"claimed": len(rows), "artifacts": rows}
+
+
+@app.get("/artifacts/{artifact_id}", tags=["Artifacts"])
+def get_artifact(artifact_id: str, authorized: bool = Depends(auth)):
+    """One artifact including its complete, untruncated content."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM raw_artifacts WHERE id = %s", (artifact_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, f"artifact {artifact_id} not found")
+    return dict(row)
+
+
+@app.post("/artifacts/{artifact_id}/processed", tags=["Artifacts"])
+def mark_artifact_processed(artifact_id: str, req: ArtifactProcessedRequest,
+                            authorized: bool = Depends(auth)):
+    """Record the outcome of an LLM pass over one artifact."""
+    if req.llm_status not in ("done", "failed", "skipped", "pending"):
+        raise HTTPException(400, "llm_status must be done|failed|skipped|pending")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            UPDATE raw_artifacts
+               SET llm_status = %s, llm_model = COALESCE(%s, llm_model),
+                   llm_result = COALESCE(%s, llm_result), llm_error = %s,
+                   llm_processed_at = now()
+             WHERE id = %s
+            RETURNING id, tool, target, llm_status, llm_model, llm_processed_at
+        """, (req.llm_status, req.llm_model,
+              Json(req.llm_result) if req.llm_result is not None else None,
+              req.llm_error, artifact_id))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, f"artifact {artifact_id} not found")
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("raw_artifact_processed", row["tool"], {
+            "artifact_id": str(row["id"]), "tool": row["tool"],
+            "target": row["target"], "llm_status": row["llm_status"],
+            "llm_model": row["llm_model"],
+        })
+    except Exception:
+        pass
+    return {"ok": True, **{k: (str(v) if k == "id" else v) for k, v in dict(row).items()}}
+
+
+class CustomAction(BaseModel):
+    """An action the operator wrote themselves, rather than one a rule proposed."""
+    title: str
+    scanner: str
+    script: str
+    priority: int = 60
+    rationale: Optional[str] = None
+    category: str = "manual"
+
+
+class QueueActionsRequest(BaseModel):
+    """Actions the operator chose to queue as scan recommendations.
+
+    Three ways in, because rule output is a starting point rather than the whole
+    answer: take a suggestion as-is (`action_ids`), take one and adjust it
+    (`overrides` — the only way to run the "needs input" suggestions, whose
+    placeholders must be filled from the credential store or a chosen wordlist),
+    or write your own (`custom_actions`).
+    """
+    action_ids: List[str] = []
+    # action_id -> {"script": ..., "priority": ...}
+    overrides: Dict[str, Dict[str, Any]] = {}
+    custom_actions: List[CustomAction] = []
+    engagement_id: Optional[str] = None
+
+
+def _already_ran(cur, scanner: str, target: str, script: str) -> dict:
+    """Has this exact follow-up already been executed against this target?
+
+    Evidence-based on purpose. An earlier version of this idea suppressed 63
+    NSE recommendations because a *similar* scan had run, when in fact
+    nfs-showmount, rmi-*, distcc-*, snmp-*, tftp-enum, ntp-monlist and
+    x11-access had never run at all. So: match the tool AND the distinctive
+    tokens of the command (script names, template tags), never the tool alone.
+    """
+    if not scanner or not target:
+        return {"ran": False, "count": 0}
+    # `re` is aliased to _re_module at the top of this file; plain `re` is not bound.
+    tokens = [t for t in _re_module.findall(r"[a-z0-9][a-z0-9-]{4,}", (script or "").lower())
+              if t not in ("nmap", "target", "script", "sudo", "http", "https",
+                           "netexec", "nuclei", "katana", "searchsploit")]
+    cur.execute("""
+        SELECT id, command, status, completed_at
+          FROM tool_executions
+         WHERE tool = %s AND target = %s
+         ORDER BY started_at DESC LIMIT 50
+    """, (scanner, target))
+    rows = cur.fetchall()
+    if not rows:
+        return {"ran": False, "count": 0}
+    if not tokens:
+        # No distinguishing tokens — report the tool ran, but do NOT claim this
+        # specific action did.
+        return {"ran": False, "count": 0, "tool_ran_count": len(rows)}
+    matches = [r for r in rows
+               if all(t in (r["command"] or "").lower() for t in tokens)]
+    if not matches:
+        return {"ran": False, "count": 0, "tool_ran_count": len(rows)}
+    newest = matches[0]
+    return {"ran": True, "count": len(matches),
+            "last_exec_id": str(newest["id"]), "last_status": newest["status"],
+            "last_at": newest["completed_at"].isoformat() if newest["completed_at"] else None}
+
+
+class ArtifactDrainRequest(BaseModel):
+    limit: int = 10
+    tool: Optional[str] = None
+    model: Optional[str] = None
+    requeue_stale_minutes: int = 30
+
+
+@app.post("/artifacts/drain", tags=["Artifacts"])
+def drain_artifact_queue(req: ArtifactDrainRequest, authorized: bool = Depends(auth)):
+    """Run the LLM pass over a batch of pending artifacts.
+
+    The queue had every server-side piece and no consumer, so it only grew: 274
+    pending, one row stuck in 'processing' since it was claimed, and the cleanup
+    job's own warning says such rows "will never age out".
+
+    This is on-demand rather than a standing loop because the LLM pass is an
+    ENRICHMENT — artifact_actions.suggest_actions() already works on raw text and
+    treats llm_result as optional — so the operator decides when to spend model
+    time. Also requeues rows abandoned in 'processing', which is what makes
+    claiming recoverable at all.
+    """
+    import artifact_consumer
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            result = artifact_consumer.process_batch(
+                cur, limit=req.limit, tool=req.tool, model=req.model,
+                requeue_stale_minutes=req.requeue_stale_minutes)
+            depth = artifact_consumer.queue_depth(cur)
+        except Exception as e:
+            log.exception("drain_artifact_queue failed")
+            raise HTTPException(500, f"artifact drain failed: {type(e).__name__}: {e}")
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("artifact_batch_processed", "artifact_consumer", {
+            "claimed": result.get("claimed"), "done": result.get("done"),
+            "parked": result.get("parked"),
+            "requeued_stale": result.get("requeued_stale"),
+            "model": result.get("model"), "queue_depth": depth,
+        })
+    except Exception:
+        pass
+    return {"ok": True, **result, "queue_depth": depth}
+
+
+class ArtifactSkipRedundantRequest(BaseModel):
+    dry_run: bool = True
+    limit: int = 5000
+
+
+@app.post("/artifacts/skip-redundant", tags=["Artifacts"])
+def skip_redundant_artifacts(req: ArtifactSkipRedundantRequest,
+                             authorized: bool = Depends(auth)):
+    """Mark pending artifacts skipped when a dedicated parser already read them.
+
+    Costs no model time. The tool list is DERIVED from etl/parse_*.py rather than
+    hard-coded, so adding a parser takes effect without editing this endpoint —
+    and an unreadable parser directory means skip NOTHING, never skip everything.
+
+    Rows are kept: /export/burp and /export/har read artifact content, and
+    'skipped' is reversible via /artifacts/{id}/processed.
+    """
+    import artifact_consumer
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            result = artifact_consumer.skip_redundant(
+                cur, dry_run=req.dry_run, limit=req.limit)
+            depth = artifact_consumer.queue_depth(cur)
+        except Exception as e:
+            log.exception("skip_redundant_artifacts failed")
+            raise HTTPException(500, f"skip failed: {type(e).__name__}: {e}")
+    if not req.dry_run and result.get("skipped"):
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("artifact_batch_skipped", "artifact_consumer", {
+                "skipped": result.get("skipped"),
+                "candidates": result.get("candidates"),
+                "by_tool": result.get("by_tool"),
+                "queue_depth": depth,
+            })
+        except Exception:
+            pass
+    return {"ok": True, **result, "queue_depth": depth}
+
+
+@app.post("/artifacts/requeue-stale", tags=["Artifacts"])
+def requeue_stale_artifacts(older_than_minutes: int = Query(30, ge=1),
+                            authorized: bool = Depends(auth)):
+    """Return artifacts abandoned in 'processing' to 'pending'.
+
+    A claimed row whose worker died is invisible to both sides: not pending so
+    nothing retries it, not done so nothing reports it. Separate from /drain so
+    an operator can recover the queue without spending any model time.
+    """
+    import artifact_consumer
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        n = artifact_consumer.requeue_stale(cur, older_than_minutes)
+        depth = artifact_consumer.queue_depth(cur)
+    return {"ok": True, "requeued": n, "queue_depth": depth}
+
+
+@app.get("/artifacts/{artifact_id}/actions", tags=["Artifacts"])
+def get_artifact_actions(artifact_id: str, authorized: bool = Depends(auth)):
+    """Possible follow-on actions derived from this artifact's raw output.
+
+    Each suggestion cites the exact text that triggered it, and is checked
+    against tool_executions so the operator can see what has already been done
+    WITHOUT it being hidden — a suppressed action the operator cannot see is
+    indistinguishable from one that was never considered.
+    """
+    from artifact_actions import suggest_actions
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM raw_artifacts WHERE id = %s", (artifact_id,))
+        art = cur.fetchone()
+        if not art:
+            raise HTTPException(404, f"artifact {artifact_id} not found")
+        actions = suggest_actions(
+            content=art["content"], tool=art["tool"], target=art["target"] or "",
+            port=art["port"], service=art["service"] or "",
+            llm_result=art.get("llm_result"),
+        )
+        for a in actions:
+            a["already_run"] = _already_ran(cur, a["scanner"], art["target"] or "", a["script"])
+        # Which of these are already queued as recommendations?
+        cur.execute("""
+            SELECT scanner, script, status FROM scan_recommendations
+             WHERE host(ip) = %s AND source = 'artifact'
+        """, (art["target"] or "",))
+        queued = {(r["scanner"], r["script"]): r["status"] for r in cur.fetchall()}
+    for a in actions:
+        a["queued_status"] = queued.get((a["scanner"], a["script"]))
+    return {
+        "artifact_id": artifact_id,
+        "tool": art["tool"], "target": art["target"],
+        "content_format": art["content_format"], "native_json": art["native_json"],
+        "llm_status": art["llm_status"],
+        "actions": actions,
+        "counts": {
+            "total": len(actions),
+            "already_run": sum(1 for a in actions if a["already_run"]["ran"]),
+            "queued": sum(1 for a in actions if a["queued_status"]),
+            "needs_input": sum(1 for a in actions if a["needs_input"]),
+        },
+    }
+
+
+@app.post("/artifacts/{artifact_id}/actions/queue", tags=["Artifacts"])
+def queue_artifact_actions(artifact_id: str, req: QueueActionsRequest,
+                           authorized: bool = Depends(auth)):
+    """Queue chosen follow-on actions as scan recommendations.
+
+    Deliberately reuses scan_recommendations rather than inventing a second
+    execution path: that table already has a dispatcher, a force-run override
+    for skipped items, and a UI. Queued rows land as 'pending' and are run from
+    the Recommendations page like any other.
+    """
+    from artifact_actions import suggest_actions
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM raw_artifacts WHERE id = %s", (artifact_id,))
+        art = cur.fetchone()
+        if not art:
+            raise HTTPException(404, f"artifact {artifact_id} not found")
+        if not art["target"]:
+            raise HTTPException(400, "artifact has no target; nothing to scan")
+        actions = {a["id"]: a for a in suggest_actions(
+            content=art["content"], tool=art["tool"], target=art["target"],
+            port=art["port"], service=art["service"] or "",
+            llm_result=art.get("llm_result"))}
+        chosen = []
+        for i in req.action_ids:
+            if i not in actions:
+                continue
+            a = dict(actions[i])
+            # Operator edits win over the rule's own command. This is the only
+            # way to run a "needs input" suggestion, whose placeholders have to
+            # be filled from the credential store or a chosen wordlist.
+            ov = req.overrides.get(i) or {}
+            if ov.get("script"):
+                a["script"] = str(ov["script"])[:2000]
+                a["edited"] = True
+            if ov.get("priority") is not None:
+                try:
+                    a["priority"] = max(0, min(100, int(ov["priority"])))
+                except (TypeError, ValueError):
+                    pass
+            # Two ways a command can be un-runnable, and both must be caught:
+            # a {brace} placeholder the substituter could not fill, and a rule
+            # that declared needs_input because its script carries literal
+            # stand-ins (USER/PASS) no substituter would ever notice. Checking
+            # only for braces let `netexec ... -u USER -p PASS` queue as-is and
+            # fail at dispatch.
+            if a.get("needs_input") and not ov.get("script"):
+                raise HTTPException(
+                    400, f"action '{i}' needs input before it can run: {a['script']}. "
+                         f"Supply overrides['{i}'].script with the placeholders filled in.")
+            if "{" in a["script"]:
+                raise HTTPException(
+                    400, f"action '{i}' still contains a placeholder: {a['script']}. "
+                         "Fill it in before queuing — an unresolved command cannot run.")
+            chosen.append(a)
+        unknown = [i for i in req.action_ids if i not in actions]
+
+        for c in req.custom_actions:
+            scanner = (c.scanner or "").strip()
+            script = (c.script or "").strip()
+            if not _re_module.match(r"^[a-zA-Z0-9_.-]+$", scanner):
+                raise HTTPException(400, f"invalid scanner name: {scanner!r}")
+            if not script:
+                raise HTTPException(400, "custom action needs a command")
+            chosen.append({
+                "id": f"manual_{scanner}", "title": (c.title or scanner).strip()[:200],
+                "scanner": scanner, "script": script[:2000],
+                "priority": max(0, min(100, int(c.priority))),
+                "rationale": (c.rationale or "Added manually by the operator.")[:500],
+                "evidence": "", "category": c.category, "source": "manual",
+            })
+
+        queued = []
+        for a in chosen:
+            row = _insert_recommendation(
+                cur, {**dict(art), "id": artifact_id}, a,
+                "manual-edited" if a.get("edited") else
+                ("manual" if a.get("source") == "manual" else "manual"),
+                req.engagement_id)
+            queued.append({"recommendation_id": str(row["id"]), "action_id": a["id"],
+                           "scanner": a["scanner"], "script": a["script"],
+                           "status": row["status"]})
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("artifact_actions_queued", art["tool"], {
+            "artifact_id": artifact_id, "target": art["target"],
+            "queued": len(queued), "action_ids": [q["action_id"] for q in queued],
+            "engagement_id": str(req.engagement_id or art["engagement_id"] or ""),
+        })
+    except Exception:
+        pass
+    return {"ok": True, "queued": queued, "unknown_action_ids": unknown}
+
+
 @app.post("/ingest/vulnx")
 def ingest_vulnx(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="vulnx", job_id=job_id)
     try:
         from etl.parse_vulnx import parse_vulnx
         stats = parse_vulnx(path, profile="api-upload", job_id=job_id)
@@ -2859,7 +4010,7 @@ def ingest_vulnx(file: UploadFile = File(...), job_id: str = None, authorized: b
 
 @app.post("/ingest/amass")
 def ingest_amass(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="amass", job_id=job_id)
     try:
         from etl.parse_amass import parse_amass
         stats = parse_amass(path, profile="api-upload", job_id=job_id)
@@ -2869,7 +4020,7 @@ def ingest_amass(file: UploadFile = File(...), job_id: str = None, authorized: b
 
 @app.post("/ingest/gau")
 def ingest_gau(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="gau", job_id=job_id)
     try:
         from etl.parse_gau import parse_gau
         stats = parse_gau(path, source="gau", profile="api-upload", job_id=job_id)
@@ -2879,7 +4030,7 @@ def ingest_gau(file: UploadFile = File(...), job_id: str = None, authorized: boo
 
 @app.post("/ingest/waybackurls")
 def ingest_waybackurls(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="waybackurls", job_id=job_id)
     try:
         from etl.parse_gau import parse_gau
         stats = parse_gau(path, source="waybackurls", profile="api-upload", job_id=job_id)
@@ -2889,7 +4040,7 @@ def ingest_waybackurls(file: UploadFile = File(...), job_id: str = None, authori
 
 @app.post("/ingest/trufflehog")
 def ingest_trufflehog(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="trufflehog", job_id=job_id)
     try:
         from etl.parse_trufflehog import parse_trufflehog
         stats = parse_trufflehog(path, profile="api-upload", job_id=job_id)
@@ -2899,7 +4050,7 @@ def ingest_trufflehog(file: UploadFile = File(...), job_id: str = None, authoriz
 
 @app.post("/ingest/censys")
 def ingest_censys(file: UploadFile = File(...), job_id: str = None, search_type: str = "hosts", authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="censys", job_id=job_id)
     try:
         from etl.parse_censys import parse_censys
         stats = parse_censys(path, search_type=search_type, profile="api-upload", job_id=job_id)
@@ -2909,7 +4060,7 @@ def ingest_censys(file: UploadFile = File(...), job_id: str = None, search_type:
 
 @app.post("/ingest/ffuf")
 def ingest_ffuf(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="ffuf", job_id=job_id)
     try:
         from etl.parse_ffuf import parse_ffuf
         stats = parse_ffuf(path, profile="api-upload", job_id=job_id)
@@ -2919,7 +4070,7 @@ def ingest_ffuf(file: UploadFile = File(...), job_id: str = None, authorized: bo
 
 @app.post("/ingest/netexec")
 def ingest_netexec(file: UploadFile = File(...), job_id: str = None, authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="netexec", job_id=job_id)
     try:
         from etl.parse_netexec import parse_netexec
         stats = parse_netexec(path, profile="api-upload", job_id=job_id)
@@ -2929,7 +4080,7 @@ def ingest_netexec(file: UploadFile = File(...), job_id: str = None, authorized:
 
 @app.post("/ingest/impacket")
 def ingest_impacket(file: UploadFile = File(...), job_id: str = None, tool: str = "secretsdump", target: str = "", authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="impacket", job_id=job_id)
     try:
         from etl.parse_impacket import parse_impacket
         stats = parse_impacket(path, tool=tool, target=target, profile="api-upload", job_id=job_id)
@@ -2939,7 +4090,7 @@ def ingest_impacket(file: UploadFile = File(...), job_id: str = None, tool: str 
 
 @app.post("/ingest/hashcat")
 def ingest_hashcat(file: UploadFile = File(...), job_id: str = None, hash_type: str = "unknown", authorized: bool = Depends(auth)):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="hashcat", job_id=job_id)
     try:
         from etl.parse_hashcat import parse_hashcat
         stats = parse_hashcat(path, hash_type=hash_type, profile="api-upload", job_id=job_id)
@@ -2954,7 +4105,7 @@ def ingest_greyhatwarfare(
     background_tasks: BackgroundTasks = None,
     authorized: bool = Depends(auth),
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="greyhatwarfare", job_id=job_id)
     try:
         from etl.parse_greyhatwarfare import parse_greyhatwarfare
         stats = parse_greyhatwarfare(path, profile="api-upload", job_id=job_id)
@@ -2976,7 +4127,7 @@ def ingest_subdomain_takeover(
     background_tasks: BackgroundTasks = None,
     authorized: bool = Depends(auth),
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="subdomain_takeover", job_id=job_id)
     try:
         from etl.parse_subdomain_takeover import parse_subdomain_takeover_file
         stats = parse_subdomain_takeover_file(path, source="subdomain_takeover", scan_id=job_id)
@@ -3000,7 +4151,7 @@ def ingest_prowler(
     authorized: bool = Depends(auth),
     background_tasks: BackgroundTasks = None,
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="prowler", job_id=job_id)
     try:
         from etl.parse_prowler import parse_prowler
         stats = parse_prowler(path, profile="api-upload", job_id=job_id)
@@ -3017,7 +4168,7 @@ def ingest_scoutsuite(
     authorized: bool = Depends(auth),
     background_tasks: BackgroundTasks = None,
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="scoutsuite", job_id=job_id)
     try:
         from etl.parse_scoutsuite import parse_scoutsuite
         stats = parse_scoutsuite(path, profile="api-upload", job_id=job_id)
@@ -3034,7 +4185,7 @@ def ingest_pacu(
     authorized: bool = Depends(auth),
     background_tasks: BackgroundTasks = None,
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="pacu", job_id=job_id)
     try:
         from etl.parse_pacu import parse_pacu
         stats = parse_pacu(path, profile="api-upload", job_id=job_id)
@@ -3051,7 +4202,7 @@ def ingest_cloudfox(
     authorized: bool = Depends(auth),
     background_tasks: BackgroundTasks = None,
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="cloudfox", job_id=job_id)
     try:
         from etl.parse_cloudfox import parse_cloudfox
         stats = parse_cloudfox(path, profile="api-upload", job_id=job_id)
@@ -3068,7 +4219,7 @@ def ingest_azurehound(
     authorized: bool = Depends(auth),
     background_tasks: BackgroundTasks = None,
 ):
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="azurehound", job_id=job_id)
     try:
         from etl.parse_azurehound import parse_azurehound
         stats = parse_azurehound(path, profile="api-upload", job_id=job_id)
@@ -3294,7 +4445,7 @@ def ingest_microburst(
                 },
             )
 
-    path = _save_upload_to_tmp(file)
+    path = _save_upload_to_tmp(file, tool="microburst", job_id=job_id, engagement_id=engagement_id)
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         eid = _resolve_engagement_id(engagement_id)
         cur.execute(
@@ -3372,7 +4523,8 @@ def _run_vault_auto_import_if_enabled(engagement_id: Optional[str] = None,
         return
     try:
         import vault_import_agent
-        with get_db(autocommit=True) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # NOT autocommit -- SAVEPOINT needs a transaction; see the endpoint above.
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             result = vault_import_agent.import_secrets_from_recon(
                 cur, engagement_id=engagement_id,
                 source="microburst", dry_run=False, limit=500,
@@ -3396,6 +4548,47 @@ def _run_vault_auto_import_if_enabled(engagement_id: Optional[str] = None,
         log.warning("Vault import auto-run failed (non-fatal): %s", e)
 
 
+def _run_credential_bridge(engagement_id: Optional[str] = None,
+                           job_id: Optional[str] = None) -> None:
+    """Post-ingest hook: project fresh credential_findings into the vault and the
+    identity directory.
+
+    Unlike _run_vault_auto_import_if_enabled this is NOT behind an opt-in flag,
+    and the difference is deliberate. That one runs an LLM over unstructured
+    recon rows and materialises credentials it inferred, so an operator should
+    choose it. This is a deterministic re-projection of rows the credential
+    tester already verified and already stored, and it copies no secret material
+    (credential_value stays NULL — see etl/credential_bridge.py). Gating it
+    behind a setting would reproduce exactly the reported symptom: credentials
+    confirmed valid, and a Users page showing nothing.
+    """
+    try:
+        from etl.credential_bridge import bridge_credential_findings
+        # NOT autocommit: the per-row error handling uses SAVEPOINT, which is only
+        # legal inside a transaction block. get_db() commits on clean exit.
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            result = bridge_credential_findings(
+                cur, engagement_id=engagement_id, dry_run=False, limit=1000)
+        log.info("credential bridge: examined=%s accounts=%s creds=%s identities=%s",
+                 result.get("findings_examined"), result.get("accounts"),
+                 result.get("credentials_upserted"), result.get("identities_upserted"))
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("credential_bridge_completed", "credential_bridge", {
+                "job_id": job_id,
+                "engagement_id": engagement_id,
+                "findings_examined": result.get("findings_examined", 0),
+                "accounts": result.get("accounts", 0),
+                "credentials_upserted": result.get("credentials_upserted", 0),
+                "identities_upserted": result.get("identities_upserted", 0),
+                "errors": len(result.get("errors") or []),
+            })
+        except Exception:
+            pass
+    except Exception as e:
+        log.warning("Credential bridge failed (non-fatal): %s", e)
+
+
 @app.get("/cloud/posture")
 def cloud_posture(authorized: bool = Depends(auth)):
     """Cloud posture summary: sources imported, finding counts, credential status."""
@@ -3405,6 +4598,33 @@ def cloud_posture(authorized: bool = Depends(auth)):
 
 
 # ── Identities (unified directory of detected users / SPs / guests) ──────────
+
+def _identity_services(tags) -> List[str]:
+    """The services an identity's credential was proven on, e.g. ['ftp/21'].
+
+    etl/credential_bridge.py records them as `service:<proto>/<port>` tags when it
+    projects a verified credential_findings row, so this is a read of what the
+    bridge already stored rather than another join. Cloud identities have none and
+    get an empty list.
+
+    Sorted by port NUMBER: string ordering puts 'ftp/2121' before 'telnet/23'.
+    """
+    out = []
+    for t in (tags or []):
+        if isinstance(t, str) and t.startswith("service:"):
+            v = t.split(":", 1)[1].strip()
+            if v:
+                out.append(v)
+
+    def _key(svc):
+        proto, _, port = svc.partition("/")
+        try:
+            return (proto, int(port))
+        except ValueError:
+            return (proto, 0)
+
+    return sorted(set(out), key=_key)
+
 
 @app.get("/identities", tags=["Identities"])
 def list_identities(
@@ -3496,10 +4716,91 @@ def list_identities(
             "last_seen": r["last_seen"].isoformat() if r["last_seen"] else None,
             "engagement_id": str(r["engagement_id"]) if r["engagement_id"] else None,
             "has_credential": r["has_credential"],
+            # Which service the credential was found on — an account that is valid
+            # on telnet is a different lead from one valid only on ftp.
+            "services": _identity_services(r["tags"]),
         }
 
     return {"total": total, "limit": limit, "offset": offset,
             "results": [_serialize(r) for r in rows]}
+
+
+@app.post("/identities/import-enumerated", tags=["Identities"])
+def import_enumerated_identities_endpoint(
+    dry_run: bool = Query(True), target: str = Query(None),
+    limit: int = Query(2000, ge=1, le=20000), _: bool = Depends(auth)):
+    """Record enumerated usernames as identities with no credential yet.
+
+    35 accounts were enumerated on 192.168.1.150 through an SMB null session and
+    the only durable record was raw tool text — the vault held four names, all of
+    them ones a password had already been found for.
+
+    Stored with `status='unknown'`: enumeration proves the account EXISTS, not
+    that it can be used. A working login is what proves 'active', and a re-import
+    never downgrades one that has been proven.
+    """
+    import sys as _sys
+    if "/app" not in _sys.path:
+        _sys.path.insert(0, "/app")
+    import target_wordlists as tw
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            result = tw.import_enumerated_identities(
+                cur, dry_run=dry_run, target=target, limit=limit)
+        except Exception as e:
+            raise HTTPException(500, f"identity import failed: {e}")
+    if not dry_run and result.get("inserted"):
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("enumerated_identities_imported", "identities", {
+                "inserted": result["inserted"], "updated": result["updated"],
+                "found": result["found"], "hosts": result["hosts"]})
+        except Exception:
+            pass
+    return {"ok": True, **result}
+
+
+@app.get("/identities/credential-state", tags=["Identities"])
+def identities_credential_state(
+    state: str = Query(None, description="username_only | password_stored | password_verified"),
+    host: str = Query(None), limit: int = Query(500, ge=1, le=5000),
+    _: bool = Depends(auth)):
+    """Discovered accounts and whether a password is known for each.
+
+    Reads `v_identity_credential_state`, which DERIVES the answer by joining the
+    vault and the verified findings. Deliberately not a stored flag: that goes
+    stale the moment a password is cracked, and a stale flag would send the
+    operator to re-attack an account already owned — or skip one still open.
+
+    `state=username_only` is the spray list: enumerated, no password yet.
+    """
+    where, params = ["1=1"], []
+    if state:
+        where.append("credential_state = %s")
+        params.append(state)
+    if host:
+        where.append("host = %s")
+        params.append(host)
+    params.append(limit)
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT identity_id::text, provider, identifier, username, host,
+                   principal_type, status, sources, tags, credential_state,
+                   has_credential, vault_entries, verified_findings,
+                   first_seen, last_seen
+              FROM v_identity_credential_state
+             WHERE {' AND '.join(where)}
+             ORDER BY has_credential, username
+             LIMIT %s
+        """, params)
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.execute("""
+            SELECT credential_state, count(*) AS n
+              FROM v_identity_credential_state GROUP BY 1
+        """)
+        counts = {r["credential_state"]: r["n"] for r in cur.fetchall()}
+    return {"ok": True, "identities": rows, "returned": len(rows),
+            "counts_by_state": counts}
 
 
 @app.get("/identities/groups", tags=["Identities"])
@@ -3573,17 +4874,35 @@ def get_identity(identity_id: str, authorized: bool = Depends(auth)):
         if not row:
             raise HTTPException(404, "Identity not found")
 
+        # grants_access_to holds the port ids the credential was proven against
+        # (filled by etl/credential_bridge.py). Resolving them here is the
+        # authoritative "found on" answer, rather than the tag projection the
+        # listing uses for speed. has_secret says whether there is anything to
+        # replay: credential testing stores only a masked password.
         cur.execute("""
-            SELECT id, username, domain, credential_type, status, source, created_at
-            FROM credential_vault
-            WHERE LOWER(username) = LOWER(%s)
-               OR LOWER(username || '@' || COALESCE(domain,'')) = LOWER(%s)
-            ORDER BY created_at DESC
+            SELECT cv.id, cv.username, cv.domain, cv.credential_type, cv.status,
+                   cv.source, cv.created_at, cv.notes,
+                   cv.credential_value IS NOT NULL AS has_secret,
+                   -- COALESCE(service, proto): the listing renders 'ftp/21' from
+                   -- the credential finding's service name, so showing 'tcp/21'
+                   -- here would read as a different port set for the same account.
+                   COALESCE((SELECT array_agg(COALESCE(NULLIF(p.service, ''), p.proto)
+                                              || '/' || p.port
+                                              ORDER BY p.port, p.proto)
+                               FROM ports p
+                              WHERE p.id = ANY(cv.grants_access_to)), '{}') AS services
+            FROM credential_vault cv
+            WHERE LOWER(cv.username) = LOWER(%s)
+               OR LOWER(cv.username || '@' || COALESCE(cv.domain,'')) = LOWER(%s)
+            ORDER BY cv.created_at DESC
         """, (row["identifier"], row["identifier"]))
         creds = [{
             "id": str(c["id"]), "username": c["username"], "domain": c["domain"],
             "credential_type": c["credential_type"], "status": c["status"],
             "source": c["source"],
+            "services": list(c["services"] or []),
+            "has_secret": c["has_secret"],
+            "notes": c["notes"],
             "created_at": c["created_at"].isoformat() if c["created_at"] else None,
         } for c in cur.fetchall()]
 
@@ -3610,6 +4929,7 @@ def get_identity(identity_id: str, authorized: bool = Depends(auth)):
         "is_admin": row["is_admin"], "is_guest": row["is_guest"], "is_dirsync": row["is_dirsync"],
         "tags": list(row["tags"] or []),
         "sources": list(row["sources"] or []),
+        "services": _identity_services(row["tags"]),
         "first_seen": row["first_seen"].isoformat() if row["first_seen"] else None,
         "last_seen": row["last_seen"].isoformat() if row["last_seen"] else None,
         "raw": row["raw"],
@@ -3782,7 +5102,10 @@ def vault_import_from_recon(body: VaultImportBody, _: bool = Depends(auth)):
     """Run the vault-import agent over recon_findings of a given source/type
     and either preview (dry_run=true) or commit credential_vault rows."""
     import vault_import_agent
-    with get_db(autocommit=True) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+    # NOT autocommit: import_secrets_from_recon's commit phase wraps each row in a
+    # SAVEPOINT, which raises NoActiveSqlTransaction on an autocommit connection.
+    # Same defect as the credential bridge, found while fixing it.
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         try:
             result = vault_import_agent.import_secrets_from_recon(
                 cur,
@@ -3805,6 +5128,63 @@ def vault_import_from_recon(body: VaultImportBody, _: bool = Depends(auth)):
                 "imported": result.get("imported"),
                 "proposed": result.get("proposed"),
                 "model": result.get("model"),
+            })
+        except Exception:
+            pass
+    return {"ok": True, **result}
+
+
+class CredentialBridgeBody(BaseModel):
+    engagement_id: Optional[str] = None
+    only_valid: bool = True
+    dry_run: bool = True
+    limit: int = 1000
+    # Restrict the sweep to specific credential_findings.source values. Omitted
+    # means every source, which is what a post-ingest run wants — but it also
+    # means any caller committing against a live database rewrites every account
+    # in it, so anything experimental should name its own source.
+    sources: Optional[List[str]] = None
+
+
+@app.post("/vault/bridge-credential-findings", tags=["Vault"])
+def vault_bridge_credential_findings(body: CredentialBridgeBody, _: bool = Depends(auth)):
+    """Project verified `credential_findings` into `credential_vault` + `identities`.
+
+    The sibling /vault/import-from-recon covers cloud-secret recon findings. This
+    covers the credential-testing path (brutus / hydra / medusa / ncrack), whose
+    output the vault has never seen — so every consumer that reads the vault,
+    including the Users page's `has_credential` badge, behaved as if no
+    credentials had been found.
+
+    Grouped by account, not by finding: one vault row per (source, host,
+    username) with the proven services in `grants_access_to`. Idempotent, so
+    re-running updates in place rather than duplicating.
+    """
+    from etl.credential_bridge import bridge_credential_findings
+    # NOT autocommit -- see _run_credential_bridge: SAVEPOINT needs a transaction.
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            result = bridge_credential_findings(
+                cur,
+                engagement_id=body.engagement_id,
+                only_valid=body.only_valid,
+                dry_run=body.dry_run,
+                limit=body.limit,
+                sources=body.sources,
+            )
+        except Exception as e:
+            log.exception("vault_bridge_credential_findings failed")
+            raise HTTPException(500, f"credential bridge failed: {type(e).__name__}: {e}")
+    if not body.dry_run and (result.get("credentials_upserted") or result.get("identities_upserted")):
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("credential_bridge_completed", "credential_bridge", {
+                "engagement_id": body.engagement_id,
+                "findings_examined": result.get("findings_examined"),
+                "accounts": result.get("accounts"),
+                "credentials_upserted": result.get("credentials_upserted"),
+                "identities_upserted": result.get("identities_upserted"),
+                "errors": len(result.get("errors") or []),
             })
         except Exception:
             pass
@@ -4019,7 +5399,11 @@ def get_job_results(job_id: str, authorized: bool = Depends(auth)):
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         try:
             cur.execute(
+                # total_tasks/finished_tasks are maintained by
+                # /jobs/nmap-from-masscan but were never returned, so a caller
+                # could not see progress it was already recording.
                 "SELECT id, type, params, result, progress, status, error, "
+                "total_tasks, finished_tasks, "
                 "started_at, finished_at, created_at "
                 "FROM jobs WHERE id=%s::uuid",
                 (job_id,),
@@ -4039,6 +5423,8 @@ def get_job_results(job_id: str, authorized: bool = Depends(auth)):
         "progress": row["progress"],
         "status": row["status"],
         "error": row["error"],
+        "total_tasks": row["total_tasks"],
+        "finished_tasks": row["finished_tasks"],
         "started_at": row["started_at"].isoformat() if row["started_at"] else None,
         "finished_at": row["finished_at"].isoformat() if row["finished_at"] else None,
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
@@ -4118,10 +5504,16 @@ def get_vulnerabilities(
 
     where_sql = "WHERE " + " AND ".join(where) if where else ""
 
+    # LEFT JOIN, not INNER. vulns.port_id is NULL for findings that belong to an
+    # ASSET rather than a specific port — every nuclei/web finding, for one. An
+    # inner join through ports silently discarded all of them: a high-severity
+    # CVE-2012-1823 (PHP CGI RCE) sat ingested in the table while
+    # /vulns?severity=high returned 0 results. Assets are reached via the port
+    # when there is one and via vulns.asset_id when there is not.
     count_sql = f"""
         SELECT count(*) AS n FROM public.vulns v
-        JOIN public.ports p ON v.port_id = p.id
-        JOIN public.assets a ON p.asset_id = a.id
+        LEFT JOIN public.ports p ON v.port_id = p.id
+        LEFT JOIN public.assets a ON a.id = COALESCE(p.asset_id, v.asset_id)
         {where_sql}
     """
 
@@ -4132,8 +5524,8 @@ def get_vulnerabilities(
                p.port, p.proto, p.service, p.product, p.version, p.banner,
                v.created_at
         FROM public.vulns v
-        JOIN public.ports p ON v.port_id = p.id
-        JOIN public.assets a ON p.asset_id = a.id
+        LEFT JOIN public.ports p ON v.port_id = p.id
+        LEFT JOIN public.assets a ON a.id = COALESCE(p.asset_id, v.asset_id)
         {where_sql}
         ORDER BY v.created_at DESC
         LIMIT %s OFFSET %s
@@ -4155,6 +5547,8 @@ def get_vulnerabilities(
 
 class UnifiedFinding(BaseModel):
     id: str = Field(..., description="Unique identifier")
+    problem_id: Optional[str] = Field(None, description="Infrastructure problem group (shared across virtual hosts of one machine); null when the finding cannot be grouped")
+    affects_hosts: int = Field(1, description="How many virtual hosts of this machine show the same problem. 1 means it was seen on this host only")
     source: str = Field(..., description="Source scanner (nmap, nuclei, zap, gobuster, playwright)")
     asset_id: Optional[str] = Field(None, description="Asset UUID")
     ip: Optional[str] = Field(None, description="IP address")
@@ -4177,8 +5571,32 @@ class UnifiedFinding(BaseModel):
 
 
 class SearchAggregations(BaseModel):
-    by_severity: Dict[str, int] = Field(default_factory=dict)
-    by_source: Dict[str, int] = Field(default_factory=dict)
+    """Two different questions, deliberately answered differently.
+
+    GLOBAL, RAW (by_severity, by_source) — computed over the whole dataset,
+    IGNORING the query filters, and counting rows. That is not a bug: the
+    frontend uses by_source to render a filter chip for every source that
+    exists, so chips do not vanish as you narrow the filter, and Dashboard.tsx /
+    Reports.tsx want dataset totals. Changing these to respect the filter would
+    break all three.
+
+    FILTERED, PER-PROBLEM (problems_by_severity, distinct_problems,
+    shared_problems) — computed over the rows the query actually matched, and
+    collapsed so a server-level problem seen on six virtual hosts counts once.
+
+    They differ on BOTH axes, so the names have to say so. `by_severity` next to
+    a `by_severity_deduped` invited exactly the wrong reading — that the only
+    difference was dedup.
+    """
+
+    # global, raw row counts
+    by_severity: Dict[str, int] = Field(default_factory=dict, description="GLOBAL row counts by severity — ignores query filters")
+    by_source: Dict[str, int] = Field(default_factory=dict, description="GLOBAL row counts by source — ignores query filters, so every source stays filterable")
+    # filtered, one entry per underlying problem
+    problems_by_severity: Dict[str, int] = Field(default_factory=dict, description="FILTERED counts by severity, one per underlying problem")
+    problems_by_source: Dict[str, int] = Field(default_factory=dict, description="FILTERED counts by source, one per underlying problem. Use this when a breakdown must agree with the rows the filter actually matched; use by_source when every source must stay visible as a filter option.")
+    distinct_problems: int = Field(0, description="FILTERED: matching rows collapsed to one per underlying problem")
+    shared_problems: int = Field(0, description="FILTERED: of those, how many appear on more than one virtual host")
 
 
 class UnifiedSearchResponse(BaseModel):
@@ -4202,6 +5620,10 @@ def search_findings(
     workflow_status: Optional[List[str]] = Query(None, description="Filter by workflow status (new, triaging, confirmed, false_positive, accepted_risk, in_report, deferred)"),
     engagement_id: Optional[str] = Query(None, description="Filter by engagement ID"),
     tags: Optional[List[str]] = Query(None, description="Filter by tags (findings must have ALL specified tags)"),
+    problem_scope: Optional[str] = Query(None, description="Filter by how far a problem spreads: 'shared' (one problem seen on several virtual hosts of a machine), 'single' (observed on one host only), 'all'. NOT the engagement scope — see the `scope_name` concept elsewhere."),
+    problem_id: Optional[str] = Query(None, description="Filter to one infrastructure problem group (infrastructure_fingerprint)"),
+    collapse_problems: bool = Query(False, description="Return one row per underlying problem instead of one per virtual host"),
+    include_inventory: bool = Query(False, description="Include crawl inventory — URLs a crawler merely discovered, with no name or issue type. Excluded by default because a crawled URL is not a finding: 746 of 779 rows in one deployment were katana output, which made every severity count meaningless"),
     limit: int = Query(100, ge=1, le=1000, description="Max results to return"),
     offset: int = Query(0, ge=0, description="Pagination offset"),
     authorized: bool = Depends(auth)
@@ -4256,6 +5678,9 @@ def search_findings(
             v.original_severity,
             v.report_ready,
             v.engagement_id::text,
+            NULL::text as problem_id,
+            1 as affects_hosts,
+            'finding'::text as record_kind,
             'vuln' as finding_source
         FROM vulns v
         LEFT JOIN assets a ON a.id = v.asset_id
@@ -4293,9 +5718,22 @@ def search_findings(
             wf.original_severity,
             wf.report_ready,
             wf.engagement_id::text,
+            wf.infrastructure_fingerprint as problem_id,
+            COALESCE(ic.n, 1) as affects_hosts,
+            wf.record_kind,
             'web' as finding_source
         FROM web_findings wf
         LEFT JOIN assets a ON a.id = wf.asset_id
+        -- One aggregate scan, joined in, rather than a correlated subquery per
+        -- row. affects_hosts > 1 is what makes a finding "shared": the same
+        -- problem observed on several virtual hosts of one machine.
+        LEFT JOIN (
+            SELECT infrastructure_fingerprint AS fp,
+                   count(DISTINCT asset_id)   AS n
+              FROM web_findings
+             WHERE infrastructure_fingerprint IS NOT NULL
+             GROUP BY infrastructure_fingerprint
+        ) ic ON ic.fp = wf.infrastructure_fingerprint
 
         UNION ALL
 
@@ -4332,6 +5770,9 @@ def search_findings(
             pf.original_severity,
             pf.report_ready,
             pf.engagement_id::text,
+            NULL::text as problem_id,
+            1 as affects_hosts,
+            'finding'::text as record_kind,
             'playwright' as finding_source
         FROM playwright_findings pf
         LEFT JOIN assets a ON a.id = pf.asset_id
@@ -4347,7 +5788,12 @@ def search_findings(
             a.hostname,
             pt.port,
             NULL::text as url,
-            CASE WHEN pt.service = 'tcpwrapped' THEN 'info' ELSE 'recon' END as severity,
+            -- Informational, not a separate 'recon' severity. The two were
+            -- functionally identical: both mapped to SARIF 'note', both were
+            -- ordinary severity chips, neither was filtered differently by any
+            -- export or report. Only the sort rank differed. Collapsing them
+            -- means one informational bucket instead of two names for it.
+            'info'::text as severity,
             COALESCE(pt.service, '') || ' ' || COALESCE(pt.product, '') || ' ' || COALESCE(pt.version, '') as title,
             CASE WHEN pt.is_open THEN 'open' ELSE 'closed' END || '/' || pt.proto || ' ' || COALESCE(pt.service, '?') || COALESCE(' ' || pt.product || ' ' || pt.version, '') || COALESCE(' banner=' || LEFT(pt.banner, 100), '') as evidence,
             ARRAY[]::text[] as cve,
@@ -4368,10 +5814,137 @@ def search_findings(
             NULL::text as original_severity,
             NULL::boolean as report_ready,
             NULL::text as engagement_id,
+            NULL::text as problem_id,
+            1 as affects_hosts,
+            -- INVENTORY, not a finding. "port 2121 runs ProFTPD 1.3.1" is an
+            -- observation about the target, not a weakness in it — the same
+            -- distinction that moved 746 katana crawl rows out of this view.
+            -- These 40 rows were the entire remaining gap between
+            -- /findings/search (94) and /export/sarif (54): the same engagement
+            -- described two ways depending on which artefact you opened.
+            --
+            -- Not hidden: include_inventory=true brings them back, the Ports and
+            -- Assets views read the `ports` table directly, and CVE matching
+            -- still consumes the service/product/version from it. They just stop
+            -- padding a findings count and a severity facet.
+            'inventory'::text as record_kind,
             'portscan' as finding_source
         FROM ports pt
         LEFT JOIN assets a ON a.id = pt.asset_id
         WHERE pt.is_open = true
+
+        UNION ALL
+
+        -- From credential_findings (brutus/hydra/medusa/ncrack, credential-check)
+        --
+        -- A working set of credentials is one of the highest-value results an
+        -- engagement produces, and it was the only finding class not reachable
+        -- from the findings list: it lived in its own table and had no branch
+        -- here, so 7 valid credentials on a live engagement were invisible to
+        -- every severity filter, export and report built on this endpoint.
+        --
+        -- valid_cred = true is the gate. Failed attempts are audit trail, not
+        -- findings; surfacing them would bury the working credentials among the
+        -- passwords that did NOT work.
+        --
+        -- The secret itself is NOT exposed here. credential_findings stores only
+        -- a masked form (metadata.audit…password_masked) by design; the cleartext
+        -- belongs in credential_vault behind its own access control. The evidence
+        -- below is what an operator needs to act — which account, which service,
+        -- proven working — without spraying passwords through every findings
+        -- list, export and screenshot.
+        SELECT
+            cf.id::text,
+            COALESCE(cf.source, 'credentials') as source,
+            cf.asset_id::text,
+            COALESCE(host(cf.ip)::text, host(a.ip)::text, '') as ip,
+            a.hostname,
+            cf.port,
+            NULL::text as url,
+            COALESCE(cf.severity, 'critical') as severity,
+            'Valid credentials — ' || COALESCE(cf.username, '(unknown user)')
+                || '@' || COALESCE(cf.protocol, 'service')
+                || COALESCE(':' || cf.port::text, '') as title,
+            'Authentication succeeded as user=' || COALESCE(cf.username, '?')
+                || COALESCE(' auth_type=' || cf.auth_type, '')
+                || COALESCE(' secret_type=' || cf.secret_type, '')
+                || COALESCE(' proto=' || cf.protocol, '')
+                || COALESCE(' [' || (cf.metadata->'audit'->>'summary') || ']', '')
+                || ' — secret masked; see credential vault' as evidence,
+            ARRAY[]::text[] as cve,
+            -- CWE-798 Use of Hard-coded Credentials / CWE-521 Weak Password
+            -- Requirements: the closest standard classification for a guessable
+            -- or default account, so credential findings join CWE-filtered
+            -- reporting instead of being uncategorised.
+            ARRAY['CWE-521']::text[] as cwe,
+            NULL::float as cvss,
+            NULL::text as method,
+            'Valid credentials were recovered for this service. Any account '
+                || 'reachable with a guessed, default or reused password grants '
+                || 'the access that account holds.' as description,
+            'Rotate the credential, disable the account if unused, and enforce '
+                || 'a password policy plus lockout on this service.' as solution,
+            NULL::text as reference,
+            'confirmed' as confidence,
+            ARRAY[]::text[] as tags,
+            cf.created_at,
+            NULL::text as workflow_status,
+            NULL::text as assigned_to,
+            NULL::text as verified_by,
+            cf.last_verified_at as verified_at,
+            NULL::text as tester_notes,
+            NULL::text as original_severity,
+            NULL::boolean as report_ready,
+            cf.engagement_id::text,
+            NULL::text as problem_id,
+            1 as affects_hosts,
+            'finding'::text as record_kind,
+            'credential' as finding_source
+        FROM credential_findings cf
+        LEFT JOIN assets a ON a.id = cf.asset_id
+        WHERE cf.valid_cred = true
+
+        UNION ALL
+
+        -- Service-enum recon (email + DNS infrastructure: spf/dmarc/dkim,
+        -- nameservers, dns_records). ONLY these finding sources — the bulk
+        -- subdomain/dnsx enumeration stays in the Recon Explorer, not here.
+        SELECT
+            rf.id::text,
+            rf.source,
+            rf.asset_id::text,
+            COALESCE(host(a.ip)::text, rf.target, '') as ip,
+            COALESCE(a.hostname, rf.target) as hostname,
+            NULL::int as port,
+            NULL::text as url,
+            rf.severity,
+            rf.finding_type as title,
+            LEFT(rf.data::text, 500) as evidence,
+            ARRAY[]::text[] as cve,
+            ARRAY[]::text[] as cwe,
+            NULL::numeric as cvss,
+            NULL::text as method,
+            NULL::text as description,
+            NULL::text as solution,
+            NULL::text as reference,
+            NULL::text as confidence,
+            COALESCE(rf.tags, ARRAY[]::text[]) as tags,
+            rf.created_at,
+            NULL::text as workflow_status,
+            NULL::text as assigned_to,
+            NULL::text as verified_by,
+            NULL::timestamptz as verified_at,
+            NULL::text as tester_notes,
+            NULL::text as original_severity,
+            NULL::boolean as report_ready,
+            rf.engagement_id::text,
+            rf.fingerprint as problem_id,
+            1 as affects_hosts,
+            'finding'::text as record_kind,
+            'recon' as finding_source
+        FROM recon_findings rf
+        LEFT JOIN assets a ON a.id = rf.asset_id
+        WHERE rf.source IN ('email-enum', 'dns-enum')
     )
     SELECT * FROM unified
     """
@@ -4399,6 +5972,36 @@ def search_findings(
     if port:
         where_clauses_pg.append("port = %s")
         params_pg.append(port)
+
+    # Scope is derived, not declared: "shared" means the same problem was
+    # actually observed on more than one virtual host of a machine. Deciding it
+    # from the data avoids guessing whether a finding is server- or app-level.
+    # Named problem_scope, not scope: in this codebase "scope" already means the
+    # ENGAGEMENT scope — the named set of authorised targets that gates dispatch.
+    # Reusing the word for something else in the same response would be a bad
+    # collision in a tool where scope is a security boundary.
+    if problem_scope:
+        wanted = problem_scope.strip().lower()
+        if wanted in ("shared", "infrastructure", "infra"):
+            where_clauses_pg.append("affects_hosts > 1")
+        elif wanted in ("single", "application", "app"):
+            where_clauses_pg.append("affects_hosts <= 1")
+        elif wanted not in ("all", ""):
+            raise HTTPException(
+                400,
+                f"Unknown problem_scope {problem_scope!r}. "
+                "Use 'shared', 'single' or 'all'.")
+
+    if problem_id:
+        where_clauses_pg.append("problem_id = %s")
+        params_pg.append(problem_id)
+
+    # Crawl inventory is excluded by DEFAULT. It is not deleted or moved —
+    # /export/burp and /export/har read web_findings by URL to build the Burp
+    # sitemap and the HAR file, so those rows are the crawl surface that makes
+    # the tool's primary deliverable work. They just are not findings.
+    if not include_inventory:
+        where_clauses_pg.append("record_kind = 'finding'")
 
     if cve:
         where_clauses_pg.append("EXISTS (SELECT 1 FROM unnest(cve) c WHERE c ILIKE %s)")
@@ -4430,14 +6033,33 @@ def search_findings(
         params_pg.append(list(workflow_status))
 
     if engagement_id:
-        # Match findings directly linked to engagement OR whose IP is in the engagement's scope
+        # Match findings directly linked to the engagement OR whose IP is in its
+        # scope.
+        #
+        # The scope side resolves scope_targets by its OWN engagement_id, which is
+        # reliably populated. It previously joined by NAME —
+        # scope_targets.name = engagements.scope_name — and that silently matched
+        # nothing whenever the two strings disagreed: on a live engagement,
+        # `engagements.scope_name` was EMPTY while its scope_targets rows were
+        # named 'msf'. The subquery returned no targets, so the filter degraded to
+        # `engagement_id = %s` alone, and every finding whose row had a NULL
+        # engagement_id vanished from the engagement view — 49 nmap and 28,232
+        # zap findings on that engagement, with no error to explain it. Only
+        # sources that stamp engagement_id (e.g. nuclei) appeared, which made it
+        # look like a per-tool ingestion problem rather than a filter bug.
+        #
+        # The name-based lookup is kept as a fallback so rows predating
+        # scope_targets.engagement_id still resolve.
         where_clauses_pg.append(
             "(engagement_id = %s OR ip IN ("
-            "  SELECT target FROM scope_targets WHERE name = ("
-            "    SELECT scope_name FROM engagements WHERE id = %s::uuid"
-            "  ) AND target_type = 'ip'"
+            "  SELECT target FROM scope_targets"
+            "   WHERE target_type = 'ip' AND target <> ''"
+            "     AND (engagement_id = %s::uuid"
+            "          OR name = NULLIF((SELECT scope_name FROM engagements"
+            "                             WHERE id = %s::uuid), ''))"
             "))"
         )
+        params_pg.append(engagement_id)
         params_pg.append(engagement_id)
         params_pg.append(engagement_id)
 
@@ -4450,23 +6072,38 @@ def search_findings(
         where_sql = "WHERE " + " AND ".join(where_clauses_pg)
 
     # Main query for results — order by severity rank then date
-    severity_order = """
-    CASE severity
-        WHEN 'critical' THEN 1
-        WHEN 'high'     THEN 2
-        WHEN 'medium'   THEN 3
-        WHEN 'low'      THEN 4
-        WHEN 'info'     THEN 5
-        WHEN 'recon'    THEN 6
-        ELSE 7
-    END
-    """
-    main_sql = f"""
-    {base_query}
-    {where_sql}
-    ORDER BY {severity_order}, created_at DESC
-    LIMIT %s OFFSET %s
-    """
+    # One scale for the whole stack: public.severity_rank() mirrors
+    # etl/severity.py and the frontend's SEVERITY_RANK, pinned by
+    # tests/test_severity_scale.py. DESC because higher = more severe, which also
+    # puts unknown values LAST — the hand-written ascending CASE this replaces
+    # used ELSE 7 to fake that, and got it wrong if anyone flipped the direction.
+    severity_order = "public.severity_rank(severity) DESC"
+    if collapse_problems:
+        # One row per underlying problem. DISTINCT ON rather than a window
+        # function so no helper column leaks into the result set.
+        #
+        # PARTITION/DISTINCT key is COALESCE(problem_id, id): partitioning on
+        # problem_id alone would treat every ungroupable row (NULL) as ONE
+        # group and collapse thousands of unrelated findings into a single row.
+        main_sql = f"""
+        SELECT * FROM (
+            SELECT DISTINCT ON (COALESCE(problem_id, id)) *
+            FROM (
+                {base_query}
+                {where_sql}
+            ) filtered
+            ORDER BY COALESCE(problem_id, id), {severity_order}, created_at DESC
+        ) collapsed
+        ORDER BY {severity_order}, created_at DESC
+        LIMIT %s OFFSET %s
+        """
+    else:
+        main_sql = f"""
+        {base_query}
+        {where_sql}
+        ORDER BY {severity_order}, created_at DESC
+        LIMIT %s OFFSET %s
+        """
     params_pg.extend([limit, offset])
 
     # Count query
@@ -4488,18 +6125,44 @@ def search_findings(
             v.severity
         FROM vulns v
         UNION ALL
+        -- Same inventory rule as the main query. If the global facet counted
+        -- crawl inventory while the default view excluded it, the UI would
+        -- render a `katana` chip with 746 that returns nothing when clicked.
         SELECT wf.source, wf.severity FROM web_findings wf
+         WHERE (%(include_inventory)s OR wf.record_kind = 'finding')
         UNION ALL
         SELECT 'playwright' as source, pf.severity FROM playwright_findings pf
         UNION ALL
-        SELECT 'portscan' as source, CASE WHEN service = 'tcpwrapped' THEN 'info' ELSE 'recon' END as severity FROM ports WHERE is_open = true
+        -- recon_findings was MISSING from this union while the main query
+        -- included it, so `dns-enum` (5) and `email-enum` (6) rows counted
+        -- toward `total` but appeared in NO global facet. The frontend builds
+        -- its source filter chips from by_source precisely so a chip never
+        -- vanishes as you narrow the filter — so those 11 findings were listed
+        -- but could not be filtered to, ever. Same WHERE as the main query's
+        -- recon branch; if that gate changes, change it here too.
+        SELECT rf.source, rf.severity FROM recon_findings rf
+         WHERE rf.source IN ('email-enum', 'dns-enum')
+        UNION ALL
+        -- Mirrors the main query's ports branch, which is now inventory. Without
+        -- the same gate the facet would render a `portscan` chip with 40 that
+        -- returns nothing when clicked -- exactly the katana bug this comment
+        -- block warns about two branches up.
+        SELECT 'portscan' as source, 'info'::text as severity FROM ports
+         WHERE is_open = true AND %(include_inventory)s
+        UNION ALL
+        -- Must mirror the credential branch in the main query above, including
+        -- the valid_cred gate. If these two drift, the severity facet counts
+        -- disagree with the rows actually returned.
+        SELECT COALESCE(cf.source, 'credentials') as source,
+               COALESCE(cf.severity, 'critical') as severity
+          FROM credential_findings cf WHERE cf.valid_cred = true
     )
     SELECT
-        COALESCE(severity, 'recon') as severity,
+        COALESCE(severity, 'info') as severity,
         source,
         COUNT(*) as cnt
     FROM unified
-    GROUP BY COALESCE(severity, 'recon'), source
+    GROUP BY COALESCE(severity, 'info'), source
     """
 
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -4512,8 +6175,41 @@ def search_findings(
         cur.execute(f"SELECT COUNT(*) as total FROM ({count_sql}) sub", count_params)
         total = cur.fetchone()["total"]
 
+        # Deduped counts over the same filtered set. `total` counts ROWS, which
+        # double-counts a server-level problem once per virtual host — fine for
+        # pagination, misleading as a headline. COALESCE(problem_id, id) keeps
+        # every ungroupable row distinct; grouping on problem_id alone would
+        # fold all NULLs into one.
+        cur.execute(f"""
+            SELECT
+                COUNT(DISTINCT COALESCE(problem_id, id))                     AS distinct_problems,
+                COUNT(DISTINCT problem_id) FILTER (WHERE affects_hosts > 1)  AS shared_problems
+            FROM ({count_sql}) sub
+        """, count_params)
+        dedup_row = cur.fetchone()
+        distinct_problems = dedup_row["distinct_problems"] or 0
+        shared_problems = dedup_row["shared_problems"] or 0
+
+        # Severity facets over the collapsed set, so a chart shows one bar per
+        # problem rather than one per affected vhost.
+        cur.execute(f"""
+            SELECT severity, source, COUNT(*) AS cnt FROM (
+                SELECT DISTINCT ON (COALESCE(problem_id, id))
+                       COALESCE(severity, 'info') AS severity,
+                       COALESCE(source, 'unknown') AS source
+                FROM ({count_sql}) sub
+                ORDER BY COALESCE(problem_id, id)
+            ) collapsed
+            GROUP BY severity, source
+        """, count_params)
+        problems_by_severity: Dict[str, int] = {}
+        problems_by_source: Dict[str, int] = {}
+        for r in cur.fetchall():
+            problems_by_severity[r["severity"]] = problems_by_severity.get(r["severity"], 0) + r["cnt"]
+            problems_by_source[r["source"]] = problems_by_source.get(r["source"], 0) + r["cnt"]
+
         # Get aggregations
-        cur.execute(agg_sql)
+        cur.execute(agg_sql, {"include_inventory": bool(include_inventory)})
         agg_rows = cur.fetchall()
 
     # Process aggregations
@@ -4531,6 +6227,8 @@ def search_findings(
     for row in rows:
         findings.append(UnifiedFinding(
             id=row["id"],
+            problem_id=row.get("problem_id"),
+            affects_hosts=row.get("affects_hosts") or 1,
             source=row["source"],
             asset_id=row["asset_id"],
             ip=row["ip"],
@@ -4557,7 +6255,11 @@ def search_findings(
         total=total,
         aggregations=SearchAggregations(
             by_severity=by_severity,
-            by_source=by_source
+            by_source=by_source,
+            problems_by_severity=problems_by_severity,
+            problems_by_source=problems_by_source,
+            distinct_problems=distinct_problems,
+            shared_problems=shared_problems
         )
     )
 
@@ -4585,8 +6287,22 @@ def create_finding_note(note: NoteRequest, authorized: bool = Depends(auth)):
             (note.url, note.source, note.name, note.severity, note.evidence),
         )
         row = cur.fetchone()
+        # The web_findings dedup trigger skips the INSERT when this finding
+        # already exists (it advances last_seen instead), and a skipped insert
+        # returns NO row — `row["id"]` would raise TypeError on a perfectly
+        # normal re-scan. Fall back to looking up the row it merged into so the
+        # caller still gets the id of the finding it just recorded.
+        if row is None:
+            cur.execute(
+                """SELECT id FROM web_findings
+                    WHERE fingerprint = md5('web|' || rtrim(lower(btrim(%s)), '/')
+                                             || '|' || lower(btrim(coalesce(%s, '')))
+                                             || '|' || 'scan_execution')""",
+                (note.url or "", note.name),
+            )
+            row = cur.fetchone()
         conn.commit()
-    return {"ok": True, "id": str(row["id"])}
+    return {"ok": True, "id": str(row["id"]) if row else None}
 
 
 @app.get("/last-completed-scan")
@@ -4894,6 +6610,183 @@ def maintenance_stats(authorized: bool = Depends(auth)):
     return counts
 
 
+@app.post("/cleanup/tool-executions", tags=["Maintenance"])
+def cleanup_tool_executions(
+    stale_after_hours: int = Query(default=6, ge=1),
+    delete_older_than_days: Optional[int] = Query(default=None, ge=1),
+    dry_run: bool = Query(default=False),
+    authorized: bool = Depends(auth),
+):
+    """Reconcile stuck tool executions, and optionally prune old ones.
+
+    Two jobs, because the table had neither:
+
+    1. RECONCILE — a row is set to 'running' before the subprocess starts and
+       updated when it finishes. If the process dies in between (restart, OOM,
+       wedged tool) the row stays 'running' for ever. 41 such rows accumulated
+       here, the oldest three days stale.
+
+       The activity view already *displayed* rows like these as 'lost' via a
+       CASE expression, but never wrote it back — so the view looked correct
+       while every other reader, every count and every export still saw
+       'running'. Cosmetic fixes in one query are worse than none: they hide the
+       problem from the place most likely to reveal it.
+
+    2. PRUNE — optional age-based delete, off unless delete_older_than_days is
+       given. Execution rows carry command lines and output, so they are worth
+       keeping longer than the default suggests.
+
+    kali-listener also reaps at startup, which is stricter and immediate: after
+    a restart nothing it launched can still be alive. This endpoint covers what
+    that cannot — a tool that wedged while the service stayed up — and puts the
+    table on the same scheduled cleanup footing as jobs, scans and artifacts.
+    """
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT count(*) FROM tool_executions
+             WHERE status IN ('running','pending')
+               AND started_at < now() - (%s || ' hours')::interval
+            """,
+            [stale_after_hours],
+        )
+        stale = cur.fetchone()[0]
+        if not dry_run and stale:
+            cur.execute(
+                """
+                UPDATE tool_executions
+                   SET status = 'failed',
+                       error = coalesce(nullif(error, ''), '') ||
+                               'reconciled: no completion recorded after %s hours',
+                       completed_at = now()
+                 WHERE status IN ('running','pending')
+                   AND started_at < now() - (%s || ' hours')::interval
+                """,
+                [stale_after_hours, stale_after_hours],
+            )
+
+        deleted = 0
+        if delete_older_than_days:
+            cur.execute(
+                "SELECT count(*) FROM tool_executions WHERE started_at < now() - (%s || ' days')::interval",
+                [delete_older_than_days],
+            )
+            deleted = cur.fetchone()[0]
+            if not dry_run and deleted:
+                cur.execute(
+                    "DELETE FROM tool_executions WHERE started_at < now() - (%s || ' days')::interval",
+                    [delete_older_than_days],
+                )
+
+        cur.execute("SELECT status, count(*) FROM tool_executions GROUP BY 1")
+        remaining = {r[0]: r[1] for r in cur.fetchall()}
+
+    result = {
+        "dry_run": dry_run,
+        "stale_after_hours": stale_after_hours,
+        "reconciled": 0 if dry_run else stale,
+        "reconcilable": stale,
+        "deleted": 0 if dry_run else deleted,
+        "by_status": remaining,
+    }
+    if not dry_run and (stale or deleted):
+        logger.info("tool_executions cleanup: reconciled=%s deleted=%s", stale, deleted)
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("tool_executions_cleaned", "maintenance", result)
+        except Exception:
+            pass
+    return result
+
+
+@app.post("/cleanup/artifacts", tags=["Maintenance"])
+def cleanup_artifacts(
+    older_than_days: int = Query(default=90, ge=1),
+    keep_unprocessed: bool = Query(default=True),
+    keep_with_findings: bool = Query(default=True),
+    dry_run: bool = Query(default=False),
+    authorized: bool = Depends(auth),
+):
+    """Prune old raw artifacts.
+
+    raw_artifacts stores every byte a tool produced and had NO retention at all:
+    it only ever grew. That matters more than usual here because the content is
+    kept verbatim, so a large share of it is credential material (see
+    Docs/RAW_ARTIFACTS.md) — old data is both storage cost and standing
+    exposure.
+
+    Two safety rails, both on by default:
+
+    * keep_unprocessed — never delete an artifact still queued for LLM
+      processing. Pruning by age alone would silently discard work the queue was
+      about to do, and the loss would be invisible.
+    * keep_with_findings — never delete an artifact a finding still points at.
+      Those are the evidence behind a report; deleting them turns a cited
+      finding into an unverifiable claim.
+
+    Run dry_run=true first: this is not recoverable.
+    """
+    where = ["created_at < now() - (%s || ' days')::interval"]
+    params: list = [older_than_days]
+    if keep_unprocessed:
+        where.append("llm_status <> 'pending'")
+        where.append("llm_status <> 'processing'")
+    if keep_with_findings:
+        # A finding referencing this artifact makes it evidence, not scratch.
+        where.append("""NOT EXISTS (
+            SELECT 1 FROM public.scan_recommendations r
+             WHERE r.extra->>'artifact_id' = raw_artifacts.id::text)""")
+    clause = " AND ".join(where)
+
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT count(*), coalesce(sum(byte_size),0) FROM raw_artifacts WHERE {clause}",
+                    params)
+        count, freed = cur.fetchone()
+        if not dry_run and count:
+            cur.execute(f"DELETE FROM raw_artifacts WHERE {clause}", params)
+        cur.execute("SELECT count(*), coalesce(sum(byte_size),0) FROM raw_artifacts")
+        remaining, remaining_bytes = cur.fetchone()
+
+    # Report what the safety rails held back. keep_unprocessed and an unfed LLM
+    # queue compound: every artifact stays 'pending' forever, so age-based
+    # pruning matches nothing and the store grows without bound. Silence here
+    # would read as "nothing was old enough".
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT count(*) FROM raw_artifacts
+             WHERE created_at < now() - (%s || ' days')::interval
+               AND llm_status IN ('pending','processing')
+        """, [older_than_days])
+        held_unprocessed = cur.fetchone()[0]
+
+    result = {
+        "dry_run": dry_run,
+        "older_than_days": older_than_days,
+        "held_back_unprocessed": held_unprocessed,
+        "kept_unprocessed": keep_unprocessed,
+        "kept_with_findings": keep_with_findings,
+        "artifacts_deleted": 0 if dry_run else count,
+        "artifacts_matching": count,
+        "bytes_freed": 0 if dry_run else int(freed or 0),
+        "remaining": remaining,
+        "remaining_bytes": int(remaining_bytes or 0),
+    }
+    if keep_unprocessed and held_unprocessed:
+        result["note"] = (
+            f"{held_unprocessed} artifact(s) old enough to prune were kept because "
+            f"they are still queued for LLM processing. If nothing is consuming "
+            f"/artifacts/claim, they will never age out — run a consumer, or "
+            f"prune with keep_unprocessed=false once you accept losing that work.")
+    if not dry_run and count:
+        logger.info("pruned %d raw artifact(s), freed %d bytes", count, freed or 0)
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("artifacts_pruned", "maintenance", result)
+        except Exception:
+            pass
+    return result
+
+
 @app.post("/cleanup/jobs", tags=["Maintenance"])
 def cleanup_jobs(
     older_than_hours: Optional[int] = Query(default=None, ge=1),
@@ -5178,6 +7071,256 @@ def attack_vectors_graph(
     import attack_vectors as _av
     eid = _validate_engagement_uuid(engagement_id or _resolve_engagement_id(None))
     return _av.get_graph(engagement_id=eid)
+
+
+# ── Security tests (agent-created, re-runnable proof records) ────────────────
+class SecurityTestCreate(BaseModel):
+    name: str
+    tier: str = "safe"                     # safe | impactful
+    description: Optional[str] = None
+    category: Optional[str] = None
+    target_ip: Optional[str] = None
+    target_host: Optional[str] = None
+    target_port: Optional[int] = None
+    target_service: Optional[str] = None
+    command: Optional[str] = None
+    tool: Optional[str] = None
+    assertion: Optional[dict] = None
+    source_finding_source: Optional[str] = None
+    source_finding_id: Optional[str] = None
+    attack_vector_id: Optional[str] = None
+    pending_exploit_id: Optional[str] = None
+    created_by_session: Optional[str] = None
+    engagement_id: Optional[str] = None
+
+
+class SecurityTestPatch(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    enabled: Optional[bool] = None
+    assertion: Optional[dict] = None
+
+
+class SecurityTestRunReq(BaseModel):
+    triggered_by: str = "operator"
+    override_target: Optional[dict] = None   # {target_ip, target_port}
+
+
+@app.get("/security-tests", tags=["Security Tests"])
+def security_tests_list(
+    session_id: Optional[str] = Query(default=None),
+    engagement_id: Optional[str] = Query(default=None),
+    target_ip: Optional[str] = Query(default=None),
+    tier: Optional[str] = Query(default=None),
+    enabled: Optional[bool] = Query(default=None),
+    limit: int = Query(default=200, le=1000),
+    authorized: bool = Depends(auth),
+):
+    """List security tests with the latest-run rollup, filtered."""
+    where, params = [], []
+    if session_id:   where.append("created_by_session = %s::uuid"); params.append(session_id)
+    if engagement_id: where.append("engagement_id = %s::uuid");     params.append(engagement_id)
+    if target_ip:    where.append("target_ip = %s::inet");          params.append(target_ip)
+    if tier:         where.append("tier = %s");                     params.append(tier)
+    if enabled is not None: where.append("enabled = %s");           params.append(enabled)
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""SELECT id, name, description, tier, category, target_ip, target_host,
+                       target_port, target_service, command, tool, assertion,
+                       pending_exploit_id, created_by_session, engagement_id, enabled,
+                       last_run_at, last_run_status, run_count, created_at
+                  FROM public.security_tests {clause}
+                 ORDER BY created_at DESC LIMIT %s""",
+            (*params, limit),
+        )
+        return {"tests": [dict(r) for r in cur.fetchall()]}
+
+
+@app.get("/agent-sessions/{session_id}/security-tests", tags=["Security Tests"])
+def security_tests_for_session(session_id: str, authorized: bool = Depends(auth)):
+    """Convenience: the tests a given agent session created (drives the UI tab)."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT id, name, tier, category, target_ip, target_port, target_service,
+                      tool, enabled, last_run_at, last_run_status, run_count, created_at
+                 FROM public.security_tests
+                WHERE created_by_session = %s::uuid
+                ORDER BY created_at DESC""",
+            (session_id,),
+        )
+        return {"session_id": session_id, "tests": [dict(r) for r in cur.fetchall()]}
+
+
+@app.get("/security-tests/{test_id}", tags=["Security Tests"])
+def security_test_get(test_id: str, authorized: bool = Depends(auth)):
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM public.security_tests WHERE id = %s::uuid", (test_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"security_test not found: {test_id}")
+        return dict(row)
+
+
+@app.get("/security-tests/{test_id}/runs", tags=["Security Tests"])
+def security_test_runs(test_id: str, limit: int = Query(default=50, le=500),
+                       authorized: bool = Depends(auth)):
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT id, ran_at, completed_at, duration_ms, status, lane, command_run,
+                      exit_code, result_summary, assertion_eval, tool_execution_id,
+                      exploit_result_id, triggered_by
+                 FROM public.security_test_runs
+                WHERE test_id = %s::uuid ORDER BY ran_at DESC LIMIT %s""",
+            (test_id, limit),
+        )
+        return {"test_id": test_id, "runs": [dict(r) for r in cur.fetchall()]}
+
+
+@app.post("/security-tests", tags=["Security Tests"])
+def security_test_create(body: SecurityTestCreate, authorized: bool = Depends(auth)):
+    """Create a test definition. Used by the surface-test agent phase."""
+    if body.tier not in ("safe", "impactful"):
+        raise HTTPException(400, "tier must be safe|impactful")
+    if body.tier == "safe" and not body.command:
+        raise HTTPException(400, "a safe test requires a command")
+    if body.tier == "impactful" and not body.pending_exploit_id:
+        raise HTTPException(400, "an impactful test requires a pending_exploit_id")
+    eid = _validate_engagement_uuid(body.engagement_id or _resolve_engagement_id(None))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """INSERT INTO public.security_tests
+                 (name, description, tier, category, target_ip, target_host,
+                  target_port, target_service, command, tool, assertion,
+                  source_finding_source, source_finding_id, attack_vector_id,
+                  pending_exploit_id, created_by_session, engagement_id)
+               VALUES (%s,%s,%s,%s,%s::inet,%s,%s,%s,%s,%s,%s,%s,%s::uuid,%s::uuid,
+                       %s::uuid,%s::uuid,%s::uuid)
+               RETURNING id, created_at""",
+            (body.name, body.description, body.tier, body.category, body.target_ip,
+             body.target_host, body.target_port, body.target_service, body.command,
+             body.tool, Json(body.assertion or {}), body.source_finding_source,
+             body.source_finding_id, body.attack_vector_id, body.pending_exploit_id,
+             body.created_by_session, eid),
+        )
+        row = cur.fetchone()
+    return {"ok": True, "id": str(row["id"]), "created_at": row["created_at"].isoformat()}
+
+
+@app.patch("/security-tests/{test_id}", tags=["Security Tests"])
+def security_test_patch(test_id: str, body: SecurityTestPatch,
+                        authorized: bool = Depends(auth)):
+    sets, params = [], []
+    if body.name is not None:        sets.append("name = %s");        params.append(body.name)
+    if body.description is not None:  sets.append("description = %s"); params.append(body.description)
+    if body.enabled is not None:      sets.append("enabled = %s");     params.append(body.enabled)
+    if body.assertion is not None:    sets.append("assertion = %s");   params.append(Json(body.assertion))
+    if not sets:
+        raise HTTPException(400, "nothing to update")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"UPDATE public.security_tests SET {', '.join(sets)} WHERE id = %s::uuid RETURNING id",
+            (*params, test_id),
+        )
+        if not cur.fetchone():
+            raise HTTPException(404, f"security_test not found: {test_id}")
+    return {"ok": True, "id": test_id}
+
+
+@app.post("/security-tests/{test_id}/run", tags=["Security Tests"])
+def security_test_run(test_id: str, body: SecurityTestRunReq,
+                      authorized: bool = Depends(auth)):
+    """Re-run a stored test.
+
+    SAFE  → dispatch to kali-listener /tools/execute (itself scope- and
+            concurrency-gated), then record the run.
+    IMPACTFUL → NEVER executes here. Re-sets the referenced pending_exploit to
+            'pending' and returns 202 requires_approval. Execution happens only
+            through the existing approval → execute_approved_exploit path, which
+            structurally prevents a re-run from bypassing the human gate.
+    """
+    import security_tests as _st
+    with get_db(autocommit=True) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM public.security_tests WHERE id = %s::uuid", (test_id,))
+        t = cur.fetchone()
+    if not t:
+        raise HTTPException(404, f"security_test not found: {test_id}")
+    if not t["enabled"]:
+        raise HTTPException(409, "test is disabled")
+
+    if t["tier"] == "impactful":
+        pid = t.get("pending_exploit_id")
+        if not pid:
+            raise HTTPException(409, "impactful test has no pending_exploit to approve")
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE public.pending_exploits SET status='pending' WHERE id = %s::uuid",
+                        (pid,))
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=202, content={
+            "ok": True, "run_id": None, "status": "skipped",
+            "requires_approval": True, "pending_exploit_id": str(pid),
+            "message": ("Impactful test re-run needs operator approval. Approve via "
+                        "POST /pentest/{session_id}/approve with this pending_exploit_id."),
+        })
+
+    # SAFE lane — dispatch the stored command to the gated executor.
+    override = body.override_target or {}
+    target = override.get("target_ip") or t.get("target_ip") or t.get("target_host")
+    port = override.get("target_port") or t.get("target_port")
+    if not target or not t.get("command"):
+        raise HTTPException(400, "safe test has no target/command to run")
+    import httpx as _hx, time as _time
+    base = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    t0 = _time.time()
+    try:
+        with _hx.Client(verify=False, timeout=max(30, (t.get("metadata") or {}).get("timeout", 300) if isinstance(t.get("metadata"), dict) else 300)) as c:
+            resp = c.post(f"{base}/tools/execute", json={
+                "tool": t.get("tool") or "curl", "command": t["command"],
+                "target": str(target), "port": port, "service": t.get("target_service"),
+                "timeout": 300})
+    except Exception as e:
+        # The executor was unreachable — the run never completed. Record error.
+        with get_db() as conn:
+            r = _st.record_test_run(conn, test_id=test_id, lane="safe",
+                command_run=t["command"], exit_code=None, output=None,
+                status_override="error", triggered_by=body.triggered_by,
+                engagement_id=t.get("engagement_id"))
+        raise HTTPException(502, f"executor unreachable: {e}")
+    if resp.status_code in (403, 400, 429):
+        with get_db() as conn:
+            r = _st.record_test_run(conn, test_id=test_id, lane="safe",
+                command_run=t["command"], exit_code=None,
+                output=f"[{resp.status_code}] {resp.text[:300]}",
+                status_override="skipped", triggered_by=body.triggered_by,
+                engagement_id=t.get("engagement_id"))
+        return {"ok": True, "run_id": r["run_id"], "status": "skipped",
+                "reason": f"executor refused ({resp.status_code})", "detail": resp.text[:300]}
+    data = resp.json() if resp.headers.get("content-type","").startswith("application/json") else {}
+    exec_id = data.get("exec_id") or data.get("execution_id")
+    # /tools/execute runs async; poll the execution briefly for a terminal state.
+    exit_code, out, http_status = None, "", None
+    if exec_id:
+        with _hx.Client(verify=False, timeout=30) as c:
+            for _ in range(20):
+                _time.sleep(3)
+                er = c.get(f"{base}/tools/executions/{exec_id}")
+                if er.status_code != 200:
+                    break
+                ed = er.json()
+                if ed.get("status") in ("completed", "failed", "timeout"):
+                    exit_code = ed.get("exit_code")
+                    out = ed.get("output") or ""
+                    pr = ed.get("parsed_results") or {}
+                    http_status = pr.get("status_code") if isinstance(pr, dict) else None
+                    break
+    dur = int((_time.time() - t0) * 1000)
+    with get_db() as conn:
+        r = _st.record_test_run(conn, test_id=test_id, lane="safe",
+            command_run=t["command"], exit_code=exit_code, output=out,
+            duration_ms=dur, tool_execution_id=exec_id, http_status=http_status,
+            triggered_by=body.triggered_by, engagement_id=t.get("engagement_id"))
+    return {"ok": True, "run_id": r["run_id"], "status": r["status"],
+            "result_summary": r["result_summary"], "tool_execution_id": exec_id}
 
 
 @app.post("/cleanup/exploits", tags=["Maintenance"])
@@ -6535,7 +8678,9 @@ def proxy_replay(
                   AND wf.url NOT LIKE '%%,%%'
                   {where_sql}
                 ORDER BY
-                    CASE wf.severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END
+                    -- was: CASE ... ELSE 4, which lumped low, info and
+                    -- unknown into one bucket. severity_rank keeps them apart.
+                    public.severity_rank(wf.severity) DESC
                 LIMIT %s
             """, (*fparams, limit))
             payload_requests = cur.fetchall()
@@ -6550,8 +8695,14 @@ def proxy_replay(
     if order == "sequential":
         base_urls.sort(key=lambda r: (_path_depth(r["url"]), r["url"]))
     elif order == "severity":
-        sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "recon": 5}
-        base_urls.sort(key=lambda r: sev_order.get(r.get("severity", "info"), 9))
+        # One scale for the whole stack (etl/severity.py). Higher = more
+        # severe, so callers sort DESCENDING; the local dict this replaces
+        # was ascending, which is the sort of inconsistency that put 1495
+        # attack vectors below `info` on the frontend.
+        from etl.severity import severity_rank as _sev_rank
+        # Negated because the scale is higher = more severe; unknown ranks 0
+        # and so sorts last, which the old `, 9)` default faked.
+        base_urls.sort(key=lambda r: -_sev_rank(r.get("severity")))
 
     # Dedup base URLs
     seen = set()
@@ -7041,6 +9192,39 @@ def _extract_parent_domain(target: str) -> str:
     if len(parts) >= 2:
         return '.'.join(parts[-2:])
     return host
+
+
+@app.get("/recon/customer-hosts", tags=["Recon"])
+def recon_customer_hosts(_: bool = Depends(auth)):
+    """Hosts detected as customer-owned (TLS cert / CNAME registrable-domain
+    mismatch) or moved to `customer_scope`. Single source for the "Customer"
+    indicator rendered across the UI (Recon Explorer, Findings, Services)."""
+    out: dict = {}
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT target, metadata->>'owner_domain' AS owner,
+                   metadata->>'registrant_org' AS org
+              FROM follow_up_items
+             WHERE rule_id IN ('customer_hosted_site','customer_hosted_site_cname')
+               AND target IS NOT NULL AND target <> ''
+        """)
+        for r in cur.fetchall():
+            h = (r["target"] or "").strip().lower()
+            if not h:
+                continue
+            e = out.setdefault(h, {})
+            if r["owner"] and not e.get("owner_domain"):
+                e["owner_domain"] = r["owner"]
+            if r["org"] and not e.get("registrant_org"):
+                e["registrant_org"] = r["org"]
+        # Operator-confirmed customer sites (moved to customer_scope).
+        cur.execute("SELECT DISTINCT target FROM scope_targets "
+                    "WHERE name = 'customer_scope' AND target <> ''")
+        for r in cur.fetchall():
+            h = (r["target"] or "").strip().lower()
+            if h:
+                out.setdefault(h, {})["confirmed"] = True
+    return {"count": len(out), "hosts": out}
 
 
 @app.get("/recon/domains", tags=["Recon"])
@@ -10550,16 +12734,23 @@ def params_summary(
 @app.get("/scope/names", tags=["Scope"])
 def list_scope_names(authorized: bool = Depends(auth)):
     """List distinct scope names with target counts."""
+    # Placeholder rows (empty target, source '__placeholder__') exist so a named
+    # scope can be created before it has any targets. They are NOT targets and
+    # must not be counted — the engagement-scoped endpoints below already filter
+    # them with the same predicate; these global ones did not, so a scope holding
+    # only a placeholder reported target_count=1 and looked populated.
     sql = """
         SELECT name,
-               COUNT(*) AS target_count,
+               COUNT(*) FILTER (
+                   WHERE target <> '' AND source IS DISTINCT FROM %s
+               ) AS target_count,
                MAX(added_at) AS last_updated
         FROM scope_targets
         GROUP BY name
         ORDER BY last_updated DESC
     """
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql)
+        cur.execute(sql, (_SCOPE_PLACEHOLDER_SOURCE,))
         rows = cur.fetchall()
     return {
         "names": [
@@ -10582,9 +12773,14 @@ def get_scope(
     """List targets for a named scope. Match is case-insensitive so the
     operator (or LLM) can pass "Default" / "default" / "DEFAULT" interchangeably."""
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # Exclude placeholder rows — see list_scope_names. A caller treating this
+        # response as "the scope" (the BFF scan gate does exactly that) would
+        # otherwise enforce against a scope whose only entry matches nothing,
+        # refusing every scan.
         cur.execute(
-            "SELECT COUNT(*) FROM scope_targets WHERE LOWER(name) = LOWER(%s)",
-            [name],
+            "SELECT COUNT(*) FROM scope_targets "
+            "WHERE LOWER(name) = LOWER(%s) AND target <> '' AND source IS DISTINCT FROM %s",
+            [name, _SCOPE_PLACEHOLDER_SOURCE],
         )
         total = cur.fetchone()["count"]
 
@@ -10592,9 +12788,10 @@ def get_scope(
             """SELECT id::text, name, target, target_type, source, added_at
                FROM scope_targets
                WHERE LOWER(name) = LOWER(%s)
+                 AND target <> '' AND source IS DISTINCT FROM %s
                ORDER BY added_at DESC
                LIMIT %s""",
-            [name, limit],
+            [name, _SCOPE_PLACEHOLDER_SOURCE, limit],
         )
         rows = cur.fetchall()
 
@@ -10615,6 +12812,23 @@ def get_scope(
     }
 
 
+def _infer_target_type(target: str) -> str:
+    """Classify a bare scope target as ip | cidr | domain.
+
+    Mirrors the auto-discovery path's rule so the two agree. A wrong-but-present
+    type is still better than NULL, which the gate cannot match at all.
+    """
+    t = (target or "").strip()
+    if "/" in t and any(c.isdigit() for c in t.split("/")[-1]):
+        return "cidr"
+    try:
+        import ipaddress
+        ipaddress.ip_address(t)
+        return "ip"
+    except ValueError:
+        return "domain"
+
+
 @app.post("/scope/add", tags=["Scope"])
 def add_to_scope(
     body: dict,
@@ -10626,29 +12840,40 @@ def add_to_scope(
     if not targets:
         raise HTTPException(status_code=400, detail="No targets provided")
 
+    # Attach to the active engagement if one is set. Storing an engagement's
+    # target under engagement_id IS NULL put it in the GLOBAL list only, so the
+    # engagement-scoped gate (load_engagement_scope) never saw it — a target you
+    # authorised for THIS engagement was invisible to the dispatcher for it.
+    eid = _validate_engagement_uuid(_resolve_engagement_id(body.get("engagement_id")))
+
     added = 0
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         for t in targets:
             target_val = t.get("target", "").strip()
             if not target_val:
                 continue
-            # Idempotent insert for the GLOBAL scope list (engagement_id IS NULL).
-            # The legacy UNIQUE(name,target) was dropped in favor of
-            # UNIQUE(engagement_id,name,target) (see ensure_all_tables.sql), so
-            # ON CONFLICT (name,target) no longer matches a constraint. Guard on
-            # the NULL-engagement row set instead.
+            # target_type is what the scope GATE matches on (is_in_scope keys off
+            # it: 'ip' exact, 'cidr' network, 'domain'/'url' suffix). An INSERT
+            # that left it NULL — which is what happened when a caller sent only
+            # {"target": ...} — stored a row that matched no branch and was
+            # therefore silently OUT of scope while looking present in the list.
+            # Infer it when the caller did not supply it, using the same rule the
+            # auto-discovery path uses below.
+            ttype = (t.get("target_type") or "").strip().lower() or _infer_target_type(target_val)
             cur.execute(
-                """INSERT INTO scope_targets (name, target, target_type, source)
-                   SELECT %s, %s, %s, %s
+                """INSERT INTO scope_targets (name, target, target_type, source, engagement_id)
+                   SELECT %s, %s, %s, %s, %s
                    WHERE NOT EXISTS (
                        SELECT 1 FROM scope_targets
-                       WHERE engagement_id IS NULL AND name = %s AND target = %s
+                       WHERE target = %s AND name = %s
+                         AND engagement_id IS NOT DISTINCT FROM %s
                    )""",
-                [name, target_val, t.get("target_type"), t.get("source"), name, target_val],
+                [name, target_val, ttype, t.get("source"), eid,
+                 target_val, name, eid],
             )
             added += cur.rowcount
         conn.commit()
-    return {"ok": True, "name": name, "added": added}
+    return {"ok": True, "name": name, "added": added, "engagement_id": eid}
 
 
 @app.delete("/scope/targets", tags=["Scope"])
@@ -10846,6 +13071,40 @@ def _capture_scope_decisions(targets: list, from_scope: str, to_scope: str, cur)
         """, (t, target_type, from_scope, to_scope,
               json.dumps(ctx), ctx_text,
               embedding if embedding else None))
+
+
+def _move_target_to_scope(cur, target: str, scope: str, engagement_id=None):
+    """Move one target out of unknown_scope into `scope`, keeping engagement_id.
+
+    Uses the current unique index (engagement_id, name, target) — the legacy
+    (name, target) constraint every older INSERT still names was dropped by the
+    schema migration, so those ON CONFLICTs now raise. When engagement_id is
+    unknown, inherit it from the row we are moving so the Recon Agent can see it.
+    """
+    from scope_classifier import target_type_of
+    if not engagement_id:
+        cur.execute("SELECT engagement_id FROM scope_targets WHERE target = %s "
+                    "AND engagement_id IS NOT NULL LIMIT 1", (target,))
+        row = cur.fetchone()
+        engagement_id = (row["engagement_id"] if isinstance(row, dict) else row[0]) if row else None
+    cur.execute("DELETE FROM scope_targets WHERE name = 'unknown_scope' AND target = %s "
+                "AND (engagement_id = %s::uuid OR %s IS NULL)",
+                (target, engagement_id, engagement_id))
+    cur.execute(
+        """INSERT INTO scope_targets (id, engagement_id, name, target, target_type, source)
+           VALUES (gen_random_uuid(), %s::uuid, %s, %s, %s, 'auto-classified')
+           ON CONFLICT (engagement_id, name, target) DO NOTHING""",
+        (engagement_id, scope, target, target_type_of(target)))
+
+
+def _distill(cur, target: str, scope: str, engagement_id=None, method="manual"):
+    """Best-effort rule distillation; never raises into the request path."""
+    try:
+        from scope_classifier import distill_rule_from_decision
+        return distill_rule_from_decision(cur, target, scope, engagement_id, method)
+    except Exception as e:
+        logging.warning(f"rule distillation failed for {target}->{scope}: {e}")
+        return None
 
 
 @app.post("/scope/move", tags=["Scope"])
@@ -11062,23 +13321,22 @@ def accept_suggestion(suggestion_id: str, authorized: bool = Depends(auth)):
 
         target = sug["target"]
         scope = sug["suggested_scope"]
+        eid = sug.get("engagement_id")
 
-        # Move target
-        cur.execute("DELETE FROM scope_targets WHERE name = 'unknown_scope' AND target = %s", (target,))
-        cur.execute("""
-            INSERT INTO scope_targets (id, name, target, target_type, source)
-            VALUES (gen_random_uuid(), %s, %s, 'domain', 'auto-classified')
-            ON CONFLICT (name, target) DO NOTHING
-        """, (scope, target))
+        # Move target within THIS engagement (engagement_id is what makes the
+        # Recon Agent see it; the old name-only conflict target no longer exists).
+        _move_target_to_scope(cur, target, scope, eid)
 
-        # Record decision
+        # Record decision, and distil a reusable rule so the next host under this
+        # domain is a deterministic hit — the model is not asked twice.
         _capture_scope_decisions([target], "unknown_scope", scope, cur)
+        learned = _distill(cur, target, scope, eid, sug.get("method") or "similarity")
 
         # Mark suggestion accepted
         cur.execute("UPDATE scope_suggestions SET status = 'accepted', reviewed_at = now() WHERE id = %s", (suggestion_id,))
         conn.commit()
 
-    return {"ok": True, "target": target, "scope": scope}
+    return {"ok": True, "target": target, "scope": scope, "learned_rule": learned}
 
 
 @app.post("/scope/suggestions/{suggestion_id}/reject", tags=["Scope Classification"])
@@ -11114,17 +13372,57 @@ def bulk_accept_suggestions(body: dict, authorized: bool = Depends(auth)):
         for sug in cur.fetchall():
             target = sug["target"]
             scope = sug["suggested_scope"]
-            cur.execute("DELETE FROM scope_targets WHERE name = 'unknown_scope' AND target = %s", (target,))
-            cur.execute("""
-                INSERT INTO scope_targets (id, name, target, target_type, source)
-                VALUES (gen_random_uuid(), %s, %s, 'domain', 'auto-classified')
-                ON CONFLICT (name, target) DO NOTHING
-            """, (scope, target))
+            _move_target_to_scope(cur, target, scope, sug.get("engagement_id"))
             _capture_scope_decisions([target], "unknown_scope", scope, cur)
+            _distill(cur, target, scope, sug.get("engagement_id"), sug.get("method") or "similarity")
             cur.execute("UPDATE scope_suggestions SET status = 'accepted', reviewed_at = now() WHERE id = %s", (sug["id"],))
             accepted += 1
         conn.commit()
     return {"ok": True, "accepted": accepted, "min_confidence": min_conf}
+
+
+class AutoClassifyBody(BaseModel):
+    generate_rules: bool = True
+    limit: Optional[int] = None
+    unknown_scope: str = "unknown_scope"
+
+
+@app.post("/engagements/{engagement_id}/scope/auto-classify", tags=["Scope Classification"])
+def engagement_auto_classify(engagement_id: str, body: AutoClassifyBody = None,
+                             authorized: bool = Depends(auth)):
+    """Assign every discovered host to a scope UNDER this engagement, deterministically.
+
+    Two steps, both LLM-free:
+      1. generate_seed_rules — turns each operator-entered domain seed into a
+         `*.{domain}` auto_apply rule (self-learning: the seed you typed becomes
+         a reusable classifier).
+      2. classify_and_assign_engagement — matches every discovered host against
+         those rules. In-scope hosts land in the matched scope; the rest land in
+         `unknown_scope`. BOTH carry engagement_id, so the Recon Agent scans the
+         in-scope set and the unknown bucket is there for triage.
+
+    Reusable across every recon tool — it reads recon_findings/assets, not any
+    single tool's output.
+    """
+    from scope_classifier import generate_seed_rules, classify_and_assign_engagement
+    body = body or AutoClassifyBody()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT id, name FROM engagements WHERE id = %s::uuid", (engagement_id,))
+        eng = cur.fetchone()
+        if not eng:
+            raise HTTPException(404, f"engagement {engagement_id} not found")
+        rules_created = generate_seed_rules(cur, engagement_id) if body.generate_rules else 0
+        result = classify_and_assign_engagement(
+            cur, engagement_id, unknown_scope=body.unknown_scope, limit=body.limit)
+        conn.commit()
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("scope_auto_classified", "scope_classifier", {
+            "engagement_id": engagement_id, "rules_created": rules_created, **result})
+    except Exception:
+        pass
+    return {"ok": True, "engagement_id": engagement_id,
+            "rules_created": rules_created, **result}
 
 
 @app.get("/scope/classification-rules", tags=["Scope Classification"])
@@ -11385,6 +13683,258 @@ def list_wordlists(authorized: bool = Depends(auth)):
         r["id"] = str(r["id"])
         r["created_at"] = r["created_at"].isoformat() if r.get("created_at") else None
     return {"ok": True, "wordlists": rows}
+
+@app.post("/wordlists/resolve-command", tags=["Wordlists"])
+def resolve_command_wordlists(body: dict, _: bool = Depends(auth)):
+    """Fill {user_list}/{password_list} in a command with readable paths.
+
+    The BFF cannot import `etl/` (no such mount on pentest-dashboard) and has no
+    database, so rather than duplicate this logic there — and need an agreement
+    test to keep two copies honest — the dispatcher asks here.
+
+    Falls back to the STATIC short lists if building fails: 17 x 25 = 425
+    candidates, never rockyou's 243,854,783, and never a leftover placeholder for
+    the listener to refuse. `source` reports which path was taken, because a
+    silent fallback would hide that the discovered usernames were not used.
+    """
+    command = (body or {}).get("command") or ""
+    target = (body or {}).get("target") or ""
+    port = (body or {}).get("port")
+    service = (body or {}).get("service") or ""
+    if not command:
+        raise HTTPException(400, "command is required")
+
+    import sys as _sys
+    if "/app" not in _sys.path:
+        _sys.path.insert(0, "/app")
+    import target_wordlists as tw
+
+    if not tw.needs_lists(command):
+        return {"ok": True, "command": command, "changed": False,
+                "source": "not_needed"}
+    if not target:
+        raise HTTPException(400, "target is required to build per-target lists")
+
+    from etl.scope_gate import check_dispatch, load_dispatch_scope
+    with get_db() as conn, conn.cursor() as cur:
+        scope_rows, scope_source = load_dispatch_scope(cur, None)
+        if scope_source == "unavailable":
+            raise HTTPException(503, "scope could not be loaded — refusing")
+        refusal = check_dispatch(target, scope_rows)
+        if refusal:
+            raise HTTPException(403, f"Out of scope — {refusal}")
+        result = tw.resolve_command(cur, command, target, port=port,
+                                    service_hint=service)
+    return {"ok": True, **result}
+
+
+@app.post("/wordlists/build-target", tags=["Wordlists"])
+def build_target_wordlists(target: str = Query(...),
+                           port: int = Query(None),
+                           service: str = Query(""),
+                           include_curated: bool = Query(True),
+                           write: bool = Query(True),
+                           _: bool = Depends(auth)):
+    """Build the candidate lists for one target/service, ordered by priority.
+
+    Composition, cheapest and most likely first:
+      1. usernames discovered ON THIS HOST — enum4linux-ng found 35
+      2. the documented default pair for the SERVICE
+      3. the username as its own password — how msfadmin:msfadmin works, and a
+         pair the generic 25-entry shortlist could never produce
+      4. the generic curated shortlist, as the tail
+
+    Order is priority because hydra reads the file top to bottom: a pair that is
+    going to be found is found in the first few hundred attempts rather than
+    after the generic tail. Every entry carries its provenance so a recovered
+    credential can be traced back to the evidence that suggested it.
+
+    Scope-gated: building a list for a host names that host, and an
+    out-of-scope target must not be prepared for attack any more than scanned.
+    """
+    import sys as _sys
+    if "/app" not in _sys.path:
+        _sys.path.insert(0, "/app")
+    from etl.scope_gate import check_dispatch, load_dispatch_scope
+    import target_wordlists as tw
+
+    with get_db() as conn, conn.cursor() as cur:
+        scope_rows, scope_source = load_dispatch_scope(cur, None)
+        if scope_source == "unavailable":
+            raise HTTPException(503, "scope could not be loaded — refusing")
+        refusal = check_dispatch(target, scope_rows)
+        if refusal:
+            raise HTTPException(403, f"Out of scope — {refusal}")
+        built = tw.build_lists(cur, target, port=port, service_hint=service,
+                               include_curated=include_curated)
+
+    paths = {}
+    if write:
+        try:
+            paths = tw.write_lists(built)
+        except OSError as e:
+            raise HTTPException(500, f"could not write lists: {e}")
+        # Register so the lists appear alongside every other selectable option.
+        with get_db() as conn, conn.cursor() as cur:
+            for kind in ("users", "passwords"):
+                path = paths.get(kind)
+                if not path:
+                    continue
+                cur.execute("""
+                    INSERT INTO wordlists (name, path, source, list_type,
+                                           line_count, size_bytes, description)
+                    VALUES (%s,%s,'generated',%s,%s,%s,%s)
+                    ON CONFLICT (path) DO UPDATE
+                       SET line_count = EXCLUDED.line_count,
+                           size_bytes = EXCLUDED.size_bytes,
+                           description = EXCLUDED.description
+                """, (os.path.basename(path), path,
+                      "usernames" if kind == "users" else "passwords",
+                      paths.get(f"{kind}_lines"),
+                      os.path.getsize(path) if os.path.exists(path) else None,
+                      f"generated for {target}"
+                      f"{'/' + (built.get('service') or '') if built.get('service') else ''}"
+                      f" — {built['counts']['discovered_usernames']} discovered usernames"))
+            conn.commit()
+
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("target_wordlists_built", "wordlists", {
+            "target": target, "service": built.get("service"), "port": port,
+            **built["counts"], "paths": paths})
+    except Exception:
+        pass
+
+    # The candidate count is reported so the operator sees what the listener's
+    # guard will judge BEFORE dispatching, rather than after a refusal.
+    return {"ok": True, **{k: v for k, v in built.items()
+                           if k not in ("user_provenance", "password_provenance")},
+            "provenance": {"users": built["user_provenance"],
+                           "passwords": built["password_provenance"]},
+            "paths": paths}
+
+
+@app.post("/wordlists/discover", tags=["Wordlists"])
+def discover_image_wordlists(curated_only: bool = Query(False),
+                             min_lines: int = Query(2, ge=1),
+                             _: bool = Depends(auth)):
+    """Register the wordlists that exist inside kali-listener.
+
+    The registry held TWO rows because `_auto_register_host_files` only ever
+    looked at rag-api's host-mounted /wordlists — while every brute-force
+    command in the catalogue names /usr/share/wordlists/..., which exists only
+    in the listener image. So the operator could not select from the lists
+    actually in use, and the one they were given by default was rockyou.
+
+    Line counts come from the listener, the same source the candidate-space
+    guard enforces on, so an advertised size and an enforced size cannot differ.
+    """
+    import httpx as _hx
+    base = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    try:
+        with _hx.Client(verify=False, timeout=120) as c:
+            resp = c.get(f"{base}/wordlists/inventory",
+                         params={"curated_only": curated_only,
+                                 "min_lines": min_lines, "max_files": 2000})
+            resp.raise_for_status()
+            body = resp.json()
+    except Exception as e:
+        raise HTTPException(502, f"could not read listener wordlist inventory: {e}")
+
+    rows = body.get("wordlists") or []
+    # `name` is UNIQUE and seclists ships the same basename in several
+    # directories, so a bare basename would raise on the second one. Only the
+    # colliding names are qualified, and by parent directory, so the common case
+    # stays readable and the result is deterministic.
+    from collections import Counter
+    basename_counts = Counter(w["name"] for w in rows)
+    for w in rows:
+        if basename_counts[w["name"]] > 1:
+            parent = os.path.basename(os.path.dirname(w["path"]))
+            w["_store_name"] = f"{parent}/{w['name']}"
+        else:
+            w["_store_name"] = w["name"]
+
+    added = updated = failed = 0
+    problems = []
+    with get_db() as conn, conn.cursor() as cur:
+        for w in rows:
+            # A savepoint per row: one name collision with a pre-existing host
+            # row must not abort the whole batch.
+            cur.execute("SAVEPOINT wl")
+            try:
+                cur.execute("""
+                INSERT INTO wordlists (name, path, source, list_type,
+                                       line_count, size_bytes, description)
+                VALUES (%s,%s,'image:kali-listener',%s,%s,%s,%s)
+                ON CONFLICT (path) DO UPDATE
+                   SET line_count = EXCLUDED.line_count,
+                       size_bytes = EXCLUDED.size_bytes,
+                       list_type  = EXCLUDED.list_type,
+                       description = EXCLUDED.description
+                    RETURNING (xmax = 0) AS inserted
+                """, (w["_store_name"], w["path"], w["list_type"],
+                      w["line_count"], w.get("size_bytes"),
+                      f"size_verdict={w['size_verdict']}"
+                      + (" curated" if w.get("curated") else "")))
+                got = cur.fetchone()
+                cur.execute("RELEASE SAVEPOINT wl")
+                if got is not None:
+                    was_new = got["inserted"] if isinstance(got, dict) else got[0]
+                    if was_new:
+                        added += 1
+                    else:
+                        updated += 1
+            except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT wl")
+                # The batch-level disambiguation cannot see PRE-EXISTING rows:
+                # rockyou.txt was already registered from the host mount at a
+                # different path, so the image copy collided on `name`. Retry
+                # once, parent-qualified.
+                parent = os.path.basename(os.path.dirname(w["path"]))
+                retry_name = f"{parent}/{w['name']}"
+                if retry_name == w["_store_name"]:
+                    failed += 1
+                    if len(problems) < 10:
+                        problems.append(f"{w['path']}: {type(e).__name__}: {e}")
+                    continue
+                cur.execute("SAVEPOINT wl2")
+                try:
+                    cur.execute("""
+                        INSERT INTO wordlists (name, path, source, list_type,
+                                               line_count, size_bytes, description)
+                        VALUES (%s,%s,'image:kali-listener',%s,%s,%s,%s)
+                        ON CONFLICT (path) DO UPDATE
+                           SET line_count = EXCLUDED.line_count,
+                               size_bytes = EXCLUDED.size_bytes,
+                               list_type  = EXCLUDED.list_type
+                        RETURNING (xmax = 0) AS inserted
+                    """, (retry_name, w["path"], w["list_type"], w["line_count"],
+                          w.get("size_bytes"),
+                          f"size_verdict={w['size_verdict']}"))
+                    got = cur.fetchone()
+                    cur.execute("RELEASE SAVEPOINT wl2")
+                    if got is not None:
+                        was_new = got["inserted"] if isinstance(got, dict) else got[0]
+                        added += 1 if was_new else 0
+                        updated += 0 if was_new else 1
+                except Exception as e2:
+                    cur.execute("ROLLBACK TO SAVEPOINT wl2")
+                    failed += 1
+                    if len(problems) < 10:
+                        problems.append(f"{w['path']}: {type(e2).__name__}: {e2}")
+        conn.commit()
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("wordlists_discovered", "wordlists", {
+            "seen": len(rows), "added": added, "updated": updated,
+            "curated_only": curated_only})
+    except Exception:
+        pass
+    return {"ok": True, "seen": len(rows), "added": added, "updated": updated,
+            "failed": failed, "problems": problems,
+            "thresholds": body.get("thresholds")}
+
 
 @app.post("/wordlists/upload", tags=["Wordlists"])
 def upload_wordlist(
@@ -11914,6 +14464,10 @@ import hashlib
 EXPORT_CATEGORIES = {
     "assets":      ["assets", "ports"],
     "findings":    ["vulns", "web_findings", "playwright_findings"],
+    # The infrastructure rollup: one row per shared problem rather than one per
+    # virtual host. Until now nothing but a test read this view, so a report of
+    # 778 web findings gave no way to see that they collapse to 13 problems.
+    "infrastructure": ["v_infrastructure_findings"],
     "recon":       ["recon_findings"],
     "credentials": ["credential_findings"],
     "params":      ["discovered_params"],
@@ -11945,9 +14499,68 @@ def _serialize_value(val):
     return str(val)
 
 
+# Views and a few tables have no created_at, and an unconditional
+# `ORDER BY created_at` turns adding one to an export category into a 500.
+# Resolved from the catalog rather than hard-coded per table.
+_EXPORT_ORDER_PREFERENCE = ("created_at", "last_seen", "discovered_at",
+                            "first_seen", "updated_at")
+
+
+def _export_order_column(cur, table: str) -> Optional[str]:
+    cur.execute("""
+        SELECT column_name FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = %s
+    """, (table,))
+    have = {r[0] if not isinstance(r, dict) else r["column_name"]
+            for r in cur.fetchall()}
+    for col in _EXPORT_ORDER_PREFERENCE:
+        if col in have:
+            return col
+    return None
+
+
+def _export_web_findings(cur, include_inventory: bool,
+                         collapse_problems: bool, limit: int = 50000) -> list:
+    """web_findings for /export/data, honouring the same two switches the
+    findings search and the SARIF export honour.
+
+    DISTINCT ON keys on COALESCE(infrastructure_fingerprint, id::text), never on
+    the fingerprint alone: it is NULL for every ungroupable row, and in Postgres
+    a DISTINCT ON over a NULL key folds ALL of them into one row — which would
+    silently drop hundreds of unrelated findings from the export.
+    """
+    where = "WHERE 1=1"
+    if not include_inventory:
+        where += " AND COALESCE(record_kind, 'finding') = 'finding'"
+    if collapse_problems:
+        sql = f"""
+            SELECT * FROM (
+                SELECT DISTINCT ON (COALESCE(infrastructure_fingerprint, id::text)) *
+                  FROM public.web_findings
+                  {where}
+                 ORDER BY COALESCE(infrastructure_fingerprint, id::text),
+                          public.severity_rank(severity) DESC, last_seen DESC
+            ) collapsed
+            ORDER BY public.severity_rank(severity) DESC, last_seen DESC
+            LIMIT %s
+        """
+    else:
+        sql = f"""
+            SELECT * FROM public.web_findings
+            {where}
+            ORDER BY last_seen DESC
+            LIMIT %s
+        """
+    cur.execute(sql, [limit])
+    cols = [d[0] for d in cur.description]
+    return [{c: _serialize_value(r[c]) for c in cols} for r in cur.fetchall()]
+
+
 def _export_table_rows(cur, table: str, limit: int = 50000) -> list:
-    """Generic SELECT * from a table with safe serialization."""
-    cur.execute(f"SELECT * FROM {table} ORDER BY created_at DESC LIMIT %s", [limit])
+    """Generic SELECT * from a table or view, with safe serialization."""
+    order_col = _export_order_column(cur, table)
+    order_sql = f"ORDER BY {order_col} DESC" if order_col else ""
+    cur.execute(f"SELECT * FROM {table} {order_sql} LIMIT %s", [limit])
     cols = [desc[0] for desc in cur.description]
     rows = []
     for row in cur.fetchall():
@@ -12024,6 +14637,8 @@ def _build_nessus_xml(data: dict) -> str:
 def export_sarif(
     severity: Optional[List[str]] = Query(None),
     source: Optional[List[str]] = Query(None),
+    collapse_problems: bool = Query(False, description="Emit one SARIF result per underlying problem, with a location per affected virtual host, instead of one result per host"),
+    include_inventory: bool = Query(False, description="Include crawl inventory (record_kind='inventory') as SARIF results. Off by default: it was 746 of 787 results, drowning the 41 real findings"),
     limit: int = Query(5000, ge=1, le=50000),
     authorized: bool = Depends(auth),
 ):
@@ -12048,6 +14663,10 @@ def export_sarif(
         "medium": "warning",
         "low": "note",
         "info": "note",
+        # Explicit rather than relying on sev_map.get(..., "note"). It landed on
+        # "note" by fallthrough, so changing that default would have silently
+        # moved every one of these. Kept for pre-migration rows.
+        "recon": "note",
     }
 
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -12077,10 +14696,18 @@ def export_sarif(
         # --- Collect web findings ---
         web_sql = """
             SELECT id, url, source, name, severity, issue_type, evidence,
-                   description, cwe, fingerprint, first_seen
+                   description, cwe, fingerprint, first_seen,
+                   infrastructure_fingerprint
             FROM web_findings WHERE 1=1
         """
         web_params = []
+        if not include_inventory:
+            # 746 of 787 SARIF results were katana crawl rows — the inventory the
+            # record_kind column exists to separate. /findings/search filters them
+            # and reported 94 findings while this export emitted 787, so the same
+            # engagement looked like two different engagements depending on which
+            # artefact the reader opened.
+            web_sql += " AND COALESCE(record_kind, 'finding') = 'finding'"
         if severity:
             web_sql += " AND severity = ANY(%s)"
             web_params.append(severity)
@@ -12090,6 +14717,36 @@ def export_sarif(
         web_sql += f" ORDER BY first_seen DESC LIMIT {int(limit)}"
         cur.execute(web_sql, web_params)
         web_rows = cur.fetchall()
+
+        # --- Collect credential findings ---
+        # Omitted entirely until now: there was no `brutus` run in the output, so
+        # a verified credential — arguably the most actionable thing a pentest
+        # produces — never appeared in a SARIF report at all.
+        cred_sql = """
+            SELECT id, host(ip)::text AS ip, port, protocol, username,
+                   secret_type, severity, source, fingerprint, discovered_at,
+                   secret_value IS NOT NULL AS has_secret
+              FROM credential_findings WHERE valid_cred IS TRUE
+        """
+        cred_params: list = []
+        if severity:
+            cred_sql += " AND severity = ANY(%s)"
+            cred_params.append(severity)
+        if source:
+            cred_sql += " AND COALESCE(source, 'brutus') = ANY(%s)"
+            cred_params.append(source)
+        cred_sql += f" ORDER BY discovered_at DESC NULLS LAST LIMIT {int(limit)}"
+        cur.execute(cred_sql, cred_params)
+        cred_rows = cur.fetchall()
+
+        # --- Collect playwright findings ---
+        cur.execute(f"""
+            SELECT id, url, finding_type, severity, description, evidence,
+                   created_at
+              FROM playwright_findings
+             ORDER BY created_at DESC LIMIT {int(limit)}
+        """)
+        pw_rows = cur.fetchall()
 
     # Group by tool for SARIF runs
     tool_results: dict = {}
@@ -12144,6 +14801,27 @@ def export_sarif(
         tool_results[tool_name]["results"].append(result)
 
     # Process web findings
+    # SARIF represents "one problem, several places" natively: a result carries a
+    # LIST of locations. So a server-level problem on shared hosting should be
+    # one result with a location per affected virtual host — not N near-identical
+    # results, which is what a report consumer would otherwise have to dedupe by
+    # hand.
+    #
+    # Grouped on COALESCE(infrastructure_fingerprint, id): keying on the
+    # fingerprint alone would fold every ungroupable row into one bucket, since
+    # they all share a NULL.
+    if collapse_problems:
+        merged: Dict[str, Dict[str, Any]] = {}
+        for row in web_rows:
+            key = row.get("infrastructure_fingerprint") or f"row:{row['id']}"
+            if key in merged:
+                merged[key]["_urls"].append(row.get("url") or "")
+                continue
+            head = dict(row)
+            head["_urls"] = [row.get("url") or ""]
+            merged[key] = head
+        web_rows = list(merged.values())
+
     for row in web_rows:
         tool_name = row.get("source") or "web"
         if tool_name not in tool_results:
@@ -12161,16 +14839,23 @@ def export_sarif(
             "ruleId": rule_id,
             "level": sev_map.get(row.get("severity", "info"), "note"),
             "message": {"text": (row.get("description") or name)[:2000]},
-            "locations": [{
-                "physicalLocation": {
-                    "artifactLocation": {"uri": row.get("url") or ""},
-                }
-            }],
+            "locations": [
+                {"physicalLocation": {"artifactLocation": {"uri": u}}}
+                for u in (row.get("_urls") or [row.get("url") or ""])
+            ],
             "properties": {
                 "severity": row.get("severity"),
                 "created_at": str(row.get("first_seen")),
             },
         }
+
+        # Only meaningful when collapsed; a consumer reading affects_hosts=1 on
+        # every result would learn nothing.
+        if collapse_problems:
+            urls = row.get("_urls") or []
+            result["properties"]["affects_locations"] = len(urls)
+            if row.get("infrastructure_fingerprint"):
+                result["properties"]["problem_id"] = row["infrastructure_fingerprint"]
 
         if row.get("fingerprint"):
             result["fingerprints"] = {"finding/v1": row["fingerprint"]}
@@ -12180,6 +14865,57 @@ def export_sarif(
             result["properties"]["cwe"] = cwes
 
         tool_results[tool_name]["results"].append(result)
+
+    # Process credential findings
+    for row in cred_rows:
+        tool_name = row.get("source") or "brutus"
+        tool_results.setdefault(tool_name, {"rules": {}, "results": []})
+        rule_id = f"credential/{row.get('secret_type') or 'password'}"
+        tool_results[tool_name]["rules"].setdefault(rule_id, {
+            "id": rule_id,
+            "shortDescription": {"text": "Valid credential accepted by a service"},
+        })
+        # The secret itself is deliberately NOT in the message. A SARIF file is
+        # made to be handed to other tooling and CI, which is a wider audience
+        # than the database; has_secret says whether one is stored to look up.
+        result = {
+            "ruleId": rule_id,
+            "level": sev_map.get((row.get("severity") or "").lower(), "note"),
+            "message": {"text": (f"Valid credential: {row.get('username')} on "
+                                 f"{row.get('protocol')}://{row.get('ip')}:{row.get('port')}")},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {
+                        "uri": f"{row.get('protocol')}://{row.get('ip')}:{row.get('port')}"},
+                }
+            }],
+            "properties": {
+                "username": row.get("username"),
+                "service": row.get("protocol"),
+                "port": row.get("port"),
+                "secret_stored": bool(row.get("has_secret")),
+            },
+        }
+        if row.get("fingerprint"):
+            result["fingerprints"] = {"finding/v1": row["fingerprint"]}
+        tool_results[tool_name]["results"].append(result)
+
+    # Process playwright findings
+    for row in pw_rows:
+        tool_name = "playwright"
+        tool_results.setdefault(tool_name, {"rules": {}, "results": []})
+        rule_id = row.get("finding_type") or "playwright/finding"
+        tool_results[tool_name]["rules"].setdefault(rule_id, {
+            "id": rule_id, "shortDescription": {"text": rule_id},
+        })
+        tool_results[tool_name]["results"].append({
+            "ruleId": rule_id,
+            "level": sev_map.get((row.get("severity") or "").lower(), "note"),
+            "message": {"text": row.get("description") or rule_id},
+            "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": row.get("url") or "unknown"}}}],
+            "properties": {"evidence": row.get("evidence")},
+        })
 
     # Build SARIF runs
     for tool_name, data in tool_results.items():
@@ -12205,8 +14941,11 @@ def export_sarif(
 @app.get("/export/data", tags=["Export"])
 def export_data(
     format: str = Query("json", description="Export format: json, csv, nessus"),
-    categories: str = Query("assets,findings,recon,credentials,params,exploits,screenshots",
-                            description="Comma-separated categories"),
+    categories: str = Query(
+        "assets,findings,infrastructure,recon,credentials,params,exploits,screenshots",
+        description="Comma-separated categories"),
+    include_inventory: bool = Query(False, description="Include crawl inventory (record_kind='inventory') in web_findings. Off by default, matching /findings/search and /export/sarif"),
+    collapse_problems: bool = Query(False, description="One web_findings row per underlying problem instead of one per virtual host"),
     authorized: bool = Depends(auth),
 ):
     """
@@ -12232,7 +14971,15 @@ def export_data(
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         for tbl in tables_to_query:
             try:
-                rows = _export_table_rows(cur, tbl)
+                # web_findings is the only table where inventory and virtual-host
+                # duplication apply. Until now /export/data had neither control,
+                # so the same engagement read as 779 rows here and 94 in
+                # /findings/search — three export paths, three different answers.
+                if tbl == "web_findings":
+                    rows = _export_web_findings(cur, include_inventory,
+                                                collapse_problems)
+                else:
+                    rows = _export_table_rows(cur, tbl)
                 data[tbl] = rows
                 counts[tbl] = len(rows)
             except Exception:
@@ -12945,6 +15692,26 @@ def _list_available_models() -> List[str]:
     return []
 
 
+def _effective_backend_model():
+    """If the LLM proxy resolves to a REMOTE backend (openai/azure/anthropic),
+    return (model_name, backend). The proxy overrides any per-agent model with
+    this, so it is what every agent actually runs on. Returns (None, None) for a
+    local Ollama backend, where per-agent model overrides genuinely apply."""
+    try:
+        base = (os.environ.get("OLLAMA_BASE_URL")
+                or os.environ.get("OLLAMA_URL")
+                or "http://host.docker.internal:11434").rstrip("/")
+        resp = requests.get(f"{base}/api/tags", timeout=5, verify=False)
+        if resp.status_code == 200:
+            for m in resp.json().get("models", []):
+                b = (m.get("backend") or "").lower()
+                if b and b not in ("ollama", "local"):
+                    return m.get("name"), b
+    except Exception:
+        pass
+    return None, None
+
+
 @app.get("/settings/agent-models", tags=["Settings"])
 def get_agent_models(_: bool = Depends(auth)):
     """Return registered agents with their currently-resolved model + the list
@@ -12958,6 +15725,8 @@ def get_agent_models(_: bool = Depends(auth)):
                 overrides[k] = r["value"]
     except Exception:
         pass
+
+    eff_model, eff_backend = _effective_backend_model()
 
     agents = []
     for spec in AGENT_MODEL_REGISTRY:
@@ -12973,6 +15742,12 @@ def get_agent_models(_: bool = Depends(auth)):
             if not current:
                 current = spec["default"]
                 source = "default"
+        # A remote backend (openai/azure/anthropic) overrides every agent's model
+        # at the llm_query proxy, so report the model actually used, not the
+        # (ignored) local env value.
+        if eff_model:
+            current = eff_model
+            source = f"backend:{eff_backend}"
         agents.append({
             "id": spec["id"], "name": spec["name"], "description": spec["description"],
             "current_model": current, "source": source, "default_model": spec["default"],
@@ -13395,6 +16170,240 @@ def delete_engagement_scope(eid: str, scope_name: str, _: bool = Depends(auth)):
         deleted = cur.rowcount
         conn.commit()
     return {"ok": True, "deleted": deleted, "scope": scope_name}
+
+
+class MarkCustomerSitesBody(BaseModel):
+    targets: List[str] = []
+    scope_name: str = "customer_scope"
+
+
+# Reserved buckets that are NOT part of the scanned scope; mirrored in the recon
+# agent's RESERVED_NONSCANNABLE (dashboard/bff/services/recon_agent.py).
+_RESERVED_SCOPES = ("customer_scope", "excluded", "not_in_scope")
+
+
+def _bg_capture_customer_decisions(targets: list, scope_name: str):
+    """Best-effort scope_decisions capture (embeds per-host recon context). Runs
+    AFTER the response as a background task — it is ~0.16s/host, so a large
+    selection would otherwise block the request past the client timeout and look
+    like a hang. Learning-only; the scope move already committed."""
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            for t in targets:
+                try:
+                    _capture_scope_decisions([t], "customer-site", scope_name, cur)
+                except Exception:
+                    pass
+            conn.commit()
+    except Exception as e:
+        logging.warning(f"bg customer scope decisions failed: {e}")
+
+
+@app.post("/engagements/{eid}/scope/mark-customer-sites", tags=["Engagements"])
+def mark_customer_sites(eid: str, body: MarkCustomerSitesBody,
+                        background_tasks: BackgroundTasks, _: bool = Depends(auth)):
+    """Move hosts into the engagement's `customer_scope` (out of the scanned scope).
+
+    Per-host BY DESIGN: we host customers on SHARED domains (e.g. convio.net), so a
+    domain-pattern rule would wrongly exclude our own infra. All DB work is done in
+    BULK (single statements over the whole target list) so marking a whole group of
+    hundreds of hosts returns in ~a second instead of looping per host:
+      1. removes them from the scanned engagement scopes (e.g. `blackbaud`);
+      2. files them under `customer_scope` (engagement-scoped, UI-visible);
+      3. records them in the global `not_in_scope` list (dispatch-gate safety);
+      4. resolves the matching customer-site follow-ups + tags the assets.
+    The per-host scope_decisions (learning; embeds recon context, ~0.16s each) are
+    captured in a BACKGROUND task so they never block the request — and deliberately
+    NOT distilled into a `*.domain` rule (that would nuke the shared domain). The
+    recon agent skips `customer_scope`, so scanning of these hosts stops.
+    """
+    from psycopg2.extras import execute_values
+    scope_name = (body.scope_name or "customer_scope").strip() or "customer_scope"
+    seen: set = set()
+    targets = [t for t in (str(x).strip() for x in (body.targets or []))
+               if t and not (t in seen or seen.add(t))]
+    if not targets:
+        raise HTTPException(400, "no targets provided")
+    tt = {t: _classify_target(t) for t in targets}
+
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # Ensure the bucket exists so it shows in the engagement's scope list.
+        cur.execute("""
+            INSERT INTO scope_targets (engagement_id, name, target, target_type, source)
+            VALUES (%s::uuid, %s, %s, 'domain', %s)
+            ON CONFLICT (engagement_id, name, target) DO NOTHING
+        """, (eid, scope_name, _SCOPE_PLACEHOLDER_TARGET, _SCOPE_PLACEHOLDER_SOURCE))
+
+        # 1. bulk remove from the scanned engagement scopes
+        cur.execute("""
+            DELETE FROM scope_targets
+             WHERE engagement_id = %s::uuid AND target = ANY(%s) AND name NOT IN %s
+        """, (eid, targets, _RESERVED_SCOPES))
+        # 2. bulk file under customer_scope
+        execute_values(cur,
+            "INSERT INTO scope_targets (engagement_id, name, target, target_type, source) "
+            "VALUES %s ON CONFLICT (engagement_id, name, target) DO NOTHING",
+            [(eid, scope_name, t, tt[t], 'customer-site-exclude') for t in targets],
+            template="(%s::uuid, %s, %s, %s, %s)")
+        moved = len(targets)
+        # 3. secondary safety: global not_in_scope. Delete-then-insert because a
+        #    unique index does not dedupe NULL-engagement rows.
+        cur.execute("""DELETE FROM scope_targets
+                        WHERE engagement_id IS NULL AND name = 'not_in_scope'
+                          AND target = ANY(%s)""", (targets,))
+        execute_values(cur,
+            "INSERT INTO scope_targets (name, target, target_type, source) VALUES %s",
+            [(t, tt[t]) for t in targets],
+            template="('not_in_scope', %s, %s, 'customer-site-exclude')")
+        # 4. bulk resolve matching customer-site follow-ups
+        cur.execute("""
+            UPDATE follow_up_items
+               SET status = 'resolved', resolved_at = now(), updated_at = now()
+             WHERE target = ANY(%s)
+               AND rule_id IN ('customer_hosted_site', 'customer_hosted_site_cname')
+               AND status NOT IN ('resolved', 'dismissed')
+        """, (targets,))
+        resolved = cur.rowcount
+        # 5. durable 'customer-site' tag on the assets (badge source).
+        try:
+            cur.execute("""
+                UPDATE assets SET tags = (
+                    SELECT array_agg(DISTINCT x)
+                      FROM unnest(COALESCE(tags,'{}'::text[]) || ARRAY['customer-site']) x)
+                 WHERE lower(hostname) = ANY(%s)
+            """, ([t.lower() for t in targets],))
+        except Exception as e:
+            logging.warning(f"customer-site asset tag failed: {e}")
+        conn.commit()
+
+    # Learning decisions run after the response (slow per-host embed).
+    background_tasks.add_task(_bg_capture_customer_decisions, targets, scope_name)
+
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("customer_scope_excluded", "scope", {
+            "engagement_id": eid, "scope": scope_name, "moved": moved,
+            "resolved_follow_ups": resolved, "targets": targets[:50]})
+    except Exception:
+        pass
+    return {"ok": True, "engagement_id": eid, "scope": scope_name,
+            "moved": moved, "resolved_follow_ups": resolved}
+
+
+class WhoisAgentBody(BaseModel):
+    engagement_id: Optional[str] = None
+    stale_days: int = 90
+    limit: int = 1000
+    dispatch: bool = True
+
+
+def _gather_whois_domains(cur, engagement_id: Optional[str] = None) -> set:
+    """Distinct registrable domains worth a WHOIS across ALL scopes + discovered
+    owner domains. IPs are dropped (registrable_domain returns None)."""
+    from scope_classifier import registrable_domain
+    doms: set = set()
+    if engagement_id:
+        cur.execute("SELECT DISTINCT target FROM scope_targets "
+                    "WHERE target <> '' AND engagement_id = %s::uuid", (engagement_id,))
+    else:
+        cur.execute("SELECT DISTINCT target FROM scope_targets WHERE target <> ''")
+    for r in cur.fetchall():
+        rd = registrable_domain((r["target"] or "").strip())
+        if rd:
+            doms.add(rd)
+    # discovered customer owner domains (from the customer-site follow-ups)
+    cur.execute("""SELECT DISTINCT metadata->>'owner_domain' od FROM follow_up_items
+                    WHERE rule_id IN ('customer_hosted_site','customer_hosted_site_cname')
+                      AND metadata->>'owner_domain' IS NOT NULL
+                      AND metadata->>'owner_domain' <> ''""")
+    for r in cur.fetchall():
+        if r["od"]:
+            doms.add(r["od"].strip().lower())
+    return doms
+
+
+@app.post("/whois-agent/run", tags=["ReconAgent"])
+def whois_agent_run(body: WhoisAgentBody = None, _: bool = Depends(auth)):
+    """Standing WHOIS collector — passive registrant lookup for EVERY scope +
+    discovered owner domain, not just in-scope hosts.
+
+    WHOIS is a public-registry lookup with no traffic to the target host, so it is
+    safe (host-scan authorisation rules do not apply) for the out-of-scope
+    customer/owner domains that the recon agent's scope-gated whois never reaches.
+    Two idempotent phases:
+      1. dispatch WHOIS (via osint-runner, passive) for domains with no fresh
+         record (older than `stale_days` or missing);
+      2. copy registrant org/country from the whois recon_finding into each
+         customer-site follow-up's metadata (what the report renders).
+    """
+    import httpx as _hx
+    from datetime import timedelta as _timedelta
+    from scope_classifier import registrable_domain
+    body = body or WhoisAgentBody()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        domains = _gather_whois_domains(cur, body.engagement_id)
+        # existing whois coverage, keyed by registrable domain (keep the newest)
+        cur.execute("SELECT target, created_at FROM recon_findings WHERE source = 'whois'")
+        have: dict = {}
+        for r in cur.fetchall():
+            reg = registrable_domain((r["target"] or "").strip()) or (r["target"] or "").strip().lower()
+            if reg and (reg not in have or (r["created_at"] and have[reg] and r["created_at"] > have[reg])):
+                have[reg] = r["created_at"]
+        cutoff = datetime.now(timezone.utc) - _timedelta(days=max(1, body.stale_days))
+        missing = sorted(d for d in domains
+                         if d not in have or (have[d] and have[d] < cutoff))
+        missing = missing[:max(1, body.limit)]
+
+        dispatched = 0
+        if body.dispatch and missing:
+            osint_url = os.environ.get("OSINT_RUNNER_URL", "https://osint-runner:8024")
+            try:
+                rr = _hx.post(f"{osint_url}/jobs/whois", json={"targets": missing},
+                              headers={"x-api-key": API_KEY}, verify=False, timeout=30)
+                if rr.status_code < 400:
+                    dispatched = len(missing)
+                else:
+                    log.warning("whois dispatch HTTP %s: %s", rr.status_code, rr.text[:200])
+            except Exception as e:
+                log.warning("whois dispatch failed: %s", e)
+
+        # Enrich customer follow-ups from whatever whois we already have.
+        cur.execute("SELECT target, data FROM recon_findings WHERE source = 'whois'")
+        wmap: dict = {}
+        for r in cur.fetchall():
+            d = r["data"] if isinstance(r["data"], dict) else {}
+            reg = registrable_domain((r["target"] or "").strip()) or (r["target"] or "").strip().lower()
+            org = (d.get("org") or d.get("registrant_org") or d.get("registrant_organization") or "").strip()
+            country = (d.get("registrant_country") or d.get("country") or "").strip()
+            registrar = (d.get("registrar") or "").strip()
+            created = (d.get("creation_date") or d.get("created") or "").strip()
+            # WHOIS registrant org is often GDPR-redacted; registrar + created are
+            # usually present, so capture them too for attribution context.
+            if reg and (org or country or registrar or created):
+                wmap[reg] = {"registrant_org": org, "registrant_country": country,
+                             "registrar": registrar, "whois_created": created,
+                             "whois_enriched": "1"}
+        enriched = 0
+        for od, w in wmap.items():
+            cur.execute("""
+                UPDATE follow_up_items
+                   SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb, updated_at = now()
+                 WHERE rule_id IN ('customer_hosted_site','customer_hosted_site_cname')
+                   AND metadata->>'owner_domain' = %s
+                   AND COALESCE(metadata->>'whois_enriched','') = ''
+            """, (Json(w), od))
+            enriched += cur.rowcount
+        conn.commit()
+
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("whois_agent_run", "whois-agent", {
+            "domains": len(domains), "dispatched": dispatched,
+            "enriched_follow_ups": enriched})
+    except Exception:
+        pass
+    return {"ok": True, "domains": len(domains), "with_whois": len(have),
+            "dispatched": dispatched, "enriched_follow_ups": enriched}
 
 
 class ScopeRename(BaseModel):
@@ -14458,7 +17467,16 @@ def scope_analysis(scope_name: str, _: bool = Depends(auth)):
 
         # ── 8. Discovered params in scope ──
         cur.execute(f"""
-            SELECT dp.url_pattern, dp.param_name, dp.method, dp.location,
+            -- Columns are http_method / param_location. This read dp.method
+            -- and dp.location, so every call raised UndefinedColumn and this
+            -- scope-analysis endpoint was a guaranteed 500 — Postgres reports
+            -- only the first bad column, so both had to be found via schema.
+            -- Aliased back to the short names the consumers below already use
+            -- (dp.get("method"), dp.get("location")).
+            -- NB: no braces in this comment; the query is an f-string.
+            SELECT dp.url_pattern, dp.param_name,
+                   dp.http_method   AS method,
+                   dp.param_location AS location,
                    dp.sample_values, dp.occurrence_count
             FROM discovered_params dp
             WHERE ({" OR ".join(["dp.url_pattern ILIKE %s"] * len(like_patterns))})
@@ -15724,6 +18742,108 @@ class FeedbackBody(BaseModel):
     notes: Optional[str] = None
 
 
+class RescopeRequest(BaseModel):
+    dry_run: bool = True
+    limit: int = 500
+
+
+@app.post("/follow-ups/rescope", tags=["Follow-Ups"])
+def rescope_follow_ups(req: RescopeRequest, authorized: bool = Depends(auth)):
+    """Re-evaluate quarantined follow-ups against the CURRENT scope.
+
+    Why this is needed: `_is_out_of_scope_target` fails closed, which is right at
+    discovery time — but the quarantine was never revisited. Its own docstring
+    says "the caller quarantines rather than deletes, so this is recoverable",
+    and nothing recovered it.
+
+    Two ways a row ends up wrongly quarantined:
+
+      * it was discovered before the scope was configured (correct then, wrong
+        now), or
+      * its `target` was the literal string "unknown", because the rule engine's
+        target resolver only looked at target/url/ip and rules like
+        sensitive_parameter select `url_pattern`. Scope matching then treated
+        "unknown" as a hostname and refused it, so "we do not know the target"
+        became "the target is out of scope". Fixed in rule_engine._row_target;
+        this repairs the rows already stored.
+
+    The target is recovered from the SOURCE ROW where possible and only then from
+    the title, because a title is display text and parsing it is a guess.
+    Nothing is ever moved INTO quarantine here: a row that is genuinely
+    out-of-scope keeps its label.
+    """
+    import re as _re
+    from osint_agent import _is_out_of_scope_target
+
+    label = "[OUT-OF-SCOPE] "
+    fixed, checked, still_oos = [], 0, 0
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT f.id, f.title, f.target, f.tags, f.finding_id, f.finding_source,
+                   f.engagement_id,
+                   dp.url_pattern              AS dp_url,
+                   wf.url                      AS wf_url,
+                   host(av.ip)                 AS vuln_ip
+              FROM follow_up_items f
+              LEFT JOIN discovered_params dp ON dp.id = f.finding_id
+              LEFT JOIN web_findings wf      ON wf.id = f.finding_id
+              LEFT JOIN vulns v              ON v.id  = f.finding_id
+              LEFT JOIN assets av            ON av.id = v.asset_id
+             WHERE f.title LIKE %s
+             ORDER BY f.created_at
+             LIMIT %s
+        """, (label + "%", req.limit))
+        rows = cur.fetchall()
+
+        for r in rows:
+            checked += 1
+            bare = (r["target"] or "").strip()
+            recovered = None
+            for cand in (r["dp_url"], r["wf_url"], r["vuln_ip"]):
+                if cand and str(cand).strip():
+                    recovered = str(cand).strip()
+                    break
+            if not recovered and (not bare or bare.lower() == "unknown"):
+                # Last resort: the row's own title. A URL first, then a bare IPv4.
+                m = _re.search(r"https?://[^\s\"']+", r["title"] or "")
+                if not m:
+                    m = _re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", r["title"] or "")
+                recovered = m.group(0) if m else None
+            target = recovered or bare
+            if not target or target.lower() == "unknown":
+                still_oos += 1
+                continue
+            if _is_out_of_scope_target(target, cur, r["engagement_id"]):
+                still_oos += 1
+                continue
+
+            new_title = r["title"][len(label):] if r["title"].startswith(label) else r["title"]
+            new_tags = [t for t in (r["tags"] or [])
+                        if t not in ("out-of-scope", "unknown-scope")]
+            fixed.append({"id": str(r["id"]), "target": target,
+                          "title": new_title, "was_target": r["target"]})
+            if not req.dry_run:
+                cur.execute("""
+                    UPDATE follow_up_items
+                       SET title = %s, target = %s, tags = %s::text[],
+                           updated_at = now()
+                     WHERE id = %s
+                """, (new_title, target, new_tags, r["id"]))
+
+    if not req.dry_run and fixed:
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("follow_ups_rescoped", "osint_agent", {
+                "checked": checked, "corrected": len(fixed),
+                "still_out_of_scope": still_oos,
+            })
+        except Exception:
+            pass
+    return {"ok": True, "dry_run": req.dry_run, "checked": checked,
+            "corrected": len(fixed), "still_out_of_scope": still_oos,
+            "items": fixed}
+
+
 @app.get("/follow-ups/stats", tags=["Follow-Ups"])
 def follow_up_stats(
     engagement_id: Optional[str] = Query(None),
@@ -15844,7 +18964,7 @@ def follow_ups_grouped(
             cur.execute(f"""
                 SELECT
                     CASE
-                        WHEN title LIKE 'Vulnerable: %% on %%' THEN trim(split_part(title, ' on ', 1))
+                        WHEN title LIKE '%% on %%' THEN trim(split_part(title, ' on ', 1))
                         WHEN title LIKE '%% \u2014 %%' THEN trim(split_part(title, ' \u2014 ', 1))
                         WHEN title LIKE '%% -- %%' THEN trim(split_part(title, ' -- ', 1))
                         WHEN title LIKE '%% \u2013 %%' THEN trim(split_part(title, ' \u2013 ', 1))
@@ -15930,6 +19050,174 @@ def list_follow_ups(
         """, params)
         rows = cur.fetchall()
     return {"follow_ups": rows}
+
+
+def _derive_follow_up_url(target: Optional[str], detail: dict) -> str:
+    """Best-effort URL for a follow-up host. Generic across rules: honours an
+    already-URL target, otherwise builds from host + the linked finding's port."""
+    t = (target or "").strip()
+    if not t:
+        return ""
+    if t.lower().startswith(("http://", "https://")):
+        return t
+    host = t.split("/")[0]
+    port = str((detail or {}).get("port") or "").strip()
+    if port in ("80", ""):
+        return f"http://{host}" if port == "80" else f"https://{host}"
+    if port == "443":
+        return f"https://{host}"
+    return f"https://{host}:{port}"
+
+
+@app.get("/follow-ups/export", tags=["Follow-Ups"])
+def export_follow_ups(
+    format: str = Query("csv", description="csv | json | md | urls"),
+    status: Optional[str] = Query(None),
+    exclude_status: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    priority: Optional[str] = Query(None),
+    flagged_by: Optional[str] = Query(None),
+    engagement_id: Optional[str] = Query(None),
+    rule_id: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    _: bool = Depends(auth),
+):
+    """Export follow-up items in a chosen format, enriched with the linked
+    finding's detail. Filters mirror GET /follow-ups exactly, so any view an
+    operator can build in the UI can be exported. Generic across rules — cert,
+    CVE, exposed-admin all flow through the same path; rule-specific detail rides
+    along in `detail_json` (CSV/JSON) rather than in bespoke columns.
+
+    Formats: csv (flat rows), json (enriched objects), md (grouped report),
+    urls (one derived URL per line, de-duplicated)."""
+    from fastapi import Response
+    fmt = (format or "csv").lower()
+    if fmt not in ("csv", "json", "md", "urls"):
+        raise HTTPException(400, "format must be csv | json | md | urls")
+
+    clauses, params = [], []
+    for col, val in (("status", status), ("severity", severity), ("priority", priority),
+                     ("flagged_by", flagged_by), ("rule_id", rule_id)):
+        if val:
+            clauses.append(f"{col} = %s"); params.append(val)
+    if exclude_status:
+        clauses.append("status != %s"); params.append(exclude_status)
+    if engagement_id:
+        clauses.append("engagement_id = %s::uuid"); params.append(engagement_id)
+    if search:
+        clauses.append("(title ILIKE %s OR target ILIKE %s OR reason ILIKE %s OR rule_id ILIKE %s)")
+        params.extend([f"%{search}%"] * 4)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT * FROM follow_up_items {where}
+            ORDER BY rule_id,
+                CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                              WHEN 'medium' THEN 2 ELSE 3 END,
+                target
+        """, params)
+        rows = [dict(r) for r in cur.fetchall()]
+
+        # Enrich recon-sourced items with their tlsx/dns/etc finding detail.
+        recon_ids = [r["finding_id"] for r in rows
+                     if r.get("finding_source") == "recon" and r.get("finding_id")]
+        detail_by_id = {}
+        if recon_ids:
+            cur.execute("SELECT id::text, data FROM recon_findings WHERE id = ANY(%s::uuid[])",
+                        ([str(i) for i in recon_ids],))
+            for r in cur.fetchall():
+                d = r["data"]
+                if isinstance(d, str):
+                    try:
+                        d = json.loads(d)
+                    except Exception:
+                        d = {}
+                detail_by_id[r["id"]] = d or {}
+
+    enriched = []
+    for r in rows:
+        detail = detail_by_id.get(str(r.get("finding_id")), {}) if r.get("finding_id") else {}
+        enriched.append({
+            "follow_up_id": str(r["id"]),
+            "rule_id": r.get("rule_id") or "",
+            "title": r.get("title") or "",
+            "host": r.get("target") or "",
+            "url": _derive_follow_up_url(r.get("target"), detail),
+            "severity": r.get("severity") or "",
+            "priority": r.get("priority") or "",
+            "status": r.get("status") or "",
+            "reason": r.get("reason") or "",
+            "flagged_by": r.get("flagged_by") or "",
+            "assigned_to": r.get("assigned_to") or "",
+            "confidence": r.get("confidence"),
+            "tags": r.get("tags") or [],
+            "created_at": r["created_at"].isoformat() if r.get("created_at") else "",
+            "finding_source": r.get("finding_source") or "",
+            "finding_id": str(r["finding_id"]) if r.get("finding_id") else "",
+            "detail": detail,
+            "metadata": r.get("metadata") or {},
+        })
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    tag = (rule_id or "all").replace("/", "_")
+    fname = f"follow-ups-{tag}-{stamp}"
+
+    if fmt == "json":
+        return Response(json.dumps({"count": len(enriched), "follow_ups": enriched}, default=str),
+                        media_type="application/json",
+                        headers={"Content-Disposition": f'attachment; filename="{fname}.json"'})
+
+    if fmt == "urls":
+        seen, lines = set(), []
+        for e in enriched:
+            u = e["url"]
+            if u and u not in seen:
+                seen.add(u); lines.append(u)
+        return Response("\n".join(lines) + ("\n" if lines else ""),
+                        media_type="text/plain",
+                        headers={"Content-Disposition": f'attachment; filename="{fname}-urls.txt"'})
+
+    if fmt == "csv":
+        import csv as _csv
+        import io as _io
+        buf = _io.StringIO()
+        cols = ["follow_up_id", "rule_id", "title", "host", "url", "severity",
+                "priority", "status", "reason", "flagged_by", "assigned_to",
+                "confidence", "tags", "created_at", "finding_source",
+                "finding_id", "detail_json"]
+        w = _csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for e in enriched:
+            row = dict(e)
+            row["tags"] = ",".join(e["tags"]) if isinstance(e["tags"], list) else (e["tags"] or "")
+            _d = e["detail"] or e.get("metadata") or {}
+            row["detail_json"] = json.dumps(_d, default=str) if _d else ""
+            row.pop("detail", None)
+            row.pop("metadata", None)
+            w.writerow(row)
+        return Response(buf.getvalue(), media_type="text/csv",
+                        headers={"Content-Disposition": f'attachment; filename="{fname}.csv"'})
+
+    # md — grouped by rule_id
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for e in enriched:
+        groups[e["rule_id"] or "(no rule)"].append(e)
+    lines = [f"# Follow-ups export ({len(enriched)} items)", "",
+             f"Generated {stamp} UTC" + (f" · engagement {engagement_id}" if engagement_id else ""), ""]
+    for rid in sorted(groups):
+        g = groups[rid]
+        lines.append(f"## {rid} — {len(g)} item(s)")
+        lines.append("")
+        lines.append("| Host | URL | Severity | Reason |")
+        lines.append("|---|---|---|---|")
+        for e in g:
+            reason = (e["reason"] or "").replace("|", "\\|")
+            lines.append(f"| {e['host']} | {e['url']} | {e['severity']} | {reason} |")
+        lines.append("")
+    return Response("\n".join(lines), media_type="text/markdown",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}.md"'})
 
 
 @app.post("/follow-ups", tags=["Follow-Ups"])
@@ -16423,6 +19711,504 @@ def get_gap_schedule(engagement_id: str, _: bool = Depends(auth)):
         return {"schedule": {"enabled": False, "interval_minutes": 30, "auto_fill": True}}
 
 
+@app.post("/agent/post-review", tags=["Post Review"])
+def run_post_review_endpoint(
+    queue_reruns: bool = Query(False, description="Insert the proposed re-runs "
+                               "as pending recommendations (never dispatches)"),
+    since_days: int = Query(None, ge=1, le=365),
+    target: str = Query(None),
+    engagement_id: str = Query(None),
+    _: bool = Depends(auth),
+):
+    """Review executed work: classify every execution and find what was missed.
+
+    Synchronous on purpose — the report IS the answer, and a background task
+    that returns `{"queued": true}` would make the operator poll for the thing
+    they just asked for. 1348 executions classify in about two seconds.
+
+    `queue_reruns=true` writes PENDING recommendations. It never dispatches;
+    a human still presses Run, and every proposed target passes the scope gate
+    first, with refusals reported rather than dropped.
+    """
+    from post_review_agent import run_post_review
+    try:
+        report = run_post_review(
+            triggered_by="api", since_days=since_days, target=target,
+            queue_reruns=queue_reruns, engagement_id=engagement_id)
+    except Exception as e:
+        raise HTTPException(500, f"post review failed: {e}")
+    return {"ok": True, **report}
+
+
+@app.get("/agent/post-review/analysis-coverage", tags=["Post Review"])
+def analysis_coverage_endpoint(limit_tools: int = Query(40, ge=1, le=200),
+                               _: bool = Depends(auth)):
+    """Which tools produce output nothing interprets — and which merely failed.
+
+    The rollout order for analysis profiles, chosen by evidence rather than an
+    audit. `write_a_profile_next` is ranked by unexplained bytes;
+    `failing_not_unparsed` is reported separately because those runs need
+    repeating, not an extractor — dig is 22 of 22 connection failures, and a dig
+    extractor would parse error strings and learn nothing.
+    """
+    from post_review_agent import analysis_coverage
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            return {"ok": True, **analysis_coverage(cur, limit_tools=limit_tools)}
+        except Exception as e:
+            raise HTTPException(500, f"coverage report failed: {e}")
+
+
+@app.post("/agent/post-review/ingest-facts", tags=["Post Review"])
+def ingest_extracted_facts_endpoint(
+    dry_run: bool = Query(True, description="Report what would be stored, store nothing"),
+    limit: int = Query(4000, ge=1, le=20000),
+    target: str = Query(None),
+    _: bool = Depends(auth),
+):
+    """Store extracted facts as findings with a real type and severity.
+
+    The `ingest` remedy the review has been reporting. 100 executions were
+    `captured_uninterpreted`: their text was in the database, but only inside
+    generic `tool_output` / `tool_table_row` rows with `key_values` empty — 94.2%
+    of `recon_findings`. Nothing said "SMBv1 is enabled", so nothing could filter
+    or triage it.
+
+    Defaults to a dry run, because this writes findings that will appear in
+    reports and exports.
+    """
+    from post_review_agent import ingest_extracted_facts
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            result = ingest_extracted_facts(cur, dry_run=dry_run, limit=limit,
+                                            target=target)
+        except Exception as e:
+            raise HTTPException(500, f"fact ingestion failed: {e}")
+    if not dry_run and result.get("inserted"):
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("extracted_facts_ingested", "post_review_agent", {
+                "inserted": result["inserted"], "facts_found": result["facts_found"],
+                "by_severity": result["by_severity"], "target": target,
+            })
+        except Exception:
+            pass
+    return {"ok": True, **result}
+
+
+# ── Self-adapting extractors (extractor_learned overlay) ────────────────────
+
+class ExtractorLearnBody(BaseModel):
+    artifact_id: Optional[str] = None
+    tool: Optional[str] = None
+    output: Optional[str] = None
+    model: Optional[str] = None
+
+
+@app.post("/extractors/learn", tags=["Extractors"])
+def extractors_learn(body: ExtractorLearnBody, _: bool = Depends(auth)):
+    """Distil deterministic extractors from one artifact: values the model fills
+    but the tool's regexes miss become ACTIVE regex rules (extracted code-only
+    next time); a matching finding rule is PROPOSED for review."""
+    import extractor_learn
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        tool = (body.tool or "").strip()
+        raw = body.output or ""
+        target, port, command = "", None, ""
+        if body.artifact_id:
+            cur.execute("SELECT tool, content, target, port, command FROM raw_artifacts WHERE id = %s",
+                        (body.artifact_id,))
+            a = cur.fetchone()
+            if not a:
+                raise HTTPException(404, f"artifact {body.artifact_id} not found")
+            tool = tool or a["tool"]
+            raw = raw or (a["content"] or "")
+            target, port, command = a.get("target") or "", a.get("port"), a.get("command") or ""
+        if not tool or not raw.strip():
+            raise HTTPException(400, "provide artifact_id, or tool + output")
+        try:
+            result = extractor_learn.distill_artifact(
+                cur, tool, raw, target=target, port=port, command=command,
+                model=body.model, artifact_id=body.artifact_id)
+            conn.commit()
+        except Exception as e:
+            log.exception("extractor distill failed")
+            raise HTTPException(500, f"distill failed: {type(e).__name__}: {e}")
+    return {"ok": True, **result}
+
+
+class ExtractorAnalyzeBody(BaseModel):
+    artifact_id: Optional[str] = None
+    tool: Optional[str] = None
+    output: Optional[str] = None
+    focus: Optional[str] = None          # "anything new to focus on" from the operator
+    learn: bool = False                  # false = preview only (no LLM, no writes)
+    model: Optional[str] = None
+
+
+@app.post("/extractors/analyze", tags=["Extractors"])
+def extractors_analyze(body: ExtractorAnalyzeBody, _: bool = Depends(auth)):
+    """Show what the deterministic profile extracts from an artifact NOW, and —
+    when `learn` is set — send it to the LLM to distil new reusable rules,
+    optionally directed by a `focus` hint the operator typed.
+
+    `learn=false` is a pure preview: no model call, no writes. `learn=true`
+    authors ACTIVE deterministic rules for anything the regexes miss and PROPOSES
+    matching finding rules for review (see /extractors/learned)."""
+    import extractor_specs as es
+    import extractor_learn
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        tool = (body.tool or "").strip()
+        raw = body.output or ""
+        target, port, command = "", None, ""
+        if body.artifact_id:
+            cur.execute("SELECT tool, content, target, port, command FROM raw_artifacts WHERE id = %s",
+                        (body.artifact_id,))
+            a = cur.fetchone()
+            if not a:
+                raise HTTPException(404, f"artifact {body.artifact_id} not found")
+            tool = tool or a["tool"]
+            raw = raw or (a["content"] or "")
+            target, port, command = a.get("target") or "", a.get("port"), a.get("command") or ""
+        if not tool or not raw.strip():
+            raise HTTPException(400, "provide artifact_id, or tool + output")
+
+        spec = es.spec_for(tool)
+        deterministic = es.run_deterministic(spec, raw) if spec else {}
+        coverage = es.coverage(spec, raw) if spec else None
+        out = {
+            "ok": True, "tool": tool,
+            "has_profile": bool(spec),
+            "source_file": (spec or {}).get("_source_file"),
+            "schema": list((spec or {}).get("schema") or {}),
+            "deterministic": deterministic,   # what is extracted normally, code-only
+            "coverage": coverage,
+        }
+        if body.learn:
+            try:
+                out["learn"] = extractor_learn.distill_artifact(
+                    cur, tool, raw, target=target, port=port, command=command,
+                    model=body.model, artifact_id=body.artifact_id, focus=body.focus)
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                log.exception("extractor analyze/learn failed")
+                raise HTTPException(500, f"learn failed: {type(e).__name__}: {e}")
+    return out
+
+
+@app.get("/extractors/learned", tags=["Extractors"])
+def list_extractor_learned(status: Optional[str] = None, tool: Optional[str] = None,
+                           _: bool = Depends(auth)):
+    """List learned extractor rules (deterministic auto-active; notable proposed)."""
+    where, params = [], []
+    if status:
+        where.append("status = %s"); params.append(status)
+    if tool:
+        where.append("tool = %s"); params.append(tool)
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"SELECT id::text, tool, kind, rule, status, confidence, source, "
+                    f"reviewed_by, created_at, approved_at FROM extractor_learned {clause} "
+                    f"ORDER BY tool, kind, created_at DESC", params)
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"count": len(rows), "learned": rows}
+
+
+@app.post("/extractors/learned/{rule_id}/{action}", tags=["Extractors"])
+def review_extractor_learned(rule_id: str, action: str,
+                             x_operator: str = Header("operator", alias="X-Operator"),
+                             _: bool = Depends(auth)):
+    """Approve (activate) or reject a proposed learned rule (e.g. a finding rule).
+    Approving a notable makes it fire on future extractions. Records the actor
+    (reviewed_by) and emits an `extractor_rule_reviewed` audit event."""
+    if action not in ("approve", "reject"):
+        raise HTTPException(400, "action must be approve or reject")
+    new_status = "active" if action == "approve" else "rejected"
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("UPDATE extractor_learned SET status = %s, reviewed_by = %s, "
+                    "approved_at = CASE WHEN %s = 'active' THEN now() ELSE approved_at END "
+                    "WHERE id = %s::uuid RETURNING id::text, tool, kind, status",
+                    (new_status, x_operator, new_status, rule_id))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"learned rule {rule_id} not found")
+        conn.commit()
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("extractor_rule_reviewed", "extractors", {
+            "rule_id": rule_id, "action": action, "actor": x_operator,
+            "tool": row["tool"], "kind": row["kind"], "status": row["status"]})
+    except Exception:
+        pass
+    return {"ok": True, "actor": x_operator, **dict(row)}
+
+
+@app.post("/extractors/export", tags=["Extractors"])
+def export_extractor_learned(tool: Optional[str] = None, _: bool = Depends(auth)):
+    """Render ACTIVE learned rules as YAML per tool, for committing into
+    knowledge/extractors/{tool}.yaml. Returns the YAML (the spec dir is a
+    read-only mount at runtime, so the operator commits the returned blocks)."""
+    import yaml as _yaml
+    where, params = ["status = 'active'"], []
+    if tool:
+        where.append("tool = %s"); params.append(tool)
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"SELECT tool, kind, rule FROM extractor_learned "
+                    f"WHERE {' AND '.join(where)} ORDER BY tool, kind", params)
+        rows = cur.fetchall()
+    by_tool: dict = {}
+    for r in rows:
+        t = by_tool.setdefault(r["tool"], {"tool": r["tool"], "deterministic": {},
+                                           "notable": [], "follow_on": []})
+        if r["kind"] == "deterministic":
+            t["deterministic"].update(r["rule"])
+        else:
+            t[r["kind"]].append(r["rule"])
+    out = {}
+    for t, spec in by_tool.items():
+        spec = {k: v for k, v in spec.items() if v}
+        out[t] = _yaml.safe_dump(spec, sort_keys=False, allow_unicode=True)
+    return {"ok": True, "tools": list(out), "yaml": out}
+
+
+# ── Agent-to-agent feedback channel (agent_flags) ───────────────────────────
+
+class AgentFlagBody(BaseModel):
+    flagging_agent: str
+    flag_type: str = "interesting_finding"
+    data: Dict[str, Any] = {}
+    engagement_id: Optional[str] = None
+    target_agent: Optional[str] = None
+
+
+@app.post("/agent-flags", tags=["Agent Feedback"])
+def create_agent_flag(body: AgentFlagBody, _: bool = Depends(auth)):
+    """An agent flags something interesting that may warrant another run."""
+    import agent_flags as af
+    if body.flag_type not in ("interesting_finding", "needs_rescan", "coverage_gap"):
+        raise HTTPException(400, "flag_type must be interesting_finding|needs_rescan|coverage_gap")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        fid = af.flag_for_agent(cur, body.flagging_agent, body.flag_type, body.data,
+                                engagement_id=body.engagement_id, target_agent=body.target_agent)
+        conn.commit()
+    return {"ok": True, "flag_id": fid}
+
+
+@app.get("/agent-flags", tags=["Agent Feedback"])
+def list_agent_flags(status: Optional[str] = None, engagement_id: Optional[str] = None,
+                     limit: int = 200, _: bool = Depends(auth)):
+    where, params = [], []
+    if status:
+        where.append("status = %s"); params.append(status)
+    if engagement_id:
+        where.append("engagement_id = %s::uuid"); params.append(engagement_id)
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    params.append(max(1, min(limit, 1000)))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"SELECT id::text, flagging_agent, target_agent, engagement_id::text, "
+                    f"flag_type, data, status, acted_by, created_at, acted_at FROM agent_flags "
+                    f"{clause} ORDER BY created_at DESC LIMIT %s", params)
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"count": len(rows), "flags": rows}
+
+
+@app.post("/agent-flags/{flag_id}/approve", tags=["Agent Feedback"])
+def approve_agent_flag(flag_id: str,
+                       x_operator: str = Header("operator", alias="X-Operator"),
+                       _: bool = Depends(auth)):
+    """Approve a flag → enqueue a scan_recommendation (recon agent dispatches it
+    through the scope gate). Records the actor + emits an audit event."""
+    import agent_flags as af
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT id, engagement_id, data, status FROM agent_flags WHERE id = %s::uuid",
+                    (flag_id,))
+        flag = cur.fetchone()
+        if not flag:
+            raise HTTPException(404, f"flag {flag_id} not found")
+        outcome = af.enqueue_from_flag(cur, flag)
+        cur.execute("UPDATE agent_flags SET status = %s, acted_by = %s, acted_at = now() "
+                    "WHERE id = %s::uuid", (outcome["status"], x_operator, flag_id))
+        conn.commit()
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("agent_flag_reviewed", "agent-flags", {
+            "flag_id": flag_id, "action": "approve", "actor": x_operator, **outcome})
+    except Exception:
+        pass
+    return {"ok": True, "flag_id": flag_id, "actor": x_operator, **outcome}
+
+
+@app.post("/agent-flags/{flag_id}/dismiss", tags=["Agent Feedback"])
+def dismiss_agent_flag(flag_id: str,
+                       x_operator: str = Header("operator", alias="X-Operator"),
+                       _: bool = Depends(auth)):
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE agent_flags SET status = 'dismissed', acted_by = %s, acted_at = now() "
+                    "WHERE id = %s::uuid", (x_operator, flag_id))
+        n = cur.rowcount
+        conn.commit()
+    if not n:
+        raise HTTPException(404, f"flag {flag_id} not found")
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("agent_flag_reviewed", "agent-flags", {
+            "flag_id": flag_id, "action": "dismiss", "actor": x_operator})
+    except Exception:
+        pass
+    return {"ok": True, "flag_id": flag_id, "status": "dismissed", "actor": x_operator}
+
+
+@app.post("/agent-flags/drain", tags=["Agent Feedback"])
+def drain_agent_flags(auto: bool = False, min_confidence: float = 0.9,
+                      limit: int = 50, _: bool = Depends(auth)):
+    """Coordinator: turn pending flags into scan_recommendations. With auto=false
+    (default) this is a no-op reminder; with auto=true it acts on high-confidence
+    in-scope flags (data.confidence >= min_confidence). All still scope-gated at
+    dispatch."""
+    import agent_flags as af
+    acted = acknowledged = 0
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT id, engagement_id, data, status FROM agent_flags "
+                    "WHERE status = 'pending' ORDER BY created_at LIMIT %s",
+                    (max(1, min(limit, 500)),))
+        flags = cur.fetchall()
+        for flag in flags:
+            data = flag["data"] if isinstance(flag["data"], dict) else {}
+            if not auto:
+                continue
+            if float(data.get("confidence", 0) or 0) < min_confidence:
+                continue
+            outcome = af.enqueue_from_flag(cur, flag)
+            cur.execute("UPDATE agent_flags SET status = %s, acted_at = now() WHERE id = %s",
+                        (outcome["status"], flag["id"]))
+            acted += outcome["status"] == "acted"
+            acknowledged += outcome["status"] == "acknowledged"
+        conn.commit()
+    return {"ok": True, "pending": len(flags), "acted": acted, "acknowledged": acknowledged}
+
+
+@app.get("/agent/post-review/executions/{execution_id}", tags=["Post Review"])
+def get_reviewed_execution(execution_id: str, _: bool = Depends(auth)):
+    """One execution in FULL, for display: output, return code, options, analysis.
+
+    The stored report deliberately carries no output — 1,348 full outputs is a
+    2.2 MB row — so this is where the complete text lives. It returns the whole
+    output untruncated, the return code, the parsed flags the tool was actually
+    called with, and what the analysis extracted from it.
+    """
+    from post_review_agent import _parse_options, classify_execution, \
+        option_signature, _catalogue_commands
+    from output_analysis import analyse_output
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT id::text, tool, command, target, port, service, status,
+                   exit_code, COALESCE(output, '') AS output,
+                   COALESCE(error, '')  AS error,
+                   octet_length(COALESCE(output, '')) AS output_bytes,
+                   started_at, completed_at, parsed_results
+            FROM tool_executions WHERE id = %s
+        """, (execution_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "execution not found")
+    r = dict(row)
+    verdict = classify_execution(r, _catalogue_commands())
+    opts = _parse_options(r["command"])
+    analysis = analyse_output(r["tool"], r["output"], r.get("exit_code"))
+    return {
+        "execution": r,
+        "return_code": r.get("exit_code"),
+        "options": {"argv0": opts["argv0"], "subcommands": opts["subcommands"],
+                    "flags": {k: (True if v is True else str(v))
+                              for k, v in opts["flags"].items()},
+                    "positional": opts["positional"],
+                    "signature": option_signature(r["command"]),
+                    "pipeline": opts["pipeline"], "parse_ok": opts["parse_ok"]},
+        "classification": verdict,
+        "analysis": analysis,
+    }
+
+
+@app.get("/agent/post-review/invocations", tags=["Post Review"])
+def post_review_invocations(tool: str = Query(None), limit: int = Query(200, ge=1, le=2000),
+                            _: bool = Depends(auth)):
+    """Return code x option signature, per tool — which invocation form works.
+
+    nmap alone spans four exit codes across 27 command forms and 379 runs, so
+    "nmap failed" was never a usable statement. Grouping by the flag NAMES (not
+    their values) collapses those into comparable forms.
+    """
+    from post_review_agent import option_signature
+    from output_analysis import analyse_output
+    where, params = ["1=1"], []
+    if tool:
+        where.append("tool = %s")
+        params.append(tool)
+    params.append(limit)
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT tool, command, exit_code, status,
+                   COALESCE(output, '') AS output
+            FROM tool_executions
+            WHERE {' AND '.join(where)}
+            ORDER BY started_at DESC LIMIT %s
+        """, params)
+        rows = [dict(r) for r in cur.fetchall()]
+    matrix = {}
+    for r in rows:
+        sig = option_signature(r["command"])
+        ec = "null" if r["exit_code"] is None else str(r["exit_code"])
+        v = analyse_output(r["tool"], r["output"], r["exit_code"])["verdict"]
+        key = (r["tool"], sig)
+        slot = matrix.setdefault(key, {
+            "tool": r["tool"], "options": sig, "runs": 0,
+            "return_codes": {}, "output_verdicts": {}, "example_command": r["command"]})
+        slot["runs"] += 1
+        slot["return_codes"][ec] = slot["return_codes"].get(ec, 0) + 1
+        slot["output_verdicts"][v] = slot["output_verdicts"].get(v, 0) + 1
+    out = sorted(matrix.values(), key=lambda m: (m["tool"], -m["runs"]))
+    return {"invocations": out, "forms": len(out), "executions_read": len(rows)}
+
+
+@app.get("/agent/post-review/reports", tags=["Post Review"])
+def list_post_review_reports(limit: int = Query(20, ge=1, le=200),
+                             engagement_id: str = Query(None),
+                             _: bool = Depends(auth)):
+    """Recent post-review reports, newest first (summary only, not the body)."""
+    where, params = ["1=1"], []
+    if engagement_id:
+        where.append("engagement_id = %s")
+        params.append(engagement_id)
+    params.append(limit)
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT id::text, engagement_id::text, status, executions_reviewed,
+                   issues_found, reruns_queued, created_at, completed_at,
+                   triggered_by, report -> 'summary' AS summary
+            FROM post_review_reports
+            WHERE {' AND '.join(where)}
+            ORDER BY created_at DESC LIMIT %s
+        """, params)
+        return {"reports": [dict(r) for r in cur.fetchall()]}
+
+
+@app.get("/agent/post-review/reports/{report_id}", tags=["Post Review"])
+def get_post_review_report(report_id: str, _: bool = Depends(auth)):
+    """One post-review report, in full."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT id::text, engagement_id::text, status, report,
+                   executions_reviewed, issues_found, reruns_queued,
+                   created_at, completed_at, triggered_by
+            FROM post_review_reports WHERE id = %s
+        """, (report_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "report not found")
+    return {"report": dict(row)}
+
+
 @app.get("/nodes", tags=["Nodes"])
 def list_nodes(_: bool = Depends(auth)):
     """List remote nodes (for Burp extension and external integrations)."""
@@ -16627,6 +20413,141 @@ def get_agents_status(_: bool = Depends(auth)):
             "id": "cloud-triage-agent", "name": "Cloud Triage Agent",
             "type": "on-demand", "status": "error",
             "description": "Re-ranks open cloud recommendations by attack-chain order and produces a top-3 next-actions plan",
+        })
+
+    # 7. Artifact LLM Review Agent — services the raw_artifacts LLM-review queue.
+    #    The consumer + /artifacts/drain already exist; this surfaces the queue so
+    #    an operator can see the backlog and process it from the AI Agents page.
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT count(*) FILTER (WHERE llm_status = 'pending')    AS pending,
+                       count(*) FILTER (WHERE llm_status = 'processing') AS processing,
+                       count(*) FILTER (WHERE llm_status = 'done')       AS done,
+                       count(*) FILTER (WHERE llm_status = 'failed')     AS failed,
+                       count(*)                                          AS total,
+                       max(llm_processed_at)                             AS last_run
+                  FROM raw_artifacts
+            """)
+            a = cur.fetchone() or {}
+            pending = int(a.get("pending") or 0)
+            processing = int(a.get("processing") or 0)
+            agents.append({
+                "id": "artifact-review", "name": "Artifact LLM Review",
+                "type": "on-demand",
+                "status": "running" if processing > 0 else "idle",
+                "description": "Runs the LLM enrichment pass over raw scan output pending review, then extracts follow-on actions",
+                "queue_pending": pending,
+                "queue_processing": processing,
+                "queue_done": int(a.get("done") or 0),
+                "queue_failed": int(a.get("failed") or 0),
+                "queue_total": int(a.get("total") or 0),
+                "last_run": a["last_run"].isoformat() if a.get("last_run") else None,
+            })
+    except Exception:
+        agents.append({
+            "id": "artifact-review", "name": "Artifact LLM Review",
+            "type": "on-demand", "status": "error",
+            "description": "Runs the LLM enrichment pass over raw scan output pending review, then extracts follow-on actions",
+        })
+
+    # 8. Pre-Validation Agent — verifies agent/LLM factual claims (ports, CVEs,
+    #    services, hosts) against what the scans actually recorded, BEFORE those
+    #    claims are trusted. Deterministic (regex + SQL) via scan-recommender
+    #    /kb/agent-output/verify; autogen runs it per-session and persists the
+    #    outcome to agent_sessions.metadata->'claim_validation'.
+    try:
+        r = _fast_get("https://scan-recommender:8013/health")
+        reachable = bool(r and r.status_code == 200)
+        validated = unsupported = 0
+        last_val = None
+        try:
+            with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT count(*) FILTER (WHERE metadata ? 'claim_validation') AS validated,
+                           COALESCE(SUM((metadata->'claim_validation'->>'unsupported_count')::int)
+                                    FILTER (WHERE metadata ? 'claim_validation'), 0) AS unsupported,
+                           MAX(updated_at) FILTER (WHERE metadata ? 'claim_validation') AS last_run
+                      FROM agent_sessions
+                """)
+                v = cur.fetchone() or {}
+                validated = int(v.get("validated") or 0)
+                unsupported = int(v.get("unsupported") or 0)
+                last_val = v.get("last_run")
+        except Exception:
+            pass
+        agents.append({
+            "id": "pre-validation", "name": "Pre-Validation Agent",
+            "type": "continuous", "status": "running" if reachable else "unreachable",
+            "description": "Verifies agent/LLM claims (ports, CVEs, services, hosts) against recorded scan data before findings are trusted",
+            "service_port": 8013,
+            "sessions_validated": validated,
+            "unsupported_claims": unsupported,
+            "last_run": last_val.isoformat() if last_val else None,
+        })
+    except Exception:
+        agents.append({
+            "id": "pre-validation", "name": "Pre-Validation Agent",
+            "type": "continuous", "status": "error",
+            "description": "Verifies agent/LLM claims against recorded scan data before findings are trusted",
+            "service_port": 8013,
+        })
+
+    # 9. WHOIS Collection Agent — passive registrant lookup across ALL scopes +
+    #    discovered owner domains (not just in-scope hosts, since whois is public).
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            domains = _gather_whois_domains(cur)
+            cur.execute("SELECT DISTINCT target, max(created_at) last FROM recon_findings "
+                        "WHERE source = 'whois' GROUP BY target")
+            from scope_classifier import registrable_domain as _rd
+            have = set()
+            last_run = None
+            for r in cur.fetchall():
+                reg = _rd((r["target"] or "").strip()) or (r["target"] or "").strip().lower()
+                if reg:
+                    have.add(reg)
+                if r["last"] and (last_run is None or r["last"] > last_run):
+                    last_run = r["last"]
+            covered = len(domains & have)
+            agents.append({
+                "id": "whois-agent", "name": "WHOIS Collection",
+                "type": "on-demand", "status": "idle",
+                "description": "Passive WHOIS/registrant lookup for every scope + discovered owner domain (identifies who owns customer sites)",
+                "coverage_total": len(domains),
+                "coverage_completed": covered,
+                "coverage_pending": max(0, len(domains) - covered),
+                "last_run": last_run.isoformat() if last_run else None,
+            })
+    except Exception:
+        agents.append({
+            "id": "whois-agent", "name": "WHOIS Collection",
+            "type": "on-demand", "status": "error",
+            "description": "Passive WHOIS/registrant lookup for every scope + discovered owner domain",
+        })
+
+    # 10. Agent Feedback channel — one agent flags interesting things; approving a
+    #     flag enqueues a scope-gated scan_recommendation.
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT count(*) FILTER (WHERE status='pending') pending, "
+                        "count(*) FILTER (WHERE status='acted') acted, "
+                        "max(created_at) last FROM agent_flags")
+            a = cur.fetchone() or {}
+            pend = int(a.get("pending") or 0)
+            agents.append({
+                "id": "agent-feedback", "name": "Agent Feedback",
+                "type": "on-demand", "status": "running" if pend > 0 else "idle",
+                "description": "Inter-agent channel: flags interesting findings for review; approving one queues a scope-gated follow-up scan",
+                "queue_pending": pend,
+                "queue_done": int(a.get("acted") or 0),
+                "last_run": a["last"].isoformat() if a.get("last") else None,
+            })
+    except Exception:
+        agents.append({
+            "id": "agent-feedback", "name": "Agent Feedback",
+            "type": "on-demand", "status": "error",
+            "description": "Inter-agent channel for flagging interesting findings",
         })
 
     return {"agents": agents}
@@ -16906,7 +20827,10 @@ def _store_collection(parsed: dict) -> str:
                 cid, ep["method"], ep["path"], ep["operation_id"],
                 ep["summary"], Json(ep["parameters"]), Json(ep["request_body"]),
                 Json(ep["responses"]), Json(ep["security"]),
-                ep["tags"] or [],
+                # api_endpoints.tags is text[] and ep comes from a parsed
+                # OpenAPI document, so its shape is whatever the spec author
+                # wrote — a string is as likely as a list.
+                as_text_array(ep["tags"]),
             ))
 
         conn.commit()
@@ -18082,8 +22006,7 @@ def export_findings_exchange(
                    wf.evidence, wf.method, wf.description, wf.solution, wf.confidence,
                    wf.status_code, wf.payload
             FROM web_findings wf {where}
-            ORDER BY CASE wf.severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2
-                     WHEN 'medium' THEN 3 WHEN 'low' THEN 4 ELSE 5 END
+            ORDER BY public.severity_rank(wf.severity) DESC
             LIMIT %s
         """, params)
 

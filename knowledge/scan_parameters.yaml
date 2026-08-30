@@ -1,0 +1,166 @@
+# Discovered values that INFLUENCE how we test a host.
+#
+# WHY THIS FILE
+# -------------
+# Four tools already produce parameter-shaped facts and every one uses a
+# different shape:
+#
+#   netexec    smb_password_policy   params.lockout_threshold
+#   ssh-audit  ssh_config            banner, software, algorithms[]
+#   wafw00f    waf_detection         detected, firewall
+#   httpx      web_service           webserver, tech[]
+#
+# So nothing could read them generically. This declares the VOCABULARY — one key
+# per value that matters — and where each is found. Same lesson as the canonical
+# finding ids: the plumbing was never the hard part, the naming was.
+#
+# THREE LAYERS, and only one of them is stored in a table:
+#   observed  — read from findings/executions, with provenance. NOT copied
+#               anywhere, because a copy goes stale the moment a re-scan
+#               disagrees with it.
+#   declared  — what the operator states, in `scan_parameters`. No tool can
+#               discover "never spray this host".
+#   effective — declared if present, else observed, else the default here.
+#
+# `influences` names what CONSUMES the value. A parameter nothing consumes is
+# just trivia; keep that column honest.
+
+parameters:
+
+  # ── credential attacks ────────────────────────────────────────────────────
+  smb_lockout_threshold:
+    type: string
+    default: unknown
+    description: >
+      Bad-password attempts permitted before an account locks. "None" means no
+      lockout is enforced at all.
+    influences: [brute_force_safety]
+    why: >
+      This decides whether an online attack is safe to run. With no threshold a
+      spray is harmless to the accounts; with a threshold of 3, the same
+      82-password list is an account-lockout denial of service across every
+      account in the userlist.
+    sources:
+      - kind: finding
+        finding_type: smb_password_policy
+        path: params.lockout_threshold
+
+  smb_lockout_duration:
+    type: string
+    default: unknown
+    description: How long an account stays locked once the threshold is hit.
+    influences: [brute_force_safety]
+    sources:
+      - kind: finding
+        finding_type: smb_password_policy
+        path: params.lockout_duration
+
+  smb_min_password_length:
+    type: string
+    default: unknown
+    description: Minimum password length the domain enforces.
+    influences: [wordlist_selection]
+    why: Candidates shorter than this cannot be valid and only waste attempts.
+    sources:
+      - kind: finding
+        finding_type: smb_password_policy
+        path: params.min_password_length
+
+  observed_rate_per_min:
+    type: number
+    default: null
+    description: Attempts per minute actually achieved against this host.
+    influences: [candidate_space_estimate]
+    why: >
+      The candidate-space guard hardcodes 256 tries/min. Measured rates on this
+      engagement were 16 (telnet), 22, 116 and 256 (ftp) — a 16x spread. At 16
+      a 4,100-candidate list takes 4.3 HOURS, not the 16 minutes the guard
+      reports, so it admits runs that cannot finish.
+    aggregate: min          # pessimistic on purpose; 256 was the best case
+    sources:
+      - kind: execution_regex
+        tool: hydra
+        pattern: '([0-9.]+) tries/min'
+
+  # ── whether a tool can work here at all ───────────────────────────────────
+  ssh_software:
+    type: string
+    default: unknown
+    description: SSH server software and version.
+    influences: [tool_compatibility]
+    sources:
+      - kind: finding
+        finding_type: ssh_config
+        path: software
+
+  ssh_banner:
+    type: string
+    default: unknown
+    description: Raw SSH identification banner.
+    influences: [tool_compatibility]
+    why: >
+      OpenSSH 4.7p1 offers only legacy MACs, and modern hydra offers only SHA2 —
+      so `hydra ssh://` cannot negotiate with this host at all and every SSH
+      brute-force proposal against it is dead on arrival.
+    sources:
+      - kind: finding
+        finding_type: ssh_config
+        path: banner
+
+  ssh_mac_algorithms:
+    type: list
+    default: []
+    description: MAC algorithms the SSH server offers.
+    influences: [tool_compatibility]
+    why: >
+      hydra could not negotiate SSH with this host at all — "kex error : no match
+      for method mac algo client->server". The server offers only legacy MACs
+      (hmac-md5, hmac-sha1, hmac-ripemd160 ...) while modern hydra offers only
+      SHA2 ones, so every SSH brute-force proposal against it is dead on arrival
+      and would be recorded as a scan that found nothing.
+    sources:
+      - kind: execution_regex
+        tool: ssh-audit
+        pattern: '^\(mac\)\s+(\S+)'
+
+  # ── web ───────────────────────────────────────────────────────────────────
+  waf_present:
+    type: boolean
+    default: null
+    description: Whether a web application firewall was detected.
+    influences: [scan_aggressiveness]
+    why: A WAF changes what a noisy scan costs, and what its results mean.
+    sources:
+      - kind: finding
+        finding_type: waf_detection
+        path: detected
+
+  waf_product:
+    type: string
+    default: unknown
+    description: The WAF product name, when one was identified.
+    influences: [scan_aggressiveness]
+    sources:
+      - kind: finding
+        finding_type: waf_detection
+        path: firewall
+
+  web_server:
+    type: string
+    default: unknown
+    description: Web server product and version.
+    influences: [tool_compatibility, wordlist_selection]
+    sources:
+      - kind: finding
+        finding_type: web_service
+        path: webserver
+
+  web_technologies:
+    type: list
+    default: []
+    description: Technologies fingerprinted on the web service.
+    influences: [wordlist_selection]
+    sources:
+      - kind: finding
+        finding_type: web_service
+        path: tech

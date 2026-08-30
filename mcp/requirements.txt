@@ -1,5 +1,17 @@
 # MCP Server Requirements
-mcp>=1.0.0
+#
+# Pinned below 2.0.0. The unpinned `mcp>=1.0.0` silently resolved to 2.0.0, which
+# removed the low-level `Server.list_tools` / `Server.call_tool` decorator API that
+# autogen-http-mcp-server.py, mcp-stdio-server.py and ollama-mcp-bridge.py are
+# written against — every one of them crash-looped on
+#   AttributeError: 'Server' object has no attribute 'list_tools'
+# the first time their image was rebuilt. Nothing in the repo changed; the
+# resolver just picked a new major on a fresh build, so the containers kept
+# working until something forced a rebuild.
+#
+# Raise this deliberately, together with porting those three files to the 2.x API
+# — not as a side effect of an unrelated rebuild.
+mcp>=1.0.0,<2.0.0
 httpx>=0.27.0
 
 # HTTP transport dependencies

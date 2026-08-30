@@ -11,12 +11,27 @@ Given raw stdout from a security tool execution, attempts to:
 import os
 import re
 import json
+try:  # etl is imported as a package from rag-api, bare from within etl/
+    from etl.sql_types import as_text_array
+except ImportError:  # pragma: no cover
+    from sql_types import as_text_array
 import uuid
 import ipaddress
 import logging
 from typing import Optional
 
 import psycopg2
+
+# Shared fingerprint helpers. This module previously used a LOCAL _fingerprint()
+# (md5 of its arguments joined by "|"), which produced hashes that could never
+# match the ones every other writer computes for the same finding — so a finding
+# recorded here and the same finding recorded by parse_nuclei/parse_nmap would
+# survive as two rows no matter how good the unique index was.
+from etl.fingerprint import vuln_fingerprint, web_fingerprint, recon_fingerprint
+try:
+    from scope_gate import load_ingest_scope, host_in_scope
+except ImportError:  # pragma: no cover
+    from etl.scope_gate import load_ingest_scope, host_in_scope
 from psycopg2.extras import RealDictCursor
 
 log = logging.getLogger(__name__)
@@ -74,7 +89,12 @@ def _resolve_asset_id(cur, target: str) -> Optional[str]:
         import uuid as _uuid
         asset_id = str(_uuid.uuid4())
         cur.execute(
-            "INSERT INTO assets (id, ip) VALUES (%s, %s) ON CONFLICT (ip) DO UPDATE SET ip = EXCLUDED.ip RETURNING id",
+            # Conflict target must match ix_assets_ip_hostname exactly — see
+            # etl/asset_utils.py. `ON CONFLICT (ip)` matches no index and
+            # raises InvalidColumnReference on every row.
+            "INSERT INTO assets (id, ip) VALUES (%s, %s) "
+            "ON CONFLICT (ip, COALESCE(hostname, '')) DO UPDATE SET last_seen = now() "
+            "RETURNING id",
             (asset_id, target),
         )
         row = cur.fetchone()
@@ -462,6 +482,7 @@ def structure_tool_output(
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            _enf_scope, _scope_rows = load_ingest_scope(cur)
             asset_id = _resolve_asset_id(cur, target)
 
             # --- Strategy 0: Tool-specific parser ---
@@ -506,7 +527,7 @@ def structure_tool_output(
                         cur.execute("SAVEPOINT tool_rec")
                         fid = _insert_table_row_finding(
                             cur, row, tool_name, target, port,
-                            service, asset_id, job_id
+                            service, asset_id, job_id, stdout
                         )
                         cur.execute("RELEASE SAVEPOINT tool_rec")
                         if fid:
@@ -544,6 +565,16 @@ def structure_tool_output(
                 for url in all_urls[:50]:  # cap at 50
                     try:
                         cur.execute("SAVEPOINT tool_rec")
+                        # Tool banners advertise their own project URLs —
+                        # nmap prints nmap.org, sqlmap prints sqlmap.org, and
+                        # several print github.com. Extracting URLs from stdout
+                        # therefore files findings against third-party hosts that
+                        # were never scanned. Four such rows appeared the moment
+                        # tool stdout started being ingested.
+                        if not host_in_scope(url, _enf_scope, _scope_rows):
+                            stats["out_of_scope"] = stats.get("out_of_scope", 0) + 1
+                            cur.execute("RELEASE SAVEPOINT tool_rec")
+                            continue
                         fid = _insert_web_finding(
                             cur, tool_name, url, target,
                             global_severity, job_id
@@ -676,9 +707,9 @@ def _insert_json_finding(cur, rec: dict, tool_name: str, target: str,
              rec_name or f"{tool_name} finding",
              rec_severity,
              json.dumps(rec, default=str)[:4000],
-             _CWE_RE.findall(json.dumps(rec)) or None,
+             as_text_array(_CWE_RE.findall(json.dumps(rec))),
              json.dumps({"cves": cve_list}) if cve_list else "{}",
-             _fingerprint(tool_name, rec_url, rec_name)),
+             web_fingerprint(rec_url, tool_name, rec_name, "tool_finding")),
         )
         row = cur.fetchone()
         return str(row["id"]) if row else fid
@@ -704,9 +735,9 @@ def _insert_json_finding(cur, rec: dict, tool_name: str, target: str,
             (fid, asset_id, port_id,
              f"{tool_name}:{rec_name or 'finding'}",
              json.dumps(rec, default=str)[:4000],
-             rec_severity, cve_list,
+             rec_severity, as_text_array(cve_list),
              json.dumps({"source": tool_name, "job_id": job_id, "port": port}),
-             _fingerprint(tool_name, rec_target, str(cve_list))),
+             vuln_fingerprint(rec_target, port, f"{tool_name}:{rec_name or 'finding'}", cve_list)),
         )
         row = cur.fetchone()
         return str(row["id"]) if row else fid
@@ -724,15 +755,30 @@ def _insert_json_finding(cur, rec: dict, tool_name: str, target: str,
          rec_target or target,
          json.dumps(data, default=str),
          rec_severity,
-         _fingerprint(tool_name, rec_target, json.dumps(rec, default=str)[:200])),
+         recon_fingerprint(tool_name, "tool_finding", rec_target or target,
+                           json.dumps(rec, default=str)[:200])),
     )
     return fid
 
 
 def _insert_table_row_finding(cur, row: dict, tool_name: str, target: str,
                               port: Optional[int], service: Optional[str],
-                              asset_id: Optional[str], job_id: Optional[str]) -> Optional[str]:
-    """Insert a parsed table row as a recon_finding."""
+                              asset_id: Optional[str], job_id: Optional[str],
+                              raw_output: Optional[str] = None) -> Optional[str]:
+    """Insert a parsed table row as a recon_finding.
+
+    `raw_output` is kept alongside the inferred columns because the inference is
+    frequently wrong. crackmapexec prints a whitespace-aligned SMB banner, which
+    the table strategy read as a header row — so the DATA became the column
+    NAMES:
+
+        keys: metasploitable, 445, smb, 192.168.1.150,
+              [*]_unix_(name:metasploitable)_(domain:localdomain)_(signing:false)_(smbv1:true)
+
+    Those rows exported cleanly and were useless to process. Structure inference
+    on arbitrary CLI output will keep guessing wrong; keeping the raw text means
+    a wrong guess costs fidelity in one field instead of losing the finding.
+    """
     # Try to extract a target from the row
     row_target = (row.get("host") or row.get("ip") or row.get("target")
                   or row.get("address") or target)
@@ -751,6 +797,8 @@ def _insert_table_row_finding(cur, row: dict, tool_name: str, target: str,
                 break
 
     data = dict(row)
+    if raw_output:
+        data["raw_output"] = raw_output[:8000]
     if job_id:
         data["job_id"] = job_id
     if port:
@@ -768,7 +816,8 @@ def _insert_table_row_finding(cur, row: dict, tool_name: str, target: str,
          row_target or target,
          json.dumps(data, default=str),
          severity,
-         _fingerprint(tool_name, row_target, json.dumps(row, default=str)[:200])),
+         recon_fingerprint(tool_name, "tool_finding", row_target or target,
+                           json.dumps(row, default=str)[:200])),
     )
     return fid
 
@@ -797,9 +846,9 @@ def _insert_vuln_finding(cur, tool_name: str, target: str, port: Optional[int],
         (fid, asset_id, port_id,
          f"{tool_name}:targeted-recon",
          stdout[:4000],
-         severity, cves[:10],
+         severity, as_text_array(cves[:10]),
          json.dumps({"source": tool_name, "job_id": job_id, "port": port}),
-         _fingerprint(tool_name, target, str(cves[:3]))),
+         vuln_fingerprint(target, port, f"{tool_name}:targeted-recon", cves)),
     )
     row = cur.fetchone()
     return str(row["id"]) if row else fid
@@ -819,12 +868,13 @@ def _insert_web_finding(cur, tool_name: str, url: str, target: str,
          f"URL discovered by {tool_name}",
          "info",
          f"Found during targeted recon of {target}",
-         _fingerprint(tool_name, url, "discovered_url")),
+         web_fingerprint(url, tool_name, f"URL discovered by {tool_name}", "discovered_url")),
     )
     row = cur.fetchone()
     return str(row["id"]) if row else fid
 
 
-def _fingerprint(*parts) -> str:
-    import hashlib
-    return hashlib.md5("|".join(str(p) for p in parts).encode()).hexdigest()
+# _fingerprint() removed. It was md5 of its arguments joined by "|", a scheme
+# unique to this module, so a finding recorded here could never match the same
+# finding recorded by any other parser and both rows survived the unique index.
+# All call sites now use the shared helpers in etl/fingerprint.py.

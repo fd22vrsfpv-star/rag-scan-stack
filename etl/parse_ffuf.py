@@ -3,6 +3,12 @@ from urllib.parse import urlparse
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 
+try:
+    from scope_gate import load_ingest_scope, host_in_scope
+except ImportError:  # pragma: no cover — etl/ may already be on PYTHONPATH
+    from etl.scope_gate import load_ingest_scope, host_in_scope
+
+
 DB_DSN = os.environ.get("DB_DSN", "postgresql://app:app@rag-postgres:5432/scans")
 
 def _ensure_asset(cur, ip_str):
@@ -15,7 +21,7 @@ def _ensure_asset(cur, ip_str):
     row = cur.fetchone()
     if row:
         asset_id = str(row["id"])
-        cur.execute("UPDATE assets SET updated_at=now() WHERE id=%s", (asset_id,))
+        cur.execute("UPDATE assets SET last_seen=now() WHERE id=%s", (asset_id,))
         return asset_id
     asset_id = str(uuid.uuid4())
     cur.execute("INSERT INTO assets (id, ip) VALUES (%s,%s)", (asset_id, ip))
@@ -34,7 +40,7 @@ def parse_ffuf(path: str, profile: str = "upload", job_id: str = None):
       ]
     }
     """
-    stats = dict(records_seen=0, assets_upserted=0, recon_findings_inserted=0, skipped=0, errors=0, error_examples=[])
+    stats = dict(out_of_scope=0, records_seen=0, assets_upserted=0, recon_findings_inserted=0, skipped=0, errors=0, error_examples=[])
 
     try:
         with open(path) as f:
@@ -52,10 +58,17 @@ def parse_ffuf(path: str, profile: str = "upload", job_id: str = None):
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            _enforce_scope, _scope_rows = load_ingest_scope(cur)
             for rec in results:
                 try:
                     cur.execute("SAVEPOINT rec_sp")
                     url = rec.get("url", "")
+                    # Ingest scope gate: never record a host the engagement
+                    # does not cover, whatever the tool reported.
+                    if not host_in_scope(url, _enforce_scope, _scope_rows):
+                        stats["out_of_scope"] = stats.get("out_of_scope", 0) + 1
+                        cur.execute("RELEASE SAVEPOINT rec_sp")
+                        continue
                     status_code = rec.get("status", 0)
                     if not url:
                         stats["skipped"] += 1

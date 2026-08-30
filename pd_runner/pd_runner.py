@@ -13,6 +13,9 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.responses import HTMLResponse, Response, FileResponse
 from pydantic import BaseModel
 import uvicorn, requests
+# Shared job runner, delivered by the rag-common base image
+# (common/tool_job.py). Both runners previously carried their own copy.
+from tool_job import run_tool_job
 
 logging.basicConfig(level=logging.INFO)
 
@@ -237,7 +240,8 @@ def _read_jsonl(path: str) -> list:
     return results
 
 
-def _ingest_results(tool: str, output_path: str, job_id: str = None) -> dict:
+def _ingest_results(tool: str, output_path: str, job_id: str = None,
+                    source: str = None) -> dict:
     """POST results file to rag-api ingest endpoint."""
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
         return {"ok": True, "skipped": "no output"}
@@ -247,6 +251,10 @@ def _ingest_results(tool: str, output_path: str, job_id: str = None) -> dict:
         params = {}
         if job_id:
             params["job_id"] = job_id
+        # Distinguishes the TOOL that produced the file from the PARSER used to
+        # read it, when one tool's output is ingested in another's format.
+        if source:
+            params["source"] = source
         r = requests.post(f"{API_BASE}/ingest/{tool}", files=files, headers=headers, params=params, timeout=300, verify=False)
         r.raise_for_status()
         return r.json()
@@ -259,84 +267,59 @@ def _ingest_results(tool: str, output_path: str, job_id: str = None) -> dict:
 # Tool Runner Functions
 # ===============================
 
-def _run_tool_job(job_id: str, tool: str, cmd: list, targets_file: str, output_file: str, ingest_as: str = None, env: dict = None, no_ingest: bool = False):
-    """Generic background job runner for PD tools."""
+# ── Scope gate ────────────────────────────────────────────────────────────
+# Shared implementation from etl/scope_gate.py (bind-mounted at /runner/etl).
+# This runner writes its targets to a FILE and hands the path to the tool, so
+# the file is what actually decides where packets go — that is what gets
+# checked, not just the request arguments.
+try:
+    from etl.scope_gate import check_targets_file, load_dispatch_scope
+    SCOPE_GATE_AVAILABLE = True
+except Exception as _scope_err:                 # pragma: no cover
+    SCOPE_GATE_AVAILABLE = False
+    logging.error("scope gate UNAVAILABLE (%s) — jobs will be refused. "
+                  "Check the ./etl:/runner/etl mount.", _scope_err)
+
+
+def _scope_refusal_for_targets(targets_file: str):
+    """Refusal string when a targets file is out of scope, else None.
+
+    Fails CLOSED: an unavailable gate or unreadable scope refuses the job. A
+    scanner that cannot tell whether it is authorised must not scan.
+    """
+    if not SCOPE_GATE_AVAILABLE:
+        return "scope gate unavailable (etl/scope_gate not importable) — refusing"
     try:
-        import time as _time
-        _t0 = _time.time()
-        cmd_str = " ".join(cmd)
-        _job_tracker.update_job(job_id, status="running", started_at=datetime.now().isoformat())
-        _job_tracker.push_command(job_id, tool, cmd_str)
-        _job_tracker.update_progress(job_id, stage="running")
+        _c = conn()
+        try:
+            with _c.cursor() as cur:
+                rows, _src = load_dispatch_scope(cur)
+        finally:
+            _c.close()
+    except Exception as exc:
+        return f"scope could not be read ({exc}) — refusing"
+    return check_targets_file(targets_file, rows)
 
-        emit_webhook_event("scan_started", tool, {"job_id": job_id, "scan_type": tool})
-        write_audit("scan_started", tool, "pd_runner", {
-            "job_id": job_id, "execution_mode": "local", "command": cmd_str,
-        })
 
-        logging.info(f"[{job_id}] Running {tool}: {cmd_str}")
-        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, env=env)
+def _run_tool_job(job_id: str, tool: str, cmd: list, targets_file: str, output_file: str, ingest_as: str = None, env: dict = None, no_ingest: bool = False):
+    """Run one tool job. The implementation is shared — see common/tool_job.py.
 
-        if cp.returncode not in (0, 1):
-            raise RuntimeError(f"{tool} exit {cp.returncode}: {cp.stderr[:500]}")
-
-        # Count results
-        findings_count = 0
-        raw_output = ""
-        if os.path.exists(output_file):
-            with open(output_file) as f:
-                content = f.read()
-                findings_count = sum(1 for line in content.splitlines() if line.strip())
-                raw_output = content[:10000]  # cap raw output for test mode
-        _job_tracker.update_progress(job_id, findings_count=findings_count)
-
-        # Ingest (skip if no_ingest / test mode)
-        ing = None
-        if no_ingest:
-            logging.info(f"[{job_id}] no_ingest=true, skipping ingestion")
-        else:
-            _job_tracker.update_progress(job_id, stage="ingesting")
-            ingest_tool = ingest_as or tool
-            ing = _ingest_results(ingest_tool, output_file, job_id=job_id)
-
-        _job_tracker.update_progress(job_id, stage="done")
-        duration_s = round(_time.time() - _t0, 2)
-        result_data = {"ok": True, "findings_count": findings_count, "report": output_file, "ingest": ing, "no_ingest": no_ingest, "command": cmd_str, "duration_s": duration_s}
-        if no_ingest:
-            result_data["raw_output"] = raw_output
-            result_data["stdout"] = cp.stdout[-2000:] if cp.stdout else None
-            result_data["stderr"] = cp.stderr[-2000:] if cp.stderr else None
-        _job_tracker.update_job(
-            job_id, status="completed",
-            result=result_data,
-            completed_at=datetime.now().isoformat(),
-        )
-        emit_webhook_event("scan_completed", tool, {"job_id": job_id, "findings_count": findings_count})
-        write_audit("scan_completed", tool, "pd_runner", {
-            "job_id": job_id, "findings_count": findings_count,
-            "duration_s": duration_s, "command": cmd_str,
-        })
-
-        # Save session results
-        if not no_ingest:
-            _save_session_results(job_id, tool, "pd-runner", [output_file],
-                                  metadata={"findings_count": findings_count})
-
-    except Exception as e:
-        _job_tracker.update_job(job_id, status="failed", error=str(e), completed_at=datetime.now().isoformat())
-        _job_tracker.update_progress(job_id, stage="failed")
-        emit_webhook_event("scan_failed", tool, {"job_id": job_id, "error": str(e)})
-        write_audit("scan_failed", tool, "pd_runner", {
-            "job_id": job_id, "error": str(e),
-        })
-        logging.error(f"[{job_id}] {tool} failed: {e}")
-    finally:
-        # Cleanup targets file
-        if targets_file and os.path.exists(targets_file):
-            try:
-                os.remove(targets_file)
-            except OSError:
-                pass
+    This module previously carried its own copy. The two copies had drifted,
+    with improvements stranded in one of them, so the shared version is the
+    union and this service gains whatever it was missing.
+    """
+    run_tool_job(
+        job_id=job_id, tool=tool, cmd=cmd, targets_file=targets_file,
+        output_file=output_file, ingest_as=ingest_as, env=env, no_ingest=no_ingest,
+        service_name="pd_runner", session_label="pd-runner",
+        job_tracker=_job_tracker,
+        emit_webhook_event=emit_webhook_event,
+        write_audit=write_audit,
+        ingest_results=_ingest_results,
+        scope_refusal=_scope_refusal_for_targets,
+        save_session_results=_save_session_results,
+        on_success=None,
+    )
 
 
 # ===============================
@@ -391,7 +374,11 @@ class HttpxReq(BaseModel):
 
 class NaabuReq(BaseModel):
     targets: List[str]
-    ports: Optional[str] = "1-1000"
+    # None means "not specified" — run_naabu then falls back to naabu's own
+    # -top-ports 1000, the frequency-ranked list. The previous "1-1000" default
+    # was the first 1000 port NUMBERS, which misses mysql 3306, postgresql 5432,
+    # vnc 5900 and tomcat 8180, and applied to every caller that omitted the field.
+    ports: Optional[str] = None
     rate: Optional[int] = 1000
     top_ports: Optional[str] = None
     proxy: Optional[str] = None
@@ -408,6 +395,12 @@ class KatanaReq(BaseModel):
     filter_similar: Optional[bool] = True       # collapse /users/123 and /users/456
     proxy: Optional[str] = None
     no_ingest: Optional[bool] = False
+    # Crawl scope. katana's default is "rdn" (root domain), which is far too
+    # loose for an engagement: crawling a Metasploitable TWiki instance followed
+    # links off-host and issued requests to twiki.org, twitter.com, youtube.com,
+    # wikipedia and others — third parties that are not in anyone's scope. "fqdn"
+    # keeps the crawler on the exact host it was pointed at.
+    field_scope: Optional[str] = "fqdn"          # fqdn | rdn | dn, or a regex
 
 class TlsxReq(BaseModel):
     targets: Any = None  # list or "from_db"
@@ -524,6 +517,13 @@ def run_naabu(req: NaabuReq, background_tasks: BackgroundTasks):
         cmd.extend(["-rate", str(req.rate)])
     if req.top_ports:
         cmd.extend(["-top-ports", req.top_ports])
+    # Neither given: naabu supports -top-ports natively, so the frequency-ranked
+    # top-1000 costs nothing to express here and needs no profile lookup — unlike
+    # masscan, which has no such flag and forces profiles to resolve to explicit
+    # lists. Without this, omitting ports fell through to naabu's own default of
+    # its top-100, a tenth of the intended scope.
+    if not req.ports and not req.top_ports:
+        cmd.extend(["-top-ports", "1000"])
     if req.proxy:
         cmd.extend(["-proxy", req.proxy])
 
@@ -554,6 +554,12 @@ def run_katana(req: KatanaReq, background_tasks: BackgroundTasks):
 
     cmd = ["katana", "-list", targets_file, "-jsonl", "-o", output_file, "-silent",
            "-depth", str(req.depth or 3)]
+    # Keep the crawler on the target host. Without this katana uses its default
+    # root-domain scope and will follow off-site links out of the engagement —
+    # a real authorization problem, not just noisy data, because it means the
+    # scanner sends traffic to third-party sites during an engagement.
+    if req.field_scope:
+        cmd.extend(["-field-scope", req.field_scope])
     if req.js_crawl:
         cmd.append("-js-crawl")
     if req.xhr_extraction:

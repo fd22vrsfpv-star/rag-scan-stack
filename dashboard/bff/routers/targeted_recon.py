@@ -52,7 +52,11 @@ SAFE_TOOLS = {
 # Default wordlist paths (must match service_tools.yaml defaults)
 _WORDLIST_DEFAULTS = {
     "wordlist_usernames": "/usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt",
-    "wordlist_passwords": "/usr/share/wordlists/rockyou.txt",
+    # Was rockyou.txt (14,344,399 lines). Paired with the 17-name userlist that
+    # is 243,854,783 candidates — 15,875 hours at the observed rate — which the
+    # listener's candidate-space guard now refuses outright.
+    "wordlist_passwords": ("/usr/share/wordlists/seclists/Passwords/"
+                           "Common-Credentials/top-passwords-shortlist.txt"),
     "wordlist_dirs": "/usr/share/wordlists/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt",
     "wordlist_subdomains": "/usr/share/wordlists/seclists/Discovery/DNS/subdomains-top1million-5000.txt",
 }
@@ -69,7 +73,7 @@ async def _load_wordlist_paths(s) -> dict[str, str]:
         return _wordlist_cache["paths"]
     overrides = {}
     try:
-        async with httpx.AsyncClient(verify=False, timeout=5) as c:
+        async with httpx.AsyncClient(timeout=5) as c:
             for key, default in _WORDLIST_DEFAULTS.items():
                 try:
                     resp = await c.get(
@@ -134,7 +138,7 @@ async def targeted_recon_lookup(req: ReconLookupRequest):
             params["banner"] = req.banner
         params["persist"] = "false"  # don't persist recommendation, just lookup
 
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             resp = await c.get(
                 f"{s.scan_recommender_url}/next_scan",
                 params=params,
@@ -160,7 +164,7 @@ async def targeted_recon_lookup(req: ReconLookupRequest):
         try:
             svc_name = req.service or PORT_SERVICE_MAP.get(req.port, "")
             svc_port = req.port or 0
-            async with httpx.AsyncClient(verify=False, timeout=10) as c:
+            async with httpx.AsyncClient(timeout=10) as c:
                 resp = await c.get(
                     f"{s.scan_recommender_url}/kb/services/{svc_name}",
                     params={"port": svc_port} if svc_port else {},
@@ -269,7 +273,7 @@ async def targeted_recon_lookup(req: ReconLookupRequest):
     # Fetch available nodes for the dropdown
     nodes = []
     try:
-        async with httpx.AsyncClient(verify=False, timeout=5) as c:
+        async with httpx.AsyncClient(timeout=5) as c:
             resp = await c.get(f"{s.tunnel_manager_url}/nodes")
             if resp.status_code == 200:
                 for n in resp.json().get("nodes", []):
@@ -350,7 +354,7 @@ async def targeted_recon_execute(req: ReconExecuteRequest):
     last_status = 500
     for attempt in range(3):
         try:
-            async with httpx.AsyncClient(verify=False, timeout=req.timeout + 10) as c:
+            async with httpx.AsyncClient(timeout=req.timeout + 10) as c:
                 exec_resp = await c.post(
                     f"{s.tunnel_manager_url}/ssh/{req.node_id}/exec",
                     json={"command": command, "timeout": req.timeout},
@@ -402,7 +406,7 @@ async def targeted_recon_execute(req: ReconExecuteRequest):
     if has_file_output and ingest_type:
         try:
             # Download the output file from the remote node
-            async with httpx.AsyncClient(verify=False, timeout=60) as c:
+            async with httpx.AsyncClient(timeout=60) as c:
                 dl_resp = await c.post(
                     f"{s.tunnel_manager_url}/ssh/{req.node_id}/download",
                     json={"remote_path": _extract_output_path(output_flag)},
@@ -428,7 +432,7 @@ async def targeted_recon_execute(req: ReconExecuteRequest):
     # Step 3: Structure stdout via /ingest/tool-output
     if stdout.strip() and req.auto_ingest:
         try:
-            async with httpx.AsyncClient(verify=False, timeout=30) as c:
+            async with httpx.AsyncClient(timeout=30) as c:
                 struct_resp = await c.post(
                     f"{s.rag_api_url}/ingest/tool-output",
                     headers={"x-api-key": s.api_key, **engagement_headers()},

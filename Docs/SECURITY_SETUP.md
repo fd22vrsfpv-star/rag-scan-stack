@@ -53,6 +53,43 @@ The `generate-credentials.sh` script creates a secure `.env` file with cryptogra
 - Sets restrictive file permissions (`chmod 600`)
 - Provides clear documentation and warnings
 
+### ⚠️ Credentials that BOTH sides must agree on
+
+Most credentials in `.env` are consumed by exactly one service. A few are read by
+**two** services that must agree, and changing one without recreating the other
+breaks the pair. Because the failing side reports an *authentication* error rather
+than a *mismatch* error, these are easy to misdiagnose.
+
+| Variable | Read by | If you change it |
+|----------|---------|------------------|
+| `MSF_RPC_USER` / `MSF_RPC_PASS` | `metasploit` (starts `msfrpcd` with them) **and** `exploit-runner` (authenticates with them) | **Recreate `metasploit`, not just restart it.** The command line is fixed at container creation, so a restart keeps the old credential. |
+| `API_KEY` | `rag-api` (validates) and every service that queries it | Recreate all API consumers |
+| `POSTGRES_PASSWORD` | `rag-postgres` and every DB client | See "Database Security" below |
+
+```bash
+# After changing MSF_RPC_USER / MSF_RPC_PASS in .env:
+docker compose up -d --force-recreate --no-deps metasploit exploit-runner
+
+# Verify the two sides agree — this must return HTTP 200, not 500:
+docker exec exploit-runner curl -sk -o /dev/null -w '%{http_code}\n' \
+  http://localhost:8017/msf/jobs
+```
+
+**Why this warning exists.** `docker-compose.yml` previously started `msfrpcd`
+with a hardcoded `-U msf -P msf` while `exploit-runner` authenticated using
+`${MSF_RPC_PASS}` from `.env`. The moment that variable held a real value the two
+disagreed, msfrpcd answered every login with `Login Failed`, and — because the
+client carried on without a token — the operator saw the far more misleading
+`Invalid Authentication Token`. `/msf/jobs` and `/msf/sessions` returned HTTP 500
+until the credentials were realigned. The compose file now passes the env vars
+through, so one `.env` value drives both sides; the recreate requirement remains.
+
+**Symptom to recognise:** `exploit-runner` logs showing
+`MSF login error: MSF RPC error: Login Failed` mean the credentials disagree — not
+that the token expired. If instead you see
+`MSF authentication failed — check MSF_RPC_USER / MSF_RPC_PASS ...`, that is the
+client telling you the same thing directly.
+
 ### Step 2: Initial Container Startup
 
 ```bash

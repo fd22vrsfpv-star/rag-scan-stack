@@ -1,6 +1,8 @@
 # Python runtime with pre-built Go binaries
 # Binaries are built by: scripts/build-go-tools.sh → pd_runner/bin/
-FROM python:3.12-slim
+# Shared modules (validation, tool_job) come from this base — see
+# common/Dockerfile. Build it first: scripts/build-base-image.sh
+FROM rag-common:latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl dnsutils libpcap-dev \
@@ -32,7 +34,9 @@ COPY pd_runner/requirements.txt /runner/requirements.txt
 RUN pip install --no-cache-dir -r /runner/requirements.txt
 
 COPY pd_runner/pd_runner.py     /runner/pd_runner.py
-COPY pd_runner/validation.py    /runner/validation.py
+# validation.py now comes from the rag-common base image; the per-service
+# copy was deleted. Seven copies existed and one had drifted with a real
+# fix stranded in it.
 COPY pd_runner/log_manager.py   /runner/log_manager.py
 
 EXPOSE 8023

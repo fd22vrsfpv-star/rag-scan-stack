@@ -24,21 +24,21 @@ async def register_node(node_id: str = Query(...), node_name: str = Query(...), 
     params = {"node_id": node_id, "node_name": node_name}
     if owner:
         params["owner"] = owner
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.post(_api("/sync/register-node"), params=params, headers=_headers())
     return r.json()
 
 
 @router.get("/nodes")
 async def list_nodes():
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.get(_api("/sync/nodes"), headers=_headers())
     return r.json()
 
 
 @router.get("/status")
 async def sync_status(node_id: str = Query("local")):
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.get(_api("/sync/status"), params={"node_id": node_id}, headers=_headers())
     return r.json()
 
@@ -48,7 +48,7 @@ async def get_changes(since_lsn: int = Query(0), limit: int = Query(1000), table
     params = {"since_lsn": since_lsn, "limit": limit}
     if table:
         params["table"] = table
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.get(_api("/sync/changes"), params=params, headers=_headers())
     return r.json()
 
@@ -60,7 +60,7 @@ async def apply_changes(
     strategy: str = Query("last_write_wins"),
 ):
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.post(
             _api("/sync/apply"),
             params={"node_id": node_id, "strategy": strategy},
@@ -72,21 +72,21 @@ async def apply_changes(
 
 @router.post("/push")
 async def push_changes(node_id: str = Query(...)):
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.post(_api("/sync/push"), params={"node_id": node_id}, headers=_headers())
     return r.json()
 
 
 @router.get("/conflicts")
 async def list_conflicts(status: str = Query("pending"), limit: int = Query(50)):
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.get(_api("/sync/conflicts"), params={"status": status, "limit": limit}, headers=_headers())
     return r.json()
 
 
 @router.patch("/conflicts/{conflict_id}")
 async def resolve_conflict(conflict_id: str, resolution: str = Query(...), resolved_by: str = Query("user")):
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.patch(
             _api(f"/sync/conflicts/{conflict_id}"),
             params={"resolution": resolution, "resolved_by": resolved_by},
@@ -100,7 +100,7 @@ async def create_snapshot(node_id: str = Query(...), tables: str = Query(None)):
     params = {"node_id": node_id}
     if tables:
         params["tables"] = tables
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.post(_api("/sync/snapshot"), params=params, headers=_headers())
     return r.json()
 
@@ -125,7 +125,7 @@ async def sync_schema():
     """Apply local schema (DDL) to the remote database via the tunnel."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=300) as c:
+        async with httpx.AsyncClient(timeout=300) as c:
             resp = await c.post(f"{s.container_logs_url}/db/sync-schema", timeout=280)
             if resp.status_code >= 400:
                 return {"ok": False, "error": f"Schema sync failed: HTTP {resp.status_code}: {resp.text[:200]}"}
@@ -157,7 +157,7 @@ async def push_to_remote(
     h = _headers()
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             try:
                 mode_resp = await c.get(f"{s.container_logs_url}/db/config")
                 mode = mode_resp.json().get("mode", "local")
@@ -166,7 +166,7 @@ async def push_to_remote(
 
         # Delegate to container-logs service which has psycopg2 and Docker SDK
         # It connects directly to both local postgres and remote via tunnel
-        async with httpx.AsyncClient(verify=False, timeout=300) as c:
+        async with httpx.AsyncClient(timeout=300) as c:
             resp = await c.post(
                 f"{s.container_logs_url}/db/sync-push",
                 timeout=280,
@@ -196,7 +196,7 @@ async def pull_from_remote(
 
     try:
         # Check mode
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             try:
                 mode_resp = await c.get(f"{s.container_logs_url}/db/config")
                 mode = mode_resp.json().get("mode", "local")
@@ -234,7 +234,7 @@ async def reset_watermark(node_id: str = Query("local")):
     h = _headers()
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        async with httpx.AsyncClient(timeout=30) as c:
             # Get current max LSN
             status_resp = await c.get(
                 _api("/sync/status"), params={"node_id": node_id}, headers=h,

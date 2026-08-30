@@ -10,7 +10,7 @@ router = APIRouter()
 @router.get("/api/wordlists")
 async def list_wordlists():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/wordlists",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -24,7 +24,7 @@ async def list_wordlists():
 async def upload_wordlist(file: UploadFile = File(...), list_type: str = "passwords", description: str = None):
     s = get_settings()
     content = await file.read()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         files = {"file": (file.filename, content, file.content_type or "text/plain")}
         params = {"list_type": list_type}
         if description:
@@ -43,7 +43,7 @@ async def upload_wordlist(file: UploadFile = File(...), list_type: str = "passwo
 @router.delete("/api/wordlists/{wordlist_id}")
 async def delete_wordlist(wordlist_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/wordlists/{wordlist_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},

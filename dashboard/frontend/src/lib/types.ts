@@ -31,6 +31,11 @@ export interface Port {
 
 export interface Finding {
   id?: string
+  // Virtual-host rollup. problem_id groups the same underlying problem across
+  // the vhosts of one machine; affects_hosts is how many show it (1 = this host
+  // only). null problem_id means the finding could not be grouped.
+  problem_id?: string | null
+  affects_hosts?: number
   title: string
   severity: string
   source: string
@@ -170,10 +175,19 @@ export interface HealthResponse {
 
 export interface FindingsResponse {
   findings: Finding[]
+  /** Row count for the active filter — drives pagination, so it counts one row
+   *  per virtual host rather than one per underlying problem. */
   total: number
   aggregations: {
+    /** GLOBAL row counts, ignoring the query filters. by_source is relied on to
+     *  keep every source chip visible as filters narrow. */
     by_severity: Record<string, number>
     by_source: Record<string, number>
+    /** FILTERED and collapsed to one entry per underlying problem. */
+    problems_by_severity?: Record<string, number>
+    problems_by_source?: Record<string, number>
+    distinct_problems?: number
+    shared_problems?: number
   }
 }
 

@@ -67,7 +67,6 @@ claude_desktop_config*.json
 *.backup
 bs.out
 test_*.sh
-pytest.ini
 
 # Development
 requirements-dev.txt
@@ -198,3 +197,8 @@ logs/
 # Wordlist payloads — populated by scripts/install-wordlists.sh (rockyou ~134MB, SecLists ~30MB)
 wordlists/*
 !wordlists/.gitkeep
+certs/ca-bundle.crt
+
+# Generated report/export artifacts (PDF/CSV/URL lists from the export endpoints
+# and ad-hoc extracts). Deliverables, not source.
+exports/

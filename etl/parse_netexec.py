@@ -2,6 +2,12 @@ import os, json, uuid, re, ipaddress
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 
+try:
+    from scope_gate import load_ingest_scope, host_in_scope
+except ImportError:  # pragma: no cover
+    from etl.scope_gate import load_ingest_scope, host_in_scope
+
+
 DB_DSN = os.environ.get("DB_DSN", "postgresql://app:app@rag-postgres:5432/scans")
 
 def _ensure_asset(cur, ip_str):
@@ -14,7 +20,7 @@ def _ensure_asset(cur, ip_str):
     row = cur.fetchone()
     if row:
         asset_id = str(row["id"])
-        cur.execute("UPDATE assets SET updated_at=now() WHERE id=%s", (asset_id,))
+        cur.execute("UPDATE assets SET last_seen=now() WHERE id=%s", (asset_id,))
         return asset_id
     asset_id = str(uuid.uuid4())
     cur.execute("INSERT INTO assets (id, ip) VALUES (%s,%s)", (asset_id, ip))
@@ -42,7 +48,7 @@ def parse_netexec(path: str, profile: str = "upload", job_id: str = None):
     SMB  192.168.1.100  445  DC01  [-] DOMAIN\user:wrongpass STATUS_LOGON_FAILURE
     SMB  192.168.1.100  445  DC01  [*] Windows Server 2019
     """
-    stats = dict(records_seen=0, assets_upserted=0, recon_findings_inserted=0,
+    stats = dict(out_of_scope=0, records_seen=0, assets_upserted=0, recon_findings_inserted=0,
                  credential_successes=0, skipped=0, errors=0, error_examples=[])
 
     lines = []
@@ -58,6 +64,7 @@ def parse_netexec(path: str, profile: str = "upload", job_id: str = None):
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            _enforce_scope, _scope_rows = load_ingest_scope(cur)
             for line in lines:
                 try:
                     cur.execute("SAVEPOINT rec_sp")
@@ -66,6 +73,11 @@ def parse_netexec(path: str, profile: str = "upload", job_id: str = None):
                     if m:
                         protocol = m.group(1).lower()
                         ip = m.group(2)
+                        # Ingest scope gate: netexec output can name hosts discovered on the segment, not just the target.
+                        if not host_in_scope(ip, _enforce_scope, _scope_rows):
+                            stats["out_of_scope"] = stats.get("out_of_scope", 0) + 1
+                            cur.execute("RELEASE SAVEPOINT rec_sp")
+                            continue
                         port = int(m.group(3))
                         host_name = m.group(4)
                         domain = m.group(5)

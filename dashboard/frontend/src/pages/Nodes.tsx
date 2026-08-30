@@ -1556,7 +1556,7 @@ function WireGuardTunnels() {
       if (response.ok && result.proxy) {
         alert(`✅ WireGuard peer "${peer.name}" is reachable!\n\nSOCKS Proxy: ${result.proxy}\nStatus: ${result.status || 'online'}`)
       } else {
-        alert(`❌ WireGuard peer "${peer.name}" connectivity test failed.\n\nError: ${result.error || 'No proxy available'}\n\nCheck that WireGuard tunnel is active and microsocks is running on the remote node.`)
+        alert(`❌ WireGuard peer "${peer.name}" connectivity test failed.\n\nError: ${result.error || 'No proxy available'}\n\nCheck that WireGuard tunnel is active and danted is running on the remote node (systemctl status danted).`)
       }
     } catch (error) {
       alert(`❌ Test failed for "${peer.name}"\n\nError: ${error}\n\nCheck network connectivity and WireGuard configuration.`)

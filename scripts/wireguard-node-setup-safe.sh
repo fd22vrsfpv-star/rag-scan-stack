@@ -213,45 +213,75 @@ case $OS in
         ;;
 esac
 
-# Install microsocks (SOCKS5 proxy)
-log "Installing microsocks SOCKS5 proxy..."
+# SOCKS proxy: dante-server, not microsocks.
+#
+# microsocks was fetched from
+#   github.com/rofl0r/microsocks/releases/download/v1.0.3/microsocks-linux-x86_64
+# which 404s — that project ships SOURCE-ONLY releases and has never published a
+# binary. `curl -L -o` without -f returns exit 0 on a 404, so the `|| error`
+# guard never fired: it wrote the 9-byte "Not Found" body to
+# /usr/local/bin/microsocks and marked it executable.
+#
+# dante-server is packaged, systemd-managed, logs to syslog, and — unlike
+# microsocks, which accepts anyone who can reach its bind address — enforces
+# access control, so the node is not an open SOCKS relay.
+#
+# Binary/config/service names differ by distro: Debian/Ubuntu ship danted +
+# /etc/danted.conf, EPEL ships sockd + /etc/sockd.conf. Both are detected.
+log "Installing dante-server SOCKS5 proxy..."
 
-MICROSOCKS_VERSION="v1.0.3"
-MICROSOCKS_URL="https://github.com/rofl0r/microsocks/releases/download/${MICROSOCKS_VERSION}/microsocks-linux-x86_64"
+case $OS in
+    "ubuntu"|"debian")
+        apt-get install -y dante-server || warn "dante-server package install reported an error"
+        ;;
+    "centos"|"rhel"|"fedora"|"rocky"|"almalinux")
+        dnf install -y dante-server || yum install -y dante-server || \
+            warn "dante-server package install reported an error"
+        ;;
+    "arch")
+        # `dante` is AUR-only on Arch; there is no official package to install.
+        warn "dante is AUR-only on Arch — install it manually (e.g. 'yay -S dante') before creating a peer"
+        ;;
+esac
 
-if command -v microsocks >/dev/null 2>&1; then
-    warn "microsocks already installed, skipping..."
-else
-    log "Downloading microsocks ${MICROSOCKS_VERSION}..."
-    curl -L -o /tmp/microsocks "$MICROSOCKS_URL" || error "Failed to download microsocks"
+# Resolve the binary the distro actually installed. /usr/sbin is not always on
+# root's PATH under a non-login SSH shell, so probe the paths directly too.
+DANTE_BIN=""
+for cand in danted sockd /usr/sbin/danted /usr/sbin/sockd; do
+    if command -v "$cand" >/dev/null 2>&1 || [ -x "$cand" ]; then
+        DANTE_BIN="$cand"
+        break
+    fi
+done
 
-    chmod +x /tmp/microsocks
-    mv /tmp/microsocks /usr/local/bin/microsocks
-
-    log "✅ microsocks installed to /usr/local/bin/microsocks"
+if [[ -z "$DANTE_BIN" ]]; then
+    error "dante-server did not install — no danted/sockd binary found. The SOCKS proxy cannot start without it."
 fi
 
-# Create systemd service for microsocks
-log "Creating systemd service for microsocks..."
-cat > /etc/systemd/system/microsocks.service << 'EOF'
-[Unit]
-Description=microsocks SOCKS5 proxy for WireGuard
-After=network.target wg-quick@wg0.service
-Wants=wg-quick@wg0.service
+case "$DANTE_BIN" in
+    *sockd) DANTE_SVC="sockd"; DANTE_CONF="/etc/sockd.conf" ;;
+    *)      DANTE_SVC="danted"; DANTE_CONF="/etc/danted.conf" ;;
+esac
 
-[Service]
-Type=simple
-User=nobody
-Group=nogroup
-ExecStart=/usr/local/bin/microsocks -i 10.66.0.0 -p 1080
-Restart=always
-RestartSec=5
+log "✅ dante-server installed (binary=$DANTE_BIN, service=$DANTE_SVC, config=$DANTE_CONF)"
 
-[Install]
-WantedBy=multi-user.target
-EOF
-
+# The packaged unit auto-starts against a stub config and crash-loops until a
+# real one exists. The config needs the wg0 address, which is not assigned until
+# a peer is created — so hold the service down here and let wg-rag-helper start
+# it once wg0 is up.
+systemctl stop "$DANTE_SVC" >/dev/null 2>&1 || true
+systemctl disable "$DANTE_SVC" >/dev/null 2>&1 || true
 systemctl daemon-reload
+
+# Record what wg-rag-helper should drive, so the helper does not have to repeat
+# the distro detection at runtime.
+cat > /etc/default/wg-rag-socks << EOF
+# Written by wireguard-node-setup-safe.sh — consumed by wg-rag-helper.
+DANTE_SVC=$DANTE_SVC
+DANTE_CONF=$DANTE_CONF
+WG_SUBNET=10.66.0.0/24
+SOCKS_PORT=1080
+EOF
 
 # Create WireGuard directory
 log "Creating WireGuard configuration directory..."
@@ -269,16 +299,69 @@ cat > /usr/local/bin/wg-rag-helper << 'EOF'
 #!/bin/bash
 # WireGuard RAG Scan Stack Helper
 
+DANTE_SVC="danted"
+DANTE_CONF="/etc/danted.conf"
+WG_SUBNET="10.66.0.0/24"
+SOCKS_PORT="1080"
+[ -r /etc/default/wg-rag-socks ] && . /etc/default/wg-rag-socks
+
+# danted binds `internal` at startup, so wg0 must already carry its address
+# before the service starts — and the address is only known after a peer config
+# has been installed. Generate the config from the live interface rather than
+# hardcoding it (the old unit hardcoded 10.66.0.0, a network address nothing can
+# bind to, so the proxy could never have listened).
+write_socks_config() {
+    local wg_ip ext_if
+    wg_ip="$(ip -4 -o addr show wg0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+    if [ -z "$wg_ip" ]; then
+        echo "ERROR: wg0 has no IPv4 address — bring the tunnel up first" >&2
+        return 1
+    fi
+
+    # The external interface is whatever carries the default route; danted needs
+    # it named explicitly and it is not always eth0.
+    ext_if="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)"
+    ext_if="${ext_if:-eth0}"
+
+    # Accept ONLY the WireGuard subnet. Without this the node is an open SOCKS
+    # relay to anyone who can reach the address.
+    cat > "$DANTE_CONF" <<DANTED
+logoutput: syslog
+internal: $wg_ip port = $SOCKS_PORT
+external: $ext_if
+socksmethod: none
+clientmethod: none
+user.privileged: root
+user.unprivileged: nobody
+
+client pass {
+    from: $WG_SUBNET to: 0.0.0.0/0
+    log: connect disconnect error
+}
+socks pass {
+    from: $WG_SUBNET to: 0.0.0.0/0
+    log: connect disconnect error
+}
+DANTED
+    echo "Wrote $DANTE_CONF (internal=$wg_ip:$SOCKS_PORT, external=$ext_if)"
+}
+
 case "$1" in
     start)
-        echo "Starting WireGuard and microsocks..."
+        echo "Starting WireGuard and dante..."
         wg-quick up wg0
-        systemctl start microsocks
-        echo "✅ WireGuard tunnel active"
+        write_socks_config || exit 1
+        systemctl enable "$DANTE_SVC" >/dev/null 2>&1 || true
+        systemctl restart "$DANTE_SVC" || {
+            echo "ERROR: $DANTE_SVC failed to start" >&2
+            journalctl -u "$DANTE_SVC" -n 20 --no-pager 2>&1 | tail -20
+            exit 1
+        }
+        echo "✅ WireGuard tunnel active, SOCKS proxy listening"
         ;;
     stop)
-        echo "Stopping WireGuard and microsocks..."
-        systemctl stop microsocks
+        echo "Stopping WireGuard and dante..."
+        systemctl stop "$DANTE_SVC"
         wg-quick down wg0
         echo "✅ WireGuard tunnel stopped"
         ;;
@@ -289,8 +372,9 @@ case "$1" in
         echo "=== Interface Status ==="
         ip addr show wg0 2>/dev/null || echo "wg0 interface not up"
         echo ""
-        echo "=== microsocks Status ==="
-        systemctl is-active microsocks
+        echo "=== dante ($DANTE_SVC) Status ==="
+        systemctl is-active "$DANTE_SVC"
+        ss -ln 2>/dev/null | grep ":$SOCKS_PORT" || echo "not listening on port $SOCKS_PORT"
         ;;
     restart)
         echo "Restarting WireGuard..."

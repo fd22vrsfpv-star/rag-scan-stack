@@ -6,7 +6,8 @@ import {
   useBulkUpdateFollowUps, useSendToBurpQueue, useBurpQueueStats,
   useAgentRules, useAgentStats, useTriggerAgentScan, useToggleAgentRule,
   useReloadRules, useTestRule, useCreateAdhocRule, useDeleteRule, useAgentRule,
-  type FollowUpItem, type FollowUpGroup, type RuleTestResult,
+  downloadFollowUpsExport, useMarkCustomerSites,
+  type FollowUpItem, type FollowUpGroup, type RuleTestResult, type ExportFormat,
 } from '@/api/followups'
 // ScanRecommendationsPanel was extracted from this file into a shared
 // component so the top-level /recommendations page can render it too.
@@ -17,7 +18,7 @@ import { useScopeNames, useAddToScope } from '@/api/scope'
 import { useUIStore } from '@/stores/ui'
 import {
   Flag, Plus, X, CheckCircle, XCircle, Clock, AlertTriangle, Loader2,
-  ChevronRight, ChevronDown, Bot, RefreshCw, Eye, Trash2, Play, Wand2, RotateCcw, Pencil, ExternalLink, Send,
+  ChevronRight, ChevronDown, Bot, RefreshCw, Eye, Trash2, Play, Wand2, RotateCcw, Pencil, ExternalLink, Send, Download,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { SEVERITY_BG } from '@/lib/constants'
@@ -47,6 +48,8 @@ export default function FollowUps() {
   const [selected, setSelected] = useState<FollowUpItem | null>(null)
   const [showCreate, setShowCreate] = useState(false)
   const [showRules, setShowRules] = useState(false)
+  const [showExport, setShowExport] = useState(false)
+  const [exporting, setExporting] = useState<ExportFormat | null>(null)
   const [showAdhoc, setShowAdhoc] = useState(false)
   const [editRuleId, setEditRuleId] = useState<string | null>(null)
   const [testResults, setTestResults] = useState<RuleTestResult | null>(null)
@@ -80,6 +83,7 @@ export default function FollowUps() {
   const sendToBurp = useSendToBurpQueue()
   const { data: burpQueueStats } = useBurpQueueStats()
   const excludeFromScope = useExcludeFromScope()
+  const markCustomer = useMarkCustomerSites()
   const addToScope = useAddToScope()
   const { data: scopeData } = useScopeNames()
   const scopeNames = (scopeData?.names ?? []).map((n: any) => typeof n === 'string' ? n : n.name) as string[]
@@ -124,7 +128,10 @@ export default function FollowUps() {
   const extractFindingName = (title: string) => {
     const t = title || 'Untitled'
     // Software CVE titles: group by product+version (before " on ")
-    if (t.startsWith('Vulnerable: ') && t.includes(' on ')) {
+    // Strip " on <host>" for ANY finding (not just "Vulnerable:") so
+    // "Missing headers on https://host/" groups under "Missing headers".
+    // MUST match the server's group_key CASE in api.py follow_ups_grouped.
+    if (t.includes(' on ')) {
       return t.slice(0, t.indexOf(' on ')).trim()
     }
     // Try em dash first (most common in agent-generated titles)
@@ -239,6 +246,25 @@ export default function FollowUps() {
       })
     }
   }
+  const handleExport = async (fmt: ExportFormat) => {
+    setExporting(fmt)
+    setShowExport(false)
+    try {
+      await downloadFollowUpsExport(fmt, {
+        status: filters.status,
+        exclude_status: excludeStatus,
+        severity: filters.severity,
+        priority: filters.priority,
+        flagged_by: filters.flagged_by,
+        engagement_id: activeEngagementId,
+        search: searchFilter || filters.search,
+      })
+    } catch (e) {
+      alert(`Export failed: ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setExporting(null)
+    }
+  }
   const handleBulkUpdate = (fields: { status?: string; priority?: string; notes?: string }) => {
     const ids = Array.from(selectedIds)
     if (!ids.length) return
@@ -254,6 +280,18 @@ export default function FollowUps() {
     if (!unique.length) return
     excludeFromScope.mutate({ targets: unique, source: 'follow-up-bulk' })
     handleBulkAction('dismiss')
+  }
+  const handleMarkCustomerSites = () => {
+    if (!engagementId) { alert('Select an engagement first'); return }
+    const targets = items
+      .filter(i => selectedIds.has(i.id) && i.target)
+      .map(i => i.target!)
+    const unique = [...new Set(targets)]
+    if (!unique.length) return
+    markCustomer.mutate(
+      { eid: engagementId, targets: unique },
+      { onSuccess: () => setSelectedIds(new Set()) },
+    )
   }
   const handleAddToScope = (scopeName: string) => {
     const targets = items
@@ -284,11 +322,11 @@ export default function FollowUps() {
   return (
     <div className="space-y-4">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-start justify-between gap-2 flex-wrap">
         <h2 className="text-lg font-semibold flex items-center gap-2">
           <Flag className="h-5 w-5" /> Follow-Up Panel
         </h2>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap justify-end">
           <a
             href="/exploits"
             className="h-7 px-3 text-xs rounded border border-orange-500/50 bg-orange-500/10 text-orange-400 hover:bg-orange-500/20 flex items-center gap-1.5 font-medium"
@@ -314,6 +352,42 @@ export default function FollowUps() {
           >
             Rules ({rules.length})
           </button>
+          <div className="relative">
+            <button
+              onClick={() => setShowExport(v => !v)}
+              disabled={!!exporting}
+              title="Export the current follow-ups view (honours the active filters)"
+              className="h-7 px-3 text-xs rounded border border-border bg-background hover:bg-accent flex items-center gap-1"
+            >
+              {exporting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Download className="h-3 w-3" />}
+              Export <ChevronDown className="h-3 w-3" />
+            </button>
+            {showExport && (
+              <>
+                <div className="fixed inset-0 z-10" onClick={() => setShowExport(false)} />
+                <div className="absolute right-0 mt-1 z-20 w-44 rounded border border-border bg-background shadow-lg py-1 text-xs">
+                  {([
+                    ['pdf', 'PDF report (by rule)'],
+                    ['csv', 'CSV (full detail)'],
+                    ['urls', 'URL list (.txt)'],
+                    ['md', 'Markdown (by rule)'],
+                    ['json', 'JSON'],
+                  ] as [ExportFormat, string][]).map(([fmt, label]) => (
+                    <button
+                      key={fmt}
+                      onClick={() => handleExport(fmt)}
+                      className="w-full text-left px-3 py-1.5 hover:bg-accent flex items-center gap-2"
+                    >
+                      <Download className="h-3 w-3 text-muted-foreground" /> {label}
+                    </button>
+                  ))}
+                  <div className="border-t border-border mt-1 pt-1 px-3 py-1 text-[10px] text-muted-foreground">
+                    Exports the filtered view ({items.length} shown)
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
           <button
             onClick={() => setShowCreate(true)}
             className="h-7 px-3 text-xs rounded bg-primary text-primary-foreground hover:bg-primary/90 flex items-center gap-1"
@@ -670,6 +744,13 @@ export default function FollowUps() {
               <option key={s} value={s}>{s}</option>
             ))}
           </select>
+          {engagementId && (
+            <button onClick={handleMarkCustomerSites} disabled={markCustomer.isPending}
+              title="Move selected hosts into this engagement's customer_scope (out of the scanned scope). Per-host — safe on shared domains like convio.net."
+              className="h-6 px-2 text-[11px] rounded border border-purple-500/30 bg-purple-500/10 text-purple-400 hover:bg-purple-500/20">
+              {markCustomer.isPending ? 'Marking...' : 'Mark customer site (OOS)'}
+            </button>
+          )}
           <button onClick={() => handleSendToBurp()} disabled={sendToBurp.isPending}
             title="Queue selected findings for import in Burp Suite's RagScanBridge extension"
             className="h-6 px-2 text-[11px] rounded border border-orange-500/30 bg-orange-500/10 text-orange-400 hover:bg-orange-500/20 flex items-center gap-1">
@@ -694,8 +775,8 @@ export default function FollowUps() {
           No follow-up items yet. Run the agent or add items manually.
         </div>
       ) : (
-        <div className="border border-border rounded-lg overflow-hidden">
-          <table className="w-full text-xs">
+        <div className="border border-border rounded-lg overflow-x-auto">
+          <table className="w-full min-w-[960px] text-xs">
             <thead className="bg-muted/50">
               <tr>
                 <th className="px-2 py-2 w-8">
@@ -1529,7 +1610,10 @@ function GroupItems({ groupKey, groupBy, total, statusFilter, excludeStatus, sel
   const extractFinding = (title: string) => {
     const t = title || ''
     // Software CVE: "Vulnerable: IIS 10.0 on 1.2.3.4 — CVE-..." → "Vulnerable: IIS 10.0"
-    if (t.startsWith('Vulnerable: ') && t.includes(' on ')) {
+    // Strip " on <host>" for ANY finding (not just "Vulnerable:") so
+    // "Missing headers on https://host/" groups under "Missing headers".
+    // MUST match the server's group_key CASE in api.py follow_ups_grouped.
+    if (t.includes(' on ')) {
       return t.slice(0, t.indexOf(' on ')).trim()
     }
     for (const sep of [' \u2014 ', ' -- ', ' \u2013 ']) {

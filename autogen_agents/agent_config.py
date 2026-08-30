@@ -6,7 +6,6 @@ Configures Autogen agents to use Ollama or vLLM for local LLM inference
 import os
 import logging
 from typing import Dict, List, Optional
-import autogen
 
 log = logging.getLogger("agent_config")
 
@@ -32,9 +31,26 @@ def _get_active_model_from_db() -> str | None:
     return None
 
 
+try:
+    from common.llm_settings import get_llm_settings
+except Exception:
+    get_llm_settings = None
+
+
+def _llm(key: str, default: str = "") -> str:
+    """Resolved LLM setting (dashboard DB over env), or `default` if unavailable."""
+    if get_llm_settings is None:
+        return default
+    try:
+        val = get_llm_settings().get(key)
+        return val if val else default
+    except Exception:
+        return default
+
+
 def get_llm_backend() -> str:
-    """Get configured LLM backend: 'ollama', 'vllm', or 'azure'"""
-    return os.environ.get("LLM_BACKEND", "ollama").lower()
+    """Get configured LLM backend: 'ollama', 'vllm', 'azure', 'openai', ..."""
+    return _llm("backend", os.environ.get("LLM_BACKEND", "ollama")).lower()
 
 
 def get_vllm_config(
@@ -133,10 +149,27 @@ def get_azure_config(
     Returns:
         List of LLM config dictionaries
     """
-    model = model or os.environ.get("AZURE_MODEL", "gpt-4o")
-    base_url = base_url or os.environ.get("AZURE_ENDPOINT")
-    api_key = api_key or os.environ.get("AZURE_API_KEY")
-    api_version = api_version or os.environ.get("AZURE_API_VERSION", "2024-08-01-preview")
+    model = model or _llm("azure_model", os.environ.get("AZURE_MODEL", "gpt-4o"))
+    base_url = base_url or _llm("azure_endpoint", os.environ.get("AZURE_ENDPOINT", "")) or None
+    api_key = api_key or _llm("azure_api_key", os.environ.get("AZURE_API_KEY", "")) or None
+    api_version = api_version or _llm("azure_api_version", os.environ.get("AZURE_API_VERSION", "2024-08-01-preview"))
+
+    # Microsoft Foundry OpenAI-compatible endpoint (…/openai/v1): autogen must
+    # drive it as an openai client (model in body, no api-version), not azure.
+    _b = (base_url or "").lower()
+    if base_url and (".services.ai.azure.com" in _b or "/openai/v1" in _b
+                     or _b.rstrip("/").endswith("/openai")):
+        import re
+        root = re.sub(r'(/openai)?(/v1)?(/chat/completions)?/?$', '',
+                      base_url.rstrip('/'), flags=re.I).rstrip('/')
+        return [{
+            "model": model,
+            "api_type": "openai",
+            "base_url": f"{root}/openai/v1",
+            "api_key": api_key,
+            "temperature": temperature,
+            "timeout": timeout,
+        }]
 
     return [{
         "model": model,
@@ -156,9 +189,9 @@ def get_openai_config(
     timeout: int = DEFAULT_LLM_TIMEOUT
 ) -> List[Dict]:
     """Get OpenAI configuration for Autogen agents."""
-    model = model or os.environ.get("OPENAI_MODEL", "gpt-4o")
-    api_key = api_key or os.environ.get("OPENAI_API_KEY")
-    base_url = os.environ.get("OPENAI_API_BASE", "https://api.openai.com")
+    model = model or _llm("openai_model", os.environ.get("OPENAI_MODEL", "gpt-4o"))
+    api_key = api_key or _llm("openai_api_key", os.environ.get("OPENAI_API_KEY", "")) or None
+    base_url = _llm("openai_api_base", os.environ.get("OPENAI_API_BASE", "https://api.openai.com"))
 
     return [{
         "model": model,
@@ -229,6 +262,12 @@ def get_ab_test_config(
     """
     Get LLM config with A/B testing support for GRPO fine-tuned models.
 
+    NOTE: today this ALWAYS takes the fallback path. No GRPO model has ever
+    been trained (the trainer is opt-in scaffolding that has never run), so
+    grpo_model_registry has no active rows and this returns the default config.
+    The A/B machinery is dormant until a fine-tuned model is registered — see
+    Docs/GRPO_TRAINING_GUIDE.md (status banner).
+
     Queries grpo_model_registry for active fine-tuned models and
     probabilistically selects based on ab_weight.
 
@@ -297,163 +336,20 @@ def get_ab_test_config(
         return get_llm_config(temperature=temperature, timeout=timeout), "default"
 
 
-def create_assistant_agent(
-    name: str,
-    system_message: str,
-    llm_config: Optional[Dict] = None,
-    human_input_mode: str = "NEVER",
-    max_consecutive_auto_reply: int = 10,
-    code_execution_config: Optional[Dict] = None
-) -> autogen.AssistantAgent:
-    """
-    Create an Autogen AssistantAgent with Ollama configuration
+# ===============================
+# AutoGen agent factories — REMOVED
+# ===============================
+# create_assistant_agent / create_user_proxy_agent / register_function_to_agent /
+# create_group_chat / create_group_chat_manager lived here. They were thin
+# wrappers over `autogen.AssistantAgent`, `autogen.UserProxyAgent` and
+# `autogen.GroupChat`, used only by pentest_agents.PentestTeam, and went with it
+# when AutoGen was retired (Docs/LANGGRAPH_MIGRATION_PLAN.md, Phase 5).
+#
+# What stays: every get_*_config() above (they resolve the ACTIVE LLM backend
+# from the dashboard DB and are what langgraph_engine._chat_model() reads), and
+# SYSTEM_MESSAGES below (the operator-editable agent prompts, served and saved by
+# the /prompts endpoints and now consumed by the LangGraph engine).
 
-    Args:
-        name: Agent name
-        system_message: System prompt defining agent's role
-        llm_config: LLM configuration (uses Ollama if None)
-        human_input_mode: "ALWAYS", "NEVER", or "TERMINATE"
-        max_consecutive_auto_reply: Maximum auto-replies
-        code_execution_config: Code execution settings
-
-    Returns:
-        Configured AssistantAgent
-    """
-    if llm_config is None:
-        llm_config = {
-            "config_list": get_llm_config(),
-            "cache_seed": None,  # Disable caching for dynamic responses
-        }
-
-    agent = autogen.AssistantAgent(
-        name=name,
-        system_message=system_message,
-        llm_config=llm_config,
-        human_input_mode=human_input_mode,
-        max_consecutive_auto_reply=max_consecutive_auto_reply,
-        code_execution_config=code_execution_config or False,
-    )
-
-    return agent
-
-
-def create_user_proxy_agent(
-    name: str = "UserProxy",
-    system_message: str = "A human admin.",
-    human_input_mode: str = "NEVER",
-    max_consecutive_auto_reply: int = 10,
-    code_execution_config: Optional[Dict] = None
-) -> autogen.UserProxyAgent:
-    """
-    Create an Autogen UserProxyAgent for executing actions
-
-    Args:
-        name: Agent name
-        system_message: System prompt
-        human_input_mode: Input mode
-        max_consecutive_auto_reply: Maximum auto-replies
-        code_execution_config: Code execution settings
-
-    Returns:
-        Configured UserProxyAgent
-    """
-    if code_execution_config is None:
-        code_execution_config = {
-            "work_dir": "/app/cache",
-            "use_docker": False,
-            "timeout": 300,
-            "last_n_messages": 3,
-        }
-
-    agent = autogen.UserProxyAgent(
-        name=name,
-        system_message=system_message,
-        human_input_mode=human_input_mode,
-        max_consecutive_auto_reply=max_consecutive_auto_reply,
-        code_execution_config=code_execution_config,
-    )
-
-    return agent
-
-
-def register_function_to_agent(
-    agent: autogen.ConversableAgent,
-    func,
-    name: str,
-    description: str
-):
-    """
-    Register a custom function as a tool for an agent
-
-    Args:
-        agent: Agent to register function to
-        func: Python function to register
-        name: Function name
-        description: Function description for the LLM
-    """
-    agent.register_function(
-        function_map={name: func}
-    )
-
-
-def create_group_chat(
-    agents: List[autogen.Agent],
-    max_round: int = 20,
-    admin_name: str = "Admin",
-    speaker_selection_method: str = "auto"
-) -> autogen.GroupChat:
-    """
-    Create a group chat for multi-agent collaboration
-
-    Args:
-        agents: List of agents to include
-        max_round: Maximum conversation rounds
-        admin_name: Name of admin agent
-        speaker_selection_method: "auto", "manual", or "round_robin"
-
-    Returns:
-        GroupChat instance
-    """
-    groupchat = autogen.GroupChat(
-        agents=agents,
-        messages=[],
-        max_round=max_round,
-        speaker_selection_method=speaker_selection_method,
-        allow_repeat_speaker=False
-    )
-
-    return groupchat
-
-
-def create_group_chat_manager(
-    groupchat: autogen.GroupChat,
-    llm_config: Optional[Dict] = None
-) -> autogen.GroupChatManager:
-    """
-    Create a manager for a group chat
-
-    Args:
-        groupchat: GroupChat instance
-        llm_config: LLM configuration (uses Ollama if None)
-
-    Returns:
-        GroupChatManager instance
-    """
-    if llm_config is None:
-        llm_config = {
-            "config_list": get_llm_config(),
-            "cache_seed": None,
-        }
-
-    manager = autogen.GroupChatManager(
-        groupchat=groupchat,
-        llm_config=llm_config
-    )
-
-    return manager
-
-
-# Language requirement to add to all agents
 ENGLISH_ONLY = """
 LANGUAGE REQUIREMENT: You MUST respond in English ONLY.
 - NEVER use Chinese (中文), Thai (ไทย), or any non-English language
@@ -488,7 +384,7 @@ MASSCAN-FIRST WORKFLOW:
 - Only after masscan finds open ports should nmap run for service detection
 
 HANDOFF EXAMPLES:
-- No existing data: "Scanner, please run MASSCAN on 192.168.1.150 ports 1-1000 FIRST"
+- No existing data: "Scanner, please run MASSCAN on 192.168.1.150 over the top-1000 ports FIRST"
 - Masscan found ports: "Scanner, masscan found ports 22,80,443. Run nmap on these ports"
 - During scan wait: "I'll query existing assets while we wait for the scan"
 
@@ -505,20 +401,28 @@ CRITICAL: When asked to scan, IMMEDIATELY call the tool function. Never say "I w
 YOUR FIRST ACTION MUST BE: call start_full_scan(targets='TARGET_IP'). Do NOT call get_scan_recommendations first. Do NOT describe what you plan to do. Just call start_full_scan immediately.
 
 SCAN WORKFLOW (follow this order):
-1. start_full_scan(targets) — quick scan ports 1-1000 + web ports from settings + service detection (~2-3 min)
+1. start_full_scan(targets) — quick pass over nmap's TOP-1000 ports + web ports from settings + service detection.
+   It ALSO schedules a full-range (1-65535) masscan follow-up automatically, in parallel.
+   NEVER pass quick_ports='1-1000'. That is the first 1000 port NUMBERS, not the 1000 most
+   commonly open ports — it misses mysql 3306, postgresql 5432, vnc 5900, tomcat 8180.
+   Call start_full_scan(targets='TARGET_IP') with NO port arguments and let it choose.
 2. Read follow-ups → run web scans ONE AT A TIME: start_pipeline_scan → wait → start_nuclei_scan → wait
-3. start_deep_port_scan(targets) — scans remaining ports 1001-65535 (CRITICAL: always run after web scans)
+3. start_deep_port_scan(targets) — NOT normally needed: step 1 already sweeps 1-65535.
+   Call it only if start_full_scan was skipped for this target.
 4. start_udp_scan(targets) — UDP service discovery on common ports (53,161,500,etc.) - ALWAYS RUN if targets are live
 ALWAYS wait for each scan to complete before starting the next one.
 
 YOUR SCAN TOOLS - CALL THESE TO START SCANS:
 
 QUICK SCAN (ALWAYS START WITH THIS):
-- start_full_scan(targets): Quick port scan (1-1000 + high web ports) + service detection
-  Phase 1: Quick masscan, Phase 2: Nmap service detection on discovered ports
+- start_full_scan(targets): Quick port scan (nmap top-1000 + high web ports) + service detection
+  Phase 1: Quick masscan over the top-1000, Phase 2: Nmap service detection on discovered
+  ports IN PARALLEL with a full-range 1-65535 masscan, Phase 3: service detection on what
+  that sweep adds
 
 DEEP PORT SCAN (RUN LAST, after web scans):
-- start_deep_port_scan(targets): Scan remaining ports 1001-65535 with service detection
+- start_deep_port_scan(targets): Full-range 1-65535 sweep with service detection.
+  USUALLY REDUNDANT — start_full_scan already runs this sweep as its phase 2.
   NOTE: if the operator pinned a PORT SCOPE for this session, this tool returns
   {{"skipped": true, "reason": ...}}. That is expected and final — the selected scope
   already covers the intended range. Do NOT retry it and do NOT try to work around it
@@ -565,7 +469,8 @@ AFTER FULL_SCAN COMPLETES - CRITICAL:
 - After starting parallel scans, call wait_for_job_completion on the web pipeline job_id
   The other scans will likely finish while ZAP runs
 - SEQUENTIAL SCANS (run in this exact order after parallel scans complete):
-  1. start_deep_port_scan(targets) — ALWAYS run to scan full port range 1001-65535
+  1. start_deep_port_scan(targets) — SKIP unless start_full_scan did not run; its
+     phase 2 already swept the full 1-65535 range
   2. start_udp_scan(targets) — ALWAYS run to discover UDP services (DNS, SNMP, etc.)
   3. Run credential checks ONLY if auth services were found
 - You do NOT have shell access — your ONLY way to scan is through the registered tool functions
@@ -683,7 +588,8 @@ CRITICAL EFFICIENCY RULES:
 5. Only check status ONCE after starting a scan, then move on to parallel tasks
 
 FINDINGS-DRIVEN WORKFLOW:
-1. "Scanner, call start_full_scan(targets='TARGET_IP')" — quick scan ports 1-1000 + web ports
+1. "Scanner, call start_full_scan(targets='TARGET_IP')" — top-1000 quick pass + web ports,
+   with a full-range 1-65535 masscan following automatically
    Then "Scanner, call wait_for_job_completion(job_id='JOB_ID', job_type='nmap')"
    ONLY Scanner should call scan tools and wait_for_job_completion — never ask Analyzer or Reconnaissance.
 
@@ -696,7 +602,7 @@ FINDINGS-DRIVEN WORKFLOW:
    b. "Scanner, call start_smb_vuln_scan(target='TARGET_IP')" → wait — if ports 139/445 found
    c. "Scanner, call start_credential_check(target='TARGET_IP', services='ssh,ftp')" → wait — if auth services found
    d. "Scanner, call start_nuclei_scan(target_url='http://TARGET_IP')" → wait — if HTTP ports found
-   e. "Scanner, call start_deep_port_scan(targets='TARGET_IP')" → wait — deep scan remaining ports 1001-65535
+   e. Skip the deep port scan — start_full_scan's phase 2 already swept 1-65535
    Do NOT say "investigate port 80" or "run nikto" — give the EXACT tool call.
 
 4. "Scanner, start_udp_scan" (run LAST - slowest, only if time permits)

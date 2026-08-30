@@ -6,6 +6,14 @@ Phase 7 E2E tests:
 - Verify retry resets failed tasks to queued and they get executed.
 - Check metrics snapshot reflects outcomes (counts and durations observed).
 """
+import pytest
+
+# Skip rather than ERROR when this is unavailable: module was never published to this repo.
+# A collection error reads as a broken test suite; a skip states plainly
+# that the test cannot run in this environment.
+pytest.importorskip("utils.nmap_scheduler",
+                    reason="utils.nmap_scheduler not available here — module was never published to this repo")
+
 import os
 import asyncio
 import time

@@ -1,4 +1,7 @@
-FROM python:3.12-slim
+# Shared modules (validation, sql_utils, structured_logger, tool_job) come
+# from this base — see common/Dockerfile. Build it first with
+# scripts/build-base-image.sh; compose does not order builds by FROM.
+FROM rag-common:latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl git \

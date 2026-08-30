@@ -11,6 +11,23 @@ Properties locked down here:
   3. Malformed YAML entries are dropped loudly, never half-applied.
   4. No profile means no change.
 """
+import pytest
+
+# Guarded alongside bs4: this module also reaches BFF config, which needs
+# pydantic-settings. That package belongs to the pentest-dashboard image and
+# is deliberately absent from tests/requirements.txt, so a laptop run stays
+# possible — the test skips instead of erroring.
+pytest.importorskip("pydantic_settings",
+                    reason="pydantic-settings is a pentest-dashboard dependency")
+
+import pytest
+
+# Skip rather than ERROR when this is unavailable: beautifulsoup4; present in the scan-recommender image.
+# A collection error reads as a broken test suite; a skip states plainly
+# that the test cannot run in this environment.
+pytest.importorskip("bs4",
+                    reason="bs4 not available here — beautifulsoup4; present in the scan-recommender image")
+
 import os
 import sys
 import textwrap

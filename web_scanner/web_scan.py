@@ -1,4 +1,11 @@
 import os, time, subprocess, pathlib, re, uuid, threading, logging, shutil, json
+# Module-level: archive_raw_artifact() runs outside the functions that
+# import requests locally, and its except-block would have swallowed the
+# resulting NameError as a failed archive rather than a missing import.
+import requests
+# Shared scan-slot accounting from the rag-common base image, so this
+# service honours the same MAX_CONCURRENT_SCANS ceiling as the runners.
+from tool_job import scan_slot
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import psycopg2
@@ -57,7 +64,11 @@ def emit_webhook_event(event_type: str, source: str, data: dict, severity: str =
             f"{API_BASE}/webhooks/emit",
             headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
             json=payload,
-            timeout=5
+            timeout=5,
+            # rag-api serves HTTPS with the stack's self-signed cert, so every
+            # webhook emit failed verification and was swallowed by the except
+            # below as a warning. Subscribers silently received nothing.
+            verify=False,
         )
     except Exception as e:
         logger.warning(f"Failed to emit webhook: {e}")
@@ -101,6 +112,40 @@ def _insert_info_finding(source: str, url: str, name: str, evidence: str):
         logger.warning(f"[{source}] Failed to insert info finding: {e}")
 
 
+def archive_raw_artifact(path, tool: str, job_id: str = None, target: str = None):
+    """Archive one raw scan output file to the artifact store.
+
+    web_scanner delivers its results by INSERTing parsed rows straight into
+    web_findings, so unlike the services that upload to /ingest/<tool> its raw
+    output never reached raw_artifacts. The ZAP and nikto XML were written to
+    the session directory on disk and nowhere else — fine until the container is
+    rebuilt or the volume pruned, and invisible to the Scan Results UI and to
+    LLM post-processing.
+
+    Failures are logged and swallowed: the scan already succeeded and its
+    findings are already stored.
+    """
+    try:
+        fp = pathlib.Path(path)
+        if not fp.exists() or not fp.is_file() or fp.stat().st_size == 0:
+            return
+        content = fp.read_text(errors="replace")
+        r = requests.post(
+            f"{API_BASE}/ingest/raw-artifact",
+            json={"tool": tool, "content": content, "target": target or "",
+                  "job_id": job_id, "source": "web_scanner",
+                  "command": f"file:{fp.name}"},
+            headers={"x-api-key": API_KEY}, timeout=120, verify=False,
+        )
+        if r.status_code < 400:
+            logger.info(f"[archive] {tool} {fp.name} ({fp.stat().st_size} B) -> "
+                        f"{r.json().get('artifact_id')}")
+        else:
+            logger.warning(f"[archive] HTTP {r.status_code} for {fp.name}: {r.text[:200]}")
+    except Exception as e:
+        logger.warning(f"[archive] failed for {path}: {e}")
+
+
 def _save_session_results(job_id, job_type, scanner, files, metadata=None):
     """Copy raw scan output files to a session-based directory."""
     try:
@@ -121,6 +166,17 @@ def _save_session_results(job_id, job_type, scanner, files, metadata=None):
             manifest["metadata"] = metadata
         (session_path / "manifest.json").write_text(json.dumps(manifest, indent=2))
         logger.info(f"[session] Saved {len(copied)} files to {session_path}")
+        # Same files into the artifact store: the session directory is local to
+        # this container, while raw_artifacts is queryable, deduped, and feeds
+        # the follow-on action rules.
+        for fp in files:
+            name = pathlib.Path(str(fp)).name.lower()
+            # Name the producing tool where the filename makes it unambiguous,
+            # so tool-scoped rules apply correctly; otherwise fall back to the
+            # scanner that ran the job.
+            tool = ("nikto" if "nikto" in name else
+                    "zap" if ("zap" in name or name.endswith(".xml")) else scanner)
+            archive_raw_artifact(fp, tool, job_id=job_id)
     except Exception as e:
         logger.warning(f"[session] Failed to save session results: {e}")
 
@@ -174,7 +230,12 @@ class JobTracker:
                 # Keep progress.stage in sync with top-level stage
                 if "stage" in kwargs and "progress" in self.jobs[job_id]:
                     self.jobs[job_id]["progress"]["stage"] = kwargs["stage"]
-                if self.jobs[job_id].get("status") in ("completed", "failed", "stopped"):
+                # 'blocked' is terminal too — a scope refusal will never proceed,
+                # so it must survive a restart like any other final state.
+                # Without it a refused job silently reverts to whatever was in
+                # memory, and the operator loses the reason it never ran.
+                if self.jobs[job_id].get("status") in ("completed", "failed",
+                                                       "stopped", "blocked"):
                     self._persist(job_id)
 
     def push_command(self, job_id: str, stage: str, command: str):
@@ -937,12 +998,68 @@ class NiktoReq(BaseModel):
     timeout_sec: int = 1800  # Timeout in seconds (default 30 minutes)
 
 
+# ── Scope gate ────────────────────────────────────────────────────────────
+# Shared implementation from etl/scope_gate.py (bind-mounted at /scanner/etl).
+# Fails CLOSED: if the gate or the scope cannot be read, the job is refused. A
+# scanner that cannot tell whether it is authorised must not scan.
+try:
+    from etl.scope_gate import check_dispatch, load_dispatch_scope
+    SCOPE_GATE_AVAILABLE = True
+except Exception as _scope_err:                 # pragma: no cover
+    SCOPE_GATE_AVAILABLE = False
+    logger.error("scope gate UNAVAILABLE (%s) — jobs will be refused. "
+                  "Check the ./etl:/scanner/etl mount.", _scope_err)
+
+
+def _scope_refusal_for_hosts(hosts):
+    """Refusal string when any host is out of scope, else None."""
+    if not SCOPE_GATE_AVAILABLE:
+        return "scope gate unavailable (etl/scope_gate not importable) — refusing"
+    hosts = [h for h in (hosts or []) if h]
+    if not hosts:
+        return None
+    try:
+        _c = conn()
+        try:
+            with _c.cursor() as cur:
+                rows, _src = load_dispatch_scope(cur)
+        finally:
+            _c.close()
+    except Exception as exc:
+        return f"scope could not be read ({exc}) — refusing"
+    for h in hosts:
+        refusal = check_dispatch(str(h), rows)
+        if refusal:
+            return refusal
+    return None
+
+
 def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_katana: bool, do_zap: bool, limit: Optional[int], wordlist: Optional[str] = None, target_url: Optional[str] = None, target_urls: Optional[List[str]] = None, proxy: Optional[str] = None):
     """Background task to run web scan with progress tracking.
 
     When proxy is set (SOCKS URL), Gobuster gets --proxy flag and ZAP gets
     an upstream proxy configured via API before scanning.
     """
+    # Refuse before any request is made. URLs are reduced to their host by the
+    # shared gate, so http://evil.example/x is judged on `evil.example`.
+    _urls = list(target_urls or []) + ([target_url] if target_url else [])
+    _refusal = _scope_refusal_for_hosts(_urls)
+    if _refusal:
+        logger.warning("REFUSED web-scan job %s: %s", job_id, _refusal)
+        _job_tracker.update_job(job_id, status="failed",
+                                error=f"Out of scope — {_refusal}")
+        return
+
+    # Hold a scan slot for the whole job. Acquired AFTER the scope gate so a
+    # refused job never consumes capacity.
+    try:
+        _slot = scan_slot(job_id, "web-scan")
+        _slot.__enter__()
+    except TimeoutError as e:
+        logger.error("web-scan job %s: %s", job_id, e)
+        _job_tracker.update_job(job_id, status="failed", error=str(e))
+        return
+
     try:
         _t0 = time.time()
         # Emit webhook for scan start
@@ -1251,6 +1368,12 @@ def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_ka
         write_audit("scan_failed", "web-scan", "web_scanner", {
             "job_id": job_id, "error": str(e),
         })
+    finally:
+        # Release the scan slot however this job ends — success, exception, or
+        # early return above. Without this a crashed job would permanently
+        # consume one of the service's MAX_CONCURRENT_SCANS slots, and enough
+        # crashes would wedge the scanner entirely.
+        _slot.__exit__(None, None, None)
 
 
 @app.get("/health")

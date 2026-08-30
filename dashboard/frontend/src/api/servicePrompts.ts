@@ -298,8 +298,12 @@ export interface ToolCoverage {
   reason?: string
   kb_tool_count: number
   binary_count?: number
-  /** Tools the KB will recommend that exist nowhere — these fail at dispatch. */
-  unrunnable: Array<{ tool: string; referenced_by: string[]; references: number }>
+  /** Valid tool names not installed in THIS stack. Availability, not correctness:
+   *  tools run on provisioned nodes and across pipes, so local absence predicts
+   *  nothing. Useful for provisioning decisions only. */
+  not_installed_locally: Array<{ tool: string; referenced_by: string[]; references: number }>
+  /** @deprecated alias for not_installed_locally, kept for older builds. */
+  unrunnable?: Array<{ tool: string; referenced_by: string[]; references: number }>
   /** Provisioned onto a node but never recommended — paid-for, unusable capability. */
   uncatalogued: string[]
   uncatalogued_total?: number

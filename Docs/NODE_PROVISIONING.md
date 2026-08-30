@@ -29,7 +29,7 @@ ssh root@YOUR_NODE_IP "reboot"
 
 ### Networking & Tunneling
 - ✅ **WireGuard** - Full WireGuard tools and utilities
-- ✅ **microsocks** - SOCKS5 proxy for tunnel routing
+- ✅ **dante-server** - SOCKS5 proxy for tunnel routing (`danted` on Debian/Ubuntu, `sockd` on EPEL)
 - ✅ **Network tools** - nmap, tcpdump, netcat, dnsutils
 - ✅ **IP forwarding** - Kernel networking optimizations
 
@@ -39,7 +39,7 @@ ssh root@YOUR_NODE_IP "reboot"
 - ✅ **Node.js** - Latest LTS Node.js and npm
 
 ### RAG Scan Stack Integration
-- ✅ **Systemd services** - microsocks service configuration
+- ✅ **Systemd services** - dante (`danted`) service, held down until wg0 has an address
 - ✅ **Helper commands** - `rag-helper` management utility
 - ✅ **Security** - Firewall rules for SSH and WireGuard
 
@@ -149,10 +149,10 @@ ssh root@YOUR_NODE_IP "rag-helper info"
 # ✅ Docker version
 # ✅ WireGuard tools  
 # ✅ Go, Python, Node.js versions
-# ✅ microsocks installed
+# ✅ dante-server installed
 
 # Test WireGuard readiness
-ssh root@YOUR_NODE_IP "which wg && which wg-quick && which microsocks"
+ssh root@YOUR_NODE_IP "which wg && which wg-quick && (command -v danted || command -v sockd || ls /usr/sbin/danted)"
 # Should return paths to all three binaries
 ```
 
@@ -206,7 +206,7 @@ After provisioning, nodes will:
 ssh root@NODE_IP "
   docker ps && 
   wg version && 
-  microsocks -V && 
+  (danted -v 2>&1 | head -1 || sockd -v 2>&1 | head -1) && 
   systemctl status docker
 "
 ```

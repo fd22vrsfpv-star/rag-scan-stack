@@ -18,6 +18,11 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 from etl.fingerprint import web_fingerprint
+try:
+    from scope_gate import load_ingest_scope, host_in_scope
+except ImportError:  # pragma: no cover
+    from etl.scope_gate import load_ingest_scope, host_in_scope
+
 
 # Configure logging - integrate with log_manager if available
 logger = logging.getLogger("parse_zap")
@@ -299,7 +304,7 @@ def parse_zap_alerts(
         logger.info(f"Base URL Filter: {base_url}")
     logger.info("=" * 60)
 
-    stats = {
+    stats = {"out_of_scope": 0, 
         "total_alerts": 0,
         "inserted": 0,
         "skipped_duplicate": 0,
@@ -324,6 +329,10 @@ def parse_zap_alerts(
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Scope loaded once per run, inside THIS function — the first version
+            # loaded it in _worker, a different function, which would have raised
+            # NameError the moment an alert was processed.
+            _enforce_scope, _scope_rows = load_ingest_scope(cur)
             # Process in batches
             processed = 0
             while processed < total_count:
@@ -397,6 +406,11 @@ def parse_zap_alerts(
 
                     # Link to asset by extracting IP or hostname from URL
                     alert_url = alert.get("url", "")
+                    # Ingest scope gate: ZAP spiders and can follow links
+                    # off the target host.
+                    if not host_in_scope(alert_url, _enforce_scope, _scope_rows):
+                        stats["out_of_scope"] = stats.get("out_of_scope", 0) + 1
+                        continue
                     ip = extract_ip_from_url(alert_url)
 
                     if ip:
@@ -463,6 +477,13 @@ def parse_zap_alerts(
                                confidence, tags, request_data, response_data,
                                first_seen, last_seen, fingerprint)
                             VALUES (%s, %s, %s, 'zap', 'zap-alert', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now(), %s)
+                            -- Re-seeing a finding advances last_seen instead of
+                            -- inserting it again. Requires uq_web_findings_fingerprint;
+                            -- without that index this raises rather than deduping.
+                            ON CONFLICT (fingerprint) DO UPDATE SET
+                                last_seen = now(),
+                                severity  = EXCLUDED.severity,
+                                evidence  = COALESCE(EXCLUDED.evidence, web_findings.evidence)
                         """, (
                             finding_id,
                             asset_id,

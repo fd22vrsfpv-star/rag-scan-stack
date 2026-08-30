@@ -306,10 +306,14 @@ async def check_database_schema():
             # Agent / LLM
             'agent_sessions', 'agent_messages', 'agent_tool_calls',
             'session_scan_metrics', 'llm_request_metrics',
+            # LangGraph durable checkpoints (AGENT_ENGINE=langgraph). Created by
+            # PostgresSaver.setup() and declared in db_init/ensure_all_tables.sql.
+            'checkpoints', 'checkpoint_blobs', 'checkpoint_writes', 'checkpoint_migrations',
             # Jobs / Tasks
             'jobs', 'tasks',
             # Exploit management
             'pending_exploits', 'exploit_results', 'exploit_chunks', 'tool_executions',
+            'security_tests', 'security_test_runs',
             # Webhooks
             'webhooks', 'webhook_events', 'webhook_deliveries',
             # Engagements / Workflow

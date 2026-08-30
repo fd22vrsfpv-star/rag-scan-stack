@@ -1,6 +1,46 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { apiFetch } from './client'
+import { apiFetch, apiUrl } from './client'
 import { POLL } from '@/lib/polling'
+
+export type ExportFormat = 'pdf' | 'csv' | 'urls' | 'md' | 'json'
+
+export interface FollowUpExportFilters {
+  status?: string
+  exclude_status?: string
+  severity?: string
+  priority?: string
+  flagged_by?: string
+  engagement_id?: string
+  rule_id?: string
+  search?: string
+}
+
+/** Download the current follow-ups view as a file. Filters mirror the list, so
+ *  what's on screen is what exports. Streams through the BFF (which adds auth);
+ *  filename comes from the server's Content-Disposition. */
+export async function downloadFollowUpsExport(
+  format: ExportFormat, filters: FollowUpExportFilters = {},
+): Promise<void> {
+  const params = new URLSearchParams({ format })
+  for (const [k, v] of Object.entries(filters)) if (v) params.set(k, String(v))
+  const eid = (() => { try { return localStorage.getItem('selected-engagement') } catch { return null } })()
+  const resp = await fetch(apiUrl(`/follow-ups/export?${params}`), {
+    headers: eid ? { 'X-Engagement-Id': eid } : {},
+  })
+  if (!resp.ok) throw new Error(`Export ${resp.status}: ${await resp.text()}`)
+  const blob = await resp.blob()
+  const cd = resp.headers.get('content-disposition') || ''
+  const m = cd.match(/filename="?([^"]+)"?/)
+  const filename = m ? m[1] : `follow-ups.${format === 'urls' ? 'txt' : format}`
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
 
 export interface FollowUpItem {
   id: string
@@ -221,6 +261,24 @@ export function useSubmitFeedback() {
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['follow-ups'] })
+    },
+  })
+}
+
+/** Move selected follow-up targets into the engagement's customer_scope (out of
+ *  the scanned scope). Per-host — safe on shared domains. */
+export function useMarkCustomerSites() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ eid, targets }: { eid: string; targets: string[] }) =>
+      apiFetch<{ ok: boolean; moved: number; resolved_follow_ups: number; scope: string }>(
+        `/engagements/${eid}/scope/mark-customer-sites`,
+        { method: 'POST', body: JSON.stringify({ targets }) },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['follow-ups'] })
+      qc.invalidateQueries({ queryKey: ['recon-domains'] })
+      qc.invalidateQueries({ queryKey: ['scope'] })
     },
   })
 }

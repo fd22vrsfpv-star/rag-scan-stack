@@ -1,12 +1,20 @@
 import asyncio
+import json
 import logging
+import re
 import httpx
 from typing import List, Optional
 from fastapi import APIRouter, Query, Request, HTTPException
 from pydantic import BaseModel
 from psycopg2.extras import Json
 from config import get_settings
-from engagement import engagement_headers
+from engagement import current_engagement_id, engagement_headers
+# One scope implementation for the whole BFF (see scope_guard.py).
+from scope_guard import host_in_scope as _host_in_scope, scope_rows_for as _scope_rows_for
+# The engagement's scan ceiling, read through the accessor so a runtime
+# change via set_max_concurrent() is respected. routers/nodes.py imports
+# from routers.scans the same way, so this introduces no new cycle.
+from routers.scans import get_max_concurrent
 from polling import register_job
 from utils import safe_json
 
@@ -19,7 +27,7 @@ router = APIRouter()
 async def create_credential(request: Request):
     s = get_settings()
     params = dict(request.query_params)
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/credentials",
             params=params,
@@ -31,7 +39,7 @@ async def create_credential(request: Request):
 @router.delete("/api/credentials/{cid}")
 async def delete_credential(cid: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/credentials/{cid}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -51,7 +59,7 @@ async def list_all_credentials(
     if status: params["status"] = status
     if protocol: params["protocol"] = protocol
     if source: params["source"] = source
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/credentials",
             params=params,
@@ -63,7 +71,7 @@ async def list_all_credentials(
 @router.get("/api/assets")
 async def list_assets(limit: int = Query(100, le=5000)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/assets",
             params={"limit": limit},
@@ -76,7 +84,7 @@ async def list_assets(limit: int = Query(100, le=5000)):
 async def purge_by_pattern(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.request(
             "DELETE",
             f"{s.rag_api_url}/purge/pattern",
@@ -90,7 +98,7 @@ async def purge_by_pattern(request: Request):
 async def delete_assets(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.request(
             "DELETE",
             f"{s.rag_api_url}/assets",
@@ -103,7 +111,7 @@ async def delete_assets(request: Request):
 @router.delete("/api/targets/{domain}")
 async def purge_target_domain(domain: str, dry_run: bool = Query(False)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/targets/{domain}",
             params={"dry_run": str(dry_run).lower()},
@@ -118,7 +126,7 @@ async def purge_target_domain(domain: str, dry_run: bool = Query(False)):
 @router.get("/api/assets/{ip}/ports")
 async def asset_ports(ip: str, limit: int = Query(200, le=5000)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/ports/open",
             params={"ip": ip, "limit": limit},
@@ -130,7 +138,7 @@ async def asset_ports(ip: str, limit: int = Query(200, le=5000)):
 @router.get("/api/assets/{ip}/vulns")
 async def asset_vulns(ip: str, limit: int = Query(200, le=5000)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/vulns",
             params={"ip": ip, "limit": limit},
@@ -145,7 +153,7 @@ async def recon_subdomains(domain: str = Query(None), limit: int = Query(500, le
     params = {"limit": limit}
     if domain:
         params["domain"] = domain
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/recon/subdomains",
             params=params,
@@ -158,7 +166,7 @@ async def recon_subdomains(domain: str = Query(None), limit: int = Query(500, le
 async def delete_subdomains(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.request(
             "DELETE",
             f"{s.rag_api_url}/recon/subdomains",
@@ -168,10 +176,37 @@ async def delete_subdomains(request: Request):
         return safe_json(resp)
 
 
+@router.get("/api/assets/{ip}/parameters")
+async def asset_scan_parameters(ip: str, request: Request):
+    """Per-host values that influence testing, for the Assets view."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=60) as c:
+        resp = await c.get(
+            f"{s.rag_api_url}/assets/{ip}/parameters",
+            params=dict(request.query_params),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
+@router.post("/api/assets/{ip}/parameters")
+async def declare_asset_scan_parameter(ip: str, request: Request):
+    """Declare an operator override for a per-host testing parameter."""
+    s = get_settings()
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=60) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/assets/{ip}/parameters",
+            json=body,
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
 @router.get("/api/assets/{ip}/credentials")
 async def asset_credentials(ip: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/assets/{ip}/credentials",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -183,7 +218,7 @@ async def asset_credentials(ip: str):
 async def update_credential_status(cid: str, request: Request):
     s = get_settings()
     params = dict(request.query_params)
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.patch(
             f"{s.rag_api_url}/credential-findings/{cid}/status",
             params=params,
@@ -206,7 +241,7 @@ async def detected_software(
     elif ip: params["ip"] = ip
     if product and not search: params["product"] = product
     if source: params["source"] = source
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/software",
             params=params,
@@ -218,7 +253,7 @@ async def detected_software(
 @router.get("/api/software/cve-tuning")
 async def get_cve_tuning():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/cve-tuning", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
@@ -227,7 +262,7 @@ async def get_cve_tuning():
 async def update_cve_tuning(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.put(f"{s.rag_api_url}/software/cve-tuning", json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
@@ -236,7 +271,7 @@ async def update_cve_tuning(request: Request):
 async def bulk_dismiss_software(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(
             f"{s.rag_api_url}/software/bulk-dismiss",
             json=body,
@@ -252,7 +287,7 @@ async def bulk_dismiss_software(request: Request):
 async def software_searchsploit(product: str, version: str = "", target_version: str = "", analyze: bool = False, limit: int = 20):
     s = get_settings()
     timeout = 120 if analyze else 15
-    async with httpx.AsyncClient(verify=False, timeout=timeout) as c:
+    async with httpx.AsyncClient(timeout=timeout) as c:
         resp = await c.get(
             f"{s.rag_api_url}/software/searchsploit",
             params={"product": product, "version": version, "target_version": target_version, "analyze": str(analyze).lower(), "limit": limit},
@@ -264,7 +299,7 @@ async def software_searchsploit(product: str, version: str = "", target_version:
 @router.get("/api/software/research-cache")
 async def software_research_cache(product: str, version: str = ""):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(
             f"{s.rag_api_url}/software/research-cache",
             params={"product": product, "version": version},
@@ -280,7 +315,7 @@ async def software_bulk_check(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(f"{s.rag_api_url}/software/bulk-check",
                             json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         if resp.status_code >= 400:
@@ -313,7 +348,7 @@ async def software_bulk_check(request: Request):
 @router.get("/api/software/bulk-check/status")
 async def software_bulk_check_status():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/bulk-check/status",
                            headers={"x-api-key": s.api_key, **engagement_headers()})
         data = resp.json()
@@ -338,7 +373,7 @@ async def software_bulk_check_status():
 @router.post("/api/software/bulk-check/cancel")
 async def software_bulk_check_cancel():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.post(f"{s.rag_api_url}/software/bulk-check/cancel",
                             headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -348,7 +383,7 @@ async def software_bulk_check_cancel():
 async def software_cve_decision(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(f"{s.rag_api_url}/software/cve-decision",
                             json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -357,7 +392,7 @@ async def software_cve_decision(request: Request):
 @router.get("/api/software/cve-decisions")
 async def get_cve_decisions(product: str, version: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/cve-decisions",
                            params={"product": product, "version": version},
                            headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -367,7 +402,7 @@ async def get_cve_decisions(product: str, version: str):
 @router.delete("/api/software/research-cache")
 async def clear_research_cache(product: str, version: str = ""):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.delete(f"{s.rag_api_url}/software/research-cache",
                               params={"product": product, "version": version},
                               headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -377,7 +412,7 @@ async def clear_research_cache(product: str, version: str = ""):
 @router.post("/api/software/backfill-refs")
 async def backfill_followup_refs():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(f"{s.rag_api_url}/software/backfill-refs",
                             headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -386,7 +421,7 @@ async def backfill_followup_refs():
 @router.get("/api/nuclei/templates/search")
 async def search_nuclei_templates(q: str, limit: int = 20):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.nuclei_url}/templates/search",
                            params={"q": q, "limit": limit})
         return safe_json(resp)
@@ -395,7 +430,7 @@ async def search_nuclei_templates(q: str, limit: int = 20):
 @router.get("/api/software/llm-debug")
 async def software_llm_debug(product: str, version: str = ""):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/llm-debug",
                            params={"product": product, "version": version},
                            headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -405,7 +440,7 @@ async def software_llm_debug(product: str, version: str = ""):
 @router.get("/api/software/release-date")
 async def get_release_date(product: str, version: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/release-date",
                            params={"product": product, "version": version},
                            headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -416,7 +451,7 @@ async def get_release_date(product: str, version: str):
 async def set_release_date(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.put(f"{s.rag_api_url}/software/release-date",
                            json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -425,7 +460,7 @@ async def set_release_date(request: Request):
 @router.get("/api/software/ddg-jobs")
 async def list_ddg_jobs():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/ddg-jobs",
                            headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -434,7 +469,7 @@ async def list_ddg_jobs():
 @router.get("/api/software/vendor-pages")
 async def list_vendor_pages():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/vendor-pages", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
@@ -443,7 +478,7 @@ async def list_vendor_pages():
 async def save_vendor_page(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.put(f"{s.rag_api_url}/software/vendor-pages", json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
@@ -451,7 +486,7 @@ async def save_vendor_page(request: Request):
 @router.delete("/api/software/vendor-pages/{keyword}")
 async def delete_vendor_page(keyword: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.delete(f"{s.rag_api_url}/software/vendor-pages/{keyword}", headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 
@@ -460,7 +495,7 @@ async def delete_vendor_page(keyword: str):
 async def scan_manual_urls(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.post(f"{s.rag_api_url}/software/scan-urls",
                             json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -469,7 +504,7 @@ async def scan_manual_urls(request: Request):
 @router.get("/api/software/deep-search-cache")
 async def get_deep_search_cache(product: str, version: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/deep-search-cache",
                            params={"product": product, "version": version},
                            headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -480,7 +515,7 @@ async def get_deep_search_cache(product: str, version: str):
 async def cve_deep_search(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.post(f"{s.rag_api_url}/software/cve-deep-search",
                             json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -489,7 +524,7 @@ async def cve_deep_search(request: Request):
 @router.get("/api/software/cve-prompt")
 async def get_cve_prompt():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(f"{s.rag_api_url}/software/cve-prompt",
                            headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -499,7 +534,7 @@ async def get_cve_prompt():
 async def update_cve_prompt(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.put(f"{s.rag_api_url}/software/cve-prompt",
                            json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -509,7 +544,7 @@ async def update_cve_prompt(request: Request):
 async def software_ddg_search_raw(query: str = Query(...), max_results: int = Query(20)):
     """Generic DDG search — returns raw results (for GitHub PoC tab)."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/software/ddg-search-raw",
             params={"query": query, "max_results": max_results},
@@ -521,7 +556,7 @@ async def software_ddg_search_raw(query: str = Query(...), max_results: int = Qu
 @router.get("/api/software/ddg-search")
 async def software_ddg_search(product: str, version: str = "", force: bool = False):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.get(
             f"{s.rag_api_url}/software/ddg-search",
             params={"product": product, "version": version, "force": str(force).lower()},
@@ -538,7 +573,7 @@ async def software_ddg_search(product: str, version: str = "", force: bool = Fal
 @router.get("/api/software/ddg-search/{job_id}")
 async def software_ddg_search_status(job_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/software/ddg-search/{job_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -559,26 +594,29 @@ async def list_scan_recommendations(
     """List all scan recommendations from the DB, optionally filtered by status."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
-            params = {"limit": str(limit)}
-            if status != "all":
-                params["status"] = status
+        async with httpx.AsyncClient(timeout=10) as c:
+            # Pass `status` through ALWAYS, including "all".
+            #
+            # Omitting it for "all" let the upstream default take over — and that
+            # default is "pending", so asking for every status returned only
+            # pending and the 28 completed recommendations were invisible. The
+            # upstream already treats "all" as "no filter"; it just has to be
+            # told.
+            params = {"limit": str(limit), "status": status}
+            # Straight to scan-recommender, which owns this table.
+            #
+            # This used to try rag-api's /scan-recommendations first and fall
+            # back here on 404. rag-api has never declared that route, so the
+            # first leg was a guaranteed wasted round-trip on every load of the
+            # page — the fallback was doing all the work.
             resp = await c.get(
-                f"{s.rag_api_url}/scan-recommendations",
+                f"{s.scan_recommender_url}/recommendations",
                 params=params,
                 headers={"x-api-key": s.api_key, **engagement_headers()},
             )
             if resp.status_code == 200:
                 return safe_json(resp)
-            # Fallback: query DB directly if rag-api doesn't have the endpoint
-            resp2 = await c.get(
-                f"{s.scan_recommender_url}/recommendations",
-                params=params,
-                headers={"x-api-key": s.api_key, **engagement_headers()},
-            )
-            if resp2.status_code == 200:
-                return resp2.json()
-            return {"recommendations": [], "error": f"No endpoint available (rag-api: {resp.status_code}, recommender: {resp2.status_code})"}
+            return {"recommendations": [], "error": f"recommender returned {resp.status_code}"}
     except Exception as e:
         return {"recommendations": [], "error": str(e)}
 
@@ -686,7 +724,7 @@ async def add_scan_recommendation(body: AddScanRecommendationRequest):
     # alongside the auto-generated rule firings.
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=5) as c:
+        async with httpx.AsyncClient(timeout=5) as c:
             await c.post(
                 f"{s.rag_api_url}/webhooks/emit",
                 json={
@@ -721,6 +759,444 @@ class RunRecommendationsRequest(BaseModel):
     proxy: Optional[str] = None  # SOCKS proxy URL, e.g. socks5://node-manager:10001
     use_kali: bool = False       # Route manual tools to the internal Kali container
     node_id: Optional[str] = None  # Remote node for SSH-based tool execution
+    # Run a recommendation the platform decided was unnecessary.
+    #
+    # Suppression is a suggestion, not a verdict: "nmap already produced results
+    # for this host" or "credentials already recovered" is usually right and
+    # occasionally wrong, and the operator is better placed to judge. Without
+    # this, a suppressed recommendation is unrunnable and the tool has quietly
+    # overruled the tester.
+    force: bool = False
+    # Run Metasploit modules directly instead of queueing them for approval.
+    #
+    # Defaults to FALSE and must be set explicitly by the caller. This endpoint
+    # is also called by the recon agent (services/recon_agent.py) and by agent
+    # session finalisation (autogen_service.py), and neither of those is a human
+    # deciding to exploit a host. An operator pressing Run in the UI IS that
+    # decision, which is what this flag expresses — so the separate approval
+    # step is redundant there, and still required everywhere else.
+    #
+    # Fail-safe by omission: any caller that does not know about this flag
+    # cannot auto-exploit.
+    approve_exploits: bool = False
+
+
+# Suggested manual commands for recommendations dispatch cannot run.
+#
+# This tool exists to feed MANUAL workflows, so "skipped, here is why" is half an
+# answer. Each entry turns an undispatchable recommendation into something the
+# operator can paste. Placeholders are filled from the rec.
+_MANUAL_COMMANDS = {
+    # artifact — operate on a downloaded file, not a host
+    "exiftool": "exiftool -a -u -g1 '{file}'",
+    "binwalk": "binwalk -e '{file}'",
+    "strings": "strings -n 8 '{file}' | less",
+    "steghide": "steghide info '{file}'",
+    "pdfid": "pdfid.py '{file}'",
+    "oledump": "oledump.py '{file}'",
+    # range — sweep a scope once
+    "masscan": "masscan {target} -p1-65535 --rate 1000 -oJ masscan.json",
+    "netdiscover": "netdiscover -r {target}",
+    "arp-scan": "arp-scan --localnet",
+    "fping": "fping -a -g {target} 2>/dev/null",
+    # resource — wordlists / template sets: what to USE them with
+    "seclists": ("gobuster dir -u http://{target} -w "
+                 "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt"),
+    "wordlists": ("hydra -I -L {user_list} -P {password_list} "
+                  "{target} <service>"),
+    # rockyou is 14,344,399 lines: paired with any userlist it exceeds the
+    # listener's candidate-space limit and is refused, so the hint that used to
+    # name it here pointed operators at a command that cannot run.
+    "rockyou": ("hydra -I -l <user> -P {password_list} {target} <service>   "
+                "# rockyou itself is refused: 14.3M candidates cannot finish"),
+    "nuclei-templates": "nuclei -u http://{target} -t /root/nuclei-templates/ -severity high,critical",
+}
+
+_KIND_TITLE = {
+    "artifact": "Run {tool} against collected files",
+    "range": "Sweep {target} with {tool} (scope-wide, run once)",
+    "resource": "Use {tool} with an appropriate tool against {target}",
+}
+
+
+async def _manual_followup_for(rec: dict, kind: str, ip: str) -> Optional[dict]:
+    """Create a follow_up_item carrying the command to run by hand.
+
+    Returns the follow-up summary, or None if it could not be recorded. Never
+    raises: failing to file a follow-up must not turn a clean skip into an error.
+    """
+    scanner = (rec.get("scanner") or "").lower()
+    target = ip or "<target>"
+    cmd = _MANUAL_COMMANDS.get(scanner)
+    if cmd:
+        cmd = cmd.format(target=target, file="<path/to/file>")
+    else:
+        # Unknown tool of a known kind — still worth surfacing, without
+        # inventing a command line we cannot vouch for.
+        cmd = f"{scanner} <see tool docs>  # target: {target}"
+
+    title = _KIND_TITLE.get(kind, "Manual step: {tool}").format(tool=scanner, target=target)
+    reason = (f"Recommended by the KB but not dispatchable automatically "
+              f"(target_kind={kind}). Suggested command: {cmd}")
+    try:
+        s = get_settings()
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(
+                f"{s.rag_api_url}/follow-ups",
+                # Fields match FollowUpCreate exactly. It has no metadata column,
+                # so the command goes in `notes` — where the operator will
+                # actually read it — rather than an extra key pydantic drops.
+                json={
+                    "title": title,
+                    "target": target,
+                    "severity": "info",
+                    "reason": reason,
+                    "priority": "low",
+                    "flagged_by": "scan_recommender",
+                    "rule_id": f"manual_{kind}_tool",
+                    "tags": ["manual", kind, scanner],
+                    "notes": (f"$ {cmd}\n\n"
+                              f"tool={scanner} target_kind={kind} "
+                              f"recommendation_id={rec.get('id')}"),
+                },
+                headers={"x-api-key": s.api_key, **engagement_headers()},
+            )
+        if r.status_code < 400:
+            return {"created": True, "command": cmd, "title": title}
+        log.warning("manual follow-up POST failed (%s): %s", r.status_code, r.text[:160])
+        return {"created": False, "command": cmd, "title": title}
+    except Exception as e:
+        log.warning("manual follow-up for %s failed: %s", scanner, e)
+        return {"created": False, "command": cmd, "title": title}
+
+
+# Tool NAME sets, module level so both dispatch and the coverage endpoint read
+# the same source. The URLs themselves stay in-function because they resolve from
+# settings at call time; only the names are static.
+SCANNER_NAMES_ROUTED = frozenset(['alterx', 'dirsearch', 'dnsx', 'feroxbuster', 'ffuf', 'gobuster', 'httpx', 'hydra', 'katana', 'medusa', 'metasploit', 'naabu', 'ncrack', 'nikto', 'nmap', 'nuclei', 'sqlmap', 'subfinder', 'tlsx', 'vulnx', 'wappalyzer', 'wfuzz', 'whatweb'])
+MANUAL_TOOL_NAMES = frozenset(['ajpycat', 'curl', 'ftp', 'irssi', 'lftp', 'mysql', 'mysqltuner', 'netcat', 'psql', 'rmg', 'rpcinfo', 'showmount', 'smtp-user-enum', 'ssh-audit', 'swaks', 'telnet', 'vncviewer'])
+
+@router.get("/api/scan-recommendations/tool-coverage")
+async def recommendation_tool_coverage():
+    """Which recommended tools have nowhere to run.
+
+    A recommendation names a TOOL; running it needs that tool to be either routed
+    to a service (SCANNER_URLS), or present in the Kali image and its registry.
+    When a new tool starts being recommended and neither is true, the only signal
+    today is a skip buried in a dispatch response.
+
+    This lists the gap directly, so "we added a tool to the KB" and "the tool can
+    actually run" stop drifting apart. `unregistered` is the actionable set: add
+    to SCANNER_URLS (with a payload branch) if a service owns it, or to the
+    node-manager tool registry + kali image if it is CLI-only.
+    """
+    s = get_settings()
+    routed = set(SCANNER_NAMES_ROUTED)
+    manual = set(MANUAL_TOOL_NAMES)
+
+    recommended: set = set()
+    try:
+        from db import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT lower(scanner) FROM scan_recommendations "
+                        "WHERE scanner IS NOT NULL")
+            recommended = {r[0] for r in cur.fetchall() if r and r[0]}
+    except Exception as e:
+        raise HTTPException(503, f"could not read scan_recommendations: {e}")
+
+    registry: set = set()
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            # /tools is a 404 — the endpoint is /tools/allowed. Getting this
+            # wrong made the report claim 21 tools were unregistered while they
+            # were demonstrably installed, which is worse than no report.
+            r = await c.get(f"{s.kali_listener_url}/tools/allowed",
+                            headers={"x-api-key": s.api_key})
+            if r.status_code == 200:
+                data = r.json()
+                items = data.get("tools") if isinstance(data, dict) else data
+                if isinstance(items, dict):
+                    registry = {k.lower() for k in items}
+                elif isinstance(items, list):
+                    registry = {(t.get("name") if isinstance(t, dict) else str(t)).lower()
+                                for t in items}
+    except Exception as e:
+        log.warning("tool registry fetch failed: %s", e)
+
+    covered = routed | manual | registry
+    unregistered = sorted(recommended - covered)
+    return {
+        "recommended_tools": len(recommended),
+        "routed_to_service": sorted(recommended & routed),
+        "manual_on_kali": sorted(recommended & (manual | registry)),
+        "unregistered": unregistered,
+        "detail": ("Tools in `unregistered` are recommended but have nowhere to run. "
+                   "Add to SCANNER_URLS + a payload branch if a service owns the "
+                   "tool, or to the node-manager tool registry and the kali image "
+                   "if it is CLI-only."),
+    }
+
+
+class ReorderRequest(BaseModel):
+    """New execution order for queued recommendations.
+
+    `ids` is the desired order, first to run first. Priorities are rewritten to
+    match, spaced apart so a later single-item move does not need a full
+    renumber.
+    """
+    ids: List[str]
+    # Where the reordered block starts. Defaults below the recommender's own
+    # high-value band (5/10) so a manual reorder does not silently outrank a
+    # curated Metasploit module unless the operator asks for it.
+    start: int = 20
+    step: int = 5
+
+
+async def _allowed_tool_names():
+    """Lowercased tool allowlist from kali-listener, or None if unreadable.
+
+    None is deliberately distinct from an empty set: a failed probe must not be
+    reported as "no tools are available", which would mark every recommendation
+    blocked for the wrong reason. Mirrors the shape handling in the coverage
+    report — /tools/allowed has returned both a dict and a list.
+    """
+    s_cfg = get_settings()
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{s_cfg.kali_listener_url}/tools/allowed",
+                            headers={"x-api-key": s_cfg.api_key})
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        items = data.get("tools") if isinstance(data, dict) else data
+        if isinstance(items, dict):
+            return {k.lower() for k in items}
+        if isinstance(items, list):
+            return {(t.get("name") if isinstance(t, dict) else str(t)).lower() for t in items}
+    except Exception as e:
+        log.debug("tool allowlist unavailable: %s", e)
+    return None
+
+
+@router.get("/api/scan-recommendations/blockers")
+async def recommendation_blockers(limit: int = 500):
+    """Why each non-terminal recommendation is not running.
+
+    Answering this used to mean checking five unrelated places: the row's status,
+    whether extra.job_id existed, the pending_exploits approval queue, the BFF's
+    in-memory slot queue, and the tool allowlist. Nothing joined them, so
+    "queued" looked identical whether the work was seconds away or waiting on a
+    human indefinitely.
+
+    Each item gets one reason and a `blocked` flag — blocked means it will NOT
+    proceed on its own.
+    """
+    from db import get_db
+
+    def _load():
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT r.id::text, host(r.ip)::text AS ip, r.scanner, r.status,
+                       r.priority, r.target_kind,
+                       COALESCE(NULLIF(r.script,''), r.extra->>'dispatched_command') AS command,
+                       r.extra->>'job_id'             AS job_id,
+                       r.extra->>'pending_exploit_id' AS pending_exploit_id,
+                       r.extra->>'skip_reason'        AS skip_reason,
+                       pe.status                      AS approval_status
+                  FROM scan_recommendations r
+                  LEFT JOIN pending_exploits pe
+                         ON pe.id::text = r.extra->>'pending_exploit_id'
+                 WHERE r.status IN ('pending','queued','skipped','failed')
+                 ORDER BY r.priority, r.created_at
+                 LIMIT %s
+            """, (max(1, min(limit, 2000)),))
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    try:
+        rows = await asyncio.to_thread(_load)
+    except Exception as e:
+        raise HTTPException(500, f"could not read recommendations: {e}")
+
+    scope_rows, scope_source = _scope_rows_for(current_engagement_id.get())
+    allowed = await _allowed_tool_names()
+    limit_now = get_max_concurrent()
+
+    def classify(r):
+        scanner = (r["scanner"] or "").lower()
+        # Order matters: report the FIRST thing that would stop it, which is the
+        # thing an operator has to act on.
+        if not _host_in_scope(r["ip"], scope_rows):
+            return ("out_of_scope", True,
+                    f"{r['ip']} is not in the engagement scope ({scope_source}). Dispatch "
+                    f"refuses this, including with force.")
+        if r["pending_exploit_id"]:
+            st = r["approval_status"] or "unknown"
+            return ("awaiting_approval", st == "pending",
+                    f"Metasploit module queued for human approval (approval status: {st}). "
+                    f"Exploits are never auto-run — approve it under Exploits.")
+        if r["status"] == "failed":
+            # blocked=True: `blocked` means "will not proceed without someone
+            # acting". A failed recommendation will not retry itself, so
+            # counting it as will_proceed overstated how much was actually
+            # moving — only in-flight work belongs in that bucket.
+            return ("failed", True,
+                    "Ran and failed. Open the row for the command and output, then re-run.")
+        if r["status"] == "skipped":
+            return ("skipped", True,
+                    r["skip_reason"] or "Suppressed by the platform. Use force to run it anyway.")
+        if (r["target_kind"] or "service") != "service":
+            return ("not_dispatchable", True,
+                    f"target_kind={r['target_kind']} — dispatch only handles service targets.")
+        if scanner == "metasploit":
+            # Metasploit is excluded from the kali allowlist ON PURPOSE — it is
+            # routed to the human approval queue instead. Reporting it as
+            # "tool_unavailable" was accurate about the allowlist and wrong
+            # about the cause, which sends an operator looking for a missing
+            # package instead of an approval.
+            return ("needs_operator_run", True,
+                    "Metasploit never runs automatically. Select it and press Run with "
+                    "'Run exploits directly' ticked and it executes in the metasploit "
+                    "container through the selected proxy; untick that and it queues for "
+                    "approval under Exploits instead.")
+        if allowed is not None and scanner and scanner not in allowed:
+            return ("tool_unavailable", True,
+                    f"'{scanner}' is not in the executor's allowlist, so it cannot be run "
+                    f"here. Install it on the executor, or run it by hand.")
+        if r["command"] and re.search(r"\{[a-zA-Z_]+\}", r["command"]):
+            return ("needs_input", True,
+                    f"Command still contains a placeholder: {r['command']}. Edit it before running.")
+        if r["status"] == "queued" and r["job_id"]:
+            return ("running", False,
+                    f"Dispatched as job {r['job_id'][:8]} — in flight.")
+        if r["status"] == "queued":
+            return ("queued_no_job", True,
+                    "Marked queued but carries no job id — the dispatch did not complete. Re-run it.")
+        return ("not_started", True,
+                "Never dispatched. Nothing starts a pending recommendation on its own — "
+                "select it and press Run.")
+
+    items = []
+    for r in rows:
+        reason, blocked, detail = classify(r)
+        items.append({**{k: r[k] for k in ("id", "ip", "scanner", "status", "priority", "command")},
+                      "reason": reason, "blocked": blocked, "detail": detail})
+
+    summary: dict = {}
+    for it in items:
+        summary[it["reason"]] = summary.get(it["reason"], 0) + 1
+
+    return {
+        "total": len(items),
+        # blocked = needs someone to act. will_proceed = genuinely in flight.
+        "blocked": sum(1 for i in items if i["blocked"]),
+        "will_proceed": sum(1 for i in items if not i["blocked"]),
+        "by_reason": summary,
+        "concurrency_limit": limit_now,
+        "scope_source": scope_source,
+        "items": items,
+    }
+
+
+@router.post("/api/scan-recommendations/reorder")
+async def reorder_recommendations(body: ReorderRequest):
+    """Set the execution order of queued recommendations.
+
+    Order is expressed through the existing `priority` column rather than a new
+    one, so everything that already reads priority — the listing, the dispatcher
+    — honours the change with no further wiring. Lower runs first.
+    """
+    if not body.ids:
+        raise HTTPException(400, "ids is empty — nothing to reorder")
+    if len(set(body.ids)) != len(body.ids):
+        raise HTTPException(400, "ids contains duplicates; the order would be ambiguous")
+
+    def _do():
+        from db import get_db
+        updated = []
+        with get_db() as conn, conn.cursor() as cur:
+            for i, rid in enumerate(body.ids):
+                pri = max(0, min(100, body.start + i * body.step))
+                cur.execute(
+                    """
+                    UPDATE scan_recommendations
+                       SET priority = %s, updated_at = now()
+                     WHERE id = %s::uuid
+                       -- Only reorder work that has not run. Rewriting the
+                       -- priority of a completed scan would rewrite history
+                       -- without changing what happens next.
+                       AND status IN ('pending','queued','skipped','failed')
+                    RETURNING id, priority
+                    """,
+                    (pri, rid),
+                )
+                row = cur.fetchone()
+                if row:
+                    updated.append({"id": str(row[0]), "priority": row[1]})
+            conn.commit()
+        return updated
+
+    try:
+        updated = await asyncio.to_thread(_do)
+    except Exception as e:
+        log.warning("reorder failed: %s", e)
+        raise HTTPException(500, f"reorder failed: {e}")
+
+    skipped = [i for i in body.ids if i not in {u["id"] for u in updated}]
+    return {
+        "ok": True,
+        "reordered": updated,
+        # Named explicitly: an id silently dropped because the scan already ran
+        # would look like the reorder simply did not take.
+        "not_reordered": skipped,
+        "detail": (f"{len(skipped)} id(s) were left alone because they have already "
+                   f"run or no longer exist") if skipped else None,
+    }
+
+
+def msf_module_port(rec):
+    """The MODULE's port, not the port of the service that triggered the rec.
+
+    16 of 36 metasploit dispatches went out with a contradictory RPORT.
+    `exploit/multi/misc/java_rmi_server` carries port 1099 in its own metadata
+    and was dispatched `RPORT=21` — an RMI exploit aimed at FTP — because the
+    row's `port` column holds the TRIGGER port, while the recommender records
+    the module's own service and port under `extra.high_value`.
+
+    Returns None when nothing is known, so the caller still falls back to
+    resolving the port from the database.
+    """
+    extra = rec.get("extra") or {}
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except Exception:
+            extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+    high = extra.get("high_value")
+    if isinstance(high, dict) and high.get("port"):
+        return high["port"]
+    if extra.get("port"):
+        return extra["port"]
+    return rec.get("port")
+
+
+def msf_job_identifier(data, rec):
+    """A usable identifier for a dispatch, in order of preference.
+
+    An auxiliary or scanner module starts a JOB and never creates a session, so
+    `session_id` is None for most dispatches. The old code fell back to the
+    literal string "msf", which gave all 36 queued recommendations the same
+    non-identifier — nothing could correlate a dispatch with its result, and none
+    of them ever produced a recorded execution.
+    """
+    data = data or {}
+    for key in ("job_id", "session_id"):
+        value = data.get(key)
+        if value not in (None, "", "msf"):
+            return str(value)
+    return str(rec.get("id"))          # unique, unlike "msf"
 
 
 @router.post("/api/scan-recommendations/run")
@@ -733,17 +1209,84 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
     headers = {"x-api-key": s.api_key, "Content-Type": "application/json", **engagement_headers()}
     results = []
 
-    # Fetch the full recommendation details
-    async with httpx.AsyncClient(verify=False, timeout=15) as client:
-        resp = await client.get(
-            f"{s.scan_recommender_url}/recommendations",
-            params={"status": "all", "limit": 500},
-            headers=headers,
-        )
-        all_recs = resp.json().get("recommendations", []) if resp.status_code == 200 else []
+    # Resolve the requested ids DIRECTLY against the table, not via the
+    # recommender's list endpoint.
+    #
+    # That endpoint selects
+    #   SELECT DISTINCT ON (ip, scanner, COALESCE(action,''), COALESCE(template,''))
+    # so it collapses duplicates — 182 rows in the table came back as 119 — and
+    # DISTINCT ON keeps only one row per group. Any id that lost the tie-break was
+    # simply absent, and this endpoint answered "No matching recommendations
+    # found" for a row that plainly exists and is pending.
+    #
+    # That made it structurally impossible for the recon agent's KB drain to work:
+    # the drain selects ids from the RAW table, then posts them here, where they
+    # were looked up in the DEDUPLICATED view. Ids the drain picks are exactly the
+    # ones most likely to have been deduped away.
+    #
+    # Ids are exact keys, so dedupe is meaningless for this lookup — query for
+    # them. The list endpoint stays as-is: collapsing duplicates is right for
+    # DISPLAY, just not for resolution by primary key.
+    recs_by_id: dict = {}
+    try:
+        from db import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.id::text, host(r.ip)::text AS ip, r.service, r.scanner,
+                       r.action, r.script, r.template, r.source, r.model,
+                       r.confidence, r.priority, r.status, r.extra, r.target_kind,
+                       -- scan_recommendations has no port column, so {port} in a
+                       -- script could never be filled and the command was
+                       -- dispatched with the literal placeholder still in it.
+                       -- Prefer a port whose service matches the recommendation.
+                       pt.port
+                  FROM scan_recommendations r
+                  LEFT JOIN LATERAL (
+                      SELECT p.port
+                        FROM ports p
+                        JOIN assets a ON a.id = p.asset_id
+                       WHERE host(a.ip) = host(r.ip)
+                         AND COALESCE(p.is_open, true)
+                       ORDER BY (p.service IS NOT DISTINCT FROM r.service) DESC, p.port
+                       LIMIT 1
+                  ) pt ON true
+                 WHERE r.id = ANY(%s::uuid[])
+                """,
+                (list(body.ids),),
+            )
+            cols = [d[0] for d in cur.description]
+            for row in cur.fetchall():
+                rec = dict(zip(cols, row))
+                recs_by_id[rec["id"]] = rec
+    except Exception as e:
+        # Fall back to the list endpoint rather than failing outright — a DB
+        # hiccup should not make dispatch impossible, even if dedupe may hide
+        # some ids on that path.
+        log.warning("recommendation id lookup failed (%s) — falling back to the "
+                    "recommender list, which deduplicates and may not find every id", e)
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{s.scan_recommender_url}/recommendations",
+                params={"status": "all", "limit": 500},
+                headers=headers,
+            )
+            all_recs = resp.json().get("recommendations", []) if resp.status_code == 200 else []
+        recs_by_id = {r["id"]: r for r in all_recs}
 
-    recs_by_id = {r["id"]: r for r in all_recs}
-    selected = [recs_by_id[rid] for rid in body.ids if rid in recs_by_id]
+    # Dispatch in PRIORITY order, not the order the ids happened to arrive in.
+    #
+    # priority was set by the recommender and the artifact rules but nothing
+    # ordered by it here, so with the concurrency bound in place the first N
+    # dispatched were simply whichever the UI listed first — an arbitrary
+    # selection out of a queue that had already been ranked. Lower runs first,
+    # matching scan_recommender.py ("lower int = runs first"); created_at breaks
+    # ties so the order is stable rather than dependent on dict iteration.
+    selected = sorted(
+        (recs_by_id[rid] for rid in body.ids if rid in recs_by_id),
+        key=lambda r: (r.get("priority") if r.get("priority") is not None else 50,
+                       str(r.get("created_at") or "")),
+    )
 
     if not selected:
         return {"ok": False, "error": "No matching recommendations found", "results": []}
@@ -780,6 +1323,12 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
     already_active_results = []
     for rec in selected:
         cur_status = (rec.get("status") or "pending").lower()
+        # `force` only overrides a SUPPRESSION decision. It deliberately does not
+        # override queued/running: that guard prevents double-dispatch of work
+        # already in flight, which is a different problem.
+        if body.force and cur_status == "skipped":
+            dispatchable.append(rec)
+            continue
         if cur_status in _ACTIVE_REC_STATES:
             already_active_results.append({
                 "id": rec["id"],
@@ -793,6 +1342,33 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
     selected = dispatchable
 
     # Map scanner → service URL
+    # ── Tool → service routing ────────────────────────────────────────────
+    #
+    # A recommended tool with NO entry here falls through to the manual-Kali
+    # branch, which tries `apt-get install <scanner>` in the Kali container. That
+    # is the wrong answer whenever the stack ALREADY runs a service for the tool:
+    # katana, naabu and tlsx were all being skipped as "missing on kali" while
+    # pd-runner sat there serving /jobs/katana, /jobs/naabu and /jobs/tlsx with
+    # the binaries installed.
+    #
+    # Before adding a tool to MANUAL_TOOLS or leaving it unmapped, check whether a
+    # service already owns it. Inventory below is taken from each service's actual
+    # @app.post("/jobs/...") routes, not from memory:
+    #
+    #   nmap_scanner    nmap, masscan (masscan-then-nmap, masscan-only, full-scan,
+    #                   nmap-udp, smb-vuln-scan, credential-check)
+    #   nuclei-runner   nuclei
+    #   web-scanner     gobuster, nikto, content-recon, web-scan, pipeline-scan
+    #   pd-runner       httpx, naabu, katana, tlsx, whatweb, ffuf
+    #   osint-runner    subfinder, dnsx, alterx, vulnx, amass, gau, waybackurls,
+    #                   wafw00f, gowitness, whois, trufflehog, subzy, dns-enum,
+    #                   service-enum, subdomain-takeover, crtsh, shuffledns, ...
+    #   brutus-runner   hydra/medusa/ncrack (all via /jobs/brutus)
+    #   exploit-runner  metasploit (queued for approval, never auto-exploited)
+    #   kali-listener   genuinely CLI-only tools — the fallback, not the default
+    #
+    # Adding a route needs BOTH an entry here and a payload branch in
+    # dispatch_rec(); a URL alone yields "No automated handler for '<scanner>'".
     SCANNER_URLS = {
         "nmap": s.nmap_scanner_url,
         "nuclei": s.nuclei_url,
@@ -803,6 +1379,14 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         "ffuf": s.pd_runner_url,
         "whatweb": s.pd_runner_url,
         "httpx": s.pd_runner_url,
+        # katana / naabu / tlsx were absent from this map even though pd-runner
+        # serves /jobs/katana, /jobs/naabu and /jobs/tlsx and ships all three
+        # binaries. Missing here meant they fell through to the manual-Kali
+        # branch and were skipped as "missing on kali" — asking a Kali container
+        # to install tools the stack already runs a dedicated container for.
+        "katana": s.pd_runner_url,
+        "naabu": s.pd_runner_url,
+        "tlsx": s.pd_runner_url,
         "sqlmap": s.web_scanner_url,
         "metasploit": s.exploit_runner_url,
         "wfuzz": s.pd_runner_url,
@@ -816,7 +1400,9 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         "vulnx": s.osint_runner_url,
     }
 
-    # Tools that are manual/CLI-only — skip with explanation
+    # Tools that are manual/CLI-only — skip with explanation.
+    # Mirrors MANUAL_TOOL_NAMES; kept as a literal for readability, and asserted
+    # against the shared constant so the two cannot drift apart silently.
     MANUAL_TOOLS = {
         "curl", "telnet", "netcat", "vncviewer", "irssi", "lftp", "ftp",
         "psql", "mysql", "rpcinfo", "showmount", "smtp-user-enum",
@@ -827,14 +1413,98 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
     use_kali = body.use_kali
     node_id = body.node_id
 
+    # Loaded once per request: dispatching a batch should not re-query the scope
+    # for every recommendation in it.
+    _scope_rows, _scope_source = _scope_rows_for(current_engagement_id.get())
+    if not _scope_rows:
+        log.warning("no scope targets configured (%s) — every dispatch will be "
+                    "blocked; this is deliberate, an unconfigured scope must not "
+                    "mean 'scan anything'", _scope_source)
+
     # Map scanner → endpoint and payload builder
+    # Dispatch understands ONE shape: (ip, service, port) -> scanner. Anything
+    # else must be refused with a reason rather than fired at an IP as though it
+    # were a network scan — a silent no-op that then sits in the KB coverage
+    # report forever as "recommended but never run".
+    NON_SERVICE_KIND_REASON = {
+        "artifact": ("targets a FILE, not a host — it needs an artifact reference "
+                     "(evidence_store / content_extractions), which this dispatch "
+                     "path does not carry yet"),
+        "range": ("targets a CIDR/scope, not a single service — it must be "
+                  "deduped to one sweep per scope at GENERATION time, or it "
+                  "produces one identical sweep per discovered service"),
+        "resource": ("is not runnable — it is an INPUT to other tools (wordlists, "
+                     "template sets). Treat it as a prerequisite to install, not "
+                     "a scan to dispatch"),
+    }
+
     async def dispatch_rec(rec):
-        scanner = rec.get("scanner", "").lower()
+        # `or ""` — same nullable-column trap as the nmap branch below:
+        # .get(k, "") returns None when the key exists with a NULL value.
+        scanner = (rec.get("scanner") or "").lower()
         ip = (rec.get("ip") or "").replace("/32", "")
         service_url = SCANNER_URLS.get(scanner)
         result = {"id": rec["id"], "scanner": scanner, "ip": ip}
 
+        # Scope gate FIRST, before any other decision. Checked here rather than
+        # at generation time because a recommendation can outlive the scope that
+        # produced it, and `force` must never be able to override authorisation —
+        # it exists to overrule the platform's *suppression* judgement, not the
+        # operator's *scope*.
+        if not _host_in_scope(ip, _scope_rows):
+            result["status"] = "blocked"
+            result["out_of_scope"] = True
+            result["detail"] = (
+                f"BLOCKED — {ip or 'this target'} is not in the engagement scope "
+                f"({_scope_source}). Nothing was dispatched. Add it to the scope "
+                f"if you are authorised to test it.")
+            log.warning("dispatch blocked: %s is out of scope for rec %s (%s)",
+                        ip, rec.get("id"), scanner)
+            return result
+
+        kind = (rec.get("target_kind") or "service").lower()
+        if kind != "service":
+            result["status"] = "skipped"
+            result["target_kind"] = kind
+            result["detail"] = f"'{scanner}' {NON_SERVICE_KIND_REASON.get(kind, f'has target_kind={kind}, which dispatch does not handle')}"
+            # A skip with no next step is a dead end. These tools are still worth
+            # running — just by hand — so hand the operator the command instead of
+            # only explaining why the pipeline will not.
+            fu = await _manual_followup_for(rec, kind, ip)
+            if fu:
+                result["manual_followup"] = fu
+            return result
+
+        # Tools a service DOES serve but which are not mapped above. Without this
+        # the operator is told "missing on kali" for something the stack already
+        # runs — the exact confusion that hid the katana/naabu/tlsx gap.
+        SERVED_ELSEWHERE = {
+            "katana": "pd-runner /jobs/katana",
+            "naabu": "pd-runner /jobs/naabu",
+            "tlsx": "pd-runner /jobs/tlsx",
+            "ffuf": "pd-runner /jobs/ffuf",
+            "whatweb": "pd-runner /jobs/whatweb",
+            "httpx": "pd-runner /jobs/httpx",
+            "amass": "osint-runner /jobs/amass",
+            "gau": "osint-runner /jobs/gau",
+            "waybackurls": "osint-runner /jobs/waybackurls",
+            "wafw00f": "osint-runner /jobs/wafw00f",
+            "gowitness": "osint-runner /jobs/gowitness",
+            "whois": "osint-runner /jobs/whois",
+            "trufflehog": "osint-runner /jobs/trufflehog",
+            "dnsenum": "osint-runner /jobs/dns-enum",
+            "dnsrecon": "osint-runner /jobs/dns-enum",
+            "subfinder": "osint-runner /jobs/subfinder",
+        }
+
         if not service_url:
+            hint = SERVED_ELSEWHERE.get(scanner)
+            if hint:
+                result["status"] = "skipped"
+                result["detail"] = (
+                    f"'{scanner}' is served by {hint} but is not in SCANNER_URLS — "
+                    f"route it there rather than installing it on kali")
+                return result
             # Try Kali container for manual/CLI tools — preflight first.
             if use_kali and scanner not in ("metasploit",):
                 pf = await _preflight_tool("kali", scanner, None)
@@ -864,22 +1534,80 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             return result
 
         try:
-            async with httpx.AsyncClient(verify=False, timeout=30) as client:
+            # Bound up front because only some branches below assign them. The
+            # dispatch recorder reads both, and referencing an unassigned local
+            # raised UnboundLocalError *after* the scan had already been
+            # accepted — turning successful nmap dispatches into failures.
+            endpoint = None
+            payload = None
+            async with httpx.AsyncClient(timeout=30) as client:
                 if scanner == "nmap":
-                    script = rec.get("script", "")
-                    action = rec.get("action", "")
-                    # Nmap script recommendations (banner, http-title, etc.) are already covered
-                    # by service detection — only dispatch actual port scans
+                    # `or ""`, NOT .get(k, ""). The second argument to .get only
+                    # applies when the KEY IS ABSENT; these rows come from
+                    # scan_recommendations where `action` and `script` are
+                    # nullable columns, so the key is present with a None value
+                    # and .get happily returns None.
+                    #
+                    # That made action.lower() below raise
+                    #   AttributeError: 'NoneType' object has no attribute 'lower'
+                    # for every nmap rec with a NULL action — 20 of them, all
+                    # reported as "failed" with no traceback and no retry, which
+                    # is why the KB queue sat at 144 pending while the agent
+                    # dispatched nothing cycle after cycle.
+                    script = rec.get("script") or ""
+                    action = rec.get("action") or ""
+                    # Skip an NSE script ONLY when that script has actually
+                    # produced a result for this host.
+                    #
+                    # This used to skip EVERY script rec as "already run during
+                    # service detection". That assumption is wrong: a default
+                    # -sV runs none of nfs-showmount, rmi-dumpregistry,
+                    # distcc-*, snmp-*, tftp-enum, ntp-monlist or x11-access,
+                    # and on a live engagement vulns.script held only nuclei
+                    # entries — so 63 legitimate enumeration scans were being
+                    # refused, permanently, while reporting themselves as
+                    # already done.
+                    #
+                    # `banner` and friends genuinely ARE covered, and they still
+                    # get skipped — but now because the evidence says so.
                     if script and not any(kw in action.lower() for kw in ("port scan", "discovery", "full scan")):
-                        result["status"] = "skipped"
-                        result["detail"] = f"Nmap script '{script.split(' ')[0]}' — already run during service detection"
-                        return result
-                    payload = {"targets": [ip], "ports": str(rec.get("port", "1-1000"))}
+                        _tokens = [t for t in re.findall(r"[a-z0-9][a-z0-9-]{3,}", script.lower())
+                                   if t not in ("nmap", "target", "script", "sudo")]
+                        _already = False
+                        if _tokens:
+                            try:
+                                from db import get_db
+                                with get_db() as _c, _c.cursor() as _cur:
+                                    _cur.execute(
+                                        "SELECT 1 FROM vulns v LEFT JOIN assets a ON a.id=v.asset_id "
+                                        " WHERE v.script IS NOT NULL AND lower(v.script) = ANY(%s) "
+                                        "   AND (a.ip IS NULL OR host(a.ip)=%s) LIMIT 1",
+                                        (_tokens, ip),
+                                    )
+                                    _already = _cur.fetchone() is not None
+                            except Exception as _e:
+                                # Fail toward RUNNING the scan: wrongly skipping
+                                # loses coverage silently, wrongly running costs
+                                # one redundant scan.
+                                log.debug(f"nse-already-ran check failed for {ip}: {_e}")
+                                _already = False
+                        if _already and not getattr(body, "force", False):
+                            result["status"] = "skipped"
+                            result["detail"] = (
+                                f"Nmap script '{script.split(' ')[0]}' — already produced "
+                                "results for this host")
+                            return result
+                    # Omit ports when the rec does not name one: the scanner then
+                    # applies its top-1000 profile. "1-1000" is the first 1000 port
+                    # NUMBERS, not the 1000 most commonly open ports.
+                    payload = {"targets": [ip]}
+                    if rec.get("port"):
+                        payload["ports"] = str(rec["port"])
                     if proxy_url:
                         payload["proxy"] = proxy_url
                     r = await client.post(f"{service_url}/jobs/masscan-then-nmap", json=payload, headers=headers)
                 elif scanner == "nuclei":
-                    template = rec.get("template", "")
+                    template = rec.get("template") or ""
                     payload = {"targets": [f"http://{ip}"]}
                     if template:
                         tags = [t.strip() for t in template.split(",") if t.strip()]
@@ -947,6 +1675,31 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                     if proxy_url:
                         payload["proxy"] = proxy_url
                     r = await client.post(f"{service_url}/jobs/brutus", json=payload, headers=headers)
+                elif scanner == "katana":
+                    port = rec.get("port") or 80
+                    scheme = "https" if str(port) in ("443", "8443") else "http"
+                    r = await client.post(
+                        f"{service_url}/jobs/katana",
+                        json={"targets": [f"{scheme}://{ip}:{port}"], "depth": 3,
+                              "js_crawl": True},
+                        headers=headers,
+                    )
+                elif scanner == "naabu":
+                    # No `ports` -> pd_runner falls back to -top-ports 1000, the
+                    # frequency-ranked list, rather than a sequential low range.
+                    payload = {"targets": [ip], "rate": 1000}
+                    if rec.get("port"):
+                        payload["ports"] = str(rec["port"])
+                    if proxy_url:
+                        payload["proxy"] = proxy_url
+                    r = await client.post(f"{service_url}/jobs/naabu",
+                                          json=payload, headers=headers)
+                elif scanner == "tlsx":
+                    payload = {"targets": [ip], "ports": str(rec.get("port") or 443)}
+                    if proxy_url:
+                        payload["proxy"] = proxy_url
+                    r = await client.post(f"{service_url}/jobs/tlsx",
+                                          json=payload, headers=headers)
                 elif scanner == "wappalyzer":
                     port = rec.get("port") or 80
                     r = await client.post(
@@ -954,6 +1707,92 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                         json={"targets": [f"http://{ip}:{port}"]},
                         headers=headers,
                     )
+                elif scanner == "metasploit" and body.approve_exploits:
+                    # The operator pressed Run on this module, which IS the
+                    # approval — so execute it in the metasploit container via
+                    # exploit-runner rather than queueing a second confirmation.
+                    #
+                    # Reached only when the caller set approve_exploits. The
+                    # recon agent and agent-session finalisation call this same
+                    # endpoint and do not set it, so they still queue for review.
+                    module = (rec.get("script") or "").strip()
+                    if not module:
+                        result["status"] = "skipped"
+                        result["detail"] = "Metasploit rec has no module — nothing to run"
+                        return result
+
+                    def _resolve_port():
+                        from db import get_db
+                        with get_db() as conn, conn.cursor() as cur:
+                            cur.execute("SELECT (extra->>'port')::int FROM scan_recommendations "
+                                        "WHERE id = %s::uuid", (rec["id"],))
+                            row = cur.fetchone()
+                            return row[0] if row else None
+
+                    # The MODULE's port, not the port of whatever service
+                    # triggered the recommendation.
+                    #
+                    # 16 of 36 dispatches went out with a contradictory RPORT:
+                    # `exploit/multi/misc/java_rmi_server` carries port 1099 in
+                    # its own metadata and was dispatched RPORT=21, i.e. an RMI
+                    # exploit aimed at FTP. The recommender records the module's
+                    # service and port under extra.high_value; the row's `port`
+                    # column is the trigger, which is not the same thing.
+                    msf_port = msf_module_port(rec)
+                    if msf_port is None:
+                        try:
+                            msf_port = await asyncio.to_thread(_resolve_port)
+                        except Exception:
+                            msf_port = None
+
+                    opts = {"RHOSTS": ip}
+                    if msf_port:
+                        opts["RPORT"] = msf_port
+                    payload = {
+                        "module_type": "exploit" if module.startswith("exploit/") else "auxiliary",
+                        "module_name": module,
+                        "options": opts,
+                        # exploit-runner turns this into MSF's Proxies option and
+                        # REFUSES the run if it cannot, rather than connecting
+                        # direct behind the operator's back.
+                        "proxy_url": proxy_url,
+                    }
+                    try:
+                        async with httpx.AsyncClient(timeout=300) as c:
+                            r = await c.post(f"{s.exploit_runner_url}/execute/msf",
+                                             json=payload,
+                                             headers={"x-api-key": s.api_key, **engagement_headers()})
+                        if r.status_code in (200, 201, 202):
+                            data = r.json()
+                            ok = bool(data.get("success"))
+                            result["status"] = "dispatched" if ok else "failed"
+                            result["detail"] = (f"Metasploit {module} ran in the metasploit "
+                                                f"container{' via ' + proxy_url if proxy_url else ''}: "
+                                                f"{'success' if ok else 'no session/failed'}")
+                            await _mark_rec_dispatched(
+                                # job_id first: an auxiliary module starts a job
+                                # and never creates a session. Falling back to
+                                # the literal "msf" gave all 36 dispatches the
+                                # same non-identifier, so no result could ever be
+                                # correlated back. The rec id is the last resort
+                                # because it is at least unique.
+                                rec_id=rec["id"],
+                                job_id=msf_job_identifier(data, rec),
+                                ip=ip, port=msf_port, service=rec.get("service"),
+                                scanner=scanner, node_id=None,
+                                command=f"msf {module} RHOSTS={ip}"
+                                        + (f" RPORT={msf_port}" if msf_port else "")
+                                        + (f" Proxies={proxy_url}" if proxy_url else ""),
+                                endpoint=f"{s.exploit_runner_url}/execute/msf",
+                            )
+                        else:
+                            result["status"] = "failed"
+                            result["detail"] = f"exploit-runner HTTP {r.status_code}: {r.text[:160]}"
+                    except Exception as e:
+                        result["status"] = "failed"
+                        result["detail"] = f"{type(e).__name__}: {str(e)[:120]}"
+                    return result
+
                 elif scanner == "metasploit":
                     # Don't auto-exploit. Queue the module into the
                     # pending_exploits approval workflow (Exploit Manager), with
@@ -1095,6 +1934,11 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                             service=rec.get("service"),
                             scanner=scanner,
                             node_id=node_id,
+                            # No shell command exists for these — the request
+                            # itself is the record of what ran.
+                            command=_describe_dispatch(endpoint, payload, scanner, service_url),
+                            endpoint=(f"{service_url}{endpoint}" if endpoint
+                                      else f"{service_url} [{scanner}]" if service_url else None),
                         )
                 else:
                     result["status"] = "failed"
@@ -1106,15 +1950,116 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
 
         return result
 
+    # The fallback lists, if rag-api cannot be reached. STATIC and SHORT:
+    # 17 x 25 = 425 candidates. Never rockyou's 14,344,399 — a fallback that
+    # cannot finish is worse than a refusal, because it looks like a scan.
+    _STATIC_USER_LIST = ("/usr/share/wordlists/seclists/Usernames/"
+                         "top-usernames-shortlist.txt")
+    _STATIC_PASSWORD_LIST = ("/usr/share/wordlists/seclists/Passwords/"
+                             "Common-Credentials/top-passwords-shortlist.txt")
+
+    async def _resolve_brute_lists(command: str, rec, ip: str) -> tuple:
+        """Fill {user_list}/{password_list} before the unresolved-placeholder check.
+
+        rag-api builds the per-target lists because it has the database: 35
+        usernames discovered on this host, the service's documented defaults, and
+        the username-as-password rule that produces msfadmin:msfadmin. The BFF
+        cannot do that itself — no `etl` mount, no database — so it asks rather
+        than keeping a second copy of the logic.
+
+        Returns (command, source). `source` is reported so a silent fallback
+        cannot hide that the discovered usernames were not used.
+        """
+        if not command or ("{user_list}" not in command
+                           and "{password_list}" not in command):
+            return command, None
+        s = get_settings()
+        try:
+            async with httpx.AsyncClient(timeout=180, verify=False) as c:
+                r = await c.post(
+                    f"{s.rag_api_url}/wordlists/resolve-command",
+                    json={"command": command, "target": ip,
+                          "port": rec.get("port"),
+                          "service": rec.get("service") or ""},
+                    headers={"x-api-key": s.api_key, **engagement_headers()},
+                )
+            if r.status_code == 200:
+                body = r.json()
+                if body.get("command"):
+                    return body["command"], body.get("source") or "generated"
+            elif r.status_code == 403:
+                # Out of scope is an AUTHORISATION answer, not a lookup failure.
+                # Falling back here would substitute paths for a host we have
+                # just been told not to touch.
+                return command, "refused_out_of_scope"
+        except Exception as e:                       # noqa: BLE001
+            log.warning("brute list resolve failed for %s: %s", ip, e)
+        return (command.replace("{user_list}", _STATIC_USER_LIST)
+                       .replace("{password_list}", _STATIC_PASSWORD_LIST),
+                "static_fallback")
+
+    def _fill_placeholders(command: str, rec) -> tuple:
+        """Substitute {target}/{ip}/{port}/{service} in a recommendation's script.
+
+        Returns (command, unresolved). The recommender writes templates like
+        `gobuster dir -u http://{target}:{port} -w ...`, and only the remote-node
+        route ever substituted them — the Kali route passed `script` through
+        verbatim, so the tool received a literal "{target}" and failed with a
+        confusing error that looked like a tool problem rather than a templating
+        one.
+
+        Unresolved placeholders are REPORTED rather than dispatched: running a
+        command known to be malformed produces a failure the operator then has to
+        diagnose, when the cause is already known here.
+        """
+        if not command:
+            return command, []
+        ip = rec.get("ip") or ""
+        port = rec.get("port")
+        service = rec.get("service") or ""
+        out = command.replace("{target}", ip).replace("{ip}", ip)
+        if port not in (None, ""):
+            out = out.replace("{port}", str(port))
+        if service:
+            out = out.replace("{service}", service)
+        unresolved = re.findall(r"\{[a-zA-Z_]+\}", out)
+        return out, unresolved
+
     async def _dispatch_via_kali(rec, scanner, ip, result):
         """Route tool execution to the internal Kali container."""
-        command = rec.get("script", "")
+        command, _list_source = await _resolve_brute_lists(
+            rec.get("script") or "", rec, ip)
+        if _list_source == "refused_out_of_scope":
+            result["status"] = "skipped"
+            result["detail"] = (f"{ip} is not in the configured scope — refusing "
+                                f"to prepare or run a credential attack against it")
+            return result
+        if _list_source:
+            result["wordlist_source"] = _list_source
+        command, _unresolved = _fill_placeholders(command, rec)
+        if _unresolved:
+            result["status"] = "skipped"
+            result["detail"] = (f"command still contains {', '.join(sorted(set(_unresolved)))} "
+                                f"— no value known for it on {ip}. Edit the command and re-run.")
+            return result
         if not command:
             # Build a sensible default command
             port = rec.get("port") or ""
             service = rec.get("service") or ""
             if scanner in ("hydra", "medusa", "ncrack"):
-                command = f"{scanner} -l admin -P /usr/share/wordlists/rockyou.txt {service}://{ip}:{port}" if port else f"{scanner} -l admin -P /usr/share/wordlists/rockyou.txt ssh://{ip}"
+                # Was `-l admin -P rockyou.txt`: 14,344,399 candidates against a
+                # single guessed username, which the listener's candidate-space
+                # guard now refuses outright. Built through the placeholders
+                # instead, so this default gets the discovered usernames too.
+                where = f"{service}://{ip}:{port}" if port else f"ssh://{ip}"
+                flags = "-I " if scanner == "hydra" else ""
+                command = (f"{scanner} {flags}-L {{user_list}} "
+                           f"-P {{password_list}} {where}")
+                command, _fb = await _resolve_brute_lists(command, rec, ip)
+                if _fb == "refused_out_of_scope":
+                    result["status"] = "skipped"
+                    result["detail"] = f"{ip} is not in the configured scope"
+                    return result
             elif scanner == "ssh-audit":
                 command = f"ssh-audit {ip}"
             elif scanner in ("showmount",):
@@ -1139,7 +2084,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             command = command.replace("{port}", str(rec["port"]))
 
         try:
-            async with httpx.AsyncClient(verify=False, timeout=60) as client:
+            async with httpx.AsyncClient(timeout=60) as client:
                 r = await client.post(
                     f"{s.kali_listener_url}/tools/execute",
                     json={"tool": scanner, "command": command, "target": ip},
@@ -1173,6 +2118,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                         rec_id=rec["id"], job_id=exec_id or f"kali:{ip}",
                         ip=ip, port=rec.get("port"), service=rec.get("service"),
                         scanner=scanner, node_id=None,
+                        command=command, endpoint="kali-listener /tools/execute",
                     )
                 else:
                     result["status"] = "failed"
@@ -1182,9 +2128,30 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             result["detail"] = f"Kali: {type(e).__name__}: {str(e)[:60]}"
         return result
 
+    def _describe_dispatch(endpoint, payload, scanner=None, service_url=None):
+        """Human-readable record of a scanner-service dispatch.
+
+        These tools take a JSON payload rather than a shell command, so the
+        request IS the command as far as the operator is concerned.
+
+        Only two branches name `endpoint`; the rest build their URL inline. The
+        payload still describes what ran, so it is recorded with whatever
+        context is available rather than dropping the record entirely and
+        leaving another blank row in the completed list.
+        """
+        if not payload and not endpoint:
+            return None
+        import json as _json
+        try:
+            body = _json.dumps(payload, default=str)[:800]
+        except Exception:
+            body = str(payload)[:800]
+        where = endpoint or (f"{service_url or ''} [{scanner}]" if scanner else "")
+        return f"POST {where} {body}".strip()
+
     async def _mark_rec_dispatched(
         rec_id: str, job_id: str, ip: str, port, service, scanner: str,
-        node_id: Optional[str],
+        node_id: Optional[str], command: str = None, endpoint: str = None,
     ):
         """Close the first half of the rec → job lifecycle loop.
 
@@ -1208,6 +2175,19 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             extra_merge = {"job_id": job_id}
             if node_id:
                 extra_merge["node_id"] = node_id
+            # Persist WHAT WAS ACTUALLY RUN. Without this the completed list
+            # can show nothing: `script` is frequently empty or a fragment
+            # ("banner") because the recommender names a scanner rather than a
+            # command line, _dispatch_via_kali builds the real command at
+            # dispatch time, and scanner-service dispatches send a JSON payload
+            # to an endpoint instead of a shell command. All of it was
+            # discarded once the request returned.
+            if command:
+                extra_merge["dispatched_command"] = str(command)[:2000]
+            if endpoint:
+                extra_merge["dispatched_endpoint"] = str(endpoint)[:300]
+            from datetime import datetime as _dt, timezone as _tz
+            extra_merge["dispatched_at"] = _dt.now(_tz.utc).isoformat()
             with get_db() as conn, conn.cursor() as cur:
                 cur.execute(
                     """
@@ -1232,7 +2212,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
 
         # Step 2: fire-and-forget webhook.
         try:
-            async with httpx.AsyncClient(verify=False, timeout=5) as c:
+            async with httpx.AsyncClient(timeout=5) as c:
                 await c.post(
                     f"{s.rag_api_url}/webhooks/emit",
                     json={
@@ -1255,10 +2235,14 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
 
     async def _dispatch_via_node(rec, scanner, ip, nid, result):
         """Route tool execution to a remote node via SSH."""
-        command = rec.get("script") or f"{scanner} {ip}"
-        command = command.replace("{target}", ip).replace("{ip}", ip)
+        command, _unresolved = _fill_placeholders(rec.get("script") or f"{scanner} {ip}", rec)
+        if _unresolved:
+            result["status"] = "skipped"
+            result["detail"] = (f"command still contains {', '.join(sorted(set(_unresolved)))} "
+                                f"— no value known for it on {ip}. Edit the command and re-run.")
+            return result
         try:
-            async with httpx.AsyncClient(verify=False, timeout=60) as client:
+            async with httpx.AsyncClient(timeout=60) as client:
                 r = await client.post(
                     f"{s.tunnel_manager_url}/ssh/{nid}/exec",
                     json={"command": command, "timeout": 45},
@@ -1315,7 +2299,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             payload = {"event_type": event_type, "source": "bff", "data": data}
             if severity:
                 payload["severity"] = severity
-            async with httpx.AsyncClient(verify=False, timeout=5) as c:
+            async with httpx.AsyncClient(timeout=5) as c:
                 await c.post(f"{s.rag_api_url}/webhooks/emit", json=payload,
                              headers={"x-api-key": s.api_key, **engagement_headers()})
         except Exception as e:
@@ -1327,13 +2311,13 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         error we allow the dispatch through (don't block on a flaky check)."""
         try:
             if executor == "kali":
-                async with httpx.AsyncClient(verify=False, timeout=10) as c:
+                async with httpx.AsyncClient(timeout=10) as c:
                     chk = await c.get(f"{s.kali_listener_url}/tools/check",
                                       params={"tools": scanner}, headers=headers)
                     if chk.status_code == 200 and scanner in (chk.json().get("found") or []):
                         return {"ok": True, "detail": "present"}
                 # Missing → attempt install
-                async with httpx.AsyncClient(verify=False, timeout=600) as c:
+                async with httpx.AsyncClient(timeout=600) as c:
                     inst = await c.post(f"{s.kali_listener_url}/tools/install",
                                         json={"tool": scanner}, headers=headers)
                 ok = inst.status_code == 200 and (inst.json() or {}).get("installed")
@@ -1342,7 +2326,7 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                 return {"ok": bool(ok),
                         "detail": "installed on kali" if ok else f"'{scanner}' missing on kali; install failed"}
             else:  # node
-                async with httpx.AsyncClient(verify=False, timeout=30) as c:
+                async with httpx.AsyncClient(timeout=30) as c:
                     chk = await c.post(f"{s.tunnel_manager_url}/ssh/{nid}/exec",
                                        json={"command": f"which {scanner}", "timeout": 15},
                                        headers=headers)
@@ -1365,7 +2349,54 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             log.debug(f"preflight {executor}/{scanner} error: {e}")
             return {"ok": True, "detail": f"preflight skipped ({type(e).__name__})"}
 
-    dispatched_results = await asyncio.gather(*[dispatch_rec(r) for r in selected])
+    # Bound the fan-out by the engagement's scan limit.
+    #
+    # asyncio.gather over the selection meant the batch size WAS the concurrency
+    # — 50 selected recommendations dispatched 50 scans at once. That is how the
+    # recommender got saturated: callers hit their read timeout and the results
+    # were recorded as failures for scans that had actually started.
+    #
+    # The semaphore only bounds how many dispatches are in flight from here; it
+    # does not wait for the scans themselves to finish, which are tracked by the
+    # runners and the polling loop.
+    _limit = max(1, get_max_concurrent())
+    _sem = asyncio.Semaphore(_limit)
+
+    async def _bounded(rec):
+        async with _sem:
+            return await dispatch_rec(rec)
+
+    if len(selected) > _limit:
+        log.info("dispatching %d recommendation(s) %d at a time (MAX_CONCURRENT_SCANS)",
+                 len(selected), _limit)
+    dispatched_results = await asyncio.gather(*[_bounded(r) for r in selected])
+
+    # A recommendation that needs a HUMAN should leave a follow-up, not just a log
+    # line in an API response nobody re-reads. Any outcome that cannot proceed
+    # without operator action — a manual-only tool, a tool missing from the image,
+    # one the allowlist rejects, or one with no automated handler — becomes a
+    # follow_up_item carrying the command to run by hand.
+    #
+    # Done here rather than at each skip site: there are eight of them, and a new
+    # one added later would silently miss the follow-up. Every result passes
+    # through this point.
+    _NEEDS_OPERATOR = (
+        "manual tool", "missing on kali", "install failed", "not in allowed list",
+        "no automated handler", "not in scanner_urls", "see tool docs",
+    )
+    for _res in dispatched_results:
+        if not isinstance(_res, dict) or _res.get("manual_followup"):
+            continue                      # target_kind path already filed one
+        if _res.get("status") not in ("skipped", "failed"):
+            continue
+        _detail = str(_res.get("detail") or "").lower()
+        if not any(k in _detail for k in _NEEDS_OPERATOR):
+            continue                      # a real dispatch failure, not a manual step
+        _rec = recs_by_id.get(_res.get("id")) or {}
+        _fu = await _manual_followup_for(
+            _rec, _res.get("target_kind") or "manual", _res.get("ip") or "")
+        if _fu:
+            _res["manual_followup"] = _fu
     # Combine fresh dispatches with the idempotency-guard skips so the UI
     # sees one consistent list -- "already queued" recs surface as skipped.
     results = list(dispatched_results) + already_active_results
@@ -1411,7 +2442,7 @@ async def recommender_tool_coverage(live: bool = Query(False)):
     headers = {"x-api-key": s.api_key, **engagement_headers()}
     universe, kali_found, nodes_cov = [], set(), {}
 
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         # 1. Universe from the canonical registry.
         try:
             r = await c.get(f"{s.tunnel_manager_url}/tools/registry", headers=headers)
@@ -1535,7 +2566,7 @@ TOOL_INSTALL_MAP = {
 async def list_tool_executions(limit: int = 50):
     """Recent Kali tool executions (the output of Kali-dispatched recs)."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(
             f"{s.kali_listener_url}/tools/executions",
             params={"limit": limit},
@@ -1550,7 +2581,7 @@ async def list_tool_executions(limit: int = 50):
 async def get_tool_execution(exec_id: str):
     """A single Kali tool execution with full output + parsed results."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(
             f"{s.kali_listener_url}/tools/executions/{exec_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -1565,7 +2596,7 @@ async def list_allowed_tools():
     """The Kali container's effective tool allowlist (registry + fallback +
     operator Settings overrides − MSF). Used by the Settings allowlist panel."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(
             f"{s.kali_listener_url}/tools/allowed",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -1584,7 +2615,7 @@ async def check_tools_on_node(body: ToolCheckRequest):
     # Internal Kali container — use /tools/allowed endpoint
     if body.node_id in ("kali-local", "kali", "internal"):
         try:
-            async with httpx.AsyncClient(verify=False, timeout=10) as client:
+            async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.get(
                     f"{s.kali_listener_url}/tools/allowed",
                     headers=headers,
@@ -1613,7 +2644,7 @@ async def check_tools_on_node(body: ToolCheckRequest):
     # Remote node — use SSH exec
     checks = " && ".join(f'(which {t} >/dev/null 2>&1 && echo "FOUND:{t}" || echo "MISSING:{t}")' for t in body.tools)
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
                 f"{s.tunnel_manager_url}/ssh/{body.node_id}/exec",
                 json={"command": checks, "timeout": 20},
@@ -1656,7 +2687,7 @@ async def install_tools_on_node(body: ToolInstallRequest):
 
     # Internal Kali container — use the listener's /tools/install endpoint.
     if body.node_id in ("kali-local", "kali", "internal"):
-        async with httpx.AsyncClient(verify=False, timeout=300) as client:
+        async with httpx.AsyncClient(timeout=300) as client:
             for tool in body.tools:
                 reason = _kali_unmanageable(tool)
                 if reason:
@@ -1686,7 +2717,7 @@ async def install_tools_on_node(body: ToolInstallRequest):
         }
 
     # Remote node — install via SSH exec.
-    async with httpx.AsyncClient(verify=False, timeout=120) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         for tool in body.tools:
             install_cmd = TOOL_INSTALL_MAP.get(tool)
             if not install_cmd:
@@ -1738,7 +2769,7 @@ async def port_recommendations(
         params["banner"] = banner
     if port:
         params["port"] = str(port)
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.scan_recommender_url}/next_scan",
             params=params,
@@ -1759,7 +2790,7 @@ async def get_vulnx_findings(
         params["version"] = version
     if ip:
         params["ip"] = ip
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/software/vulnx-findings",
             params=params,

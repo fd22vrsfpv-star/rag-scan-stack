@@ -1,5 +1,6 @@
 """Execute tool calls against backend services."""
 
+import asyncio          # scan-slot semaphore, see _scan_semaphore()
 import logging
 import os
 import httpx
@@ -74,12 +75,17 @@ TOOL_ROUTES: dict[str, tuple[str, callable, callable]] = {
     "start_masscan": (
         "POST",
         lambda s, a: f"{s.nmap_scanner_url}/jobs/masscan-only",
-        lambda a: {"targets": _split_targets(a["target"]), "ports": a.get("ports", "1-1000"), "rate": a.get("rate", 1000)},
+        lambda a: {"targets": _split_targets(a["target"]), "rate": a.get("rate", 1000),
+                   # Omitted when unset so the scanner applies its per-route default
+                   # (top-1000 for nmap enrichment, full range for masscan discovery)
+                   # instead of the sequential 1-1000 that used to be hardcoded here.
+                   **({"ports": a["ports"]} if a.get("ports") else {})},
     ),
     "start_nmap_scan": (
         "POST",
         lambda s, a: f"{s.nmap_scanner_url}/jobs/masscan-then-nmap",
-        lambda a: {"targets": _split_targets(a["target"]), "ports": a.get("ports", "1-1000"), "rate": 1000},
+        lambda a: {"targets": _split_targets(a["target"]), "rate": 1000,
+                   **({"ports": a["ports"]} if a.get("ports") else {})},
     ),
     "start_full_port_scan": (
         "POST",
@@ -123,7 +129,8 @@ TOOL_ROUTES: dict[str, tuple[str, callable, callable]] = {
     "start_naabu": (
         "POST",
         lambda s, a: f"{s.pd_runner_url}/jobs/naabu",
-        lambda a: {"targets": a["targets"], "ports": a.get("ports", "1-1000"), "rate": a.get("rate", 1000)},
+        lambda a: {"targets": a["targets"], "rate": a.get("rate", 1000),
+                   **({"ports": a["ports"]} if a.get("ports") else {})},
     ),
     "start_udp_scan": (
         "POST",
@@ -334,6 +341,97 @@ def _check_placeholder_args(arguments: dict) -> str | None:
     return None
 
 
+# Argument keys that name something this tool will send traffic AT. Checked
+# against the engagement scope before any dispatch — this path is driven by an
+# LLM choosing tool arguments, so the target is not necessarily anything an
+# operator typed.
+_TARGET_ARG_KEYS = ("target", "targets", "ip", "host", "hosts", "url", "domain")
+
+
+def _hosts_from_arguments(arguments: dict) -> list[str]:
+    """Every host-like value in a tool call, flattened.
+
+    Accepts the shapes these tools actually use: a bare string, a
+    comma-separated string, and a list. A URL is reduced to its hostname so
+    `https://10.0.0.1:8443/x` is checked as `10.0.0.1`.
+    """
+    out: list[str] = []
+    for key in _TARGET_ARG_KEYS:
+        val = (arguments or {}).get(key)
+        if not val:
+            continue
+        items = val if isinstance(val, (list, tuple)) else _split_targets(str(val))
+        for item in items:
+            h = str(item).strip()
+            if not h:
+                continue
+            if "://" in h:
+                from urllib.parse import urlparse
+                h = urlparse(h).hostname or h
+            else:
+                h = h.split("/")[0].split(":")[0]
+            if h:
+                out.append(h)
+    return out
+
+
+def _scope_refusal(name: str, arguments: dict) -> dict | None:
+    """Structured refusal when a tool call names an out-of-scope host.
+
+    Returns the same shape as the allowlist refusal above so the model gets an
+    error it can read and adapt to, rather than an exception.
+    """
+    hosts = _hosts_from_arguments(arguments)
+    if not hosts:
+        return None
+    try:
+        from scope_guard import host_in_scope, scope_rows_for
+        from engagement import current_engagement_id
+        rows, source = scope_rows_for(current_engagement_id.get())
+    except Exception as e:                       # pragma: no cover
+        log.warning("scope check unavailable (%s) — refusing %s", e, name)
+        return {"error": "scope_unavailable", "tool": name,
+                "message": "REFUSED: the engagement scope could not be read."}
+    bad = [h for h in hosts if not host_in_scope(h, rows)]
+    if not bad:
+        return None
+    return {
+        "error": "out_of_scope",
+        "tool": name,
+        "targets": bad,
+        "message": (f"REFUSED: {', '.join(bad)} is not in the engagement scope "
+                    f"({source}). Nothing was dispatched. Only test hosts the "
+                    f"engagement authorises."),
+    }
+
+
+# ── Scan-volume bound ───────────────────────────────────────────────────────
+# Only SCAN_TOOLS consume a slot. Bounding EVERY tool call by
+# MAX_CONCURRENT_SCANS would refuse read-only calls like get_assets the moment
+# scans are saturated, which breaks the UI without protecting anything.
+#
+# SHED, DO NOT QUEUE (CLAUDE.md): the LLM tool loop has its own timeout, and a
+# call admitted now and abandoned later wastes the work twice. A structured
+# at-capacity error is something the model can read and retry, in the same shape
+# as the allowlist and scope refusals.
+_scan_slots: dict[int, "asyncio.Semaphore"] = {}
+
+
+def _scan_semaphore() -> "asyncio.Semaphore":
+    """Semaphore sized by the CURRENT engagement limit.
+
+    Keyed by size so a runtime set_max_concurrent() takes effect instead of
+    being frozen at import time. In-flight holders of an old semaphore drain
+    naturally; the alternative — resizing in place — has no safe primitive.
+    """
+    from routers.scans import get_max_concurrent
+    size = max(1, get_max_concurrent())
+    sem = _scan_slots.get(size)
+    if sem is None:
+        sem = _scan_slots[size] = asyncio.Semaphore(size)
+    return sem
+
+
 async def execute_tool(name: str, arguments: dict, allowed_tools: list[str] | None = None) -> dict:
     """Execute a tool call and return the result.
 
@@ -353,6 +451,42 @@ async def execute_tool(name: str, arguments: dict, allowed_tools: list[str] | No
         for prefix in ("query:", "functions.", "tools.", "tool:", "function:"):
             if name.startswith(prefix):
                 name = name[len(prefix):]
+
+    # Scope gate. An out-of-scope host is refused regardless of which tool was
+    # asked for, and regardless of the allowlist below — that governs WHICH
+    # tools may run, this governs WHAT they may be pointed at.
+    _refusal = _scope_refusal(name, arguments)
+    if _refusal:
+        log.warning("tool %s refused: %s", name, _refusal.get("targets"))
+        return _refusal
+
+    # Scope first, then volume: an out-of-scope call must be refused whether or
+    # not there is capacity, and must not consume a slot to find that out.
+    if name in SCAN_TOOLS or name == "start_scan_pipeline":
+        sem = _scan_semaphore()
+        if sem.locked() and sem._value <= 0:      # noqa: SLF001 - no public probe
+            from routers.scans import get_max_concurrent
+            log.warning("tool %s shed: %s scans already in flight", name,
+                        get_max_concurrent())
+            return {
+                "error": "at_capacity",
+                "tool": name,
+                "limit": get_max_concurrent(),
+                "message": (f"REFUSED: {get_max_concurrent()} concurrent scans "
+                            "already in flight (MAX_CONCURRENT_SCANS). Nothing "
+                            "was dispatched — retry when one finishes."),
+            }
+        async with sem:
+            return await _execute_tool_inner(name, arguments, allowed_tools,
+                                             settings, headers)
+    return await _execute_tool_inner(name, arguments, allowed_tools,
+                                     settings, headers)
+
+
+async def _execute_tool_inner(name: str, arguments: dict,
+                              allowed_tools: list[str] | None,
+                              settings, headers) -> dict:
+    """The body of execute_tool, after the scope and volume gates."""
 
     # Layer-3 hardening: per-request allowlist. Refuse anything outside it
     # — including unknown tool names that would otherwise fall through to
@@ -408,7 +542,7 @@ async def execute_tool(name: str, arguments: dict, allowed_tools: list[str] | No
     method, url_fn, payload_fn = TOOL_ROUTES[name]
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             # Special: get_job_status tries multiple services
             if method == "MULTI_GET":
                 return await _get_job_status(client, arguments, settings, headers)
@@ -455,7 +589,7 @@ async def _start_pipeline(args: dict, settings, headers) -> dict:
             "scope_name": args.get("scope_name"),
             "config": {"use_tunnels": args.get("use_tunnels", False)},
         }
-        async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        async with httpx.AsyncClient(timeout=30) as c:
             resp = await c.post(f"{_BFF_BASE}/api/pipelines", json=body,
                                 headers={**headers, "Content-Type": "application/json"})
             return resp.json() if resp.status_code < 500 else {"error": resp.text[:300]}
@@ -466,7 +600,7 @@ async def _start_pipeline(args: dict, settings, headers) -> dict:
 async def _get_pipeline_status(args: dict, settings, headers) -> dict:
     pid = args.get("pipeline_id", "")
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15) as c:
             resp = await c.get(f"{settings.rag_api_url}/pipelines/{pid}", headers=headers)
             if resp.status_code >= 400:
                 return {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
@@ -486,7 +620,7 @@ async def _get_pipeline_status(args: dict, settings, headers) -> dict:
 async def _stop_pipeline(args: dict, settings, headers) -> dict:
     pid = args.get("pipeline_id", "")
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15) as c:
             resp = await c.post(f"{_BFF_BASE}/api/pipelines/{pid}/stop",
                                 headers=headers)
             return resp.json() if resp.status_code < 500 else {"error": resp.text[:300]}
@@ -520,7 +654,7 @@ async def _read_uploaded_file(args: dict, settings, headers) -> dict:
     as_text = args.get("as_text", True)
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        async with httpx.AsyncClient(timeout=30) as c:
             # First fetch metadata to know content_type + total size
             meta_resp = await c.get(f"{settings.rag_api_url}/evidence/{file_id}",
                                     headers=headers)
@@ -642,7 +776,7 @@ async def _execute_mcp_tool(name: str, arguments: dict) -> dict:
     base_url = info.get("url") or f"{mcp_scheme}://{mcp_host}:{port}/mcp"
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=120) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 base_url,
                 json={
@@ -713,7 +847,7 @@ async def _execute_sse_mcp_tool(name: str, arguments: dict, info: dict) -> dict:
 
         def sse_listener():
             try:
-                with httpx.Client(verify=False, timeout=180) as sse_client:
+                with httpx.Client(timeout=180) as sse_client:
                     with connect_sse(sse_client, "GET", sse_url) as event_source:
                         for event in event_source.iter_sse():
                             if stop_event.is_set():
@@ -743,7 +877,7 @@ async def _execute_sse_mcp_tool(name: str, arguments: dict, info: dict) -> dict:
 
         message_url = data
 
-        with httpx.Client(verify=False, timeout=120) as client:
+        with httpx.Client(timeout=120) as client:
             # Initialize
             client.post(message_url, json={
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -800,7 +934,7 @@ async def _execute_remote_mcp_tool(name: str, arguments: dict, node_id: str) -> 
     import os
     tunnel_manager_url = os.environ.get("TUNNEL_MANAGER_URL", "http://host.docker.internal:8027")
     try:
-        async with httpx.AsyncClient(verify=False, timeout=120) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 f"{tunnel_manager_url}/ssh/{node_id}/mcp-proxy",
                 json={

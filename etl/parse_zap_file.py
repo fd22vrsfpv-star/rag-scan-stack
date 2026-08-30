@@ -72,6 +72,12 @@ def emit_webhook_event(event_type: str, source: str, data: dict, severity: str =
         logger.warning(f"Failed to emit webhook: {e}")
 
 
+try:
+    from scope_gate import load_ingest_scope, host_in_scope
+except ImportError:  # pragma: no cover — etl/ may already be on PYTHONPATH
+    from etl.scope_gate import load_ingest_scope, host_in_scope
+
+
 def extract_ip_from_url(url: str) -> Optional[str]:
     m = re.match(r"https?://([^/:]+)", url or "")
     if not m:
@@ -133,9 +139,17 @@ def detect_zap_format(filepath: str) -> str:
 def _insert_finding(cur, stats: dict, dedupe: bool, *, url: str, name: str,
                     severity: str, evidence: str, method: str, attack: str,
                     cwe: str, description: str, solution: str, reference: str,
-                    confidence: str, plugin_id: str, param: str) -> None:
+                    confidence: str, plugin_id: str, param: str,
+                    enforce_scope: bool, scope_rows) -> None:
     if not url:
         stats["skipped_no_url"] += 1
+        return
+
+    # Ingest scope gate, applied at the single insert chokepoint so every alert
+    # in the report is judged. ZAP follows links, so a spidered report can carry
+    # third-party hosts that nobody asked about.
+    if not host_in_scope(url, enforce_scope, scope_rows):
+        stats["out_of_scope"] = stats.get("out_of_scope", 0) + 1
         return
 
     fp = web_fingerprint(url=url, source="zap", name=name, issue_type="zap-alert")
@@ -165,6 +179,10 @@ def _insert_finding(cur, stats: dict, dedupe: bool, *, url: str, name: str,
                method, payload, cwe, refs, description, solution, reference,
                confidence, tags, first_seen, last_seen, fingerprint)
             VALUES (%s, %s, %s, 'zap', 'zap-alert', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now(), %s)
+            ON CONFLICT (fingerprint) DO UPDATE SET
+                last_seen = now(),
+                severity  = EXCLUDED.severity,
+                evidence  = COALESCE(EXCLUDED.evidence, web_findings.evidence)
         """, (
             finding_id, asset_id, url, name, severity,
             (evidence or None), (method or None), (attack or None),
@@ -187,7 +205,8 @@ def _insert_finding(cur, stats: dict, dedupe: bool, *, url: str, name: str,
         stats["errors"].append(str(e))
 
 
-def _parse_json(filepath: str, cur, stats: dict, dedupe: bool) -> None:
+def _parse_json(filepath: str, cur, stats: dict, dedupe: bool,
+                enforce_scope: bool, scope_rows) -> None:
     with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
         data = json.load(fh)
 
@@ -232,10 +251,12 @@ def _parse_json(filepath: str, cur, stats: dict, dedupe: bool) -> None:
                     cwe=cwe, description=desc, solution=soln, reference=ref,
                     confidence=confidence, plugin_id=plugin_id,
                     param=inst.get("param") or "",
+                    enforce_scope=enforce_scope, scope_rows=scope_rows,
                 )
 
 
-def _parse_xml(filepath: str, cur, stats: dict, dedupe: bool) -> None:
+def _parse_xml(filepath: str, cur, stats: dict, dedupe: bool,
+               enforce_scope: bool, scope_rows) -> None:
     """Stream a ZAP XML report; <alertitem> carries the alert, <instance> the URLs."""
     for event, elem in iterparse(filepath, events=("end",)):
         if elem.tag.lower() != "alertitem":
@@ -260,6 +281,7 @@ def _parse_xml(filepath: str, cur, stats: dict, dedupe: bool) -> None:
             uri = (elem.findtext("uri") or "").strip()
             if uri:
                 _insert_finding(cur, stats, dedupe, url=uri, name=name,
+                                enforce_scope=enforce_scope, scope_rows=scope_rows,
                                 severity=severity, evidence=elem.findtext("evidence") or "",
                                 method=elem.findtext("method") or "",
                                 attack=elem.findtext("attack") or "", cwe=cwe,
@@ -277,6 +299,7 @@ def _parse_xml(filepath: str, cur, stats: dict, dedupe: bool) -> None:
                 cwe=cwe, description=desc, solution=soln, reference=ref,
                 confidence=confidence, plugin_id=plugin_id,
                 param=inst.findtext("param") or "",
+                enforce_scope=enforce_scope, scope_rows=scope_rows,
             )
         elem.clear()
 
@@ -313,14 +336,17 @@ def parse_zap_file(filepath: str, profile: str = "cli", dedupe: bool = True) -> 
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor() as cur:
+            # Loaded once per report; passed to every insert so the gate cannot be
+            # forgotten at one of the three call sites.
+            _enforce_scope, _scope_rows = load_ingest_scope(cur)
             if fmt == "xml":
                 try:
-                    _parse_xml(filepath, cur, stats, dedupe)
+                    _parse_xml(filepath, cur, stats, dedupe, _enforce_scope, _scope_rows)
                 except ParseError as e:
                     raise ValueError(f"Malformed ZAP XML: {e}") from e
             else:
                 try:
-                    _parse_json(filepath, cur, stats, dedupe)
+                    _parse_json(filepath, cur, stats, dedupe, _enforce_scope, _scope_rows)
                 except json.JSONDecodeError as e:
                     raise ValueError(f"Malformed ZAP JSON: {e}") from e
         conn.commit()

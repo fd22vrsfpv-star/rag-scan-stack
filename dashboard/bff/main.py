@@ -13,6 +13,7 @@ from routers.findings import router as findings_router
 from routers.rag import router as rag_router
 from routers.scans import router as scans_router
 from routers.exploits import router as exploits_router
+from routers.security_tests import router as security_tests_router
 from routers.reports import router as reports_router
 from routers.chat import router as chat_router
 from routers.feedback import router as feedback_router
@@ -32,6 +33,7 @@ from routers.credentials import router as credentials_router
 from routers.identities import router as identities_router
 from routers.opsec import router as opsec_router
 from routers.followups import router as followups_router
+from routers.artifacts import router as artifacts_router
 from routers.api_tester import router as api_tester_router
 from routers.about import router as about_router
 from routers.delta import router as delta_router
@@ -91,6 +93,7 @@ app.add_middleware(
 
 # Register all routers
 app.include_router(health_router)
+app.include_router(artifacts_router)
 app.include_router(assets_router)
 app.include_router(findings_router)
 # Must precede scans_router: its POST /api/import/{tool} catch-all would
@@ -99,6 +102,7 @@ app.include_router(imports_router)
 app.include_router(scans_router)
 app.include_router(rag_router)
 app.include_router(exploits_router)
+app.include_router(security_tests_router)
 app.include_router(reports_router)
 app.include_router(chat_router)
 app.include_router(feedback_router)

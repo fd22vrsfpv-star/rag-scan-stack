@@ -57,7 +57,7 @@ def _load_llm_tuning() -> dict:
             resp = _hx.get(
                 f"{settings.rag_api_url}/settings/config/llm.{key}",
                 headers={"x-api-key": settings.api_key},
-                verify=False, timeout=5,
+                timeout=5,
             )
             if resp.status_code == 200:
                 val = resp.json().get("value", "")
@@ -157,7 +157,7 @@ async def stream_chat(
                     r = _hx.get(
                         f"{settings.rag_api_url}/evidence/{fid}/content",
                         headers={"x-api-key": settings.api_key},
-                        verify=False, timeout=15,
+                        timeout=15,
                     )
                     if r.status_code == 200:
                         try:
@@ -404,7 +404,7 @@ async def _stream_ollama(settings, model: str, messages: list[dict], tools: list
             **({"seed": t["seed"]} if t.get("seed", 0) > 0 else {}),
         },
     }
-    async with httpx.AsyncClient(verify=False, timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         async with client.stream("POST", url, json=payload) as resp:
             async for line in resp.aiter_lines():
                 if not line.strip():
@@ -455,7 +455,7 @@ async def _stream_openai_compatible(
     # Accumulators for streamed tool calls (OpenAI streams them incrementally)
     pending_tool_calls: dict[int, dict] = {}  # index → {id, name, arguments_str}
 
-    async with httpx.AsyncClient(verify=False, timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         async with client.stream("POST", url, json=payload, headers=headers) as resp:
             async for line in resp.aiter_lines():
                 line = line.strip()
@@ -601,7 +601,7 @@ async def _stream_anthropic(
     tool_json_buffer = ""
     accumulated_tool_calls = []
 
-    async with httpx.AsyncClient(verify=False, timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         async with client.stream("POST", "https://api.anthropic.com/v1/messages",
                                   json=payload, headers=headers) as resp:
             async for line in resp.aiter_lines():

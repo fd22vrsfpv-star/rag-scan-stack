@@ -94,8 +94,54 @@ docker compose up -d rag-postgres
 ### Vulnerability Management (1)
 - `vulns` - Nmap NSE vulnerability findings
 
+### Credentials (3)
+- `credential_findings` - per-service authentication results (brutus/hydra/medusa/ncrack)
+- `credential_vault` - cleartext/cracked secrets, access-controlled
+- `credential_access_map` - what a credential grants access to
+
+Rows with `valid_cred = true` are surfaced by `/findings/search` as a finding
+source (`finding_source = 'credential'`, severity `critical`). Failed attempts
+are deliberately NOT surfaced — they are audit trail, and listing them buries the
+working credentials among the passwords that did not work.
+
+**The secret is never selected into the findings union.** `credential_findings`
+stores only a masked form (`metadata.audit…password_masked`); cleartext belongs
+in `credential_vault` behind its own access control. Findings lists are rendered,
+exported and screenshotted, so a secret exposed there escapes the vault's
+controls entirely. Guarded by `tests/test_findings_credential_source.py`.
+
 ### Scan Intelligence (1)
 - `scan_recommendations` - AI-suggested next scans
+
+The recon agent drains this table, so its status column is a queue state, not
+just a label. Full lifecycle in [RECON_AGENT.md](RECON_AGENT.md).
+
+| `status` | Meaning | Still in the queue? |
+|---|---|---|
+| `pending` | awaiting dispatch | yes |
+| `queued` / `completed` | dispatched, a job exists | no |
+| `skipped` | deliberately not run (already covered by service detection, in-flight duplicate, manual-only tool) | no |
+| `failed` | dispatch attempted and permanently rejected | no |
+
+Columns worth knowing about:
+
+- **`ip` is `inet`**, so it renders as `192.168.1.150/32`. Comparing it to
+  `scope_targets.target` (plain `text`) without `host()` on both sides silently
+  matches nothing.
+- **`action`, `script`, `template`, `banner` are nullable.** A NULL arrives in
+  Python as a key that *is present* holding `None`, so `rec.get("action", "")`
+  returns `None` rather than the default — use `(rec.get(col) or "")`. This
+  caused a live outage; see `tests/test_rec_dispatch_nullable_fields.py`.
+- **`target_kind`** — `service` | `artifact` | `range` | `resource`. Only
+  `service` is dispatchable against an `(ip, port)`; the others are refused with
+  a reason and become manual follow-ups. A NULL is treated as `service` so rows
+  predating the column behave as before.
+- **`extra.dispatch_failures`** (jsonb) — count of transient dispatch failures.
+  At `RECON_AGENT_MAX_DISPATCH_ATTEMPTS` (default 3) the rec is retired even if
+  its failure was never classified as permanent.
+- **`engagement_id`** — populated, but the recon agent's scoping query does
+  **not** rely on it alone; it unions with `scope_targets` because assets are not
+  always stamped.
 
 ### Playwright/Browser Testing (4)
 - `playwright_scans` - Browser automation sessions
@@ -106,9 +152,41 @@ docker compose up -d rag-postgres
 ### Integration (1)
 - `zap_sessions` - ZAP proxy session tracking
 
-### Agent System (2)
-- `agent_sessions` - Multi-agent scan sessions
+### Agent System (6)
+- `agent_sessions` - Multi-agent scan sessions.
+  `status` is constrained: `active`, `completed`, `failed`, `stopped`, `stalled`,
+  `awaiting_approval`. **Any write of a value outside that list raises** — the
+  CHECK is declared in `db_init/ensure_all_tables.sql`,
+  `db_init/create_agent_tables.sql`, `db_init/setup_alldb.sql` and the runtime
+  self-heal migration in `autogen_agents/db_utils.py::ensure_schema`; all four
+  must be changed together.
+  `awaiting_approval` means the LangGraph session is parked on a durable
+  `interrupt()` waiting for an operator to answer
+  `POST /pentest/{id}/approve`. It is deliberately NOT `active`, because the
+  session watchdog only inspects `active` and would otherwise mark a
+  legitimately-paused session as stalled.
 - `agent_messages` - Agent conversation history
+
+#### LangGraph durable checkpoints (4)
+Library-managed by `langgraph-checkpoint-postgres` — `PostgresSaver.setup()`
+creates and migrates them on every agent-session start and resume. Declared in
+`db_init/create_langgraph_checkpoint_tables.sql` (and mirrored in
+`ensure_all_tables.sql`) so a fresh install has them before the first session,
+and asserted by `scripts/post-install-check.sh`, `scripts/ensure_db_schema.sh`
+and rag-api's `health_router.py`.
+
+- `checkpoints` - one row per graph super-step; `thread_id` **is** the agent
+  session id. This is what makes a paused session survive a restart.
+- `checkpoint_blobs` - channel values too large to inline
+- `checkpoint_writes` - pending writes per task
+- `checkpoint_migrations` - the library's own schema version
+
+> **Do not seed `checkpoint_migrations`.** The library reads `MAX(v)` to decide
+> which migrations to apply, and every migration is idempotent — so an empty
+> table means "re-apply all", which is correct. Seeding version rows would make
+> it SKIP migrations it has not actually run, which is how a hand-mirrored
+> schema silently drifts from the library's.
+
 
 ### Supporting Tables (6)
 - `port_observation` - Detailed port scan data
@@ -142,6 +220,35 @@ docker compose up -d rag-postgres
 ```bash
 ./scripts/ensure_db_schema.sh
 ```
+
+### Issue: agent sessions fail to persist scans — `ON CONFLICT ... no unique constraint`
+**Cause**: Missing `uq_session_scan_metrics_session_job` on an existing database.
+
+`autogen_agents/scan_tools.py::persist_to_db` upserts with
+`ON CONFLICT (session_id, job_id)`, which **raises** unless that unique index
+exists. Fresh installs get it from `setup_alldb.sql`; **databases created before
+2026-08-17 do not have it and must run the migration.**
+
+**Solution**:
+```bash
+./scripts/ensure_db_schema.sh     # dedupes, creates the index, then asserts it
+```
+
+The migration deduplicates first, because the index cannot be built while
+duplicates exist. They *will* exist on any pre-existing database: the code
+previously used `ON CONFLICT DO NOTHING` against a table keyed only on `id`, so
+nothing ever conflicted and every persist re-inserted — one live database held
+104 rows for 75 distinct jobs. The dedupe keeps the most advanced row per job (a
+terminal status beats `running`, then most recent, with `id` as a final
+tiebreaker).
+
+Second-order symptom on un-migrated databases: a scan persisted while `running`
+could never be corrected once it completed, so `session_scan_metrics` accumulated
+rows permanently stuck mid-flight. That also makes the post-session flow-summary
+refresh under-report, since it rebuilds from this table.
+
+`scripts/ensure_db_schema.sh` now fails loudly if the index is absent rather than
+letting the first agent session hit it at runtime.
 
 ## Development Workflow
 

@@ -521,6 +521,23 @@ _ALL_EVENT_TYPES = [
     "stage_started", "stage_completed", "stage_failed",
     "finding_high", "finding_critical", "finding_exploitable",
     "ingest_completed",
+    # Audit trail for operator/agent review actions (self-adapting extractors +
+    # agent-to-agent feedback). Captured in webhook_events as an append-only log.
+    "extractor_rule_reviewed", "agent_flag_reviewed", "agent_flag",
+    # LangGraph agent engine (Docs/LANGGRAPH_MIGRATION_PLAN.md). This list is an
+    # ALLOW-LIST, not a catch-all: an event type missing from it is emitted,
+    # answered 200, and then silently dropped — so the langgraph events were
+    # firing correctly and never reaching the Agent Activity timeline that reads
+    # webhook_events. Every new emitter must add its types here.
+    "langgraph_session_started", "langgraph_session_completed",
+    "langgraph_session_failed", "langgraph_session_resumed",
+    "langgraph_phase_completed", "langgraph_scan_dispatched",
+    "langgraph_awaiting_approval", "langgraph_exploit_decision",
+    "langgraph_exploit_executed",
+    # Surface-test phase (attack-surface analysis + custom test generation).
+    "langgraph_surface_analyzed", "langgraph_surface_test_planned",
+    "langgraph_surface_test_executed", "langgraph_surface_test_completed",
+    "langgraph_surface_decision",
 ]
 
 

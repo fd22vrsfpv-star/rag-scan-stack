@@ -72,7 +72,7 @@ async def rag_ask(req: RagAskRequest):
     s = get_settings()
     params = {"q": req.q, "top_k": req.top_k}
     try:
-        async with httpx.AsyncClient(verify=False, timeout=180) as c:
+        async with httpx.AsyncClient(timeout=180) as c:
             resp = await c.get(
                 f"{s.scan_recommender_url}/rag/ask",
                 params=params,
@@ -96,7 +96,7 @@ async def rag_feedback(req: RagFeedbackRequest):
     """
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15) as c:
             resp = await c.post(
                 f"{s.scan_recommender_url}/rag/feedback",
                 json=req.dict(),
@@ -117,7 +117,7 @@ async def rag_feedback_stats(days: int = Query(30, ge=1, le=365)):
     feedback loop is producing useful training data."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15) as c:
             resp = await c.get(
                 f"{s.scan_recommender_url}/rag/feedback/stats",
                 params={"days": days},
@@ -144,7 +144,7 @@ async def rag_training_preview(
     if min_rating is not None:
         params["min_rating"] = min_rating
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        async with httpx.AsyncClient(timeout=30) as c:
             resp = await c.get(
                 f"{s.scan_recommender_url}/rag/training/preview",
                 params=params,
@@ -178,7 +178,7 @@ async def rag_eval_run(req: RagEvalRunRequest):
     helpful chunks, and persists the run into rag_eval_runs."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=300) as c:
+        async with httpx.AsyncClient(timeout=300) as c:
             resp = await c.post(
                 f"{s.scan_recommender_url}/rag/eval/run",
                 json=req.dict(),
@@ -197,7 +197,7 @@ async def rag_eval_history(limit: int = Query(20, ge=1, le=200)):
     fetch /api/rag/eval/{id} for the full breakdown."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15) as c:
             resp = await c.get(
                 f"{s.scan_recommender_url}/rag/eval/history",
                 params={"limit": limit},
@@ -221,7 +221,7 @@ async def rag_training_export(req: RagTrainingExportRequest):
     service can pick them up directly when it's deployed."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=300) as c:
+        async with httpx.AsyncClient(timeout=300) as c:
             resp = await c.post(
                 f"{s.scan_recommender_url}/rag/training/export",
                 json=req.dict(),
@@ -259,7 +259,7 @@ async def rag_tools_recommend(
     if port is not None:
         params["port"] = port
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        async with httpx.AsyncClient(timeout=30) as c:
             resp = await c.get(
                 f"{s.scan_recommender_url}/rag/tools/recommend",
                 params=params,
@@ -311,7 +311,7 @@ async def ingest_playbooks(body: PlaybookIngestRequest = PlaybookIngestRequest()
     s = get_settings()
     payload = {k: v for k, v in body.model_dump().items() if v is not None}
     try:
-        async with httpx.AsyncClient(verify=False, timeout=900) as c:
+        async with httpx.AsyncClient(timeout=900) as c:
             resp = await c.post(
                 f"{s.scan_recommender_url}/rag/playbooks/ingest",
                 json=payload, headers=engagement_headers(),
@@ -330,7 +330,7 @@ async def ingest_service_doc(body: ServiceDocIngestRequest):
     """Store one training document scoped to a service / port / technology."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=180) as c:
+        async with httpx.AsyncClient(timeout=180) as c:
             resp = await c.post(
                 f"{s.scan_recommender_url}/rag/service-docs/ingest",
                 json=body.model_dump(), headers=engagement_headers(),
@@ -354,7 +354,7 @@ async def list_service_docs(
     params = {k: v for k, v in {
         "service": service, "port": port, "tech": tech, "limit": limit,
     }.items() if v not in (None, "")}
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(f"{s.scan_recommender_url}/rag/service-docs", params=params)
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, _detail(resp))
@@ -365,7 +365,7 @@ async def list_service_docs(
 async def delete_service_doc(doc_id: int):
     """Remove every chunk of one training document."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.delete(f"{s.scan_recommender_url}/rag/service-docs/{doc_id}")
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, _detail(resp))

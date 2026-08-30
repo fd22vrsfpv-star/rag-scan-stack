@@ -36,6 +36,35 @@ OPENAI_API_BASE = os.environ.get("OPENAI_API_BASE", "https://api.openai.com")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 
+# Live config: dashboard Settings -> LLM Tuning (DB llm.*) over env. See
+# llm_settings.py; _refresh_llm_globals() runs before each request (middleware).
+try:
+    from common.llm_settings import get_llm_settings
+except Exception:
+    get_llm_settings = None
+
+
+def _refresh_llm_globals():
+    if get_llm_settings is None:
+        return
+    global LLM_BACKEND, OPENAI_API_BASE, OPENAI_MODEL, OPENAI_API_KEY
+    global AZURE_ENDPOINT, AZURE_MODEL, AZURE_API_KEY, AZURE_API_VERSION
+    global ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+    try:
+        s = get_llm_settings()
+    except Exception:
+        return
+    LLM_BACKEND = (s.get("backend") or LLM_BACKEND).lower()
+    OPENAI_API_BASE = s.get("openai_api_base") or OPENAI_API_BASE
+    OPENAI_MODEL = s.get("openai_model") or OPENAI_MODEL
+    OPENAI_API_KEY = s.get("openai_api_key") or OPENAI_API_KEY
+    AZURE_ENDPOINT = s.get("azure_endpoint") or AZURE_ENDPOINT
+    AZURE_MODEL = s.get("azure_model") or AZURE_MODEL
+    AZURE_API_KEY = s.get("azure_api_key") or AZURE_API_KEY
+    AZURE_API_VERSION = s.get("azure_api_version") or AZURE_API_VERSION
+    ANTHROPIC_API_KEY = s.get("anthropic_api_key") or ANTHROPIC_API_KEY
+    ANTHROPIC_MODEL = s.get("anthropic_model") or ANTHROPIC_MODEL
+
 DB_HOST = os.environ.get("DB_HOST", "rag-postgres")
 DB_PORT = os.environ.get("DB_PORT", "5432")
 DB_NAME = os.environ.get("DB_NAME", "scans")
@@ -110,6 +139,11 @@ class ScanRecommendation(BaseModel):
 
 class ScanRecommendationsResponse(BaseModel):
     recommendations: List[ScanRecommendation]
+    # Optional so existing callers are unaffected; FastAPI's response_model would
+    # otherwise strip it. Carries the preflight verdict when the target had no
+    # observed data, so "recommendations from a service name alone" is visible
+    # at the point of use rather than only in a log line.
+    preflight: Optional[Dict] = None
 
 
 class OllamaQueryRequest(BaseModel):
@@ -142,6 +176,11 @@ SAFE_TOOLS = {
 # ---- Auto-execute config ----
 KALI_LISTENER_URL = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
 AUTO_EXECUTE = os.environ.get("AUTO_EXECUTE_SAFE", "1").lower() in ("1", "true", "yes")
+
+# Engagement-wide scan ceiling. Defined here, above every use: the auto-execute
+# semaphore is constructed at import time roughly 900 lines before the admission
+# block, so defining it there raised NameError and crash-looped the service.
+SCAN_LIMIT = int(os.environ.get("MAX_CONCURRENT_SCANS", "5"))
 
 # ---- Webhook emit (cross-container HTTP) ----
 # scan-recommender is its own container/image with no access to rag-api's
@@ -679,7 +718,27 @@ def _build_guidance_block(
     return "\n".join(lines)
 
 
-def _get_training_context(service: Optional[str], port: Optional[int], top_k: int = 3,
+# Minimum similarity for a chunk to be pasted into the recommendation prompt.
+#
+# Set from measurement, not taste. Every playbook title ends in "Penetration
+# Testing Methodology", so a query built from the same words scores ~0.3-0.5
+# against ALL of them on boilerplate alone — a service with no playbook still
+# pulls one. Measured against the 12-playbook corpus (MiniLM-L6-v2):
+#
+#     matched     smb 0.648   ssh 0.672   mysql 0.666
+#     unmatched   ipp 0.490   finger 0.473   cups-printing 0.314
+#
+# 0.55 separates them. At 0.25 a `finger` scan got Web Methodology pasted into
+# its prompt at 0.473 — worse than no context, because it is confidently wrong.
+#
+# NOTE this is 6 services against 12 documents. Re-measure as the corpus grows;
+# TRAINING_CONTEXT_MIN_SIM overrides it without a rebuild. Dropping the
+# boilerplate from the query instead was tried and is WORSE (ssh then matches
+# the Metasploitable guide at 0.459 rather than SSH Methodology at 0.672).
+_TRAINING_CONTEXT_MIN_SIM = float(os.getenv("TRAINING_CONTEXT_MIN_SIM", "0.55"))
+
+
+def _get_training_context(service: Optional[str], port: Optional[int], top_k: int = 5,
                           tech: Optional[List[str]] = None) -> str:
     """Retrieved per-service/port/tech training documents, or '' when unavailable.
 
@@ -690,22 +749,54 @@ def _get_training_context(service: Optional[str], port: Optional[int], top_k: in
     if not service and not port and not tech_list:
         return ""
     try:
-        from exploits_rag import _embed, _retrieve, TRAINING_SOURCE_REPO
+        from exploits_rag import (_embed, _retrieve, TRAINING_SOURCE_REPO,
+                                  KNOWLEDGE_SOURCE_REPO, service_canonical)
+        # Include the family's canonical name alongside whatever nmap reported.
+        # Unscoped playbooks are matched on wording, so "microsoft-ds" alone
+        # scored 0.506 against the SMB playbook (under the floor, dropped) while
+        # "smb" scored 0.648. Naming both costs two tokens and stops the same
+        # service being served or not served depending on how it was fingerprinted.
+        canon = service_canonical(service) if service else ""
         query = " ".join(filter(None, [
-            service or "", f"port {port}" if port else "",
+            service or "", canon if canon and canon != (service or "").lower() else "",
+            f"port {port}" if port else "",
             " ".join(tech_list), "penetration testing methodology",
         ])).strip()
+        # Both corpora, not just 'training'. This function pinned
+        # source_repos=['training'] AND required a service/port/tech scope, so on
+        # an install whose knowledge is methodology playbooks — ingested as
+        # source_repo='knowledge_base', with no service/port tags — pass 1
+        # matched nothing and pass 2 was skipped (it is skipped whenever
+        # source_repos is set). It returned "" on every call, so ingested
+        # knowledge reached /rag/ask and never reached the recommendation
+        # prompt, which is the one place it would change a scan.
         hits = _retrieve(
             _embed(query), top_k,
             service=service, port=port, tech=tech_list or None,
-            source_repos=[TRAINING_SOURCE_REPO],
+            source_repos=[TRAINING_SOURCE_REPO, KNOWLEDGE_SOURCE_REPO],
         )
     except Exception as e:
         logger.debug("training context retrieval failed: %s", e)
         return ""
+    # Similarity floor — for UNSCOPED matches only.
+    #
+    # The floor exists to stop generic prose being pasted into the prompt for an
+    # unrelated service (a `finger` scan pulling Web Methodology at 0.473).
+    # Applying it to service-scoped docs too was wrong, and measurably so: an
+    # operator-tagged HTB web cheatsheet retrieved for an `http` query scored
+    # 0.30 — because it is bash commands and the query is prose — so it was
+    # dropped, AND it had already displaced the playbook that would have passed.
+    # http/80 ended up with NO context at all while https/443 got the playbook.
+    #
+    # A doc tagged service=http, retrieved for an http query, is relevant by
+    # construction: the operator asserted that when they tagged it. Only rows
+    # that matched on embedding distance alone have to clear the bar.
+    hits = [h for h in hits
+            if h.get("match") == "scoped"
+            or float(h.get("ranked_score", h.get("sim") or 0.0)) >= _TRAINING_CONTEXT_MIN_SIM]
     if not hits:
         return ""
-    lines = ["", "TRAINING CONTEXT (operator-provided knowledge for this service/port):"]
+    lines = ["", "KNOWLEDGE CONTEXT (ingested methodology for this service/port):"]
     for h in hits:
         header = h.get("section_header") or h.get("title") or "note"
         lines.append(f"- [{header}] {(h.get('chunk') or '')[:600].strip()}")
@@ -896,8 +987,52 @@ def generate_recommendations(row: Dict, port: Optional[int] = None, ip: Optional
     return _enrich_and_finalize(recs, row, port, ip)
 
 
+# Auto-execute is the side of /next_scan that actually RUNS tools, so it is
+# bounded by the engagement's scan limit. Before this, one recommender call per
+# open port per scan each spawned a dispatch thread, those tools' output was
+# ingested, ingestion triggered more recommender calls, and the loop fed itself
+# — which is how the recommender ended up saturated and dispatches timed out.
+#
+# At capacity the dispatch is SKIPPED, not queued: the recommendation is already
+# persisted, so the work reappears in the pending queue rather than being lost.
+_auto_exec_slots = threading.BoundedSemaphore(SCAN_LIMIT)
+_auto_exec_skipped = {"n": 0}
+
+
+def _auto_exec_scope_refusal(ip: str, command: str = ""):
+    """Refusal string when this host must not be auto-scanned, else None.
+
+    Auto-execute is the one path that dispatches with NO operator in the loop —
+    a recommendation is generated and a tool fires at the host. It was bounded
+    by the engagement scan limit but never checked against the engagement SCOPE,
+    so volume was capped and authorization was not.
+
+    Fails closed: an unimportable gate refuses rather than dispatching.
+    """
+    try:
+        from etl.scope_gate import enforce_target_scope
+    except Exception as e:                     # pragma: no cover - deployment
+        return (f"scope gate unavailable ({type(e).__name__}: {e}) — refusing "
+                "auto-execute; check the ./etl mount on scan-recommender")
+    return enforce_target_scope(str(ip or ""), command)
+
+
 def _dispatch_auto_execute(ip: str, service: str, port: int):
     """Fire-and-forget call to kali-listener's /tools/execute-recommended."""
+    refusal = _auto_exec_scope_refusal(ip, f"auto-execute {service}/{port}")
+    if refusal:
+        logger.warning("REFUSED auto-execute for %s:%s/%s: %s",
+                       ip, port, service, refusal)
+        return
+    if not _auto_exec_slots.acquire(blocking=False):
+        _auto_exec_skipped["n"] += 1
+        if _auto_exec_skipped["n"] % 20 == 1:
+            logger.warning(
+                "auto-execute at the engagement scan limit (%d) — skipped %d "
+                "dispatch(es); those recommendations stay pending and can be run "
+                "from the Recommendations page.",
+                SCAN_LIMIT, _auto_exec_skipped["n"])
+        return
     try:
         resp = requests.post(
             f"{KALI_LISTENER_URL}/tools/execute-recommended",
@@ -908,9 +1043,164 @@ def _dispatch_auto_execute(ip: str, service: str, port: int):
         logger.info(f"Auto-execute dispatch for {ip}:{port}/{service} → {resp.status_code}")
     except Exception as e:
         logger.warning(f"Auto-execute dispatch failed for {ip}:{port}/{service}: {e}")
+    finally:
+        _auto_exec_slots.release()
 
 
 # ---- Persistence ----
+# ── Tool classification for scan_recommendations.target_kind ─────────────────
+#
+# Dispatch understands ONE shape: (ip, service, port) -> scanner. Tools that do
+# not fit it must be labelled at GENERATION, because two of the three classes
+# cannot be fixed later:
+#
+#   range     A sweep of a CIDR, run ONCE. The unique fingerprint is
+#             md5(ip|service|scanner|action|script|template), so a range tool
+#             recommended per discovered (ip, service) produces a DIFFERENT
+#             fingerprint every time — one identical sweep per service found. On
+#             a host with 18 open ports that is 18 masscans of the same range.
+#             Deduping at dispatch cannot recover this: the rows already exist.
+#   artifact  Targets a FILE, not a host. `ip` is meaningless for it.
+#   resource  Not runnable at all — an INPUT to other tools.
+#
+# Anything unlisted is 'service', the default, so this map only ever narrows
+# behaviour for tools explicitly known not to fit.
+RANGE_TOOLS = {"masscan", "nmap-sweep", "netdiscover", "arp-scan", "fping", "zmap"}
+ARTIFACT_TOOLS = {"exiftool", "binwalk", "strings", "foremost", "steghide", "pdfid",
+                  "oledump", "peepdf"}
+RESOURCE_TOOLS = {"seclists", "wordlists", "rockyou", "nuclei-templates",
+                  "payloadsallthethings", "fuzzdb"}
+
+
+def classify_target_kind(scanner: Optional[str]) -> str:
+    """'service' | 'range' | 'artifact' | 'resource' for a tool name."""
+    t = (scanner or "").strip().lower()
+    if t in RANGE_TOOLS:
+        return "range"
+    if t in ARTIFACT_TOOLS:
+        return "artifact"
+    if t in RESOURCE_TOOLS:
+        return "resource"
+    return "service"
+
+
+def _scope_cidr_for(cur, engagement_id: Optional[str], ip: str) -> Optional[str]:
+    """The engagement CIDR containing `ip`, if one is defined.
+
+    A range sweep belongs to a SCOPE, not a host. Keying it to the covering CIDR
+    is what makes the existing fingerprint collapse many per-host suggestions
+    into one sweep. Falls back to None (caller then keys on the host with a NULL
+    service, which still collapses per-service duplicates for that host).
+    """
+    if not engagement_id:
+        return None
+    try:
+        cur.execute(
+            """
+            SELECT st.target FROM public.scope_targets st
+             WHERE st.engagement_id = %s::uuid
+               AND st.target_type = 'cidr'
+               AND st.target ~ '^[0-9]+([.][0-9]+){3}/[0-9]+$'
+               AND %s::inet <<= st.target::inet
+             ORDER BY masklen(st.target::inet) ASC
+             LIMIT 1
+            """,
+            (engagement_id, ip),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception as e:
+        logger.debug("scope CIDR lookup failed for %s: %s", ip, e)
+        return None
+
+
+def _already_satisfied(cur, ip, rec, rec_service):
+    """Has this recommendation's work already been done? Returns a reason or None.
+
+    The queue filled with work that could never produce anything: 63 of 143
+    pending recommendations were nmap NSE scripts that the dispatcher ALWAYS
+    skips as "already run during service detection", 16 were nuclei re-runs after
+    nuclei had completed, and 2 were brute-force against services whose
+    credentials had already been recovered. They were regenerated as fast as the
+    recon agent could mark them skipped, so the queue never meaningfully drained.
+
+    Suppression is EVENT-based, not time-based: a scanner is suppressed only
+    until something changes. If a service is discovered after that scanner last
+    completed, the recommendation is allowed through again — a new port is
+    exactly the case where re-running is worth it.
+    """
+    scanner = (rec.get("scanner") or "").lower()
+    script = rec.get("script")
+    action = (rec.get("action") or "")
+
+    # 1. nmap NSE scripts — suppress ONLY when that exact script has actually
+    #    produced a result for this host.
+    #
+    #    The first version of this assumed any NSE rec was "already covered by
+    #    service detection" (mirroring what dispatch_rec says). That is wrong and
+    #    it suppressed 63 real recommendations: nfs-showmount, rmi-*, distcc-*,
+    #    snmp-*, tftp-enum, ntp-monlist, x11-access. A default -sV does not run
+    #    any of those — `vulns.script` for the host held only nuclei:* entries,
+    #    so none of them had ever run.
+    #
+    #    Evidence, not assumption: the script must appear in vulns.script for
+    #    this host. Many recs carry a full command rather than a bare script
+    #    name, so match on the script tokens found inside it.
+    if scanner == "nmap" and script:
+        tokens = [t for t in re.findall(r"[a-z0-9][a-z0-9-]{3,}", script.lower())
+                  if t not in ("nmap", "target", "script", "sudo")]
+        if tokens:
+            cur.execute(
+                """
+                SELECT 1 FROM public.vulns v
+                  LEFT JOIN public.assets a ON a.id = v.asset_id
+                 WHERE v.script IS NOT NULL
+                   AND (a.ip IS NULL OR host(a.ip) = %s)
+                   AND lower(v.script) = ANY(%s)
+                 LIMIT 1
+                """,
+                (ip, tokens),
+            )
+            if cur.fetchone():
+                return f"nmap script {tokens[0]} has already produced results for this host"
+
+    # 2. Brute force where the credentials are already recovered. The objective
+    #    is met; running it again just re-proves a known password.
+    if scanner in ("hydra", "medusa", "ncrack", "brutus") and rec_service:
+        cur.execute(
+            "SELECT 1 FROM public.credential_findings "
+            " WHERE valid_cred AND host(ip)=%s AND lower(protocol)=lower(%s) LIMIT 1",
+            (ip, rec_service),
+        )
+        if cur.fetchone():
+            return f"valid credentials already recovered for {rec_service}"
+
+    # 3. Same scanner already completed for this host, with nothing new since.
+    #    `ports.created_at > completed_at` is the "something changed" test: a
+    #    service found after the scan ran is a reason to run it again.
+    if scanner:
+        cur.execute(
+            """
+            SELECT 1
+              FROM public.session_scan_metrics m
+             WHERE m.status = 'completed'
+               AND (m.scan_type = %s OR m.scan_type ILIKE %s)
+               AND m.completed_at IS NOT NULL
+               AND NOT EXISTS (
+                     SELECT 1 FROM public.ports p
+                       JOIN public.assets a ON a.id = p.asset_id
+                      WHERE host(a.ip) = %s
+                        AND p.created_at > m.completed_at)
+             LIMIT 1
+            """,
+            (scanner, scanner + "%", ip),
+        )
+        if cur.fetchone():
+            return f"{scanner} already completed for this host; nothing new since"
+
+    return None
+
+
 def persist_recommendations(
     ip: str,
     recs: List[Dict[str, Optional[str]]],
@@ -938,6 +1228,7 @@ def persist_recommendations(
         return 0
 
     inserted = 0
+    suppressed = 0
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         # Resolve asset_id from IP if the caller didn't have it.  Cheap
         # one-shot lookup; persisting recs without the FK link silently
@@ -1006,28 +1297,82 @@ def persist_recommendations(
             # priority: NULL → DB default (50) via COALESCE.  Lower runs first.
             rec_priority = rec.get("priority")
 
+            # Classify, and for RANGE tools rewrite the identity so the existing
+            # unique fingerprint does the deduping for us.
+            #
+            # fingerprint = md5(ip|service|scanner|action|script|template). A
+            # range sweep suggested once per discovered (ip, service) therefore
+            # gets a distinct fingerprint each time — 18 open ports on one host
+            # meant 18 masscans of the same range. Keying it to the covering
+            # scope CIDR with a NULL service collapses them all to ONE row.
+            # Dispatch-side dedupe cannot fix this; by then the rows exist.
+            rec_kind = classify_target_kind(rec.get("scanner"))
+            rec_ip = ip
+            if rec_kind == "range":
+                scope_cidr = _scope_cidr_for(cur, engagement_id, ip)
+                rec_ip = scope_cidr or ip
+                rec_service = None          # a sweep is not service-specific
+                rec_banner = None
+                rec_extra.pop("port", None)  # nor port-specific
+                rec_asset_id = None          # a CIDR is not one asset
+            else:
+                rec_asset_id = asset_id
+
+            # Suppress work that is already done. Guarded by a SAVEPOINT so a
+            # lookup failure degrades to "recommend it" rather than aborting the
+            # whole batch — withholding a scan on a broken query would be worse
+            # than a redundant row.
+            cur.execute("SAVEPOINT sat_check")
+            try:
+                _reason = _already_satisfied(cur, ip, rec, rec_service)
+                cur.execute("RELEASE SAVEPOINT sat_check")
+            except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT sat_check")
+                logger.debug(f"already-satisfied check skipped for {ip}: {e}")
+                _reason = None
+            # Record the suppression instead of dropping the row.
+            #
+            # The first version skipped the INSERT entirely, which meant an
+            # operator who disagreed with the call had no way to run it — the
+            # recommendation simply did not exist. Persisting it as 'skipped'
+            # with a reason keeps it visible, filterable and dispatchable with
+            # force=true, which is the difference between the tool making a
+            # suggestion and the tool making the decision.
+            rec_status = "pending"
+            if _reason:
+                suppressed += 1
+                rec_status = "skipped"
+                rec_extra["skip_reason"] = _reason
+                logger.debug(f"suppressed {rec.get('scanner')} for {ip}: {_reason}")
+
             cur.execute(
                 """
                 INSERT INTO public.scan_recommendations
-                  (asset_id, ip, service, banner, scanner, action, script, template, source, model, extra, priority, engagement_id)
+                  (asset_id, ip, service, banner, scanner, action, script, template, source, model, extra, priority, engagement_id, target_kind, status)
                 VALUES
-                  (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 50), %s)
+                  (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 50), %s, %s, %s)
                 ON CONFLICT (fingerprint) DO NOTHING
                 RETURNING id;
                 """,
                 (
-                    asset_id, ip, rec_service, rec_banner,
+                    rec_asset_id, rec_ip, rec_service, rec_banner,
                     rec.get("scanner"), rec.get("action"),
                     rec.get("script"), rec.get("template"),
                     source, model,
                     Json(rec_extra) if rec_extra else None,
                     rec_priority,
                     engagement_id,
+                    rec_kind,
+                                        rec_status,
                 ),
             )
             if cur.rowcount > 0:
                 inserted += 1
         conn.commit()
+    if suppressed:
+        logger.info(
+            "persist_recommendations(%s): %d inserted, %d suppressed as "
+            "already satisfied", ip, inserted, suppressed)
     return inserted
 
 
@@ -1092,8 +1437,14 @@ def _ollama_nonstream_generate(prompt: str, model: str, endpoint: str,
 def _azure_chat_url(endpoint: str, model: str, api_version: str) -> str:
     """Build Azure chat completions URL based on endpoint pattern."""
     base = endpoint.rstrip("/")
-    if ".models.ai.azure.com" in base:
-        # AI Foundry serverless — OpenAI-compatible
+    low = base.lower()
+    if ".services.ai.azure.com" in low or "/openai/v1" in low or low.rstrip("/").endswith("/openai"):
+        # Microsoft Foundry OpenAI-compatible endpoint — model goes in the body.
+        import re
+        root = re.sub(r'(/openai)?(/v1)?(/chat/completions)?/?$', '', base, flags=re.I).rstrip("/")
+        return f"{root}/openai/v1/chat/completions"
+    if ".models.ai.azure.com" in low:
+        # AI Foundry model-inference — OpenAI-compatible
         return f"{base}/v1/chat/completions"
     # Azure OpenAI
     return f"{base}/openai/deployments/{model}/chat/completions?api-version={api_version}"
@@ -1108,6 +1459,9 @@ def _azure_generate(prompt: str, json_mode: bool = False,
     """Call Azure chat completions and return the assistant message content."""
     url = _azure_chat_url(AZURE_ENDPOINT, AZURE_MODEL, AZURE_API_VERSION)
     payload: Dict[str, Any] = {
+        # `model` is required by OpenAI-compatible Foundry endpoints and ignored
+        # by classic Azure deployment URLs.
+        "model": AZURE_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.7,
         "max_tokens": 2048,
@@ -1426,6 +1780,18 @@ Rules:
 
 # ---- FastAPI ----
 app = FastAPI(title="Scan Recommender")
+
+
+@app.middleware("http")
+async def _llm_settings_mw(request, call_next):
+    # Pull the latest LLM settings (DB over env) before handling each request.
+    try:
+        _refresh_llm_globals()
+    except Exception:
+        pass
+    return await call_next(request)
+
+
 router = APIRouter()
 # added to include the python for searchsploit
 app.include_router(rag_router)
@@ -1580,6 +1946,124 @@ def ollama_query_route(req: OllamaQueryRequest):
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Ollama service unavailable: {e}")
 
+# ── Admission control for /next_scan ──────────────────────────────────────
+#
+# nmap_scanner calls this once per OPEN PORT, per host, per scan, and rag-api
+# does the same on ingest. A batch of concurrent scans against a host with ~30
+# open ports therefore produces hundreds of near-simultaneous requests to an
+# endpoint that can reach an LLM. The service saturated, callers hit their
+# 15s read timeout, and the BFF recorded the resulting dispatch timeouts as
+# FAILED recommendations for scans that had actually started.
+#
+# Rejecting fast is strictly better than timing out slowly: the caller learns
+# immediately and stops queuing more work, instead of every request paying the
+# full timeout while the backlog grows. 429 + Retry-After is the standard way to
+# say "not now" without pretending the request was invalid.
+# Tied to the engagement-wide scan limit rather than a number of its own.
+# MAX_CONCURRENT_SCANS is what the operator already sets to say how much
+# activity this engagement may generate, and /next_scan is not a passive query:
+# with AUTO_EXECUTE_SAFE on it LAUNCHES tools (see _dispatch_auto_execute), so a
+# separate limit here would silently overrule the engagement's own ceiling.
+#
+# Override with NEXT_SCAN_MAX_CONCURRENCY only if this endpoint needs to differ
+# from the engagement limit.
+NEXT_SCAN_MAX_CONCURRENCY = int(os.environ.get("NEXT_SCAN_MAX_CONCURRENCY", str(SCAN_LIMIT)))
+# How long a caller may wait for a slot before being turned away. Short on
+# purpose — a caller that waits is a caller not scanning.
+NEXT_SCAN_QUEUE_WAIT_SEC = float(os.environ.get("NEXT_SCAN_QUEUE_WAIT_SEC", "2"))
+
+_next_scan_slots = threading.BoundedSemaphore(NEXT_SCAN_MAX_CONCURRENCY)
+_next_scan_stats = {"admitted": 0, "rejected": 0}
+_next_scan_stats_lock = threading.Lock()
+
+
+@contextmanager
+def _next_scan_admission():
+    """Admit a bounded number of concurrent /next_scan calls.
+
+    Raises HTTPException(429) when the service is already at capacity.
+    """
+    acquired = _next_scan_slots.acquire(timeout=NEXT_SCAN_QUEUE_WAIT_SEC)
+    if not acquired:
+        with _next_scan_stats_lock:
+            _next_scan_stats["rejected"] += 1
+            rejected = _next_scan_stats["rejected"]
+        if rejected % 25 == 1:
+            logger.warning(
+                "next_scan at capacity (%d concurrent); shed %d request(s) so far. "
+                "Callers should back off rather than retry immediately.",
+                NEXT_SCAN_MAX_CONCURRENCY, rejected)
+        raise HTTPException(
+            status_code=429,
+            detail=f"scan recommender at capacity ({NEXT_SCAN_MAX_CONCURRENCY} concurrent)",
+            headers={"Retry-After": "5"},
+        )
+    with _next_scan_stats_lock:
+        _next_scan_stats["admitted"] += 1
+    try:
+        yield
+    finally:
+        _next_scan_slots.release()
+
+
+def _llm_status() -> dict:
+    """Is the configured LLM backend actually usable?
+
+    Worth reporting explicitly because the failure is SILENT: /next_scan only
+    reaches the LLM when a service has no port rows, and if the backend is
+    missing it falls back to deterministic rules and still returns 200. On this
+    install no ollama container was running at all and OLLAMA_MODEL was set to a
+    model that does not exist, so LLM-backed recommendations had simply stopped
+    happening with nothing to indicate it.
+
+    Cheap and fail-soft: a short timeout, and any error is reported rather than
+    raised, since this is a diagnostic endpoint.
+    """
+    info = {"backend": LLM_BACKEND, "model": OLLAMA_MODEL}
+    if LLM_BACKEND != "ollama":
+        info["reachable"] = None
+        info["note"] = f"backend '{LLM_BACKEND}' is not probed here"
+        return info
+    try:
+        # resolve_ollama_health_endpoint returns the API BASE (".../api"), which
+        # callers append a path to — the /health endpoint check above does
+        # `f"{endpoint}/tags"`. Requesting the base directly 404s, which this
+        # check previously reported as "LLM backend unreachable" on a perfectly
+        # working install. Ollama here runs natively on the host and is reached
+        # via host.docker.internal.
+        r = requests.get(f"{resolve_ollama_health_endpoint(OLLAMA_BASE_URL)}/tags", timeout=3)
+        info["reachable"] = r.status_code < 400
+        names = [m.get("name") for m in (r.json().get("models") or [])] if r.ok else []
+        info["models_available"] = names[:10]
+        info["model_present"] = OLLAMA_MODEL in names
+        if not info["reachable"]:
+            info["note"] = (f"backend answered HTTP {r.status_code} — LLM "
+                            f"recommendations are deterministic-only")
+        elif not info["model_present"]:
+            info["note"] = (f"model '{OLLAMA_MODEL}' is not installed — LLM "
+                            f"recommendations silently fall back to rules")
+    except Exception as e:
+        info["reachable"] = False
+        info["model_present"] = False
+        info["note"] = (f"{type(e).__name__}: LLM backend unreachable — "
+                        f"recommendations are deterministic-only")
+    return info
+
+
+@router.get("/next_scan/capacity")
+def next_scan_capacity():
+    """Admission stats, so saturation is observable rather than inferred from
+    client-side timeouts."""
+    with _next_scan_stats_lock:
+        stats = dict(_next_scan_stats)
+    return {"max_concurrency": NEXT_SCAN_MAX_CONCURRENCY,
+            "engagement_scan_limit": SCAN_LIMIT,
+            "llm": _llm_status(),
+            "auto_execute_enabled": AUTO_EXECUTE,
+            "auto_execute_skipped": _auto_exec_skipped["n"],
+            "queue_wait_seconds": NEXT_SCAN_QUEUE_WAIT_SEC, **stats}
+
+
 @router.get("/next_scan", response_model=ScanRecommendationsResponse)
 def get_next_scan_recommendations(
     ip: str = Query(..., description="IP address of the asset"),
@@ -1589,9 +2073,15 @@ def get_next_scan_recommendations(
     use_ollama: bool = Query(False, description="Force fetching from Ollama even if DB has rows"),
     persist: bool = Query(True, description="Persist results to DB if schema exists"),
 ):
+    with _next_scan_admission():
+        return _next_scan_impl(ip, service, banner, port, use_ollama, persist)
+
+
+def _next_scan_impl(ip, service, banner, port, use_ollama, persist):
     recommendations: List[ScanRecommendation] = []
     effective_service = service
     effective_port = port
+    preflight_verdict = None
     try:
         # Build filtered query — narrow to specific service/port when provided
         query = "SELECT p.service, p.banner, p.port FROM public.ports p JOIN public.assets a ON p.asset_id = a.id WHERE host(a.ip)=%s"
@@ -1609,6 +2099,16 @@ def get_next_scan_recommendations(
             rows = cur.fetchall()
             logger.info(f"DB rows found for {ip} (service={service}, port={port}): {len(rows)}")
         if not rows or use_ollama:
+            # Nothing observed for this target: the model is being asked to
+            # recommend probes for a service no scan reported. Sometimes correct
+            # (the operator may know it is there), but it must not be silent —
+            # the preflight verdict rides along with the response so the caller
+            # can see the recommendations rest on a service name alone.
+            if not rows:
+                logger.warning(
+                    "next_scan: no recorded ports for %s — recommending from the "
+                    "service name alone", ip)
+                preflight_verdict = preflight_check(ip, service, port)
             # `port` is passed so per-port and per-(port,service) operator
             # prompts resolve — previously the LLM path discarded it entirely.
             ollama_recs = fetch_ollama_recommendations(ip, service, banner, port=port)
@@ -1789,7 +2289,8 @@ def get_next_scan_recommendations(
                 daemon=True,
             ).start()
 
-        return ScanRecommendationsResponse(recommendations=recommendations)
+        return ScanRecommendationsResponse(recommendations=recommendations,
+                                           preflight=preflight_verdict)
     except HTTPException:
         raise
     except Exception as e:
@@ -1820,29 +2321,126 @@ def list_all_recommendations(
             conditions = []
             params = []
             if status and status != "all":
-                conditions.append("status = %s")
+                conditions.append("r.status = %s")
                 params.append(status)
             if ip:
-                conditions.append("ip = %s::inet")
+                conditions.append("r.ip = %s::inet")
                 params.append(ip)
             if eid:
                 conditions.append(
-                    "(engagement_id = %s::uuid OR (engagement_id IS NULL "
-                    "AND asset_id IN (SELECT id FROM public.assets "
+                    "(r.engagement_id = %s::uuid OR (r.engagement_id IS NULL "
+                    "AND r.asset_id IN (SELECT id FROM public.assets "
                     "WHERE engagement_id = %s::uuid)))"
                 )
                 params.extend([eid, eid])
             where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
             cur.execute(
                 f"""
-                SELECT DISTINCT ON (ip, scanner, COALESCE(action,''), COALESCE(template,''))
-                       id, ip::text, service, banner, scanner, action, script, template,
-                       source, model, confidence, priority, status, executed_at,
-                       created_at, updated_at
-                FROM scan_recommendations
+                -- `status` is part of the dedup key on purpose.
+                --
+                -- Without it, DISTINCT ON collapses a completed recommendation
+                -- into a pending duplicate with the same (ip, scanner, action,
+                -- template) and the ordering below keeps the pending one — so
+                -- `status=all` returned 93 rows, every one pending, and the 28
+                -- completed recommendations were invisible. Work that HAS run is
+                -- exactly what an operator is looking for when they widen the
+                -- filter.
+                SELECT DISTINCT ON (r.ip, r.scanner, COALESCE(r.action,''), COALESCE(r.template,''), r.status)
+                       r.id, r.ip::text, r.service, r.banner, r.scanner, r.action,
+                       r.script, r.template,
+                       r.source, r.model, r.confidence, r.priority, r.status,
+                       r.executed_at, r.created_at, r.updated_at, r.target_kind,
+                       -- What the recommendation actually PRODUCED.
+                       --
+                       -- A completed recommendation with no visible result is
+                       -- indistinguishable from one that never ran — the exact
+                       -- complaint that started this. extra.job_id links to the
+                       -- run; for kali tools that is a tool_executions row, so
+                       -- the outcome and a preview of the captured output come
+                       -- back with the recommendation instead of requiring a
+                       -- second lookup the UI was not making.
+                       r.extra->>'job_id' AS job_id,
+                       te.status           AS result_status,
+                       te.exit_code        AS result_exit_code,
+                       length(coalesce(te.output, '')) AS result_bytes,
+                       -- Fall back to te.error: a tool that fails often writes
+                       -- nothing to stdout, so a failed recommendation showed an
+                       -- empty output box and no reason at all.
+                       left(COALESCE(NULLIF(te.output, ''), te.error, ''), 400)
+                                           AS result_preview,
+                       NULLIF(te.error, '') AS result_error,
+                       -- Why a recommendation was suppressed. Without this the UI
+                       -- can filter to status='skipped' but cannot say WHY, which
+                       -- makes the decision unreviewable — and the operator has to
+                       -- take the tool's word for it.
+                       r.extra->>'skip_reason' AS skip_reason,
+                       -- The command that was ACTUALLY dispatched.
+                       --
+                       -- r.script is regularly empty or a fragment ("banner"):
+                       -- the recommender names a scanner, kali builds the real
+                       -- command at dispatch time, and scanner-service
+                       -- dispatches send a JSON payload to an endpoint instead
+                       -- of a shell command. All of that used to be thrown away
+                       -- once the request returned, so a completed
+                       -- recommendation showed no command at all.
+                       -- dispatched_command FIRST: it is what actually ran.
+                       -- r.script is the recommender's TEMPLATE and still holds
+                       -- its placeholders, so showing it for an executed
+                       -- recommendation displays a command the operator never
+                       -- ran and which would not work if copied.
+                       -- NB: this query is an f-string. Do NOT write brace
+                       -- placeholders in these comments -- Python evaluates them
+                       -- and the whole listing dies with "name is not defined",
+                       -- which surfaces as an empty recommendations page.
+                       COALESCE(r.extra->>'dispatched_command', NULLIF(r.script, ''))
+                                           AS command,
+                       NULLIF(r.script, '') AS script_template,
+                       r.extra->>'dispatched_command' AS dispatched_command,
+                       r.extra->>'dispatched_endpoint' AS dispatched_endpoint,
+                       -- Output for the OTHER dispatch route. tool_executions
+                       -- only covers kali tools; httpx/katana/nmap run inside
+                       -- scanner services whose job ids exist nowhere in this
+                       -- database, so those recommendations had no retrievable
+                       -- output whatsoever. Their uploads are now archived with
+                       -- the job id attached, which is the link back.
+                       ra.artifact_id, ra.artifact_tool, ra.artifact_bytes,
+                       ra.artifact_preview,
+                       -- Whether this recommendation's target is inside the
+                       -- configured scope. Recommendations are generated from
+                       -- whatever hosts appear in scan output, so a redirect or
+                       -- a certificate SAN can put a third party's address in
+                       -- the queue. Dispatch blocks these, but a blocked item
+                       -- that looks identical to a runnable one just reads as
+                       -- broken -- the operator has to be able to SEE why.
+                       -- Only ip/cidr rows can match an IP target; a domain
+                       -- scope entry cannot authorise a bare address here.
+                       EXISTS (
+                           SELECT 1 FROM public.scope_targets st
+                            WHERE (lower(COALESCE(st.target_type,'ip')) = 'ip'
+                                   AND st.target = host(r.ip))
+                               OR (lower(st.target_type) = 'cidr'
+                                   AND st.target ~ '^[0-9a-fA-F:.]+/[0-9]+$'
+                                   AND r.ip <<= st.target::inet)
+                       ) AS in_scope
+                FROM scan_recommendations r
+                -- 1:1 on a unique id, so this cannot multiply rows.
+                LEFT JOIN tool_executions te
+                       ON te.id::text = r.extra->>'job_id'
+                -- LIMIT 1 keeps this 1:1 as well: a job can produce several
+                -- artifacts (stdout plus native JSON), and without the limit
+                -- each would duplicate the recommendation row.
+                LEFT JOIN LATERAL (
+                    SELECT a.id::text AS artifact_id, a.tool AS artifact_tool,
+                           a.byte_size AS artifact_bytes,
+                           left(coalesce(a.content, ''), 400) AS artifact_preview
+                      FROM raw_artifacts a
+                     WHERE a.job_id = r.extra->>'job_id'
+                     ORDER BY a.native_json DESC, a.created_at DESC
+                     LIMIT 1
+                ) ra ON true
                 {where}
-                ORDER BY ip, scanner, COALESCE(action,''), COALESCE(template,''),
-                         priority ASC, created_at DESC
+                ORDER BY r.ip, r.scanner, COALESCE(r.action,''), COALESCE(r.template,''), r.status,
+                         r.priority ASC, r.created_at DESC
                 LIMIT %s
                 """,
                 params + [limit]
@@ -2628,26 +3226,201 @@ def get_tool_catalog_info():
     return info
 
 
+class VerifyAgentBody(BaseModel):
+    session_id: Optional[str] = None
+    text: Optional[str] = None
+    ip: Optional[str] = None
+    # Off by default: it costs a model call, and the regex pass already covers
+    # ports/CVEs/hosts/services. Turn it on to catch assertions with no token to
+    # match, e.g. "the share was writable without credentials".
+    use_llm: bool = False
+
+
+@kb_router.post("/agent-output/verify")
+def verify_agent_output(body: VerifyAgentBody):
+    """Check an agent's factual claims against what the scans actually recorded.
+
+    Deterministic by design — regex extraction, SQL verification. Asking a second
+    model to judge the first adds another thing that can hallucinate, and ports,
+    CVEs, services and hosts all have exact database answers.
+
+    Catches FABRICATION, not wrongness: a claim about a port that was recorded
+    counts as supported even if its service label is wrong. Nor can it prove a
+    negative — an unsupported claim may be true but unrecorded, which is why the
+    field is `unsupported` rather than `false`. Ingestion being broken would make
+    every claim look unsupported, so read this alongside the scan's ingest stats.
+    """
+    from agent_claims import extract_claims, verify_claims, summarise
+
+    text = body.text or ""
+    session_id = (body.session_id or "").strip()
+    if session_id:
+        try:
+            with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT agent_name, role, content FROM public.agent_messages "
+                    " WHERE session_id = %s::uuid ORDER BY created_at", (session_id,))
+                rows = cur.fetchall()
+        except Exception as e:
+            raise HTTPException(400, f"Could not read session {session_id}: {e}")
+        if not rows:
+            raise HTTPException(404, f"No messages for session {session_id}")
+        # Executor messages are raw tool output, not the agent's own assertions;
+        # verifying a tool's own JSON against the database it fed would be
+        # circular. Only narrative roles make checkable claims.
+        text = "\n".join(r["content"] for r in rows
+                          if (r["agent_name"] or "").lower() not in ("executor", "admin"))
+        if not text.strip():
+            return {"ok": True, "session_id": session_id, "claims_checked": 0,
+                    "unsupported_count": 0, "by_kind": {}, "unsupported": [],
+                    "note": "session contains only tool output, no agent narrative to check"}
+
+    if not text.strip():
+        raise HTTPException(400, "provide session_id or text")
+
+    vocab = []
+    try:
+        kb = get_tool_kb()
+        vocab = list((kb._data.get("services") or {}).keys())
+    except Exception as e:
+        logger.debug("verify: KB vocabulary unavailable (%s)", e)
+
+    claims = extract_claims(text, service_vocab=vocab)
+    llm_used = False
+    if body.use_llm:
+        # The model PROPOSES; SQL still decides. Nothing it returns can mark a
+        # claim supported — every checkable kind goes through verify_claims, and
+        # anything else lands in manual follow-up.
+        from agent_claims import llm_extract_claims, merge_claims
+        proposed = llm_extract_claims(text, ollama_query)
+        if proposed:
+            llm_used = True
+            claims = merge_claims(claims, proposed)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            results = verify_claims(cur, claims, ip=body.ip)
+    except Exception as e:
+        logger.error("verify_agent_output failed: %s", e)
+        raise HTTPException(500, f"Verification failed: {e}")
+
+    out = summarise(results)
+    if out["unsupported_count"]:
+        _emit_webhook("agent_output_unsupported_claims", {
+            "session_id": session_id or None, "ip": body.ip,
+            "claims_checked": out["claims_checked"],
+            "unsupported_count": out["unsupported_count"],
+            "kinds": {k: v["unsupported"] for k, v in out["by_kind"].items()},
+        })
+    return {"ok": True, "session_id": session_id or None,
+            "llm_extraction_used": llm_used, **out}
+
+
+def preflight_check(ip: Optional[str] = None, service: Optional[str] = None,
+                    port: Optional[int] = None) -> Dict:
+    """Is the input sound enough to base recommendations on?
+
+    Runs BEFORE generation, because every downstream check is wasted on garbage
+    input. `/next_scan` will happily answer for a host with no recorded ports —
+    the `if not rows` branch asks the model to recommend probes for a service it
+    has never observed. That is not always wrong (an operator may know the
+    service is there), but it should be visible rather than silent.
+
+    DETERMINISTIC ON PURPOSE. This gates the LLM path, so implementing it with an
+    LLM would put the thing being guarded in charge of the gate. Every question
+    here — is there scan data, is the catalog present, how old is it — has an
+    exact answer.
+
+    Returns {ok, blockers, warnings, facts}. `blockers` are conditions under
+    which recommendations are probably worthless; `warnings` are worth knowing
+    but not disqualifying. Nothing here refuses to run: the operator decides.
+    """
+    blockers: List[str] = []
+    warnings: List[str] = []
+    facts: Dict = {}
+
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if ip:
+                cur.execute(
+                    "SELECT COUNT(*) AS n, MAX(p.last_seen) AS last "
+                    "  FROM ports p JOIN assets a ON a.id = p.asset_id "
+                    " WHERE host(a.ip) = %s", (ip,))
+            else:
+                cur.execute("SELECT COUNT(*) AS n, MAX(last_seen) AS last FROM ports")
+            row = cur.fetchone() or {}
+            facts["ports_recorded"] = int(row.get("n") or 0)
+            facts["last_seen"] = str(row.get("last")) if row.get("last") else None
+
+            if facts["ports_recorded"] == 0:
+                blockers.append(
+                    f"No ports recorded{' for ' + ip if ip else ''}. Recommendations would be "
+                    f"generated from the service name alone, with nothing observed to ground "
+                    f"them — check the scan ran and its ingest stats before trusting the output."
+                )
+            elif service:
+                cur.execute(
+                    "SELECT 1 FROM ports p JOIN assets a ON a.id = p.asset_id "
+                    " WHERE host(a.ip) = %s AND lower(p.service) = lower(%s) LIMIT 1"
+                    if ip else
+                    "SELECT 1 FROM ports WHERE lower(service) = lower(%s) LIMIT 1",
+                    (ip, service) if ip else (service,))
+                if not cur.fetchone():
+                    warnings.append(
+                        f"{service!r} was not observed{' on ' + ip if ip else ''} — "
+                        f"recommending for a service no scan reported.")
+    except Exception as e:
+        warnings.append(f"Could not check recorded scan data: {e}")
+
+    try:
+        from tool_catalog import catalog_info
+        info = catalog_info()
+        facts["catalog_entries"] = sum(info.get("counts", {}).values())
+        facts["catalog_age_seconds"] = info.get("age_seconds")
+        if not info.get("exists"):
+            warnings.append(
+                "No tool catalog — recommendations will not be validated, so unrunnable "
+                "invocations can reach dispatch. Run scripts/refresh-tool-catalogs.sh.")
+        elif (info.get("age_seconds") or 0) > 7 * 86400:
+            warnings.append(
+                f"Tool catalog is {int(info['age_seconds'] / 86400)} days old; anything "
+                f"installed since is invisible to validation.")
+    except Exception as e:
+        warnings.append(f"Could not read the tool catalog: {e}")
+
+    return {"ok": not blockers, "blockers": blockers, "warnings": warnings, "facts": facts}
+
+
+@kb_router.get("/preflight")
+def preflight(ip: Optional[str] = Query(None), service: Optional[str] = Query(None),
+              port: Optional[int] = Query(None)):
+    """Check whether recommendations for this target would rest on real data."""
+    return preflight_check(ip, service, port)
+
+
 @kb_router.get("/tool-coverage")
 def get_tool_coverage():
-    """Cross-check what the KB RECOMMENDS against what is actually installed.
+    """Cross-check the KB's tool names against the local catalog.
 
-    Two independent failures, in opposite directions:
+    IMPORTANT — what "not installed" does and does not mean.
 
-    * `unrunnable` — a tool the KB (YAML or operator override) will recommend
-      that exists nowhere in the stack. The validator does NOT catch these: it
-      only gates nmap/metasploit/nuclei, so a recommendation for `snmp-check`
-      sails through and fails at dispatch. Measured today: the shipped YAML
-      recommends snmp-check, which is installed on nothing.
+    Binary availability is a LOCAL AVAILABILITY signal, not a correctness one.
+    Tools execute on provisioned nodes, across pipes, and on instances that may
+    not exist yet; a stack that lacks `vncviewer` today says nothing about the
+    node that will run it. Names like `mysqltuner`, `impacket-getnpusers` and
+    `kubectl` are perfectly correct KB entries whether or not this host has them.
 
-    * `uncatalogued` — a tool that IS installed (often provisioned onto a node)
-      but which no KB entry mentions, so it can never be recommended. Every one
-      of these is capability the stack paid to install and cannot use.
+    That is a different question from IDENTIFIER VALIDITY, which is what the
+    validator actually gates. For nmap scripts, msf modules and nuclei templates
+    the catalog is authoritative about whether a name is REAL — nmap ships a
+    fixed script set, so `smb-enum-links` does not exist anywhere, not merely
+    here. Those are rejected because they are wrong, not because they are absent.
 
-    Advisory. Scanner labels are not reliably binary names (`metasploit` is
-    msfconsole; the KB uses labels like `nmap-smb-vuln`), so this reports rather
-    than enforces — the same reasoning that keeps the binary check out of the
-    blocking path.
+    So:
+    * `not_installed_locally` — informational. Useful for deciding what to
+      provision; NOT a prediction of failure.
+    * `uncatalogued` — installed (often provisioned onto a node) but referenced
+      by no KB entry, so it can never be recommended. Capability paid for and
+      unused.
     """
     from tool_catalog import load_catalogs, _SCANNER_BINARY
 
@@ -2655,7 +3428,8 @@ def get_tool_coverage():
     binaries = cats.get("binaries") or set()
     if not binaries:
         return {"ok": False, "reason": "no binary catalog — run scripts/refresh-tool-catalogs.sh",
-                "unrunnable": [], "uncatalogued": [], "kb_tool_count": 0}
+                "not_installed_locally": [], "unrunnable": [],
+        "uncatalogued": [], "kb_tool_count": 0}
 
     # Every tool name the KB can recommend, and where it came from.
     referenced: Dict[str, set] = {}
@@ -2684,7 +3458,7 @@ def get_tool_coverage():
         mapped = _SCANNER_BINARY.get(name, name)
         return mapped is None or mapped in binaries
 
-    unrunnable = sorted(
+    not_local = sorted(
         ({"tool": n, "referenced_by": sorted(s)[:6], "references": len(s)}
          for n, s in referenced.items() if not _installed(n)),
         key=lambda r: -r["references"],
@@ -2713,7 +3487,12 @@ def get_tool_coverage():
         "ok": True,
         "kb_tool_count": len(referenced),
         "binary_count": len(binaries),
-        "unrunnable": unrunnable,
+        # Renamed from "unrunnable": these names are correct, just absent
+        # locally. Tools run on nodes and provisioned instances, so local
+        # absence predicts nothing. `unrunnable` is kept as an alias so an
+        # older UI build does not silently render an empty section.
+        "not_installed_locally": not_local,
+        "unrunnable": not_local,
         "uncatalogued": sorted(interesting)[:60],
         "uncatalogued_total": len(interesting),
     }

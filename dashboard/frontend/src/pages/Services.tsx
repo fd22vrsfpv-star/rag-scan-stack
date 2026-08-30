@@ -320,6 +320,20 @@ export default function Services() {
     fetchDbMode()
   }, [])
 
+  // Active LLM backend (Settings -> LLM Tuning). Marks local (ollama/vllm) vs
+  // remote (openai/azure/anthropic) so the operator can see at a glance which
+  // model the stack is actually using.
+  const [llmInfo, setLlmInfo] = useState<{ backend: string; model: string; remote: boolean } | null>(null)
+  useEffect(() => {
+    apiFetch<Record<string, string>>('/settings/llm').then(d => {
+      const backend = (d.backend || d.env_backend || 'ollama').toLowerCase()
+      const model = backend === 'openai' ? d.openai_model
+        : backend === 'azure' ? d.azure_model
+        : backend === 'anthropic' ? d.anthropic_model : ''
+      setLlmInfo({ backend, model: model || '', remote: ['openai', 'azure', 'anthropic'].includes(backend) })
+    }).catch(() => setLlmInfo(null))
+  }, [])
+
   const getStatus = (key?: string) => {
     if (!key || !health?.services) return undefined
     return health.services[key]?.status
@@ -350,6 +364,15 @@ export default function Services() {
         <div className="flex items-center gap-2">
           <h2 className="text-lg font-semibold">Services</h2>
           <span className="text-[10px] text-muted-foreground font-mono">Build {BUILD_VERSION}</span>
+          {llmInfo && (
+            <span
+              className={"text-[10px] px-2 py-0.5 rounded-full font-mono " +
+                (llmInfo.remote ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground")}
+              title="Active LLM backend (Settings → LLM Tuning)"
+            >
+              LLM: {llmInfo.remote ? 'remote' : 'local'} · {llmInfo.backend}{llmInfo.model ? ` · ${llmInfo.model}` : ''}
+            </span>
+          )}
         </div>
       </div>
 
@@ -452,7 +475,7 @@ export default function Services() {
       {/* ── GPU Tab ──────────────────────────────────────────── */}
       {activeTab === 'gpu' && (
         <div className="space-y-6">
-          <OllamaStatusCard ollama={ollama} />
+          <OllamaStatusCard ollama={ollama} remote={!!llmInfo?.remote} model={llmInfo?.model} />
         </div>
       )}
 
@@ -664,7 +687,7 @@ function ServiceProfilesCard() {
   )
 }
 
-function OllamaStatusCard({ ollama }: { ollama?: import('@/api/reports').OllamaStatus }) {
+function OllamaStatusCard({ ollama, remote, model }: { ollama?: import('@/api/reports').OllamaStatus; remote?: boolean; model?: string }) {
   const [loadingModel, setLoadingModel] = useState<string | null>(null)
   const [pullInput, setPullInput] = useState('')
   const [pulling, setPulling] = useState(false)
@@ -677,6 +700,25 @@ function OllamaStatusCard({ ollama }: { ollama?: import('@/api/reports').OllamaS
   const globalModel = activeModelData?.model ?? chatModel
 
   if (!ollama) return null
+
+  // Remote backend (openai/azure/anthropic): local model management — GPU/VRAM,
+  // load/unload/pull — doesn't apply. Show a compact note instead of the Ollama
+  // controls (the model is chosen in Settings → LLM Tuning).
+  if (remote) {
+    return (
+      <div className="bg-card border border-border rounded-lg p-4">
+        <h3 className="text-sm font-semibold mb-2 flex items-center gap-2">
+          <Cpu className="h-4 w-4" />
+          LLM Backend
+        </h3>
+        <p className="text-xs text-muted-foreground">
+          Using a remote backend{model ? <> — <span className="text-primary font-mono">{model}</span></> : null}.
+          Local Ollama model management (load / unload / pull, GPU/VRAM) doesn't apply.
+          Change the model in <strong>Settings → LLM Tuning</strong>.
+        </p>
+      </div>
+    )
+  }
 
   const gpu = ollama.gpu
   const vramUsedPct = gpu ? Math.round((gpu.vram_used_mb / gpu.vram_total_mb) * 100) : 0

@@ -136,6 +136,378 @@ DO $$ BEGIN ALTER TABLE public.ports ADD COLUMN IF NOT EXISTS updated_at timesta
 DO $$ BEGIN ALTER TABLE public.ports ADD COLUMN IF NOT EXISTS modified_by text; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE public.ports ADD COLUMN IF NOT EXISTS node_id text DEFAULT 'local'; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 
+-- ── Normalize asset identity so port data is not duplicated per IP ──
+--
+-- ix_assets_ip_hostname is UNIQUE(ip, COALESCE(hostname,'')) on purpose, so one
+-- IP may legitimately hold several asset rows (virtual hosts). But a hostname
+-- that is merely the IP string is not a vhost — it is "hostname unknown"
+-- written the wrong way, and it counts as a DIFFERENT row from hostname=NULL.
+-- Ports hang off asset_id, so each such row carried its own copy of that host's
+-- ports: this deployment had 99 port rows for 59 real (ip, proto, port) tuples.
+--
+-- Root cause was playwright_scanner calling
+-- get_or_create_asset(netloc, hostname=netloc). Fixed there and in both asset
+-- helpers, with CHECK assets_hostname_not_ip as the schema-level backstop.
+--
+-- Runs as ONE transaction so a partial remap can never be left behind, and the
+-- scratch tables use ON COMMIT DROP so the block is re-runnable in a session.
+-- Idempotent: a no-op once normalized.
+BEGIN;
+
+-- 1. hostname == the IP means "hostname unknown". Normalize to NULL where that
+--    does not collide with an existing NULL-hostname row for the same IP
+--    (step 5 merges those).
+UPDATE assets a
+   SET hostname = NULL
+ WHERE a.hostname = host(a.ip)
+   AND NOT EXISTS (SELECT 1 FROM assets b
+                    WHERE b.ip = a.ip AND b.hostname IS NULL AND b.id <> a.id);
+
+-- 2. One canonical asset per IP owns that IP's network-level data. Ports are a
+--    property of the host, not of a virtual host. Preference: the NULL-hostname
+--    (IP-level) row, then oldest, id as a strict final tiebreaker.
+CREATE TEMP TABLE canonical_asset ON COMMIT DROP AS
+SELECT DISTINCT ON (ip) ip, id AS keep_id
+  FROM assets ORDER BY ip, (hostname IS NULL) DESC, first_seen NULLS LAST, id;
+
+CREATE TEMP TABLE asset_remap ON COMMIT DROP AS
+SELECT a.id AS from_id, c.keep_id AS to_id
+  FROM assets a JOIN canonical_asset c ON c.ip = a.ip
+ WHERE a.id <> c.keep_id;
+
+-- 3. Resolve each port to its DESTINATION asset first, then pick one winner per
+--    (destination, proto, port). Deduping only against rows already at the
+--    target is not enough: several source assets can remap to the same
+--    canonical, and their port sets then collide with each other rather than
+--    with the target. That is exactly how the first draft of this migration
+--    failed, on ux_ports_asset_proto_port_scans.
+CREATE TEMP TABLE port_target ON COMMIT DROP AS
+SELECT p.id, COALESCE(r.to_id, p.asset_id) AS target_asset, p.proto, p.port
+  FROM ports p LEFT JOIN asset_remap r ON r.from_id = p.asset_id;
+
+CREATE TEMP TABLE port_keep ON COMMIT DROP AS
+SELECT DISTINCT ON (t.target_asset, t.proto, t.port) t.id
+  FROM port_target t JOIN ports p ON p.id = t.id
+ ORDER BY t.target_asset, t.proto, t.port, p.last_seen DESC NULLS LAST, p.id;
+
+-- Fold the losers' detail into the winner, so a merge never loses a banner or
+-- version that only the duplicate row happened to carry.
+UPDATE ports w
+   SET first_seen = LEAST(w.first_seen, agg.min_first),
+       last_seen  = GREATEST(w.last_seen, agg.max_last),
+       service    = COALESCE(w.service, agg.service),
+       product    = COALESCE(w.product, agg.product),
+       version    = COALESCE(w.version, agg.version),
+       banner     = COALESCE(w.banner,  agg.banner),
+       is_open    = w.is_open OR agg.any_open
+  FROM (SELECT k.id AS win_id,
+               MIN(p.first_seen) AS min_first, MAX(p.last_seen) AS max_last,
+               MIN(p.service) AS service, MIN(p.product) AS product,
+               MIN(p.version) AS version, MIN(p.banner) AS banner,
+               bool_or(COALESCE(p.is_open, false)) AS any_open
+          FROM port_keep k
+          JOIN port_target t  ON t.id = k.id
+          JOIN port_target t2 ON t2.target_asset = t.target_asset
+                             AND t2.proto = t.proto AND t2.port = t.port
+          JOIN ports p ON p.id = t2.id
+         GROUP BY k.id) agg
+ WHERE w.id = agg.win_id;
+
+DELETE FROM ports WHERE id IN (
+    SELECT id FROM port_target EXCEPT SELECT id FROM port_keep);
+
+UPDATE ports p SET asset_id = r.to_id
+  FROM asset_remap r WHERE p.asset_id = r.from_id;
+
+-- 4. port_observation is an append-only observation log with no uniqueness on
+--    (asset_id, proto, port) — many rows per port is the point. Repoint only.
+UPDATE port_observation o SET asset_id = r.to_id
+  FROM asset_remap r WHERE o.asset_id = r.from_id;
+
+-- 5. A "hostname = the IP" row is the same host as its NULL-hostname sibling.
+--    Repoint its remaining children and drop it. `ports` is the ONLY child with
+--    a unique index on asset_id and is already handled above, so the rest
+--    cannot collide. scan_recommendations.fingerprint is generated from
+--    ip/service/scanner/action/script/template — not asset_id — so repointing
+--    does not change it.
+CREATE TEMP TABLE phantom_remap ON COMMIT DROP AS
+SELECT a.id AS from_id, b.id AS to_id
+  FROM assets a
+  JOIN assets b ON b.ip = a.ip AND b.hostname IS NULL AND b.id <> a.id
+ WHERE a.hostname = host(a.ip);
+
+UPDATE web_findings         t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE vulns                t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE playwright_scans     t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE playwright_findings  t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE dom_analysis         t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE content_extractions  t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE discovered_params    t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE credential_findings  t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE recon_findings       t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE scan_recommendations t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE scan_targets         t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE findings             t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE attack_vectors       t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE attack_path_edges    t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE port_observation     t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE ports                t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+
+UPDATE assets k
+   SET first_seen = LEAST(k.first_seen, a.first_seen),
+       last_seen  = GREATEST(k.last_seen, a.last_seen),
+       os         = COALESCE(k.os, a.os)
+  FROM phantom_remap p JOIN assets a ON a.id = p.from_id
+ WHERE k.id = p.to_id;
+
+DELETE FROM assets WHERE id IN (SELECT from_id FROM phantom_remap);
+
+-- 5b. One address, two asset rows — the SAME machine recorded twice.
+--
+-- Step 5 above only merges the "hostname = the IP" phantom. It deliberately
+-- leaves a genuinely-named row alone, to protect virtual hosts. But a row with
+-- NO hostname is not a virtual host: it is the same machine before its name was
+-- known. ix_assets_ip_hostname is UNIQUE(ip, COALESCE(hostname,'')), so
+-- (192.168.1.150, '') and (192.168.1.150, 'metasploitable') are two legal rows,
+-- and this deployment had exactly that:
+--
+--     nameless row     57 ports,  6 vulns,   1 web,   0 creds,  39 recon
+--     'metasploitable'  0 ports,  2 vulns, 758 web,   7 creds, 110 recon
+--
+-- Step 2 puts ports on the NULL-hostname row by preference, so the host's ports
+-- lived on one row and its findings on the other. Anything joining ports to
+-- findings through asset_id returned nothing, and credential_findings.port_id
+-- was NULL on every row because parse_brutus looks the port up under the
+-- finding's own asset_id.
+--
+-- Merging is only safe when at most ONE distinct hostname is involved. Two
+-- different names on one address IS a multi-name host, where picking a survivor
+-- would be arbitrary — those are reported and left alone.
+--
+-- The child tables come from the CATALOG, not from the foreign-key list:
+-- pending_exploits.asset_id has no FK, so an FK-driven merge would silently
+-- orphan it, and step 5's hand-written list of 16 tables omits it for that
+-- reason. Anything that grows an asset_id later is covered without edits here.
+CREATE OR REPLACE FUNCTION public.merge_duplicate_assets()
+RETURNS TABLE(address inet, winner uuid, losers integer, rows_repointed bigint)
+LANGUAGE plpgsql AS $MDA$
+DECLARE
+    child_tables text[];
+    grp          record;
+    cand         record;
+    tbl          text;
+    n            bigint;
+    kids         bigint;
+    best_kids    bigint;
+    win          uuid;
+    losers_arr   uuid[];
+    moved        bigint;
+    rid          uuid;
+    agg          record;
+BEGIN
+    SELECT array_agg(c.table_name::text ORDER BY c.table_name) INTO child_tables
+      FROM information_schema.columns c
+      JOIN information_schema.tables t
+        ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+     WHERE c.table_schema = 'public'
+       AND c.column_name = 'asset_id'
+       AND t.table_type = 'BASE TABLE';
+
+    FOR grp IN
+        SELECT a.ip
+          FROM public.assets a
+         GROUP BY a.ip
+        HAVING count(*) > 1
+           -- count(DISTINCT ...) ignores NULLs, so (NULL, 'name') counts as one
+           -- name and merges; ('a', 'b') counts as two and does not.
+           AND count(DISTINCT NULLIF(btrim(a.hostname), '')) <= 1
+         ORDER BY a.ip
+    LOOP
+        -- Survivor: the row carrying the most dependent rows, so the merge moves
+        -- as little as possible. The ORDER BY makes ties deterministic and
+        -- prefers keeping the NAMED row, which holds strictly more information.
+        best_kids := -1;
+        win       := NULL;
+        FOR cand IN
+            SELECT id FROM public.assets
+             WHERE ip = grp.ip
+             ORDER BY (NULLIF(btrim(hostname), '') IS NOT NULL) DESC,
+                      first_seen NULLS LAST, id
+        LOOP
+            kids := 0;
+            FOREACH tbl IN ARRAY child_tables LOOP
+                EXECUTE format('SELECT count(*) FROM public.%I WHERE asset_id = $1', tbl)
+                   INTO n USING cand.id;
+                kids := kids + n;
+            END LOOP;
+            IF kids > best_kids THEN
+                best_kids := kids;
+                win       := cand.id;
+            END IF;
+        END LOOP;
+
+        SELECT array_agg(id) INTO losers_arr
+          FROM public.assets WHERE ip = grp.ip AND id <> win;
+        IF losers_arr IS NULL THEN
+            CONTINUE;
+        END IF;
+
+        moved := 0;
+        FOREACH tbl IN ARRAY child_tables LOOP
+            BEGIN
+                EXECUTE format(
+                    'UPDATE public.%I SET asset_id = $1 WHERE asset_id = ANY($2)', tbl)
+                  USING win, losers_arr;
+                GET DIAGNOSTICS n = ROW_COUNT;
+                moved := moved + n;
+            EXCEPTION WHEN unique_violation THEN
+                -- Today only ports has a unique index naming asset_id, but do not
+                -- depend on that staying true. Move what can move; a child that
+                -- already exists on the survivor is the same fact twice, so the
+                -- loser's copy goes rather than blocking the whole merge.
+                FOR rid IN EXECUTE format(
+                        'SELECT id FROM public.%I WHERE asset_id = ANY($1)', tbl)
+                        USING losers_arr
+                LOOP
+                    BEGIN
+                        EXECUTE format(
+                            'UPDATE public.%I SET asset_id = $1 WHERE id = $2', tbl)
+                          USING win, rid;
+                        moved := moved + 1;
+                    EXCEPTION WHEN unique_violation THEN
+                        EXECUTE format('DELETE FROM public.%I WHERE id = $1', tbl)
+                          USING rid;
+                    END;
+                END LOOP;
+            END;
+        END LOOP;
+
+        -- Read the losers' attributes BEFORE deleting them, then apply them AFTER.
+        --
+        -- The order is load-bearing. When the nameless row is the one carrying
+        -- the children it wins, and giving it the loser's hostname while that
+        -- loser still exists violates ix_assets_ip_hostname:
+        --     duplicate key value ... (198.51.100.11, merge-probe.test)
+        -- The live split happened to have the NAMED row winning, so its hostname
+        -- never changed and this never fired there — a synthetic case found it.
+        SELECT min(NULLIF(btrim(a.hostname), ''))       AS hostname,
+               min(a.os)                                AS os,
+               min(a.env)                               AS env,
+               min(a.content_hash)                      AS content_hash,
+               min(a.engagement_id::text)::uuid         AS engagement_id,
+               array_agg(DISTINCT t)  FILTER (WHERE t  IS NOT NULL) AS tags,
+               array_agg(DISTINCT pr) FILTER (WHERE pr IS NOT NULL) AS provider,
+               min(a.provider_evidence::text)::jsonb    AS provider_evidence,
+               min(a.first_seen)                        AS first_seen,
+               max(a.last_seen)                         AS last_seen
+          INTO agg
+          FROM public.assets a
+          LEFT JOIN LATERAL unnest(COALESCE(a.tags, '{}'::text[]))     t  ON true
+          LEFT JOIN LATERAL unnest(COALESCE(a.provider, '{}'::text[])) pr ON true
+         WHERE a.id = ANY(losers_arr);
+
+        DELETE FROM public.assets WHERE id = ANY(losers_arr);
+
+        -- A merge must never drop the one attribute a duplicate row happened to
+        -- be the only carrier of — the hostname above all, which is the whole
+        -- reason the second row existed.
+        UPDATE public.assets w
+           SET hostname          = COALESCE(NULLIF(btrim(w.hostname), ''), agg.hostname),
+               os                = COALESCE(w.os, agg.os),
+               env               = COALESCE(w.env, agg.env),
+               content_hash      = COALESCE(w.content_hash, agg.content_hash),
+               engagement_id     = COALESCE(w.engagement_id, agg.engagement_id),
+               tags              = (SELECT array_agg(DISTINCT x) FROM unnest(
+                                       COALESCE(w.tags, '{}'::text[])
+                                    || COALESCE(agg.tags, '{}'::text[])) x),
+               provider          = (SELECT array_agg(DISTINCT x) FROM unnest(
+                                       COALESCE(w.provider, '{}'::text[])
+                                    || COALESCE(agg.provider, '{}'::text[])) x),
+               -- winner's keys win on conflict
+               provider_evidence = COALESCE(agg.provider_evidence, '{}'::jsonb)
+                                || COALESCE(w.provider_evidence, '{}'::jsonb),
+               first_seen        = LEAST(w.first_seen, agg.first_seen),
+               last_seen         = GREATEST(w.last_seen, agg.last_seen),
+               modified_at       = now()
+         WHERE w.id = win;
+
+        address        := grp.ip;
+        winner         := win;
+        losers         := array_length(losers_arr, 1);
+        rows_repointed := moved;
+        RETURN NEXT;
+    END LOOP;
+
+    -- Report rather than silently skip. An address holding two DIFFERENT
+    -- hostnames is a real multi-name host, and an operator should know it is
+    -- being left alone instead of wondering why the count never drops.
+    FOR grp IN
+        SELECT a.ip, count(*) AS n
+          FROM public.assets a
+         GROUP BY a.ip
+        HAVING count(*) > 1
+           AND count(DISTINCT NULLIF(btrim(a.hostname), '')) > 1
+    LOOP
+        RAISE NOTICE 'assets: % has % rows with different hostnames (virtual hosts) - left unmerged', grp.ip, grp.n;
+    END LOOP;
+END $MDA$;
+
+DO $RUNMDA$
+DECLARE r record; BEGIN
+    FOR r IN SELECT * FROM public.merge_duplicate_assets() LOOP
+        RAISE NOTICE 'assets: merged % duplicate row(s) for % into %, repointed % child row(s)',
+                     r.losers, r.address, r.winner, r.rows_repointed;
+    END LOOP;
+END $RUNMDA$;
+
+
+-- 5c. Backfill credential_findings.port_id, which was NULL on every row.
+--
+-- parse_brutus resolves the port with
+--     SELECT id FROM ports WHERE asset_id = <finding's asset> AND port = <port>
+-- and the finding attached to the nameless asset row that had no ports, so the
+-- lookup found nothing and the column stayed empty. 5b puts the ports and the
+-- credentials on the same asset, which makes the lookup work — but only for rows
+-- ingested from here on. This fills in the ones already stored.
+--
+-- Matched on (asset, port) only: ports.proto is the TRANSPORT ('tcp'), while
+-- credential_findings.protocol is the SERVICE ('ftp', 'telnet'), so they are not
+-- comparable. tcp is preferred because credential testing is TCP.
+UPDATE public.credential_findings cf
+   SET port_id = p.id
+  FROM public.ports p
+ WHERE cf.port_id IS NULL
+   AND p.asset_id = cf.asset_id
+   AND p.port     = cf.port
+   AND p.id = (SELECT p2.id FROM public.ports p2
+                WHERE p2.asset_id = cf.asset_id AND p2.port = cf.port
+                ORDER BY (p2.proto = 'tcp') DESC, p2.last_seen DESC NULLS LAST, p2.id
+                LIMIT 1);
+
+-- A scan refused by the scope gate is 'blocked', not 'failed'.
+--
+-- CLAUDE.md: "Blocked items MUST be labelled in the UI, not silently dropped."
+-- Folding a refusal into 'failed' invites a retry of something that will never
+-- be allowed to run. The CREATE TABLE above predates the gate, so the value is
+-- added here for databases that already exist.
+DO $PWB$ BEGIN
+    ALTER TABLE public.playwright_scans
+        DROP CONSTRAINT IF EXISTS playwright_scans_status_check;
+    ALTER TABLE public.playwright_scans
+        ADD CONSTRAINT playwright_scans_status_check
+        CHECK (status IN ('queued','running','completed','failed','blocked'));
+EXCEPTION WHEN undefined_table THEN NULL; END $PWB$;
+
+-- 6. Prevent recurrence. NOT VALID so a pre-existing violation can never block
+--    this migration; steps 1 and 5 have already cleared them.
+DO $NORM$ BEGIN
+    ALTER TABLE public.assets
+      ADD CONSTRAINT assets_hostname_not_ip
+      CHECK (hostname IS NULL OR hostname <> host(ip)) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL; END $NORM$;
+
+COMMIT;
+
 -- findings
 CREATE TABLE IF NOT EXISTS public.findings (
     id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -357,10 +729,36 @@ CREATE TABLE IF NOT EXISTS public.scan_recommendations (
     confidence  numeric,
     priority    integer DEFAULT 50,
     status      text DEFAULT 'pending' CHECK (status IN ('pending','queued','running','completed','failed','skipped')),
+    -- What the recommendation is actually aimed at. Dispatch only understands
+    -- 'service' — (ip, service, port) -> scanner. The others exist so a
+    -- recommendation that does NOT fit that shape is refused with a reason
+    -- instead of being fired at an IP as if it were a network scan:
+    --   service   default; a network service on a host
+    --   artifact  a FILE, not a host (exiftool on a downloaded document). Needs
+    --             an artifact reference; `ip` is meaningless for it.
+    --   range     a CIDR/scope swept once (masscan). Must be deduped at
+    --             GENERATION, not per discovered service, or it produces N
+    --             identical sweeps.
+    --   resource  not runnable at all (seclists, wordlists) — an INPUT to other
+    --             tools. Must never count against KB coverage, or the metric can
+    --             never reach 100% by construction.
+    target_kind text NOT NULL DEFAULT 'service'
+                CHECK (target_kind IN ('service','artifact','range','resource')),
     executed_at timestamptz,
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
+-- Existing installs: add target_kind + its constraint without failing if present.
+DO $$ BEGIN
+    ALTER TABLE public.scan_recommendations
+        ADD COLUMN IF NOT EXISTS target_kind text NOT NULL DEFAULT 'service';
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN
+    ALTER TABLE public.scan_recommendations
+        ADD CONSTRAINT scan_recommendations_target_kind_check
+        CHECK (target_kind IN ('service','artifact','range','resource'));
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
+CREATE INDEX IF NOT EXISTS idx_scan_recommendations_target_kind ON public.scan_recommendations(target_kind);
 CREATE INDEX IF NOT EXISTS idx_scan_recommendations_asset_id ON public.scan_recommendations(asset_id);
 CREATE INDEX IF NOT EXISTS idx_scan_recommendations_ip ON public.scan_recommendations(ip);
 CREATE INDEX IF NOT EXISTS idx_scan_recommendations_scanner ON public.scan_recommendations(scanner);
@@ -420,6 +818,31 @@ EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 CREATE INDEX IF NOT EXISTS idx_credential_findings_secret_type ON public.credential_findings(secret_type);
 
+-- Migration: store the RECOVERED SECRET alongside the account it belongs to.
+--
+-- CAUTION: this column holds credential material IN PLAINTEXT. That is a
+-- deliberate operator decision, not an oversight — a recovered password is the
+-- primary artefact of a credential-testing phase and lateral movement needs the
+-- actual secret, not a masked copy. Consequences to be aware of:
+--
+--   * /export/data includes the `credentials` category BY DEFAULT and reads
+--     SELECT *, so JSON and CSV exports carry these passwords. That is the
+--     point — the exports feed manual tools — but it means an export file is
+--     as sensitive as the database.
+--   * metadata.audit stays MASKED. It records every password TRIED, including
+--     ones belonging to no account here, and unmasking a wordlist buys nothing.
+--   * anyone with read access to this table has the credentials. Restrict it.
+--
+-- Named secret_value to pair with the existing secret_type, which already says
+-- what KIND of secret this is (password, ntlm_hash, ssh_key, ...).
+DO $$ BEGIN
+  ALTER TABLE public.credential_findings ADD COLUMN IF NOT EXISTS secret_value text;
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
+COMMENT ON COLUMN public.credential_findings.secret_value IS
+  'Recovered secret in PLAINTEXT (password/hash/key per secret_type). Present by '
+  'operator decision so follow-on attacks can use it. Exported by /export/data.';
+
 -- Migration: add discovered_at, last_verified_at, status to credential_findings
 DO $$ BEGIN
   ALTER TABLE public.credential_findings ADD COLUMN IF NOT EXISTS discovered_at timestamptz DEFAULT now();
@@ -452,6 +875,9 @@ CREATE INDEX IF NOT EXISTS idx_recon_findings_finding_type ON public.recon_findi
 CREATE INDEX IF NOT EXISTS idx_recon_findings_target ON public.recon_findings(target);
 CREATE INDEX IF NOT EXISTS idx_recon_findings_asset_id ON public.recon_findings(asset_id);
 CREATE INDEX IF NOT EXISTS idx_recon_findings_created_at ON public.recon_findings(created_at DESC);
+-- Links a raw_artifact (which carries job_id) to the findings its run produced,
+-- for the Scan Results per-artifact summary (target + severity counts).
+CREATE INDEX IF NOT EXISTS idx_recon_findings_job_id ON public.recon_findings ((data->>'job_id'));
 
 -- ===============================
 -- Playwright tables
@@ -463,7 +889,7 @@ CREATE TABLE IF NOT EXISTS public.playwright_scans (
     asset_id     uuid REFERENCES public.assets(id) ON DELETE CASCADE,
     url          text NOT NULL,
     status       text NOT NULL DEFAULT 'queued'
-                 CHECK (status IN ('queued','running','completed','failed')),
+                 CHECK (status IN ('queued','running','completed','failed','blocked')),
     start_time   timestamptz,
     end_time     timestamptz,
     browser      text DEFAULT 'chromium',
@@ -774,7 +1200,7 @@ CREATE TABLE IF NOT EXISTS public.agent_sessions (
     session_name       text NOT NULL,
     target_description text NOT NULL,
     status             text NOT NULL DEFAULT 'active'
-                       CHECK (status IN ('active','completed','failed','stopped','stalled')),
+                       CHECK (status IN ('active','completed','failed','stopped','stalled','awaiting_approval')),
     configuration      jsonb DEFAULT '{}'::jsonb,
     summary            text,
     metadata           jsonb DEFAULT '{}'::jsonb,
@@ -800,6 +1226,61 @@ CREATE INDEX IF NOT EXISTS idx_agent_messages_session_id ON public.agent_message
 CREATE INDEX IF NOT EXISTS idx_agent_messages_agent_name ON public.agent_messages(agent_name);
 CREATE INDEX IF NOT EXISTS idx_agent_messages_created_at ON public.agent_messages(created_at DESC);
 
+-- ---------------------------------------------------------------------------
+-- LangGraph durable checkpoints (AGENT_ENGINE=langgraph)
+--
+-- Library-managed by langgraph-checkpoint-postgres (PostgresSaver.setup(), run
+-- on every langgraph session start/resume). Declared here so a fresh install
+-- has them up front and the health check can assert them. DDL copied verbatim
+-- from langgraph.checkpoint.postgres.base.MIGRATIONS.
+--
+-- checkpoint_migrations is intentionally left EMPTY: the library reads MAX(v)
+-- to decide what to apply, and every migration is idempotent, so an empty table
+-- means "re-apply all" (correct). Seeding versions would make it SKIP work.
+-- Mirrored in db_init/create_langgraph_checkpoint_tables.sql — keep in sync.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.checkpoint_migrations (
+    v INTEGER PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS public.checkpoints (
+    thread_id TEXT NOT NULL,
+    checkpoint_ns TEXT NOT NULL DEFAULT '',
+    checkpoint_id TEXT NOT NULL,
+    parent_checkpoint_id TEXT,
+    type TEXT,
+    checkpoint JSONB NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}',
+    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.checkpoint_blobs (
+    thread_id TEXT NOT NULL,
+    checkpoint_ns TEXT NOT NULL DEFAULT '',
+    channel TEXT NOT NULL,
+    version TEXT NOT NULL,
+    type TEXT NOT NULL,
+    blob BYTEA,
+    PRIMARY KEY (thread_id, checkpoint_ns, channel, version)
+);
+
+CREATE TABLE IF NOT EXISTS public.checkpoint_writes (
+    thread_id TEXT NOT NULL,
+    checkpoint_ns TEXT NOT NULL DEFAULT '',
+    checkpoint_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    channel TEXT NOT NULL,
+    type TEXT,
+    blob BYTEA NOT NULL,
+    task_path TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
+);
+
+CREATE INDEX IF NOT EXISTS checkpoints_thread_id_idx ON public.checkpoints(thread_id);
+CREATE INDEX IF NOT EXISTS checkpoint_blobs_thread_id_idx ON public.checkpoint_blobs(thread_id);
+CREATE INDEX IF NOT EXISTS checkpoint_writes_thread_id_idx ON public.checkpoint_writes(thread_id);
+
 -- session_scan_metrics
 CREATE TABLE IF NOT EXISTS public.session_scan_metrics (
     id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -818,6 +1299,40 @@ CREATE TABLE IF NOT EXISTS public.session_scan_metrics (
 CREATE INDEX IF NOT EXISTS idx_session_scan_metrics_session_id ON public.session_scan_metrics(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_scan_metrics_scan_type ON public.session_scan_metrics(scan_type);
 CREATE INDEX IF NOT EXISTS idx_session_scan_metrics_created_at ON public.session_scan_metrics(created_at DESC);
+
+-- One row per (session, job). REQUIRED by the upsert in
+-- autogen_agents/scan_tools.py::persist_to_db.
+--
+-- The table's only key was PRIMARY KEY (id), so the existing
+-- `ON CONFLICT DO NOTHING` had no constraint to match and never fired: every
+-- persist re-INSERTED. A live database held 104 rows for 75 distinct jobs,
+-- including one job with 6 copies carrying two different statuses.
+--
+-- It also made a scan persisted while `running` impossible to correct once it
+-- completed, which is what stops session_scan_metrics being a usable source for
+-- rebuilding a flow summary after the in-memory registry is discarded.
+--
+-- Deduplicate before creating the index or it cannot be built. Keep the most
+-- advanced row per job: a terminal status beats `running`, then the most recent.
+DELETE FROM public.session_scan_metrics a
+ USING public.session_scan_metrics b
+ WHERE a.job_id IS NOT NULL
+   AND a.session_id = b.session_id
+   AND a.job_id     = b.job_id
+   AND a.id <> b.id
+   -- id is the final tiebreaker so the ordering is STRICT and total. Without it
+   -- two rows with the same status rank and the same timestamp would each fail
+   -- the "<" test, both survive, and CREATE UNIQUE INDEX would then error out.
+   AND (
+         (CASE WHEN a.status IN ('running','queued') THEN 0 ELSE 1 END,
+          COALESCE(a.completed_at, a.started_at, a.created_at), a.id)
+         <
+         (CASE WHEN b.status IN ('running','queued') THEN 0 ELSE 1 END,
+          COALESCE(b.completed_at, b.started_at, b.created_at), b.id)
+       );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_session_scan_metrics_session_job
+    ON public.session_scan_metrics(session_id, job_id);
 
 -- llm_request_metrics
 CREATE TABLE IF NOT EXISTS public.llm_request_metrics (
@@ -959,6 +1474,93 @@ CREATE TABLE IF NOT EXISTS public.exploit_results (
 CREATE INDEX IF NOT EXISTS idx_exploit_results_pending_id ON public.exploit_results(pending_exploit_id);
 CREATE INDEX IF NOT EXISTS idx_exploit_results_success ON public.exploit_results(success);
 CREATE INDEX IF NOT EXISTS idx_exploit_results_executed_at ON public.exploit_results(executed_at DESC);
+
+-- ============================================================================
+-- Security tests — reusable, re-runnable proof-of-exploitability records.
+-- ============================================================================
+-- security_tests is the TEST DEFINITION (a command + the assertion that proves
+-- it, tiered safe|impactful); security_test_runs is the append-only pass/fail
+-- HISTORY. This is a thin scheduling/assertion layer over machinery that already
+-- exists — it does NOT re-implement exploit execution:
+--   * an IMPACTFUL test references a pending_exploits row (its command + the
+--     approval gate live there) and each run maps to an exploit_results row;
+--   * a SAFE test carries its own command and each run maps to a tool_executions
+--     row (written by kali-listener /tools/execute).
+CREATE TABLE IF NOT EXISTS public.security_tests (
+    id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name                  text NOT NULL,
+    description           text,
+    tier                  text NOT NULL DEFAULT 'safe'
+                          CHECK (tier IN ('safe','impactful')),
+    -- free text on purpose (mirrors pending_exploits.exploit_type vocabulary);
+    -- a new category never needs a CHECK migration.
+    category              text,
+    target_ip             inet,
+    target_host           text,
+    target_port           integer,
+    target_service        text,
+    -- SAFE lane command; NULL for impactful (the command lives on the
+    -- referenced pending_exploit).
+    command               text,
+    tool                  text,
+    -- Structured assertion, evaluated deterministically by record_test_run.
+    assertion             jsonb NOT NULL DEFAULT '{}'::jsonb,
+    source_finding_source text,
+    source_finding_id     uuid,
+    attack_vector_id      uuid REFERENCES public.attack_vectors(id) ON DELETE SET NULL,
+    pending_exploit_id    uuid REFERENCES public.pending_exploits(id) ON DELETE SET NULL,
+    created_by_session    uuid REFERENCES public.agent_sessions(id) ON DELETE SET NULL,
+    engagement_id         uuid REFERENCES public.engagements(id) ON DELETE SET NULL,
+    enabled               boolean NOT NULL DEFAULT true,
+    -- Latest-run rollup for cheap list rendering (updated by record_test_run).
+    last_run_at           timestamptz,
+    last_run_status       text CHECK (last_run_status IN ('pass','fail','error','skipped')),
+    run_count             integer NOT NULL DEFAULT 0,
+    metadata              jsonb DEFAULT '{}'::jsonb,
+    created_at            timestamptz NOT NULL DEFAULT now(),
+    updated_at            timestamptz NOT NULL DEFAULT now(),
+    -- An impactful test MUST reference a pending_exploit (its command + approval
+    -- gate); a safe test MUST carry its own command.
+    CONSTRAINT security_tests_lane_ck CHECK (
+        (tier = 'impactful' AND pending_exploit_id IS NOT NULL)
+        OR (tier = 'safe' AND command IS NOT NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_security_tests_session    ON public.security_tests(created_by_session);
+CREATE INDEX IF NOT EXISTS idx_security_tests_engagement ON public.security_tests(engagement_id) WHERE engagement_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_security_tests_target     ON public.security_tests(target_ip, target_port);
+CREATE INDEX IF NOT EXISTS idx_security_tests_tier       ON public.security_tests(tier);
+CREATE INDEX IF NOT EXISTS idx_security_tests_pending    ON public.security_tests(pending_exploit_id) WHERE pending_exploit_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_security_tests_enabled    ON public.security_tests(enabled) WHERE enabled;
+
+CREATE TABLE IF NOT EXISTS public.security_test_runs (
+    id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    test_id              uuid NOT NULL REFERENCES public.security_tests(id) ON DELETE CASCADE,
+    ran_at               timestamptz NOT NULL DEFAULT now(),
+    completed_at         timestamptz,
+    duration_ms          integer,
+    status               text NOT NULL DEFAULT 'error'
+                         CHECK (status IN ('pass','fail','error','skipped')),
+    lane                 text NOT NULL CHECK (lane IN ('safe','impactful')),
+    command_run          text,
+    exit_code            integer,
+    result_summary       text,
+    assertion_eval       jsonb DEFAULT '{}'::jsonb,
+    -- Exactly one is set per lane (enforced in record_test_run).
+    tool_execution_id    uuid REFERENCES public.tool_executions(id) ON DELETE SET NULL,
+    exploit_result_id    uuid REFERENCES public.exploit_results(id) ON DELETE SET NULL,
+    triggered_by         text,
+    triggered_by_session uuid REFERENCES public.agent_sessions(id) ON DELETE SET NULL,
+    engagement_id        uuid REFERENCES public.engagements(id) ON DELETE SET NULL,
+    output               text,
+    metadata             jsonb DEFAULT '{}'::jsonb,
+    created_at           timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_security_test_runs_test       ON public.security_test_runs(test_id, ran_at DESC);
+CREATE INDEX IF NOT EXISTS idx_security_test_runs_status     ON public.security_test_runs(status);
+CREATE INDEX IF NOT EXISTS idx_security_test_runs_engagement ON public.security_test_runs(engagement_id) WHERE engagement_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_security_test_runs_toolexec   ON public.security_test_runs(tool_execution_id) WHERE tool_execution_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_security_test_runs_exploitres ON public.security_test_runs(exploit_result_id) WHERE exploit_result_id IS NOT NULL;
 
 -- msf_modules (Metasploit module cache)
 CREATE TABLE IF NOT EXISTS public.msf_modules (
@@ -1425,6 +2027,11 @@ END IF; END$$;
 DO $$ BEGIN IF to_regclass('public.pending_exploits') IS NOT NULL THEN
   DROP TRIGGER IF EXISTS trg_pending_exploits_updated_at ON public.pending_exploits;
   CREATE TRIGGER trg_pending_exploits_updated_at BEFORE UPDATE ON public.pending_exploits FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+END IF; END$$;
+
+DO $$ BEGIN IF to_regclass('public.security_tests') IS NOT NULL THEN
+  DROP TRIGGER IF EXISTS trg_security_tests_updated_at ON public.security_tests;
+  CREATE TRIGGER trg_security_tests_updated_at BEFORE UPDATE ON public.security_tests FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
 END IF; END$$;
 
 DO $$ BEGIN IF to_regclass('public.webhooks') IS NOT NULL THEN
@@ -2029,7 +2636,7 @@ CREATE TABLE IF NOT EXISTS public.evidence_store (
 CREATE TABLE IF NOT EXISTS public.evidence_links (
     id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     evidence_id    uuid NOT NULL REFERENCES public.evidence_store(id) ON DELETE CASCADE,
-    entity_type    text NOT NULL CHECK (entity_type IN ('finding','web_finding','playwright_finding','asset','checklist_item','exploit_result')),
+    entity_type    text NOT NULL CHECK (entity_type IN ('finding','web_finding','playwright_finding','asset','checklist_item','exploit_result','security_test_run')),
     entity_id      uuid NOT NULL,
     created_at     timestamptz DEFAULT now(),
     UNIQUE(evidence_id, entity_type, entity_id)
@@ -2263,6 +2870,60 @@ DROP TRIGGER IF EXISTS trg_detection_rule_state_updated ON public.detection_rule
 CREATE TRIGGER trg_detection_rule_state_updated
   BEFORE UPDATE ON public.detection_rule_state
   FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+
+-- Self-adapting extractor overlay. When the LLM analysis pass extracts something
+-- a tool's deterministic profile (knowledge/extractors/{tool}.yaml) missed, the
+-- distiller (app/rag-api/extractor_learn.py) authors a stable regex ONCE and
+-- stores it here; extractor_specs.load_specs() merges ACTIVE rows onto the tool's
+-- spec so future runs extract it deterministically — no model. 'deterministic'
+-- rows auto-apply (read-only); 'notable'/'follow_on' rows start 'proposed' and
+-- fire only once approved. POST /extractors/export writes approved rows to YAML.
+CREATE TABLE IF NOT EXISTS public.extractor_learned (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tool              text NOT NULL,
+    kind              text NOT NULL CHECK (kind IN ('deterministic','notable','follow_on')),
+    rule              jsonb NOT NULL,
+    status            text NOT NULL DEFAULT 'proposed'
+                      CHECK (status IN ('active','proposed','rejected')),
+    confidence        numeric,
+    source            text NOT NULL DEFAULT 'distilled',
+    sample_artifact_id uuid,
+    reviewed_by       text,               -- audit: who approved/rejected
+    created_at        timestamptz DEFAULT now(),
+    updated_at        timestamptz DEFAULT now(),
+    approved_at       timestamptz
+);
+-- One learned rule per (tool, kind, rule shape) — re-distilling the same shape
+-- is a no-op rather than a duplicate.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_extractor_learned_tool_kind_rule
+  ON public.extractor_learned (tool, kind, md5(rule::text));
+CREATE INDEX IF NOT EXISTS idx_extractor_learned_tool_status
+  ON public.extractor_learned (tool, status);
+DROP TRIGGER IF EXISTS trg_extractor_learned_updated ON public.extractor_learned;
+CREATE TRIGGER trg_extractor_learned_updated
+  BEFORE UPDATE ON public.extractor_learned
+  FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+
+-- Agent-to-agent feedback channel. One agent flags something interesting (a
+-- finding worth another run, a coverage gap); a coordinator turns approved flags
+-- into scan_recommendations (which the recon agent dispatches through the scope
+-- gate). See app/rag-api/agent_flags.py.
+CREATE TABLE IF NOT EXISTS public.agent_flags (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    flagging_agent  text NOT NULL,
+    target_agent    text,
+    engagement_id   uuid REFERENCES public.engagements(id) ON DELETE CASCADE,
+    flag_type       text NOT NULL
+                    CHECK (flag_type IN ('interesting_finding','needs_rescan','coverage_gap')),
+    data            jsonb NOT NULL DEFAULT '{}'::jsonb,
+    status          text NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','acknowledged','acted','dismissed')),
+    acted_by        text,               -- audit: who approved/dismissed
+    created_at      timestamptz DEFAULT now(),
+    acted_at        timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_agent_flags_status ON public.agent_flags (status);
+CREATE INDEX IF NOT EXISTS idx_agent_flags_engagement ON public.agent_flags (engagement_id);
 
 -- ============================================================================
 -- TIER 11: API Collections + Test Sessions (Swagger/OpenAPI Ingestion)
@@ -3017,6 +3678,119 @@ CREATE TABLE IF NOT EXISTS public.gap_analysis_reports (
 CREATE INDEX IF NOT EXISTS idx_gap_reports_engagement ON gap_analysis_reports(engagement_id);
 CREATE INDEX IF NOT EXISTS idx_gap_reports_created ON gap_analysis_reports(created_at DESC);
 
+-- post_review_reports — review of work that RAN (see app/rag-api/post_review_agent.py)
+--
+-- engagement_id is NULLABLE here, unlike gap_analysis_reports: tool_executions
+-- carries no engagement_id column, so a review is stack-wide by default. Making
+-- it NOT NULL would force a false attribution onto every stored report.
+CREATE TABLE IF NOT EXISTS public.post_review_reports (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id       uuid REFERENCES public.engagements(id) ON DELETE CASCADE,
+    status              text NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+    report              jsonb NOT NULL DEFAULT '{}',
+    executions_reviewed integer NOT NULL DEFAULT 0,
+    issues_found        integer NOT NULL DEFAULT 0,
+    reruns_queued       integer NOT NULL DEFAULT 0,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    completed_at        timestamptz,
+    triggered_by        text DEFAULT 'manual'
+);
+CREATE INDEX IF NOT EXISTS idx_post_review_created ON post_review_reports(created_at DESC);
+
+-- wordlists.path is the real identity of a list; `name` (already UNIQUE) is only
+-- its basename, and seclists ships the same basename in several directories.
+-- Without this index, POST /wordlists/discover's ON CONFLICT (path) raises
+-- "no unique or exclusion constraint matching the ON CONFLICT specification".
+CREATE UNIQUE INDEX IF NOT EXISTS ux_wordlists_path ON public.wordlists(path);
+
+-- v_identity_credential_state — "which discovered accounts have no password yet"
+--
+-- DERIVED, never stored. A stored `has_credential` flag goes stale the moment a
+-- password is cracked or a spray succeeds, and a stale flag here would send the
+-- operator to re-attack an account already owned — or skip one still open.
+--
+-- `identities.status` is an ACCOUNT-state field (active/disabled/unknown/deleted)
+-- and cannot express credential knowledge, which is why this is a separate axis:
+--   status='unknown' + no credential  -> enumerated only, never authenticated
+--   status='active'  + credential     -> a login that worked
+--
+-- Matching is on username AND host, because a username is only meaningful with
+-- the host it was enumerated on. `identities.domain` holds that host for locally
+-- discovered principals (the bridge writes `user@host` into identifier and the
+-- host into domain).
+CREATE OR REPLACE VIEW public.v_identity_credential_state AS
+SELECT i.id                AS identity_id,
+       i.provider,
+       i.identifier,
+       i.display_name      AS username,
+       i.domain            AS host,
+       i.principal_type,
+       i.status,
+       i.sources,
+       i.tags,
+       i.first_seen,
+       i.last_seen,
+       COALESCE(cv.n, 0)   AS vault_entries,
+       COALESCE(cf.n, 0)   AS verified_findings,
+       (COALESCE(cv.n, 0) + COALESCE(cf.n, 0)) > 0 AS has_credential,
+       CASE
+         WHEN COALESCE(cf.n, 0) > 0 THEN 'password_verified'
+         WHEN COALESCE(cv.n, 0) > 0 THEN 'password_stored'
+         ELSE 'username_only'
+       END                 AS credential_state
+  FROM public.identities i
+  LEFT JOIN (
+        SELECT lower(btrim(username)) AS u, count(*) AS n
+          FROM public.credential_vault
+         WHERE COALESCE(username, '') <> ''
+           AND COALESCE(credential_value, cracked_value, '') <> ''
+         GROUP BY 1
+  ) cv ON cv.u = lower(btrim(i.display_name))
+  LEFT JOIN (
+        SELECT lower(btrim(username)) AS u, host(ip) AS h, count(*) AS n
+          FROM public.credential_findings
+         WHERE COALESCE(username, '') <> ''
+         GROUP BY 1, 2
+  ) cf ON cf.u = lower(btrim(i.display_name))
+      AND cf.h = i.domain;
+
+CREATE INDEX IF NOT EXISTS idx_identities_domain ON public.identities(domain)
+    WHERE domain IS NOT NULL;
+
+-- scan_parameters — values the OPERATOR declares, and nothing else.
+--
+-- Discovered values are NOT stored here. They live in recon_findings with their
+-- provenance and history, and are read from there; copying them into a table
+-- would go stale the moment a re-scan disagrees, which is the same trap avoided
+-- with v_identity_credential_state.
+--
+-- This table holds only what no tool can discover: "treat the lockout as 5",
+-- "never spray this host", "assume 20 attempts a minute". The effective value a
+-- scan should use is `declared if present, else observed, else the default in
+-- knowledge/scan_parameters.yaml` — resolved in app/rag-api/scan_parameters.py
+-- rather than duplicated into SQL, so the vocabulary lives in exactly one place.
+CREATE TABLE IF NOT EXISTS public.scan_parameters (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    scope_type   text NOT NULL DEFAULT 'host'
+                 CHECK (scope_type IN ('global', 'host', 'service')),
+    -- '' for global, so the unique index constrains it: a NULL here would let
+    -- unlimited duplicate global declarations through.
+    scope_value  text NOT NULL DEFAULT '',
+    key          text NOT NULL,
+    value        text,
+    note         text,
+    declared_by  text,
+    engagement_id uuid REFERENCES public.engagements(id) ON DELETE CASCADE,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_scan_parameters_scope_key
+    ON public.scan_parameters(scope_type, scope_value, key);
+CREATE INDEX IF NOT EXISTS idx_scan_parameters_key ON public.scan_parameters(key);
+CREATE INDEX IF NOT EXISTS idx_post_review_engagement ON post_review_reports(engagement_id)
+    WHERE engagement_id IS NOT NULL;
+
 -- ============================================================================
 -- TIER 14: Burp Follow-Up Queue
 -- Queue of follow-up findings destined for import into Burp Suite via
@@ -3727,3 +4501,827 @@ END $$;
 -- ============================================================================
 SELECT 'ensure_all_tables.sql complete — schema is ready' as status;
 SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;
+
+-- ===========================================================================
+-- Finding deduplication: enforce the fingerprints that were already computed
+-- ===========================================================================
+--
+-- CLAUDE.md requires "finding fingerprinting (stable hash) to deduplicate across
+-- tools/runs" and "first seen / last seen". etl/fingerprint.py implements the
+-- hashes, the tables carry fingerprint/first_seen/last_seen columns — and
+-- nothing ever enforced them, so duplicates accumulated unchecked:
+--
+--     vulns                369 rows /    34 fingerprints   10.9x
+--     web_findings/katana  32218 rows /   630 (url,name)   51.1x
+--     web_findings/zap     28232 rows / 27039 fingerprints  1.04x
+--
+-- ZAP was the only source computing a fingerprint at all, which is also why it
+-- is the only one that is nearly clean — evidence the mechanism works as soon as
+-- it is applied. Every other source wrote NULL, and NULLs never conflict, so no
+-- index alone could have deduplicated them.
+--
+-- Order matters: backfill the missing fingerprints, collapse duplicates, and
+-- only then add the unique index.
+
+-- 1. Backfill web_findings.fingerprint for the ~54% of rows that never got one.
+--
+-- This MUST reproduce etl/fingerprint.py::web_fingerprint exactly, or the
+-- backfilled rows will not match what the parsers generate and the same finding
+-- will duplicate once more. That function is:
+--     key = "web|" + url.strip().lower().rstrip("/") + "|" + name.strip().lower()
+--           + "|" + issue_type.strip().lower()
+-- Verified byte-for-byte against the Python for URL casing, surrounding
+-- whitespace, repeated trailing slashes, and NULL fields.
+UPDATE public.web_findings
+   SET fingerprint = md5('web|' || rtrim(lower(btrim(coalesce(url, ''))), '/')
+                          || '|' || lower(btrim(coalesce(name, '')))
+                          || '|' || lower(btrim(coalesce(issue_type, ''))))
+ WHERE fingerprint IS NULL;
+
+-- 2. Collapse duplicates, preserving the real first/last seen window.
+--    Aggregate BEFORE deleting: the surviving row must span the whole group,
+--    otherwise collapsing rows silently narrows a finding's observed lifetime.
+UPDATE public.web_findings w
+   SET first_seen = g.min_first,
+       last_seen  = g.max_last
+  FROM (SELECT fingerprint,
+               min(coalesce(first_seen, created_at)) AS min_first,
+               max(coalesce(last_seen,  created_at)) AS max_last
+          FROM public.web_findings
+         WHERE fingerprint IS NOT NULL
+         GROUP BY fingerprint HAVING count(*) > 1) g
+ WHERE w.fingerprint = g.fingerprint;
+
+DELETE FROM public.web_findings a
+ USING public.web_findings b
+ WHERE a.fingerprint IS NOT NULL
+   AND a.fingerprint = b.fingerprint
+   AND a.id <> b.id
+   -- Keep the most recently seen row; id is the final tiebreaker so the
+   -- ordering is strict and total and exactly one row per group survives.
+   AND (coalesce(a.last_seen, a.created_at), a.id)
+       < (coalesce(b.last_seen, b.created_at), b.id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_web_findings_fingerprint
+    ON public.web_findings(fingerprint);
+
+-- 3. Same for vulns. Every row already carries a fingerprint here, so there is
+--    nothing to backfill — only 10.9x of accumulated duplication to collapse.
+DELETE FROM public.vulns a
+ USING public.vulns b
+ WHERE a.fingerprint IS NOT NULL
+   AND a.fingerprint = b.fingerprint
+   AND a.id <> b.id
+   AND (coalesce(a.updated_at, a.created_at), a.id)
+       < (coalesce(b.updated_at, b.created_at), b.id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_vulns_fingerprint
+    ON public.vulns(fingerprint);
+
+-- credential_findings: one row per (ip, port, username, auth_type).
+--
+-- Same class as the fingerprint problem above, but this table has no
+-- fingerprint column — its natural key is the account itself. Re-testing the
+-- same credential re-inserted every time: 22 rows for 7 real credentials, and
+-- the findings list showed "Valid credentials — anonymous@ftp:21" twice.
+--
+-- Re-verification is meaningful information, so the upsert advances
+-- last_verified_at rather than ignoring the row. NULL usernames are excluded
+-- from the key via a partial index; they carry no account identity to dedupe on.
+-- Collapse duplicates on the COALESCED key before tightening the index.
+--
+-- The previous dedupe gated on `username IS NOT NULL`, which is dead: username
+-- is NOT NULL in the schema. The actual hole was auth_type, which IS nullable —
+-- and in Postgres a NULL makes rows non-equal for a unique index, so two rows
+-- with the same (ip, port, username) and a NULL auth_type were both stored.
+-- Demonstrated on this deployment: two identical inserts with auth_type NULL
+-- both landed; with auth_type='password' the second was correctly rejected.
+UPDATE public.credential_findings c
+   SET last_verified_at = g.max_seen
+  FROM (SELECT ip, port, username, COALESCE(auth_type, '') AS auth_key,
+               max(coalesce(last_verified_at, discovered_at, created_at)) AS max_seen
+          FROM public.credential_findings
+         GROUP BY ip, port, username, COALESCE(auth_type, '')
+        HAVING count(*) > 1) g
+ WHERE c.ip = g.ip AND c.port = g.port AND c.username = g.username
+   AND COALESCE(c.auth_type, '') = g.auth_key;
+
+DELETE FROM public.credential_findings a
+ USING public.credential_findings b
+ WHERE a.ip = b.ip
+   AND a.port = b.port
+   AND a.username = b.username
+   AND COALESCE(a.auth_type, '') = COALESCE(b.auth_type, '')
+   AND a.id <> b.id
+   -- Prefer a confirmed-valid row over a failed attempt for the same account,
+   -- then the most recently seen; id makes the ordering strict.
+   AND (coalesce(a.valid_cred, false),
+        coalesce(a.last_verified_at, a.discovered_at, a.created_at), a.id)
+       < (coalesce(b.valid_cred, false),
+          coalesce(b.last_verified_at, b.discovered_at, b.created_at), b.id);
+
+-- Total, not partial, and coalesced on the one nullable key column. Any
+-- ON CONFLICT targeting this index must repeat the expression EXACTLY or
+-- Postgres raises "no unique or exclusion constraint matching the ON CONFLICT
+-- specification" on every row (see the comment in etl/asset_utils.py for what
+-- that failure looked like the last time: 23 records seen, 23 errors, 0 stored).
+DROP INDEX IF EXISTS public.uq_credential_findings_identity;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_credential_findings_identity
+    ON public.credential_findings(ip, port, username, COALESCE(auth_type, ''));
+-- ── credential_findings: fingerprint dedup, matching the other finding tables ──
+--
+-- This table deduped on an identity INDEX while vulns, web_findings and
+-- recon_findings all dedupe on a fingerprint COLUMN plus a trigger. Two
+-- mechanisms for one concept means every reader has to know which table works
+-- which way, and only the fingerprint tables get a stable id for exports and
+-- the delta view.
+--
+-- discovered_at / last_verified_at already serve first_seen / last_seen here,
+-- so no new timestamp columns are needed — but nothing was bumping
+-- last_verified_at except the ON CONFLICT in etl/parse_brutus.py. The trigger
+-- now does it for every writer.
+DO $$ BEGIN ALTER TABLE public.credential_findings ADD COLUMN IF NOT EXISTS fingerprint text; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+
+-- Must match etl/fingerprint.py::credential_fingerprint EXACTLY, or a row
+-- written by a Python-side writer and one written by a raw INSERT of the same
+-- account would not recognise each other. tests/test_fingerprint.py pins both
+-- to a shared case table and exercises this through the real trigger.
+--
+-- valid_cred and status are deliberately NOT hashed: a credential that stopped
+-- working is the same account, and hashing the outcome would add a row every
+-- time the result flipped.
+CREATE OR REPLACE FUNCTION public.credential_findings_dedup() RETURNS trigger AS $fn$
+DECLARE
+    existing_id uuid;
+BEGIN
+    IF NEW.fingerprint IS NULL THEN
+        NEW.fingerprint := md5('cred|' || coalesce(host(NEW.ip), '')
+                               || '|' || CASE WHEN NEW.port IS NOT NULL AND NEW.port <> 0
+                                              THEN NEW.port::text ELSE '0' END
+                               || '|' || lower(btrim(coalesce(NEW.username, '')))
+                               || '|' || lower(btrim(coalesce(NEW.auth_type, ''))));
+    END IF;
+
+    SELECT id INTO existing_id
+      FROM public.credential_findings WHERE fingerprint = NEW.fingerprint;
+
+    IF FOUND THEN
+        -- Re-testing a known credential is a re-verification, not a new
+        -- finding. This mirrors what the ON CONFLICT in etl/parse_brutus.py
+        -- used to be solely responsible for, so every writer now gets it.
+        UPDATE public.credential_findings
+           SET last_verified_at = now(),
+               valid_cred       = COALESCE(NEW.valid_cred, valid_cred),
+               status           = COALESCE(NEW.status, status),
+               secret_type      = COALESCE(NEW.secret_type, secret_type),
+               banner           = COALESCE(NEW.banner, banner),
+               metadata         = COALESCE(NEW.metadata, metadata),
+               -- The recovered secret. A re-verification often DOES
+               -- capture the password when the first observation did
+               -- not, and without this the new value is discarded: this
+               -- trigger RETURNs NULL on a duplicate, so the writer's own
+               -- ON CONFLICT DO UPDATE never runs and there is no other
+               -- path by which secret_value can reach an existing row.
+               -- COALESCE, never assignment: a run that did not recover
+               -- the password must not erase one already stored.
+               secret_value     = COALESCE(NEW.secret_value, secret_value)
+         WHERE id = existing_id;
+        RETURN NULL;   -- skip the INSERT
+    END IF;
+
+    IF NEW.discovered_at IS NULL THEN NEW.discovered_at := now(); END IF;
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_credential_findings_dedup ON public.credential_findings;
+CREATE TRIGGER trg_credential_findings_dedup
+    BEFORE INSERT ON public.credential_findings
+    FOR EACH ROW EXECUTE FUNCTION public.credential_findings_dedup();
+
+-- Backfill existing rows through the same expression the trigger uses.
+UPDATE public.credential_findings
+   SET fingerprint = md5('cred|' || coalesce(host(ip), '')
+                         || '|' || CASE WHEN port IS NOT NULL AND port <> 0
+                                        THEN port::text ELSE '0' END
+                         || '|' || lower(btrim(coalesce(username, '')))
+                         || '|' || lower(btrim(coalesce(auth_type, ''))))
+ WHERE fingerprint IS NULL;
+
+-- Collapse any rows that the case-insensitive username or coalesced auth_type
+-- now considers identical but the old index treated as distinct.
+DELETE FROM public.credential_findings a
+ USING public.credential_findings b
+ WHERE a.fingerprint = b.fingerprint
+   AND a.id <> b.id
+   -- Prefer a confirmed-valid row, then the most recently seen; id makes the
+   -- ordering strict and total so exactly one row per group survives.
+   AND (coalesce(a.valid_cred, false),
+        coalesce(a.last_verified_at, a.discovered_at, a.created_at), a.id)
+       < (coalesce(b.valid_cred, false),
+          coalesce(b.last_verified_at, b.discovered_at, b.created_at), b.id);
+
+-- Only the unique index. vulns and web_findings each carry a redundant plain
+-- idx_*_fingerprint alongside their uq_*_fingerprint, which buys nothing -- a
+-- unique btree already serves equality lookups -- and costs write throughput on
+-- the highest-volume tables in the schema. Not propagating that here.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_credential_findings_fingerprint
+    ON public.credential_findings(fingerprint);
+-- ── Virtual-host grouping: one problem, N affected vhosts ──────────────────
+--
+-- web_findings.fingerprint hashes the URL, which contains the hostname, so a
+-- server-level problem on shared hosting stores one row per vhost. That is
+-- correct for app-level findings and wrong for infrastructure ones.
+--
+-- The fix GROUPS rather than merges: every per-vhost row is kept, and a second
+-- host-independent key marks them as facets of one underlying problem. Because
+-- nothing is merged, the grouping key can be heuristic without risking data
+-- loss — which is why no scope classifier is needed.
+--
+-- Must match etl/fingerprint.py::infrastructure_fingerprint EXACTLY.
+DO $$ BEGIN ALTER TABLE public.web_findings ADD COLUMN IF NOT EXISTS infrastructure_fingerprint text; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+
+-- ── web_findings: separate crawl INVENTORY from actual FINDINGS ────────────
+--
+-- 746 of 779 rows in this deployment are katana output: one row per discovered
+-- URL, with no name and no issue_type. A crawled URL is not a finding, but they
+-- were counted as one everywhere — the severity chart showed "recon: 782",
+-- exports listed them, and the vhost rollup had almost nothing to group.
+--
+-- They are NOT junk, and must not be moved or deleted: /export/burp and
+-- /export/har both read web_findings BY URL to build the Burp sitemap and the
+-- HAR file, which is the tool's primary deliverable ("import into manual
+-- tools"). The HAR query calls web_findings the "richest data for HAR".
+--
+-- So the fix is classification, not relocation. A generated column means no
+-- writer has to be changed and the value cannot drift from the data it
+-- describes.
+--
+-- Why not just filter severity='recon': whatweb and httpx use 'recon' for real,
+-- NAMED findings. Severity conflates "informational finding" with "a URL we
+-- merely saw". Absence of both name and issue_type is what actually
+-- distinguishes them — and it is the same condition infrastructure_fingerprint
+-- already uses to decide a row cannot be grouped, so the two stay consistent.
+DO $$ BEGIN
+    ALTER TABLE public.web_findings
+      ADD COLUMN IF NOT EXISTS record_kind text
+      GENERATED ALWAYS AS (
+        CASE WHEN COALESCE(btrim(name), '') = ''
+              AND COALESCE(btrim(issue_type), '') = ''
+             THEN 'inventory' ELSE 'finding' END
+      ) STORED;
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
+
+-- Findings queries filter on this on every request, and inventory dominates the
+-- table, so the index earns its keep.
+CREATE INDEX IF NOT EXISTS idx_web_findings_record_kind
+    ON public.web_findings(record_kind);
+
+-- ── One numeric severity scale, in SQL ─────────────────────────────────────
+--
+-- Severity ordering was hand-written as a CASE expression in five places in
+-- api.py alone, in three different conventions (ELSE 0, ELSE 4, ELSE 5, ELSE 7;
+-- critical as 1 or as 5). Two of them also collapsed `low` and `info` together.
+--
+-- Higher = more severe, so `ORDER BY severity_rank(severity) DESC` reads the way
+-- it sounds and an unknown value sorts LAST instead of first — which is the bug
+-- the ascending copies had, since ELSE 7 put garbage above critical when someone
+-- reversed the direction.
+--
+-- Must match etl/severity.py and the frontend's SEVERITY_RANK exactly;
+-- tests/test_severity_scale.py pins all three to one case table.
+--
+-- IMMUTABLE so it can be used in an index and so the planner can fold it.
+CREATE OR REPLACE FUNCTION public.severity_rank(sev text)
+RETURNS integer
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    SELECT CASE lower(btrim(coalesce(sev, '')))
+        WHEN 'critical' THEN 6
+        WHEN 'high'     THEN 5
+        WHEN 'medium'   THEN 4
+        WHEN 'low'      THEN 3
+        WHEN 'info'     THEN 2
+        -- 'recon' is the pre-2026-08-22 name for 'info' and ranks identically,
+        -- so rows written before that migration sort correctly rather than
+        -- falling to unknown.
+        WHEN 'recon'    THEN 2
+        -- A failed scan is not a finding about the target; ranking it above
+        -- informational output would push real results down.
+        WHEN 'error'    THEN 1
+        ELSE 0
+    END
+$$;
+
+-- ── Collapse the 'recon' severity into 'info' ──────────────────────────────
+--
+-- The two were functionally identical. Measured before removing it:
+--   * both mapped to SARIF level "note" — and 'recon' only by FALLTHROUGH,
+--     since sev_map had no key for it
+--   * both were ordinary severity chips in the UI, both included in reports
+--   * no export, filter or report treated them differently
+--   * the only difference was sort rank (info 5, recon 6)
+-- A consumer had already given up on the distinction:
+-- burp-extension/RagScanBridge.py buckets {"info","recon","informational",""}
+-- as one thing.
+--
+-- attack_vectors is included because its severity is COPIED from the source
+-- finding (app/rag-api/attack_vectors.py) — the same notion propagated, not a
+-- different scale. 1495 of its rows carried 'recon' purely because the findings
+-- they derive from did.
+--
+-- Idempotent: a second run matches nothing.
+UPDATE public.web_findings   SET severity = 'info' WHERE severity = 'recon';
+UPDATE public.vulns          SET severity = 'info' WHERE severity = 'recon';
+UPDATE public.recon_findings SET severity = 'info' WHERE severity = 'recon';
+UPDATE public.attack_vectors SET severity = 'info' WHERE severity = 'recon';
+
+-- Any other table that grew a severity column since. Named tables above are
+-- kept explicit for reviewability; this catches the rest rather than leaving a
+-- silent gap when a new findings table appears.
+DO $RECON$
+DECLARE
+    t text;
+BEGIN
+    FOR t IN
+        SELECT c.table_name
+          FROM information_schema.columns c
+          JOIN information_schema.tables tb
+            ON tb.table_schema = c.table_schema AND tb.table_name = c.table_name
+         WHERE c.table_schema = 'public'
+           AND c.column_name = 'severity'
+           AND tb.table_type = 'BASE TABLE'
+           AND c.is_generated = 'NEVER'
+           AND c.table_name NOT IN ('web_findings','vulns','recon_findings','attack_vectors')
+    LOOP
+        EXECUTE format(
+            'UPDATE public.%I SET severity = %L WHERE severity = %L', t, 'info', 'recon');
+    END LOOP;
+END $RECON$;
+
+
+CREATE INDEX IF NOT EXISTS idx_web_findings_infra_fp
+    ON public.web_findings(infrastructure_fingerprint)
+ WHERE infrastructure_fingerprint IS NOT NULL;
+
+-- Group-level triage. Sparse on purpose: a row exists only once someone has
+-- actually triaged the group, so this does not shadow the per-finding
+-- workflow_status for the untouched majority.
+CREATE TABLE IF NOT EXISTS public.finding_group_state (
+    infrastructure_fingerprint text PRIMARY KEY,
+    status          text DEFAULT 'new',
+    assigned_to     text,
+    notes           text,
+    suppressed      boolean DEFAULT false,
+    created_at      timestamptz DEFAULT now(),
+    updated_at      timestamptz DEFAULT now()
+);
+
+CREATE OR REPLACE FUNCTION public._touch_finding_group_state() RETURNS trigger AS $fn$
+BEGIN
+    NEW.updated_at := now();
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_finding_group_state_updated_at ON public.finding_group_state;
+CREATE TRIGGER trg_finding_group_state_updated_at
+    BEFORE UPDATE ON public.finding_group_state
+    FOR EACH ROW EXECUTE FUNCTION public._touch_finding_group_state();
+
+-- Compute the key on write. The IP comes from the finding's asset, so this
+-- resolves through assets rather than parsing it back out of the URL: after the
+-- vhost normalisation, several asset rows share one ip, which is exactly the
+-- relation being grouped on.
+CREATE OR REPLACE FUNCTION public._web_findings_infra_fp() RETURNS trigger AS $fn$
+DECLARE
+    v_ip   text;
+    v_port text;
+BEGIN
+    IF NEW.infrastructure_fingerprint IS NOT NULL THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT host(a.ip) INTO v_ip FROM public.assets a WHERE a.id = NEW.asset_id;
+
+    -- No host means "same host" is unanswerable, and a blank name AND blank
+    -- issue_type means this is not a finding (katana crawl rows look like that:
+    -- 746 of 779 in one deployment). Either way, leave it ungrouped rather than
+    -- inventing a bucket.
+    IF v_ip IS NULL OR v_ip = ''
+       OR (coalesce(btrim(NEW.name), '') = '' AND coalesce(btrim(NEW.issue_type), '') = '')
+    THEN
+        RETURN NEW;
+    END IF;
+
+    v_port := CASE WHEN NEW.port IS NOT NULL AND NEW.port <> 0
+                   THEN NEW.port::text ELSE '0' END;
+
+    NEW.infrastructure_fingerprint := md5('infra|' || v_ip || '|' || v_port
+        || '|' || lower(btrim(coalesce(NEW.name, '')))
+        || '|' || lower(btrim(coalesce(NEW.issue_type, ''))));
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+-- The name is deliberately "z_infra" so it sorts LAST. Postgres fires BEFORE
+-- triggers in alphabetical order by trigger name, and this one depends on two
+-- earlier ones:
+--
+--   trg_web_findings_dedup  -> RETURNs NULL for a duplicate, so a skipped
+--                              INSERT never bothers computing a grouping key
+--   trg_web_findings_port   -> populates NEW.port from the URL
+--
+-- Named trg_web_findings_infra it would fire at 'i', BEFORE 'port', and key on
+-- port 0 while the stored row ended up with 443 — a wrong grouping key that
+-- also disagrees with etl/fingerprint.py, which receives the real port.
+DROP TRIGGER IF EXISTS trg_web_findings_infra ON public.web_findings;
+DROP TRIGGER IF EXISTS trg_web_findings_z_infra ON public.web_findings;
+CREATE TRIGGER trg_web_findings_z_infra
+    BEFORE INSERT ON public.web_findings
+    FOR EACH ROW EXECUTE FUNCTION public._web_findings_infra_fp();
+
+-- Backfill through the same expression.
+UPDATE public.web_findings w
+   SET infrastructure_fingerprint = md5('infra|' || host(a.ip) || '|'
+       || CASE WHEN w.port IS NOT NULL AND w.port <> 0 THEN w.port::text ELSE '0' END
+       || '|' || lower(btrim(coalesce(w.name, '')))
+       || '|' || lower(btrim(coalesce(w.issue_type, ''))))
+  FROM public.assets a
+ WHERE a.id = w.asset_id
+   AND w.infrastructure_fingerprint IS NULL
+   AND NOT (coalesce(btrim(w.name), '') = '' AND coalesce(btrim(w.issue_type), '') = '');
+
+-- One row per underlying problem, with the vhosts it affects. A view rather
+-- than a table so there is no member count to keep in sync — the per-vhost rows
+-- remain the single source of truth.
+CREATE OR REPLACE VIEW public.v_infrastructure_findings AS
+SELECT
+    w.infrastructure_fingerprint,
+    min(host(a.ip))                                   AS ip,
+    min(w.port)                                       AS port,
+    min(w.name)                                       AS name,
+    min(w.issue_type)                                 AS issue_type,
+    -- WORST severity, not the lexically largest. max() on text ranks
+    -- 'medium' above 'critical' and 'high', so a group that mixes them
+    -- under-reported its own severity — silently, and in the dangerous
+    -- direction. Every group in this deployment happened to be
+    -- single-severity, so nothing showed it. public.severity_rank() is
+    -- the one scale the whole stack shares.
+    (array_agg(w.severity ORDER BY public.severity_rank(w.severity) DESC,
+                                   w.severity))[1]     AS severity,
+    count(*)                                          AS finding_count,
+    count(DISTINCT a.id)                              AS affected_asset_count,
+    array_agg(DISTINCT coalesce(a.hostname, host(a.ip))
+              ORDER BY coalesce(a.hostname, host(a.ip))) AS affected_hosts,
+    min(w.first_seen)                                 AS first_seen,
+    max(w.last_seen)                                  AS last_seen,
+    coalesce(s.status, 'new')                         AS group_status,
+    s.assigned_to                                     AS group_assigned_to,
+    coalesce(s.suppressed, false)                     AS group_suppressed
+FROM public.web_findings w
+JOIN public.assets a ON a.id = w.asset_id
+LEFT JOIN public.finding_group_state s
+       ON s.infrastructure_fingerprint = w.infrastructure_fingerprint
+WHERE w.infrastructure_fingerprint IS NOT NULL
+GROUP BY w.infrastructure_fingerprint, s.status, s.assigned_to, s.suppressed;
+
+
+
+-- ===========================================================================
+-- web_findings: fingerprint + dedup at the database, not in 18 call sites
+-- ===========================================================================
+--
+-- Fingerprints only dedupe if EVERY writer computes one. They did not: of ~26
+-- insert sites across 6 services, one (ZAP) computed a fingerprint. Everything
+-- else wrote NULL, and NULL never conflicts, so the unique index was inert for
+-- them — katana re-inserted an entire crawl every run (32,218 rows for 630
+-- findings).
+--
+-- Patching each site is fragile (different column sets, gen_random_uuid()
+-- inline, four services) and silently fails again the next time someone adds a
+-- parser. Doing it here makes the invariant hold for current AND future writers.
+--
+-- TRADE-OFF, stated plainly: this is behaviour that is not visible at the call
+-- site. An INSERT of a finding that already exists becomes an UPDATE of
+-- last_seen and inserts no row. Callers relying on RETURNING id therefore get
+-- no row back — only app/rag-api/api.py:4682 did, and it now handles that.
+CREATE OR REPLACE FUNCTION public.web_findings_dedup() RETURNS trigger AS $fn$
+DECLARE
+    existing_id uuid;
+BEGIN
+    -- Must match etl/fingerprint.py::web_fingerprint exactly, or a row inserted
+    -- by a Python-side writer and one inserted here would not recognise each
+    -- other as the same finding.
+    IF NEW.fingerprint IS NULL THEN
+        NEW.fingerprint := md5('web|' || rtrim(lower(btrim(coalesce(NEW.url, ''))), '/')
+                                || '|' || lower(btrim(coalesce(NEW.name, '')))
+                                || '|' || lower(btrim(coalesce(NEW.issue_type, ''))));
+    END IF;
+
+    SELECT id INTO existing_id
+      FROM public.web_findings
+     WHERE fingerprint = NEW.fingerprint;
+
+    IF FOUND THEN
+        -- Re-seeing a finding is new information about WHEN, not a new finding.
+        UPDATE public.web_findings
+           SET last_seen   = now(),
+               severity    = COALESCE(NEW.severity, severity),
+               evidence    = COALESCE(NEW.evidence, evidence),
+               status_code = COALESCE(NEW.status_code, status_code)
+         WHERE id = existing_id;
+        RETURN NULL;   -- skip the INSERT
+    END IF;
+
+    IF NEW.first_seen IS NULL THEN NEW.first_seen := now(); END IF;
+    IF NEW.last_seen  IS NULL THEN NEW.last_seen  := now(); END IF;
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_web_findings_dedup ON public.web_findings;
+CREATE TRIGGER trg_web_findings_dedup
+    BEFORE INSERT ON public.web_findings
+    FOR EACH ROW EXECUTE FUNCTION public.web_findings_dedup();
+
+-- ===========================================================================
+-- vulns: same dedup guard as web_findings
+-- ===========================================================================
+--
+-- Every vulns writer currently supplies a fingerprint, so unlike web_findings
+-- this is a guard against regression rather than a fix for a live leak. It has
+-- two parts with VERY different confidence levels, and the difference matters:
+--
+--   * The DEDUP is exact. It compares the fingerprint the writer already
+--     computed against what is stored; nothing is recomputed, so it cannot
+--     disagree with the application.
+--
+--   * The FILL is BEST-EFFORT, and only runs when a writer supplies no
+--     fingerprint at all. It cannot be perfectly faithful to
+--     etl/fingerprint.py::vuln_fingerprint, because that hashes the ip and PORT
+--     the scanner observed, while the row stores only asset_id and port_id —
+--     when port_id is NULL the port is simply not recoverable. A best-effort
+--     hash still deduplicates repeat inserts from the same writer, which is the
+--     common case; NULL deduplicates nothing at all.
+--
+-- Verified against live data: reproduces 34 of 34 stored fingerprints once the
+-- metadata.port fallback below is applied. (A first version got 33/34 and the
+-- outlier was misread as proof of a second hash format in the data; it was in
+-- fact a vuln_fingerprint row whose port lived only in metadata.)
+--
+-- A second format DOES exist in the code — etl/parse_tool_output.py used a local
+-- _fingerprint() that is just md5 of its arguments joined by "|" — but it had not
+-- written any of the live rows. That writer has since been moved onto
+-- vuln_fingerprint / web_fingerprint so the two cannot diverge in future.
+
+-- vulns needs first_seen / last_seen for the delta view, the same way
+-- web_findings already has them. updated_at cannot stand in: the
+-- trg_vulns_updated_at trigger touches it on ANY write, so an operator adding
+-- tester_notes is indistinguishable from a scan re-observing the finding.
+-- Maintained by vulns_dedup() below.
+DO $$ BEGIN ALTER TABLE public.vulns ADD COLUMN IF NOT EXISTS first_seen timestamptz DEFAULT now(); EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN ALTER TABLE public.vulns ADD COLUMN IF NOT EXISTS last_seen  timestamptz DEFAULT now(); EXCEPTION WHEN OTHERS THEN NULL; END $$;
+-- Backfill existing rows: created_at is when we first saw it, updated_at is the
+-- best available proxy for the last sighting on rows that predate these columns.
+UPDATE public.vulns SET first_seen = COALESCE(first_seen, created_at, now()) WHERE first_seen IS NULL;
+UPDATE public.vulns SET last_seen  = COALESCE(last_seen, updated_at, created_at, now()) WHERE last_seen IS NULL;
+
+CREATE OR REPLACE FUNCTION public.vulns_dedup() RETURNS trigger AS $fn$
+DECLARE
+    existing_id uuid;
+    v_ip   text;
+    v_port text;
+    v_cve  text;
+BEGIN
+    IF NEW.fingerprint IS NULL THEN
+        SELECT coalesce(host(a.ip), '') INTO v_ip
+          FROM public.assets a WHERE a.id = NEW.asset_id;
+        SELECT CASE WHEN p.port IS NOT NULL AND p.port <> 0 THEN p.port::text ELSE NULL END
+          INTO v_port FROM public.ports p WHERE p.id = NEW.port_id;
+
+        -- Fall back to metadata.port when port_id is not set. vuln_fingerprint
+        -- hashes the port the SCANNER observed, which is often recorded in
+        -- metadata even when no ports row was linked — e.g. nuclei's
+        -- CVE-2011-2523 match on 6200. Using it takes this expression from
+        -- reproducing 33 of 34 live fingerprints to 34 of 34.
+        IF v_port IS NULL AND (NEW.metadata->>'port') ~ '^[0-9]+$'
+           AND (NEW.metadata->>'port') <> '0' THEN
+            v_port := NEW.metadata->>'port';
+        END IF;
+
+        v_ip   := coalesce(v_ip, '');
+        v_port := coalesce(v_port, '0');
+
+        -- Mirrors _extract_first_cve: first array element matching the CVE
+        -- shape, upper-cased. unnest preserves array order.
+        SELECT upper(c) INTO v_cve
+          FROM unnest(coalesce(NEW.cve, ARRAY[]::text[])) c
+         WHERE c ~* '^CVE-[0-9]{4}-[0-9]+'
+         LIMIT 1;
+
+        IF v_cve IS NOT NULL THEN
+            NEW.fingerprint := md5('cve|' || v_cve || '|' || v_ip || '|' || v_port);
+        ELSE
+            -- _normalize_script is strip().lower()
+            NEW.fingerprint := md5('script|' || lower(btrim(coalesce(NEW.script, '')))
+                                   || '|' || v_ip || '|' || v_port);
+        END IF;
+    END IF;
+
+    SELECT id INTO existing_id
+      FROM public.vulns WHERE fingerprint = NEW.fingerprint;
+
+    IF FOUND THEN
+        -- Re-seeing a vuln is new information about WHEN, not a new finding.
+        --
+        -- last_seen is maintained separately from updated_at on purpose:
+        -- trg_vulns_updated_at touches updated_at on ANY write, including an
+        -- operator editing tester_notes or workflow_status, so updated_at
+        -- cannot answer "when did a scan last observe this". The delta view
+        -- needs the scan-observation timestamp, which is this one.
+        UPDATE public.vulns
+           SET updated_at = now(),
+               last_seen  = now(),
+               severity   = COALESCE(NEW.severity, severity),
+               output     = COALESCE(NEW.output, output),
+               cvss       = COALESCE(NEW.cvss, cvss)
+         WHERE id = existing_id;
+        RETURN NULL;   -- skip the INSERT
+    END IF;
+
+    IF NEW.first_seen IS NULL THEN NEW.first_seen := now(); END IF;
+    IF NEW.last_seen  IS NULL THEN NEW.last_seen  := now(); END IF;
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_vulns_dedup ON public.vulns;
+CREATE TRIGGER trg_vulns_dedup
+    BEFORE INSERT ON public.vulns
+    FOR EACH ROW EXECUTE FUNCTION public.vulns_dedup();
+
+-- ===========================================================================
+-- recon_findings: fingerprint + dedup
+-- ===========================================================================
+--
+-- Every one of the 575 live rows had a NULL fingerprint: ~50 insert sites across
+-- ~30 files write this table and none of them computed one. Patching them
+-- individually is not realistic, so this follows the web_findings pattern and
+-- enforces the invariant at the database.
+--
+-- THE DATA KEY IS LOAD-BEARING. recon_fingerprint takes
+-- (source, finding_type, target, data_key), and `target` alone is NOT the
+-- identity here: gowitness writes one row per screenshot but sets target to the
+-- HOST, so all 563 of its rows share target='192.168.1.150' and differ only in
+-- `data`. Keying on (source, finding_type, target) would have collapsed 575 rows
+-- to 5 and destroyed 558 distinct findings. `data` must be part of the key.
+--
+-- Known limit: the trigger uses jsonb's canonical text form, while a Python
+-- writer passing its own data_key (e.g. parse_tool_output's
+-- json.dumps(rec)[:200]) may serialise differently. Rows from those two paths
+-- may therefore not dedupe against each other. Supplied fingerprints are never
+-- recomputed, so this only affects the fill.
+
+UPDATE public.recon_findings
+   SET fingerprint = md5('recon|' || lower(btrim(coalesce(source, '')))
+                          || '|' || lower(btrim(coalesce(finding_type, '')))
+                          || '|' || lower(btrim(coalesce(target, '')))
+                          || '|' || lower(btrim(coalesce(data::text, ''))))
+ WHERE fingerprint IS NULL;
+
+DELETE FROM public.recon_findings a
+ USING public.recon_findings b
+ WHERE a.fingerprint IS NOT NULL
+   AND a.fingerprint = b.fingerprint
+   AND a.id <> b.id
+   AND (a.created_at, a.id) < (b.created_at, b.id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_recon_findings_fingerprint
+    ON public.recon_findings(fingerprint);
+
+CREATE OR REPLACE FUNCTION public.recon_findings_dedup() RETURNS trigger AS $fn$
+DECLARE
+    existing_id uuid;
+BEGIN
+    IF NEW.fingerprint IS NULL THEN
+        NEW.fingerprint := md5('recon|' || lower(btrim(coalesce(NEW.source, '')))
+                                || '|' || lower(btrim(coalesce(NEW.finding_type, '')))
+                                || '|' || lower(btrim(coalesce(NEW.target, '')))
+                                || '|' || lower(btrim(coalesce(NEW.data::text, ''))));
+    END IF;
+
+    SELECT id INTO existing_id
+      FROM public.recon_findings WHERE fingerprint = NEW.fingerprint;
+
+    IF FOUND THEN
+        UPDATE public.recon_findings
+           SET severity = COALESCE(NEW.severity, severity),
+               data     = COALESCE(NEW.data, data)
+         WHERE id = existing_id;
+        RETURN NULL;   -- skip the INSERT
+    END IF;
+
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_recon_findings_dedup ON public.recon_findings;
+CREATE TRIGGER trg_recon_findings_dedup
+    BEFORE INSERT ON public.recon_findings
+    FOR EACH ROW EXECUTE FUNCTION public.recon_findings_dedup();
+
+-- ── raw_artifacts: complete, untruncated tool output ──────────────────────
+--
+-- Every byte a tool produced, kept verbatim for post-analysis and LLM
+-- processing. This exists because the pipeline was lossy in three places at
+-- once and each loss was invisible:
+--
+--   1. tool_executions.output is written ONLY by kali-listener. Output from
+--      the scanner services and targeted_recon had no durable home at all.
+--   2. When a tool writes its own JSON (nuclei -jsonl, whatweb --log-json,
+--      enum4linux-ng -oJ, dnsrecon --json, sqlmap --report-json), that file
+--      was read, POSTed to the parser, then UNLINKED — the authoritative
+--      structured artifact was the one thing never persisted.
+--   3. The parser keeps 8 KB of raw_output on a finding; ingest truncates at
+--      200 KB. Fine for display, useless as a source of truth.
+--
+-- Content is deduped on (tool, target, sha256) rather than blindly appended:
+-- re-running the same scan yields byte-identical output, and paying an LLM to
+-- re-read it is pure waste. Repeats bump last_seen/occurrences, matching the
+-- first_seen/last_seen convention used by the finding tables.
+CREATE TABLE IF NOT EXISTS public.raw_artifacts (
+    id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id    uuid,
+    tool             text NOT NULL,
+    command          text,
+    target           text,
+    port             integer,
+    service          text,
+    exec_id          uuid,
+    job_id           text,
+    scan_id          uuid,
+    source           text DEFAULT 'unknown',
+    -- Operator-supplied label for a manually uploaded artifact ("what is this").
+    note             text,
+    -- Records in THIS file (JSONL lines / JSON array length / non-blank lines),
+    -- computed at ingest. The per-artifact item count — NOT a job-wide findings
+    -- join, which over-counts when tools share a job_id.
+    item_count       integer,
+    content_format   text DEFAULT 'text',
+    native_json      boolean DEFAULT false,
+    content          text NOT NULL,
+    content_sha256   text NOT NULL,
+    byte_size        integer,
+    first_seen       timestamptz DEFAULT now(),
+    last_seen        timestamptz DEFAULT now(),
+    occurrences      integer DEFAULT 1,
+    -- LLM post-processing state. 'pending' is the work queue.
+    llm_status       text DEFAULT 'pending',
+    llm_model        text,
+    llm_processed_at timestamptz,
+    llm_result       jsonb,
+    llm_error        text,
+    llm_attempts     integer DEFAULT 0,
+    created_at       timestamptz DEFAULT now(),
+    CONSTRAINT raw_artifacts_llm_status_check CHECK (
+        llm_status IN ('pending','processing','done','failed','skipped'))
+);
+
+-- Backfill for databases created before these columns existed (idempotent).
+ALTER TABLE public.raw_artifacts ADD COLUMN IF NOT EXISTS note text;
+ALTER TABLE public.raw_artifacts ADD COLUMN IF NOT EXISTS item_count integer;
+
+ALTER TABLE public.raw_artifacts
+    DROP CONSTRAINT IF EXISTS raw_artifacts_scan_id_fkey;
+ALTER TABLE public.raw_artifacts
+    ADD CONSTRAINT raw_artifacts_scan_id_fkey
+    FOREIGN KEY (scan_id) REFERENCES public.scans(id) ON DELETE SET NULL;
+
+-- Required by the ON CONFLICT upsert in /ingest/raw-artifact. Without a
+-- matching unique index that statement RAISES rather than deduping.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_artifacts_identity
+    ON public.raw_artifacts (tool, COALESCE(target,''), content_sha256);
+-- The post-processing queue reads WHERE llm_status='pending' ORDER BY created_at.
+CREATE INDEX IF NOT EXISTS idx_raw_artifacts_llm_status
+    ON public.raw_artifacts (llm_status, created_at);
+CREATE INDEX IF NOT EXISTS idx_raw_artifacts_tool     ON public.raw_artifacts (tool);
+CREATE INDEX IF NOT EXISTS idx_raw_artifacts_target   ON public.raw_artifacts (target);
+CREATE INDEX IF NOT EXISTS idx_raw_artifacts_exec_id  ON public.raw_artifacts (exec_id);
+CREATE INDEX IF NOT EXISTS idx_raw_artifacts_job_id   ON public.raw_artifacts (job_id);
+CREATE INDEX IF NOT EXISTS idx_raw_artifacts_created  ON public.raw_artifacts (created_at DESC);
+
+-- Existing installs: widen the evidence_links entity_type CHECK so a
+-- security_test_run can be a first-class evidence entity (symmetric with
+-- exploit_result). Idempotent — a fresh table already has the wider set above.
+DO $$ BEGIN
+  ALTER TABLE public.evidence_links DROP CONSTRAINT IF EXISTS evidence_links_entity_type_check;
+  ALTER TABLE public.evidence_links ADD CONSTRAINT evidence_links_entity_type_check
+    CHECK (entity_type IN ('finding','web_finding','playwright_finding','asset',
+                           'checklist_item','exploit_result','security_test_run'));
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
+
+GRANT ALL PRIVILEGES ON public.security_tests     TO app;
+GRANT ALL PRIVILEGES ON public.security_test_runs TO app;

@@ -10,16 +10,12 @@ import { useAttackVectors, useAttackGraph, useComputeAttackVectors, type AttackV
 import { useUIStore } from '@/stores/ui'
 import PageHelp from '@/components/PageHelp'
 import InfoTip from '@/components/InfoTip'
+import { compareSeverity, SEVERITY_BY_RANK, severityDot } from '@/lib/constants'
 
 type SortKey = 'risk' | 'findings' | 'severity'
 
-// Severity rank for sorting/ordering (high → low). Unknown sorts last.
-const SEV_RANK: Record<string, number> = { critical: 5, high: 4, medium: 3, low: 2, info: 1 }
-const SEV_ORDER = ['critical', 'high', 'medium', 'low', 'info']
-const SEV_DOT: Record<string, string> = {
-  critical: 'bg-red-600', high: 'bg-orange-500', medium: 'bg-yellow-400',
-  low: 'bg-blue-500', info: 'bg-gray-500',
-}
+// Severity ordering and the dot palette are canonical in lib/constants.ts —
+// four local copies had drifted, two of them with opposite conventions.
 
 // Risk 0..100 → green→amber→red.
 function riskColor(risk: number): string {
@@ -151,7 +147,7 @@ function AttackMapInner() {
     const sorted = [...list].sort((a, b) => {
       if (sortBy === 'findings') return (b.finding_count ?? 0) - (a.finding_count ?? 0)
       if (sortBy === 'severity') {
-        const d = (SEV_RANK[b.severity || ''] ?? 0) - (SEV_RANK[a.severity || ''] ?? 0)
+        const d = compareSeverity(a.severity, b.severity)
         return d !== 0 ? d : b.risk_score - a.risk_score
       }
       return b.risk_score - a.risk_score
@@ -355,7 +351,7 @@ function AttackMapInner() {
             {/* Severity filter — only severities present in the data get a chip */}
             <div className="flex items-center gap-1 flex-wrap">
               <span className="text-[10px] text-muted-foreground mr-0.5">Severity</span>
-              {SEV_ORDER.filter((s) => sevCounts[s]).map((s) => {
+              {SEVERITY_BY_RANK.filter((s) => sevCounts[s]).map((s) => {
                 const active = sevFilter.has(s)
                 return (
                   <button
@@ -368,7 +364,7 @@ function AttackMapInner() {
                         : 'border-border bg-muted/40 text-muted-foreground hover:border-primary/50'
                     }`}
                   >
-                    <span className={`h-1.5 w-1.5 rounded-full ${SEV_DOT[s] || 'bg-gray-500'}`} />
+                    <span className={`h-1.5 w-1.5 rounded-full ${severityDot(s)}`} />
                     {s}
                     <span className="text-muted-foreground/70">{sevCounts[s]}</span>
                   </button>
@@ -409,7 +405,7 @@ function AttackMapInner() {
                     <span className="text-muted-foreground">{v.tactic}</span>
                     {v.severity && (
                       <span className="flex items-center gap-1 text-[10px] text-muted-foreground capitalize">
-                        <span className={`h-1.5 w-1.5 rounded-full ${SEV_DOT[v.severity] || 'bg-gray-500'}`} />
+                        <span className={`h-1.5 w-1.5 rounded-full ${severityDot(v.severity)}`} />
                         {v.severity}
                       </span>
                     )}

@@ -32,6 +32,10 @@ Nessus XML structure (NessusClientData_v2):
 """
 import os
 import uuid
+try:  # etl is imported as a package from rag-api, bare from within etl/
+    from etl.sql_types import as_text_array
+except ImportError:  # pragma: no cover
+    from sql_types import as_text_array
 import json
 import logging
 import ipaddress
@@ -376,7 +380,11 @@ def parse_nessus(path: str, profile: str = "upload", job_id: str = None, target:
                         cur.execute(
                             """INSERT INTO vulns
                                (id, asset_id, port_id, script, output, severity, cve, cvss, refs, metadata, fingerprint)
-                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                               ON CONFLICT (fingerprint) DO UPDATE SET
+                                   updated_at = now(),
+                                   severity   = EXCLUDED.severity,
+                                   output     = COALESCE(EXCLUDED.output, vulns.output)""",
                             (
                                 vuln_id,
                                 asset_id,
@@ -384,7 +392,7 @@ def parse_nessus(path: str, profile: str = "upload", job_id: str = None, target:
                                 f"nessus:{plugin_id}",
                                 output_text[:4000],
                                 severity,
-                                cves if cves else None,
+                                as_text_array(cves),
                                 cvss,
                                 Json(refs) if refs else Json({}),
                                 Json(metadata),

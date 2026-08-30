@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 import types
@@ -11,13 +12,25 @@ from fastapi.testclient import TestClient
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 API_FILE = REPO_ROOT / "app" / "rag-api" / "api.py"
-#MIGR_FILE = REPO_ROOT / "db_init" / "002_jobs.sql"
 
 API_KEY = os.environ.get("API_KEY", "changeme")
 
+
+def _redact(dsn: str) -> str:
+    """Never put a live password in test output — skip messages reach CI logs."""
+    return re.sub(r"://([^:/@]+):[^@]*@", r"://\1:***@", dsn or "")
+
 def load_api_module():
     # Ensure DB_DSN is set before import
-    os.environ.setdefault("DB_DSN", os.environ.get("TEST_DB_DSN", "postgresql://app:app@127.0.0.1:5432/scans"))
+    os.environ.setdefault("DB_DSN", os.environ.get("TEST_DB_DSN", "postgresql://app:app@127.0.0.1:5433/scans"))
+    # api.py imports its siblings flat (`import vault_client`), the way it does
+    # inside its container where /app is the working directory. Loading it by
+    # path without that directory on sys.path fails with ModuleNotFoundError —
+    # which the old MIGR_FILE NameError hid, because the fixture never got far
+    # enough to try.
+    api_dir = str(API_FILE.parent)
+    if api_dir not in sys.path:
+        sys.path.insert(0, api_dir)
     spec = importlib.util.spec_from_file_location("rag_api_module", str(API_FILE))
     mod = importlib.util.module_from_spec(spec)
     sys.modules["rag_api_module"] = mod
@@ -27,24 +40,36 @@ def load_api_module():
 def _connect(dsn: str):
     return psycopg2.connect(dsn)
 
-def _apply_migration(dsn: str):
+def _require_schema(dsn: str):
+    """Confirm the tables exist. Do NOT try to create them.
+
+    This used to read db_init/002_jobs.sql, whose definition was commented out
+    at the top of this file while the two uses of MIGR_FILE below it stayed —
+    so the fixture raised NameError, and the `except Exception` around it
+    reported that as "cannot connect/apply migration". The tests looked like
+    they were waiting for a database when they were simply broken; the file
+    itself is long gone, and jobs/tasks are created by ensure_all_tables.sql.
+    """
     with _connect(dsn) as conn, conn.cursor() as cur:
-        if MIGR_FILE.exists():
-            sql = MIGR_FILE.read_text()
-            cur.execute(sql)
-            conn.commit()
+        cur.execute("""SELECT count(*) FROM information_schema.tables
+                        WHERE table_schema = 'public'
+                          AND table_name IN ('jobs', 'tasks')""")
+        found = cur.fetchone()[0]
+    if found != 2:
+        raise RuntimeError(
+            f"jobs/tasks missing (found {found} of 2) — run scripts/ensure_db_schema.sh")
 
 @pytest.fixture(scope="session")
 def db_dsn():
-    return os.environ.get("TEST_DB_DSN", os.environ.get("DB_DSN", "postgresql://app:app@127.0.0.1:5432/scans"))
+    return os.environ.get("TEST_DB_DSN", os.environ.get("DB_DSN", "postgresql://app:app@127.0.0.1:5433/scans"))
 
 @pytest.fixture(scope="session")
 def db_or_skip(db_dsn):
     try:
-        _apply_migration(db_dsn)
+        _require_schema(db_dsn)
         return db_dsn
     except Exception as e:
-        pytest.skip(f"Skipping DB-backed tests: cannot connect/apply migration to {db_dsn}: {e!r}")
+        pytest.skip(f"no database at {_redact(db_dsn)}: {type(e).__name__}: {e}")
 
 @pytest.fixture()
 def api_app(db_or_skip, monkeypatch):
@@ -112,11 +137,14 @@ def test_job_lifecycle_success(client, api_app, monkeypatch, db_or_skip):
 
 def test_job_lifecycle_scanner_unavailable(client, api_app, monkeypatch):
     # Mock scanner raising connection error
-    class _E(Exception): pass
-    def _raise(*a, **kw): 
-        import requests as _r
+    import requests as _r
+    def _raise(*a, **kw):
         raise _r.exceptions.ConnectionError("unreachable")
-    monkeypatch.setattr(api_app, "requests", types.SimpleNamespace(post=_raise))
+    # The handler catches `requests.RequestException`, so a stand-in with only
+    # `post` makes the except clause itself raise AttributeError and the test
+    # fails for a reason that has nothing to do with the behaviour under test.
+    monkeypatch.setattr(api_app, "requests", types.SimpleNamespace(
+        post=_raise, RequestException=_r.RequestException, exceptions=_r.exceptions))
     # Create job
     r = client.post("/jobs", json={"type":"masscan-nmap"}, headers=auth_headers())
     job_id = r.json()["id"]

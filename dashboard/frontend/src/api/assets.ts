@@ -83,6 +83,35 @@ export interface StoredRecommendation {
   executed_at: string | null
   created_at: string
   purpose_group?: string | null
+
+  // What the recommendation actually ran and produced. The API has returned
+  // these for a while; they were simply not declared here, so the completed
+  // list rendered a status and nothing else.
+  /** What actually ran: extra.dispatched_command, falling back to the template. */
+  command?: string | null
+  /** The recommender's raw template, which may still contain {target}/{port}. */
+  script_template?: string | null
+  /** stderr from the tool, when it failed without writing to stdout. */
+  result_error?: string | null
+  /** Command built at dispatch time; `script` is often empty or a fragment. */
+  dispatched_command?: string | null
+  dispatched_endpoint?: string | null
+  job_id?: string | null
+  /** Populated for kali-dispatched tools (tool_executions). */
+  result_status?: string | null
+  result_exit_code?: number | null
+  result_bytes?: number | null
+  result_preview?: string | null
+  /** Populated for scanner-service dispatches, via the archived upload. */
+  artifact_id?: string | null
+  artifact_tool?: string | null
+  artifact_bytes?: number | null
+  artifact_preview?: string | null
+  skip_reason?: string | null
+  /** False when the target is outside the configured scope. Dispatch refuses
+   *  these — including with force — so they must be visibly distinct from
+   *  runnable items rather than just failing when clicked. */
+  in_scope?: boolean | null
 }
 
 export function useScanRecommendations(status = 'pending', engagementId?: string | null) {
@@ -690,5 +719,65 @@ export function useUpdateCveTuning() {
       qc.invalidateQueries({ queryKey: ['cve-tuning'] })
       qc.invalidateQueries({ queryKey: ['detected-software'] })
     },
+  })
+}
+
+
+/** Set the execution order of queued recommendations.
+ *
+ *  Order is carried by the existing `priority` column — LOWER runs first, the
+ *  convention scan_recommender uses — so the listing and the dispatcher both
+ *  honour a reorder with no extra wiring.
+ */
+export function useReorderRecommendations() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (ids: string[]) =>
+      apiFetch<{
+        ok: boolean
+        reordered: Array<{ id: string; priority: number }>
+        not_reordered: string[]
+        detail: string | null
+      }>('/scan-recommendations/reorder', {
+        method: 'POST',
+        body: JSON.stringify({ ids }),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['scan-recommendations'] }),
+  })
+}
+
+
+export interface BlockerSummary {
+  total: number
+  /** Needs someone to act — will not proceed on its own. */
+  blocked: number
+  /** Genuinely in flight. */
+  will_proceed: number
+  by_reason: Record<string, number>
+  concurrency_limit: number
+  scope_source: string
+  items: Array<{
+    id: string
+    ip: string | null
+    scanner: string
+    status: string
+    priority: number
+    command: string | null
+    reason: string
+    blocked: boolean
+    detail: string
+  }>
+}
+
+/** Why each queued/pending recommendation is not running.
+ *
+ *  Answering this by hand meant checking the row status, whether a job id
+ *  existed, the approval queue, the slot queue and the tool allowlist — five
+ *  places, none of them joined. */
+export function useRecommendationBlockers() {
+  return useQuery({
+    queryKey: ['recommendation-blockers'],
+    queryFn: () => apiFetch<BlockerSummary>('/scan-recommendations/blockers'),
+    refetchInterval: POLL.NORMAL,
   })
 }
