@@ -176,6 +176,8 @@ export interface AgentSession {
      *  past session still reports its engine after the default is flipped. */
     engine?: string
     enable_exploit_phase?: boolean
+    enable_surface_test_phase?: boolean
+    surface_target_host?: string
   }
 }
 

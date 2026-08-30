@@ -328,6 +328,14 @@ class PentestState(TypedDict):
     log: Annotated[List[str], operator.add]
     exploit_candidate: Optional[str]
     exploit_decision: Optional[dict]
+    # Surface-test phase (opt-in, independent of exploit_phase).
+    surface_test_phase: bool
+    surface_target_request: Optional[str]
+    surface_target: Optional[str]
+    surface_tests: Optional[list]
+    surface_safe_results: Optional[list]
+    pending_surface_tests: Optional[list]
+    surface_decision: Optional[dict]
     report: Optional[str]
 
 
@@ -841,11 +849,459 @@ def report(state: PentestState) -> dict:
     return {"phase": "done", "report": rpt, "log": ["report: composed"]}
 
 
+# ── surface-test phase ───────────────────────────────────────────────────────
+# Analyze ONE operator-selected host's attack surface, generate custom tests,
+# and prove which are exploitable. Two lanes: SAFE tests run autonomously (via
+# the scope-gated /tools/execute), IMPACTFUL tests queue for the SAME human
+# approval interrupt the exploit phase uses. Every test is persisted as a
+# re-runnable security_tests row with pass/fail history.
+
+# Classification: a test is SAFE iff its category is read-only AND its tool is a
+# known non-destructive tool AND it is not sourced from an exploit. Anything else
+# is IMPACTFUL. The sets are ast-readable so tests/test_langgraph_phases.py pins
+# them. IMPACTFUL is the safe default — a category we do not recognise is gated.
+_SAFE_CATEGORIES = {
+    "version_probe", "nuclei_detect", "tls_check", "lfi_read", "sqli_detect",
+    "dir_enum", "banner", "http_probe", "cert_check",
+}
+_IMPACTFUL_CATEGORIES = {
+    "rce", "shell", "msf_exploit", "file_write", "upload", "cred_bruteforce",
+    "dos", "sqli_dump", "deserialization",
+}
+# Read-only tools the safe lane may dispatch. The /tools/execute endpoint is the
+# real authority (Metasploit excluded there); this is a conservative agent-side
+# snapshot so a tool we do not list is treated as impactful (fails safe).
+_SAFE_TOOL_HINTS = {
+    "curl", "wget", "httpx", "nuclei", "nikto", "whatweb", "sslscan",
+    "testssl.sh", "testssl", "sslyze", "gobuster", "feroxbuster", "dirb",
+    "dirsearch", "ffuf", "sqlmap", "nmap", "dig", "host", "nslookup",
+    "enum4linux", "enum4linux-ng", "smbmap", "smbclient", "snmpwalk",
+    "onesixtyone", "ldapsearch", "dnsrecon", "dnsenum", "wafw00f", "ssh-audit",
+    "nbtscan", "showmount", "rpcclient",
+}
+# Cap per host — this is a single-host exhaustive sweep, not the cross-host
+# _DETERMINISTIC_PLAN_LIMIT that bounds recommender calls across many hosts.
+_SURFACE_TEST_LIMIT = int(os.environ.get("SURFACE_TEST_LIMIT", "24"))
+
+
+def _host_of(raw) -> "str | None":
+    """Normalize an attack-vector `target` (host, url, or 'svc on host') to a
+    host/IP suitable for query_open_ports(target=)."""
+    import re as _re
+    raw = str(raw or "").strip()
+    if not raw:
+        return None
+    m = _re.search(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}", raw)
+    if m:
+        return m.group(0)
+    host = raw.split("//")[-1].split("/")[0].split(":")[0].strip()
+    return host or None
+
+
+def _tool_head(command: str) -> str:
+    return (command or "").strip().split(" ", 1)[0].split("/")[-1].lower()
+
+
+def _classify(category: str, command: str, has_exploit_ref: bool) -> str:
+    """safe|impactful. SAFE requires all three: read-only category, allowlisted
+    tool, no exploit source. Everything else is impactful (fails safe)."""
+    if has_exploit_ref:
+        return "impactful"
+    if (category in _SAFE_CATEGORIES
+            and _tool_head(command) in _SAFE_TOOL_HINTS):
+        return "safe"
+    return "impactful"
+
+
+def _assertion_for(category: str, tls: str) -> dict:
+    """A deterministic structured assertion per test category — the observable
+    that proves the finding. Kept simple so record_test_run can evaluate it."""
+    if category == "tls_check":
+        return {"expect_exit_code": 0, "min_output_bytes": 40}
+    if category == "lfi_read":
+        return {"expect_substring": ["root:x:0:0"]}
+    if category == "sqli_detect":
+        return {"expect_regex": "(?i)injectable|parameter .* is vulnerable|syntax error"}
+    if category == "nuclei_detect":
+        return {"expect_regex": r"\[[a-z0-9-]+\]"}   # nuclei prints [template-id]
+    if category in ("version_probe", "http_probe", "banner", "cert_check"):
+        return {"expect_exit_code": 0, "min_output_bytes": 1}
+    if category == "dir_enum":
+        return {"expect_regex": r"(?i)status: ?200|/[a-z0-9]"}
+    return {"expect_exit_code": 0}
+
+
+def _surface_categories_for(svc: str, tls: str) -> "list[tuple[str,str]]":
+    """(category, tool) safe probes appropriate to a service. Deterministic; the
+    concrete command comes from get_tool_recommendations where possible, else a
+    sensible default here."""
+    web = svc in _SERVICE_FAMILIES_WEB
+    out = []
+    if web:
+        out += [("http_probe", "httpx"), ("nuclei_detect", "nuclei"),
+                ("dir_enum", "gobuster")]
+        if tls == "yes":
+            out += [("tls_check", "sslscan")]
+    if svc in ("smb", "microsoft-ds", "netbios-ssn", "cifs"):
+        out += [("version_probe", "enum4linux-ng")]
+    if svc in ("ssh",):
+        out += [("version_probe", "ssh-audit")]
+    if svc in ("snmp",):
+        out += [("version_probe", "snmpwalk")]
+    if not out:
+        out = [("banner", "nmap")]
+    return out
+
+
+def _build_surface_tests(host: str) -> list:
+    """Deterministic (no LLM) custom tests for ONE host's surface.
+
+    Reuses query_open_ports(target=host) + get_tool_recommendations per service.
+    Each element becomes a candidate test dict with a structured assertion and a
+    safe|impactful tier. Impactful candidates carry an exploit_ref (from the
+    recommender's metasploit[] or match_vuln_to_exploits) so they route to the
+    approval lane; nothing here executes.
+    """
+    tests: list = []
+    try:
+        ports = json.loads(_tool(scan_tools.query_open_ports, target=host, limit=100))
+        items = ports.get("items") or []
+    except Exception:  # noqa: BLE001
+        items = []
+
+    seen = set()
+    for row in items:
+        svc = (row.get("service") or "").strip().lower()
+        port, ip = row.get("port"), row.get("ip") or host
+        if not svc or (svc, port) in seen:
+            continue
+        seen.add((svc, port))
+        if len(tests) >= _SURFACE_TEST_LIMIT:
+            break
+        tls = _tls_state(svc, row.get("product"), row.get("banner"))
+        try:
+            rec = json.loads(_tool(scan_tools.get_tool_recommendations,
+                                   service=svc, port=port))
+        except Exception:  # noqa: BLE001
+            rec = {}
+        rec_tools = {(_tool_head(t.get("command") or t.get("name") or "")): t
+                     for t in (rec.get("tools") or [])}
+
+        # SAFE candidates from the service's read-only probe set.
+        for category, default_tool in _surface_categories_for(svc, tls):
+            rt = rec_tools.get(default_tool)
+            cmd = (rt.get("command") if rt else None)
+            if cmd:
+                cmd = cmd.replace("{target}", str(ip))
+            else:
+                scheme = "https" if tls == "yes" else "http"
+                cmd = {
+                    "httpx": f"httpx -u {scheme}://{ip}:{port} -title -tech-detect -status-code",
+                    "nuclei": f"nuclei -u {scheme}://{ip}:{port} -silent",
+                    "gobuster": f"gobuster dir -u {scheme}://{ip}:{port} -w /usr/share/wordlists/dirb/common.txt -q",
+                    "sslscan": f"sslscan {ip}:{port}",
+                    "enum4linux-ng": f"enum4linux-ng -A {ip}",
+                    "ssh-audit": f"ssh-audit {ip}:{port}",
+                    "snmpwalk": f"snmpwalk -v2c -c public {ip}",
+                    "nmap": f"nmap -sV -Pn -p {port} {ip}",
+                }.get(default_tool, f"nmap -sV -Pn -p {port} {ip}")
+            tier = _classify(category, cmd, has_exploit_ref=False)
+            tests.append({
+                "name": f"{category} {svc}/{port} @ {ip}",
+                "host": ip, "service": svc, "port": port, "tool": _tool_head(cmd),
+                "command": cmd, "category": category, "tier": tier,
+                "assertion": _assertion_for(category, tls),
+                "exploit_ref": None,
+            })
+
+        # IMPACTFUL candidates: metasploit modules the recommender named.
+        for m in (rec.get("metasploit") or [])[:2]:
+            module = m.get("module") or m.get("name")
+            if not module:
+                continue
+            tests.append({
+                "name": f"msf_exploit {module} @ {ip}",
+                "host": ip, "service": svc, "port": port, "tool": "metasploit",
+                "command": None, "category": "msf_exploit", "tier": "impactful",
+                "assertion": {"expect_shell": True},
+                "exploit_ref": {"source": "metasploit", "module": module,
+                                "purpose": m.get("purpose")},
+            })
+
+    return tests
+
+
+def surface_plan(state: PentestState) -> dict:
+    """Deterministic: pick+bound the target, build+classify tests, persist each,
+    queue impactful ones. NO execution here — safe execution is the next node so
+    the checkpointed interrupt never re-runs a real scan."""
+    sid = state["session_id"]
+    host = _host_of(state.get("surface_target_request"))
+    if not host:
+        try:
+            av = json.loads(_tool(scan_tools.get_attack_vectors, limit=1, min_risk=40.0))
+            vs = av.get("vectors") or []
+            host = _host_of(vs[0].get("target")) if vs else None
+        except Exception:  # noqa: BLE001
+            host = None
+    if not host:
+        _msg(sid, "SurfaceTester",
+             "No target host given and no ranked attack vector to fall back on — "
+             "skipping surface tests.")
+        _emit("langgraph_surface_analyzed", sid, {"mode": "no_target"})
+        return {"phase": "surface_onward", "surface_target": None,
+                "surface_tests": [], "pending_surface_tests": [],
+                "findings": ["surface: no target"], "log": ["surface: no target"]}
+
+    candidates = _build_surface_tests(host)
+    import db_utils
+    eng = (get_agent_session(_sid(sid)) or {}).get("configuration", {})
+    engagement_id = eng.get("engagement_id") if isinstance(eng, dict) else None
+
+    persisted, pending = [], []
+    for c in candidates:
+        pending_exploit_id = None
+        if c["tier"] == "impactful":
+            # Queue the exploit for approval FIRST (side effect lives here, before
+            # the interrupt) so the security_tests row can reference it.
+            ref = c.get("exploit_ref") or {}
+            try:
+                res = json.loads(_tool(
+                    scan_tools.queue_exploit_for_approval,
+                    exploit_id=ref.get("module") or c["name"],
+                    source=ref.get("source") or "metasploit",
+                    exploit_title=c["name"],
+                    customized_command=(c.get("command") or ref.get("module") or c["name"]),
+                    target_ip=c["host"], target_port=c.get("port"),
+                    target_service=c.get("service"), exploit_type="rce",
+                    session_id=sid))
+                pending_exploit_id = (res.get("pending_exploit_id")
+                                      or res.get("id") if isinstance(res, dict) else None)
+            except Exception as e:  # noqa: BLE001
+                _msg(sid, "SurfaceTester", f"[queue failed for {c['name']}: {e}]")
+                continue
+            if not pending_exploit_id:
+                continue
+        try:
+            test_id = db_utils.create_security_test(
+                name=c["name"], tier=c["tier"], category=c["category"],
+                target_ip=c["host"], target_port=c.get("port"),
+                target_service=c.get("service"), command=c.get("command"),
+                tool=c.get("tool"), assertion=c.get("assertion"),
+                pending_exploit_id=pending_exploit_id,
+                created_by_session=sid, engagement_id=engagement_id)
+        except Exception as e:  # noqa: BLE001
+            _msg(sid, "SurfaceTester", f"[persist failed for {c['name']}: {e}]")
+            continue
+        rec = {**c, "test_id": test_id, "pending_exploit_id": pending_exploit_id}
+        persisted.append(rec)
+        if c["tier"] == "impactful":
+            pending.append(rec)
+            try:
+                db_utils.record_test_run(test_id, "impactful",
+                                         status_override="skipped",
+                                         command_run=c.get("command"),
+                                         triggered_by="agent",
+                                         triggered_by_session=sid,
+                                         engagement_id=engagement_id)
+            except Exception:  # noqa: BLE001
+                pass
+
+    safe_n = sum(1 for t in persisted if t["tier"] == "safe")
+    _msg(sid, "SurfaceTester",
+         f"Attack surface of {host}: {len(persisted)} custom test(s) — "
+         f"{safe_n} safe (run now), {len(pending)} impactful (need approval).")
+    _emit("langgraph_surface_analyzed", sid,
+          {"target": host, "tests": len(persisted), "safe": safe_n,
+           "impactful": len(pending)})
+    _emit("langgraph_surface_test_planned", sid,
+          {"target": host, "safe": safe_n, "impactful": len(pending)})
+    return {"phase": "surface_safe_exec", "surface_target": host,
+            "surface_tests": persisted, "pending_surface_tests": pending,
+            "findings": [f"surface: {len(persisted)} tests planned for {host}"],
+            "log": [f"surface_plan: {host} safe={safe_n} impactful={len(pending)}"]}
+
+
+def surface_safe_exec(state: PentestState) -> dict:
+    """Run the SAFE tests autonomously. SIDE EFFECTS (real scans) live here,
+    BEFORE the checkpointed interrupt, so a resume never re-runs them."""
+    sid = state["session_id"]
+    import db_utils, time as _time
+    tests = state.get("surface_tests") or []
+    safe = [t for t in tests if t["tier"] == "safe"]
+    results = []
+    for t in safe:
+        t0 = _time.time()
+        out = {}
+        try:
+            out = json.loads(_tool(scan_tools.run_custom_test,
+                                   tool=t["tool"], command=t["command"],
+                                   target=t["host"], port=t.get("port"),
+                                   service=t.get("service"), timeout=300))
+        except Exception as e:  # noqa: BLE001
+            out = {"ok": False, "status_code": 0, "error": str(e)}
+        code = out.get("status_code")
+        if code in (400, 403, 429):
+            # Refused by the gate (out-of-scope / not allowlisted / at capacity).
+            # Record and move on — never retried, never escalated to impactful.
+            try:
+                db_utils.record_test_run(t["test_id"], "safe",
+                    command_run=t["command"], status_override="skipped",
+                    output=f"[{code}] {out.get('detail') or out.get('error')}",
+                    triggered_by="agent", triggered_by_session=sid)
+            except Exception:  # noqa: BLE001
+                pass
+            continue
+        exec_id = out.get("exec_id")
+        exit_code, body, http_status = None, "", None
+        if exec_id:
+            for _ in range(20):
+                _time.sleep(3)
+                try:
+                    st = json.loads(_tool(scan_tools.get_execution_status, exec_id=exec_id))                         if hasattr(scan_tools, "get_execution_status") else {}
+                except Exception:  # noqa: BLE001
+                    st = {}
+                if not st:
+                    break
+                if st.get("status") in ("completed", "failed", "timeout"):
+                    exit_code = st.get("exit_code")
+                    body = st.get("output") or ""
+                    pr = st.get("parsed_results") or {}
+                    http_status = pr.get("status_code") if isinstance(pr, dict) else None
+                    break
+        try:
+            r = db_utils.record_test_run(
+                t["test_id"], "safe", command_run=t["command"], exit_code=exit_code,
+                output=body, duration_ms=int((_time.time() - t0) * 1000),
+                tool_execution_id=exec_id, http_status=http_status,
+                triggered_by="agent", triggered_by_session=sid)
+            results.append({"test": t["name"], "status": r["status"]})
+            _emit("langgraph_surface_test_executed", sid,
+                  {"test": t["name"], "status": r["status"], "lane": "safe"})
+        except Exception as e:  # noqa: BLE001
+            _msg(sid, "SurfaceTester", f"[record failed for {t['name']}: {e}]")
+
+    passed = sum(1 for r in results if r["status"] == "pass")
+    _msg(sid, "SurfaceTester",
+         f"Ran {len(results)} safe test(s): {passed} proved (pass), "
+         f"{len(results) - passed} not proven.")
+    return {"phase": "surface_safe_done", "surface_safe_results": results,
+            "findings": [f"surface: {passed}/{len(results)} safe tests proved"],
+            "log": [f"surface_safe_exec: {passed}/{len(results)} pass"]}
+
+
+def surface_approval(state: PentestState) -> dict:
+    """Human gate for impactful surface tests. ONLY interrupt() — no side effect
+    before the pause, so a resume re-entering this node repeats nothing (mirror
+    of exploit_approval)."""
+    from langgraph.types import interrupt
+    pending = state.get("pending_surface_tests") or []
+    decision = interrupt({
+        "kind": "surface_test_approval",
+        "session_id": str(state["session_id"]),
+        "target": state.get("surface_target", "")[:300],
+        "candidate": "\n".join(f"- {t['name']} (pending_exploit_id={t.get('pending_exploit_id')})"
+                               for t in pending)[:2000],
+        "prompt": ("Approve execution of the queued impactful test(s)? Reply via "
+                   "POST /pentest/{session_id}/approve with "
+                   '{"approved": true|false, "pending_exploit_id": "<uuid>"}'),
+    })
+    if isinstance(decision, dict):
+        approved = bool(decision.get("approved"))
+        note = str(decision.get("note") or "")
+        pending_id = decision.get("pending_exploit_id")
+    else:
+        approved, note, pending_id = bool(decision), "", None
+    sid = state["session_id"]
+    _msg(sid, "SurfaceTester",
+         f"[operator decision] approved={approved}"
+         f"{' pending_exploit_id=' + str(pending_id) if pending_id else ''}",
+         role="user")
+    _emit("langgraph_surface_decision", sid,
+          {"approved": approved, "pending_exploit_id": str(pending_id or "")})
+    return {"phase": "surface_exec" if approved else "surface_onward",
+            "surface_decision": {"approved": approved, "note": note[:500],
+                                 "pending_exploit_id": str(pending_id or "") or None},
+            "findings": [f"surface_approval: approved={approved}"],
+            "log": [f"surface_approval: approved={approved}"]}
+
+
+def surface_exec(state: PentestState) -> dict:
+    """Execute the operator-approved impactful test via the SAME gated body, and
+    record the run against its security_tests row."""
+    sid = state["session_id"]
+    import db_utils
+    decision = state.get("surface_decision") or {}
+    pending_id = decision.get("pending_exploit_id")
+    if not pending_id:
+        _msg(sid, "SurfaceTester",
+             "[approved but no pending_exploit_id] Nothing executed.")
+        return {"phase": "surface_onward",
+                "findings": ["surface_exec: skipped (no id)"],
+                "log": ["surface_exec skipped: no id"]}
+    result = _tool(scan_tools.execute_approved_exploit, pending_id)
+    # Find the security_test that referenced this pending exploit.
+    test = next((t for t in (state.get("pending_surface_tests") or [])
+                 if str(t.get("pending_exploit_id")) == str(pending_id)), None)
+    if test:
+        # Read the exploit_results row id + success for the run record.
+        try:
+            import psycopg2
+            from db_utils import get_db_dsn
+            with psycopg2.connect(get_db_dsn()) as conn, conn.cursor() as cur:
+                cur.execute("SELECT id, success, output FROM public.exploit_results "
+                            "WHERE pending_exploit_id=%s::uuid ORDER BY executed_at DESC LIMIT 1",
+                            (pending_id,))
+                r = cur.fetchone()
+            er_id, success, out = (str(r[0]), r[1], r[2]) if r else (None, False, result)
+            db_utils.record_test_run(
+                test["test_id"], "impactful", command_run=test.get("command"),
+                output=(out or "")[:20000], exploit_result_id=er_id,
+                has_shell=bool(success),
+                status_override=("pass" if success else "fail"),
+                triggered_by="agent", triggered_by_session=sid)
+        except Exception as e:  # noqa: BLE001
+            _msg(sid, "SurfaceTester", f"[record impactful failed: {e}]")
+    _msg(sid, "SurfaceTester", f"[execute_approved_exploit {pending_id}]\n{result[:1500]}")
+    _emit("langgraph_surface_test_completed", sid,
+          {"executed": True, "pending_exploit_id": str(pending_id)})
+    return {"phase": "surface_onward",
+            "findings": [f"surface_exec: executed {pending_id}"],
+            "log": [f"surface_exec: {pending_id}"]}
+
+
 # ── graph ────────────────────────────────────────────────────────────────────
-def _after_analyze(state: PentestState) -> str:
-    """The exploit phase is opt-in per session. Skipping straight to report keeps
-    a default session from parking on an approval nobody asked for."""
+def _surface_onward(state: PentestState) -> str:
+    """After the surface phase, chain into the exploit phase if it too is opted
+    in, else the report."""
     return "exploit_plan" if state.get("exploit_phase") else "report"
+
+
+def _after_analyze(state: PentestState) -> str:
+    """Both extra phases are opt-in and independent. Surface runs first (it can
+    generate impactful candidates the exploit phase would otherwise duplicate)."""
+    if state.get("surface_test_phase"):
+        return "surface_plan"
+    return "exploit_plan" if state.get("exploit_phase") else "report"
+
+
+def _after_surface_plan(state: PentestState) -> str:
+    # Always run the safe lane (it no-ops with zero safe tests) before any gate.
+    if state.get("surface_target"):
+        return "surface_safe_exec"
+    return _surface_onward(state)
+
+
+def _after_surface_safe(state: PentestState) -> str:
+    # Gate only when impactful tests are queued; otherwise chain onward.
+    if state.get("pending_surface_tests"):
+        return "surface_approval"
+    return _surface_onward(state)
+
+
+def _after_surface_approval(state: PentestState) -> str:
+    decision = state.get("surface_decision") or {}
+    return "surface_exec" if decision.get("approved") else _surface_onward(state)
 
 
 def _after_exploit_plan(state: PentestState) -> str:
@@ -865,11 +1321,29 @@ def build_graph(checkpointer=None):
     g.add_node("exploit_plan", exploit_plan)
     g.add_node("exploit_approval", exploit_approval)
     g.add_node("exploit_exec", exploit_exec)
+    g.add_node("surface_plan", surface_plan)
+    g.add_node("surface_safe_exec", surface_safe_exec)
+    g.add_node("surface_approval", surface_approval)
+    g.add_node("surface_exec", surface_exec)
     g.add_node("report", report)
     g.add_edge(START, "recon")
     g.add_edge("recon", "scan")
     g.add_edge("scan", "analyze")
     g.add_conditional_edges("analyze", _after_analyze,
+                            {"surface_plan": "surface_plan",
+                             "exploit_plan": "exploit_plan", "report": "report"})
+    # Surface-test phase: plan -> safe-exec (side effects here, before the
+    # checkpointed interrupt) -> approval -> exec, then chain onward.
+    g.add_conditional_edges("surface_plan", _after_surface_plan,
+                            {"surface_safe_exec": "surface_safe_exec",
+                             "exploit_plan": "exploit_plan", "report": "report"})
+    g.add_conditional_edges("surface_safe_exec", _after_surface_safe,
+                            {"surface_approval": "surface_approval",
+                             "exploit_plan": "exploit_plan", "report": "report"})
+    g.add_conditional_edges("surface_approval", _after_surface_approval,
+                            {"surface_exec": "surface_exec",
+                             "exploit_plan": "exploit_plan", "report": "report"})
+    g.add_conditional_edges("surface_exec", _surface_onward,
                             {"exploit_plan": "exploit_plan", "report": "report"})
     g.add_conditional_edges("exploit_plan", _after_exploit_plan,
                             {"exploit_approval": "exploit_approval", "report": "report"})
@@ -1026,12 +1500,16 @@ def run_langgraph_session_sync(
     web_profile: Optional[str] = None,
     auto_run_recommendations: Optional[bool] = None,
     exploit_phase: Optional[bool] = None,
+    surface_test_phase: Optional[bool] = None,
+    surface_target: Optional[str] = None,
 ):
     """Drop-in LangGraph replacement for the AutoGen session runner."""
     from llm_metrics import LLMMetricsContext
     sid = str(session_id)
     if exploit_phase is None:
         exploit_phase = os.environ.get("LANGGRAPH_EXPLOIT_PHASE", "").strip().lower() in ("1", "true", "yes")
+    if surface_test_phase is None:
+        surface_test_phase = os.environ.get("LANGGRAPH_SURFACE_TEST_PHASE", "").strip().lower() in ("1", "true", "yes")
     if proxy:
         try:
             scan_tools.set_session_proxy(proxy)
@@ -1051,7 +1529,8 @@ def run_langgraph_session_sync(
 
     update_agent_session(_sid(sid), status="active",
                          metadata={"engine": ENGINE_NAME,
-                                   "exploit_phase": bool(exploit_phase)})
+                                   "exploit_phase": bool(exploit_phase),
+                                   "surface_test_phase": bool(surface_test_phase)})
     _msg(sid, "Coordinator",
          f"LangGraph engine starting.\nTarget: {target_description[:300]}\nTask: {task[:300]}\n"
          f"auto_execute={bool(auto_execute_scans)} exploit_phase={bool(exploit_phase)}",
@@ -1069,7 +1548,12 @@ def run_langgraph_session_sync(
             final = graph.invoke({
                 "session_id": sid, "target": target_description, "task": task,
                 "auto_execute": bool(auto_execute_scans),
-                "exploit_phase": bool(exploit_phase), "phase": "recon",
+                "exploit_phase": bool(exploit_phase),
+                "surface_test_phase": bool(surface_test_phase),
+                "surface_target_request": surface_target,
+                "surface_target": None, "surface_tests": None,
+                "surface_safe_results": None, "pending_surface_tests": None,
+                "surface_decision": None, "phase": "recon",
                 "findings": [], "log": [], "exploit_candidate": None,
                 "exploit_decision": None, "report": None,
             }, cfg)

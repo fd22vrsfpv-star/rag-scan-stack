@@ -64,6 +64,18 @@ TOOL_SPECS: List[ToolSpec] = [
         func=scan_tools.get_scan_recommendations,
     ),
     ToolSpec(
+        name="analyze_attack_surface",
+        description=(
+            "Enumerate ONE host's full attack surface as structured JSON: the "
+            "MITRE-mapped attack vectors, its open ports/services, web-finding "
+            "count, and per-service tool/methodology recommendations (including "
+            "ingested attack-path knowledge). Pass target_host to focus a host, "
+            "or omit it to use the highest-risk host. This is the read-only "
+            "'what could be attacked here' view a surface-test agent starts from."
+        ),
+        func=scan_tools.analyze_attack_surface,
+    ),
+    ToolSpec(
         name="get_tool_recommendations",
         description=(
             "Get the CONCRETE tests to run against a discovered service, as "

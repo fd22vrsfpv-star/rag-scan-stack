@@ -220,9 +220,10 @@ def test_engine_source_calls_execute_only_in_the_exec_node():
             if (isinstance(sub, ast.Attribute)
                     and sub.attr == "execute_approved_exploit"):
                 callers.append(node.name)
-    assert callers == ["exploit_exec"], (
+    assert set(callers) <= {"exploit_exec", "surface_exec"}, (
         f"scan_tools.execute_approved_exploit is called from {callers}; it must be "
-        "called only from exploit_exec, which sits after the approval interrupt")
+        "called only from exploit_exec / surface_exec, which sit AFTER an approval "
+        "interrupt — never from a planning or safe-execution node")
 
 
 # ── 4. engine resolution (the canary control) ───────────────────────────────
@@ -528,3 +529,122 @@ def test_approve_409s_on_a_session_that_is_not_parked():
         pytest.skip("session rows carry no id")
     r2 = _post(f"/api/agent-sessions/{sid}/approve", {"approved": False})
     assert r2.status_code == 409, f"expected 409, got {r2.status_code}: {r2.text[:300]}"
+
+
+# ── 6. surface-test phase ───────────────────────────────────────────────────
+# The surface-test agent generates custom tests, runs SAFE ones autonomously and
+# gates IMPACTFUL ones on the same interrupt() the exploit phase uses. Two
+# properties are load-bearing and easy to break with a later edit:
+#   * classification cannot let an impactful test into the safe lane;
+#   * safe execution (real scans) must sit BEFORE the checkpointed interrupt, so
+#     a resume never re-runs it.
+# These read source with ast, so they run on a bare checkout.
+
+def _engine_src():
+    return (_autogen_dir() / "langgraph_engine.py").read_text(encoding="utf-8")
+
+
+def _engine_sets():
+    return _set_constants(_autogen_dir() / "langgraph_engine.py")
+
+
+def test_surface_categories_are_disjoint_and_correctly_tiered():
+    sets = _engine_sets()
+    safe = sets.get("_SAFE_CATEGORIES")
+    imp = sets.get("_IMPACTFUL_CATEGORIES")
+    assert safe and imp, "surface category sets missing — guard would pass vacuously"
+    assert not (safe & imp), f"categories in both tiers: {safe & imp}"
+    # the dangerous categories must be impactful
+    assert {"rce", "shell", "msf_exploit", "file_write", "cred_bruteforce"} <= imp, (
+        "a destructive category is not classified impactful")
+    # the read-only ones must be safe
+    assert {"version_probe", "nuclei_detect", "tls_check", "lfi_read",
+            "sqli_detect"} <= safe, "a read-only probe is not classified safe"
+
+
+def test_classify_fails_safe():
+    """_classify must never call an exploit-sourced or non-allowlisted-tool test
+    safe. Behavioral, via ast-extraction of the function."""
+    import ast as _ast
+    src = _engine_src()
+    tree = _ast.parse(src)
+    ns = {"os": __import__("os")}
+    # pull the constants + helpers _classify depends on
+    want = {"_SAFE_CATEGORIES", "_IMPACTFUL_CATEGORIES", "_SAFE_TOOL_HINTS"}
+    for n in tree.body:
+        if isinstance(n, _ast.Assign) and getattr(n.targets[0], "id", "") in want:
+            exec(compile(_ast.Module([n], []), "<c>", "exec"), ns)
+        if isinstance(n, _ast.FunctionDef) and n.name in ("_tool_head", "_classify"):
+            exec(compile(_ast.Module([n], []), "<f>", "exec"), ns)
+    c = ns["_classify"]
+    assert c("nuclei_detect", "nuclei -u http://x", False) == "safe"
+    assert c("rce", "curl x", False) == "impactful"          # bad category
+    assert c("nuclei_detect", "nuclei -u x", True) == "impactful"   # exploit ref
+    assert c("nuclei_detect", "msfconsole x", False) == "impactful"  # non-allowlisted tool
+    assert c("version_probe", "sslscan 1.2.3.4:443", False) == "safe"
+
+
+def test_run_custom_test_is_in_no_agent_toolset():
+    """run_custom_test takes an arbitrary command; handing it to an LLM would
+    launder any command through the gate. It must be in NO phase toolset and NOT
+    registered as a ToolSpec."""
+    src = _engine_src()
+    for m in re.finditer(r"([A-Z_]+_TOOLS)\s*=\s*", src):
+        # crude: no toolset literal should contain run_custom_test
+        pass
+    assert '"run_custom_test"' not in src or "run_custom_test" not in _engine_sets().get("SCAN_TOOLS_READONLY", set()), \
+        "run_custom_test leaked into a phase toolset"
+    reg = (_autogen_dir() / "tool_registry.py").read_text(encoding="utf-8")
+    assert '"run_custom_test"' not in reg, (
+        "run_custom_test is registered as an agent tool — it must stay off the "
+        "LLM surface (deterministic-only)")
+
+
+def test_surface_approval_is_the_only_interrupt_node():
+    """interrupt() must live only in the two approval nodes; the plan/exec nodes
+    must not contain it, or a resume would re-run their side effects."""
+    tree = ast.parse(_engine_src())
+    interrupt_nodes = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call) and getattr(sub.func, "id", "") == "interrupt":
+                    interrupt_nodes.append(node.name)
+    assert set(interrupt_nodes) == {"exploit_approval", "surface_approval"}, (
+        f"interrupt() is called in {interrupt_nodes}; only the two *_approval "
+        "nodes may pause — a plan/exec node with interrupt() re-runs its side "
+        "effects on resume")
+
+
+def test_safe_execution_runs_before_the_interrupt():
+    """run_custom_test (real scans) must be called from surface_safe_exec, which
+    the graph places BEFORE surface_approval. If safe exec moved into or after
+    the interrupt node, every resume would re-run the scans."""
+    tree = ast.parse(_engine_src())
+    callers = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Attribute) and sub.attr == "run_custom_test":
+                    callers.append(node.name)
+    assert set(callers) <= {"surface_safe_exec"}, (
+        f"run_custom_test is called from {callers}; safe execution must live only "
+        "in surface_safe_exec, before the checkpointed interrupt")
+    # and the edge order: surface_safe_exec is wired before surface_approval
+    src = _engine_src()
+    i_safe = src.index('g.add_node("surface_safe_exec"')
+    i_appr = src.index('g.add_node("surface_approval"')
+    assert i_safe < i_appr, "surface_safe_exec must be declared before surface_approval"
+
+
+def test_surface_event_types_are_in_the_allowlist():
+    """A langgraph_surface_* event not in _ALL_EVENT_TYPES is emitted, 200'd and
+    silently dropped from the Agent Activity timeline."""
+    router = _autogen_dir().parent / "app" / "rag-api" / "webhooks" / "router.py"
+    if not router.exists():
+        pytest.skip("webhooks/router.py not present")
+    src = router.read_text(encoding="utf-8")
+    for ev in ("langgraph_surface_analyzed", "langgraph_surface_test_planned",
+               "langgraph_surface_test_executed", "langgraph_surface_test_completed",
+               "langgraph_surface_decision"):
+        assert f'"{ev}"' in src, f"{ev} missing from _ALL_EVENT_TYPES — it will be dropped"

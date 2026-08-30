@@ -525,6 +525,27 @@ class PentestRequest(BaseModel):
             "status='awaiting_approval' until a human acts."
         ),
     )
+    enable_surface_test_phase: Optional[bool] = Field(
+        None,
+        description=(
+            "LangGraph engine only. Adds the attack-surface test phase after "
+            "analysis: the agent enumerates ONE target's surface, generates "
+            "custom security tests, runs the SAFE ones autonomously (recorded "
+            "with pass/fail history) and PAUSES on the same durable interrupt "
+            "for any IMPACTFUL test until the operator answers "
+            "POST /pentest/{id}/approve. Off unless set "
+            "(LANGGRAPH_SURFACE_TEST_PHASE env default)."
+        ),
+    )
+    surface_target_host: Optional[str] = Field(
+        None,
+        description=(
+            "Surface-test phase only. The ONE host/IP to enumerate and prove "
+            "exhaustively. Omit to let the agent pick the highest-risk host "
+            "from get_attack_vectors. Must be in scope — the scope gate still "
+            "refuses out-of-scope dispatch."
+        ),
+    )
 
 
 class ApprovalRequest(BaseModel):
@@ -1922,6 +1943,8 @@ def run_pentest_session_sync(
     auto_run_recommendations: Optional[bool] = None,
     engine: Optional[str] = None,
     exploit_phase: Optional[bool] = None,
+    surface_test_phase: Optional[bool] = None,
+    surface_target: Optional[str] = None,
 ):
     """Run a pentest session. Delegates to the LangGraph engine.
 
@@ -1961,7 +1984,9 @@ def run_pentest_session_sync(
         session_id, target_description, initial_task, max_rounds,
         resume_context, session_name, auto_execute_scans, proxy,
         port_profile, web_profile, auto_run_recommendations,
-        exploit_phase=exploit_phase)
+        exploit_phase=exploit_phase,
+        surface_test_phase=surface_test_phase,
+        surface_target=surface_target)
 
 
 @app.get("/health")
@@ -2099,6 +2124,8 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
                 "web_profile": request.web_profile,
                 "engine": engine,
                 "enable_exploit_phase": bool(request.enable_exploit_phase),
+                "enable_surface_test_phase": bool(request.enable_surface_test_phase),
+                "surface_target_host": request.surface_target_host,
             }
         )
 
@@ -2133,6 +2160,8 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
                 request.auto_run_recommendations,
                 engine,
                 request.enable_exploit_phase,
+                request.enable_surface_test_phase,
+                request.surface_target_host,
             )
         )
 
@@ -2233,6 +2262,8 @@ async def resume_pentest(session_id: str, request: ResumeRequest):
             # engines is not a resume of the same test.
             "engine": resolve_agent_engine(config.get('engine')),
             "enable_exploit_phase": bool(config.get('enable_exploit_phase')),
+            "enable_surface_test_phase": bool(config.get('enable_surface_test_phase')),
+            "surface_target_host": config.get('surface_target_host'),
         }
     )
 
@@ -2271,6 +2302,8 @@ async def resume_pentest(session_id: str, request: ResumeRequest):
             None,  # auto_run_recommendations
             resolve_agent_engine(config.get('engine')),
             bool(config.get('enable_exploit_phase')),
+            bool(config.get('enable_surface_test_phase')),
+            config.get('surface_target_host'),
         )
     )
 
@@ -2428,6 +2461,7 @@ async def get_agent_engine():
                          "not installed. Requests naming it are logged and run on "
                          "langgraph."),
         "exploit_phase_default": os.environ.get("LANGGRAPH_EXPLOIT_PHASE") or None,
+        "surface_test_phase_default": os.environ.get("LANGGRAPH_SURFACE_TEST_PHASE") or None,
         "availability": availability,
     }
 

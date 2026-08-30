@@ -49,6 +49,13 @@ class StartSessionRequest(BaseModel):
     # LangGraph only: add the exploit phase, which PAUSES the session on a
     # durable interrupt until an operator answers /approve.
     enable_exploit_phase: Optional[bool] = None
+    # LangGraph only: add the attack-surface test phase — enumerate ONE host,
+    # generate custom security tests, run SAFE ones autonomously and PAUSE for
+    # approval on any IMPACTFUL one.
+    enable_surface_test_phase: Optional[bool] = None
+    # The ONE host/IP the surface-test phase enumerates. Omit to auto-pick the
+    # highest-risk host. Must be in scope.
+    surface_target_host: Optional[str] = None
 
 
 class ResumeRequest(BaseModel):
