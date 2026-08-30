@@ -9,7 +9,7 @@ import logging
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Body, File, HTTPException, Query, UploadFile
 from utils import safe_json
 
 from config import get_settings
@@ -74,7 +74,7 @@ async def import_web_scan(
     params = {"tool": tool.lower()} if tool else {}
     try:
         # Parsing a large report is DB-bound; allow well past the normal timeout.
-        async with httpx.AsyncClient(verify=False, timeout=300) as c:
+        async with httpx.AsyncClient(timeout=300) as c:
             resp = await c.post(
                 f"{s.rag_api_url}/ingest/web-scan",
                 params=params,
@@ -104,3 +104,34 @@ async def import_web_scan(
     log.info("Imported %s via %s: %s", file.filename,
              (result or {}).get("tool"), (result or {}).get("stats", {}).get("inserted"))
     return result
+
+
+@router.post("/api/ingest/raw-artifact")
+async def ingest_raw_artifact(body: dict = Body(...)):
+    """Store one manually-uploaded artifact verbatim (operator supplies tool +
+    an optional note). The UI reads the file client-side and posts its text, so
+    this is a JSON passthrough to rag-api's /ingest/raw-artifact — the stored row
+    then behaves like any other: Extract & Learn, drain, follow-on actions."""
+    if not (body.get("tool") or "").strip():
+        raise HTTPException(400, "tool is required")
+    if not (body.get("content") or "").strip():
+        raise HTTPException(400, "content is empty")
+    body.setdefault("source", "manual-upload")
+    s = get_settings()
+    try:
+        async with httpx.AsyncClient(timeout=300) as c:
+            resp = await c.post(
+                f"{s.rag_api_url}/ingest/raw-artifact", json=body,
+                headers={"x-api-key": s.api_key, **engagement_headers()})
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Ingest service unreachable: {e}")
+    if resp.status_code >= 400:
+        detail = resp.text
+        try:
+            jb = resp.json()
+            if isinstance(jb, dict) and "detail" in jb:
+                detail = jb["detail"]
+        except Exception:
+            pass
+        raise HTTPException(resp.status_code, detail)
+    return safe_json(resp)

@@ -16,7 +16,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Optional, Union
+from typing import Dict, Optional, Tuple, Union
 import secrets
 import base64
 
@@ -1158,7 +1158,7 @@ async def _reload_wg_tunnels():
     """Reload/reconnect ALL WireGuard tunnels from DB on startup.
 
     Starts WireGuard tunnels for nodes with successful WireGuard installation.
-    Uses socat to forward local SOCKS port to remote microsocks.
+    Uses socat to forward the local SOCKS port to the remote SOCKS server (danted).
     """
     try:
         conn = _get_conn()
@@ -1218,7 +1218,7 @@ async def _reload_wg_tunnels():
 
             # Start WireGuard tunnel using socat
             try:
-                # Create socat process to forward local SOCKS port to remote microsocks
+                # Create socat process to forward local SOCKS port to the remote SOCKS server
                 socat_cmd = [
                     "socat",
                     f"TCP-LISTEN:{socks_port},fork",
@@ -2440,6 +2440,52 @@ async def ssh_download(node_id: str, req: SSHDownloadRequest):
 # ---------------------------------------------------------------------------
 # Remote Tool Execution — run tools directly on SSH dropbox hosts
 # ---------------------------------------------------------------------------
+# ── Scope gate for the remote-node path ───────────────────────────────────
+#
+# This service SSHes to a node and runs scanners there, so nothing inside the
+# stack sees that traffic and nothing downstream can refuse it. It was also
+# invisible to the audit: node_manager was not in _ROOTS in
+# tests/test_dispatch_invariants.py, so the whole remote path never appeared in
+# SCOPE_DEBT at all.
+#
+# The gate cannot live in the uploaded script. node_manager pushes
+# service_enum_cli.py to /tmp on the node and runs it with python3; etl/ is
+# never delivered alongside, and the node has no database. So the decision has
+# to be made HERE, before dispatch, where the target is known and Postgres is
+# reachable.
+#
+# FAILS CLOSED: no gate means no remote scan.
+try:
+    from common.tool_job import MAX_CONCURRENT_SCANS, async_scan_slot
+    _NODE_SLOTS_OK = True
+except ImportError as _slot_exc:          # pragma: no cover - deployment problem
+    _NODE_SLOTS_OK = False
+    _NODE_SLOT_ERROR = str(_slot_exc)
+
+try:
+    from etl.scope_gate import enforce_target_scope
+    _NODE_SCOPE_GATE_OK = True
+except Exception as _node_scope_exc:      # pragma: no cover - deployment problem
+    _NODE_SCOPE_GATE_OK = False
+    _NODE_SCOPE_ERROR = str(_node_scope_exc)
+
+
+def _remote_scope_refusal(targets, command=""):
+    """Refusal string when a remote scan must not run, else None."""
+    if not _NODE_SCOPE_GATE_OK:
+        return (f"scope gate unavailable ({_NODE_SCOPE_ERROR}) — refusing remote "
+                "scan; check the ./etl:/app/etl mount on node-manager")
+    for t in (targets or []):
+        refusal = enforce_target_scope(str(t), command)
+        if refusal:
+            return refusal
+    if not targets:
+        # No target at all is not a licence to scan; the command may still name
+        # a host, and an empty list must not skip the check entirely.
+        return enforce_target_scope("", command)
+    return None
+
+
 REMOTE_SCAN_TEMPLATES = {
     "masscan": {
         "cmd": ["masscan", "-p", "{ports}", "--rate", "{rate}", "-oJ", "/tmp/scan_out.json"],
@@ -2530,6 +2576,36 @@ REMOTE_SCAN_TEMPLATES = {
 @app.post("/ssh/{node_id}/remote-scan")
 async def remote_scan(node_id: str, req: RemoteScanRequest):
     """Run a scan tool on a remote SSH host, download results, and ingest them."""
+    # Authorisation before anything else — before the template is resolved, the
+    # script uploaded, or a connection opened.
+    _refusal = _remote_scope_refusal(req.targets, " ".join(req.extra_args or []))
+    if _refusal:
+        log.warning("REFUSED remote %s on %s: %s",
+                    getattr(req, "scan_type", "?"), req.targets, _refusal)
+        raise HTTPException(status_code=403, detail=f"Out of scope — {_refusal}")
+
+    # A remote scan is a scan: it consumes the same ceiling as a local one,
+    # rather than a private number. 503 rather than queueing, because this is a
+    # synchronous request path — admitting it and then abandoning it wastes the
+    # work twice, which is the rule CLAUDE.md states as "shed, do not queue".
+    if not _NODE_SLOTS_OK:
+        raise HTTPException(
+            status_code=503,
+            detail=f"scan limit cannot be enforced ({_NODE_SLOT_ERROR}); "
+                   "check the ./common:/app/common mount on node-manager")
+    try:
+        async with async_scan_slot(node_id, f"remote:{getattr(req, 'scan_type', '?')}",
+                                   timeout=5):
+            return await _remote_scan_bounded(node_id, req)
+    except TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail=f"all {MAX_CONCURRENT_SCANS} scan slots busy — retry shortly")
+
+
+async def _remote_scan_bounded(node_id: str, req):
+    """The body of remote_scan, run while holding a scan slot."""
+
     if req.scan_type not in REMOTE_SCAN_TEMPLATES:
         raise HTTPException(400, f"Unsupported scan type: {req.scan_type}. "
                             f"Available: {list(REMOTE_SCAN_TEMPLATES.keys())}")
@@ -2623,8 +2699,29 @@ async def remote_scan(node_id: str, req: RemoteScanRequest):
         if not targets:
             raise HTTPException(400, "No valid IP targets after DNS resolution")
 
-    # Append targets
-    cmd.extend(targets)
+    # Pre-dispatch validation (shared module — see common/dispatch_validation.py,
+    # also used by other dispatch paths). Catches an empty target set and
+    # single-vs-multi arity BEFORE the tool runs.
+    from common.dispatch_validation import validate_dispatch
+    _val = validate_dispatch(req.scan_type, targets)
+    if not _val.ok:
+        raise HTTPException(400, _val.reason)
+
+    # Append targets positionally ONLY when the template does not already place
+    # them via a placeholder ({domain}/{target}/{targets}). service-enum uses
+    # "--domain {domain}"; appending the target list again dumps it as stray
+    # positionals (service_enum_cli.py: "unrecognized arguments: ...").
+    _has_placeholder = any(
+        ("{domain}" in p or "{target}" in p or "{targets}" in p) for p in tmpl["cmd"])
+    if not _has_placeholder:
+        cmd.extend(targets)
+    elif len(_val.fanout) > 1 and not tmpl.get("_per_target"):
+        # Single-arity template given N targets: it only placed the first. The
+        # download+ingest fan-out is not wired on this path yet, so refuse loudly
+        # rather than silently scanning only targets[0].
+        raise HTTPException(400,
+            f"{req.scan_type} accepts a single target per run, but {len(targets)} "
+            f"were provided ({', '.join(targets[:5])}). Dispatch one target per job.")
 
     # Append extra args if provided
     if req.extra_args:
@@ -3117,6 +3214,16 @@ _PROVISION_TOOLS = {
                   "kali": f"{_VENV_PIP} install Pillow",
                   "ubuntu": f"{_VENV_PIP} install Pillow",
                   "debian": f"{_VENV_PIP} install Pillow"},
+    # remote-method-guesser: java-rmi enumeration (port 1099). Not packaged by
+    # Kali, so it is a pinned GitHub release jar behind a /usr/local/bin wrapper.
+    # `verify` greps the banner instead of trusting the exit code — rmg --help
+    # prints correct usage and then exits 1, like many Java CLIs, which fails a
+    # naive `command && echo ok` check on a perfectly good install.
+    "rmg":       {"check": "which rmg",
+                  "verify": "rmg --help 2>&1 | grep -m1 remote-method-guesser",
+                  "kali": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y default-jre-headless && curl -fsSL -o /opt/rmg.jar https://github.com/qtc-de/remote-method-guesser/releases/download/v5.1.0/rmg-5.1.0-jar-with-dependencies.jar && printf '#!/bin/sh\\nexec java -jar /opt/rmg.jar \"$@\"\\n' > /usr/local/bin/rmg && chmod +x /usr/local/bin/rmg",
+                  "ubuntu": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y default-jre-headless && curl -fsSL -o /opt/rmg.jar https://github.com/qtc-de/remote-method-guesser/releases/download/v5.1.0/rmg-5.1.0-jar-with-dependencies.jar && printf '#!/bin/sh\\nexec java -jar /opt/rmg.jar \"$@\"\\n' > /usr/local/bin/rmg && chmod +x /usr/local/bin/rmg",
+                  "debian": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y default-jre-headless && curl -fsSL -o /opt/rmg.jar https://github.com/qtc-de/remote-method-guesser/releases/download/v5.1.0/rmg-5.1.0-jar-with-dependencies.jar && printf '#!/bin/sh\\nexec java -jar /opt/rmg.jar \"$@\"\\n' > /usr/local/bin/rmg && chmod +x /usr/local/bin/rmg"},
     "exiftool":  {"check": "which exiftool",
                   "verify": "exiftool -ver 2>&1",
                   "kali": f"{_APT_CLEANUP}; DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' libimage-exiftool-perl",
@@ -4323,7 +4430,7 @@ async def create_do_droplet(req: DOCreateRequest):
             # Start tunnel in async loop
             import asyncio
             loop = asyncio.new_event_loop()
-            tunnel = SSHTunnel(node_id=node_id, host=ip, user="root", ssh_port=22,
+            tunnel = SSHTunnel(node_id=node_id, name=req.name, host=ip, user="root", ssh_port=22,
                                key_file=ssh_key, socks_port=socks_port)
             result = loop.run_until_complete(ssh_manager.start_tunnel(tunnel))
             loop.close()
@@ -5001,7 +5108,7 @@ async def create_ec2_instance(req: AWSCreateRequest):
         resp = ec2_client.describe_security_groups(GroupNames=[sg_name])
         sg_id = resp["SecurityGroups"][0]["GroupId"]
     except ClientError:
-        resp = ec2_client.create_security_group(GroupName=sg_name, Description="Pentest scan node — SSH access")
+        resp = ec2_client.create_security_group(GroupName=sg_name, Description="Pentest scan node - SSH access")
         sg_id = resp["GroupId"]
         ec2_client.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[
             {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "SSH"}]},
@@ -5090,7 +5197,7 @@ async def create_ec2_instance(req: AWSCreateRequest):
 
             import asyncio
             loop = asyncio.new_event_loop()
-            tunnel = SSHTunnel(node_id=node_id, host=ip, user="ubuntu", ssh_port=22,
+            tunnel = SSHTunnel(node_id=node_id, name=req.name, host=ip, user="ubuntu", ssh_port=22,
                                key_file=ssh_key, socks_port=socks_port)
             result = loop.run_until_complete(ssh_manager.start_tunnel(tunnel))
             loop.close()
@@ -5228,6 +5335,10 @@ class WireGuardConfig(BaseModel):
     qr_code: Optional[str] = None
     installation_status: str = "pending"  # pending, success, failed
     installation_logs: list[str] = []
+    # How the Endpoint was determined, and what still has to be true for it to
+    # work (NAT forwarding). Present only when it had to be derived, i.e. when
+    # WG_SERVERURL was left at "auto".
+    endpoint_note: Optional[str] = None
 
 class CreateWGPeerRequest(BaseModel):
     """Request to create a WireGuard peer."""
@@ -5269,7 +5380,7 @@ async def _auto_install_wireguard(node_id: str, client_config: str, assigned_ip:
     logs.append(f"Starting WireGuard installation on {user}@{host}:{ssh_port}")
 
     try:
-        # Step 1: Install WireGuard and microsocks using script upload approach
+        # Step 1: Install WireGuard and the SOCKS server using script upload approach
         logs.append("Step 1: Installing WireGuard and dependencies...")
 
         # Create installation script content
@@ -5279,29 +5390,100 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 
 echo "Cleaning up any stuck apt processes and locks..."
-# Exact names only: `pkill -f 'apt|dpkg'` also matches this script's own command
-# line (the remote shell is invoked as `zsh -c '...apt...'`) and kills the very
-# install it is preparing for.
-for _p in apt apt-get dpkg; do pkill -x "$_p" 2>/dev/null || true; done
+# Serialise installs on this node with a lock, and do NOT kill other apt runs.
+#
+# The previous approach waited, then pkill'd whatever survived. With two
+# invocations in flight that is mutual destruction: one reaches its pkill and
+# kills the other's `apt-get update` mid-fetch, which the log shows as
+# "Terminated  apt-get ... update -qq" and the caller sees as a step timeout.
+# Nothing serialised installs on a node, so any overlap — a retry, the watchdog,
+# two operators — produced exactly that.
+#
+# flock makes overlap wait instead of fight. The lock is released automatically
+# when this shell exits, including on kill, so a crashed run cannot wedge it.
+exec 9>/var/lock/rag-wg-install.lock 2>/dev/null || exec 9>/tmp/rag-wg-install.lock
+if ! flock -w 600 9; then
+    echo "ERROR: another WireGuard install has held the lock for 10 minutes"
+    exit 1
+fi
+echo "Acquired install lock"
+
+# Only now consider genuinely orphaned apt state. A process still running here
+# is not a competing install (the lock excludes those) — it is unattended
+# upgrades or a leftover, so wait for it rather than killing it.
+echo "Waiting for any in-flight apt/dpkg to finish..."
+for _i in $(seq 1 48); do
+    if ! pgrep -x apt-get >/dev/null 2>&1 && ! pgrep -x dpkg >/dev/null 2>&1 \
+       && ! pgrep -x unattended-upgrade >/dev/null 2>&1; then
+        break
+    fi
+    sleep 5
+done
+
+# Stale lock FILES (not processes) are safe to clear once nothing is running.
+if ! pgrep -x apt-get >/dev/null 2>&1 && ! pgrep -x dpkg >/dev/null 2>&1; then
+    rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
+          /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null || true
+    dpkg --configure -a >/dev/null 2>&1 || true
+fi
 rm -f /var/lib/dpkg/lock* /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null || true
 dpkg --configure -a 2>/dev/null || true
 
-echo "Updating package lists..."
-apt-get update -qq
+# Wait for the dpkg lock rather than dying on it. The pkill above clears a
+# STUCK apt, but a legitimately running one — unattended-upgrades, or another
+# provisioning run — is not stuck and must not be killed. Without this, a
+# concurrent `apt-get update` made the install fail instantly with
+# "Could not get lock /var/lib/dpkg/lock-frontend", which then presented as a
+# 180s step timeout rather than as a lock conflict.
+APT_OPTS="-o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+export DEBIAN_FRONTEND=noninteractive
+
+# Refresh package lists only when they are actually stale.
+#
+# Measured on a live node: lists 60 days old, and `apt-get update` still running
+# after 182 seconds — a full 76MB refetch. Every install paid that cost even when
+# the previous one had just done it, which is most of why a fixed step budget
+# kept expiring. Six hours is well inside the window where a package that
+# resolved before still resolves.
+LISTS_AGE_MIN=99999
+NEWEST="$(find /var/lib/apt/lists -maxdepth 1 -name '*Packages*' -printf '%T@\n' 2>/dev/null | sort -rn | head -1)"
+if [ -n "$NEWEST" ]; then
+    LISTS_AGE_MIN=$(( ( $(date +%s) - ${{NEWEST%.*}} ) / 60 ))
+fi
+if [ "$LISTS_AGE_MIN" -gt 360 ]; then
+    echo "Package lists are ${LISTS_AGE_MIN} min old — updating (this can take minutes)..."
+    apt-get $APT_OPTS update -qq
+else
+    echo "Package lists are ${LISTS_AGE_MIN} min old — skipping update"
+fi
 
 echo "Installing WireGuard tools..."
-apt-get install -y wireguard-tools iproute2 curl netcat-openbsd
+apt-get $APT_OPTS install -y wireguard-tools iproute2 curl netcat-openbsd
 
-# Install microsocks if not present
-if ! command -v microsocks >/dev/null 2>&1; then
-    if [ ! -f /usr/local/bin/microsocks ]; then
-        echo "Downloading microsocks..."
-        curl -L -o /tmp/microsocks https://github.com/rofl0r/microsocks/releases/download/v1.0.3/microsocks-linux-x86_64
-        chmod +x /tmp/microsocks
-        mv /tmp/microsocks /usr/local/bin/microsocks
-        echo "microsocks installed"
-    fi
+# SOCKS proxy: dante-server, not microsocks.
+#
+# microsocks was fetched from
+#   github.com/rofl0r/microsocks/releases/download/v1.0.3/microsocks-linux-x86_64
+# which 404s — that project ships SOURCE-ONLY releases. `curl -L -o` without -f
+# then wrote the 404 body to disk, leaving a 9-byte "Not Found" file marked
+# executable, and the failure surfaced much later as "microsocks startup failed
+# - Unknown error".
+#
+# dante-server is packaged (1.4.4), and three properties matter more than the
+# download being fixable:
+#   * systemd-managed — supervised, restarted on failure, survives reboot. The
+#     microsocks path used nohup, so the proxy died with the shell or the box.
+#   * real logging to syslog rather than a redirect into /tmp.
+#   * ACCESS CONTROL. `microsocks -i <ip> -p 1080` accepts anyone who can reach
+#     that address — an open SOCKS relay on an internet-facing node. danted
+#     restricts to the WireGuard subnet below.
+echo "Installing dante-server..."
+apt-get $APT_OPTS install -y dante-server >/dev/null 2>&1 || true
+if ! command -v danted >/dev/null 2>&1 && [ ! -x /usr/sbin/danted ]; then
+    echo "ERROR: dante-server did not install"
+    exit 1
 fi
+echo "dante-server ready"
 
 echo "Installation completed successfully"
 """
@@ -5329,7 +5511,11 @@ echo "Installation completed successfully"
             # Execute script remotely (simple command that won't be blocked)
             result = await ssh_manager.exec_command(
                 node_id=node_id, host=host, user=user, ssh_port=ssh_port,
-                key_file=key_file, command="bash /tmp/install_wg.sh", timeout=180
+                key_file=key_file, command="bash /tmp/install_wg.sh",
+            # Must exceed the 120s dpkg lock wait above plus the actual install,
+            # otherwise the step times out while apt is legitimately waiting and
+            # the operator sees "Command timed out" instead of the real cause.
+            timeout=420
             )
 
         finally:
@@ -5452,42 +5638,68 @@ echo "Config installed: /etc/wireguard/wg0.conf"
         if result.get("stdout"):
             logs.append(f"Interface info: {result['stdout'][:100]}...")
 
-        # Step 4: Start microsocks
-        logs.append("Step 4: Starting microsocks SOCKS proxy...")
-        microsocks_cmd = f"""
-        # Kill any existing microsocks
-        pkill microsocks 2>/dev/null || true
+        # Step 4: Configure and start the SOCKS server
+        logs.append("Step 4: Configuring dante SOCKS proxy...")
+        socks_cmd = f"""
+        set -e
+        # The external interface is whatever carries the default route; danted
+        # needs it named explicitly and it is not always eth0.
+        EXT_IF="$(ip route get 1.1.1.1 2>/dev/null | awk '{{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}}' | head -1)"
+        EXT_IF="${{EXT_IF:-eth0}}"
+        echo "External interface: $EXT_IF"
 
-        # Start microsocks on WireGuard interface
-        echo "Starting microsocks on {assigned_ip}:1080..."
-        nohup /usr/local/bin/microsocks -i {assigned_ip} -p 1080 >/tmp/microsocks.log 2>&1 &
+        # Bind to the WireGuard address and accept ONLY the WireGuard subnet.
+        # microsocks had no equivalent — it accepted anyone who could reach the
+        # address, which on an internet-facing node is an open relay.
+        cat > /etc/danted.conf <<DANTED
+logoutput: syslog
+internal: {assigned_ip} port = 1080
+external: $EXT_IF
+socksmethod: none
+clientmethod: none
+user.privileged: root
+user.unprivileged: nobody
+
+client pass {{
+    from: 10.66.0.0/24 to: 0.0.0.0/0
+    log: connect disconnect error
+}}
+socks pass {{
+    from: 10.66.0.0/24 to: 0.0.0.0/0
+    log: connect disconnect error
+}}
+DANTED
+
+        # danted binds `internal` at startup, so wg0 must already carry the
+        # address — step 3 brought it up. Restart rather than start so a stale
+        # instance bound to a previous IP is replaced.
+        systemctl enable danted >/dev/null 2>&1 || true
+        systemctl restart danted 2>&1 | tail -3 || true
         sleep 3
 
-        # Verify microsocks is listening
-        echo "Checking microsocks status..."
-        if netstat -ln 2>/dev/null | grep {assigned_ip}:1080; then
-            echo "microsocks is listening on {assigned_ip}:1080"
-        elif ss -ln 2>/dev/null | grep {assigned_ip}:1080; then
-            echo "microsocks is listening on {assigned_ip}:1080 (ss)"
+        echo "Checking danted status..."
+        if ss -ln 2>/dev/null | grep -q "{assigned_ip}:1080" || netstat -ln 2>/dev/null | grep -q "{assigned_ip}:1080"; then
+            echo "danted is listening on {assigned_ip}:1080"
         else
-            echo "ERROR: microsocks not listening on {assigned_ip}:1080"
-            cat /tmp/microsocks.log 2>/dev/null || echo "No microsocks log"
+            echo "ERROR: danted not listening on {assigned_ip}:1080"
+            systemctl status danted --no-pager 2>&1 | tail -12 || true
+            journalctl -u danted -n 20 --no-pager 2>&1 | tail -20 || true
             exit 1
         fi
         """
 
         result = await ssh_manager.exec_command(
             node_id=node_id, host=host, user=user, ssh_port=ssh_port,
-            key_file=key_file, command=microsocks_cmd, timeout=30
+            key_file=key_file, command=socks_cmd, timeout=30
         )
 
         if not result.get("ok"):
-            logs.append(f"ERROR: microsocks startup failed - {result.get('error', 'Unknown error')}")
+            logs.append(f"ERROR: dante startup failed - {result.get('error', 'Unknown error')}")
             if result.get("stderr"):
                 logs.append(f"STDERR: {result['stderr'][:200]}")
             return logs, False
 
-        logs.append("✓ microsocks SOCKS proxy started")
+        logs.append("✓ dante SOCKS proxy started (systemd-managed, restricted to the WG subnet)")
 
         # Step 5: Test connectivity
         logs.append("Step 5: Testing WireGuard connectivity...")
@@ -5500,12 +5712,12 @@ echo "Config installed: /etc/wireguard/wg0.conf"
             echo "WARNING: Cannot ping WireGuard server"
         fi
 
-        # Test if microsocks responds
-        echo "Testing microsocks connectivity..."
+        # Test if the SOCKS server (danted) responds
+        echo "Testing SOCKS connectivity..."
         if nc -z {assigned_ip} 1080; then
-            echo "✓ microsocks is responding"
+            echo "✓ SOCKS proxy is responding"
         else
-            echo "ERROR: microsocks not responding"
+            echo "ERROR: SOCKS proxy not responding"
             exit 1
         fi
 
@@ -5567,13 +5779,161 @@ def _get_next_wg_ip():
     conn.close()
     raise HTTPException(503, "No available IPs in WireGuard subnet")
 
+_WG_PUBKEY_PATH = "/opt/rag-scan-stack/wireguard/server/server/publickey-server"
+
+# wg-server sits behind an "optional" compose profile and is OFF by default, so
+# `docker compose up -d` never starts it and `docker compose ps` does not list
+# it. Telling the operator to "start wg-server first" was accurate and useless —
+# the ordinary start command does not start it, and nothing said why. The exact
+# command is included here because that is the missing piece.
+_WG_NOT_RUNNING = (
+    "WireGuard server is not running. It is behind an optional compose profile, "
+    "so a normal `docker compose up -d` does not start it and it will not appear "
+    "in `docker compose ps`.\n\n"
+    "Start it with:\n"
+    "    docker compose --profile optional up -d wg-server\n\n"
+    "Then retry. If it is already running, the server keys are missing — check "
+    "`docker logs wg-server` for its first-run key generation."
+)
+
+
+
+_WG_CONF_PATH = "/opt/rag-scan-stack/wireguard/server/wg_confs/wg0.conf"
+
+
+def _wg_peers_from_config() -> Dict[str, str]:
+    """Map peer IP -> public key by reading the server config we already mount.
+
+    Replaces `subprocess.run(["docker", "exec", "wg-server", "wg", "show", ...])`,
+    which failed with "No such file or directory: 'docker'" because the CLI is
+    not in this image and the socket is not mounted.
+
+    NOT mounting the socket is deliberate. Docker socket access is
+    root-equivalent on the host — a container that can talk to it can start a
+    privileged container and escape. Granting that to a service which already
+    executes operator-supplied commands on remote hosts is a poor trade for
+    reading a key mapping, particularly in a security tool.
+
+    The data wanted here is configuration, not runtime: the caller only needs
+    peer IP -> public key, and `_add_peer_to_server` writes that same file. Live
+    handshake state genuinely does need the runtime namespace, and the caller
+    that wants it already falls back to a connectivity test.
+    """
+    peers: Dict[str, str] = {}
+    try:
+        with open(_WG_CONF_PATH, "r") as fh:
+            current_key = None
+            for raw in fh:
+                line = raw.strip()
+                if line.lower().startswith("[peer]"):
+                    current_key = None
+                elif line.lower().startswith("publickey"):
+                    current_key = line.split("=", 1)[1].strip()
+                elif line.lower().startswith("allowedips") and current_key:
+                    ips = line.split("=", 1)[1].strip()
+                    for entry in ips.split(","):
+                        ip = entry.strip().split("/")[0]
+                        if ip:
+                            peers[ip] = current_key
+    except FileNotFoundError:
+        log.debug("WireGuard config not present at %s — server likely not started",
+                  _WG_CONF_PATH)
+    except Exception as e:
+        log.warning("Could not parse WireGuard config: %s", e)
+    return peers
+
+
+
+async def _derive_wg_endpoint(node_id: str) -> Optional[Tuple[str, str]]:
+    """Where this server is reachable, as (address, how_we_learned_it).
+
+    `WG_SERVERURL` defaults to "auto", which reaches the client config verbatim
+    and yields `Endpoint = auto:51820` — an unroutable string.
+
+    Two ways to answer, tried in this order:
+
+    1. **Ask the node.** Our SSH session arrives from some address and the node
+       has it in `$SSH_CLIENT`. That is authoritative FOR THAT NODE: by
+       definition an address it can route to us on, correct even when this host
+       is multi-homed or the node is on the same LAN.
+    2. **Ask a public-IP service.** Works with no node connected, but it answers
+       "what does the INTERNET see", which is not necessarily what a particular
+       node sees, and it discloses a lookup to a third party — a small but real
+       consideration for a tool run from an operator's box. Hence second, and
+       only when the node cannot answer.
+
+    Note the direction: the node's own IP (54.186.15.40 here) is the WRONG
+    answer — that is where WE dial IT. The endpoint is where IT dials US; behind
+    NAT those differ, and this host is 199.168.198.186 from the node's side.
+
+    CAVEAT either way: this yields the right ADDRESS, not a working path. If it
+    is a NAT gateway, UDP/51820 must still be forwarded here. Callers say so
+    rather than implying the tunnel will work.
+    """
+    # 1. The node's own view.
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT metadata FROM remote_nodes WHERE id = %s", (node_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        meta = (row[0] if row else None) or {}
+    except Exception as e:
+        log.debug("wg endpoint: no metadata for %s (%s)", node_id, e)
+        meta = {}
+
+    if meta.get("host"):
+        try:
+            res = await ssh_manager.exec_command(
+                node_id=node_id, host=meta["host"],
+                user=meta.get("user", "root"),
+                ssh_port=meta.get("ssh_port", 22),
+                key_file=meta.get("key_file", "id_rsa"),
+                command="echo $SSH_CLIENT",
+                timeout=15,
+            )
+            addr = ((res or {}).get("stdout") or "").strip().split()
+            addr = addr[0] if addr else ""
+            if addr and re.match(r"^[0-9a-fA-F:.]+$", addr) and len(addr) <= 45:
+                log.info("WireGuard endpoint %s derived from node %s SSH_CLIENT",
+                         addr, node_id)
+                return addr, "node's SSH_CLIENT (authoritative for this node)"
+        except Exception as e:
+            log.debug("wg endpoint: node %s could not report SSH_CLIENT (%s)", node_id, e)
+
+    # 2. Public-IP lookup. Opt-out, because it is an outbound call to a third
+    #    party from the operator's host.
+    if os.getenv("WG_ENDPOINT_PUBLIC_LOOKUP", "1").lower() in ("1", "true", "yes"):
+        for url in ("https://ifconfig.me/ip", "https://api.ipify.org"):
+            try:
+                import urllib.request
+                with urllib.request.urlopen(url, timeout=6) as r:
+                    addr = r.read().decode().strip()
+                if addr and re.match(r"^[0-9a-fA-F:.]+$", addr) and len(addr) <= 45:
+                    log.info("WireGuard endpoint %s derived from %s", addr, url)
+                    return addr, f"public-IP lookup via {url}"
+            except Exception as e:
+                log.debug("wg endpoint: %s failed (%s)", url, e)
+
+    return None
+
+
 def _get_server_public_key():
     """Read WireGuard server public key."""
     try:
-        with open("/opt/rag-scan-stack/wireguard/server/server/publickey-server", "r") as f:
-            return f.read().strip()
+        with open(_WG_PUBKEY_PATH, "r") as f:
+            key = f.read().strip()
     except FileNotFoundError:
-        raise HTTPException(503, "WireGuard server not initialized. Start wg-server container first.")
+        raise HTTPException(503, _WG_NOT_RUNNING)
+    if not key:
+        # File exists but is empty — the container started and did not finish
+        # generating keys. A different failure from "never started", and one the
+        # old message would have mislabelled.
+        raise HTTPException(
+            503, "WireGuard server key file is empty — the container started but has "
+                 "not finished initialising. Check `docker logs wg-server`.")
+    return key
 
 def _add_peer_to_server(public_key: str, allowed_ip: str, name: str = ""):
     """Add peer to WireGuard server configuration."""
@@ -5629,13 +5989,21 @@ def _remove_peer_from_server(public_key: str):
 def _get_peer_status(public_key: str):
     """Get live status for a WireGuard peer from the WireGuard server."""
     try:
-        # Try to get real WireGuard status via docker exec to wg-server container
+        # Peer PRESENCE comes from the mounted config; live handshake state would
+        # need wg-server's network namespace, which is what the docker exec here
+        # was reaching for. That call always failed ("No such file or directory:
+        # 'docker'") and fell through to the connectivity test below — which is
+        # the honest check anyway, since it proves the tunnel carries traffic
+        # rather than merely that a peer is configured.
         try:
-            # Execute 'wg show' inside the wg-server container to get real status
-            result = subprocess.run(
-                ["docker", "exec", "wg-server", "wg", "show", "wg0"],
-                capture_output=True, text=True, timeout=5
-            )
+            configured = _wg_peers_from_config()
+
+            class _Result:            # shape the fallback logic already expects
+                returncode = 0 if configured else 1
+                stdout = "\n".join(f"peer: {k}" for k in configured.values())
+                stderr = "" if configured else "no peers in server config"
+
+            result = _Result()
 
             if result.returncode != 0:
                 # Fall back to connectivity test
@@ -5779,6 +6147,27 @@ async def create_wg_peer(request: CreateWGPeerRequest):
         server_public_key = _get_server_public_key()
         server_url = request.endpoint or os.getenv("WG_SERVERURL", "auto")
         server_port = os.getenv("WG_LISTEN_PORT", "51820")
+        endpoint_note = None
+        if not server_url or server_url == "auto":
+            # "auto" reaches the client config verbatim as `Endpoint = auto:51820`,
+            # which cannot be dialled. Ask the node where it sees us from, or fall
+            # back to a public-IP lookup.
+            derived = await _derive_wg_endpoint(request.node_id)
+            if derived:
+                server_url, how = derived
+                endpoint_note = (
+                    f"Endpoint {server_url}:{server_port} was derived from the {how}. "
+                    f"If that address is a NAT gateway, UDP/{server_port} must be "
+                    f"forwarded to this host — deriving the address cannot do that. "
+                    f"Set WG_SERVERURL to pin it explicitly."
+                )
+            else:
+                endpoint_note = (
+                    "Could not determine a reachable endpoint; the config says "
+                    "'auto', which is NOT dialable. Set WG_SERVERURL to this "
+                    "server's reachable address."
+                )
+            log.warning("WireGuard endpoint resolution: %s", endpoint_note)
 
         # Store WireGuard config but keep tunnel_method as 'ssh' until verified
         cur.execute("""
@@ -5857,7 +6246,8 @@ PersistentKeepalive = 25
             node_id=request.node_id,
             client_config=client_config,
             installation_status=installation_status,
-            installation_logs=installation_logs
+            installation_logs=installation_logs,
+            endpoint_note=endpoint_note,
         )
 
     except Exception as e:
@@ -5871,29 +6261,12 @@ def _sync_wg_server_to_database():
     """
     try:
         # Get WireGuard server configuration
-        result = subprocess.run(
-            ["docker", "exec", "wg-server", "wg", "show", "wg0", "dump"],
-            capture_output=True, text=True, timeout=10
-        )
-
-        if result.returncode != 0:
-            log.warning("Could not get WireGuard server configuration: %s", result.stderr)
+        # Read the mounted server config rather than shelling out to docker —
+        # see _wg_peers_from_config for why the socket is deliberately not mounted.
+        server_peers = _wg_peers_from_config()
+        if not server_peers:
+            log.debug("No WireGuard peers in server config — nothing to sync")
             return
-
-        # Parse server peers
-        server_peers = {}
-        lines = result.stdout.strip().split('\n')
-
-        for line in lines[1:]:  # Skip interface line
-            parts = line.strip().split('\t')
-            if len(parts) >= 2:
-                public_key = parts[0]
-                allowed_ips = parts[3] if len(parts) > 3 else ""
-
-                # Extract IP from allowed_ips (e.g., "10.66.0.3/32" -> "10.66.0.3")
-                if allowed_ips and '/' in allowed_ips:
-                    peer_ip = allowed_ips.split('/')[0]
-                    server_peers[peer_ip] = public_key
 
         # Update database with correct public keys
         conn = _get_conn()
@@ -6510,7 +6883,7 @@ async def start_wg_tunnel(node_id: str):
 
     # Start the WireGuard tunnel
     try:
-        # Create socat process to forward local SOCKS port to remote microsocks
+        # Create socat process to forward local SOCKS port to the remote SOCKS server
         # socat TCP-LISTEN:10120,fork TCP:10.66.0.3:1080
         socat_cmd = [
             "socat",

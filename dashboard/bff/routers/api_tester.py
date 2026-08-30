@@ -73,7 +73,7 @@ class CollectionToScope(BaseModel):
 @router.post("/api/api-collections/import-url")
 async def import_swagger_url(body: ImportUrl):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.post(
             f"{s.rag_api_url}/api-collections/import-url",
             json=body.model_dump(),
@@ -87,7 +87,7 @@ async def import_swagger_url(body: ImportUrl):
 @router.post("/api/api-collections/import")
 async def import_swagger_file(file: UploadFile = File(...)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(
             f"{s.rag_api_url}/api-collections/import",
             files={"file": (file.filename, await file.read(), file.content_type or "application/json")},
@@ -101,7 +101,7 @@ async def import_swagger_file(file: UploadFile = File(...)):
 @router.post("/api/api-collections/import-dir")
 async def import_swagger_dir():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.post(
             f"{s.rag_api_url}/api-collections/import-dir",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -114,7 +114,7 @@ async def import_swagger_dir():
 @router.get("/api/api-collections")
 async def list_collections():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/api-collections",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -125,7 +125,7 @@ async def list_collections():
 @router.get("/api/api-collections/{collection_id}")
 async def get_collection(collection_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/api-collections/{collection_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -138,7 +138,7 @@ async def get_collection(collection_id: str):
 @router.delete("/api/api-collections/{collection_id}")
 async def delete_collection(collection_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/api-collections/{collection_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -163,7 +163,7 @@ async def list_endpoints(
         params["tag"] = tag
     if search:
         params["search"] = search
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/api-collections/{collection_id}/endpoints",
             params=params,
@@ -177,7 +177,7 @@ async def list_endpoints(
 @router.post("/api/api-test/sessions")
 async def create_session(body: TestSessionCreate):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/api-test/sessions",
             json=body.model_dump(exclude_none=True),
@@ -191,7 +191,7 @@ async def create_session(body: TestSessionCreate):
 @router.get("/api/api-test/sessions")
 async def list_sessions():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/api-test/sessions",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -202,7 +202,7 @@ async def list_sessions():
 @router.patch("/api/api-test/sessions/{session_id}")
 async def update_session(session_id: str, body: TestSessionUpdate):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.patch(
             f"{s.rag_api_url}/api-test/sessions/{session_id}",
             json=body.model_dump(exclude_none=True),
@@ -216,7 +216,7 @@ async def update_session(session_id: str, body: TestSessionUpdate):
 @router.delete("/api/api-test/sessions/{session_id}")
 async def delete_session(session_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/api-test/sessions/{session_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -229,7 +229,7 @@ async def delete_session(session_id: str):
 @router.post("/api/api-test/execute")
 async def execute_test(body: TestExecute):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.post(
             f"{s.rag_api_url}/api-test/execute",
             json=body.model_dump(exclude_none=True),
@@ -250,7 +250,7 @@ async def get_history(
     params = {"limit": limit}
     if endpoint_id:
         params["endpoint_id"] = endpoint_id
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/api-test/sessions/{session_id}/history",
             params=params,
@@ -262,7 +262,7 @@ async def get_history(
 @router.post("/api/api-test/send-to-pipeline")
 async def send_to_pipeline(body: SendToPipeline):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(
             f"{s.rag_api_url}/api-test/send-to-pipeline",
             json=body.model_dump(exclude_none=True),
@@ -278,7 +278,7 @@ async def send_to_pipeline(body: SendToPipeline):
 @router.post("/api/auth/capture")
 async def capture_auth(body: AuthCapture):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=90) as c:
+    async with httpx.AsyncClient(timeout=90) as c:
         resp = await c.post(
             f"{s.playwright_scanner_url}/auth/capture",
             json=body.model_dump(exclude_none=True),
@@ -293,7 +293,7 @@ async def capture_auth(body: AuthCapture):
 @router.delete("/api/api-test/sessions/{session_id}/history")
 async def clear_session_history(session_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/api-test/sessions/{session_id}/history",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -306,7 +306,7 @@ async def clear_session_history(session_id: str):
 @router.get("/api/api-collections/{collection_id}/common-params")
 async def get_common_params(collection_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/api-collections/{collection_id}/common-params",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -325,7 +325,7 @@ class ParamConfigBody(BaseModel):
 @router.get("/api/api-collections/{collection_id}/param-configs")
 async def list_param_configs(collection_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/api-collections/{collection_id}/param-configs",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -336,7 +336,7 @@ async def list_param_configs(collection_id: str):
 @router.post("/api/api-collections/{collection_id}/param-configs")
 async def create_param_config(collection_id: str, body: ParamConfigBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/api-collections/{collection_id}/param-configs",
             json=body.model_dump(exclude_none=True),
@@ -350,7 +350,7 @@ async def create_param_config(collection_id: str, body: ParamConfigBody):
 @router.put("/api/api-param-configs/{config_id}")
 async def update_param_config(config_id: str, body: ParamConfigBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.put(
             f"{s.rag_api_url}/api-param-configs/{config_id}",
             json=body.model_dump(exclude_none=True),
@@ -364,7 +364,7 @@ async def update_param_config(config_id: str, body: ParamConfigBody):
 @router.delete("/api/api-param-configs/{config_id}")
 async def delete_param_config(config_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/api-param-configs/{config_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -377,7 +377,7 @@ async def delete_param_config(config_id: str):
 @router.post("/api/api-collections/{collection_id}/param-configs/import")
 async def import_param_configs(collection_id: str, body: dict):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/api-collections/{collection_id}/param-configs/import",
             json=body,
@@ -393,7 +393,7 @@ async def import_param_configs(collection_id: str, body: dict):
 @router.post("/api/api-collections/{collection_id}/to-scope")
 async def collection_to_scope(collection_id: str, body: CollectionToScope):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(
             f"{s.rag_api_url}/api-collections/{collection_id}/to-scope",
             json=body.model_dump(),
@@ -409,7 +409,7 @@ async def collection_to_scope(collection_id: str, body: CollectionToScope):
 @router.post("/api/api-test/run-all")
 async def run_all_endpoints(body: RunAll):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=300) as c:
+    async with httpx.AsyncClient(timeout=300) as c:
         resp = await c.post(
             f"{s.rag_api_url}/api-test/run-all",
             json=body.model_dump(exclude_none=True),

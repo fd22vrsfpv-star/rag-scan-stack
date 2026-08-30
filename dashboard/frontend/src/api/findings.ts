@@ -18,6 +18,15 @@ function buildFindingsParams(filters: FindingsFilter): URLSearchParams {
   if (filters.workflow_status?.length) filters.workflow_status.forEach(s => params.append('workflow_status', s))
   if (filters.engagement_id) params.set('engagement_id', filters.engagement_id)
   if (filters.tags?.length) filters.tags.forEach(t => params.append('tags', t))
+  // Virtual-host rollup. problem_scope is NOT the engagement scope — that is a
+  // separate, security-relevant concept (see useScopeFilter).
+  if (filters.problem_scope && filters.problem_scope !== 'all') {
+    params.set('problem_scope', filters.problem_scope)
+  }
+  if (filters.problem_id) params.set('problem_id', filters.problem_id)
+  if (filters.collapse_problems) params.set('collapse_problems', 'true')
+  // Crawl inventory is excluded server-side by default.
+  if (filters.include_inventory) params.set('include_inventory', 'true')
   return params
 }
 
@@ -38,7 +47,14 @@ export function useInfiniteFindings(filters: FindingsFilter = {}) {
     },
     getNextPageParam: (lastPage, allPages) => {
       const loaded = allPages.reduce((n, p) => n + (p.findings?.length ?? 0), 0)
-      return loaded < (lastPage.total ?? 0) ? loaded : undefined
+      // `total` counts ROWS. When collapsing, the server returns one row per
+      // problem, so paginating against `total` would keep asking for pages that
+      // are already exhausted. distinct_problems is the matching row count for
+      // the collapsed view.
+      const available = filters.collapse_problems
+        ? (lastPage.aggregations?.distinct_problems ?? lastPage.total ?? 0)
+        : (lastPage.total ?? 0)
+      return loaded < available ? loaded : undefined
     },
     refetchInterval: POLL.NORMAL,
   })
@@ -54,6 +70,17 @@ export interface FindingsFilter {
   workflow_status?: string[]
   engagement_id?: string
   tags?: string[]
+  /** 'shared' = one problem seen on several vhosts of a machine, 'single' = seen
+   *  on one host only, 'all' = no filter. Distinct from the engagement scope. */
+  problem_scope?: 'all' | 'shared' | 'single'
+  /** Drill into one infrastructure problem group. */
+  problem_id?: string
+  /** Return one row per underlying problem instead of one per virtual host. */
+  collapse_problems?: boolean
+  /** Include URLs a crawler merely discovered (no name, no issue type). These
+   *  are the crawl surface the Burp/HAR exports are built from, but they are
+   *  not findings — 746 of 779 rows were katana output before this existed. */
+  include_inventory?: boolean
   limit?: number
   offset?: number
 }

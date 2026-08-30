@@ -13,6 +13,15 @@ import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+from urllib.parse import urlparse
+
+# The SAME fail-closed matcher the discovery ingests (parse_subfinder/parse_dnsx)
+# use, so ip/cidr/domain/url scope behaves identically everywhere.
+try:
+    from etl.scope_gate import is_in_scope, load_engagement_scope
+except ImportError:  # container layouts that mount etl/ flat
+    from scope_gate import is_in_scope, load_engagement_scope
+
 from rule_engine import get_engine
 
 log = logging.getLogger("osint_agent")
@@ -33,118 +42,191 @@ def _get_or_create_unknown_scope_engagement(cur):
     if row:
         return row[0] if isinstance(row, tuple) else row.get('id')
 
-    # Create unknown_scope engagement
+    # Create unknown_scope engagement.
+    #
+    # This INSERT named `description` and `scope`, NEITHER of which exists on
+    # public.engagements (the columns are `notes` and `scope_name`). So the whole
+    # quarantine path raised UndefinedColumn the first time it was reached —
+    # which, given the scope check was default-allow and almost never fired, is
+    # why nobody hit it. Fixing the check exposed this immediately.
     cur.execute("""
-        INSERT INTO engagements (id, name, description, status, scope, start_date, created_at, updated_at)
+        INSERT INTO engagements (id, name, notes, status, scope_name, start_date, created_at, updated_at)
         VALUES (gen_random_uuid(), 'unknown_scope',
                 'Auto-created engagement for out-of-scope discoveries during OSINT scanning',
                 'active',
-                'Out-of-scope domains and targets discovered during reconnaissance',
+                'unknown_scope',
                 now(), now(), now())
         RETURNING id
     """)
-    engagement_id = cur.fetchone()[0]
+    # RealDictCursor returns a dict, so [0] raises KeyError. The SELECT above
+    # already handled both cursor shapes; this path did not — the second latent
+    # bug in this function, and like the column-name one, only reachable once the
+    # scope check actually started firing.
+    row = cur.fetchone()
+    engagement_id = row[0] if isinstance(row, (tuple, list)) else row.get("id")
     log.info("Created 'unknown_scope' engagement: %s", engagement_id)
     return engagement_id
 
 
-def _is_out_of_scope_target(target, cur):
-    """Check if a target appears to be out of scope based on domain patterns and asset associations."""
+def _target_hostname(target):
+    """Bare hostname from a target string, or "" when none can be parsed.
+
+    Scope is decided by the URL's HOST and nothing else. Substring matching is
+    what made the old check wrong in both directions: it would have called
+    devblog.attacker.com in-scope (contains "dev"), and it cannot tell
+    http://192.168.1.150/redir?url=https://www.owasp.org — an in-scope open
+    redirect ON the target — apart from http://www.owasp.org/... , which is a
+    different host entirely.
+    """
     if not target:
-        return False
-
-    from urllib.parse import urlparse
+        return ""
+    t = str(target).strip()
     try:
-        # Extract domain from URL or use target directly
-        if target.startswith(('http://', 'https://')):
-            parsed = urlparse(target)
-            domain = parsed.netloc.lower()
-            # Remove port numbers if present
-            if ':' in domain:
-                domain = domain.split(':')[0]
-        else:
-            # Handle plain domain or IP
-            domain = target.split('/')[0].split(':')[0].lower()
+        netloc = urlparse(t if "://" in t else "//" + t).netloc
+    except Exception:
+        netloc = t.split("/")[0]
+    return (netloc.split("@")[-1].split(":")[0] or "").strip().lower().rstrip(".")
 
-        # First check if this domain is already associated with in-scope assets
-        # This is the key fix - check the domain against existing assets
+
+def _scanned_host_scope(cur):
+    """Fallback scope: the hosts we actually SCANNED.
+
+    Used only when no scope_targets rows exist. These come from nmap/masscan
+    ingestion, i.e. hosts an operator pointed a scanner at — not hosts a crawler
+    merely linked to. That distinction is the whole point: the old check consulted
+    `assets` for in-scope-ness while discovery was writing into the same table, so
+    anything crawled could authorize itself.
+    """
+    rows = []
+    try:
+        cur.execute("SAVEPOINT scanned_scope")
+        cur.execute("SELECT DISTINCT host(ip)::text FROM assets WHERE ip IS NOT NULL")
+        rows += [(r[0] if not isinstance(r, dict) else r.get("host"), "ip")
+                 for r in cur.fetchall()]
+        cur.execute("SELECT DISTINCT LOWER(hostname) FROM assets WHERE hostname IS NOT NULL")
+        for r in cur.fetchall():
+            h = r[0] if not isinstance(r, dict) else r.get("lower")
+            h = _target_hostname(h)
+            if h:
+                rows.append((h, "domain"))
+        cur.execute("RELEASE SAVEPOINT scanned_scope")
+    except Exception as e:
         try:
-            cur.execute("SAVEPOINT scope_check")
-            # Check for exact hostname match
-            cur.execute("SELECT COUNT(*) FROM assets WHERE LOWER(hostname) = %s", (domain,))
-            exact_match = cur.fetchone()[0] > 0
-
-            if exact_match:
-                cur.execute("RELEASE SAVEPOINT scope_check")
-                return False  # Domain is in scope
-
-            # Check for domain suffix match (e.g., subdomain.example.com matches example.com)
-            cur.execute("SELECT COUNT(*) FROM assets WHERE hostname IS NOT NULL AND (LOWER(hostname) = %s OR LOWER(hostname) LIKE %s)",
-                       (domain, f"%.{domain}"))
-            domain_match = cur.fetchone()[0] > 0
-
-            if domain_match:
-                cur.execute("RELEASE SAVEPOINT scope_check")
-                return False  # Domain or parent domain is in scope
-
-            # Check if the domain is a subdomain of an in-scope domain
-            cur.execute("SELECT hostname FROM assets WHERE hostname IS NOT NULL")
-            in_scope_domains = [row[0].lower() for row in cur.fetchall() if row[0]]
-
-            for in_scope_domain in in_scope_domains:
-                if domain.endswith(f".{in_scope_domain}") or domain == in_scope_domain:
-                    cur.execute("RELEASE SAVEPOINT scope_check")
-                    return False  # Subdomain of in-scope domain
-
-            cur.execute("RELEASE SAVEPOINT scope_check")
+            cur.execute("ROLLBACK TO SAVEPOINT scanned_scope")
         except Exception:
-            try:
-                cur.execute("ROLLBACK TO SAVEPOINT scope_check")
-            except:
-                pass
+            pass
+        log.warning("scanned-host scope lookup failed: %s", e)
+    return [(t, tt) for t, tt in rows if t]
 
-        # Only flag as out-of-scope if domain is clearly external
-        # Known out-of-scope external service domains
-        external_service_patterns = [
-            "demo.testfire.net",
-            "addons.mozilla.org",
-            "github.com",
-            "stackoverflow.com",
-            "w3.org",
-            "mozilla.org",
-            "google.com",
-            "microsoft.com",
-            "apple.com",
-            "facebook.com",
-            "twitter.com",
-            "linkedin.com",
-            "youtube.com",
-            "cloudfront.net",
-            "amazonaws.com",
-            "googletagmanager.com",
-            "googleapis.com",
-            "gstatic.com",
-            "googlesyndication.com",
-            "doubleclick.net"
-        ]
 
-        for pattern in external_service_patterns:
-            if domain == pattern or domain.endswith(f".{pattern}"):
-                return True
+def _host_aliases(cur, host):
+    """Every known identity of `host`: itself, its IPs, and its hostnames.
 
-        # Check if domain looks like internal/private (definitely in scope)
-        if any(internal in domain for internal in ["localhost", "127.", "10.", "192.168.", "172.", "local", "test", "dev", "internal"]):
-            return False
+    A host can be in scope under a name the scope entry does not use. Scope may
+    list 127.0.0.1 while the finding says "localhost"; or scope lists a hostname,
+    the scan resolved it to an IP, and later findings are recorded against that
+    IP. Matching the literal string alone rejects both, which reads to the
+    operator as the gate refusing a host it demonstrably just scanned.
 
-        # Be conservative - don't flag as out of scope unless we're very confident it's external
-        # This prevents false positives on unknown but potentially in-scope domains
+    Aliases come from `assets`, where nmap/masscan ingestion records the ip <->
+    hostname pairing it actually observed. Only pairings we OBSERVED are used —
+    this does not perform live DNS resolution, which an attacker-controlled
+    record could otherwise use to talk its way into scope.
+    """
+    aliases = {host}
+    # Loopback is the one pairing every system agrees on and that assets may not
+    # carry explicitly.
+    if host in ("localhost", "127.0.0.1", "::1"):
+        aliases |= {"localhost", "127.0.0.1", "::1"}
+    try:
+        cur.execute("SAVEPOINT host_aliases")
+        # hostname -> ip(s)
+        cur.execute(
+            "SELECT DISTINCT host(ip)::text AS ip FROM assets "
+            "WHERE ip IS NOT NULL AND LOWER(hostname) = %s", (host,))
+        for r in cur.fetchall():
+            v = r[0] if not isinstance(r, dict) else r.get("ip")
+            if v:
+                aliases.add(str(v).lower())
+        # ip -> hostname(s)
+        cur.execute(
+            "SELECT DISTINCT LOWER(hostname) AS hostname FROM assets "
+            "WHERE hostname IS NOT NULL AND host(ip)::text = %s", (host,))
+        for r in cur.fetchall():
+            v = r[0] if not isinstance(r, dict) else r.get("hostname")
+            v = _target_hostname(v)
+            if v:
+                aliases.add(v)
+        cur.execute("RELEASE SAVEPOINT host_aliases")
+    except Exception as e:
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT host_aliases")
+        except Exception:
+            pass
+        log.warning("alias lookup failed for %r: %s", host, e)
+    return aliases
+
+
+def _load_scope_rows(cur, engagement_id=None):
+    """(scope_rows, source). Engagement scope first, then any scope, then scanned hosts."""
+    rows = load_engagement_scope(cur, engagement_id) if engagement_id else []
+    if rows:
+        return rows, "engagement"
+    try:
+        cur.execute("SAVEPOINT any_scope")
+        cur.execute("SELECT target, target_type FROM public.scope_targets")
+        rows = [(r[0], r[1]) if not isinstance(r, dict) else (r.get("target"), r.get("target_type"))
+                for r in cur.fetchall()]
+        cur.execute("RELEASE SAVEPOINT any_scope")
+    except Exception:
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT any_scope")
+        except Exception:
+            pass
+        rows = []
+    if rows:
+        return rows, "scope_targets"
+    return _scanned_host_scope(cur), "scanned-hosts"
+
+
+def _is_out_of_scope_target(target, cur, engagement_id=None):
+    """True when `target` is NOT in scope. DEFAULT-DENY.
+
+    The previous implementation was default-ALLOW behind a 20-entry hardcoded
+    denylist (github.com, google.com, ...) and ended with:
+
+        # Be conservative - don't flag as out of scope unless we're very confident
         return False
 
-    except Exception:
-        pass
+    So every unrecognised external host was treated as in-scope. www.owasp.org,
+    irongeek.com, www.jcp.org, java.sun.com, www.jguru.com, en.wikipedia.org,
+    samurai.inguardians.com and www.hackersforcharity.org — all linked from the
+    target's own pages — became follow-up items on an engagement that never
+    authorized them. For an authorization boundary the default must be deny.
 
-    return False
-
+    Scope resolution is delegated to etl.scope_gate.is_in_scope, the same
+    fail-closed matcher the discovery ingests use, so ip/cidr/domain/url all
+    behave identically across the system.
+    """
+    host = _target_hostname(target)
+    if not host:
+        # Nothing to authorize against. Fail closed — the caller quarantines
+        # rather than deletes, so this is recoverable.
+        return True
+    scope_rows, source = _load_scope_rows(cur, engagement_id)
+    if not scope_rows:
+        log.warning(
+            "no scope available (no scope_targets, no scanned assets) — cannot "
+            "authorize %r; treating as out-of-scope", host,
+        )
+        return True
+    # Check every known identity, not just the literal string — see _host_aliases.
+    aliases = _host_aliases(cur, host)
+    in_scope = any(is_in_scope(a, scope_rows) for a in aliases)
+    if not in_scope:
+        log.info("out-of-scope target %r (aliases: %s; scope source: %s)",
+                 host, sorted(aliases), source)
+    return not in_scope
 
 def _create_follow_up(cur, *, rule_id, title, target, severity, reason,
                       finding_source, finding_id, confidence=0.9, tags=None,
@@ -201,8 +283,12 @@ def _create_follow_up(cur, *, rule_id, title, target, severity, reason,
         except Exception:
             pass
 
-    # If no engagement found and target appears out of scope, assign to unknown_scope
-    if not engagement_id and _is_out_of_scope_target(target, cur):
+    # Scope is checked ALWAYS, not only when no engagement matched. The old
+    # `if not engagement_id and ...` meant an out-of-scope host that inherited an
+    # engagement from surrounding context skipped the check completely — the
+    # authorization boundary was conditional on a lookup that had nothing to do
+    # with authorization.
+    if _is_out_of_scope_target(target, cur, engagement_id):
         is_out_of_scope = True
         engagement_id = _get_or_create_unknown_scope_engagement(cur)
 

@@ -155,7 +155,7 @@ make clean          # reset everything (destroys local DB data)
 | `tunnel-manager/` | Native Go service for tunnel lifecycle, port allocation, profile-based proxy routing. |
 | `nmap_scanner/`, `nuclei/`, `osint_runner/`, `pd_runner/`, `playwright_scanner/`, `web_scanner/`, `brutus_runner/`, `news_runner/` | Tool-specific scanner runners — each a parser + executor + audit emitter. |
 | `exploit_runner/` | Optional headless Metasploit / web-PoC runner for cleared exploitation steps. |
-| `autogen_agents/`, `scan_recommender/` | Optional LLM agents and RAG-grounded scan recommendation. |
+| `autogen_agents/`, `scan_recommender/` | LangGraph agent sessions (the directory keeps the historical `autogen` name; `pyautogen` is retired) and RAG-grounded scan recommendation. |
 | `burp-extension/` | Jython extension that ingests findings into Burp Issues (with real request/response). |
 | `db_init/` | Postgres schema (`ensure_all_tables.sql`) + verification (`ensure_db_schema.sh`). |
 | `knowledge/` | Scope rules and playbook content used by the recommender's RAG retrieval. |

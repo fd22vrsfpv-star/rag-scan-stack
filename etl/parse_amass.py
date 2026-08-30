@@ -2,6 +2,12 @@ import os, json, uuid, ipaddress
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 
+try:
+    from scope_gate import load_ingest_scope, host_in_scope
+except ImportError:  # pragma: no cover — etl/ may already be on PYTHONPATH
+    from etl.scope_gate import load_ingest_scope, host_in_scope
+
+
 DB_DSN = os.environ.get("DB_DSN", "postgresql://app:app@rag-postgres:5432/scans")
 
 def _load_jsonl(path):
@@ -24,7 +30,7 @@ def _ensure_asset(cur, ip_str):
     row = cur.fetchone()
     if row:
         asset_id = str(row["id"])
-        cur.execute("UPDATE assets SET updated_at=now() WHERE id=%s", (asset_id,))
+        cur.execute("UPDATE assets SET last_seen=now() WHERE id=%s", (asset_id,))
         return asset_id
     asset_id = str(uuid.uuid4())
     cur.execute("INSERT INTO assets (id, ip) VALUES (%s,%s)", (asset_id, ip))
@@ -36,7 +42,7 @@ def parse_amass(path: str, profile: str = "upload", job_id: str = None):
     Amass JSON format (one per line):
     {"name": "sub.example.com", "domain": "example.com", "addresses": [{"ip": "1.2.3.4", "cidr": "1.2.3.0/24", "asn": 12345}], "tag": "dns", "sources": ["DNS"]}
     """
-    stats = dict(records_seen=0, assets_upserted=0, recon_findings_inserted=0, skipped=0, errors=0, error_examples=[])
+    stats = dict(out_of_scope=0, records_seen=0, assets_upserted=0, recon_findings_inserted=0, skipped=0, errors=0, error_examples=[])
     records = _load_jsonl(path)
     stats["records_seen"] = len(records)
     if not records:
@@ -45,10 +51,17 @@ def parse_amass(path: str, profile: str = "upload", job_id: str = None):
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            _enforce_scope, _scope_rows = load_ingest_scope(cur)
             for rec in records:
                 try:
                     cur.execute("SAVEPOINT rec_sp")
                     name = rec.get("name", "").strip()
+                    # Ingest scope gate. amass enumerates broadly and can surface names outside the
+                    # engagement, especially with third-party data sources enabled.
+                    if not host_in_scope(name, _enforce_scope, _scope_rows):
+                        stats["out_of_scope"] = stats.get("out_of_scope", 0) + 1
+                        cur.execute("RELEASE SAVEPOINT rec_sp")
+                        continue
                     if not name:
                         stats["skipped"] += 1
                         cur.execute("RELEASE SAVEPOINT rec_sp")

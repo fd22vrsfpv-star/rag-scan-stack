@@ -61,7 +61,7 @@ def _ensure_asset(cur, ip_str: str, hostname: str = None, engagement_id: str = N
                         "engagement_id = COALESCE(engagement_id, %s), updated_at = now() WHERE id = %s",
                         (hostname, engagement_id, asset_id))
         elif hostname:
-            cur.execute("UPDATE assets SET hostname = COALESCE(hostname, %s), updated_at = now() WHERE id = %s",
+            cur.execute("UPDATE assets SET hostname = COALESCE(hostname, %s), last_seen = now() WHERE id = %s",
                         (hostname, asset_id))
         return asset_id
     asset_id = str(uuid.uuid4())

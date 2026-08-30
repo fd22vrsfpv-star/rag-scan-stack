@@ -12,7 +12,7 @@ router = APIRouter()
 @router.get("/api/cloud/posture")
 async def cloud_posture():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/cloud/posture",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -36,7 +36,7 @@ async def cloud_recommendations(
         params["priority"] = priority
     if status:
         params["status"] = status
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/cloud/recommendations",
             params=params,
@@ -48,7 +48,7 @@ async def cloud_recommendations(
 @router.post("/api/cloud/recommendations/refresh")
 async def cloud_refresh():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(
             f"{s.rag_api_url}/cloud/recommendations/refresh",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -63,7 +63,7 @@ class RecStatusUpdate(BaseModel):
 @router.patch("/api/cloud/recommendations/{rec_id}")
 async def cloud_recommendation_update(rec_id: str, body: RecStatusUpdate):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.patch(
             f"{s.rag_api_url}/cloud/recommendations/{rec_id}",
             params={"status": body.status},
@@ -95,7 +95,7 @@ async def cloud_triage_run(
         params["provider"] = provider
     if model:
         params["model"] = model
-    async with httpx.AsyncClient(verify=False, timeout=300) as c:
+    async with httpx.AsyncClient(timeout=300) as c:
         resp = await c.post(
             f"{s.rag_api_url}/cloud/triage/run",
             params=params,
@@ -117,7 +117,7 @@ async def cloud_triage_latest(
         params["engagement_id"] = engagement_id
     if provider:
         params["provider"] = provider
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/cloud/triage/latest",
             params=params,
@@ -140,7 +140,7 @@ async def cloud_tenants(
                  ("engagement_id", engagement_id)):
         if v:
             params[k] = v
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/cloud-tenants",
             params=params,

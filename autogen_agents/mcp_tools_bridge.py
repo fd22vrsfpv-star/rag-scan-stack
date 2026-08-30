@@ -32,34 +32,18 @@ BUILTIN_MCP_SERVERS = [
     ("zap", 9023),
 ]
 
-# Tools already registered natively in scan_tools.py — skip these to avoid conflicts
-NATIVE_TOOL_NAMES = {
-    # Query tools
-    "query_assets", "query_open_ports", "query_vulnerabilities", "query_exploitdb",
-    "get_scan_recommendations", "get_web_findings", "query_credential_findings",
-    "search_all_findings",
-    # Scan tools
-    "start_full_scan", "start_deep_port_scan", "start_pipeline_scan",
-    "start_smb_vuln_scan", "start_credential_check", "start_masscan",
-    "start_nmap_scan", "start_udp_scan", "start_web_scan", "start_nuclei_scan",
-    "start_playwright_scan", "start_nikto_scan",
-    # Job status
-    "get_nmap_job_status", "get_web_scan_job_status", "get_nuclei_job_status",
-    "get_playwright_job_status", "wait_for_job_completion", "get_all_active_jobs",
-    "get_session_scan_status", "get_pd_job_status", "get_brutus_job_status",
-    "get_osint_job_status",
-    # PD tools
-    "start_httpx_probe", "start_naabu", "start_katana",
-    # Brutus
-    "start_brutus",
-    # OSINT
-    "start_subfinder", "start_dnsx", "start_asnmap", "start_uncover",
-    "start_cloudlist", "start_passive_recon", "get_passive_recon_plan",
-    # Exploit tools
-    "match_vuln_to_exploits", "search_msf_modules", "customize_exploit",
-    "queue_exploit_for_approval", "get_exploit_approval_status",
-    "list_pending_exploits", "execute_approved_exploit",
-}
+# Tools already exposed natively to the agents — skip these so an MCP server
+# advertising the same name cannot shadow the scope-gated local body.
+#
+# This used to be a hand-maintained set: a THIRD copy of the tool roster after
+# the AutoGen registrations and langgraph_tools. It had already drifted — it
+# listed "start_nikto_scan", which no agent tool provides, and omitted several
+# tools that do exist — so a real MCP tool could be skipped as a "native
+# duplicate" of something that was never registered. Derived from the registry
+# now, so it cannot drift again.
+from tool_registry import TOOL_NAMES as _REGISTRY_TOOL_NAMES
+
+NATIVE_TOOL_NAMES = set(_REGISTRY_TOOL_NAMES)
 
 # Map tool name patterns to agent roles for smart registration
 AGENT_ROLE_PATTERNS = {

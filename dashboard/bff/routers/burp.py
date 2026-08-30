@@ -31,7 +31,7 @@ async def burp_status():
     except HTTPException:
         return {"connected": False, "error": "BURP_API_URL not configured"}
     try:
-        async with httpx.AsyncClient(verify=False, timeout=5) as c:
+        async with httpx.AsyncClient(timeout=5) as c:
             resp = await c.get(f"{base}/v0.1/scan", headers=_burp_headers())
             return {"connected": True, "url": base, "status_code": resp.status_code,
                     "scans": resp.json() if resp.status_code == 200 else None}
@@ -66,7 +66,7 @@ async def start_burp_scan(request: Request):
         scan_body["application_logins"] = body["credentials"]
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        async with httpx.AsyncClient(timeout=30) as c:
             resp = await c.post(f"{base}/v0.1/scan", json=scan_body, headers=_burp_headers())
             if resp.status_code in (200, 201):
                 location = resp.headers.get("Location", "")
@@ -81,7 +81,7 @@ async def start_burp_scan(request: Request):
 async def burp_scan_status(task_id: str):
     base = _burp_url()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             resp = await c.get(f"{base}/v0.1/scan/{task_id}", headers=_burp_headers())
             if resp.status_code == 200:
                 data = resp.json()
@@ -96,7 +96,7 @@ async def burp_scan_status(task_id: str):
 async def list_burp_scans():
     base = _burp_url()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             resp = await c.get(f"{base}/v0.1/scan", headers=_burp_headers())
             return {"scans": resp.json()} if resp.status_code == 200 else {"scans": [], "error": f"HTTP {resp.status_code}"}
     except Exception as e:
@@ -107,7 +107,7 @@ async def list_burp_scans():
 async def cancel_burp_scan(task_id: str):
     base = _burp_url()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             resp = await c.delete(f"{base}/v0.1/scan/{task_id}", headers=_burp_headers())
             return {"ok": resp.status_code in (200, 204), "status_code": resp.status_code}
     except Exception as e:
@@ -118,7 +118,7 @@ async def cancel_burp_scan(task_id: str):
 async def burp_scan_issues(task_id: str):
     base = _burp_url()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        async with httpx.AsyncClient(timeout=30) as c:
             resp = await c.get(f"{base}/v0.1/scan/{task_id}", headers=_burp_headers())
             if resp.status_code != 200:
                 return {"issues": [], "error": f"HTTP {resp.status_code}"}
@@ -134,7 +134,7 @@ async def import_burp_results(task_id: str):
     base = _burp_url()
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        async with httpx.AsyncClient(timeout=30) as c:
             resp = await c.get(f"{base}/v0.1/scan/{task_id}", headers=_burp_headers())
             if resp.status_code != 200:
                 raise HTTPException(502, f"Burp returned {resp.status_code}")
@@ -149,19 +149,36 @@ async def import_burp_results(task_id: str):
                 "name": issue.get("name", ""), "severity": (issue.get("severity") or "info").lower(),
                 "confidence": (issue.get("confidence") or "tentative").lower(),
                 "evidence": issue.get("detail", "")[:2000], "description": issue.get("description", ""),
-                "solution": issue.get("remediation", ""), "source": "burp",
-                "issue_type": f"burp-{issue.get('type_index', 'unknown')}",
+                "solution": issue.get("remediation", ""),
+                # /import/findings-exchange reads the per-finding key as "type";
+                # "source" is a single body-level field, not repeated per item.
+                "type": f"burp-{issue.get('type_index', 'unknown')}",
             })
-        imported = 0
-        async with httpx.AsyncClient(verify=False, timeout=60) as c:
-            for finding in findings:
-                try:
-                    resp = await c.post(f"{s.rag_api_url}/findings/web", json=finding, headers={"x-api-key": s.api_key, **engagement_headers()})
-                    if resp.status_code < 300:
-                        imported += 1
-                except Exception:
-                    pass
-        return {"ok": True, "imported": imported, "total": len(findings), "task_id": task_id}
+        # One bulk call to the endpoint built for exactly this ("Import findings
+        # from Burp Suite or other tools in exchange format"), which also dedups
+        # on (url, name, source).
+        #
+        # This used to POST each finding to /findings/web — a route no service
+        # has ever declared — inside `except Exception: pass`. Every import
+        # returned {"ok": true, "imported": 0} and stored nothing, reporting
+        # success while losing the data. Errors now surface instead of being
+        # swallowed, and `skipped` distinguishes "already had it" from "failed".
+        async with httpx.AsyncClient(timeout=60) as c:
+            resp = await c.post(
+                f"{s.rag_api_url}/import/findings-exchange",
+                json={"source": "burp", "findings": findings},
+                headers={"x-api-key": s.api_key, **engagement_headers()},
+            )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, f"Import failed: {resp.text}")
+        result = resp.json()
+        return {
+            "ok": True,
+            "imported": result.get("imported", 0),
+            "skipped": result.get("skipped", 0),
+            "total": len(findings),
+            "task_id": task_id,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -172,7 +189,7 @@ async def _get_burp_proxy_url() -> str:
     """Get Burp proxy URL from DB setting or fall back to env config."""
     s = get_settings()
     try:
-        async with httpx.AsyncClient(verify=False, timeout=3) as c:
+        async with httpx.AsyncClient(timeout=3) as c:
             resp = await c.get(f"{s.rag_api_url}/settings/config/burp_proxy_url", headers={"x-api-key": s.api_key, **engagement_headers()})
             if resp.status_code == 200:
                 return safe_json(resp).get("value") or s.burp_proxy_url
@@ -192,7 +209,7 @@ async def test_burp_proxy():
     start = time.time()
     try:
         # Test connectivity through Burp proxy → httpbin to get external IP
-        async with httpx.AsyncClient(proxy=proxy_url, verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(proxy=proxy_url, timeout=10) as c:
             resp = await c.get("https://httpbin.org/ip")
             elapsed = round((time.time() - start) * 1000)
             if resp.status_code == 200:
@@ -231,7 +248,7 @@ async def configure_burp_proxy(request: Request):
     node_id = body.get("node_id")
     if node_id:
         try:
-            async with httpx.AsyncClient(verify=False, timeout=5) as c:
+            async with httpx.AsyncClient(timeout=5) as c:
                 resp = await c.get(f"{s.tunnel_manager_url}/nodes/{node_id}", headers={"x-api-key": s.api_key, **engagement_headers()})
                 if resp.status_code == 200:
                     node = resp.json()
@@ -240,7 +257,7 @@ async def configure_burp_proxy(request: Request):
                     docker_host_ip = body.get("docker_host_ip")
                     if not docker_host_ip:
                         try:
-                            async with httpx.AsyncClient(verify=False, timeout=3) as c2:
+                            async with httpx.AsyncClient(timeout=3) as c2:
                                 r2 = await c2.get(f"{s.rag_api_url}/settings/config/docker_host_ip", headers={"x-api-key": s.api_key, **engagement_headers()})
                                 if r2.status_code == 200:
                                     docker_host_ip = r2.json().get("value")
@@ -270,7 +287,7 @@ async def configure_burp_proxy(request: Request):
         "port": proxy_port, "version": socks_version,
     }}}}
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             resp = await c.put(f"{base}/v0.1/configuration", json=config, headers=_burp_headers())
             if resp.status_code in (200, 204):
                 return {"ok": True, "message": f"Burp SOCKS{socks_version} proxy set to {proxy_host}:{proxy_port}",
@@ -293,7 +310,7 @@ async def configure_burp_proxy(request: Request):
 async def add_to_burp_queue(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/burp-queue",
             json=body,
@@ -308,7 +325,7 @@ async def list_burp_queue(
     limit: int = Query(200),
 ):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/burp-queue",
             params={"status": status, "limit": limit},
@@ -320,7 +337,7 @@ async def list_burp_queue(
 @router.get("/api/burp/queue/stats")
 async def burp_queue_stats():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(
             f"{s.rag_api_url}/burp-queue/stats",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -331,7 +348,7 @@ async def burp_queue_stats():
 @router.patch("/api/burp/queue/{item_id}")
 async def update_burp_queue_item(item_id: str, status: str = Query(...)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.patch(
             f"{s.rag_api_url}/burp-queue/{item_id}",
             params={"status": status},
@@ -344,7 +361,7 @@ async def update_burp_queue_item(item_id: str, status: str = Query(...)):
 async def bulk_mark_imported(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/burp-queue/mark-imported",
             json=body,
@@ -356,7 +373,7 @@ async def bulk_mark_imported(request: Request):
 @router.delete("/api/burp/queue/{item_id}")
 async def delete_burp_queue_item(item_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/burp-queue/{item_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},

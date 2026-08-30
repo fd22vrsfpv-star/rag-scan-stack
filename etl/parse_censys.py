@@ -2,6 +2,12 @@ import os, json, uuid, ipaddress
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 
+try:
+    from scope_gate import load_ingest_scope, host_in_scope
+except ImportError:  # pragma: no cover
+    from etl.scope_gate import load_ingest_scope, host_in_scope
+
+
 DB_DSN = os.environ.get("DB_DSN", "postgresql://app:app@rag-postgres:5432/scans")
 
 def _load_jsonl(path):
@@ -24,7 +30,7 @@ def _ensure_asset(cur, ip_str):
     row = cur.fetchone()
     if row:
         asset_id = str(row["id"])
-        cur.execute("UPDATE assets SET updated_at=now() WHERE id=%s", (asset_id,))
+        cur.execute("UPDATE assets SET last_seen=now() WHERE id=%s", (asset_id,))
         return asset_id
     asset_id = str(uuid.uuid4())
     cur.execute("INSERT INTO assets (id, ip) VALUES (%s,%s)", (asset_id, ip))
@@ -38,7 +44,7 @@ def _ensure_asset_by_hostname(cur, hostname):
     row = cur.fetchone()
     if row:
         asset_id = str(row["id"])
-        cur.execute("UPDATE assets SET updated_at=now() WHERE id=%s", (asset_id,))
+        cur.execute("UPDATE assets SET last_seen=now() WHERE id=%s", (asset_id,))
         return asset_id
     asset_id = str(uuid.uuid4())
     cur.execute("INSERT INTO assets (id, hostname) VALUES (%s,%s)", (asset_id, hostname))
@@ -47,7 +53,7 @@ def _ensure_asset_by_hostname(cur, hostname):
 
 def parse_censys(path: str, search_type: str = "hosts", profile: str = "upload", job_id: str = None):
     """Parse Censys JSONL output (hosts, certs, or subdomains)."""
-    stats = dict(records_seen=0, assets_upserted=0, recon_findings_inserted=0,
+    stats = dict(out_of_scope=0, records_seen=0, assets_upserted=0, recon_findings_inserted=0,
                  ports_inserted=0, skipped=0, errors=0, error_examples=[])
 
     records = _load_jsonl(path)
@@ -58,6 +64,7 @@ def parse_censys(path: str, search_type: str = "hosts", profile: str = "upload",
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            _enforce_scope, _scope_rows = load_ingest_scope(cur)
             for rec in records:
                 try:
                     cur.execute("SAVEPOINT rec_sp")
@@ -65,6 +72,11 @@ def parse_censys(path: str, search_type: str = "hosts", profile: str = "upload",
 
                     if rec_type == "host":
                         ip = rec.get("ip", "")
+                        # Ingest scope gate: censys is a third-party dataset and returns whatever it holds for a query.
+                        if not host_in_scope(ip, _enforce_scope, _scope_rows):
+                            stats["out_of_scope"] = stats.get("out_of_scope", 0) + 1
+                            cur.execute("RELEASE SAVEPOINT rec_sp")
+                            continue
                         if not ip:
                             stats["skipped"] += 1
                             cur.execute("RELEASE SAVEPOINT rec_sp")
@@ -102,7 +114,11 @@ def parse_censys(path: str, search_type: str = "hosts", profile: str = "upload",
                             # Also insert into ports table if it exists
                             try:
                                 cur.execute("""
-                                    INSERT INTO ports (id, asset_id, port, protocol, service, banner)
+                                    -- Column is `proto`, not `protocol`. With the
+                                    -- wrong name this INSERT raised inside the
+                                    -- surrounding try/except, so Censys-discovered
+                                    -- services never reached the ports table.
+                                    INSERT INTO ports (id, asset_id, port, proto, service, banner)
                                     VALUES (%s, %s, %s, %s, %s, %s)
                                     ON CONFLICT DO NOTHING
                                 """, (str(uuid.uuid4()), asset_id, port,

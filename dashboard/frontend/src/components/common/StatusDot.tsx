@@ -16,6 +16,10 @@ const STATUS_COLORS: Record<string, string> = {
   timeout: 'bg-red-500',
   cancelled: 'bg-yellow-500',
   error: 'bg-red-500',
+  // A LangGraph session paused on an approval interrupt. Pulsing because
+  // it is live and blocking on a human, not finished — a static dot reads
+  // as 'done' and the approval goes unnoticed.
+  awaiting_approval: 'bg-purple-500 animate-pulse',
 }
 
 export function StatusDot({ status }: { status: string }) {

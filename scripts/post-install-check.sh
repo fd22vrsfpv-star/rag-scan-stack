@@ -37,8 +37,13 @@ EXPECTED_TABLES=(
   # TIER 7: Agent / LLM
   agent_sessions agent_messages agent_tool_calls
   session_scan_metrics llm_request_metrics prompt_configs
+  # LangGraph durable checkpoints (AGENT_ENGINE=langgraph). Library-managed by
+  # PostgresSaver.setup(), but declared in db_init so a fresh install has them
+  # before the first agent session — assert them like any other table.
+  checkpoints checkpoint_blobs checkpoint_writes checkpoint_migrations
   # TIER 8: Exploit management
   pending_exploits exploit_results exploit_chunks
+  security_tests security_test_runs
   msf_modules active_listeners exploit_callbacks tool_executions
   # TIER 9: Webhooks
   webhooks webhook_events webhook_deliveries
@@ -61,6 +66,8 @@ EXPECTED_TABLES=(
   sync_nodes sync_state sync_log sync_conflicts
   # TIER 18: Scope
   scope_targets scope_classification_rules scope_decisions scope_suggestions
+  # Self-adapting extractors + agent-to-agent feedback channel
+  extractor_learned agent_flags
   # TIER 18: Scan pipelines
   scan_pipelines scan_pipeline_jobs
   # TIER 19: Recon agent
@@ -75,6 +82,18 @@ EXPECTED_TABLES=(
   chat_presets
   # TIER 24: Per-service / per-port prompts + RAG training data
   service_prompts
+  # TIER 25: Virtual-host finding groups (one problem, N affected vhosts)
+  finding_group_state
+  # TIER 26: Post-execution review (app/rag-api/post_review_agent.py)
+  post_review_reports
+  # TIER 27: Operator-declared scan parameters (app/rag-api/scan_parameters.py)
+  scan_parameters
+)
+
+# Views that reports and the spray list depend on. A missing view fails only when
+# a page queries it, which reads as "no results" rather than "not installed".
+EXPECTED_VIEWS=(
+  v_identity_credential_state
 )
 
 for table in "${EXPECTED_TABLES[@]}"; do
@@ -83,6 +102,15 @@ for table in "${EXPECTED_TABLES[@]}"; do
     pass "$table"
   else
     fail "$table — table missing"
+  fi
+done
+
+for view in "${EXPECTED_VIEWS[@]}"; do
+  result=$(docker exec rag-postgres psql -U app -d scans -tAc "SELECT EXISTS (SELECT FROM pg_views WHERE schemaname='public' AND viewname='$view')" 2>/dev/null)
+  if [[ "$result" == "t" ]]; then
+    pass "$view (view)"
+  else
+    fail "$view (view) — view missing"
   fi
 done
 
@@ -113,7 +141,7 @@ fi
 # Check critical views
 echo ""
 echo "  -- Views --"
-EXPECTED_VIEWS=(detected_software)
+EXPECTED_VIEWS=(detected_software v_infrastructure_findings)
 for view in "${EXPECTED_VIEWS[@]}"; do
   result=$(docker exec rag-postgres psql -U app -d scans -tAc "SELECT EXISTS (SELECT FROM pg_views WHERE schemaname='public' AND viewname='$view')" 2>/dev/null)
   if [[ "$result" == "t" ]]; then
@@ -161,6 +189,58 @@ else
   warn "scope_targets: index check skipped (no DB connection helper available)"
 fi
 
+# scan_recommendations.target_kind — dispatch refuses non-'service' kinds rather
+# than firing a file/range/resource recommendation at an IP as a network scan.
+# Missing column means every rec reads as 'service' and that guard cannot work.
+HAS_TK=$(_run_sql "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='scan_recommendations' AND column_name='target_kind')")
+if [[ "$HAS_TK" == "t" ]]; then
+  pass "scan_recommendations.target_kind column present"
+elif [[ "$HAS_TK" == "f" ]]; then
+  fail "scan_recommendations.target_kind missing — run ./scripts/ensure_db_schema.sh (dispatch cannot distinguish file/range/resource recs)"
+else
+  warn "scan_recommendations.target_kind check skipped (no DB connection helper available)"
+fi
+
+# Asset identity: a hostname equal to the IP is not a virtual host, it is
+# "hostname unknown" written wrongly — and ix_assets_ip_hostname(ip,
+# COALESCE(hostname,'')) counts it as a DIFFERENT row from hostname=NULL. Ports
+# hang off asset_id, so each such row carries a duplicate copy of that host's
+# ports, inflating every port count an agent or report reads.
+HAS_HN_CHECK=$(_run_sql "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='assets_hostname_not_ip')")
+if [[ "$HAS_HN_CHECK" == "t" ]]; then
+  pass "assets_hostname_not_ip CHECK present"
+elif [[ "$HAS_HN_CHECK" == "f" ]]; then
+  fail "assets_hostname_not_ip missing — run ./scripts/ensure_db_schema.sh (duplicate assets per IP will recur, each carrying a copy of that host's ports)"
+else
+  warn "assets_hostname_not_ip check skipped (no DB connection helper available)"
+fi
+
+DUP_PORT_ROWS=$(docker exec rag-postgres psql -U app -d scans -tAc \
+  "SELECT (SELECT count(*) FROM ports) - (SELECT count(*) FROM (SELECT DISTINCT a.ip, p.proto, p.port FROM ports p JOIN assets a ON p.asset_id = a.id) d);" 2>/dev/null)
+if [[ -z "$DUP_PORT_ROWS" ]]; then
+  warn "ports duplication check skipped (could not query)"
+elif [[ "$DUP_PORT_ROWS" -le 0 ]]; then
+  pass "ports carry no (ip, proto, port) duplicates"
+else
+  fail "ports has $DUP_PORT_ROWS duplicate (ip, proto, port) row(s) — run ./scripts/ensure_db_schema.sh"
+fi
+
+# Verified credentials must reach the vault, or the Users page badge stays dark.
+# The bridge runs automatically after a brutus ingest, so a non-zero count here
+# means an upgrade landed on a database that already had credential findings.
+UNBRIDGED=$(_run_sql "SELECT count(*) FROM (
+    SELECT DISTINCT host(cf.ip) AS h, lower(cf.username) AS u
+      FROM credential_findings cf WHERE cf.valid_cred IS TRUE) f
+   WHERE NOT EXISTS (SELECT 1 FROM credential_vault cv
+                      WHERE lower(cv.username) = f.u AND cv.domain = f.h)")
+if [[ -z "$UNBRIDGED" ]]; then
+  warn "credential bridge check skipped (could not query)"
+elif [[ "$UNBRIDGED" -eq 0 ]]; then
+  pass "every verified credential is present in credential_vault"
+else
+  warn "$UNBRIDGED verified credential account(s) are not in credential_vault — the Users page 'cred' badge will be dark for them; POST /vault/bridge-credential-findings {\"dry_run\": false}"
+fi
+
 # assets.provider column + GIN index — required for cloud-hosting filter
 HAS_PROVIDER=$(_run_sql "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='assets' AND column_name='provider')")
 if [[ "$HAS_PROVIDER" == "t" ]]; then
@@ -179,6 +259,16 @@ elif [[ "$HAS_PRIO" == "f" ]]; then
   fail "scan_recommendations.priority missing — run ./scripts/ensure_db_schema.sh"
 else
   warn "scan_recommendations.priority check skipped (no DB connection helper available)"
+fi
+
+# raw_artifacts.note / item_count — upload label + per-file item count (Scan Results)
+HAS_ARTIFACT_COLS=$(_run_sql "SELECT (count(*) = 2)::text FROM information_schema.columns WHERE table_name='raw_artifacts' AND column_name IN ('note','item_count')")
+if [[ "$HAS_ARTIFACT_COLS" == "true" ]]; then
+  pass "raw_artifacts.note + item_count columns present"
+elif [[ "$HAS_ARTIFACT_COLS" == "false" ]]; then
+  fail "raw_artifacts.note/item_count missing — run ./scripts/ensure_db_schema.sh"
+else
+  warn "raw_artifacts.note/item_count check skipped (no DB connection helper available)"
 fi
 
 # idx_assets_engagement_ip — G3 discovery scan-loop hot lookup
@@ -495,12 +585,106 @@ if [[ -n "$DASH" ]]; then
     pass "port profiles loaded from knowledge/port_profiles.yaml"
   fi
 
+  # Follow-on action rules also come from the knowledge/ mount. A missing or
+  # malformed file does not break any endpoint — it just means NO follow-up is
+  # ever suggested, which looks identical to "this output had nothing to act
+  # on". Assert both that rules loaded and that none failed to parse.
+  # Recommender capacity + LLM backend. Both fail SILENTLY: /next_scan returns
+  # 200 from deterministic rules whether or not the LLM is usable, so a missing
+  # container or an uninstalled model shows up as "fewer recommendations" rather
+  # than as an error. Reported as a warning, not a failure — deterministic-only
+  # is a valid way to run this.
+  # ONE probe, direct. The old primary leg went through the dashboard at
+  # /api/scan-recommendations/capacity -- a route NO service declares. It
+  # returned {"detail":"Not Found"}, which is not empty, so the `-z` test below
+  # never fired and the working fallback was unreachable. The check then warned
+  # "scan-recommender may be down" about a service answering 200 with
+  # engagement_scan_limit and reachable:true. A dead leg that MASKS a live one is
+  # worse than a missing check: it trains the operator to ignore the output.
+  #
+  # CLAUDE.md: "A fallback leg is an endpoint. Verify every leg or delete it."
+  # Deleted, because nothing else in the repo ever called that path.
+  CAP_JSON=$(docker exec scan-recommender curl -sk --max-time 15 \
+      "https://127.0.0.1:8013/next_scan/capacity" 2>/dev/null || true)
+  if ! echo "$CAP_JSON" | grep -q '"engagement_scan_limit"'; then
+    # Retry over plain HTTP once: TLS on this port is the norm, but a dev
+    # container may serve http and a wrong-scheme miss should not read as down.
+    CAP_JSON=$(docker exec scan-recommender curl -s --max-time 15 \
+        "http://127.0.0.1:8013/next_scan/capacity" 2>/dev/null || true)
+  fi
+  if echo "$CAP_JSON" | grep -q '"engagement_scan_limit"'; then
+    LIMIT=$(echo "$CAP_JSON" | grep -o '"engagement_scan_limit":[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
+    pass "recommender bounded by engagement scan limit (${LIMIT})"
+    if echo "$CAP_JSON" | grep -q '"reachable":[[:space:]]*false'; then
+      warn "LLM backend unreachable — recommendations are deterministic-only: $(echo "$CAP_JSON" | grep -o '"note":[[:space:]]*"[^"]*"' | head -1)"
+    elif echo "$CAP_JSON" | grep -q '"model_present":[[:space:]]*false'; then
+      warn "configured LLM model is not installed — LLM recommendations fall back to rules"
+    fi
+  else
+    warn "could not read recommender capacity (scan-recommender may be down)"
+  fi
+
+  RULES_JSON=$(docker exec "$DASH" curl -sk "https://127.0.0.1/api/artifacts/auto-queue" 2>/dev/null || true)
+  RULES_N=$(echo "$RULES_JSON" | grep -o '"rules_loaded":[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
+  if [[ -z "$RULES_N" || "$RULES_N" -eq 0 ]]; then
+    fail "no artifact follow-on rules loaded — check knowledge/artifact_rules/builtin.yaml and the ./knowledge:/knowledge:ro mount"
+  elif echo "$RULES_JSON" | grep -q '"rule_errors":[[:space:]]*\[[^]]'; then
+    fail "artifact rule file has errors (those rules are not running): $(echo "$RULES_JSON" | grep -o '"rule_errors":.*')"
+  else
+    pass "artifact follow-on rules loaded (${RULES_N} rules)"
+  fi
+
   WEB_DEGRADED=$(docker exec "$DASH" curl -sk "https://127.0.0.1/api/web-profiles" 2>/dev/null \
     | grep -o '"degraded":[[:space:]]*true' || true)
   if [[ -n "$WEB_DEGRADED" ]]; then
     fail "web profiles degraded — check ./knowledge:/knowledge:ro mount on pentest-dashboard"
   else
     pass "web profiles loaded from knowledge/web_profiles.yaml"
+  fi
+
+  # The merged CA bundle is what lets internal HTTPS verify instead of every
+  # caller passing verify=False. If it is missing, REQUESTS_CA_BUNDLE points at a
+  # nonexistent path and EVERY verifying TLS call in that container fails — a far
+  # louder failure than the one it replaced, so check it explicitly.
+  if [[ -f certs/ca-bundle.crt ]]; then
+    bundle_n=$(grep -c "BEGIN CERTIFICATE" certs/ca-bundle.crt || echo 0)
+    if [[ "$bundle_n" -gt 100 ]] && grep -q "RagScanStack internal" certs/ca-bundle.crt; then
+      pass "CA bundle present (${bundle_n} certs, includes the internal cert)"
+    else
+      fail "certs/ca-bundle.crt looks wrong (${bundle_n} certs, internal cert marker missing) — rerun scripts/generate-ca-bundle.sh"
+    fi
+    if docker ps --format '{{.Names}}' | grep -q '^rag-api$'; then
+      if docker exec rag-api test -r /certs/ca-bundle.crt 2>/dev/null; then
+        pass "rag-api can read /certs/ca-bundle.crt"
+      else
+        fail "rag-api cannot read /certs/ca-bundle.crt — REQUESTS_CA_BUNDLE points at a missing file; every verifying HTTPS call in it will fail"
+      fi
+    fi
+  else
+    fail "certs/ca-bundle.crt missing — run scripts/generate-ca-bundle.sh (services set REQUESTS_CA_BUNDLE to it)"
+  fi
+
+  # nmap_scanner resolves the SAME profile for its own empty-ports fallback, so
+  # it needs the knowledge/ mount too. Without it the fallback degrades to the
+  # sequential 1-1000 range — which still returns HTTP 200 and still produces
+  # results, just results that miss mysql/postgresql/vnc/tomcat. Nothing else in
+  # this script would catch that.
+  if docker ps --format '{{.Names}}' | grep -q '^nmap_scanner$'; then
+    if docker exec nmap_scanner test -r /knowledge/port_profiles.yaml 2>/dev/null; then
+      pass "nmap_scanner can read knowledge/port_profiles.yaml"
+    else
+      fail "nmap_scanner cannot read /knowledge/port_profiles.yaml — add ./knowledge:/knowledge:ro to the nmap_scanner volumes; its default quick scan will silently fall back to the sequential 1-1000 range"
+    fi
+
+    # The deep sweep must cover the full range. 1001-65535 was correct only while
+    # the quick pass was sequential 1-1000; against the frequency-ranked top-1000
+    # it leaves the low ports outside that list unscanned by either phase.
+    DEEP=$(docker exec nmap_scanner printenv DEEP_SCAN_PORTS 2>/dev/null || echo "")
+    if [[ "$DEEP" == "1001-65535" ]]; then
+      fail "nmap_scanner DEEP_SCAN_PORTS=1001-65535 — stale value; set DEEP_SCAN_PORTS=1-65535 in .env and recreate the container"
+    else
+      pass "nmap_scanner deep sweep scope = ${DEEP:-1-65535 (default)}"
+    fi
   fi
 fi
 
@@ -520,4 +704,68 @@ else
   echo ""
   echo "All critical checks passed."
   exit 0
+fi
+
+# ── Running code vs working tree ──────────────────────────────────────────
+# Most services bake their source into the image, so `docker compose restart`
+# re-runs OLD code with no error. A scope fix once sat committed and believed
+# live for hours while the container kept ingesting out-of-scope hosts.
+echo ""
+echo "🔍 Verifying containers run the current code..."
+# Shared modules copied per Docker build context must stay identical. A weaker
+# sanitizer in one service is a real hole, and drift here is silent: each
+# service works fine in isolation.
+if python3 "$(dirname "${BASH_SOURCE[0]}")/check_shared_code.py" >/dev/null 2>&1; then
+  pass "shared modules consistent across services"
+else
+  fail "shared module drift — run: python3 scripts/check_shared_code.py --list"
+fi
+
+# Every SQL column reference must exist on the table it reads or writes.
+#
+# The one defect class no other guard here can catch: it passes ast.parse,
+# imports fine, reports a healthy container, and 500s only when that code path
+# runs. Postgres also reports only the FIRST bad column, so one fix can reveal
+# the next. Its first run found 20 — including seven in one function whose
+# caller logged the failure as a warning, so agents silently lost the "what we
+# already know about this target" context and re-scanned covered ground.
+if python3 "$(dirname "${BASH_SOURCE[0]}")/../tests/test_sql_columns.py" >/tmp/sqlcols.log 2>&1; then
+  pass "SQL columns — $(grep -oE 'Checked [0-9]+' /tmp/sqlcols.log | head -1 | awk '{print $2}') reference(s) resolve against the schema"
+else
+  fail "SQL reference(s) name a column their table does not have:"
+  grep -E '^  ✗' /tmp/sqlcols.log 2>/dev/null | head -10 || true
+fi
+
+# Every BFF proxy call must name a path some service actually declares.
+#
+# Static, so it runs before anything is up. 68% of BFF routes are thin proxies
+# whose only real failure mode is naming a dead upstream path — and a fallback
+# or a bare `except` hides that from the live sweep. Its first run found four,
+# including a Burp import that reported success while storing nothing.
+if python3 "$(dirname "${BASH_SOURCE[0]}")/../tests/test_proxy_contracts.py" >/tmp/proxy.log 2>&1; then
+  pass "proxy contracts — $(grep -oE 'Checked [0-9]+' /tmp/proxy.log | head -1 | awk '{print $2}') call(s) resolve upstream"
+else
+  fail "proxy call(s) name an upstream path no service declares:"
+  grep -E '^  ✗' /tmp/proxy.log 2>/dev/null | head -10 || true
+fi
+
+# Call every GET endpoint — bare and parameterised — and fail on any 5xx.
+#
+# ~1,150 endpoints exist and about 11% are mentioned by any test, so this sweep
+# is the only thing that touches most of them. Its first run found four broken
+# endpoints in two minutes — a query on a non-existent column and a set of
+# routes made unreachable by declaration order. Extending it to parameterised
+# GETs (ids resolved live from list endpoints) immediately found a fifth:
+# /scope/{name}/analysis selected two columns that do not exist.
+if python3 "$(dirname "${BASH_SOURCE[0]}")/smoke_endpoints.py" >/tmp/smoke.log 2>&1; then
+  pass "endpoint smoke sweep — no 5xx ($(grep -c '200' /tmp/smoke.log 2>/dev/null || echo '?') checked)"
+else
+  fail "endpoint smoke sweep found failing endpoint(s):"
+  grep -E '^  ✗' /tmp/smoke.log 2>/dev/null | head -10 || true
+fi
+
+if python3 "$(dirname "${BASH_SOURCE[0]}")/check_image_freshness.py"; then
+    :
+else
+    echo "   ^ rebuild the services listed above; a restart will not help"
 fi

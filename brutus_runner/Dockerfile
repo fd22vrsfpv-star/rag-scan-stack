@@ -11,7 +11,10 @@ ENV GOTOOLCHAIN=auto
 RUN CGO_ENABLED=0 go install github.com/praetorian-inc/brutus/cmd/brutus@latest
 
 # Stage 2: Python runtime
-FROM python:3.12-slim
+# Shared modules (validation, sql_utils, structured_logger, tool_job) come
+# from this base — see common/Dockerfile. Build it first with
+# scripts/build-base-image.sh; compose does not order builds by FROM.
+FROM rag-common:latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
@@ -38,7 +41,9 @@ COPY brutus_runner/requirements.txt /runner/requirements.txt
 RUN pip install --no-cache-dir -r /runner/requirements.txt
 
 COPY brutus_runner/brutus_runner.py /runner/brutus_runner.py
-COPY brutus_runner/validation.py    /runner/validation.py
+# validation.py now comes from the rag-common base image; the per-service
+# copy was deleted. Seven copies existed and one had drifted with a real
+# fix stranded in it.
 COPY brutus_runner/log_manager.py   /runner/log_manager.py
 
 EXPOSE 8025

@@ -26,8 +26,12 @@ class TestDatabaseUtils:
         # Setup mock
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_connect.return_value.__exit__ = MagicMock(return_value=None)
+        # db_utils.get_db() is a @contextmanager that yields psycopg2.connect(...)
+        # DIRECTLY, so the patched connect() return value IS the connection.
+        # Treating it as its own context manager left the real conn a bare
+        # MagicMock, so fetchone() never returned the configured rows and every
+        # assertion compared against a MagicMock instead of a UUID.
+        mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 
@@ -40,10 +44,19 @@ class TestDatabaseUtils:
 
         # Verify
         assert result == asset_id
-        mock_cursor.execute.assert_any_call(
-            "SELECT id FROM assets WHERE ip = %s::inet",
-            ('192.168.1.100',)
-        )
+        # Assert the SUBSTANCE of the lookup, not its exact text. The query has
+        # since gained a hostname condition and a LIMIT, and pinning the literal
+        # string made a legitimate query change look like a regression while
+        # testing nothing about behaviour.
+        lookups = [c for c in mock_cursor.execute.call_args_list
+                   if "SELECT id FROM assets" in c[0][0]]
+        assert lookups, "expected an asset lookup query"
+        sql, params = lookups[0][0][0], lookups[0][0][1]
+        # A hostname was supplied, and the code resolves by hostname FIRST
+        # (falling back to ip). The original test asserted an ip lookup, which
+        # stopped being the first query when that precedence was introduced.
+        assert ("hostname = %s" in sql) or ("ip = %s::inet" in sql), sql
+        assert ('testhost' in params) or ('192.168.1.100' in params), params
         # Should update last_seen
         assert mock_cursor.execute.call_count == 2
         mock_conn.commit.assert_called_once()
@@ -53,21 +66,38 @@ class TestDatabaseUtils:
         """Test creating a new asset."""
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_connect.return_value.__exit__ = MagicMock(return_value=None)
+        # db_utils.get_db() is a @contextmanager that yields psycopg2.connect(...)
+        # DIRECTLY, so the patched connect() return value IS the connection.
+        # Treating it as its own context manager left the real conn a bare
+        # MagicMock, so fetchone() never returned the configured rows and every
+        # assertion compared against a MagicMock instead of a UUID.
+        mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 
-        # No existing asset
+        # No existing asset. THREE lookups now precede the insert, not one:
+        #   1. exact (ip, hostname) combo
+        #   2. NEW: a nameless row for this address, or the single named one —
+        #      a row with no hostname is this host before its name was known, and
+        #      inserting a sibling instead of reusing it is what split
+        #      192.168.1.150 into two assets with its ports on one and its
+        #      findings on the other
+        #   3. the INSERT's RETURNING id
+        # Asserting on a fixed call index would only pin the old sequence, so
+        # find the insert instead of counting to it.
         asset_id = uuid.uuid4()
-        mock_cursor.fetchone.side_effect = [None, {'id': asset_id}]
+        mock_cursor.fetchone.side_effect = [None, None, {'id': asset_id}]
 
         # Execute
         result = db_utils.get_or_create_asset('192.168.1.200')
 
         # Verify
         assert result == asset_id
-        assert 'INSERT INTO assets' in mock_cursor.execute.call_args_list[1][0][0]
+        statements = [c[0][0] for c in mock_cursor.execute.call_args_list]
+        assert any('INSERT INTO assets' in sql for sql in statements), statements
+        # and the adoption lookup really ran, or nothing stops the duplicate
+        assert any('FROM assets b WHERE b.ip = a.ip' in sql for sql in statements), \
+            'the nameless-row lookup is gone; duplicate assets will recur'
         mock_conn.commit.assert_called_once()
 
     @patch('playwright_scanner.db_utils.psycopg2.connect')
@@ -75,8 +105,12 @@ class TestDatabaseUtils:
         """Test creating a Playwright scan record."""
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_connect.return_value.__exit__ = MagicMock(return_value=None)
+        # db_utils.get_db() is a @contextmanager that yields psycopg2.connect(...)
+        # DIRECTLY, so the patched connect() return value IS the connection.
+        # Treating it as its own context manager left the real conn a bare
+        # MagicMock, so fetchone() never returned the configured rows and every
+        # assertion compared against a MagicMock instead of a UUID.
+        mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 
@@ -107,8 +141,12 @@ class TestDatabaseUtils:
         """Test updating a Playwright scan with results."""
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_connect.return_value.__exit__ = MagicMock(return_value=None)
+        # db_utils.get_db() is a @contextmanager that yields psycopg2.connect(...)
+        # DIRECTLY, so the patched connect() return value IS the connection.
+        # Treating it as its own context manager left the real conn a bare
+        # MagicMock, so fetchone() never returned the configured rows and every
+        # assertion compared against a MagicMock instead of a UUID.
+        mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 
@@ -137,8 +175,12 @@ class TestDatabaseUtils:
         """Test creating a Playwright finding."""
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_connect.return_value.__exit__ = MagicMock(return_value=None)
+        # db_utils.get_db() is a @contextmanager that yields psycopg2.connect(...)
+        # DIRECTLY, so the patched connect() return value IS the connection.
+        # Treating it as its own context manager left the real conn a bare
+        # MagicMock, so fetchone() never returned the configured rows and every
+        # assertion compared against a MagicMock instead of a UUID.
+        mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 
@@ -173,8 +215,12 @@ class TestDatabaseUtils:
         """Test saving screenshot to database."""
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_connect.return_value.__exit__ = MagicMock(return_value=None)
+        # db_utils.get_db() is a @contextmanager that yields psycopg2.connect(...)
+        # DIRECTLY, so the patched connect() return value IS the connection.
+        # Treating it as its own context manager left the real conn a bare
+        # MagicMock, so fetchone() never returned the configured rows and every
+        # assertion compared against a MagicMock instead of a UUID.
+        mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 
@@ -207,8 +253,12 @@ class TestDatabaseUtils:
         """Test that duplicate screenshots are not saved."""
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_connect.return_value.__exit__ = MagicMock(return_value=None)
+        # db_utils.get_db() is a @contextmanager that yields psycopg2.connect(...)
+        # DIRECTLY, so the patched connect() return value IS the connection.
+        # Treating it as its own context manager left the real conn a bare
+        # MagicMock, so fetchone() never returned the configured rows and every
+        # assertion compared against a MagicMock instead of a UUID.
+        mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 
@@ -235,8 +285,12 @@ class TestDatabaseUtils:
         """Test saving DOM analysis results."""
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_connect.return_value.__exit__ = MagicMock(return_value=None)
+        # db_utils.get_db() is a @contextmanager that yields psycopg2.connect(...)
+        # DIRECTLY, so the patched connect() return value IS the connection.
+        # Treating it as its own context manager left the real conn a bare
+        # MagicMock, so fetchone() never returned the configured rows and every
+        # assertion compared against a MagicMock instead of a UUID.
+        mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=None)
 

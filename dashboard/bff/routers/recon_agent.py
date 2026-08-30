@@ -11,10 +11,32 @@ from utils import safe_json
 router = APIRouter()
 
 
+class WhoisAgentBody(BaseModel):
+    engagement_id: Optional[str] = None
+    stale_days: int = 90
+    limit: int = 1000
+    dispatch: bool = True
+
+
+@router.post("/api/whois-agent/run")
+async def run_whois_agent(body: WhoisAgentBody = WhoisAgentBody()):
+    """Passive WHOIS collection across all scopes + discovered owner domains."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=60) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/whois-agent/run",
+            json=body.dict(),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, resp.text)
+    return safe_json(resp)
+
+
 @router.get("/api/recon-agent/{eid}")
 async def get_agent_state(eid: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/recon-agent/{eid}",
                            headers={"x-api-key": s.api_key, **engagement_headers()})
     return safe_json(resp)
@@ -28,7 +50,7 @@ class EnableBody(BaseModel):
 @router.post("/api/recon-agent/{eid}/enable")
 async def enable_agent(eid: str, body: EnableBody = EnableBody()):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(
             f"{s.rag_api_url}/recon-agent/{eid}/enable",
             json=body.dict(),
@@ -42,7 +64,7 @@ async def enable_agent(eid: str, body: EnableBody = EnableBody()):
 @router.post("/api/recon-agent/{eid}/disable")
 async def disable_agent(eid: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(f"{s.rag_api_url}/recon-agent/{eid}/disable",
                             headers={"x-api-key": s.api_key, **engagement_headers()})
     return safe_json(resp)
@@ -51,7 +73,7 @@ async def disable_agent(eid: str):
 @router.post("/api/recon-agent/{eid}/pause")
 async def pause_agent(eid: str, minutes: int = Query(60)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.post(f"{s.rag_api_url}/recon-agent/{eid}/pause",
                             params={"minutes": minutes},
                             headers={"x-api-key": s.api_key, **engagement_headers()})
@@ -62,7 +84,7 @@ async def pause_agent(eid: str, minutes: int = Query(60)):
 async def get_coverage(eid: str, target: Optional[str] = None):
     s = get_settings()
     params = {"target": target} if target else {}
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/recon-agent/{eid}/coverage",
                            params=params, headers={"x-api-key": s.api_key, **engagement_headers()})
     return safe_json(resp)
@@ -72,7 +94,7 @@ async def get_coverage(eid: str, target: Optional[str] = None):
 async def get_agent_log(eid: str, limit: int = Query(20)):
     """Recent campaign events from the recon agent for this engagement."""
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(
             f"{s.rag_api_url}/engagements/{eid}/campaign-events",
             params={"operator": "recon_agent", "limit": limit},
@@ -92,7 +114,7 @@ async def run_now(eid: str):
         raise HTTPException(503, "Recon agent not running")
     # Reset last_run_at to force immediate execution on next tick
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT_NORMAL) as c:
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         await c.patch(
             f"{s.rag_api_url}/recon-agent/{eid}",
             json={"last_run_at": "2000-01-01T00:00:00Z"},
@@ -105,7 +127,7 @@ async def run_now(eid: str):
 async def github_search(product: str, version: str = "", cve: str = "", force: bool = False):
     s = get_settings()
     params = {"product": product, "version": version, "cve": cve, "force": str(force).lower()}
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(f"{s.rag_api_url}/software/github-search",
                            params=params, headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code >= 400:

@@ -93,13 +93,13 @@ services:
         command: "ssh-audit --no-colors {target}:{port}"
       - name: hydra
         purpose: brute force credentials
-        command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt ssh://{target}:{port}"
+        command: "hydra -I -L {user_list} -P {password_list} ssh://{target}:{port}"
       - name: medusa
         purpose: parallel brute force
-        command: "medusa -h {target} -U /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt -M ssh"
+        command: "medusa -h {target} -U {user_list} -P {password_list} -M ssh"
       - name: ncrack
         purpose: network authentication cracker
-        command: "ncrack -p {port} --user root -P /usr/share/wordlists/rockyou.txt {target}"
+        command: "ncrack -p {port} --user root -P {password_list} {target}"
       - name: vulnx
         purpose: CVE lookup by product and version
         command: "vulnx search \"{product} {version}\" --json"
@@ -133,10 +133,10 @@ services:
         command: "nikto -h http://{target}:{port}"
       - name: gobuster
         purpose: directory and file bruteforce
-        command: "gobuster dir -u http://{target}:{port} -w /usr/share/wordlists/dirb/common.txt"
+        command: "gobuster dir -u http://{target}:{port} -w /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt"
       - name: feroxbuster
         purpose: fast recursive content discovery
-        command: "feroxbuster -u http://{target}:{port} -w /usr/share/wordlists/dirb/common.txt"
+        command: "feroxbuster -u http://{target}:{port} -w /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt"
       - name: dirsearch
         purpose: web path scanner
         command: "dirsearch -u http://{target}:{port}"
@@ -157,7 +157,7 @@ services:
         command: "wfuzz -c -z file,wordlist.txt http://{target}:{port}/FUZZ"
       - name: ffuf
         purpose: fast web fuzzer
-        command: "ffuf -u http://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/common.txt"
+        command: "ffuf -u http://{target}:{port}/FUZZ -w /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt"
       - name: curl
         purpose: manual HTTP requests
         command: "curl -v http://{target}:{port}/"
@@ -209,7 +209,7 @@ services:
         command: "nikto -h https://{target}:{port}"
       - name: gobuster
         purpose: directory bruteforce
-        command: "gobuster dir -u https://{target}:{port} -w /usr/share/wordlists/dirb/common.txt -k"
+        command: "gobuster dir -u https://{target}:{port} -w /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt -k"
       - name: nuclei
         purpose: template-based vulnerability scanning
         command: "nuclei -u https://{target}:{port} -tags cve,misconfig,exposure,ssl"
@@ -242,13 +242,16 @@ services:
         command: "nmap -sV -sC -p {port} --script=ftp-* {target}"
       - name: hydra
         purpose: brute force FTP credentials
-        command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt ftp://{target}:{port}"
+        command: "hydra -I -L {user_list} -P {password_list} ftp://{target}:{port}"
       - name: ftp
-        purpose: manual connection test
-        command: "ftp {target} {port}"
+        purpose: anonymous listing (non-interactive)
+        # Fed on stdin. `ftp {target} {port}` alone opens a prompt, gets nothing,
+        # and exits 0 — 43 of its 78 runs recorded no output at all, which reads
+        # as "nothing there" rather than "we never asked it anything".
+        command: "printf 'user anonymous anonymous\nls -la\nbye\n' | ftp -inv {target} {port}"
       - name: lftp
         purpose: advanced FTP client
-        command: "lftp -u anonymous, ftp://{target}:{port}"
+        command: "lftp -u anonymous, -e 'ls -la; bye' ftp://{target}:{port}"
       - name: vulnx
         purpose: CVE lookup by product and version
         command: "vulnx search \"{product} {version}\" --json"
@@ -280,10 +283,11 @@ services:
         command: "nmap -sV -sC -p {port} --script=mysql-* {target}"
       - name: mysql
         purpose: direct connection
-        command: "mysql -h {target} -P {port} -u root"
+        # -e, or mysql opens a prompt, reads nothing and exits 0.
+        command: "mysql -h {target} -P {port} -u root -e 'select version(); show databases;'"
       - name: hydra
         purpose: brute force credentials
-        command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt mysql://{target}:{port}"
+        command: "hydra -I -L {user_list} -P {password_list} mysql://{target}:{port}"
       - name: mysqltuner
         purpose: security audit
         command: "mysqltuner --host {target} --port {port}"
@@ -318,10 +322,11 @@ services:
         command: "nmap -sV -sC -p {port} --script=pgsql-* {target}"
       - name: psql
         purpose: direct connection
-        command: "psql -h {target} -p {port} -U postgres"
+        # -c, for the same reason as mysql above.
+        command: "psql -h {target} -p {port} -U postgres -c 'select version();' -c '\\l'"
       - name: hydra
         purpose: brute force credentials
-        command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt postgres://{target}:{port}"
+        command: "hydra -I -L {user_list} -P {password_list} postgres://{target}:{port}"
       - name: vulnx
         purpose: CVE lookup by product and version
         command: "vulnx search \"{product} {version}\" --json"
@@ -356,7 +361,7 @@ services:
         command: "impacket-mssqlclient sa@{target} -port {port}"
       - name: hydra
         purpose: brute force credentials
-        command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt mssql://{target}:{port}"
+        command: "hydra -I -L {user_list} -P {password_list} mssql://{target}:{port}"
     metasploit:
       - module: auxiliary/scanner/mssql/mssql_ping
         purpose: MSSQL discovery
@@ -400,6 +405,26 @@ services:
       - name: crackmapexec
         purpose: SMB authentication and enumeration
         command: "crackmapexec smb {target} -u '' -p '' --shares"
+      # netexec is the maintained successor to crackmapexec, which is no longer
+      # developed. Same output shape, so the existing SMB extractor reads it
+      # unchanged and its findings land under the SAME canonical types
+      # (smb_null_session, smb_v1_enabled, smb_writable_share) as a further
+      # confirming source. Flags verified against /usr/bin/netexec in this image.
+      - name: netexec
+        purpose: SMB share enumeration over a null session
+        command: "netexec smb {target} -u '' -p '' --shares"
+      - name: netexec
+        purpose: SMB user enumeration over a null session
+        command: "netexec smb {target} -u '' -p '' --users"
+      - name: netexec
+        purpose: SMB group enumeration
+        command: "netexec smb {target} -u '' -p '' --groups"
+      - name: netexec
+        purpose: SMB password policy (lockout threshold before any spraying)
+        command: "netexec smb {target} -u '' -p '' --pass-pol"
+      - name: netexec
+        purpose: SMB user enumeration by RID brute force
+        command: "netexec smb {target} -u '' -p '' --rid-brute"
       - name: impacket-smbclient
         purpose: Python SMB client
         command: "impacket-smbclient {target}"
@@ -449,10 +474,10 @@ services:
         command: "rdesktop {target}:{port}"
       - name: hydra
         purpose: brute force credentials
-        command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt rdp://{target}:{port}"
+        command: "hydra -I -L {user_list} -P {password_list} rdp://{target}:{port}"
       - name: crowbar
         purpose: RDP brute force
-        command: "crowbar -b rdp -s {target}/32 -u admin -C /usr/share/wordlists/rockyou.txt"
+        command: "crowbar -b rdp -s {target}/32 -u admin -C {password_list}"
       - name: vulnx
         purpose: CVE lookup by product and version
         command: "vulnx search \"{product} {version}\" --json"
@@ -479,10 +504,12 @@ services:
         command: "nmap -sV -sC -p {port} --script=telnet-* {target}"
       - name: telnet
         purpose: manual connection
-        command: "telnet {target} {port}"
+        # Banner grab. Bare telnet waits at a prompt forever (or until the
+        # harness timeout) and records nothing.
+        command: "printf '\\n' | timeout 10 telnet {target} {port}"
       - name: hydra
         purpose: brute force credentials
-        command: "hydra -L /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt telnet://{target}:{port}"
+        command: "hydra -I -L {user_list} -P {password_list} telnet://{target}:{port}"
       - name: vulnx
         purpose: CVE lookup by product and version
         command: "vulnx search \"{product} {version}\" --json"
@@ -535,13 +562,13 @@ services:
         command: "nmap -sV -sC -p {port} --script=dns-* {target}"
       - name: dig
         purpose: DNS queries
-        command: "dig @{target} -p {port} ANY example.com"
+        command: "dig @{target} -p {port} ANY {domain}"
       - name: dnsrecon
         purpose: DNS reconnaissance
-        command: "dnsrecon -d example.com -n {target}"
+        command: "dnsrecon -d {domain} -n {target}"
       - name: dnsenum
         purpose: DNS enumeration
-        command: "dnsenum --dnsserver {target} example.com"
+        command: "dnsenum --dnsserver {target} {domain}"
     metasploit:
       - module: auxiliary/scanner/dns/dns_amp
         purpose: DNS amplification check
@@ -614,7 +641,7 @@ services:
         command: "vncviewer {target}:{port}"
       - name: hydra
         purpose: brute force credentials
-        command: "hydra -P /usr/share/wordlists/rockyou.txt vnc://{target}:{port}"
+        command: "hydra -I -P {password_list} vnc://{target}:{port}"
     metasploit:
       - module: auxiliary/scanner/vnc/vnc_none_auth
         purpose: VNC no auth check
@@ -995,10 +1022,10 @@ services:
         command: "nmap -sV --script pop3-capabilities,pop3-ntlm-info -p {port} {target}"
       - name: hydra
         purpose: brute force POP3 credentials
-        command: "hydra -L users.txt -P passwords.txt pop3://{target}:{port}"
+        command: "hydra -I -L {user_list} -P {password_list} pop3://{target}:{port}"
       - name: medusa
         purpose: parallel POP3 brute force
-        command: "medusa -h {target} -U users.txt -P passwords.txt -M pop3"
+        command: "medusa -h {target} -U {user_list} -P {password_list} -M pop3"
       - name: openssl
         purpose: STARTTLS / SSL banner inspection
         command: "openssl s_client -starttls pop3 -connect {target}:{port}"
@@ -1021,10 +1048,10 @@ services:
         command: "nmap -sV --script imap-capabilities,imap-ntlm-info -p {port} {target}"
       - name: hydra
         purpose: IMAP brute force
-        command: "hydra -L users.txt -P passwords.txt imap://{target}:{port}"
+        command: "hydra -I -L {user_list} -P {password_list} imap://{target}:{port}"
       - name: medusa
         purpose: parallel IMAP brute force
-        command: "medusa -h {target} -U users.txt -P passwords.txt -M imap"
+        command: "medusa -h {target} -U {user_list} -P {password_list} -M imap"
       - name: openssl
         purpose: STARTTLS / SSL banner inspection
         command: "openssl s_client -starttls imap -connect {target}:{port}"
@@ -1066,7 +1093,7 @@ services:
         command: "java -jar jenkins-cli.jar -s http://{target}:{port}/ who-am-i"
       - name: hydra
         purpose: Jenkins login brute force
-        command: "hydra -L users.txt -P passwords.txt {target} -s {port} http-get /login"
+        command: "hydra -I -L {user_list} -P {password_list} {target} -s {port} http-get /login"
     metasploit:
       - module: exploit/multi/http/jenkins_script_console
         purpose: Jenkins Script Console RCE
@@ -1303,7 +1330,7 @@ services:
         command: "odat all -s {target} -p {port}"
       - name: hydra
         purpose: brute force SID/credentials
-        command: "hydra -L users.txt -P passwords.txt {target} -s {port} oracle-listener"
+        command: "hydra -I -L {user_list} -P {password_list} {target} -s {port} oracle-listener"
       - name: tnscmd10g
         purpose: TNS listener probe
         command: "tnscmd10g version -h {target} -p {port}"
@@ -1407,7 +1434,7 @@ services:
         command: "nmap -sV --script db2-das-info -p {port} {target}"
       - name: hydra
         purpose: Db2 brute force
-        command: "hydra -L users.txt -P passwords.txt db2://{target}:{port}"
+        command: "hydra -I -L {user_list} -P {password_list} db2://{target}:{port}"
     metasploit:
       - module: auxiliary/scanner/db2/db2_auth
         purpose: Db2 authentication brute
@@ -1443,7 +1470,7 @@ services:
         command: "nuclei -u http://{target}:{port} -tags rabbitmq,amqp,cve,default-login"
       - name: hydra
         purpose: mgmt UI brute force
-        command: "hydra -L users.txt -P passwords.txt {target} -s {port} http-get /"
+        command: "hydra -I -L {user_list} -P {password_list} {target} -s {port} http-get /"
     nuclei_tags: ["rabbitmq", "amqp", "messaging", "default-login", "exposure"]
     common_vulns:
       - "Default guest/guest credentials (restricted to localhost since 3.6)"
@@ -1592,7 +1619,7 @@ services:
         command: "nmap -sV -p {port} {target}"
       - name: hydra
         purpose: TACACS+ shared-secret brute
-        command: "hydra -L users.txt -P passwords.txt tacacs+://{target}"
+        command: "hydra -I -L {user_list} -P {password_list} tacacs+://{target}"
     nuclei_tags: ["tacacs", "cisco", "auth", "network"]
     common_vulns:
       - "Weak shared secret (key)"
@@ -1750,7 +1777,7 @@ services:
     tools:
       - name: whois
         purpose: query WHOIS data
-        command: "whois -h {target} -p {port} example.com"
+        command: "whois -h {target} -p {port} {domain}"
     nuclei_tags: ["whois", "network", "info-leak"]
     common_vulns:
       - "Internal WHOIS server may leak asset inventory"
@@ -1793,7 +1820,7 @@ services:
         command: "svmap {target}:{port}"
       - name: hydra
         purpose: SIP credential brute
-        command: "hydra -L users.txt -P passwords.txt sip://{target}:{port}"
+        command: "hydra -I -L {user_list} -P {password_list} sip://{target}:{port}"
     metasploit:
       - module: auxiliary/scanner/sip/options
         purpose: SIP OPTIONS scan

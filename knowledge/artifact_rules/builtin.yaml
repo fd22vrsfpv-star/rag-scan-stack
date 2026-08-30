@@ -1,0 +1,249 @@
+# Follow-on action rules for raw tool artifacts.
+#
+# These decide what a pentester is prompted to do next after a tool runs. They
+# are read from /knowledge (a read-only bind mount), so edits take effect on the
+# next analysis WITHOUT rebuilding rag-api — the loader re-reads when any rule
+# file's mtime changes.
+#
+# Put local rules in custom/*.yaml rather than editing this file; both are
+# loaded, and a custom rule with the same `id` overrides the builtin one. That
+# also lets you disable a builtin by redefining it with `enabled: false`.
+#
+# FIELDS
+#   id          required, unique. Also the handle used when queuing.
+#   pattern     required, Python regex. Matched case-insensitively, multiline.
+#   scanner     required, the tool that will run. Must be one the dispatcher
+#               routes (see routers/assets.py) or it cannot execute.
+#   script      required, the command. {target} and {port} are substituted;
+#               {cve} is filled from CVEs found in the output. A placeholder
+#               left unresolved marks the action "needs input" rather than
+#               presenting it as runnable.
+#   title       required, shown in the UI.
+#   rationale   required, why this follow-up is worth doing.
+#   priority    0-100, **LOWER runs first**. Default 50.
+#               This is the convention the rest of the stack uses — see
+#               scan_recommender.py::_append_high_value_port_recs ("lower int =
+#               runs first"), which assigns 5 to a curated Metasploit module on
+#               a high-value port. These rules originally used the opposite
+#               direction, so the most urgent findings (credentials, SMBv1)
+#               sorted LAST. Inverted to match.
+#   category    grouping/colour in the UI. Default "general".
+#   tools       which tools' output this rule applies to. ["*"] or omitted =
+#               every tool. Names are matched case-insensitively.
+#   auto_queue  when true, the action is queued automatically as a PENDING
+#               recommendation as soon as matching output is stored. It is
+#               never executed automatically — a human still presses Run.
+#               Default false. Only set this for cheap, unambiguous, read-only
+#               confirmations; anything needing input can never auto-queue.
+#   enabled     set false to switch a rule off. Default true.
+#
+# SCOPE SAFETY: rules only ever act on the artifact's own target. Hosts merely
+# mentioned in output (a redirect, a banner URL) are never turned into targets.
+
+version: 1
+
+defaults:
+  priority: 50   # lower runs first
+  category: general
+  auto_queue: false
+  enabled: true
+
+rules:
+  # ── SMB ────────────────────────────────────────────────────────────────
+  - id: smbv1_enabled
+    category: smb
+    tools: [crackmapexec, netexec, smbmap, smbclient, enum4linux, enum4linux-ng, nmap]
+    pattern: 'SMBv1\s*[:=]\s*(?:True|true|1|enabled)'
+    scanner: nmap
+    script: "nmap -p445 --script smb-vuln-ms17-010,smb-vuln-ms08-067 {target}"
+    title: Test SMBv1 host for known critical SMB vulnerabilities
+    rationale: >-
+      SMBv1 is enabled, so the MS17-010/MS08-067 families are worth checking
+      directly rather than inferring from version.
+    priority: 15
+    auto_queue: true
+
+  - id: smb_signing_disabled
+    category: smb
+    tools: [crackmapexec, netexec, smbmap, smbclient, enum4linux, enum4linux-ng, nmap]
+    pattern: 'signing\s*[:=]\s*(?:False|false|0|disabled)'
+    scanner: nmap
+    script: "nmap -p445 --script smb-security-mode,smb2-security-mode {target}"
+    title: Confirm SMB signing is not required
+    rationale: >-
+      SMB signing disabled permits relay attacks. Confirm and record the exact
+      security mode before relying on it.
+    priority: 30
+    auto_queue: true
+
+  - id: smb_shares
+    category: smb
+    tools: [crackmapexec, netexec, smbmap, smbclient, enum4linux, enum4linux-ng, nmap]
+    pattern: '\b(IPC\$|ADMIN\$|C\$|\bsharename\b|Disk\s+Permissions)'
+    scanner: smbmap
+    script: "smbmap -H {target}"
+    title: Enumerate SMB share permissions
+    rationale: Shares are exposed; map read/write access per share.
+    priority: 35
+
+  # ── FTP / NFS / SNMP / SSH ─────────────────────────────────────────────
+  - id: anonymous_ftp
+    category: ftp
+    tools: [nmap, hydra, ftp, nuclei]
+    pattern: '(Anonymous\s+FTP\s+login\s+allowed|ftp-anon|anonymous\s+access\s+allowed)'
+    scanner: nmap
+    script: "nmap -p21 --script ftp-anon,ftp-syst {target}"
+    title: Enumerate anonymous FTP contents
+    rationale: Anonymous FTP is permitted — list what is actually readable.
+    priority: 25
+    auto_queue: true
+
+  - id: nfs_export
+    category: nfs
+    tools: [nmap, showmount, rpcinfo]
+    pattern: '(/\S+\s+\*\s*$|nfs-showmount|Export\s+list\s+for)'
+    scanner: showmount
+    script: "showmount -e {target}"
+    title: Enumerate NFS exports
+    rationale: An NFS export was referenced; confirm what is world-exported.
+    priority: 35
+
+  - id: snmp_public
+    category: snmp
+    tools: [nmap, snmpwalk, onesixtyone]
+    pattern: '\b(community\s+string)\b|snmp.{0,30}\bpublic\b'
+    scanner: snmpwalk
+    script: "snmpwalk -v2c -c public {target}"
+    title: Walk SNMP with the default community string
+    rationale: A default community string was referenced — enumerate the MIB.
+    priority: 40
+
+  - id: ssh_version
+    category: ssh
+    tools: [nmap, ssh-audit, hydra, httpx]
+    pattern: 'SSH-2\.0-\S+|OpenSSH[_ ]\d+\.\d+'
+    scanner: ssh-audit
+    script: "ssh-audit {target}"
+    title: Audit SSH algorithms and key exchange
+    rationale: >-
+      An SSH banner is present; audit ciphers/KEX rather than judging by version
+      string alone.
+    priority: 55
+
+  # ── Web ────────────────────────────────────────────────────────────────
+  - id: software_version
+    category: web
+    tools: [whatweb, httpx, nmap, nuclei, nikto, wappalyzer, curl]
+    # [^0-9]{0,24} bridges the product name to its version across BOTH shapes:
+    # text ("Apache[2.2.8]", "Apache/2.2.8") and the native JSON we now prefer
+    # ('"Apache":{"version":["2.2.8"]}'). Excluding digits from the bridge stops
+    # it skipping over an unrelated number to reach a distant version.
+    pattern: '\b(Apache|nginx|lighttpd|IIS|vsftpd|ProFTPD|Postfix|Samba|MySQL|PostgreSQL|Tomcat|Jetty|OpenSSL)\b[^0-9]{0,24}(\d+\.\d+(?:\.\d+)?)'
+    scanner: nuclei
+    script: "nuclei -u http://{target} -tags cve,default-login"
+    title: Run version-targeted vulnerability templates
+    rationale: >-
+      A specific software version was identified; nuclei's CVE templates are the
+      cheapest confirmation step.
+    priority: 30
+
+  - id: http_service
+    category: web
+    tools: [whatweb, httpx, nmap, katana, nuclei, nikto, curl, wafw00f]
+    pattern: '(HTTP/1\.[01]\s+200|http_status"?\s*[:=]\s*200|\[200 OK\])'
+    scanner: katana
+    script: "katana -u http://{target} -field-scope fqdn"
+    title: Crawl the web service for additional attack surface
+    rationale: >-
+      A live HTTP response was observed; enumerate reachable endpoints. Scope is
+      pinned to the target's own FQDN.
+    priority: 45
+
+  - id: web_directories
+    category: web
+    tools: [whatweb, httpx, nikto, gobuster, feroxbuster, ffuf, dirsearch, katana, curl]
+    pattern: '(Directory\s+indexing|Index of /|/(?:admin|phpmyadmin|manager|wp-admin|cgi-bin)/?\b)'
+    scanner: feroxbuster
+    script: "feroxbuster -u http://{target} -d 2"
+    title: Enumerate content under discovered directories
+    rationale: >-
+      An interesting path was observed; enumerate siblings and children rather
+      than stopping at the one that surfaced.
+    priority: 40
+
+  - id: cms_detected
+    category: web
+    tools: [whatweb, httpx, nuclei, nikto, wappalyzer, curl]
+    pattern: '\b(WordPress|Joomla|Drupal|Magento|TWiki|phpMyAdmin)\b'
+    scanner: nuclei
+    script: "nuclei -u http://{target} -tags cms,exposure"
+    title: Run CMS-specific checks
+    rationale: >-
+      A CMS was fingerprinted; CMS templates cover its known exposures and
+      default logins.
+    priority: 35
+
+  # ── Cross-cutting ──────────────────────────────────────────────────────
+  - id: cve_referenced
+    category: exploit
+    tools: ["*"]
+    pattern: 'CVE-\d{4}-\d{4,7}'
+    scanner: searchsploit
+    script: "searchsploit --cve {cve}"
+    title: Look up public exploits for referenced CVEs
+    rationale: >-
+      The output names specific CVEs; check the local ExploitDB mirror for
+      matching public exploits.
+    priority: 20
+    # Local database lookup — no network traffic to the target at all.
+    auto_queue: true
+
+  - id: credentials_found
+    category: credentials
+    tools: ["*"]
+    pattern: '(\[\+\]\s*\S+\\\S+:\S+|password\s*[:=]\s*\S{3,}|valid\s+credentials|login\s+successful)'
+    scanner: netexec
+    script: "netexec smb {target} -u USER -p PASS --shares"
+    title: Validate recovered credentials and map their access
+    rationale: >-
+      Credential material appeared in the output. Confirm what the account can
+      actually reach — placeholders must be filled in from the credential store
+      before running.
+    priority: 10
+    needs_input: true
+
+  - id: database_service
+    category: database
+    tools: [nmap, netexec, sqlmap, naabu, masscan]
+    pattern: '\b(mysql|postgresql|mongodb|redis|mssql)\b.{0,40}\b(\d{4})\b|\b(3306|5432|27017|6379|1433)\b'
+    scanner: nmap
+    script: "nmap -sV --script '*-info,*-empty-password' {target}"
+    title: Probe database service for unauthenticated access
+    rationale: >-
+      A database service was referenced; check for empty or default
+      authentication.
+    priority: 25
+
+  - id: open_ports
+    category: recon
+    tools: [nmap, masscan, naabu, rustscan]
+    pattern: '(\d{1,5})/tcp\s+open|Discovered\s+open\s+port\s+(\d{1,5})'
+    scanner: nmap
+    script: "nmap -sV -sC -p {port} {target}"
+    title: Service-scan newly observed open ports
+    rationale: >-
+      Open ports were observed without full service detection; version and
+      default scripts refine what is actually there.
+    priority: 40
+
+  - id: tls_present
+    category: tls
+    tools: [nmap, tlsx, sslscan, testssl, whatweb, httpx, openssl]
+    pattern: '\b(TLSv1(\.[012])?|SSLv[23]|ssl-cert|Certificate)\b'
+    scanner: tlsx
+    script: "tlsx -u {target} -san -cn -expired -self-signed"
+    title: Inspect TLS configuration and certificate
+    rationale: >-
+      TLS was observed; capture protocol versions, SANs and certificate
+      problems.
+    priority: 50

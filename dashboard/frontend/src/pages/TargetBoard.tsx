@@ -25,14 +25,11 @@ import { useScopeFilter } from '@/hooks/useScopeFilter'
 import { useUIStore } from '@/stores/ui'
 import PageHelp from '@/components/PageHelp'
 import InfoTip from '@/components/InfoTip'
+import { compareSeverity, severityDot } from '@/lib/constants'
 
 type SortKey = 'risk' | 'followups' | 'recommendations'
 
-const SEV_RANK: Record<string, number> = { critical: 5, high: 4, medium: 3, low: 2, info: 1 }
-const SEV_DOT: Record<string, string> = {
-  critical: 'bg-red-600', high: 'bg-orange-500', medium: 'bg-yellow-400',
-  low: 'bg-blue-500', info: 'bg-gray-500',
-}
+// Severity ordering and the dot palette are canonical in lib/constants.ts.
 
 function riskColor(risk: number): string {
   const r = Math.max(0, Math.min(100, risk)) / 100
@@ -128,7 +125,7 @@ export default function TargetBoard() {
     // Sort each column's items by its natural priority.
     for (const r of map.values()) {
       r.vectors.sort((a, b) => b.risk_score - a.risk_score)
-      r.followups.sort((a, b) => (SEV_RANK[b.severity] ?? 0) - (SEV_RANK[a.severity] ?? 0))
+      r.followups.sort((a, b) => compareSeverity(a.severity, b.severity))
       r.recommendations.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))
     }
     return [...map.values()]
@@ -247,7 +244,7 @@ function TargetSwimlane({ row }: { row: TargetRow }) {
               <div className="flex items-center gap-1.5">
                 <span className="font-mono px-1 py-0.5 rounded text-white text-[10px]" style={{ background: riskColor(v.risk_score) }}>{v.risk_score}</span>
                 <span className="font-mono text-[11px] text-foreground">{v.technique}</span>
-                {v.severity && <span className={`h-1.5 w-1.5 rounded-full ${SEV_DOT[v.severity] || 'bg-gray-500'}`} />}
+                {v.severity && <span className={`h-1.5 w-1.5 rounded-full ${severityDot(v.severity)}`} />}
                 <span className="ml-auto text-[10px] text-muted-foreground">{v.finding_count ?? 0}×</span>
               </div>
               <div className="text-[10px] text-muted-foreground truncate">{v.technique_name}</div>
@@ -262,7 +259,7 @@ function TargetSwimlane({ row }: { row: TargetRow }) {
           {row.followups.slice(0, 6).map((f) => (
             <Link key={f.id} to={`/follow-ups?search=${q}`} className="block rounded border border-border bg-muted/30 hover:bg-muted/60 hover:border-primary/50 p-1.5 transition-colors">
               <div className="flex items-center gap-1.5">
-                <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${SEV_DOT[f.severity] || 'bg-gray-500'}`} />
+                <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${severityDot(f.severity)}`} />
                 <span className="text-[11px] text-foreground truncate">{middleTruncate(f.title)}</span>
               </div>
               <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground capitalize">

@@ -1,0 +1,144 @@
+# smbclient -L -N — anonymous share listing.
+#
+# 51 stored runs, all `captured_uninterpreted`: 9 recon_findings rows existed for
+# smbclient and every one was a generic `tool_output` dump. The output states, in
+# plain words, that an anonymous login succeeded and then lists the shares.
+#
+# The finding ids here are CANONICAL and shared with the crackmapexec/enum4linux
+# extractors, so this becomes a FOURTH confirming source for conditions already
+# recorded rather than new vocabulary. `source` records which tool saw it.
+#
+# The share table's header is `Sharename  Type  Comment` over a row of dashes.
+# The pattern below requires the literal `Disk` column, so neither the header nor
+# the rule line can match — the header trap is avoided structurally rather than
+# by a deny-list.
+tool: smbclient
+description: Anonymous SMB share listing — null session, disk shares, SMB1 fallback.
+enabled: true
+max_chars: 20000
+
+deterministic:
+  # `-N` supplies no password, so this line IS the null session.
+  null_session:
+    pattern: '^Anonymous login successful'
+    type: boolean
+  # Only Disk rows are shares. IPC$ and ADMIN$ are IPC service endpoints.
+  shares:
+    pattern: '^\s+(\S+)\s+Disk\s'
+    capture: all
+    type: list
+  ipc_endpoints:
+    pattern: '^\s+(\S+)\s+IPC\s'
+    capture: all
+    type: list
+  # The client only falls back like this when the server offers SMB1.
+  smb1_fallback:
+    pattern: 'Reconnecting with SMB1'
+    type: boolean
+  samba_version:
+    pattern: '(Samba\s+[0-9][0-9A-Za-z.\-]*)'
+
+schema:
+  shares:
+    type: list
+    description: Disk share names only
+  ipc_endpoints:
+    type: list
+    description: IPC service endpoints such as IPC$ and ADMIN$
+  null_session:
+    type: boolean
+    description: true when the anonymous login was accepted
+  smb1_fallback:
+    type: boolean
+    description: true when the client had to reconnect using SMB1
+  samba_version:
+    type: string
+  workgroup:
+    type: string
+  server_name:
+    type: string
+    description: the NetBIOS master browser name, if the workgroup table lists one
+
+prompt: |
+  Extract facts from `smbclient -L <host> -N` output.
+
+  `Anonymous login successful` means an unauthenticated session was accepted —
+  `-N` supplies no password at all.
+
+  The share table is `Sharename  Type  Comment`. Only rows whose Type is `Disk`
+  are real shares; `IPC$` and `ADMIN$` are IPC endpoints. Never treat the header
+  row or the row of dashes beneath it as a share.
+
+  A `Workgroup / Master` table at the end gives the workgroup and the master
+  browser's name.
+
+examples:
+  - output: |
+      Anonymous login successful
+
+      	Sharename       Type      Comment
+      	---------       ----      -------
+      	print$          Disk      Printer Drivers
+      	tmp             Disk      oh noes!
+      	IPC$            IPC       IPC Service (metasploitable server (Samba 3.0.20-Debian))
+      Reconnecting with SMB1 for workgroup listing.
+
+      	Workgroup            Master
+      	---------            -------
+      	WORKGROUP            METASPLOITABLE
+    extract: |
+      {"null_session": true, "shares": ["print$", "tmp"],
+       "ipc_endpoints": ["IPC$"], "smb1_fallback": true,
+       "samba_version": "Samba 3.0.20-Debian",
+       "workgroup": "WORKGROUP", "server_name": "METASPLOITABLE"}
+
+notable:
+  # Ids are CANONICAL and shared with the other SMB extractors, so this reads as
+  # a further confirmation of a known condition, not a new problem.
+  - id: smb_null_session
+    when: null_session == true
+    severity: high
+    title: SMB null session accepted (anonymous share listing)
+    detail: >
+      `smbclient -L -N` supplies no password and the server accepted it, so the
+      share layout is readable by anyone who can reach the port.
+  - id: smb_shares_enumerated
+    when: len(shares) > 0
+    severity: medium
+    title: "{shares} SMB disk share(s) listed anonymously"
+    detail: >
+      Share names and comments disclose host layout and software versions to an
+      unauthenticated caller. Each is a candidate for anonymous read and write
+      testing.
+  - id: smb_v1_enabled
+    when: smb1_fallback == true
+    severity: medium
+    title: Server accepted an SMB1 reconnection
+    detail: >
+      The client fell back to SMB1 and the server honoured it, so the deprecated
+      dialect is still available.
+
+follow_on:
+  # ONE ACTION PER SHARE — the capability a text regex cannot express.
+  #
+  # The old rule engine matched "shares were found" and proposed a generic
+  # command, because a regex over raw text has no handle on the share NAMES it
+  # matched. The extractor already knows them, so `for_each` turns each into its
+  # own command: `//target/tmp`, `//target/opt`.
+  #
+  # It iterates `shares`, which holds Disk rows only — IPC$ and ADMIN$ are in
+  # `ipc_endpoints` and are service endpoints, not browsable shares, so they
+  # produce no action at all.
+  - id: browse_share
+    when: len(shares) > 0
+    for_each: shares
+    scanner: smbclient
+    script: "smbclient //{target}/{item} -N -c 'ls'"
+    title: "List the contents of //{target}/{item}"
+    category: smb
+    priority: 20
+    auto_queue: true
+    rationale: >
+      The share is known to exist and the null session is known to be accepted,
+      so listing it needs no credential and says immediately whether anything
+      readable is exposed.

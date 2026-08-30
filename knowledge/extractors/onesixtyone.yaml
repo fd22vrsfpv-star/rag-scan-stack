@@ -1,0 +1,79 @@
+# onesixtyone — fast SNMP community-string scanner.
+#
+# There was no SNMP coverage, so onesixtyone hits landed as generic dumps. Its
+# whole purpose is to find WHICH community strings a host accepts, and the output
+# says so on one line per hit:
+#
+#     192.168.1.150 [public] Linux target 4.19.0-6-amd64
+#     192.168.1.150 [private] Linux target 4.19.0-6-amd64
+#
+# A recovered community is the key to the entire SNMP tree, so this feeds a
+# snmpwalk with the exact community it found — the deterministic follow-on the
+# raw-text rule engine could never express, because it never held the community
+# value it matched.
+tool: onesixtyone
+description: SNMP community-string scanner — recovered communities open the whole SNMP tree.
+enabled: true
+max_chars: 20000
+
+deterministic:
+  # `<ip> [<community>] <sysDescr>` — the community is the bracketed token.
+  communities:
+    pattern: '^\S+\s+\[([^\]]+)\]'
+    capture: all
+    type: list
+  sys_descr:
+    pattern: '^\S+\s+\[[^\]]+\]\s+(.+?)\s*$'
+
+schema:
+  communities:
+    type: list
+    description: community strings the host accepted, one per hit line
+  sys_descr:
+    type: string
+    description: the sysDescr banner returned alongside a hit
+
+prompt: |
+  Extract facts from `onesixtyone` output. Each hit line is
+  `<ip> [<community>] <sysDescr banner>`.
+
+  Report every distinct community string inside the brackets — these are the
+  strings the host ACCEPTED. The trailing text is the system banner. A line with
+  no bracketed token is not a hit.
+
+examples:
+  - output: |
+      Scanning 1 hosts, 2 communities
+      192.168.1.150 [public] Linux target 4.19.0-6-amd64 #1 SMP x86_64
+      192.168.1.150 [private] Linux target 4.19.0-6-amd64 #1 SMP x86_64
+    extract: |
+      {"communities": ["public", "private"],
+       "sys_descr": "Linux target 4.19.0-6-amd64 #1 SMP x86_64"}
+
+notable:
+  - id: snmp_community_found
+    when: len(communities) > 0
+    severity: high
+    title: "{communities} SNMP community string(s) accepted"
+    detail: >
+      Each recovered community string grants unauthenticated read of the SNMP
+      tree (and write, if it is a write community). `private` in particular is a
+      conventional write community and warrants a set-capability check.
+    params: [communities]
+
+follow_on:
+  # The community is KNOWN — walk the tree with each one. This is the exact case
+  # for_each exists: the extractor holds the community value, so the command is
+  # complete and auto-queues.
+  - id: walk_with_community
+    when: len(communities) > 0
+    for_each: communities
+    scanner: snmpwalk
+    script: "snmpwalk -v2c -c {item} {target}"
+    title: "Walk the SNMP tree on {target} with community '{item}'"
+    category: snmp
+    priority: 15
+    auto_queue: true
+    rationale: >
+      onesixtyone proved the community is accepted; snmpwalk is what turns that
+      into the actual disclosed data (processes, software, interfaces).

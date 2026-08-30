@@ -5,6 +5,7 @@ import { useScans } from '@/api/scans'
 import { useHealth } from '@/api/reports'
 import { useCloudPosture } from '@/api/cloudSuggestor'
 import { useUIStore } from '@/stores/ui'
+import { findingFacets } from '@/lib/findingFacets'
 import { SeverityBadge } from '@/components/common/SeverityBadge'
 import { StatusDot } from '@/components/common/StatusDot'
 import { Link } from 'react-router-dom'
@@ -40,11 +41,15 @@ export default function Dashboard() {
   const { data: health } = useHealth()
   const { data: cloudPosture } = useCloudPosture()
 
-  const agg = findingsData?.aggregations?.by_severity || {}
+  // This page passes engagement_id, so it must NOT chart by_severity — that
+  // facet is global and ignores the filters. See lib/findingFacets.ts.
+  const facets = findingFacets(findingsData)
+  const agg = facets.bySeverity
   const chartData = SEVERITY_LEVELS
     .filter(s => agg[s] != null)
     .map(s => ({ name: s, value: agg[s] }))
-  const totalFindings = findingsData?.total ?? 0
+  const rowTotal = facets.rows
+  const totalFindings = facets.problems
   const totalAssets = assetsData?.count ?? 0
   const activeScans = scansData?.jobs?.filter(j => j.status === 'running' || j.status === 'queued').length ?? 0
   const healthyServices = health
@@ -55,7 +60,16 @@ export default function Dashboard() {
     <div className="space-y-6">
       {/* Stats Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-4">
-        <StatCard title="Total Findings" value={totalFindings} subtitle={`${agg.critical ?? 0} critical`} color="text-red-500" />
+        <StatCard
+          title="Findings"
+          value={totalFindings}
+          subtitle={
+            facets.isRolledUp
+              ? `${agg.critical ?? 0} critical · ${rowTotal.toLocaleString()} incl. per-host`
+              : `${agg.critical ?? 0} critical`
+          }
+          color="text-red-500"
+        />
         <StatCard title="Assets Discovered" value={totalAssets} />
         <StatCard title="Active Scans" value={activeScans} color="text-green-500" />
         <StatCard title="Services Online" value={`${healthyServices}/${health ? Object.keys(health.services).length : 0}`} />

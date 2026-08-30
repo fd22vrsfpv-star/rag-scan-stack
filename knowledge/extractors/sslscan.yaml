@@ -1,0 +1,135 @@
+# sslscan — TLS configuration and protocol/cipher weaknesses.
+#
+# tlsx has a parser, but sslscan is a different tool with a different textual
+# format and was landing as a generic dump. The findings that matter are the
+# deprecated protocols the server still enables and any Heartbleed exposure — all
+# of them stated as fixed lines, so they resolve deterministically with no model.
+#
+# The protocol lines read `SSLv3     enabled` / `TLSv1.0   disabled`; the boolean
+# patterns require the literal `enabled`, so a disabled protocol never fires.
+tool: sslscan
+description: TLS scan — deprecated protocols (SSLv2/SSLv3/TLS1.0) and Heartbleed.
+enabled: true
+max_chars: 40000
+
+deterministic:
+  sslv2_enabled:
+    pattern: '^SSLv2\s+enabled'
+    type: boolean
+  sslv3_enabled:
+    pattern: '^SSLv3\s+enabled'
+    type: boolean
+  tlsv1_0_enabled:
+    pattern: '^TLSv1\.0\s+enabled'
+    type: boolean
+  # `TLSv1.2 vulnerable to heartbleed` fires; `not vulnerable to heartbleed`
+  # is excluded by the per-line negative lookahead.
+  heartbleed_vulnerable:
+    pattern: '^(?!.*not vulnerable).*vulnerable to heartbleed'
+    type: boolean
+  # Accepted ciphers over a deprecated SSL protocol — the concrete weak offering.
+  weak_ssl_ciphers:
+    pattern: '^Accepted\s+(SSLv\d.+?)\s*$'
+    capture: all
+    type: list
+  # Full posture — captured so a healthy protocol/cipher line reads as
+  # UNDERSTOOD by the profile, not as uncovered residual that would trip a
+  # spurious coverage_gap. Only the weak states above become findings.
+  protocols:
+    pattern: '^((?:SSLv\d|TLSv\d(?:\.\d)?)\s+(?:enabled|disabled))\s*$'
+    capture: all
+    type: list
+  accepted_ciphers:
+    pattern: '^(Accepted\s+\S+\s+\d+\s+bits\s+\S+)'
+    capture: all
+    type: list
+  # Both `vulnerable` and `not vulnerable` lines — presence means the test ran.
+  heartbleed_tested:
+    pattern: 'vulnerable to heartbleed'
+    type: boolean
+
+schema:
+  sslv2_enabled:
+    type: boolean
+  sslv3_enabled:
+    type: boolean
+  tlsv1_0_enabled:
+    type: boolean
+  heartbleed_vulnerable:
+    type: boolean
+  heartbleed_tested:
+    type: boolean
+    description: true when a Heartbleed test line is present (either result)
+  weak_ssl_ciphers:
+    type: list
+    description: accepted cipher lines negotiated over SSLv2/SSLv3
+  protocols:
+    type: list
+    description: every protocol line with its enabled/disabled state
+  accepted_ciphers:
+    type: list
+    description: every accepted cipher line, weak or strong
+
+prompt: |
+  Extract facts from `sslscan` output.
+
+  The `SSL/TLS Protocols` block lists each protocol as `enabled` or `disabled` —
+  report SSLv2, SSLv3 and TLSv1.0 only when they say `enabled`. The Heartbleed
+  block says `<proto> vulnerable to heartbleed` or `<proto> not vulnerable to
+  heartbleed`; set `heartbleed_vulnerable` true only for the affirmative form.
+
+  Under `Supported Server Cipher(s)`, `Accepted` lines over SSLv2/SSLv3 are weak
+  offerings — collect those lines.
+
+examples:
+  - output: |
+      SSL/TLS Protocols:
+      SSLv2     disabled
+      SSLv3     enabled
+      TLSv1.0   enabled
+      TLSv1.2   enabled
+
+      Heartbleed:
+      TLSv1.2 not vulnerable to heartbleed
+
+      Supported Server Cipher(s):
+      Accepted  SSLv3    128 bits  RC4-MD5
+      Accepted  TLSv1.2  256 bits  AES256-GCM-SHA384
+    extract: |
+      {"sslv3_enabled": true, "tlsv1_0_enabled": true,
+       "heartbleed_vulnerable": false, "heartbleed_tested": true,
+       "weak_ssl_ciphers": ["SSLv3    128 bits  RC4-MD5"],
+       "protocols": ["SSLv2     disabled", "SSLv3     enabled",
+                     "TLSv1.0   enabled", "TLSv1.2   enabled"],
+       "accepted_ciphers": ["Accepted  SSLv3    128 bits  RC4-MD5",
+                            "Accepted  TLSv1.2  256 bits  AES256-GCM-SHA384"]}
+
+notable:
+  - id: ssl_sslv2_enabled
+    when: sslv2_enabled == true
+    severity: high
+    title: SSLv2 is enabled
+    detail: >
+      SSLv2 is fundamentally broken (DROWN) and its presence undermines every
+      service sharing the key. It should be disabled outright.
+  - id: ssl_sslv3_enabled
+    when: sslv3_enabled == true
+    severity: medium
+    title: SSLv3 is enabled (POODLE)
+    detail: >
+      SSLv3 is vulnerable to POODLE and is deprecated; a modern client never
+      needs it, so it is a downgrade target that should be disabled.
+  - id: ssl_tlsv1_0_enabled
+    when: tlsv1_0_enabled == true
+    severity: low
+    title: TLSv1.0 is enabled
+    detail: >
+      TLSv1.0 is deprecated (PCI DSS disallows it). It is low risk on its own but
+      belongs on the hardening list.
+  - id: ssl_heartbleed
+    when: heartbleed_vulnerable == true
+    severity: critical
+    title: Server is vulnerable to Heartbleed (CVE-2014-0160)
+    detail: >
+      Heartbleed leaks server memory to any unauthenticated client — private
+      keys and session data included. This is a drop-everything remediation.

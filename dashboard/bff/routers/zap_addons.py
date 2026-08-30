@@ -29,7 +29,7 @@ async def list_addons():
     params = _zap_params(s)
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30) as c:
+        async with httpx.AsyncClient(timeout=30) as c:
             installed_resp = await c.get(
                 f"{base}/JSON/autoupdate/view/installedAddons/",
                 params=params,
@@ -74,7 +74,7 @@ async def install_addon(body: AddonAction):
     params = {**_zap_params(s), "id": body.addon_id}
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=120) as c:
+        async with httpx.AsyncClient(timeout=120) as c:
             resp = await c.get(
                 f"{base}/JSON/autoupdate/action/installAddon/",
                 params=params,
@@ -100,7 +100,7 @@ async def uninstall_addon(body: AddonAction):
     params = {**_zap_params(s), "id": body.addon_id}
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=60) as c:
+        async with httpx.AsyncClient(timeout=60) as c:
             resp = await c.get(
                 f"{base}/JSON/autoupdate/action/uninstallAddon/",
                 params=params,

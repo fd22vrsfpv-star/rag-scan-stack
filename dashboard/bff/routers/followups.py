@@ -1,6 +1,6 @@
 from typing import Optional
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 from config import get_settings
 from engagement import engagement_headers
@@ -52,13 +52,94 @@ async def follow_up_stats(engagement_id: Optional[str] = Query(None)):
     params = {}
     if engagement_id:
         params["engagement_id"] = engagement_id
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/follow-ups/stats",
             params=params,
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
+
+
+class MarkCustomerSitesBody(BaseModel):
+    targets: list[str] = []
+    scope_name: str = "customer_scope"
+
+
+@router.post("/api/engagements/{eid}/scope/mark-customer-sites")
+async def mark_customer_sites(eid: str, body: MarkCustomerSitesBody):
+    """Move selected follow-up targets into the engagement's customer_scope
+    (out of the scanned scope). Thin proxy to rag-api."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=120) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/engagements/{eid}/scope/mark-customer-sites",
+            json=body.model_dump(),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.get("/api/follow-ups/export")
+async def export_follow_ups(
+    format: str = Query("csv"),
+    status: Optional[str] = Query(None),
+    exclude_status: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    priority: Optional[str] = Query(None),
+    flagged_by: Optional[str] = Query(None),
+    engagement_id: Optional[str] = Query(None),
+    rule_id: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+):
+    """Download follow-ups in csv/json/md/urls/pdf. Filters mirror the list view,
+    so the current on-screen filter set exports exactly. csv/json/md/urls stream
+    straight through from rag-api; pdf is rendered here (WeasyPrint lives in the
+    BFF) from the enriched JSON."""
+    s = get_settings()
+    filters = {k: v for k, v in (
+        ("status", status), ("exclude_status", exclude_status),
+        ("severity", severity), ("priority", priority),
+        ("flagged_by", flagged_by), ("engagement_id", engagement_id),
+        ("rule_id", rule_id), ("search", search)) if v}
+
+    # PDF is built in the BFF: fetch the enriched JSON, render grouped-by-rule.
+    if format == "pdf":
+        async with httpx.AsyncClient(timeout=120) as c:
+            resp = await c.get(
+                f"{s.rag_api_url}/follow-ups/export",
+                params={**filters, "format": "json"},
+                headers={"x-api-key": s.api_key, **engagement_headers()},
+            )
+            if resp.status_code >= 400:
+                raise HTTPException(resp.status_code, resp.text)
+        items = resp.json().get("follow_ups", [])
+        filter_line = " · ".join(f"{k}={v}" for k, v in filters.items()) or "all follow-ups"
+        try:
+            from services.report_renderer import render_follow_ups_pdf
+            pdf = render_follow_ups_pdf(items, filter_line=filter_line)
+        except Exception as e:
+            raise HTTPException(500, f"PDF render failed: {type(e).__name__}: {e}")
+        fname = f"follow-ups-{(rule_id or 'all')}-report.pdf"
+        return Response(content=pdf, media_type="application/pdf",
+                        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+    async with httpx.AsyncClient(timeout=120) as c:
+        resp = await c.get(
+            f"{s.rag_api_url}/follow-ups/export",
+            params={**filters, "format": format},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return Response(
+            content=resp.content,
+            media_type=resp.headers.get("content-type", "application/octet-stream"),
+            headers={"Content-Disposition":
+                     resp.headers.get("content-disposition", "attachment")},
+        )
 
 
 @router.get("/api/follow-ups/group-ids")
@@ -75,7 +156,7 @@ async def follow_up_group_ids(
     if status: params["status"] = status
     if exclude_status: params["exclude_status"] = exclude_status
     if engagement_id: params["engagement_id"] = engagement_id
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.rag_api_url}/follow-ups/group-ids", params=params,
                            headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
@@ -96,7 +177,7 @@ async def follow_ups_grouped(
         params["exclude_status"] = exclude_status
     if engagement_id:
         params["engagement_id"] = engagement_id
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/follow-ups/grouped",
             params=params,
@@ -136,7 +217,7 @@ async def list_follow_ups(
         params["rule_id"] = rule_id
     if search:
         params["search"] = search
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/follow-ups",
             params=params,
@@ -148,7 +229,7 @@ async def list_follow_ups(
 @router.post("/api/follow-ups")
 async def create_follow_up(body: FollowUpCreate):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/follow-ups",
             json=body.model_dump(exclude_none=True),
@@ -162,7 +243,7 @@ async def create_follow_up(body: FollowUpCreate):
 @router.patch("/api/follow-ups/{item_id}")
 async def update_follow_up(item_id: str, body: FollowUpUpdate):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.patch(
             f"{s.rag_api_url}/follow-ups/{item_id}",
             json=body.model_dump(exclude_none=True),
@@ -176,7 +257,7 @@ async def update_follow_up(item_id: str, body: FollowUpUpdate):
 @router.delete("/api/follow-ups/{item_id}")
 async def delete_follow_up(item_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/follow-ups/{item_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -189,7 +270,7 @@ async def delete_follow_up(item_id: str):
 @router.post("/api/follow-ups/{item_id}/feedback")
 async def submit_feedback(item_id: str, body: FeedbackBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/follow-ups/{item_id}/feedback",
             json=body.model_dump(exclude_none=True),
@@ -206,7 +287,7 @@ async def submit_feedback(item_id: str, body: FeedbackBody):
 async def bulk_update_followups(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(
             f"{s.rag_api_url}/followups/bulk-update",
             json=body,
@@ -226,7 +307,7 @@ class AgentScanBody(BaseModel):
 @router.post("/api/agent/scan")
 async def trigger_agent_scan(body: AgentScanBody = AgentScanBody()):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(
             f"{s.rag_api_url}/agent/scan",
             json=body.model_dump(),
@@ -238,7 +319,7 @@ async def trigger_agent_scan(body: AgentScanBody = AgentScanBody()):
 @router.get("/api/agent/rules")
 async def list_agent_rules():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/agent/rules",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -249,7 +330,7 @@ async def list_agent_rules():
 @router.get("/api/agent/rules/{rule_id}")
 async def get_agent_rule(rule_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/agent/rules/{rule_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -262,7 +343,7 @@ async def get_agent_rule(rule_id: str):
 @router.patch("/api/agent/rules/{rule_id}")
 async def toggle_agent_rule(rule_id: str, enabled: bool = Query(True)):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.patch(
             f"{s.rag_api_url}/agent/rules/{rule_id}",
             params={"enabled": enabled},
@@ -274,7 +355,7 @@ async def toggle_agent_rule(rule_id: str, enabled: bool = Query(True)):
 @router.post("/api/agent/rules/reload")
 async def reload_agent_rules():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/agent/rules/reload",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -291,7 +372,7 @@ class RuleTestBody(BaseModel):
 @router.post("/api/agent/rules/test")
 async def test_agent_rule(body: RuleTestBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(
             f"{s.rag_api_url}/agent/rules/test",
             json=body.model_dump(exclude_none=True),
@@ -308,7 +389,7 @@ class AdhocRuleBody(BaseModel):
 @router.post("/api/agent/rules/adhoc")
 async def create_adhoc_rule(body: AdhocRuleBody):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/agent/rules/adhoc",
             json=body.model_dump(),
@@ -322,7 +403,7 @@ async def create_adhoc_rule(body: AdhocRuleBody):
 @router.delete("/api/agent/rules/{rule_id}")
 async def delete_agent_rule(rule_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/agent/rules/{rule_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -335,7 +416,7 @@ async def delete_agent_rule(rule_id: str):
 @router.get("/api/agent/stats")
 async def agent_stats():
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/agent/stats",
             headers={"x-api-key": s.api_key, **engagement_headers()},

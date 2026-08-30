@@ -4,7 +4,13 @@ Handles nc/socat listeners and captures callback connections.
 """
 
 import os
+import shlex
 import re
+import time        # scope gate: cache TTL (module-level; there is a
+                   # function-local `import time` elsewhere, which does NOT
+                   # bind the name at module scope)
+import ipaddress   # scope gate: CIDR membership
+import fnmatch     # scope gate: *.domain matching
 import uuid
 import signal
 import subprocess
@@ -909,10 +915,34 @@ _FALLBACK_ALLOWED_TOOLS = {
     "nmap", "hydra", "medusa", "nikto", "whatweb", "enum4linux",
     "smbclient", "smbmap", "ssh-audit", "netexec", "crackmapexec", "nbtscan",
     "snmpwalk", "onesixtyone", "ldapsearch", "dig", "host", "nslookup",
-    "redis-cli", "psql", "mysql", "rpcclient", "showmount"
+    "redis-cli", "psql", "mysql", "rpcclient", "showmount",
+    # Baked into this image (see kali_listener/Dockerfile). Present in the
+    # node-manager registry too; listed here so a registry fetch failure does not
+    # reject a tool the image demonstrably has.
+    "rmg", "dnsenum", "dnsrecon", "enum4linux-ng", "sqlmap", "gobuster",
+    "nuclei", "smtp-user-enum", "snmpcheck", "swaks", "avahi-browse",
+    "tftp", "telnet", "ftp", "lftp", "vncviewer", "ntpq", "ntpdate",
 }
 # Metasploit is never auto-dispatchable here.
 _MSF_DENY = {"metasploit", "msfconsole", "msfvenom", "msf"}
+
+# Alias -> canonical tool name, applied only when the alias itself is not
+# allowlisted. Purely a naming fix: the canonical name must still be present in
+# the allowlist for the call to proceed, so this cannot grant a capability that
+# was not already granted.
+#
+# Deliberately NOT an alias for anything in _MSF_DENY — Metasploit stays
+# reachable only through the Exploit Manager's approval queue.
+# Every entry must be verified on BOTH sides: the alias is a name the
+# recommender actually emits, and the canonical name is both allowlisted and
+# present as a binary in this image. `ncat` and `cme` were considered and
+# rejected — neither binary exists here, so aliasing them would swap a clear
+# "not in allowed list" rejection for a confusing exec failure.
+TOOL_ALIASES = {
+    # KB recommender emits `nc`; the registry lists `netcat`. /usr/bin/nc and
+    # /usr/bin/netcat are both present (netcat-traditional).
+    "nc": "netcat",
+}
 
 # Cache of {tool_name: install_cmd}, rebuilt every _TOOL_REGISTRY_TTL seconds so
 # operator allowlist edits (from Settings) take effect without a restart.
@@ -1031,8 +1061,218 @@ def get_allowed_tools() -> set:
 ALLOWED_TOOLS = _FALLBACK_ALLOWED_TOOLS
 
 
-async def execute_tool(exec_id: str, tool: str, command: str, timeout: int):
-    """Execute a tool command and capture output."""
+# Concurrency ceiling, shared with every other service via common/tool_job.py.
+#
+# The ASYNC variant matters here: this service's executor is
+# `await asyncio.create_subprocess_shell`, and holding the threading semaphore
+# would block the event loop for up to SLOT_WAIT_TIMEOUT (1800s), stalling every
+# other request including the health check that keeps this container marked
+# healthy.
+#
+# ./common is bind-mounted at /app/common (docker-compose.yml), the same way
+# ./etl is for the scope gate. If it is missing we refuse to run tools rather
+# than silently running unbounded — this service executes whatever it is handed,
+# so an unbounded fallback is the worst possible failure mode.
+try:
+    from common.tool_job import (
+        MAX_CONCURRENT_SCANS,
+        active_async_slot_count,
+        async_scan_slot,
+    )
+    _SLOTS_AVAILABLE = True
+except ImportError as _slot_exc:      # pragma: no cover - deployment problem
+    _SLOTS_AVAILABLE = False
+    _SLOT_IMPORT_ERROR = str(_slot_exc)
+    MAX_CONCURRENT_SCANS = 0
+
+
+# ── Scope enforcement (last line of defence) ──────────────────────────────
+#
+# This service executes whatever it is handed. Every other dispatcher — the BFF,
+# the recommender's auto-execute, remote nodes, the agents — eventually arrives
+# here, which makes it the one place a scope check cannot be routed around.
+#
+# The matching rules live in etl/scope_gate.py, bind-mounted at /app/etl. They
+# briefly existed in three copies (etl, the BFF, here) because build contexts
+# could not reach a shared file; the mount removes that excuse. Only the DB
+# lookup is local, because each service reaches Postgres its own way.
+try:
+    from etl.scope_gate import check_dispatch, load_dispatch_scope, load_host_aliases
+    SCOPE_GATE_AVAILABLE = True
+except Exception as _scope_import_error:        # pragma: no cover
+    SCOPE_GATE_AVAILABLE = False
+    logger.error("scope gate UNAVAILABLE (%s) — every execution will be refused. "
+                 "Check the ./etl:/app/etl mount on kali-listener.",
+                 _scope_import_error)
+
+SCOPE_CACHE_TTL = int(os.environ.get("SCOPE_CACHE_TTL", "30"))
+_scope_cache = {"rows": None, "at": 0.0}
+
+
+def _scope_rows(force: bool = False):
+    """Scope targets, cached briefly — this runs on every execution."""
+    now = time.time()
+    if not force and _scope_cache["rows"] is not None and \
+            now - _scope_cache["at"] < SCOPE_CACHE_TTL:
+        return _scope_cache["rows"]
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                rows, _source = load_dispatch_scope(cur)
+        finally:
+            conn.close()
+    except Exception as e:
+        # Do NOT cache a failed load as "empty scope": a transient DB blip would
+        # then refuse every execution for the whole TTL rather than just the
+        # call that hit it.
+        logger.warning(f"scope load failed: {e} — refusing executions until it recovers")
+        return []
+    _scope_cache.update({"rows": rows, "at": now})
+    return rows
+
+
+def enforce_scope(target: str, command: str = "") -> Optional[str]:
+    """Return an error string when this execution must be refused, else None."""
+    if not SCOPE_GATE_AVAILABLE:
+        # Fail CLOSED. A missing mount must not silently disable the gate —
+        # that is indistinguishable from having no gate at all.
+        return ("scope gate is unavailable (etl/scope_gate not importable) — "
+                "refusing to execute")
+    # Resolve aliases so this agrees with the BFF and the scan launcher: a host
+    # in scope under its other observed identity must not be refused here purely
+    # because the caller used a different name for it.
+    aliases = set()
+    if target:
+        try:
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cur:
+                    aliases = load_host_aliases(cur, target)
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning(f"alias lookup failed for {target}: {e}")
+    return check_dispatch(target, _scope_rows(), command, aliases=aliases)
+
+
+def store_raw_artifact(tool: str, content: str, command: str = "", target: str = "",
+                       port=None, service=None, exec_id: str = None, job_id: str = None,
+                       native_json: bool = False) -> None:
+    """Persist COMPLETE tool output to the artifact store.
+
+    Deliberately separate from the /ingest/tool-output call below, which
+    truncates at 200 KB and exists to produce findings. This keeps every byte
+    for later analysis — including the tool's native JSON file, which used to
+    be read, parsed and then unlinked, so the one authoritative structured
+    artifact was the only thing never kept.
+
+    Failures are logged and swallowed: the tool already ran, and losing the
+    archive copy must not turn a successful execution into a failed one.
+    """
+    if not content or not content.strip():
+        return
+    try:
+        import requests as req_lib
+        r = req_lib.post(
+            f"{API_BASE}/ingest/raw-artifact",
+            json={"tool": tool, "content": content, "command": (command or "")[:4000],
+                  "target": target or "", "port": port, "service": service,
+                  "exec_id": exec_id, "job_id": job_id,
+                  "source": "kali_listener", "native_json": native_json},
+            headers={"x-api-key": API_KEY}, timeout=120, verify=False,
+        )
+        if r.status_code < 400:
+            d = r.json()
+            logger.info(f"[{(exec_id or '')[:8]}] archived {len(content)} bytes "
+                        f"({d.get('content_format')}, native_json={native_json}) "
+                        f"-> {d.get('artifact_id')} new={d.get('new')}")
+        else:
+            logger.warning(f"[{(exec_id or '')[:8]}] artifact store HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        logger.warning(f"[{(exec_id or '')[:8]}] artifact store failed: {e}")
+
+
+# Tools whose NATIVE JSON output we prefer over parsing their text.
+#
+# Guessing structure out of CLI text goes wrong in ways that are worse than
+# useless: the table strategy read crackmapexec's whitespace-aligned SMB banner
+# as a header row, so the DATA became the column NAMES. Where a tool can emit
+# JSON itself, that is authoritative and free.
+#
+# Each flag was verified against `--help` INSIDE this image, not assumed — most
+# of these write JSON to a FILE rather than stdout, which changes how the output
+# has to be collected:
+#
+#   nuclei          -jsonl                 -> stdout (JSONL)
+#   enum4linux-ng   -oJ <file>             -> file (appends .json itself)
+#   whatweb         --log-json=<file>      -> file
+#   dnsrecon        --json <file>          -> file
+#   sqlmap          --report-json=<file>   -> file
+#
+# crackmapexec, netexec and nikto have no JSON option in this image and keep
+# using the text path, which is why raw_output is still preserved there.
+JSON_CAPABLE = {
+    "nuclei":        {"flag": "-jsonl", "mode": "stdout"},
+    "enum4linux-ng": {"flag": "-oJ {out}", "mode": "file", "suffix": ".json"},
+    "whatweb":       {"flag": "--log-json={out}", "mode": "file"},
+    "dnsrecon":      {"flag": "--json {out}", "mode": "file"},
+    "sqlmap":        {"flag": "--report-json={out}", "mode": "file"},
+}
+
+
+def apply_json_output(tool: str, command: str):
+    """Return (command, json_path). Adds the tool's native JSON flag.
+
+    Never overrides an explicit choice: if the command already asks for JSON, it
+    is left alone. A tool not in the map is returned unchanged rather than
+    guessed at — appending an unsupported flag would fail the whole run, which is
+    worse than parsing its text.
+    """
+    spec = JSON_CAPABLE.get((tool or "").lower())
+    if not spec:
+        return command, None
+    if any(tok in command for tok in ("-json", "--json", "-jsonl", "-oJ", "--log-json")):
+        return command, None
+    if spec["mode"] == "stdout":
+        return f"{command} {spec['flag']}", None
+    out = f"/tmp/{(tool or 'tool')}-{uuid.uuid4().hex[:8]}"
+    cmd = f"{command} {spec['flag'].format(out=out)}"
+    return cmd, out + spec.get("suffix", "")
+
+
+async def execute_tool(exec_id: str, tool: str, command: str, timeout: int,
+                       target: str = "", port: int = None,
+                       service: str = None, job_id: str = None):
+    """Execute a tool command and capture output.
+
+    Bounded by MAX_CONCURRENT_SCANS. This is the last line of defence: every
+    dispatcher in the stack eventually reaches /tools/execute, so several
+    callers that never consult the limit themselves are bounded here.
+    """
+    if not _SLOTS_AVAILABLE:
+        msg = (f"refusing to execute: common/tool_job is not importable "
+               f"({_SLOT_IMPORT_ERROR}) so the scan limit cannot be enforced")
+        logger.error(f"[{exec_id[:8]}] {msg}")
+        db_update_tool_execution(exec_id, "failed", error=msg)
+        return
+
+    try:
+        async with async_scan_slot(exec_id, f"tool:{tool}"):
+            await _execute_tool_bounded(exec_id, tool, command, timeout,
+                                        target, port, service, job_id)
+    except TimeoutError as exc:
+        # Fail loudly rather than pinning a coroutine forever.
+        logger.error(f"[{exec_id[:8]}] {exc}")
+        db_update_tool_execution(exec_id, "failed", error=str(exc))
+
+
+async def _execute_tool_bounded(exec_id: str, tool: str, command: str, timeout: int,
+                                target: str = "", port: int = None,
+                                service: str = None, job_id: str = None):
+    """The body of execute_tool, run while holding a scan slot."""
+    # Prefer the tool's own JSON where it has one.
+    command, _json_path = apply_json_output(tool, command)
     logger.info(f"[{exec_id[:8]}] Executing: {command}")
 
     # Update status to running
@@ -1069,11 +1309,80 @@ async def execute_tool(exec_id: str, tool: str, command: str, timeout: int):
             # Parse output
             parsed_results = parse_tool_output(tool, output)
 
-            # Update database
-            status = "completed" if exit_code == 0 else "failed"
+            # Update database.
+            #
+            # Not `exit_code == 0`: ssh-audit exits 3 when it FINDS something,
+            # so 17 successful audits carrying 9 KB of results each were stored
+            # as failures. See TOOL_SUCCESS_EXIT_CODES.
+            status = "completed" if is_success_exit(tool, exit_code) else "failed"
             db_update_tool_execution(
                 exec_id, status, exit_code, output, error, parsed_results
             )
+
+            # Turn the output into findings.
+            #
+            # Without this a tool runs, succeeds, stores 1KB of real output in
+            # tool_executions — and the operator sees nothing. crackmapexec
+            # returned the host's SMB banner (signing:False, SMBv1:True) 21 times
+            # and produced not one finding, which reads as "selecting the
+            # recommendation does nothing".
+            #
+            # parse_tool_output above only covers 6 tools (nmap, hydra, nikto,
+            # enum4linux, ssh-audit, whatweb) out of 78 allowlisted, so for
+            # nearly everything it returns None and the output dies here.
+            # /ingest/tool-output applies the generic structurer — JSON, then
+            # table, CVE, URL, key-value, raw-text fallback — so every tool
+            # surfaces something rather than only the six with bespoke parsers.
+            # Prefer the tool's own JSON file when it wrote one: authoritative
+            # structure beats inferring columns from aligned text.
+            ingest_payload = output
+            _native = False
+            if _json_path:
+                try:
+                    _jp = pathlib.Path(_json_path)
+                    if _jp.exists() and _jp.stat().st_size > 0:
+                        ingest_payload = _jp.read_text(errors="replace")
+                        _native = True
+                        logger.info(f"[{exec_id[:8]}] using native JSON from {_json_path}")
+                    _jp.unlink(missing_ok=True)
+                except Exception as _je:
+                    logger.debug(f"[{exec_id[:8]}] JSON output unusable, using stdout: {_je}")
+
+            # Archive EVERY byte before anything lossy touches it. Both copies
+            # are kept when a tool emitted native JSON: the JSON is the better
+            # input for machine processing, but stdout often carries context
+            # (warnings, timing, banners) the JSON file omits entirely.
+            store_raw_artifact(tool, output, command, target, port, service,
+                               exec_id, job_id, native_json=False)
+            if _native:
+                store_raw_artifact(tool, ingest_payload, command, target, port,
+                                   service, exec_id, job_id, native_json=True)
+
+            if ingest_payload and ingest_payload.strip():
+                try:
+                    import requests as req_lib
+                    req_lib.post(
+                        f"{API_BASE}/ingest/tool-output",
+                        json={
+                            "stdout": ingest_payload[:200000],
+                            "tool_name": tool,
+                            "target": target or "",
+                            "port": port,
+                            "service": service,
+                            "job_id": job_id,
+                            # Already archived above — don't double-count.
+                            "archived": True,
+                            "command": command[:4000],
+                            "source": "kali_listener",
+                        },
+                        headers={"x-api-key": API_KEY},
+                        timeout=60,
+                        verify=False,
+                    )
+                except Exception as e:
+                    # Never fail the execution because reporting failed — the
+                    # output is already persisted on the row above.
+                    logger.warning(f"[{exec_id[:8]}] tool-output ingest failed: {e}")
 
             # Update in-memory tracking
             active_executions[exec_id].update({
@@ -1129,6 +1438,51 @@ async def execute_tool(exec_id: str, tool: str, command: str, timeout: int):
 # --- FastAPI App ---
 
 @asynccontextmanager
+def _reap_orphaned_executions():
+    """Fail executions this service was running when it last stopped.
+
+    A tool_executions row is set to 'running' before the subprocess starts and
+    updated when it finishes. If the container stops in between — a rebuild, a
+    restart, an OOM kill — the row stays 'running' for ever. Nothing reconciled
+    it, so 41 rows sat at 'running' with no process alive and the oldest three
+    days stale, which reads exactly like a hung scan.
+
+    Safe because of what a restart implies: this service launches its tools as
+    child processes, so nothing it started can have survived its own death. Any
+    row still 'running' at startup is definitionally orphaned.
+
+    NOTE: that reasoning assumes ONE listener. If this is ever scaled to
+    multiple replicas sharing a database, a starting replica would wrongly fail
+    a sibling's live executions — key the reap on an instance id first.
+    """
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE tool_executions
+                       SET status = 'failed',
+                           error = coalesce(nullif(error, ''), '') ||
+                                   'interrupted: kali-listener restarted while this was running',
+                           completed_at = now()
+                     WHERE status IN ('running', 'pending')
+                    RETURNING id
+                """)
+                reaped = cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+        if reaped:
+            logger.warning("reaped %d orphaned tool execution(s) left 'running' by a "
+                           "previous restart", reaped)
+        else:
+            logger.info("no orphaned tool executions to reap")
+    except Exception as e:
+        # Never block startup on this: the service is still useful with stale
+        # rows present, and failing to boot would be a worse outcome.
+        logger.warning("orphan reap failed: %s", e)
+
+
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     logger.info("=" * 60)
@@ -1136,6 +1490,9 @@ async def lifespan(app: FastAPI):
     logger.info(f"Port Range: {PORT_START}-{PORT_END}")
     logger.info(f"API Port: {API_PORT}")
     logger.info("=" * 60)
+    # Reconcile before serving: a row left 'running' by the previous process is
+    # orphaned by definition, and looks identical to a hung scan until cleared.
+    _reap_orphaned_executions()
     yield
     # Cleanup on shutdown
     logger.info("Shutting down - stopping all listeners...")
@@ -1421,6 +1778,336 @@ async def clear_logs():
 
 # --- Tool Execution Endpoints ---
 
+# ── candidate-space guard for online password attacks ───────────────────────
+#
+# Every hydra/medusa/ncrack command in knowledge/service_tools.yaml named
+# rockyou.txt — 14,344,399 passwords. With a 17-name userlist that is
+# 243,854,783 candidates, and hydra said so itself:
+#
+#   [DATA] overall 16 tasks, 243854783 login tries (l:17/p:14344399)
+#   [STATUS] 256.00 tries/min, 243854527 to do in 15875:57h
+#
+# 15,875 HOURS. Every one of those 48 runs was killed by the deadline and
+# recorded as a scan that found nothing — so a hopeless invocation and a host
+# with strong passwords produced identical evidence. Nothing warned before
+# dispatch; this does.
+#
+# Counting is done HERE because this is where the files are: the listener can
+# read the wordlists, the recommender cannot.
+# ── per-tool exit-code semantics ────────────────────────────────────────────
+#
+# `status = "completed" if exit_code == 0 else "failed"` is wrong for security
+# tools that use the exit code to report WHAT THEY FOUND.
+#
+# ssh-audit is the measured case: 17 stored executions exited 3 carrying
+# 8.9-9.5 KB of output, and 23 `vulns` rows were parsed out of them — a
+# successful audit recorded as a failure. Verified against this image:
+#
+#     ssh-audit -n 192.168.1.150   -> exit 3, 9,530 bytes   (findings present)
+#     ssh-audit -n 127.0.0.1       -> exit 1,    80 bytes   (connection refused)
+#
+# So 3 means "issues found" and 1 means a real failure. Only 0 and 3 are success.
+#
+# ADD ONLY MEASURED ENTRIES. A guessed exit code here silently reclassifies real
+# failures as successes, which is worse than the bug it fixes: a failure that
+# reads as a result is invisible, while a result that reads as a failure at least
+# shows up in the review. Record the measurement in a comment beside the entry.
+TOOL_SUCCESS_EXIT_CODES = {
+    "ssh-audit": {0, 3},
+}
+
+
+def is_success_exit(tool, exit_code):
+    """True when this exit code means the tool did its job.
+
+    Defaults to the universal rule (0 only) for anything not measured.
+    """
+    if exit_code is None:
+        return False
+    allowed = TOOL_SUCCESS_EXIT_CODES.get((tool or "").strip().lower(), {0})
+    return exit_code in allowed
+
+
+# Used only when no rate has been measured against the host. Deliberately NOT
+# 256: that was the fastest rate ever observed here, so it made every unmeasured
+# estimate the best case.
+DEFAULT_RATE_PER_MIN = float(os.environ.get("DEFAULT_RATE_PER_MIN", "60"))
+
+CANDIDATE_WARN = int(os.environ.get("CANDIDATE_SPACE_WARN", "50000"))
+CANDIDATE_REFUSE = int(os.environ.get("CANDIDATE_SPACE_REFUSE", "1000000"))
+
+# -L/-U take a userlist, -P a password list, -C a combo file. Single-value
+# forms (-l, -p, --user) count as one.
+_LIST_FLAGS = {"-L": "users", "-U": "users", "-P": "passwords",
+               "-C": "combos", "--userlist": "users", "--passwords": "passwords"}
+_SINGLE_FLAGS = {"-l": "users", "-p": "passwords", "--user": "users",
+                 "--pass": "passwords"}
+_BRUTE_TOOLS = {"hydra", "medusa", "ncrack", "crowbar", "patator", "brutus"}
+
+_linecount_cache = {}
+
+# Lists worth offering as defaults. This is a FILTER, not a promise: a name here
+# appears only if the file is actually present, so an absent one is simply not
+# offered. Verified present in this image today: top-passwords-shortlist.txt
+# (25), best110.txt (110), default-passwords.txt (2,875),
+# top-usernames-shortlist.txt (17). The other three are not installed here.
+# Never let a DEFAULT name an absent file — that was the gobuster bug, where
+# 20 of 20 runs failed on /usr/share/wordlists/dirb/common.txt.
+_CURATED_LISTS = {
+    "top-passwords-shortlist.txt",          # 25 — the default
+    "default-passwords.txt",                # 2,875
+    "top-usernames-shortlist.txt",          # 17 — the default
+    "unix_users.txt",
+    "best110.txt",
+    "darkweb2017-top100.txt",
+    "probable-v2-top1575.txt",
+}
+
+
+def _count_lines(path):
+    """Lines in a wordlist, cached on (size, mtime).
+
+    Returns None when the file cannot be read — an unknown count must not be
+    treated as zero, because zero would silently pass the guard.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (path, st.st_size, int(st.st_mtime))
+    if key in _linecount_cache:
+        return _linecount_cache[key]
+    try:
+        with open(path, "rb") as fh:
+            n = sum(1 for _ in fh)
+    except OSError:
+        return None
+    _linecount_cache[key] = n
+    return n
+
+
+def estimate_candidate_space(tool, command):
+    """(estimate, detail) for a brute-force command, or (None, detail).
+
+    None means "not a brute-force tool" or "cannot tell" — never a silent zero.
+    """
+    if (tool or "").strip().lower() not in _BRUTE_TOOLS:
+        return None, {"reason": "not a brute-force tool"}
+    try:
+        tokens = shlex.split(command or "")
+    except ValueError:
+        tokens = (command or "").split()
+
+    counts = {"users": None, "passwords": None, "combos": None}
+    files = {}
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+        if tok in _LIST_FLAGS and nxt and not nxt.startswith("-"):
+            kind = _LIST_FLAGS[tok]
+            n = _count_lines(nxt)
+            files[kind] = {"path": nxt, "lines": n}
+            counts[kind] = n
+            i += 2
+            continue
+        if tok in _SINGLE_FLAGS and nxt and not nxt.startswith("-"):
+            counts[_SINGLE_FLAGS[tok]] = 1
+            i += 2
+            continue
+        i += 1
+
+    if counts["combos"] is not None:
+        est = counts["combos"]
+    elif counts["users"] is None and counts["passwords"] is None:
+        return None, {"reason": "no wordlist arguments found", "files": files}
+    else:
+        # An unspecified side is 1, not 0: hydra with only -P still tries every
+        # password against the implied single user.
+        est = (counts["users"] or 1) * (counts["passwords"] or 1)
+
+    unreadable = [k for k, v in files.items() if v.get("lines") is None]
+    return est, {"counts": counts, "files": files, "unreadable": unreadable}
+
+
+# Rate lookup for the time estimate.
+#
+# This duplicates the `observed_rate_per_min` source declared in
+# knowledge/scan_parameters.yaml, because rag-api's scan_parameters module is
+# not mounted here. CLAUDE.md requires duplicated logic to be pinned: the
+# agreement test is
+# tests/test_scan_parameters.py::test_listener_rate_matches_the_parameter_store.
+#
+# `min` on purpose. Measured hydra rates on this engagement were 16 (telnet),
+# 22, 116 and 256 (ftp) — a 16x spread — and the constant below WAS 256, the
+# best case. At 16/min a 4,100-candidate list takes 4.3 hours, not the 16
+# minutes the guard reported.
+_RATE_RE = re.compile(r"([0-9.]+) tries/min")
+_rate_cache = {}
+
+
+def observed_rate_per_min(target):
+    """Slowest rate actually achieved against this host, or None if unmeasured."""
+    if not target:
+        return None
+    if target in _rate_cache:
+        return _rate_cache[target]
+    rate = None
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COALESCE(output, '') FROM tool_executions
+                     WHERE target = %s AND tool = 'hydra'
+                       AND octet_length(COALESCE(output, '')) > 0
+                     ORDER BY started_at DESC LIMIT 100
+                """, (target,))
+                values = []
+                for (output,) in cur.fetchall():
+                    for m in _RATE_RE.findall(output):
+                        try:
+                            values.append(float(m))
+                        except ValueError:
+                            continue
+                if values:
+                    rate = min(values)
+        finally:
+            conn.close()
+    except Exception:                       # noqa: BLE001
+        rate = None
+    _rate_cache[target] = rate
+    return rate
+
+
+# Lockout policy for the per-account limit.
+#
+# Like observed_rate_per_min above, this duplicates a source declared in
+# knowledge/scan_parameters.yaml because rag-api's module is not mounted here.
+# Pinned by tests/test_scan_parameters.py::test_listener_lockout_matches_the_parameter_store.
+#
+# Two different safety questions, and only the first was ever asked:
+#   total volume        can this finish?           -> candidate count
+#   per-account tries   will this lock accounts?   -> passwords per user
+# A 50-user x 82-password list is 4,100 candidates and finishes in 16 minutes.
+# Against a domain with a lockout threshold of 3 it also locks out all 50
+# accounts. Small and fast is not the same as safe.
+_lockout_cache = {}
+
+
+def observed_lockout_threshold(target):
+    """('None'|digits|None) — the domain lockout threshold last observed.
+
+    None means never measured, which is NOT the same as no lockout.
+    """
+    if not target:
+        return None
+    if target in _lockout_cache:
+        return _lockout_cache[target]
+    value = None
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT data->'params'->>'lockout_threshold'
+                      FROM recon_findings
+                     WHERE finding_type = 'smb_password_policy' AND target = %s
+                       AND data->'params'->>'lockout_threshold' IS NOT NULL
+                     ORDER BY created_at DESC LIMIT 1
+                """, (target,))
+                row = cur.fetchone()
+                if row:
+                    value = row[0]
+        finally:
+            conn.close()
+    except Exception:                       # noqa: BLE001
+        value = None
+    _lockout_cache[target] = value
+    return value
+
+
+# Services whose logins are governed by the SMB/domain account policy. An ftp or
+# a web login is frequently a local account the domain policy never touches, so
+# applying the threshold there would refuse work for no reason.
+_DOMAIN_AUTH_HINTS = ("smb://", "winrm://", "rdp://", "mssql://", "ldap://",
+                      "-m smb", "-m winrm", "-m rdp")
+
+
+def check_account_lockout(tool, command, target, force=False):
+    """(refusal, warning) for locking accounts out, independent of volume.
+
+    Unknown policy WARNS rather than refuses. Refusing every brute-force against
+    a host nobody has run `--pass-pol` on would block real work on a guess; the
+    warning names the command that resolves it. Flip the marked branch to refuse
+    if this engagement wants fail-closed.
+    """
+    if (tool or "").strip().lower() not in _BRUTE_TOOLS:
+        return None, None
+    low = (command or "").lower()
+    if not any(h in low for h in _DOMAIN_AUTH_HINTS):
+        return None, None
+
+    est, detail = estimate_candidate_space(tool, command)
+    if est is None:
+        return None, None
+    per_account = (detail.get("counts") or {}).get("passwords") or 1
+
+    threshold = observed_lockout_threshold(target)
+    if threshold is None:
+        # <-- fail-closed switch: return a refusal here instead.
+        return None, (
+            f"lockout policy for {target} has never been measured, and this "
+            f"would try {per_account} password(s) per account. Run "
+            f"`netexec smb {target} -u '' -p '' --pass-pol` first to find out "
+            f"whether that locks every account out.")
+    if str(threshold).strip().lower() in ("none", "0", "not set", "disabled"):
+        return None, None                    # measured: no lockout enforced
+    try:
+        limit = int(str(threshold).strip())
+    except ValueError:
+        return None, None
+    if per_account >= limit and not force:
+        return (f"lockout threshold on {target} is {limit} and this would try "
+                f"{per_account} password(s) per account — it would lock out "
+                f"every account in the userlist rather than find a credential. "
+                f"Use at most {max(1, limit - 1)} passwords per account, or "
+                f"pass force."), None
+    return None, None
+
+
+def check_candidate_space(tool, command, force=False, target=None):
+    """(refusal_or_None, warning_or_None). Volume judgement, not authorisation.
+
+    CLAUDE.md: an override overrules the platform's SUPPRESSION judgement, never
+    the operator's AUTHORIZATION. Candidate volume is suppression, so `force`
+    may pass it — unlike the scope gate, which force must never pass.
+    """
+    est, detail = estimate_candidate_space(tool, command)
+    if est is None:
+        return None, None
+    # Measured for THIS host when we have it. The old constant 256 was the
+    # fastest rate ever seen here, so every estimate was the best case.
+    measured = observed_rate_per_min(target)
+    rate = measured if measured else DEFAULT_RATE_PER_MIN
+    hours = est / rate / 60.0
+    how = "measured on this host" if measured else "assumed, never measured here"
+    human = (f"{est:,} candidates"
+             + (f" ({detail['counts'].get('users') or 1} users x "
+                f"{detail['counts'].get('passwords') or 1} passwords)"
+                if not detail["counts"].get("combos") else "")
+             + f" — about {hours:,.0f}h at {rate:.0f} tries/min ({how})")
+    if est >= CANDIDATE_REFUSE and not force:
+        return (f"{human}. Refusing: this cannot finish inside any timeout, and "
+                f"a run killed by the deadline looks identical to a target that "
+                f"held. Use a short password list and a discovered-user list, "
+                f"or pass force to override."), None
+    if est >= CANDIDATE_WARN:
+        return None, (f"{human}. This is likely to be killed by the deadline; "
+                      f"its result will not mean the passwords are strong.")
+    return None, None
+
+
 @app.post("/tools/execute", response_model=ToolExecutionResponse)
 async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: BackgroundTasks):
     """
@@ -1429,6 +2116,79 @@ async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: B
     The tool must be in the allowed list for security reasons.
     Results are parsed automatically for common tools (nmap, hydra, nikto, etc.)
     """
+    # Scope gate FIRST. 403, not 400: this is an authorisation decision, not a
+    # malformed request.
+    #
+    # NB: this endpoint is NOT the universal chokepoint an earlier version of
+    # this comment claimed. Measured against the dispatch-debt list, exactly ONE
+    # of 17 ungated modules reaches here; the other 16 subprocess directly or
+    # call another scanner service over HTTP. So this gate protects its own
+    # callers well and is worth keeping strict, but it is defence in depth, not
+    # coverage — the remaining modules each need their own gate. See
+    # SCOPE_DEBT/LIMIT_DEBT in tests/test_dispatch_invariants.py.
+    scope_error = enforce_scope(request.target, request.command)
+    if scope_error:
+        logger.warning(f"REFUSED {request.tool} on {request.target}: {scope_error}")
+        raise HTTPException(status_code=403, detail=f"Out of scope — {scope_error}")
+
+    # An unresolved {placeholder} must never reach a shell.
+    #
+    # This is the execution chokepoint and it had no such check, while the
+    # artifact-actions queue path in rag-api already refuses to queue a command
+    # containing one ("an unresolved command cannot run"). The gap mattered as
+    # soon as the DNS/whois templates in knowledge/service_tools.yaml stopped
+    # hardcoding `example.com` and started naming {domain}: without this, an
+    # engagement with no domain in scope would run `dnsrecon -d {domain}`
+    # literally. Previously it ran against example.com — 19 for 19 — producing
+    # output about someone else's domain and telling the operator nothing.
+    unresolved = re.findall(r"\{[a-z_]+\}", request.command or "")
+    if unresolved:
+        logger.warning("REFUSED %s on %s: unresolved placeholder(s) %s",
+                       request.tool, request.target, unresolved)
+        raise HTTPException(
+            status_code=400,
+            detail=(f"command still contains {', '.join(sorted(set(unresolved)))} — "
+                    "fill it in before running. An unresolved command cannot "
+                    "produce meaningful output."))
+
+    # Candidate-space guard. AFTER scope (authorisation first, always) and after
+    # the placeholder check, because counting the wordlists in an unresolved
+    # command would be meaningless.
+    cs_refusal, cs_warning = check_candidate_space(
+        request.tool, request.command,
+        force=bool(getattr(request, "force", False)),
+        target=request.target)
+    lk_refusal, lk_warning = check_account_lockout(
+        request.tool, request.command, request.target,
+        force=bool(getattr(request, "force", False)))
+    if lk_refusal:
+        logger.warning("REFUSED %s on %s: %s", request.tool, request.target,
+                       lk_refusal)
+        _emit_webhook_sync("brute_force_refused_lockout", {
+            "tool": request.tool, "target": request.target,
+            "command": request.command[:400], "reason": lk_refusal})
+        raise HTTPException(status_code=400, detail=lk_refusal)
+    if lk_warning:
+        logger.warning("LOCKOUT-UNKNOWN %s on %s: %s", request.tool,
+                       request.target, lk_warning)
+        _emit_webhook_sync("brute_force_lockout_unknown", {
+            "tool": request.tool, "target": request.target,
+            "warning": lk_warning})
+
+    if cs_refusal:
+        logger.warning("REFUSED %s on %s: %s", request.tool, request.target,
+                       cs_refusal)
+        _emit_webhook_sync("brute_force_refused_oversized", {
+            "tool": request.tool, "target": request.target,
+            "command": request.command[:400], "reason": cs_refusal})
+        raise HTTPException(status_code=400, detail=cs_refusal)
+    if cs_warning:
+        logger.warning("OVERSIZED %s on %s: %s", request.tool, request.target,
+                       cs_warning)
+        _emit_webhook_sync("brute_force_oversized_warning", {
+            "tool": request.tool, "target": request.target,
+            "command": request.command[:400], "warning": cs_warning})
+
     # Validate tool token shape (no shell metacharacters in the tool name).
     tool_lower = request.tool.lower()
     if not re.match(r'^[a-zA-Z0-9_.-]+$', tool_lower):
@@ -1436,6 +2196,20 @@ async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: B
                             detail=f"Invalid tool name: '{request.tool}'")
     # Validate tool is allowed (registry-derived, minus Metasploit).
     allowed = get_allowed_tools()
+    # Canonicalise well-known aliases before the check.
+    #
+    # This does NOT widen the allowlist: every alias resolves to a name that had
+    # to be allowed on its own merits, and an alias whose canonical name is not
+    # allowed is still rejected. It only stops the same tool being accepted or
+    # refused depending on which of its two names the caller happened to use.
+    #
+    # Real case: the KB recommender emits `nc`, the registry lists `netcat`, and
+    # the binary in this image is `nc` (from netcat-traditional). Dispatches were
+    # rejected with "Tool 'nc' is not in allowed list" while `netcat` — the same
+    # binary, the same capability — was permitted. Same failure shape as the
+    # tool-name vs apt-package-name mismatches in Docs/TOOL_ROUTING.md.
+    if tool_lower not in allowed:
+        tool_lower = TOOL_ALIASES.get(tool_lower, tool_lower)
     if tool_lower not in allowed:
         raise HTTPException(
             status_code=400,
@@ -1478,7 +2252,8 @@ async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: B
 
     # Start execution in background
     background_tasks.add_task(
-        execute_tool, exec_id, request.tool, request.command, request.timeout
+        execute_tool, exec_id, request.tool, request.command, request.timeout,
+        request.target, request.port, request.service, request.scan_id
     )
 
     logger.info(f"[{exec_id[:8]}] Queued tool execution: {request.tool} -> {request.target}")
@@ -1585,6 +2360,95 @@ async def get_tool_execution(exec_id: str):
     )
 
 
+@app.get("/wordlists/inventory")
+async def wordlist_inventory(max_files: int = 2000, min_lines: int = 2,
+                            curated_only: bool = False):
+    """Wordlists that exist IN THIS IMAGE, with real line counts.
+
+    The `wordlists` table only ever saw rag-api's host-mounted /wordlists, so it
+    held two rows — while every brute-force command in the catalogue names
+    /usr/share/wordlists/..., a path that exists ONLY here. The operator could
+    not select from the lists actually in use because nothing had ever looked.
+
+    Line counts come from the same `_count_lines` the candidate-space guard
+    uses, so a list's advertised size and the size the guard enforces on cannot
+    disagree.
+
+    `size_verdict` is advisory and derived from the guard's own thresholds:
+      safe      usable as a default
+      large     will warn when paired with a userlist
+      hopeless  refused outright; 934h+ at the observed rate
+    """
+    roots = [
+        "/usr/share/wordlists/seclists/Passwords/Common-Credentials",
+        "/usr/share/wordlists/seclists/Passwords/Default-Credentials",
+        "/usr/share/wordlists/seclists/Usernames",
+        "/usr/share/wordlists",
+        "/wordlists",
+    ]
+    seen, out = set(), []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            for name in sorted(files):
+                if not name.endswith((".txt", ".lst")):
+                    continue
+                path = os.path.join(dirpath, name)
+                if path in seen:
+                    continue
+                seen.add(path)
+                lines = _count_lines(path)
+                if lines is None or lines < min_lines:
+                    # seclists ships ~370 single-line per-vendor credential
+                    # files. They are real, but as selectable OPTIONS they bury
+                    # the handful anyone actually wants. min_lines=1 returns them.
+                    continue
+                # FILENAME wins over directory. Reading the directory first
+                # labelled every `*_default-users.txt` under
+                # Passwords/Default-Credentials as a password list.
+                fn, low = name.lower(), path.lower()
+                if "user" in fn:
+                    kind = "usernames"
+                elif "pass" in fn or "cred" in fn or "rockyou" in fn:
+                    kind = "passwords"
+                elif "username" in low:
+                    kind = "usernames"
+                elif "password" in low or "credential" in low:
+                    kind = "passwords"
+                else:
+                    kind = "other"
+                # Paired against a 17-name userlist, the guard warns at
+                # CANDIDATE_WARN and refuses at CANDIDATE_REFUSE.
+                if lines * 17 >= CANDIDATE_REFUSE:
+                    verdict = "hopeless"
+                elif lines * 17 >= CANDIDATE_WARN:
+                    verdict = "large"
+                else:
+                    verdict = "safe"
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    size = None
+                curated = name in _CURATED_LISTS
+                if curated_only and not curated:
+                    continue
+                out.append({"name": name, "path": path, "list_type": kind,
+                            "line_count": lines, "size_bytes": size,
+                            "size_verdict": verdict, "curated": curated})
+                if len(out) >= max_files:
+                    break
+            if len(out) >= max_files:
+                break
+        if len(out) >= max_files:
+            break
+    # Curated first, then smallest — the order an operator picks from.
+    out.sort(key=lambda w: (not w["curated"], w["list_type"], w["line_count"]))
+    return {"ok": True, "count": len(out), "truncated": len(out) >= max_files,
+            "thresholds": {"warn": CANDIDATE_WARN, "refuse": CANDIDATE_REFUSE},
+            "wordlists": out}
+
+
 @app.get("/tools/allowed")
 async def list_allowed_tools():
     """List all allowed tools that can be executed (registry-derived, minus MSF)."""
@@ -1616,6 +2480,201 @@ async def check_tools(tools: str):
         except Exception:
             missing.append(t)
     return {"ok": True, "found": found, "missing": missing, "total": len(names)}
+
+
+class ToolVerifyRequest(BaseModel):
+    """Commands to verify. `command` may still contain {placeholders}."""
+    commands: List[Dict[str, str]] = Field(
+        ..., description="[{tool, command}] — command may contain {target}/{port}")
+    timeout: int = Field(default=15, ge=3, le=60,
+                         description="Per-command probe timeout in seconds")
+    capture_help: bool = Field(
+        default=False,
+        description="Also capture each distinct tool's own --help, so the real "
+                    "accepted options are recorded rather than assumed")
+
+
+# ── Command verification ────────────────────────────────────────────────────
+#
+# Confirms a command's OPTIONS and CALL PATH at runtime, which no static check
+# can do. It exists because gobuster failed 20 of 20 runs on a wordlist path
+# absent from this image, and dnsrecon ran 19 times against a hardcoded
+# `example.com` — both invisible to pytest, to the container healthcheck, and to
+# any report, because a broken invocation and an empty result look identical.
+#
+# HOW: substitute a DEAD LOOPBACK target, run the command, and classify the
+# failure. The three modes are cleanly distinguishable in practice:
+#
+#   flag provided but not defined   -> the options are wrong
+#   ... does not exist              -> a path in the command is missing
+#   connection refused / timeout    -> options accepted, call path works
+#
+# SAFETY. This is a self-test, not a dispatch surface, and it is deliberately
+# built so it cannot become one:
+#   * the probe target is HARDCODED loopback; no caller-supplied host reaches it
+#   * it runs its own subprocess and never goes through /tools/execute, so it
+#     cannot launder a command past the scope gate
+#   * a command with no {target} placeholder CANNOT be redirected to loopback, so
+#     it is reported unverifiable rather than run — running it might touch
+#     something real
+#   * anything whose substituted form still names a non-loopback host is refused
+_PROBE_HOST = "127.0.0.1"
+_PROBE_PORT = "1"          # reserved, nothing listens
+_PROBE_SUBS = {
+    "{target}": _PROBE_HOST, "{port}": _PROBE_PORT,
+    "{domain}": "localhost", "{product}": "probe", "{version}": "0",
+}
+_BAD_OPTION_MARKERS = (
+    "not defined", "incorrect usage", "unrecognized option", "unrecognised option",
+    "invalid option", "unknown flag", "unknown option", "unknown argument",
+    "no such option", "usage:", "invalid argument",
+)
+_MISSING_PATH_MARKERS = ("does not exist", "no such file", "cannot open",
+                         "not found or not readable", "can't open")
+_REACHED_NETWORK_MARKERS = (
+    "connection refused", "connect failed", "couldn't connect", "could not connect",
+    "timed out", "timeout", "no route to host", "network is unreachable",
+    "connection reset", "refused", "unreachable", "no response",
+)
+
+
+def _classify_probe(out: str) -> tuple:
+    """(verdict, detail) from a probe's combined output. Order matters.
+
+    Bad options are checked FIRST: a tool that rejects its flags never reaches
+    the filesystem or the network, so a later marker would misattribute it.
+    """
+    low = (out or "").lower()
+    for m in _BAD_OPTION_MARKERS:
+        if m in low:
+            return "bad_option", m
+    for m in _MISSING_PATH_MARKERS:
+        if m in low:
+            return "missing_path", m
+    for m in _REACHED_NETWORK_MARKERS:
+        if m in low:
+            return "ok", m
+    # Ran, said nothing recognisable, did not complain about its own arguments.
+    return "ok", "no diagnostic output"
+
+
+@app.post("/tools/verify")
+async def verify_tool_commands(request: ToolVerifyRequest):
+    """Verify each command's binary, paths, options and call path.
+
+    Returns one result per command with a verdict:
+      ok            — options accepted and the call path works
+      bad_option    — the tool rejected its own arguments
+      missing_path  — a file the command names is absent from this image
+      no_binary     — the tool is not installed here
+      interactive   — no commands/input supplied; it would exit 0 saying nothing
+      unverifiable  — no {target} to redirect, so probing it might hit something real
+    """
+    results = []
+    for entry in request.commands[:200]:
+        tool = (entry.get("tool") or "").strip()
+        cmd = (entry.get("command") or "").strip()
+        if not tool or not cmd:
+            continue
+
+        rec = {"tool": tool, "command": cmd}
+
+        if not re.match(r"^[a-zA-Z0-9_.-]+$", tool):
+            rec.update(verdict="no_binary", detail="tool name is not a bare token")
+            results.append(rec); continue
+
+        which = await asyncio.create_subprocess_exec(
+            "which", tool, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE)
+        await which.communicate()
+        if which.returncode != 0:
+            rec.update(verdict="no_binary", detail=f"{tool} is not installed here")
+            results.append(rec); continue
+
+        # A session with nothing to do exits 0 and reports nothing — 78 lftp runs
+        # and 43 ftp runs looked like "found nothing".
+        if tool in ("lftp", "ftp", "telnet", "mysql", "psql") and not re.search(
+                r"(-e\s|-c\s|<<|printf|echo\s|\|)", cmd):
+            rec.update(verdict="interactive",
+                       detail="no commands or stdin supplied; would exit 0 silently")
+            results.append(rec); continue
+
+        if "{target}" not in cmd:
+            rec.update(verdict="unverifiable",
+                       detail="no {target} to redirect to loopback; not probed "
+                              "because it might contact something real")
+            results.append(rec); continue
+
+        probe = cmd
+        for ph, val in _PROBE_SUBS.items():
+            probe = probe.replace(ph, val)
+        leftover = re.findall(r"\{[a-z_]+\}", probe)
+        if leftover:
+            rec.update(verdict="unverifiable",
+                       detail=f"unsubstitutable placeholder(s) {sorted(set(leftover))}")
+            results.append(rec); continue
+        # Belt and braces: after substitution the command must not name a host
+        # other than loopback, or this endpoint becomes a way to send traffic.
+        for host in re.findall(r"(?:https?://|@)([A-Za-z0-9_.-]+)", probe):
+            if host not in (_PROBE_HOST, "localhost"):
+                rec.update(verdict="unverifiable",
+                           detail=f"probe would contact {host}, not loopback")
+                break
+        if rec.get("verdict"):
+            results.append(rec); continue
+
+        rec["probe"] = probe
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                probe, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT)
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(),
+                                                timeout=request.timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                rec.update(verdict="ok", detail="timed out against a dead port — "
+                                                "options accepted")
+                results.append(rec); continue
+            text = (out or b"").decode("utf-8", "replace")
+            verdict, detail = _classify_probe(text)
+            rec.update(verdict=verdict, detail=detail,
+                       output_head=text[:300], exit_code=proc.returncode)
+        except Exception as e:                 # pragma: no cover
+            rec.update(verdict="unverifiable", detail=f"{type(e).__name__}: {e}")
+        results.append(rec)
+
+    # The tool's OWN statement of its options, captured rather than assumed.
+    # --help formats vary wildly (gobuster nests flags under subcommands, hydra
+    # prints its own layout), which is exactly why grepping help text to validate
+    # a flag is unreliable and the loopback probe above is the real check. This
+    # is for the record: it tells a reader which options the installed build
+    # actually offers.
+    helps = {}
+    if request.capture_help:
+        for tool in sorted({r["tool"] for r in results
+                            if r["verdict"] != "no_binary"}):
+            for flag in ("--help", "-h"):
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        tool, flag, stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT)
+                    out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+                except Exception:
+                    continue
+                text = (out or b"").decode("utf-8", "replace").strip()
+                if text:
+                    helps[tool] = text[:4000]
+                    break
+
+    counts = {}
+    for r in results:
+        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+    broken = [r for r in results
+              if r["verdict"] in ("bad_option", "missing_path", "no_binary",
+                                  "interactive")]
+    return {"ok": not broken, "checked": len(results), "counts": counts,
+            "broken": broken, "results": results, "help": helps}
 
 
 @app.post("/tools/install")
@@ -1672,6 +2731,14 @@ async def execute_recommended_tools(
 
     Example: POST /tools/execute-recommended?target=192.168.1.1&service=ssh&port=22
     """
+    # Same gate as /tools/execute. This path is driven by the recommender's
+    # auto-execute, which fires from ingest — i.e. from hosts that appeared in
+    # scan output rather than from anything an operator chose.
+    scope_error = enforce_scope(target)
+    if scope_error:
+        logger.warning(f"REFUSED execute-recommended on {target}: {scope_error}")
+        raise HTTPException(status_code=403, detail=f"Out of scope — {scope_error}")
+
     import httpx
 
     # Get recommendations from scan-recommender
@@ -1730,7 +2797,8 @@ async def execute_recommended_tools(
         }
 
         # Queue execution
-        background_tasks.add_task(execute_tool, exec_id, tool_name, command, 300)
+        background_tasks.add_task(execute_tool, exec_id, tool_name, command, 300,
+                                  target, None, None, None)
 
         executions.append({
             "id": exec_id,

@@ -50,6 +50,24 @@ services:
     volumes:
       - searchsploit-data:/var/lib/searchsploit
     networks: [ agents_net ]
+  # ── Where the database actually lives ──────────────────────────────────
+  # In LOCAL mode it is this container. In `remote` / `remote_direct` mode
+  # (db-config.json) it is NOT: a sidecar named `rag-db-tunnel` takes over the
+  # `rag-postgres` NETWORK ALIAS on agents_net and forwards to the remote
+  # Postgres — SSH tunnel for `remote`, `socat` TCP forward for `remote_direct`.
+  #
+  # That sidecar is deliberately NOT declared here. Its command is built from
+  # db-config.json at runtime (host, port, key, mode), which a static compose
+  # service cannot express, and giving it com.docker.compose.* labels would let
+  # `docker compose up --remove-orphans` delete the stack's entire database
+  # path. It is created and kept alive by container_logs.py
+  # (`_ensure_remote_tunnel` / `_ensure_remote_direct`, `_auto_start_db` on
+  # startup, `_enforce_db_mode_loop` every 60s) and is labelled for discovery:
+  #
+  #     docker ps --filter label=com.rag-scan-stack.role=db-proxy
+  #
+  # In remote mode this local service must stay DOWN — container-logs removes it
+  # if it reappears, because it would steal the alias from the sidecar.
   rag-postgres:
     image: pgvector/pgvector:pg16
     container_name: rag-postgres
@@ -161,6 +179,25 @@ services:
     build:
       context: .
       dockerfile: app/rag-api/Dockerfile
+    # `docker compose watch` syncs edits into the running container, so a
+    # code change takes effect without a rebuild. Baked images remain the
+    # deploy artifact; this only changes the DEV loop, which is where
+    # silently-stale code actually bites.
+    #
+    # Deliberately NOT a bind mount of the source: a bind mount also hides a
+    # missing COPY in the Dockerfile, so code works locally and the clean
+    # build breaks. sync keeps the image honest.
+    #
+    # target is this image's REAL root (/app) — they differ per service.
+    develop:
+      watch:
+        - action: sync
+          path: ./app/rag-api
+          target: /app
+          ignore:
+            - __pycache__/
+        - action: rebuild
+          path: ./app/rag-api/requirements.txt
     container_name: rag-api
     restart: unless-stopped
     logging:
@@ -173,6 +210,12 @@ services:
     environment:
       BUILD_VERSION: ${BUILD_VERSION:-2026.04.17-1}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       API_KEY: ${API_KEY:-changeme}
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       EMBEDDER_URL: ${EMBEDDER_URL:-https://embedder:8030}
@@ -196,9 +239,17 @@ services:
       EXPLOITDB_CSV: /exploitdb/files_exploits.csv
       NEWS_RUNNER_URL: ${NEWS_RUNNER_URL:-http://news-runner:8028}
       # Ollama — used by cloud_triage_agent, takeover_hunter, vault_import_agent.
+      # OLLAMA_BASE_URL points at the llm_query proxy (a drop-in Ollama that
+      # exposes /api/* and translates to the CONFIGURED backend), so these agents
+      # run on the selected LLM (e.g. DeepSeek) instead of hitting Ollama direct.
+      # OLLAMA_URL stays at real Ollama for anything that needs raw Ollama.
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
-      OLLAMA_BASE_URL: ${OLLAMA_URL:-http://ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:26b}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://llm_query:8002}
+      # gemma4:31b, matching scan-recommender and .env. The previous default
+      # named gemma4:26b, which is not a tag anyone here has — a request for
+      # an absent model returns an error, so a fresh install with no .env
+      # override would look broken rather than misconfigured.
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
     command: uvicorn api:app --host 0.0.0.0 --port 8000 --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
     # depends_on: [wait-for-db]  # removed — wait-for-db is local-db profile only
     ports: ["8000:8000"]
@@ -239,10 +290,20 @@ services:
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
       EMBED_MODEL: ${EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+    # TLS, like every other service. certs/server.crt ALREADY carries
+    # `DNS:embedder` in its SAN — the intent was always https — but the command
+    # override and the certs mount were missing, so the embedder served plain
+    # HTTP while all four callers used EMBEDDER_URL=https://embedder:8030. Every
+    # embed call failed with `SSLError WRONG_VERSION_NUMBER`, which is why
+    # scope_decisions held 1151 rows and 0 embeddings and why /rag/ask could
+    # never embed a question.
+    command: uvicorn main:app --host 0.0.0.0 --port 8030 --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
+    volumes:
+      - ./certs:/certs:ro
     ports: ["8030:8030"]
     networks: [agents_net]
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8030/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8030/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -267,6 +328,11 @@ services:
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
       EMBED_MODEL: ${EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+    # Same TLS wiring as the CPU embedder — it takes over the `embedder`
+    # network alias, so callers' https:// URLs must work here too.
+    command: uvicorn main:app --host 0.0.0.0 --port 8030 --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
+    volumes:
+      - ./certs:/certs:ro
     ports: ["8031:8030"]
     networks:
       agents_net:
@@ -280,7 +346,7 @@ services:
               count: all
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8030/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8030/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -290,6 +356,35 @@ services:
     build:
       context: ./zap
     container_name: zap
+    # ZAP was OOM-killed (exit 137) part-way through a real scan and never came
+    # back — every later web scan reported "ZAP not reachable at zap:8090". It was
+    # the only service here with NEITHER a restart policy NOR a memory limit.
+    #
+    # mem_limit alone is NOT sufficient, and an earlier version of this comment
+    # wrongly claimed it was. zap.sh sizes the JVM heap itself, and it reads the
+    # container limit from /sys/fs/cgroup/memory/memory.stat — the **cgroup v1**
+    # path. This host is cgroup v2 (/sys/fs/cgroup/memory.max), so that check
+    # silently misses and zap.sh falls back to HOST memory:
+    #
+    #     Available memory: 39540 MB
+    #     Using JVM args: -Xmx9885m        <- a 9.9GB heap inside a 4GiB container
+    #
+    # So the JVM happily grew past the cgroup limit. -Xmx below is the actual fix;
+    # zap.sh explicitly honours a -Xmx argument ("Overridden by the user"). Keep it
+    # meaningfully under mem_limit — the JVM needs headroom beyond the heap for
+    # metaspace, thread stacks and native buffers.
+    #
+    # Measured, not guessed: with -Xmx3g under a 4g limit ZAP sat at 97.5% and was
+    # still CLIMBING (98.4%) during an active scan of 209 URLs. -Xmx caps the HEAP,
+    # not the process; ZAP's non-heap overhead is ~900MB, so 3g heap + 4g limit
+    # leaves effectively zero slack. 6g against a 3g heap gives that overhead room.
+    # Raise the limit rather than shrink the heap: ZAP's passive scan queue grows
+    # with the site tree, so a smaller heap just moves the failure to GC thrash.
+    #
+    # restart:unless-stopped stays: it means a single bad target degrades one scan
+    # rather than disabling web scanning until someone notices.
+    restart: unless-stopped
+    mem_limit: ${ZAP_MEM_LIMIT:-6g}
     networks: [agents_net]
     environment:
       BUILD_VERSION: ${BUILD_VERSION:-dev}
@@ -297,7 +392,20 @@ services:
     ports: ["8090:8090"]
     volumes:
       - zap-plugins:/home/zap/.ZAP/plugin
-    command: ["zap.sh","-daemon","-host","0.0.0.0","-port","8090",
+    # -silent disables the marketplace update check and telemetry.
+    #
+    # Without it ZAP contacts the add-on marketplace at startup, installs any
+    # updates it finds, and then RESTARTS ITSELF to load them. That is why zap
+    # exited with code 0 (a clean, self-initiated stop — not OOM, not a crash)
+    # part-way through scans: measured 3 startup announcements against
+    # RestartCount=2, with "Installing new addon retire v0.64.0" in the log. The
+    # restart wipes the session, which is how a scan of Metasploitable with 207
+    # seeded URLs reported "0 alerts".
+    #
+    # Add-ons are already baked into the image at build time (see zap/Dockerfile
+    # + addons.txt), so there is nothing to fetch at runtime. This also stops the
+    # scanner making outbound marketplace calls during an engagement.
+    command: ["zap.sh","-daemon","-silent","-Xmx${ZAP_JVM_HEAP:-3g}","-host","0.0.0.0","-port","8090",
               "-config","api.key=${ZAP_API_KEY:-changeme}",
               "-config","api.addrs.addr.name=.*",
               "-config","api.addrs.addr.regex=true"]
@@ -326,7 +434,23 @@ services:
       PYTHONHTTPSVERIFY: "0"
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
+      # Engagement-wide scan ceiling. Bounds concurrent tool execution in
+      # common/tool_job.py — PER SERVICE, not globally (see that module).
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
+      # web-scanner writes findings straight to Postgres, so it never
+      # needed to authenticate to rag-api and had no API_KEY at all. It
+      # now POSTs raw ZAP/nikto output to /ingest/raw-artifact, which 401s
+      # without this — the archive call was reaching the API and being
+      # rejected, logged only as a warning.
+      API_KEY: ${API_KEY}
+      API_BASE: ${API_BASE:-https://rag-api:8000}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       WORDLIST: ${WORDLIST:-/opt/seclists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-medium.txt}
       WEB_PORTS: ${WEB_PORTS:-80,443,8080,8443,8000,8888,3000,5000}
@@ -342,6 +466,11 @@ services:
     volumes:
       - ./web_reports:/reports
       - ./etl:/scanner/etl
+      # shared scan-slot semaphore (common/tool_job.py) — bounds this
+      # service by MAX_CONCURRENT_SCANS instead of a private number.
+      # /scanner, NOT /app: this image's code lives in /scanner and its etl
+      # mount goes there too, so /app/common would not be importable.
+      - ./common:/scanner/common:ro
       - ./scan_results:/scan_results
       - ./scan_audit:/scan_audit
       - ./scan_audit/audit_writer.py:/scanner/audit_writer.py:ro
@@ -372,6 +501,12 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       API_BASE: https://rag-api:8000
       API_KEY: ${API_KEY:-changeme}
@@ -407,6 +542,25 @@ services:
     build:
       context: .
       dockerfile: osint_runner/Dockerfile
+    # `docker compose watch` syncs edits into the running container, so a
+    # code change takes effect without a rebuild. Baked images remain the
+    # deploy artifact; this only changes the DEV loop, which is where
+    # silently-stale code actually bites.
+    #
+    # Deliberately NOT a bind mount of the source: a bind mount also hides a
+    # missing COPY in the Dockerfile, so code works locally and the clean
+    # build breaks. sync keeps the image honest.
+    #
+    # target is this image's REAL root (/runner) — they differ per service.
+    develop:
+      watch:
+        - action: sync
+          path: ./osint_runner
+          target: /runner
+          ignore:
+            - __pycache__/
+        - action: rebuild
+          path: ./osint_runner/requirements.txt
     container_name: osint-runner
     restart: unless-stopped
     logging:
@@ -421,7 +575,16 @@ services:
       PYTHONHTTPSVERIFY: "0"
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
+      # Engagement-wide scan ceiling. Bounds concurrent tool execution in
+      # common/tool_job.py — PER SERVICE, not globally (see that module).
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       API_BASE: https://rag-api:8000
       API_KEY: ${API_KEY:-changeme}
@@ -458,6 +621,25 @@ services:
     build:
       context: .
       dockerfile: pd_runner/Dockerfile
+    # `docker compose watch` syncs edits into the running container, so a
+    # code change takes effect without a rebuild. Baked images remain the
+    # deploy artifact; this only changes the DEV loop, which is where
+    # silently-stale code actually bites.
+    #
+    # Deliberately NOT a bind mount of the source: a bind mount also hides a
+    # missing COPY in the Dockerfile, so code works locally and the clean
+    # build breaks. sync keeps the image honest.
+    #
+    # target is this image's REAL root (/runner) — they differ per service.
+    develop:
+      watch:
+        - action: sync
+          path: ./pd_runner
+          target: /runner
+          ignore:
+            - __pycache__/
+        - action: rebuild
+          path: ./pd_runner/requirements.txt
     container_name: pd-runner
     restart: unless-stopped
     logging:
@@ -472,7 +654,16 @@ services:
       PYTHONHTTPSVERIFY: "0"
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
+      # Engagement-wide scan ceiling. Bounds concurrent tool execution in
+      # common/tool_job.py — PER SERVICE, not globally (see that module).
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       API_BASE: https://rag-api:8000
       API_KEY: ${API_KEY:-changeme}
@@ -519,7 +710,11 @@ services:
       API_KEY: ${API_KEY:-changeme}
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       OLLAMA_BASE_URL: ${OLLAMA_URL:-http://ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:26b}
+      # gemma4:31b, matching scan-recommender and .env. The previous default
+      # named gemma4:26b, which is not a tag anyone here has — a request for
+      # an absent model returns an error, so a fresh install with no .env
+      # override would look broken rather than misconfigured.
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
       NEWS_AGENT_MODEL: ${NEWS_AGENT_MODEL:-gemma4:26b}
       NEWS_AUTO_FETCH: ${NEWS_AUTO_FETCH:-1}
       NEWS_FETCH_INTERVAL_HOURS: ${NEWS_FETCH_INTERVAL_HOURS:-24}
@@ -548,7 +743,16 @@ services:
       PYTHONHTTPSVERIFY: "0"
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
+      # Engagement-wide scan ceiling. Bounds concurrent tool execution in
+      # common/tool_job.py — PER SERVICE, not globally (see that module).
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       API_BASE: https://rag-api:8000
       API_KEY: ${API_KEY:-changeme}
@@ -590,7 +794,17 @@ services:
       PYTHONHTTPSVERIFY: "0"
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
+      # The engagement-wide scan ceiling. The recommender bounds both its
+      # /next_scan admission and its auto-execute dispatches by this, so a
+      # single number governs how much activity an engagement generates.
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       NMAP_OUT_DIR: /app/nmap_out
       NMAP_SERVICE_DETECTION: ${NMAP_SERVICE_DETECTION:-1}
@@ -598,7 +812,7 @@ services:
       NMAP_SCRIPTS: ${NMAP_SCRIPTS:-banner,http-title,ssl-cert,ssl-enum-ciphers,ssh2-enum-algos,vulscan/vulscan.nse,vulners}
       NMAP_PORT_BATCH: ${NMAP_PORT_BATCH:-100}
       WEB_PORTS: ${WEB_PORTS:-80,443,8080,8443,8000,8888,3000,5000}
-      DEEP_SCAN_PORTS: ${DEEP_SCAN_PORTS:-1001-65535}
+      DEEP_SCAN_PORTS: ${DEEP_SCAN_PORTS:-1-65535}
       PYTHONPATH: /app
       # API_BASE hardcoded to https:// rather than ${API_BASE:-...} -- the
       # other 5 runners (brutus, node-manager, nuclei, osint, pd) all
@@ -621,6 +835,10 @@ services:
       - ./scan_results:/scan_results
       - ./scan_audit:/scan_audit
       - ./scan_audit/audit_writer.py:/app/audit_writer.py:ro
+      # Port scope profiles. nmap-api resolves DEFAULT_QUICK_PORTS_PROFILE from
+      # here so its own empty-ports fallback matches what the BFF and the agents
+      # send, rather than reinstating the sequential 1-1000 range.
+      - ./knowledge:/knowledge:ro
       - ./certs:/certs:ro
     cap_add: [NET_RAW, NET_ADMIN]
     healthcheck:
@@ -648,7 +866,17 @@ services:
       PYTHONHTTPSVERIFY: "0"
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
+      # The engagement-wide scan ceiling. The recommender bounds both its
+      # /next_scan admission and its auto-execute dispatches by this, so a
+      # single number governs how much activity an engagement generates.
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       PG_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       # Individual DB_* vars for scan_recommender's _conn() helper.  The
@@ -670,6 +898,15 @@ services:
       OLLAMA_BASE_URL: ${OLLAMA_URL:-http://ollama:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
       CHAT_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
+      # Embeddings are resolved SEPARATELY from LLM_BACKEND: the chat model
+      # (DeepSeek-V4-Flash) cannot embed, and Azure AI Services has no
+      # /embeddings route for it. `auto` picks Azure only when AZURE_EMBED_MODEL
+      # is explicitly set, else the app/embedder service, else ollama.
+      # Before this, /rag/ask embedded against `ollama:11434` in a deployment
+      # with no ollama container, so get_scan_recommendations was permanently
+      # broken for both agent engines.
+      EMBED_BACKEND: ${EMBED_BACKEND:-auto}
+      EMBEDDER_URL: ${EMBEDDER_URL:-https://embedder:8030}
       TOOL_KB_PATH: "/knowledge/service_tools.yaml"
       PLAYBOOK_DIR: "/knowledge/playbooks"
       KALI_LISTENER_URL: "https://kali-listener:8019"
@@ -700,6 +937,8 @@ services:
     networks:
       - agents_net
     volumes:
+      - ./common:/app/common:ro    # shared llm_settings resolver (one copy, see common/llm_settings.py)
+      - ./etl:/app/etl:ro                             # shared scope gate (etl/scope_gate.py)
       - searchsploit-data:/var/lib/searchsploit
       - ./knowledge:/knowledge:ro
       - ./certs:/certs:ro
@@ -736,6 +975,12 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       BROWSER_TYPE: ${BROWSER_TYPE:-chromium}  # chromium, firefox, or webkit
       VIEWPORT_WIDTH: ${VIEWPORT_WIDTH:-1920}
@@ -758,6 +1003,10 @@ services:
     ports:
       - "8014:8014"
     volumes:
+      - ./etl:/app/etl:ro                             # shared scope gate (etl/scope_gate.py)
+      # shared scan-slot semaphore (common/tool_job.py) — bounds this
+      # service by MAX_CONCURRENT_SCANS instead of a private number
+      - ./common:/app/common:ro
       - ./playwright_screenshots:/screenshots
       - ./playwright_reports:/reports
     # SHM size needed for Chromium to avoid crashes
@@ -774,6 +1023,25 @@ services:
     build:
       context: ./autogen_agents
       dockerfile: Dockerfile
+    # `docker compose watch` syncs edits into the running container, so a
+    # code change takes effect without a rebuild. Baked images remain the
+    # deploy artifact; this only changes the DEV loop, which is where
+    # silently-stale code actually bites.
+    #
+    # Deliberately NOT a bind mount of the source: a bind mount also hides a
+    # missing COPY in the Dockerfile, so code works locally and the clean
+    # build breaks. sync keeps the image honest.
+    #
+    # target is this image's REAL root (/app) — they differ per service.
+    develop:
+      watch:
+        - action: sync
+          path: ./autogen_agents
+          target: /app
+          ignore:
+            - __pycache__/
+        - action: rebuild
+          path: ./autogen_agents/requirements.txt
     container_name: autogen-agents
     restart: unless-stopped
     logging:
@@ -789,8 +1057,28 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       API_KEY: ${API_KEY:-changeme}
+      # Orchestration backend for the AI agent sessions.
+      # 'langgraph' is the DEFAULT as of migration Phase 4 (deterministic
+      # StateGraph + durable Postgres checkpoints); 'autogen' is the legacy
+      # GroupChat, kept as the fallback for one release. See
+      # Docs/LANGGRAPH_MIGRATION_PLAN.md. To fall back stack-wide set
+      # AGENT_ENGINE=autogen in .env; to compare a single session, POST
+      # /pentest with {"engine": "autogen"} — no restart needed.
+      AGENT_ENGINE: ${AGENT_ENGINE:-langgraph}
+      # LangGraph exploit phase. Off by default ON PURPOSE: with it on, a
+      # session PAUSES at status='awaiting_approval' until an operator answers
+      # POST /pentest/{id}/approve, so enabling it stack-wide would leave
+      # unattended sessions parked. Turn it on per session with
+      # {"enable_exploit_phase": true}.
+      LANGGRAPH_EXPLOIT_PHASE: ${LANGGRAPH_EXPLOIT_PHASE:-false}
       # LLM Backend: "ollama", "vllm", "azure", "openai", or "anthropic"
       LLM_BACKEND: ${LLM_BACKEND:-ollama}
       # Ollama settings (default)
@@ -823,7 +1111,7 @@ services:
       OSINT_RUNNER_URL: "https://osint-runner:8024"
       BRUTUS_RUNNER_URL: "https://brutus-runner:8025"
       WEB_PORTS: ${WEB_PORTS:-80,443,8080,8443,8000,8888,3000,5000}
-      DEEP_SCAN_PORTS: ${DEEP_SCAN_PORTS:-1001-65535}
+      DEEP_SCAN_PORTS: ${DEEP_SCAN_PORTS:-1-65535}
       SCAN_DEBUG: "false"
       LLM_TIMEOUT: "900"
       SESSION_STALL_TIMEOUT: "3600"
@@ -859,6 +1147,11 @@ services:
     ports:
       - "8015:8015"
     volumes:
+      # shared scope gate (etl/scope_gate.py) and scan-slot ceiling
+      # (common/tool_job.py). /app is this image's working dir and is
+      # already on sys.path, so both import without any PYTHONPATH change.
+      - ./etl:/app/etl:ro
+      - ./common:/app/common:ro
       - ./autogen_logs:/app/logs
       - ./autogen_cache:/app/cache
       - ./scan_sessions:/app/scan_sessions
@@ -1115,6 +1408,12 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       MSF_RPC_HOST: ${MSF_RPC_HOST:-metasploit}
       MSF_RPC_PORT: ${MSF_RPC_PORT:-55553}
@@ -1133,6 +1432,10 @@ services:
     ports:
       - "8017:8017"
     volumes:
+      - ./etl:/app/etl:ro                             # shared scope gate (etl/scope_gate.py)
+      # shared scan-slot semaphore (common/tool_job.py) — bounds this
+      # service by MAX_CONCURRENT_SCANS instead of a private number
+      - ./common:/app/common:ro
       - ./exploitdb:/opt/exploitdb:ro
       - ./modified_exploits:/app/modified_exploits
     # Minimal capabilities for network access
@@ -1165,6 +1468,12 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       PROJECT_DIR: /project
       # Lets the DB-mode-switch handler emit webhook events
       # (db_mode_switched / db_consumers_recreated) to rag-api.
@@ -1200,11 +1509,20 @@ services:
     mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
     cpus: ${DEFAULT_CPUS:-2.0}
     environment:
+      # Without this the shared ceiling silently defaults to 5 instead of
+      # using the number the operator actually set.
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
       SSL_CERTFILE: /certs/server.crt
       PYTHONHTTPSVERIFY: "0"
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       API_KEY: ${API_KEY:-changeme}
       RAG_API_URL: ${RAG_API_URL:-https://rag-api:8000}
@@ -1218,6 +1536,9 @@ services:
       - "8019:8019"
       - "9080-9180:9080-9180"
     volumes:
+      - ./etl:/app/etl:ro                             # shared scope gate (etl/scope_gate.py)
+      - ./common:/app/common:ro                        # shared scan-slot ceiling (common/tool_job.py)
+      - ${WORDLISTS_DIR:-./wordlists}:/wordlists:ro    # generated per-target user/password lists (target_wordlists.py)
       - ./certs:/certs:ro
     cap_add:
       - NET_RAW
@@ -1256,10 +1577,18 @@ services:
       MSF_RPC_PORT: "55553"
       MSF_RPC_USER: ${MSF_RPC_USER:-msf}
       MSF_RPC_PASS: ${MSF_RPC_PASS:-msf}
-    # Start msfrpcd daemon (keeps running)
+    # Start msfrpcd daemon (keeps running).
+    #
+    # Credentials come from the env vars declared above, NOT hardcoded. This
+    # previously read `-U msf -P msf` while exploit-runner authenticated with
+    # ${MSF_RPC_PASS} from .env, so the two sides disagreed the moment that
+    # variable was set to anything real. msfrpcd answered every login with
+    # "Login Failed", which the client then reported as the far more misleading
+    # "Invalid Authentication Token" — and /msf/jobs and /msf/sessions returned
+    # HTTP 500 for as long as the mismatch stood.
     command: >
       /bin/bash -c "
-        ./msfrpcd -U msf -P msf -S -a 0.0.0.0 -p 55553 -f
+        ./msfrpcd -U \"$$MSF_RPC_USER\" -P \"$$MSF_RPC_PASS\" -S -a 0.0.0.0 -p 55553 -f
       "
     networks:
       - agents_net
@@ -1422,6 +1751,8 @@ services:
         context: ./llm_query
         dockerfile: Dockerfile
       container_name: llm_query
+      volumes:
+        - ./common:/app/common:ro    # shared llm_settings resolver (one copy, see common/llm_settings.py)
       restart: unless-stopped
       logging:
         driver: json-file
@@ -1434,6 +1765,9 @@ services:
         OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
         OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
         OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-300}
+        # DB access so the LLM settings resolver can read dashboard llm.* config
+        # (Settings -> LLM Tuning). Reaches the DB via the rag-postgres alias.
+        DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
         # LLM Backend + Azure/OpenAI/Anthropic settings
         LLM_BACKEND: ${LLM_BACKEND:-ollama}
         AZURE_API_KEY: ${AZURE_API_KEY:-}
@@ -1756,6 +2090,18 @@ services:
     build:
       context: .
       dockerfile: node_manager/Dockerfile
+    # Sync to /app, matching the Dockerfile's flattening — host
+    # node_manager/node_manager.py becomes /app/node_manager.py, which is what
+    # actually gets imported.
+    develop:
+      watch:
+        - action: sync
+          path: ./node_manager
+          target: /app
+          ignore:
+            - __pycache__/
+        - action: rebuild
+          path: ./node_manager/requirements.txt
     container_name: node-manager
     command: uvicorn node_manager:app --host 0.0.0.0 --port 8027 --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
     restart: unless-stopped
@@ -1767,11 +2113,18 @@ services:
     mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
     cpus: ${DEFAULT_CPUS:-2.0}
     environment:
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
       SSL_CERTFILE: /certs/server.crt
       SSL_KEYFILE: /certs/server.key
       PYTHONHTTPSVERIFY: "0"
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
+      # peer calls verify AND external HTTPS (template/CVE feeds) still works.
+      # Regenerate with scripts/generate-ca-bundle.sh after replacing the cert.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       DB_DSN: ${DB_DSN:-postgresql://app:app@rag-postgres:5432/scans}
       # Remote database configuration
       REMOTE_DB_HOST: ${REMOTE_DB_HOST:-}
@@ -1793,8 +2146,18 @@ services:
       API_BASE: https://rag-api:8000
       API_KEY: ${API_KEY:-changeme}
     volumes:
+      - ./etl:/app/etl:ro                              # shared scope gate for the remote-node path
+      - ./common:/app/common:ro                        # shared scan-slot ceiling
       - ${SSH_KEY_PATH:-./ssh-keys}:/ssh-keys:ro
-      - ./node_manager:/app/node_manager:ro
+      # NOTE: ./node_manager is deliberately NOT mounted here.
+      # It used to be mounted at /app/node_manager, which was actively
+      # misleading: the mount is live, so edits DID change files inside the
+      # container, but nothing imports them. The Dockerfile flattens the
+      # source to /app/*.py and `uvicorn node_manager:app` resolves to
+      # /app/node_manager.py — /app/node_manager/ has no __init__.py, so it is
+      # never imported. Editing a file appeared to take effect while the
+      # running code never changed. Use `docker compose watch` (below) or
+      # rebuild; scripts/check_image_freshness.py will tell you which.
       - ./certs:/certs:ro
       - ./wireguard:/opt/rag-scan-stack/wireguard:rw
       - /tmp:/tmp
@@ -1847,6 +2210,25 @@ services:
     build:
       context: ./dashboard
       dockerfile: Dockerfile
+    # `docker compose watch` syncs edits into the running container, so a
+    # code change takes effect without a rebuild. Baked images remain the
+    # deploy artifact; this only changes the DEV loop, which is where
+    # silently-stale code actually bites.
+    #
+    # Deliberately NOT a bind mount of the source: a bind mount also hides a
+    # missing COPY in the Dockerfile, so code works locally and the clean
+    # build breaks. sync keeps the image honest.
+    #
+    # target is this image's REAL root (/app/bff) — they differ per service.
+    develop:
+      watch:
+        - action: sync
+          path: ./dashboard/bff
+          target: /app/bff
+          ignore:
+            - __pycache__/
+        - action: rebuild
+          path: ./dashboard/bff/requirements.txt
     container_name: pentest-dashboard
     restart: unless-stopped
     logging:
@@ -1859,6 +2241,13 @@ services:
     environment:
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      # Trust the stack's self-signed cert WITHOUT disabling verification.
+      # 14 other services already had this; pentest-dashboard did not, and it
+      # holds 554 of the ~905 verify=False calls in the tree — the busiest
+      # caller in the stack could not verify anything, which is what made those
+      # verify=False flags unremovable rather than merely untidy.
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.crt
+      SSL_CERT_FILE: /certs/ca-bundle.crt
       RAG_API_URL: https://rag-api:8000
       NMAP_SCANNER_URL: https://nmap_scanner:8012
       WEB_SCANNER_URL: https://web-scanner:8010
@@ -1868,7 +2257,10 @@ services:
       EXPLOIT_RUNNER_URL: https://exploit-runner:8017
       SCAN_RECOMMENDER_URL: https://scan-recommender:8013
       AUTOGEN_URL: https://autogen-agents:8015
-      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      # The 'Ollama LLM Server' panel reads settings.ollama_url — point it at the
+      # llm_query proxy so it reflects the CONFIGURED backend (e.g. DeepSeek)
+      # instead of the raw (possibly-down) local Ollama.
+      OLLAMA_URL: ${DASHBOARD_OLLAMA_URL:-http://llm_query:8002}
       BRUTUS_RUNNER_URL: https://brutus-runner:8025
       PLAYWRIGHT_SCANNER_URL: https://playwright-scanner:8014
       ZAP_URL: http://zap:8090
@@ -1917,7 +2309,12 @@ services:
       - ./mcp/third_party:/mcp/third_party
       - ./mcpo/config.json:/mcpo/config.json
       - ./db-config.json:/app/db-config.json:rw
+      - ./certs:/certs:ro          # CA bundle for outbound TLS verification
       - ./knowledge:/knowledge:ro
+      # Scope matcher, shared rather than copied. The BFF runs from /app/bff, so
+      # this lands on its import path and `from etl.scope_gate import is_in_scope`
+      # resolves to the SAME fail-closed matcher the discovery ingests use.
+      - ./etl:/app/bff/etl:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro  # Enable docker exec for WireGuard status querying
     networks:
       - agents_net
@@ -1927,7 +2324,11 @@ services:
       - "3002:443"
       - "3001:80"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:443/api/health || curl -f http://127.0.0.1:80/api/health || exit 1"]
+      # /api/healthz, NOT /api/health: the latter probes every upstream service
+      # and is as slow as the slowest one, so it marked this container unhealthy
+      # for other services' latency. Liveness here means nginx is serving and the
+      # BFF process is up.
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:443/api/healthz || curl -f http://127.0.0.1:80/api/healthz || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 10

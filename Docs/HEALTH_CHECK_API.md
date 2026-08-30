@@ -103,7 +103,11 @@ curl http://localhost:8000/health/database
 **Checks**:
 - Database connectivity
 - Table count (expects 21 tables)
-- Critical tables present (assets, ports, web_findings, vulns, scan_recommendations, agent_sessions, agent_messages)
+- Critical tables present (assets, ports, web_findings, vulns, scan_recommendations,
+  agent_sessions, agent_messages, and the LangGraph checkpoint tables
+  `checkpoints` / `checkpoint_blobs` / `checkpoint_writes` /
+  `checkpoint_migrations` — a missing checkpoint table means no agent session
+  can pause for approval or survive a restart)
 
 ### 3. Individual Service Check
 

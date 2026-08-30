@@ -23,7 +23,7 @@ async def list_content_extractions(asset_id: str = None, scan_id: str = None, se
     if search:
         params["search"] = search
     params["limit"] = limit
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/content-extractions",
             params=params,
@@ -42,7 +42,7 @@ async def content_extraction_summary(asset_id: str = None, search: str = None):
         params["asset_id"] = asset_id
     if search:
         params["search"] = search
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/content-extractions/summary",
             params=params,
@@ -57,7 +57,7 @@ async def content_extraction_summary(asset_id: str = None, search: str = None):
 async def update_extraction(extraction_id: str, request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.patch(
             f"{s.rag_api_url}/content-extractions/{extraction_id}",
             json=body,
@@ -71,7 +71,7 @@ async def update_extraction(extraction_id: str, request: Request):
 @router.delete("/api/content-extractions/{extraction_id}")
 async def delete_extraction(extraction_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/content-extractions/{extraction_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -89,7 +89,7 @@ async def list_patterns(category: str = None):
     params = {}
     if category:
         params["category"] = category
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/content-intel/patterns",
             params=params,
@@ -104,7 +104,7 @@ async def list_patterns(category: str = None):
 async def create_pattern(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.post(
             f"{s.rag_api_url}/content-intel/patterns",
             json=body,
@@ -119,7 +119,7 @@ async def create_pattern(request: Request):
 async def update_pattern(pattern_id: str, request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.put(
             f"{s.rag_api_url}/content-intel/patterns/{pattern_id}",
             json=body,
@@ -133,7 +133,7 @@ async def update_pattern(pattern_id: str, request: Request):
 @router.delete("/api/content-intel/patterns/{pattern_id}")
 async def delete_pattern(pattern_id: str):
     s = get_settings()
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/content-intel/patterns/{pattern_id}",
             headers={"x-api-key": s.api_key, **engagement_headers()},
@@ -153,7 +153,7 @@ async def get_sitemap(domain: str = None, asset_id: str = None):
         params["domain"] = domain
     if asset_id:
         params["asset_id"] = asset_id
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/content-intel/sitemap",
             params=params,
@@ -170,7 +170,7 @@ async def export_sitemap_urls(domain: str = None, asset_id: str = None):
     params = {}
     if domain: params["domain"] = domain
     if asset_id: params["asset_id"] = asset_id
-    async with httpx.AsyncClient(verify=False, timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{s.rag_api_url}/content-intel/sitemap/export/urls",
             params=params,
@@ -190,7 +190,7 @@ async def export_sitemap_urls(domain: str = None, asset_id: str = None):
 async def generate_wordlist(request: Request):
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(verify=False, timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.post(
             f"{s.rag_api_url}/wordlists/generate",
             json=body,
@@ -223,7 +223,7 @@ async def generate_credential_guesses(req: CredentialGuessReq):
 
     # 1. Fetch content extractions for this asset/URL
     intel_context = {}
-    async with httpx.AsyncClient(verify=False, timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15) as c:
         params = {"limit": 20}
         if req.asset_id:
             params["asset_id"] = req.asset_id
@@ -307,9 +307,13 @@ Respond ONLY with valid JSON in this exact format:
         # Get active model from DB or fall back to config
         model = s.ollama_model
         try:
-            async with httpx.AsyncClient(verify=False, timeout=5) as c:
+            async with httpx.AsyncClient(timeout=5) as c:
+                # Config settings live behind /settings/config/{key}. Calling
+                # /settings/ollama_active_model 404'd, and the bare `except`
+                # below hid it — so this always fell through to s.ollama_model
+                # and the operator's model choice in Settings was ignored.
                 r = await c.get(
-                    f"{s.rag_api_url}/settings/ollama_active_model",
+                    f"{s.rag_api_url}/settings/config/ollama_active_model",
                     headers={"x-api-key": s.api_key, **engagement_headers()},
                 )
                 if r.status_code == 200:
@@ -319,7 +323,7 @@ Respond ONLY with valid JSON in this exact format:
         except Exception:
             pass
 
-        async with httpx.AsyncClient(verify=False, timeout=300) as c:
+        async with httpx.AsyncClient(timeout=300) as c:
             try:
                 resp = await c.post(
                     f"{s.ollama_url}/api/generate",

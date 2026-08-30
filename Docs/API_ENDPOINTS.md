@@ -137,10 +137,27 @@ curl -X POST http://localhost:8014/scan \
 **Endpoints**:
 - `GET /health` - Health check
 - `GET /docs` - Interactive Swagger UI documentation
-- `POST /pentest` - Start a multi-agent penetration testing session
+- `POST /pentest` - Start a multi-agent penetration testing session.
+  Body options relevant to the engine (Docs/LANGGRAPH_MIGRATION_PLAN.md):
+  `engine` (`langgraph` default | `autogen` legacy fallback — pins THIS session,
+  no restart needed) and `enable_exploit_phase` (LangGraph only; the session
+  PAUSES at `status=awaiting_approval` until an operator answers).
 - `GET /pentest/{session_id}` - Get pentest session status
 - `GET /pentest/{session_id}/messages` - Get conversation messages
 - `GET /sessions` - List all pentest sessions
+- `GET /pentest/engine` - Resolved orchestration engine for new sessions, the
+  env/default it came from, and whether each engine is loadable. Declared before
+  `/pentest/{session_id}` or the path would be read as a session id.
+- `GET /pentest/{session_id}/pending-approval` - What a paused LangGraph session
+  is waiting for, read from its **Postgres checkpoint** (so it is correct after a
+  service restart). `awaiting_approval: false` for a session that is not parked.
+- `POST /pentest/{session_id}/approve` - Answer the approval interrupt and
+  continue the SAME session from its checkpoint (`Command(resume=…)`) — no new
+  session row, no replay of completed phases.
+  Body: `{"approved": bool, "pending_exploit_id": "<uuid>", "note": "..."}`.
+  `approved=true` **requires** `pending_exploit_id` (400 without it: an approval
+  that executes nothing would read as "approved and run"). 400 malformed id,
+  404 unknown session, 409 session not parked on an approval.
 
 **🎉 NEW: Diagnostic Log Viewing**:
 - `GET /logs/ui` - **Web interface for viewing diagnostic logs** (recommended)
@@ -225,3 +242,26 @@ Use `http://<service-name>:<port>` (e.g., `http://nmap_scanner:8012`)
 
 ### From Another Container
 Services can communicate using their container names via the `agents_net` Docker network.
+
+## Raw Artifacts
+
+> **Caution:** artifact `content` is unredacted tool output and therefore
+> contains recovered credentials in plaintext (37% of artifacts matched
+> credential patterns on a lightly-used install). Treat the database, its
+> backups and this API as credential material. See `Docs/RAW_ARTIFACTS.md`.
+
+Complete, untruncated tool output for post-analysis and LLM processing.
+See `Docs/RAW_ARTIFACTS.md`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/ingest/raw-artifact` | Store one tool's complete output (deduped on tool+target+sha256) |
+| GET | `/artifacts` | List/filter artifacts (content omitted unless `include_content=true`) |
+| GET | `/artifacts/stats` | Queue depth and bytes by `llm_status` |
+| POST | `/artifacts/claim` | Atomically claim pending artifacts for LLM processing |
+| GET | `/artifacts/{id}` | One artifact including full content |
+| POST | `/artifacts/{id}/processed` | Record LLM outcome (`done`/`failed`/`skipped`) |
+| GET | `/artifacts/{id}/actions` | Evidence-cited follow-on actions for this artifact |
+| POST | `/artifacts/{id}/actions/queue` | Queue chosen, edited, or custom actions as scan recommendations |
+| GET | `/artifacts/auto-queue` | Auto-queue state, which rules opt in, and rule-file errors |
+| POST | `/artifacts/auto-queue` | Enable/disable automatic queuing (never auto-runs) |

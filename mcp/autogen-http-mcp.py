@@ -27,6 +27,12 @@ WEB_SCANNER_URL = os.environ.get("WEB_SCANNER_URL", "http://localhost:8010")
 NUCLEI_URL = os.environ.get("NUCLEI_URL", "http://localhost:8011")
 SCAN_RECOMMENDER_URL = os.environ.get("SCAN_RECOMMENDER_URL", "http://localhost:8013")
 
+# rag-api requires x-api-key on every data route and returns HTTP 422
+# "missing header x-api-key" without it. This file never sent one, so every
+# query_* tool failed regardless of whether its path was right.
+API_KEY = os.environ.get("API_KEY", "changeme")
+RAG_HEADERS = {"x-api-key": API_KEY}
+
 # Configurable timeouts
 TIMEOUT_SCAN = float(os.environ.get("MCP_TIMEOUT_SCAN", "300"))  # 5 min for scan operations
 TIMEOUT_QUICK = float(os.environ.get("MCP_TIMEOUT_QUICK", "30"))  # 30s for quick queries
@@ -194,7 +200,7 @@ Returns a job_id - use get_nmap_job_status to monitor progress.""",
             "type": "object",
             "properties": {
                 "target": {"type": "string", "description": "IP address, hostname, or CIDR range (e.g., 10.0.1.0/24)"},
-                "ports": {"type": "string", "description": "Port range (e.g., '22,80,443' or '1-1000')", "default": "1-1000"},
+                "ports": {"type": "string", "description": "Port range. OMIT for the server default (nmap's top-1000 for nmap scans, full range for masscan discovery). Do NOT pass '1-1000' — that is the first 1000 port NUMBERS and misses mysql 3306, postgresql 5432, vnc 5900, tomcat 8180."},
                 "scan_type": {"type": "string", "enum": ["quick", "full", "service"], "default": "service"}
             },
             "required": ["target"]
@@ -301,14 +307,19 @@ Returns consolidated findings with severity, CVE references, and remediation inf
     ),
     Tool(
         name="search_exploits",
-        description="""Search the exploit database using semantic search (RAG).
+        description="""List pending scan recommendations from the knowledge base.
 
-Finds relevant exploits based on service, version, or vulnerability description.
-Uses vector embeddings for semantic matching.""",
+NOTE: this does NOT do semantic/vector search. It previously claimed to, but
+pointed at an endpoint that does not exist and always failed. It now reads
+scan-recommender's /recommendations, which the KB populates per discovered
+(ip, service) after each scan ingests.
+
+Filtering is by IP or CIDR only. A free-text `query` cannot be applied and the
+response will say so explicitly rather than pretend it filtered.""",
         inputSchema={
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Search query (e.g., 'Apache 2.4 remote code execution')"},
+                "query": {"type": "string", "description": "An IP or CIDR to filter by. Free text is NOT searched — this endpoint has no text search."},
                 "limit": {"type": "integer", "default": 10}
             },
             "required": ["query"]
@@ -518,14 +529,31 @@ async def call_tool(name: str, arguments: dict):
             # === Scanning Tools ===
             elif name == "start_nmap_scan":
                 target = arguments["target"]
-                ports = arguments.get("ports", "1-1000")
+                ports = arguments.get("ports")  # None -> scanner picks the top-1000
                 scan_type = arguments.get("scan_type", "service")
 
+                # This request body was wrong in two ways and the tool could never
+                # have worked:
+                #
+                #   "target": target       -> the endpoint requires `targets`, a LIST.
+                #                             MasscanBody ignores unknown fields, so
+                #                             `targets` was simply absent and every
+                #                             call returned HTTP 422 "Field required".
+                #   "nmap_options": "-sV"  -> not a MasscanBody field either, so it was
+                #                             silently dropped. The quick/service
+                #                             distinction never reached nmap.
+                #
+                # Service detection is expressed by `service_detection`, which is the
+                # -sV this was reaching for. `scripts` is deliberately left unset so
+                # the scanner's NMAP_SCRIPTS env default applies, rather than this
+                # client inventing a script list of its own.
+                targets = [target] if isinstance(target, str) else list(target)
                 try:
                     resp = await client.post(f"{NMAP_URL}/jobs/masscan-then-nmap", json={
-                        "target": target,
-                        "ports": ports,
-                        "nmap_options": "-sV" if scan_type == "service" else "-sT"
+                        "targets": targets,
+                        "rate": 1000,
+                        "service_detection": scan_type in ("service", "full"),
+                        **({"ports": ports} if ports else {})
                     })
                     if resp.status_code == 200:
                         result = resp.json()
@@ -533,7 +561,11 @@ async def call_tool(name: str, arguments: dict):
                             "status": "started",
                             "job_id": result.get("job_id"),
                             "target": target,
-                            "ports": ports,
+                            # Report the scope that is actually in effect. Echoing a
+                            # bare null here would read to the model as "no ports
+                            # scanned" and invite it to retry with an explicit range.
+                            "ports": ports or "server default (nmap top-1000)",
+                            "service_detection": scan_type in ("service", "full"),
                             "message": "Scan started. Use get_nmap_job_status to monitor progress."
                         }, indent=2))]
                     else:
@@ -553,12 +585,16 @@ async def call_tool(name: str, arguments: dict):
                 extensions = arguments.get("extensions", "")
                 use_zap = arguments.get("use_zap", True)
 
+                # /scan does not exist on web-scanner (HTTP 404). The real route is
+                # /jobs/web-scan, whose JobReq wants `target_url` and `do_zap` — not
+                # `url`/`use_zap`. It has no `extensions` field at all, so that
+                # argument was never going to reach gobuster; it is dropped here
+                # rather than sent to be silently ignored.
                 try:
-                    resp = await client.post(f"{WEB_SCANNER_URL}/scan", json={
-                        "url": target_url,
+                    resp = await client.post(f"{WEB_SCANNER_URL}/jobs/web-scan", json={
+                        "target_url": target_url,
                         "wordlist": wordlist,
-                        "extensions": extensions,
-                        "use_zap": use_zap
+                        "do_zap": use_zap
                     })
                     if resp.status_code == 200:
                         result = resp.json()
@@ -584,11 +620,15 @@ async def call_tool(name: str, arguments: dict):
                 templates = arguments.get("templates", "")
                 severity = arguments.get("severity", "medium")
 
+                # /scan does not exist on nuclei-runner (HTTP 404). The real route is
+                # /jobs/nuclei-scan, and its template filter is `tags` (e.g. "cve,rce"),
+                # not `templates`. `target` singular IS correct here — JobReq accepts
+                # both `target` and `targets`.
                 try:
-                    resp = await client.post(f"{NUCLEI_URL}/scan", json={
+                    resp = await client.post(f"{NUCLEI_URL}/jobs/nuclei-scan", json={
                         "target": target,
-                        "templates": templates,
-                        "severity": severity
+                        "severity": severity,
+                        **({"tags": templates} if templates else {})
                     })
                     if resp.status_code == 200:
                         result = resp.json()
@@ -614,11 +654,14 @@ async def call_tool(name: str, arguments: dict):
                 browser = arguments.get("browser", "chromium")
                 screenshot = arguments.get("screenshot", True)
 
+                # The route and `url`/`browser` were correct, but the model field is
+                # `capture_screenshots` — `screenshot` was silently ignored, so this
+                # toggle never did anything and scans always ran with the default.
                 try:
                     resp = await client.post(f"{PLAYWRIGHT_URL}/scan", json={
                         "url": target_url,
                         "browser": browser,
-                        "screenshot": screenshot
+                        "capture_screenshots": screenshot
                     })
                     if resp.status_code == 200:
                         result = resp.json()
@@ -646,7 +689,7 @@ async def call_tool(name: str, arguments: dict):
                     params["ip"] = arguments["ip_filter"]
 
                 try:
-                    resp = await client.get(f"{RAG_API_URL}/assets", params=params)
+                    resp = await client.get(f"{RAG_API_URL}/assets", params=params, headers=RAG_HEADERS)
                     if resp.status_code == 200:
                         return [TextContent(type="text", text=json.dumps(resp.json(), indent=2))]
                     else:
@@ -664,15 +707,35 @@ async def call_tool(name: str, arguments: dict):
                 params = {"limit": arguments.get("limit", 100)}
                 if "ip" in arguments:
                     params["ip"] = arguments["ip"]
-                if "port" in arguments:
-                    params["port"] = arguments["port"]
                 if "service" in arguments:
                     params["service"] = arguments["service"]
+                # /ports/open filters by ip/service/search only — there is no `port`
+                # parameter, and FastAPI drops unknown query params, so the caller's
+                # `port` silently did nothing. `search` is NOT a substitute: it
+                # substring-matches service/product/banner, so search="80" matches
+                # the text "80" in a banner, not port 80.
+                #
+                # The rows carry a real `port` field, so the filter is applied here
+                # instead. Fetch a wider page when filtering, since the server would
+                # otherwise apply `limit` before this filter ever sees the rows.
+                port_filter = arguments.get("port")
+                if port_filter is not None:
+                    params["limit"] = 5000
 
                 try:
-                    resp = await client.get(f"{RAG_API_URL}/ports", params=params)
+                    # /ports does not exist (HTTP 404) — the route is /ports/open.
+                    resp = await client.get(f"{RAG_API_URL}/ports/open", params=params, headers=RAG_HEADERS)
                     if resp.status_code == 200:
-                        return [TextContent(type="text", text=json.dumps(resp.json(), indent=2))]
+                        data = resp.json()
+                        if port_filter is not None and isinstance(data, dict):
+                            keep = [i for i in data.get("items", [])
+                                    if str(i.get("port")) == str(port_filter)]
+                            trimmed = keep[:arguments.get("limit", 100)]
+                            data = {**data, "items": trimmed, "count": len(trimmed),
+                                    "total": len(keep),
+                                    "filtered_by": {"port": port_filter,
+                                                    "note": "port filtered client-side; /ports/open has no port parameter"}}
+                        return [TextContent(type="text", text=json.dumps(data, indent=2))]
                     else:
                         return [TextContent(type="text", text=json.dumps({
                             "error": f"HTTP {resp.status_code}",
@@ -692,7 +755,9 @@ async def call_tool(name: str, arguments: dict):
                     params["ip"] = arguments["ip"]
 
                 try:
-                    resp = await client.get(f"{RAG_API_URL}/findings", params=params)
+                    # /findings does not exist (HTTP 404). Findings are served by
+                    # /vulns, which takes the same ip/severity/limit filters.
+                    resp = await client.get(f"{RAG_API_URL}/vulns", params=params, headers=RAG_HEADERS)
                     if resp.status_code == 200:
                         return [TextContent(type="text", text=json.dumps(resp.json(), indent=2))]
                     elif resp.status_code == 404:
@@ -715,13 +780,35 @@ async def call_tool(name: str, arguments: dict):
                 query = arguments["query"]
                 limit = arguments.get("limit", 10)
 
+                # /rag/ask does not exist on scan-recommender (HTTP 405). The
+                # closest real capability is GET /recommendations, which lists the
+                # KB-generated scan recommendations per discovered (ip, service).
+                #
+                # It filters by ip/service/status — there is NO free-text or vector
+                # search, so `query` cannot be honoured as written. An IP or CIDR is
+                # applied as the `ip` filter; anything else cannot be turned into a
+                # server-side filter, and is reported back as unapplied rather than
+                # dropped silently, so the model is not left believing it searched.
+                params = {"limit": min(max(int(limit), 1), 500), "status": "pending"}
+                q = str(query).strip()
+                looks_like_ip = q and all(c.isdigit() or c in "./:" for c in q)
+                if looks_like_ip:
+                    params["ip"] = q
                 try:
-                    resp = await client.post(f"{SCAN_RECOMMENDER_URL}/rag/ask", json={
-                        "question": query,
-                        "top_k": limit
-                    })
+                    resp = await client.get(f"{SCAN_RECOMMENDER_URL}/recommendations", params=params)
                     if resp.status_code == 200:
-                        return [TextContent(type="text", text=json.dumps(resp.json(), indent=2))]
+                        payload = resp.json()
+                        if not looks_like_ip and q:
+                            payload = {
+                                "note": (
+                                    f"'{q}' was NOT used as a search term — /recommendations "
+                                    f"filters by ip/service/status only and has no free-text "
+                                    f"search. Showing pending recommendations instead. Pass an "
+                                    f"IP or CIDR to filter."
+                                ),
+                                **(payload if isinstance(payload, dict) else {"recommendations": payload}),
+                            }
+                        return [TextContent(type="text", text=json.dumps(payload, indent=2))]
                     else:
                         return [TextContent(type="text", text=json.dumps({
                             "error": f"HTTP {resp.status_code}",

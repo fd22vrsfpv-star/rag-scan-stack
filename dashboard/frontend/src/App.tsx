@@ -9,6 +9,7 @@ const Dashboard = lazy(() => import('@/pages/Dashboard'))
 const ScanLauncher = lazy(() => import('@/pages/ScanLauncher'))
 const ScanMonitor = lazy(() => import('@/pages/ScanMonitor'))
 const ScanDetail = lazy(() => import('@/pages/ScanDetail'))
+const ScanResults = lazy(() => import('@/pages/ScanResults'))
 const AssetBrowser = lazy(() => import('@/pages/AssetBrowser'))
 const FindingsExplorer = lazy(() => import('@/pages/FindingsExplorer'))
 const ExploitManager = lazy(() => import('@/pages/ExploitManager'))
@@ -155,6 +156,7 @@ export default function App() {
           <Route element={<AppShell />}>
             <Route index element={<Suspense fallback={<Loading />}><Dashboard /></Suspense>} />
             <Route path="scans/launch" element={<Suspense fallback={<Loading />}><ScanLauncher /></Suspense>} />
+            <Route path="scans/results" element={<Suspense fallback={<Loading />}><ScanResults /></Suspense>} />
             <Route path="scans/:jobId" element={<Suspense fallback={<Loading />}><ScanDetail /></Suspense>} />
             <Route path="scans" element={<Suspense fallback={<Loading />}><ScanMonitor /></Suspense>} />
             <Route path="agents" element={<Suspense fallback={<Loading />}><AIAgents /></Suspense>} />

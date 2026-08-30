@@ -6,21 +6,31 @@ import {
   useAgentSession,
   useAgentMessages,
   useSessionScans,
+  useSessionFlowSummary,
   useStartSession,
   useStopSession,
   useResumeSession,
   useDeleteSession,
   useClearSessionHistory,
+  usePendingApproval,
+  useApproveSession,
 } from '@/api/agentSessions'
 import type { AgentSession, AgentMessage, SessionScan } from '@/api/agentSessions'
 import { useModelPerformanceWarning } from '@/api/agents'
+import {
+  useSessionSecurityTests,
+  useSecurityTestRuns,
+  useRunSecurityTest,
+  useToggleSecurityTest,
+} from '@/api/securityTests'
+import type { SecurityTest } from '@/api/securityTests'
 import { apiFetch } from '@/api/client'
 import { useScopeNames, useScope } from '@/api/scope'
 import { StatusDot } from '@/components/common/StatusDot'
 import { JsonViewer } from '@/components/common/JsonViewer'
 import { ModelPerformanceWarningModal } from '@/components/common/ModelPerformanceWarningModal'
 import { cn } from '@/lib/utils'
-import { ArrowLeft, Plus, Square, Play, X, Wrench, Terminal, ChevronDown, ChevronRight, ExternalLink, Trash2, Shield, Crosshair, Wifi, Puzzle } from 'lucide-react'
+import { ArrowLeft, Plus, Square, Play, X, Wrench, Terminal, ChevronDown, ChevronRight, ExternalLink, Trash2, Shield, Crosshair, Wifi, Puzzle, AlertTriangle, ListChecks, PauseCircle, Check, Ban } from 'lucide-react'
 import { useScanDefaultsStore } from '@/stores/scanDefaults'
 import { useNodes } from '@/api/nodes'
 import { usePortProfiles } from '@/api/portProfiles'
@@ -116,6 +126,250 @@ function extractToolName(msg: AgentMessage): string | null {
 }
 
 /* ────────────── Scan Card ────────────── */
+
+/* ────────────── End-of-session scan flow summary ──────────────
+ *
+ * Built at teardown by scan_tools.build_flow_summary() and persisted to
+ * agent_sessions.metadata.scan_flow_summary, so it survives the process. It was
+ * previously written to logs and a webhook only — invisible in the UI, which is
+ * where an operator actually reviews a finished run.
+ *
+ * The signal that earns its place at the top: produced_nothing. A scan type that
+ * COMPLETED while producing nothing is the exact shape of a silently-broken tool
+ * (ZAP once reported "0 alerts" from 207 seeded URLs after its session was
+ * wiped) and is indistinguishable from a clean run if you only count statuses.
+ */
+
+interface FlowType {
+  scan_type: string
+  runs: number
+  completed: number
+  running: number
+  failed: number
+  targets: string[]
+  results: Record<string, number>
+  failures: { job_id?: string; error?: string }[]
+  produced_nothing: boolean
+  total_duration_seconds: number
+}
+
+interface KbCoverage {
+  available: boolean
+  reason?: string
+  acted_on?: number
+  ignored?: number
+  coverage_pct?: number
+  recommendations?: number
+  by_source?: Record<string, number>
+  recommended_but_never_run?: { scanner: string; recommendations?: number }[]
+}
+
+interface FlowSummary {
+  total_scans: number
+  scan_types_run: number
+  flow_order: string[]
+  by_scan_type: FlowType[]
+  types_that_produced_nothing: string[]
+  types_with_failures: string[]
+  kb_coverage?: KbCoverage
+  generated_at?: string
+  /** Types still running when the teardown snapshot was taken. Non-empty means
+   *  the numbers are provisional until the post-session refresh lands. */
+  in_flight_at_teardown?: string[]
+  refreshed_at?: string
+  source?: string
+}
+
+interface ClaimValidation {
+  ok?: boolean
+  by_kind?: Record<string, { total: number; unsupported: number }>
+  notable?: { kind: string; value: string; detail?: string; context?: string }[]
+}
+
+function dur(seconds: number | null | undefined): string {
+  if (seconds == null || seconds === 0) return '—'
+  return seconds < 60 ? `${seconds.toFixed(1)}s` : `${(seconds / 60).toFixed(1)}m`
+}
+
+function ScanFlowSummary({ summary, validation }: {
+  summary: FlowSummary
+  validation?: ClaimValidation
+}) {
+  const [expanded, setExpanded] = useState(true)
+  const kb = summary.kb_coverage
+  const quiet = summary.types_that_produced_nothing ?? []
+  const broken = summary.types_with_failures ?? []
+  const inFlight = summary.in_flight_at_teardown ?? []
+
+  return (
+    <div className="bg-card border border-border rounded-lg">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-muted/30 transition-colors"
+      >
+        {expanded ? <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />}
+        <ListChecks className="h-4 w-4 shrink-0 text-muted-foreground" />
+        <span className="text-sm font-medium flex-1">Session flow summary</span>
+        <span className="text-xs text-muted-foreground">
+          {summary.total_scans} scans · {summary.scan_types_run} types
+        </span>
+        {quiet.length > 0 && (
+          <span className="text-xs px-1.5 py-0.5 rounded bg-yellow-500/10 text-yellow-500">
+            {quiet.length} produced nothing
+          </span>
+        )}
+        {broken.length > 0 && (
+          <span className="text-xs px-1.5 py-0.5 rounded bg-red-500/10 text-red-500">
+            {broken.length} with failures
+          </span>
+        )}
+        {inFlight.length > 0 && (
+          <span className="text-xs px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500">
+            {inFlight.length} still running
+          </span>
+        )}
+      </button>
+
+      {expanded && (
+        <div className="px-4 pb-4 space-y-4 border-t border-border pt-3">
+          {/* Flow order — the actual sequence the session ran, not alphabetical */}
+          {summary.flow_order?.length > 0 && (
+            <div className="flex items-center gap-1.5 flex-wrap text-xs">
+              {summary.flow_order.map((t, i) => (
+                <span key={t} className="flex items-center gap-1.5">
+                  {i > 0 && <span className="text-muted-foreground">→</span>}
+                  <span className="px-1.5 py-0.5 rounded bg-muted/50 font-mono">{t}</span>
+                </span>
+              ))}
+            </div>
+          )}
+
+          {/* Per-type outcomes */}
+          <div className="space-y-1.5">
+            {(summary.by_scan_type ?? []).map(t => {
+              const produced = Object.entries(t.results ?? {})
+              return (
+                <div key={t.scan_type} className="text-xs border border-border/60 rounded px-3 py-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-mono font-medium">{t.scan_type}</span>
+                    <span className="text-muted-foreground">{t.runs} run{t.runs === 1 ? '' : 's'}</span>
+                    {t.completed > 0 && <span className="text-green-500">{t.completed} completed</span>}
+                    {t.running > 0 && <span className="text-blue-500">{t.running} running</span>}
+                    {t.failed > 0 && <span className="text-red-500">{t.failed} failed</span>}
+                    <span className="text-muted-foreground ml-auto">{dur(t.total_duration_seconds)}</span>
+                  </div>
+
+                  {/* What it PRODUCED — the question status counts cannot answer */}
+                  <div className="mt-1 flex items-center gap-2 flex-wrap text-muted-foreground">
+                    {produced.length > 0 ? (
+                      produced.map(([k, v]) => (
+                        <span key={k} className="px-1.5 py-0.5 rounded bg-muted/40">
+                          {k.replace(/_/g, ' ')}: <span className="text-foreground">{String(v)}</span>
+                        </span>
+                      ))
+                    ) : t.produced_nothing ? (
+                      <span className="flex items-center gap-1 text-yellow-500">
+                        <AlertTriangle className="h-3 w-3" />
+                        completed but produced nothing
+                      </span>
+                    ) : (
+                      <span>no results recorded yet</span>
+                    )}
+                    {t.targets?.length > 0 && (
+                      <span className="ml-auto font-mono">{t.targets.join(', ')}</span>
+                    )}
+                  </div>
+
+                  {t.failures?.length > 0 && (
+                    <div className="mt-1 space-y-0.5">
+                      {t.failures.map((f, i) => (
+                        <div key={i} className="text-red-400 font-mono truncate">
+                          {f.error || 'no error recorded'}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+
+          {/* KB coverage — did the run do what the knowledge base said to do */}
+          {kb && (
+            <div className="text-xs border-t border-border pt-3">
+              <div className="font-medium mb-1">Knowledge-base coverage</div>
+              {kb.available === false ? (
+                <p className="text-muted-foreground">Unavailable{kb.reason ? ` — ${kb.reason}` : ''}</p>
+              ) : (
+                <div className="flex items-center gap-3 flex-wrap text-muted-foreground">
+                  <span>acted on <span className="text-foreground">{kb.acted_on ?? 0}</span> of <span className="text-foreground">{kb.recommendations ?? 0}</span></span>
+                  {kb.coverage_pct != null && (
+                    <span className={cn(kb.coverage_pct < 50 ? 'text-yellow-500' : 'text-green-500')}>
+                      {kb.coverage_pct}% coverage
+                    </span>
+                  )}
+                  {kb.by_source && Object.entries(kb.by_source).map(([src, n]) => (
+                    <span key={src} className="px-1.5 py-0.5 rounded bg-muted/40">{src}: {n}</span>
+                  ))}
+                </div>
+              )}
+              {(kb.recommended_but_never_run?.length ?? 0) > 0 && (
+                <div className="mt-1 text-muted-foreground">
+                  never run:{' '}
+                  <span className="font-mono">
+                    {kb.recommended_but_never_run!.slice(0, 8).map(r => r.scanner).join(', ')}
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Agent claims checked against what the scans actually recorded */}
+          {validation?.by_kind && (
+            <div className="text-xs border-t border-border pt-3">
+              <div className="font-medium mb-1">Agent claim validation</div>
+              <div className="flex items-center gap-3 flex-wrap text-muted-foreground">
+                {Object.entries(validation.by_kind).map(([kind, v]) => (
+                  <span key={kind} className="px-1.5 py-0.5 rounded bg-muted/40">
+                    {kind}: <span className="text-foreground">{v.total}</span>
+                    {v.unsupported > 0 && (
+                      <span className="text-yellow-500"> · {v.unsupported} unsupported</span>
+                    )}
+                  </span>
+                ))}
+              </div>
+              {/* "Unsupported" is deliberately not called "false": it can equally
+                  mean ingestion broke, which is why it reads beside the produced
+                  counts above rather than on its own. */}
+              <p className="mt-1 text-muted-foreground">
+                Unsupported = not found in recorded scan data. That can mean a fabricated
+                claim <em>or</em> that ingestion failed — compare with what each type produced above.
+              </p>
+            </div>
+          )}
+
+          {/* Say plainly that the numbers are provisional. Without this a scan
+              that simply had not finished is indistinguishable from one that
+              genuinely found nothing. */}
+          {inFlight.length > 0 && (
+            <p className="text-xs text-blue-400">
+              Still running when this was taken: <span className="font-mono">{inFlight.join(', ')}</span>.
+              Counts for these are provisional and refresh when the scans report in.
+            </p>
+          )}
+
+          {(summary.generated_at || summary.refreshed_at) && (
+            <p className="text-[11px] text-muted-foreground">
+              {summary.generated_at && <>generated {new Date(summary.generated_at).toLocaleString()}</>}
+              {summary.refreshed_at && <> · refreshed {new Date(summary.refreshed_at).toLocaleString()}</>}
+              {summary.source && <> · {summary.source}</>}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
 
 function ScanCard({ scan }: { scan: SessionScan }) {
   const [expanded, setExpanded] = useState(false)
@@ -264,12 +518,27 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const [resumeNodeId, setResumeNodeId] = useState('')
   const nodesQuery = useNodes()
   const resumeOnlineNodes = (nodesQuery.data?.nodes ?? []).filter(n => n.status === 'online')
-  const [activeTab, setActiveTab] = useState<'messages' | 'scans'>('messages')
+  // Prefer the dedicated endpoint: it serves the LIVE tracker while the session
+  // is active and the persisted copy once it has ended. session.metadata holds
+  // only the teardown snapshot, which is taken while scans are frequently still
+  // running, so it under-reports until the post-session refresh lands.
+  const { data: liveFlow } = useSessionFlowSummary(sessionId)
+  const sessionMeta = (session as unknown as { metadata?: Record<string, unknown> } | undefined)?.metadata
+  const storedFlow = sessionMeta?.scan_flow_summary as FlowSummary | undefined
+  // `source: "none"` means the endpoint found nothing — fall back rather than
+  // rendering an empty panel over a summary we already have.
+  const flowSummary = (liveFlow && (liveFlow as { total_scans?: number }).total_scans
+    ? (liveFlow as unknown as FlowSummary)
+    : storedFlow)
+  const claimValidation = sessionMeta?.claim_validation as ClaimValidation | undefined
+  const [activeTab, setActiveTab] = useState<'messages' | 'scans' | 'security'>('messages')
   const [showToolCalls, setShowToolCalls] = useState(true)
 
   const logRef = useRef<HTMLDivElement>(null)
   const messages = msgData?.messages ?? []
   const scans: SessionScan[] = scanData?.scans ?? []
+  const { data: secTestData } = useSessionSecurityTests(sessionId)
+  const securityTests: SecurityTest[] = secTestData?.tests ?? []
 
   const filteredMessages = showToolCalls
     ? messages
@@ -285,6 +554,14 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const canStop = session?.status === 'active'
   const isRoundsExhausted = session?.status === 'rounds_exhausted'
   const isAgentFailure = session?.status === 'agent_failure'
+  // Paused on a LangGraph approval interrupt. NOT a stall: the graph is
+  // checkpointed in Postgres and resumes from this exact point once answered,
+  // which is why /resume (a new child session) is the wrong control here.
+  const isAwaitingApproval = session?.status === 'awaiting_approval'
+  const { data: pendingApproval } = usePendingApproval(sessionId, isAwaitingApproval)
+  const approveSession = useApproveSession()
+  const [approveExploitId, setApproveExploitId] = useState('')
+  const [approveNote, setApproveNote] = useState('')
 
   const handleResume = () => {
     const selectedNode = resumeOnlineNodes.find(n => n.id === resumeNodeId)
@@ -336,14 +613,18 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                       ? 'bg-orange-500/10 text-orange-500'
                       : session.status === 'rounds_exhausted'
                         ? 'bg-yellow-500/10 text-yellow-500'
-                        : 'bg-yellow-500/10 text-yellow-500',
+                        : session.status === 'awaiting_approval'
+                          ? 'bg-purple-500/10 text-purple-400'
+                          : 'bg-yellow-500/10 text-yellow-500',
             )}
           >
             {session.status === 'rounds_exhausted'
               ? 'needs more rounds'
               : session.status === 'agent_failure'
                 ? 'agent failed — resumable'
-                : session.status}
+                : session.status === 'awaiting_approval'
+                  ? 'awaiting approval'
+                  : session.status}
           </span>
         )}
       </div>
@@ -364,6 +645,37 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
               <span className="text-muted-foreground">Auto Execute: </span>
               <span>{(session.auto_execute_scans ?? session.configuration?.auto_execute_scans) ? 'Yes' : 'No'}</span>
             </div>
+            {/* Which engine this session actually ran on. Persisted per session,
+                so a run stays labelled after the service default is flipped —
+                without it an A/B comparison is unreadable. */}
+            {session.configuration?.engine && (
+              <div>
+                <span className="text-muted-foreground">Engine: </span>
+                <span className={cn(
+                  'font-mono text-xs px-1.5 py-0.5 rounded',
+                  session.configuration.engine === 'langgraph'
+                    ? 'bg-blue-500/10 text-blue-400'
+                    : 'bg-muted text-muted-foreground',
+                )}>{session.configuration.engine}</span>
+              </div>
+            )}
+            {session.configuration?.enable_exploit_phase && (
+              <div>
+                <span className="text-muted-foreground">Exploit phase: </span>
+                <span className="text-purple-400">on (needs approval)</span>
+              </div>
+            )}
+            {session.configuration?.enable_surface_test_phase && (
+              <div>
+                <span className="text-muted-foreground">Surface-test phase: </span>
+                <span className="text-purple-400">on</span>
+                {session.configuration?.surface_target_host ? (
+                  <span className="font-mono text-xs text-foreground"> → {String(session.configuration.surface_target_host)}</span>
+                ) : (
+                  <span className="text-xs text-muted-foreground"> (auto-pick host)</span>
+                )}
+              </div>
+            )}
             {session.configuration?.proxy && (
               <div className="flex items-center gap-1.5">
                 <Wifi className="h-3 w-3 text-blue-400" />
@@ -381,6 +693,83 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
           {session.error && (
             <p className="text-xs text-red-500">Error: {typeof session.error === 'string' ? session.error : JSON.stringify(session.error)}</p>
           )}
+        </div>
+      )}
+
+      {/* Awaiting-approval banner.
+          A paused session MUST be labelled, not left looking like a running
+          one: the graph does nothing at all until this is answered, and a
+          silent pause is indistinguishable from a hang. */}
+      {isAwaitingApproval && (
+        <div className="bg-purple-500/10 border border-purple-500/30 rounded-lg px-4 py-3 space-y-3">
+          <div className="flex items-start gap-3">
+            <PauseCircle className="h-5 w-5 text-purple-400 shrink-0 mt-0.5" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium text-purple-400">
+                Paused — waiting for your approval
+              </p>
+              <p className="text-xs text-muted-foreground">
+                The graph is checkpointed in Postgres and resumes from this exact
+                point. Nothing has been executed.
+              </p>
+              {pendingApproval?.pending?.candidate && (
+                <pre className="mt-2 text-xs bg-background/60 border border-border rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap">
+                  {pendingApproval.pending.candidate}
+                </pre>
+              )}
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              value={approveExploitId}
+              onChange={e => setApproveExploitId(e.target.value)}
+              placeholder="pending_exploit_id (required to approve)"
+              className="flex-1 min-w-[18rem] px-2 py-1.5 bg-background border border-border rounded-md text-xs font-mono"
+            />
+            <input
+              value={approveNote}
+              onChange={e => setApproveNote(e.target.value)}
+              placeholder="note (optional)"
+              className="flex-1 min-w-[10rem] px-2 py-1.5 bg-background border border-border rounded-md text-xs"
+            />
+            <button
+              onClick={() => approveSession.mutate({
+                id: sessionId,
+                approved: true,
+                pending_exploit_id: approveExploitId.trim(),
+                note: approveNote || undefined,
+              })}
+              disabled={!approveExploitId.trim() || approveSession.isPending}
+              title={approveExploitId.trim()
+                ? 'Execute the queued exploit and continue'
+                : 'Enter the pending_exploit_id to approve'}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-purple-600 text-white rounded-md text-sm hover:bg-purple-700 disabled:opacity-50"
+            >
+              <Check className="h-3.5 w-3.5" /> Approve &amp; run
+            </button>
+            <button
+              onClick={() => approveSession.mutate({
+                id: sessionId,
+                approved: false,
+                note: approveNote || undefined,
+              })}
+              disabled={approveSession.isPending}
+              className="flex items-center gap-1.5 px-3 py-1.5 border border-border rounded-md text-sm hover:bg-muted disabled:opacity-50"
+            >
+              <Ban className="h-3.5 w-3.5" /> Decline
+            </button>
+          </div>
+          {approveSession.isError && (
+            <p className="text-xs text-red-500">
+              {(approveSession.error as Error)?.message ?? 'Approval failed'}
+            </p>
+          )}
+          <Link
+            to="/exploits"
+            className="inline-flex items-center gap-1 text-xs text-purple-400 hover:underline"
+          >
+            <ExternalLink className="h-3 w-3" /> Find the id in Pending Exploits
+          </Link>
         </div>
       )}
 
@@ -528,6 +917,17 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
         >
           Scans & Tools ({scans.length})
         </button>
+        <button
+          onClick={() => setActiveTab('security')}
+          className={cn(
+            'px-3 py-2 text-sm font-medium border-b-2 transition-colors',
+            activeTab === 'security'
+              ? 'border-primary text-foreground'
+              : 'border-transparent text-muted-foreground hover:text-foreground',
+          )}
+        >
+          Security Tests ({securityTests.length})
+        </button>
       </div>
 
       {/* Messages tab */}
@@ -602,6 +1002,12 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
       {/* Scans & Tools tab */}
       {activeTab === 'scans' && (
         <div className="space-y-3">
+          {/* End-of-session flow summary. Rendered FIRST: it answers "did each
+              kind of scan do its job", which is the question an operator opens a
+              finished session to ask. The per-scan cards below answer "what ran". */}
+          {flowSummary && (
+            <ScanFlowSummary summary={flowSummary} validation={claimValidation} />
+          )}
           {/* Summary bar */}
           <div className="flex items-center gap-4 text-xs">
             <span className="text-muted-foreground">
@@ -639,6 +1045,163 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
           <AvailableMcpTools />
         </div>
       )}
+
+      {/* Security Tests tab */}
+      {activeTab === 'security' && (
+        <SecurityTestsPanel sessionId={sessionId} tests={securityTests} />
+      )}
+    </div>
+  )
+}
+
+/* ────────────── Security Tests Panel ────────────── */
+
+function statusPill(status?: string | null) {
+  const map: Record<string, string> = {
+    pass: 'bg-green-500/15 text-green-400',
+    fail: 'bg-red-500/15 text-red-400',
+    error: 'bg-amber-500/15 text-amber-400',
+    skipped: 'bg-muted text-muted-foreground',
+  }
+  const cls = (status && map[status]) || 'bg-muted text-muted-foreground'
+  return (
+    <span className={cn('px-1.5 py-0.5 rounded text-[10px] font-medium uppercase', cls)}>
+      {status || 'never'}
+    </span>
+  )
+}
+
+function SecurityTestRunHistory({ testId }: { testId: string }) {
+  const { data } = useSecurityTestRuns(testId)
+  const runs = data?.runs ?? []
+  if (runs.length === 0)
+    return <p className="text-xs text-muted-foreground px-3 py-2">No runs yet.</p>
+  return (
+    <div className="px-3 py-2 space-y-1">
+      {runs.map(r => (
+        <div key={r.id} className="flex items-start gap-2 text-xs border-l-2 border-border pl-2">
+          {statusPill(r.status)}
+          <span className="px-1 rounded bg-muted text-muted-foreground uppercase text-[10px]">{r.lane}</span>
+          <div className="flex-1 min-w-0">
+            <p className="font-mono break-words" style={{ overflowWrap: 'anywhere' }}>
+              {r.result_summary || r.command_run || '(no summary)'}
+            </p>
+            <span className="text-muted-foreground">
+              {r.ran_at ? new Date(r.ran_at).toLocaleString() : ''}
+              {r.exit_code != null && ` · exit ${r.exit_code}`}
+              {r.tool_execution_id && ` · exec ${r.tool_execution_id.slice(0, 8)}`}
+              {r.exploit_result_id && ` · exploit ${r.exploit_result_id.slice(0, 8)}`}
+            </span>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function SecurityTestRow({ test, sessionId }: { test: SecurityTest; sessionId?: string }) {
+  const [expanded, setExpanded] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
+  const runTest = useRunSecurityTest(sessionId)
+  const toggleTest = useToggleSecurityTest(sessionId)
+
+  const onRun = () => {
+    setNotice(null)
+    runTest.mutate({ id: test.id }, {
+      onSuccess: (d) => {
+        if (d?.requires_approval)
+          setNotice('Impactful test — approval required. Approve it through the exploit-approval banner above; nothing was executed.')
+        else
+          setNotice(`Run recorded: ${d?.status ?? 'done'}`)
+      },
+      onError: (e) => setNotice((e as Error)?.message ?? 'Run failed'),
+    })
+  }
+
+  return (
+    <div className="border border-border rounded-md">
+      <div className="flex items-center gap-2 px-3 py-2">
+        <button onClick={() => setExpanded(v => !v)} className="text-muted-foreground shrink-0">
+          {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+        </button>
+        <span className={cn(
+          'px-1.5 py-0.5 rounded text-[10px] font-medium uppercase shrink-0',
+          test.tier === 'impactful' ? 'bg-red-500/15 text-red-400' : 'bg-blue-500/15 text-blue-400',
+        )}>
+          {test.tier}
+        </span>
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium break-words" style={{ overflowWrap: 'anywhere' }}>{test.name}</p>
+          <p className="text-xs text-muted-foreground">
+            {test.category || 'uncategorised'}
+            {test.target_ip && ` · ${test.target_ip}`}
+            {test.target_port != null && `:${test.target_port}`}
+            {test.target_service && ` (${test.target_service})`}
+            {test.tool && ` · ${test.tool}`}
+          </p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {statusPill(test.last_run_status)}
+          <span className="text-xs text-muted-foreground">×{test.run_count}</span>
+          <label className="flex items-center gap-1 text-[10px] text-muted-foreground cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={test.enabled}
+              onChange={e => toggleTest.mutate({ id: test.id, enabled: e.target.checked })}
+              className="rounded border-border"
+            />
+            enabled
+          </label>
+          <button
+            onClick={onRun}
+            disabled={runTest.isPending || !test.enabled}
+            className="px-2 py-1 text-xs rounded bg-primary text-primary-foreground disabled:opacity-50"
+            title={test.tier === 'impactful'
+              ? 'Impactful — re-running requires operator approval'
+              : 'Re-run this safe test now'}
+          >
+            {runTest.isPending ? 'Running…' : 'Re-run'}
+          </button>
+        </div>
+      </div>
+      {notice && (
+        <p className="px-3 pb-2 text-xs text-amber-400">{notice}</p>
+      )}
+      {expanded && (
+        <div className="border-t border-border">
+          {test.command && (
+            <p className="px-3 py-2 text-xs font-mono text-muted-foreground break-words" style={{ overflowWrap: 'anywhere' }}>
+              $ {test.command}
+            </p>
+          )}
+          <SecurityTestRunHistory testId={test.id} />
+        </div>
+      )}
+    </div>
+  )
+}
+
+function SecurityTestsPanel({ sessionId, tests }: { sessionId?: string; tests: SecurityTest[] }) {
+  if (tests.length === 0) {
+    return (
+      <p className="text-sm text-muted-foreground text-center py-8">
+        No security tests generated. Launch a session with the attack-surface test
+        phase enabled and point it at a target host.
+      </p>
+    )
+  }
+  const safe = tests.filter(t => t.tier === 'safe').length
+  const impactful = tests.length - safe
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-4 text-xs">
+        <span className="text-muted-foreground">Total: <span className="text-foreground font-medium">{tests.length}</span></span>
+        <span className="text-blue-400">Safe: {safe}</span>
+        <span className="text-red-400">Impactful: {impactful}</span>
+      </div>
+      {tests.map(t => (
+        <SecurityTestRow key={t.id} test={t} sessionId={sessionId} />
+      ))}
     </div>
   )
 }
@@ -766,6 +1329,17 @@ function SessionList() {
     initial_task: SESSION_PROFILES[DEFAULT_PROFILE].task,
     max_rounds: 200,
     auto_execute_scans: true,
+    // '' = use the service default (AGENT_ENGINE), which is the only engine
+    // there is now. Kept as a field because the API still accepts it and saved
+    // launch presets may carry one.
+    engine: '',
+    // Off by default: with it on the session pauses for an approval, so an
+    // operator who walks away comes back to a parked session.
+    enable_exploit_phase: false,
+    // Attack-surface test phase: enumerate ONE host, generate custom tests, run
+    // safe ones and pause for approval on impactful ones. Off by default.
+    enable_surface_test_phase: false,
+    surface_target_host: '',
   })
 
   // Node + scope selector data
@@ -784,8 +1358,12 @@ function SessionList() {
   }, [activeScope, scopeData])
 
   const sessions: AgentSession[] = data?.sessions ?? []
-  const active = sessions.filter(s => s.status === 'active')
-  const history = sessions.filter(s => s.status !== 'active')
+  // A session paused on an approval interrupt is LIVE, not history: it is
+  // waiting on the operator and resumes the moment it is answered. Filing it
+  // under history is how an approval sits unnoticed for hours.
+  const LIVE_STATUSES = ['active', 'awaiting_approval']
+  const active = sessions.filter(s => LIVE_STATUSES.includes(s.status))
+  const history = sessions.filter(s => !LIVE_STATUSES.includes(s.status))
 
   const handleScopeClear = () => {
     setActiveScope('')
@@ -803,8 +1381,18 @@ function SessionList() {
 
     // port_profile is omitted entirely when unset, so the scanner agent keeps
     // its built-in quick (1-1000+web) then deep (1001-65535) policy.
+    // engine: '' means "no override" — sending the key at all would make the
+    // service treat an empty string as a choice. There is no selector any more,
+    // but the field survives so a saved launch preset carrying an engine still
+    // forwards it (the service warns and runs LangGraph if it is the retired one).
+    const { engine, surface_target_host, ...formRest } = form
     const sessionData = {
-      ...form, proxy,
+      ...formRest, proxy,
+      ...(engine ? { engine } : {}),
+      // Only forward a target host when the surface phase is on AND one was
+      // typed — an empty string would override the agent's auto-pick.
+      ...(formRest.enable_surface_test_phase && surface_target_host.trim()
+        ? { surface_target_host: surface_target_host.trim() } : {}),
       ...(portProfile ? { port_profile: portProfile } : {}),
       ...(webProfile ? { web_profile: webProfile } : {}),
     }
@@ -839,6 +1427,10 @@ function SessionList() {
           initial_task: SESSION_PROFILES[DEFAULT_PROFILE].task,
           max_rounds: 200,
           auto_execute_scans: true,
+          engine: '',
+          enable_exploit_phase: false,
+          enable_surface_test_phase: false,
+          surface_target_host: '',
         })
       },
     })
@@ -998,6 +1590,11 @@ function SessionList() {
                 ))}
               </select>
             </div>
+            {/* The engine selector is gone: AutoGen was retired, so LangGraph is
+                the only engine. Offering a second option that the service
+                warns about and then silently overrides would be a control that
+                claims to do something it does not — worse than no control.
+                GET /api/agent-sessions/engine reports what is running. */}
             <label className="flex items-center gap-2 text-sm pb-1">
               <input
                 type="checkbox"
@@ -1007,6 +1604,39 @@ function SessionList() {
               />
               Auto Execute Scans
             </label>
+            <label
+              className="flex items-center gap-2 text-sm pb-1"
+              title="LangGraph only. Adds the exploit phase: one candidate is queued and the session PAUSES until you approve it."
+            >
+              <input
+                type="checkbox"
+                checked={form.enable_exploit_phase}
+                onChange={e => setForm(f => ({ ...f, enable_exploit_phase: e.target.checked }))}
+                className="rounded border-border"
+              />
+              Exploit phase <span className="text-xs text-muted-foreground">(pauses for approval)</span>
+            </label>
+            <label
+              className="flex items-center gap-2 text-sm pb-1"
+              title="LangGraph only. Enumerates ONE host's attack surface, generates custom security tests, runs the safe ones and PAUSES for approval on impactful ones."
+            >
+              <input
+                type="checkbox"
+                checked={form.enable_surface_test_phase}
+                onChange={e => setForm(f => ({ ...f, enable_surface_test_phase: e.target.checked }))}
+                className="rounded border-border"
+              />
+              Surface-test phase <span className="text-xs text-muted-foreground">(generate + prove custom tests)</span>
+            </label>
+            {form.enable_surface_test_phase && (
+              <input
+                type="text"
+                value={form.surface_target_host}
+                onChange={e => setForm(f => ({ ...f, surface_target_host: e.target.value }))}
+                placeholder="Target host/IP (optional — else highest-risk host)"
+                className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border outline-none focus:border-primary"
+              />
+            )}
           </div>
           {/* Remote proxy node */}
           {onlineNodes.length > 0 && (
@@ -1124,14 +1754,18 @@ function SessionList() {
                         ? 'text-orange-500'
                         : s.status === 'rounds_exhausted'
                           ? 'text-yellow-500'
-                          : 'text-yellow-500',
+                          : s.status === 'awaiting_approval'
+                            ? 'text-purple-400'
+                            : 'text-yellow-500',
                 )}
               >
                 {s.status === 'rounds_exhausted'
                   ? 'needs more rounds'
                   : s.status === 'agent_failure'
                     ? 'agent failed'
-                    : s.status}
+                    : s.status === 'awaiting_approval'
+                      ? 'awaiting approval'
+                      : s.status}
               </span>
               <span className="text-xs text-muted-foreground">{timeAgo(s.end_time || s.updated_at || s.created_at)}</span>
               <button

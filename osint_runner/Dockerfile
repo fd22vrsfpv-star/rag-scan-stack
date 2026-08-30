@@ -1,6 +1,8 @@
 # Python runtime with pre-built Go binaries
 # Binaries are built by: scripts/build-go-tools.sh → osint_runner/bin/
-FROM python:3.12-slim
+# Shared modules (validation, tool_job) come from this base — see
+# common/Dockerfile. Build it first: scripts/build-base-image.sh
+FROM rag-common:latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl dnsutils musl whatweb chromium whois \
@@ -48,7 +50,9 @@ RUN pip install --no-cache-dir -r /runner/requirements.txt
 
 COPY osint_runner/resolvers.txt    /runner/resolvers.txt
 COPY osint_runner/osint_runner.py  /runner/osint_runner.py
-COPY osint_runner/validation.py    /runner/validation.py
+# validation.py now comes from the rag-common base image; the per-service
+# copy was deleted. Seven copies existed and one had drifted with a real
+# fix stranded in it.
 COPY osint_runner/log_manager.py   /runner/log_manager.py
 COPY osint_runner/service_enum.py  /runner/service_enum.py
 

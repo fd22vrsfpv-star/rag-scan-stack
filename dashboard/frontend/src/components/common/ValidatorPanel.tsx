@@ -80,20 +80,28 @@ function CoverageSection() {
 
   return (
     <div className="space-y-2 border-t border-border pt-2">
-      <h4 className="text-xs font-semibold">KB vs installed tools</h4>
+      <h4 className="text-xs font-semibold">KB tool coverage</h4>
+      <p className="text-[10px] text-muted-foreground">
+        The validator checks whether an <em>identifier</em> is real — an nmap script, msf
+        module or nuclei template that does not exist is rejected wherever it would run.
+        Whether a binary happens to be installed here is a separate, informational question.
+      </p>
 
-      {data.unrunnable.length > 0 && (
+      {data.not_installed_locally.length > 0 && (
         <div className="space-y-1">
-          <p className="text-[11px] text-yellow-400 flex items-start gap-1.5">
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
-            <span>
-              <strong>{data.unrunnable.length}</strong> tool(s) the KB recommends are
-              installed nowhere. These are not blocked by the validator — it only gates{' '}
-              nmap/metasploit/nuclei — so they reach dispatch and fail there.
-            </span>
+          {/* Deliberately NOT a warning. These names are correct — they are just
+              absent from THIS stack. Tools execute on provisioned nodes and
+              across pipes, so local absence predicts nothing about whether a
+              recommendation will run. Framing it as impending failure sent the
+              operator chasing 43 non-problems. */}
+          <p className="text-[11px] text-muted-foreground">
+            <strong>{data.not_installed_locally.length}</strong> tool(s) the KB names are not
+            installed in this stack. That is <em>availability</em>, not a mistake — these are
+            valid tool names, and they may well exist on a provisioned node. Useful for
+            deciding what to provision; it does not predict failure.
           </p>
-          <div className="max-h-32 overflow-y-auto text-[10px] font-mono space-y-0.5 pl-5">
-            {data.unrunnable.slice(0, 20).map(u => (
+          <div className="max-h-32 overflow-y-auto text-[10px] font-mono space-y-0.5 pl-1">
+            {data.not_installed_locally.slice(0, 20).map(u => (
               <div key={u.tool} className="text-muted-foreground">
                 <span className="text-foreground">{u.tool}</span>
                 {' — '}{u.referenced_by.join(', ')}
@@ -101,10 +109,11 @@ function CoverageSection() {
               </div>
             ))}
           </div>
-          <p className="text-[10px] text-muted-foreground pl-5">
-            Fix by installing them on a node, declaring them in{' '}
-            <code className="font-mono">tool_catalogs.local.json</code> if they live where the
-            probe cannot see, or removing them from the service in KB Overrides.
+          <p className="text-[10px] text-muted-foreground pl-1">
+            To make one known locally, install it on a node and re-run{' '}
+            <code className="font-mono">inventory-node.sh</code>, or declare it in{' '}
+            <code className="font-mono">tool_catalogs.local.json</code> if it runs somewhere
+            the probe cannot see.
           </p>
         </div>
       )}
@@ -157,9 +166,9 @@ function CoverageSection() {
         </div>
       )}
 
-      {data.unrunnable.length === 0 && data.uncatalogued.length === 0 && (
+      {data.not_installed_locally.length === 0 && data.uncatalogued.length === 0 && (
         <p className="text-[11px] text-muted-foreground">
-          Everything the KB recommends is installed, and every provisioned tool is referenced.
+          Every tool the KB names is installed locally, and every provisioned tool is referenced.
         </p>
       )}
     </div>

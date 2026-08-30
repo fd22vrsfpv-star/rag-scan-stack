@@ -13,11 +13,10 @@
  */
 
 import { useState } from 'react'
-import { useScanRecommendations, useGenerateRecommendations, type StoredRecommendation } from '@/api/assets'
+import { useScanRecommendations, useGenerateRecommendations, useReorderRecommendations,
+         useRecommendationBlockers, type StoredRecommendation } from '@/api/assets'
 import { useUIStore } from '@/stores/ui'
-import {
-  Wand2, ChevronDown, ChevronRight, Eye, Play, Loader2,
-} from 'lucide-react'
+import { Wand2, ChevronDown, ChevronRight, Eye, Play, Loader2, ExternalLink, ShieldAlert, ChevronUp, ListOrdered } from 'lucide-react'
 
 // ---- grouping helpers ----
 
@@ -111,6 +110,133 @@ export interface ScanRecommendationsPanelProps {
 
 // ---- Component ----
 
+
+
+/** Human wording for each blocker reason, and what to do about it. */
+const BLOCKER_LABEL: Record<string, string> = {
+  awaiting_approval: 'awaiting approval (Exploits)',
+  needs_operator_run: 'Metasploit — press Run (never auto-runs)',
+  tool_unavailable: 'tool not installed on the executor',
+  needs_input: 'command has an unfilled placeholder',
+  out_of_scope: 'target not in engagement scope',
+  not_started: 'never dispatched — press Run',
+  queued_no_job: 'marked queued but never dispatched — re-run',
+  skipped: 'suppressed by the platform (force to override)',
+  failed: 'ran and failed — re-run',
+  running: 'in flight',
+}
+
+/**
+ * Marks a recommendation whose target is outside the configured scope.
+ *
+ * Dispatch refuses these — including with force, because force overrules the
+ * platform's suppression judgement, not the operator's authorisation. Without a
+ * visible marker a blocked item is indistinguishable from a runnable one and
+ * simply appears broken when clicked.
+ */
+function OutOfScopeBadge() {
+  return (
+    <span
+      title="Target is not in the engagement scope — dispatch is blocked. Add it to the scope if you are authorised to test it."
+      className="px-1.5 py-0.5 rounded text-[10px] font-medium border border-red-500/40 bg-red-500/15 text-red-400 flex items-center gap-1 whitespace-nowrap">
+      <ShieldAlert className="h-3 w-3" /> out of scope
+    </span>
+  )
+}
+
+/**
+ * What a recommendation actually ran and produced.
+ *
+ * Completed recommendations previously showed a status badge and nothing else:
+ * no command, no output, no way to tell a scan that found nothing from one whose
+ * result was never captured. Both dispatch routes are covered here — kali tools
+ * report through tool_executions, scanner services (httpx/katana/nmap) keep
+ * their job ids outside this database entirely and are reached through the
+ * archived upload instead.
+ */
+function RecDetail({ r }: { r: StoredRecommendation }) {
+  // Prefer what actually ran; the template still holds {target}/{port}.
+  const command = r.dispatched_command || r.command || r.script
+  const isTemplate = !r.dispatched_command && /\{[a-zA-Z_]+\}/.test(command || '')
+  const output = r.result_preview || r.artifact_preview
+  const bytes = r.result_bytes ?? r.artifact_bytes
+  // Distinguish "ran and produced nothing" from "we never captured it". Older
+  // recommendations predate result capture, and showing an empty panel for them
+  // repeats exactly the confusion this is meant to fix.
+  const nothingCaptured = !command && !output && !r.job_id && !r.skip_reason
+
+  return (
+    <div className="px-3 py-2 bg-black/30 border-t border-border/10 text-[11px] space-y-2">
+      {r.in_scope === false && (
+        <div className="text-red-400 border border-red-500/30 bg-red-500/10 rounded px-2 py-1">
+          <b>Blocked — out of scope.</b> {r.ip} is not in the engagement scope, so
+          this will not be dispatched even with force. Add it to the scope only if
+          you are authorised to test it.
+        </div>
+      )}
+      {r.skip_reason && (
+        <div className="text-orange-400">
+          <span className="text-muted-foreground">Skipped: </span>{r.skip_reason}
+        </div>
+      )}
+
+      {command ? (
+        <div>
+          <div className="text-muted-foreground mb-0.5">Command</div>
+          <pre className="font-mono bg-black border border-border/30 rounded px-2 py-1 overflow-x-auto whitespace-pre-wrap break-all">{command}</pre>
+          {isTemplate && (
+            <div className="text-orange-400 mt-0.5">
+              This is the recommender's template, not a command that ran —
+              the placeholder is filled in at dispatch.
+            </div>
+          )}
+          {r.dispatched_endpoint && (
+            <div className="text-muted-foreground mt-0.5">via {r.dispatched_endpoint}</div>
+          )}
+        </div>
+      ) : !nothingCaptured && (
+        <div className="text-muted-foreground">
+          No command recorded — this ran before the dispatched command was persisted.
+        </div>
+      )}
+
+      <div className="flex gap-3 flex-wrap text-muted-foreground">
+        {r.job_id && <span>job <code className="text-foreground">{r.job_id.slice(0, 8)}</code></span>}
+        {r.result_status && <span>result <code className="text-foreground">{r.result_status}</code></span>}
+        {r.result_exit_code !== null && r.result_exit_code !== undefined &&
+          <span>exit <code className={r.result_exit_code === 0 ? 'text-green-400' : 'text-red-400'}>{r.result_exit_code}</code></span>}
+        {!!bytes && <span>{bytes.toLocaleString()} bytes</span>}
+        {r.executed_at && <span>{new Date(r.executed_at).toLocaleString()}</span>}
+      </div>
+
+      {output ? (
+        <div>
+          <div className="text-muted-foreground mb-0.5">
+            Output {r.artifact_tool ? `(${r.artifact_tool})` : ''}
+          </div>
+          <pre className="font-mono bg-black border border-border/30 rounded px-2 py-1 max-h-48 overflow-auto whitespace-pre-wrap break-all">{output}</pre>
+          {r.artifact_id && (
+            <a href={`/scans/results?target=${encodeURIComponent(r.ip || '')}`}
+               className="text-blue-400 hover:underline inline-flex items-center gap-1 mt-1">
+              View complete output in Scan Results <ExternalLink className="h-3 w-3" />
+            </a>
+          )}
+        </div>
+      ) : nothingCaptured ? (
+        <div className="text-muted-foreground">
+          Nothing was captured for this run. Recommendations dispatched before
+          result archiving kept only their status — re-run it to capture the
+          command and output.
+        </div>
+      ) : (
+        <div className="text-muted-foreground">
+          No output recorded{r.job_id ? ' for this job' : ''}.
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function ScanRecommendationsPanel({
   embedded = true,
   filters,
@@ -120,7 +246,18 @@ export function ScanRecommendationsPanel({
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set())
   const [runResult, setRunResult] = useState<any>(null)
   const [running, setRunning] = useState(false)
+  // Which rows have their command/output detail open.
+  const [openRows, setOpenRows] = useState<Set<string>>(new Set())
+  // Local ordering overlay. Applied on top of the server's priority order so a
+  // move is visible immediately; persisted by the reorder mutation below.
+  const [order, setOrder] = useState<string[] | null>(null)
+  const reorder = useReorderRecommendations()
+  const { data: blockers } = useRecommendationBlockers()
+  const [showBlockers, setShowBlockers] = useState(false)
   const [useKali, setUseKali] = useState(true)
+  // Default ON: the operator selected these and pressed Run. Left as a
+  // visible control so the consequence is stated, not buried.
+  const [approveExploits, setApproveExploits] = useState(true)
   const [toolCheck, setToolCheck] = useState<any>(null)
   const [checking, setChecking] = useState(false)
   const [installing, setInstalling] = useState(false)
@@ -149,7 +286,16 @@ export function ScanRecommendationsPanel({
       const res = await fetch('/api/scan-recommendations/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: Array.from(selected), use_kali: useKali }),
+        // approve_exploits: pressing Run here IS the human approval, so a
+        // Metasploit module executes in the metasploit container instead of
+        // queueing a second confirmation. The same endpoint is called by the
+        // recon agent and by agent-session finalisation, neither of which sets
+        // this — so automated paths still queue for review.
+        body: JSON.stringify({
+          ids: Array.from(selected),
+          use_kali: useKali,
+          approve_exploits: approveExploits,
+        }),
       })
       const data = await res.json()
       setRunResult(data)
@@ -238,6 +384,35 @@ export function ScanRecommendationsPanel({
     )
   }
 
+  /** Queued items in their current display order — server priority, with any
+   *  unsaved local moves applied on top. */
+  function orderedQueued(items: StoredRecommendation[]): StoredRecommendation[] {
+    const queued = items.filter(r => r.status === 'pending' || r.status === 'queued')
+    if (!order) return queued
+    const pos = new Map(order.map((id, i) => [id, i]))
+    // Items missing from the overlay (newly generated since the last move) sort
+    // after the explicitly ordered ones rather than jumping to the front.
+    return [...queued].sort((a, b) =>
+      (pos.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (pos.get(b.id) ?? Number.MAX_SAFE_INTEGER))
+  }
+
+  function move(items: StoredRecommendation[], id: string, delta: number) {
+    const ids = orderedQueued(items).map(r => r.id)
+    const from = ids.indexOf(id)
+    const to = from + delta
+    if (from < 0 || to < 0 || to >= ids.length) return
+    ids.splice(to, 0, ids.splice(from, 1)[0])
+    setOrder(ids)
+  }
+
+  function toggleRow(id: string) {
+    setOpenRows(prev => {
+      const next = new Set(prev)
+      next.has(id) ? next.delete(id) : next.add(id)
+      return next
+    })
+  }
+
   const toggleSelect = (id: string) => {
     const next = new Set(selected)
     next.has(id) ? next.delete(id) : next.add(id)
@@ -272,6 +447,16 @@ export function ScanRecommendationsPanel({
         <label className="flex items-center gap-1 text-[10px] cursor-pointer" title="Route manual tools (hydra, ssh-audit, etc.) to internal Kali container">
           <input type="checkbox" checked={useKali} onChange={() => setUseKali(!useKali)} className="rounded" />
           Use Kali
+        </label>
+
+        <label className="flex items-center gap-1.5" title="Metasploit modules run in the metasploit container, through the selected proxy. Untick to queue them for separate approval instead.">
+
+          <input type="checkbox" checked={approveExploits}
+
+            onChange={e => setApproveExploits(e.target.checked)} className="rounded" />
+
+          <span>Run exploits directly</span>
+
         </label>
         {selected.size > 0 && (
           <>
@@ -341,6 +526,63 @@ export function ScanRecommendationsPanel({
       )}
 
       {/* Per-IP sections */}
+      {blockers && blockers.total > 0 && (
+        <div className="mb-2 rounded border border-border bg-card/60 text-xs">
+          <button onClick={() => setShowBlockers(v => !v)}
+                  className="w-full flex items-center gap-2 px-3 py-2 hover:bg-muted/20">
+            {showBlockers ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+            <span className="font-medium">
+              {blockers.will_proceed > 0
+                ? `${blockers.will_proceed} in flight, ${blockers.blocked} waiting on you`
+                : `Nothing is running — ${blockers.blocked} item(s) need action`}
+            </span>
+            <span className="text-muted-foreground ml-auto">
+              concurrency limit {blockers.concurrency_limit}
+            </span>
+          </button>
+          {showBlockers && (
+            <div className="px-3 pb-2 space-y-1">
+              {Object.entries(blockers.by_reason)
+                .sort((a, b) => b[1] - a[1])
+                .map(([reason, n]) => (
+                  <div key={reason} className="flex items-baseline gap-2">
+                    <span className="w-8 text-right tabular-nums text-muted-foreground">{n}</span>
+                    <span>{BLOCKER_LABEL[reason] ?? reason}</span>
+                  </div>
+                ))}
+              <p className="text-[11px] text-muted-foreground pt-1">
+                Nothing starts a pending recommendation on its own — select and Run.
+                Scope refusals and approval gates cannot be overridden with force.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+      {order && (
+        <div className="flex items-center gap-2 px-3 py-2 mb-2 text-xs rounded border border-blue-500/30 bg-blue-500/10">
+          <ListOrdered className="h-4 w-4 text-blue-400" />
+          <span>Run order changed — not saved yet. Lower runs first.</span>
+          <button
+            disabled={reorder.isPending}
+            onClick={() => reorder.mutate(orderedQueued(recs).map(r => r.id),
+                                          { onSuccess: () => setOrder(null) })}
+            className="ml-auto px-2 py-1 rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-40">
+            {reorder.isPending ? 'Saving…' : 'Save order'}
+          </button>
+          <button onClick={() => setOrder(null)}
+                  className="px-2 py-1 rounded bg-muted/30 hover:bg-muted/50">Discard</button>
+        </div>
+      )}
+      {reorder.isError && (
+        <div className="px-3 py-2 mb-2 text-xs rounded border border-red-500/30 bg-red-500/10 text-red-400">
+          {(reorder.error as Error).message}
+        </div>
+      )}
+      {reorder.data?.not_reordered?.length ? (
+        <div className="px-3 py-2 mb-2 text-xs rounded border border-amber-500/30 bg-amber-500/10 text-amber-400">
+          {reorder.data.detail}
+        </div>
+      ) : null}
       {Object.entries(byIp).map(([ip, items]) => {
         const grouped = groupByPurpose(items)
         return (
@@ -379,8 +621,18 @@ export function ScanRecommendationsPanel({
                             <span className="font-mono w-24">{r.scanner}</span>
                             <span className="text-muted-foreground flex-1">{r.action || '—'}</span>
                             <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium border ${statusBadgeClass(r.status)}`}>{r.status}</span>
+                            {r.in_scope === false && <OutOfScopeBadge />}
+                            <button onClick={() => toggleRow(r.id)} title="Show command and output"
+                                    className="text-muted-foreground hover:text-foreground">
+                              {openRows.has(r.id) ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                            </button>
                           </div>
-                        ))}
+                        )).flatMap((el, i) => {
+                          const rec = grp.items[i]
+                          return openRows.has(rec.id)
+                            ? [el, <RecDetail key={`${rec.id}-d`} r={rec} />]
+                            : [el]
+                        })}
                       </div>
                     )}
                   </div>
@@ -390,6 +642,7 @@ export function ScanRecommendationsPanel({
               // Single tool (no group or single-member group)
               const r = grp.items[0]
               return (
+                <div key={r.id + '-wrap'}>
                 <div key={r.id} className={`flex items-center gap-2 px-3 py-1.5 text-xs border-t border-border/10 hover:bg-muted/10 ${selected.has(r.id) ? 'bg-blue-500/5' : ''}`}>
                   {r.status === 'pending' && (
                     <input type="checkbox" checked={selected.has(r.id)}
@@ -403,6 +656,29 @@ export function ScanRecommendationsPanel({
                   </span>
                   <span className="text-muted-foreground w-20">{r.service || '—'}</span>
                   <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium border ${statusBadgeClass(r.status)}`}>{r.status}</span>
+                  {r.in_scope === false && <OutOfScopeBadge />}
+                  {(r.status === 'pending' || r.status === 'queued') && (
+                    <span className="flex items-center">
+                      {/* Lower priority runs first, so "up" means sooner. */}
+                      <button onClick={() => move(recs, r.id, -1)} title="Run sooner"
+                              className="text-muted-foreground hover:text-foreground px-0.5">
+                        <ChevronUp className="h-3 w-3" />
+                      </button>
+                      <button onClick={() => move(recs, r.id, 1)} title="Run later"
+                              className="text-muted-foreground hover:text-foreground px-0.5">
+                        <ChevronDown className="h-3 w-3" />
+                      </button>
+                      <span className="text-[10px] text-muted-foreground ml-1" title="Lower runs first">
+                        P{r.priority}
+                      </span>
+                    </span>
+                  )}
+                  <button onClick={() => toggleRow(r.id)} title="Show command and output"
+                          className="text-muted-foreground hover:text-foreground">
+                    {openRows.has(r.id) ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                  </button>
+                </div>
+                {openRows.has(r.id) && <RecDetail r={r} />}
                 </div>
               )
             })}

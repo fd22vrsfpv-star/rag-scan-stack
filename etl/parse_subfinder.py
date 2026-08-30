@@ -81,12 +81,12 @@ def parse_subfinder(path: str, profile: str = "upload", job_id: str = None,
                         if row:
                             asset_id = str(row["id"])
                             if eid:
-                                cur.execute("UPDATE assets SET updated_at=now(), "
+                                cur.execute("UPDATE assets SET last_seen=now(), "
                                             "engagement_id=COALESCE(engagement_id,%s) WHERE id=%s",
                                             (eid, asset_id))
                                 stats["assets_scoped"] += 1
                             else:
-                                cur.execute("UPDATE assets SET updated_at=now() WHERE id=%s", (asset_id,))
+                                cur.execute("UPDATE assets SET last_seen=now() WHERE id=%s", (asset_id,))
                         else:
                             asset_id = str(uuid.uuid4())
                             cur.execute("INSERT INTO assets (id, ip, engagement_id) VALUES (%s,%s,%s)",
@@ -101,12 +101,12 @@ def parse_subfinder(path: str, profile: str = "upload", job_id: str = None,
                         if row:
                             asset_id = str(row["id"])
                             if eid:
-                                cur.execute("UPDATE assets SET updated_at=now(), "
+                                cur.execute("UPDATE assets SET last_seen=now(), "
                                             "engagement_id=COALESCE(engagement_id,%s) WHERE id=%s",
                                             (eid, asset_id))
                                 stats["assets_scoped"] += 1
                             else:
-                                cur.execute("UPDATE assets SET updated_at=now() WHERE id=%s", (asset_id,))
+                                cur.execute("UPDATE assets SET last_seen=now() WHERE id=%s", (asset_id,))
                         # else: leave asset_id=None; assets table requires ip NOT NULL
 
                     # Also insert into recon_findings for Burp export / dashboard

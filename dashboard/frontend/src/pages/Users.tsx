@@ -42,6 +42,9 @@ interface Identity {
   first_seen: string | null
   last_seen: string | null
   has_credential: boolean
+  // proto/port the credential was proven on, e.g. ['ftp/21','telnet/23'].
+  // Empty for cloud/directory identities, which have no service.
+  services?: string[]
 }
 
 interface IdentityDetail extends Identity {
@@ -53,6 +56,9 @@ interface IdentityDetail extends Identity {
     credential_type: string
     status: string
     source: string
+    services?: string[]
+    has_secret?: boolean
+    notes?: string | null
     created_at: string | null
   }>
   recon_findings: Array<{
@@ -152,7 +158,7 @@ export default function Users() {
     const header = [
       'id', 'provider', 'identifier', 'display_name', 'principal_type',
       'status', 'mfa_state', 'last_signin', 'tenant_id', 'domain',
-      'is_admin', 'is_guest', 'is_dirsync', 'has_credential',
+      'is_admin', 'is_guest', 'is_dirsync', 'has_credential', 'services',
       'tags', 'sources', 'first_seen', 'last_seen',
     ].join(',')
     const esc = (v: any) => {
@@ -165,6 +171,7 @@ export default function Users() {
       esc(r.principal_type), esc(r.status), esc(r.mfa_state), esc(r.last_signin),
       esc(r.tenant_id), esc(r.domain),
       r.is_admin, r.is_guest, r.is_dirsync, r.has_credential,
+      esc((r.services || []).join(' ')),
       esc((r.tags || []).join('|')), esc((r.sources || []).join('|')),
       esc(r.first_seen), esc(r.last_seen),
     ].join(','))
@@ -318,7 +325,7 @@ export default function Users() {
   return (
     <div className="space-y-4">
       <PageHelp id="users" title="How to use Users">
-        <p>Detected user/SP/guest identities aggregated across tools (MicroBurst, AzureHound today; netexec/impacket coming). Each row is keyed on (<code>provider</code>, <code>identifier</code>) — a UPN, AppId, or sAMAccountName depending on source. The <strong>Has Credential</strong> badge is a left-join against <code>credential_vault</code>; click any row to see linked creds and the recon findings that surfaced this identity.</p>
+        <p>Detected identities aggregated across tools: cloud/directory accounts from MicroBurst and AzureHound, plus <strong>host-local service accounts</strong> bridged from verified credential findings (brutus/hydra/medusa/ncrack) under provider <code>local</code>. Each row is keyed on (<code>provider</code>, <code>identifier</code>) — a UPN or AppId for cloud, <code>user@host</code> for local accounts. The <strong>Has Credential</strong> badge is a join against <code>credential_vault</code>; click any row to see linked creds and the recon findings that surfaced this identity. Bridged rows record which services the account is valid on, but not the password itself — credential testing stores only a masked copy.</p>
       </PageHelp>
 
       <div className="flex items-center gap-2">
@@ -363,6 +370,11 @@ export default function Users() {
           <option value="on_prem_ad">on_prem_ad</option>
           <option value="aws">aws</option>
           <option value="gcp">gcp</option>
+          {/* Host-local service accounts bridged from credential_findings
+              (brutus/hydra/medusa/ncrack). Without this option the rows are
+              listed but cannot be filtered to, which is how the whole class
+              stayed invisible. */}
+          <option value="local">local</option>
         </select>
         <select
           value={principalType} onChange={e => setPrincipalTypeF(e.target.value)}
@@ -489,6 +501,7 @@ export default function Users() {
                 <th className="px-3 py-2 text-left">Display Name</th>
                 <th className="px-3 py-2 text-left">Type</th>
                 <th className="px-3 py-2 text-left">Flags</th>
+                <th className="px-3 py-2 text-left">Found On</th>
                 <th className="px-3 py-2 text-left">Sources</th>
                 <th className="px-3 py-2 text-left">Provider</th>
                 <th className="px-3 py-2 text-left">Last Seen</th>
@@ -496,8 +509,8 @@ export default function Users() {
             </thead>
             <tbody>
               {visibleRows.length === 0 && !listQ.isFetching && (
-                <tr><td colSpan={8} className="px-3 py-6 text-center text-muted-foreground">
-                  No identities yet. Import a MicroBurst zip or AzureHound JSON to populate.
+                <tr><td colSpan={9} className="px-3 py-6 text-center text-muted-foreground">
+                  No identities yet. Import a MicroBurst zip or AzureHound JSON, or run a credential test (brutus) — verified service credentials are bridged in as provider 'local'.
                 </td></tr>
               )}
               {visibleRows.map(r => (
@@ -526,6 +539,15 @@ export default function Users() {
                       {r.has_credential && <span className="px-1.5 py-0.5 text-[10px] rounded border bg-emerald-500/15 text-emerald-400 border-emerald-500/30 flex items-center gap-0.5"><Key className="h-2.5 w-2.5" />cred</span>}
                       {r.status === 'disabled' && <span className="px-1.5 py-0.5 text-[10px] rounded border bg-zinc-500/15 text-zinc-400 border-zinc-500/30">disabled</span>}
                     </div>
+                  </td>
+                  <td className="px-3 py-2">
+                    {r.services?.length
+                      ? <div className="flex flex-wrap gap-1">
+                          {r.services.map(sv => (
+                            <span key={sv} className="px-1.5 py-0.5 text-[10px] rounded border bg-sky-500/15 text-sky-400 border-sky-500/30 font-mono">{sv}</span>
+                          ))}
+                        </div>
+                      : <span className="text-muted-foreground">—</span>}
                   </td>
                   <td className="px-3 py-2 text-xs">{r.sources.join(', ')}</td>
                   <td className="px-3 py-2 text-xs">{r.provider}</td>
@@ -668,8 +690,24 @@ export default function Users() {
                     <ul className="space-y-1">
                       {detailQ.data.credentials.map(c => (
                         <li key={c.id} className="border border-border rounded px-2 py-1">
-                          <span className="font-mono">{c.username}</span>
-                          <span className="ml-1 text-muted-foreground">({c.credential_type}, {c.status})</span>
+                          <div>
+                            <span className="font-mono">{c.username}</span>
+                            <span className="ml-1 text-muted-foreground">({c.credential_type}, {c.status})</span>
+                            {c.has_secret === false && (
+                              <span className="ml-1 px-1 py-0.5 text-[10px] rounded border bg-zinc-500/15 text-zinc-400 border-zinc-500/30"
+                                    title="Credential testing records only a masked password, so there is nothing stored to replay">
+                                no secret stored
+                              </span>
+                            )}
+                          </div>
+                          {!!c.services?.length && (
+                            <div className="mt-0.5 flex flex-wrap gap-1">
+                              <span className="text-muted-foreground text-[10px]">valid on</span>
+                              {c.services.map(sv => (
+                                <span key={sv} className="px-1.5 py-0.5 text-[10px] rounded border bg-sky-500/15 text-sky-400 border-sky-500/30 font-mono">{sv}</span>
+                              ))}
+                            </div>
+                          )}
                         </li>
                       ))}
                     </ul>

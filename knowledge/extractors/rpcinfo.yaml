@@ -1,0 +1,92 @@
+# rpcinfo — RPC program map, and the ports nobody scanned.
+#
+# 7 stored runs, none interpreted. The value is not the program numbers; it is
+# WHERE the services are bound:
+#
+#     100000    2   tcp    111  portmapper
+#     100024    1   udp  45406  status
+#     100024    1   tcp  33737  status
+#     100003    2   udp   2049  nfs
+#
+# `status` on 45406 and 33737 sits far outside any default nmap port range, so
+# a normal port scan never sees it. rpcinfo is one of the few tools that reports
+# a service the rest of the pipeline has no other way to learn about — which is
+# why its follow-on FEEDS the ports table rather than only raising a finding.
+tool: rpcinfo
+class: service_enumeration
+description: RPC program map — services and the (often non-standard) ports they bind.
+enabled: true
+max_chars: 20000
+
+deterministic:
+  # Every data row is `program vers proto port service`, all numeric except the
+  # protocol and name. The header row (`program vers proto port service`) cannot
+  # match because it has no digits — structural, not a deny-list.
+  services:
+    pattern: '^\s*\d+\s+\d+\s+\w+\s+\d+\s+(\S+)\s*$'
+    capture: all
+    type: list
+  service_ports:
+    pattern: '^\s*\d+\s+\d+\s+\w+\s+(\d+)\s+\S+\s*$'
+    capture: all
+    type: list
+  nfs_present:
+    pattern: '^\s*\d+\s+\d+\s+\w+\s+\d+\s+nfs\s*$'
+    type: boolean
+  mountd_present:
+    pattern: '^\s*\d+\s+\d+\s+\w+\s+\d+\s+mountd\s*$'
+    type: boolean
+
+schema:
+  services:
+    type: list
+    description: RPC service names, one per mapped program
+  service_ports:
+    type: list
+    description: the ports those services are bound to
+  nfs_present:
+    type: boolean
+  mountd_present:
+    type: boolean
+
+prompt: |
+  Extract the RPC program map. Each data row is
+  `program vers proto port service`.
+
+  Report the SERVICE names and the PORTS they are bound to. The first line is a
+  column header and is not data. Ports well outside the common range (30000+)
+  are normal here and are the most useful part of the output.
+
+examples:
+  - output: |
+         program vers proto   port  service
+          100000    2   tcp    111  portmapper
+          100024    1   udp  45406  status
+          100003    2   udp   2049  nfs
+    extract: |
+      {"services": ["portmapper", "status", "nfs"],
+       "service_ports": ["111", "45406", "2049"], "nfs_present": true}
+
+notable:
+  - id: nfs_exported
+    when: nfs_present == true
+    severity: medium
+    title: NFS is reachable over RPC
+    detail: >
+      An NFS server is bound and reachable. Exports are frequently readable
+      without credentials, and a world-writable export is a direct path to file
+      drop.
+
+follow_on:
+  # services_to_ports is inherited from the service_enumeration class.
+  - id: list_nfs_exports
+    when: nfs_present == true
+    scanner: showmount
+    script: "showmount -e {target}"
+    title: List the NFS exports
+    category: nfs
+    priority: 15
+    auto_queue: true
+    rationale: >
+      rpcinfo proves NFS is bound; showmount is what turns that into the export
+      list, which is the part that says whether anything is readable.

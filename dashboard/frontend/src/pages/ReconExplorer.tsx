@@ -13,6 +13,7 @@ import { useScopeNames, useAddToScope } from '@/api/scope'
 import { useUIStore } from '@/stores/ui'
 import { DataTable } from '@/components/common/DataTable'
 import { SeverityBadge } from '@/components/common/SeverityBadge'
+import { CustomerBadge } from '@/components/common/CustomerBadge'
 import { SourceBadge } from '@/components/common/SourceBadge'
 import { ScopeFilter } from '@/components/common/ScopeFilter'
 import { useScopeFilter } from '@/hooks/useScopeFilter'
@@ -372,7 +373,7 @@ function FindingsTab() {
   const [expandedDomains, setExpandedDomains] = useState<Set<string>>(new Set())
   const globalScope = useUIStore(s => s.selectedScopeName)
   const [scopeFilterVal, setScopeFilterVal] = useState(globalScope || '')
-  const { matchesScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilterVal)
+  const { matchesScope, matchesAnyScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilterVal)
 
   // Sync with global engagement scope
   useEffect(() => {
@@ -396,7 +397,8 @@ function FindingsTab() {
   const allFindings = data?.findings ?? []
   const findings = useMemo(() => {
     if (!isScopeFiltering) return allFindings
-    return allFindings.filter(f => matchesScope(f.target || f.hostname || ''))
+    // Every identity, not the first non-empty one — see matchesAnyScope.
+    return allFindings.filter(f => matchesAnyScope(f.target, f.hostname))
   }, [allFindings, isScopeFiltering, matchesScope])
   const total = isScopeFiltering ? findings.length : (data?.total ?? 0)
 
@@ -788,7 +790,10 @@ function FindingsTab() {
                         onClick={() => setSelected(f)}
                       >
                         <td className="px-3 py-1.5"></td>
-                        <td className="px-3 py-1.5 pl-8 font-mono text-xs">{f.target}</td>
+                        <td className="px-3 py-1.5 pl-8 font-mono text-xs">
+                          {f.target}
+                          <CustomerBadge host={f.target} className="ml-1" />
+                        </td>
                         <td className="px-3 py-1.5">
                           <span className="px-1.5 py-0.5 rounded text-[10px] bg-muted border border-border">{f.finding_type}</span>
                         </td>
@@ -862,7 +867,10 @@ function FindingsTab() {
               <span className="text-xs text-muted-foreground">{selected.finding_type}</span>
               {selected.severity && <SeverityBadge severity={selected.severity} />}
             </div>
-            <h4 className="text-sm font-medium font-mono">{selected.target}</h4>
+            <div className="flex items-center gap-2 flex-wrap">
+              <h4 className="text-sm font-medium font-mono">{selected.target}</h4>
+              <CustomerBadge host={selected.target || selected.hostname} />
+            </div>
             <div className="grid grid-cols-2 gap-2 text-xs">
               {selected.resolved_ip && (
                 <div><span className="text-muted-foreground">Resolved IP:</span> <span className="font-mono">{selected.resolved_ip}</span></div>
@@ -1260,6 +1268,7 @@ function DomainOverviewTab() {
                 <button onClick={() => setDrilldownDomain(null)} className="text-primary hover:underline font-mono">{selectedDomain}</button>
                 <ChevronRight className="h-3 w-3 text-muted-foreground" />
                 <span className="font-mono font-medium">{drilldownDomain}</span>
+                <CustomerBadge host={drilldownDomain} />
               </div>
             )}
             <DomainDetail overview={overview} onSubdomainClick={(sub) => setDrilldownDomain(sub)} parentDomain={drilldownDomain ? selectedDomain : undefined} />

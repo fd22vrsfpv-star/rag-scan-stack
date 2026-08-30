@@ -3,6 +3,9 @@ import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 import ipaddress
 
+import logging
+logger = logging.getLogger("parse_impacket")
+
 DB_DSN = os.environ.get("DB_DSN", "postgresql://app:app@rag-postgres:5432/scans")
 
 def _ensure_asset(cur, ip_str):
@@ -15,7 +18,7 @@ def _ensure_asset(cur, ip_str):
     row = cur.fetchone()
     if row:
         asset_id = str(row["id"])
-        cur.execute("UPDATE assets SET updated_at=now() WHERE id=%s", (asset_id,))
+        cur.execute("UPDATE assets SET last_seen=now() WHERE id=%s", (asset_id,))
         return asset_id
     asset_id = str(uuid.uuid4())
     cur.execute("INSERT INTO assets (id, ip) VALUES (%s,%s)", (asset_id, ip))
@@ -27,6 +30,12 @@ SECRETSDUMP_RE = re.compile(r'^(.+?):(\d+):([a-fA-F0-9]{32}):([a-fA-F0-9]{32})::
 # GetUserSPNs / GetNPUsers: $krb5tgs$ or $krb5asrep$ hashes
 KERBEROAST_RE = re.compile(r'(\$krb5tgs\$\d+\$\*?[^$]+\$[^$]+\$[^$]+\$[a-fA-F0-9]+)')
 ASREPROAST_RE = re.compile(r'(\$krb5asrep\$\d+\$[^:]+:[a-fA-F0-9]+)')
+
+try:
+    from scope_gate import load_ingest_scope, host_in_scope
+except ImportError:  # pragma: no cover — etl/ may already be on PYTHONPATH
+    from etl.scope_gate import load_ingest_scope, host_in_scope
+
 
 def parse_impacket(path: str, tool: str = "secretsdump", target: str = "", profile: str = "upload", job_id: str = None):
     """Parse Impacket tool output based on the tool type.
@@ -55,6 +64,16 @@ def parse_impacket(path: str, tool: str = "secretsdump", target: str = "", profi
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Ingest scope gate. Impacket output is attributed to ONE target, so
+            # a single check covers the file — unlike the crawlers, which need a
+            # per-record decision. Credential material from a host nobody
+            # authorised must not be stored as an engagement finding.
+            _enforce_scope, _scope_rows = load_ingest_scope(cur)
+            if target and not host_in_scope(target, _enforce_scope, _scope_rows):
+                stats["out_of_scope"] = stats.get("out_of_scope", 0) + 1
+                logger.warning("impacket: target %s is out of scope — nothing ingested", target)
+                return stats
+
             # Resolve target to asset
             if target:
                 asset_id_for_target = _ensure_asset(cur, target)

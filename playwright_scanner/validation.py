@@ -236,13 +236,22 @@ def sanitize_port(port: int) -> int:
     return port_int
 
 
-def sanitize_command_arg(arg: str, allowed_chars: Optional[str] = None) -> str:
+def sanitize_command_arg(arg: str, allowed_chars: Optional[str] = None,
+                         max_len: int = 1000) -> str:
     """
     Sanitize command-line argument to prevent command injection.
 
     Args:
         arg: The argument to sanitize
         allowed_chars: Regex pattern of allowed characters (default: alphanumeric + common safe chars)
+        max_len: Length cap. The 1000-char default suits names and flags but is
+            far too small for a port SPEC: nmap's frequency-ranked top-1000,
+            expressed as explicit ranges, is 3,808 characters. Profiles have to
+            resolve to explicit lists because masscan has no --top-ports, so a
+            scan using the top-1000 profile was rejected outright with
+            "argument too long" — including the agent's own default scope.
+            Length is not what makes an argument dangerous here; the character
+            allowlist is, and that still applies.
 
     Returns:
         The sanitized argument
@@ -253,8 +262,8 @@ def sanitize_command_arg(arg: str, allowed_chars: Optional[str] = None) -> str:
     if not arg or not isinstance(arg, str):
         raise ValidationError("argument must be a non-empty string")
 
-    if len(arg) > 1000:
-        raise ValidationError("argument too long")
+    if len(arg) > max_len:
+        raise ValidationError(f"argument too long ({len(arg)} > {max_len})")
 
     # Default allowed characters: alphanumeric, dash, underscore, dot, comma, colon
     if allowed_chars is None:

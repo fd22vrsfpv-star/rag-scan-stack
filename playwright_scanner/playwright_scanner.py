@@ -111,6 +111,59 @@ zap_bridge = ZAPBridge() if USE_ZAP else None
 
 
 # Pydantic models
+# ── Authorization gate ──────────────────────────────────────────────────────
+# This service drives a real browser at whatever URL it is handed, across FOUR
+# entry points — /scan, /auth/capture, /poc and /crawl — and none of them
+# checked the engagement scope. /poc is the sharpest: it injects an attack
+# payload into a URL and loads it.
+#
+# The gate takes a HOST, so the hostname is extracted from the URL. A URL whose
+# host cannot be parsed is refused rather than passed through: an unparseable
+# target is "cannot check", and cannot-check must never read as authorised.
+try:
+    from etl.scope_gate import enforce_target_scope
+    _SCOPE_GATE_OK = True
+    _SCOPE_GATE_ERROR = ""
+except Exception as _scope_exc:            # pragma: no cover - deployment problem
+    _SCOPE_GATE_OK = False
+    _SCOPE_GATE_ERROR = str(_scope_exc)
+
+
+# Bound by the shared ceiling rather than a private number. Each browser session
+# is one scan's worth of load; see the per-service note in common/tool_job.py.
+try:
+    from common.tool_job import async_scan_slot, MAX_CONCURRENT_SCANS
+    _SLOTS_OK = True
+    _SLOTS_ERROR = ""
+except Exception as _slot_exc:             # pragma: no cover - deployment problem
+    _SLOTS_OK = False
+    _SLOTS_ERROR = str(_slot_exc)
+    MAX_CONCURRENT_SCANS = 0
+
+    from contextlib import asynccontextmanager as _acm
+
+    @_acm
+    async def async_scan_slot(job_id: str = "", label: str = "scan", timeout=None):
+        raise RuntimeError(
+            f"scan slot pool unavailable ({_SLOTS_ERROR}) — check the "
+            "./common:/app/common mount on playwright-scanner")
+        yield  # pragma: no cover
+
+
+def _scope_refusal_for_url(url, context: str = ""):
+    """Refusal string when this URL must NOT be fetched, else None. Fails closed."""
+    if not _SCOPE_GATE_OK:
+        return (f"scope gate unavailable ({_SCOPE_GATE_ERROR}) — refusing to "
+                "browse; check the ./etl:/app/etl mount on playwright-scanner")
+    try:
+        host = urlparse(str(url or "")).hostname
+    except Exception as exc:
+        return f"could not parse a host out of {url!r} ({exc}) — refusing"
+    if not host:
+        return f"no host in {url!r} — refusing rather than guessing"
+    return enforce_target_scope(host, context or str(url))
+
+
 class ScanRequest(BaseModel):
     url: HttpUrl = Field(..., description="Target URL to scan")
     browser: Optional[str] = Field("chromium", description="Browser type: chromium, firefox, or webkit")
@@ -151,6 +204,26 @@ async def perform_scan(scan_request: ScanRequest, scan_id: uuid.UUID):
         scan_request: Scan configuration
         scan_id: UUID of the scan record
     """
+    refusal = _scope_refusal_for_url(scan_request.url, f"playwright scan {scan_request.url}")
+    if refusal:
+        logger.warning("REFUSED playwright scan of %s: %s", scan_request.url, refusal)
+        # 'blocked', not 'failed': a refusal is a decision, and an operator
+        # reading "failed" would retry it. CLAUDE.md — blocked items must be
+        # labelled, not silently dropped.
+        update_playwright_scan(scan_id=scan_id, status="blocked",
+                               errors=[{"error": refusal, "blocked": "out_of_scope"}])
+        emit_webhook_event("playwright_scan_blocked", "playwright", {
+            "scan_id": str(scan_id), "url": str(scan_request.url),
+            "reason": refusal,
+        })
+        return
+
+    async with async_scan_slot(job_id=str(scan_id), label="playwright"):
+        await _perform_scan_slotted(scan_request, scan_id)
+
+
+async def _perform_scan_slotted(scan_request: ScanRequest, scan_id: uuid.UUID):
+    """Body of perform_scan(), inside the scope gate and a scan slot."""
     browser = None
     context = None
     page = None
@@ -232,11 +305,25 @@ async def perform_scan(scan_request: ScanRequest, scan_id: uuid.UUID):
                 )
                 return
 
-            # Get asset ID from URL
+            # Get asset ID from URL.
+            #
+            # .hostname, not .netloc: netloc keeps the port ("host:8080") and the
+            # userinfo, so an IP target became the un-resolvable string
+            # "192.168.1.150:8080" and landed on the 0.0.0.0 placeholder asset.
+            #
+            # And when the host IS an ip literal, do NOT pass it as the hostname.
+            # This called get_or_create_asset(netloc, hostname=netloc), which
+            # wrote assets(ip='X', hostname='X'). The unique index is
+            # ix_assets_ip_hostname(ip, COALESCE(hostname,'')), so 'X' and ''
+            # count as different rows — creating a second asset for a host that
+            # already had one. Ports hang off asset_id, so every asset row for
+            # an IP carried its own copy of that host's ports: 99 port rows for
+            # 59 real (ip, proto, port) tuples.
+            # get_or_create_asset drops a hostname that is merely the ip, so
+            # passing both is safe and other callers get the same protection.
             parsed_url = urlparse(url_str)
-            hostname = parsed_url.netloc
-            # For now, use hostname as IP (in real scenario, resolve it)
-            asset_id = get_or_create_asset(hostname, hostname=hostname)
+            host = parsed_url.hostname or ""
+            asset_id = get_or_create_asset(host, hostname=host)
 
             # Initialize analyzers
             security_checker = SecurityChecker()
@@ -425,18 +512,34 @@ async def perform_scan(scan_request: ScanRequest, scan_id: uuid.UUID):
                 from db_utils import get_db
                 with get_db() as conn, conn.cursor() as cur:
                     for zap_finding in zap_results.get('alerts', []):
+                        # web_findings.cwe is text[], but the ZAP alert carries a
+                        # single string ("CWE-79") — psycopg2 cannot adapt a str
+                        # to an array, so the insert failed on the type as well
+                        # as on the column name. etl/parse_zap.py builds a list
+                        # for the same column; match it.
+                        cwe_value = zap_finding.get('cwe')
+                        if cwe_value is None or cwe_value == []:
+                            cwe_array = None
+                        elif isinstance(cwe_value, (list, tuple)):
+                            cwe_array = [str(c) for c in cwe_value if c]
+                        else:
+                            cwe_array = [str(cwe_value)]
                         cur.execute(
                             """
+                            -- `refs` (jsonb), not `references` — which is both the
+                            -- wrong column name and a SQL reserved word, so every
+                            -- ZAP finding from this path failed to save. Matches
+                            -- how etl/parse_zap.py writes the same data.
                             INSERT INTO web_findings
                             (asset_id, url, source, issue_type, name, severity,
-                             evidence, method, payload, cwe, references)
+                             evidence, method, payload, cwe, refs)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             """,
                             (asset_id, zap_finding['url'], zap_finding['source'],
                              zap_finding['issue_type'], zap_finding['name'],
                              zap_finding['severity'], zap_finding['evidence'],
                              zap_finding.get('method'), zap_finding.get('payload'),
-                             zap_finding.get('cwe'), Json(zap_finding.get('references', {})))
+                             cwe_array, Json(zap_finding.get('references', {})))
                         )
                     conn.commit()
 
@@ -689,6 +792,11 @@ async def capture_auth_token(req: AuthCaptureRequest):
     - client_credentials: POST to token URL with client_id/secret, return access_token
     - intercept: Launch browser, navigate to login_url, monitor network for tokens
     """
+    refusal = _scope_refusal_for_url(req.login_url, f"auth capture {req.mode}")
+    if refusal:
+        logger.warning("REFUSED auth capture at %s: %s", req.login_url, refusal)
+        raise HTTPException(403, refusal)
+
     if req.mode == "client_credentials":
         return await _capture_client_credentials(req)
     elif req.mode == "intercept":
@@ -851,6 +959,11 @@ async def execute_poc(req: PoCRequest):
         response_body: first 2000 chars of page content
         dom_changes: summary of DOM changes if detected
     """
+    refusal = _scope_refusal_for_url(req.url, f"poc {req.injection_point} {req.url}")
+    if refusal:
+        logger.warning("REFUSED poc against %s: %s", req.url, refusal)
+        raise HTTPException(403, refusal)
+
     import asyncio
     from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
 
@@ -1082,6 +1195,16 @@ async def _perform_crawl(job_id: str, req: CrawlRequest):
     All traffic goes through ZAP proxy so ZAP builds its site tree.
     Returns discovered URLs for downstream pipeline stages.
     """
+    # Every seed, not just req.url: a single unchecked seed_urls entry is a
+    # complete bypass of the gate on req.url.
+    for _u in [req.url, *(req.seed_urls or [])]:
+        refusal = _scope_refusal_for_url(_u, f"crawl seed {_u}")
+        if refusal:
+            logger.warning("REFUSED crawl seed %s: %s", _u, refusal)
+            _crawl_jobs[job_id] = {"status": "blocked", "error": refusal,
+                                   "pages_visited": 0, "urls_found": 0}
+            return
+
     from urllib.parse import urlparse, urljoin
     from collections import deque
 
@@ -1246,11 +1369,33 @@ async def start_crawl(req: CrawlRequest, background_tasks: BackgroundTasks):
 
     Pipeline usage: Katana → **Playwright crawl** → Gobuster → Nikto → Nuclei → ZAP
     """
-    # Validate target
+    # Validate target.
+    #
+    # allow_private=True, matching all 23 other validate_scan_target call sites
+    # across nmap_scanner / web_scanner / nuclei. This route was the lone
+    # exception, so the SSRF guard rejected every RFC1918 address — i.e. the
+    # normal case for an internal engagement. A pipeline scan of
+    # http://192.168.1.150 failed here with HTTP 400 and the log only said
+    # "Playwright crawl start failed: HTTP 400", so it read as a transport
+    # problem rather than the target being refused on principle.
+    #
+    # Authorization is not this function's job: scope enforcement (BFF +
+    # nmap_scanner, via etl.scope_gate) decides what may be scanned. This check
+    # is input validation.
+    # validate_scan_target takes a HOST, not a URL — handing it the full
+    # "http://192.168.1.150" fails with "Invalid domain name format". The nine
+    # other URL-based callers in this stack all parse first
+    # (validate_scan_target(parsed.hostname, allow_private=True)); this one did
+    # not, so every crawl of an http:// target was rejected before it started.
     try:
-        validate_scan_target(req.url)
+        _parsed = urlparse(req.url)
+        _host = _parsed.hostname or _parsed.netloc or req.url
+        validate_scan_target(_host, allow_private=True)
     except ValidationError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid crawl target {req.url!r} (host {_host!r}): {e}",
+        )
 
     job_id = str(uuid.uuid4())
     _crawl_jobs[job_id] = {

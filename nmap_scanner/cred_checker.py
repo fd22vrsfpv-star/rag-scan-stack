@@ -4,6 +4,8 @@ Tests default and weak credentials for common services.
 """
 
 import os
+import threading      # scan-slot semaphore, see _cred_scan_slot()
+from contextlib import contextmanager
 import subprocess
 import logging
 import json
@@ -126,6 +128,60 @@ class CredentialResult:
     details: Optional[str] = None
 
 
+# ── Scope gate ────────────────────────────────────────────────────────────
+#
+# This module subprocesses straight to a target, so nothing downstream can
+# refuse on its behalf. The matcher is shared (etl/scope_gate.py, bind-mounted
+# at /app/etl) and enforce_target_scope does its own DB lookup, so adopting it
+# costs one line per dispatch.
+#
+# FAILS CLOSED: if the gate cannot be imported we refuse, because a missing
+# mount must not be indistinguishable from an authorised target.
+try:
+    from etl.scope_gate import enforce_target_scope
+    _SCOPE_GATE_OK = True
+except Exception as _scope_exc:      # pragma: no cover - deployment problem
+    _SCOPE_GATE_OK = False
+    _SCOPE_GATE_ERROR = str(_scope_exc)
+
+
+# ── Scan-volume bound ───────────────────────────────────────────────────────
+# This module subprocesses hydra straight at a host, so it IS a scan initiator
+# and must respect the engagement ceiling rather than invent one. `common/` is
+# not mounted into nmap-scanner, so the semaphore is built here from the SAME
+# env var common/tool_job.py reads — the number is shared even though the
+# counter cannot be. That limitation is the same one tool_job documents: the
+# bound is PER PROCESS, so two initiators at the limit still total 2N.
+#
+# Credential checks WAIT for a slot rather than being shed: they run inside an
+# already-accepted scan, and dropping one would silently skip a service the
+# operator asked to be tested.
+MAX_CONCURRENT_SCANS = int(os.environ.get("MAX_CONCURRENT_SCANS", "5"))
+_CRED_SLOT_WAIT_S = int(os.environ.get("SCAN_SLOT_WAIT_TIMEOUT", "1800"))
+_cred_slots = threading.BoundedSemaphore(MAX_CONCURRENT_SCANS)
+
+
+@contextmanager
+def _cred_scan_slot(label: str = "cred-check"):
+    """Hold one of MAX_CONCURRENT_SCANS slots for the duration of a check."""
+    if not _cred_slots.acquire(timeout=_CRED_SLOT_WAIT_S):
+        raise TimeoutError(
+            f"{label}: no scan slot within {_CRED_SLOT_WAIT_S}s "
+            f"(MAX_CONCURRENT_SCANS={MAX_CONCURRENT_SCANS})")
+    try:
+        yield
+    finally:
+        _cred_slots.release()
+
+
+def _scope_refusal(target: str = "", command: str = ""):
+    """Refusal string when this must not be sent, else None."""
+    if not _SCOPE_GATE_OK:
+        return (f"scope gate unavailable ({_SCOPE_GATE_ERROR}) — refusing to "
+                "send traffic; check the ./etl:/app/etl mount")
+    return enforce_target_scope(target, command)
+
+
 def get_service_from_port(port: int) -> Optional[str]:
     """Infer service type from port number"""
     for service, ports in SERVICE_PORTS.items():
@@ -239,6 +295,17 @@ def check_credentials_hydra(
     Returns:
         Tuple of (successful credential results, audit dict).
     """
+    refusal = _scope_refusal(target)
+    if refusal:
+        logger.warning("REFUSED hydra against %s: %s", target, refusal)
+        return []
+
+    with _cred_scan_slot(f"hydra {target}:{port}"):
+        return _check_credentials_slotted(target, port, service, credentials, timeout)
+
+
+def _check_credentials_slotted(target, port, service, credentials, timeout):
+    """Body of the credential check, inside the scope gate and a scan slot."""
     results: List[CredentialResult] = []
     audit_attempts: List[Dict[str, Any]] = []
     kex_legacy_detected = False
@@ -374,6 +441,11 @@ def check_credentials_nmap(
     The audit instead captures the full Cartesian product that was
     submitted plus the parsed successes.
     """
+    refusal = _scope_refusal(target)
+    if refusal:
+        logger.warning("REFUSED nmap against %s: %s", target, refusal)
+        return []
+
     results: List[CredentialResult] = []
     audit_attempts: List[Dict[str, Any]] = []
 

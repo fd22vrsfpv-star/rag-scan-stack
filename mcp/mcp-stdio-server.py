@@ -246,7 +246,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "targets": {"type": "array", "items": {"type": "string"}, "description": "List of IPs or CIDR ranges"},
-                "ports": {"type": "string", "description": "Port range (e.g., '1-1000' or '1-65535')", "default": "1-1000"},
+                "ports": {"type": "string", "description": "Port range. OMIT for the server default (nmap's top-1000 for nmap scans, full range for masscan discovery). Do NOT pass '1-1000' — that is the first 1000 port NUMBERS and misses mysql 3306, postgresql 5432, vnc 5900, tomcat 8180."},
                 "udp": {"type": "boolean", "description": "Scan UDP ports instead of TCP", "default": False},
                 "rate": {"type": "integer", "description": "Packets per second", "default": 1000}
             },
@@ -260,7 +260,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "targets": {"type": "array", "items": {"type": "string"}, "description": "List of IPs or hostnames"},
-                "ports": {"type": "string", "description": "Port range or comma-separated ports", "default": "1-1000"},
+                "ports": {"type": "string", "description": "Port range. OMIT for the server default (nmap's top-1000 for nmap scans, full range for masscan discovery). Do NOT pass '1-1000' — that is the first 1000 port NUMBERS and misses mysql 3306, postgresql 5432, vnc 5900, tomcat 8180."},
                 "scan_type": {"type": "string", "enum": ["quick", "full", "udp"], "description": "Scan type: quick (fast), full (service detection + vuln scripts), udp (UDP scan)", "default": "full"}
             },
             "required": ["targets"]
@@ -563,7 +563,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "targets": {"type": "array", "items": {"type": "string"}, "description": "List of IPs, hostnames, or CIDR ranges"},
-                "ports": {"type": "string", "description": "Port specification (e.g., '80,443', '1-1000', 'top-100')"},
+                "ports": {"type": "string", "description": "Port specification. Omit for the top-1000 default. Do NOT pass '1-1000' — that is the first 1000 port NUMBERS, not the 1000 most commonly open ports."},
                 "rate": {"type": "integer", "description": "Packets per second rate limit"}
             },
             "required": ["targets"]
@@ -862,9 +862,12 @@ async def call_tool(name: str, arguments: dict):
                     targets = [targets]
                 payload = {
                     "targets": targets,
-                    "ports": arguments.get("ports", "1-1000"),
                     "rate": arguments.get("rate", 1000)
                 }
+                # Omit rather than default: the scanner picks the right scope per
+                # route, and a client-side "1-1000" would override it.
+                if arguments.get("ports"):
+                    payload["ports"] = arguments["ports"]
                 if arguments.get("udp"):
                     payload["udp"] = True
                 resp = await client.post(f"{NMAP_URL}/jobs/masscan-only", json=payload)
@@ -885,8 +888,8 @@ async def call_tool(name: str, arguments: dict):
 
                 resp = await client.post(f"{NMAP_URL}{endpoint}", json={
                     "targets": targets,
-                    "ports": arguments.get("ports", "1-1000"),
-                    "rate": 1000
+                    "rate": 1000,
+                    **({"ports": arguments["ports"]} if arguments.get("ports") else {})
                 })
                 return [TextContent(type="text", text=json.dumps(resp.json() if resp.status_code == 200 else {"error": resp.text}, indent=2))]
 

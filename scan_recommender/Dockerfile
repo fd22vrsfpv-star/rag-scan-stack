@@ -7,6 +7,8 @@ WORKDIR /app
 
 # Copy the current directory contents into the container at /app
 COPY scan_recommender.py /app/scan_recommender.py
+# llm_settings now comes from the ./common bind mount as
+# `common.llm_settings` — one copy, not four. See common/llm_settings.py.
 COPY exploits_rag.py      /app/exploits_rag.py
 COPY multi_app.py         /app/multi_app.py
 COPY log_manager.py       /app/log_manager.py
@@ -15,6 +17,7 @@ COPY run_ingest.py        /app/run_ingest.py
 COPY tool_kb.py           /app/tool_kb.py
 COPY url_fetch.py         /app/url_fetch.py
 COPY tool_catalog.py      /app/tool_catalog.py
+COPY agent_claims.py      /app/agent_claims.py
 COPY entrypoint.sh        /app/entrypoint.sh
 COPY requirements.txt /app/requirements.txt
 

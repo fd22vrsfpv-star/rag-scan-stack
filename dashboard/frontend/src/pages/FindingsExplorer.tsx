@@ -18,6 +18,7 @@ import { useCreateFollowUp, useCreateAdhocRule } from '@/api/followups'
 import { useAssetPorts, useAssetVulns } from '@/api/assets'
 import { SeverityBadge } from '@/components/common/SeverityBadge'
 import { SourceBadge } from '@/components/common/SourceBadge'
+import { CustomerBadge } from '@/components/common/CustomerBadge'
 import { SEVERITY_LEVELS, PREDEFINED_TAGS, TAG_COLORS, TAG_COLOR_DEFAULT } from '@/lib/constants'
 import type { Finding, WorkflowStatus } from '@/lib/types'
 import { X, ThumbsUp, ThumbsDown, Check, ChevronRight, ChevronDown, Upload, MessageSquare, Swords, Tag, Crosshair, Zap, Loader2, Globe, Trash2, Flag } from 'lucide-react'
@@ -134,11 +135,29 @@ function isGroup(item: Finding | FindingGroup): item is FindingGroup {
   return 'findings' in item && Array.isArray((item as FindingGroup).findings)
 }
 
+// "affects N hosts" marker for a problem seen on several virtual hosts of one
+// machine. Rendered only when N > 1, so it stays quiet for the common case; a
+// badge on every row would be noise rather than signal.
+function HostSpreadBadge({ finding }: { finding: Finding }) {
+  const n = finding.affects_hosts ?? 1
+  if (n <= 1) return null
+  return (
+    <span
+      title={`This problem was also found on ${n - 1} other virtual host${n === 2 ? '' : 's'} of the same machine`}
+      className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium
+                 border border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400 shrink-0"
+    >
+      <Globe className="w-2.5 h-2.5" />
+      {n} hosts
+    </span>
+  )
+}
+
 export default function FindingsExplorer() {
   const globalScope = useUIStore(s => s.selectedScopeName)
   const engagementId = useUIStore(s => s.selectedEngagementId)
   const [scopeFilter, setScopeFilter] = useState(globalScope || '')
-  const { matchesScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilter)
+  const { matchesScope, matchesAnyScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilter)
   const [searchParams] = useSearchParams()
   // Seed the host filter from a deep link (e.g. the Attack Map "Findings" link
   // passes ?ip=<host>). Applied once on mount via the lazy initializer.
@@ -186,12 +205,22 @@ export default function FindingsExplorer() {
   const allFindings = useMemo(() => (data?.pages ?? []).flatMap(p => p.findings ?? []), [data])
   const findings = useMemo(() => {
     if (!isScopeFiltering) return allFindings
-    return allFindings.filter(f => matchesScope(f.hostname || f.ip || f.url || ''))
+    // Every identity, not the first non-empty one — see matchesAnyScope.
+    return allFindings.filter(f => matchesAnyScope(f.hostname, f.ip, f.url))
   }, [allFindings, isScopeFiltering, matchesScope])
   // total = server-side count for the active filter set (respects severity/source/status).
   const serverTotal = data?.pages?.[0]?.total ?? 0
   const total = isScopeFiltering ? findings.length : serverTotal
   const loadedCount = allFindings.length
+  // Rollup counts. `total` counts ROWS (one per virtual host); distinctProblems
+  // collapses a server-level problem seen on several vhosts into one. Showing
+  // both is the point — "812 findings / 340 problems" is the honest headline.
+  const agg = data?.pages?.[0]?.aggregations
+  const distinctProblems = agg?.distinct_problems ?? 0
+  const sharedProblems = agg?.shared_problems ?? 0
+  const problemScope = filters.problem_scope ?? 'all'
+  const collapsing = !!filters.collapse_problems
+  const showingInventory = !!filters.include_inventory
 
   const toggleSelectAll = () => {
     if (selectedIds.size === findings.length) setSelectedIds(new Set())
@@ -275,6 +304,12 @@ export default function FindingsExplorer() {
               : loadedCount < total
                 ? `${loadedCount.toLocaleString()} of ${total.toLocaleString()} findings`
                 : `${total.toLocaleString()} findings`}
+            {distinctProblems > 0 && distinctProblems !== total && (
+              <span className="ml-1.5 text-muted-foreground/80">
+                · {distinctProblems.toLocaleString()} distinct problem{distinctProblems === 1 ? '' : 's'}
+                {sharedProblems > 0 && `, ${sharedProblems} across multiple hosts`}
+              </span>
+            )}
           </span>
         </div>
       </div>
@@ -295,6 +330,67 @@ export default function FindingsExplorer() {
               {s}
             </button>
           ))}
+        </div>
+        {/* Virtual-host rollup. A server-level problem on shared hosting is
+            recorded once per vhost, because a tester triaging one host needs
+            that host's row. These controls let you see it as one problem
+            instead. NOT the engagement scope — that is the ScopeFilter above. */}
+        <div className="flex flex-wrap gap-1.5 items-center">
+          <span className="text-xs text-muted-foreground py-1 inline-flex items-center gap-1">
+            Host spread:
+            <InfoTip text="A problem on shared hosting appears once per virtual host. 'Shared across hosts' shows only problems seen on more than one vhost of the same machine; 'This host only' shows the rest. Separate from the engagement scope filter." />
+          </span>
+          {([
+            { key: 'all', label: 'All' },
+            { key: 'shared', label: 'Shared across hosts' },
+            { key: 'single', label: 'This host only' },
+          ] as const).map(opt => (
+            <button
+              key={opt.key}
+              onClick={() => setFilters(f => ({
+                ...f,
+                problem_scope: opt.key === 'all' ? undefined : opt.key,
+              }))}
+              className={cn(
+                'px-2.5 py-1 rounded-md text-sm font-medium border transition-colors',
+                problemScope === opt.key
+                  ? 'border-primary bg-primary/15 text-primary ring-1 ring-primary/30'
+                  : 'border-border bg-muted/50 text-foreground hover:border-primary/50',
+              )}
+            >
+              {opt.label}
+            </button>
+          ))}
+          <button
+            onClick={() => setFilters(f => ({
+              ...f,
+              include_inventory: f.include_inventory ? undefined : true,
+            }))}
+            title="Crawl inventory is every URL a crawler discovered. It is what the Burp and HAR exports are built from, but a discovered URL is not a finding — so it is excluded from this list by default."
+            className={cn(
+              'ml-2 px-2.5 py-1 rounded-md text-sm font-medium border transition-colors',
+              showingInventory
+                ? 'border-primary bg-primary/15 text-primary ring-1 ring-primary/30'
+                : 'border-border bg-muted/50 text-foreground hover:border-primary/50',
+            )}
+          >
+            {showingInventory ? 'Including crawled URLs' : 'Show crawled URLs'}
+          </button>
+          <button
+            onClick={() => setFilters(f => ({
+              ...f,
+              collapse_problems: f.collapse_problems ? undefined : true,
+            }))}
+            title="Show one row per underlying problem instead of one per virtual host"
+            className={cn(
+              'ml-2 px-2.5 py-1 rounded-md text-sm font-medium border transition-colors',
+              collapsing
+                ? 'border-primary bg-primary/15 text-primary ring-1 ring-primary/30'
+                : 'border-border bg-muted/50 text-foreground hover:border-primary/50',
+            )}
+          >
+            {collapsing ? 'Grouped by problem' : 'Group by problem'}
+          </button>
         </div>
         <div className="flex flex-wrap gap-1.5 items-center">
           <span className="text-xs text-muted-foreground py-1 inline-flex items-center gap-1">
@@ -543,11 +639,13 @@ export default function FindingsExplorer() {
                               <div className="flex items-center gap-2">
                                 {extractScreenshotPath(f) && <MicroScreenshot path={extractScreenshotPath(f)!} alt={displayTitle(f)} />}
                                 <span className="text-xs text-muted-foreground font-mono">{displayTitle(f)}</span>
+                                <HostSpreadBadge finding={f} />
                               </div>
                             </td>
                             <td className="px-3 py-2">
                               <span className="text-xs font-mono">{displayHost(f)}</span>
                               {f.ip && f.hostname && <span className="text-[10px] text-muted-foreground ml-1">{cleanIp(f.ip)}</span>}
+                              <CustomerBadge host={displayHost(f)} className="ml-1" />
                             </td>
                             <td className="px-3 py-2 text-xs font-mono">{f.port ?? ''}</td>
                             <td className="px-3 py-2"><SourceBadge source={f.source} /></td>
@@ -585,6 +683,7 @@ export default function FindingsExplorer() {
                         <div className="flex items-center gap-2">
                           {extractScreenshotPath(f) && <MicroScreenshot path={extractScreenshotPath(f)!} alt={displayTitle(f)} />}
                           <span className="text-sm">{displayTitle(f)}</span>
+                          <HostSpreadBadge finding={f} />
                         </div>
                       </td>
                       <td className="px-3 py-2">
@@ -1112,7 +1211,7 @@ function FindingDetailPanel({
 
         {/* Core finding info */}
         <div className="grid grid-cols-2 gap-2 text-xs">
-          {finding.hostname && <div className="col-span-2"><span className="text-muted-foreground">Hostname:</span> <span className="font-mono">{finding.hostname}</span></div>}
+          {finding.hostname && <div className="col-span-2"><span className="text-muted-foreground">Hostname:</span> <span className="font-mono">{finding.hostname}</span> <CustomerBadge host={finding.hostname} className="ml-1" /></div>}
           <div><span className="text-muted-foreground">IP:</span> <span className="font-mono">{cleanIp(finding.ip)}</span></div>
           <div><span className="text-muted-foreground">Port:</span> {finding.port}</div>
           {finding.cve && <div><span className="text-muted-foreground">CVE:</span> {finding.cve}</div>}

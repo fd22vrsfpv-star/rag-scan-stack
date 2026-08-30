@@ -16,6 +16,11 @@
 #    2. Go Tool Build     — compile Go security tools (~10-15 min first time)
 #    3. Environment       — generate .env with secure credentials
 #    4. Infrastructure    — create network, directories, kong config
+# The shared base image must exist before any service that does
+# `FROM rag-common:latest`. compose builds in parallel and does NOT
+# order builds by their FROM dependencies, so a clean machine fails
+# with "pull access denied for rag-common" without this.
+bash "$(dirname "${BASH_SOURCE[0]}")/build-base-image.sh"
 #    5. Docker Build      — docker compose build
 #    6. Start Services    — docker compose up -d
 #    7. Database Schema   — wait for postgres, apply schema
@@ -1124,6 +1129,13 @@ EDB_RW_PASSWORD=${EXPLOITDB_PASSWORD}
 
 # ZAP (OWASP ZAP Proxy) API Key
 ZAP_API_KEY=${ZAP_API_KEY}
+# Container memory cap for ZAP. Without one the JVM sizes its heap from host
+# RAM and gets OOM-killed mid-scan (exit 137), taking web scanning down with it.
+ZAP_MEM_LIMIT=6g
+# JVM max heap for ZAP. Must stay under ZAP_MEM_LIMIT: zap.sh only reads the
+# cgroup v1 memory path, so on a cgroup v2 host it sizes the heap from HOST RAM
+# and blows past the container limit.
+ZAP_JVM_HEAP=3g
 ZAP_ADDR=zap
 ZAP_PORT=8090
 
@@ -1135,6 +1147,13 @@ CHISEL_USER=pentest
 CHISEL_PASSWORD=${CHISEL_PASSWORD}
 
 # Metasploit RPC Credentials
+# WARNING: read by TWO services that must agree — the \`metasploit\` container
+# starts msfrpcd with these, and \`exploit-runner\` authenticates with them.
+# After changing either, RECREATE metasploit (not just restart): the msfrpcd
+# command line is fixed at container creation, so a restart keeps the old value.
+#   docker compose up -d --force-recreate --no-deps metasploit exploit-runner
+# A mismatch shows up as HTTP 500 on /msf/jobs and /msf/sessions, and msfrpcd
+# reports "Login Failed". See Docs/SECURITY_SETUP.md.
 MSF_RPC_USER=msf
 MSF_RPC_PASS=${MSF_RPC_PASS}
 MSF_RPC_HOST=metasploit
@@ -1180,7 +1199,7 @@ NMAP_SCANNER_URL=https://nmap_scanner:8012
 
 WORDLIST=/opt/seclists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-medium.txt
 WEB_PORTS=80,443,8080,8443,8000,8888,3000,5000
-DEEP_SCAN_PORTS=1001-65535
+DEEP_SCAN_PORTS=1-65535
 SCHEME_HINT=auto
 REPORT_DIR=/reports
 
@@ -1479,6 +1498,25 @@ if [ -f "scripts/generate-certs.sh" ]; then
     fi
 else
     log_warn "scripts/generate-certs.sh not found — skipping TLS cert generation"
+fi
+
+# The self-signed cert above is not in any default trust store, so every internal
+# HTTPS call fails verification unless the caller passes verify=False — which is
+# how ~19 call sites ended up disabling verification on a security tool. Build a
+# bundle that MERGES the public CA roots with our cert instead: services point
+# REQUESTS_CA_BUNDLE / SSL_CERT_FILE at it, internal calls verify for real, and
+# external HTTPS (nuclei templates, CVE feeds) keeps working because the public
+# roots are still there. Must run AFTER cert generation.
+if [ -f "scripts/generate-ca-bundle.sh" ]; then
+    log_info "Building merged CA bundle (certs/ca-bundle.crt)"
+    if bash scripts/generate-ca-bundle.sh >/dev/null 2>&1; then
+        log_ok "CA bundle ready — internal TLS verifies without disabling verification"
+    else
+        log_warn "CA bundle generation failed — internal HTTPS calls that verify will fail; \
+run scripts/generate-ca-bundle.sh manually"
+    fi
+else
+    log_warn "scripts/generate-ca-bundle.sh not found — skipping CA bundle"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════

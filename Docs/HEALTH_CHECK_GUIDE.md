@@ -48,7 +48,9 @@ List all running containers
 ### ✓ Database (3 checks)
 - PostgreSQL connectivity
 - Table count (21 tables expected)
-- Critical tables exist (assets, ports, web_findings, vulns, scan_recommendations, agent_sessions)
+- Critical tables exist (assets, ports, web_findings, vulns, scan_recommendations,
+  agent_sessions, and the LangGraph checkpoint tables `checkpoints`,
+  `checkpoint_blobs`, `checkpoint_writes`, `checkpoint_migrations`)
 
 ### ✓ AI/LLM (1 check)
 - Ollama service running

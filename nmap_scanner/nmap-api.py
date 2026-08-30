@@ -130,7 +130,14 @@ INGEST_TIMEOUT        = _env_int("INGEST_TIMEOUT", 600)
 INGEST_TIMEOUT_SHORT  = _env_int("INGEST_TIMEOUT_SHORT", 300)
 
 # Recommender / dispatch HTTP timeouts — seconds
-RECOMMENDER_TIMEOUT   = _env_int("RECOMMENDER_TIMEOUT", 15)
+# Must cover the worst ADMITTED latency, which follows from the engagement scan
+# limit: the recommender admits MAX_CONCURRENT_SCANS calls and largely
+# serialises them at ~4-5s each, so with the default of 5 the last admitted
+# caller waits ~25s. At the old 15s the caller gave up on work the recommender
+# was still doing — the request was neither cancelled nor reused, just recorded
+# as a failure. Requests beyond the limit are shed in ~2s with a 429, so this
+# longer timeout is only ever paid by calls that were actually accepted.
+RECOMMENDER_TIMEOUT   = _env_int("RECOMMENDER_TIMEOUT", 35)
 DISPATCH_TIMEOUT      = _env_int("DISPATCH_TIMEOUT", 10)
 
 # Process-wait timeouts (graceful kill) — seconds
@@ -206,6 +213,8 @@ def _trigger_scan_recommender(nmap_hosts: list, job_id: str = None):
             banner = port_info.get("product")
             if banner and port_info.get("version"):
                 banner = f"{banner} {port_info['version']}"
+            if not _recommender_available():
+                continue
             try:
                 params = {"ip": ip, "persist": "true"}
                 if service:
@@ -214,12 +223,21 @@ def _trigger_scan_recommender(nmap_hosts: list, job_id: str = None):
                     params["banner"] = banner
                 if port:
                     params["port"] = str(port)
-                resp = requests.get(
-                    f"{SCAN_RECOMMENDER_URL}/next_scan",
-                    params=params,
-                    timeout=RECOMMENDER_TIMEOUT,
-                    verify=False,
-                )
+                with _rec_slots:
+                    resp = requests.get(
+                        f"{SCAN_RECOMMENDER_URL}/next_scan",
+                        params=params,
+                        timeout=RECOMMENDER_TIMEOUT,
+                        verify=False,
+                    )
+                # 429 means the recommender shed this request on purpose. Treat
+                # it as a failure for breaker purposes so we back off rather
+                # than retrying into a service that just said "not now".
+                if resp.status_code == 429:
+                    _recommender_note(False)
+                    logging.debug(f"{tag}Recommender at capacity for {ip}/{service}")
+                    continue
+                _recommender_note(resp.status_code == 200)
                 if resp.status_code == 200:
                     recs = resp.json().get("recommendations", [])
                     total += len(recs)
@@ -238,8 +256,66 @@ def _trigger_scan_recommender(nmap_hosts: list, job_id: str = None):
                 else:
                     logging.debug(f"{tag}Recommender returned {resp.status_code} for {ip}/{service}")
             except Exception as e:
+                _recommender_note(False)
                 logging.warning(f"{tag}Recommender call failed for {ip}/{service}: {type(e).__name__}: {e}")
     logging.info(f"{tag}Scan recommender: generated {total} recommendations for {len(nmap_hosts)} hosts")
+
+
+# ── Recommender back-pressure ─────────────────────────────────────────────
+#
+# This module calls /next_scan once per OPEN PORT, per host, per scan. A host
+# with 30 open ports scanned by several concurrent jobs produces hundreds of
+# near-simultaneous requests to an LLM-backed endpoint, which then saturates.
+#
+# Two mechanisms, because they solve different halves:
+#   * a semaphore bounds how many calls THIS process makes at once, so one busy
+#     scanner cannot monopolise the recommender;
+#   * a circuit breaker stops calling entirely for a cooldown once the endpoint
+#     starts refusing or timing out. Without it, every port costs a full
+#     RECOMMENDER_TIMEOUT wait, so saturation makes each scan dramatically
+#     slower AND keeps the recommender pinned — the failure feeds itself.
+#
+# Recommendations are a best-effort enrichment: exploit_watcher's periodic poll
+# picks up anything skipped here, so shedding load costs coverage timing, not
+# coverage.
+# Same ceiling the engagement uses for scans: a recommender call can launch
+# tools, so it counts as scan activity rather than a free lookup.
+RECOMMENDER_MAX_INFLIGHT = _env_int("RECOMMENDER_MAX_INFLIGHT",
+                                    _env_int("MAX_CONCURRENT_SCANS", 5))
+RECOMMENDER_BREAKER_THRESHOLD = _env_int("RECOMMENDER_BREAKER_THRESHOLD", 3)
+RECOMMENDER_BREAKER_COOLDOWN = _env_int("RECOMMENDER_BREAKER_COOLDOWN", 120)
+
+_rec_slots = threading.BoundedSemaphore(RECOMMENDER_MAX_INFLIGHT)
+_rec_breaker = {"failures": 0, "open_until": 0.0, "skipped": 0}
+_rec_breaker_lock = threading.Lock()
+
+
+def _recommender_available() -> bool:
+    """False while the breaker is open, so callers skip without paying a timeout."""
+    with _rec_breaker_lock:
+        if time.time() < _rec_breaker["open_until"]:
+            _rec_breaker["skipped"] += 1
+            return False
+        return True
+
+
+def _recommender_note(ok: bool) -> None:
+    """Record an outcome; trip or reset the breaker."""
+    with _rec_breaker_lock:
+        if ok:
+            if _rec_breaker["failures"] or _rec_breaker["open_until"]:
+                logging.info("Recommender healthy again after %d skipped call(s)",
+                             _rec_breaker["skipped"])
+            _rec_breaker.update({"failures": 0, "open_until": 0.0, "skipped": 0})
+            return
+        _rec_breaker["failures"] += 1
+        if _rec_breaker["failures"] >= RECOMMENDER_BREAKER_THRESHOLD:
+            _rec_breaker["open_until"] = time.time() + RECOMMENDER_BREAKER_COOLDOWN
+            _rec_breaker["failures"] = 0
+            logging.warning(
+                "Recommender unresponsive — pausing recommendation calls for %ds. "
+                "Scans continue; exploit_watcher's poll will pick these up.",
+                RECOMMENDER_BREAKER_COOLDOWN)
 
 
 def _dispatch_nuclei_targeted(ip: str, port: int, tags: str, job_id: str = None):
@@ -315,6 +391,24 @@ def _trigger_subfinder_for_domains(targets: List[str], job_id: str = None):
         logging.debug(f"{tag}Subfinder auto-trigger failed: {e}")
 
 
+def _nmap_service_name(svc) -> "str | None":
+    """Service name with nmap's tunnel prefix applied.
+
+    `<service name="http" tunnel="ssl"/>` becomes `ssl/http`, which is exactly
+    what nmap itself displays. Returns the bare name when there is no tunnel,
+    so nothing changes for plaintext services.
+    """
+    if svc is None:
+        return None
+    name = svc.get("name")
+    if not name:
+        return None
+    tunnel = (svc.get("tunnel") or "").strip().lower()
+    if tunnel and not name.lower().startswith(f"{tunnel}/"):
+        return f"{tunnel}/{name}"
+    return name
+
+
 def _parse_nmap_xml_summary(xml_path):
     """Extract hosts, ports, services, and scripts from nmap XML into a dict."""
     import xml.etree.ElementTree as ET
@@ -342,9 +436,25 @@ def _parse_nmap_xml_summary(xml_path):
                 "port": int(port.get("portid", 0)),
                 "protocol": port.get("protocol"),
                 "state": (port.find("state") or {}).get("state") if port.find("state") is not None else None,
-                "service": svc.get("name") if svc is not None else None,
+                # nmap records TLS in a SEPARATE `tunnel` attribute:
+                #   <service name="http" tunnel="ssl" .../>
+                # Dropping it stored those listeners as plain `http`, and since
+                # the transport is not a property of the port number there was
+                # then NO evidence anywhere that the connection was wrapped —
+                # 260 rows in this deployment sat as `http` on 443 (Apache,
+                # Azure Application Gateway, Cloudflare) with nothing to say
+                # otherwise. Downstream that produces `nikto -h http://host:443`
+                # against a TLS listener.
+                #
+                # Stored using nmap's OWN display convention, `ssl/http`, rather
+                # than a new column: it is what `nmap` prints, it needs no schema
+                # change, and every existing consumer already handles it — the
+                # http service family includes `ssl/http`, and the recommender
+                # resolves it to https.
+                "service": _nmap_service_name(svc),
                 "product": svc.get("product") if svc is not None else None,
                 "version": svc.get("version") if svc is not None else None,
+                "tunnel": svc.get("tunnel") if svc is not None else None,
             }
             scripts = []
             for script in port.findall("script"):
@@ -383,14 +493,70 @@ def _save_session_results(job_id, job_type, scanner, files, metadata=None):
     except Exception as e:
         logging.warning(f"[session] Failed to save session results: {e}")
 
-# Build default quick_ports: 1-1000 + any WEB_PORTS above 1000
+# Build default quick_ports: nmap's frequency-ranked top-1000 + any WEB_PORTS
+# above 1000.
+#
+# This is the fallback used when a caller sends empty ports. It used to be the
+# sequential range 1-1000, which sounds like "the common ports" but is not — it
+# is the first 1000 port NUMBERS. The services that matter most sit above it
+# (mysql 3306, postgresql 5432, vnc 5900, irc 6667, tomcat 8180, java-rmi 1099),
+# so a fallback scan could report "12 open ports" while missing every
+# high-value service.
+#
+# nmap's top-1000 is the 1000 most commonly OPEN ports. Same probe count, finds
+# all of the above. Resolved from knowledge/port_profiles.yaml — the same file
+# the BFF and the agents resolve — so this fallback cannot drift away from what
+# the rest of the stack considers "the default scope".
 _WEB_PORTS_STR = os.environ.get("WEB_PORTS", "80,443,8080,8443,8000,8888,3000,5000")
 _HIGH_WEB_PORTS = ",".join(
     p.strip() for p in _WEB_PORTS_STR.split(",")
     if p.strip().isdigit() and int(p.strip()) > 1000
 )
-DEFAULT_QUICK_PORTS = f"1-1000,{_HIGH_WEB_PORTS}" if _HIGH_WEB_PORTS else "1-1000"
-DEFAULT_DEEP_SCAN_PORTS = os.environ.get("DEEP_SCAN_PORTS", "1001-65535")
+_LEGACY_QUICK_PORTS = f"1-1000,{_HIGH_WEB_PORTS}" if _HIGH_WEB_PORTS else "1-1000"
+DEFAULT_QUICK_PORTS_PROFILE = os.environ.get("DEFAULT_QUICK_PORTS_PROFILE", "top-1000")
+PORT_PROFILES_PATH = os.environ.get("PORT_PROFILES_PATH", "/knowledge/port_profiles.yaml")
+
+
+def _resolve_default_quick_ports() -> str:
+    """Read the quick-scan profile from knowledge/port_profiles.yaml.
+
+    Degrades to the old sequential range rather than leaving scans with no scope
+    at all — a missing /knowledge mount should not take the scanner down. The
+    warning names what the degraded scope misses so it is actionable in the log.
+    """
+    import yaml
+    with open(PORT_PROFILES_PATH) as fh:
+        data = yaml.safe_load(fh) or {}
+    profiles = data.get("profiles") or {}
+    entry = profiles.get(DEFAULT_QUICK_PORTS_PROFILE)
+    if not entry or not entry.get("ports"):
+        raise KeyError(
+            f"profile {DEFAULT_QUICK_PORTS_PROFILE!r} not in {PORT_PROFILES_PATH}"
+        )
+    ports = str(entry["ports"]).strip()
+    # masscan has no --top-ports flag; the YAML is documented as explicit ranges
+    # only, but assert it here so a hand-edit cannot reach the binary.
+    if "--top-ports" in ports:
+        raise ValueError(f"profile {DEFAULT_QUICK_PORTS_PROFILE!r} contains --top-ports")
+    return f"{ports},{_HIGH_WEB_PORTS}" if _HIGH_WEB_PORTS else ports
+
+
+try:
+    DEFAULT_QUICK_PORTS = _resolve_default_quick_ports()
+except Exception as _pp_err:      # missing mount, bad YAML, unknown profile
+    logging.warning(
+        "Port profile %r unavailable (%s) — falling back to the sequential range %r, "
+        "which misses mysql/postgresql/vnc/irc/tomcat",
+        DEFAULT_QUICK_PORTS_PROFILE, _pp_err, _LEGACY_QUICK_PORTS,
+    )
+    DEFAULT_QUICK_PORTS = _LEGACY_QUICK_PORTS
+
+# Follow-up sweep: the FULL range, not "everything above 1000". 1001-65535 was
+# the correct complement only while the quick pass was the sequential 1-1000.
+# The top-1000 is frequency-ranked and scattered across 1-65535, so 1001-65535
+# would both re-probe ports phase 1 already covered and leave the low ports
+# outside the top-1000 unscanned by either phase.
+DEFAULT_DEEP_SCAN_PORTS = os.environ.get("DEEP_SCAN_PORTS", "1-65535")
 
 
 def emit_webhook_event(event_type: str, source: str, data: dict, severity: str = None):
@@ -432,9 +598,147 @@ class _MasscanInterruptedError(Exception):
         self.paused_conf = paused_conf
         super().__init__(f"Masscan interrupted, paused.conf at {paused_conf}")
 
+# ─────────────────────── scope enforcement (authorization) ───────────────────
+# The BFF gates /api/scans, but that only covers the dashboard. A real scan went
+# autogen-agents -> nmap_scanner directly and never touched it, which is exactly
+# the path that would pick up a crawled www.owasp.org and point a scanner at it.
+# Every scan path converges HERE, so this is where the boundary belongs.
+#
+# Default-deny WHEN A SCOPE EXISTS. With no scope defined there is nothing to
+# authorize against and refusing everything would make the scanner useless, so it
+# warns loudly instead. SCAN_SCOPE_ENFORCE=strict refuses in that case too.
+_SCOPE_CACHE = {"rows": None, "at": 0.0}
+_SCOPE_TTL = 30.0
+
+
+def _scope_rows():
+    """[(target, target_type)] from rag-api, briefly cached. [] means no scope."""
+    now = time.time()
+    if _SCOPE_CACHE["rows"] is not None and (now - _SCOPE_CACHE["at"]) < _SCOPE_TTL:
+        return _SCOPE_CACHE["rows"]
+    rows = []
+    try:
+        hdr = {"x-api-key": API_KEY}
+        names = ["default"]
+        rn = requests.get(f"{API_BASE}/scope/names", headers=hdr, timeout=10)
+        if rn.status_code == 200:
+            found = [n.get("name") for n in (rn.json().get("names") or []) if n.get("name")]
+            if found:
+                names = found
+        for nm in names:
+            r = requests.get(f"{API_BASE}/scope", params={"name": nm, "limit": 5000},
+                             headers=hdr, timeout=10)
+            if r.status_code != 200:
+                continue
+            for i in (r.json().get("targets") or []):
+                t = (i.get("target") or "").strip()
+                # Placeholder rows carry an empty target; they are not scope.
+                if t and i.get("source") != "__placeholder__":
+                    rows.append((t, i.get("target_type")))
+    except Exception as e:
+        # Never fail closed on a transport hiccup — that would stop an operator
+        # scanning because rag-api blipped. Logged so it is visible, not silent.
+        logging.warning("scope load failed (%s) — scope gate cannot enforce this request", e)
+    _SCOPE_CACHE["rows"], _SCOPE_CACHE["at"] = rows, now
+    return rows
+
+
+def _enforce_scope(targets, scan_type="scan"):
+    """Raise HTTP 403 for any target outside the engagement scope."""
+    if _in_scope is None or _scope_host is None:
+        logging.warning("scope gate UNAVAILABLE (etl/scope_gate not importable) — "
+                        "check the ./etl:/app/etl:ro mount")
+        return
+    hosts = []
+    for t in (targets or []):
+        h = _scope_host(str(t))
+        if h:
+            hosts.append(h)
+    if not hosts:
+        return
+    rows = _scope_rows()
+    mode = os.environ.get("SCAN_SCOPE_ENFORCE", "warn").strip().lower()
+    if not rows:
+        if mode == "strict":
+            raise HTTPException(status_code=403, detail=(
+                "Scan refused: SCAN_SCOPE_ENFORCE=strict but no scope is defined. "
+                "Add targets via POST /scope/add before scanning."))
+        logging.warning("scope gate INACTIVE for %s %s — no scope_targets defined",
+                        scan_type, hosts[:5])
+        return
+    # Alias-aware, matching the BFF gate and kali-listener: a host in scope
+    # under its other observed identity (scope has the IP, request used the
+    # hostname) must not be refused here alone.
+    blocked = [h for h in hosts
+               if not (_in_scope_aliased(h, rows, _scope_aliases(h))
+                       if _in_scope_aliased else _in_scope(h, rows))]
+    if blocked:
+        logging.warning("scope gate BLOCKED %s for out-of-scope host(s): %s", scan_type, blocked)
+        raise HTTPException(status_code=403, detail=(
+            f"Scan refused — out of scope: {', '.join(blocked)}. Add them via "
+            f"POST /scope/add if authorized, or scan an in-scope target."))
+
+
+# Same fail-closed matcher the discovery ingests and the BFF gate use, so scope
+# semantics cannot drift between the places that enforce it.
+try:
+    from etl.scope_gate import (is_in_scope as _in_scope,
+                                _host_from_url as _scope_host,
+                                is_in_scope_with_aliases as _in_scope_aliased,
+                                load_host_aliases as _load_aliases)
+except ImportError:
+    _in_scope = None
+    _scope_host = None
+    _in_scope_aliased = None
+    _load_aliases = None
+
+
+def _scope_aliases(host):
+    """Observed ip<->hostname pairings for `host`, via rag-api.
+
+    This service has no direct database access — it reaches everything through
+    rag-api — so aliases come from /assets rather than a SQL lookup.
+
+    Without this, this gate refused a host that the BFF gate and kali-listener
+    both accepted: the scope listed the IP and the request used the hostname.
+    Four gates with three behaviours meant a target's authorisation depended on
+    which service happened to evaluate it.
+
+    Uses OBSERVED pairings, never live DNS: a resolver answer is
+    attacker-influencable, and letting a DNS record talk a host into scope would
+    defeat the gate.
+    """
+    h = (host or "").strip().lower().rstrip(".")
+    if not h:
+        return set()
+    aliases = {h}
+    if h in ("localhost", "127.0.0.1", "::1"):
+        return aliases | {"localhost", "127.0.0.1", "::1"}
+    try:
+        r = requests.get(f"{API_BASE}/assets", params={"limit": 5000},
+                         headers={"x-api-key": API_KEY}, timeout=10, verify=False)
+        if r.status_code == 200:
+            for a in (r.json().get("assets") or []):
+                ip = str(a.get("ip") or "").strip().lower()
+                hn = str(a.get("hostname") or "").strip().lower()
+                if h in (ip, hn):
+                    aliases |= {x for x in (ip, hn) if x}
+    except Exception as e:
+        # Narrow, never widen: fall back to the host as given.
+        logging.warning("alias lookup failed for %r: %s", host, e)
+    return aliases
+
+
 class MasscanBody(BaseModel):
     targets: List[str] = Field(..., description="List of IPs/CIDRs to scan")
-    ports: str = Field("1-65535", description="Ports range or list")
+    # None means "caller did not specify" — deliberately distinct from an explicit
+    # value, because the right default differs per route and could not be
+    # expressed while this model hardcoded one for both. /jobs/masscan-only is a
+    # pure discovery sweep and keeps 1-65535; /jobs/masscan-then-nmap feeds nmap
+    # enrichment and defaults to the top-1000 profile, so an MCP client that omits
+    # ports no longer silently gets a scope neither the operator nor the profile
+    # asked for. Callers passing an explicit value are unaffected.
+    ports: Optional[str] = Field(None, description="Ports range or list. Omit for the route default.")
     rate: int = Field(1000, ge=1, le=100000, description="Masscan rate (packets per second)")
     interface: Optional[str] = Field(None, description="Network interface for Masscan (-e)")
     proxy: Optional[str] = Field(None, description="SOCKS proxy URL (e.g. socks5://host:port). When set, skips masscan and uses nmap -sT --proxies")
@@ -461,20 +765,28 @@ class MasscanBody(BaseModel):
             except ValidationError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid target '{target}': {e}")
         self.targets = validated_targets
+        # Authorization boundary. Placed in validate_inputs, which every
+        # job-creating route already calls, so no route can add itself
+        # later and quietly skip the check.
+        _enforce_scope(self.targets, self.__class__.__name__)
 
-        # Validate ports format - handle both port ranges and nmap arguments
-        self.ports = self.ports.strip()
-        try:
-            if self.ports.startswith('--top-ports'):
-                # Handle nmap --top-ports argument (allow spaces, dashes, letters, numbers)
-                sanitize_command_arg(self.ports, allowed_chars=r'^[a-zA-Z0-9\s\-=]+$')
-            else:
-                # Handle traditional port ranges (numbers, commas, dashes only)
-                # Strip spaces for traditional port ranges
-                self.ports = self.ports.replace(' ', '')
-                sanitize_command_arg(self.ports, allowed_chars=r'^[0-9,\-]+$')
-        except ValidationError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid ports format: {e}")
+        # Validate ports format - handle both port ranges and nmap arguments.
+        # None means "not specified" — each route substitutes its own default
+        # afterwards, so there is nothing to sanitize yet. Guarded rather than
+        # returned early, so interface validation below still runs.
+        if self.ports is not None:
+            self.ports = self.ports.strip()
+            try:
+                if self.ports.startswith('--top-ports'):
+                    # Handle nmap --top-ports argument (allow spaces, dashes, letters, numbers)
+                    sanitize_command_arg(self.ports, allowed_chars=r'^[a-zA-Z0-9\s\-=]+$', max_len=65536)
+                else:
+                    # Handle traditional port ranges (numbers, commas, dashes only)
+                    # Strip spaces for traditional port ranges
+                    self.ports = self.ports.replace(' ', '')
+                    sanitize_command_arg(self.ports, allowed_chars=r'^[0-9,\-]+$', max_len=65536)
+            except ValidationError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid ports format: {e}")
 
         # Validate interface if provided
         if self.interface:
@@ -482,6 +794,16 @@ class MasscanBody(BaseModel):
                 sanitize_command_arg(self.interface, allowed_chars=r'^[a-zA-Z0-9_-]+$')
             except ValidationError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid interface: {e}")
+
+    def resolve_ports(self, default: str) -> str:
+        """The caller's ports, or `default` when they did not specify any.
+
+        Routes call this AFTER validate_inputs. The substituted default comes from
+        DEFAULT_QUICK_PORTS / a literal, both of which are trusted values built in
+        this module — not caller input — so they need no re-sanitising.
+        """
+        return self.ports if self.ports else default
+
 
 def create_job(job_type: str, params: Dict) -> str:
     """Create a new job and return job_id"""
@@ -684,7 +1006,7 @@ def _run_nmap_fallback(targets: List[str], ports: str, job_id: str = None) -> st
 
     target_str = " ".join(targets)
 
-    # Guard against empty ports — use default 1-1000 if not specified
+    # Guard against empty ports — fall back to the top-1000 profile if not specified
     if not ports or not ports.strip():
         ports = DEFAULT_QUICK_PORTS
         logging.warning("[nmap-fallback] Empty ports string — defaulting to %s", ports)
@@ -1258,6 +1580,12 @@ def masscan_then_nmap(body: MasscanBody, background_tasks: BackgroundTasks):
     # Validate inputs
     body.validate_inputs()
 
+    # This route feeds nmap enrichment, so an unspecified scope means the
+    # frequency-ranked top-1000 — NOT the model's old blanket 1-65535, which made
+    # every MCP client that omitted ports run a full sweep plus service detection
+    # on everything it found.
+    body.ports = body.resolve_ports(DEFAULT_QUICK_PORTS)
+
     # Store per-scan nmap options for the background task to pick up
     global _nmap_scan_opts
     _nmap_scan_opts = {
@@ -1405,6 +1733,11 @@ def masscan_only(body: MasscanBody, background_tasks: BackgroundTasks):
     """
     # Validate inputs
     body.validate_inputs()
+
+    # Pure discovery sweep with no nmap enrichment behind it, so an unspecified
+    # scope means the full range — same value this model defaulted to before, kept
+    # deliberately rather than by omission.
+    body.ports = body.resolve_ports("1-65535")
 
     # Create job
     job_id = create_job("masscan-only", {
@@ -1972,18 +2305,22 @@ class UdpScanBody(BaseModel):
             except ValidationError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid target '{target}': {e}")
         self.targets = validated_targets
+        # Authorization boundary. Placed in validate_inputs, which every
+        # job-creating route already calls, so no route can add itself
+        # later and quietly skip the check.
+        _enforce_scope(self.targets, self.__class__.__name__)
 
         # Validate ports format - handle both port ranges and nmap arguments
         self.ports = self.ports.strip()
         try:
             if self.ports.startswith('--top-ports'):
                 # Handle nmap --top-ports argument (allow spaces, dashes, letters, numbers)
-                sanitize_command_arg(self.ports, allowed_chars=r'^[a-zA-Z0-9\s\-=]+$')
+                sanitize_command_arg(self.ports, allowed_chars=r'^[a-zA-Z0-9\s\-=]+$', max_len=65536)
             else:
                 # Handle traditional port ranges (numbers, commas, dashes only)
                 # Strip spaces for traditional port ranges
                 self.ports = self.ports.replace(' ', '')
-                sanitize_command_arg(self.ports, allowed_chars=r'^[0-9,\-]+$')
+                sanitize_command_arg(self.ports, allowed_chars=r'^[0-9,\-]+$', max_len=65536)
         except ValidationError as e:
             raise HTTPException(status_code=400, detail=f"Invalid ports format: {e}")
 
@@ -2236,7 +2573,14 @@ async def export_logs():
 class FullScanRequest(BaseModel):
     targets: List[str] = Field(..., description="List of IPs/CIDRs to scan")
     quick_ports: str = Field(DEFAULT_QUICK_PORTS, description="Ports for quick initial scan")
-    full_ports: str = Field("", description="Ports for full scan (empty = skip deep scan)")
+    # Defaults to the full-range follow-up rather than "". Phase 2 runs it in
+    # PARALLEL with the phase-1 nmap enrichment, so it costs no extra wall-clock,
+    # and leaving it opt-in meant every caller that omitted the field — including
+    # the BFF's own /scans/full route — silently shipped top-1000-only coverage.
+    # Callers that deliberately want a narrow scope (an operator-selected port
+    # profile) send "" explicitly to skip it.
+    full_ports: str = Field(DEFAULT_DEEP_SCAN_PORTS,
+                            description="Ports for the follow-up sweep (empty = skip deep scan)")
     rate: int = Field(1000, ge=1, le=100000, description="Masscan rate (packets per second)")
     interface: Optional[str] = Field(None, description="Network interface for Masscan (-e)")
     run_smb_vuln_scan: bool = Field(False, description="Run SMB vulnerability scan if 139/445 found")
@@ -2254,19 +2598,32 @@ class FullScanRequest(BaseModel):
             except ValidationError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid target '{target}': {e}")
         self.targets = validated_targets
+        # Authorization boundary. Placed in validate_inputs, which every
+        # job-creating route already calls, so no route can add itself
+        # later and quietly skip the check.
+        _enforce_scope(self.targets, self.__class__.__name__)
 
         # Validate ports format (skip empty full_ports — means no deep scan)
         for ports_field in [self.quick_ports, self.full_ports]:
             if not ports_field.strip():
                 continue
             try:
+                # max_len=65536 matches the masscan/UDP request models above. The
+                # 1000-char default is far too small for a port SPEC: profiles must
+                # resolve to explicit lists (masscan has no --top-ports), and the
+                # top-1000 is 3,808 characters — 3,838 once WEB_PORTS are unioned in.
+                # Without this the route rejected its own default scope with
+                # "Invalid ports format: argument too long (3838 > 1000)", and the
+                # agent quietly fell back to a plain 1-1000 masscan.
+                # Length is not what makes this argument dangerous; the character
+                # allowlist is, and that still applies unchanged.
                 if ports_field.startswith('--top-ports'):
                     # Handle nmap --top-ports argument (allow spaces, dashes, letters, numbers)
-                    sanitize_command_arg(ports_field, allowed_chars=r'^[a-zA-Z0-9\s\-=]+$')
+                    sanitize_command_arg(ports_field, allowed_chars=r'^[a-zA-Z0-9\s\-=]+$', max_len=65536)
                 else:
                     # Handle traditional port ranges (numbers, commas, dashes only)
                     ports_field = ports_field.replace(' ', '')
-                    sanitize_command_arg(ports_field, allowed_chars=r'^[0-9,\-]+$')
+                    sanitize_command_arg(ports_field, allowed_chars=r'^[0-9,\-]+$', max_len=65536)
             except ValidationError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid ports format: {e}")
 
@@ -2378,8 +2735,8 @@ def _run_full_scan_async(
 ):
     """
     Background task for phased full scan:
-    Phase 1: Quick masscan (1-1000)
-    Phase 2: Parallel - Nmap on Phase 1 ports + Masscan (1001-65535)
+    Phase 1: Quick masscan (nmap top-1000, frequency-ranked)
+    Phase 2: Parallel - Nmap on Phase 1 ports + Masscan (full range, 1-65535)
     Phase 3: Nmap on Phase 2 ports
     Phase 4: SMB vulnerability scan (if enabled and 139/445 found)
     """
@@ -2397,7 +2754,12 @@ def _run_full_scan_async(
             "scan_type": "full-scan",
             "targets": targets[:10],
             "targets_count": len(targets),
-            "phases": ["quick-discovery", "parallel-enum", "service-detection", "vuln-scan"]
+            "phases": ["quick-discovery", "parallel-enum", "service-detection", "vuln-scan"],
+            # Scope, so a subscriber can tell a top-1000 pass from a narrow
+            # operator-selected profile without inferring it from the results.
+            "quick_ports": quick_ports,
+            "full_ports": full_ports or None,
+            "deep_sweep": bool(full_ports.strip()),
         })
 
         result = {
@@ -2409,7 +2771,7 @@ def _run_full_scan_async(
         }
 
         # ========================================
-        # PHASE 1: Quick Masscan (1-1000)
+        # PHASE 1: Quick Masscan (top-1000)
         # ========================================
         update_job_status(job_id, "running", "phase1_quick_scan", f"Phase 1: Quick scan ports {quick_ports}")
         logging.info(f"[{job_id}] Phase 1: Quick masscan {quick_ports}")
@@ -2476,7 +2838,7 @@ def _run_full_scan_async(
             return results
 
         def run_full_masscan():
-            """Run masscan on remaining ports (1001-65535)"""
+            """Run the follow-up masscan sweep over the full range (1-65535)"""
             nonlocal full_ports_found
             try:
                 path = _run_masscan(targets, full_ports, rate, interface)
@@ -2739,8 +3101,8 @@ def full_scan(body: FullScanRequest, background_tasks: BackgroundTasks):
     Start a comprehensive full port scan with parallel phases.
 
     This runs a phased scanning approach for maximum coverage:
-    - Phase 1: Quick masscan (ports 1-1000)
-    - Phase 2: PARALLEL - Nmap on Phase 1 ports + Masscan (ports 1001-65535)
+    - Phase 1: Quick masscan (nmap top-1000, frequency-ranked)
+    - Phase 2: PARALLEL - Nmap on Phase 1 ports + Masscan (full range, 1-65535)
     - Phase 3: Nmap service detection on Phase 2 ports
     - Phase 4: SMB vulnerability scan (if 139/445 found)
 
@@ -2908,6 +3270,10 @@ class CredentialCheckRequest(BaseModel):
             except ValidationError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid target '{target}': {e}")
         self.targets = validated_targets
+        # Authorization boundary. Placed in validate_inputs, which every
+        # job-creating route already calls, so no route can add itself
+        # later and quietly skip the check.
+        _enforce_scope(self.targets, self.__class__.__name__)
 
         # Validate services if provided
         valid_services = ["ssh", "ftp", "telnet", "mysql", "postgres", "vnc", "tomcat", "smb", "redis", "mongodb", "mssql"]
@@ -2956,6 +3322,29 @@ def _run_credential_check_async(
 
                 all_results.append(result)
                 total_valid += result.get("total_valid", 0)
+
+                # Enumerate every hit into the JOB log. cred_checker already logs
+                # each one, but without the job id — so a job-scoped log view
+                # showed the ports being tried and then nothing, reading as "found
+                # nothing" even on a run that recovered msfadmin:msfadmin. The
+                # count alone in the completion line is not enough to act on;
+                # the operator needs service/host/port/username to use it.
+                for chk in (result.get("checks") or []):
+                    for cred in (chk.get("valid_credentials") or []):
+                        logging.info(
+                            "[%s] VALID CREDENTIAL: %s://%s:%s  %s:%s",
+                            job_id,
+                            chk.get("service", "?"),
+                            chk.get("target", validated_target),
+                            chk.get("port", "?"),
+                            cred.get("username", "?"),
+                            cred.get("password", "?"),
+                        )
+                if result.get("total_valid", 0) == 0:
+                    logging.info("[%s] no valid credentials on %s (%d pairs tried)",
+                                 job_id, validated_target,
+                                 sum((c.get("credentials_tested") or 0)
+                                     for c in (result.get("checks") or [])))
 
             except Exception as e:
                 logging.error(f"[{job_id}] Credential check failed for {target}: {e}")
@@ -3022,6 +3411,12 @@ def _run_credential_check_async(
                                 "port":     int(port_n) if port_n is not None else 0,
                                 "protocol": service,
                                 "username": cred.get("username", ""),
+                                # The recovered password. This producer used to
+                                # drop it, so parse_brutus had nothing to store
+                                # even once it gained a column for it — the
+                                # plaintext was logged one screen up and then
+                                # thrown away.
+                                "password": cred.get("password", ""),
                                 "success":  True,
                                 "audit":    chk_audit,
                             }))

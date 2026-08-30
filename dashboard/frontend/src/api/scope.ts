@@ -27,12 +27,23 @@ export function useScope(name: string) {
     queryKey: ['scope', name, engagementId],
     queryFn: async () => {
       if (engagementId && name) {
-        // Fetch from engagement-scoped endpoint
-        return apiFetch<ScopeResponse>(
-          `/engagements/${engagementId}/scopes/${encodeURIComponent(name)}`
-        )
+        // Engagement-scoped first, but fall back when it yields NOTHING.
+        //
+        // Scope NAMES come from a global list when no engagement is selected
+        // (see useScopeNames), so the dropdown can offer a scope the
+        // currently-selected engagement does not own. The engagement-scoped
+        // lookup then returns zero targets, and a consumer that reads "no
+        // targets" as "nothing is in scope" hides every row -- which is how
+        // selecting the `msf` scope emptied the Assets table instead of
+        // showing 192.168.1.150.
+        try {
+          const scoped = await apiFetch<ScopeResponse>(
+            `/engagements/${engagementId}/scopes/${encodeURIComponent(name)}`
+          )
+          if (scoped?.targets?.length) return scoped
+        } catch { /* fall through to the global lookup */ }
       }
-      // Fallback to global scope endpoint
+      // Global scope endpoint: the same scope, not filtered by engagement.
       return apiFetch<ScopeResponse>(`/scope?name=${encodeURIComponent(name)}`)
     },
     enabled: !!name,

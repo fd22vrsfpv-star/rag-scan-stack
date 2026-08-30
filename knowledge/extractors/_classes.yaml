@@ -1,0 +1,129 @@
+# Analysis-profile CLASS templates.
+#
+# WHY THIS FILE
+# -------------
+# 103 tools in the catalogue, 5 with an extraction spec. Writing 98 more specs
+# by hand does not happen — but the tools are not 103 different problems. A
+# credential attack always reports recovered pairs and a rate, whatever the
+# binary; a user enumerator always yields a list of accounts. So the SHAPE lives
+# here once and a per-tool spec supplies only the patterns that differ.
+#
+# A tool's own spec always wins. Merging is one level deep for `schema` and
+# `deterministic`, and additive for `notable` and `follow_on` — a tool rule with
+# the same `id` replaces the class rule rather than duplicating it.
+#
+# NOT loaded as a spec itself: `_spec_files()` skips names beginning with "_".
+#
+# Every `follow_on` here either runs something (`scanner` + `script`) or feeds a
+# sink that already has a consumer (`feeds`). A rule that does neither is
+# rejected by the loader, because a declaration with no effect reads as coverage.
+
+classes:
+
+  user_enumeration:
+    description: Discovers account names on a service.
+    prompt: |
+      Extract the account names this tool proved to exist. Report only names the
+      output states as valid — a name that was merely TRIED is not a result.
+    schema:
+      valid_users:
+        type: list
+        description: account names the tool confirmed exist
+    notable:
+      - id: users_enumerated
+        when: len(valid_users) > 0
+        severity: medium
+        title: "{valid_users} account name(s) enumerated"
+        detail: >
+          A confirmed account list removes the guessing half of a credential
+          attack: every name is a real login rather than a dictionary entry.
+        params: [valid_users]
+    follow_on:
+      # The loop the SMB path already proved end to end: enumerate -> identities
+      # -> generated wordlist -> a targeted spray instead of a generic one.
+      - id: users_to_identities
+        when: len(valid_users) > 0
+        feeds: identities
+        feed_field: valid_users
+        category: recon
+        priority: 10
+        rationale: >
+          Recorded as principals with status='unknown' — enumeration proves an
+          account EXISTS, not that it can be used. They then reach every
+          generated wordlist for this host automatically.
+
+  credential_attack:
+    description: Online password guessing against a service.
+    prompt: |
+      Extract credentials the tool RECOVERED, and whether the run could ever
+      have finished. A candidate being tried is not a result.
+    schema:
+      credentials:
+        type: list
+        description: recovered pairs, never candidates that were merely tried
+      valid_found:
+        type: number
+      remaining_hours:
+        type: number
+    notable:
+      - id: credentials_recovered
+        when: len(credentials) > 0
+        severity: critical
+        title: "{credentials} credential pair(s) recovered"
+        detail: >
+          A working credential is the highest-value result this class produces.
+          It belongs in the vault and opens follow-on enumeration on every
+          service that accepts the same pair.
+      - id: attack_cannot_finish
+        when: remaining_hours > 24
+        severity: medium
+        title: "Attack could not finish — {remaining_hours}h remaining"
+        detail: >
+          The candidate list is too large for the achieved rate, so the run was
+          always going to be killed by the deadline. A timeout here says nothing
+          about the target's password strength.
+    follow_on:
+      - id: recovered_credentials_to_vault
+        when: len(credentials) > 0
+        feeds: identities
+        feed_field: credentials
+        category: credentials
+        priority: 5
+        rationale: >
+          A recovered pair proves the account is usable, so the identity moves
+          from 'unknown' to 'active' and the secret is available to follow-on
+          enumeration.
+
+  service_enumeration:
+    description: Lists services, often on ports a port scan would miss.
+    prompt: |
+      Extract each service the tool reports, with its port and protocol. These
+      are frequently on high, non-standard ports that a default port scan never
+      reaches.
+    schema:
+      services:
+        type: list
+        description: service names reported
+      service_ports:
+        type: list
+        description: ports the services are bound to
+    notable:
+      - id: services_enumerated
+        when: len(services) > 0
+        severity: info
+        title: "{services} service(s) enumerated"
+        detail: >
+          Testing parameters rather than a defect: these name what is reachable,
+          including ports outside a default scan range.
+        params: [services, service_ports]
+    follow_on:
+      - id: services_to_ports
+        when: len(service_ports) > 0
+        feeds: ports
+        feed_field: service_ports
+        category: recon
+        priority: 15
+        rationale: >
+          A service on a non-standard port is invisible to the next scan unless
+          it is recorded. rpcinfo routinely reports ports in the 30000-50000
+          range that a default nmap run never touches.

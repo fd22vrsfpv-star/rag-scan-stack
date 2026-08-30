@@ -191,7 +191,11 @@ encrypt_backup() {
     if [ "$ENABLE_ENCRYPTION" = "true" ]; then
         log "Encrypting backup files..."
 
-        for file in "$BACKUP_DIR"/*.{gz,dump,sql} 2>/dev/null; do
+        # A redirect is not valid in a `for ... in` list — this was a syntax
+        # error, so the WHOLE script failed to parse and no backup ever ran.
+        # The `[ -f "$file" ]` guard below already handles a glob that matched
+        # nothing, which is what the redirect was reaching for.
+        for file in "$BACKUP_DIR"/*.gz "$BACKUP_DIR"/*.dump "$BACKUP_DIR"/*.sql; do
             if [ -f "$file" ]; then
                 if gpg --encrypt --recipient "$ENCRYPTION_RECIPIENT" "$file"; then
                     log "  ${GREEN}✓ Encrypted: $(basename "$file")${NC}"
