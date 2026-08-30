@@ -59,6 +59,9 @@ class StartSessionRequest(BaseModel):
     # Surface-test phase: LLM-author a custom test per web finding instead of the
     # fixed WSTG-map command (falls back to the map; impactful still gated).
     enable_test_synthesis: Optional[bool] = None
+    # Surface-test phase: auto-fire queued impactful tests without the approval
+    # interrupt, capturing proof. The scope gate still refuses out-of-scope.
+    enable_auto_exploit: Optional[bool] = None
 
 
 class ResumeRequest(BaseModel):
