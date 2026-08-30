@@ -1475,6 +1475,93 @@ CREATE INDEX IF NOT EXISTS idx_exploit_results_pending_id ON public.exploit_resu
 CREATE INDEX IF NOT EXISTS idx_exploit_results_success ON public.exploit_results(success);
 CREATE INDEX IF NOT EXISTS idx_exploit_results_executed_at ON public.exploit_results(executed_at DESC);
 
+-- ============================================================================
+-- Security tests — reusable, re-runnable proof-of-exploitability records.
+-- ============================================================================
+-- security_tests is the TEST DEFINITION (a command + the assertion that proves
+-- it, tiered safe|impactful); security_test_runs is the append-only pass/fail
+-- HISTORY. This is a thin scheduling/assertion layer over machinery that already
+-- exists — it does NOT re-implement exploit execution:
+--   * an IMPACTFUL test references a pending_exploits row (its command + the
+--     approval gate live there) and each run maps to an exploit_results row;
+--   * a SAFE test carries its own command and each run maps to a tool_executions
+--     row (written by kali-listener /tools/execute).
+CREATE TABLE IF NOT EXISTS public.security_tests (
+    id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name                  text NOT NULL,
+    description           text,
+    tier                  text NOT NULL DEFAULT 'safe'
+                          CHECK (tier IN ('safe','impactful')),
+    -- free text on purpose (mirrors pending_exploits.exploit_type vocabulary);
+    -- a new category never needs a CHECK migration.
+    category              text,
+    target_ip             inet,
+    target_host           text,
+    target_port           integer,
+    target_service        text,
+    -- SAFE lane command; NULL for impactful (the command lives on the
+    -- referenced pending_exploit).
+    command               text,
+    tool                  text,
+    -- Structured assertion, evaluated deterministically by record_test_run.
+    assertion             jsonb NOT NULL DEFAULT '{}'::jsonb,
+    source_finding_source text,
+    source_finding_id     uuid,
+    attack_vector_id      uuid REFERENCES public.attack_vectors(id) ON DELETE SET NULL,
+    pending_exploit_id    uuid REFERENCES public.pending_exploits(id) ON DELETE SET NULL,
+    created_by_session    uuid REFERENCES public.agent_sessions(id) ON DELETE SET NULL,
+    engagement_id         uuid REFERENCES public.engagements(id) ON DELETE SET NULL,
+    enabled               boolean NOT NULL DEFAULT true,
+    -- Latest-run rollup for cheap list rendering (updated by record_test_run).
+    last_run_at           timestamptz,
+    last_run_status       text CHECK (last_run_status IN ('pass','fail','error','skipped')),
+    run_count             integer NOT NULL DEFAULT 0,
+    metadata              jsonb DEFAULT '{}'::jsonb,
+    created_at            timestamptz NOT NULL DEFAULT now(),
+    updated_at            timestamptz NOT NULL DEFAULT now(),
+    -- An impactful test MUST reference a pending_exploit (its command + approval
+    -- gate); a safe test MUST carry its own command.
+    CONSTRAINT security_tests_lane_ck CHECK (
+        (tier = 'impactful' AND pending_exploit_id IS NOT NULL)
+        OR (tier = 'safe' AND command IS NOT NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_security_tests_session    ON public.security_tests(created_by_session);
+CREATE INDEX IF NOT EXISTS idx_security_tests_engagement ON public.security_tests(engagement_id) WHERE engagement_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_security_tests_target     ON public.security_tests(target_ip, target_port);
+CREATE INDEX IF NOT EXISTS idx_security_tests_tier       ON public.security_tests(tier);
+CREATE INDEX IF NOT EXISTS idx_security_tests_pending    ON public.security_tests(pending_exploit_id) WHERE pending_exploit_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_security_tests_enabled    ON public.security_tests(enabled) WHERE enabled;
+
+CREATE TABLE IF NOT EXISTS public.security_test_runs (
+    id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    test_id              uuid NOT NULL REFERENCES public.security_tests(id) ON DELETE CASCADE,
+    ran_at               timestamptz NOT NULL DEFAULT now(),
+    completed_at         timestamptz,
+    duration_ms          integer,
+    status               text NOT NULL DEFAULT 'error'
+                         CHECK (status IN ('pass','fail','error','skipped')),
+    lane                 text NOT NULL CHECK (lane IN ('safe','impactful')),
+    command_run          text,
+    exit_code            integer,
+    result_summary       text,
+    assertion_eval       jsonb DEFAULT '{}'::jsonb,
+    -- Exactly one is set per lane (enforced in record_test_run).
+    tool_execution_id    uuid REFERENCES public.tool_executions(id) ON DELETE SET NULL,
+    exploit_result_id    uuid REFERENCES public.exploit_results(id) ON DELETE SET NULL,
+    triggered_by         text,
+    triggered_by_session uuid REFERENCES public.agent_sessions(id) ON DELETE SET NULL,
+    engagement_id        uuid REFERENCES public.engagements(id) ON DELETE SET NULL,
+    output               text,
+    metadata             jsonb DEFAULT '{}'::jsonb,
+    created_at           timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_security_test_runs_test       ON public.security_test_runs(test_id, ran_at DESC);
+CREATE INDEX IF NOT EXISTS idx_security_test_runs_status     ON public.security_test_runs(status);
+CREATE INDEX IF NOT EXISTS idx_security_test_runs_engagement ON public.security_test_runs(engagement_id) WHERE engagement_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_security_test_runs_toolexec   ON public.security_test_runs(tool_execution_id) WHERE tool_execution_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_security_test_runs_exploitres ON public.security_test_runs(exploit_result_id) WHERE exploit_result_id IS NOT NULL;
+
 -- msf_modules (Metasploit module cache)
 CREATE TABLE IF NOT EXISTS public.msf_modules (
     id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1940,6 +2027,11 @@ END IF; END$$;
 DO $$ BEGIN IF to_regclass('public.pending_exploits') IS NOT NULL THEN
   DROP TRIGGER IF EXISTS trg_pending_exploits_updated_at ON public.pending_exploits;
   CREATE TRIGGER trg_pending_exploits_updated_at BEFORE UPDATE ON public.pending_exploits FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+END IF; END$$;
+
+DO $$ BEGIN IF to_regclass('public.security_tests') IS NOT NULL THEN
+  DROP TRIGGER IF EXISTS trg_security_tests_updated_at ON public.security_tests;
+  CREATE TRIGGER trg_security_tests_updated_at BEFORE UPDATE ON public.security_tests FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
 END IF; END$$;
 
 DO $$ BEGIN IF to_regclass('public.webhooks') IS NOT NULL THEN
@@ -2544,7 +2636,7 @@ CREATE TABLE IF NOT EXISTS public.evidence_store (
 CREATE TABLE IF NOT EXISTS public.evidence_links (
     id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     evidence_id    uuid NOT NULL REFERENCES public.evidence_store(id) ON DELETE CASCADE,
-    entity_type    text NOT NULL CHECK (entity_type IN ('finding','web_finding','playwright_finding','asset','checklist_item','exploit_result')),
+    entity_type    text NOT NULL CHECK (entity_type IN ('finding','web_finding','playwright_finding','asset','checklist_item','exploit_result','security_test_run')),
     entity_id      uuid NOT NULL,
     created_at     timestamptz DEFAULT now(),
     UNIQUE(evidence_id, entity_type, entity_id)
@@ -5220,3 +5312,16 @@ CREATE INDEX IF NOT EXISTS idx_raw_artifacts_target   ON public.raw_artifacts (t
 CREATE INDEX IF NOT EXISTS idx_raw_artifacts_exec_id  ON public.raw_artifacts (exec_id);
 CREATE INDEX IF NOT EXISTS idx_raw_artifacts_job_id   ON public.raw_artifacts (job_id);
 CREATE INDEX IF NOT EXISTS idx_raw_artifacts_created  ON public.raw_artifacts (created_at DESC);
+
+-- Existing installs: widen the evidence_links entity_type CHECK so a
+-- security_test_run can be a first-class evidence entity (symmetric with
+-- exploit_result). Idempotent — a fresh table already has the wider set above.
+DO $$ BEGIN
+  ALTER TABLE public.evidence_links DROP CONSTRAINT IF EXISTS evidence_links_entity_type_check;
+  ALTER TABLE public.evidence_links ADD CONSTRAINT evidence_links_entity_type_check
+    CHECK (entity_type IN ('finding','web_finding','playwright_finding','asset',
+                           'checklist_item','exploit_result','security_test_run'));
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
+
+GRANT ALL PRIVILEGES ON public.security_tests     TO app;
+GRANT ALL PRIVILEGES ON public.security_test_runs TO app;

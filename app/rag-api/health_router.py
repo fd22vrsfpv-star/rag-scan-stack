@@ -313,6 +313,7 @@ async def check_database_schema():
             'jobs', 'tasks',
             # Exploit management
             'pending_exploits', 'exploit_results', 'exploit_chunks', 'tool_executions',
+            'security_tests', 'security_test_runs',
             # Webhooks
             'webhooks', 'webhook_events', 'webhook_deliveries',
             # Engagements / Workflow

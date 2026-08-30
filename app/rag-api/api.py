@@ -7060,6 +7060,256 @@ def attack_vectors_graph(
     return _av.get_graph(engagement_id=eid)
 
 
+# ── Security tests (agent-created, re-runnable proof records) ────────────────
+class SecurityTestCreate(BaseModel):
+    name: str
+    tier: str = "safe"                     # safe | impactful
+    description: Optional[str] = None
+    category: Optional[str] = None
+    target_ip: Optional[str] = None
+    target_host: Optional[str] = None
+    target_port: Optional[int] = None
+    target_service: Optional[str] = None
+    command: Optional[str] = None
+    tool: Optional[str] = None
+    assertion: Optional[dict] = None
+    source_finding_source: Optional[str] = None
+    source_finding_id: Optional[str] = None
+    attack_vector_id: Optional[str] = None
+    pending_exploit_id: Optional[str] = None
+    created_by_session: Optional[str] = None
+    engagement_id: Optional[str] = None
+
+
+class SecurityTestPatch(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    enabled: Optional[bool] = None
+    assertion: Optional[dict] = None
+
+
+class SecurityTestRunReq(BaseModel):
+    triggered_by: str = "operator"
+    override_target: Optional[dict] = None   # {target_ip, target_port}
+
+
+@app.get("/security-tests", tags=["Security Tests"])
+def security_tests_list(
+    session_id: Optional[str] = Query(default=None),
+    engagement_id: Optional[str] = Query(default=None),
+    target_ip: Optional[str] = Query(default=None),
+    tier: Optional[str] = Query(default=None),
+    enabled: Optional[bool] = Query(default=None),
+    limit: int = Query(default=200, le=1000),
+    authorized: bool = Depends(auth),
+):
+    """List security tests with the latest-run rollup, filtered."""
+    where, params = [], []
+    if session_id:   where.append("created_by_session = %s::uuid"); params.append(session_id)
+    if engagement_id: where.append("engagement_id = %s::uuid");     params.append(engagement_id)
+    if target_ip:    where.append("target_ip = %s::inet");          params.append(target_ip)
+    if tier:         where.append("tier = %s");                     params.append(tier)
+    if enabled is not None: where.append("enabled = %s");           params.append(enabled)
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""SELECT id, name, description, tier, category, target_ip, target_host,
+                       target_port, target_service, command, tool, assertion,
+                       pending_exploit_id, created_by_session, engagement_id, enabled,
+                       last_run_at, last_run_status, run_count, created_at
+                  FROM public.security_tests {clause}
+                 ORDER BY created_at DESC LIMIT %s""",
+            (*params, limit),
+        )
+        return {"tests": [dict(r) for r in cur.fetchall()]}
+
+
+@app.get("/agent-sessions/{session_id}/security-tests", tags=["Security Tests"])
+def security_tests_for_session(session_id: str, authorized: bool = Depends(auth)):
+    """Convenience: the tests a given agent session created (drives the UI tab)."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT id, name, tier, category, target_ip, target_port, target_service,
+                      tool, enabled, last_run_at, last_run_status, run_count, created_at
+                 FROM public.security_tests
+                WHERE created_by_session = %s::uuid
+                ORDER BY created_at DESC""",
+            (session_id,),
+        )
+        return {"session_id": session_id, "tests": [dict(r) for r in cur.fetchall()]}
+
+
+@app.get("/security-tests/{test_id}", tags=["Security Tests"])
+def security_test_get(test_id: str, authorized: bool = Depends(auth)):
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM public.security_tests WHERE id = %s::uuid", (test_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"security_test not found: {test_id}")
+        return dict(row)
+
+
+@app.get("/security-tests/{test_id}/runs", tags=["Security Tests"])
+def security_test_runs(test_id: str, limit: int = Query(default=50, le=500),
+                       authorized: bool = Depends(auth)):
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT id, ran_at, completed_at, duration_ms, status, lane, command_run,
+                      exit_code, result_summary, assertion_eval, tool_execution_id,
+                      exploit_result_id, triggered_by
+                 FROM public.security_test_runs
+                WHERE test_id = %s::uuid ORDER BY ran_at DESC LIMIT %s""",
+            (test_id, limit),
+        )
+        return {"test_id": test_id, "runs": [dict(r) for r in cur.fetchall()]}
+
+
+@app.post("/security-tests", tags=["Security Tests"])
+def security_test_create(body: SecurityTestCreate, authorized: bool = Depends(auth)):
+    """Create a test definition. Used by the surface-test agent phase."""
+    if body.tier not in ("safe", "impactful"):
+        raise HTTPException(400, "tier must be safe|impactful")
+    if body.tier == "safe" and not body.command:
+        raise HTTPException(400, "a safe test requires a command")
+    if body.tier == "impactful" and not body.pending_exploit_id:
+        raise HTTPException(400, "an impactful test requires a pending_exploit_id")
+    eid = _validate_engagement_uuid(body.engagement_id or _resolve_engagement_id(None))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """INSERT INTO public.security_tests
+                 (name, description, tier, category, target_ip, target_host,
+                  target_port, target_service, command, tool, assertion,
+                  source_finding_source, source_finding_id, attack_vector_id,
+                  pending_exploit_id, created_by_session, engagement_id)
+               VALUES (%s,%s,%s,%s,%s::inet,%s,%s,%s,%s,%s,%s,%s,%s::uuid,%s::uuid,
+                       %s::uuid,%s::uuid,%s::uuid)
+               RETURNING id, created_at""",
+            (body.name, body.description, body.tier, body.category, body.target_ip,
+             body.target_host, body.target_port, body.target_service, body.command,
+             body.tool, Json(body.assertion or {}), body.source_finding_source,
+             body.source_finding_id, body.attack_vector_id, body.pending_exploit_id,
+             body.created_by_session, eid),
+        )
+        row = cur.fetchone()
+    return {"ok": True, "id": str(row["id"]), "created_at": row["created_at"].isoformat()}
+
+
+@app.patch("/security-tests/{test_id}", tags=["Security Tests"])
+def security_test_patch(test_id: str, body: SecurityTestPatch,
+                        authorized: bool = Depends(auth)):
+    sets, params = [], []
+    if body.name is not None:        sets.append("name = %s");        params.append(body.name)
+    if body.description is not None:  sets.append("description = %s"); params.append(body.description)
+    if body.enabled is not None:      sets.append("enabled = %s");     params.append(body.enabled)
+    if body.assertion is not None:    sets.append("assertion = %s");   params.append(Json(body.assertion))
+    if not sets:
+        raise HTTPException(400, "nothing to update")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"UPDATE public.security_tests SET {', '.join(sets)} WHERE id = %s::uuid RETURNING id",
+            (*params, test_id),
+        )
+        if not cur.fetchone():
+            raise HTTPException(404, f"security_test not found: {test_id}")
+    return {"ok": True, "id": test_id}
+
+
+@app.post("/security-tests/{test_id}/run", tags=["Security Tests"])
+def security_test_run(test_id: str, body: SecurityTestRunReq,
+                      authorized: bool = Depends(auth)):
+    """Re-run a stored test.
+
+    SAFE  → dispatch to kali-listener /tools/execute (itself scope- and
+            concurrency-gated), then record the run.
+    IMPACTFUL → NEVER executes here. Re-sets the referenced pending_exploit to
+            'pending' and returns 202 requires_approval. Execution happens only
+            through the existing approval → execute_approved_exploit path, which
+            structurally prevents a re-run from bypassing the human gate.
+    """
+    import security_tests as _st
+    with get_db(autocommit=True) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM public.security_tests WHERE id = %s::uuid", (test_id,))
+        t = cur.fetchone()
+    if not t:
+        raise HTTPException(404, f"security_test not found: {test_id}")
+    if not t["enabled"]:
+        raise HTTPException(409, "test is disabled")
+
+    if t["tier"] == "impactful":
+        pid = t.get("pending_exploit_id")
+        if not pid:
+            raise HTTPException(409, "impactful test has no pending_exploit to approve")
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE public.pending_exploits SET status='pending' WHERE id = %s::uuid",
+                        (pid,))
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=202, content={
+            "ok": True, "run_id": None, "status": "skipped",
+            "requires_approval": True, "pending_exploit_id": str(pid),
+            "message": ("Impactful test re-run needs operator approval. Approve via "
+                        "POST /pentest/{session_id}/approve with this pending_exploit_id."),
+        })
+
+    # SAFE lane — dispatch the stored command to the gated executor.
+    override = body.override_target or {}
+    target = override.get("target_ip") or t.get("target_ip") or t.get("target_host")
+    port = override.get("target_port") or t.get("target_port")
+    if not target or not t.get("command"):
+        raise HTTPException(400, "safe test has no target/command to run")
+    import httpx as _hx, time as _time
+    base = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    t0 = _time.time()
+    try:
+        with _hx.Client(verify=False, timeout=max(30, (t.get("metadata") or {}).get("timeout", 300) if isinstance(t.get("metadata"), dict) else 300)) as c:
+            resp = c.post(f"{base}/tools/execute", json={
+                "tool": t.get("tool") or "curl", "command": t["command"],
+                "target": str(target), "port": port, "service": t.get("target_service"),
+                "timeout": 300})
+    except Exception as e:
+        # The executor was unreachable — the run never completed. Record error.
+        with get_db() as conn:
+            r = _st.record_test_run(conn, test_id=test_id, lane="safe",
+                command_run=t["command"], exit_code=None, output=None,
+                status_override="error", triggered_by=body.triggered_by,
+                engagement_id=t.get("engagement_id"))
+        raise HTTPException(502, f"executor unreachable: {e}")
+    if resp.status_code in (403, 400, 429):
+        with get_db() as conn:
+            r = _st.record_test_run(conn, test_id=test_id, lane="safe",
+                command_run=t["command"], exit_code=None,
+                output=f"[{resp.status_code}] {resp.text[:300]}",
+                status_override="skipped", triggered_by=body.triggered_by,
+                engagement_id=t.get("engagement_id"))
+        return {"ok": True, "run_id": r["run_id"], "status": "skipped",
+                "reason": f"executor refused ({resp.status_code})", "detail": resp.text[:300]}
+    data = resp.json() if resp.headers.get("content-type","").startswith("application/json") else {}
+    exec_id = data.get("exec_id") or data.get("execution_id")
+    # /tools/execute runs async; poll the execution briefly for a terminal state.
+    exit_code, out, http_status = None, "", None
+    if exec_id:
+        with _hx.Client(verify=False, timeout=30) as c:
+            for _ in range(20):
+                _time.sleep(3)
+                er = c.get(f"{base}/tools/executions/{exec_id}")
+                if er.status_code != 200:
+                    break
+                ed = er.json()
+                if ed.get("status") in ("completed", "failed", "timeout"):
+                    exit_code = ed.get("exit_code")
+                    out = ed.get("output") or ""
+                    pr = ed.get("parsed_results") or {}
+                    http_status = pr.get("status_code") if isinstance(pr, dict) else None
+                    break
+    dur = int((_time.time() - t0) * 1000)
+    with get_db() as conn:
+        r = _st.record_test_run(conn, test_id=test_id, lane="safe",
+            command_run=t["command"], exit_code=exit_code, output=out,
+            duration_ms=dur, tool_execution_id=exec_id, http_status=http_status,
+            triggered_by=body.triggered_by, engagement_id=t.get("engagement_id"))
+    return {"ok": True, "run_id": r["run_id"], "status": r["status"],
+            "result_summary": r["result_summary"], "tool_execution_id": exec_id}
+
+
 @app.post("/cleanup/exploits", tags=["Maintenance"])
 def cleanup_exploits(
     dry_run: bool = Query(default=False),

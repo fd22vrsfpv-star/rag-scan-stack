@@ -534,6 +534,10 @@ _ALL_EVENT_TYPES = [
     "langgraph_phase_completed", "langgraph_scan_dispatched",
     "langgraph_awaiting_approval", "langgraph_exploit_decision",
     "langgraph_exploit_executed",
+    # Surface-test phase (attack-surface analysis + custom test generation).
+    "langgraph_surface_analyzed", "langgraph_surface_test_planned",
+    "langgraph_surface_test_executed", "langgraph_surface_test_completed",
+    "langgraph_surface_decision",
 ]
 
 

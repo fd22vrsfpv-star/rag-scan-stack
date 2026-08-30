@@ -13,6 +13,7 @@ from routers.findings import router as findings_router
 from routers.rag import router as rag_router
 from routers.scans import router as scans_router
 from routers.exploits import router as exploits_router
+from routers.security_tests import router as security_tests_router
 from routers.reports import router as reports_router
 from routers.chat import router as chat_router
 from routers.feedback import router as feedback_router
@@ -101,6 +102,7 @@ app.include_router(imports_router)
 app.include_router(scans_router)
 app.include_router(rag_router)
 app.include_router(exploits_router)
+app.include_router(security_tests_router)
 app.include_router(reports_router)
 app.include_router(chat_router)
 app.include_router(feedback_router)

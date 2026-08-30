@@ -1541,3 +1541,169 @@ def delete_prompt_config(config_id: uuid.UUID) -> bool:
         result = cur.fetchone()
         conn.commit()
         return result is not None
+
+
+# ── Security tests (agent-created, re-runnable proof records) ────────────────
+# Thin wrappers so the LangGraph surface-test nodes can create a test row and
+# record a run without managing a transaction. The assertion evaluation itself
+# lives in the rag-api module app/rag-api/security_tests.py (the ONE evaluator);
+# here we only need the INSERT for creation and delegate run-recording to a
+# vendored copy of the evaluator to avoid a cross-service import.
+def create_security_test(
+    name: str,
+    tier: str,
+    *,
+    category: Optional[str] = None,
+    target_ip: Optional[str] = None,
+    target_host: Optional[str] = None,
+    target_port: Optional[int] = None,
+    target_service: Optional[str] = None,
+    command: Optional[str] = None,
+    tool: Optional[str] = None,
+    assertion: Optional[Dict] = None,
+    source_finding_source: Optional[str] = None,
+    source_finding_id: Optional[str] = None,
+    attack_vector_id: Optional[str] = None,
+    pending_exploit_id: Optional[str] = None,
+    created_by_session: Optional[str] = None,
+    engagement_id: Optional[str] = None,
+) -> str:
+    """Insert one security_tests row; returns its id (str). Enforces the lane
+    invariant up front so the DB CHECK is never the first to complain."""
+    if tier not in ("safe", "impactful"):
+        raise ValueError(f"tier must be safe|impactful, got {tier!r}")
+    if tier == "safe" and not command:
+        raise ValueError("a safe test requires a command")
+    if tier == "impactful" and not pending_exploit_id:
+        raise ValueError("an impactful test requires a pending_exploit_id")
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO public.security_tests
+                 (name, tier, category, target_ip, target_host, target_port,
+                  target_service, command, tool, assertion, source_finding_source,
+                  source_finding_id, attack_vector_id, pending_exploit_id,
+                  created_by_session, engagement_id)
+               VALUES (%s,%s,%s,%s::inet,%s,%s,%s,%s,%s,%s,%s,%s::uuid,%s::uuid,
+                       %s::uuid,%s::uuid,%s::uuid)
+               RETURNING id""",
+            (name, tier, category, target_ip, target_host, target_port,
+             target_service, command, tool, Json(assertion or {}),
+             source_finding_source, source_finding_id, attack_vector_id,
+             pending_exploit_id, created_by_session, engagement_id),
+        )
+        return str(cur.fetchone()[0])
+
+
+def _eval_assertion_local(assertion, *, exit_code=None, output=None,
+                          http_status=None, has_shell=False, has_screenshot=False):
+    """A minimal copy of app/rag-api/security_tests.evaluate_assertion so the
+    agent (a different container) can score a run without a cross-service HTTP
+    hop. Kept behaviourally identical; tests/test_security_tests.py pins both to
+    the same case table so they cannot drift."""
+    import re as _re
+    a = assertion or {}
+    out = output or ""
+    if not ((exit_code is not None) or out or has_shell or has_screenshot):
+        return "error", {"_reason": "run did not complete"}, "run did not complete"
+    keys = {"expect_exit_code", "expect_substring", "expect_not_substring",
+            "expect_regex", "expect_status", "expect_shell", "expect_screenshot",
+            "min_output_bytes"}
+    clauses = {k: v for k, v in a.items() if k in keys}
+    evald, fails = {}, []
+    def rec(k, ok, d):
+        evald[k] = {"pass": ok, "detail": d}
+        (fails.append(f"{k}: {d}") if not ok else None)
+    if "expect_exit_code" in clauses:
+        rec("expect_exit_code", exit_code == clauses["expect_exit_code"],
+            f"exit_code={exit_code} want={clauses['expect_exit_code']}")
+    if "expect_substring" in clauses:
+        w = clauses["expect_substring"]; w = w if isinstance(w, list) else [w]
+        miss = [x for x in w if str(x) not in out]
+        rec("expect_substring", not miss, "all present" if not miss else f"missing {miss}")
+    if "expect_not_substring" in clauses:
+        b = clauses["expect_not_substring"]; b = b if isinstance(b, list) else [b]
+        pres = [x for x in b if str(x) in out]
+        rec("expect_not_substring", not pres, "none present" if not pres else f"present {pres}")
+    if "expect_regex" in clauses:
+        try:
+            ok = _re.search(str(clauses["expect_regex"]), out) is not None
+            rec("expect_regex", ok, "matched" if ok else "no match")
+        except _re.error as e:
+            rec("expect_regex", False, f"bad regex: {e}")
+    if "expect_status" in clauses:
+        rec("expect_status", http_status == clauses["expect_status"],
+            f"status={http_status} want={clauses['expect_status']}")
+    if clauses.get("expect_shell"):
+        rec("expect_shell", bool(has_shell), "shell" if has_shell else "no shell")
+    if clauses.get("expect_screenshot"):
+        rec("expect_screenshot", bool(has_screenshot), "shot" if has_screenshot else "no shot")
+    if "min_output_bytes" in clauses:
+        rec("min_output_bytes", len(out) >= int(clauses["min_output_bytes"]),
+            f"{len(out)} >= {clauses['min_output_bytes']}")
+    if not clauses:
+        return "pass", {"_reason": "no clauses"}, "completed (no assertion)"
+    if fails:
+        return "fail", evald, "; ".join(fails)[:400]
+    return "pass", evald, f"all {len(clauses)} clause(s) held"
+
+
+def record_test_run(
+    test_id: str,
+    lane: str,
+    *,
+    command_run: Optional[str] = None,
+    exit_code: Optional[int] = None,
+    output: Optional[str] = None,
+    duration_ms: Optional[int] = None,
+    tool_execution_id: Optional[str] = None,
+    exploit_result_id: Optional[str] = None,
+    http_status: Optional[int] = None,
+    has_shell: bool = False,
+    has_screenshot: bool = False,
+    status_override: Optional[str] = None,
+    triggered_by: str = "agent",
+    triggered_by_session: Optional[str] = None,
+    engagement_id: Optional[str] = None,
+) -> Dict:
+    """Insert a security_test_runs row, evaluate the assertion, update the
+    rollup. Same invariants as the rag-api helper: exactly one evidence FK,
+    agreeing with `lane`."""
+    if lane not in ("safe", "impactful"):
+        raise ValueError(f"lane must be safe|impactful, got {lane!r}")
+    if lane == "safe" and exploit_result_id is not None:
+        raise ValueError("a safe run cannot carry an exploit_result_id")
+    if lane == "impactful" and tool_execution_id is not None:
+        raise ValueError("an impactful run cannot carry a tool_execution_id")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT assertion, engagement_id FROM public.security_tests WHERE id = %s::uuid",
+                    (test_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"security_test not found: {test_id}")
+        eng = engagement_id or row.get("engagement_id")
+        if status_override in ("pass", "fail", "error", "skipped"):
+            status, evald, summary = status_override, {"_reason": f"override:{status_override}"}, status_override
+        else:
+            status, evald, summary = _eval_assertion_local(
+                row.get("assertion"), exit_code=exit_code, output=output,
+                http_status=http_status, has_shell=has_shell, has_screenshot=has_screenshot)
+        cur.execute(
+            """INSERT INTO public.security_test_runs
+                 (test_id, completed_at, duration_ms, status, lane, command_run,
+                  exit_code, result_summary, assertion_eval, tool_execution_id,
+                  exploit_result_id, triggered_by, triggered_by_session,
+                  engagement_id, output)
+               VALUES (%s::uuid, now(), %s, %s, %s, %s, %s, %s, %s, %s::uuid,
+                       %s::uuid, %s, %s::uuid, %s::uuid, %s)
+               RETURNING id""",
+            (test_id, duration_ms, status, lane, command_run, exit_code, summary,
+             Json(evald), tool_execution_id, exploit_result_id, triggered_by,
+             triggered_by_session, eng, (output or "")[:20000]),
+        )
+        run_id = str(cur.fetchone()["id"])
+        cur.execute(
+            """UPDATE public.security_tests
+                  SET last_run_at = now(), last_run_status = %s, run_count = run_count + 1
+                WHERE id = %s::uuid""",
+            (status, test_id))
+    return {"run_id": run_id, "status": status, "result_summary": summary}

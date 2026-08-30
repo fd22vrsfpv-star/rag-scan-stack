@@ -76,6 +76,7 @@ SAMPLE_FROM = {
     "exploit_id":    ("/api/exploits/pending", ["exploits", "pending", "items", "data"], ["id", "exploit_id"]),
     "credential_id": ("/api/credentials", ["credentials", "findings", "items", "data"], ["id"]),
     "scope_name":    ("/api/scope/names", ["names", "scopes", "items", "data"], ["name", "scope_name"]),
+    "test_id":       ("/api/security-tests", ["tests", "items", "data"], ["id", "test_id"]),
 }
 
 # Params with a safe, stable literal. A 404 on these is a fine result — it

@@ -45,7 +45,8 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 # compare against. Raise it deliberately when tools are added.
 #   49 = the roster when AutoGen was retired
 #   50 = + get_tool_recommendations (structured, agent-actionable tests)
-MIN_TOOLS = 50
+#   51 = + analyze_attack_surface (one-host surface enumeration)
+MIN_TOOLS = 51
 
 
 def _agent_dir() -> pathlib.Path:

@@ -3822,6 +3822,129 @@ def get_scan_recommendations(context: str) -> str:
     return json.dumps(result, indent=2)
 
 
+def run_custom_test(tool: str, command: str, target: str, port: int = None,
+                    service: str = None, timeout: int = 300) -> str:
+    """Run ONE allowlisted, scope-gated security-test command and capture evidence.
+
+    DELIBERATELY NOT registered as an agent tool. It takes an arbitrary command
+    string, and handing that to a react-agent would let the model launder any
+    command through the gate — strictly more dangerous than the fixed start_*
+    dispatchers. It is called ONLY deterministically from the surface-test safe
+    lane. Keeping it off every LLM toolset preserves the property that the
+    toolset, not the prompt, enforces what can be dispatched.
+
+    It only POSTs to kali-listener /tools/execute, which independently enforces
+    the scope gate (fail-closed; scans the command for out-of-scope IP literals),
+    the tool allowlist (Metasploit excluded), the dangerous-char filter, and
+    MAX_CONCURRENT_SCANS. No local subprocess, no target pre-filtering — the slot
+    and the scope decision are held at that endpoint.
+
+    Returns JSON: {ok, exec_id, status_code} on dispatch, or an error shape. The
+    caller polls /tools/executions/{exec_id} for the terminal result + evidence.
+    """
+    import httpx as _hx
+    base = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    payload = {"tool": tool, "command": command, "target": target,
+               "port": port, "service": service, "timeout": timeout}
+    try:
+        with _hx.Client(verify=False, timeout=timeout + 30) as c:
+            r = c.post(f"{base}/tools/execute", json=payload)
+        body = {}
+        if r.headers.get("content-type", "").startswith("application/json"):
+            body = r.json()
+        return json.dumps({
+            "ok": r.status_code < 400,
+            "status_code": r.status_code,
+            "exec_id": body.get("exec_id") or body.get("execution_id"),
+            "detail": None if r.status_code < 400 else r.text[:400],
+            **({k: v for k, v in body.items() if k not in ("exec_id", "execution_id")}),
+        })
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "status_code": 0,
+                           "error": f"{type(e).__name__}: {e}"})
+
+
+def get_execution_status(exec_id: str) -> str:
+    """Read one kali-listener tool execution (status, exit_code, output,
+    parsed_results) — the terminal evidence for a safe security-test run.
+    Read-only GET; returns JSON string, or an error shape."""
+    import httpx as _hx
+    base = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    try:
+        with _hx.Client(verify=False, timeout=30) as c:
+            r = c.get(f"{base}/tools/executions/{exec_id}")
+        if r.status_code != 200:
+            return json.dumps({"ok": False, "status_code": r.status_code})
+        return json.dumps(r.json())
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+def analyze_attack_surface(target_host: str = None, limit: int = 8) -> str:
+    """Enumerate one host's full attack surface as structured JSON.
+
+    Composes the MITRE-mapped attack vectors, the host's open ports/services,
+    its web findings, and per-service tool/methodology recommendations (including
+    ingested attack-path knowledge) into one summary an agent can turn into
+    concrete tests.
+
+    Args:
+        target_host: The host/IP to analyze. When omitted, the highest-risk host
+            from the attack-vector map is used.
+        limit: Max (service, port) pairs to expand recommendations for.
+
+    Returns a JSON string: {target, vectors[], services[{service, port,
+    recommendations}], web_findings_count}.
+    """
+    st = get_scan_tools()
+    host = (target_host or "").strip() or None
+
+    def _j(fn, **kw):
+        try:
+            return json.loads(fn(**kw))
+        except Exception:
+            return {}
+
+    # get_attack_vectors is a module-level tool; call it for the ranked list.
+    try:
+        av = json.loads(get_attack_vectors(limit=limit, min_risk=0.0))
+        vlist = av.get("vectors") or []
+    except Exception:
+        vlist = []
+
+    if not host and vlist:
+        raw = str(vlist[0].get("target") or "")
+        # normalize a target that may be a host, url, or "service on host"
+        import re as _re
+        m = _re.search(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}", raw)
+        host = m.group(0) if m else (raw.split("//")[-1].split("/")[0].split(":")[0] or None)
+
+    ports = _j(query_open_ports, target=host, limit=100) if host else {}
+    items = ports.get("items") or []
+    web = _j(get_web_findings, target=host, limit=100) if host else {}
+    web_items = web.get("items") or web.get("findings") or []
+
+    seen, services = set(), []
+    for row in items:
+        svc = (row.get("service") or "").strip().lower()
+        prt = row.get("port")
+        if not svc or (svc, prt) in seen:
+            continue
+        seen.add((svc, prt))
+        if len(services) >= limit:
+            break
+        rec = _j(get_tool_recommendations, service=svc, port=prt)
+        services.append({"service": svc, "port": prt, "ip": row.get("ip"),
+                         "recommendations": rec})
+
+    return json.dumps({
+        "target": host,
+        "vectors": vlist[:limit],
+        "services": services,
+        "web_findings_count": len(web_items),
+    }, indent=2)
+
+
 def get_tool_recommendations(service: str = None, port: int = None) -> str:
     """
     Get the CONCRETE tests to run against a discovered service, as structured

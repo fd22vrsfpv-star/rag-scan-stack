@@ -17,6 +17,13 @@ import {
 } from '@/api/agentSessions'
 import type { AgentSession, AgentMessage, SessionScan } from '@/api/agentSessions'
 import { useModelPerformanceWarning } from '@/api/agents'
+import {
+  useSessionSecurityTests,
+  useSecurityTestRuns,
+  useRunSecurityTest,
+  useToggleSecurityTest,
+} from '@/api/securityTests'
+import type { SecurityTest } from '@/api/securityTests'
 import { apiFetch } from '@/api/client'
 import { useScopeNames, useScope } from '@/api/scope'
 import { StatusDot } from '@/components/common/StatusDot'
@@ -524,12 +531,14 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     ? (liveFlow as unknown as FlowSummary)
     : storedFlow)
   const claimValidation = sessionMeta?.claim_validation as ClaimValidation | undefined
-  const [activeTab, setActiveTab] = useState<'messages' | 'scans'>('messages')
+  const [activeTab, setActiveTab] = useState<'messages' | 'scans' | 'security'>('messages')
   const [showToolCalls, setShowToolCalls] = useState(true)
 
   const logRef = useRef<HTMLDivElement>(null)
   const messages = msgData?.messages ?? []
   const scans: SessionScan[] = scanData?.scans ?? []
+  const { data: secTestData } = useSessionSecurityTests(sessionId)
+  const securityTests: SecurityTest[] = secTestData?.tests ?? []
 
   const filteredMessages = showToolCalls
     ? messages
@@ -654,6 +663,17 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
               <div>
                 <span className="text-muted-foreground">Exploit phase: </span>
                 <span className="text-purple-400">on (needs approval)</span>
+              </div>
+            )}
+            {session.configuration?.enable_surface_test_phase && (
+              <div>
+                <span className="text-muted-foreground">Surface-test phase: </span>
+                <span className="text-purple-400">on</span>
+                {session.configuration?.surface_target_host ? (
+                  <span className="font-mono text-xs text-foreground"> → {String(session.configuration.surface_target_host)}</span>
+                ) : (
+                  <span className="text-xs text-muted-foreground"> (auto-pick host)</span>
+                )}
               </div>
             )}
             {session.configuration?.proxy && (
@@ -897,6 +917,17 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
         >
           Scans & Tools ({scans.length})
         </button>
+        <button
+          onClick={() => setActiveTab('security')}
+          className={cn(
+            'px-3 py-2 text-sm font-medium border-b-2 transition-colors',
+            activeTab === 'security'
+              ? 'border-primary text-foreground'
+              : 'border-transparent text-muted-foreground hover:text-foreground',
+          )}
+        >
+          Security Tests ({securityTests.length})
+        </button>
       </div>
 
       {/* Messages tab */}
@@ -1014,6 +1045,163 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
           <AvailableMcpTools />
         </div>
       )}
+
+      {/* Security Tests tab */}
+      {activeTab === 'security' && (
+        <SecurityTestsPanel sessionId={sessionId} tests={securityTests} />
+      )}
+    </div>
+  )
+}
+
+/* ────────────── Security Tests Panel ────────────── */
+
+function statusPill(status?: string | null) {
+  const map: Record<string, string> = {
+    pass: 'bg-green-500/15 text-green-400',
+    fail: 'bg-red-500/15 text-red-400',
+    error: 'bg-amber-500/15 text-amber-400',
+    skipped: 'bg-muted text-muted-foreground',
+  }
+  const cls = (status && map[status]) || 'bg-muted text-muted-foreground'
+  return (
+    <span className={cn('px-1.5 py-0.5 rounded text-[10px] font-medium uppercase', cls)}>
+      {status || 'never'}
+    </span>
+  )
+}
+
+function SecurityTestRunHistory({ testId }: { testId: string }) {
+  const { data } = useSecurityTestRuns(testId)
+  const runs = data?.runs ?? []
+  if (runs.length === 0)
+    return <p className="text-xs text-muted-foreground px-3 py-2">No runs yet.</p>
+  return (
+    <div className="px-3 py-2 space-y-1">
+      {runs.map(r => (
+        <div key={r.id} className="flex items-start gap-2 text-xs border-l-2 border-border pl-2">
+          {statusPill(r.status)}
+          <span className="px-1 rounded bg-muted text-muted-foreground uppercase text-[10px]">{r.lane}</span>
+          <div className="flex-1 min-w-0">
+            <p className="font-mono break-words" style={{ overflowWrap: 'anywhere' }}>
+              {r.result_summary || r.command_run || '(no summary)'}
+            </p>
+            <span className="text-muted-foreground">
+              {r.ran_at ? new Date(r.ran_at).toLocaleString() : ''}
+              {r.exit_code != null && ` · exit ${r.exit_code}`}
+              {r.tool_execution_id && ` · exec ${r.tool_execution_id.slice(0, 8)}`}
+              {r.exploit_result_id && ` · exploit ${r.exploit_result_id.slice(0, 8)}`}
+            </span>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function SecurityTestRow({ test, sessionId }: { test: SecurityTest; sessionId?: string }) {
+  const [expanded, setExpanded] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
+  const runTest = useRunSecurityTest(sessionId)
+  const toggleTest = useToggleSecurityTest(sessionId)
+
+  const onRun = () => {
+    setNotice(null)
+    runTest.mutate({ id: test.id }, {
+      onSuccess: (d) => {
+        if (d?.requires_approval)
+          setNotice('Impactful test — approval required. Approve it through the exploit-approval banner above; nothing was executed.')
+        else
+          setNotice(`Run recorded: ${d?.status ?? 'done'}`)
+      },
+      onError: (e) => setNotice((e as Error)?.message ?? 'Run failed'),
+    })
+  }
+
+  return (
+    <div className="border border-border rounded-md">
+      <div className="flex items-center gap-2 px-3 py-2">
+        <button onClick={() => setExpanded(v => !v)} className="text-muted-foreground shrink-0">
+          {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+        </button>
+        <span className={cn(
+          'px-1.5 py-0.5 rounded text-[10px] font-medium uppercase shrink-0',
+          test.tier === 'impactful' ? 'bg-red-500/15 text-red-400' : 'bg-blue-500/15 text-blue-400',
+        )}>
+          {test.tier}
+        </span>
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium break-words" style={{ overflowWrap: 'anywhere' }}>{test.name}</p>
+          <p className="text-xs text-muted-foreground">
+            {test.category || 'uncategorised'}
+            {test.target_ip && ` · ${test.target_ip}`}
+            {test.target_port != null && `:${test.target_port}`}
+            {test.target_service && ` (${test.target_service})`}
+            {test.tool && ` · ${test.tool}`}
+          </p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {statusPill(test.last_run_status)}
+          <span className="text-xs text-muted-foreground">×{test.run_count}</span>
+          <label className="flex items-center gap-1 text-[10px] text-muted-foreground cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={test.enabled}
+              onChange={e => toggleTest.mutate({ id: test.id, enabled: e.target.checked })}
+              className="rounded border-border"
+            />
+            enabled
+          </label>
+          <button
+            onClick={onRun}
+            disabled={runTest.isPending || !test.enabled}
+            className="px-2 py-1 text-xs rounded bg-primary text-primary-foreground disabled:opacity-50"
+            title={test.tier === 'impactful'
+              ? 'Impactful — re-running requires operator approval'
+              : 'Re-run this safe test now'}
+          >
+            {runTest.isPending ? 'Running…' : 'Re-run'}
+          </button>
+        </div>
+      </div>
+      {notice && (
+        <p className="px-3 pb-2 text-xs text-amber-400">{notice}</p>
+      )}
+      {expanded && (
+        <div className="border-t border-border">
+          {test.command && (
+            <p className="px-3 py-2 text-xs font-mono text-muted-foreground break-words" style={{ overflowWrap: 'anywhere' }}>
+              $ {test.command}
+            </p>
+          )}
+          <SecurityTestRunHistory testId={test.id} />
+        </div>
+      )}
+    </div>
+  )
+}
+
+function SecurityTestsPanel({ sessionId, tests }: { sessionId?: string; tests: SecurityTest[] }) {
+  if (tests.length === 0) {
+    return (
+      <p className="text-sm text-muted-foreground text-center py-8">
+        No security tests generated. Launch a session with the attack-surface test
+        phase enabled and point it at a target host.
+      </p>
+    )
+  }
+  const safe = tests.filter(t => t.tier === 'safe').length
+  const impactful = tests.length - safe
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-4 text-xs">
+        <span className="text-muted-foreground">Total: <span className="text-foreground font-medium">{tests.length}</span></span>
+        <span className="text-blue-400">Safe: {safe}</span>
+        <span className="text-red-400">Impactful: {impactful}</span>
+      </div>
+      {tests.map(t => (
+        <SecurityTestRow key={t.id} test={t} sessionId={sessionId} />
+      ))}
     </div>
   )
 }
@@ -1148,6 +1336,10 @@ function SessionList() {
     // Off by default: with it on the session pauses for an approval, so an
     // operator who walks away comes back to a parked session.
     enable_exploit_phase: false,
+    // Attack-surface test phase: enumerate ONE host, generate custom tests, run
+    // safe ones and pause for approval on impactful ones. Off by default.
+    enable_surface_test_phase: false,
+    surface_target_host: '',
   })
 
   // Node + scope selector data
@@ -1193,10 +1385,14 @@ function SessionList() {
     // service treat an empty string as a choice. There is no selector any more,
     // but the field survives so a saved launch preset carrying an engine still
     // forwards it (the service warns and runs LangGraph if it is the retired one).
-    const { engine, ...formRest } = form
+    const { engine, surface_target_host, ...formRest } = form
     const sessionData = {
       ...formRest, proxy,
       ...(engine ? { engine } : {}),
+      // Only forward a target host when the surface phase is on AND one was
+      // typed — an empty string would override the agent's auto-pick.
+      ...(formRest.enable_surface_test_phase && surface_target_host.trim()
+        ? { surface_target_host: surface_target_host.trim() } : {}),
       ...(portProfile ? { port_profile: portProfile } : {}),
       ...(webProfile ? { web_profile: webProfile } : {}),
     }
@@ -1233,6 +1429,8 @@ function SessionList() {
           auto_execute_scans: true,
           engine: '',
           enable_exploit_phase: false,
+          enable_surface_test_phase: false,
+          surface_target_host: '',
         })
       },
     })
@@ -1418,6 +1616,27 @@ function SessionList() {
               />
               Exploit phase <span className="text-xs text-muted-foreground">(pauses for approval)</span>
             </label>
+            <label
+              className="flex items-center gap-2 text-sm pb-1"
+              title="LangGraph only. Enumerates ONE host's attack surface, generates custom security tests, runs the safe ones and PAUSES for approval on impactful ones."
+            >
+              <input
+                type="checkbox"
+                checked={form.enable_surface_test_phase}
+                onChange={e => setForm(f => ({ ...f, enable_surface_test_phase: e.target.checked }))}
+                className="rounded border-border"
+              />
+              Surface-test phase <span className="text-xs text-muted-foreground">(generate + prove custom tests)</span>
+            </label>
+            {form.enable_surface_test_phase && (
+              <input
+                type="text"
+                value={form.surface_target_host}
+                onChange={e => setForm(f => ({ ...f, surface_target_host: e.target.value }))}
+                placeholder="Target host/IP (optional — else highest-risk host)"
+                className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border outline-none focus:border-primary"
+              />
+            )}
           </div>
           {/* Remote proxy node */}
           {onlineNodes.length > 0 && (
