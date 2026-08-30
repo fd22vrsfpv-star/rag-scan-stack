@@ -331,6 +331,7 @@ class PentestState(TypedDict):
     # Surface-test phase (opt-in, independent of exploit_phase).
     surface_test_phase: bool
     surface_synthesize: Optional[bool]
+    surface_auto_exploit: Optional[bool]
     surface_target_request: Optional[str]
     surface_target: Optional[str]
     surface_tests: Optional[list]
@@ -1403,6 +1404,74 @@ def surface_exec(state: PentestState) -> dict:
             "log": [f"surface_exec: {pending_id}"]}
 
 
+def _exec_one_impactful(sid, pending_id, test):
+    """Execute ONE queued impactful test through the SAME scope-gated runner
+    (execute_approved_exploit -> exploit-runner, which fails CLOSED on an
+    out-of-scope target — so auto-firing can never reach a host outside scope),
+    then record PROOF: the run's assertion is evaluated against the exploit
+    output, so a test passes only when it actually demonstrated impact. Returns
+    the run status ('pass'|'fail'|'error') or None."""
+    import db_utils
+    result = _tool(scan_tools.execute_approved_exploit, pending_id)
+    if not test:
+        return None
+    try:
+        import psycopg2
+        from db_utils import get_db_dsn
+        with psycopg2.connect(get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute("SELECT id, success, output FROM public.exploit_results "
+                        "WHERE pending_exploit_id=%s::uuid ORDER BY executed_at DESC LIMIT 1",
+                        (pending_id,))
+            r = cur.fetchone()
+        er_id, success, out = (str(r[0]), r[1], r[2]) if r else (None, False, result)
+        rec = db_utils.record_test_run(
+            test["test_id"], "impactful", command_run=test.get("command"),
+            output=(out or "")[:20000], exploit_result_id=er_id,
+            has_shell=bool(success), triggered_by="agent",
+            triggered_by_session=sid)
+        return rec.get("status")
+    except Exception as e:  # noqa: BLE001
+        _msg(sid, "SurfaceTester", f"[auto-exploit record failed for {pending_id}: {e}]")
+        return None
+
+
+def surface_auto_exec(state: PentestState) -> dict:
+    """AUTO-EXPLOIT (opt-in): fire every queued impactful test WITHOUT the human
+    approval interrupt, capturing proof. The scope gate is NOT bypassed — each
+    dispatch still goes through execute_approved_exploit -> the exploit-runner's
+    scope gate, which refuses any out-of-scope target; those are recorded as
+    blocked, never executed. This node has side effects and NO interrupt, so it
+    replaces surface_approval only when auto-exploit is enabled."""
+    sid = state["session_id"]
+    pending = state.get("pending_surface_tests") or []
+    _msg(sid, "SurfaceTester",
+         f"[AUTO-EXPLOIT] firing {len(pending)} queued impactful test(s) "
+         "through the scope gate (out-of-scope is refused, not run).")
+    proved, results = 0, []
+    for t in pending:
+        pid = t.get("pending_exploit_id")
+        if not pid:
+            continue
+        status = _exec_one_impactful(sid, pid, t)
+        results.append({"test": t["name"], "status": status})
+        if status == "pass":
+            proved += 1
+        _emit("langgraph_surface_test_completed", sid,
+              {"executed": True, "auto": True, "pending_exploit_id": str(pid),
+               "status": status})
+    _msg(sid, "SurfaceTester",
+         f"[AUTO-EXPLOIT] {proved}/{len(results)} impactful test(s) PROVED "
+         "(assertion held on the exploit output).")
+    _emit("langgraph_surface_decision", sid,
+          {"approved": True, "auto_exploit": True, "proved": proved,
+           "total": len(results)})
+    return {"phase": "surface_onward",
+            "surface_decision": {"approved": True, "auto_exploit": True,
+                                 "proved": proved, "total": len(results)},
+            "findings": [f"surface_auto_exec: {proved}/{len(results)} proved"],
+            "log": [f"surface_auto_exec: {proved}/{len(results)} proved"]}
+
+
 # ── graph ────────────────────────────────────────────────────────────────────
 def _surface_onward(state: PentestState) -> str:
     """After the surface phase, chain into the exploit phase if it too is opted
@@ -1426,8 +1495,11 @@ def _after_surface_plan(state: PentestState) -> str:
 
 
 def _after_surface_safe(state: PentestState) -> str:
-    # Gate only when impactful tests are queued; otherwise chain onward.
+    # No impactful tests -> chain onward. Otherwise: auto-exploit (fire through
+    # the scope gate, no human pause) when opted in, else the human approval gate.
     if state.get("pending_surface_tests"):
+        if state.get("surface_auto_exploit"):
+            return "surface_auto_exec"
         return "surface_approval"
     return _surface_onward(state)
 
@@ -1458,6 +1530,7 @@ def build_graph(checkpointer=None):
     g.add_node("surface_safe_exec", surface_safe_exec)
     g.add_node("surface_approval", surface_approval)
     g.add_node("surface_exec", surface_exec)
+    g.add_node("surface_auto_exec", surface_auto_exec)
     g.add_node("report", report)
     g.add_edge(START, "recon")
     g.add_edge("recon", "scan")
@@ -1472,7 +1545,10 @@ def build_graph(checkpointer=None):
                              "exploit_plan": "exploit_plan", "report": "report"})
     g.add_conditional_edges("surface_safe_exec", _after_surface_safe,
                             {"surface_approval": "surface_approval",
+                             "surface_auto_exec": "surface_auto_exec",
                              "exploit_plan": "exploit_plan", "report": "report"})
+    g.add_conditional_edges("surface_auto_exec", _surface_onward,
+                            {"exploit_plan": "exploit_plan", "report": "report"})
     g.add_conditional_edges("surface_approval", _after_surface_approval,
                             {"surface_exec": "surface_exec",
                              "exploit_plan": "exploit_plan", "report": "report"})
@@ -1636,6 +1712,7 @@ def run_langgraph_session_sync(
     surface_test_phase: Optional[bool] = None,
     surface_target: Optional[str] = None,
     synthesize_tests: Optional[bool] = None,
+    auto_exploit: Optional[bool] = None,
 ):
     """Drop-in LangGraph replacement for the AutoGen session runner."""
     from llm_metrics import LLMMetricsContext
@@ -1685,6 +1762,7 @@ def run_langgraph_session_sync(
                 "exploit_phase": bool(exploit_phase),
                 "surface_test_phase": bool(surface_test_phase),
                 "surface_synthesize": synthesize_tests,
+                "surface_auto_exploit": auto_exploit,
                 "surface_target_request": surface_target,
                 "surface_target": None, "surface_tests": None,
                 "surface_safe_results": None, "pending_surface_tests": None,

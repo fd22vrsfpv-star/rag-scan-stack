@@ -1515,6 +1515,7 @@ function SessionList() {
     enable_surface_test_phase: false,
     surface_target_host: '',
     enable_test_synthesis: false,
+    enable_auto_exploit: false,
   })
 
   // Node + scope selector data
@@ -1607,6 +1608,7 @@ function SessionList() {
           enable_surface_test_phase: false,
           surface_target_host: '',
           enable_test_synthesis: false,
+          enable_auto_exploit: false,
         })
       },
     })
@@ -1825,6 +1827,20 @@ function SessionList() {
                   className="rounded border-border"
                 />
                 Synthesize custom tests <span className="text-xs text-muted-foreground">(AI-authored per finding)</span>
+              </label>
+            )}
+            {form.enable_surface_test_phase && (
+              <label
+                className="flex items-center gap-2 text-sm pb-1 text-orange-400"
+                title="Fire queued impactful tests automatically (no approval click), capturing proof. The scope gate still refuses any out-of-scope target. Use only inside an authorised engagement."
+              >
+                <input
+                  type="checkbox"
+                  checked={form.enable_auto_exploit}
+                  onChange={e => setForm(f => ({ ...f, enable_auto_exploit: e.target.checked }))}
+                  className="rounded border-border"
+                />
+                Auto-exploit in scope <span className="text-xs text-orange-400/70">(no approval — scope gate still enforced)</span>
               </label>
             )}
           </div>

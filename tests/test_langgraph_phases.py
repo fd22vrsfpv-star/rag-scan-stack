@@ -220,10 +220,17 @@ def test_engine_source_calls_execute_only_in_the_exec_node():
             if (isinstance(sub, ast.Attribute)
                     and sub.attr == "execute_approved_exploit"):
                 callers.append(node.name)
-    assert set(callers) <= {"exploit_exec", "surface_exec"}, (
+    # exploit_exec / surface_exec run after the human approval interrupt.
+    # _exec_one_impactful is the shared executor; its only auto-mode caller is
+    # surface_auto_exec, whose authorization is the runner's scope gate (which
+    # fails CLOSED on out-of-scope) rather than a human interrupt. It must NEVER
+    # be reachable from a planning or safe-execution node — enforced by the graph
+    # topology test (surface_auto_exec is opt-in behind the auto_exploit flag).
+    assert set(callers) <= {"exploit_exec", "surface_exec", "_exec_one_impactful"}, (
         f"scan_tools.execute_approved_exploit is called from {callers}; it must be "
-        "called only from exploit_exec / surface_exec, which sit AFTER an approval "
-        "interrupt — never from a planning or safe-execution node")
+        "called only from exploit_exec / surface_exec / _exec_one_impactful, which "
+        "run AFTER an approval gate (human interrupt) or the runner's fail-closed "
+        "scope gate — never from a planning or safe-execution node")
 
 
 # ── 4. engine resolution (the canary control) ───────────────────────────────
@@ -688,3 +695,55 @@ def test_synthesis_helper_fails_safe_to_none():
     assert any(isinstance(b, ast.Try) for b in fn.body), (
         "_synthesize_finding_test must wrap its body in try/except and return "
         "None on failure (deterministic fallback)")
+
+
+# ── 8. auto-exploit is opt-in and never bypasses the scope gate ──────────────
+
+def test_auto_exploit_routing_is_opt_in():
+    """_after_surface_safe must route to surface_auto_exec ONLY behind the
+    auto_exploit flag; with it off (the default) queued impactful tests go to the
+    human approval gate. Source-checked so it runs on a bare checkout."""
+    tree = ast.parse(_engine_src())
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "_after_surface_safe"), None)
+    assert fn is not None, "_after_surface_safe missing"
+    # collect (returned string constant, set of names guarding it)
+    guarded = {}
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Constant):
+            guards = set()
+            for anc in ast.walk(fn):
+                if isinstance(anc, ast.If):
+                    for sub in ast.walk(anc.test):
+                        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                            guards.add(sub.value)
+            guarded.setdefault(node.value.value, guards)
+    src = _engine_src()
+    # auto-exec is only returned inside a block testing surface_auto_exploit
+    i_auto = src.index('"surface_auto_exec"')
+    window = src[max(0, i_auto - 200):i_auto]
+    assert "surface_auto_exploit" in window, (
+        "surface_auto_exec must be routed to only under an if state.get("
+        "'surface_auto_exploit') branch — auto-exploit has to be opt-in")
+    assert "surface_approval" in src, "the human approval route must remain"
+
+
+def test_auto_exec_executes_only_via_the_scope_gated_runner():
+    """surface_auto_exec must reach execution ONLY through _exec_one_impactful
+    (-> execute_approved_exploit -> the runner's fail-closed scope gate). It must
+    NOT call run_custom_test or any other dispatch directly."""
+    tree = ast.parse(_engine_src())
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "surface_auto_exec"), None)
+    assert fn is not None, "surface_auto_exec missing"
+    called = {s.attr for s in ast.walk(fn) if isinstance(s, ast.Attribute)}
+    called |= {s.func.id for s in ast.walk(fn)
+               if isinstance(s, ast.Call) and isinstance(s.func, ast.Name)}
+    assert "run_custom_test" not in called, "auto-exec must not dispatch scans directly"
+    assert "execute_approved_exploit" not in called, (
+        "auto-exec must execute via the _exec_one_impactful helper, not call the "
+        "runner directly")
+    assert "_exec_one_impactful" in called, "auto-exec must use the shared gated executor"
+    # and no interrupt in the auto path
+    assert not any(isinstance(s, ast.Call) and getattr(s.func, "id", "") == "interrupt"
+                   for s in ast.walk(fn)), "surface_auto_exec must not interrupt"

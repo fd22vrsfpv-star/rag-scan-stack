@@ -556,6 +556,18 @@ class PentestRequest(BaseModel):
             "(LANGGRAPH_SYNTH_TESTS env default)."
         ),
     )
+    enable_auto_exploit: Optional[bool] = Field(
+        None,
+        description=(
+            "Surface-test phase only. AUTO-EXPLOIT: fire queued impactful tests "
+            "WITHOUT the human approval interrupt, capturing proof (the assertion "
+            "evaluated against the exploit output). The scope gate is NOT "
+            "bypassed — every dispatch still passes the exploit-runner's "
+            "fail-closed scope gate, so an out-of-scope target is refused, never "
+            "run. Off unless set (LANGGRAPH_AUTO_EXPLOIT env default). Use only "
+            "within an authorised engagement."
+        ),
+    )
 
 
 class ApprovalRequest(BaseModel):
@@ -1956,6 +1968,7 @@ def run_pentest_session_sync(
     surface_test_phase: Optional[bool] = None,
     surface_target: Optional[str] = None,
     synthesize_tests: Optional[bool] = None,
+    auto_exploit: Optional[bool] = None,
 ):
     """Run a pentest session. Delegates to the LangGraph engine.
 
@@ -1998,7 +2011,8 @@ def run_pentest_session_sync(
         exploit_phase=exploit_phase,
         surface_test_phase=surface_test_phase,
         surface_target=surface_target,
-        synthesize_tests=synthesize_tests)
+        synthesize_tests=synthesize_tests,
+        auto_exploit=auto_exploit)
 
 
 @app.get("/health")
@@ -2139,6 +2153,7 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
                 "enable_surface_test_phase": bool(request.enable_surface_test_phase),
                 "surface_target_host": request.surface_target_host,
                 "enable_test_synthesis": bool(request.enable_test_synthesis),
+                "enable_auto_exploit": bool(request.enable_auto_exploit),
             }
         )
 
@@ -2176,6 +2191,7 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
                 request.enable_surface_test_phase,
                 request.surface_target_host,
                 request.enable_test_synthesis,
+                request.enable_auto_exploit,
             )
         )
 
@@ -2279,6 +2295,7 @@ async def resume_pentest(session_id: str, request: ResumeRequest):
             "enable_surface_test_phase": bool(config.get('enable_surface_test_phase')),
             "surface_target_host": config.get('surface_target_host'),
             "enable_test_synthesis": bool(config.get('enable_test_synthesis')),
+            "enable_auto_exploit": bool(config.get('enable_auto_exploit')),
         }
     )
 
@@ -2320,6 +2337,7 @@ async def resume_pentest(session_id: str, request: ResumeRequest):
             bool(config.get('enable_surface_test_phase')),
             config.get('surface_target_host'),
             bool(config.get('enable_test_synthesis')),
+            bool(config.get('enable_auto_exploit')),
         )
     )
 
@@ -2479,6 +2497,7 @@ async def get_agent_engine():
         "exploit_phase_default": os.environ.get("LANGGRAPH_EXPLOIT_PHASE") or None,
         "surface_test_phase_default": os.environ.get("LANGGRAPH_SURFACE_TEST_PHASE") or None,
         "test_synthesis_default": os.environ.get("LANGGRAPH_SYNTH_TESTS") or None,
+        "auto_exploit_default": os.environ.get("LANGGRAPH_AUTO_EXPLOIT") or None,
         "availability": availability,
     }
 
