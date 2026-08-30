@@ -867,7 +867,7 @@ _SAFE_CATEGORIES = {
     # confirms a specific web finding without changing data or running code;
     # anything that does is IMPACTFUL (rce/sqli_dump/cred_bruteforce/upload/…).
     "xss_detect", "ssti_detect", "ssrf_detect", "xxe_detect", "redirect_check",
-    "header_check", "cookie_check", "cors_check", "error_check",
+    "header_check", "cookie_check", "cors_check", "error_check", "method_check",
 }
 _IMPACTFUL_CATEGORIES = {
     "rce", "shell", "msf_exploit", "file_write", "upload", "cred_bruteforce",
