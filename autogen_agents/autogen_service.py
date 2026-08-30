@@ -2472,6 +2472,8 @@ class SynthesizeTestRequest(BaseModel):
     name: Optional[str] = None
     url: Optional[str] = None
     target: Optional[str] = None
+    cve: Optional[str] = None          # pull an ExploitDB writeup as extra guidance
+    edb_id: Optional[str] = None       # or a specific ExploitDB entry
     session_id: Optional[str] = None
     persist: bool = True
 
@@ -2493,7 +2495,7 @@ async def synthesize_test(req: SynthesizeTestRequest):
     import scan_tools
     import test_synth
     import db_utils as _db
-    guidance, matched = "", None
+    guidance, matched, edb_used = "", None, None
     try:
         g = _json.loads(scan_tools.get_wstg_guidance(
             issue_type=req.issue_type, cwe=req.cwe, name=req.name,
@@ -2502,8 +2504,22 @@ async def synthesize_test(req: SynthesizeTestRequest):
         matched = (g.get("entry") or {}).get("wstg_id") if g.get("matched") else None
     except Exception:  # noqa: BLE001
         pass
-    finding = {"issue_type": req.issue_type, "cwe": req.cwe, "name": req.name,
-               "url": req.url, "target": req.target}
+    # ExploitDB writeup as additional guidance when a CVE/EDB id is supplied (or a
+    # CVE was passed in `cwe`). Most ExploitDB-derived tests are real exploits, so
+    # they will fail-safe classify impactful and stay approval-gated.
+    if req.cve or req.edb_id or (req.cwe and req.cwe.upper().startswith("CVE-")):
+        try:
+            ed = _json.loads(scan_tools.get_exploitdb_guidance(
+                cve=req.cve or (req.cwe if (req.cwe or "").upper().startswith("CVE-") else None),
+                edb_id=req.edb_id))
+            if ed.get("matched"):
+                edb_used = (ed.get("top") or {}).get("edb_id")
+                guidance = (guidance + "\n\n=== ExploitDB writeup ===\n"
+                            + (ed.get("guidance") or ""))[:8000]
+        except Exception:  # noqa: BLE001
+            pass
+    finding = {"issue_type": req.issue_type, "cwe": req.cve or req.cwe,
+               "name": req.name, "url": req.url, "target": req.target}
     out = test_synth.synthesize(finding, guidance)
     if not out.get("ok"):
         raise HTTPException(502, out.get("error") or "synthesis failed")
@@ -2519,7 +2535,7 @@ async def synthesize_test(req: SynthesizeTestRequest):
         except Exception as e:  # noqa: BLE001
             raise HTTPException(500, f"persist failed: {e}")
     return {"ok": True, "spec": spec, "matched_wstg": matched,
-            "persisted_id": persisted_id,
+            "matched_exploitdb": edb_used, "persisted_id": persisted_id,
             "requires_approval": spec["tier"] == "impactful"}
 
 
