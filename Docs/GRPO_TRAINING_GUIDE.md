@@ -1,16 +1,41 @@
 # GRPO Training Pipeline Guide
 
-Fine-tune pentest models using Group Relative Policy Optimization (GRPO) with human feedback from analyst ratings on agent outputs.
+> ## ⚠️ STATUS: NOT IMPLEMENTED — opt-in scaffolding only
+>
+> **No model has ever been fine-tuned by this stack, and none is today.** The
+> `grpo-trainer` service sits behind `--profile training`, has **never been
+> built or run**, and `grpo_trainer/datasets/` is **empty**. Nothing in the
+> default deployment invokes it, and no `rag_eval_run` has ever measured a
+> before/after. Treat every "Deployment & A/B Testing" step below as a
+> *design sketch for a capability that is not wired up*, not an operational
+> procedure.
+>
+> **What actually improves results today is retrieval-time preference
+> learning**, not model training: `_apply_feedback_ranking` re-ranks retrieved
+> chunks by `sim + 0.08*tanh(net_votes/3)` from `rag_feedback`
+> (helpful/unhelpful votes). That reorders near-ties from human feedback; it
+> does **not** change any model's weights. See `Docs/KNOWLEDGE_BASE_GUIDE.md`
+> ("Still open: no model is trained").
+>
+> The feedback-collection tables (`grpo_feedback`, `grpo_training_runs`,
+> `grpo_model_registry`) and the `POST /rag/training/export` corpus builder are
+> real and kept, because they are the *inputs* a future trainer would need — but
+> exporting data is not training a model. Before trusting any claim of
+> improvement, run `POST /rag/eval/run` for a baseline (currently `rag_eval_runs`
+> is empty).
+>
+> Everything below this banner describes the *intended* pipeline should GRPO be
+> enabled. It requires a GPU host and is out of scope for the default stack.
 
-## Overview
+## Overview (design — not yet operational)
 
-The pipeline has three stages:
+The intended pipeline has three stages:
 
-1. **Feedback Collection** - Capture and rate agent outputs from pentest sessions
-2. **GRPO Training** - Fine-tune a model using rated feedback + synthetic scan data
-3. **Deployment & A/B Testing** - Export the model and compare it against the baseline
+1. **Feedback Collection** - Capture and rate agent outputs from pentest sessions *(live: feedback is collected)*
+2. **GRPO Training** - Fine-tune a model using rated feedback + synthetic scan data *(NOT wired up: never run, no weights produced)*
+3. **Deployment & A/B Testing** - Export the model and compare it against the baseline *(NOT wired up: no fine-tuned model exists to deploy)*
 
-GRPO samples multiple completions per prompt, scores them with a reward function, and uses group-relative advantages to update the policy. No separate critic model is needed, making it memory-efficient for local GPU training.
+GRPO samples multiple completions per prompt, scores them with a reward function, and uses group-relative advantages to update the policy. No separate critic model is needed, making it memory-efficient for local GPU training. *(This is the algorithm the scaffolding targets; it has not been exercised in this deployment.)*
 
 ---
 
