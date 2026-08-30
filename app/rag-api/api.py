@@ -489,9 +489,22 @@ async def get_scan_results(job_id: str, x_api_key: str = Header(...), db_dsn=DB_
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid X-API-Key")
 
+    # The scan runs recorded under this job. This used to query `scan_results`,
+    # a table that has never existed in db_init — so every call 500'd with
+    # `relation "scan_results" does not exist`. The real per-job record is
+    # `scan_runs` (one row per tool run, keyed by job_id), with its findings in
+    # `scan_run_findings` (run_id -> finding). Returned shape is unchanged
+    # ({job_id, results}) so any consumer of the documented contract still works.
     try:
         with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute("SELECT * FROM scan_results WHERE job_id = %s", (job_id,))
+            cursor.execute(
+                """SELECT id, tool, target, job_id, profile, started_at,
+                          finished_at, finding_count, metadata
+                     FROM scan_runs
+                    WHERE job_id = %s
+                    ORDER BY started_at DESC""",
+                (job_id,),
+            )
             results = cursor.fetchall()
         return {"job_id": job_id, "results": results}
     except Exception as e:

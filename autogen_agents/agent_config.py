@@ -262,6 +262,12 @@ def get_ab_test_config(
     """
     Get LLM config with A/B testing support for GRPO fine-tuned models.
 
+    NOTE: today this ALWAYS takes the fallback path. No GRPO model has ever
+    been trained (the trainer is opt-in scaffolding that has never run), so
+    grpo_model_registry has no active rows and this returns the default config.
+    The A/B machinery is dormant until a fine-tuned model is registered — see
+    Docs/GRPO_TRAINING_GUIDE.md (status banner).
+
     Queries grpo_model_registry for active fine-tuned models and
     probabilistically selects based on ab_weight.
 
