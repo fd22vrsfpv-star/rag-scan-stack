@@ -863,6 +863,11 @@ def report(state: PentestState) -> dict:
 _SAFE_CATEGORIES = {
     "version_probe", "nuclei_detect", "tls_check", "lfi_read", "sqli_detect",
     "dir_enum", "banner", "http_probe", "cert_check",
+    # WSTG finding-driven SAFE detection probes (curl/nuclei/sslscan only). Each
+    # confirms a specific web finding without changing data or running code;
+    # anything that does is IMPACTFUL (rce/sqli_dump/cred_bruteforce/upload/…).
+    "xss_detect", "ssti_detect", "ssrf_detect", "xxe_detect", "redirect_check",
+    "header_check", "cookie_check", "cors_check", "error_check",
 }
 _IMPACTFUL_CATEGORIES = {
     "rce", "shell", "msf_exploit", "file_write", "upload", "cred_bruteforce",
@@ -1027,6 +1032,66 @@ def _build_surface_tests(host: str) -> list:
                 "exploit_ref": {"source": "metasploit", "module": module,
                                 "purpose": m.get("purpose")},
             })
+
+    # WSTG finding-driven tests: turn each of the host's WEB findings into the
+    # OWASP-WSTG-guided test that proves it. The map (rag-api /rag/wstg) keys a
+    # finding by issue_type / CWE / nuclei tag / name to a tier+category+command+
+    # assertion. Safe probes run in the autonomous lane; impactful ones carry a
+    # 'wstg' exploit_ref so surface_plan queues them for the SAME human approval
+    # as any other impactful test. `_classify` still fails safe on top of this.
+    try:
+        web = json.loads(_tool(scan_tools.get_web_findings, target=host, limit=100))
+        findings = (web.get("findings") or web.get("web_findings")
+                    or web.get("items") or [])
+    except Exception:  # noqa: BLE001
+        findings = []
+
+    seen_wstg = set()
+    for f in findings:
+        if len(tests) >= _SURFACE_TEST_LIMIT:
+            break
+        issue = f.get("issue_type") or f.get("finding_type") or f.get("name")
+        fname = f.get("name") or f.get("title")
+        cwe = f.get("cwe")
+        cwe_s = ",".join(cwe) if isinstance(cwe, list) else (str(cwe) if cwe else None)
+        tags = f.get("tags")
+        nuc = ",".join(t for t in tags if isinstance(t, str)) if isinstance(tags, list) else None
+        furl = f.get("url")
+        fip = f.get("ip") or f.get("host") or host
+        fport = f.get("port")
+        tgt = f"{fip}:{fport}" if fport else str(fip)
+        try:
+            g = json.loads(scan_tools.get_wstg_guidance(
+                issue_type=issue, cwe=cwe_s, name=fname, nuclei_tags=nuc,
+                target=tgt, url=furl))
+        except Exception:  # noqa: BLE001
+            g = {}
+        ent = g.get("entry") if g.get("matched") else None
+        if not ent:
+            continue
+        cmd = ent.get("command_rendered") or ent.get("command")
+        cat = ent.get("category")
+        wid = ent.get("wstg_id")
+        wid_s = ",".join(wid) if isinstance(wid, list) else str(wid or "")
+        # One test per (wstg-class, target) — a scan often reports the same class
+        # many times; we prove it once.
+        key = (ent.get("id"), fip, fport)
+        if key in seen_wstg:
+            continue
+        seen_wstg.add(key)
+        impactful_ref = (ent.get("tier") == "impactful"
+                         or cat in _IMPACTFUL_CATEGORIES)
+        tier = _classify(cat, cmd or "", has_exploit_ref=impactful_ref)
+        tests.append({
+            "name": f"WSTG {wid_s} {cat} @ {furl or tgt}",
+            "host": fip, "service": "http", "port": fport,
+            "tool": _tool_head(cmd or ""),
+            "command": cmd, "category": cat, "tier": tier,
+            "assertion": ent.get("assertion") or {},
+            "exploit_ref": ({"source": "wstg", "module": wid_s,
+                             "purpose": ent.get("wstg_note")}
+                            if tier == "impactful" else None),
+        })
 
     return tests
 

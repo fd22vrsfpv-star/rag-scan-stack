@@ -107,3 +107,57 @@ export function useToggleSecurityTest(sessionId?: string) {
     },
   })
 }
+
+export interface WstgGuide {
+  id: string
+  wstg_id: string[]
+  tier: 'safe' | 'impactful'
+  category: string
+  tool: string
+  command: string
+  assertion: Record<string, unknown>
+  wstg_note?: string
+}
+
+/** The WSTG finding-class catalogue — drives "start a custom payload from a
+ *  WSTG guide" in the create form. */
+export function useWstgGuides() {
+  return useQuery({
+    queryKey: ['wstg-guides'],
+    queryFn: () => apiFetch<{ count: number; entries: WstgGuide[] }>('/rag/wstg/guides'),
+    staleTime: 300000,
+  })
+}
+
+export interface CreateSecurityTestBody {
+  name: string
+  tier: 'safe' | 'impactful'
+  category?: string
+  description?: string
+  target_ip?: string
+  target_host?: string
+  target_port?: number
+  target_service?: string
+  command?: string
+  tool?: string
+  assertion?: Record<string, unknown>
+  pending_exploit_id?: string
+  created_by_session?: string
+}
+
+/** Create an operator-authored test with a custom payload. Safe tests run
+ *  through the scope-gated /tools/execute; impactful require a pending_exploit. */
+export function useCreateSecurityTest(sessionId?: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body: CreateSecurityTestBody) =>
+      apiFetch<{ ok: boolean; id: string }>('/security-tests', {
+        method: 'POST',
+        body: JSON.stringify({ ...body, created_by_session: body.created_by_session ?? sessionId }),
+      }),
+    onSuccess: () => {
+      if (sessionId)
+        qc.invalidateQueries({ queryKey: ['security-tests', 'session', sessionId] })
+    },
+  })
+}
