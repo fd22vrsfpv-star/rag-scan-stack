@@ -1383,17 +1383,21 @@ def surface_exec(state: PentestState) -> dict:
             import psycopg2
             from db_utils import get_db_dsn
             with psycopg2.connect(get_db_dsn()) as conn, conn.cursor() as cur:
-                cur.execute("SELECT id, success, output FROM public.exploit_results "
+                cur.execute("SELECT id, success, output, session_type, session_id "
+                            "FROM public.exploit_results "
                             "WHERE pending_exploit_id=%s::uuid ORDER BY executed_at DESC LIMIT 1",
                             (pending_id,))
                 r = cur.fetchone()
             er_id, success, out = (str(r[0]), r[1], r[2]) if r else (None, False, result)
+            session_type, session_id = (r[3], r[4]) if r else (None, None)
             db_utils.record_test_run(
                 test["test_id"], "impactful", command_run=test.get("command"),
                 output=(out or "")[:20000], exploit_result_id=er_id,
                 has_shell=bool(success),
                 status_override=("pass" if success else "fail"),
                 triggered_by="agent", triggered_by_session=sid)
+            if success:
+                _postex_enumerate(test.get("host"), session_type, session_id, sid)
         except Exception as e:  # noqa: BLE001
             _msg(sid, "SurfaceTester", f"[record impactful failed: {e}]")
     _msg(sid, "SurfaceTester", f"[execute_approved_exploit {pending_id}]\n{result[:1500]}")
@@ -1404,13 +1408,45 @@ def surface_exec(state: PentestState) -> dict:
             "log": [f"surface_exec: {pending_id}"]}
 
 
+def _postex_enumerate(host, session_type, session_id, sid):
+    """A shell of ANY kind -> run bounded post-ex enumeration through it and
+    harvest credentials (exploit-runner /postex/enumerate dispatches per shell
+    type). Best-effort; never blocks or fails the run. Enumeration only."""
+    if not session_type or str(session_type).lower() in ("none", "web_poc", ""):
+        return
+    if not session_id:
+        _msg(sid, "SurfaceTester",
+             f"[post-ex] shell on {host} ({session_type}) but no session id recorded — skipped")
+        return
+    try:
+        import requests as _rq
+        base = os.environ.get("EXPLOIT_RUNNER_URL", "https://exploit-runner:8017")
+        r = _rq.post(f"{base}/postex/enumerate",
+                     json={"session_type": session_type, "session_id": str(session_id),
+                           "host": host, "platform": "linux"},
+                     headers={"x-api-key": os.environ.get("API_KEY", "changeme")},
+                     timeout=90, verify=False)
+        d = r.json() if r.status_code < 400 else {}
+        _msg(sid, "SurfaceTester",
+             f"[post-ex] {host} ({session_type}): priv={d.get('privileged')}, "
+             f"users={len(d.get('local_users') or [])}, "
+             f"creds_harvested={d.get('credentials_harvested', 0)}")
+        _emit("langgraph_postex_enumerated", sid,
+              {"host": host, "session_type": session_type,
+               "privileged": d.get("privileged"),
+               "credentials_harvested": d.get("credentials_harvested", 0)})
+    except Exception as e:  # noqa: BLE001
+        _msg(sid, "SurfaceTester", f"[post-ex enumerate failed: {e}]")
+
+
 def _exec_one_impactful(sid, pending_id, test):
     """Execute ONE queued impactful test through the SAME scope-gated runner
     (execute_approved_exploit -> exploit-runner, which fails CLOSED on an
     out-of-scope target — so auto-firing can never reach a host outside scope),
     then record PROOF: the run's assertion is evaluated against the exploit
-    output, so a test passes only when it actually demonstrated impact. Returns
-    the run status ('pass'|'fail'|'error') or None."""
+    output, so a test passes only when it actually demonstrated impact. When the
+    exploit yields a SHELL, post-ex enumeration fires automatically. Returns the
+    run status ('pass'|'fail'|'error') or None."""
     import db_utils
     result = _tool(scan_tools.execute_approved_exploit, pending_id)
     if not test:
@@ -1419,16 +1455,20 @@ def _exec_one_impactful(sid, pending_id, test):
         import psycopg2
         from db_utils import get_db_dsn
         with psycopg2.connect(get_db_dsn()) as conn, conn.cursor() as cur:
-            cur.execute("SELECT id, success, output FROM public.exploit_results "
+            cur.execute("SELECT id, success, output, session_type, session_id "
+                        "FROM public.exploit_results "
                         "WHERE pending_exploit_id=%s::uuid ORDER BY executed_at DESC LIMIT 1",
                         (pending_id,))
             r = cur.fetchone()
         er_id, success, out = (str(r[0]), r[1], r[2]) if r else (None, False, result)
+        session_type, session_id = (r[3], r[4]) if r else (None, None)
         rec = db_utils.record_test_run(
             test["test_id"], "impactful", command_run=test.get("command"),
             output=(out or "")[:20000], exploit_result_id=er_id,
             has_shell=bool(success), triggered_by="agent",
             triggered_by_session=sid)
+        if success:
+            _postex_enumerate(test.get("host"), session_type, session_id, sid)
         return rec.get("status")
     except Exception as e:  # noqa: BLE001
         _msg(sid, "SurfaceTester", f"[auto-exploit record failed for {pending_id}: {e}]")
