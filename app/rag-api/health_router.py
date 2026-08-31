@@ -313,7 +313,7 @@ async def check_database_schema():
             'jobs', 'tasks',
             # Exploit management
             'pending_exploits', 'exploit_results', 'exploit_chunks', 'tool_executions',
-            'credential_spray_attempts', 'credential_spray_approvals', 'password_policies',
+            'lateral_movement', 'credential_spray_attempts', 'credential_spray_approvals', 'password_policies',
             'platform_control',
             'security_tests', 'security_test_runs',
             # Webhooks

@@ -7597,6 +7597,11 @@ class CredentialReuseRequest(BaseModel):
     # Hold every (account, service) spray until it is approved (see
     # /credentials/spray-approval). On by default — spraying is impactful.
     require_approval: bool = True
+    # Lateral movement: where these creds were harvested + record the attack
+    # path (from_host → cred → target) in lateral_movement for the report.
+    from_host: Optional[str] = None
+    record_chain: bool = False
+    hop: int = 1
 
 
 class SprayApprovalRequest(BaseModel):
@@ -7772,13 +7777,50 @@ def credentials_reuse(body: CredentialReuseRequest, authorized: bool = Depends(a
         except Exception:
             pass
 
+    # Record the attack path for the report ("A → cred → B"). Every recorded hop
+    # already passed the scope gate above; this is the ledger, not the authority.
+    if body.record_chain and plan:
+        dispatched_keys = {(d["target_host"], d["target_port"]) for d in dispatched}
+        with get_db(autocommit=True) as conn, conn.cursor() as cur:
+            for item in plan:
+                cur.execute(
+                    """INSERT INTO public.lateral_movement
+                         (engagement_id, from_host, via_username, to_host, to_service,
+                          to_port, hop, status, source_credential_id)
+                       VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s::uuid)""",
+                    (eid, body.from_host, item["username"], item["target_host"],
+                     item["service"], item["target_port"], body.hop,
+                     "dispatched" if (item["target_host"], item["target_port"]) in dispatched_keys
+                     else "planned", item["source_credential_id"]),
+                )
+
     return {"ok": True, "dispatch": body.dispatch,
             "verified_credentials": len(creds), "plan": plan,
             "planned": len(plan), "dispatched": dispatched,
             "skipped_already_attempted": skipped_dedup,
             "refused_out_of_scope": refused_scope,
             "throttled_rate_limit": throttled,
-            "held_needs_approval": needs_approval}
+            "held_needs_approval": needs_approval,
+            "chain_recorded": bool(body.record_chain and plan)}
+
+
+@app.get("/lateral/{engagement_id}", tags=["Credentials"])
+def lateral_chain(engagement_id: str, authorized: bool = Depends(auth)):
+    """The lateral-movement attack path for an engagement — how the platform
+    moved from host to host with harvested credentials (for the report)."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT from_host, via_username, to_host, to_service, to_port,
+                      hop, status, created_at
+                 FROM public.lateral_movement
+                WHERE engagement_id = %s::uuid
+                ORDER BY hop, created_at""",
+            (engagement_id,),
+        )
+        hops = [dict(r) for r in cur.fetchall()]
+    return {"engagement_id": engagement_id, "hops": hops,
+            "hosts_reached": len({h["to_host"] for h in hops}),
+            "max_hop": max((h["hop"] for h in hops), default=0)}
 
 
 @app.post("/credentials/spray-approval", tags=["Credentials"])

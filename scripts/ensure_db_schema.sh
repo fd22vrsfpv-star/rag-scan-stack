@@ -110,6 +110,7 @@ CRITICAL_TABLES=(
     "tasks"
     "pending_exploits"
     "exploit_results"
+    "lateral_movement"
     "credential_spray_attempts"
     "credential_spray_approvals"
     "password_policies"
