@@ -1539,6 +1539,27 @@ CREATE TABLE IF NOT EXISTS public.credential_spray_approvals (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_spray_approval ON public.credential_spray_approvals
     (COALESCE(engagement_id::text,''), lower(username), lower(service));
 
+-- ── Lateral-movement attack-path ledger ─────────────────────────────────────
+-- Records each hop the platform takes with a harvested credential: from the
+-- host we looted it on, via an account, to another in-scope host/service. Built
+-- for the report ("how we got from A to D") and to bound/loop-guard chaining.
+-- Every hop is still gated by the scope gate + spray approval at dispatch time;
+-- this table is the record, not the authority.
+CREATE TABLE IF NOT EXISTS public.lateral_movement (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid,
+    from_host     text,             -- where the credential was harvested
+    via_username  text NOT NULL,
+    to_host       text NOT NULL,
+    to_service    text,
+    to_port       integer,
+    hop           integer NOT NULL DEFAULT 1,
+    status        text NOT NULL DEFAULT 'planned',  -- planned|dispatched|succeeded|failed
+    source_credential_id uuid,
+    created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_lateral_engagement ON public.lateral_movement(engagement_id);
+
 -- ── Global kill-switch / blast-radius control ───────────────────────────────
 -- One row per control scope: 'global' halts EVERY dispatch; an engagement_id
 -- string halts only that engagement. Enforced at the scope gate

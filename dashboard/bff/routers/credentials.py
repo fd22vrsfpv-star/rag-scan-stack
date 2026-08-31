@@ -311,3 +311,13 @@ async def set_password_policy(body: PasswordPolicyBody):
                             json=body.model_dump(exclude_none=True),
                             headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
+
+
+@router.get("/api/lateral/{engagement_id}")
+async def lateral_chain(engagement_id: str):
+    """The lateral-movement attack path for an engagement (for the report)."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.get(f"{s.rag_api_url}/lateral/{engagement_id}",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)

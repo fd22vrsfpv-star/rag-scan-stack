@@ -1423,14 +1423,20 @@ def _postex_enumerate(host, session_type, session_id, sid):
         base = os.environ.get("EXPLOIT_RUNNER_URL", "https://exploit-runner:8017")
         r = _rq.post(f"{base}/postex/enumerate",
                      json={"session_type": session_type, "session_id": str(session_id),
-                           "host": host, "platform": "linux"},
+                           "host": host, "platform": "linux",
+                           # chain into a scope-gated lateral spray PLAN (no
+                           # dispatch — the plan still goes through approval).
+                           "lateral": True},
                      headers={"x-api-key": os.environ.get("API_KEY", "changeme")},
-                     timeout=90, verify=False)
+                     timeout=120, verify=False)
         d = r.json() if r.status_code < 400 else {}
+        lat = d.get("lateral") or {}
         _msg(sid, "SurfaceTester",
              f"[post-ex] {host} ({session_type}): priv={d.get('privileged')}, "
              f"users={len(d.get('local_users') or [])}, "
-             f"creds_harvested={d.get('credentials_harvested', 0)}")
+             f"creds_harvested={d.get('credentials_harvested', 0)}"
+             + (f" → lateral plan: {lat.get('planned', 0)} target(s), "
+                f"{lat.get('held_needs_approval', 0)} need approval" if lat else ""))
         _emit("langgraph_postex_enumerated", sid,
               {"host": host, "session_type": session_type,
                "privileged": d.get("privileged"),
