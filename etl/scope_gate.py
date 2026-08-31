@@ -173,6 +173,35 @@ _IPV4_RE = _re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _SELF_ADDRS = ("127.", "0.0.0.0", "::1")
 
 
+def is_halted(cur, engagement_id=None):
+    """Global kill-switch check. Returns (halted, reason).
+
+    A 'global' halt stops every dispatch; an engagement-scoped halt stops only
+    that engagement's. Fail SAFE here (return not-halted on a DB error) because
+    load_dispatch_scope — which calls this — ALREADY fails closed on a DB error
+    (returns ([], "unavailable") → refuse). So a DB outage refuses via that path;
+    this check only decides the halted case when the DB is reachable.
+    """
+    try:
+        keys = ["global"]
+        if engagement_id:
+            keys.append(str(engagement_id))
+        cur.execute(
+            "SELECT scope, reason FROM public.platform_control "
+            "WHERE halted = true AND scope = ANY(%s) LIMIT 1",
+            (keys,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return False, None
+        scope = row.get("scope") if isinstance(row, dict) else row[0]
+        reason = row.get("reason") if isinstance(row, dict) else row[1]
+        return True, f"platform HALTED ({scope}): {reason or 'no reason given'}"
+    except Exception as e:  # table missing / transient — see docstring
+        logger.debug("halt check unavailable: %s", e)
+        return False, None
+
+
 def load_dispatch_scope(cur, engagement_id=None):
     """Scope rows for an authorisation decision.
 
@@ -182,8 +211,16 @@ def load_dispatch_scope(cur, engagement_id=None):
 
     On ANY error returns ([], "unavailable") — the caller must treat an empty
     result as "refuse", never as "no restrictions".
+
+    The GLOBAL KILL-SWITCH is enforced here: when the platform is halted this
+    returns ([], "halted"), so every caller that treats an empty scope as
+    "refuse" (all of them, by contract) stops dispatching — one switch, one
+    chokepoint, no per-caller changes.
     """
     try:
+        halted, _reason = is_halted(cur, engagement_id)
+        if halted:
+            return [], "halted"
         if engagement_id:
             rows = load_engagement_scope(cur, engagement_id)
             if rows:

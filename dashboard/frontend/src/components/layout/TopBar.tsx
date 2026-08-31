@@ -5,8 +5,45 @@ import { useEngagements } from '@/api/engagements'
 import { useUIStore } from '@/stores/ui'
 import { useAutoSelectEngagementScope } from '@/hooks/useAutoSelectEngagementScope'
 import { BUILD_VERSION } from '@/lib/constants'
-import { MessageCircle } from 'lucide-react'
+import { MessageCircle, OctagonX, Play } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { useControlStatus, useHalt, useResume } from '@/api/control'
+
+function KillSwitch() {
+  const { data } = useControlStatus()
+  const halt = useHalt()
+  const resume = useResume()
+  const halted = !!data?.halted
+
+  if (halted) {
+    return (
+      <button
+        onClick={() => resume.mutate()}
+        disabled={resume.isPending}
+        title={data?.reason || 'Platform halted — all dispatch refused'}
+        className="flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-semibold bg-red-600 text-white animate-pulse disabled:opacity-60"
+      >
+        <Play className="h-3.5 w-3.5" />
+        {resume.isPending ? 'Resuming…' : 'HALTED · Resume'}
+      </button>
+    )
+  }
+  return (
+    <button
+      onClick={() => {
+        if (window.confirm('HALT the platform? This refuses ALL scans and agent dispatch (in-scope and out) until you resume. In-flight work is not killed.')) {
+          halt.mutate(undefined)
+        }
+      }}
+      disabled={halt.isPending}
+      title="Emergency stop — refuse all dispatch platform-wide"
+      className="flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-medium border border-red-500/50 text-red-500 hover:bg-red-500/10 disabled:opacity-60"
+    >
+      <OctagonX className="h-3.5 w-3.5" />
+      {halt.isPending ? 'Halting…' : 'Halt'}
+    </button>
+  )
+}
 
 const ROUTE_TITLES: Record<string, string> = {
   '/': 'Dashboard',
@@ -82,6 +119,8 @@ export function TopBar() {
           )} />
           <span>{healthyCount}/{totalServices}</span>
         </div>
+
+        <KillSwitch />
 
         <button
           onClick={() => {

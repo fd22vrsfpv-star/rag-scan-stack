@@ -518,6 +518,7 @@ _SELF_SINK_URL = os.environ.get(
 _ALL_EVENT_TYPES = [
     "scan_started", "scan_completed", "scan_failed", "scan_stopped",
     "scan_summary",
+    "platform_halted", "platform_resumed",
     "stage_started", "stage_completed", "stage_failed",
     "finding_high", "finding_critical", "finding_exploitable",
     "ingest_completed",
