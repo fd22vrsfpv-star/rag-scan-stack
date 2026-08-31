@@ -250,3 +250,64 @@ async def delete_access_map(map_id: str):
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
+
+
+# ── Credential reuse / spray loop (Phase 2) ──────────────────────────────────
+
+class ReuseBody(BaseModel):
+    engagement_id: Optional[str] = None
+    credential_id: Optional[str] = None
+    dispatch: bool = False
+    max_targets: int = 100
+    max_attempts_per_account: int = 3
+    window_minutes: int = 60
+    require_approval: bool = True
+
+
+@router.post("/api/credentials/reuse")
+async def credentials_reuse(body: ReuseBody):
+    """Plan (or dispatch) a credential-reuse spray — scope-gated, rate-limited
+    per account, and held per (account, service) until approved."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=60) as c:
+        resp = await c.post(f"{s.rag_api_url}/credentials/reuse",
+                            json=body.model_dump(),
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+class SprayApprovalBody(BaseModel):
+    engagement_id: Optional[str] = None
+    username: str
+    service: str
+    approved: bool = True
+    approved_by: Optional[str] = None
+    note: Optional[str] = None
+
+
+@router.post("/api/credentials/spray-approval")
+async def spray_approval(body: SprayApprovalBody):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.post(f"{s.rag_api_url}/credentials/spray-approval",
+                            json=body.model_dump(exclude_none=True),
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+class PasswordPolicyBody(BaseModel):
+    engagement_id: Optional[str] = None
+    scope_host: Optional[str] = None
+    lockout_threshold: int
+    window_minutes: int = 30
+    source: Optional[str] = "operator"
+
+
+@router.post("/api/password-policy")
+async def set_password_policy(body: PasswordPolicyBody):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.post(f"{s.rag_api_url}/password-policy",
+                            json=body.model_dump(exclude_none=True),
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)

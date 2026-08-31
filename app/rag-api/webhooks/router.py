@@ -541,6 +541,7 @@ _ALL_EVENT_TYPES = [
     "langgraph_surface_decision",
     # Phase 0 orchestration seam: the recon loop hands off to a full session.
     "recon_agent_pipeline_launched",
+    "credential_reuse_sprayed",
 ]
 
 
