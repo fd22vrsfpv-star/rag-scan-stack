@@ -214,6 +214,12 @@ class ReconAgent:
     def __init__(self):
         self._stopped = False
         self._settings = get_settings()
+        # Phase 0 orchestration seam: when recon coverage for an engagement is
+        # complete AND the engagement opted into auto_drive, the loop launches ONE
+        # full analyze→prove session. In-memory per-engagement cooldown so an idle
+        # loop does not relaunch every tick (a restart may launch once more — safe).
+        self._last_driven = {}  # engagement_id -> monotonic seconds
+        self._DRIVE_COOLDOWN = int(os.environ.get("RECON_DRIVE_COOLDOWN_SEC", "10800"))
 
     async def run(self):
         """Main loop. Polls every BASE_INTERVAL seconds for enabled engagements."""
@@ -287,6 +293,80 @@ class ReconAgent:
                 await self._agent_cycle(eid, agent.get("config") or {}, agent)
             except Exception:
                 log.exception("Agent cycle failed for engagement %s", eid[:8] if eid else "?")
+
+    async def _maybe_drive_pipeline(self, eid: str, headers: dict, targets: list) -> None:
+        """Hand a coverage-complete engagement off to a full analyze→prove
+        session — the Phase-0 seam that turns the recon loop into a driver.
+
+        Safe by construction: (1) opt-in per engagement (auto_drive); (2) a
+        per-engagement cooldown so an idle loop does not relaunch every tick;
+        (3) skipped if a session is already active for this engagement; (4) the
+        launch itself is refused with 409 while the platform is halted (the
+        /pentest kill-switch guard); (5) it launches with the surface-test phase
+        (safe probes auto-run) but EXPLOITATION STAYS HUMAN-GATED — exploit_phase
+        and auto_exploit are OFF, so impactful findings still queue for approval.
+        """
+        now = time.monotonic()
+        last = self._last_driven.get(eid, 0)
+        if now - last < self._DRIVE_COOLDOWN:
+            return
+        s = self._settings
+        try:
+            # Skip if a session for this engagement is already active/paused.
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.get(f"{s.autogen_url}/pentest/sessions", headers=headers)
+                sessions = (r.json() or {}).get("sessions", []) if r.status_code == 200 else []
+            live = {"active", "awaiting_approval", "running"}
+            for sess in sessions:
+                cfg = sess.get("configuration") or {}
+                if (str(cfg.get("engagement_id")) == str(eid)
+                        and sess.get("status") in live):
+                    self._last_driven[eid] = now  # something is already driving
+                    return
+            # Engagement STOP condition (Phase 1): if every in-scope service is
+            # already tested, there is nothing left to drive — record the
+            # cooldown and stop. This is what turns "keep looping" into "done".
+            try:
+                async with httpx.AsyncClient(timeout=15) as c:
+                    cov = await c.get(f"{s.rag_api_url}/coverage/{eid}/complete", headers=headers)
+                if cov.status_code == 200 and (cov.json() or {}).get("complete"):
+                    self._last_driven[eid] = now
+                    log.info("[recon:%s] auto-drive: engagement test-complete — nothing to drive", eid[:8])
+                    return
+            except Exception:
+                pass  # coverage unavailable — fall through and drive
+            # Launch one driven session. Target = the engagement's scope hosts.
+            tgt = ", ".join(str(t) for t in targets[:50]) or eid
+            body = {
+                "session_name": f"auto-drive {eid[:8]}",
+                "target_description": tgt,
+                "initial_task": ("Analyze the completed recon/scan data for this "
+                                 "engagement and prove exploitable web findings. "
+                                 "Impactful actions require operator approval."),
+                "enable_surface_test_phase": True,   # safe probes auto-run
+                "enable_exploit_phase": False,       # exploitation stays human-gated
+                # auto_exploit + synthesis stay OFF here — a hands-off driver must
+                # not silently escalate; the operator opts into those explicitly.
+            }
+            async with httpx.AsyncClient(timeout=30) as c:
+                resp = await c.post(f"{s.autogen_url}/pentest", json=body, headers=headers)
+            if resp.status_code == 409:
+                log.info("[recon:%s] auto-drive skipped — platform halted", eid[:8])
+                return
+            if resp.status_code >= 400:
+                log.warning("[recon:%s] auto-drive launch failed %s: %s",
+                            eid[:8], resp.status_code, resp.text[:160])
+                return
+            sid = (resp.json() or {}).get("session_id")
+            self._last_driven[eid] = now
+            log.info("[recon:%s] auto-drive launched session %s (coverage complete)",
+                     eid[:8], sid)
+            await self._emit_webhook(eid, "recon_agent_pipeline_launched", headers, {
+                "engagement_id": eid, "session_id": sid, "targets": len(targets),
+                "reason": "recon coverage complete",
+            })
+        except Exception as e:
+            log.debug("[recon:%s] auto-drive error: %s", eid[:8], e)
 
     async def _emit_webhook(self, eid: str, event_type: str, headers: dict,
                              data: dict, severity: str | None = None) -> None:
@@ -1210,12 +1290,37 @@ class ReconAgent:
                  eid[:8], dispatched, kb_drained, kb_failed, kb_skipped_pending,
                  kb_total_pending, len(open_followups), len(targets))
 
+        # Blast-radius budget: count this cycle's dispatches against the scope's
+        # scan_budget. When scans_used reaches the budget the scope gate refuses
+        # further dispatch (over_budget → empty dispatch scope), so the next
+        # cycle is fully blocked. Per-cycle granularity — overshoot is bounded by
+        # one cycle's max_dispatches. Best-effort; never blocks the cycle.
+        if dispatched > 0:
+            try:
+                s = self._settings
+                async with httpx.AsyncClient(timeout=5) as c:
+                    await c.post(
+                        f"{s.rag_api_url}/control/note-dispatch",
+                        json={"engagement_id": eid, "count": dispatched},
+                        headers=headers,
+                    )
+            except Exception as e:
+                log.debug("[recon:%s] budget note-dispatch failed: %s", eid[:8], e)
+
         # Webhook: cycle completed
         await self._emit_webhook(eid, "recon_agent_cycle_completed", headers, {
             "engagement_id": eid, "dispatched": dispatched,
             "followups_open": len(open_followups), "targets_checked": len(targets),
             "profile": profile,
         })
+
+        # Phase 0 orchestration seam: recon coverage for this engagement is
+        # COMPLETE when a cycle dispatched nothing new and the KB backlog is
+        # empty. If the engagement opted into auto_drive, hand off to a full
+        # analyze→prove session — the loop stops enumerating and starts testing.
+        coverage_complete = (dispatched == 0 and kb_total_pending == 0)
+        if config.get("auto_drive") and coverage_complete:
+            await self._maybe_drive_pipeline(eid, headers, targets)
 
 
 # Module-level singleton

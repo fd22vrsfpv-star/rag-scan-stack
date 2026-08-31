@@ -2132,6 +2132,24 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
     """
     import asyncio
 
+    # Kill-switch: don't launch a session while the platform is halted — every
+    # scan it issued would be refused at the scope gate anyway, so fail fast with
+    # a clear message instead of spawning a session that can do nothing.
+    try:
+        from db_utils import get_db_dsn
+        import psycopg2
+        with psycopg2.connect(get_db_dsn()) as _c, _c.cursor() as _cur:
+            _cur.execute("SELECT halted, reason FROM public.platform_control "
+                         "WHERE scope = 'global' AND halted = true LIMIT 1")
+            _h = _cur.fetchone()
+        if _h:
+            raise HTTPException(409, f"platform is HALTED — {(_h[1] or 'no reason given')}. "
+                                     "Resume from the control switch before launching.")
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # control table unreadable — the scope gate still fails closed
+
     try:
         # Create session in database
         # The resolved engine is persisted, not just the requested one: a
