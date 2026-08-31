@@ -846,9 +846,27 @@ def report(state: PentestState) -> dict:
            + (f"operator exploit decision: approved={decision.get('approved')}\n"
               if decision else "")
            + f"Steps:\n{lines}")
-    _msg(sid, "Reporter", rpt)
-    _emit("langgraph_phase_completed", sid, {"phase": "report"})
-    return {"phase": "done", "report": rpt, "log": ["report: composed"]}
+    # Phase 3: attach the FULL engagement report (findings, evidence, severity)
+    # from the real generator, not just this step list. Best-effort — the step
+    # summary is the fallback so a generator hiccup never fails the session.
+    full = None
+    try:
+        import report_generator
+        r = report_generator.generate_full_report(target=state.get("target"),
+                                                  format="markdown")
+        if isinstance(r, str):
+            full = r
+        elif isinstance(r, dict):
+            full = r.get("markdown") or r.get("report") or r.get("content")
+    except Exception as e:  # noqa: BLE001
+        _msg(sid, "Reporter", f"[full report unavailable, using summary: {e}]")
+    final = full if (isinstance(full, str) and full.strip()) else rpt
+    if full and final is not rpt:
+        final = rpt + "\n\n" + "=" * 60 + "\n\n" + final   # summary header + full report
+    _msg(sid, "Reporter", final[:6000])
+    _emit("langgraph_phase_completed", sid, {"phase": "report",
+                                             "full_report": bool(full)})
+    return {"phase": "done", "report": final, "log": ["report: composed"]}
 
 
 # ── surface-test phase ───────────────────────────────────────────────────────
