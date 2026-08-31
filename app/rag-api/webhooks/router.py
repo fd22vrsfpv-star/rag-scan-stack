@@ -542,6 +542,7 @@ _ALL_EVENT_TYPES = [
     # Phase 0 orchestration seam: the recon loop hands off to a full session.
     "recon_agent_pipeline_launched",
     "credential_reuse_sprayed",
+    "postex_enumerated", "langgraph_postex_enumerated",
 ]
 
 
