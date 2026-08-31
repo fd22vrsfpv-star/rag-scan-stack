@@ -99,3 +99,25 @@ async def coverage_complete(engagement_id: str):
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
         return safe_json(resp)
+
+
+@router.get("/api/findings/verification/{engagement_id}")
+async def findings_verification(engagement_id: str):
+    """Which scanner findings are backed by a passing proof test (Phase 3)."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=20) as c:
+        resp = await c.get(f"{s.rag_api_url}/findings/verification/{engagement_id}", headers=_hdrs())
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.get("/api/learning/status")
+async def learning_status():
+    """Learning-loop health metrics (Phase 4)."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.get(f"{s.rag_api_url}/learning/status", headers=_hdrs())
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)

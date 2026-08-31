@@ -7552,6 +7552,87 @@ def coverage(engagement_id: str, authorized: bool = Depends(auth)):
     }
 
 
+@app.get("/learning/status", tags=["Coverage"])
+def learning_status(authorized: bool = Depends(auth)):
+    """Measure the learning loop — the one thing that was missing. Surfaces three
+    honest signals: (1) do our generated tests actually PROVE things (test
+    outcome rate); (2) is retrieval feedback being collected (the ranker's
+    input); (3) has retrieval quality been MEASURED (rag_eval). Answers 'is it
+    improving?' with numbers instead of a claim."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT status, count(*) c FROM public.security_test_runs GROUP BY status")
+        outcomes = {r["status"]: r["c"] for r in cur.fetchall()}
+        cur.execute("SELECT count(*) c FROM public.rag_feedback")
+        fb_votes = cur.fetchone()["c"]
+        cur.execute("SELECT count(*) c FROM public.rag_eval_runs")
+        eval_runs = cur.fetchone()["c"]
+        latest = None
+        if eval_runs:
+            cur.execute("SELECT model_label, ndcg_at_5, mrr, recall_at_5 "
+                        "FROM public.rag_eval_runs LIMIT 1")
+            latest = dict(cur.fetchone())
+    total = sum(outcomes.values())
+    proven = outcomes.get("pass", 0)
+    return {
+        "generated_tests": {
+            "runs": total, "proven": proven,
+            "failed": outcomes.get("fail", 0), "error": outcomes.get("error", 0),
+            "prove_rate_pct": round(100 * proven / total, 1) if total else None,
+        },
+        "retrieval_feedback": {
+            "votes": fb_votes, "learning_active": fb_votes > 0,
+            "note": "re-ranks retrieval by helpful/unhelpful votes; identical to "
+                    "pure similarity when empty",
+        },
+        "retrieval_eval": {
+            "runs": eval_runs, "measured": eval_runs > 0, "latest": latest,
+            "note": "POST /rag/eval/run for a baseline before trusting gains",
+        },
+        "assessment": (
+            "measured" if eval_runs else
+            ("collecting feedback, not yet measured" if fb_votes else
+             "no outcome measurement yet — run tests and POST /rag/eval/run")),
+    }
+
+
+@app.get("/findings/verification/{engagement_id}", tags=["Coverage"])
+def findings_verification(engagement_id: str, authorized: bool = Depends(auth)):
+    """Auto-verify scanner findings against PROOF. A scanner (nuclei/ZAP) finding
+    on a host is `confirmed` when a security test PASSED against that host —
+    i.e. we independently demonstrated something there — else `unverified`. This
+    separates proven findings from raw scanner output before the report, without
+    destructively editing the scanner's own confidence."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """WITH proven_hosts AS (
+                   SELECT DISTINCT host(st.target_ip)::text AS host
+                     FROM public.security_test_runs r
+                     JOIN public.security_tests st ON st.id = r.test_id
+                    WHERE r.status = 'pass' AND st.target_ip IS NOT NULL
+               )
+               SELECT wf.id, wf.source, wf.issue_type, wf.name, wf.severity,
+                      regexp_replace(a.ip::text,'/[0-9]+$','') AS host,
+                      (ph.host IS NOT NULL) AS confirmed
+                 FROM public.web_findings wf
+                 JOIN public.assets a ON a.id = wf.asset_id
+                 LEFT JOIN proven_hosts ph
+                        ON ph.host = regexp_replace(a.ip::text,'/[0-9]+$','')
+                WHERE a.engagement_id = %s::uuid
+                ORDER BY confirmed DESC, wf.severity""",
+            (engagement_id,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    total = len(rows)
+    confirmed = sum(1 for r in rows if r["confirmed"])
+    return {
+        "engagement_id": engagement_id,
+        "summary": {"findings": total, "confirmed": confirmed,
+                    "unverified": total - confirmed,
+                    "pct_confirmed": round(100 * confirmed / total, 1) if total else 0.0},
+        "findings": rows,
+    }
+
+
 @app.get("/coverage/{engagement_id}/complete", tags=["Coverage"])
 def coverage_complete(engagement_id: str, authorized: bool = Depends(auth)):
     """Engagement stop condition: complete when every in-scope open service has
