@@ -110,6 +110,7 @@ CRITICAL_TABLES=(
     "tasks"
     "pending_exploits"
     "exploit_results"
+    "platform_control"
     "security_tests"
     "security_test_runs"
     "exploit_chunks"

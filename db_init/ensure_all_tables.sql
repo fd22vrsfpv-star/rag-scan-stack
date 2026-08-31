@@ -1486,6 +1486,29 @@ CREATE INDEX IF NOT EXISTS idx_exploit_results_executed_at ON public.exploit_res
 --     approval gate live there) and each run maps to an exploit_results row;
 --   * a SAFE test carries its own command and each run maps to a tool_executions
 --     row (written by kali-listener /tools/execute).
+-- ── Global kill-switch / blast-radius control ───────────────────────────────
+-- One row per control scope: 'global' halts EVERY dispatch; an engagement_id
+-- string halts only that engagement. Enforced at the scope gate
+-- (etl/scope_gate.is_halted -> load_dispatch_scope returns ([], "halted")), so a
+-- halt refuses every gated dispatcher with no per-caller change. Also read by
+-- the recon-agent loop and the /pentest launcher for a clear "halted" message.
+CREATE TABLE IF NOT EXISTS public.platform_control (
+    scope        text PRIMARY KEY,               -- 'global' | '<engagement_id>'
+    halted       boolean NOT NULL DEFAULT false,
+    reason       text,
+    actor        text,
+    -- Blast-radius budget (nullable = no cap). Enforced alongside the halt.
+    scan_budget       integer,                    -- max dispatches for this scope
+    scans_used        integer NOT NULL DEFAULT 0,
+    host_cap          integer,                    -- max distinct hosts touched
+    metadata     jsonb NOT NULL DEFAULT '{}',
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+-- The singleton global row always exists (not halted by default).
+INSERT INTO public.platform_control (scope, halted)
+VALUES ('global', false)
+ON CONFLICT (scope) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS public.security_tests (
     id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     name                  text NOT NULL,

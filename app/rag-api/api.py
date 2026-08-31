@@ -7482,6 +7482,111 @@ def security_test_send_to_burp(test_id: str, authorized: bool = Depends(auth)):
             "message": "queued for Burp — import from the Burp queue"}
 
 
+# ── Global kill-switch / blast-radius control ────────────────────────────────
+# Halt is enforced at the scope gate (etl/scope_gate.is_halted), so a halt
+# refuses every gated dispatcher at once. These endpoints just flip the flag and
+# report it; the enforcement is structural, not per-endpoint.
+
+class HaltRequest(BaseModel):
+    reason: Optional[str] = None
+    scope: Optional[str] = "global"   # 'global' or an engagement_id
+    actor: Optional[str] = None
+
+
+class BudgetRequest(BaseModel):
+    scope: Optional[str] = "global"
+    scan_budget: Optional[int] = None   # max dispatches (null clears the cap)
+    host_cap: Optional[int] = None       # max distinct hosts (null clears)
+
+
+@app.post("/control/halt", tags=["Control"])
+def control_halt(body: HaltRequest, authorized: bool = Depends(auth)):
+    """EMERGENCY STOP. Halt all gated dispatch for a scope ('global' or an
+    engagement id). Every scanner/agent that passes the scope gate refuses
+    immediately; in-flight work is not killed, but no new work is admitted."""
+    scope = (body.scope or "global").strip() or "global"
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """INSERT INTO public.platform_control (scope, halted, reason, actor, updated_at)
+               VALUES (%s, true, %s, %s, now())
+               ON CONFLICT (scope) DO UPDATE
+                 SET halted = true, reason = EXCLUDED.reason,
+                     actor = EXCLUDED.actor, updated_at = now()
+               RETURNING scope, halted, reason, actor""",
+            (scope, body.reason, body.actor),
+        )
+        row = dict(cur.fetchone())
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("platform_halted", "control",
+                     {"scope": scope, "reason": body.reason, "actor": body.actor})
+    except Exception:
+        pass
+    return {"ok": True, **row,
+            "message": f"platform HALTED ({scope}) — all gated dispatch is refused"}
+
+
+@app.post("/control/resume", tags=["Control"])
+def control_resume(body: HaltRequest, authorized: bool = Depends(auth)):
+    """Lift a halt for a scope. Dispatch resumes (still scope-gated as normal)."""
+    scope = (body.scope or "global").strip() or "global"
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """INSERT INTO public.platform_control (scope, halted, reason, actor, updated_at)
+               VALUES (%s, false, %s, %s, now())
+               ON CONFLICT (scope) DO UPDATE
+                 SET halted = false, reason = EXCLUDED.reason,
+                     actor = EXCLUDED.actor, updated_at = now()
+               RETURNING scope, halted""",
+            (scope, body.reason, body.actor),
+        )
+        row = dict(cur.fetchone())
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("platform_resumed", "control", {"scope": scope, "actor": body.actor})
+    except Exception:
+        pass
+    return {"ok": True, **row, "message": f"platform resumed ({scope})"}
+
+
+@app.post("/control/budget", tags=["Control"])
+def control_budget(body: BudgetRequest, authorized: bool = Depends(auth)):
+    """Set the blast-radius budget for a scope: a max number of dispatches
+    (scan_budget) and/or distinct hosts (host_cap). Null clears a cap."""
+    scope = (body.scope or "global").strip() or "global"
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """INSERT INTO public.platform_control (scope, halted, scan_budget, host_cap, updated_at)
+               VALUES (%s, false, %s, %s, now())
+               ON CONFLICT (scope) DO UPDATE
+                 SET scan_budget = EXCLUDED.scan_budget,
+                     host_cap = EXCLUDED.host_cap, updated_at = now()
+               RETURNING scope, scan_budget, scans_used, host_cap""",
+            (scope, body.scan_budget, body.host_cap),
+        )
+        row = dict(cur.fetchone())
+    return {"ok": True, **row}
+
+
+@app.get("/control/status", tags=["Control"])
+def control_status(engagement_id: Optional[str] = Query(default=None),
+                   authorized: bool = Depends(auth)):
+    """Current control state. `halted` is the EFFECTIVE state for the given
+    engagement (global halt OR that engagement's halt)."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT scope, halted, reason, actor, scan_budget, scans_used,
+                      host_cap, updated_at
+                 FROM public.platform_control ORDER BY scope""")
+        rows = [dict(r) for r in cur.fetchall()]
+    by = {r["scope"]: r for r in rows}
+    halted = bool(by.get("global", {}).get("halted"))
+    reason = by.get("global", {}).get("reason")
+    if engagement_id and by.get(str(engagement_id), {}).get("halted"):
+        halted, reason = True, by[str(engagement_id)].get("reason")
+    return {"halted": halted, "reason": reason, "controls": rows}
+
+
 @app.post("/cleanup/exploits", tags=["Maintenance"])
 def cleanup_exploits(
     dry_run: bool = Query(default=False),
