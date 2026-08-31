@@ -202,6 +202,37 @@ def is_halted(cur, engagement_id=None):
         return False, None
 
 
+def over_budget(cur, engagement_id=None):
+    """Blast-radius check. Returns (exceeded, reason).
+
+    A scope is over budget when its platform_control row has a scan_budget set
+    and scans_used has reached it. Bounds the AUTONOMOUS loop's reach; the loop
+    increments scans_used per dispatch (see /control/note-dispatch). Fail SAFE
+    (not-exceeded on error) for the same reason as is_halted — load_dispatch_scope
+    already fails closed on a DB outage.
+    """
+    try:
+        keys = ["global"]
+        if engagement_id:
+            keys.append(str(engagement_id))
+        cur.execute(
+            "SELECT scope, scan_budget, scans_used FROM public.platform_control "
+            "WHERE scan_budget IS NOT NULL AND scans_used >= scan_budget "
+            "AND scope = ANY(%s) LIMIT 1",
+            (keys,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return False, None
+        scope = row.get("scope") if isinstance(row, dict) else row[0]
+        used = row.get("scans_used") if isinstance(row, dict) else row[2]
+        budget = row.get("scan_budget") if isinstance(row, dict) else row[1]
+        return True, f"scan budget exhausted ({scope}): {used}/{budget}"
+    except Exception as e:
+        logger.debug("budget check unavailable: %s", e)
+        return False, None
+
+
 def load_dispatch_scope(cur, engagement_id=None):
     """Scope rows for an authorisation decision.
 
@@ -212,15 +243,18 @@ def load_dispatch_scope(cur, engagement_id=None):
     On ANY error returns ([], "unavailable") — the caller must treat an empty
     result as "refuse", never as "no restrictions".
 
-    The GLOBAL KILL-SWITCH is enforced here: when the platform is halted this
-    returns ([], "halted"), so every caller that treats an empty scope as
-    "refuse" (all of them, by contract) stops dispatching — one switch, one
-    chokepoint, no per-caller changes.
+    Two platform controls are enforced here, at the one chokepoint every gated
+    dispatcher passes: the KILL-SWITCH (halt → ([], "halted")) and the
+    BLAST-RADIUS budget (over budget → ([], "budget-exceeded")). Because every
+    caller treats an empty scope as "refuse", one place stops all dispatch.
     """
     try:
         halted, _reason = is_halted(cur, engagement_id)
         if halted:
             return [], "halted"
+        exceeded, _b = over_budget(cur, engagement_id)
+        if exceeded:
+            return [], "budget-exceeded"
         if engagement_id:
             rows = load_engagement_scope(cur, engagement_id)
             if rows:

@@ -25,11 +25,12 @@ except Exception as e:  # pragma: no cover
 
 
 class FakeCursor:
-    """Minimal cursor: answers the platform_control halt query from `halted`,
-    and any scope_targets query from `scope_rows`."""
-    def __init__(self, halted=False, reason="stop", scope_rows=None):
+    """Minimal cursor: answers the platform_control halt/budget queries and any
+    scope_targets query from `scope_rows`."""
+    def __init__(self, halted=False, reason="stop", scope_rows=None, over_budget=False):
         self.halted = halted
         self.reason = reason
+        self.over = over_budget
         self.scope_rows = scope_rows if scope_rows is not None else [("1.2.3.4", "ip")]
         self._last = None
 
@@ -38,13 +39,14 @@ class FakeCursor:
         self._params = params
 
     def fetchone(self):
+        if "platform_control" in self._last and "scan_budget" in self._last:
+            # over_budget query
+            return ("global", 5, 5) if self.over else None
         if "platform_control" in self._last:
             return ("global", self.reason) if self.halted else None
         return None
 
     def fetchall(self):
-        if "platform_control" in self._last:
-            return [("global", self.reason)] if self.halted else []
         if "scope_targets" in self._last:
             return list(self.scope_rows)
         return []
@@ -71,6 +73,16 @@ def test_not_halted_returns_the_real_scope():
     assert rows == [("10.0.0.5", "ip")] and source == "all-engagements"
     # a normal in-scope dispatch is allowed
     assert sg.check_dispatch("10.0.0.5", rows) is None
+
+
+def test_over_budget_empties_the_dispatch_scope():
+    assert sg.over_budget(FakeCursor(over_budget=True))[0] is True
+    assert sg.over_budget(FakeCursor(over_budget=False)) == (False, None)
+    rows, source = sg.load_dispatch_scope(FakeCursor(over_budget=True))
+    assert rows == [] and source == "budget-exceeded", (
+        "a scope past its scan_budget must yield an EMPTY dispatch scope so the "
+        "autonomous loop stops; got rows=%r source=%r" % (rows, source))
+    assert sg.check_dispatch("1.2.3.4", rows) is not None
 
 
 # ── live control endpoints (skip without a stack) ────────────────────────────
@@ -112,3 +124,19 @@ def test_halt_status_resume_roundtrip():
         assert st2.json().get("halted") is False
     finally:
         _req("POST", "/control/resume", {"scope": scope})
+
+
+def test_budget_counts_and_reports_over():
+    scope = "pytest-budget-scope"
+    try:
+        b = _req("POST", "/control/budget", {"scope": scope, "scan_budget": 2})
+        if b.status_code in (401, 403):
+            pytest.skip("auth required")
+        assert b.status_code == 200 and b.json().get("scans_used") == 0
+        n1 = _req("POST", "/control/note-dispatch", {"engagement_id": scope, "count": 1})
+        assert n1.json().get("over_budget") is False
+        n2 = _req("POST", "/control/note-dispatch", {"engagement_id": scope, "count": 1})
+        assert n2.json().get("over_budget") is True, "2/2 dispatches must be over budget"
+    finally:
+        # clear the budget (also resets used to 0) and remove the test row
+        _req("POST", "/control/budget", {"scope": scope, "scan_budget": None})

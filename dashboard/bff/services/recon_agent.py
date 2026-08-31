@@ -1210,6 +1210,23 @@ class ReconAgent:
                  eid[:8], dispatched, kb_drained, kb_failed, kb_skipped_pending,
                  kb_total_pending, len(open_followups), len(targets))
 
+        # Blast-radius budget: count this cycle's dispatches against the scope's
+        # scan_budget. When scans_used reaches the budget the scope gate refuses
+        # further dispatch (over_budget → empty dispatch scope), so the next
+        # cycle is fully blocked. Per-cycle granularity — overshoot is bounded by
+        # one cycle's max_dispatches. Best-effort; never blocks the cycle.
+        if dispatched > 0:
+            try:
+                s = self._settings
+                async with httpx.AsyncClient(timeout=5) as c:
+                    await c.post(
+                        f"{s.rag_api_url}/control/note-dispatch",
+                        json={"engagement_id": eid, "count": dispatched},
+                        headers=headers,
+                    )
+            except Exception as e:
+                log.debug("[recon:%s] budget note-dispatch failed: %s", eid[:8], e)
+
         # Webhook: cycle completed
         await self._emit_webhook(eid, "recon_agent_cycle_completed", headers, {
             "engagement_id": eid, "dispatched": dispatched,

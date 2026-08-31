@@ -7552,20 +7552,50 @@ def control_resume(body: HaltRequest, authorized: bool = Depends(auth)):
 @app.post("/control/budget", tags=["Control"])
 def control_budget(body: BudgetRequest, authorized: bool = Depends(auth)):
     """Set the blast-radius budget for a scope: a max number of dispatches
-    (scan_budget) and/or distinct hosts (host_cap). Null clears a cap."""
+    (scan_budget) and/or distinct hosts (host_cap). Setting a budget RESETS the
+    used counter to 0 — a new budget starts a fresh count. Null clears a cap."""
     scope = (body.scope or "global").strip() or "global"
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            """INSERT INTO public.platform_control (scope, halted, scan_budget, host_cap, updated_at)
-               VALUES (%s, false, %s, %s, now())
+            """INSERT INTO public.platform_control (scope, halted, scan_budget, host_cap, scans_used, updated_at)
+               VALUES (%s, false, %s, %s, 0, now())
                ON CONFLICT (scope) DO UPDATE
                  SET scan_budget = EXCLUDED.scan_budget,
-                     host_cap = EXCLUDED.host_cap, updated_at = now()
+                     host_cap = EXCLUDED.host_cap, scans_used = 0, updated_at = now()
                RETURNING scope, scan_budget, scans_used, host_cap""",
             (scope, body.scan_budget, body.host_cap),
         )
         row = dict(cur.fetchone())
     return {"ok": True, **row}
+
+
+class NoteDispatchRequest(BaseModel):
+    engagement_id: Optional[str] = None
+    count: int = 1
+
+
+@app.post("/control/note-dispatch", tags=["Control"])
+def control_note_dispatch(body: NoteDispatchRequest, authorized: bool = Depends(auth)):
+    """Count N dispatches against the budget. The autonomous loop calls this per
+    dispatch; when scans_used reaches scan_budget the scope gate refuses further
+    work (over_budget → empty dispatch scope). Rows with no budget still count
+    (harmless) so a budget set later starts from the real number only after a
+    reset. Returns the updated counters for global + the engagement."""
+    keys = ["global"]
+    if body.engagement_id:
+        keys.append(str(body.engagement_id))
+    n = max(0, int(body.count or 1))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "UPDATE public.platform_control SET scans_used = scans_used + %s, "
+            "updated_at = now() WHERE scope = ANY(%s) "
+            "RETURNING scope, scan_budget, scans_used",
+            (n, keys),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    over = any(r["scan_budget"] is not None and r["scans_used"] >= r["scan_budget"]
+               for r in rows)
+    return {"ok": True, "counted": n, "over_budget": over, "controls": rows}
 
 
 @app.get("/control/status", tags=["Control"])
