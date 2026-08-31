@@ -1486,6 +1486,103 @@ CREATE INDEX IF NOT EXISTS idx_exploit_results_executed_at ON public.exploit_res
 --     approval gate live there) and each run maps to an exploit_results row;
 --   * a SAFE test carries its own command and each run maps to a tool_executions
 --     row (written by kali-listener /tools/execute).
+-- ── Credential-reuse (spray) attempt ledger ─────────────────────────────────
+-- Tracks which (credential, target) pairs the reuse loop has already sprayed so
+-- it never re-sprays. No such dedup existed; credential_findings tracks
+-- SUCCESSES, not attempts. secret_fingerprint is a sha256 of the secret so the
+-- plaintext is not duplicated here.
+CREATE TABLE IF NOT EXISTS public.credential_spray_attempts (
+    id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id        uuid,
+    username             text NOT NULL,
+    secret_fingerprint   text,
+    target_host          text NOT NULL,
+    target_port          integer NOT NULL,
+    service              text,
+    source_credential_id uuid,
+    status               text NOT NULL DEFAULT 'dispatched',  -- dispatched|skipped|failed
+    brutus_job_id        text,
+    attempted_at         timestamptz NOT NULL DEFAULT now()
+);
+-- COALESCE the nullable secret so a NULL fingerprint does not bypass dedup
+-- (a table-level UNIQUE can't hold an expression; a unique index can).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_spray_identity ON public.credential_spray_attempts
+    (username, COALESCE(secret_fingerprint, ''), target_host, target_port);
+CREATE INDEX IF NOT EXISTS idx_spray_engagement ON public.credential_spray_attempts(engagement_id);
+
+-- Discovered or operator-set password/lockout policy. Caps how many times a
+-- single account may be sprayed in a window so the loop never locks a real
+-- account. When absent, the reuse loop uses a conservative built-in default.
+CREATE TABLE IF NOT EXISTS public.password_policies (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id     uuid,
+    scope_host        text,            -- host/domain (NULL = engagement-wide)
+    lockout_threshold integer,         -- failed attempts before lockout
+    window_minutes    integer NOT NULL DEFAULT 30,
+    source            text NOT NULL DEFAULT 'operator',
+    updated_at        timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_pwpolicy_engagement ON public.password_policies(engagement_id);
+
+-- Per (account, service) approval to spray a credential. With require_approval
+-- on (default), a spray to an (account, service) pair with no approval is held.
+CREATE TABLE IF NOT EXISTS public.credential_spray_approvals (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid,
+    username      text NOT NULL,
+    service       text NOT NULL,
+    approved      boolean NOT NULL DEFAULT true,
+    approved_by   text,
+    note          text,
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_spray_approval ON public.credential_spray_approvals
+    (COALESCE(engagement_id::text,''), lower(username), lower(service));
+
+-- ── Lateral-movement attack-path ledger ─────────────────────────────────────
+-- Records each hop the platform takes with a harvested credential: from the
+-- host we looted it on, via an account, to another in-scope host/service. Built
+-- for the report ("how we got from A to D") and to bound/loop-guard chaining.
+-- Every hop is still gated by the scope gate + spray approval at dispatch time;
+-- this table is the record, not the authority.
+CREATE TABLE IF NOT EXISTS public.lateral_movement (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid,
+    from_host     text,             -- where the credential was harvested
+    via_username  text NOT NULL,
+    to_host       text NOT NULL,
+    to_service    text,
+    to_port       integer,
+    hop           integer NOT NULL DEFAULT 1,
+    status        text NOT NULL DEFAULT 'planned',  -- planned|dispatched|succeeded|failed
+    source_credential_id uuid,
+    created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_lateral_engagement ON public.lateral_movement(engagement_id);
+
+-- ── Global kill-switch / blast-radius control ───────────────────────────────
+-- One row per control scope: 'global' halts EVERY dispatch; an engagement_id
+-- string halts only that engagement. Enforced at the scope gate
+-- (etl/scope_gate.is_halted -> load_dispatch_scope returns ([], "halted")), so a
+-- halt refuses every gated dispatcher with no per-caller change. Also read by
+-- the recon-agent loop and the /pentest launcher for a clear "halted" message.
+CREATE TABLE IF NOT EXISTS public.platform_control (
+    scope        text PRIMARY KEY,               -- 'global' | '<engagement_id>'
+    halted       boolean NOT NULL DEFAULT false,
+    reason       text,
+    actor        text,
+    -- Blast-radius budget (nullable = no cap). Enforced alongside the halt.
+    scan_budget       integer,                    -- max dispatches for this scope
+    scans_used        integer NOT NULL DEFAULT 0,
+    host_cap          integer,                    -- max distinct hosts touched
+    metadata     jsonb NOT NULL DEFAULT '{}',
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+-- The singleton global row always exists (not halted by default).
+INSERT INTO public.platform_control (scope, halted)
+VALUES ('global', false)
+ON CONFLICT (scope) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS public.security_tests (
     id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     name                  text NOT NULL,

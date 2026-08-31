@@ -518,6 +518,7 @@ _SELF_SINK_URL = os.environ.get(
 _ALL_EVENT_TYPES = [
     "scan_started", "scan_completed", "scan_failed", "scan_stopped",
     "scan_summary",
+    "platform_halted", "platform_resumed",
     "stage_started", "stage_completed", "stage_failed",
     "finding_high", "finding_critical", "finding_exploitable",
     "ingest_completed",
@@ -538,6 +539,10 @@ _ALL_EVENT_TYPES = [
     "langgraph_surface_analyzed", "langgraph_surface_test_planned",
     "langgraph_surface_test_executed", "langgraph_surface_test_completed",
     "langgraph_surface_decision",
+    # Phase 0 orchestration seam: the recon loop hands off to a full session.
+    "recon_agent_pipeline_launched",
+    "credential_reuse_sprayed",
+    "postex_enumerated", "langgraph_postex_enumerated",
 ]
 
 

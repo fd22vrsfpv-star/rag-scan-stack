@@ -7482,6 +7482,603 @@ def security_test_send_to_burp(test_id: str, authorized: bool = Depends(auth)):
             "message": "queued for Burp — import from the Burp queue"}
 
 
+# ── Service-level coverage ledger + engagement-complete stop condition ────────
+# A self-driving loop needs to know what it has finished. Coverage is COMPUTED
+# from existing data (no ledger table to keep in sync): each in-scope open
+# service is `enumerated`; `tested` once any tool_execution or security_test
+# targeted it; `proven` once a run passed or an exploit succeeded against it.
+
+_COVERAGE_SQL = """
+WITH svc AS (
+    -- assets.ip may carry a /32 CIDR suffix; other tables store the bare IP, so
+    -- strip it here or the tested/proven joins never match.
+    SELECT regexp_replace(a.ip::text, '/[0-9]+$', '') AS host,
+           p.port AS port, max(p.service) AS service
+      FROM public.ports p JOIN public.assets a ON a.id = p.asset_id
+     WHERE a.engagement_id = %(eid)s::uuid AND p.is_open = true AND p.port IS NOT NULL
+     GROUP BY regexp_replace(a.ip::text, '/[0-9]+$', ''), p.port
+),
+tested AS (
+    SELECT DISTINCT target::text AS host, port FROM public.tool_executions
+     WHERE target IS NOT NULL AND port IS NOT NULL
+    UNION
+    SELECT DISTINCT host(target_ip)::text AS host, target_port AS port
+      FROM public.security_tests WHERE target_ip IS NOT NULL AND target_port IS NOT NULL
+),
+proven AS (
+    SELECT DISTINCT host(pe.target_ip)::text AS host, pe.target_port AS port
+      FROM public.exploit_results er
+      JOIN public.pending_exploits pe ON pe.id = er.pending_exploit_id
+     WHERE er.success = true AND pe.target_ip IS NOT NULL
+    UNION
+    SELECT DISTINCT host(st.target_ip)::text AS host, st.target_port AS port
+      FROM public.security_test_runs r
+      JOIN public.security_tests st ON st.id = r.test_id
+     WHERE r.status = 'pass' AND st.target_ip IS NOT NULL
+)
+SELECT s.host, s.port, s.service,
+       (t.host IS NOT NULL) AS tested,
+       (pr.host IS NOT NULL) AS proven
+  FROM svc s
+  LEFT JOIN tested t  ON t.host = s.host  AND t.port = s.port
+  LEFT JOIN proven pr ON pr.host = s.host AND pr.port = s.port
+ ORDER BY s.host, s.port
+"""
+
+
+def _coverage_rows(engagement_id):
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(_COVERAGE_SQL, {"eid": engagement_id})
+        return [dict(r) for r in cur.fetchall()]
+
+
+@app.get("/coverage/{engagement_id}", tags=["Coverage"])
+def coverage(engagement_id: str, authorized: bool = Depends(auth)):
+    """Service-level coverage for an engagement: every in-scope open service and
+    whether it has been tested / proven, plus a rollup."""
+    rows = _coverage_rows(engagement_id)
+    total = len(rows)
+    tested = sum(1 for r in rows if r["tested"])
+    proven = sum(1 for r in rows if r["proven"])
+    return {
+        "engagement_id": engagement_id,
+        "summary": {
+            "services": total, "tested": tested, "proven": proven,
+            "untested": total - tested,
+            "pct_tested": round(100 * tested / total, 1) if total else 100.0,
+            "pct_proven": round(100 * proven / total, 1) if total else 0.0,
+        },
+        "services": rows,
+    }
+
+
+@app.get("/learning/status", tags=["Coverage"])
+def learning_status(authorized: bool = Depends(auth)):
+    """Measure the learning loop — the one thing that was missing. Surfaces three
+    honest signals: (1) do our generated tests actually PROVE things (test
+    outcome rate); (2) is retrieval feedback being collected (the ranker's
+    input); (3) has retrieval quality been MEASURED (rag_eval). Answers 'is it
+    improving?' with numbers instead of a claim."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT status, count(*) c FROM public.security_test_runs GROUP BY status")
+        outcomes = {r["status"]: r["c"] for r in cur.fetchall()}
+        cur.execute("SELECT count(*) c FROM public.rag_feedback")
+        fb_votes = cur.fetchone()["c"]
+        cur.execute("SELECT count(*) c FROM public.rag_eval_runs")
+        eval_runs = cur.fetchone()["c"]
+        latest = None
+        if eval_runs:
+            cur.execute("SELECT model_label, ndcg_at_5, mrr, recall_at_5 "
+                        "FROM public.rag_eval_runs LIMIT 1")
+            latest = dict(cur.fetchone())
+    total = sum(outcomes.values())
+    proven = outcomes.get("pass", 0)
+    return {
+        "generated_tests": {
+            "runs": total, "proven": proven,
+            "failed": outcomes.get("fail", 0), "error": outcomes.get("error", 0),
+            "prove_rate_pct": round(100 * proven / total, 1) if total else None,
+        },
+        "retrieval_feedback": {
+            "votes": fb_votes, "learning_active": fb_votes > 0,
+            "note": "re-ranks retrieval by helpful/unhelpful votes; identical to "
+                    "pure similarity when empty",
+        },
+        "retrieval_eval": {
+            "runs": eval_runs, "measured": eval_runs > 0, "latest": latest,
+            "note": "POST /rag/eval/run for a baseline before trusting gains",
+        },
+        "assessment": (
+            "measured" if eval_runs else
+            ("collecting feedback, not yet measured" if fb_votes else
+             "no outcome measurement yet — run tests and POST /rag/eval/run")),
+    }
+
+
+@app.get("/findings/verification/{engagement_id}", tags=["Coverage"])
+def findings_verification(engagement_id: str, authorized: bool = Depends(auth)):
+    """Auto-verify scanner findings against PROOF. A scanner (nuclei/ZAP) finding
+    on a host is `confirmed` when a security test PASSED against that host —
+    i.e. we independently demonstrated something there — else `unverified`. This
+    separates proven findings from raw scanner output before the report, without
+    destructively editing the scanner's own confidence."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """WITH proven_hosts AS (
+                   SELECT DISTINCT host(st.target_ip)::text AS host
+                     FROM public.security_test_runs r
+                     JOIN public.security_tests st ON st.id = r.test_id
+                    WHERE r.status = 'pass' AND st.target_ip IS NOT NULL
+               )
+               SELECT wf.id, wf.source, wf.issue_type, wf.name, wf.severity,
+                      regexp_replace(a.ip::text,'/[0-9]+$','') AS host,
+                      (ph.host IS NOT NULL) AS confirmed
+                 FROM public.web_findings wf
+                 JOIN public.assets a ON a.id = wf.asset_id
+                 LEFT JOIN proven_hosts ph
+                        ON ph.host = regexp_replace(a.ip::text,'/[0-9]+$','')
+                WHERE a.engagement_id = %s::uuid
+                ORDER BY confirmed DESC, wf.severity""",
+            (engagement_id,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    total = len(rows)
+    confirmed = sum(1 for r in rows if r["confirmed"])
+    return {
+        "engagement_id": engagement_id,
+        "summary": {"findings": total, "confirmed": confirmed,
+                    "unverified": total - confirmed,
+                    "pct_confirmed": round(100 * confirmed / total, 1) if total else 0.0},
+        "findings": rows,
+    }
+
+
+@app.get("/coverage/{engagement_id}/complete", tags=["Coverage"])
+def coverage_complete(engagement_id: str, authorized: bool = Depends(auth)):
+    """Engagement stop condition: complete when every in-scope open service has
+    been tested. Returns the remaining untested services so the driver knows
+    whether there is anything left to do."""
+    rows = _coverage_rows(engagement_id)
+    remaining = [{"host": r["host"], "port": r["port"], "service": r["service"]}
+                 for r in rows if not r["tested"]]
+    total = len(rows)
+    return {
+        "engagement_id": engagement_id,
+        "complete": (total == 0) or (len(remaining) == 0),
+        "services": total, "tested": total - len(remaining),
+        "remaining": remaining[:200],
+    }
+
+
+# ── Credential reuse / spray loop (Phase 2) ──────────────────────────────────
+# Take a VERIFIED credential and re-test it against OTHER in-scope hosts running
+# the same service. Plan-by-default (credential spraying is impactful and is
+# never autonomous in this platform) — dispatch only on explicit opt-in, and even
+# then every target passes the scope gate here AND again at brutus. Deduped so a
+# (credential, target) pair is sprayed once.
+
+_PROTO_PORTS = {
+    "ssh": {22, 2222}, "ftp": {21, 2121}, "telnet": {23}, "smb": {445, 139},
+    "mysql": {3306, 33060}, "postgres": {5432, 5433}, "postgresql": {5432, 5433},
+    "rdp": {3389}, "winrm": {5985, 5986}, "vnc": {5900, 5901, 5902},
+    "mssql": {1433}, "ldap": {389, 636},
+}
+
+
+class CredentialReuseRequest(BaseModel):
+    engagement_id: Optional[str] = None
+    credential_id: Optional[str] = None    # one credential, else all verified
+    dispatch: bool = False                  # False = plan only (default, safe)
+    max_targets: int = 100
+    # Lockout safety: cap attempts PER ACCOUNT in a window. When a discovered
+    # password policy exists, it overrides these with (threshold-1) to stay under
+    # lockout; these are the fallback when no policy is known.
+    max_attempts_per_account: int = 3
+    window_minutes: int = 60
+    # Hold every (account, service) spray until it is approved (see
+    # /credentials/spray-approval). On by default — spraying is impactful.
+    require_approval: bool = True
+    # Lateral movement: where these creds were harvested + record the attack
+    # path (from_host → cred → target) in lateral_movement for the report.
+    from_host: Optional[str] = None
+    record_chain: bool = False
+    hop: int = 1
+
+
+class SprayApprovalRequest(BaseModel):
+    engagement_id: Optional[str] = None
+    username: str
+    service: str
+    approved: bool = True
+    approved_by: Optional[str] = None
+    note: Optional[str] = None
+
+
+class PasswordPolicyRequest(BaseModel):
+    engagement_id: Optional[str] = None
+    scope_host: Optional[str] = None
+    lockout_threshold: int
+    window_minutes: int = 30
+    source: Optional[str] = "operator"
+
+
+def _account_rate_limit(cur, engagement_id, host, default_limit, default_window):
+    """Effective (limit, window_minutes) for spraying ONE account, derived from a
+    discovered/authored password policy when present (threshold-1, its window),
+    else the caller's conservative defaults. Host-specific policy wins over an
+    engagement-wide one."""
+    try:
+        cur.execute(
+            """SELECT lockout_threshold, window_minutes FROM public.password_policies
+                WHERE (%(eid)s IS NULL OR engagement_id = %(eid)s::uuid OR engagement_id IS NULL)
+                  AND (scope_host IS NULL OR scope_host = %(host)s)
+                ORDER BY (scope_host = %(host)s) DESC NULLS LAST, updated_at DESC LIMIT 1""",
+            {"eid": engagement_id, "host": host},
+        )
+        row = cur.fetchone()
+        if row and row.get("lockout_threshold"):
+            thr = int(row["lockout_threshold"])
+            return max(1, thr - 1), int(row.get("window_minutes") or default_window)
+    except Exception:
+        pass
+    return default_limit, default_window
+
+
+@app.post("/credentials/reuse", tags=["Credentials"])
+def credentials_reuse(body: CredentialReuseRequest, authorized: bool = Depends(auth)):
+    """Compute (and optionally dispatch) a credential-reuse spray plan.
+
+    For each verified credential, finds OTHER in-scope hosts running the same
+    service and plans to try the credential there — scope-gated and deduped.
+    `dispatch=false` (default) returns the plan only; `dispatch=true` queues each
+    spray at brutus (itself scope-gated) and records the attempt so it never
+    repeats. Respects the kill-switch/budget via the shared scope gate.
+    """
+    import hashlib
+    import sys as _sys
+    _sys.path.insert(0, "/app")
+    from etl.scope_gate import load_dispatch_scope, check_dispatch
+
+    eid = body.engagement_id
+    with get_db(autocommit=True) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT id, username, secret_value, protocol,
+                      host(ip)::text AS ip, port
+                 FROM public.credential_findings
+                WHERE valid_cred = true AND secret_value IS NOT NULL AND secret_value <> ''
+                  AND (%(cid)s IS NULL OR id = %(cid)s::uuid)
+                  AND (%(eid)s IS NULL OR engagement_id = %(eid)s::uuid)""",
+            {"cid": body.credential_id, "eid": eid},
+        )
+        creds = [dict(r) for r in cur.fetchall()]
+        cur.execute(
+            """SELECT regexp_replace(a.ip::text,'/[0-9]+$','') AS host, p.port
+                 FROM public.ports p JOIN public.assets a ON a.id = p.asset_id
+                WHERE p.is_open = true AND p.port IS NOT NULL
+                  AND (%(eid)s IS NULL OR a.engagement_id = %(eid)s::uuid)""",
+            {"eid": eid},
+        )
+        targets = [(r["host"], r["port"]) for r in cur.fetchall()]
+        scope_rows, _src = load_dispatch_scope(cur, eid)
+        # already-attempted (credential, target) pairs
+        cur.execute("SELECT username, COALESCE(secret_fingerprint,'') fp, "
+                    "target_host, target_port FROM public.credential_spray_attempts")
+        attempted = {(r["username"], r["fp"], r["target_host"], r["target_port"])
+                     for r in cur.fetchall()}
+        # approvals: (lower username, lower service) -> approved
+        cur.execute("SELECT lower(username) u, lower(service) s, approved "
+                    "FROM public.credential_spray_approvals "
+                    "WHERE (%(eid)s IS NULL OR engagement_id = %(eid)s::uuid OR engagement_id IS NULL)",
+                    {"eid": eid})
+        approvals = {(r["u"], r["s"]): r["approved"] for r in cur.fetchall()}
+
+        plan, refused_scope, skipped_dedup, throttled, needs_approval = [], 0, 0, 0, 0
+        for cred in creds:
+            proto = (cred.get("protocol") or "").lower()
+            fp = hashlib.sha256((cred.get("secret_value") or "").encode()).hexdigest()[:16]
+            ports = _PROTO_PORTS.get(proto, {cred.get("port")})
+            uname = cred["username"]
+            # LOCKOUT SAFETY: cap attempts for THIS account in the window. The
+            # policy (if discovered) overrides the request defaults with
+            # threshold-1 so a real account is never locked out.
+            eff_limit, window = _account_rate_limit(
+                cur, eid, cred.get("ip"),
+                body.max_attempts_per_account, body.window_minutes)
+            cur.execute(
+                "SELECT count(*) c FROM public.credential_spray_attempts "
+                "WHERE username = %s AND status = 'dispatched' "
+                "AND attempted_at > now() - (%s || ' minutes')::interval",
+                (uname, window))
+            recent = cur.fetchone()["c"]
+            remaining = max(0, eff_limit - recent)
+            for host, port in targets:
+                if port not in ports or host == cred.get("ip"):
+                    continue
+                if (uname, fp, host, port) in attempted:
+                    skipped_dedup += 1
+                    continue
+                if check_dispatch(host, scope_rows):     # refusal => out of scope
+                    refused_scope += 1
+                    continue
+                if remaining <= 0:
+                    throttled += 1
+                    continue
+                approved = approvals.get((uname.lower(), proto), False)
+                if body.require_approval and not approved:
+                    needs_approval += 1
+                    continue
+                remaining -= 1
+                plan.append({"username": uname, "secret_fp": fp,
+                             "target_host": host, "target_port": port, "service": proto,
+                             "source_credential_id": str(cred["id"]),
+                             "rate_limit": eff_limit, "window_minutes": window})
+                if len(plan) >= body.max_targets:
+                    break
+            if len(plan) >= body.max_targets:
+                break
+
+    dispatched = []
+    if body.dispatch and plan:
+        import requests as _rq
+        brutus = os.environ.get("BRUTUS_RUNNER_URL", "https://brutus-runner:8025")
+        for item in plan:
+            cred = next(c for c in creds if str(c["id"]) == item["source_credential_id"])
+            job_id = None
+            try:
+                r = _rq.post(f"{brutus}/jobs/brutus",
+                    json={"targets": [f"{item['target_host']}:{item['target_port']}"],
+                          "protocols": [item["service"]],
+                          "usernames": [item["username"]],
+                          "passwords": [cred["secret_value"]], "secret_type": "password"},
+                    headers={"x-api-key": API_KEY}, timeout=20, verify=False)
+                if r.status_code == 403:
+                    refused_scope += 1
+                    continue  # brutus refused (out of scope / halted) — do not record
+                job_id = (r.json() or {}).get("job_id") if r.status_code < 400 else None
+            except Exception:
+                pass
+            with get_db(autocommit=True) as conn, conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO public.credential_spray_attempts
+                         (engagement_id, username, secret_fingerprint, target_host,
+                          target_port, service, source_credential_id, status, brutus_job_id)
+                       VALUES (%s::uuid, %s, %s, %s, %s, %s, %s::uuid, %s, %s)
+                       ON CONFLICT (username, COALESCE(secret_fingerprint,''), target_host, target_port)
+                         DO NOTHING""",
+                    (eid, item["username"], item["secret_fp"], item["target_host"],
+                     item["target_port"], item["service"], item["source_credential_id"],
+                     "dispatched" if job_id else "failed", job_id),
+                )
+            dispatched.append({**item, "brutus_job_id": job_id})
+        # count the sprays against the blast-radius budget
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("credential_reuse_sprayed", "credentials",
+                         {"engagement_id": eid, "count": len(dispatched)})
+        except Exception:
+            pass
+
+    # Record the attack path for the report ("A → cred → B"). Every recorded hop
+    # already passed the scope gate above; this is the ledger, not the authority.
+    if body.record_chain and plan:
+        dispatched_keys = {(d["target_host"], d["target_port"]) for d in dispatched}
+        with get_db(autocommit=True) as conn, conn.cursor() as cur:
+            for item in plan:
+                cur.execute(
+                    """INSERT INTO public.lateral_movement
+                         (engagement_id, from_host, via_username, to_host, to_service,
+                          to_port, hop, status, source_credential_id)
+                       VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s::uuid)""",
+                    (eid, body.from_host, item["username"], item["target_host"],
+                     item["service"], item["target_port"], body.hop,
+                     "dispatched" if (item["target_host"], item["target_port"]) in dispatched_keys
+                     else "planned", item["source_credential_id"]),
+                )
+
+    return {"ok": True, "dispatch": body.dispatch,
+            "verified_credentials": len(creds), "plan": plan,
+            "planned": len(plan), "dispatched": dispatched,
+            "skipped_already_attempted": skipped_dedup,
+            "refused_out_of_scope": refused_scope,
+            "throttled_rate_limit": throttled,
+            "held_needs_approval": needs_approval,
+            "chain_recorded": bool(body.record_chain and plan)}
+
+
+@app.get("/lateral/{engagement_id}", tags=["Credentials"])
+def lateral_chain(engagement_id: str, authorized: bool = Depends(auth)):
+    """The lateral-movement attack path for an engagement — how the platform
+    moved from host to host with harvested credentials (for the report)."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT from_host, via_username, to_host, to_service, to_port,
+                      hop, status, created_at
+                 FROM public.lateral_movement
+                WHERE engagement_id = %s::uuid
+                ORDER BY hop, created_at""",
+            (engagement_id,),
+        )
+        hops = [dict(r) for r in cur.fetchall()]
+    return {"engagement_id": engagement_id, "hops": hops,
+            "hosts_reached": len({h["to_host"] for h in hops}),
+            "max_hop": max((h["hop"] for h in hops), default=0)}
+
+
+@app.post("/credentials/spray-approval", tags=["Credentials"])
+def credentials_spray_approval(body: SprayApprovalRequest, authorized: bool = Depends(auth)):
+    """Approve (or revoke) spraying a credential for one (account, service) pair.
+    With require_approval on (default), the reuse loop only dispatches approved
+    pairs — approval is tied to the account AND the service, not the whole run."""
+    eid = _validate_engagement_uuid(body.engagement_id) if body.engagement_id else None
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """INSERT INTO public.credential_spray_approvals
+                 (engagement_id, username, service, approved, approved_by, note)
+               VALUES (%s::uuid, %s, %s, %s, %s, %s)
+               ON CONFLICT (COALESCE(engagement_id::text,''), lower(username), lower(service))
+                 DO UPDATE SET approved = EXCLUDED.approved,
+                   approved_by = EXCLUDED.approved_by, note = EXCLUDED.note,
+                   updated_at = now()
+               RETURNING id, username, service, approved""",
+            (eid, body.username, body.service, body.approved, body.approved_by, body.note),
+        )
+        row = dict(cur.fetchone())
+    return {"ok": True, **row}
+
+
+@app.post("/password-policy", tags=["Credentials"])
+def set_password_policy(body: PasswordPolicyRequest, authorized: bool = Depends(auth)):
+    """Record a password/lockout policy (discovered or operator-set). The reuse
+    loop caps per-account spray at threshold-1 within the policy window so a real
+    account is never locked out."""
+    eid = _validate_engagement_uuid(body.engagement_id) if body.engagement_id else None
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """INSERT INTO public.password_policies
+                 (engagement_id, scope_host, lockout_threshold, window_minutes, source)
+               VALUES (%s::uuid, %s, %s, %s, %s)
+               RETURNING id, scope_host, lockout_threshold, window_minutes""",
+            (eid, body.scope_host, body.lockout_threshold, body.window_minutes, body.source),
+        )
+        row = dict(cur.fetchone())
+    return {"ok": True, **row}
+
+
+# ── Global kill-switch / blast-radius control ────────────────────────────────
+# Halt is enforced at the scope gate (etl/scope_gate.is_halted), so a halt
+# refuses every gated dispatcher at once. These endpoints just flip the flag and
+# report it; the enforcement is structural, not per-endpoint.
+
+class HaltRequest(BaseModel):
+    reason: Optional[str] = None
+    scope: Optional[str] = "global"   # 'global' or an engagement_id
+    actor: Optional[str] = None
+
+
+class BudgetRequest(BaseModel):
+    scope: Optional[str] = "global"
+    scan_budget: Optional[int] = None   # max dispatches (null clears the cap)
+    host_cap: Optional[int] = None       # max distinct hosts (null clears)
+
+
+@app.post("/control/halt", tags=["Control"])
+def control_halt(body: HaltRequest, authorized: bool = Depends(auth)):
+    """EMERGENCY STOP. Halt all gated dispatch for a scope ('global' or an
+    engagement id). Every scanner/agent that passes the scope gate refuses
+    immediately; in-flight work is not killed, but no new work is admitted."""
+    scope = (body.scope or "global").strip() or "global"
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """INSERT INTO public.platform_control (scope, halted, reason, actor, updated_at)
+               VALUES (%s, true, %s, %s, now())
+               ON CONFLICT (scope) DO UPDATE
+                 SET halted = true, reason = EXCLUDED.reason,
+                     actor = EXCLUDED.actor, updated_at = now()
+               RETURNING scope, halted, reason, actor""",
+            (scope, body.reason, body.actor),
+        )
+        row = dict(cur.fetchone())
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("platform_halted", "control",
+                     {"scope": scope, "reason": body.reason, "actor": body.actor})
+    except Exception:
+        pass
+    return {"ok": True, **row,
+            "message": f"platform HALTED ({scope}) — all gated dispatch is refused"}
+
+
+@app.post("/control/resume", tags=["Control"])
+def control_resume(body: HaltRequest, authorized: bool = Depends(auth)):
+    """Lift a halt for a scope. Dispatch resumes (still scope-gated as normal)."""
+    scope = (body.scope or "global").strip() or "global"
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """INSERT INTO public.platform_control (scope, halted, reason, actor, updated_at)
+               VALUES (%s, false, %s, %s, now())
+               ON CONFLICT (scope) DO UPDATE
+                 SET halted = false, reason = EXCLUDED.reason,
+                     actor = EXCLUDED.actor, updated_at = now()
+               RETURNING scope, halted""",
+            (scope, body.reason, body.actor),
+        )
+        row = dict(cur.fetchone())
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("platform_resumed", "control", {"scope": scope, "actor": body.actor})
+    except Exception:
+        pass
+    return {"ok": True, **row, "message": f"platform resumed ({scope})"}
+
+
+@app.post("/control/budget", tags=["Control"])
+def control_budget(body: BudgetRequest, authorized: bool = Depends(auth)):
+    """Set the blast-radius budget for a scope: a max number of dispatches
+    (scan_budget) and/or distinct hosts (host_cap). Setting a budget RESETS the
+    used counter to 0 — a new budget starts a fresh count. Null clears a cap."""
+    scope = (body.scope or "global").strip() or "global"
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """INSERT INTO public.platform_control (scope, halted, scan_budget, host_cap, scans_used, updated_at)
+               VALUES (%s, false, %s, %s, 0, now())
+               ON CONFLICT (scope) DO UPDATE
+                 SET scan_budget = EXCLUDED.scan_budget,
+                     host_cap = EXCLUDED.host_cap, scans_used = 0, updated_at = now()
+               RETURNING scope, scan_budget, scans_used, host_cap""",
+            (scope, body.scan_budget, body.host_cap),
+        )
+        row = dict(cur.fetchone())
+    return {"ok": True, **row}
+
+
+class NoteDispatchRequest(BaseModel):
+    engagement_id: Optional[str] = None
+    count: int = 1
+
+
+@app.post("/control/note-dispatch", tags=["Control"])
+def control_note_dispatch(body: NoteDispatchRequest, authorized: bool = Depends(auth)):
+    """Count N dispatches against the budget. The autonomous loop calls this per
+    dispatch; when scans_used reaches scan_budget the scope gate refuses further
+    work (over_budget → empty dispatch scope). Rows with no budget still count
+    (harmless) so a budget set later starts from the real number only after a
+    reset. Returns the updated counters for global + the engagement."""
+    keys = ["global"]
+    if body.engagement_id:
+        keys.append(str(body.engagement_id))
+    n = max(0, int(body.count or 1))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "UPDATE public.platform_control SET scans_used = scans_used + %s, "
+            "updated_at = now() WHERE scope = ANY(%s) "
+            "RETURNING scope, scan_budget, scans_used",
+            (n, keys),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    over = any(r["scan_budget"] is not None and r["scans_used"] >= r["scan_budget"]
+               for r in rows)
+    return {"ok": True, "counted": n, "over_budget": over, "controls": rows}
+
+
+@app.get("/control/status", tags=["Control"])
+def control_status(engagement_id: Optional[str] = Query(default=None),
+                   authorized: bool = Depends(auth)):
+    """Current control state. `halted` is the EFFECTIVE state for the given
+    engagement (global halt OR that engagement's halt)."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT scope, halted, reason, actor, scan_budget, scans_used,
+                      host_cap, updated_at
+                 FROM public.platform_control ORDER BY scope""")
+        rows = [dict(r) for r in cur.fetchall()]
+    by = {r["scope"]: r for r in rows}
+    halted = bool(by.get("global", {}).get("halted"))
+    reason = by.get("global", {}).get("reason")
+    if engagement_id and by.get(str(engagement_id), {}).get("halted"):
+        halted, reason = True, by[str(engagement_id)].get("reason")
+    return {"halted": halted, "reason": reason, "controls": rows}
+
+
 @app.post("/cleanup/exploits", tags=["Maintenance"])
 def cleanup_exploits(
     dry_run: bool = Query(default=False),
