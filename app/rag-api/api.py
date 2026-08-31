@@ -7482,6 +7482,93 @@ def security_test_send_to_burp(test_id: str, authorized: bool = Depends(auth)):
             "message": "queued for Burp — import from the Burp queue"}
 
 
+# ── Service-level coverage ledger + engagement-complete stop condition ────────
+# A self-driving loop needs to know what it has finished. Coverage is COMPUTED
+# from existing data (no ledger table to keep in sync): each in-scope open
+# service is `enumerated`; `tested` once any tool_execution or security_test
+# targeted it; `proven` once a run passed or an exploit succeeded against it.
+
+_COVERAGE_SQL = """
+WITH svc AS (
+    -- assets.ip may carry a /32 CIDR suffix; other tables store the bare IP, so
+    -- strip it here or the tested/proven joins never match.
+    SELECT regexp_replace(a.ip::text, '/[0-9]+$', '') AS host,
+           p.port AS port, max(p.service) AS service
+      FROM public.ports p JOIN public.assets a ON a.id = p.asset_id
+     WHERE a.engagement_id = %(eid)s::uuid AND p.is_open = true AND p.port IS NOT NULL
+     GROUP BY regexp_replace(a.ip::text, '/[0-9]+$', ''), p.port
+),
+tested AS (
+    SELECT DISTINCT target::text AS host, port FROM public.tool_executions
+     WHERE target IS NOT NULL AND port IS NOT NULL
+    UNION
+    SELECT DISTINCT host(target_ip)::text AS host, target_port AS port
+      FROM public.security_tests WHERE target_ip IS NOT NULL AND target_port IS NOT NULL
+),
+proven AS (
+    SELECT DISTINCT host(pe.target_ip)::text AS host, pe.target_port AS port
+      FROM public.exploit_results er
+      JOIN public.pending_exploits pe ON pe.id = er.pending_exploit_id
+     WHERE er.success = true AND pe.target_ip IS NOT NULL
+    UNION
+    SELECT DISTINCT host(st.target_ip)::text AS host, st.target_port AS port
+      FROM public.security_test_runs r
+      JOIN public.security_tests st ON st.id = r.test_id
+     WHERE r.status = 'pass' AND st.target_ip IS NOT NULL
+)
+SELECT s.host, s.port, s.service,
+       (t.host IS NOT NULL) AS tested,
+       (pr.host IS NOT NULL) AS proven
+  FROM svc s
+  LEFT JOIN tested t  ON t.host = s.host  AND t.port = s.port
+  LEFT JOIN proven pr ON pr.host = s.host AND pr.port = s.port
+ ORDER BY s.host, s.port
+"""
+
+
+def _coverage_rows(engagement_id):
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(_COVERAGE_SQL, {"eid": engagement_id})
+        return [dict(r) for r in cur.fetchall()]
+
+
+@app.get("/coverage/{engagement_id}", tags=["Coverage"])
+def coverage(engagement_id: str, authorized: bool = Depends(auth)):
+    """Service-level coverage for an engagement: every in-scope open service and
+    whether it has been tested / proven, plus a rollup."""
+    rows = _coverage_rows(engagement_id)
+    total = len(rows)
+    tested = sum(1 for r in rows if r["tested"])
+    proven = sum(1 for r in rows if r["proven"])
+    return {
+        "engagement_id": engagement_id,
+        "summary": {
+            "services": total, "tested": tested, "proven": proven,
+            "untested": total - tested,
+            "pct_tested": round(100 * tested / total, 1) if total else 100.0,
+            "pct_proven": round(100 * proven / total, 1) if total else 0.0,
+        },
+        "services": rows,
+    }
+
+
+@app.get("/coverage/{engagement_id}/complete", tags=["Coverage"])
+def coverage_complete(engagement_id: str, authorized: bool = Depends(auth)):
+    """Engagement stop condition: complete when every in-scope open service has
+    been tested. Returns the remaining untested services so the driver knows
+    whether there is anything left to do."""
+    rows = _coverage_rows(engagement_id)
+    remaining = [{"host": r["host"], "port": r["port"], "service": r["service"]}
+                 for r in rows if not r["tested"]]
+    total = len(rows)
+    return {
+        "engagement_id": engagement_id,
+        "complete": (total == 0) or (len(remaining) == 0),
+        "services": total, "tested": total - len(remaining),
+        "remaining": remaining[:200],
+    }
+
+
 # ── Global kill-switch / blast-radius control ────────────────────────────────
 # Halt is enforced at the scope gate (etl/scope_gate.is_halted), so a halt
 # refuses every gated dispatcher at once. These endpoints just flip the flag and
