@@ -323,6 +323,18 @@ class ReconAgent:
                         and sess.get("status") in live):
                     self._last_driven[eid] = now  # something is already driving
                     return
+            # Engagement STOP condition (Phase 1): if every in-scope service is
+            # already tested, there is nothing left to drive — record the
+            # cooldown and stop. This is what turns "keep looping" into "done".
+            try:
+                async with httpx.AsyncClient(timeout=15) as c:
+                    cov = await c.get(f"{s.rag_api_url}/coverage/{eid}/complete", headers=headers)
+                if cov.status_code == 200 and (cov.json() or {}).get("complete"):
+                    self._last_driven[eid] = now
+                    log.info("[recon:%s] auto-drive: engagement test-complete — nothing to drive", eid[:8])
+                    return
+            except Exception:
+                pass  # coverage unavailable — fall through and drive
             # Launch one driven session. Target = the engagement's scope hosts.
             tgt = ", ".join(str(t) for t in targets[:50]) or eid
             body = {

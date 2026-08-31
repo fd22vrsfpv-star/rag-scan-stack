@@ -77,3 +77,25 @@ async def status(engagement_id: Optional[str] = Query(default=None)):
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
         return safe_json(resp)
+
+
+@router.get("/api/coverage/{engagement_id}")
+async def coverage(engagement_id: str):
+    """Service-level coverage for an engagement (enumerated / tested / proven)."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=20) as c:
+        resp = await c.get(f"{s.rag_api_url}/coverage/{engagement_id}", headers=_hdrs())
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.get("/api/coverage/{engagement_id}/complete")
+async def coverage_complete(engagement_id: str):
+    """Engagement stop condition: is every in-scope service tested?"""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=20) as c:
+        resp = await c.get(f"{s.rag_api_url}/coverage/{engagement_id}/complete", headers=_hdrs())
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
