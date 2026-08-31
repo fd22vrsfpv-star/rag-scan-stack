@@ -1486,6 +1486,59 @@ CREATE INDEX IF NOT EXISTS idx_exploit_results_executed_at ON public.exploit_res
 --     approval gate live there) and each run maps to an exploit_results row;
 --   * a SAFE test carries its own command and each run maps to a tool_executions
 --     row (written by kali-listener /tools/execute).
+-- ── Credential-reuse (spray) attempt ledger ─────────────────────────────────
+-- Tracks which (credential, target) pairs the reuse loop has already sprayed so
+-- it never re-sprays. No such dedup existed; credential_findings tracks
+-- SUCCESSES, not attempts. secret_fingerprint is a sha256 of the secret so the
+-- plaintext is not duplicated here.
+CREATE TABLE IF NOT EXISTS public.credential_spray_attempts (
+    id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id        uuid,
+    username             text NOT NULL,
+    secret_fingerprint   text,
+    target_host          text NOT NULL,
+    target_port          integer NOT NULL,
+    service              text,
+    source_credential_id uuid,
+    status               text NOT NULL DEFAULT 'dispatched',  -- dispatched|skipped|failed
+    brutus_job_id        text,
+    attempted_at         timestamptz NOT NULL DEFAULT now()
+);
+-- COALESCE the nullable secret so a NULL fingerprint does not bypass dedup
+-- (a table-level UNIQUE can't hold an expression; a unique index can).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_spray_identity ON public.credential_spray_attempts
+    (username, COALESCE(secret_fingerprint, ''), target_host, target_port);
+CREATE INDEX IF NOT EXISTS idx_spray_engagement ON public.credential_spray_attempts(engagement_id);
+
+-- Discovered or operator-set password/lockout policy. Caps how many times a
+-- single account may be sprayed in a window so the loop never locks a real
+-- account. When absent, the reuse loop uses a conservative built-in default.
+CREATE TABLE IF NOT EXISTS public.password_policies (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id     uuid,
+    scope_host        text,            -- host/domain (NULL = engagement-wide)
+    lockout_threshold integer,         -- failed attempts before lockout
+    window_minutes    integer NOT NULL DEFAULT 30,
+    source            text NOT NULL DEFAULT 'operator',
+    updated_at        timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_pwpolicy_engagement ON public.password_policies(engagement_id);
+
+-- Per (account, service) approval to spray a credential. With require_approval
+-- on (default), a spray to an (account, service) pair with no approval is held.
+CREATE TABLE IF NOT EXISTS public.credential_spray_approvals (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid,
+    username      text NOT NULL,
+    service       text NOT NULL,
+    approved      boolean NOT NULL DEFAULT true,
+    approved_by   text,
+    note          text,
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_spray_approval ON public.credential_spray_approvals
+    (COALESCE(engagement_id::text,''), lower(username), lower(service));
+
 -- ── Global kill-switch / blast-radius control ───────────────────────────────
 -- One row per control scope: 'global' halts EVERY dispatch; an engagement_id
 -- string halts only that engagement. Enforced at the scope gate

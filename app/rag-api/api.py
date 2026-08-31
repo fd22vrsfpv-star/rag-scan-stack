@@ -7569,6 +7569,258 @@ def coverage_complete(engagement_id: str, authorized: bool = Depends(auth)):
     }
 
 
+# ── Credential reuse / spray loop (Phase 2) ──────────────────────────────────
+# Take a VERIFIED credential and re-test it against OTHER in-scope hosts running
+# the same service. Plan-by-default (credential spraying is impactful and is
+# never autonomous in this platform) — dispatch only on explicit opt-in, and even
+# then every target passes the scope gate here AND again at brutus. Deduped so a
+# (credential, target) pair is sprayed once.
+
+_PROTO_PORTS = {
+    "ssh": {22, 2222}, "ftp": {21, 2121}, "telnet": {23}, "smb": {445, 139},
+    "mysql": {3306, 33060}, "postgres": {5432, 5433}, "postgresql": {5432, 5433},
+    "rdp": {3389}, "winrm": {5985, 5986}, "vnc": {5900, 5901, 5902},
+    "mssql": {1433}, "ldap": {389, 636},
+}
+
+
+class CredentialReuseRequest(BaseModel):
+    engagement_id: Optional[str] = None
+    credential_id: Optional[str] = None    # one credential, else all verified
+    dispatch: bool = False                  # False = plan only (default, safe)
+    max_targets: int = 100
+    # Lockout safety: cap attempts PER ACCOUNT in a window. When a discovered
+    # password policy exists, it overrides these with (threshold-1) to stay under
+    # lockout; these are the fallback when no policy is known.
+    max_attempts_per_account: int = 3
+    window_minutes: int = 60
+    # Hold every (account, service) spray until it is approved (see
+    # /credentials/spray-approval). On by default — spraying is impactful.
+    require_approval: bool = True
+
+
+class SprayApprovalRequest(BaseModel):
+    engagement_id: Optional[str] = None
+    username: str
+    service: str
+    approved: bool = True
+    approved_by: Optional[str] = None
+    note: Optional[str] = None
+
+
+class PasswordPolicyRequest(BaseModel):
+    engagement_id: Optional[str] = None
+    scope_host: Optional[str] = None
+    lockout_threshold: int
+    window_minutes: int = 30
+    source: Optional[str] = "operator"
+
+
+def _account_rate_limit(cur, engagement_id, host, default_limit, default_window):
+    """Effective (limit, window_minutes) for spraying ONE account, derived from a
+    discovered/authored password policy when present (threshold-1, its window),
+    else the caller's conservative defaults. Host-specific policy wins over an
+    engagement-wide one."""
+    try:
+        cur.execute(
+            """SELECT lockout_threshold, window_minutes FROM public.password_policies
+                WHERE (%(eid)s IS NULL OR engagement_id = %(eid)s::uuid OR engagement_id IS NULL)
+                  AND (scope_host IS NULL OR scope_host = %(host)s)
+                ORDER BY (scope_host = %(host)s) DESC NULLS LAST, updated_at DESC LIMIT 1""",
+            {"eid": engagement_id, "host": host},
+        )
+        row = cur.fetchone()
+        if row and row.get("lockout_threshold"):
+            thr = int(row["lockout_threshold"])
+            return max(1, thr - 1), int(row.get("window_minutes") or default_window)
+    except Exception:
+        pass
+    return default_limit, default_window
+
+
+@app.post("/credentials/reuse", tags=["Credentials"])
+def credentials_reuse(body: CredentialReuseRequest, authorized: bool = Depends(auth)):
+    """Compute (and optionally dispatch) a credential-reuse spray plan.
+
+    For each verified credential, finds OTHER in-scope hosts running the same
+    service and plans to try the credential there — scope-gated and deduped.
+    `dispatch=false` (default) returns the plan only; `dispatch=true` queues each
+    spray at brutus (itself scope-gated) and records the attempt so it never
+    repeats. Respects the kill-switch/budget via the shared scope gate.
+    """
+    import hashlib
+    import sys as _sys
+    _sys.path.insert(0, "/app")
+    from etl.scope_gate import load_dispatch_scope, check_dispatch
+
+    eid = body.engagement_id
+    with get_db(autocommit=True) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT id, username, secret_value, protocol,
+                      host(ip)::text AS ip, port
+                 FROM public.credential_findings
+                WHERE valid_cred = true AND secret_value IS NOT NULL AND secret_value <> ''
+                  AND (%(cid)s IS NULL OR id = %(cid)s::uuid)
+                  AND (%(eid)s IS NULL OR engagement_id = %(eid)s::uuid)""",
+            {"cid": body.credential_id, "eid": eid},
+        )
+        creds = [dict(r) for r in cur.fetchall()]
+        cur.execute(
+            """SELECT regexp_replace(a.ip::text,'/[0-9]+$','') AS host, p.port
+                 FROM public.ports p JOIN public.assets a ON a.id = p.asset_id
+                WHERE p.is_open = true AND p.port IS NOT NULL
+                  AND (%(eid)s IS NULL OR a.engagement_id = %(eid)s::uuid)""",
+            {"eid": eid},
+        )
+        targets = [(r["host"], r["port"]) for r in cur.fetchall()]
+        scope_rows, _src = load_dispatch_scope(cur, eid)
+        # already-attempted (credential, target) pairs
+        cur.execute("SELECT username, COALESCE(secret_fingerprint,'') fp, "
+                    "target_host, target_port FROM public.credential_spray_attempts")
+        attempted = {(r["username"], r["fp"], r["target_host"], r["target_port"])
+                     for r in cur.fetchall()}
+        # approvals: (lower username, lower service) -> approved
+        cur.execute("SELECT lower(username) u, lower(service) s, approved "
+                    "FROM public.credential_spray_approvals "
+                    "WHERE (%(eid)s IS NULL OR engagement_id = %(eid)s::uuid OR engagement_id IS NULL)",
+                    {"eid": eid})
+        approvals = {(r["u"], r["s"]): r["approved"] for r in cur.fetchall()}
+
+        plan, refused_scope, skipped_dedup, throttled, needs_approval = [], 0, 0, 0, 0
+        for cred in creds:
+            proto = (cred.get("protocol") or "").lower()
+            fp = hashlib.sha256((cred.get("secret_value") or "").encode()).hexdigest()[:16]
+            ports = _PROTO_PORTS.get(proto, {cred.get("port")})
+            uname = cred["username"]
+            # LOCKOUT SAFETY: cap attempts for THIS account in the window. The
+            # policy (if discovered) overrides the request defaults with
+            # threshold-1 so a real account is never locked out.
+            eff_limit, window = _account_rate_limit(
+                cur, eid, cred.get("ip"),
+                body.max_attempts_per_account, body.window_minutes)
+            cur.execute(
+                "SELECT count(*) c FROM public.credential_spray_attempts "
+                "WHERE username = %s AND status = 'dispatched' "
+                "AND attempted_at > now() - (%s || ' minutes')::interval",
+                (uname, window))
+            recent = cur.fetchone()["c"]
+            remaining = max(0, eff_limit - recent)
+            for host, port in targets:
+                if port not in ports or host == cred.get("ip"):
+                    continue
+                if (uname, fp, host, port) in attempted:
+                    skipped_dedup += 1
+                    continue
+                if check_dispatch(host, scope_rows):     # refusal => out of scope
+                    refused_scope += 1
+                    continue
+                if remaining <= 0:
+                    throttled += 1
+                    continue
+                approved = approvals.get((uname.lower(), proto), False)
+                if body.require_approval and not approved:
+                    needs_approval += 1
+                    continue
+                remaining -= 1
+                plan.append({"username": uname, "secret_fp": fp,
+                             "target_host": host, "target_port": port, "service": proto,
+                             "source_credential_id": str(cred["id"]),
+                             "rate_limit": eff_limit, "window_minutes": window})
+                if len(plan) >= body.max_targets:
+                    break
+            if len(plan) >= body.max_targets:
+                break
+
+    dispatched = []
+    if body.dispatch and plan:
+        import requests as _rq
+        brutus = os.environ.get("BRUTUS_RUNNER_URL", "https://brutus-runner:8025")
+        for item in plan:
+            cred = next(c for c in creds if str(c["id"]) == item["source_credential_id"])
+            job_id = None
+            try:
+                r = _rq.post(f"{brutus}/jobs/brutus",
+                    json={"targets": [f"{item['target_host']}:{item['target_port']}"],
+                          "protocols": [item["service"]],
+                          "usernames": [item["username"]],
+                          "passwords": [cred["secret_value"]], "secret_type": "password"},
+                    headers={"x-api-key": API_KEY}, timeout=20, verify=False)
+                if r.status_code == 403:
+                    refused_scope += 1
+                    continue  # brutus refused (out of scope / halted) — do not record
+                job_id = (r.json() or {}).get("job_id") if r.status_code < 400 else None
+            except Exception:
+                pass
+            with get_db(autocommit=True) as conn, conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO public.credential_spray_attempts
+                         (engagement_id, username, secret_fingerprint, target_host,
+                          target_port, service, source_credential_id, status, brutus_job_id)
+                       VALUES (%s::uuid, %s, %s, %s, %s, %s, %s::uuid, %s, %s)
+                       ON CONFLICT (username, COALESCE(secret_fingerprint,''), target_host, target_port)
+                         DO NOTHING""",
+                    (eid, item["username"], item["secret_fp"], item["target_host"],
+                     item["target_port"], item["service"], item["source_credential_id"],
+                     "dispatched" if job_id else "failed", job_id),
+                )
+            dispatched.append({**item, "brutus_job_id": job_id})
+        # count the sprays against the blast-radius budget
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("credential_reuse_sprayed", "credentials",
+                         {"engagement_id": eid, "count": len(dispatched)})
+        except Exception:
+            pass
+
+    return {"ok": True, "dispatch": body.dispatch,
+            "verified_credentials": len(creds), "plan": plan,
+            "planned": len(plan), "dispatched": dispatched,
+            "skipped_already_attempted": skipped_dedup,
+            "refused_out_of_scope": refused_scope,
+            "throttled_rate_limit": throttled,
+            "held_needs_approval": needs_approval}
+
+
+@app.post("/credentials/spray-approval", tags=["Credentials"])
+def credentials_spray_approval(body: SprayApprovalRequest, authorized: bool = Depends(auth)):
+    """Approve (or revoke) spraying a credential for one (account, service) pair.
+    With require_approval on (default), the reuse loop only dispatches approved
+    pairs — approval is tied to the account AND the service, not the whole run."""
+    eid = _validate_engagement_uuid(body.engagement_id) if body.engagement_id else None
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """INSERT INTO public.credential_spray_approvals
+                 (engagement_id, username, service, approved, approved_by, note)
+               VALUES (%s::uuid, %s, %s, %s, %s, %s)
+               ON CONFLICT (COALESCE(engagement_id::text,''), lower(username), lower(service))
+                 DO UPDATE SET approved = EXCLUDED.approved,
+                   approved_by = EXCLUDED.approved_by, note = EXCLUDED.note,
+                   updated_at = now()
+               RETURNING id, username, service, approved""",
+            (eid, body.username, body.service, body.approved, body.approved_by, body.note),
+        )
+        row = dict(cur.fetchone())
+    return {"ok": True, **row}
+
+
+@app.post("/password-policy", tags=["Credentials"])
+def set_password_policy(body: PasswordPolicyRequest, authorized: bool = Depends(auth)):
+    """Record a password/lockout policy (discovered or operator-set). The reuse
+    loop caps per-account spray at threshold-1 within the policy window so a real
+    account is never locked out."""
+    eid = _validate_engagement_uuid(body.engagement_id) if body.engagement_id else None
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """INSERT INTO public.password_policies
+                 (engagement_id, scope_host, lockout_threshold, window_minutes, source)
+               VALUES (%s::uuid, %s, %s, %s, %s)
+               RETURNING id, scope_host, lockout_threshold, window_minutes""",
+            (eid, body.scope_host, body.lockout_threshold, body.window_minutes, body.source),
+        )
+        row = dict(cur.fetchone())
+    return {"ok": True, **row}
+
+
 # ── Global kill-switch / blast-radius control ────────────────────────────────
 # Halt is enforced at the scope gate (etl/scope_gate.is_halted), so a halt
 # refuses every gated dispatcher at once. These endpoints just flip the flag and
