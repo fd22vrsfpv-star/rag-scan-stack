@@ -165,18 +165,22 @@ def evidenced_ids(findings):
     return ids
 
 
-def compute(findings):
-    """Return the full 98-test coverage matrix + summary for these findings."""
+def compute(findings, reviewed_ids=None):
+    """Return the full 98-test coverage matrix + summary. `reviewed_ids` are the
+    WSTG ids an operator has signed off in the Tier-4 manual checklist — a
+    reviewed manual test counts as covered (human-guided, not auto-proven)."""
     gen = generator_wstg_ids()
     ev = evidenced_ids(findings)
+    reviewed = set(reviewed_ids or ())
     rows, by_cat = [], {}
     for cid, (name, tier) in CATALOG.items():
         fam = cid.split("-")[1]
         has_gen, evidenced = cid in gen, cid in ev
-        covered = has_gen or evidenced
+        manual_reviewed = cid in reviewed
+        covered = has_gen or evidenced or manual_reviewed
         rows.append({"id": cid, "name": name, "category": fam, "auto_tier": tier,
                      "has_generator": has_gen, "evidenced": evidenced,
-                     "covered": covered})
+                     "manual_reviewed": manual_reviewed, "covered": covered})
         c = by_cat.setdefault(fam, {"total": 0, "covered": 0})
         c["total"] += 1
         c["covered"] += 1 if covered else 0
@@ -190,6 +194,7 @@ def compute(findings):
             "pct_covered": round(100 * covered / total, 1) if total else 0.0,
             "with_generator": sum(1 for r in rows if r["has_generator"]),
             "evidenced": sum(1 for r in rows if r["evidenced"]),
+            "manual_reviewed": sum(1 for r in rows if r["manual_reviewed"]),
             "gaps_automatable": len(gaps_auto), "gaps_manual": len(gaps_manual),
         },
         "by_category": by_cat,
