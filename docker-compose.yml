@@ -1408,6 +1408,9 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      API_KEY: ${API_KEY:-changeme}
+      RAG_API_URL: https://rag-api:8000
+      NODE_MANAGER_URL: https://node-manager:8020
       # Trust the stack's self-signed cert WITHOUT disabling verification.
       # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
       # peer calls verify AND external HTTPS (template/CVE feeds) still works.
