@@ -665,7 +665,13 @@ def _insert_json_finding(cur, rec: dict, tool_name: str, target: str,
                   or rec.get("hostname") or target)
     rec_url = rec.get("url") or rec.get("matched-at") or rec.get("endpoint")
     rec_cves = rec.get("cve") or rec.get("cves") or rec.get("vulnerabilities")
-    rec_severity = rec.get("severity") or rec.get("risk") or rec.get("level")
+    # Nuclei nests severity under `info.severity` (top-level `severity` is absent),
+    # so a naive rec.get("severity") fell through to the "info" default and every
+    # nuclei finding — including high/critical CVEs like CVE-2012-1823 — was stored
+    # as info. Read the nested form too.
+    _rec_info = rec.get("info") if isinstance(rec.get("info"), dict) else {}
+    rec_severity = (rec.get("severity") or rec.get("risk") or rec.get("level")
+                    or _rec_info.get("severity"))
     rec_name = (rec.get("name") or rec.get("title") or rec.get("template-id")
                 or rec.get("info", {}).get("name") if isinstance(rec.get("info"), dict) else None
                 or rec.get("check") or rec.get("plugin_name"))
