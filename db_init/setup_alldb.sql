@@ -1593,7 +1593,7 @@ BEGIN
       port_id             uuid REFERENCES public.ports(id) ON DELETE SET NULL,
 
       -- Exploit source info
-      source              text NOT NULL CHECK (source IN ('exploitdb', 'metasploit')),
+      source              text NOT NULL CHECK (source IN ('exploitdb', 'metasploit', 'webshell')),
       exploit_id          text NOT NULL,  -- EDB-ID or MSF module path
       exploit_title       text NOT NULL,
       exploit_type        text CHECK (exploit_type IN ('rce', 'auth_bypass', 'info_disclosure', 'other')),

@@ -465,6 +465,25 @@ echo ""
 # The legacy UNIQUE(name, target) constraint blocked adding the same target
 # value across different engagements' scopes. ensure_all_tables.sql migration
 # drops it and creates the engagement-scoped unique index.
+echo "🔍 Verifying pending_exploits.source allows 'webshell' (WSTG-CONF-06 webshell upload)..."
+SRC_OK=$(docker exec rag-postgres psql -U app -d scans -tAc \
+  "SELECT pg_get_constraintdef(oid) LIKE '%webshell%' FROM pg_constraint WHERE conname='pending_exploits_source_check'" 2>/dev/null)
+if [ "$SRC_OK" != "t" ]; then
+    echo "  ⚠  pending_exploits_source_check missing 'webshell' — migrating"
+    docker exec rag-postgres psql -U app -d scans -c \
+      "ALTER TABLE pending_exploits DROP CONSTRAINT IF EXISTS pending_exploits_source_check; \
+       ALTER TABLE pending_exploits ADD CONSTRAINT pending_exploits_source_check \
+       CHECK (source = ANY (ARRAY['exploitdb','metasploit','webshell']))" >/dev/null 2>&1
+fi
+SRC_OK=$(docker exec rag-postgres psql -U app -d scans -tAc \
+  "SELECT pg_get_constraintdef(oid) LIKE '%webshell%' FROM pg_constraint WHERE conname='pending_exploits_source_check'" 2>/dev/null)
+if [ "$SRC_OK" = "t" ]; then
+    echo "  ✓ pending_exploits.source permits 'webshell'"
+else
+    echo "  ❌ pending_exploits.source still rejects 'webshell'"
+    MISSING=$((MISSING + 1))
+fi
+
 echo "🔍 Verifying scope_targets schema migration..."
 LEGACY=$(docker exec rag-postgres psql -U app -d scans -tAc \
   "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.scope_targets'::regclass AND conname='scope_targets_name_target_key')" 2>/dev/null)

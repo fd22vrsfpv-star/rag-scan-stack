@@ -668,6 +668,119 @@ def test_safe_lane_bounds_and_strips_exploit_nse_from_nmap():
         "bounder must detect -sC and screen scripts against the safe allow-set")
 
 
+def test_msf_ranking_filters_platform_mismatches():
+    """_rank_msf must drop modules whose platform contradicts the target family
+    (a windows/smb exploit against a Linux host), and NEVER filter on an unknown
+    target (fail-open). Sabotage: remove the _platform_mismatch filter, or make
+    an unknown target drop everything → fails."""
+    src = _engine_src()
+    fn = src[src.index("def _rank_msf("):]
+    fn = fn[:fn.index("\ndef ", 1)]
+    assert "_platform_mismatch(" in fn, "_rank_msf must apply the platform filter"
+    mm = src[src.index("def _platform_mismatch("):]
+    mm = mm[:mm.index("\ndef ", 1)]
+    assert "if not target:" in mm and "return False" in mm, (
+        "_platform_mismatch must fail-open on an unknown target (never drop on a guess)")
+    inf = src[src.index("def _infer_target_platform("):]
+    inf = inf[:inf.index("\ndef ", 1)]
+    assert "return None" in inf, "_infer_target_platform must return None when unsure"
+
+
+def test_msf_ranking_puts_real_exploits_before_scanners():
+    """The recommender lists auxiliary/ scanners before exploit/ modules, and the
+    old inline [:2] kept the scanners and DROPPED the real exploit (vsftpd
+    backdoor at index 3). _rank_msf must sort exploit/ modules ahead of
+    auxiliary/ ones. Sabotage: make _rank rank them equal → the exploit can fall
+    outside the cap → fails."""
+    src = _engine_src()
+    fn = src[src.index("def _rank_msf("):]
+    fn = fn[:fn.index("\ndef ", 1)]
+    assert 'startswith("exploit/")' in fn and "return 0" in fn, (
+        "_rank_msf must rank exploit/ modules first (return 0)")
+    assert 'startswith("auxiliary/")' in fn, (
+        "_rank_msf must recognise and de-prioritise auxiliary/ scanners")
+    # priority helper: a real exploit / webshell / edb outranks an aux scanner
+    pf = src[src.index("def _test_priority("):]
+    pf = pf[:pf.index("\ndef ", 1)]
+    assert '"webshell_upload"' in pf and '"edb_exploit"' in pf, (
+        "_test_priority must rank webshell + ExploitDB tests as high-value")
+
+
+def test_webshell_upload_is_impactful():
+    """WSTG-CONF-06 webshell upload MUST be an impactful category so it can never
+    run in the autonomous safe lane — it uploads code and gets a shell."""
+    sets = _engine_sets()
+    assert "webshell_upload" in sets.get("_IMPACTFUL_CATEGORIES", set()), (
+        "webshell_upload must be impactful (human-gated), never safe")
+
+
+def test_wstg_conf06_probe_is_scope_gated_before_traffic():
+    """The WSTG-CONF-06 method probe sends real OPTIONS traffic, so it MUST pass
+    the scope gate first. Assert _host_in_scope is checked before _detect_webdav
+    in the probe loop. Sabotage: remove the _host_in_scope guard → fails."""
+    src = _engine_src()
+    fn = src[src.index("def _wstg_conf06_webshell_tests("):]
+    fn = fn[:fn.index("\ndef ", 1)]
+    assert "_host_in_scope(" in fn, "WSTG-CONF-06 probe must scope-check the host"
+    assert fn.index("_host_in_scope(") < fn.index("_detect_webdav("), (
+        "scope check must precede the OPTIONS probe (authorisation before traffic)")
+    # and the scope helper fails closed
+    hs = src[src.index("def _host_in_scope("):]
+    hs = hs[:hs.index("\ndef ", 1)]
+    assert "return False" in hs, "_host_in_scope must fail closed (return False on error)"
+
+
+def test_webshell_ref_dispatches_as_webshell_with_valid_type():
+    """A webshell test's ref must dispatch under source 'webshell' (what
+    exploit-runner branches on) and a DB-valid exploit_type. Sabotage: change
+    dispatch_source or use a type outside the CHECK constraint → fails."""
+    src = _engine_src()
+    fn = src[src.index("def _webshell_ref("):]
+    fn = fn[:fn.index("\ndef ", 1)]
+    assert '"dispatch_source": "webshell"' in fn
+    assert '"vector": "webdav_put"' in fn
+    # file_upload is in the pending_exploits.exploit_type CHECK set; webshell_upload is NOT.
+    assert '"exploit_type": "file_upload"' in fn, (
+        "exploit_type must satisfy the pending_exploits CHECK constraint")
+
+
+def test_exploit_runner_webshell_branch_scope_gated():
+    """exploit-runner's source=webshell branch sends a PUT, so it MUST refuse an
+    out-of-scope target BEFORE deploying. Sabotage: drop the scope refusal, or
+    call _deploy_webshell before it → fails."""
+    er = (REPO / "exploit_runner" / "exploit_runner.py").read_text(encoding="utf-8")
+    assert 'elif source == "webshell":' in er, "webshell dispatch branch missing"
+    branch = er[er.index('elif source == "webshell":'):]
+    branch = branch[:branch.index("\n        else:")]
+    assert "_exploit_scope_refusal(" in branch, "webshell branch must scope-check"
+    assert branch.index("_exploit_scope_refusal(") < branch.index("_deploy_webshell("), (
+        "scope refusal must precede the webshell PUT")
+    # and it proves EXECUTION, not just upload
+    dep = er[er.index("def _deploy_webshell_one("):]
+    dep = dep[:dep.index("\ndef ", 1)]
+    assert "_WEBSHELL_MARKER" in dep, "deploy must verify command execution, not just a 201"
+
+
+def test_exec_nodes_approve_before_execute():
+    """execute_approved_exploit REQUIRES status='approved' and otherwise refuses
+    ("not approved"). Every node that calls it after an operator/auto approval
+    MUST first transition the pending_exploit via _mark_approved — the resume
+    only sets the decision, it does not flip the DB status. Sabotage: drop the
+    _mark_approved call in a node → its execute is refused; guard fails."""
+    src = _engine_src()
+    for fn_name in ("exploit_exec", "surface_exec", "_exec_one_impactful"):
+        fn = src[src.index(f"def {fn_name}("):]
+        fn = fn[:fn.index("\ndef ", 1)]
+        # Match the actual call, not a docstring mention of the name.
+        call = "scan_tools.execute_approved_exploit"
+        assert call in fn, f"{fn_name} should call execute_approved_exploit"
+        assert "_mark_approved(" in fn, (
+            f"{fn_name} calls execute_approved_exploit without _mark_approved — "
+            "the pending_exploit stays 'pending' and execution is refused")
+        assert fn.index("_mark_approved(") < fn.index(call), (
+            f"{fn_name} must mark approved BEFORE executing")
+
+
 def test_run_custom_test_resolves_the_listener_execution_id():
     """kali-listener's /tools/execute returns the id in the `id` field (it runs
     the tool in a BackgroundTask), never `exec_id`/`execution_id`. run_custom_test
