@@ -90,6 +90,17 @@ async def coverage(engagement_id: str):
         return safe_json(resp)
 
 
+@router.get("/api/coverage/wstg/{engagement_id}")
+async def wstg_coverage(engagement_id: str):
+    """Live OWASP WSTG coverage (98 tests) for an engagement."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=25) as c:
+        resp = await c.get(f"{s.rag_api_url}/coverage/wstg/{engagement_id}", headers=_hdrs())
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
 @router.get("/api/coverage/{engagement_id}/complete")
 async def coverage_complete(engagement_id: str):
     """Engagement stop condition: is every in-scope service tested?"""

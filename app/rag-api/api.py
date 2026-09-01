@@ -7640,6 +7640,41 @@ def findings_verification(engagement_id: str, authorized: bool = Depends(auth)):
     }
 
 
+@app.get("/coverage/wstg/{engagement_id}", tags=["Coverage"])
+def wstg_coverage(engagement_id: str, authorized: bool = Depends(auth)):
+    """Live OWASP WSTG coverage for an engagement — which of the 98 WSTG v4.2
+    tests are covered (a generator can produce one, OR a finding evidences one),
+    and which are gaps split into automatable vs inherently-manual. Makes what
+    the scanners already find (ZAP/nuclei/whatweb/nmap) COUNT toward WSTG."""
+    import wstg_coverage as wc
+    findings = []
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # web_findings for the engagement (tags is jsonb here)
+        cur.execute(
+            """SELECT wf.source, wf.name, wf.issue_type,
+                      CASE WHEN jsonb_typeof(wf.tags)='array'
+                           THEN ARRAY(SELECT jsonb_array_elements_text(wf.tags))
+                           ELSE ARRAY[]::text[] END AS tags
+                 FROM public.web_findings wf
+                 JOIN public.assets a ON a.id = wf.asset_id
+                WHERE a.engagement_id = %s::uuid""",
+            (engagement_id,))
+        findings.extend(dict(r) for r in cur.fetchall())
+        # vulns for the engagement (nuclei/nmap write here; tags is text[])
+        cur.execute(
+            """SELECT v.script AS source, v.script AS name, NULL::text AS issue_type,
+                      COALESCE(v.tags, ARRAY[]::text[]) AS tags
+                 FROM public.vulns v
+                 JOIN public.assets a ON a.id = v.asset_id
+                WHERE a.engagement_id = %s::uuid""",
+            (engagement_id,))
+        findings.extend(dict(r) for r in cur.fetchall())
+    result = wc.compute(findings)
+    result["engagement_id"] = engagement_id
+    result["findings_considered"] = len(findings)
+    return result
+
+
 @app.get("/coverage/{engagement_id}/complete", tags=["Coverage"])
 def coverage_complete(engagement_id: str, authorized: bool = Depends(auth)):
     """Engagement stop condition: complete when every in-scope open service has
