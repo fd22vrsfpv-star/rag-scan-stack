@@ -1647,6 +1647,25 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
     except Exception:  # noqa: BLE001
         findings = []
 
+    # Web ports (and their scheme) for THIS host — used to (a) skip web
+    # finding-driven tests on non-web ports (a header_check on :22/SSH would
+    # just hang) and (b) give a bare host:port URL a proper http(s):// scheme.
+    _web_ports, _port_scheme = {}, {}
+    for row in items:
+        svc = (row.get("service") or "").strip().lower()
+        p = row.get("port")
+        if svc in _SERVICE_FAMILIES_WEB and p is not None:
+            _web_ports[p] = svc
+            _port_scheme[p] = "https" if _tls_state(
+                svc, row.get("product"), row.get("banner")) == "yes" else "http"
+
+    def _web_url(url, ip, port):
+        """Ensure a web test URL carries an http(s):// scheme."""
+        if url and str(url).startswith(("http://", "https://")):
+            return url
+        scheme = _port_scheme.get(port, "https" if str(port) in ("443", "8443") else "http")
+        return f"{scheme}://{ip}:{port}" if port else f"{scheme}://{ip}"
+
     synth_on = _SYNTH_TESTS_DEFAULT if synthesize is None else bool(synthesize)
     seen_wstg = set()
     synth_count = 0
@@ -1662,6 +1681,13 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
         furl = f.get("url")
         fip = f.get("ip") or f.get("host") or host
         fport = f.get("port")
+        # Skip web finding-driven tests on a NON-web port: a finding on :22 (SSH)
+        # etc. must not spawn an HTTP test that just hangs. Allow it only when the
+        # port is a known web port, or the finding already carries an http URL.
+        if fport is not None and fport not in _web_ports and not str(furl or "").startswith("http"):
+            continue
+        # Give the URL a real scheme (the endpoint returns bare host:port).
+        furl = _web_url(furl, fip, fport)
         tgt = f"{fip}:{fport}" if fport else str(fip)
         try:
             g = json.loads(scan_tools.get_wstg_guidance(
