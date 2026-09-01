@@ -644,6 +644,60 @@ def test_safe_execution_runs_before_the_interrupt():
     assert i_safe < i_appr, "surface_safe_exec must be declared before surface_approval"
 
 
+def test_safe_lane_bounds_and_strips_exploit_nse_from_nmap():
+    """A safe-lane nmap probe must be routed through _bound_safe_command, which
+    strips `-sC`/`--script=<glob>` (exploit/brute NSE like ftp-vsftpd-backdoor —
+    hangs the sequential lane AND crosses the safe/impactful boundary) and adds a
+    `--host-timeout`. Guards the wiring (recommender cmd → _bound_safe_command)
+    and the strip/rebuild. Sabotage: drop the _bound_safe_command call, or make
+    it a passthrough → fails."""
+    src = _engine_src()
+    # 1) the resolved recommender command is passed through the bounder
+    build = src[src.index("def _build_surface_tests("):]
+    build = build[:build.index("\ndef ", 1)]
+    assert "_bound_safe_command(cmd" in build, (
+        "recommender-supplied safe commands must go through _bound_safe_command")
+    # 2) the bounder rebuilds aggressive nmap to a bounded version scan
+    fn = src[src.index("def _bound_safe_command("):]
+    fn = fn[:fn.index("\ndef ", 1)]
+    assert "--host-timeout" in fn, "bounder must add a host-timeout"
+    assert 'return f"nmap -sV -Pn --host-timeout' in fn, (
+        "aggressive nmap (-sC/--script glob) must be rebuilt as a bounded "
+        "version scan")
+    assert "-sC" in fn and "_SAFE_NSE_SCRIPTS" in fn, (
+        "bounder must detect -sC and screen scripts against the safe allow-set")
+
+
+def test_run_custom_test_resolves_the_listener_execution_id():
+    """kali-listener's /tools/execute returns the id in the `id` field (it runs
+    the tool in a BackgroundTask), never `exec_id`/`execution_id`. run_custom_test
+    MUST read `id` or exec_id is always None, the safe-lane poll loop is skipped,
+    and every safe test records empty output as an error. Sabotage: drop
+    `body.get("id")` from the exec_id resolution → this fails."""
+    st_src = (_autogen_dir() / "scan_tools.py").read_text(encoding="utf-8")
+    fn = st_src[st_src.index("def run_custom_test("):]
+    fn = fn[:fn.index("\ndef ", 1)]
+    # the exec_id value must fall back to the listener's `id` field
+    assert re.search(r'"exec_id":\s*body\.get\([^)]*\)(\s*or\s*body\.get\([^)]*\))*\s*or\s*body\.get\(\s*["\']id["\']\s*\)', fn), (
+        "run_custom_test must resolve exec_id from body.get('id') — the "
+        "listener returns the execution id in the `id` field")
+
+
+def test_safe_lane_poll_is_deadline_based_not_a_fixed_60s():
+    """The safe-lane result poll must cover the tool's own timeout. A fixed
+    20×3s=60s loop recorded slow scanners (nuclei/gobuster take minutes) as empty
+    errors. Sabotage: revert surface_safe_exec to `for _ in range(20)` → fails."""
+    src = _engine_src()
+    fn = src[src.index("def surface_safe_exec("):]
+    fn = fn[:fn.index("\ndef ", 1)]
+    assert "_SAFE_TEST_POLL_SECONDS" in fn and "deadline" in fn, (
+        "surface_safe_exec must poll to a wall-clock deadline "
+        "(_SAFE_TEST_POLL_SECONDS), not a fixed iteration count")
+    assert "for _ in range(20)" not in fn, (
+        "the fixed 60s (20×3s) poll cap is back — slow safe tests will record "
+        "empty errors")
+
+
 def test_surface_event_types_are_in_the_allowlist():
     """A langgraph_surface_* event not in _ALL_EVENT_TYPES is emitted, 200'd and
     silently dropped from the Agent Activity timeline."""

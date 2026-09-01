@@ -1072,6 +1072,10 @@ _SAFE_TOOL_HINTS = {
 # Cap per host — this is a single-host exhaustive sweep, not the cross-host
 # _DETERMINISTIC_PLAN_LIMIT that bounds recommender calls across many hosts.
 _SURFACE_TEST_LIMIT = int(os.environ.get("SURFACE_TEST_LIMIT", "24"))
+# How long surface_safe_exec polls one safe test for its terminal result. Must
+# exceed run_custom_test's tool timeout (300s) so slow scanners (nuclei/gobuster)
+# are captured instead of recorded as empty errors. Env-tunable.
+_SAFE_TEST_POLL_SECONDS = int(os.environ.get("SAFE_TEST_POLL_SECONDS", "330"))
 # Opt-in LLM synthesis in the surface phase: author a custom test per web finding
 # instead of the fixed WSTG-map command. Bounded (one LLM call each) and it falls
 # back to the deterministic map on any failure, so it never blocks the phase.
@@ -1164,7 +1168,11 @@ def _assertion_for(category: str, tls: str) -> dict:
     if category == "nuclei_detect":
         return {"expect_regex": r"\[[a-z0-9-]+\]"}   # nuclei prints [template-id]
     if category in ("version_probe", "http_probe", "banner", "cert_check"):
-        return {"expect_exit_code": 0, "min_output_bytes": 1}
+        # A detection probe PASSES when it produced identifying output — the exit
+        # code is not the signal. ssh-audit exits 3 when it FINDS weak crypto
+        # (a successful probe, not a failure); testssl/sslscan and whatweb behave
+        # similarly. Requiring exit 0 mislabelled a good 9.5 KB banner as "fail".
+        return {"min_output_bytes": 20}
     if category == "dir_enum":
         return {"expect_regex": r"(?i)status: ?200|/[a-z0-9]"}
     return {"expect_exit_code": 0}
@@ -1177,7 +1185,12 @@ def _surface_categories_for(svc: str, tls: str) -> "list[tuple[str,str]]":
     web = svc in _SERVICE_FAMILIES_WEB
     out = []
     if web:
-        out += [("http_probe", "httpx"), ("nuclei_detect", "nuclei"),
+        # whatweb, not ProjectDiscovery httpx: the kali image ships Python's
+        # httpx at /usr/bin/httpx (different CLI, and not on the allowlist), so
+        # an `httpx -title -tech-detect …` probe both 400s at the gate and would
+        # not parse. whatweb is present, allowlisted, and gives title / server /
+        # tech — exactly what http_probe asserts on.
+        out += [("http_probe", "whatweb"), ("nuclei_detect", "nuclei"),
                 ("dir_enum", "gobuster")]
         if tls == "yes":
             out += [("tls_check", "sslscan")]
@@ -1190,6 +1203,42 @@ def _surface_categories_for(svc: str, tls: str) -> "list[tuple[str,str]]":
     if not out:
         out = [("banner", "nmap")]
     return out
+
+
+# NSE script categories that are read-only/version-detection and safe to keep on
+# a safe-lane nmap probe. Anything else (exploit, brute, dos, intrusive, or a
+# service glob like `ftp-*` that pulls in ftp-vsftpd-backdoor) is stripped.
+_SAFE_NSE_SCRIPTS = {"banner", "ssl-cert", "ssl-enum-ciphers", "http-title",
+                     "http-headers", "http-server-header"}
+
+
+def _bound_safe_command(cmd: str, ip, port) -> str:
+    """Make a recommender-supplied command safe and bounded for the safe lane.
+
+    The recommender emits aggressive nmap probes like
+    `nmap -sV -sC -p 21 --script=ftp-*` for a "banner" test. `--script=ftp-*`
+    pulls in exploit/brute NSE (ftp-vsftpd-backdoor et al.) — that both HANGS
+    (seen: a 5-minute defunct nmap blocking the whole sequential safe lane) and
+    crosses the safe/impactful line a safe test must not cross. Reduce any nmap
+    command carrying `-sC`/`--script=` (unless the scripts are all in the safe
+    allow-set) to a bounded version scan, and give every nmap probe a
+    `--host-timeout` so one slow host cannot stall the lane.
+    """
+    head = _tool_head(cmd)
+    if head != "nmap":
+        return cmd
+    import re as _re
+    scripts = _re.findall(r"--script[= ]([^\s]+)", cmd)
+    flat = ",".join(scripts)
+    aggressive = ("-sC" in cmd.split()) or (
+        flat and any(tok.strip() not in _SAFE_NSE_SCRIPTS
+                     for tok in flat.split(",") if tok.strip()))
+    if aggressive:
+        # Rebuild as a plain, bounded version scan on the same port.
+        return f"nmap -sV -Pn --host-timeout 120s -p {port} {ip}"
+    if "--host-timeout" not in cmd:
+        cmd = cmd.replace("nmap", "nmap --host-timeout 120s", 1)
+    return cmd
 
 
 def _build_surface_tests(host: str, synthesize: bool = None) -> list:
@@ -1232,18 +1281,21 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
             cmd = (rt.get("command") if rt else None)
             if cmd:
                 cmd = cmd.replace("{target}", str(ip))
+                cmd = _bound_safe_command(cmd, ip, port)
             else:
                 scheme = "https" if tls == "yes" else "http"
                 cmd = {
-                    "httpx": f"httpx -u {scheme}://{ip}:{port} -title -tech-detect -status-code",
+                    # Present + allowlisted in the kali image (see _surface_categories_for).
+                    "whatweb": f"whatweb -a 3 --color=never {scheme}://{ip}:{port}",
                     "nuclei": f"nuclei -u {scheme}://{ip}:{port} -silent",
-                    "gobuster": f"gobuster dir -u {scheme}://{ip}:{port} -w /usr/share/wordlists/dirb/common.txt -q",
+                    # seclists is installed; /usr/share/wordlists/dirb/ is not.
+                    "gobuster": f"gobuster dir -u {scheme}://{ip}:{port} -w /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt -q",
                     "sslscan": f"sslscan {ip}:{port}",
                     "enum4linux-ng": f"enum4linux-ng -A {ip}",
                     "ssh-audit": f"ssh-audit {ip}:{port}",
                     "snmpwalk": f"snmpwalk -v2c -c public {ip}",
-                    "nmap": f"nmap -sV -Pn -p {port} {ip}",
-                }.get(default_tool, f"nmap -sV -Pn -p {port} {ip}")
+                    "nmap": f"nmap -sV -Pn --host-timeout 120s -p {port} {ip}",
+                }.get(default_tool, f"nmap -sV -Pn --host-timeout 120s -p {port} {ip}")
             tier = _classify(category, cmd, has_exploit_ref=False)
             tests.append({
                 "name": f"{category} {svc}/{port} @ {ip}",
@@ -1472,14 +1524,21 @@ def surface_safe_exec(state: PentestState) -> dict:
         exec_id = out.get("exec_id")
         exit_code, body, http_status = None, "", None
         if exec_id:
-            for _ in range(20):
+            # Poll to a wall-clock deadline that covers the tool's own timeout —
+            # nuclei (6k templates) and gobuster (thousands of paths on a slow
+            # host) take minutes, and a fixed 60s cap recorded them as empty
+            # errors even though they completed. +30s margin over the 300s tool
+            # timeout, then we give up and record what we have.
+            deadline = _time.time() + _SAFE_TEST_POLL_SECONDS
+            while _time.time() < deadline:
                 _time.sleep(3)
                 try:
-                    st = json.loads(_tool(scan_tools.get_execution_status, exec_id=exec_id))                         if hasattr(scan_tools, "get_execution_status") else {}
+                    st = json.loads(_tool(scan_tools.get_execution_status, exec_id=exec_id)) \
+                        if hasattr(scan_tools, "get_execution_status") else {}
                 except Exception:  # noqa: BLE001
                     st = {}
-                if not st:
-                    break
+                # A transient read miss ({} or {"ok": false}) is not terminal —
+                # keep polling rather than breaking out with empty output.
                 if st.get("status") in ("completed", "failed", "timeout"):
                     exit_code = st.get("exit_code")
                     body = st.get("output") or ""
