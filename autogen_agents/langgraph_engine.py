@@ -1056,7 +1056,7 @@ _SAFE_CATEGORIES = {
 }
 _IMPACTFUL_CATEGORIES = {
     "rce", "shell", "msf_exploit", "file_write", "upload", "cred_bruteforce",
-    "dos", "sqli_dump", "deserialization",
+    "dos", "sqli_dump", "deserialization", "webshell_upload",
 }
 # Read-only tools the safe lane may dispatch. The /tools/execute endpoint is the
 # real authority (Metasploit excluded there); this is a conservative agent-side
@@ -1241,6 +1241,115 @@ def _bound_safe_command(cmd: str, ip, port) -> str:
     return cmd
 
 
+# WSTG-CONF-06 — common writable-collection names to method-probe. WebDAV on a
+# named collection (Metasploitable's /dav/, IIS /webdav/, upload dirs) is the
+# classic PUT-a-webshell vector. Kept small and bounded — this is a method test,
+# not a directory brute.
+_DAV_CANDIDATE_PATHS = ("/dav/", "/webdav/", "/uploads/")
+
+
+def _webshell_ref_from_url(url, ip, port, wid_s="WSTG-CONF-06") -> dict:
+    """Build the webshell dispatch ref (source=webshell + DAV path/scheme) that
+    the exploit-runner needs. Path/scheme come from a finding URL when present,
+    else default to the /dav/ collection over http."""
+    scheme, path = "http", "/dav/"
+    try:
+        if url:
+            import urllib.parse as _up
+            u = _up.urlparse(url if "://" in str(url) else f"http://{url}")
+            scheme = u.scheme or "http"
+            p = u.path or "/dav/"
+            # Use the collection (directory) portion, not a file.
+            if not p.endswith("/"):
+                p = p.rsplit("/", 1)[0] + "/"
+            path = p or "/dav/"
+    except Exception:  # noqa: BLE001
+        pass
+    # exploit_type must satisfy the pending_exploits CHECK constraint; a webshell
+    # upload IS a file_upload (leading to RCE). dispatch_source='webshell' is what
+    # execute-by-id branches on — the exploit_type is metadata.
+    return {"source": "wstg", "dispatch_source": "webshell",
+            "exploit_type": "file_upload", "module": wid_s,
+            "parameters": {"vector": "webdav_put", "path": path, "scheme": scheme},
+            "purpose": "WSTG-CONF-06 writable PUT/WebDAV -> webshell RCE"}
+
+
+def _host_in_scope(host: str) -> bool:
+    """Fail-closed scope check for a planner-time recon probe. The OPTIONS method
+    test below sends real traffic, so it passes the same gate as any dispatch —
+    if the scope cannot be read, refuse (return False). Uses the canonical
+    one-line enforcer (connect + load + check) so this path can never drift from
+    every other dispatcher's gate."""
+    try:
+        from etl.scope_gate import enforce_target_scope
+        return enforce_target_scope(host) is None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _detect_webdav(scheme: str, ip, port, path: str):
+    """WSTG-CONF-06 OPTIONS probe. Returns the collection path when it advertises
+    WebDAV (a `DAV:` header, `MS-Author-Via`, or PUT in Allow), else None.
+    Read-only — writability is proven later by the gated PUT in the exploit-runner."""
+    try:
+        import httpx as _hx
+        url = f"{scheme}://{ip}:{port}{path}"
+        with _hx.Client(verify=False, timeout=10, follow_redirects=True) as c:
+            r = c.request("OPTIONS", url)
+        hdr = {k.lower(): v for k, v in r.headers.items()}
+        allow = (hdr.get("allow") or "").upper()
+        if hdr.get("dav") or "ms-author-via" in hdr or "PUT" in allow:
+            return path if path.endswith("/") else path + "/"
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _wstg_conf06_webshell_tests(items: list) -> list:
+    """WSTG-CONF-06 (Test HTTP Methods): the OWASP way this vector is found.
+
+    The deterministic recommender is service+port-keyed (http/80 -> canned MSF
+    aux modules) and never inspects the banner, so a writable WebDAV collection
+    was invisible to it. This runs the actual WSTG-CONF-06 method test — a
+    scope-gated OPTIONS probe on candidate collections — and, when a WebDAV
+    collection answers, emits an IMPACTFUL `webshell_upload` test carrying the
+    WSTG map's assertion. The PUT itself is gated: it runs only after the human
+    approval interrupt, in the exploit-runner's `source=webshell` branch."""
+    out, seen = [], set()
+    # Assertion is fixed here rather than via get_wstg_guidance: the map's SAFE
+    # `http_methods` (method_check) entry shares CWE-650 and shadows the match,
+    # so a lookup would return the wrong (detection) assertion. This is the
+    # impactful ESCALATION — a passing run must show command output.
+    assertion = {"expect_regex": "(?i)(uid=[0-9]|gid=[0-9]|PXWEBSHELL_OK)"}
+    wid_s = "WSTG-CONF-06"
+    for row in items:
+        svc = (row.get("service") or "").strip().lower()
+        if svc not in _SERVICE_FAMILIES_WEB:
+            continue
+        port, ip = row.get("port"), row.get("ip")
+        if not ip or (ip, port) in seen:
+            continue
+        seen.add((ip, port))
+        if not _host_in_scope(ip):
+            continue
+        scheme = "https" if _tls_state(svc, row.get("product"), row.get("banner")) == "yes" else "http"
+        for path in _DAV_CANDIDATE_PATHS:
+            coll = _detect_webdav(scheme, ip, port, path)
+            if not coll:
+                continue
+            url = f"{scheme}://{ip}:{port}{coll}"
+            ref = _webshell_ref_from_url(url, ip, port, wid_s)
+            out.append({
+                "name": f"WSTG-CONF-06 webshell_upload (WebDAV PUT) @ {url}",
+                "host": ip, "service": "http", "port": port, "tool": "webshell",
+                "command": None, "category": "webshell_upload", "tier": "impactful",
+                "assertion": assertion,
+                "exploit_ref": ref,
+            })
+            break  # one webshell vector per web port is enough
+    return out
+
+
 def _build_surface_tests(host: str, synthesize: bool = None) -> list:
     """Deterministic (no LLM) custom tests for ONE host's surface.
 
@@ -1256,6 +1365,12 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
         items = ports.get("items") or []
     except Exception:  # noqa: BLE001
         items = []
+
+    # WSTG-CONF-06 (Test HTTP Methods) FIRST: a writable WebDAV collection is a
+    # direct RCE (upload a webshell), the highest-value vector on the host — it
+    # must never be crowded out of the _SURFACE_TEST_LIMIT budget by lower-value
+    # probes. Detected up front and prepended.
+    tests.extend(_wstg_conf06_webshell_tests(items))
 
     seen = set()
     for row in items:
@@ -1386,15 +1501,24 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
         impactful_ref = (ent.get("tier") == "impactful"
                          or cat in _IMPACTFUL_CATEGORIES)
         tier = _classify(cat, cmd or "", has_exploit_ref=impactful_ref)
+        # webshell_upload can't dispatch as a plain wstg command — it needs the
+        # webshell branch (PUT + RCE). Derive the collection path/scheme from the
+        # finding URL and give it a webshell dispatch ref, same as the active
+        # WSTG-CONF-06 probe below.
+        if cat == "webshell_upload" and tier == "impactful":
+            e_ref = _webshell_ref_from_url(furl, fip, fport, wid_s or "WSTG-CONF-06")
+            e_tool = "webshell"
+        else:
+            e_ref = ({"source": "wstg", "module": wid_s,
+                      "purpose": ent.get("wstg_note")} if tier == "impactful" else None)
+            e_tool = _tool_head(cmd or "")
         tests.append({
             "name": f"WSTG {wid_s} {cat} @ {furl or tgt}",
             "host": fip, "service": "http", "port": fport,
-            "tool": _tool_head(cmd or ""),
+            "tool": e_tool,
             "command": cmd, "category": cat, "tier": tier,
             "assertion": ent.get("assertion") or {},
-            "exploit_ref": ({"source": "wstg", "module": wid_s,
-                             "purpose": ent.get("wstg_note")}
-                            if tier == "impactful" else None),
+            "exploit_ref": e_ref,
         })
 
     return tests
@@ -1434,15 +1558,24 @@ def surface_plan(state: PentestState) -> dict:
             # Queue the exploit for approval FIRST (side effect lives here, before
             # the interrupt) so the security_tests row can reference it.
             ref = c.get("exploit_ref") or {}
+            # The dispatch source is what execute-by-id branches on. Most refs
+            # dispatch under their own source (metasploit); a webshell test names
+            # a `dispatch_source` ("webshell") distinct from its provenance
+            # `source` ("wstg"), and carries structured `parameters` (the DAV
+            # path/scheme) the exploit-runner needs. Fall back to the old
+            # metasploit/rce defaults so nothing else changes.
+            dispatch_source = ref.get("dispatch_source") or ref.get("source") or "metasploit"
+            exploit_type = ref.get("exploit_type") or "rce"
             try:
                 res = json.loads(_tool(
                     scan_tools.queue_exploit_for_approval,
                     exploit_id=ref.get("module") or c["name"],
-                    source=ref.get("source") or "metasploit",
+                    source=dispatch_source,
                     exploit_title=c["name"],
                     customized_command=(c.get("command") or ref.get("module") or c["name"]),
                     target_ip=c["host"], target_port=c.get("port"),
-                    target_service=c.get("service"), exploit_type="rce",
+                    target_service=c.get("service"), exploit_type=exploit_type,
+                    parameters=ref.get("parameters"),
                     session_id=sid))
                 pending_exploit_id = (res.get("pending_exploit_id")
                                       or res.get("id") if isinstance(res, dict) else None)
@@ -1663,12 +1796,17 @@ def _postex_enumerate(host, session_type, session_id, sid):
     try:
         import requests as _rq
         base = os.environ.get("EXPLOIT_RUNNER_URL", "https://exploit-runner:8017")
-        r = _rq.post(f"{base}/postex/enumerate",
-                     json={"session_type": session_type, "session_id": str(session_id),
-                           "host": host, "platform": "linux",
-                           # chain into a scope-gated lateral spray PLAN (no
-                           # dispatch — the plan still goes through approval).
-                           "lateral": True},
+        payload = {"session_type": session_type, "session_id": str(session_id),
+                   "host": host, "platform": "linux",
+                   # chain into a scope-gated lateral spray PLAN (no dispatch —
+                   # the plan still goes through approval).
+                   "lateral": True}
+        # A webshell drives commands through its invocation URL (with a {cmd}
+        # slot), stored as session_id. The post-ex webshell provider reads
+        # webshell_url, so pass it or enumeration has no channel.
+        if str(session_type).lower() == "webshell":
+            payload["webshell_url"] = str(session_id)
+        r = _rq.post(f"{base}/postex/enumerate", json=payload,
                      headers={"x-api-key": os.environ.get("API_KEY", "changeme")},
                      timeout=120, verify=False)
         d = r.json() if r.status_code < 400 else {}

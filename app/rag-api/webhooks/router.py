@@ -543,6 +543,9 @@ _ALL_EVENT_TYPES = [
     "recon_agent_pipeline_launched",
     "credential_reuse_sprayed",
     "postex_enumerated", "langgraph_postex_enumerated",
+    # WSTG-CONF-06 webshell-upload proof (exploit-runner source=webshell). A
+    # writable WebDAV collection uploaded a shell and executed a command.
+    "webshell_proven", "webshell_deploy_failed",
 ]
 
 
