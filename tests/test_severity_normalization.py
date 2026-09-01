@@ -59,3 +59,21 @@ def test_passing_test_confirms_its_source_finding():
     # must only fire on a pass and never override operator triage
     assert 'status == "pass"' in fn, "confirm only on a genuine pass"
     assert "IN ('new','triaging')" in fn, "must not override an operator's own triage"
+
+
+def test_zap_adds_discovered_sites_to_scope_before_scanning():
+    """gobuster/katana-discovered URLs must be put in a ZAP context/scope and the
+    seeds spidered BEFORE the active scan — otherwise ascan only attacks the base
+    URL and the app-layer surface (DVWA/Mutillidae) is never tested. Guards the
+    zap_scan_with_urls scope+spider wiring. Sabotage: drop include_in_context, or
+    spider only the base -> fails."""
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[1] / "web_scanner" / "web_scan.py").read_text(encoding="utf-8")
+    fn = src[src.index("def zap_scan_with_urls("):]
+    fn = fn[:fn.index("\ndef ", 1)]
+    assert "include_in_context" in fn, "discovered sites must be added to a ZAP context/scope"
+    assert "for s in seeds" in fn, "each seed (not just the base) must be spidered"
+    assert "inscopeonly=True" in fn, "active scan must run over the in-scope tree"
+    # and the pipeline seeds known vulnerable apps generic wordlists miss
+    assert "_seed_known_apps" in src and "_KNOWN_VULN_APP_PATHS" in src, (
+        "the pipeline must seed known vulnerable-app roots (DVWA/Mutillidae/...)")
