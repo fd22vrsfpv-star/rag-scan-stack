@@ -315,7 +315,7 @@ async def check_database_schema():
             'pending_exploits', 'exploit_results', 'exploit_chunks', 'tool_executions',
             'lateral_movement', 'credential_spray_attempts', 'credential_spray_approvals', 'password_policies',
             'platform_control',
-            'security_tests', 'security_test_runs',
+            'security_tests', 'security_test_runs', 'wstg_manual_reviews',
             # Webhooks
             'webhooks', 'webhook_events', 'webhook_deliveries',
             # Engagements / Workflow
