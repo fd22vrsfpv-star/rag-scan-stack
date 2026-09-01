@@ -1079,6 +1079,16 @@ services:
       # unattended sessions parked. Turn it on per session with
       # {"enable_exploit_phase": true}.
       LANGGRAPH_EXPLOIT_PHASE: ${LANGGRAPH_EXPLOIT_PHASE:-false}
+      # LLM rate-limit backoff. When a phase's model returns 429 the agent waits
+      # and retries instead of degrading to the deterministic summary. Tune to
+      # your provider's quota. MAX_RETRIES attempts, exponential from BASE_WAIT
+      # (5,10,20,40s…) capped at MAX_WAIT; a server Retry-After header overrides.
+      LLM_RATELIMIT_MAX_RETRIES: ${LLM_RATELIMIT_MAX_RETRIES:-4}
+      LLM_RATELIMIT_BASE_WAIT: ${LLM_RATELIMIT_BASE_WAIT:-5}
+      LLM_RATELIMIT_MAX_WAIT: ${LLM_RATELIMIT_MAX_WAIT:-60}
+      # Self-tuning: adapt spacing/backoff to observed 429s (decays to zero
+      # overhead when healthy). Set false to use only the static knobs above.
+      LLM_RATELIMIT_ADAPTIVE: ${LLM_RATELIMIT_ADAPTIVE:-true}
       # LLM Backend: "ollama", "vllm", "azure", "openai", or "anthropic"
       LLM_BACKEND: ${LLM_BACKEND:-ollama}
       # Ollama settings (default)
@@ -1408,6 +1418,9 @@ services:
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
+      API_KEY: ${API_KEY:-changeme}
+      RAG_API_URL: https://rag-api:8000
+      NODE_MANAGER_URL: https://node-manager:8020
       # Trust the stack's self-signed cert WITHOUT disabling verification.
       # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
       # peer calls verify AND external HTTPS (template/CVE feeds) still works.

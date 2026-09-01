@@ -1145,22 +1145,30 @@ class ScanTools:
             self._log_response(None, e)
             return error_detail
 
-    def query_open_ports(self, limit: int = 100) -> Dict:
+    def query_open_ports(self, limit: int = 100, ip: str = None) -> Dict:
         """
         Query open ports from database
 
         Args:
             limit: Maximum number of results
+            ip: Optional server-side host filter. IMPORTANT — pass this when you
+                want one host's ports: /ports/open returns a flat, LIMIT-capped
+                page across ALL hosts, so a lab/internal IP can fall outside the
+                page and a client-side filter then sees zero. The endpoint's
+                `ip` filter is `host(a.ip)=` so it is CIDR-safe server-side.
 
         Returns:
             Dictionary with open ports data
         """
+        params = {"limit": limit}
+        if ip:
+            params["ip"] = ip
         return self._make_request(
             method="GET",
             url=f"{self.rag_api_url}/ports/open",
-            operation=f"Query open ports (limit={limit})",
+            operation=f"Query open ports (limit={limit}{', ip='+ip if ip else ''})",
             headers=self.headers,
-            params={"limit": limit}
+            params=params
         )
 
     def query_assets(self, limit: int = 100) -> Dict:
@@ -2736,17 +2744,26 @@ def query_open_ports(target: str = None, limit: int = 100) -> str:
     found. Use that guidance when choosing which tools to run next; it reflects
     technique proven against these services and overrides generic defaults.
     """
-    result = get_scan_tools().query_open_ports(limit)
+    # Push the host filter to the server (host(a.ip)=, CIDR-safe). Without this
+    # the endpoint returns a flat LIMIT-capped page across every host, so an
+    # internal lab IP falls outside the page and the client filter below sees 0.
+    result = get_scan_tools().query_open_ports(limit, ip=target or None)
 
     # rag-api returns the rows under "items"; older callers looked for "ports",
     # which silently matched nothing — the target filter below never ran, so
     # asking for one host returned every host. Accept both keys.
     rows_key = "items" if isinstance(result, dict) and "items" in result else "ports"
 
-    # Filter by target if specified
+    # Filter by target if specified. Stored IPs may carry a /32 CIDR suffix
+    # (assets.ip is inet), so strip it before comparing or a host filter never
+    # matches and the agent sees zero services for a host it just scanned.
     if target and isinstance(result, dict) and rows_key in result:
-        result[rows_key] = [p for p in result[rows_key]
-                            if p.get("ip") == target or p.get("host") == target]
+        import re as _re
+        tgt = _re.sub(r"/[0-9]+$", "", str(target))
+        def _m(p):
+            pip = _re.sub(r"/[0-9]+$", "", str(p.get("ip") or ""))
+            return pip == tgt or str(p.get("host") or "") == tgt
+        result[rows_key] = [p for p in result[rows_key] if _m(p)]
         result["filtered_by"] = target
         result["count"] = len(result[rows_key])
 
@@ -2778,9 +2795,13 @@ def query_assets(target: str = None, limit: int = 100) -> str:
     """
     result = get_scan_tools().query_assets(limit)
 
-    # Filter by target if specified
+    # Filter by target if specified (strip a /32 CIDR suffix — see query_open_ports).
     if target and isinstance(result, dict) and "assets" in result:
-        result["assets"] = [a for a in result["assets"] if a.get("ip") == target or a.get("host") == target]
+        import re as _re
+        tgt = _re.sub(r"/[0-9]+$", "", str(target))
+        result["assets"] = [a for a in result["assets"]
+                            if _re.sub(r"/[0-9]+$", "", str(a.get("ip") or "")) == tgt
+                            or str(a.get("host") or "") == tgt]
         result["filtered_by"] = target
 
     return json.dumps(result, indent=2)
@@ -3855,7 +3876,12 @@ def run_custom_test(tool: str, command: str, target: str, port: int = None,
         return json.dumps({
             "ok": r.status_code < 400,
             "status_code": r.status_code,
-            "exec_id": body.get("exec_id") or body.get("execution_id"),
+            # kali-listener's ToolExecutionResponse names the execution id `id`
+            # (it runs the tool in a BackgroundTask and returns immediately). The
+            # older `exec_id`/`execution_id` keys never appear, so without `id`
+            # here exec_id was always None — the safe-lane poll loop was skipped
+            # and every safe test recorded empty output as an error.
+            "exec_id": body.get("exec_id") or body.get("execution_id") or body.get("id"),
             "detail": None if r.status_code < 400 else r.text[:400],
             **({k: v for k, v in body.items() if k not in ("exec_id", "execution_id")}),
         })
