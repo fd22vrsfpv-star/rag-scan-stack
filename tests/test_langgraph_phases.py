@@ -668,6 +668,26 @@ def test_safe_lane_bounds_and_strips_exploit_nse_from_nmap():
         "bounder must detect -sC and screen scripts against the safe allow-set")
 
 
+def test_msf_ranking_puts_real_exploits_before_scanners():
+    """The recommender lists auxiliary/ scanners before exploit/ modules, and the
+    old inline [:2] kept the scanners and DROPPED the real exploit (vsftpd
+    backdoor at index 3). _rank_msf must sort exploit/ modules ahead of
+    auxiliary/ ones. Sabotage: make _rank rank them equal → the exploit can fall
+    outside the cap → fails."""
+    src = _engine_src()
+    fn = src[src.index("def _rank_msf("):]
+    fn = fn[:fn.index("\ndef ", 1)]
+    assert 'startswith("exploit/")' in fn and "return 0" in fn, (
+        "_rank_msf must rank exploit/ modules first (return 0)")
+    assert 'startswith("auxiliary/")' in fn, (
+        "_rank_msf must recognise and de-prioritise auxiliary/ scanners")
+    # priority helper: a real exploit / webshell / edb outranks an aux scanner
+    pf = src[src.index("def _test_priority("):]
+    pf = pf[:pf.index("\ndef ", 1)]
+    assert '"webshell_upload"' in pf and '"edb_exploit"' in pf, (
+        "_test_priority must rank webshell + ExploitDB tests as high-value")
+
+
 def test_webshell_upload_is_impactful():
     """WSTG-CONF-06 webshell upload MUST be an impactful category so it can never
     run in the autonomous safe lane — it uploads code and gets a shell."""
@@ -697,7 +717,7 @@ def test_webshell_ref_dispatches_as_webshell_with_valid_type():
     exploit-runner branches on) and a DB-valid exploit_type. Sabotage: change
     dispatch_source or use a type outside the CHECK constraint → fails."""
     src = _engine_src()
-    fn = src[src.index("def _webshell_ref_from_url("):]
+    fn = src[src.index("def _webshell_ref("):]
     fn = fn[:fn.index("\ndef ", 1)]
     assert '"dispatch_source": "webshell"' in fn
     assert '"vector": "webdav_put"' in fn
@@ -718,7 +738,7 @@ def test_exploit_runner_webshell_branch_scope_gated():
     assert branch.index("_exploit_scope_refusal(") < branch.index("_deploy_webshell("), (
         "scope refusal must precede the webshell PUT")
     # and it proves EXECUTION, not just upload
-    dep = er[er.index("def _deploy_webshell("):]
+    dep = er[er.index("def _deploy_webshell_one("):]
     dep = dep[:dep.index("\ndef ", 1)]
     assert "_WEBSHELL_MARKER" in dep, "deploy must verify command execution, not just a 201"
 
