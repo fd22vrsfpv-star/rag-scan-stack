@@ -1384,7 +1384,7 @@ CREATE TABLE IF NOT EXISTS public.pending_exploits (
     id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     asset_id           uuid REFERENCES public.assets(id) ON DELETE CASCADE,
     port_id            uuid REFERENCES public.ports(id) ON DELETE SET NULL,
-    source             text NOT NULL CHECK (source IN ('exploitdb', 'metasploit')),
+    source             text NOT NULL CHECK (source IN ('exploitdb', 'metasploit', 'webshell')),
     exploit_id         text NOT NULL,
     exploit_title      text NOT NULL,
     exploit_type       text CHECK (exploit_type IN ('rce', 'auth_bypass', 'info_disclosure', 'other')),

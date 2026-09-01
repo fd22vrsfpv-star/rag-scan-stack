@@ -759,6 +759,7 @@ def _build_test_plan(_unused_target: str = "") -> "tuple[str, int]":
         items = ports.get("items") or []
     except Exception:  # noqa: BLE001
         items = []
+    _plat = _infer_target_platform(items)
 
     # Group by (service, port), remembering one real host and how many share it.
     for row in items:
@@ -791,7 +792,7 @@ def _build_test_plan(_unused_target: str = "") -> "tuple[str, int]":
             lines.append(f"  - {t.get('name')}: {t.get('purpose')}\n    $ {cmd}")
         if rec.get("nuclei_tags"):
             lines.append(f"  - nuclei tags: {', '.join(rec['nuclei_tags'][:8])}")
-        for m in (rec.get("metasploit") or [])[:2]:
+        for m in _rank_msf(rec.get("metasploit"), platform=_plat):
             lines.append(f"  - msf: {m.get('module')} — {m.get('purpose')}")
         if rec.get("common_vulns"):
             lines.append(f"  - watch for: {'; '.join(rec['common_vulns'][:4])}")
@@ -976,6 +977,20 @@ def exploit_approval(state: PentestState) -> dict:
             "log": [f"exploit_approval: approved={approved}"]}
 
 
+def _mark_approved(pending_id, who: str, note: str = None) -> None:
+    """Transition a pending_exploit to status='approved' so the downstream
+    execute_approved_exploit (which REQUIRES that status and otherwise refuses
+    "not approved") will run it. The operator's decision at the approval
+    interrupt — or the auto-exploit opt-in — IS the authorization; this records
+    it. execute_approved_exploit still fails closed on scope, so this can never
+    turn an out-of-scope target runnable."""
+    try:
+        import db_utils as _du
+        _du.approve_exploit(pending_id, reviewed_by=who, notes=note)
+    except Exception as _e:  # noqa: BLE001
+        logger.warning("approve_exploit(%s) failed: %s", pending_id, _e)
+
+
 def exploit_exec(state: PentestState) -> dict:
     """Execute the operator-approved exploit through the SAME gated tool body."""
     sid = state["session_id"]
@@ -990,6 +1005,8 @@ def exploit_exec(state: PentestState) -> dict:
         return {"phase": "report",
                 "findings": ["exploit_exec: skipped (no id)"],
                 "log": ["exploit_exec skipped: no pending_exploit_id"]}
+    _mark_approved(pending_id, "operator (exploit approval)",
+                   (state.get("exploit_decision") or {}).get("note"))
     result = _tool(scan_tools.execute_approved_exploit, pending_id)
     _msg(sid, "Exploit", f"[execute_approved_exploit {pending_id}]\n{result[:2000]}")
     _emit("langgraph_exploit_executed", sid,
@@ -1056,8 +1073,10 @@ _SAFE_CATEGORIES = {
 }
 _IMPACTFUL_CATEGORIES = {
     "rce", "shell", "msf_exploit", "file_write", "upload", "cred_bruteforce",
-    "dos", "sqli_dump", "deserialization",
+    "dos", "sqli_dump", "deserialization", "webshell_upload", "edb_exploit",
 }
+# ExploitDB scripts to try per (product, version). Non-MSF exploit coverage.
+_EDB_PER_SERVICE = int(os.environ.get("SURFACE_EDB_LIMIT", "3"))
 # Read-only tools the safe lane may dispatch. The /tools/execute endpoint is the
 # real authority (Metasploit excluded there); this is a conservative agent-side
 # snapshot so a tool we do not list is treated as impactful (fails safe).
@@ -1071,7 +1090,164 @@ _SAFE_TOOL_HINTS = {
 }
 # Cap per host — this is a single-host exhaustive sweep, not the cross-host
 # _DETERMINISTIC_PLAN_LIMIT that bounds recommender calls across many hosts.
-_SURFACE_TEST_LIMIT = int(os.environ.get("SURFACE_TEST_LIMIT", "24"))
+# Max surface tests generated for ONE host. Deliberately high: the operator asked
+# to test EVERY recommendation, so this is a runaway backstop, not a curation cap.
+# Candidates are priority-sorted (real exploits + webshell first) before it bites,
+# so on a pathological host the highest-value tests are the ones that survive.
+_SURFACE_TEST_LIMIT = int(os.environ.get("SURFACE_TEST_LIMIT", "300"))
+# How many MSF modules per service become impactful tests. Was an inline [:2]
+# that truncated real exploits; high now so all recommended modules get through.
+_MSF_MODULE_LIMIT = int(os.environ.get("SURFACE_MSF_LIMIT", "12"))
+
+
+def _exploitdb_tests(items: list) -> list:
+    """Non-MSF exploit tests: search ExploitDB by (product, version) and emit an
+    IMPACTFUL test per real EDB script found. These execute via the exploit-runner
+    `source=exploitdb` path (the script is LLM-customised for the target, then
+    run), complementing the MSF modules — so a service with a raw PoC but no MSF
+    module still gets a proof attempt. The '(Metasploit)' EDB duplicates are
+    skipped (the MSF path already covers those)."""
+    import httpx as _hx
+    base = os.environ.get("EXPLOIT_RUNNER_URL", "https://exploit-runner:8017")
+    key = os.environ.get("API_KEY", "changeme")
+    out, seen_q, seen_edb = [], set(), set()
+    for row in items:
+        product = (row.get("product") or "").strip()
+        version = (row.get("version") or "").strip()
+        port, ip = row.get("port"), row.get("ip")
+        svc = (row.get("service") or "").strip().lower()
+        if not product or not ip:
+            continue
+        # The nmap version field is often junk (UnrealIRCd's is an admin email,
+        # Samba's is "3.X - 4.X"), so search by product + a CLEAN version token
+        # (e.g. 2.3.4) only when one is present, else product alone.
+        import re as _re
+        vm = _re.search(r"\d+\.\d+(?:\.\d+)?", version or "")
+        q = f"{product} {vm.group(0)}".strip() if vm else product.strip()
+        if q.lower() in seen_q:
+            continue
+        seen_q.add(q.lower())
+        try:
+            r = _hx.get(f"{base}/exploitdb/search",
+                        params={"q": q, "limit": 8},
+                        headers={"x-api-key": key}, verify=False, timeout=15)
+            results = (r.json().get("results") or []) if r.status_code < 400 else []
+        except Exception:  # noqa: BLE001
+            results = []
+        added = 0
+        for it in results:
+            if added >= _EDB_PER_SERVICE:
+                break
+            edb = str(it.get("edb_id") or it.get("id") or "").strip()
+            title = str(it.get("title") or it.get("description") or "")
+            if not edb or edb in seen_edb:
+                continue
+            # Skip the '(Metasploit)' EDB mirrors — the MSF path already runs those.
+            if "metasploit" in title.lower():
+                continue
+            seen_edb.add(edb)
+            added += 1
+            out.append({
+                "name": f"exploitdb EDB-{edb}: {title[:50]} @ {ip}:{port}",
+                "host": ip, "service": svc or "?", "port": port, "tool": "exploitdb",
+                "command": None, "category": "edb_exploit", "tier": "impactful",
+                "assertion": {"expect_regex": "(?i)(uid=[0-9]|gid=[0-9]|shell|success|root@)"},
+                "exploit_ref": {"source": "exploitdb", "dispatch_source": "exploitdb",
+                                "exploit_type": "rce", "module": edb, "edb_id": edb,
+                                "purpose": title[:120]},
+            })
+    return out
+
+
+def _test_priority(t: dict) -> int:
+    """Lower = kept first when capping. Real exploits and the webshell rank above
+    active safe probes, which rank above passive version/banner probes, which
+    rank above MSF auxiliary SCANNERS (version/login/enum — lowest value)."""
+    cat = t.get("category")
+    ref = t.get("exploit_ref") or {}
+    mod = str(ref.get("module") or "")
+    if cat == "webshell_upload":
+        return 0
+    if cat == "msf_exploit" and mod.startswith("exploit/"):
+        return 1                                   # a shell — the whole point
+    if cat == "edb_exploit":
+        return 1                                   # non-MSF ExploitDB script — same value
+    if t.get("tier") == "impactful":
+        return 2                                   # wstg/synth impactful (rce, sqli_dump…)
+    if cat in ("nuclei_detect", "dir_enum", "sqli_detect", "lfi_read", "cmd_injection"):
+        return 3                                   # active safe detection
+    if cat == "msf_exploit":
+        return 6                                   # auxiliary/ scanner — lowest
+    return 4                                        # version_probe / banner / tls
+
+
+# Platform inference from banners (nmap rarely fills assets.os on this lab).
+# Strong, low-false-positive tokens only — "microsoft" is excluded because nmap
+# labels a LINUX Samba port "microsoft-ds".
+_LINUX_HINTS = ("linux", "ubuntu", "debian", "unix", "smbd", "telnetd",
+                "openssh", "vsftpd", "proftpd", "distcc", "postfix",
+                "centos", "redhat", "fedora", ".el")
+_WINDOWS_HINTS = ("windows", "win32", "win64", "microsoft iis", "microsoft-iis")
+# Which MSF module platforms are INCOMPATIBLE with a given target family. The
+# module platform is the 2nd path segment: exploit/<platform>/<cat>/<name>.
+_PLATFORM_MISMATCH = {
+    "unix": {"windows", "osx", "apple_ios", "android", "mainframe"},
+    "windows": {"linux", "unix", "osx", "apple_ios", "android", "bsd", "solaris"},
+}
+
+
+def _infer_target_platform(items) -> Optional[str]:
+    """'unix' | 'windows' | None from the host's service banners/products/os.
+    None (unknown) means DON'T filter — never drop a module on a guess."""
+    blob = " ".join(
+        f"{r.get('product') or ''} {r.get('banner') or ''} "
+        f"{r.get('version') or ''} {r.get('os') or ''}"
+        for r in (items or [])).lower()
+    lin = sum(blob.count(h) for h in _LINUX_HINTS)
+    win = sum(blob.count(h) for h in _WINDOWS_HINTS)
+    if lin > win and lin:
+        return "unix"
+    if win > lin and win:
+        return "windows"
+    return None
+
+
+def _module_platform(module) -> str:
+    parts = str(module or "").lower().split("/")
+    return parts[1] if len(parts) >= 2 else ""
+
+
+def _platform_mismatch(module, target) -> bool:
+    """True when this module's platform contradicts the target family — e.g. a
+    windows/smb exploit against a Linux Samba host. Unknown target or platform
+    never mismatches (fail-open: we only drop a PROVEN wrong-OS module)."""
+    if not target:
+        return False
+    return _module_platform(module) in _PLATFORM_MISMATCH.get(target, set())
+
+
+def _rank_msf(mods, limit=None, platform=None):
+    """Filter platform mismatches, then order real `exploit/` modules (which land
+    a shell) ABOVE `auxiliary/` scanners (version/login/enum), then cap.
+
+    The recommender lists scanners first, so a naive `[:2]` kept ftp_version +
+    ftp_login and TRUNCATED OUT exploit/unix/ftp/vsftpd_234_backdoor — the actual
+    RCE — at index 3. It also returns generic Windows SMB modules (ms17_010,
+    ms08_067) for a Linux Samba port; `platform` drops those wrong-OS modules so
+    the approval queue holds only what can actually land here."""
+    def _mod(m):
+        return str((m or {}).get("module") or (m or {}).get("name") or "")
+
+    kept = [m for m in (mods or []) if not _platform_mismatch(_mod(m), platform)]
+
+    def _rank(m):
+        mod = _mod(m).lower()
+        if mod.startswith("exploit/"):
+            return 0
+        if mod.startswith("auxiliary/"):
+            return 2
+        return 1
+    return sorted(kept, key=_rank)[:(limit or _MSF_MODULE_LIMIT)]
 # How long surface_safe_exec polls one safe test for its terminal result. Must
 # exceed run_custom_test's tool timeout (300s) so slow scanners (nuclei/gobuster)
 # are captured instead of recorded as empty errors. Env-tunable.
@@ -1241,6 +1417,133 @@ def _bound_safe_command(cmd: str, ip, port) -> str:
     return cmd
 
 
+# WSTG-CONF-06 — collections a PUT webshell is commonly accepted into. Kept
+# permissive: a server that accepts PUT WITHOUT advertising it (Tomcat with
+# readonly=false, a misconfigured upload dir, no DAV header at all) should still
+# be attempted, because the gated PUT at execution is the real proof. Ordered
+# roughly by how often each is writable; the deploy tries them in turn.
+_DAV_CANDIDATE_PATHS = ("/dav/", "/webdav/", "/uploads/", "/upload/", "/files/",
+                        "/data/", "/media/", "/images/", "/tmp/", "/")
+
+
+def _webshell_ref(ip, port, scheme, paths, wid_s="WSTG-CONF-06") -> dict:
+    """Build the webshell dispatch ref. `paths` is the ORDERED list of collections
+    the deploy will try (permissive: it walks them until one accepts a webshell).
+    `path` is kept as the first entry for back-compat with older readers."""
+    paths = [p if str(p).endswith("/") else str(p) + "/" for p in (paths or ["/dav/"])]
+    # exploit_type must satisfy the pending_exploits CHECK constraint; a webshell
+    # upload IS a file_upload (leading to RCE). dispatch_source='webshell' is what
+    # execute-by-id branches on — the exploit_type is metadata.
+    return {"source": "wstg", "dispatch_source": "webshell",
+            "exploit_type": "file_upload", "module": wid_s,
+            "parameters": {"vector": "webdav_put", "path": paths[0],
+                           "paths": paths, "scheme": scheme},
+            "purpose": "WSTG-CONF-06 writable PUT/WebDAV -> webshell RCE"}
+
+
+def _webshell_ref_from_url(url, ip, port, wid_s="WSTG-CONF-06") -> dict:
+    """Ref for a webshell test derived from a finding URL (the WSTG map path).
+    Tries the finding's own collection first, then the common candidate list."""
+    scheme, path = "http", "/dav/"
+    try:
+        if url:
+            import urllib.parse as _up
+            u = _up.urlparse(url if "://" in str(url) else f"http://{url}")
+            scheme = u.scheme or "http"
+            p = u.path or "/dav/"
+            if not p.endswith("/"):
+                p = p.rsplit("/", 1)[0] + "/"
+            path = p or "/dav/"
+    except Exception:  # noqa: BLE001
+        pass
+    norm = [pp if pp.endswith("/") else pp + "/" for pp in _DAV_CANDIDATE_PATHS]
+    paths = [path] + [pp for pp in norm if pp != path]
+    return _webshell_ref(ip, port, scheme, paths, wid_s)
+
+
+def _host_in_scope(host: str) -> bool:
+    """Fail-closed scope check for a planner-time recon probe. The OPTIONS method
+    test below sends real traffic, so it passes the same gate as any dispatch —
+    if the scope cannot be read, refuse (return False). Uses the canonical
+    one-line enforcer (connect + load + check) so this path can never drift from
+    every other dispatcher's gate."""
+    try:
+        from etl.scope_gate import enforce_target_scope
+        return enforce_target_scope(host) is None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _detect_webdav(scheme: str, ip, port, path: str):
+    """WSTG-CONF-06 OPTIONS probe. Returns the collection path when it advertises
+    WebDAV (a `DAV:` header, `MS-Author-Via`, or PUT in Allow), else None.
+    Read-only — writability is proven later by the gated PUT in the exploit-runner."""
+    try:
+        import httpx as _hx
+        url = f"{scheme}://{ip}:{port}{path}"
+        with _hx.Client(verify=False, timeout=10, follow_redirects=True) as c:
+            r = c.request("OPTIONS", url)
+        hdr = {k.lower(): v for k, v in r.headers.items()}
+        allow = (hdr.get("allow") or "").upper()
+        if hdr.get("dav") or "ms-author-via" in hdr or "PUT" in allow:
+            return path if path.endswith("/") else path + "/"
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _wstg_conf06_webshell_tests(items: list) -> list:
+    """WSTG-CONF-06 (Test HTTP Methods): the OWASP way this vector is found.
+
+    The deterministic recommender is service+port-keyed (http/80 -> canned MSF
+    aux modules) and never inspects the banner, so a writable WebDAV collection
+    was invisible to it. This runs the actual WSTG-CONF-06 method test — a
+    scope-gated OPTIONS probe on candidate collections — and, when a WebDAV
+    collection answers, emits an IMPACTFUL `webshell_upload` test carrying the
+    WSTG map's assertion. The PUT itself is gated: it runs only after the human
+    approval interrupt, in the exploit-runner's `source=webshell` branch."""
+    out, seen = [], set()
+    # Assertion is fixed here rather than via get_wstg_guidance: the map's SAFE
+    # `http_methods` (method_check) entry shares CWE-650 and shadows the match,
+    # so a lookup would return the wrong (detection) assertion. This is the
+    # impactful ESCALATION — a passing run must show command output.
+    assertion = {"expect_regex": "(?i)(uid=[0-9]|gid=[0-9]|PXWEBSHELL_OK)"}
+    wid_s = "WSTG-CONF-06"
+    for row in items:
+        svc = (row.get("service") or "").strip().lower()
+        if svc not in _SERVICE_FAMILIES_WEB:
+            continue
+        port, ip = row.get("port"), row.get("ip")
+        if not ip or (ip, port) in seen:
+            continue
+        seen.add((ip, port))
+        if not _host_in_scope(ip):
+            continue
+        scheme = "https" if _tls_state(svc, row.get("product"), row.get("banner")) == "yes" else "http"
+        # PERMISSIVE: emit ONE webshell candidate for EVERY in-scope web service.
+        # The OPTIONS probe below only PRIORITISES which collection to try first —
+        # it does not gate. A server that accepts PUT without advertising DAV/PUT
+        # (Tomcat readonly=false, a stray upload dir) is still attempted; the
+        # gated PUT at execution is the proof, and the deploy walks the whole
+        # candidate list until one lands (or all fail cleanly).
+        detected = [p if p.endswith("/") else p + "/"
+                    for p in _DAV_CANDIDATE_PATHS
+                    if _detect_webdav(scheme, ip, port, p)]
+        norm = [p if p.endswith("/") else p + "/" for p in _DAV_CANDIDATE_PATHS]
+        paths = detected + [p for p in norm if p not in detected]
+        url = f"{scheme}://{ip}:{port}{paths[0]}"
+        ref = _webshell_ref(ip, port, scheme, paths, wid_s)
+        label = "WebDAV advertised" if detected else "PUT unadvertised — trying anyway"
+        out.append({
+            "name": f"WSTG-CONF-06 webshell_upload ({label}) @ {scheme}://{ip}:{port}",
+            "host": ip, "service": "http", "port": port, "tool": "webshell",
+            "command": None, "category": "webshell_upload", "tier": "impactful",
+            "assertion": assertion,
+            "exploit_ref": ref,
+        })
+    return out
+
+
 def _build_surface_tests(host: str, synthesize: bool = None) -> list:
     """Deterministic (no LLM) custom tests for ONE host's surface.
 
@@ -1256,6 +1559,18 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
         items = ports.get("items") or []
     except Exception:  # noqa: BLE001
         items = []
+
+    # WSTG-CONF-06 (Test HTTP Methods) FIRST: a writable WebDAV collection is a
+    # direct RCE (upload a webshell), the highest-value vector on the host — it
+    # must never be crowded out of the _SURFACE_TEST_LIMIT budget by lower-value
+    # probes. Detected up front and prepended.
+    tests.extend(_wstg_conf06_webshell_tests(items))
+
+    # Non-MSF exploit coverage: ExploitDB scripts matched by (product, version).
+    tests.extend(_exploitdb_tests(items))
+
+    # Infer the target OS family once, to drop platform-mismatched MSF modules.
+    _plat = _infer_target_platform(items)
 
     seen = set()
     for row in items:
@@ -1306,7 +1621,7 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
             })
 
         # IMPACTFUL candidates: metasploit modules the recommender named.
-        for m in (rec.get("metasploit") or [])[:2]:
+        for m in _rank_msf(rec.get("metasploit"), platform=_plat):
             module = m.get("module") or m.get("name")
             if not module:
                 continue
@@ -1386,18 +1701,31 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
         impactful_ref = (ent.get("tier") == "impactful"
                          or cat in _IMPACTFUL_CATEGORIES)
         tier = _classify(cat, cmd or "", has_exploit_ref=impactful_ref)
+        # webshell_upload can't dispatch as a plain wstg command — it needs the
+        # webshell branch (PUT + RCE). Derive the collection path/scheme from the
+        # finding URL and give it a webshell dispatch ref, same as the active
+        # WSTG-CONF-06 probe below.
+        if cat == "webshell_upload" and tier == "impactful":
+            e_ref = _webshell_ref_from_url(furl, fip, fport, wid_s or "WSTG-CONF-06")
+            e_tool = "webshell"
+        else:
+            e_ref = ({"source": "wstg", "module": wid_s,
+                      "purpose": ent.get("wstg_note")} if tier == "impactful" else None)
+            e_tool = _tool_head(cmd or "")
         tests.append({
             "name": f"WSTG {wid_s} {cat} @ {furl or tgt}",
             "host": fip, "service": "http", "port": fport,
-            "tool": _tool_head(cmd or ""),
+            "tool": e_tool,
             "command": cmd, "category": cat, "tier": tier,
             "assertion": ent.get("assertion") or {},
-            "exploit_ref": ({"source": "wstg", "module": wid_s,
-                             "purpose": ent.get("wstg_note")}
-                            if tier == "impactful" else None),
+            "exploit_ref": e_ref,
         })
 
-    return tests
+    # Go through ALL recommendations: keep every candidate, only ORDER them so
+    # the high-value ones (real exploits, webshell) come first — that ordering
+    # is what the operator sees in the approval queue, and what survives if the
+    # runaway backstop ever trims.
+    return sorted(tests, key=_test_priority)
 
 
 def surface_plan(state: PentestState) -> dict:
@@ -1434,15 +1762,24 @@ def surface_plan(state: PentestState) -> dict:
             # Queue the exploit for approval FIRST (side effect lives here, before
             # the interrupt) so the security_tests row can reference it.
             ref = c.get("exploit_ref") or {}
+            # The dispatch source is what execute-by-id branches on. Most refs
+            # dispatch under their own source (metasploit); a webshell test names
+            # a `dispatch_source` ("webshell") distinct from its provenance
+            # `source` ("wstg"), and carries structured `parameters` (the DAV
+            # path/scheme) the exploit-runner needs. Fall back to the old
+            # metasploit/rce defaults so nothing else changes.
+            dispatch_source = ref.get("dispatch_source") or ref.get("source") or "metasploit"
+            exploit_type = ref.get("exploit_type") or "rce"
             try:
                 res = json.loads(_tool(
                     scan_tools.queue_exploit_for_approval,
                     exploit_id=ref.get("module") or c["name"],
-                    source=ref.get("source") or "metasploit",
+                    source=dispatch_source,
                     exploit_title=c["name"],
                     customized_command=(c.get("command") or ref.get("module") or c["name"]),
                     target_ip=c["host"], target_port=c.get("port"),
-                    target_service=c.get("service"), exploit_type="rce",
+                    target_service=c.get("service"), exploit_type=exploit_type,
+                    parameters=ref.get("parameters"),
                     session_id=sid))
                 pending_exploit_id = (res.get("pending_exploit_id")
                                       or res.get("id") if isinstance(res, dict) else None)
@@ -1615,6 +1952,8 @@ def surface_exec(state: PentestState) -> dict:
         return {"phase": "surface_onward",
                 "findings": ["surface_exec: skipped (no id)"],
                 "log": ["surface_exec skipped: no id"]}
+    _mark_approved(pending_id, "operator (surface approval)",
+                   (state.get("surface_decision") or {}).get("note"))
     result = _tool(scan_tools.execute_approved_exploit, pending_id)
     # Find the security_test that referenced this pending exploit.
     test = next((t for t in (state.get("pending_surface_tests") or [])
@@ -1663,12 +2002,17 @@ def _postex_enumerate(host, session_type, session_id, sid):
     try:
         import requests as _rq
         base = os.environ.get("EXPLOIT_RUNNER_URL", "https://exploit-runner:8017")
-        r = _rq.post(f"{base}/postex/enumerate",
-                     json={"session_type": session_type, "session_id": str(session_id),
-                           "host": host, "platform": "linux",
-                           # chain into a scope-gated lateral spray PLAN (no
-                           # dispatch — the plan still goes through approval).
-                           "lateral": True},
+        payload = {"session_type": session_type, "session_id": str(session_id),
+                   "host": host, "platform": "linux",
+                   # chain into a scope-gated lateral spray PLAN (no dispatch —
+                   # the plan still goes through approval).
+                   "lateral": True}
+        # A webshell drives commands through its invocation URL (with a {cmd}
+        # slot), stored as session_id. The post-ex webshell provider reads
+        # webshell_url, so pass it or enumeration has no channel.
+        if str(session_type).lower() == "webshell":
+            payload["webshell_url"] = str(session_id)
+        r = _rq.post(f"{base}/postex/enumerate", json=payload,
                      headers={"x-api-key": os.environ.get("API_KEY", "changeme")},
                      timeout=120, verify=False)
         d = r.json() if r.status_code < 400 else {}
@@ -1696,6 +2040,7 @@ def _exec_one_impactful(sid, pending_id, test):
     exploit yields a SHELL, post-ex enumeration fires automatically. Returns the
     run status ('pass'|'fail'|'error') or None."""
     import db_utils
+    _mark_approved(pending_id, "auto-exploit (operator opt-in)")
     result = _tool(scan_tools.execute_approved_exploit, pending_id)
     if not test:
         return None
