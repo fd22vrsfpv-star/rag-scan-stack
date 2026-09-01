@@ -1745,6 +1745,10 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
             "command": cmd, "category": cat, "tier": tier,
             "assertion": ent.get("assertion") or {},
             "exploit_ref": e_ref,
+            # Link back to the scanner finding this test proves, so a PASS marks
+            # THAT finding confirmed (not just "something passed on the host").
+            "source_finding_id": f.get("id"),
+            "source_finding_source": f.get("source"),
         })
 
     # Go through ALL recommendations: keep every candidate, only ORDER them so
@@ -1821,6 +1825,8 @@ def surface_plan(state: PentestState) -> dict:
                 target_service=c.get("service"), command=c.get("command"),
                 tool=c.get("tool"), assertion=c.get("assertion"),
                 pending_exploit_id=pending_exploit_id,
+                source_finding_source=c.get("source_finding_source"),
+                source_finding_id=c.get("source_finding_id"),
                 created_by_session=sid, engagement_id=engagement_id)
         except Exception as e:  # noqa: BLE001
             _msg(sid, "SurfaceTester", f"[persist failed for {c['name']}: {e}]")
