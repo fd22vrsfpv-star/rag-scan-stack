@@ -672,6 +672,13 @@ def _insert_json_finding(cur, rec: dict, tool_name: str, target: str,
     _rec_info = rec.get("info") if isinstance(rec.get("info"), dict) else {}
     rec_severity = (rec.get("severity") or rec.get("risk") or rec.get("level")
                     or _rec_info.get("severity"))
+    # Nuclei tags (rce, php, sqli, …) live under info.tags and are the primary
+    # key the WSTG map matches a finding to a test on. Unextracted, they left the
+    # `tags` column empty and CVE-2012-1823 (tagged rce) matched nothing.
+    _rec_tags = _rec_info.get("tags") or rec.get("tags") or []
+    if isinstance(_rec_tags, str):
+        _rec_tags = [t.strip() for t in _rec_tags.split(",") if t.strip()]
+    _rec_tags = [str(t) for t in _rec_tags if t] if isinstance(_rec_tags, list) else []
     rec_name = (rec.get("name") or rec.get("title") or rec.get("template-id")
                 or rec.get("info", {}).get("name") if isinstance(rec.get("info"), dict) else None
                 or rec.get("check") or rec.get("plugin_name"))
@@ -705,9 +712,10 @@ def _insert_json_finding(cur, rec: dict, tool_name: str, target: str,
         cur.execute(
             """INSERT INTO web_findings
                (id, asset_id, url, source, issue_type, name, severity, evidence,
-                cwe, refs, fingerprint)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-               ON CONFLICT (fingerprint) DO UPDATE SET last_seen = now()
+                cwe, refs, tags, fingerprint)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (fingerprint) DO UPDATE SET last_seen = now(),
+                   tags = COALESCE(EXCLUDED.tags, web_findings.tags)
                RETURNING id""",
             (fid, asset_id, rec_url, tool_name, "tool_finding",
              rec_name or f"{tool_name} finding",
@@ -715,6 +723,7 @@ def _insert_json_finding(cur, rec: dict, tool_name: str, target: str,
              json.dumps(rec, default=str)[:4000],
              as_text_array(_CWE_RE.findall(json.dumps(rec))),
              json.dumps({"cves": cve_list}) if cve_list else "{}",
+             json.dumps(_rec_tags),   # web_findings.tags is jsonb
              web_fingerprint(rec_url, tool_name, rec_name, "tool_finding")),
         )
         row = cur.fetchone()
