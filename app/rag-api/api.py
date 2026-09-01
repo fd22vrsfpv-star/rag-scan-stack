@@ -7669,6 +7669,15 @@ def wstg_coverage(engagement_id: str, authorized: bool = Depends(auth)):
                 WHERE a.engagement_id = %s::uuid""",
             (engagement_id,))
         findings.extend(dict(r) for r in cur.fetchall())
+        # playwright_findings — the client-side (CLNT-*) family lands here, not in
+        # web_findings, so the coverage report must read it too.
+        cur.execute(
+            """SELECT 'playwright' AS source, pf.title AS name,
+                      pf.finding_type AS issue_type, ARRAY[]::text[] AS tags
+                 FROM public.playwright_findings pf
+                WHERE pf.engagement_id = %s::uuid""",
+            (engagement_id,))
+        findings.extend(dict(r) for r in cur.fetchall())
     result = wc.compute(findings)
     result["engagement_id"] = engagement_id
     result["findings_considered"] = len(findings)

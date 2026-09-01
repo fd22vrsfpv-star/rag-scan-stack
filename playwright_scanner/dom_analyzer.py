@@ -31,8 +31,44 @@ class DOMAnalyzer:
             'external_scripts': await self.get_external_scripts(),
             'websockets': await self.detect_websockets(),
             'postmessage_usage': await self.detect_postmessage(),
-            'window_properties': await self.get_window_properties()
+            'window_properties': await self.get_window_properties(),
+            'client_signals': await self.get_client_security_signals(),
         }
+
+    async def get_client_security_signals(self) -> Dict:
+        """Heuristic static scan of the live page's scripts for client-side WSTG
+        signals: DOM-XSS sinks (CLNT-01), unsafe JS execution (CLNT-02),
+        unencrypted WebSockets (CLNT-10), origin-less postMessage listeners
+        (CLNT-11), and cross-origin scripts without SRI (CLNT-13)."""
+        try:
+            return await self.page.evaluate(r"""() => {
+                const out = {domSinks:[], evalUse:false, insecureWS:false,
+                             postMessageNoOrigin:false, crossOriginNoSRI:[]};
+                const sinkRe = /\.(innerHTML|outerHTML)\s*=|document\.write|insertAdjacentHTML/;
+                const evalRe = /\beval\s*\(|new\s+Function\s*\(|setTimeout\s*\(\s*['"`]/;
+                const wsRe   = /new\s+WebSocket\s*\(\s*['"`]ws:\/\//;
+                const pmRe   = /addEventListener\s*\(\s*['"`]message['"`]/;
+                const orgRe  = /\.origin\s*(===|==|!==|!=)|\.origin\.(indexOf|match|startsWith|includes)/;
+                document.querySelectorAll('script').forEach(s => {
+                    if (s.src) {
+                        try {
+                            const u = new URL(s.src, location.href);
+                            if (u.origin !== location.origin && !s.integrity)
+                                out.crossOriginNoSRI.push(s.src.slice(0,160));
+                        } catch(e){}
+                        return;
+                    }
+                    const t = s.textContent || '';
+                    if (sinkRe.test(t) && /(location|document\.URL|location\.hash|location\.search|name)/.test(t))
+                        out.domSinks.push(t.replace(/\s+/g,' ').slice(0,140));
+                    if (evalRe.test(t)) out.evalUse = true;
+                    if (wsRe.test(t)) out.insecureWS = true;
+                    if (pmRe.test(t) && !orgRe.test(t)) out.postMessageNoOrigin = true;
+                });
+                return out;
+            }""")
+        except Exception as e:
+            return {"error": str(e)}
 
     async def extract_forms(self) -> List[Dict]:
         """

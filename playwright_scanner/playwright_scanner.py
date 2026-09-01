@@ -429,6 +429,19 @@ async def _perform_scan_slotted(scan_request: ScanRequest, scan_id: uuid.UUID):
                 if cors_finding:
                     findings.append(cors_finding)
 
+                # Client-side WSTG family (CLNT-01/02/10/11/12/13) from the live
+                # browser — DOM sinks, unsafe eval, ws://, origin-less postMessage,
+                # sensitive storage, cross-origin scripts without SRI.
+                if dom_data:
+                    try:
+                        findings.extend(security_checker.check_client_side(
+                            dom_data.get('client_signals'),
+                            dom_data.get('local_storage'),
+                            dom_data.get('session_storage'),
+                            url_str))
+                    except Exception as e:
+                        logger.warning("client-side checks failed for %s: %s", url_str, e)
+
             # Save findings to database
             screenshot_count = 0
             for finding in findings:
