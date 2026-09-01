@@ -143,6 +143,12 @@ def parse_nuclei(path: str, profile: str = None, job_id: str = None, target: str
                             reference = ", ".join(reference[:5])  # Limit to 5 refs
 
                         tags = finding.get("info", {}).get("tags", [])
+                        # Keep the list form for the vulns.tags (text[]) column —
+                        # the WSTG matcher and /findings/search key on these tags
+                        # (rce, php, sqli…). The string form below is only for the
+                        # human-readable metadata/reference.
+                        tags_list = [str(t) for t in tags] if isinstance(tags, list) else (
+                            [t.strip() for t in str(tags).split(",") if t.strip()])
                         if isinstance(tags, list):
                             tags = ", ".join(tags)
 
@@ -234,8 +240,8 @@ def parse_nuclei(path: str, profile: str = None, job_id: str = None, target: str
 
                         vuln_id = str(uuid.uuid4())
                         cur.execute("""
-                            INSERT INTO vulns (id, asset_id, port_id, script, output, severity, cve, metadata, fingerprint)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            INSERT INTO vulns (id, asset_id, port_id, script, output, severity, cve, tags, metadata, fingerprint)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             ON CONFLICT DO NOTHING
                         """, (
                             vuln_id,
@@ -245,6 +251,7 @@ def parse_nuclei(path: str, profile: str = None, job_id: str = None, target: str
                             output_text[:4000],
                             severity,
                             [cve_id] if cve_id else None,
+                            tags_list or None,   # vulns.tags is text[]
                             json.dumps(metadata),
                             fp,
                         ))

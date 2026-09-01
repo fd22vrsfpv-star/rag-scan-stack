@@ -829,27 +829,56 @@ def zap_scan_with_urls(url: str, discovered_urls: Optional[List[str]] = None, ma
     proxies = {"http": f"http://{ZAP_ADDR}:{ZAP_PORT}", "https": f"http://{ZAP_ADDR}:{ZAP_PORT}"}
     zap = ZAPv2(apikey=ZAP_API_KEY, proxies=proxies)
 
-    # Seed ZAP with discovered URLs to improve coverage
-    if discovered_urls:
-        logger.info(f"[ZAP] Seeding {len(discovered_urls)} discovered URLs into site tree")
-        for disc_url in discovered_urls:
-            try:
-                # Access URL through ZAP to add it to the site tree
-                zap.urlopen(disc_url)
-                logger.debug(f"[ZAP] Seeded: {disc_url}")
-            except Exception as e:
-                logger.debug(f"[ZAP] Failed to seed {disc_url}: {e}")
+    # SCOPE FIRST: the active scanner only attacks what is IN A CONTEXT/SCOPE.
+    # Seeding the site tree (urlopen) is not enough — without scope, ascan skips
+    # the gobuster/katana-discovered URLs. Put the target host (and every
+    # discovered URL's host) into a context before spidering/scanning.
+    import re as _re, urllib.parse as _uparse
+    ctx_name = "pentest"
+    try:
+        zap.context.new_context(ctx_name)
+    except Exception:
+        pass  # already exists — reuse it
 
-    # Run spider
-    logger.info(f"[ZAP] Starting spider on {url}")
-    sid = zap.spider.scan(url)
-    while int(zap.spider.status(sid)) < 100:
-        time.sleep(3)  # Poll every 3s to reduce overhead
-    logger.info(f"[ZAP] Spider complete on {url}")
+    def _host_pat(u):
+        pp = _uparse.urlparse(u if "://" in str(u) else "http://" + str(u))
+        return _re.escape(f"{pp.scheme}://{pp.netloc}") + ".*"
 
-    # Run active scan
-    logger.info(f"[ZAP] Starting active scan on {url}")
-    aid = zap.ascan.scan(url)
+    scope_pats = {_host_pat(url)} | {_host_pat(d) for d in (discovered_urls or [])}
+    for pat in scope_pats:
+        try:
+            zap.context.include_in_context(ctx_name, pat)
+        except Exception as e:
+            logger.debug(f"[ZAP] include_in_context {pat}: {e}")
+    logger.info(f"[ZAP] scope: {len(scope_pats)} host pattern(s) added to context '{ctx_name}'")
+
+    # Seed every discovered URL into the site tree.
+    seeds = list(dict.fromkeys([url] + list(discovered_urls or [])))
+    if len(seeds) > 1:
+        logger.info(f"[ZAP] Seeding {len(seeds)-1} discovered URL(s) into the site tree")
+    for s in seeds:
+        try:
+            zap.urlopen(s)
+        except Exception as e:
+            logger.debug(f"[ZAP] Failed to seed {s}: {e}")
+
+    # Spider the base AND each distinct seed (bounded) — not just the root — so
+    # links/params INSIDE the discovered apps (/mutillidae, /dvwa) get into the
+    # tree for the active scanner to attack.
+    _MAX_SPIDER_SEEDS = int(os.environ.get("ZAP_MAX_SPIDER_SEEDS", "14"))
+    for s in seeds[:_MAX_SPIDER_SEEDS]:
+        try:
+            logger.info(f"[ZAP] Spidering {s}")
+            sid = zap.spider.scan(s, contextname=ctx_name)
+            while int(zap.spider.status(sid)) < 100:
+                time.sleep(2)
+        except Exception as e:
+            logger.debug(f"[ZAP] spider {s} failed: {e}")
+    logger.info("[ZAP] Spider(s) complete")
+
+    # Active-scan the in-scope tree (recurse covers the seeded, now-spidered apps).
+    logger.info(f"[ZAP] Starting active scan on {url} (in-scope, recursive)")
+    aid = zap.ascan.scan(url, recurse=True, inscopeonly=True)
     waited = 0
     _last_cb_time = 0
     while int(zap.ascan.status(aid)) < 100 and waited < max_wait:
@@ -1034,6 +1063,39 @@ def _scope_refusal_for_hosts(hosts):
     return None
 
 
+# Intentionally-vulnerable / high-value app roots that generic wordlists
+# (common.txt, even 43k-line raft) do NOT contain — so gobuster never finds
+# them, katana never crawls them, and ZAP never active-scans them. Probing this
+# short list and seeding the responders fixes the app-layer blind spot.
+_KNOWN_VULN_APP_PATHS = [
+    "/dvwa/", "/mutillidae/", "/mutillidae/index.php", "/bwapp/", "/webgoat/",
+    "/tikiwiki/", "/twiki/", "/phpmyadmin/", "/adminer/", "/webdav/", "/dav/",
+    "/uploads/", "/test/", "/cgi-bin/", "/joomla/", "/wordpress/", "/drupal/",
+    "/manager/html", "/jmx-console/", "/web-console/", "/axis2/", "/rest/",
+    "/api/", "/graphql", "/actuator", "/console", "/vulnerabilities/",
+]
+
+
+def _seed_known_apps(base_url: str) -> List[str]:
+    """Probe the curated vulnerable-app roots and return the ones that respond,
+    to seed katana + ZAP so DVWA/Mutillidae/etc. actually get crawled and
+    active-scanned. Best-effort; failures are skipped."""
+    import requests as _rq
+    base = base_url.rstrip("/")
+    found = []
+    for p in _KNOWN_VULN_APP_PATHS:
+        u = base + p
+        try:
+            r = _rq.get(u, timeout=6, allow_redirects=False, verify=False)
+            if r.status_code in (200, 301, 302, 401, 403):
+                found.append(u)
+        except Exception:
+            continue
+    if found:
+        logger.info(f"[known-apps] seeded {len(found)} vulnerable-app root(s) for crawl+ZAP")
+    return found
+
+
 def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_katana: bool, do_zap: bool, limit: Optional[int], wordlist: Optional[str] = None, target_url: Optional[str] = None, target_urls: Optional[List[str]] = None, proxy: Optional[str] = None):
     """Background task to run web scan with progress tracking.
 
@@ -1203,6 +1265,14 @@ def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_ka
                             if not path.startswith("/"):
                                 path = "/" + path
                             discovered_urls.append(f"{url.rstrip('/')}{path}")
+                # Seed known vulnerable-app roots (DVWA/Mutillidae/...) that
+                # wordlists miss, so katana crawls INTO them and ZAP active-scans
+                # their app-layer surface (SQLi/XSS/IDOR) — the whole point of ZAP.
+                try:
+                    discovered_urls.extend(_seed_known_apps(url))
+                    discovered_urls = list(dict.fromkeys(discovered_urls))
+                except Exception as _e:  # noqa: BLE001
+                    logger.debug(f"[{job_id[:8]}] known-apps seeding failed: {_e}")
                 if do_playwright:
                     _job_tracker.update_progress(job_id, stage="playwright")
                     pw_urls = [url] + discovered_urls[:49]

