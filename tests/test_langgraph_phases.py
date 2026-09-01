@@ -932,3 +932,23 @@ def test_owasp_param_generator_covers_the_owasp_classes():
     # idor is a recognised impactful category
     sets = _engine_sets()
     assert "idor" in sets.get("_IMPACTFUL_CATEGORIES", set()), "idor must be impactful category"
+
+
+def test_web_pipeline_autotrigger_is_gated_and_deduped():
+    """The hands-off web-pipeline trigger must be scope-gated, deduped (no
+    re-running a heavy ZAP scan every session), bounded, and fired from
+    surface_plan ONLY when scan dispatch is allowed. Sabotage: drop the scope
+    check / dedup / auto_execute gate -> fails."""
+    src = _engine_src()
+    fn = src[src.index("def _ensure_web_pipeline("):]
+    fn = fn[:fn.index("\ndef ", 1)]
+    assert "_host_in_scope(host)" in fn, "web-pipeline trigger must scope-gate"
+    assert "interval '6 hours'" in fn or "recent web scan" in fn, "must dedup recent scans"
+    assert "_WEB_PIPELINE_MAX_PORTS" in fn, "must bound the number of web ports"
+    assert "start_pipeline_scan" in fn, "must dispatch the comprehensive pipeline"
+    # surface_plan only triggers it behind the auto_execute gate
+    sp = src[src.index("def surface_plan("):]
+    sp = sp[:sp.index("\ndef ", 1)]
+    i_gate = sp.index('state.get("auto_execute")')
+    i_call = sp.index("_ensure_web_pipeline(")
+    assert i_gate < i_call, "web pipeline must be gated on auto_execute"

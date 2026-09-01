@@ -1565,6 +1565,65 @@ _KNOWN_APPS_WORDLIST = os.environ.get(
     "KNOWN_APPS_WORDLIST", "/wordlists/known-web-apps.txt")
 
 
+_WEB_PIPELINE_MAX_PORTS = int(os.environ.get("WEB_PIPELINE_MAX_PORTS", "3"))
+
+
+def _ensure_web_pipeline(host: str, sid, engagement_id=None) -> dict:
+    """Hands-off: auto-trigger the comprehensive web pipeline
+    (Gobuster→Nikto→Playwright→Katana→ZAP→Nuclei, ZAP pre-seeded + in-scope) for a
+    host's web services, so the app-layer surface (DVWA/Mutillidae params, ZAP
+    alerts) is populated WITHOUT a manual step. Scope-gated; deduped (skips if a
+    ZAP/katana scan produced findings for this host in the last 6h); fire-and-
+    forget — the pipeline is long-running, so its findings drive the NEXT surface
+    cycle (the coverage loop re-drives). Bounded to _WEB_PIPELINE_MAX_PORTS."""
+    if not _host_in_scope(host):
+        return {"skipped": "out-of-scope"}
+    try:
+        ports = json.loads(_tool(scan_tools.query_open_ports, target=host, limit=100))
+        items = ports.get("items") or []
+    except Exception:  # noqa: BLE001
+        return {"skipped": "no ports"}
+    web = [(r.get("port"), _tls_state(r.get("service"), r.get("product"), r.get("banner")))
+           for r in items
+           if (r.get("service") or "").strip().lower() in _SERVICE_FAMILIES_WEB and r.get("port")]
+    if not web:
+        return {"skipped": "no web services"}
+    # Dedup: don't re-run a heavy pipeline if one recently produced findings.
+    try:
+        import psycopg2
+        from db_utils import get_db_dsn
+        with psycopg2.connect(get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT count(*) FROM web_findings wf JOIN assets a ON wf.asset_id = a.id
+                    WHERE regexp_replace(a.ip::text,'/[0-9]+$','') = %s
+                      AND wf.source IN ('zap','katana','nuclei','nikto')
+                      AND wf.last_seen > now() - interval '6 hours'""",
+                (host,))
+            recent = cur.fetchone()[0]
+        if recent:
+            return {"skipped": f"recent web scan ({recent} findings <6h)"}
+    except Exception:  # noqa: BLE001
+        pass
+    dispatched = []
+    for port, tls in web[:_WEB_PIPELINE_MAX_PORTS]:
+        scheme = "https" if tls == "yes" else "http"
+        url = f"{scheme}://{host}:{port}"
+        try:
+            res = json.loads(_tool(scan_tools.start_pipeline_scan, target_url=url))
+            dispatched.append({"url": url, "job_id": res.get("job_id")})
+        except Exception as e:  # noqa: BLE001
+            _msg(sid, "SurfaceTester", f"[web pipeline dispatch failed for {url}: {e}]")
+    if dispatched:
+        _msg(sid, "SurfaceTester",
+             f"[web pipeline] dispatched {len(dispatched)} comprehensive web scan(s) "
+             f"(Gobuster→…→ZAP→Nuclei) — the app-layer findings they produce (SQLi/"
+             f"XSS/IDOR surface) will drive the next surface cycle.")
+        _emit("langgraph_web_pipeline_dispatched", sid,
+              {"host": host, "dispatched": len(dispatched),
+               "urls": [d["url"] for d in dispatched]})
+    return {"dispatched": dispatched}
+
+
 def _known_app_discovery_tests(items: list) -> list:
     """One safe gobuster probe per web port against the curated vulnerable-app
     list — so DVWA / Mutillidae / tikiwiki are DISCOVERED (they answer 301/200),
@@ -1922,10 +1981,21 @@ def surface_plan(state: PentestState) -> dict:
                 "surface_tests": [], "pending_surface_tests": [],
                 "findings": ["surface: no target"], "log": ["surface: no target"]}
 
-    candidates = _build_surface_tests(host, synthesize=state.get("surface_synthesize"))
     import db_utils
     eng = (get_agent_session(_sid(sid)) or {}).get("configuration", {})
     engagement_id = eng.get("engagement_id") if isinstance(eng, dict) else None
+
+    # Hands-off web coverage: when scan dispatch is allowed, auto-trigger the
+    # comprehensive web pipeline (→ZAP) for the target's web services so the
+    # app-layer surface is enumerated without a manual step. Scope+dedup guarded;
+    # fire-and-forget (its findings drive the next cycle).
+    if bool(state.get("auto_execute")):
+        try:
+            _ensure_web_pipeline(host, sid, engagement_id)
+        except Exception as e:  # noqa: BLE001
+            _msg(sid, "SurfaceTester", f"[web pipeline autotrigger skipped: {e}]")
+
+    candidates = _build_surface_tests(host, synthesize=state.get("surface_synthesize"))
 
     persisted, pending = [], []
     for c in candidates:
