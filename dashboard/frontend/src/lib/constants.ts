@@ -1,4 +1,4 @@
-export const BUILD_VERSION = '2026.08.31-0015'
+export const BUILD_VERSION = '2026.09.01-0738'
 // Severities offered as filter chips. 'recon' was removed: it was functionally
 // identical to 'info' — same SARIF level, same treatment in every export and
 // report, differing only in sort rank — so it is now written as 'info' and
