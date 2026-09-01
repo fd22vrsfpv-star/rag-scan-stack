@@ -1732,13 +1732,23 @@ class ScanTools:
                 "fallback": True
             }
 
+    # Web scanners whose findings are ACTIONABLE (a vuln/misconfig the WSTG map
+    # can turn into a test), as opposed to pure crawl output. `nuclei` was
+    # missing — so every nuclei web_finding (CVE-2012-1823 et al.) was invisible
+    # to get_web_findings and the surface phase generated ZERO finding-driven
+    # tests. `katana` is deliberately excluded: its 450 crawl endpoints have no
+    # issue_type and would crowd real findings out of the LIMIT page.
+    WEB_FINDING_SOURCES = ["nuclei", "nikto", "zap", "burp", "playwright",
+                           "gobuster", "wafw00f", "whatweb", "httpx"]
+
     def get_web_findings(self, limit: int = 100) -> Dict:
         """
         Get web findings from database.
 
         There is no `/web_findings` endpoint (it 404s); the unified
         `/findings/search` is the source of truth and it spans the web tools via
-        the `source` filter (zap / gobuster / playwright).
+        the `source` filter. Sorted severity-first upstream, so with correct
+        severities the exploitable findings (CVE RCEs) lead the page.
 
         Args:
             limit: Maximum number of results
@@ -1751,7 +1761,7 @@ class ScanTools:
             url=f"{self.rag_api_url}/findings/search",
             operation=f"Query web findings (limit={limit})",
             headers=self.headers,
-            params={"source": ["zap", "gobuster", "playwright"], "limit": limit},
+            params={"source": self.WEB_FINDING_SOURCES, "limit": limit},
         )
         # The unified endpoint returns `results`; alias it to `findings` so the
         # get_web_findings() wrapper's target/source post-filtering still applies.

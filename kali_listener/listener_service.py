@@ -922,6 +922,9 @@ _FALLBACK_ALLOWED_TOOLS = {
     "rmg", "dnsenum", "dnsrecon", "enum4linux-ng", "sqlmap", "gobuster",
     "nuclei", "smtp-user-enum", "snmpcheck", "swaks", "avahi-browse",
     "tftp", "telnet", "ftp", "lftp", "vncviewer", "ntpq", "ntpdate",
+    # Read-only HTTP/TLS clients the WSTG safe lane needs (lfi_read, header_check,
+    # tls_check). curl was absent, so every curl-based safe test skipped [400].
+    "curl", "wget", "sslscan", "testssl.sh", "testssl", "sslyze",
 }
 # Metasploit is never auto-dispatchable here.
 _MSF_DENY = {"metasploit", "msfconsole", "msfvenom", "msf"}
