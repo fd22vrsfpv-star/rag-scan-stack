@@ -31,3 +31,14 @@ def test_nested_nuclei_severity_is_read():
     i_default = src.index('rec_severity = "info"')
     assert i_nested < i_default, (
         "the info-default must come AFTER the nested-severity read")
+
+
+def test_curl_is_allowlisted_for_safe_web_tests():
+    """The WSTG safe lane (lfi_read, header_check, tls_check) runs curl. If curl
+    is not in the kali-listener allow-list, every such test skips [400]. Guards
+    the fallback set. Sabotage: remove 'curl' -> fails."""
+    import pathlib
+    src = (REPO / "kali_listener" / "listener_service.py").read_text(encoding="utf-8")
+    fset = src[src.index("_FALLBACK_ALLOWED_TOOLS"):]
+    fset = fset[:fset.index("}")]
+    assert '"curl"' in fset, "curl must be allow-listed for the WSTG safe lane"
