@@ -1073,7 +1073,7 @@ _SAFE_CATEGORIES = {
 }
 _IMPACTFUL_CATEGORIES = {
     "rce", "shell", "msf_exploit", "file_write", "upload", "cred_bruteforce",
-    "dos", "sqli_dump", "deserialization", "webshell_upload", "edb_exploit",
+    "dos", "sqli_dump", "deserialization", "webshell_upload", "edb_exploit", "idor",
 }
 # ExploitDB scripts to try per (product, version). Non-MSF exploit coverage.
 _EDB_PER_SERVICE = int(os.environ.get("SURFACE_EDB_LIMIT", "3"))
@@ -1174,7 +1174,7 @@ def _test_priority(t: dict) -> int:
         return 1                                   # non-MSF ExploitDB script — same value
     if t.get("tier") == "impactful":
         return 2                                   # wstg/synth impactful (rce, sqli_dump…)
-    if cat in ("nuclei_detect", "dir_enum", "sqli_detect", "lfi_read", "cmd_injection"):
+    if cat in ("nuclei_detect", "dir_enum", "sqli_detect", "xss_detect", "lfi_read", "cmd_injection"):
         return 3                                   # active safe detection
     if cat == "msf_exploit":
         return 6                                   # auxiliary/ scanner — lowest
@@ -1544,6 +1544,107 @@ def _wstg_conf06_webshell_tests(items: list) -> list:
     return out
 
 
+# Parameter-name heuristics → the OWASP class each implies. Object references get
+# an IDOR test; path-like params get an LFI test; EVERY param gets SQLi + XSS.
+_IDOR_PARAM_NAMES = {"id", "uid", "userid", "user_id", "user", "username", "account",
+                     "acct", "pid", "cid", "doc", "docid", "document_id", "file_id",
+                     "fileid", "order", "order_id", "orderid", "item", "itemid",
+                     "record", "rid", "object", "oid", "customer", "invoice",
+                     "message", "msgid", "note", "profile", "aid", "gid", "author",
+                     "blogger", "owner", "email", "member", "group", "role", "level"}
+_PATH_PARAM_NAMES = {"file", "page", "path", "include", "inc", "template", "tpl",
+                     "doc", "document", "dir", "folder", "load", "read", "view",
+                     "download", "filename", "url", "site", "conf", "config",
+                     "textfile", "text_file", "pg", "action", "cat", "lang", "style"}
+
+
+def _owasp_param_tests(host: str, limit: int = 16) -> list:
+    """Turn CRAWLED parameterized endpoints into OWASP WSTG app-layer tests —
+    the IDOR / SQLi / XSS / LFI coverage a service+port-keyed recommender never
+    produces. For a target like Metasploitable's DVWA/Mutillidae this is where
+    the real application bugs live. Reads the host's crawled URLs (any source)
+    that carry a query string, classifies each parameter, and emits the tests.
+    Scope-gated (the URLs are for one in-scope host); execution is still gated
+    per-tier (SQLi/XSS/LFI safe, IDOR human-approved)."""
+    import re as _re
+    import urllib.parse as _up
+    try:
+        import psycopg2
+        from db_utils import get_db_dsn
+        with psycopg2.connect(get_db_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT DISTINCT wf.url
+                     FROM web_findings wf JOIN assets a ON wf.asset_id = a.id
+                    WHERE regexp_replace(a.ip::text,'/[0-9]+$','') = %s
+                      AND wf.url LIKE '%%?%%'
+                    LIMIT 400""",
+                (host,))
+            urls = [r[0] for r in cur.fetchall() if r[0]]
+    except Exception:  # noqa: BLE001
+        return []
+    if not _host_in_scope(host):
+        return []
+
+    out, seen = [], set()
+    for raw in urls:
+        u = _up.urlparse(raw if "://" in str(raw) else f"http://{raw}")
+        if not u.query:
+            continue
+        base = f"{u.scheme or 'http'}://{u.netloc}{u.path}"
+        port = u.port or (443 if u.scheme == "https" else 80)
+        for pname, pvals in _up.parse_qs(u.query).items():
+            low = pname.lower()
+            pval = (pvals or [""])[0]
+            key = (base, low)
+            if key in seen or len(out) >= limit:
+                continue
+            seen.add(key)
+            # Rebuild the query with a placeholder we can substitute per test.
+            def _with(val):
+                q = _up.parse_qs(u.query); q[pname] = [val]
+                return f"{base}?{_up.urlencode(q, doseq=True)}"
+
+            # SQLi — safe detection via sqlmap (allow-listed), scoped to this param.
+            out.append(_param_test("sqli_detect", "sqlmap", base, pname, port,
+                f"sqlmap -u \"{raw}\" -p {pname} --batch --smart --level 1 --risk 1 --flush-session",
+                {"expect_regex": "(?i)(is vulnerable|injectable|parameter .* is|payload)"}))
+            # XSS — safe reflection probe: does a marker payload come back verbatim?
+            xurl = _with("pxXSS<svg/onload=1>")
+            out.append(_param_test("xss_detect", "curl", base, pname, port,
+                f"curl -sk \"{xurl}\"",
+                {"expect_substring": ["pxXSS<svg/onload=1>"]}))
+            # LFI — path-like params only.
+            if low in _PATH_PARAM_NAMES:
+                lurl = _with("../../../../../../etc/passwd")
+                out.append(_param_test("lfi_read", "curl", base, pname, port,
+                    f"curl -sk \"{lurl}\"", {"expect_substring": ["root:x:0:0"]}))
+            # IDOR — object-ref params. Impactful + gated: confirming needs a
+            # second identity, so this ENUMERATES the reference for the operator.
+            if low in _IDOR_PARAM_NAMES:
+                out.append(_param_test("idor", "curl", base, pname, port,
+                    f"curl -sk \"{raw}\"", {"expect_status": 200},
+                    impactful=True, wid="WSTG-ATHZ-04"))
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _param_test(category, tool, base, pname, port, command, assertion,
+                impactful=False, wid=None) -> dict:
+    wmap = {"sqli_detect": "WSTG-INPV-05", "xss_detect": "WSTG-INPV-01,WSTG-INPV-02",
+            "lfi_read": "WSTG-ATHZ-01", "idor": "WSTG-ATHZ-04"}
+    wid = wid or wmap.get(category, "WSTG")
+    ip = base.split("://", 1)[-1].split("/")[0].split(":")[0]
+    tier = "impactful" if impactful else "safe"
+    ref = ({"source": "wstg", "module": wid, "purpose": f"{wid} {category} on {pname}"}
+           if impactful else None)
+    return {"name": f"WSTG {wid} {category} @ {base}?{pname}=",
+            "host": ip, "service": "http", "port": port, "tool": tool,
+            "command": command, "category": category, "tier": tier,
+            "assertion": assertion, "exploit_ref": ref,
+            "source_finding_id": None, "source_finding_source": "crawl-param"}
+
+
 def _build_surface_tests(host: str, synthesize: bool = None) -> list:
     """Deterministic (no LLM) custom tests for ONE host's surface.
 
@@ -1568,6 +1669,9 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
 
     # Non-MSF exploit coverage: ExploitDB scripts matched by (product, version).
     tests.extend(_exploitdb_tests(items))
+
+    # OWASP app-layer coverage: IDOR / SQLi / XSS / LFI from crawled parameters.
+    tests.extend(_owasp_param_tests(host))
 
     # Infer the target OS family once, to drop platform-mismatched MSF modules.
     _plat = _infer_target_platform(items)

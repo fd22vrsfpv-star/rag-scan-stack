@@ -914,3 +914,21 @@ def test_auto_exec_executes_only_via_the_scope_gated_runner():
     # and no interrupt in the auto path
     assert not any(isinstance(s, ast.Call) and getattr(s.func, "id", "") == "interrupt"
                    for s in ast.walk(fn)), "surface_auto_exec must not interrupt"
+
+
+def test_owasp_param_generator_covers_the_owasp_classes():
+    """The parameter-driven OWASP generator must produce IDOR / SQLi / XSS / LFI
+    tests, with IDOR impactful (gated) and the detections safe. Guards the param
+    heuristics + tiering. Sabotage: drop the idor branch, or make IDOR safe -> fails."""
+    src = _engine_src()
+    fn = src[src.index("def _owasp_param_tests("):]
+    fn = fn[:fn.index("\n\ndef _param_test(")]
+    for cat in ('"sqli_detect"', '"xss_detect"', '"lfi_read"', '"idor"'):
+        assert cat in fn, f"OWASP generator must emit {cat}"
+    # IDOR is impactful/gated; the detections are safe
+    assert "impactful=True" in fn, "IDOR must be impactful (needs a second identity to confirm)"
+    # object-ref params drive IDOR; path params drive LFI
+    assert "_IDOR_PARAM_NAMES" in fn and "_PATH_PARAM_NAMES" in fn
+    # idor is a recognised impactful category
+    sets = _engine_sets()
+    assert "idor" in sets.get("_IMPACTFUL_CATEGORIES", set()), "idor must be impactful category"
