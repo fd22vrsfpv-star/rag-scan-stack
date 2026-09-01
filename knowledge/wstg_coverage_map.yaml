@@ -54,3 +54,10 @@ rules:
   - {wstg_id: WSTG-INFO-06, sources: [katana]}
   - {wstg_id: WSTG-CONF-01, sources: [nmap]}
   - {wstg_id: WSTG-CONF-10, sources: [subdomain_takeover]}
+  # ── Tier 3: Playwright client-side family ──
+  - {wstg_id: WSTG-CLNT-01, name_contains: [dom-based xss, dom xss sink, dom-xss]}
+  - {wstg_id: WSTG-CLNT-02, name_contains: [unsafe javascript execution, eval usage, dynamic code execution]}
+  - {wstg_id: WSTG-CLNT-10, name_contains: [unencrypted websocket, insecure websocket, ws://]}
+  - {wstg_id: WSTG-CLNT-11, name_contains: [postmessage, web messaging, message event]}
+  - {wstg_id: WSTG-CLNT-12, name_contains: [sensitive data in localstorage, sensitive data in sessionstorage, browser storage]}
+  - {wstg_id: WSTG-CLNT-13, name_contains: [cross-origin script, subresource integrity, script inclusion]}
