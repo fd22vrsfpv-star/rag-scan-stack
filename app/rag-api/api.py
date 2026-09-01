@@ -5708,7 +5708,14 @@ def search_findings(
             LEFT(wf.solution, 1000) as solution,
             LEFT(wf.reference, 500) as reference,
             wf.confidence,
-            COALESCE(wf.user_tags, ARRAY[]::text[]) as tags,
+            -- Merge operator tags (user_tags, text[]) with SCANNER tags
+            -- (wf.tags, jsonb — nuclei's rce/php/sqli/…). Surfacing only
+            -- user_tags hid every scanner tag, so a WSTG matcher keyed on
+            -- nuclei_tags matched nothing and CVE findings produced no tests.
+            (COALESCE(wf.user_tags, ARRAY[]::text[]) ||
+             CASE WHEN jsonb_typeof(wf.tags) = 'array'
+                  THEN ARRAY(SELECT jsonb_array_elements_text(wf.tags))
+                  ELSE ARRAY[]::text[] END) as tags,
             wf.created_at,
             wf.workflow_status,
             wf.assigned_to,
