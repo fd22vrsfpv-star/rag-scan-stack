@@ -759,6 +759,7 @@ def _build_test_plan(_unused_target: str = "") -> "tuple[str, int]":
         items = ports.get("items") or []
     except Exception:  # noqa: BLE001
         items = []
+    _plat = _infer_target_platform(items)
 
     # Group by (service, port), remembering one real host and how many share it.
     for row in items:
@@ -791,7 +792,7 @@ def _build_test_plan(_unused_target: str = "") -> "tuple[str, int]":
             lines.append(f"  - {t.get('name')}: {t.get('purpose')}\n    $ {cmd}")
         if rec.get("nuclei_tags"):
             lines.append(f"  - nuclei tags: {', '.join(rec['nuclei_tags'][:8])}")
-        for m in _rank_msf(rec.get("metasploit")):
+        for m in _rank_msf(rec.get("metasploit"), platform=_plat):
             lines.append(f"  - msf: {m.get('module')} — {m.get('purpose')}")
         if rec.get("common_vulns"):
             lines.append(f"  - watch for: {'; '.join(rec['common_vulns'][:4])}")
@@ -1180,22 +1181,73 @@ def _test_priority(t: dict) -> int:
     return 4                                        # version_probe / banner / tls
 
 
-def _rank_msf(mods, limit=None):
-    """Order recommender MSF modules so real `exploit/` modules (which land a
-    shell) rank ABOVE `auxiliary/` scanners (version/login/enum), then cap.
+# Platform inference from banners (nmap rarely fills assets.os on this lab).
+# Strong, low-false-positive tokens only — "microsoft" is excluded because nmap
+# labels a LINUX Samba port "microsoft-ds".
+_LINUX_HINTS = ("linux", "ubuntu", "debian", "unix", "smbd", "telnetd",
+                "openssh", "vsftpd", "proftpd", "distcc", "postfix",
+                "centos", "redhat", "fedora", ".el")
+_WINDOWS_HINTS = ("windows", "win32", "win64", "microsoft iis", "microsoft-iis")
+# Which MSF module platforms are INCOMPATIBLE with a given target family. The
+# module platform is the 2nd path segment: exploit/<platform>/<cat>/<name>.
+_PLATFORM_MISMATCH = {
+    "unix": {"windows", "osx", "apple_ios", "android", "mainframe"},
+    "windows": {"linux", "unix", "osx", "apple_ios", "android", "bsd", "solaris"},
+}
+
+
+def _infer_target_platform(items) -> Optional[str]:
+    """'unix' | 'windows' | None from the host's service banners/products/os.
+    None (unknown) means DON'T filter — never drop a module on a guess."""
+    blob = " ".join(
+        f"{r.get('product') or ''} {r.get('banner') or ''} "
+        f"{r.get('version') or ''} {r.get('os') or ''}"
+        for r in (items or [])).lower()
+    lin = sum(blob.count(h) for h in _LINUX_HINTS)
+    win = sum(blob.count(h) for h in _WINDOWS_HINTS)
+    if lin > win and lin:
+        return "unix"
+    if win > lin and win:
+        return "windows"
+    return None
+
+
+def _module_platform(module) -> str:
+    parts = str(module or "").lower().split("/")
+    return parts[1] if len(parts) >= 2 else ""
+
+
+def _platform_mismatch(module, target) -> bool:
+    """True when this module's platform contradicts the target family — e.g. a
+    windows/smb exploit against a Linux Samba host. Unknown target or platform
+    never mismatches (fail-open: we only drop a PROVEN wrong-OS module)."""
+    if not target:
+        return False
+    return _module_platform(module) in _PLATFORM_MISMATCH.get(target, set())
+
+
+def _rank_msf(mods, limit=None, platform=None):
+    """Filter platform mismatches, then order real `exploit/` modules (which land
+    a shell) ABOVE `auxiliary/` scanners (version/login/enum), then cap.
 
     The recommender lists scanners first, so a naive `[:2]` kept ftp_version +
     ftp_login and TRUNCATED OUT exploit/unix/ftp/vsftpd_234_backdoor — the actual
-    RCE — at index 3. Every headline Metasploitable2 exploit (samba usermap,
-    unrealircd backdoor, distcc, java_rmi) was lost the same way."""
+    RCE — at index 3. It also returns generic Windows SMB modules (ms17_010,
+    ms08_067) for a Linux Samba port; `platform` drops those wrong-OS modules so
+    the approval queue holds only what can actually land here."""
+    def _mod(m):
+        return str((m or {}).get("module") or (m or {}).get("name") or "")
+
+    kept = [m for m in (mods or []) if not _platform_mismatch(_mod(m), platform)]
+
     def _rank(m):
-        mod = str((m or {}).get("module") or (m or {}).get("name") or "").lower()
+        mod = _mod(m).lower()
         if mod.startswith("exploit/"):
             return 0
         if mod.startswith("auxiliary/"):
             return 2
         return 1
-    return sorted(mods or [], key=_rank)[:(limit or _MSF_MODULE_LIMIT)]
+    return sorted(kept, key=_rank)[:(limit or _MSF_MODULE_LIMIT)]
 # How long surface_safe_exec polls one safe test for its terminal result. Must
 # exceed run_custom_test's tool timeout (300s) so slow scanners (nuclei/gobuster)
 # are captured instead of recorded as empty errors. Env-tunable.
@@ -1517,6 +1569,9 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
     # Non-MSF exploit coverage: ExploitDB scripts matched by (product, version).
     tests.extend(_exploitdb_tests(items))
 
+    # Infer the target OS family once, to drop platform-mismatched MSF modules.
+    _plat = _infer_target_platform(items)
+
     seen = set()
     for row in items:
         svc = (row.get("service") or "").strip().lower()
@@ -1566,7 +1621,7 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
             })
 
         # IMPACTFUL candidates: metasploit modules the recommender named.
-        for m in _rank_msf(rec.get("metasploit")):
+        for m in _rank_msf(rec.get("metasploit"), platform=_plat):
             module = m.get("module") or m.get("name")
             if not module:
                 continue

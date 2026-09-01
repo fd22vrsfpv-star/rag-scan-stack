@@ -668,6 +668,24 @@ def test_safe_lane_bounds_and_strips_exploit_nse_from_nmap():
         "bounder must detect -sC and screen scripts against the safe allow-set")
 
 
+def test_msf_ranking_filters_platform_mismatches():
+    """_rank_msf must drop modules whose platform contradicts the target family
+    (a windows/smb exploit against a Linux host), and NEVER filter on an unknown
+    target (fail-open). Sabotage: remove the _platform_mismatch filter, or make
+    an unknown target drop everything → fails."""
+    src = _engine_src()
+    fn = src[src.index("def _rank_msf("):]
+    fn = fn[:fn.index("\ndef ", 1)]
+    assert "_platform_mismatch(" in fn, "_rank_msf must apply the platform filter"
+    mm = src[src.index("def _platform_mismatch("):]
+    mm = mm[:mm.index("\ndef ", 1)]
+    assert "if not target:" in mm and "return False" in mm, (
+        "_platform_mismatch must fail-open on an unknown target (never drop on a guess)")
+    inf = src[src.index("def _infer_target_platform("):]
+    inf = inf[:inf.index("\ndef ", 1)]
+    assert "return None" in inf, "_infer_target_platform must return None when unsure"
+
+
 def test_msf_ranking_puts_real_exploits_before_scanners():
     """The recommender lists auxiliary/ scanners before exploit/ modules, and the
     old inline [:2] kept the scanners and DROPPED the real exploit (vsftpd
