@@ -406,6 +406,169 @@ PHASE_STEP_BUDGET = {
 _STEP_LIMIT_MARKER = "need more steps"
 
 
+# Rate-limit backoff knobs. A 429 is a "come back later", not a failure — waiting
+# it out keeps the LLM phase (recon/analyze) alive instead of silently degrading
+# to the deterministic summary. Waits are exponential with a ceiling and honour a
+# server-supplied Retry-After when present. Tunable via env so an operator can
+# match their provider's quota without a code change (defined in .env and the
+# autogen-agents service env in docker-compose.yml). `or` guards the empty-string
+# trap: a set-but-blank env var must fall through to the default, not parse to 0.
+def _env_num(name: str, default: float, cast=float):
+    try:
+        return cast(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        logger.warning("bad %s=%r; using default %s", name,
+                       os.environ.get(name), default)
+        return cast(default)
+
+
+_LLM_RATELIMIT_MAX_RETRIES = _env_num("LLM_RATELIMIT_MAX_RETRIES", 4, int)
+_LLM_RATELIMIT_BASE_WAIT = _env_num("LLM_RATELIMIT_BASE_WAIT", 5.0)   # sec; 5,10,20,40…
+_LLM_RATELIMIT_MAX_WAIT = _env_num("LLM_RATELIMIT_MAX_WAIT", 60.0)
+# Self-tuning: watch observed 429s and adapt. On by default; costs nothing when
+# the provider is healthy because the pacing interval decays back to zero.
+_LLM_RATELIMIT_ADAPTIVE = (os.environ.get("LLM_RATELIMIT_ADAPTIVE") or "true").lower() \
+    not in ("0", "false", "no", "off")
+
+
+class _RateLimitGovernor:
+    """Process-wide adaptive throttle (AIMD) shared across concurrent sessions.
+
+    - `pace()` sleeps just enough to honour the current min-interval before a
+      call, so a spike of 429s spaces subsequent calls out proactively.
+    - `on_rate_limit()` multiplicatively *raises* the interval and remembers the
+      server's Retry-After as the effective backoff base — the provider telling
+      us its real rate beats any hard-coded guess.
+    - `on_success()` additively *lowers* the interval, so once the provider is
+      happy the added latency bleeds off and steady-state overhead returns to 0.
+    This adapts to the quota actually in force without a redeploy; the static
+    env knobs remain the ceiling.
+    """
+
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self._interval = 0.0           # current min seconds between calls
+        self._last_call = 0.0          # monotonic ts of the last paced call
+        self._base_wait = _LLM_RATELIMIT_BASE_WAIT  # learned backoff base
+        # Bounds derived from the static knobs so self-tuning can never exceed
+        # what the operator declared as the ceiling.
+        self._interval_cap = _LLM_RATELIMIT_MAX_WAIT
+        self._decay = 1.0              # subtract per healthy call
+        self._grow = 2.0               # multiply on a 429
+
+    def pace(self):
+        if not _LLM_RATELIMIT_ADAPTIVE:
+            return
+        with self._lock:
+            interval = self._interval
+            last = self._last_call
+        if interval > 0:
+            wait = last + interval - time.monotonic()
+            if wait > 0:
+                time.sleep(min(wait, self._interval_cap))
+        with self._lock:
+            self._last_call = time.monotonic()
+
+    def on_success(self):
+        if not _LLM_RATELIMIT_ADAPTIVE:
+            return
+        with self._lock:
+            if self._interval > 0:
+                self._interval = max(0.0, self._interval - self._decay)
+
+    def on_rate_limit(self, server_wait: Optional[float]):
+        """Record a 429. Returns the effective wait to use for THIS retry."""
+        if not _LLM_RATELIMIT_ADAPTIVE:
+            return server_wait
+        with self._lock:
+            if server_wait and server_wait > 0:
+                # Trust the server's stated cool-down as the new backoff base.
+                self._base_wait = min(server_wait, self._interval_cap)
+            # Grow the proactive spacing (additive floor so the first 429 from a
+            # zero interval still moves it off the floor).
+            self._interval = min(self._interval_cap,
+                                 max(self._base_wait, self._interval * self._grow
+                                     if self._interval > 0 else self._base_wait))
+            return self._base_wait
+
+    def base_wait(self) -> float:
+        with self._lock:
+            return self._base_wait
+
+
+_rl_governor = _RateLimitGovernor()
+
+
+def _is_rate_limit_error(exc: Exception) -> Optional[float]:
+    """If `exc` looks like a rate-limit (429), return the seconds to wait
+    (server Retry-After if we can read one, else None). Otherwise return -1."""
+    # openai/azure raise RateLimitError with .status_code == 429; other stacks
+    # bury it in the message. Match on both so we don't depend on one client.
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    text = str(exc).lower()
+    looks_ratelimited = (
+        status == 429
+        or "429" in text
+        or "rate limit" in text
+        or "ratelimit" in text
+        or "too many requests" in text
+    )
+    if not looks_ratelimited:
+        return -1.0
+    # Try to read Retry-After from an attached response/headers.
+    retry_after = None
+    resp = getattr(exc, "response", None)
+    hdrs = getattr(resp, "headers", None) if resp is not None else None
+    if hdrs:
+        try:
+            ra = hdrs.get("retry-after") or hdrs.get("Retry-After")
+            if ra is not None:
+                retry_after = float(ra)
+        except (TypeError, ValueError):
+            retry_after = None
+    return retry_after  # None → caller uses exponential backoff
+
+
+def _invoke_with_backoff(agent, payload, config, *, session_id=None,
+                         agent_name: str = "") -> Any:
+    """Call `agent.invoke`, retrying on rate-limit (429) with exponential
+    backoff (honouring Retry-After). Re-raises non-rate-limit errors immediately
+    and re-raises the last 429 once retries are exhausted so the caller can fall
+    back deterministically."""
+    attempt = 0
+    while True:
+        _rl_governor.pace()   # proactive spacing (no-op once the provider is healthy)
+        try:
+            out = agent.invoke(payload, config)
+            _rl_governor.on_success()
+            return out
+        except Exception as exc:  # noqa: BLE001
+            server_wait = _is_rate_limit_error(exc)
+            if server_wait == -1.0 or attempt >= _LLM_RATELIMIT_MAX_RETRIES:
+                raise
+            # Let the governor learn from this 429 and hand back the base wait it
+            # now trusts (the server's Retry-After if it gave one).
+            learned = _rl_governor.on_rate_limit(server_wait)
+            if server_wait is not None:
+                wait = server_wait
+            else:
+                base = learned if learned and learned > 0 else _LLM_RATELIMIT_BASE_WAIT
+                wait = min(base * (2 ** attempt), _LLM_RATELIMIT_MAX_WAIT)
+            attempt += 1
+            logger.warning(
+                "%s rate-limited (429); backing off %.0fs before retry %d/%d",
+                agent_name or "LLM", wait, attempt, _LLM_RATELIMIT_MAX_RETRIES)
+            if session_id is not None:
+                try:
+                    _msg(session_id, agent_name or "LLM",
+                         f"[rate-limited: waiting {wait:.0f}s before retry "
+                         f"{attempt}/{_LLM_RATELIMIT_MAX_RETRIES}]")
+                except Exception:  # noqa: BLE001
+                    pass
+            time.sleep(wait)
+
+
 def _llm_phase(session_id, *, agent_name: str, system: str, tool_names,
                task: str, recursion_limit: int = 20):
     """Run one phase as an LLM agent (LLM ↔ ToolNode) over `tool_names`.
@@ -421,10 +584,12 @@ def _llm_phase(session_id, *, agent_name: str, system: str, tool_names,
     tools = _tools_for(tool_names)
     agent = create_react_agent(_chat_model(), tools,
                                prompt=_prompt_for(agent_name, system))
-    out = agent.invoke(
+    out = _invoke_with_backoff(
+        agent,
         {"messages": [("user", task)]},
         {"recursion_limit": recursion_limit,
          "callbacks": [metrics_callback(str(session_id), agent_name)]},
+        session_id=session_id, agent_name=agent_name,
     )
     msgs = out.get("messages", [])
     tools_used, final = [], ""
