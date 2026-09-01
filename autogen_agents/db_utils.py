@@ -1688,7 +1688,7 @@ def record_test_run(
     if lane == "impactful" and tool_execution_id is not None:
         raise ValueError("an impactful run cannot carry a tool_execution_id")
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT assertion, engagement_id FROM public.security_tests WHERE id = %s::uuid",
+        cur.execute("SELECT assertion, engagement_id, source_finding_id, source_finding_source FROM public.security_tests WHERE id = %s::uuid",
                     (test_id,))
         row = cur.fetchone()
         if not row:
@@ -1719,4 +1719,23 @@ def record_test_run(
                   SET last_run_at = now(), last_run_status = %s, run_count = run_count + 1
                 WHERE id = %s::uuid""",
             (status, test_id))
+
+        # Close the loop: a PASS proves the specific scanner finding this test
+        # was generated from, so mark THAT web_finding confirmed (verified by
+        # proof) — not just "something passed on the host". Only touches findings
+        # still 'new'/'triaging', never overrides an operator's own triage, and
+        # only on a genuine pass.
+        sfid = row.get("source_finding_id")
+        if status == "pass" and sfid:
+            try:
+                cur.execute(
+                    """UPDATE public.web_findings
+                          SET workflow_status = 'confirmed',
+                              verified_at = now(),
+                              verified_by = COALESCE(verified_by, 'auto:proof')
+                        WHERE id = %s::uuid
+                          AND COALESCE(workflow_status,'new') IN ('new','triaging')""",
+                    (str(sfid),))
+            except Exception:  # noqa: BLE001
+                pass  # a non-web-findings source id (e.g. a vuln) just no-ops
     return {"run_id": run_id, "status": status, "result_summary": summary}
