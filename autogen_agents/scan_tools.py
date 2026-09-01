@@ -3876,7 +3876,12 @@ def run_custom_test(tool: str, command: str, target: str, port: int = None,
         return json.dumps({
             "ok": r.status_code < 400,
             "status_code": r.status_code,
-            "exec_id": body.get("exec_id") or body.get("execution_id"),
+            # kali-listener's ToolExecutionResponse names the execution id `id`
+            # (it runs the tool in a BackgroundTask and returns immediately). The
+            # older `exec_id`/`execution_id` keys never appear, so without `id`
+            # here exec_id was always None — the safe-lane poll loop was skipped
+            # and every safe test recorded empty output as an error.
+            "exec_id": body.get("exec_id") or body.get("execution_id") or body.get("id"),
             "detail": None if r.status_code < 400 else r.text[:400],
             **({k: v for k, v in body.items() if k not in ("exec_id", "execution_id")}),
         })
