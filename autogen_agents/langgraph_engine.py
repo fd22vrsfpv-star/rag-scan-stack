@@ -1558,6 +1558,40 @@ _PATH_PARAM_NAMES = {"file", "page", "path", "include", "inc", "template", "tpl"
                      "textfile", "text_file", "pg", "action", "cat", "lang", "style"}
 
 
+# Curated list of intentionally-vulnerable / high-value web apps that generic
+# wordlists (common.txt, even 43k-line raft) do NOT contain. Shipped in
+# wordlists/ (bind-mounted into kali-listener at /wordlists).
+_KNOWN_APPS_WORDLIST = os.environ.get(
+    "KNOWN_APPS_WORDLIST", "/wordlists/known-web-apps.txt")
+
+
+def _known_app_discovery_tests(items: list) -> list:
+    """One safe gobuster probe per web port against the curated vulnerable-app
+    list — so DVWA / Mutillidae / tikiwiki are DISCOVERED (they answer 301/200),
+    which is the prerequisite for crawling their app-layer surface and generating
+    the OWASP param tests. Safe lane; gobuster is allow-listed."""
+    out, seen = [], set()
+    for row in items:
+        svc = (row.get("service") or "").strip().lower()
+        if svc not in _SERVICE_FAMILIES_WEB:
+            continue
+        port, ip = row.get("port"), row.get("ip")
+        if not ip or (ip, port) in seen:
+            continue
+        seen.add((ip, port))
+        scheme = "https" if _tls_state(svc, row.get("product"), row.get("banner")) == "yes" else "http"
+        out.append({
+            "name": f"app_discovery known-vuln-apps @ {scheme}://{ip}:{port}",
+            "host": ip, "service": "http", "port": port, "tool": "gobuster",
+            "command": f"gobuster dir -u {scheme}://{ip}:{port}/ -w {_KNOWN_APPS_WORDLIST} -q -t 10",
+            "category": "dir_enum", "tier": "safe",
+            "assertion": {"expect_regex": r"(?i)status: ?(200|301|302)"},
+            "exploit_ref": None,
+            "source_finding_id": None, "source_finding_source": None,
+        })
+    return out
+
+
 def _owasp_param_tests(host: str, limit: int = 16) -> list:
     """Turn CRAWLED parameterized endpoints into OWASP WSTG app-layer tests —
     the IDOR / SQLi / XSS / LFI coverage a service+port-keyed recommender never
@@ -1669,6 +1703,10 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
 
     # Non-MSF exploit coverage: ExploitDB scripts matched by (product, version).
     tests.extend(_exploitdb_tests(items))
+
+    # Discover known vulnerable web apps (DVWA/Mutillidae/etc.) that generic
+    # wordlists miss — so their app-layer surface can then be crawled + tested.
+    tests.extend(_known_app_discovery_tests(items))
 
     # OWASP app-layer coverage: IDOR / SQLi / XSS / LFI from crawled parameters.
     tests.extend(_owasp_param_tests(host))
