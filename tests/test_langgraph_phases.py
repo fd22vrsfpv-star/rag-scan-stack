@@ -668,6 +668,61 @@ def test_safe_lane_bounds_and_strips_exploit_nse_from_nmap():
         "bounder must detect -sC and screen scripts against the safe allow-set")
 
 
+def test_webshell_upload_is_impactful():
+    """WSTG-CONF-06 webshell upload MUST be an impactful category so it can never
+    run in the autonomous safe lane — it uploads code and gets a shell."""
+    sets = _engine_sets()
+    assert "webshell_upload" in sets.get("_IMPACTFUL_CATEGORIES", set()), (
+        "webshell_upload must be impactful (human-gated), never safe")
+
+
+def test_wstg_conf06_probe_is_scope_gated_before_traffic():
+    """The WSTG-CONF-06 method probe sends real OPTIONS traffic, so it MUST pass
+    the scope gate first. Assert _host_in_scope is checked before _detect_webdav
+    in the probe loop. Sabotage: remove the _host_in_scope guard → fails."""
+    src = _engine_src()
+    fn = src[src.index("def _wstg_conf06_webshell_tests("):]
+    fn = fn[:fn.index("\ndef ", 1)]
+    assert "_host_in_scope(" in fn, "WSTG-CONF-06 probe must scope-check the host"
+    assert fn.index("_host_in_scope(") < fn.index("_detect_webdav("), (
+        "scope check must precede the OPTIONS probe (authorisation before traffic)")
+    # and the scope helper fails closed
+    hs = src[src.index("def _host_in_scope("):]
+    hs = hs[:hs.index("\ndef ", 1)]
+    assert "return False" in hs, "_host_in_scope must fail closed (return False on error)"
+
+
+def test_webshell_ref_dispatches_as_webshell_with_valid_type():
+    """A webshell test's ref must dispatch under source 'webshell' (what
+    exploit-runner branches on) and a DB-valid exploit_type. Sabotage: change
+    dispatch_source or use a type outside the CHECK constraint → fails."""
+    src = _engine_src()
+    fn = src[src.index("def _webshell_ref_from_url("):]
+    fn = fn[:fn.index("\ndef ", 1)]
+    assert '"dispatch_source": "webshell"' in fn
+    assert '"vector": "webdav_put"' in fn
+    # file_upload is in the pending_exploits.exploit_type CHECK set; webshell_upload is NOT.
+    assert '"exploit_type": "file_upload"' in fn, (
+        "exploit_type must satisfy the pending_exploits CHECK constraint")
+
+
+def test_exploit_runner_webshell_branch_scope_gated():
+    """exploit-runner's source=webshell branch sends a PUT, so it MUST refuse an
+    out-of-scope target BEFORE deploying. Sabotage: drop the scope refusal, or
+    call _deploy_webshell before it → fails."""
+    er = (REPO / "exploit_runner" / "exploit_runner.py").read_text(encoding="utf-8")
+    assert 'elif source == "webshell":' in er, "webshell dispatch branch missing"
+    branch = er[er.index('elif source == "webshell":'):]
+    branch = branch[:branch.index("\n        else:")]
+    assert "_exploit_scope_refusal(" in branch, "webshell branch must scope-check"
+    assert branch.index("_exploit_scope_refusal(") < branch.index("_deploy_webshell("), (
+        "scope refusal must precede the webshell PUT")
+    # and it proves EXECUTION, not just upload
+    dep = er[er.index("def _deploy_webshell("):]
+    dep = dep[:dep.index("\ndef ", 1)]
+    assert "_WEBSHELL_MARKER" in dep, "deploy must verify command execution, not just a 201"
+
+
 def test_run_custom_test_resolves_the_listener_execution_id():
     """kali-listener's /tools/execute returns the id in the `id` field (it runs
     the tool in a BackgroundTask), never `exec_id`/`execution_id`. run_custom_test

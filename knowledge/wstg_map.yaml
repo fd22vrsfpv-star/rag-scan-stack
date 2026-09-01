@@ -470,3 +470,22 @@ entries:
     assertion:
       expect_regex: "(?i)(upload|webshell|command execution)"
     wstg_note: "WSTG-BUSL-08/09: uploading an executable/served file that runs proves impact — gated."
+
+  - id: http_methods_webshell
+    wstg_id: [WSTG-CONF-06]
+    match:
+      issue_type: [http put method enabled, webdav enabled, dangerous http method,
+                   put method, dav writable, webdav put]
+      cwe: [CWE-650]
+      nuclei_tags: [http-methods, put-method, webdav]
+      name_contains: [webdav, put method, http methods, dav writable]
+    tier: impactful
+    category: webshell_upload
+    tool: webshell
+    # No shell command: the dispatch is structured (PUT a webshell into the
+    # writable collection). exploit-runner's `source=webshell` branch performs
+    # the upload + RCE proof; the collection path/scheme travel in parameters.
+    command: ""
+    assertion:
+      expect_regex: "(?i)(uid=[0-9]|gid=[0-9]|PXWEBSHELL_OK)"
+    wstg_note: "WSTG-CONF-06 (Test HTTP Methods): a writable PUT/WebDAV collection lets an attacker upload a webshell for RCE — gated, proven by executing a command through the uploaded shell."
