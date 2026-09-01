@@ -4668,9 +4668,29 @@ def execute_approved_exploit(pending_exploit_id: str) -> str:
                 }, indent=2)
 
             else:
+                # Everything else (webshell, webapp, …) is handled by the
+                # source-dispatching /execute/by-id endpoint, which reads the
+                # pending_exploits row itself. This is the general path; the
+                # metasploit/exploitdb branches above are just the two that
+                # need bespoke request shaping.
+                response = httpx.post(
+                    f"{exploit_runner_url}/execute/by-id/{exploit_uuid}",
+                    timeout=300.0,
+                )
+                if response.status_code != 200:
+                    return json.dumps({
+                        "ok": False,
+                        "error": f"Exploit runner returned HTTP {response.status_code}",
+                        "detail": response.text[:500],
+                    }, indent=2)
+                result = response.json()
                 return json.dumps({
-                    "ok": False,
-                    "error": f"Unknown exploit source: {exploit['source']}"
+                    "ok": True,
+                    "success": result.get("success", False),
+                    "output": result.get("output", ""),
+                    "session_type": result.get("session_type"),
+                    "session_id": result.get("session_id"),
+                    "error": result.get("error"),
                 }, indent=2)
 
         except httpx.ConnectError as e:

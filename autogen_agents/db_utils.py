@@ -1057,9 +1057,13 @@ def get_pending_exploit(exploit_id: uuid.UUID) -> Optional[Dict]:
         Exploit dictionary or None
     """
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # str() the id: psycopg2 on this connection has no UUID adapter
+        # registered, so a bare uuid.UUID raises "can't adapt type 'UUID'" —
+        # which broke EVERY execute_approved_exploit (it passes a UUID here).
+        # Postgres casts the string literal to uuid for the id= comparison.
         cur.execute(
             "SELECT * FROM pending_exploits WHERE id = %s",
-            (exploit_id,)
+            (str(exploit_id),)
         )
         return cur.fetchone()
 

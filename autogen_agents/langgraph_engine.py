@@ -976,6 +976,20 @@ def exploit_approval(state: PentestState) -> dict:
             "log": [f"exploit_approval: approved={approved}"]}
 
 
+def _mark_approved(pending_id, who: str, note: str = None) -> None:
+    """Transition a pending_exploit to status='approved' so the downstream
+    execute_approved_exploit (which REQUIRES that status and otherwise refuses
+    "not approved") will run it. The operator's decision at the approval
+    interrupt — or the auto-exploit opt-in — IS the authorization; this records
+    it. execute_approved_exploit still fails closed on scope, so this can never
+    turn an out-of-scope target runnable."""
+    try:
+        import db_utils as _du
+        _du.approve_exploit(pending_id, reviewed_by=who, notes=note)
+    except Exception as _e:  # noqa: BLE001
+        logger.warning("approve_exploit(%s) failed: %s", pending_id, _e)
+
+
 def exploit_exec(state: PentestState) -> dict:
     """Execute the operator-approved exploit through the SAME gated tool body."""
     sid = state["session_id"]
@@ -990,6 +1004,8 @@ def exploit_exec(state: PentestState) -> dict:
         return {"phase": "report",
                 "findings": ["exploit_exec: skipped (no id)"],
                 "log": ["exploit_exec skipped: no pending_exploit_id"]}
+    _mark_approved(pending_id, "operator (exploit approval)",
+                   (state.get("exploit_decision") or {}).get("note"))
     result = _tool(scan_tools.execute_approved_exploit, pending_id)
     _msg(sid, "Exploit", f"[execute_approved_exploit {pending_id}]\n{result[:2000]}")
     _emit("langgraph_exploit_executed", sid,
@@ -1748,6 +1764,8 @@ def surface_exec(state: PentestState) -> dict:
         return {"phase": "surface_onward",
                 "findings": ["surface_exec: skipped (no id)"],
                 "log": ["surface_exec skipped: no id"]}
+    _mark_approved(pending_id, "operator (surface approval)",
+                   (state.get("surface_decision") or {}).get("note"))
     result = _tool(scan_tools.execute_approved_exploit, pending_id)
     # Find the security_test that referenced this pending exploit.
     test = next((t for t in (state.get("pending_surface_tests") or [])
@@ -1834,6 +1852,7 @@ def _exec_one_impactful(sid, pending_id, test):
     exploit yields a SHELL, post-ex enumeration fires automatically. Returns the
     run status ('pass'|'fail'|'error') or None."""
     import db_utils
+    _mark_approved(pending_id, "auto-exploit (operator opt-in)")
     result = _tool(scan_tools.execute_approved_exploit, pending_id)
     if not test:
         return None

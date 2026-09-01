@@ -723,6 +723,26 @@ def test_exploit_runner_webshell_branch_scope_gated():
     assert "_WEBSHELL_MARKER" in dep, "deploy must verify command execution, not just a 201"
 
 
+def test_exec_nodes_approve_before_execute():
+    """execute_approved_exploit REQUIRES status='approved' and otherwise refuses
+    ("not approved"). Every node that calls it after an operator/auto approval
+    MUST first transition the pending_exploit via _mark_approved — the resume
+    only sets the decision, it does not flip the DB status. Sabotage: drop the
+    _mark_approved call in a node → its execute is refused; guard fails."""
+    src = _engine_src()
+    for fn_name in ("exploit_exec", "surface_exec", "_exec_one_impactful"):
+        fn = src[src.index(f"def {fn_name}("):]
+        fn = fn[:fn.index("\ndef ", 1)]
+        # Match the actual call, not a docstring mention of the name.
+        call = "scan_tools.execute_approved_exploit"
+        assert call in fn, f"{fn_name} should call execute_approved_exploit"
+        assert "_mark_approved(" in fn, (
+            f"{fn_name} calls execute_approved_exploit without _mark_approved — "
+            "the pending_exploit stays 'pending' and execution is refused")
+        assert fn.index("_mark_approved(") < fn.index(call), (
+            f"{fn_name} must mark approved BEFORE executing")
+
+
 def test_run_custom_test_resolves_the_listener_execution_id():
     """kali-listener's /tools/execute returns the id in the `id` field (it runs
     the tool in a BackgroundTask), never `exec_id`/`execution_id`. run_custom_test
