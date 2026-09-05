@@ -5422,3 +5422,20 @@ EXCEPTION WHEN OTHERS THEN NULL; END $$;
 
 GRANT ALL PRIVILEGES ON public.security_tests     TO app;
 GRANT ALL PRIVILEGES ON public.security_test_runs TO app;
+
+-- WSTG Tier-4 manual-review checklist (operator sign-off for the inherently
+-- manual WSTG tests — business logic, authorization, identity). Feeds the
+-- /coverage/wstg report so a reviewed manual test counts as covered.
+CREATE TABLE IF NOT EXISTS wstg_manual_reviews (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  engagement_id uuid,
+  wstg_id text NOT NULL,
+  status text NOT NULL DEFAULT 'open' CHECK (status IN ('open','reviewed','pass','fail','na')),
+  reviewer text,
+  notes text,
+  reviewed_at timestamptz,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_wstg_manual_reviews
+  ON wstg_manual_reviews (COALESCE(engagement_id,'00000000-0000-0000-0000-000000000000'::uuid), wstg_id);
