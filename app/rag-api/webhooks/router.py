@@ -547,6 +547,12 @@ _ALL_EVENT_TYPES = [
     # writable WebDAV collection uploaded a shell and executed a command.
     "webshell_proven", "webshell_deploy_failed",
     "langgraph_web_pipeline_dispatched",
+    # Operator maintenance actions surfaced in the dashboard (Maintenance page):
+    # applying the canonical schema DDL, and seeding knowledge/seed/*.yaml into
+    # service_prompts + the RAG store. Both mutate shared state, so they belong
+    # in the append-only webhook_events audit log.
+    "maintenance_schema_applied", "maintenance_schema_apply_failed",
+    "maintenance_knowledge_seeded", "maintenance_knowledge_seed_failed",
 ]
 
 
