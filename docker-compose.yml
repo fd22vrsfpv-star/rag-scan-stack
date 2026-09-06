@@ -258,6 +258,12 @@ services:
       - ./etl:/app/etl:ro
       - ${WORDLISTS_DIR:-./wordlists}:/wordlists
       - ./knowledge:/knowledge:ro
+      # The canonical DDL, so POST /health/sql/apply-schema can apply the SAME
+      # file scripts/ensure_db_schema.sh does. Without it the endpoint fell back
+      # to a hand-maintained statement list that had already drifted: it would
+      # not have created scan_parameters, post_review_reports or
+      # v_identity_credential_state, all of which the DDL declares.
+      - ./db_init:/db_init:ro
       - ${SWAGGER_DIR:-./import/swagger}:/app/swagger_files
       - ./scan_audit:/scan_audit:ro
       - ./exploitdb:/exploitdb

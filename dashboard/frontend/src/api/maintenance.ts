@@ -300,3 +300,97 @@ export function useNodeCleanup() {
     },
   })
 }
+
+// ---- Schema + knowledge repair ----
+//
+// Two repairs that used to require shelling into the host. The schema CHECK
+// already existed server-side (rag-api GET /health/database), so this consumes
+// it rather than adding a second source of truth that could disagree.
+
+export interface SchemaCheck {
+  status: string
+  table_count: number
+  expected_tables: number
+  missing_tables: string[]
+  critical_tables_present?: boolean
+  timestamp?: string
+}
+
+export function useSchemaCheck() {
+  return useQuery({
+    queryKey: ['maintenance-schema-check'],
+    queryFn: () => apiFetch<SchemaCheck>('/maintenance/schema/check'),
+    refetchInterval: POLL.BACKGROUND,
+  })
+}
+
+export interface SchemaApplyResult {
+  ok: boolean
+  detail?: string
+  canonical_ddl?: string | null
+  canonical_applied?: boolean
+  canonical_statements_ok?: number
+  canonical_statements_failed?: number
+  statements_executed?: number
+  tables_before?: number
+  tables_after?: number
+  views_before?: number
+  views_after?: number
+  warnings?: string[]
+  error?: string
+}
+
+/** Apply the canonical DDL to create whatever the check reported missing.
+ *  Idempotent, but it mutates the database -- the caller confirms first. */
+export function useSchemaApply() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () =>
+      apiFetch<SchemaApplyResult>('/maintenance/schema/apply', { method: 'POST' }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['maintenance-schema-check'] })
+      qc.invalidateQueries({ queryKey: ['maintenance-stats'] })
+    },
+  })
+}
+
+export interface KnowledgeStatus {
+  ok: boolean
+  prompt_count: number
+  seeded: boolean
+}
+
+export function useKnowledgeStatus() {
+  return useQuery({
+    queryKey: ['maintenance-knowledge-status'],
+    queryFn: () => apiFetch<KnowledgeStatus>('/maintenance/knowledge/status'),
+    refetchInterval: POLL.BACKGROUND,
+  })
+}
+
+export interface KnowledgeSeedResult {
+  ok: boolean
+  created: number
+  updated: number
+  docs: number
+  failed: number
+  dry_run: boolean
+  files: { file: string; created: number; updated: number; docs: number; failed: number }[]
+  errors: string[]
+}
+
+/** Load knowledge/seed/*.yaml into service_prompts + the RAG store.
+ *  Idempotent: an entry whose selector exists is updated, not duplicated. */
+export function useKnowledgeSeed() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body: { dry_run?: boolean; files?: string[] } = {}) =>
+      apiFetch<KnowledgeSeedResult>('/maintenance/knowledge/seed', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['maintenance-knowledge-status'] })
+    },
+  })
+}
