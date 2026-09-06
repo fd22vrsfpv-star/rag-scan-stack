@@ -131,14 +131,39 @@ def _load_yaml(path):
         return {}
 
 
+#: WSTG ids produced by a PROACTIVE generator in autogen_agents/langgraph_engine.py
+#: rather than by a knowledge/wstg_map.yaml entry.
+#:
+#: The map is finding-driven — an entry fires when a scanner reports something
+#: that matches. The surface phase also emits tests unprompted, per web service or
+#: per crawled parameter, and those have no map entry at all. Reading only the map
+#: therefore UNDER-reports: WSTG-ATHN-06 (browser cache weakness) has been probed
+#: on every web service since the Tier-2 work and was still listed as an
+#: automatable gap.
+#:
+#: This is a deliberate duplication across a container boundary — langgraph_engine
+#: runs in autogen-agents, this module in rag-api, and rag-api cannot import it.
+#: tests/test_wstg_coverage_generators.py pins the two together, so a new
+#: proactive id that is not also in the map fails by name instead of silently
+#: going uncounted.
+PROACTIVE_WSTG_IDS = {
+    "WSTG-ATHN-06",   # _svc_test("cache_check", ...) — cache-control on the root
+}
+
+
 def generator_wstg_ids():
-    """WSTG ids the platform can PRODUCE a test for (from the map's wstg_id list)."""
+    """WSTG ids the platform can PRODUCE a test for.
+
+    Two sources: the finding-driven map, and the proactive per-service /
+    per-parameter generators that carry no map entry (see PROACTIVE_WSTG_IDS).
+    """
     ids = set()
     for e in (_load_yaml(_MAP_PATH).get("entries") or []):
         w = e.get("wstg_id")
         for x in (w if isinstance(w, list) else [w]):
             ids.update(_ID_RE.findall(str(x)))
     ids.add("WSTG-APIT-01")   # graphql_introspection uses the APIT-99 alias
+    ids |= PROACTIVE_WSTG_IDS
     return ids
 
 
