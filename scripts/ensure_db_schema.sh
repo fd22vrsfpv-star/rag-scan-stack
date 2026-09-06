@@ -117,6 +117,7 @@ CRITICAL_TABLES=(
     "platform_control"
     "security_tests"
     "security_test_runs"
+    "wstg_manual_reviews"
     "exploit_chunks"
     "scan_tool_feedback"
     "attack_vectors"

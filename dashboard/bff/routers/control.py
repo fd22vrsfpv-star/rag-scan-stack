@@ -90,6 +90,47 @@ async def coverage(engagement_id: str):
         return safe_json(resp)
 
 
+@router.get("/api/coverage/wstg/{engagement_id}")
+async def wstg_coverage(engagement_id: str):
+    """Live OWASP WSTG coverage (98 tests) for an engagement."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=25) as c:
+        resp = await c.get(f"{s.rag_api_url}/coverage/wstg/{engagement_id}", headers=_hdrs())
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.get("/api/wstg/checklist/{engagement_id}")
+async def wstg_checklist(engagement_id: str):
+    """Tier-4 manual WSTG checklist (guidance + review status) for an engagement."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=25) as c:
+        resp = await c.get(f"{s.rag_api_url}/wstg/checklist/{engagement_id}", headers=_hdrs())
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+class WstgReviewBody(BaseModel):
+    wstg_id: str
+    status: Optional[str] = "reviewed"
+    notes: Optional[str] = None
+    reviewer: Optional[str] = None
+
+
+@router.post("/api/wstg/checklist/{engagement_id}/review")
+async def wstg_checklist_review(engagement_id: str, body: WstgReviewBody):
+    """Record an operator sign-off on one manual WSTG test."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.post(f"{s.rag_api_url}/wstg/checklist/{engagement_id}/review",
+                            json=body.model_dump(exclude_none=True), headers=_hdrs())
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
 @router.get("/api/coverage/{engagement_id}/complete")
 async def coverage_complete(engagement_id: str):
     """Engagement stop condition: is every in-scope service tested?"""

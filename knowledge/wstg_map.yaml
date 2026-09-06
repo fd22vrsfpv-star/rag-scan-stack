@@ -507,3 +507,95 @@ entries:
     assertion:
       expect_status: 200
     wstg_note: "WSTG-ATHZ-04: an object reference (id/user/doc) reachable without authorization — enumerate the endpoint, then confirm cross-account access."
+
+  # ── Tier 2 additions (proactively generated too; here for finding-driven match) ──
+  - id: hpp
+    wstg_id: [WSTG-INPV-04]
+    match: {issue_type: [http parameter pollution, hpp], cwe: [CWE-235], nuclei_tags: [hpp], name_contains: [parameter pollution]}
+    tier: safe
+    category: hpp_detect
+    tool: curl
+    command: "curl -sk \"{url}\""
+    assertion: {expect_regex: "(?i)pxHPP1.*pxHPP2|pxHPP1pxHPP2"}
+    wstg_note: "WSTG-INPV-04: duplicate parameters handled unsafely (last-wins / concat)."
+  - id: ssi_injection
+    wstg_id: [WSTG-INPV-08]
+    match: {issue_type: [ssi injection, server side includes], cwe: [CWE-97], nuclei_tags: [ssi], name_contains: [server-side include, ssi]}
+    tier: safe
+    category: ssi_detect
+    tool: nuclei
+    command: "nuclei -u {url} -tags ssi -silent"
+    assertion: {expect_regex: "(?i)(ssi|server-side include|\\[[a-z0-9-]+\\])"}
+    wstg_note: "WSTG-INPV-08: an SSI directive executed server-side."
+  - id: imap_smtp_injection
+    wstg_id: [WSTG-INPV-10]
+    match: {issue_type: [imap injection, smtp injection, mail injection], cwe: [CWE-93], nuclei_tags: [smtp, imap], name_contains: [smtp injection, imap injection, mail header]}
+    tier: safe
+    category: nuclei_detect
+    tool: nuclei
+    command: "nuclei -u {url} -tags smtp,imap,injection -silent"
+    assertion: {expect_regex: "\\[[a-z0-9-]+\\]"}
+    wstg_note: "WSTG-INPV-10: CRLF in a mail parameter injects headers/commands."
+  - id: format_string
+    wstg_id: [WSTG-INPV-13]
+    match: {issue_type: [format string], cwe: [CWE-134], nuclei_tags: [format-string], name_contains: [format string]}
+    tier: safe
+    category: format_string
+    tool: curl
+    command: "curl -sk \"{url}\""
+    assertion: {expect_regex: "(?i)(warning|fatal|segmentation|va_arg)"}
+    wstg_note: "WSTG-INPV-13: %n/%s/%x surfaces a format-string artifact or error."
+  - id: hsts_missing
+    wstg_id: [WSTG-CONF-07]
+    match: {issue_type: [hsts, strict transport security], cwe: [CWE-523], nuclei_tags: [hsts], name_contains: [strict transport security, hsts]}
+    tier: safe
+    category: hsts_check
+    tool: curl
+    command: "curl -sk -I {url}"
+    assertion: {expect_not_substring: ["Strict-Transport-Security"]}
+    wstg_note: "WSTG-CONF-07: HSTS header absent over TLS."
+  - id: crossdomain_policy
+    wstg_id: [WSTG-CONF-08]
+    match: {issue_type: [cross domain policy, crossdomain], cwe: [CWE-942], nuclei_tags: [crossdomain], name_contains: [cross-domain, crossdomain]}
+    tier: safe
+    category: crossdomain_check
+    tool: curl
+    command: "curl -sk {url}/crossdomain.xml"
+    assertion: {expect_regex: "(?i)cross-domain-policy|allow-access-from"}
+    wstg_note: "WSTG-CONF-08: permissive RIA cross-domain policy."
+  - id: cloud_storage
+    wstg_id: [WSTG-CONF-11]
+    match: {issue_type: [cloud storage, open bucket, s3 bucket], cwe: [CWE-264], nuclei_tags: [aws, s3, bucket, exposure], name_contains: [bucket, cloud storage, blob]}
+    tier: safe
+    category: cloud_storage
+    tool: nuclei
+    command: "nuclei -u {url} -tags exposure,aws,s3,gcp,azure,bucket -silent"
+    assertion: {expect_regex: "\\[[a-z0-9-]+\\]"}
+    wstg_note: "WSTG-CONF-11: exposed / world-readable cloud storage."
+  - id: file_extensions
+    wstg_id: [WSTG-CONF-03]
+    match: {issue_type: [file extension, source disclosure, backup extension], cwe: [CWE-538], nuclei_tags: [backup, exposure], name_contains: [file extension, .bak, .old, source code]}
+    tier: safe
+    category: file_ext
+    tool: nuclei
+    command: "nuclei -u {url} -tags backup,exposure,config -silent"
+    assertion: {expect_regex: "\\[[a-z0-9-]+\\]"}
+    wstg_note: "WSTG-CONF-03: dangerous file extensions / source exposed."
+  - id: weak_encryption
+    wstg_id: [WSTG-CRYP-04]
+    match: {issue_type: [weak cipher, weak encryption, rc4, 3des], cwe: [CWE-326, CWE-327], nuclei_tags: [ssl, tls, weak-cipher], name_contains: [weak cipher, weak encryption, rc4, sweet32]}
+    tier: safe
+    category: tls_check
+    tool: sslscan
+    command: "sslscan {target}"
+    assertion: {expect_regex: "(?i)(RC4|3DES|weak|SSLv2|SSLv3|TLSv1\\.0)"}
+    wstg_note: "WSTG-CRYP-04: weak ciphers / obsolete protocols supported."
+  - id: exposed_session_var
+    wstg_id: [WSTG-SESS-04]
+    match: {issue_type: [session in url, exposed session, session token in url], cwe: [CWE-598], nuclei_tags: [session], name_contains: [session id in url, jsessionid in url, session token]}
+    tier: safe
+    category: session_var
+    tool: curl
+    command: "curl -sk -i {url}"
+    assertion: {expect_regex: "(?i)(jsessionid=|phpsessid=|sessionid=|sid=)[^;\\s]+"}
+    wstg_note: "WSTG-SESS-04: session identifier exposed in the URL."
