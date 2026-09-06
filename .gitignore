@@ -98,7 +98,9 @@ Docs/NUL
 # Frontend build artifacts & dependencies
 dashboard/frontend/dist/
 dashboard/frontend/node_modules/
-dashboard/frontend/package-lock.json
+# NOT package-lock.json: it is source, not a build artifact. `npm ci` in the
+# CI frontend job REQUIRES a committed lockfile, and setup-node's cache keys
+# off it — ignoring it left that job unable to run at all.
 dashboard/frontend/tsconfig.tsbuildinfo
 
 # OSINT output & runner binaries
@@ -148,7 +150,12 @@ Docs/**/*.gif
 
 # Root node_modules (from ad-hoc scripts)
 node_modules/
-package-lock.json
+# Root-only: an unanchored `package-lock.json` also matched
+# dashboard/frontend/package-lock.json, so CI checked out no lockfile — the
+# frontend job's setup-node cache could not resolve its path and `npm ci`
+# (which REQUIRES a lockfile) could never have succeeded. The app's lockfile
+# belongs in the repo: it is what makes the build reproducible.
+/package-lock.json
 
 # PEM keys
 *.pem

@@ -30,10 +30,11 @@ suite leaves no rows behind.
 """
 import json
 import os
-import subprocess
 import sys
 
 import pytest
+
+from _container import container_exec
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 MODULE = os.path.join(REPO, "app", "rag-api", "scope_classifier.py")
@@ -41,14 +42,7 @@ MODULE = os.path.join(REPO, "app", "rag-api", "scope_classifier.py")
 
 def _run(script):
     """Execute a python snippet inside the rag-api container. None if unreachable."""
-    try:
-        out = subprocess.run(["docker", "exec", "-i", "rag-api", "python3", "-c", script],
-                             capture_output=True, text=True, timeout=120)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0:
-        return f"__ERR__ {out.stderr.strip()[-800:]}"
-    return out.stdout
+    return container_exec(script, stdin=True, timeout=120, tail=800)
 
 
 @pytest.fixture(scope="module")

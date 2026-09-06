@@ -26,6 +26,8 @@ import sys
 
 import pytest
 
+from _container import is_unreachable
+
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 for path in (REPO, os.path.join(REPO, "app", "rag-api")):
     if path not in sys.path:
@@ -243,6 +245,11 @@ def _curl(path, timeout=180):
         out = subprocess.run(["docker", "exec", "rag-api", "sh", "-c", cmd],
                              capture_output=True, text=True, timeout=timeout + 30)
     except (OSError, subprocess.SubprocessError):
+        return None
+    # `docker exec` against an absent container exits non-zero with an EMPTY
+    # stdout. Returning "" made the caller's `code is None` skip miss, and the
+    # test failed with `'' == '200'` instead of skipping. See tests/_container.py.
+    if out.returncode != 0 and is_unreachable(out.stderr):
         return None
     return out.stdout.strip()
 
