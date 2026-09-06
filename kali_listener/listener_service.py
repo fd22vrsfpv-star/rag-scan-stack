@@ -925,6 +925,13 @@ _FALLBACK_ALLOWED_TOOLS = {
     # Read-only HTTP/TLS clients the WSTG safe lane needs (lfi_read, header_check,
     # tls_check). curl was absent, so every curl-based safe test skipped [400].
     "curl", "wget", "sslscan", "testssl.sh", "testssl", "sslyze",
+    # Declared in knowledge/service_tools.yaml but previously installed nowhere,
+    # so a recommendation naming one reached this allowlist and was rejected 400
+    # ("not allowed") — after already passing the scope gate. Installed in the
+    # image as of this change; ncrack is additionally covered by the existing
+    # brute-force guards (check_candidate_space / check_account_lockout), which
+    # already treat it as a credential tool.
+    "ncrack", "ffuf", "feroxbuster",
 }
 # Metasploit is never auto-dispatchable here.
 _MSF_DENY = {"metasploit", "msfconsole", "msfvenom", "msf"}
