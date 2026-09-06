@@ -20,6 +20,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nmap \
     hydra \
     medusa \
+    # Declared in knowledge/service_tools.yaml and knowledge/wstg_map.yaml but
+    # installed nowhere, so every recommendation naming one was dispatched here
+    # and died with "not found" — which surfaces as a failed scan rather than a
+    # missing tool. sslscan is the worst of the four: TWO WSTG map entries
+    # (WSTG-CRYP weak-transport tests) run `sslscan {target}`, so that whole
+    # family could never have produced a result.
+    #
+    # knowledge/tool_catalogs.json listed ncrack as PRESENT, which is why the
+    # validator never rejected it — the catalog was inventoried 2026-08-15,
+    # three weeks before these images were rebuilt. Re-run
+    # scripts/refresh-tool-catalogs.sh after changing this list.
+    ncrack \
+    sslscan \
+    ffuf \
+    feroxbuster \
     enum4linux \
     smbclient \
     smbmap \
