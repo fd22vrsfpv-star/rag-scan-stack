@@ -61,6 +61,73 @@ def _dir_stats(root: Path, extensions: set | None = None) -> dict:
     return {"file_count": count, "total_bytes": total, "human": _human_size(total)}
 
 
+# ── Schema + knowledge maintenance ──────────────────────────────────────────
+#
+# These expose two repairs that previously required shelling into the host:
+#   * the schema check/apply pair — rag-api ALREADY had the "what is missing"
+#     check (GET /health/database), so this proxies it rather than adding a
+#     second one that could disagree with it;
+#   * seeding knowledge/seed/*.yaml, which had no interface at all. A live stack
+#     ran with service_prompts EMPTY because seeding is a manual step nobody had
+#     run, and scans silently fell back to generic prompting.
+
+
+@router.get("/api/maintenance/schema/check")
+async def schema_check():
+    """What is missing: tables, views and columns. Read-only."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=60, verify=False) as c:
+        resp = await c.get(
+            f"{s.rag_api_url}/health/database",
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
+@router.post("/api/maintenance/schema/apply")
+async def schema_apply():
+    """Apply the canonical DDL to create whatever the check reported missing.
+
+    Idempotent (CREATE IF NOT EXISTS / CREATE OR REPLACE), but it MUTATES the
+    database, so the UI confirms before calling it. Generous timeout: the DDL is
+    ~275 KB and runs hundreds of statements.
+    """
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=600, verify=False) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/health/sql/apply-schema",
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
+@router.get("/api/maintenance/knowledge/status")
+async def knowledge_status():
+    """How many operator prompt rules are loaded. Zero means seeding never ran."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=30, verify=False) as c:
+        resp = await c.get(
+            f"{s.scan_recommender_url}/kb/prompts",
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        data = safe_json(resp)
+    prompts = (data or {}).get("prompts") or []
+    return {"ok": True, "prompt_count": len(prompts), "seeded": len(prompts) > 0}
+
+
+@router.post("/api/maintenance/knowledge/seed")
+async def knowledge_seed(body: Optional[dict] = None):
+    """Load the bundled knowledge corpus. Idempotent — re-seeding updates."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=900, verify=False) as c:
+        resp = await c.post(
+            f"{s.scan_recommender_url}/kb/seed",
+            json=body or {},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
 @router.get("/api/maintenance/stats")
 async def maintenance_stats():
     s = get_settings()

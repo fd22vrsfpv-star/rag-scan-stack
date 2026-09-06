@@ -7,6 +7,7 @@ Integrates with the existing check_system_health.sh script and provides structur
 
 import os
 import json
+import logging
 import subprocess
 import psycopg2
 from typing import Optional, Dict, Any, List
@@ -850,11 +851,128 @@ async def check_schema_detail(req: SchemaCheckRequest):
         return {"ok": False, "error": str(e)}
 
 
+logger = logging.getLogger(__name__)
+
+
+def _emit_maintenance_event(event_type: str, data: dict) -> None:
+    """Webhook emit for maintenance actions. Best-effort: a webhook problem must
+    never fail the repair the operator asked for — but it is LOGGED, never
+    silently swallowed, because `except: pass` around an HTTP call hides a dead
+    endpoint forever.
+
+    NOTE: `_ALL_EVENT_TYPES` in webhooks/router.py is an ALLOW-LIST. A type that
+    is not listed there is accepted with 200 and then discarded, so the event
+    never reaches the timeline. Both types below are registered.
+    """
+    try:
+        from webhooks import emit_webhook
+        # source is the SERVICE, not the area: webhook_events stores
+        # "{source}_{event_type}", so source="maintenance" rendered as
+        # maintenance_maintenance_schema_applied.
+        emit_webhook(event_type, "rag-api", data)
+    except Exception as exc:                                   # noqa: BLE001
+        logger.warning("webhook emit failed for %s: %s", event_type, exc)
+
+
+# Candidate locations for the CANONICAL schema, most preferred first. The file
+# is the single source of truth that scripts/ensure_db_schema.sh applies; this
+# endpoint must apply the SAME thing or the two repair paths disagree.
+_DDL_CANDIDATES = (
+    "/db_init/ensure_all_tables.sql",                       # bind-mounted (compose)
+    "/docker-entrypoint-initdb.d/ensure_all_tables.sql",     # inside a local postgres
+    "/app/db_init/ensure_all_tables.sql",
+)
+
+
+def _find_canonical_ddl():
+    for path in _DDL_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _read_canonical_ddl(path):
+    r"""The DDL opens with a `\connect scans` meta-command. That is psql syntax,
+    not SQL — psycopg2 raises on it — and we are already connected to the right
+    database, so strip every meta-command line."""
+    with open(path, encoding="utf-8") as fh:
+        body = fh.read()
+    return "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("\\"))
+
+
+def _split_sql_statements(sql: str):
+    """Split SQL into top-level statements, the way psql does.
+
+    WHY NOT ONE execute(): psycopg2 sends a multi-statement string as a SINGLE
+    implicit transaction, so ONE failing statement discards every other statement
+    in the file — even under autocommit. Applying the 275 KB DDL that way aborted
+    on a pre-existing duplicate-key condition and created nothing, while reporting
+    a cheerful 82-statement success from the inline list. psql survives the same
+    file because it executes statements one at a time.
+
+    Dollar-quoted bodies are why a naive `sql.split(";")` cannot be used: the DDL
+    carries 172 `$$ … $$` / `$tag$ … $tag$` blocks whose function bodies are full
+    of semicolons.
+    """
+    out, buf, i, n = [], [], 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == "-" and sql.startswith("--", i):                 # line comment
+            j = sql.find("\n", i)
+            i = n if j == -1 else j + 1
+            continue
+        if ch == "/" and sql.startswith("/*", i):                 # block comment
+            j = sql.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+            continue
+        if ch == "'":                                             # string literal
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    break
+                j += 1
+            buf.append(sql[i:j + 1]); i = j + 1
+            continue
+        if ch == "$":                                             # dollar quoting
+            k = sql.find("$", i + 1)
+            if k != -1 and sql[i + 1:k].replace("_", "").isalnum() or (k == i + 1):
+                tag = sql[i:k + 1]
+                j = sql.find(tag, k + 1)
+                if j != -1:
+                    buf.append(sql[i:j + len(tag)]); i = j + len(tag)
+                    continue
+        if ch == ";":
+            stmt = "".join(buf).strip()
+            if stmt:
+                out.append(stmt)
+            buf = []; i += 1
+            continue
+        buf.append(ch); i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
 @router.post("/sql/apply-schema")
 async def apply_schema():
-    """Apply the comprehensive schema SQL to create any missing tables, views, and columns."""
-    schema_path = "/docker-entrypoint-initdb.d/ensure_all_tables.sql"
+    """Apply the comprehensive schema SQL to create any missing tables, views, and columns.
 
+    Applies the CANONICAL db_init/ensure_all_tables.sql when it is reachable, then
+    the inline migration list (which carries self-heal ALTERs and data migrations
+    that the DDL does not).
+
+    WHY BOTH: this endpoint used to assign `schema_path` and never read it — it
+    applied only the inline list, a hand-maintained subset that had drifted from
+    the DDL. It would NOT have created scan_parameters, post_review_reports or
+    v_identity_credential_state, every one of which ensure_all_tables.sql
+    declares and which were in fact missing from the live database. Two repair
+    paths that disagree are worse than one, because the operator cannot tell
+    which ran.
+    """
     try:
         conn = psycopg2.connect(DB_DSN)
         conn.autocommit = True
@@ -866,8 +984,35 @@ async def apply_schema():
         cur.execute("SELECT COUNT(*) FROM pg_views WHERE schemaname = 'public'")
         views_before = cur.fetchone()[0]
 
-        # Run migration statements to fix missing tables/views/columns
         warnings = []
+
+        # ── 1. the canonical DDL ────────────────────────────────────────────
+        schema_path = _find_canonical_ddl()
+        canonical_applied = False
+        canonical_ok = canonical_err = 0
+        if schema_path:
+            # Statement at a time, autocommit — so one pre-existing data
+            # condition cannot discard the entire file (see _split_sql_statements).
+            for stmt in _split_sql_statements(_read_canonical_ddl(schema_path)):
+                try:
+                    cur.execute(stmt)
+                    canonical_ok += 1
+                except Exception as exc:                  # surfaced, never swallowed
+                    msg = str(exc).strip()
+                    if "already exists" in msg:
+                        continue
+                    canonical_err += 1
+                    if len(warnings) < 25:
+                        warnings.append(f"DDL: {msg[:160]}")
+            canonical_applied = canonical_ok > 0
+        else:
+            warnings.append(
+                "canonical ensure_all_tables.sql not found in "
+                + ", ".join(_DDL_CANDIDATES)
+                + " — only the inline migrations ran; mount ./db_init:/db_init:ro"
+            )
+
+        # ── 2. the inline migrations ────────────────────────────────────────
         migrations = [
             # Critical tables
             "CREATE TABLE IF NOT EXISTS public.assets (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), ip inet UNIQUE NOT NULL, hostname text, os text, first_seen timestamptz DEFAULT now(), last_seen timestamptz DEFAULT now())",
@@ -1081,9 +1226,30 @@ async def apply_schema():
         tables_added = tables_after - tables_before
         views_added = views_after - views_before
 
+        _emit_maintenance_event("maintenance_schema_applied", {
+            "canonical_ddl": schema_path,
+            "canonical_applied": canonical_applied,
+            "canonical_statements_ok": canonical_ok,
+            "canonical_statements_failed": canonical_err,
+            "statements_executed": executed,
+            "tables_before": tables_before, "tables_after": tables_after,
+            "views_before": views_before, "views_after": views_after,
+            "tables_added": tables_added, "views_added": views_added,
+            "warnings": len(warnings),
+        })
+
         return {
             "ok": True,
-            "detail": f"Schema applied ({executed} statements). Tables: {tables_before}→{tables_after} (+{tables_added}), Views: {views_before}→{views_after} (+{views_added})",
+            "canonical_ddl": schema_path,
+            "canonical_applied": canonical_applied,
+            "canonical_statements_ok": canonical_ok,
+            "canonical_statements_failed": canonical_err,
+            "detail": (
+                f"Schema applied ({f'canonical DDL {canonical_ok} stmts + ' if canonical_applied else ''}"
+                f"{executed} inline statements). "
+                f"Tables: {tables_before}→{tables_after} (+{tables_added}), "
+                f"Views: {views_before}→{views_after} (+{views_added})"
+            ),
             "tables_before": tables_before,
             "tables_after": tables_after,
             "views_before": views_before,

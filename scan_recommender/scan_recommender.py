@@ -3760,6 +3760,148 @@ def create_service_prompt(body: ServicePromptBody):
     return {"ok": True, "id": prompt_id}
 
 
+# ── Bulk seeding of the bundled knowledge corpus ────────────────────────────
+#
+# WHY AN ENDPOINT AND NOT JUST THE SCRIPT: scripts/import-knowledge.sh is an
+# operator power tool (arbitrary files, JSON, --playbooks, --dry-run) and stays.
+# This route covers the one case the dashboard needs — seeding the corpus that
+# ships in knowledge/seed/ — so an operator does not have to shell into the host
+# to fix an empty service_prompts table. It is NOT a second implementation: it
+# calls create_service_prompt / update_service_prompt / ingest_service_doc, the
+# same functions the single-item routes use, so the write path cannot drift.
+#
+# service_prompts sat EMPTY on a live stack because seeding is a manual step that
+# had never been run; scans silently fell back to generic prompting, which reads
+# as a model-quality problem rather than a missing install step.
+_SEED_DIR = os.environ.get("KNOWLEDGE_SEED_DIR", "/knowledge/seed")
+
+
+class KnowledgeSeedRequest(BaseModel):
+    """`files` are basenames inside the seed directory; omit for all of them."""
+    files: Optional[List[str]] = None
+    dry_run: bool = False
+    include_docs: bool = True
+
+
+def _seed_files(requested: Optional[List[str]]) -> List[str]:
+    if not os.path.isdir(_SEED_DIR):
+        raise HTTPException(404, f"seed directory {_SEED_DIR} is not mounted")
+    available = sorted(f for f in os.listdir(_SEED_DIR)
+                       if f.endswith((".yaml", ".yml")))
+    if not requested:
+        return available
+    chosen = []
+    for name in requested:
+        # Basename only: a seed file is picked from a fixed directory, never an
+        # arbitrary path supplied by the caller.
+        base = os.path.basename(name)
+        if base not in available:
+            raise HTTPException(400, f"no such seed file: {base}")
+        chosen.append(base)
+    return chosen
+
+
+def _existing_prompt_id(selector_type, service, tech, port) -> Optional[str]:
+    """The selector is the identity of a rule (idx_service_prompts_selector), so
+    a re-seed must UPDATE rather than collide on the unique index."""
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id::text FROM public.service_prompts
+             WHERE selector_type = %s
+               AND COALESCE(service, '') = COALESCE(%s, '')
+               AND COALESCE(tech, '')    = COALESCE(%s, '')
+               AND COALESCE(port, -1)    = COALESCE(%s, -1)
+             LIMIT 1
+            """,
+            (selector_type, service, tech, port),
+        )
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+@kb_router.post("/seed")
+def seed_knowledge(body: KnowledgeSeedRequest = KnowledgeSeedRequest()):
+    """Load knowledge/seed/*.yaml into service_prompts and the RAG store.
+
+    Idempotent: an entry whose selector already exists is UPDATED in place, and
+    service-doc ingest atomically replaces prior chunks for the same
+    (service, port, tech, title).
+    """
+    import yaml as _yaml          # lazily, as elsewhere in this module
+    files = _seed_files(body.files)
+    result = {"files": [], "created": 0, "updated": 0, "docs": 0,
+              "failed": 0, "dry_run": body.dry_run, "errors": []}
+
+    for name in files:
+        path = os.path.join(_SEED_DIR, name)
+        per = {"file": name, "created": 0, "updated": 0, "docs": 0, "failed": 0}
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = _yaml.safe_load(fh) or {}
+        except Exception as exc:
+            per["failed"] += 1
+            result["errors"].append(f"{name}: unreadable ({exc})")
+            result["files"].append(per)
+            result["failed"] += 1
+            continue
+
+        for entry in (data.get("prompts") or []):
+            try:
+                pb = ServicePromptBody(**entry)
+                existing = _existing_prompt_id(
+                    pb.selector_type.strip().lower(), pb.service, pb.tech, pb.port)
+                if body.dry_run:
+                    per["updated" if existing else "created"] += 1
+                    continue
+                if existing:
+                    update_service_prompt(existing, pb)
+                    per["updated"] += 1
+                else:
+                    create_service_prompt(pb)
+                    per["created"] += 1
+            except HTTPException as exc:
+                per["failed"] += 1
+                result["errors"].append(f"{name}: {entry.get('title', '?')}: {exc.detail}")
+            except Exception as exc:                       # noqa: BLE001
+                per["failed"] += 1
+                result["errors"].append(f"{name}: {entry.get('title', '?')}: {exc}")
+
+        if body.include_docs:
+            for doc in (data.get("service_docs") or []):
+                try:
+                    if body.dry_run:
+                        per["docs"] += 1
+                        continue
+                    # Lazy import: exploits_rag is mounted onto this app by
+                    # multi_app AFTER this module loads, so a top-level import
+                    # would be circular.
+                    from exploits_rag import ServiceDocIngest, ingest_service_doc
+                    ingest_service_doc(ServiceDocIngest(**doc))
+                    per["docs"] += 1
+                except Exception as exc:                   # noqa: BLE001
+                    per["failed"] += 1
+                    result["errors"].append(f"{name}: doc {doc.get('title', '?')}: {exc}")
+
+        for k in ("created", "updated", "docs", "failed"):
+            result[k] += per[k]
+        result["files"].append(per)
+
+    if not body.dry_run:
+        _invalidate_service_prompt_cache()
+    result["ok"] = result["failed"] == 0
+    # Truncated: a bad seed file can produce hundreds of identical messages, and
+    # an unbounded list would be the whole response body.
+    result["errors"] = result["errors"][:20]
+    _emit_webhook(
+        "maintenance_knowledge_seeded" if result["ok"] else "maintenance_knowledge_seed_failed",
+        {"files": [f["file"] for f in result["files"]], "created": result["created"],
+         "updated": result["updated"], "docs": result["docs"],
+         "failed": result["failed"], "dry_run": body.dry_run},
+    )
+    return result
+
+
 @kb_router.put("/prompts/{prompt_id}")
 def update_service_prompt(prompt_id: str, body: ServicePromptBody):
     """Replace a prompt rule (and re-index its training notes)."""

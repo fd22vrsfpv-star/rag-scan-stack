@@ -8,6 +8,10 @@ import {
   useAuditLog,
   useRotateAuditLog,
   useFollowupBulkUpdate,
+  useSchemaCheck,
+  useSchemaApply,
+  useKnowledgeStatus,
+  useKnowledgeSeed,
   ImportResult,
 } from '@/api/maintenance'
 
@@ -301,6 +305,11 @@ export default function Maintenance() {
   const [auditLimit, setAuditLimit] = useState(100)
   const { data: auditData, isLoading: auditLoading } = useAuditLog({ limit: auditLimit })
   const rotateAuditLog = useRotateAuditLog()
+  const schemaCheck = useSchemaCheck()
+  const schemaApply = useSchemaApply()
+  const knowledgeStatus = useKnowledgeStatus()
+  const knowledgeSeed = useKnowledgeSeed()
+  const [repairMsg, setRepairMsg] = useState('')
   const [rotateMsg, setRotateMsg] = useState<string>('')
 
   const setAge = (key: string, val: string) =>
@@ -651,6 +660,146 @@ export default function Maintenance() {
             </div>
           )}
         </div>
+      </div>
+
+      {/* Database schema + knowledge base — repairs that used to need a shell */}
+      <div className="bg-card border border-border rounded-lg p-4">
+        <h3 className="text-sm font-semibold mb-3">Database Schema &amp; Knowledge Base</h3>
+        <p className="text-xs text-muted-foreground mb-3">
+          The schema check reports tables the code expects but the database does not have.
+          A remote database drifts silently: a clean install is correct, so only a long-lived
+          deployment is wrong, and nothing surfaces it until a query happens to touch the
+          missing object. <strong>Apply</strong> runs the canonical
+          <code className="font-mono"> db_init/ensure_all_tables.sql</code> — the same file
+          <code className="font-mono"> scripts/ensure_db_schema.sh</code> applies — which is
+          idempotent and creates only what is absent.
+        </p>
+
+        <div className="flex items-center gap-3 mb-4 flex-wrap">
+          {schemaCheck.isLoading ? (
+            <span className="text-xs text-muted-foreground">Checking schema…</span>
+          ) : schemaCheck.isError ? (
+            <span className="text-xs text-destructive">Schema check unavailable</span>
+          ) : (
+            <>
+              <span
+                className={`text-xs px-2 py-0.5 rounded border font-mono ${
+                  (schemaCheck.data?.missing_tables?.length ?? 0) === 0
+                    ? 'border-primary/40 bg-primary/10 text-primary'
+                    : 'border-destructive/40 bg-destructive/10 text-destructive'
+                }`}
+              >
+                {(schemaCheck.data?.missing_tables?.length ?? 0) === 0
+                  ? `schema ok — ${schemaCheck.data?.table_count ?? 0} tables`
+                  : `${schemaCheck.data?.missing_tables?.length} missing`}
+              </span>
+              {(schemaCheck.data?.missing_tables?.length ?? 0) > 0 && (
+                <span className="text-xs font-mono text-muted-foreground">
+                  {schemaCheck.data?.missing_tables?.slice(0, 6).join(', ')}
+                  {(schemaCheck.data?.missing_tables?.length ?? 0) > 6 ? ' …' : ''}
+                </span>
+              )}
+            </>
+          )}
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              onClick={() => schemaCheck.refetch()}
+              className="h-7 px-3 text-xs rounded border border-border hover:bg-muted/40"
+            >
+              Re-check
+            </button>
+            <button
+              disabled={schemaApply.isPending}
+              onClick={async () => {
+                if (!window.confirm(
+                  'Apply the canonical schema DDL to this database?\n\n' +
+                  'It is idempotent (CREATE IF NOT EXISTS / CREATE OR REPLACE) and creates ' +
+                  'only what is missing, but it does write to the database.'
+                )) return
+                setRepairMsg('Applying schema…')
+                try {
+                  const r = await schemaApply.mutateAsync()
+                  setRepairMsg(r.detail || (r.ok ? 'Schema applied' : r.error || 'Failed'))
+                } catch (e) {
+                  setRepairMsg(`Failed: ${e instanceof Error ? e.message : String(e)}`)
+                }
+              }}
+              className="h-7 px-3 text-xs rounded border border-primary/40 bg-primary/10 text-primary hover:bg-primary/20 disabled:opacity-50"
+            >
+              {schemaApply.isPending ? 'Applying…' : 'Apply schema'}
+            </button>
+          </div>
+        </div>
+
+        <p className="text-xs text-muted-foreground mb-3">
+          Knowledge seeding loads <code className="font-mono">knowledge/seed/*.yaml</code> into
+          the operator prompt rules and the RAG store. With <strong>zero</strong> rules loaded,
+          scans silently fall back to generic prompting — which reads as a model-quality problem
+          rather than a missing install step. Re-seeding updates in place; it never duplicates.
+        </p>
+        <div className="flex items-center gap-3 flex-wrap">
+          {knowledgeStatus.isLoading ? (
+            <span className="text-xs text-muted-foreground">Checking knowledge base…</span>
+          ) : knowledgeStatus.isError ? (
+            <span className="text-xs text-destructive">Knowledge status unavailable</span>
+          ) : (
+            <span
+              className={`text-xs px-2 py-0.5 rounded border font-mono ${
+                knowledgeStatus.data?.seeded
+                  ? 'border-primary/40 bg-primary/10 text-primary'
+                  : 'border-destructive/40 bg-destructive/10 text-destructive'
+              }`}
+            >
+              {knowledgeStatus.data?.prompt_count ?? 0} prompt rule(s)
+              {knowledgeStatus.data?.seeded ? '' : ' — never seeded'}
+            </span>
+          )}
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              disabled={knowledgeSeed.isPending}
+              onClick={async () => {
+                setRepairMsg('Previewing seed…')
+                try {
+                  const r = await knowledgeSeed.mutateAsync({ dry_run: true })
+                  setRepairMsg(
+                    `Dry run: ${r.created} new, ${r.updated} updated, ${r.docs} doc(s)` +
+                    (r.failed ? `, ${r.failed} failed` : '')
+                  )
+                } catch (e) {
+                  setRepairMsg(`Failed: ${e instanceof Error ? e.message : String(e)}`)
+                }
+              }}
+              className="h-7 px-3 text-xs rounded border border-border hover:bg-muted/40 disabled:opacity-50"
+            >
+              Dry run
+            </button>
+            <button
+              disabled={knowledgeSeed.isPending}
+              onClick={async () => {
+                if (!window.confirm(
+                  'Seed the bundled knowledge corpus into service_prompts and the RAG store?\n\n' +
+                  'Existing rules with the same selector are updated in place.'
+                )) return
+                setRepairMsg('Seeding knowledge…')
+                try {
+                  const r = await knowledgeSeed.mutateAsync({})
+                  setRepairMsg(
+                    `Seeded: ${r.created} new, ${r.updated} updated, ${r.docs} doc(s)` +
+                    (r.failed ? `, ${r.failed} failed — ${r.errors[0] ?? ''}` : '')
+                  )
+                } catch (e) {
+                  setRepairMsg(`Failed: ${e instanceof Error ? e.message : String(e)}`)
+                }
+              }}
+              className="h-7 px-3 text-xs rounded border border-primary/40 bg-primary/10 text-primary hover:bg-primary/20 disabled:opacity-50"
+            >
+              {knowledgeSeed.isPending ? 'Seeding…' : 'Seed knowledge'}
+            </button>
+          </div>
+        </div>
+        {repairMsg && (
+          <p className="mt-3 text-xs font-mono text-primary break-words">{repairMsg}</p>
+        )}
       </div>
 
       {/* Scan Audit Log */}
