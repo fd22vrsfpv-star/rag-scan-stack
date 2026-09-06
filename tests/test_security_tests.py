@@ -66,7 +66,10 @@ def api_eval():
 def db_eval():
     if not DB_MOD.exists():
         pytest.skip("db_utils.py not present")
-    return _extract(DB_MOD, "_eval_assertion_local")
+    # _eval_assertion_local reads the module-level CLAUSE_KEYS set; without
+    # pulling it into the namespace every case raised NameError, so the
+    # "two evaluators agree" guard had never actually compared anything.
+    return _extract(DB_MOD, "_eval_assertion_local", ("CLAUSE_KEYS",))
 
 
 # Shared case table: (assertion, kwargs, expected_status)

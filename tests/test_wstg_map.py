@@ -26,6 +26,13 @@ MAP = os.path.join(REPO, "knowledge", "wstg_map.yaml")
 SEED = os.path.join(REPO, "knowledge", "seed", "wstg.yaml")
 ENGINE = os.path.join(REPO, "autogen_agents", "langgraph_engine.py")
 # The assertion clause keys the evaluator understands (app/rag-api/security_tests.py).
+# Tools whose map entry carries NO shell command: the engine builds a structured
+# dispatch ref instead (webshell -> exploit-runner's `source=webshell` branch,
+# which PUTs a shell into the writable collection). Introduced with
+# http_methods_webshell (WSTG-CONF-06) without updating this guard, which is
+# why the shape check sat red on main.
+STRUCTURED_DISPATCH_TOOLS = {"webshell"}
+
 CLAUSE_KEYS = {
     "expect_exit_code", "expect_substring", "expect_not_substring",
     "expect_regex", "expect_status", "expect_shell", "expect_screenshot",
@@ -58,7 +65,17 @@ def test_map_loads_and_is_shaped():
         assert any(m.get(k) for k in ("issue_type", "cwe", "nuclei_tags", "name_contains")), \
             f"{e['id']}: match block has no keys — nothing could ever match it"
         assert e.get("tier") in ("safe", "impactful"), f"{e['id']}: bad tier"
-        assert e.get("category") and e.get("tool") and e.get("command"), f"{e['id']}: missing category/tool/command"
+        assert e.get("category") and e.get("tool"), f"{e['id']}: missing category/tool"
+        if e["tool"] in STRUCTURED_DISPATCH_TOOLS:
+            # Structured dispatch: the engine builds the ref itself, so there is
+            # no shell command to run. Pinned as empty rather than merely allowed,
+            # so a command quietly appearing here (which nothing would execute)
+            # still trips the guard.
+            assert not e.get("command"), (
+                f"{e['id']}: tool '{e['tool']}' dispatches structurally — a command "
+                "here would never be executed")
+        else:
+            assert e.get("command"), f"{e['id']}: missing command"
         assert isinstance(e.get("assertion"), dict) and e["assertion"], f"{e['id']}: assertion must be a non-empty dict"
         bad = set(e["assertion"]) - CLAUSE_KEYS
         assert not bad, f"{e['id']}: unknown assertion clause(s) {bad}"

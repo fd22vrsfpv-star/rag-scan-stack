@@ -13,23 +13,17 @@ authorization invariant: an out-of-scope / unresolvable flag is REFUSED
 """
 import json
 import os
-import subprocess
 
 import pytest
+
+from _container import container_exec
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 MOD = os.path.join(REPO, "app", "rag-api", "agent_flags.py")
 
 
 def _run(script):
-    try:
-        out = subprocess.run(["docker", "exec", "rag-api", "python3", "-c", script],
-                             capture_output=True, text=True, timeout=90)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0:
-        return f"__ERR__ {out.stderr.strip()[-1200:]}"
-    return out.stdout
+    return container_exec(script, timeout=90, tail=1200)
 
 
 @pytest.mark.unit
