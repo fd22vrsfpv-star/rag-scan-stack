@@ -21,6 +21,70 @@ def _zap_params(s=None):
     return {"apikey": s.zap_api_key}
 
 
+@router.get("/api/zap/status")
+async def zap_status():
+    """What ZAP is actually doing right now: spider and active-scan progress.
+
+    WHY THIS EXISTS: the pipeline's ZAP stage is its slowest by a wide margin, and
+    there was NO way to tell a slow scan from a wedged one — the stack exposed
+    add-ons, reports and ingest, but nothing about scan state. A pipeline sitting
+    at `zap_running` looked identical whether ZAP was grinding through an active
+    scan or idle with no scans at all.
+
+    That distinction is not hypothetical: two pipelines were reported as stuck in
+    `zap_running` when ZAP in fact held ZERO scans — the container had been
+    recreated underneath them and every scan id was gone. This endpoint answers
+    that in one call.
+
+    `reachable=false` means ZAP itself is down, which is NOT the same as idle —
+    the two must never collapse into one state (see tests/_container.py for the
+    same distinction elsewhere in this stack).
+    """
+    s = get_settings()
+    base, params = _zap_base(s), _zap_params(s)
+
+    async def _view(path):
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(f"{base}/JSON/{path}/", params=params)
+            r.raise_for_status()
+            return r.json()
+
+    try:
+        version = (await _view("core/view/version")).get("version")
+    except Exception as exc:                                   # noqa: BLE001
+        log.warning("zap unreachable: %s", exc)
+        return {"reachable": False, "error": str(exc)[:200],
+                "detail": "ZAP is not answering — this is NOT the same as idle"}
+
+    out = {"reachable": True, "version": version, "spider": [], "active_scan": []}
+    for key, path in (("spider", "spider/view/scans"),
+                      ("active_scan", "ascan/view/scans")):
+        try:
+            scans = (await _view(path)).get("scans") or []
+        except Exception as exc:                               # noqa: BLE001
+            out[key] = []
+            out[f"{key}_error"] = str(exc)[:160]
+            continue
+        out[key] = [
+            {"id": sc.get("id"), "progress": sc.get("progress"),
+             "state": sc.get("state"), "url": sc.get("url")}
+            for sc in scans
+        ]
+
+    running = [sc for sc in out["spider"] + out["active_scan"]
+               if str(sc.get("state", "")).upper() == "RUNNING"]
+    out["busy"] = bool(running)
+    out["running_count"] = len(running)
+    # The signal the operator actually wants: a pipeline stage claiming to wait on
+    # ZAP while ZAP holds nothing is waiting on something that no longer exists.
+    out["idle_but_expected_busy_hint"] = (
+        "ZAP holds no scans. If a pipeline reports zap_running, its scan is gone "
+        "(ZAP restarted or the scan was never started) — it will not progress."
+        if not running else None
+    )
+    return out
+
+
 @router.get("/api/zap/addons")
 async def list_addons():
     """Return installed and available (marketplace) add-ons from ZAP."""

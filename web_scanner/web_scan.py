@@ -190,11 +190,60 @@ class JobTracker:
 
     PERSIST_DIR = SESSION_DIR / ".jobs"
 
+    #: Statuses that cannot survive a process restart — no worker exists for them
+    #: any more, so leaving them as-is strands the job forever.
+    _NON_TERMINAL = ("queued", "running")
+
     def __init__(self, max_jobs: int = 100):
         self.jobs: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
         self.max_jobs = max_jobs
         self.PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+        self._reconcile_orphaned_jobs()
+
+    def _reconcile_orphaned_jobs(self):
+        """Mark jobs left mid-flight by a restart as failed, with the reason.
+
+        The worker thread died with the previous process; nothing will ever move
+        these forward. Left alone they read as `running` indefinitely, which is
+        indistinguishable from a slow scan — the operator waits on a job that
+        cannot finish, and the concurrency slot is never released.
+
+        Rewrites the persisted record only; a job that genuinely completed is
+        already terminal and untouched.
+        """
+        try:
+            paths = list(self.PERSIST_DIR.glob("*.json"))
+        except Exception as exc:                                   # noqa: BLE001
+            logger.warning(f"[job-reconcile] cannot read {self.PERSIST_DIR}: {exc}")
+            return
+        fixed = 0
+        for fp in paths:
+            try:
+                data = json.loads(fp.read_text())
+            except Exception:
+                continue                                            # corrupt file
+            if data.get("status") not in self._NON_TERMINAL:
+                continue
+            was = data.get("status", "running")      # read BEFORE overwriting
+            data["status"] = "failed"
+            data["error"] = (
+                "interrupted: the web-scanner process restarted while this job was "
+                f"{was!r}. No worker survived; the job was not completed. Re-run it."
+            )
+            data["completed_at"] = datetime.now().isoformat()
+            prog = data.get("progress") or {}
+            prog["stage"] = f"interrupted_at:{prog.get('stage', 'unknown')}"
+            data["progress"] = prog
+            try:
+                fp.write_text(json.dumps(data, default=str))
+                fixed += 1
+            except Exception as exc:                                # noqa: BLE001
+                logger.warning(f"[job-reconcile] could not rewrite {fp.name}: {exc}")
+        if fixed:
+            logger.warning(
+                f"[job-reconcile] marked {fixed} job(s) as failed — they were still "
+                "in flight when this service last stopped")
 
     def create_job(self, job_type: str = "web-scan") -> str:
         """Create a new job and return its ID"""
@@ -230,12 +279,19 @@ class JobTracker:
                 # Keep progress.stage in sync with top-level stage
                 if "stage" in kwargs and "progress" in self.jobs[job_id]:
                     self.jobs[job_id]["progress"]["stage"] = kwargs["stage"]
+                # Persist on ANY status change, not only terminal ones.
+                #
                 # 'blocked' is terminal too — a scope refusal will never proceed,
                 # so it must survive a restart like any other final state.
-                # Without it a refused job silently reverts to whatever was in
-                # memory, and the operator loses the reason it never ran.
-                if self.jobs[job_id].get("status") in ("completed", "failed",
-                                                       "stopped", "blocked"):
+                #
+                # Non-terminal states persist for a different reason: a job that is
+                # still 'running' when this container is recreated used to vanish
+                # completely — no disk record, nothing to reconcile, and the caller
+                # polling a stale registry saw `running` forever. Two pipelines were
+                # lost exactly that way (the whole compose dependency graph is
+                # recreated whenever BUILD_VERSION changes in .env). Writing the
+                # running state is what makes _reconcile_orphaned_jobs possible.
+                if "status" in kwargs:
                     self._persist(job_id)
 
     def push_command(self, job_id: str, stage: str, command: str):
