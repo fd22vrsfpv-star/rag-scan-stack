@@ -7335,23 +7335,59 @@ def security_test_run(test_id: str, body: SecurityTestRunReq,
 # The agent tool get_wstg_guidance and the surface-test phase both call these,
 # so the finding->test map logic lives ONLY in app/rag-api/wstg.py.
 
+#: Chunks returned per WSTG DOCUMENT (not per query). The old code took 6 rows
+#: total across every document a pattern matched, which both truncated long docs
+#: and spliced separate ones together — see _wstg_guidance_text.
+_WSTG_CHUNKS_PER_DOC = 10
+
+
 def _wstg_guidance_text(wstg_ids, *, max_chars=4000):
-    """Concatenate the ingested WSTG prose for the given WSTG-IDs (from the
-    doc_kind='wstg' corpus in exploit_chunks), matched by id in the title."""
+    """Ingested WSTG prose for the given WSTG-IDs (doc_kind='wstg' in
+    exploit_chunks), looked up by id in the title.
+
+    Exact id matching is deliberate and is NOT a poor substitute for vector
+    search: the caller already knows exactly which test it wants, and a nearest-
+    neighbour query would happily return WSTG-CRYP-02's prose when asked for
+    CRYP-01. Semantic ranking belongs *inside* a document, not across them.
+
+    Two things the previous version got wrong, both silent:
+
+      * `ORDER BY chunk_id LIMIT 6` was applied across the whole match set, not
+        per document. `WSTG-INPV-13` matches TWO ingested documents ("Testing for
+        Buffer Overflow" and "Testing for Format String Injection"), so the
+        operator received chunk 0 of the first spliced onto chunks 0-4 of the
+        second, joined by a bare newline with nothing marking the boundary — one
+        test's methodology reading as if it were the other's.
+      * 20 of the 116 ingested documents have more than 6 chunks, so their
+        guidance was truncated mid-document with no indication.
+
+    Each document is now kept whole (up to _WSTG_CHUNKS_PER_DOC) and titled, so a
+    multi-document match reads as two documents. `max_chars` still caps the total.
+    """
     if not wstg_ids:
         return ""
-    parts = []
+    parts, seen = [], set()
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         for wid in wstg_ids:
             cur.execute(
-                """SELECT chunk FROM public.exploit_chunks
+                """SELECT title, chunk FROM public.exploit_chunks
                     WHERE doc_kind = 'wstg' AND title ILIKE %s
-                    ORDER BY chunk_id LIMIT 6""",
+                    ORDER BY title, chunk_id""",
                 (f"%{wid}%",),
             )
-            rows = cur.fetchall()
-            if rows:
-                parts.append("\n".join(r["chunk"] for r in rows))
+            by_doc = {}
+            for r in cur.fetchall():
+                by_doc.setdefault(r["title"], []).append(r["chunk"])
+            for title, chunks in by_doc.items():
+                if title in seen:          # two ids can name the same document
+                    continue
+                seen.add(title)
+                body = "\n".join(chunks[:_WSTG_CHUNKS_PER_DOC])
+                # The ingested markdown usually opens with its own heading; only
+                # add one when it does not, so the prose the model reads is not
+                # prefixed by two near-identical titles.
+                head = body.lstrip()[:200]
+                parts.append(body if head.startswith("#") else f"## {title}\n{body}")
     text = "\n\n---\n\n".join(parts)
     return text[:max_chars]
 
