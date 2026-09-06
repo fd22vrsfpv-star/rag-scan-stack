@@ -42,6 +42,31 @@ else
     exit 1
 fi
 
+# Update package-lock.json — the FOURTH location. It carries a copy of
+# package.json's `version` in TWO places (top level and packages[""]). The
+# lockfile is committed because `npm ci` refuses to run without one; if a bump
+# misses it, package.json and the lock disagree and the CI frontend job cannot
+# install. sed is not safe here (a lockfile has thousands of "version" keys), so
+# edit the two exact keys with python. Pinned by tests/test_build_version_sync.py.
+LOCK="$PROJECT_ROOT/dashboard/frontend/package-lock.json"
+if [ -f "$LOCK" ]; then
+    python3 - "$LOCK" "$NEW_VERSION" <<'PYEOF'
+import json, sys
+path, version = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as fh:
+    data = json.load(fh)
+data["version"] = version
+data.setdefault("packages", {}).setdefault("", {})["version"] = version
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+PYEOF
+    echo "✓ Updated package-lock.json"
+else
+    echo "✗ package-lock.json not found — \`npm ci\` cannot run without it"
+    exit 1
+fi
+
 echo ""
 echo "Version updated to $NEW_VERSION in all locations."
 echo "Next steps:"

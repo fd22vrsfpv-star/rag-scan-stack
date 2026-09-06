@@ -19,23 +19,17 @@ data by comparing registrable domains. Pins the high-precision behaviour:
 Runs the REAL functions inside the rag-api container; skips if unreachable.
 """
 import os
-import subprocess
 
 import pytest
+
+from _container import container_exec
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 MODULE = os.path.join(REPO, "app", "rag-api", "rule_engine.py")
 
 
 def _run(script):
-    try:
-        out = subprocess.run(["docker", "exec", "rag-api", "python3", "-c", script],
-                             capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0:
-        return f"__ERR__ {out.stderr.strip()[-800:]}"
-    return out.stdout
+    return container_exec(script, timeout=60, tail=800)
 
 
 @pytest.fixture(scope="module")
