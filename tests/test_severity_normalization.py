@@ -77,3 +77,41 @@ def test_zap_adds_discovered_sites_to_scope_before_scanning():
     # and the pipeline seeds known vulnerable apps generic wordlists miss
     assert "_seed_known_apps" in src and "_KNOWN_VULN_APP_PATHS" in src, (
         "the pipeline must seed known vulnerable-app roots (DVWA/Mutillidae/...)")
+
+
+def test_playwright_covers_client_side_wstg():
+    """Tier 3: the Playwright scanner must emit the client-side WSTG family
+    (CLNT-01/02/10/11/12/13) from live-browser signals, and the coverage map must
+    classify those findings. Sabotage: drop check_client_side or the CLNT rules."""
+    import pathlib
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    sc = (repo / "playwright_scanner" / "security_checks.py").read_text(encoding="utf-8")
+    assert "def check_client_side(" in sc, "SecurityChecker must have check_client_side"
+    for wid in ("CLNT-01", "CLNT-02", "CLNT-10", "CLNT-11", "CLNT-12", "CLNT-13"):
+        assert wid in sc, f"check_client_side must emit WSTG-{wid}"
+    # the analyzer collects the signals in the live browser
+    da = (repo / "playwright_scanner" / "dom_analyzer.py").read_text(encoding="utf-8")
+    assert "get_client_security_signals" in da, "DOMAnalyzer must collect client signals"
+    # the coverage map classifies the client-side findings
+    import yaml
+    cov = yaml.safe_load((repo / "knowledge" / "wstg_coverage_map.yaml").read_text(encoding="utf-8"))
+    clnt = {r["wstg_id"] for r in cov["rules"] if r["wstg_id"].endswith(("CLNT-01","CLNT-10","CLNT-11","CLNT-12"))}
+    assert {"WSTG-CLNT-01","WSTG-CLNT-10","WSTG-CLNT-11","WSTG-CLNT-12"} <= clnt, "coverage map must classify CLNT findings"
+
+
+def test_wstg_manual_checklist_feeds_coverage():
+    """Tier 4: the 25 manual WSTG tests get an operator checklist (backed by
+    ingested guidance) and a review sign-off that COUNTS toward coverage.
+    Sabotage: drop the reviewed_ids handling in compute(), or the endpoints."""
+    import pathlib
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    api = (repo / "app" / "rag-api" / "api.py").read_text(encoding="utf-8")
+    assert '/wstg/checklist/{engagement_id}' in api, "checklist endpoint missing"
+    assert 'wstg_manual_reviews' in api, "review must persist to wstg_manual_reviews"
+    assert "doc_kind='wstg'" in api, "checklist must attach ingested WSTG guidance"
+    wc = (repo / "app" / "rag-api" / "wstg_coverage.py").read_text(encoding="utf-8")
+    assert "reviewed_ids" in wc and "manual_reviewed" in wc, (
+        "compute() must count reviewed manual tests as covered")
+    # table declared in db_init (SQL-column guard also enforces this)
+    ddl = (repo / "db_init" / "ensure_all_tables.sql").read_text(encoding="utf-8")
+    assert "wstg_manual_reviews" in ddl, "table must be declared in db_init"

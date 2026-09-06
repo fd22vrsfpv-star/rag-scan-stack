@@ -1070,6 +1070,9 @@ _SAFE_CATEGORIES = {
     # anything that does is IMPACTFUL (rce/sqli_dump/cred_bruteforce/upload/…).
     "xss_detect", "ssti_detect", "ssrf_detect", "xxe_detect", "redirect_check",
     "header_check", "cookie_check", "cors_check", "error_check", "method_check",
+    # Tier 2 WSTG probes (all read-only curl/nuclei/sslscan detections).
+    "hsts_check", "crossdomain_check", "cloud_storage", "cache_check",
+    "ssi_detect", "format_string", "hpp_detect", "session_var", "file_ext",
 }
 _IMPACTFUL_CATEGORIES = {
     "rce", "shell", "msf_exploit", "file_write", "upload", "cred_bruteforce",
@@ -1651,6 +1654,54 @@ def _known_app_discovery_tests(items: list) -> list:
     return out
 
 
+def _svc_test(category, tool, wid, ip, port, command, assertion) -> dict:
+    scheme = "https" if str(port) in ("443", "8443") else "http"
+    return {"name": f"WSTG {wid} {category} @ {scheme}://{ip}:{port}",
+            "host": ip, "service": "http", "port": port, "tool": tool,
+            "command": command, "category": category, "tier": "safe",
+            "assertion": assertion, "exploit_ref": None,
+            "source_finding_id": None, "source_finding_source": "wstg-service"}
+
+
+def _owasp_service_tests(items: list) -> list:
+    """Tier-2 WSTG probes generated per WEB SERVICE (not per finding/param):
+    HSTS (CONF-07), cross-domain policy (CONF-08), cloud storage / exposures
+    (CONF-11), and cache-control on the root (ATHN-06). All safe, read-only
+    curl/nuclei detections — these close config-level WSTG gaps that were only
+    reachable reactively before."""
+    out, seen = [], set()
+    for row in items:
+        svc = (row.get("service") or "").strip().lower()
+        if svc not in _SERVICE_FAMILIES_WEB:
+            continue
+        port, ip = row.get("port"), row.get("ip")
+        if not ip or (ip, port) in seen:
+            continue
+        seen.add((ip, port))
+        tls = _tls_state(svc, row.get("product"), row.get("banner"))
+        scheme = "https" if tls == "yes" else "http"
+        base = f"{scheme}://{ip}:{port}"
+        # HSTS (CONF-07) — only meaningful over TLS; the ISSUE is the header's
+        # absence, so a "pass" = missing header (expect_not_substring).
+        if tls == "yes":
+            out.append(_svc_test("hsts_check", "curl", "WSTG-CONF-07", ip, port,
+                f"curl -sk -I {base}/",
+                {"expect_not_substring": ["Strict-Transport-Security", "strict-transport-security"]}))
+        # Cross-domain policy (CONF-08) — a permissive allow-access-from is the issue.
+        out.append(_svc_test("crossdomain_check", "curl", "WSTG-CONF-08", ip, port,
+            f"curl -sk {base}/crossdomain.xml",
+            {"expect_regex": "(?i)cross-domain-policy|allow-access-from"}))
+        # Cloud storage / exposures (CONF-11) — nuclei tag sweep.
+        out.append(_svc_test("cloud_storage", "nuclei", "WSTG-CONF-11", ip, port,
+            f"nuclei -u {base} -tags exposure,aws,s3,gcp,azure,bucket -silent",
+            {"expect_regex": r"\[[a-z0-9-]+\]"}))
+        # Cache-control on the root (ATHN-06) — no-store absent is the flag.
+        out.append(_svc_test("cache_check", "curl", "WSTG-ATHN-06", ip, port,
+            f"curl -sk -I {base}/",
+            {"expect_not_substring": ["no-store", "No-Store", "no-cache"]}))
+    return out
+
+
 def _owasp_param_tests(host: str, limit: int = 16) -> list:
     """Turn CRAWLED parameterized endpoints into OWASP WSTG app-layer tests —
     the IDOR / SQLi / XSS / LFI coverage a service+port-keyed recommender never
@@ -1711,6 +1762,25 @@ def _owasp_param_tests(host: str, limit: int = 16) -> list:
                 lurl = _with("../../../../../../etc/passwd")
                 out.append(_param_test("lfi_read", "curl", base, pname, port,
                     f"curl -sk \"{lurl}\"", {"expect_substring": ["root:x:0:0"]}))
+            # SSI injection (INPV-08) — an echo directive that executes returns a
+            # server value instead of the literal.
+            surl = _with('<!--#echo var="DATE_LOCAL"-->')
+            out.append(_param_test("ssi_detect", "curl", base, pname, port,
+                f"curl -sk \"{surl}\"",
+                {"expect_not_substring": ["<!--#echo", "&lt;!--#echo"]}, wid="WSTG-INPV-08"))
+            # Format string (INPV-13) — %n/%s/%x tends to surface an error or artifact.
+            furl2 = _with("%25n%25s%25x%25x%25x")
+            out.append(_param_test("format_string", "curl", base, pname, port,
+                f"curl -sk \"{furl2}\"",
+                {"expect_regex": r"(?i)(warning|fatal|segmentation|0x[0-9a-f]{6}|va_arg)"},
+                wid="WSTG-INPV-13"))
+            # HTTP Parameter Pollution (INPV-04) — duplicate the param; both
+            # markers surviving (or a concat) signals HPP-relevant handling.
+            hurl = f"{base}?{_up.urlencode({pname:['pxHPP1','pxHPP2']}, doseq=True)}"
+            out.append(_param_test("hpp_detect", "curl", base, pname, port,
+                f"curl -sk \"{hurl}\"",
+                {"expect_regex": "(?i)pxHPP1.*pxHPP2|pxHPP2.*pxHPP1|pxHPP1pxHPP2"},
+                wid="WSTG-INPV-04"))
             # IDOR — object-ref params. Impactful + gated: confirming needs a
             # second identity, so this ENUMERATES the reference for the operator.
             if low in _IDOR_PARAM_NAMES:
@@ -1769,6 +1839,9 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
 
     # OWASP app-layer coverage: IDOR / SQLi / XSS / LFI from crawled parameters.
     tests.extend(_owasp_param_tests(host))
+
+    # Tier-2 WSTG service-level probes: HSTS / cross-domain / cloud / cache.
+    tests.extend(_owasp_service_tests(items))
 
     # Infer the target OS family once, to drop platform-mismatched MSF modules.
     _plat = _infer_target_platform(items)

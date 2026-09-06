@@ -496,3 +496,58 @@ class SecurityChecker:
                 frameworks.append({'name': 'React', 'detected': True})
 
         return frameworks
+
+    def check_client_side(self, client_signals, local_storage, session_storage, url):
+        """WSTG client-side family from the live-browser signals:
+        DOM-XSS sinks (CLNT-01), unsafe JS execution (CLNT-02), unencrypted
+        WebSocket (CLNT-10), origin-less postMessage (CLNT-11), sensitive browser
+        storage (CLNT-12), cross-origin script without SRI (CLNT-13)."""
+        import re as _re
+        findings = []
+        cs = client_signals or {}
+
+        def _f(ft, sev, title, desc, ev, cwe, conf=0.5):
+            return {'finding_type': ft, 'severity': sev, 'title': title,
+                    'description': desc, 'evidence': str(ev)[:400], 'location': url,
+                    'remediation': 'Review the client-side code / storage.',
+                    'cwe': cwe, 'owasp_category': 'A03:2021-Injection',
+                    'confidence': conf}
+
+        if cs.get('domSinks'):
+            findings.append(_f('dom-xss-sink', 'medium',
+                'Potential DOM-Based XSS Sink (WSTG-CLNT-01)',
+                'A DOM sink (innerHTML/document.write/eval) is fed from a URL-controlled source.',
+                cs['domSinks'][:3], ['CWE-79'], 0.5))
+        if cs.get('evalUse'):
+            findings.append(_f('unsafe-js-exec', 'low',
+                'Unsafe JavaScript Execution (WSTG-CLNT-02)',
+                'eval() / new Function() / setTimeout(string) — dynamic code execution.',
+                'eval/Function/setTimeout(string)', ['CWE-95'], 0.4))
+        if cs.get('insecureWS'):
+            findings.append(_f('insecure-websocket', 'medium',
+                'Unencrypted WebSocket ws:// (WSTG-CLNT-10)',
+                'A WebSocket connects over ws:// (cleartext).',
+                'new WebSocket("ws://...")', ['CWE-319'], 0.7))
+        if cs.get('postMessageNoOrigin'):
+            findings.append(_f('postmessage-no-origin', 'medium',
+                'postMessage Listener Without Origin Check (WSTG-CLNT-11)',
+                'A message event listener does not validate event.origin.',
+                'addEventListener("message", …) with no origin check', ['CWE-346'], 0.5))
+        if cs.get('crossOriginNoSRI'):
+            findings.append(_f('cross-origin-script-no-sri', 'low',
+                'Cross-Origin Script Without SRI (WSTG-CLNT-13)',
+                'A cross-origin <script> lacks Subresource Integrity.',
+                cs['crossOriginNoSRI'][:3], ['CWE-353'], 0.6))
+
+        secret_re = _re.compile(r'(?i)(token|secret|password|passwd|api[_-]?key|jwt|bearer|auth|session|credit)')
+        for store_name, store in (('localStorage', local_storage), ('sessionStorage', session_storage)):
+            if isinstance(store, dict) and store:
+                hits = [k for k in store.keys() if secret_re.search(str(k))]
+                hits += [f'{k}=…' for k, v in store.items()
+                         if isinstance(v, str) and (secret_re.search(v) or (len(v) > 40 and v.count('.') == 2))]
+                if hits:
+                    findings.append(_f('sensitive-browser-storage', 'medium',
+                        f'Sensitive Data in {store_name} (WSTG-CLNT-12)',
+                        f'{store_name} appears to hold tokens/keys/secrets.',
+                        hits[:4], ['CWE-922'], 0.5))
+        return findings

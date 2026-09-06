@@ -1,0 +1,63 @@
+# Classify an existing web_finding / vuln as EVIDENCE for a WSTG test, so the
+# things the scanners already find (ZAP alerts, nuclei tags, whatweb, nmap, the
+# subdomain-takeover parser) COUNT toward WSTG coverage without re-testing.
+# Any rule that hits marks its WSTG-ID covered for that host. Rules match on the
+# finding's source, a substring of its name/issue_type, or a nuclei tag.
+version: 1
+rules:
+  # ── ZAP / nuclei / generic name-based ──
+  - {wstg_id: WSTG-CONF-04, name_contains: [directory browsing, hidden file, backup file, unreferenced, .bak, .old]}
+  - {wstg_id: WSTG-CONF-05, name_contains: [admin interface, admin panel, management interface, manager/html]}
+  - {wstg_id: WSTG-CONF-06, name_contains: [http method, trace method, insecure http, verb tampering, options method]}
+  - {wstg_id: WSTG-CONF-07, name_contains: [strict-transport, hsts]}
+  - {wstg_id: WSTG-CONF-08, name_contains: [cross-domain, crossdomain, clientaccesspolicy]}
+  - {wstg_id: WSTG-CONF-12, name_contains: [content security policy, csp header, permissions policy, security headers]}
+  - {wstg_id: WSTG-INFO-02, name_contains: [server leaks, server header, x-powered-by, web server version]}
+  - {wstg_id: WSTG-INFO-05, name_contains: [information disclosure, private ip, base64 disclosure, debug error, comment, timestamp disclosure]}
+  - {wstg_id: WSTG-ERRH-01, name_contains: [application error, error disclosure, debug error, stack trace]}
+  - {wstg_id: WSTG-ERRH-02, name_contains: [stack trace]}
+  - {wstg_id: WSTG-CLNT-09, name_contains: [clickjacking, anti-clickjacking, x-frame-options]}
+  - {wstg_id: WSTG-CLNT-07, name_contains: [cors, cross-origin, access-control-allow-origin]}
+  - {wstg_id: WSTG-CLNT-04, name_contains: [open redirect, url redirect]}
+  - {wstg_id: WSTG-SESS-02, name_contains: [cookie, httponly, secure flag, samesite]}
+  - {wstg_id: WSTG-SESS-04, name_contains: [session id in url, jsessionid in url, session token in url]}
+  - {wstg_id: WSTG-SESS-05, name_contains: [csrf, cross-site request forgery, anti-csrf]}
+  - {wstg_id: WSTG-ATHZ-01, name_contains: [path traversal, directory traversal, local file inclusion, remote file inclusion]}
+  - {wstg_id: WSTG-INPV-05, name_contains: [sql injection]}
+  - {wstg_id: WSTG-INPV-01, name_contains: [cross site scripting, reflected xss]}
+  - {wstg_id: WSTG-INPV-02, name_contains: [stored xss, persistent xss]}
+  - {wstg_id: WSTG-INPV-12, name_contains: [remote code execution, command injection, os command]}
+  - {wstg_id: WSTG-INPV-18, name_contains: [template injection, ssti]}
+  - {wstg_id: WSTG-INPV-19, name_contains: [ssrf, server-side request forgery]}
+  - {wstg_id: WSTG-INPV-07, name_contains: [xxe, xml external entity]}
+  - {wstg_id: WSTG-INPV-17, name_contains: [host header]}
+  - {wstg_id: WSTG-CRYP-01, name_contains: [weak tls, ssl, tls version, certificate]}
+  - {wstg_id: WSTG-CRYP-03, name_contains: [mixed content, cleartext, http only site, unencrypted]}
+  - {wstg_id: WSTG-BUSL-08, name_contains: [file upload, unrestricted upload]}
+  # ── nuclei tag-based ──
+  - {wstg_id: WSTG-INPV-05, nuclei_tags: [sqli, sql-injection]}
+  - {wstg_id: WSTG-INPV-01, nuclei_tags: [xss]}
+  - {wstg_id: WSTG-INPV-12, nuclei_tags: [rce, cmdi, kev]}
+  - {wstg_id: WSTG-INPV-18, nuclei_tags: [ssti]}
+  - {wstg_id: WSTG-INPV-19, nuclei_tags: [ssrf]}
+  - {wstg_id: WSTG-INPV-07, nuclei_tags: [xxe]}
+  - {wstg_id: WSTG-ATHZ-01, nuclei_tags: [lfi, traversal, rfi]}
+  - {wstg_id: WSTG-INFO-05, nuclei_tags: [exposure, disclosure, config]}
+  - {wstg_id: WSTG-CONF-02, nuclei_tags: [misconfig]}
+  - {wstg_id: WSTG-CONF-04, nuclei_tags: [backup]}
+  - {wstg_id: WSTG-CRYP-01, nuclei_tags: [ssl, tls]}
+  - {wstg_id: WSTG-APIT-01, nuclei_tags: [graphql]}
+  # ── source-based (a whole scanner covers a test) ──
+  - {wstg_id: WSTG-INFO-08, sources: [whatweb]}
+  - {wstg_id: WSTG-INFO-09, sources: [whatweb]}
+  - {wstg_id: WSTG-INFO-04, sources: [gobuster, katana, ffuf]}
+  - {wstg_id: WSTG-INFO-06, sources: [katana]}
+  - {wstg_id: WSTG-CONF-01, sources: [nmap]}
+  - {wstg_id: WSTG-CONF-10, sources: [subdomain_takeover]}
+  # ── Tier 3: Playwright client-side family ──
+  - {wstg_id: WSTG-CLNT-01, name_contains: [dom-based xss, dom xss sink, dom-xss]}
+  - {wstg_id: WSTG-CLNT-02, name_contains: [unsafe javascript execution, eval usage, dynamic code execution]}
+  - {wstg_id: WSTG-CLNT-10, name_contains: [unencrypted websocket, insecure websocket, ws://]}
+  - {wstg_id: WSTG-CLNT-11, name_contains: [postmessage, web messaging, message event]}
+  - {wstg_id: WSTG-CLNT-12, name_contains: [sensitive data in localstorage, sensitive data in sessionstorage, browser storage]}
+  - {wstg_id: WSTG-CLNT-13, name_contains: [cross-origin script, subresource integrity, script inclusion]}

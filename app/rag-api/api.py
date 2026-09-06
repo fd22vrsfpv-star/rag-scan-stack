@@ -7640,6 +7640,124 @@ def findings_verification(engagement_id: str, authorized: bool = Depends(auth)):
     }
 
 
+@app.get("/coverage/wstg/{engagement_id}", tags=["Coverage"])
+def wstg_coverage(engagement_id: str, authorized: bool = Depends(auth)):
+    """Live OWASP WSTG coverage for an engagement — which of the 98 WSTG v4.2
+    tests are covered (a generator can produce one, OR a finding evidences one),
+    and which are gaps split into automatable vs inherently-manual. Makes what
+    the scanners already find (ZAP/nuclei/whatweb/nmap) COUNT toward WSTG."""
+    import wstg_coverage as wc
+    findings = []
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # web_findings for the engagement (tags is jsonb here)
+        cur.execute(
+            """SELECT wf.source, wf.name, wf.issue_type,
+                      CASE WHEN jsonb_typeof(wf.tags)='array'
+                           THEN ARRAY(SELECT jsonb_array_elements_text(wf.tags))
+                           ELSE ARRAY[]::text[] END AS tags
+                 FROM public.web_findings wf
+                 JOIN public.assets a ON a.id = wf.asset_id
+                WHERE a.engagement_id = %s::uuid""",
+            (engagement_id,))
+        findings.extend(dict(r) for r in cur.fetchall())
+        # vulns for the engagement (nuclei/nmap write here; tags is text[])
+        cur.execute(
+            """SELECT v.script AS source, v.script AS name, NULL::text AS issue_type,
+                      COALESCE(v.tags, ARRAY[]::text[]) AS tags
+                 FROM public.vulns v
+                 JOIN public.assets a ON a.id = v.asset_id
+                WHERE a.engagement_id = %s::uuid""",
+            (engagement_id,))
+        findings.extend(dict(r) for r in cur.fetchall())
+        # playwright_findings — the client-side (CLNT-*) family lands here, not in
+        # web_findings, so the coverage report must read it too.
+        cur.execute(
+            """SELECT 'playwright' AS source, pf.title AS name,
+                      pf.finding_type AS issue_type, ARRAY[]::text[] AS tags
+                 FROM public.playwright_findings pf
+                WHERE pf.engagement_id = %s::uuid""",
+            (engagement_id,))
+        findings.extend(dict(r) for r in cur.fetchall())
+        # Tier-4 manual reviews the operator has signed off count as covered.
+        cur.execute(
+            """SELECT wstg_id FROM public.wstg_manual_reviews
+                WHERE COALESCE(engagement_id,'00000000-0000-0000-0000-000000000000'::uuid)
+                      = COALESCE(%s::uuid,'00000000-0000-0000-0000-000000000000'::uuid)
+                  AND status IN ('reviewed','pass','na')""",
+            (engagement_id,))
+        reviewed = [r["wstg_id"] for r in cur.fetchall()]
+    result = wc.compute(findings, reviewed_ids=reviewed)
+    result["engagement_id"] = engagement_id
+    result["findings_considered"] = len(findings)
+    return result
+
+
+class WstgReviewRequest(BaseModel):
+    wstg_id: str
+    status: str = "reviewed"    # reviewed | pass | fail | na | open
+    notes: Optional[str] = None
+    reviewer: Optional[str] = None
+
+
+@app.get("/wstg/checklist/{engagement_id}", tags=["Coverage"])
+def wstg_checklist(engagement_id: str, authorized: bool = Depends(auth)):
+    """Tier-4 operator checklist for the inherently-manual WSTG tests (business
+    logic, authorization, identity). Each item carries the ingested WSTG guidance
+    (how to test it) and the operator's review status — a reviewed item counts
+    toward /coverage/wstg. This makes the last 25 tests *guided*, not silent gaps."""
+    import wstg_coverage as wc
+    manual = [(cid, name) for cid, (name, tier) in wc.CATALOG.items() if tier == "manual"]
+    items = []
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT wstg_id, status, reviewer, notes, reviewed_at
+                 FROM public.wstg_manual_reviews
+                WHERE COALESCE(engagement_id,'00000000-0000-0000-0000-000000000000'::uuid)
+                      = COALESCE(%s::uuid,'00000000-0000-0000-0000-000000000000'::uuid)""",
+            (engagement_id,))
+        reviews = {r["wstg_id"]: r for r in cur.fetchall()}
+        for cid, name in manual:
+            cur.execute(
+                """SELECT chunk FROM exploit_chunks
+                    WHERE doc_kind='wstg' AND title ILIKE %s
+                    ORDER BY length(chunk) DESC LIMIT 1""",
+                (f"%{cid}%",))
+            g = cur.fetchone()
+            rv = reviews.get(cid, {})
+            items.append({
+                "wstg_id": cid, "name": name,
+                "guidance": (g["chunk"][:1800] if g else None),
+                "status": rv.get("status", "open"),
+                "reviewer": rv.get("reviewer"), "notes": rv.get("notes"),
+                "reviewed_at": rv.get("reviewed_at").isoformat() if rv.get("reviewed_at") else None,
+            })
+    done = sum(1 for i in items if i["status"] in ("reviewed", "pass", "na"))
+    return {"engagement_id": engagement_id, "manual_tests": len(items),
+            "reviewed": done, "open": len(items) - done, "items": items}
+
+
+@app.post("/wstg/checklist/{engagement_id}/review", tags=["Coverage"])
+def wstg_checklist_review(engagement_id: str, req: WstgReviewRequest,
+                         authorized: bool = Depends(auth)):
+    """Record an operator's sign-off on one manual WSTG test."""
+    if req.status not in ("open", "reviewed", "pass", "fail", "na"):
+        raise HTTPException(400, "status must be open|reviewed|pass|fail|na")
+    eng = engagement_id if engagement_id and engagement_id != "none" else None
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """INSERT INTO public.wstg_manual_reviews
+                   (engagement_id, wstg_id, status, reviewer, notes, reviewed_at)
+               VALUES (%s::uuid, %s, %s, %s, %s, now())
+               ON CONFLICT (COALESCE(engagement_id,'00000000-0000-0000-0000-000000000000'::uuid), wstg_id)
+               DO UPDATE SET status=EXCLUDED.status, reviewer=EXCLUDED.reviewer,
+                             notes=EXCLUDED.notes, reviewed_at=now(), updated_at=now()
+               RETURNING id, wstg_id, status""",
+            (eng, req.wstg_id, req.status, req.reviewer, req.notes))
+        row = cur.fetchone()
+        conn.commit()
+    return {"ok": True, "review": dict(row)}
+
+
 @app.get("/coverage/{engagement_id}/complete", tags=["Coverage"])
 def coverage_complete(engagement_id: str, authorized: bool = Depends(auth)):
     """Engagement stop condition: complete when every in-scope open service has
