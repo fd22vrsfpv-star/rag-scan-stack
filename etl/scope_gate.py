@@ -376,8 +376,24 @@ def load_host_aliases(cur, host):
 
 
 def is_in_scope_with_aliases(host, scope_rows, aliases=None):
-    """is_in_scope(), also accepting any known alias of `host`."""
+    """is_in_scope(), also accepting any known alias of `host`.
+
+    Accepts a URL as well as a bare host. The ingest side already did this via
+    host_in_scope() -> _host_from_url(); the DISPATCH side did not, so a web scan
+    of `http://demo.testfire.net/` was refused while `demo.testfire.net` sat in
+    scope as a `domain` row. Every web scan names a URL, so the operator's choices
+    were to add a second scope row per URL form or to weaken the gate — both worse
+    than normalising here, and the inconsistency between the two sides is itself
+    the bug.
+
+    This does NOT loosen matching: the host is parsed out with urlparse, so
+    `http://evil.example/?x=demo.testfire.net` resolves to `evil.example` and is
+    still refused.
+    """
     if is_in_scope(host, scope_rows):
+        return True
+    derived = _host_from_url(host) if host else None
+    if derived and derived != host and is_in_scope(derived, scope_rows):
         return True
     return any(is_in_scope(a, scope_rows) for a in (aliases or set()) if a)
 

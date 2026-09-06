@@ -7671,11 +7671,20 @@ def wstg_coverage(engagement_id: str, authorized: bool = Depends(auth)):
         findings.extend(dict(r) for r in cur.fetchall())
         # playwright_findings — the client-side (CLNT-*) family lands here, not in
         # web_findings, so the coverage report must read it too.
+        #
+        # Joined through assets, like the web_findings and vulns queries above.
+        # This used to filter on `pf.engagement_id` directly, and NOTHING populates
+        # that column: all 724 rows were NULL, so the CLNT family was reported as an
+        # automatable gap on every engagement even after a Playwright scan had
+        # produced dom-xss-sink and sensitive-browser-storage findings for it. The
+        # column has no propagation trigger (unlike vulns/findings/follow_up_items)
+        # and no other consumer, so the join is the fix rather than a backfill.
         cur.execute(
             """SELECT 'playwright' AS source, pf.title AS name,
                       pf.finding_type AS issue_type, ARRAY[]::text[] AS tags
                  FROM public.playwright_findings pf
-                WHERE pf.engagement_id = %s::uuid""",
+                 JOIN public.assets a ON a.id = pf.asset_id
+                WHERE a.engagement_id = %s::uuid""",
             (engagement_id,))
         findings.extend(dict(r) for r in cur.fetchall())
         # Tier-4 manual reviews the operator has signed off count as covered.
