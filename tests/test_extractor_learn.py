@@ -21,9 +21,10 @@ Pure functions run anywhere; the overlay round-trip runs in the rag-api containe
 and rolls back. Skips cleanly when unreachable.
 """
 import os
-import subprocess
 
 import pytest
+
+from _container import container_exec
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 LEARN = os.path.join(REPO, "app", "rag-api", "extractor_learn.py")
@@ -31,14 +32,7 @@ SPECS = os.path.join(REPO, "app", "rag-api", "extractor_specs.py")
 
 
 def _run(script):
-    try:
-        out = subprocess.run(["docker", "exec", "rag-api", "python3", "-c", script],
-                             capture_output=True, text=True, timeout=90)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0:
-        return f"__ERR__ {out.stderr.strip()[-1000:]}"
-    return out.stdout
+    return container_exec(script, timeout=90, tail=1000)
 
 
 @pytest.fixture(scope="module")
