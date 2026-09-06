@@ -14,6 +14,86 @@ pass() { echo "  [PASS] $1"; ((PASS++)); }
 fail() { echo "  [FAIL] $1"; ((FAIL++)); }
 warn() { echo "  [WARN] $1"; ((WARN++)); }
 
+# ── DB access ───────────────────────────────────────────────────────────────
+# Runs one statement and echoes the result the way `psql -tA` would: one row per
+# line, columns joined by '|', booleans as t/f, NULL as empty.
+#
+# WHY THIS SHAPE: the previous version hard-coded `docker exec rag-postgres` at
+# seven call sites, and its one fallback printed a LITERAL 't'/'f' instead of the
+# value. In this deployment Postgres is REMOTE — there is no rag-postgres
+# container — so every table check read empty and reported "table missing" for
+# ~25 tables that exist, and `SELECT count(*)` came back as the string "f",
+# which made `[[ "$X" -eq 0 ]]` evaluate `f` as an arithmetic variable and abort
+# the whole script under `set -u` ("f: unbound variable").
+#
+# The SQL is passed through the environment, not interpolated into the python
+# source, so quotes in a statement cannot break the command.
+#
+# The caller learns "ran" vs "could not run" from the EXIT STATUS, not a global:
+# `x=$(_run_sql ...)` runs the function in a SUBSHELL, so any variable it sets is
+# lost. Exit status propagates; a global does not. (Proven: `X=0; f(){ X=1; };
+# out=$(f); echo $X` prints 0.) On failure the error text is printed instead of a
+# result, so a caller that ignores the status still sees something non-numeric /
+# non-"t" rather than a silent empty string.
+#
+# "could not query" must never be reported as "missing" — that is the same
+# skip-vs-fail confusion that kept CI red (see tests/_container.py).
+_run_sql() {
+  local sql="$1" out=""
+  if docker ps --format '{{.Names}}' | grep -q '^rag-postgres$'; then
+    if out=$(docker exec rag-postgres psql -U app -d scans -tAc "$sql" 2>&1); then
+      printf '%s' "$out"; return 0
+    fi
+  fi
+  local c
+  for c in rag-api autogen-agents; do
+    docker ps --format '{{.Names}}' | grep -q "^${c}$" || continue
+    if out=$(docker exec -e SQL="$sql" "$c" python3 -c '
+import os, sys, psycopg2
+try:
+    conn = psycopg2.connect(os.environ["DB_DSN"])
+except Exception as exc:
+    sys.stderr.write("connect: %s" % exc); sys.exit(3)
+cur = conn.cursor()
+cur.execute(os.environ["SQL"])
+if cur.description:
+    for row in cur.fetchall():
+        print("|".join(
+            "t" if v is True else "f" if v is False else "" if v is None else str(v)
+            for v in row))
+' 2>&1); then
+      printf '%s' "$out"; return 0
+    fi
+  done
+  printf '%s' "${out:-no database reachable (tried rag-postgres, rag-api, autogen-agents)}"
+  return 1
+}
+
+# Numeric guard. `[[ "$x" -eq 0 ]]` on a non-numeric string sends bash into
+# arithmetic evaluation, where a bare word is a VARIABLE NAME — under `set -u`
+# that aborts the script instead of failing the comparison.
+_is_num() { [[ "${1:-}" =~ ^-?[0-9]+$ ]]; }
+
+_exists_sql() {  # $1 = kind (table|view), $2 = name
+  case "$1" in
+    table) echo "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema='public' AND table_name='$2')" ;;
+    view)  echo "SELECT EXISTS (SELECT FROM pg_views WHERE schemaname='public' AND viewname='$2')" ;;
+  esac
+}
+
+# Reports missing ONLY when the query actually RAN. $1=kind $2=name $3=label
+_check_object() {
+  local result rc
+  result=$(_run_sql "$(_exists_sql "$1" "$2")"); rc=$?
+  if (( rc != 0 )); then
+    warn "$3 — could not query the database (${result:0:90})"
+  elif [[ "$result" == "t" ]]; then
+    pass "$3"
+  else
+    fail "$3 — $1 missing"
+  fi
+}
+
 # ── 1. Database Tables ──
 echo ""
 echo "=== Database Tables ==="
@@ -88,6 +168,8 @@ EXPECTED_TABLES=(
   post_review_reports
   # TIER 27: Operator-declared scan parameters (app/rag-api/scan_parameters.py)
   scan_parameters
+  # TIER 28: WSTG guided manual checklist sign-off (app/rag-api/wstg_coverage.py)
+  wstg_manual_reviews
 )
 
 # Views that reports and the spray list depend on. A missing view fails only when
@@ -97,21 +179,11 @@ EXPECTED_VIEWS=(
 )
 
 for table in "${EXPECTED_TABLES[@]}"; do
-  result=$(docker exec rag-postgres psql -U app -d scans -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema='public' AND table_name='$table')" 2>/dev/null)
-  if [[ "$result" == "t" ]]; then
-    pass "$table"
-  else
-    fail "$table — table missing"
-  fi
+  _check_object table "$table" "$table"
 done
 
 for view in "${EXPECTED_VIEWS[@]}"; do
-  result=$(docker exec rag-postgres psql -U app -d scans -tAc "SELECT EXISTS (SELECT FROM pg_views WHERE schemaname='public' AND viewname='$view')" 2>/dev/null)
-  if [[ "$result" == "t" ]]; then
-    pass "$view (view)"
-  else
-    fail "$view (view) — view missing"
-  fi
+  _check_object view "$view" "$view (view)"
 done
 
 # Knowledge base content, not just schema. The table existing tells you nothing
@@ -124,9 +196,8 @@ done
 echo ""
 echo "  -- Knowledge base content --"
 SEED_FILES=$(ls knowledge/seed/*.yaml 2>/dev/null | wc -l | tr -d ' ')
-RULE_ROWS=$(docker exec rag-postgres psql -U app -d scans -tAc \
-  "SELECT COUNT(*) FROM public.service_prompts" 2>/dev/null || echo "")
-if [[ -z "$RULE_ROWS" ]]; then
+RULE_ROWS=$(_run_sql "SELECT COUNT(*) FROM public.service_prompts")
+if ! _is_num "$RULE_ROWS"; then
   warn "service_prompts — could not be queried"
 elif [[ "$RULE_ROWS" -gt 0 ]]; then
   pass "service_prompts — $RULE_ROWS rule(s) seeded"
@@ -143,35 +214,13 @@ echo ""
 echo "  -- Views --"
 EXPECTED_VIEWS=(detected_software v_infrastructure_findings)
 for view in "${EXPECTED_VIEWS[@]}"; do
-  result=$(docker exec rag-postgres psql -U app -d scans -tAc "SELECT EXISTS (SELECT FROM pg_views WHERE schemaname='public' AND viewname='$view')" 2>/dev/null)
-  if [[ "$result" == "t" ]]; then
-    pass "$view (view)"
-  else
-    fail "$view — view missing"
-  fi
+  _check_object view "$view" "$view (view)"
 done
 
 # Schema integrity: scope_targets must allow same target across engagements
 # Works for both local (rag-postgres container) and remote DB (via rag-api shell).
 echo ""
 echo "  -- scope_targets schema --"
-_run_sql() {
-  # Tries local rag-postgres first, falls back to rag-api which has DB_DSN env.
-  local sql="$1"
-  if docker ps --format '{{.Names}}' | grep -q '^rag-postgres$'; then
-    docker exec rag-postgres psql -U app -d scans -tAc "$sql" 2>/dev/null
-  elif docker ps --format '{{.Names}}' | grep -q '^rag-api$'; then
-    docker exec rag-api python3 -c "
-import os, psycopg2
-c = psycopg2.connect(os.environ['DB_DSN'])
-cur = c.cursor(); cur.execute(\"\"\"$sql\"\"\")
-r = cur.fetchone()
-print('t' if (r and r[0]) else 'f')
-" 2>/dev/null
-  else
-    echo ""
-  fi
-}
 HAS_LEGACY=$(_run_sql "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.scope_targets'::regclass AND conname='scope_targets_name_target_key')")
 if [[ "$HAS_LEGACY" == "f" ]]; then
   pass "scope_targets: legacy UNIQUE(name,target) constraint absent"
@@ -215,9 +264,8 @@ else
   warn "assets_hostname_not_ip check skipped (no DB connection helper available)"
 fi
 
-DUP_PORT_ROWS=$(docker exec rag-postgres psql -U app -d scans -tAc \
-  "SELECT (SELECT count(*) FROM ports) - (SELECT count(*) FROM (SELECT DISTINCT a.ip, p.proto, p.port FROM ports p JOIN assets a ON p.asset_id = a.id) d);" 2>/dev/null)
-if [[ -z "$DUP_PORT_ROWS" ]]; then
+DUP_PORT_ROWS=$(_run_sql "SELECT (SELECT count(*) FROM ports) - (SELECT count(*) FROM (SELECT DISTINCT a.ip, p.proto, p.port FROM ports p JOIN assets a ON p.asset_id = a.id) d);")
+if ! _is_num "$DUP_PORT_ROWS"; then
   warn "ports duplication check skipped (could not query)"
 elif [[ "$DUP_PORT_ROWS" -le 0 ]]; then
   pass "ports carry no (ip, proto, port) duplicates"
@@ -233,7 +281,7 @@ UNBRIDGED=$(_run_sql "SELECT count(*) FROM (
       FROM credential_findings cf WHERE cf.valid_cred IS TRUE) f
    WHERE NOT EXISTS (SELECT 1 FROM credential_vault cv
                       WHERE lower(cv.username) = f.u AND cv.domain = f.h)")
-if [[ -z "$UNBRIDGED" ]]; then
+if ! _is_num "$UNBRIDGED"; then
   warn "credential bridge check skipped (could not query)"
 elif [[ "$UNBRIDGED" -eq 0 ]]; then
   pass "every verified credential is present in credential_vault"
@@ -374,14 +422,46 @@ echo ""
 echo "=== Container Health ==="
 
 CONTAINERS=(
-  rag-postgres rag-api pentest-dashboard
+  rag-api pentest-dashboard
   playwright-scanner web-scanner nmap_scanner
   pd-runner osint-runner nuclei-runner brutus-runner
   scan-recommender container-logs node-manager
 )
 
+# rag-postgres is NOT in the list above. In remote / remote_direct mode the
+# database lives on a VPS and no such container exists here, so requiring it
+# reported a hard FAIL on a correctly-configured stack. What actually matters is
+# that the database is REACHABLE, which is what gets checked instead.
+# (It also produced the confusing bare "[FAIL] rag-postgres: " — `docker inspect`
+# on a missing object prints an empty line to stdout AND exits 1, so the
+# `|| echo not_found` appended to an empty line and matched no branch.)
+DB_MODE=$(python3 -c "
+import json
+try:
+    d = json.load(open('db-config.json'))
+except Exception:
+    d = {}
+print(d.get('mode') or (d.get('config') or {}).get('mode') or 'local')" 2>/dev/null || echo local)
+if docker ps --format '{{.Names}}' | grep -q '^rag-postgres$'; then
+  pgstatus=$(docker inspect --format='{{.State.Health.Status}}' rag-postgres 2>/dev/null)
+  if [[ "$pgstatus" == "healthy" || -z "$pgstatus" ]]; then
+    pass "rag-postgres: present (db mode: $DB_MODE)"
+  else
+    fail "rag-postgres: $pgstatus"
+  fi
+elif [[ "$DB_MODE" == "local" ]]; then
+  fail "rag-postgres: not running, but db mode is 'local'"
+else
+  if _run_sql "SELECT 1" >/dev/null 2>&1; then
+    pass "database reachable (db mode: $DB_MODE, no local rag-postgres — expected)"
+  else
+    fail "database unreachable (db mode: $DB_MODE) — $(_run_sql 'SELECT 1' 2>&1 | head -c 120)"
+  fi
+fi
+
 for cname in "${CONTAINERS[@]}"; do
-  status=$(docker inspect --format='{{.State.Health.Status}}' "$cname" 2>/dev/null || echo "not_found")
+  status=$(docker inspect --format='{{.State.Health.Status}}' "$cname" 2>/dev/null) || status="not_found"
+  [[ -z "$status" ]] && status="not_found"
   if [[ "$status" == "healthy" ]]; then
     pass "$cname: healthy"
   elif [[ "$status" == "starting" ]]; then
@@ -479,7 +559,7 @@ done
 echo ""
 echo "=== Webhooks ==="
 
-webhooks=$(docker exec rag-postgres psql -U app -d scans -tAc "SELECT name FROM webhooks ORDER BY name" 2>/dev/null)
+webhooks=$(_run_sql "SELECT name FROM webhooks ORDER BY name")
 for wh in event-log dashboard-bff; do
   if echo "$webhooks" | grep -q "$wh"; then
     pass "Webhook: $wh registered"
@@ -626,7 +706,7 @@ if [[ -n "$DASH" ]]; then
 
   RULES_JSON=$(docker exec "$DASH" curl -sk "https://127.0.0.1/api/artifacts/auto-queue" 2>/dev/null || true)
   RULES_N=$(echo "$RULES_JSON" | grep -o '"rules_loaded":[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
-  if [[ -z "$RULES_N" || "$RULES_N" -eq 0 ]]; then
+  if ! _is_num "$RULES_N" || [[ "$RULES_N" -eq 0 ]]; then
     fail "no artifact follow-on rules loaded — check knowledge/artifact_rules/builtin.yaml and the ./knowledge:/knowledge:ro mount"
   elif echo "$RULES_JSON" | grep -q '"rule_errors":[[:space:]]*\[[^]]'; then
     fail "artifact rule file has errors (those rules are not running): $(echo "$RULES_JSON" | grep -o '"rule_errors":.*')"
