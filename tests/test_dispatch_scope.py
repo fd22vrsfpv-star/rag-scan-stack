@@ -58,6 +58,58 @@ def in_scope(gate):
 SCOPE = [("192.168.1.150", "ip"), ("10.10.0.0/16", "cidr"), ("example.com", "domain")]
 
 
+# ── URL targets ─────────────────────────────────────────────────────────────
+#
+# Every web scan names a URL, and the DISPATCH side used to match the raw string:
+# `http://example.com/` was refused while `example.com` sat in scope as a domain
+# row. The ingest side already normalised via host_in_scope() -> _host_from_url(),
+# so the two sides disagreed — and the operator's way out was to add a scope row
+# per URL form, which is how scopes get sloppy.
+#
+# The negative cases below are the ones that matter: normalising must not turn
+# into substring matching, or an attacker-controlled URL that merely MENTIONS an
+# in-scope host would authorise itself.
+
+URL_IN_SCOPE = [
+    "http://example.com/",
+    "http://example.com",
+    "https://example.com:8443/path?q=1",
+    "http://sub.example.com/admin",
+    "http://192.168.1.150:80/",
+    "https://user:pw@example.com/x",          # credentials in the authority
+]
+
+URL_REFUSED = [
+    "http://evil.test/?next=example.com",     # in-scope host only in the query
+    "http://example.com.evil.test/",          # suffix attack
+    "http://evilexample.com/",                # no dot boundary
+    "http://notexample.com/",
+    "https://evil.test/example.com",          # in-scope host only in the path
+    "http://10.20.0.1/",                      # outside the CIDR
+]
+
+
+@pytest.mark.parametrize("url", URL_IN_SCOPE)
+def test_url_form_of_an_in_scope_host_is_allowed(gate, url):
+    assert gate.is_in_scope_with_aliases(url, SCOPE) is True, url
+
+
+@pytest.mark.parametrize("url", URL_REFUSED)
+def test_url_naming_an_in_scope_host_elsewhere_is_refused(gate, url):
+    assert gate.is_in_scope_with_aliases(url, SCOPE) is False, url
+
+
+def test_check_dispatch_accepts_a_url_target(gate):
+    """The end the callers actually use."""
+    assert gate.check_dispatch("http://example.com/", SCOPE) is None
+    refusal = gate.check_dispatch("http://evil.test/?x=example.com", SCOPE)
+    assert refusal and "not in the configured scope" in refusal
+
+
+def test_url_normalisation_still_fails_closed_on_empty_scope(gate):
+    assert gate.is_in_scope_with_aliases("http://example.com/", []) is False
+
+
 def test_exact_ip_is_in_scope(in_scope):
     assert in_scope("192.168.1.150", SCOPE) is True
 
