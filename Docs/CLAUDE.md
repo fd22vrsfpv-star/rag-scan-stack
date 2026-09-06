@@ -314,7 +314,16 @@ Every session, after reading these instructions, log each user prompt to PROMPT_
  this tool is designed for pentesters and redeam members, this is to collect data and help them with the workflow, the data collected will be used to import into manual tools to conduct security tests
 Start by proposing the architecture and initial folder structure, then implement the database schema + one parser end-to-end (including tests and sample fixture) before adding more parsers.
 
-for each change update the dashboard version to a date + timestamp. The version string must be updated in ALL THREE of these locations to stay in sync:
+for each change update the dashboard version to a date + timestamp. The version string must be updated in ALL FOUR of these locations to stay in sync:
 1. `dashboard/frontend/package.json` — the `"version"` field
 2. `dashboard/frontend/src/lib/constants.ts` — the `BUILD_VERSION` constant (displayed in the TopBar)
 3. `.env` — the `BUILD_VERSION` variable (injected into all service containers via docker-compose)
+4. `dashboard/frontend/package-lock.json` — the `version` field in BOTH places it appears
+   (top level and `packages[""]`). Added 2026-09-05 when the lockfile was committed:
+   `npm ci` refuses to install when it disagrees with `package.json`, so a missed bump
+   breaks the CI frontend job rather than just mislabelling the UI.
+
+**Run `scripts/update-version.sh <version>` instead of hand-editing** — it updates all
+four. *Enforced by:* `tests/test_build_version_sync.py` (pins the three tracked files;
+`.env` is gitignored and machine-local, so asserting on it would redden the suite for a
+file the repo does not control).
