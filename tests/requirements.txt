@@ -20,3 +20,8 @@ fastapi>=0.100           # routers imported by BFF tests
 pydantic>=2.0
 jinja2>=3.1
 beautifulsoup4>=4.12     # HTML extraction path in url_fetch
+
+# Undefined-name detection for service entrypoints (tests/test_undefined_names.py).
+# A NameError at import crash-loops a container; ast.parse and the CI flake8 step
+# (which runs with `|| true`) both miss it.
+pyflakes

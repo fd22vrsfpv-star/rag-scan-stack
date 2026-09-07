@@ -4445,7 +4445,12 @@ def ingest_microburst(
                 },
             )
 
-    path = _save_upload_to_tmp(file, tool="microburst", job_id=job_id, engagement_id=engagement_id)
+    # No job_id yet: the jobs row is INSERTed below, after the file is saved.
+    # This used to pass `job_id=job_id`, copied from /ingest/nmap where it IS a
+    # request parameter — here it is undefined, so every call to this endpoint
+    # raised NameError before touching the upload. `ast.parse` accepts it and
+    # the container reports healthy, which is why it survived.
+    path = _save_upload_to_tmp(file, tool="microburst", engagement_id=engagement_id)
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         eid = _resolve_engagement_id(engagement_id)
         cur.execute(
