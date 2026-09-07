@@ -827,6 +827,40 @@ def bounded_zap_http(timeout=None):
         _rq.Session.request = original
 
 
+def drain_zap_alerts(base_url: str, job_id: str = "", label: str = "progress") -> int:
+    """Ingest the alerts ZAP has found SO FAR. Returns the number newly stored.
+
+    WHY THIS EXISTS: alerts used to be collected only AFTER the active scan
+    finished, so anything that killed ZAP mid-scan lost every finding for that
+    run. That is not hypothetical — an active scan against demo.testfire.net
+    drove the JVM into GC thrash (passive rules went from milliseconds to 40-51
+    SECONDS each across 30 threads), the process died, and the scan completed
+    with 96 gowitness and 6 playwright findings and ZERO from ZAP.
+
+    Draining periodically means a ZAP death costs at most the last interval.
+
+    Idempotent by construction: parse_zap_alerts(dedupe=True) is the same ETL the
+    end-of-scan path uses, and it dedupes on insert — so calling it repeatedly
+    stores each alert once. No parallel write path, nothing to drift.
+    """
+    try:
+        import sys
+        sys.path.append("/scanner/etl")
+        from etl.parse_zap import parse_zap_alerts
+        stats = parse_zap_alerts(base_url=base_url, dedupe=True)
+        n = int(stats.get("inserted", 0) or 0)
+        if n:
+            logger.info(f"[ZAP] {label}: stored {n} new alert(s) mid-scan"
+                        + (f" [{job_id[:8]}]" if job_id else ""))
+        return n
+    except Exception as exc:                                       # noqa: BLE001
+        # Never fail the scan for a progressive save — the end-of-scan drain is
+        # still there. But log it: silently storing nothing is how the original
+        # problem stayed invisible.
+        logger.warning(f"[ZAP] progressive alert drain failed: {exc}")
+        return 0
+
+
 # ── Authenticated scanning ──────────────────────────────────────────────────
 #
 # Nine WSTG tests (ATHN-01/03/05/07, SESS-03/06/07/09, IDNT-04) cannot be
@@ -1220,22 +1254,33 @@ def _zap_scan_with_urls_inner(zap, url, discovered_urls, max_wait, progress_call
         except Exception as e:
             logger.debug(f"[ZAP] spider {s} failed: {e}")
     logger.info("[ZAP] Spider(s) complete")
+    # The PASSIVE scanner has been producing findings throughout the crawl, long
+    # before the active scan starts. Store them now rather than holding everything
+    # until the end — the active scan is the phase most likely to kill ZAP.
+    drain_zap_alerts(url, label="post-spider")
 
     # Active-scan the in-scope tree (recurse covers the seeded, now-spidered apps).
     logger.info(f"[ZAP] Starting active scan on {url} (in-scope, recursive)")
     aid = zap.ascan.scan(url, recurse=True, inscopeonly=True)
     waited = 0
     _last_cb_time = 0
+    _drain_every = int(os.environ.get("ZAP_DRAIN_INTERVAL", "60"))
+    _drained = 0
     while int(zap.ascan.status(aid)) < 100 and waited < max_wait:
         time.sleep(10)  # Poll every 10s to reduce overhead
         waited += 10
         if waited % 60 == 0:
             pct = int(zap.ascan.status(aid))
-            logger.info(f"[ZAP] Active scan progress: {pct}% ({waited}s elapsed)")
+            logger.info(f"[ZAP] Active scan progress: {pct}% ({waited}s elapsed, "
+                        f"{_drained} finding(s) stored so far)")
             if progress_callback and waited - _last_cb_time >= 90:
                 _last_cb_time = waited
                 eta = int(waited / max(pct, 1) * (100 - pct)) if pct > 0 else None
                 progress_callback(pct, eta)
+        # Store what has been found so far, so a ZAP death costs one interval
+        # rather than the entire scan.
+        if _drain_every and waited % _drain_every == 0:
+            _drained += drain_zap_alerts(url, label=f"active scan {waited}s")
 
     logger.info(f"[ZAP] Active scan complete on {url}")
 
