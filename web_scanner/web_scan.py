@@ -3,6 +3,7 @@ import os, time, subprocess, pathlib, re, uuid, threading, logging, shutil, json
 # import requests locally, and its except-block would have swallowed the
 # resulting NameError as a failed archive rather than a missing import.
 import requests
+import contextlib
 # Shared scan-slot accounting from the rag-common base image, so this
 # service honours the same MAX_CONCURRENT_SCANS ceiling as the runners.
 from tool_job import scan_slot
@@ -291,7 +292,13 @@ class JobTracker:
                 # lost exactly that way (the whole compose dependency graph is
                 # recreated whenever BUILD_VERSION changes in .env). Writing the
                 # running state is what makes _reconcile_orphaned_jobs possible.
-                if "status" in kwargs:
+                # Also on STAGE change: a pipeline sets status='running' once at
+                # the start and then walks seven stages without touching it, so
+                # persisting on status alone froze the record at 'initializing'.
+                # Two jobs wedged in zap_running were reconciled as
+                # `interrupted_at:initializing` — technically true, useless in
+                # practice, since where it died is the whole point of the field.
+                if "status" in kwargs or "stage" in kwargs:
                     self._persist(job_id)
 
     def push_command(self, job_id: str, stage: str, command: str):
@@ -772,6 +779,90 @@ def nikto_scan(url: str, timeout_sec=1800, tuning: Optional[str] = None) -> Dict
     return {"count": len(findings), "output_file": str(output_file)}
 
 
+# Every ZAP API call the zapv2 client makes is UNBOUNDED.
+#
+# zapv2._request_api builds a fresh `requests.Session()` per call and invokes
+# `session.request(...)` with no `timeout=`, and exposes no session to configure.
+# A call that never gets a response therefore blocks the thread for ever.
+#
+# Proven with a stack dump of a wedged pipeline, not inferred:
+#
+#     readinto (socket.py:720)
+#     getresponse (http/client.py:1430)
+#     _request_api (zapv2/__init__.py:177)
+#     include_in_context (zapv2/context.py:90)
+#     zap_scan_with_urls (web_scan.py:953)
+#
+# It had been sitting there ~25 minutes, before any spider was started, so the
+# stage produced nothing and the job never reached a terminal state.
+#
+# The fix injects a DEFAULT timeout only where the caller supplied none, for the
+# duration of the ZAP work. Calls that already pass `timeout=` are untouched, and
+# psycopg2 does not use `requests`, so database work is unaffected.
+ZAP_API_TIMEOUT = int(os.environ.get("ZAP_API_TIMEOUT", "60"))
+
+
+@contextlib.contextmanager
+def bounded_zap_http(timeout=None):
+    """Give every un-timed-out `requests` call inside this block a ceiling."""
+    import requests as _rq
+    original = _rq.Session.request
+    limit = timeout or ZAP_API_TIMEOUT
+
+    def _with_timeout(self, method, url, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = limit
+        return original(self, method, url, **kwargs)
+
+    _rq.Session.request = _with_timeout
+    try:
+        yield
+    finally:
+        _rq.Session.request = original
+
+
+# ZAP's spider has no server-side deadline, and neither did our wait loops.
+#
+# `max_wait` bounds only the ACTIVE scan (see its docstring); both spider loops
+# were `while status < 100: sleep()` with no ceiling at all. A spider that wedges
+# — observed live at 88% and 78% for 15+ minutes, unchanging across repeated
+# samples — therefore hangs the pipeline stage FOREVER. With _MAX_SPIDER_SEEDS=14
+# one bad seed strands the whole scan, the job never reaches a terminal state, and
+# its concurrency slot is never released.
+#
+# Per seed, not per scan: a slow seed must not consume the budget of the 13 after
+# it. On expiry the spider is stopped and the scan CONTINUES — a partial site tree
+# still feeds the active scan, and partial results beat a hung job.
+ZAP_SPIDER_MAX_WAIT = int(os.environ.get("ZAP_SPIDER_MAX_WAIT", "300"))
+
+
+def _await_spider(zap, sid, label, max_wait=None):
+    """Poll a ZAP spider to completion, bounded. Returns True if it finished."""
+    deadline = time.time() + (max_wait or ZAP_SPIDER_MAX_WAIT)
+    last = -1
+    while True:
+        try:
+            pct = int(zap.spider.status(sid))
+        except Exception as exc:                                  # noqa: BLE001
+            logger.warning(f"[ZAP] spider {label}: status unreadable ({exc}) — moving on")
+            return False
+        if pct >= 100:
+            return True
+        if time.time() >= deadline:
+            logger.warning(
+                f"[ZAP] spider {label} stopped at {pct}% after "
+                f"{max_wait or ZAP_SPIDER_MAX_WAIT}s — it was not progressing. "
+                "Continuing with a partial site tree.")
+            try:
+                zap.spider.stop(sid)
+            except Exception as exc:                              # noqa: BLE001
+                logger.debug(f"[ZAP] could not stop spider {label}: {exc}")
+            return False
+        if pct != last:
+            last = pct
+        time.sleep(2)
+
+
 def zap_scan(url: str, max_wait=900):
     """Run ZAP spider and active scan on target URL, then parse via ETL"""
     # Validate URL format
@@ -794,8 +885,7 @@ def zap_scan(url: str, max_wait=900):
     # Run spider
     logger.info(f"[ZAP] Starting spider on {url}")
     sid = zap.spider.scan(url)
-    while int(zap.spider.status(sid)) < 100:
-        time.sleep(3)  # Poll every 3s to reduce overhead
+    _await_spider(zap, sid, url)
     logger.info(f"[ZAP] Spider complete on {url}")
 
     # Run active scan
@@ -885,6 +975,13 @@ def zap_scan_with_urls(url: str, discovered_urls: Optional[List[str]] = None, ma
     proxies = {"http": f"http://{ZAP_ADDR}:{ZAP_PORT}", "https": f"http://{ZAP_ADDR}:{ZAP_PORT}"}
     zap = ZAPv2(apikey=ZAP_API_KEY, proxies=proxies)
 
+    with bounded_zap_http():
+        return _zap_scan_with_urls_inner(zap, url, discovered_urls, max_wait,
+                                         progress_callback)
+
+
+def _zap_scan_with_urls_inner(zap, url, discovered_urls, max_wait, progress_callback):
+    """The body of zap_scan_with_urls, run with every ZAP HTTP call bounded."""
     # SCOPE FIRST: the active scanner only attacks what is IN A CONTEXT/SCOPE.
     # Seeding the site tree (urlopen) is not enough — without scope, ascan skips
     # the gobuster/katana-discovered URLs. Put the target host (and every
@@ -909,14 +1006,39 @@ def zap_scan_with_urls(url: str, discovered_urls: Optional[List[str]] = None, ma
     logger.info(f"[ZAP] scope: {len(scope_pats)} host pattern(s) added to context '{ctx_name}'")
 
     # Seed every discovered URL into the site tree.
+    #
+    # BOUNDED, per seed and in total. `ZAPv2.urlopen` forwards **kwargs straight
+    # to `requests.get`, and without a timeout it blocks for ever on a URL the
+    # target never answers. That is not hypothetical: a pipeline logged
+    # "Stage 6: Running ZAP with 59 seeded URLs" and then produced nothing for
+    # 25+ minutes — no spider was ever started, because seeding never finished.
+    # A vulnerable-by-design target is exactly where a hanging endpoint is likely.
+    #
+    # The failure is also promoted from debug to warning: a silently skipped seed
+    # means the active scan never sees that URL, and the scan still reports success.
+    _SEED_TIMEOUT = int(os.environ.get("ZAP_SEED_TIMEOUT", "10"))
+    _SEED_BUDGET = int(os.environ.get("ZAP_SEED_BUDGET", "180"))
     seeds = list(dict.fromkeys([url] + list(discovered_urls or [])))
     if len(seeds) > 1:
         logger.info(f"[ZAP] Seeding {len(seeds)-1} discovered URL(s) into the site tree")
-    for s in seeds:
+    _seed_deadline = time.time() + _SEED_BUDGET
+    _seeded = _skipped = 0
+    for _i, s in enumerate(seeds):
+        if time.time() >= _seed_deadline:
+            logger.warning(
+                f"[ZAP] seeding budget ({_SEED_BUDGET}s) spent after {_seeded} URL(s); "
+                f"skipping the remaining {len(seeds) - _i}. The active scan will only "
+                "cover what was seeded.")
+            _skipped += len(seeds) - _i
+            break
         try:
-            zap.urlopen(s)
+            zap.urlopen(s, timeout=_SEED_TIMEOUT)
+            _seeded += 1
         except Exception as e:
-            logger.debug(f"[ZAP] Failed to seed {s}: {e}")
+            _skipped += 1
+            logger.warning(f"[ZAP] Failed to seed {s}: {e}")
+    if _skipped:
+        logger.warning(f"[ZAP] seeded {_seeded}/{len(seeds)} URL(s); {_skipped} skipped")
 
     # Spider the base AND each distinct seed (bounded) — not just the root — so
     # links/params INSIDE the discovered apps (/mutillidae, /dvwa) get into the
@@ -926,8 +1048,7 @@ def zap_scan_with_urls(url: str, discovered_urls: Optional[List[str]] = None, ma
         try:
             logger.info(f"[ZAP] Spidering {s}")
             sid = zap.spider.scan(s, contextname=ctx_name)
-            while int(zap.spider.status(sid)) < 100:
-                time.sleep(2)
+            _await_spider(zap, sid, s)
         except Exception as e:
             logger.debug(f"[ZAP] spider {s} failed: {e}")
     logger.info("[ZAP] Spider(s) complete")
@@ -2465,14 +2586,26 @@ def _run_content_recon(job_id: str, target_url: str, wordlist: Optional[str],
                 base_pattern = f"{parsed_target.scheme}://{parsed_target.netloc}.*"
                 zap.context.include_in_context(context_name, base_pattern)
 
-                # Seed all discovered URLs into ZAP site tree
+                # Seed all discovered URLs into ZAP site tree.
+                # Bounded exactly like the pipeline's seeding loop: urlopen has no
+                # default timeout, so one unanswering URL stalls content-recon
+                # indefinitely. `except Exception: pass` also made a skipped seed
+                # invisible — the count silently disagreed with reality.
+                _sd_timeout = int(os.environ.get("ZAP_SEED_TIMEOUT", "10"))
+                _sd_budget = int(os.environ.get("ZAP_SEED_BUDGET", "180"))
                 all_urls = list(dict.fromkeys([target_url] + discovered_urls))
-                for seed_url in all_urls:
+                _sd_deadline = time.time() + _sd_budget
+                for _n, seed_url in enumerate(all_urls):
+                    if time.time() >= _sd_deadline:
+                        logger.warning(
+                            f"[ZAP] seeding budget ({_sd_budget}s) spent; skipping "
+                            f"{len(all_urls) - _n} remaining URL(s)")
+                        break
                     try:
-                        zap.urlopen(seed_url)
+                        zap.urlopen(seed_url, timeout=_sd_timeout)
                         stats["zap_seeded"] += 1
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"[ZAP] Failed to seed {seed_url}: {e}")
 
                 # Record ZAP session in DB
                 with conn() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
