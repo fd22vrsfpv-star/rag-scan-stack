@@ -75,6 +75,17 @@ def test_in_flight_jobs_are_persisted_not_only_terminal_ones():
     )
 
 
+def test_stage_changes_are_persisted_too():
+    """A pipeline sets status='running' once and then walks seven stages. If only
+    status triggers a write, the record freezes at 'initializing' and the
+    reconciled job cannot say WHERE it died — which is the point of the field."""
+    body = _func(_src(), "update_job")
+    assert re.search(r'"stage"\s+in\s+kwargs', body), (
+        "update_job does not persist on stage changes — an interrupted job will "
+        "be reconciled as interrupted_at:initializing regardless of how far it got"
+    )
+
+
 def test_reconciliation_marks_non_terminal_as_failed_with_a_reason():
     body = _func(_src(), "_reconcile_orphaned_jobs")
     assert '"failed"' in body or "'failed'" in body, \
