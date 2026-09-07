@@ -167,6 +167,31 @@ def generator_wstg_ids():
     return ids
 
 
+#: Tests OWASP has RETIRED. Verified against the upstream WSTG repository — each
+#: of these documents contains only a redirect notice, which is why all eight
+#: ingested as header-only stubs. They are NOT an ingest bug: re-ingesting
+#: reproduces them exactly.
+#:
+#: Value = the successor test the content moved to, or None if removed outright.
+#:
+#: Why this matters to the number: the catalog's 98 includes these eight, so
+#: coverage was measured against a denominator containing tests that cannot be
+#: performed. A merged test is credited when its SUCCESSOR is covered — the work
+#: genuinely is done, under the id OWASP kept. A removed test is excluded from
+#: both the denominator and the gap list, because reporting "not covered" for a
+#: test that no longer exists is asking for work that cannot be done.
+DEPRECATED = {
+    "WSTG-INFO-09": "WSTG-INFO-08",   # merged: Fingerprint Web Application Framework
+    "WSTG-CONF-08": None,             # removed: Test RIA Cross Domain Policy
+    "WSTG-IDNT-05": "WSTG-IDNT-04",   # merged: Account Enumeration
+    "WSTG-ATHN-01": "WSTG-CRYP-03",   # merged: Sensitive Info over Unencrypted Channels
+    "WSTG-INPV-03": "WSTG-CONF-06",   # merged: Test HTTP Methods
+    "WSTG-INPV-13": None,             # removed: Buffer Overflow
+    "WSTG-ERRH-02": "WSTG-ERRH-01",   # merged: Improper Error Handling
+    "WSTG-CLNT-08": None,             # removed: Cross Site Flashing
+}
+
+
 def coverage_rules():
     return _load_yaml(_COV_PATH).get("rules") or []
 
@@ -197,26 +222,50 @@ def compute(findings, reviewed_ids=None):
     gen = generator_wstg_ids()
     ev = evidenced_ids(findings)
     reviewed = set(reviewed_ids or ())
+
+    # A test merged into another is covered when its successor is: the work is
+    # done, under the id OWASP kept. Resolved before the loop so the successor's
+    # own coverage is already known.
+    def _covered(cid):
+        return cid in gen or cid in ev or cid in reviewed
+
+    merged_covered = {
+        cid for cid, succ in DEPRECATED.items() if succ and _covered(succ)
+    }
+
     rows, by_cat = [], {}
     for cid, (name, tier) in CATALOG.items():
         fam = cid.split("-")[1]
         has_gen, evidenced = cid in gen, cid in ev
         manual_reviewed = cid in reviewed
-        covered = has_gen or evidenced or manual_reviewed
+        deprecated = cid in DEPRECATED
+        successor = DEPRECATED.get(cid)
+        covered = has_gen or evidenced or manual_reviewed or cid in merged_covered
         rows.append({"id": cid, "name": name, "category": fam, "auto_tier": tier,
                      "has_generator": has_gen, "evidenced": evidenced,
-                     "manual_reviewed": manual_reviewed, "covered": covered})
+                     "manual_reviewed": manual_reviewed, "covered": covered,
+                     "deprecated": deprecated, "merged_into": successor,
+                     "covered_via_successor": cid in merged_covered})
+        if deprecated and not successor:
+            continue                      # removed by OWASP — not a test any more
         c = by_cat.setdefault(fam, {"total": 0, "covered": 0})
         c["total"] += 1
         c["covered"] += 1 if covered else 0
-    total = len(rows)
-    covered = sum(1 for r in rows if r["covered"])
-    gaps_auto = [r["id"] for r in rows if not r["covered"] and r["auto_tier"] == "auto"]
-    gaps_manual = [r["id"] for r in rows if not r["covered"] and r["auto_tier"] == "manual"]
+    # Removed tests leave the denominator entirely; merged ones stay, because
+    # their successor's coverage is a real answer to them.
+    live = [r for r in rows if not (r["deprecated"] and not r["merged_into"])]
+    total = len(live)
+    covered = sum(1 for r in live if r["covered"])
+    gaps_auto = [r["id"] for r in live if not r["covered"] and r["auto_tier"] == "auto"]
+    gaps_manual = [r["id"] for r in live if not r["covered"] and r["auto_tier"] == "manual"]
     return {
         "summary": {
             "total": total, "covered": covered, "uncovered": total - covered,
             "pct_covered": round(100 * covered / total, 1) if total else 0.0,
+            "catalog_total": len(rows),
+            "retired": sum(1 for r in rows if r["deprecated"] and not r["merged_into"]),
+            "merged": sum(1 for r in rows if r["merged_into"]),
+            "covered_via_successor": sum(1 for r in rows if r["covered_via_successor"]),
             "with_generator": sum(1 for r in rows if r["has_generator"]),
             "evidenced": sum(1 for r in rows if r["evidenced"]),
             "manual_reviewed": sum(1 for r in rows if r["manual_reviewed"]),
