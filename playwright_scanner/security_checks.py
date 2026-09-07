@@ -499,9 +499,15 @@ class SecurityChecker:
 
     def check_client_side(self, client_signals, local_storage, session_storage, url):
         """WSTG client-side family from the live-browser signals:
-        DOM-XSS sinks (CLNT-01), unsafe JS execution (CLNT-02), unencrypted
-        WebSocket (CLNT-10), origin-less postMessage (CLNT-11), sensitive browser
-        storage (CLNT-12), cross-origin script without SRI (CLNT-13)."""
+        DOM-XSS sinks (CLNT-01), unsafe JS execution (CLNT-02), HTML injection by
+        reflection (CLNT-03), CSS injection sinks (CLNT-05), client-side resource
+        manipulation (CLNT-06), Flash objects (CLNT-08), unencrypted WebSocket
+        (CLNT-10), origin-less postMessage (CLNT-11), sensitive browser storage
+        (CLNT-12), cross-origin script without SRI (CLNT-13).
+
+        CLNT-03 keys on REFLECTION rather than on the innerHTML sinks, which are
+        already CLNT-01 — one signal reported under two ids would raise the
+        coverage number without testing anything more."""
         import re as _re
         findings = []
         cs = client_signals or {}
@@ -533,6 +539,31 @@ class SecurityChecker:
                 'postMessage Listener Without Origin Check (WSTG-CLNT-11)',
                 'A message event listener does not validate event.origin.',
                 'addEventListener("message", …) with no origin check', ['CWE-346'], 0.5))
+        if cs.get('reflectedParams'):
+            findings.append(_f('html-injection-reflected', 'medium',
+                'Query Parameter Reflected into Markup (WSTG-CLNT-03)',
+                'A query parameter is echoed back inside a tag or attribute, not '
+                'as text — the precondition for HTML injection. Confirm by hand '
+                'with a markup payload before reporting it as exploitable.',
+                cs['reflectedParams'][:3], ['CWE-79'], 0.4))
+        if cs.get('cssSinks'):
+            findings.append(_f('css-injection-sink', 'low',
+                'CSS Built From a URL-Controlled Value (WSTG-CLNT-05)',
+                'style.cssText / insertRule / setProperty is fed from a '
+                'location-derived value, which allows style and layout injection.',
+                cs['cssSinks'][:3], ['CWE-79'], 0.4))
+        if cs.get('resourceSinks'):
+            findings.append(_f('client-resource-manipulation', 'medium',
+                'Resource URL Built From a URL-Controlled Value (WSTG-CLNT-06)',
+                'A src/href/action, fetch, XHR or Worker target is derived from '
+                'the URL, so an attacker may redirect the resource the page loads.',
+                cs['resourceSinks'][:3], ['CWE-601'], 0.4))
+        if cs.get('flashObjects'):
+            findings.append(_f('flash-object', 'low',
+                'Flash Object Present (WSTG-CLNT-08)',
+                'An <object>/<embed> loads Flash content. Flash is end-of-life and '
+                'unpatched; cross-site flashing applies.',
+                cs['flashObjects'][:3], ['CWE-79'], 0.7))
         if cs.get('crossOriginNoSRI'):
             findings.append(_f('cross-origin-script-no-sri', 'low',
                 'Cross-Origin Script Without SRI (WSTG-CLNT-13)',
