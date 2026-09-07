@@ -36,19 +36,41 @@ class DOMAnalyzer:
         }
 
     async def get_client_security_signals(self) -> Dict:
-        """Heuristic static scan of the live page's scripts for client-side WSTG
-        signals: DOM-XSS sinks (CLNT-01), unsafe JS execution (CLNT-02),
-        unencrypted WebSockets (CLNT-10), origin-less postMessage listeners
-        (CLNT-11), and cross-origin scripts without SRI (CLNT-13)."""
+        """Heuristic static scan of the live page for client-side WSTG signals.
+
+        DOM-XSS sinks (CLNT-01), unsafe JS execution (CLNT-02), HTML injection by
+        reflection (CLNT-03), CSS injection sinks (CLNT-05), client-side resource
+        manipulation (CLNT-06), Flash objects (CLNT-08), unencrypted WebSockets
+        (CLNT-10), origin-less postMessage listeners (CLNT-11) and cross-origin
+        scripts without SRI (CLNT-13).
+
+        CLNT-03 deliberately uses REFLECTION, not the innerHTML sinks: those are
+        already CLNT-01, and reporting one signal under two ids would inflate
+        coverage without testing anything more. Reflection of a query parameter
+        into markup context is a genuinely different observation.
+
+        Nothing here injects a payload — it observes what the page already does
+        with the URL it was given, so it is safe to run against any target.
+        """
         try:
             return await self.page.evaluate(r"""() => {
                 const out = {domSinks:[], evalUse:false, insecureWS:false,
-                             postMessageNoOrigin:false, crossOriginNoSRI:[]};
+                             postMessageNoOrigin:false, crossOriginNoSRI:[],
+                             reflectedParams:[], cssSinks:[], resourceSinks:[],
+                             flashObjects:[]};
                 const sinkRe = /\.(innerHTML|outerHTML)\s*=|document\.write|insertAdjacentHTML/;
                 const evalRe = /\beval\s*\(|new\s+Function\s*\(|setTimeout\s*\(\s*['"`]/;
                 const wsRe   = /new\s+WebSocket\s*\(\s*['"`]ws:\/\//;
                 const pmRe   = /addEventListener\s*\(\s*['"`]message['"`]/;
                 const orgRe  = /\.origin\s*(===|==|!==|!=)|\.origin\.(indexOf|match|startsWith|includes)/;
+                // CLNT-05: a stylesheet or inline style built at runtime.
+                const cssRe  = /\.style\.cssText\s*=|insertRule\s*\(|\.setProperty\s*\(|styleSheets\[/;
+                // CLNT-06: a resource URL assigned at runtime — src/href/action,
+                // or a fetch/XHR/worker target.
+                const resRe  = /\.(src|href|action)\s*=|fetch\s*\(|XMLHttpRequest|\.open\s*\(|importScripts\s*\(|new\s+Worker\s*\(/;
+                // Only counts when the value can come from the URL — otherwise a
+                // static assignment would be reported as attacker-controllable.
+                const srcRe  = /(location|document\.URL|location\.hash|location\.search|document\.referrer|name)/;
                 document.querySelectorAll('script').forEach(s => {
                     if (s.src) {
                         try {
@@ -64,7 +86,36 @@ class DOMAnalyzer:
                     if (evalRe.test(t)) out.evalUse = true;
                     if (wsRe.test(t)) out.insecureWS = true;
                     if (pmRe.test(t) && !orgRe.test(t)) out.postMessageNoOrigin = true;
+                    if (cssRe.test(t) && srcRe.test(t))
+                        out.cssSinks.push(t.replace(/\s+/g,' ').slice(0,140));
+                    if (resRe.test(t) && srcRe.test(t))
+                        out.resourceSinks.push(t.replace(/\s+/g,' ').slice(0,140));
                 });
+
+                // CLNT-08: Flash. Rare in 2026 — absence is a true negative, and
+                // saying so is worth more than silently skipping the test.
+                document.querySelectorAll('object,embed').forEach(el => {
+                    const d = (el.getAttribute('data') || el.getAttribute('src') || '');
+                    const ty = (el.getAttribute('type') || '');
+                    if (/\.swf(\?|$)/i.test(d) || /shockwave-flash/i.test(ty))
+                        out.flashObjects.push((d || ty).slice(0,160));
+                });
+
+                // CLNT-03: does a query parameter come back inside MARKUP?
+                // Text-node reflection alone is not HTML injection.
+                try {
+                    const html = document.documentElement.outerHTML || '';
+                    new URL(location.href).searchParams.forEach((v, k) => {
+                        if (!v || v.length < 4) return;              // too short to be conclusive
+                        if (html.indexOf(v) === -1) return;          // not reflected at all
+                        const esc = v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                        // inside a tag (<... v ...>) or an attribute value
+                        const inMarkup = new RegExp('<[^>]*' + esc + '[^<]*>').test(html)
+                                      || new RegExp('=\\s*["\']?[^"\'>]*' + esc).test(html);
+                        if (inMarkup) out.reflectedParams.push({param: k, sample: v.slice(0,60)});
+                    });
+                } catch(e) {}
+
                 return out;
             }""")
         except Exception as e:

@@ -90,6 +90,44 @@ def test_zap_adds_discovered_sites_to_scope_before_scanning():
         "the pipeline must seed known vulnerable-app roots (DVWA/Mutillidae/...)")
 
 
+def test_playwright_covers_the_second_client_side_tier():
+    """Tier 3b: CLNT-03/05/06/08. Each needs a signal in dom_analyzer, an emitter
+    in security_checks, AND a rule in the coverage map — a signal with no rule is
+    collected and never credited, and a rule with no signal inflates nothing but
+    reads as covered work that does not exist.
+
+    CLNT-03 must key on REFLECTION, not the innerHTML sinks: those are already
+    CLNT-01, and crediting one observation to two ids raises the number without
+    testing anything more."""
+    import pathlib
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    dom = (repo / "playwright_scanner" / "dom_analyzer.py").read_text(encoding="utf-8")
+    sc = (repo / "playwright_scanner" / "security_checks.py").read_text(encoding="utf-8")
+    cov = (repo / "knowledge" / "wstg_coverage_map.yaml").read_text(encoding="utf-8")
+
+    for signal in ("reflectedParams", "cssSinks", "resourceSinks", "flashObjects"):
+        assert signal in dom, f"dom_analyzer does not collect {signal}"
+    for ft in ("html-injection-reflected", "css-injection-sink",
+               "client-resource-manipulation", "flash-object"):
+        assert ft in sc, f"security_checks does not emit {ft}"
+    for wid in ("CLNT-03", "CLNT-05", "CLNT-06", "CLNT-08"):
+        assert wid in sc, f"check_client_side must name WSTG-{wid}"
+        assert wid in cov, f"the coverage map has no rule for WSTG-{wid}"
+
+    # CLNT-03 must not simply re-report the CLNT-01 sinks. Anchor on the EMITTER
+    # (the finding title), not on the first mention of the id — that is in the
+    # docstring, which is what an earlier version of this assertion matched.
+    i = sc.index("(WSTG-CLNT-03)")
+    block = sc[max(0, i - 700):i]
+    assert "reflectedParams" in block, (
+        "CLNT-03 is not driven by reflection — if it keys on the innerHTML sinks "
+        "it is reporting the CLNT-01 signal twice"
+    )
+    assert "domSinks" not in block, (
+        "the CLNT-03 emitter reads domSinks, which is the CLNT-01 signal"
+    )
+
+
 def test_playwright_covers_client_side_wstg():
     """Tier 3: the Playwright scanner must emit the client-side WSTG family
     (CLNT-01/02/10/11/12/13) from live-browser signals, and the coverage map must

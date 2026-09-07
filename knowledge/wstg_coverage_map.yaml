@@ -56,6 +56,13 @@ rules:
   - {wstg_id: WSTG-CONF-10, sources: [subdomain_takeover]}
   # ── Tier 3: Playwright client-side family ──
   - {wstg_id: WSTG-CLNT-01, name_contains: [dom-based xss, dom xss sink, dom-xss]}
+  # Tier-3b: emitted by playwright_scanner check_client_side(). CLNT-03 keys on
+  # REFLECTION, not the innerHTML sinks — those are CLNT-01, and crediting one
+  # signal to two ids would raise coverage without testing anything more.
+  - {wstg_id: WSTG-CLNT-03, name_contains: [reflected into markup, html-injection-reflected, html injection]}
+  - {wstg_id: WSTG-CLNT-05, name_contains: [css injection, css-injection-sink, css built from]}
+  - {wstg_id: WSTG-CLNT-06, name_contains: [client-resource-manipulation, resource url built from, resource manipulation]}
+  - {wstg_id: WSTG-CLNT-08, name_contains: [flash object, flash-object, cross site flashing]}
   - {wstg_id: WSTG-CLNT-02, name_contains: [unsafe javascript execution, eval usage, dynamic code execution]}
   - {wstg_id: WSTG-CLNT-10, name_contains: [unencrypted websocket, insecure websocket, ws://]}
   - {wstg_id: WSTG-CLNT-11, name_contains: [postmessage, web messaging, message event]}
