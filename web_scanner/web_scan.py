@@ -298,7 +298,13 @@ class JobTracker:
                 # Two jobs wedged in zap_running were reconciled as
                 # `interrupted_at:initializing` — technically true, useless in
                 # practice, since where it died is the whole point of the field.
-                if "status" in kwargs or "stage" in kwargs:
+                # ...and on `stats`, which is where a pipeline's per-stage results
+                # and its `errors` list land. The pipeline sets the TERMINAL status
+                # first and the stats second, so persisting on status alone wrote
+                # the record before the summary existed: a job could read
+                # `completed_with_errors` with `stats: {}` — the status asserting a
+                # failure whose evidence was never saved, which is unactionable.
+                if "status" in kwargs or "stage" in kwargs or "stats" in kwargs:
                     self._persist(job_id)
 
     def push_command(self, job_id: str, stage: str, command: str):

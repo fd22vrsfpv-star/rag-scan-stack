@@ -221,7 +221,7 @@ def get_anthropic_config(
     api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
 
     # Autogen doesn't natively support Anthropic — fall back to Ollama for agent sessions
-    logger.warning("Anthropic is not natively supported by autogen agent sessions. "
+    log.warning("Anthropic is not natively supported by autogen agent sessions. "
                     "Falling back to Ollama for agent orchestration.")
     return get_ollama_config(temperature=temperature, timeout=timeout)
 
