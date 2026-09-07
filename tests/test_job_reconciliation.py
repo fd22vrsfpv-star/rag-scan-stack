@@ -86,6 +86,17 @@ def test_stage_changes_are_persisted_too():
     )
 
 
+def test_stats_are_persisted():
+    """A pipeline writes its terminal status BEFORE its stats, so persisting on
+    status alone saved the record while `stats` was still empty — producing a job
+    that reads `completed_with_errors` with no errors to show."""
+    body = _func(_src(), "update_job")
+    assert re.search(r'"stats"\s+in\s+kwargs', body), (
+        "update_job does not persist when stats are written — a completed "
+        "pipeline's errors and per-stage results never reach disk"
+    )
+
+
 def test_reconciliation_marks_non_terminal_as_failed_with_a_reason():
     body = _func(_src(), "_reconcile_orphaned_jobs")
     assert '"failed"' in body or "'failed'" in body, \

@@ -445,7 +445,7 @@ Use this for detailed service fingerprinting.""",
                 "service_detection": {
                     "type": "boolean",
                     "description": "Enable service detection (-sV) for detailed service/version fingerprinting (default: true)",
-                    "default": true
+                    "default": True
                 },
                 "version_intensity": {
                     "type": "integer",
@@ -457,7 +457,7 @@ Use this for detailed service fingerprinting.""",
                 "enable_scripts": {
                     "type": "boolean",
                     "description": "Enable NSE scripts for banner grabbing and vulnerability detection (default: true)",
-                    "default": true
+                    "default": True
                 }
             },
             "required": ["ip_address"]

@@ -2061,6 +2061,19 @@ services:
       SSH_EXTRA_OPTS: ${SSH_EXTRA_OPTS:-}
       # autossh monitoring port (0 = rely on ServerAlive)
       AUTOSSH_PORT: "0"
+    # Without this the container reports "Up" while doing nothing at all: when
+    # SSH_REMOTE_HOST is unset the command logs an error and `sleep infinity`, so
+    # the process is alive, docker is satisfied, and the operator sees a healthy
+    # tunnel that forwards nothing. It sat like that for 26 hours here.
+    #
+    # The check tests the thing that matters — is the SOCKS port accepting
+    # connections — rather than whether a process exists.
+    healthcheck:
+      test: ["CMD-SHELL", "[ -n \"$${SSH_REMOTE_HOST}\" ] && nc -z 127.0.0.1 $${SSH_SOCKS_PORT:-1080} || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     entrypoint: /bin/sh
     command:
       - -c

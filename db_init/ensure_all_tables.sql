@@ -1843,8 +1843,11 @@ CREATE INDEX IF NOT EXISTS exploit_chunks_created_at_idx ON public.exploit_chunk
 DO $$
 BEGIN
   IF (SELECT COUNT(*) FROM public.exploit_chunks) > 100 THEN
+    -- vector_cosine_ops: retrieval orders by `embedding <=> ...` (cosine). An
+    -- L2 opclass index cannot serve that ORDER BY, so the old one was dead
+    -- weight — maintained on every insert and never read.
     CREATE INDEX IF NOT EXISTS exploit_chunks_embedding_idx
-      ON public.exploit_chunks USING ivfflat (embedding vector_l2_ops) WITH (lists = 100);
+      ON public.exploit_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
   END IF;
 EXCEPTION WHEN OTHERS THEN NULL;
 END$$;
