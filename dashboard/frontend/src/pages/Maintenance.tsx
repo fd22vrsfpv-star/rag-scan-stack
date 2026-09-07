@@ -12,6 +12,7 @@ import {
   useSchemaApply,
   useKnowledgeStatus,
   useKnowledgeSeed,
+  useZapStatus,
   ImportResult,
 } from '@/api/maintenance'
 
@@ -310,6 +311,7 @@ export default function Maintenance() {
   const knowledgeStatus = useKnowledgeStatus()
   const knowledgeSeed = useKnowledgeSeed()
   const [repairMsg, setRepairMsg] = useState('')
+  const zapStatus = useZapStatus()
   const [rotateMsg, setRotateMsg] = useState<string>('')
 
   const setAge = (key: string, val: string) =>
@@ -799,6 +801,75 @@ export default function Maintenance() {
         </div>
         {repairMsg && (
           <p className="mt-3 text-xs font-mono text-primary break-words">{repairMsg}</p>
+        )}
+      </div>
+
+      {/* ZAP engine — the pipeline's slowest stage, and its most opaque */}
+      <div className="bg-card border border-border rounded-lg p-4">
+        <h3 className="text-sm font-semibold mb-3">ZAP Engine</h3>
+        <p className="text-xs text-muted-foreground mb-3">
+          <strong>Session size is the number that predicts a hang.</strong> ZAP never
+          resets its session on its own, and an oversized one makes it go
+          <em> selectively</em> deaf — cheap queries still answer while every context
+          operation blocks, so the scan appears healthy and never progresses. A
+          pipeline stuck at <code className="font-mono">zap_running</code> with no
+          scans below is waiting on something that no longer exists.
+        </p>
+        {zapStatus.isLoading ? (
+          <span className="text-xs text-muted-foreground">Checking ZAP…</span>
+        ) : zapStatus.isError ? (
+          <span className="text-xs text-destructive">ZAP status unavailable</span>
+        ) : !zapStatus.data?.reachable ? (
+          <div className="text-xs text-destructive">
+            ZAP is not answering — this is <strong>not</strong> the same as idle.
+            <div className="font-mono mt-1 break-words">{zapStatus.data?.error}</div>
+          </div>
+        ) : (
+          <>
+            <div className="flex items-center gap-2 mb-3 flex-wrap">
+              <span className="text-xs px-2 py-0.5 rounded border border-primary/40 bg-primary/10 text-primary font-mono">
+                v{zapStatus.data.version}
+              </span>
+              <span
+                className={`text-xs px-2 py-0.5 rounded border font-mono ${
+                  (zapStatus.data.messages ?? 0) > 20000 || zapStatus.data.session_warning
+                    ? 'border-destructive/40 bg-destructive/10 text-destructive'
+                    : 'border-border'
+                }`}
+              >
+                session: {zapStatus.data.messages ?? '—'} message(s)
+              </span>
+              <span className="text-xs px-2 py-0.5 rounded border border-border font-mono">
+                {zapStatus.data.busy
+                  ? `${zapStatus.data.running_count} scan(s) running`
+                  : 'idle'}
+              </span>
+              <button
+                onClick={() => zapStatus.refetch()}
+                className="ml-auto h-7 px-3 text-xs rounded border border-border hover:bg-muted/40"
+              >
+                Refresh
+              </button>
+            </div>
+            {zapStatus.data.session_warning && (
+              <p className="text-xs text-destructive mb-2">{zapStatus.data.session_warning}</p>
+            )}
+            {!zapStatus.data.busy && zapStatus.data.idle_but_expected_busy_hint && (
+              <p className="text-xs text-muted-foreground mb-2">
+                {zapStatus.data.idle_but_expected_busy_hint}
+              </p>
+            )}
+            {(zapStatus.data.spider?.length || zapStatus.data.active_scan?.length) ? (
+              <div className="text-xs font-mono text-muted-foreground space-y-0.5">
+                {(zapStatus.data.spider || []).map(s => (
+                  <div key={`sp-${s.id}`}>spider {s.id}: {s.progress}% {s.state}</div>
+                ))}
+                {(zapStatus.data.active_scan || []).map(s => (
+                  <div key={`as-${s.id}`}>ascan&nbsp; {s.id}: {s.progress}% {s.state}</div>
+                ))}
+              </div>
+            ) : null}
+          </>
         )}
       </div>
 

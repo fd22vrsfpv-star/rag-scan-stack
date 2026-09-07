@@ -394,3 +394,40 @@ export function useKnowledgeSeed() {
     },
   })
 }
+
+// ---- ZAP engine health ----
+//
+// The ZAP stage is the pipeline's slowest and its most opaque. `messages` is the
+// number that predicts a hang: an unbounded session (2.2 GB / 91% of the
+// container's memory was measured here) makes ZAP go selectively deaf — cheap
+// views still answer while every context action blocks. `reachable: false` is a
+// different state from idle and must not be shown as one.
+
+export interface ZapStatusScan {
+  id?: string
+  progress?: string
+  state?: string
+  url?: string | null
+}
+
+export interface ZapStatus {
+  reachable: boolean
+  version?: string
+  spider?: ZapStatusScan[]
+  active_scan?: ZapStatusScan[]
+  messages?: number | null
+  busy?: boolean
+  running_count?: number
+  session_warning?: string
+  idle_but_expected_busy_hint?: string | null
+  error?: string
+  detail?: string
+}
+
+export function useZapStatus() {
+  return useQuery({
+    queryKey: ['zap-status'],
+    queryFn: () => apiFetch<ZapStatus>('/zap/status'),
+    refetchInterval: POLL.BACKGROUND,
+  })
+}
