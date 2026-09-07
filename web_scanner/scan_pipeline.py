@@ -124,7 +124,8 @@ class WebScanPipeline:
     All discovery tools (1-4) run first so their URLs seed into ZAP.
     """
 
-    def __init__(self, job_tracker, gobuster_func, zap_func, nikto_func=None):
+    def __init__(self, job_tracker, gobuster_func, zap_func, nikto_func=None,
+                 auth=None):
         """
         Initialize pipeline with required dependencies.
 
@@ -138,6 +139,9 @@ class WebScanPipeline:
         self.gobuster_func = gobuster_func
         self.zap_func = zap_func
         self.nikto_func = nikto_func
+        # Optional ScanAuth. Held on the pipeline rather than threaded through
+        # run_pipeline's already long signature; _run_zap reads it.
+        self.auth = auth
         self.client = httpx.Client(verify=False, timeout=300.0)
 
     def run_pipeline(
@@ -530,7 +534,8 @@ class WebScanPipeline:
                         "alerts_found": zap_result.get("alerts_found", 0),
                         "alerts": zap_result.get("alerts", []),
                         "urls_seeded": len(context["urls"]),
-                        "xml_report": zap_result.get("xml_report")
+                        "xml_report": zap_result.get("xml_report"),
+                        "auth": zap_result.get("auth"),
                     }
                     logger.info(f"[{job_id[:8]}] ZAP found {zap_result.get('alerts_found', 0)} alerts")
 
@@ -853,11 +858,16 @@ class WebScanPipeline:
             Dict with 'alerts_found' count, 'alerts' list, and 'xml_report' path
         """
         from web_scan import zap_scan_with_urls
-        zap_result = zap_scan_with_urls(base_url, discovered_urls=discovered_urls)
+        zap_result = zap_scan_with_urls(base_url, discovered_urls=discovered_urls,
+                                        auth=getattr(self, "auth", None))
 
         result = {
             "alerts_found": zap_result["count"],
             "alerts": zap_result["alerts"],
+            # Whether ZAP actually authenticated. Surfaced so an operator can see
+            # that a scan ran UNauthenticated instead of assuming the ATHN/SESS
+            # results mean something.
+            "auth": zap_result.get("auth"),
         }
 
         # Export ZAP XML report after scan completes
