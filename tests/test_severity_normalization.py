@@ -69,8 +69,19 @@ def test_zap_adds_discovered_sites_to_scope_before_scanning():
     spider only the base -> fails."""
     import pathlib
     src = (pathlib.Path(__file__).resolve().parents[1] / "web_scanner" / "web_scan.py").read_text(encoding="utf-8")
-    fn = src[src.index("def zap_scan_with_urls("):]
-    fn = fn[:fn.index("\ndef ", 1)]
+
+    def _slice(name):
+        body = src[src.index(f"def {name}("):]
+        return body[:body.index("\ndef ", 1)]
+
+    # zap_scan_with_urls now only builds the client and delegates: the scope and
+    # spider wiring lives in _zap_scan_with_urls_inner, which runs inside
+    # bounded_zap_http() so no ZAP API call can block for ever. Both halves are
+    # the same code path, so the guard reads both.
+    fn = _slice("zap_scan_with_urls") + _slice("_zap_scan_with_urls_inner")
+    assert "bounded_zap_http" in fn, (
+        "the ZAP scan path must run inside bounded_zap_http() — the zapv2 client "
+        "issues every API call with no timeout and will otherwise hang for ever")
     assert "include_in_context" in fn, "discovered sites must be added to a ZAP context/scope"
     assert "for s in seeds" in fn, "each seed (not just the base) must be spidered"
     assert "inscopeonly=True" in fn, "active scan must run over the in-scope tree"
