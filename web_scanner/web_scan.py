@@ -827,6 +827,151 @@ def bounded_zap_http(timeout=None):
         _rq.Session.request = original
 
 
+# ── Authenticated scanning ──────────────────────────────────────────────────
+#
+# Nine WSTG tests (ATHN-01/03/05/07, SESS-03/06/07/09, IDNT-04) cannot be
+# answered by an unauthenticated scan: session fixation needs a pre- and
+# post-login session to compare, lockout needs repeated failures, timeout needs
+# an idle authenticated session. ZAP already implements all of this — form/json
+# authentication, cookie/header session management, users and forced-user mode —
+# so this wires the platform's credentials into ZAP's own machinery rather than
+# reimplementing login handling.
+#
+# Verified against the lab's DVWA before being written:
+# users.get_authentication_state went 0 -> a last-successful-login timestamp,
+# i.e. ZAP performed the login and held the session.
+#
+# CREDENTIALS ARE NEVER LOGGED. Only the username and the source are, and the
+# password is passed to ZAP and otherwise dropped.
+
+#: Vault credential_type values that hold a usable plaintext secret. A hash is
+#: useless for a form login and must not be sent as one — a scan that "ran" with
+#: an NTLM hash in the password field looks identical to one that authenticated.
+_PLAINTEXT_CRED_TYPES = ("password", "plaintext", "cleartext", "secret", "api_key", "token")
+
+
+class ScanAuth(BaseModel):
+    """Authentication for a scan. Either name a stored credential or supply one.
+
+    `credential_vault_id` selects a credential the platform already holds (from
+    post-ex collection, or one the operator added). `username`/`password` supply
+    one inline for a target the platform has never touched.
+    """
+    login_url: str
+    credential_vault_id: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    # {%username%} / {%password%} are ZAP's own substitution tokens.
+    login_request_data: str = "username={%username%}&password={%password%}&Login=Login"
+    method: str = "formBasedAuthentication"
+    session_management: str = "cookieBasedSessionManagement"
+    #: How ZAP decides it is authenticated. At least one is required — without
+    #: either, ZAP cannot detect a session drop and will happily scan the login
+    #: page over and over, reporting a clean authenticated pass that never was.
+    logged_in_regex: Optional[str] = None
+    logged_out_regex: Optional[str] = None
+
+    def resolved(self) -> tuple:
+        """Return (username, password, source). Raises ValueError if unusable."""
+        if self.credential_vault_id:
+            return _credential_from_vault(self.credential_vault_id)
+        if self.username and self.password:
+            return self.username, self.password, "inline"
+        raise ValueError(
+            "auth requires either credential_vault_id or username+password")
+
+
+def _credential_from_vault(vault_id: str) -> tuple:
+    """Look a credential up in credential_vault. Never logs the secret."""
+    with conn() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT username, credential_value, cracked_value, credential_type,
+                      status, domain
+                 FROM public.credential_vault WHERE id = %s::uuid""",
+            (vault_id,))
+        row = cur.fetchone()
+    if not row:
+        raise ValueError(f"no credential_vault row with id {vault_id}")
+    # cracked_value wins: if a hash was cracked, the plaintext is what logs in.
+    secret = (row.get("cracked_value") or "").strip() or (row.get("credential_value") or "").strip()
+    if not secret:
+        raise ValueError(
+            f"credential {vault_id} has no usable secret (credential_value and "
+            "cracked_value are both empty)")
+    ctype = (row.get("credential_type") or "").strip().lower()
+    if ctype and ctype not in _PLAINTEXT_CRED_TYPES:
+        raise ValueError(
+            f"credential {vault_id} is of type {ctype!r}, which is not a plaintext "
+            f"secret. Sending a hash as a form password produces a scan that looks "
+            f"authenticated and is not. Usable types: {', '.join(_PLAINTEXT_CRED_TYPES)}")
+    if not (row.get("username") or "").strip():
+        raise ValueError(f"credential {vault_id} has no username")
+    logger.info(f"[auth] using vault credential {vault_id} for user "
+                f"{row['username']!r} (type={ctype or 'unspecified'})")
+    return row["username"], secret, f"vault:{vault_id}"
+
+
+def configure_zap_auth(zap, context_name: str, auth: "ScanAuth", scope_regex: str):
+    """Set up ZAP authentication, session management and a forced user.
+
+    Returns {"context_id", "user_id", "username", "source", "authenticated"}.
+    Raises ValueError on a credential that cannot be used — a scan that silently
+    proceeds unauthenticated is the failure this must not produce.
+    """
+    import urllib.parse
+    username, password, source = auth.resolved()
+
+    if not (auth.logged_in_regex or auth.logged_out_regex):
+        raise ValueError(
+            "auth requires logged_in_regex or logged_out_regex: without one ZAP "
+            "cannot tell a live session from a logged-out one, and will scan the "
+            "login page while reporting an authenticated pass")
+
+    cid = zap.context.new_context(context_name)
+    zap.context.include_in_context(context_name, scope_regex)
+
+    cfg = urllib.parse.urlencode({
+        "loginUrl": auth.login_url,
+        "loginRequestData": auth.login_request_data,
+    })
+    zap.authentication.set_authentication_method(cid, auth.method, cfg)
+    zap.sessionManagement.set_session_management_method(cid, auth.session_management)
+    if auth.logged_in_regex:
+        zap.authentication.set_logged_in_indicator(cid, auth.logged_in_regex)
+    if auth.logged_out_regex:
+        zap.authentication.set_logged_out_indicator(cid, auth.logged_out_regex)
+
+    uid = zap.users.new_user(cid, f"scan-{username}")
+    zap.users.set_authentication_credentials(
+        cid, uid, urllib.parse.urlencode({"username": username, "password": password}))
+    zap.users.set_user_enabled(cid, uid, True)
+    zap.forcedUser.set_forced_user(cid, uid)
+    zap.forcedUser.set_forced_user_mode_enabled(True)
+
+    # Ask ZAP to log in NOW and confirm it worked, rather than discovering at the
+    # end that every request was unauthenticated. get_authentication_state returns
+    # a last-success timestamp; 0 means it never logged in.
+    authenticated = False
+    try:
+        zap.users.authenticate_as_user(cid, uid)
+        time.sleep(3)
+        state = str(zap.users.get_authentication_state(cid, uid) or "0")
+        authenticated = state not in ("0", "", "None")
+    except Exception as exc:                                       # noqa: BLE001
+        logger.warning(f"[auth] could not confirm login: {exc}")
+
+    if authenticated:
+        logger.info(f"[auth] ZAP authenticated as {username!r} (source={source})")
+    else:
+        logger.warning(
+            f"[auth] ZAP did NOT confirm a login for {username!r} (source={source}). "
+            "The scan will continue but its results are unauthenticated — check "
+            "login_url, login_request_data and the indicators.")
+
+    return {"context_id": cid, "user_id": uid, "username": username,
+            "source": source, "authenticated": authenticated}
+
+
 # ZAP's spider has no server-side deadline, and neither did our wait loops.
 #
 # `max_wait` bounds only the ACTIVE scan (see its docstring); both spider loops
@@ -949,6 +1094,7 @@ def zap_scan(url: str, max_wait=900):
 
 
 def zap_scan_with_urls(url: str, discovered_urls: Optional[List[str]] = None, max_wait=900,
+                       auth: Optional["ScanAuth"] = None,
                        progress_callback=None) -> Dict[str, Any]:
     """Run ZAP scan with pre-seeded URLs from Gobuster/Playwright.
 
@@ -983,10 +1129,11 @@ def zap_scan_with_urls(url: str, discovered_urls: Optional[List[str]] = None, ma
 
     with bounded_zap_http():
         return _zap_scan_with_urls_inner(zap, url, discovered_urls, max_wait,
-                                         progress_callback)
+                                         progress_callback, auth)
 
 
-def _zap_scan_with_urls_inner(zap, url, discovered_urls, max_wait, progress_callback):
+def _zap_scan_with_urls_inner(zap, url, discovered_urls, max_wait, progress_callback,
+                              auth=None):
     """The body of zap_scan_with_urls, run with every ZAP HTTP call bounded."""
     # SCOPE FIRST: the active scanner only attacks what is IN A CONTEXT/SCOPE.
     # Seeding the site tree (urlopen) is not enough — without scope, ascan skips
@@ -1010,6 +1157,21 @@ def _zap_scan_with_urls_inner(zap, url, discovered_urls, max_wait, progress_call
         except Exception as e:
             logger.debug(f"[ZAP] include_in_context {pat}: {e}")
     logger.info(f"[ZAP] scope: {len(scope_pats)} host pattern(s) added to context '{ctx_name}'")
+
+    # Authentication, if the caller supplied any. Configured BEFORE seeding and
+    # spidering so every request from here on carries the session — configuring
+    # it afterwards would leave the crawl unauthenticated, which is the whole
+    # thing this feature exists to avoid.
+    auth_info = None
+    if auth is not None:
+        try:
+            auth_info = configure_zap_auth(zap, ctx_name, auth,
+                                           _host_pat(url))
+        except ValueError as exc:
+            # A bad credential is the operator's mistake and must surface, not be
+            # swallowed into an unauthenticated scan reported as authenticated.
+            logger.error(f"[ZAP] authentication not configured: {exc}")
+            raise
 
     # Seed every discovered URL into the site tree.
     #
@@ -1131,7 +1293,7 @@ def _zap_scan_with_urls_inner(zap, url, discovered_urls, max_wait, progress_call
             count = len([a for a in raw_alerts if sev_map.get(a.get("risk"))])
         logger.info(f"[ZAP] Direct insertion: {count} findings saved")
 
-    return {"count": count, "alerts": raw_alerts}
+    return {"count": count, "alerts": raw_alerts, "auth": auth_info}
 
 
 app = FastAPI(title="Web Scanner")
@@ -1201,6 +1363,10 @@ class PipelineReq(BaseModel):
     skip_nikto: bool = False
     skip_katana: bool = False
     skip_wafw00f: bool = False
+    #: Optional authentication. When present the ZAP stage logs in and runs the
+    #: spider and active scan as that user, which is what makes the ATHN/SESS/IDNT
+    #: family testable at all.
+    auth: Optional[ScanAuth] = None
 
 
 class NiktoReq(BaseModel):
@@ -2813,7 +2979,8 @@ def _run_pipeline_scan_job(
     skip_nuclei: bool,
     skip_nikto: bool = False,
     skip_katana: bool = False,
-    skip_wafw00f: bool = False
+    skip_wafw00f: bool = False,
+    auth: Optional["ScanAuth"] = None,
 ):
     """Background task to run sequential scan pipeline with progress tracking"""
     try:
@@ -2835,7 +3002,8 @@ def _run_pipeline_scan_job(
             job_tracker=_job_tracker,
             gobuster_func=gobuster_dir_with_paths,
             zap_func=zap_scan_with_urls,
-            nikto_func=nikto_scan
+            nikto_func=nikto_scan,
+            auth=auth,
         )
 
         # Run the pipeline
@@ -3044,7 +3212,8 @@ def run_pipeline_scan(req: PipelineReq, background_tasks: BackgroundTasks):
         req.skip_nuclei,
         req.skip_nikto,
         req.skip_katana,
-        req.skip_wafw00f
+        req.skip_wafw00f,
+        req.auth,
     )
 
     return {
