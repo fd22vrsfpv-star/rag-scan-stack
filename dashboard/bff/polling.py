@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import logging
 import os
 import pathlib
@@ -43,6 +44,25 @@ def _persist(job_id: str):
     except Exception as e:
         log.debug("Failed to persist job %s: %s", job_id, e)
 
+
+# A scanner can answer `status: completed` while its payload says otherwise, so
+# the poller re-reads the result. These MUST be regexes: they were written as
+# regex strings and then used with `in`, i.e. a substring test —
+#
+#     "nmap.*timed out" in str(data).lower()
+#
+# `.*` never appears literally, so the whole nmap partial-detection branch was
+# unreachable and every partially-failed nmap was recorded as a clean success.
+# The timeout branch above it survived only because its first two conditions are
+# genuine substrings.
+_TIMEOUT_RE = re.compile(r"time(?:d\s*out|out)", re.I)
+_CMD_TIMEOUT_RE = re.compile(r"command\s+'.+?'\s+timed\s*out", re.I)
+_PARTIAL_RE = re.compile(
+    r"nmap.*timed\s*out"
+    r"|service\s*detection.*fail"
+    r"|phase\s*2.*error",
+    re.I | re.S,
+)
 
 _TERMINAL_STATUSES = {"completed", "finished", "failed", "cancelled", "canceled", "stopped", "lost", "error", "partial"}
 
@@ -399,18 +419,15 @@ async def _poll_once(client: httpx.AsyncClient):
                     # Check for timeout conditions in result data
                     result_data = data.get("result", {}) if isinstance(data.get("result"), dict) else {}
                     error_msg = data.get("error", "") or result_data.get("error", "")
+                    blob = str(data).lower()
 
                     # Detect timeout conditions
-                    if ("timeout" in str(error_msg).lower() or
-                        "timed out" in str(error_msg).lower() or
-                        "Command '.+' timed out" in str(data).lower()):
+                    if (_TIMEOUT_RE.search(str(error_msg)) or _CMD_TIMEOUT_RE.search(blob)):
                         new_status = "failed"
                         log.warning(f"Scan {job_id} marked as failed due to timeout: {error_msg}")
 
                     # Detect nmap service detection failures
-                    elif ("nmap.*timed out" in str(data).lower() or
-                          "service detection.*failed" in str(data).lower() or
-                          "phase2.*error" in str(data).lower()):
+                    elif _PARTIAL_RE.search(blob):
                         new_status = "partial"
                         log.warning(f"Scan {job_id} marked as partial due to service detection failure")
 

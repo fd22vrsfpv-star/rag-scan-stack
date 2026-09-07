@@ -417,7 +417,7 @@ def _env_num(name: str, default: float, cast=float):
     try:
         return cast(os.environ.get(name) or default)
     except (TypeError, ValueError):
-        logger.warning("bad %s=%r; using default %s", name,
+        _log.warning("bad %s=%r; using default %s", name,
                        os.environ.get(name), default)
         return cast(default)
 
@@ -556,7 +556,7 @@ def _invoke_with_backoff(agent, payload, config, *, session_id=None,
                 base = learned if learned and learned > 0 else _LLM_RATELIMIT_BASE_WAIT
                 wait = min(base * (2 ** attempt), _LLM_RATELIMIT_MAX_WAIT)
             attempt += 1
-            logger.warning(
+            _log.warning(
                 "%s rate-limited (429); backing off %.0fs before retry %d/%d",
                 agent_name or "LLM", wait, attempt, _LLM_RATELIMIT_MAX_RETRIES)
             if session_id is not None:
@@ -988,7 +988,7 @@ def _mark_approved(pending_id, who: str, note: str = None) -> None:
         import db_utils as _du
         _du.approve_exploit(pending_id, reviewed_by=who, notes=note)
     except Exception as _e:  # noqa: BLE001
-        logger.warning("approve_exploit(%s) failed: %s", pending_id, _e)
+        _log.warning("approve_exploit(%s) failed: %s", pending_id, _e)
 
 
 def exploit_exec(state: PentestState) -> dict:
