@@ -233,6 +233,11 @@ class WebScanPipeline:
         }
 
         try:
+            # Session hygiene FIRST, before any stage sends traffic through the
+            # ZAP proxy. Doing it later would discard the Playwright crawl, which
+            # goes through that proxy in stage 2.
+            context["zap_session"] = self._reset_zap_session_if_oversized(job_id)
+
             # Stage 0: wafw00f — WAF detection (runs first to inform tester)
             if not skip_wafw00f:
                 self._update_stage(job_id, "wafw00f", "running")
@@ -780,6 +785,60 @@ class WebScanPipeline:
         except Exception as e:
             logger.warning(f"Playwright crawl error: {e}")
             return result
+
+    # ZAP's session is never reset, so it accumulates every request and response
+    # from every scan for the lifetime of the container. Measured here: a single
+    # `untitled1` session had grown to 2.2 GB on disk with the container at
+    # 5.46 GiB of its 6 GiB limit — 91%.
+    #
+    # At that point ZAP does not fail, it goes SELECTIVELY deaf: cheap cached
+    # views (`core/view/mode`, `context/view/contextList`) still answer in ~1 ms,
+    # while anything touching the session store — numberOfMessages,
+    # numberOfAlerts, and every context ACTION — blocks indefinitely. Combined
+    # with a zapv2 client that sets no timeouts, that is what hung the ZAP stage.
+    #
+    # A restart took it from 5.46 GiB to 685 MiB and every one of those calls
+    # answered instantly again.
+    #
+    # Reset at pipeline START, not before the ZAP stage: Playwright crawls
+    # THROUGH the ZAP proxy in stage 2, so resetting later would discard the
+    # traffic the active scan is meant to attack.
+    ZAP_SESSION_MAX_MESSAGES = int(os.environ.get("ZAP_SESSION_MAX_MESSAGES", "20000"))
+
+    def _reset_zap_session_if_oversized(self, job_id: str = "") -> dict:
+        """Start a fresh ZAP session when the current one has grown too large.
+
+        Returns {"reset": bool, "messages": int|None, "reason": str}. Never
+        raises: a hygiene step must not fail the scan it is protecting.
+        """
+        import requests as _rq
+        base = f"http://{ZAP_ADDR}:{ZAP_PORT}"
+        params = {"apikey": ZAP_API_KEY}
+        try:
+            r = _rq.get(f"{base}/JSON/core/view/numberOfMessages/",
+                        params=params, timeout=10)
+            count = int((r.json() or {}).get("numberOfMessages", 0))
+        except Exception as exc:                                   # noqa: BLE001
+            # A timeout HERE is itself the symptom — the session store is already
+            # too big to answer. Reset on that basis rather than giving up.
+            logger.warning(
+                f"[{job_id[:8]}] ZAP message count unreadable ({exc}) — treating as "
+                "oversized and resetting the session")
+            count = None
+
+        if count is not None and count < self.ZAP_SESSION_MAX_MESSAGES:
+            return {"reset": False, "messages": count, "reason": "within limit"}
+
+        try:
+            _rq.get(f"{base}/JSON/core/action/newSession/", params=params, timeout=60)
+            logger.warning(
+                f"[{job_id[:8]}] started a fresh ZAP session (previous held "
+                f"{count if count is not None else 'an unreadable number of'} messages) — "
+                "an unbounded session is what makes ZAP's context API hang")
+            return {"reset": True, "messages": count, "reason": "oversized"}
+        except Exception as exc:                                   # noqa: BLE001
+            logger.error(f"[{job_id[:8]}] could not reset the ZAP session: {exc}")
+            return {"reset": False, "messages": count, "reason": f"reset failed: {exc}"}
 
     def _run_zap(self, base_url: str, discovered_urls: List[str], job_id: str = "") -> Dict[str, Any]:
         """

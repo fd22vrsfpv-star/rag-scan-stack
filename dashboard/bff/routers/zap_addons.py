@@ -57,6 +57,19 @@ async def zap_status():
                 "detail": "ZAP is not answering — this is NOT the same as idle"}
 
     out = {"reachable": True, "version": version, "spider": [], "active_scan": []}
+
+    # Session size is the number that predicts the failure. An unbounded session
+    # (2.2 GB / 91% of the container's memory was measured here) makes ZAP go
+    # selectively deaf: cheap views still answer, everything touching the session
+    # store hangs. If this view itself times out, that IS the symptom.
+    try:
+        out["messages"] = int((await _view("core/view/numberOfMessages")).get("numberOfMessages", 0))
+    except Exception as exc:                                       # noqa: BLE001
+        out["messages"] = None
+        out["session_warning"] = (
+            f"numberOfMessages did not answer ({str(exc)[:80]}) — the session store is "
+            "already too large to query. ZAP's context API will hang; restart it or "
+            "start a new session.")
     for key, path in (("spider", "spider/view/scans"),
                       ("active_scan", "ascan/view/scans")):
         try:
