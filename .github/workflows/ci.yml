@@ -17,7 +17,37 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install flake8
-      - name: Lint python
+      # Two passes, deliberately split.
+      #
+      # BLOCKING: syntax errors and undefined names only (E9, F63, F7, F82). An
+      # undefined name is always a bug — it crash-loops a container on import,
+      # and `ast.parse` accepts it. This used to be `flake8 … || true`, which
+      # discarded the result entirely, and the service directories that actually
+      # run in containers were not even in the list.
+      #
+      # F821 specifically, NOT the F82 prefix: that also selects F824 ("global X
+      # is unused"), which is a style nit and would make this pass fail on
+      # pre-existing code for no safety gain.
+      #
+      # `scanner` is deliberately absent from this list — that directory does not
+      # exist. The advisory pass below still names it, and flake8 answers
+      # `E902 FileNotFoundError`, which `|| true` has been swallowing.
+      #
+      # The two excluded files are ORPHANED FRAGMENTS, not modules: app/old_rag-api.py
+      # is 52 lines beginning mid-file with a bare `@app.post(...)` and no imports,
+      # and app/scan_recommender.py is a 24-line function body. Neither is imported
+      # by anything. They are excluded rather than deleted because removing files is
+      # a separate decision from turning the lint on.
+      - name: Lint python (errors only — blocking)
+        run: |
+          flake8 --select=E9,F63,F7,F821 --show-source \
+            --exclude app/old_rag-api.py,app/scan_recommender.py \
+            etl app nuclei web_scanner dashboard/bff scan_recommender \
+            kali_listener playwright_scanner nmap_scanner autogen_agents
+      # NON-BLOCKING: style. Kept advisory on purpose — a large existing codebase
+      # would fail on formatting alone, and that noise is what made the whole step
+      # `|| true` in the first place.
+      - name: Lint python (style — advisory)
         run: |
           flake8 etl app scanner nuclei || true
       - name: Byte-compile python

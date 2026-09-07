@@ -768,7 +768,9 @@ class ScanRequest(BaseModel):
 # Multi-stage orchestrated scan for 1–500 hosts. Creates a pipeline in
 # rag-api, then launches PipelineOrchestrator as a background asyncio task.
 
-_active_pipelines: dict[str, "PipelineOrchestrator"] = {}  # pipeline_id → orchestrator
+# noqa F821: "PipelineOrchestrator" is a forward reference in a string
+# annotation — never evaluated at runtime. flake8 cannot tell the two apart.
+_active_pipelines: dict[str, "PipelineOrchestrator"] = {}  # noqa: F821  # pipeline_id → orchestrator
 
 
 class PipelineRequest(BaseModel):
