@@ -7728,6 +7728,29 @@ def wstg_coverage(engagement_id: str, authorized: bool = Depends(auth)):
                 WHERE a.engagement_id = %s::uuid""",
             (engagement_id,))
         findings.extend(dict(r) for r in cur.fetchall())
+        # recon_findings — whatweb, httpx, tlsx, subfinder, dnsx and wafw00f write
+        # HERE, not to web_findings. The evidence rules in
+        # knowledge/wstg_coverage_map.yaml key on those sources (whatweb ->
+        # INFO-08/09, nmap -> CONF-01, subdomain_takeover -> CONF-10), so a rule
+        # could never fire: the query simply never opened the table.
+        #
+        # Same shape as the playwright_findings bug above — a rule keyed on a
+        # source whose table the coverage query does not read. Fingerprinting
+        # (INFO-08/09) was reported as an automatable gap on an engagement that
+        # HAD a whatweb finding for the host.
+        #
+        # `data` is jsonb and free-form per tool, so its text is folded into the
+        # name for name_contains matching; `finding_type` carries the issue kind.
+        cur.execute(
+            """SELECT rf.source AS source,
+                      COALESCE(rf.finding_type, '') || ' ' || COALESCE(rf.data::text, '') AS name,
+                      COALESCE(rf.finding_type, '') AS issue_type,
+                      COALESCE(rf.tags, ARRAY[]::text[]) AS tags
+                 FROM public.recon_findings rf
+                 JOIN public.assets a ON a.id = rf.asset_id
+                WHERE a.engagement_id = %s::uuid""",
+            (engagement_id,))
+        findings.extend(dict(r) for r in cur.fetchall())
         # Tier-4 manual reviews the operator has signed off count as covered.
         cur.execute(
             """SELECT wstg_id FROM public.wstg_manual_reviews
