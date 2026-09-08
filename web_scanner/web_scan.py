@@ -1042,6 +1042,38 @@ ZAP_MAX_ALERTS_PER_RULE = os.environ.get("ZAP_MAX_ALERTS_PER_RULE", "0")
 #: Keep passive scanning on during the active scan. Default off — see above.
 ZAP_PSCAN_DURING_ACTIVE_SCAN = os.environ.get("ZAP_PSCAN_DURING_ACTIVE_SCAN", "false")
 
+# ── Active-scanner bounds ─────────────────────────────────────────────────────
+#
+# ZAP ships the active scanner UNBOUNDED in all three dimensions that matter:
+# 64 threads per host, no per-rule time limit, no per-scan time limit. One rule
+# that misbehaves therefore misbehaves 64 times at once, for as long as it likes.
+#
+# Measured, on the scan that produced these defaults. With wappalyzer gone the
+# crawl held flat at 2.335 GiB for eight minutes — and then:
+#
+#   09:28:48  start host ... | DomXssScanRule strength MEDIUM
+#   09:29:36  WARN DomXssScanRule - Skipping scanner, failed to start browser:
+#             JdkWebSocket initial request execution error ... FirefoxDriver
+#   09:29:37  skipped plugin [failed to start or connect to the browser]
+#             in 48.935s with 118 message(s) sent
+#
+# 2.34 GiB -> 11.93 GiB in 78 seconds. DomXssScanRule launches Firefox through
+# Selenium, so 64 threads per host meant up to 64 concurrent browser launches,
+# each failing and retrying. Firefox IS in the image; geckodriver is not on PATH
+# and ZAP runs -silent, so Selenium Manager cannot fetch it. The rule costs
+# ~10 GiB and delivers a *skipped* plugin.
+#
+# THE RULE-DURATION BOUND IS THE GENERAL ONE. Capping threads fixes this rule;
+# capping per-rule runtime stops the NEXT one, whatever it turns out to be. Both
+# are cheap, so both are on.
+
+#: Concurrent active-scan threads per host. ZAP's default is 64.
+ZAP_THREAD_PER_HOST = os.environ.get("ZAP_THREAD_PER_HOST", "8")
+#: Minutes any single active-scan rule may run. ZAP's default is 0 = unlimited.
+ZAP_MAX_RULE_DURATION_MINS = os.environ.get("ZAP_MAX_RULE_DURATION_MINS", "5")
+#: Minutes a whole active scan may run. ZAP's default is 0 = unlimited.
+ZAP_MAX_SCAN_DURATION_MINS = os.environ.get("ZAP_MAX_SCAN_DURATION_MINS", "60")
+
 
 def _as_bool(v, default: bool = False) -> bool:
     """Parse an operator-supplied boolean. Unset/blank -> default."""
@@ -1068,6 +1100,12 @@ class ZapTuning(BaseModel):
     max_alerts_per_rule: Optional[int] = None
     #: Leave passive scanning enabled during the active scan.
     pscan_during_active_scan: Optional[bool] = None
+    #: Concurrent active-scan threads per host (ZAP default 64).
+    thread_per_host: Optional[int] = None
+    #: Minutes one active-scan rule may run; 0 = unlimited (ZAP default).
+    max_rule_duration_mins: Optional[int] = None
+    #: Minutes a whole active scan may run; 0 = unlimited (ZAP default).
+    max_scan_duration_mins: Optional[int] = None
 
     def resolved(self) -> dict:
         """Fold operator values over the env defaults into concrete settings."""
@@ -1082,7 +1120,25 @@ class ZapTuning(BaseModel):
                 f"[ZAP] max_alerts_per_rule {ZAP_MAX_ALERTS_PER_RULE!r} is not a "
                 "number — using 0 (unlimited)")
             max_alerts = 0
+        def _int(name, operator_value, env_value):
+            """Operator value wins; a non-numeric env default is loud, not silent."""
+            if operator_value is not None:
+                return int(operator_value)
+            try:
+                return int(env_value)
+            except (TypeError, ValueError):
+                logger.warning(f"[ZAP] {name} {env_value!r} is not a number — ignoring it")
+                return None
+
         return {
+            "thread_per_host": _int("thread_per_host", self.thread_per_host,
+                                    ZAP_THREAD_PER_HOST),
+            "max_rule_duration_mins": _int("max_rule_duration_mins",
+                                           self.max_rule_duration_mins,
+                                           ZAP_MAX_RULE_DURATION_MINS),
+            "max_scan_duration_mins": _int("max_scan_duration_mins",
+                                           self.max_scan_duration_mins,
+                                           ZAP_MAX_SCAN_DURATION_MINS),
             "disable_pscan_rules": [str(r) for r in rules],
             "pscan_only_in_scope": _as_bool(ZAP_PSCAN_ONLY_IN_SCOPE, True)
                 if self.pscan_only_in_scope is None else bool(self.pscan_only_in_scope),
@@ -1142,11 +1198,30 @@ def apply_zap_tuning(zap, tuning: Optional["ZapTuning"] = None) -> dict:
     _try("max_alerts_per_rule",
          lambda: zap.pscan.set_max_alerts_per_rule(settings["max_alerts_per_rule"]))
 
+    # Active-scanner bounds. A None means "leave ZAP's own default alone",
+    # which is what a malformed env value resolves to — better than substituting
+    # a number nobody chose.
+    if settings["thread_per_host"] is not None:
+        _try("thread_per_host",
+             lambda: zap.ascan.set_option_thread_per_host(settings["thread_per_host"]))
+    if settings["max_rule_duration_mins"] is not None:
+        _try("max_rule_duration_mins",
+             lambda: zap.ascan.set_option_max_rule_duration_in_mins(
+                 settings["max_rule_duration_mins"]))
+    if settings["max_scan_duration_mins"] is not None:
+        _try("max_scan_duration_mins",
+             lambda: zap.ascan.set_option_max_scan_duration_in_mins(
+                 settings["max_scan_duration_mins"]))
+
     logger.info(
         f"[ZAP] passive tuning: only_in_scope={settings['pscan_only_in_scope']} "
         f"max_alerts_per_rule={settings['max_alerts_per_rule']} "
         f"disabled={len(wanted)} rule(s) "
         f"pscan_during_active_scan={settings['pscan_during_active_scan']}")
+    logger.info(
+        f"[ZAP] active bounds: thread_per_host={settings['thread_per_host']} "
+        f"max_rule_duration_mins={settings['max_rule_duration_mins']} "
+        f"max_scan_duration_mins={settings['max_scan_duration_mins']}")
     return applied
 
 
@@ -1183,6 +1258,115 @@ def pscan_paused(zap, resume_setting: bool):
                 f"[ZAP] FAILED to re-enable passive scanning: {exc}. The next scan "
                 "in this ZAP session will have no passive findings until ZAP is "
                 "restarted.")
+
+
+# ── Active scan, split into per-category passes ───────────────────────────────
+#
+# ZAP already partitions every active-scan rule into five policy CATEGORIES, so
+# the natural unit for splitting a scan is the one ZAP itself uses — no custom
+# rule lists to maintain, and `set_enabled_policies` gates them directly.
+#
+# WHY SPLIT AT ALL: a single monolithic active scan is all-or-nothing. When one
+# rule wedged or blew up memory, the whole scan died and everything after it in
+# the run never executed. Observed: DomXssScanRule drove ZAP from 2.34 GiB to
+# 11.93 GiB in 78 seconds, killing a scan that still had rules to run.
+#
+# Split into passes, one bad category costs one category. Each pass drains its
+# findings before the next begins, so a later crash cannot take the earlier
+# passes' results with it.
+#
+# ORDER IS DELIBERATE. Client Browser runs LAST because it is the one that
+# launches a real browser (DomXssScanRule → Firefox via Selenium) and is by far
+# the likeliest to fail. Everything cheap and reliable is already stored by the
+# time it runs.
+#
+#: (policy id, label) in execution order. Ids are ZAP's own — verified live
+#: against ascan/view/policies on 2.16.1.
+ZAP_ASCAN_CATEGORIES = (
+    (4, "Injection"),
+    (2, "Server Security"),
+    (0, "Information Gathering"),
+    (3, "Miscellaneous"),
+    (1, "Client Browser"),
+)
+#: Split the active scan by category. Off keeps the single-pass behaviour.
+ZAP_ASCAN_SPLIT = os.environ.get("ZAP_ASCAN_SPLIT", "true")
+
+
+@contextlib.contextmanager
+def ascan_policies_restored(zap):
+    """Restore whichever active-scan policies were enabled, however we exit.
+
+    Policy enablement is SERVER-global and survives the scan. Leaving a subset
+    enabled would silently cripple every later scan in this ZAP — the same
+    cross-scan capability loss pscan_paused() guards against, and just as
+    invisible from the outside.
+    """
+    before = None
+    try:
+        before = [str(p.get("id")) for p in zap.ascan.policies()
+                  if str(p.get("enabled")).lower() == "true"]
+    except Exception as exc:                                       # noqa: BLE001
+        logger.warning(f"[ZAP] could not read enabled policies: {exc}")
+    try:
+        yield
+    finally:
+        # Fall back to all five rather than leaving a partial set behind: an
+        # unreadable "before" must not become a permanently narrowed scanner.
+        restore = before or [str(pid) for pid, _ in ZAP_ASCAN_CATEGORIES]
+        try:
+            zap.ascan.set_enabled_policies(",".join(restore))
+            logger.info(f"[ZAP] active-scan policies restored: {','.join(restore)}")
+        except Exception as exc:                                   # noqa: BLE001
+            logger.error(
+                f"[ZAP] FAILED to restore active-scan policies ({exc}). This ZAP "
+                f"will run only policies {before} until it is restarted.")
+
+
+def _run_active_pass(zap, url, max_wait, drain_every, progress_callback,
+                     label, drained_so_far=0):
+    """One bounded active scan. Returns (findings_stored, finished_cleanly).
+
+    Never raises for a ZAP-side failure: a pass that dies must not take the
+    passes after it with it — that is the whole point of splitting.
+    """
+    waited, last_cb, drained = 0, 0, 0
+    try:
+        aid = zap.ascan.scan(url, recurse=True, inscopeonly=True)
+    except Exception as exc:                                       # noqa: BLE001
+        logger.warning(f"[ZAP] {label}: could not start ({exc}) — skipping this pass")
+        return 0, False
+
+    while True:
+        try:
+            pct = int(zap.ascan.status(aid))
+        except Exception as exc:                                   # noqa: BLE001
+            logger.warning(
+                f"[ZAP] {label}: unreachable after {waited}s ({exc}). Findings "
+                f"stored so far are safe; continuing with the next pass.")
+            return drained, False
+        if pct >= 100:
+            logger.info(f"[ZAP] {label}: complete ({waited}s, {drained} stored)")
+            return drained, True
+        if waited >= max_wait:
+            logger.warning(f"[ZAP] {label}: budget {max_wait}s spent at {pct}% — "
+                           "stopping this pass and moving on")
+            try:
+                zap.ascan.stop(aid)
+            except Exception:                                      # noqa: BLE001
+                pass
+            return drained, False
+        time.sleep(10)
+        waited += 10
+        if waited % 60 == 0:
+            logger.info(f"[ZAP] {label}: {pct}% ({waited}s, "
+                        f"{drained_so_far + drained} finding(s) stored so far)")
+            if progress_callback and waited - last_cb >= 90:
+                last_cb = waited
+                eta = int(waited / max(pct, 1) * (100 - pct)) if pct > 0 else None
+                progress_callback(pct, eta)
+        if drain_every and waited % drain_every == 0:
+            drained += drain_zap_alerts(url, label=f"{label} {waited}s")
 
 
 # ZAP's spider has no server-side deadline, and neither did our wait loops.
@@ -1448,33 +1632,48 @@ def _zap_scan_with_urls_inner(zap, url, discovered_urls, max_wait, progress_call
     # Passive scanning is paused for this block by default: the active scan is
     # what generates the message volume that overruns the passive queue, and the
     # crawl's passive findings are already banked by the drain above.
-    logger.info(f"[ZAP] Starting active scan on {url} (in-scope, recursive)")
-    waited = 0
-    _last_cb_time = 0
     _drain_every = int(os.environ.get("ZAP_DRAIN_INTERVAL", "60"))
     _drained = 0
-    # `with`, not enter/exit by hand: an exception anywhere in the loop must
-    # still restore passive scanning, or the NEXT scan in this ZAP session
-    # silently produces no passive findings.
+    _split = _as_bool(ZAP_ASCAN_SPLIT, True)
+    # `with`, not enter/exit by hand: an exception anywhere below must still
+    # restore passive scanning, or the NEXT scan in this ZAP session silently
+    # produces no passive findings.
     with pscan_paused(zap, _tuning["requested"]["pscan_during_active_scan"]):
-        aid = zap.ascan.scan(url, recurse=True, inscopeonly=True)
-        while int(zap.ascan.status(aid)) < 100 and waited < max_wait:
-            time.sleep(10)  # Poll every 10s to reduce overhead
-            waited += 10
-            if waited % 60 == 0:
-                pct = int(zap.ascan.status(aid))
-                logger.info(f"[ZAP] Active scan progress: {pct}% ({waited}s elapsed, "
-                            f"{_drained} finding(s) stored so far)")
-                if progress_callback and waited - _last_cb_time >= 90:
-                    _last_cb_time = waited
-                    eta = int(waited / max(pct, 1) * (100 - pct)) if pct > 0 else None
-                    progress_callback(pct, eta)
-            # Store what has been found so far, so a ZAP death costs one interval
-            # rather than the entire scan.
-            if _drain_every and waited % _drain_every == 0:
-                _drained += drain_zap_alerts(url, label=f"active scan {waited}s")
+        if not _split:
+            logger.info(f"[ZAP] Starting active scan on {url} (in-scope, recursive)")
+            n, _ok = _run_active_pass(zap, url, max_wait, _drain_every,
+                                      progress_callback, "active scan")
+            _drained += n
+        else:
+            # Per-category passes. Each pass gets an equal share of the budget so
+            # one slow category cannot consume the whole window and starve the
+            # rest — the failure the split exists to prevent.
+            cats = ZAP_ASCAN_CATEGORIES
+            per_pass = max(60, int(max_wait / max(len(cats), 1)))
+            logger.info(
+                f"[ZAP] Active scan on {url}: {len(cats)} category pass(es), "
+                f"{per_pass}s each, Client Browser last "
+                f"(order: {', '.join(label for _, label in cats)})")
+            completed = []
+            with ascan_policies_restored(zap):
+                for pid, label in cats:
+                    try:
+                        zap.ascan.set_enabled_policies(str(pid))
+                    except Exception as exc:                       # noqa: BLE001
+                        logger.warning(f"[ZAP] could not select policy {label}: {exc}")
+                        continue
+                    n, ok = _run_active_pass(
+                        zap, url, per_pass, _drain_every, progress_callback,
+                        f"active scan [{label}]", drained_so_far=_drained)
+                    _drained += n
+                    completed.append(f"{label}{'' if ok else ' (incomplete)'}")
+                    # Bank this pass before the next one starts. Without it a
+                    # later category that kills ZAP takes the earlier passes'
+                    # findings with it, which is the thing splitting prevents.
+                    _drained += drain_zap_alerts(url, label=f"after {label}")
+            logger.info(f"[ZAP] Active scan passes: {'; '.join(completed) or 'none ran'}")
 
-    logger.info(f"[ZAP] Active scan complete on {url}")
+    logger.info(f"[ZAP] Active scan complete on {url} ({_drained} finding(s) stored)")
 
     # Fetch raw alerts via ZAP Python API (reliable, doesn't use HTTP requests)
     raw_alerts = []
