@@ -69,13 +69,45 @@ def test_the_drain_never_fails_the_scan():
 
 
 def test_the_active_scan_loop_drains_periodically():
-    """The active scan is the phase that killed ZAP."""
-    body = _func(_src(), "_zap_scan_with_urls_inner")
+    """The active scan is the phase that killed ZAP.
+
+    The wait loop moved out of _zap_scan_with_urls_inner and into
+    _run_active_pass when the active scan was split into per-category passes.
+    The guard follows the code: find whichever function actually polls
+    ascan.status, and require the drain inside it. Anchoring on the old
+    location would have quietly stopped checking anything.
+    """
+    src = _src()
+    holder = None
+    for name in ("_run_active_pass", "_zap_scan_with_urls_inner"):
+        try:
+            body = _func(src, name)
+        except AssertionError:
+            continue
+        if "ascan.scan(" in body and "ascan.status(" in body:
+            holder = (name, body)
+            break
+    assert holder, (
+        "no function both starts an active scan and polls its status — the "
+        "active-scan loop has moved again and this guard cannot see it"
+    )
+    name, body = holder
     loop = body[body.index("ascan.scan("):]
-    loop = loop[:loop.index("Active scan complete")] if "Active scan complete" in loop else loop
     assert "drain_zap_alerts" in loop, (
-        "the active-scan wait loop never stores findings, so a ZAP death during "
-        "it loses the whole scan"
+        f"{name}() never stores findings while the active scan runs, so a ZAP "
+        "death during it loses the whole scan"
+    )
+
+
+def test_findings_are_banked_between_category_passes():
+    """The split adds a second place a death can cost findings: the gap between
+    passes. Each pass must bank before the next begins."""
+    body = _func(_src(), "_zap_scan_with_urls_inner")
+    if "ZAP_ASCAN_CATEGORIES" not in body:
+        pytest.skip("active scan is not split into category passes")
+    assert 'drain_zap_alerts(url, label=f"after {label}")' in body, (
+        "no drain between passes — a later category that kills ZAP takes the "
+        "earlier passes' findings with it"
     )
 
 

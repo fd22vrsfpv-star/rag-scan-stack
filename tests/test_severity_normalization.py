@@ -78,7 +78,11 @@ def test_zap_adds_discovered_sites_to_scope_before_scanning():
     # spider wiring lives in _zap_scan_with_urls_inner, which runs inside
     # bounded_zap_http() so no ZAP API call can block for ever. Both halves are
     # the same code path, so the guard reads both.
-    fn = _slice("zap_scan_with_urls") + _slice("_zap_scan_with_urls_inner")
+    # _run_active_pass is the third half: the active scan was split into
+    # per-category passes, so ascan.scan() and its inscopeonly flag now live
+    # there rather than inline in _zap_scan_with_urls_inner.
+    fn = (_slice("zap_scan_with_urls") + _slice("_zap_scan_with_urls_inner")
+          + _slice("_run_active_pass"))
     assert "bounded_zap_http" in fn, (
         "the ZAP scan path must run inside bounded_zap_http() — the zapv2 client "
         "issues every API call with no timeout and will otherwise hang for ever")
