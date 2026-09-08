@@ -1167,6 +1167,37 @@ ZAP_DISABLE_PSCAN_RULES=
 # rather than every finding in the run.
 ZAP_DRAIN_INTERVAL=60
 
+# ── ZAP active-scanner bounds ────────────────────────────────────────────────
+# ZAP ships the active scanner UNBOUNDED in all three dimensions that matter:
+# 64 threads per host, no per-rule time limit, no per-scan time limit. One rule
+# that misbehaves therefore misbehaves 64 times at once, for as long as it likes.
+#
+# Measured: with wappalyzer gone the crawl held flat at 2.335 GiB for eight
+# minutes, then DomXssScanRule started and memory went 2.34 -> 11.93 GiB in 78
+# seconds. That rule launches Firefox through Selenium, so 64 threads meant up to
+# 64 concurrent browser launches, each failing ("failed to start browser:
+# JdkWebSocket initial request execution error") and retrying. It then logged
+# "skipped plugin" — ~10 GiB spent to deliver nothing.
+#
+# The rule-duration bound is the GENERAL one: capping threads fixes that rule,
+# capping per-rule runtime stops whichever rule runs away next.
+ZAP_THREAD_PER_HOST=8
+ZAP_MAX_RULE_DURATION_MINS=5
+ZAP_MAX_SCAN_DURATION_MINS=60
+
+# Split the ZAP active scan into per-category passes. ZAP partitions every
+# active-scan rule into five policy categories, so that is the natural unit —
+# no custom rule lists, and set_enabled_policies gates them directly.
+#
+# WHY: a monolithic active scan is all-or-nothing. DomXssScanRule drove ZAP from
+# 2.34 to 11.93 GiB in 78 seconds and killed a scan that still had rules left to
+# run. Split, one bad category costs one category; each pass banks its findings
+# before the next starts. Client Browser runs LAST because it launches a real
+# browser and is by far the likeliest to fail.
+#
+# Set to false for the old single-pass behaviour.
+ZAP_ASCAN_SPLIT=true
+
 # Kong API Gateway Admin Token
 KONG_ADMIN_TOKEN=${KONG_ADMIN_TOKEN}
 

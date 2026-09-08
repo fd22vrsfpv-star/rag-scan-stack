@@ -76,7 +76,7 @@ model".
 1. `_enforce_scan_scope` — the authorization gate
 2. `_apply_port_profile`
 3. `_apply_web_profile`
-4. `_check_proxy_required`
+4. `_check_proxy_required` — see the note below; it checks *presence*, not effect
 5. `_check_scan_limit` → **429** at `scans.py:154`
 
 ### 1.2 The scope gate — fail closed
@@ -523,9 +523,26 @@ Refusals are **labelled, not raised**: an out-of-scope pipeline returns
 `{"blocked": "out_of_scope", …}` and marks the job `status="blocked"` (`scan_pipeline.py:180-206`), which is
 also a first-class value in the `playwright_scans.status` CHECK constraint.
 
-> ZAP's context is set up *before* scanning (`web_scan.py:832-853`) — without an explicit context the active
-> scanner silently skips the gobuster/katana URLs, which is a quiet way to get a clean report that means
-> nothing.
+> ZAP's context is set up *before* scanning (`_zap_scan_with_urls_inner`, `web_scan.py:1617`) — without an
+> explicit context the active scanner silently skips the gobuster/katana URLs, which is a quiet way to get a
+> clean report that means nothing.
+
+> **Updated 2026-09-08 — the ZAP stage no longer behaves as described above alone.** Four changes, each with
+> its own controls (full reference: `Docs/WEB_SCAN_TUNING.md`):
+>
+> 1. **Findings are stored as they are found** — after the spiders and every `ZAP_DRAIN_INTERVAL` seconds
+>    during the active scan (`drain_zap_alerts`, `web_scan.py:914`), so a ZAP death costs one interval rather
+>    than the whole run.
+> 2. **Passive scanning is paused for the active scan** by default (`pscan_paused`, `:1313`), and restored in
+>    a `finally` — it is process-wide state on a long-lived ZAP.
+> 3. **The active scan runs as five per-category passes** (`ZAP_ASCAN_SPLIT`, default on), Client Browser
+>    last because it launches a real browser. Each pass banks findings before the next
+>    (`_run_active_pass`, `:1410`; `ascan_policies_restored`, `:1381`).
+> 4. **The active scanner is bounded** — 8 threads/host, 5 min/rule, 60 min/scan. ZAP's own defaults are 64
+>    threads and no time limit at all.
+>
+> The `wappalyzer` add-on is **deliberately not installed** (`zap/addons.txt`): its passive rule took 40–110s
+> per message and drove ZAP to 11.98 GiB.
 
 > **Silent fallback:** if ZAP is not ready, Playwright continues **unproxied** with only a `print` warning
 > (`playwright_scanner.py:253-258`). The scan still "succeeds"; ZAP just never sees the traffic.
@@ -614,6 +631,9 @@ operator / agent
 | Wrong LLM answering | The active backend is in `app_settings` (DB), **not** the env — `common/llm_settings.py:103` |
 | RAG returns nothing | `service_prompts` / corpus never seeded — Maintenance page → Seed knowledge, or `POST /kb/seed` |
 | ZAP report suspiciously clean | ZAP wasn't ready and Playwright ran unproxied (`playwright_scanner.py:253`) |
+| Scan egressed from the wrong IP | the receiving request model must **declare** `proxy` — Pydantic's `extra="ignore"` drops an undeclared field silently, so the gate passes and the job file records a proxy that was never applied. Pinned by `tests/test_scan_proxy_forwarding.py` |
+| gobuster stage failed | wordlist path (reported at boot since 2026-09-08) or timeout vs. wordlist size — `big` is 1.27M entries × 4 extensions ≈ 5.1M requests |
+| ZAP findings lost when ZAP died | `ZAP_DRAIN_INTERVAL` must be non-zero; see `Docs/WEB_SCAN_TUNING.md` §4.4 |
 | Recommendations page blank | 429 from `/next_scan` stopped the dispatch pass (`api.py:2258`) |
 | A finding never saved | `cwe` is `text[]` and `refs` is `jsonb` — a bare string or dict is rejected |
 

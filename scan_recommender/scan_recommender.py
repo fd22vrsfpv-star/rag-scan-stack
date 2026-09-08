@@ -10,7 +10,7 @@ from typing import Any, List, Optional, Dict, Tuple
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
-from fastapi import FastAPI, APIRouter, Query, HTTPException, Body, Header
+from fastapi import FastAPI, APIRouter, Query, HTTPException, Body, Header, BackgroundTasks
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from exploits_rag import rag_router
@@ -3820,20 +3820,131 @@ def _existing_prompt_id(selector_type, service, tech, port) -> Optional[str]:
     return row[0] if row else None
 
 
+# ── Knowledge seeding ─────────────────────────────────────────────────────────
+#
+# WHY THIS RUNS AS A JOB AND NOT INLINE:
+#   The bundled corpus is 36 prompts and 585 service docs, and each doc costs one
+#   embedding round-trip. Measured on this stack: 9 docs in 13.05s, i.e. ~1.45s
+#   per doc, so a full seed is ~14 MINUTES of work inside one HTTP request.
+#
+#   That is not a hang, but it behaves like one. The BFF allowed 900s, the
+#   maintenance test allowed 900s, and a full seed sat right on that line — so
+#   the request was abandoned mid-flight and the work was thrown away, every
+#   time. The project rule is "shed, do not queue... admitting a request and then
+#   abandoning it wastes the work twice"; a job id is how this endpoint stops
+#   doing exactly that.
+#
+#   `dry_run` stays INLINE: it writes nothing, costs milliseconds, and callers
+#   read its counts directly.
+
+#: job_id -> {status, started_at, finished_at, result, error, progress}
+_SEED_JOBS: Dict[str, dict] = {}
+_SEED_JOBS_LOCK = threading.Lock()
+#: Keep the last N jobs. Unbounded would be a slow leak in a long-lived service.
+_SEED_JOBS_MAX = 20
+
+
+def _seed_job_update(job_id: str, **fields) -> None:
+    with _SEED_JOBS_LOCK:
+        job = _SEED_JOBS.get(job_id)
+        if job is not None:
+            job.update(fields)
+
+
+def _seed_job_create() -> str:
+    import uuid
+    job_id = str(uuid.uuid4())
+    with _SEED_JOBS_LOCK:
+        _SEED_JOBS[job_id] = {
+            "job_id": job_id, "status": "running", "progress": None,
+            "started_at": _now_iso(), "finished_at": None,
+            "result": None, "error": None,
+        }
+        # Evict oldest beyond the cap.
+        if len(_SEED_JOBS) > _SEED_JOBS_MAX:
+            for stale in sorted(_SEED_JOBS.values(),
+                                key=lambda j: j["started_at"])[:-_SEED_JOBS_MAX]:
+                _SEED_JOBS.pop(stale["job_id"], None)
+    return job_id
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _run_seed_job(job_id: str, body: "KnowledgeSeedRequest") -> None:
+    """Execute a seed in the background and record its outcome."""
+    try:
+        result = _seed_execute(body, job_id=job_id)
+        _seed_job_update(job_id, status="completed" if result.get("ok") else "completed_with_errors",
+                         result=result, finished_at=_now_iso())
+    except Exception as exc:                                   # noqa: BLE001
+        logger.exception("knowledge seed job %s failed", job_id)
+        _seed_job_update(job_id, status="failed", error=f"{type(exc).__name__}: {exc}",
+                         finished_at=_now_iso())
+
+
+@kb_router.get("/seed/status")
+def seed_status(job_id: Optional[str] = None):
+    """Progress of a seed job. Omit job_id for the most recent one.
+
+    An unknown id returns `known: false` rather than a synthetic 'completed' —
+    jobs live in process memory, so a service restart genuinely loses them, and
+    saying so is the difference between "finished" and "we have no idea".
+    """
+    with _SEED_JOBS_LOCK:
+        if job_id:
+            job = _SEED_JOBS.get(job_id)
+            if not job:
+                return {"known": False, "job_id": job_id,
+                        "detail": "no such seed job — it may predate a restart of "
+                                  "this service, which keeps jobs in memory only"}
+            return {"known": True, **job}
+        if not _SEED_JOBS:
+            return {"known": False, "detail": "no seed job has run since this service started"}
+        latest = sorted(_SEED_JOBS.values(), key=lambda j: j["started_at"])[-1]
+        return {"known": True, **latest}
+
+
 @kb_router.post("/seed")
-def seed_knowledge(body: KnowledgeSeedRequest = KnowledgeSeedRequest()):
+def seed_knowledge(body: KnowledgeSeedRequest = KnowledgeSeedRequest(),
+                   background_tasks: BackgroundTasks = None):
     """Load knowledge/seed/*.yaml into service_prompts and the RAG store.
+
+    A real seed returns a `job_id` immediately; poll `GET /kb/seed/status`.
+    `dry_run` runs inline and returns its counts directly.
 
     Idempotent: an entry whose selector already exists is UPDATED in place, and
     service-doc ingest atomically replaces prior chunks for the same
     (service, port, tech, title).
     """
+    if body.dry_run:
+        return _seed_execute(body)
+    job_id = _seed_job_create()
+    if background_tasks is not None:
+        background_tasks.add_task(_run_seed_job, job_id, body)
+    else:                                       # direct call, e.g. from a test
+        threading.Thread(target=_run_seed_job, args=(job_id, body), daemon=True).start()
+    return {"ok": True, "job_id": job_id, "status": "running",
+            "status_url": f"/kb/seed/status?job_id={job_id}",
+            "detail": "seeding runs in the background (~14 min for the full "
+                      "corpus); poll status_url"}
+
+
+def _seed_execute(body: "KnowledgeSeedRequest", job_id: str = "") -> dict:
+    """The seed itself. Returns the same shape it always did."""
     import yaml as _yaml          # lazily, as elsewhere in this module
     files = _seed_files(body.files)
     result = {"files": [], "created": 0, "updated": 0, "docs": 0,
               "failed": 0, "dry_run": body.dry_run, "errors": []}
 
-    for name in files:
+    for _idx, name in enumerate(files, 1):
+        if job_id:
+            _seed_job_update(job_id, progress={
+                "file": name, "file_index": _idx, "files_total": len(files),
+                "docs_done": result["docs"], "prompts_done": result["created"] + result["updated"],
+            })
         path = os.path.join(_SEED_DIR, name)
         per = {"file": name, "created": 0, "updated": 0, "docs": 0, "failed": 0}
         try:
@@ -3868,7 +3979,19 @@ def seed_knowledge(body: KnowledgeSeedRequest = KnowledgeSeedRequest()):
                 result["errors"].append(f"{name}: {entry.get('title', '?')}: {exc}")
 
         if body.include_docs:
-            for doc in (data.get("service_docs") or []):
+            _docs = data.get("service_docs") or []
+            for _dn, doc in enumerate(_docs, 1):
+                # Per-doc progress, not per-file: gtfobins.yaml alone holds 458
+                # docs (~11 minutes), so a file-level counter sits frozen for
+                # most of the run and reads as a hang all over again.
+                if job_id and (_dn == 1 or _dn % 10 == 0 or _dn == len(_docs)):
+                    _seed_job_update(job_id, progress={
+                        "file": name, "file_index": _idx, "files_total": len(files),
+                        "doc_index": _dn, "docs_in_file": len(_docs),
+                        "docs_done": result["docs"] + per["docs"],
+                        "prompts_done": result["created"] + result["updated"]
+                                        + per["created"] + per["updated"],
+                    })
                 try:
                     if body.dry_run:
                         per["docs"] += 1

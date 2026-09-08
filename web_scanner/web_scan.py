@@ -87,6 +87,52 @@ WORDLISTS = {
     "quickhits": "/opt/seclists/Discovery/Web-Content/quickhits.txt",
     "api": "/opt/seclists/Discovery/Web-Content/common-api-endpoints-mazen160.txt",
 }
+
+
+def _resolve_default_wordlist() -> str:
+    """Resolve the gobuster default ONCE, at import, and say so if it is wrong.
+
+    WHY THIS IS NOT LEFT TO THE SCAN:
+        `WORDLIST` is operator-set and was stale on this stack — it named
+        `directory-list-2.3-medium.txt` while the image ships
+        `DirBuster-2007_directory-list-2.3-medium.txt`. Nothing checked it until
+        gobuster ran, so a full pipeline crawled, rendered and spidered the
+        target, then failed its content-discovery stage on a path that had been
+        wrong since boot. Ten minutes of real traffic to learn a config typo.
+
+    The substitution is LOUD, never silent: an operator reading the log sees
+    exactly what was asked for, what was used instead, and how to fix it. The
+    alternative — refusing to start — would take ZAP, nikto and nuclei down over
+    a wordlist, and the alternative to THAT (carry on quietly) is what produced
+    the wasted scan.
+    """
+    if pathlib.Path(WORDLIST).exists():
+        return WORDLIST
+    fallback = next((p for p in (WORDLISTS.get("medium"), WORDLISTS.get("common"),
+                                 WORDLISTS.get("small"))
+                     if p and pathlib.Path(p).exists()), None)
+    if fallback:
+        logger.error(
+            f"[gobuster] WORDLIST={WORDLIST!r} does not exist in this image. "
+            f"Using {fallback!r} instead so content discovery still runs. Fix the "
+            f"WORDLIST value in .env (docker-compose's own default is correct) "
+            f"and recreate web-scanner.")
+        return fallback
+    logger.error(
+        f"[gobuster] WORDLIST={WORDLIST!r} does not exist AND no built-in "
+        f"wordlist alias resolves either — is /opt/seclists mounted? Every "
+        f"gobuster run will fail until this is fixed.")
+    return WORDLIST
+
+
+def missing_wordlists() -> dict:
+    """Declared alias -> path, for every alias whose file is absent.
+
+    Surfaced at startup and asserted by tests/test_wordlists_exist.py. An alias
+    that resolves to nothing is indistinguishable from a scan that found nothing.
+    """
+    return {name: path for name, path in WORDLISTS.items()
+            if not pathlib.Path(path).exists()}
 REPORT_DIR  = pathlib.Path(os.environ.get("REPORT_DIR", "/reports"))
 SCHEME_HINT = os.environ.get("SCHEME_HINT", "auto")
 ZAP_ADDR    = os.environ.get("ZAP_ADDR", "zap")
@@ -481,7 +527,7 @@ def gobuster_dir(url: str, wordlist: Optional[str] = None, timeout_sec=600):
         else:
             raise ValueError(f"Invalid wordlist: {wordlist}. Use one of: {', '.join(WORDLISTS.keys())} or a full path under {ALLOWED_WORDLIST_BASE}")
     else:
-        wordlist_path = WORDLIST  # Default from env
+        wordlist_path = _resolve_default_wordlist()
 
     if not pathlib.Path(wordlist_path).exists():
         raise RuntimeError(f"wordlist not found: {wordlist_path}")
@@ -552,7 +598,7 @@ def gobuster_dir_with_paths(url: str, wordlist: Optional[str] = None, timeout_se
         else:
             raise ValueError(f"Invalid wordlist: {wordlist}. Use one of: {', '.join(WORDLISTS.keys())} or a full path under {ALLOWED_WORDLIST_BASE}")
     else:
-        wordlist_path = WORDLIST  # Default from env
+        wordlist_path = _resolve_default_wordlist()
 
     if not pathlib.Path(wordlist_path).exists():
         raise RuntimeError(f"wordlist not found: {wordlist_path}")
@@ -589,13 +635,42 @@ def gobuster_dir_with_paths(url: str, wordlist: Optional[str] = None, timeout_se
     t_err = threading.Thread(target=_read_stderr, daemon=True)
     t_out.start()
     t_err.start()
-    proc.wait(timeout=timeout_sec)
+    # A timeout must NOT discard what gobuster already found.
+    #
+    # `proc.wait(timeout=...)` raises TimeoutExpired, and the old code let that
+    # propagate — past the parse, past the DB write — so a run that had already
+    # discovered paths recorded exactly nothing. Measured: `big` is 1,273,832
+    # entries and the stage runs it with -x php,html,txt, so ~5.1M requests; at
+    # the 600s default, through a SOCKS proxy, a timeout is not an edge case, it
+    # is the expected outcome. Ten minutes of real traffic thrown away each time.
+    #
+    # Same reasoning as the ZAP progressive drain: partial results beat none, and
+    # the caller is told plainly that they are partial.
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        logger.warning(
+            f"[gobuster] {timeout_sec}s budget spent on {url} — keeping the paths "
+            f"found so far. A larger wordlist needs a larger timeout_sec; "
+            f"{wordlist_path.rsplit('/', 1)[-1]} may simply not fit this window.")
+        try:
+            proc.kill()
+        except Exception:                                          # noqa: BLE001
+            pass
+        try:
+            proc.wait(timeout=10)
+        except Exception:                                          # noqa: BLE001
+            pass
     t_out.join(timeout=5)
     t_err.join(timeout=5)
 
     out = "".join(stdout_lines)
     err = "".join(stderr_buf)
-    if proc.returncode not in (0, 1):
+    # A killed process has no meaningful return code; only judge it when it ran
+    # to completion of its own accord.
+    if not timed_out and proc.returncode not in (0, 1):
         raise RuntimeError(f"gobuster exit {proc.returncode}: {err or out}")
 
     # Strip ANSI escape codes from output
@@ -619,9 +694,18 @@ def gobuster_dir_with_paths(url: str, wordlist: Optional[str] = None, timeout_se
             """, (url, p["path"], f"size={p['size']}", p["status_code"]))
         c.commit()
 
+    if timed_out:
+        logger.info(f"[gobuster] partial run on {url}: {len(paths)} path(s) kept "
+                    f"from {timeout_sec}s of scanning")
     return {
         "paths": paths,
-        "findings_saved": len(paths)
+        "findings_saved": len(paths),
+        # Told plainly rather than inferred: a caller that treats a partial run
+        # as a complete one concludes "there is nothing else here".
+        "timed_out": timed_out,
+        "complete": not timed_out,
+        "wordlist": wordlist_path,
+        "timeout_sec": timeout_sec,
     }
 
 
@@ -1042,6 +1126,38 @@ ZAP_MAX_ALERTS_PER_RULE = os.environ.get("ZAP_MAX_ALERTS_PER_RULE", "0")
 #: Keep passive scanning on during the active scan. Default off — see above.
 ZAP_PSCAN_DURING_ACTIVE_SCAN = os.environ.get("ZAP_PSCAN_DURING_ACTIVE_SCAN", "false")
 
+# ── Active-scanner bounds ─────────────────────────────────────────────────────
+#
+# ZAP ships the active scanner UNBOUNDED in all three dimensions that matter:
+# 64 threads per host, no per-rule time limit, no per-scan time limit. One rule
+# that misbehaves therefore misbehaves 64 times at once, for as long as it likes.
+#
+# Measured, on the scan that produced these defaults. With wappalyzer gone the
+# crawl held flat at 2.335 GiB for eight minutes — and then:
+#
+#   09:28:48  start host ... | DomXssScanRule strength MEDIUM
+#   09:29:36  WARN DomXssScanRule - Skipping scanner, failed to start browser:
+#             JdkWebSocket initial request execution error ... FirefoxDriver
+#   09:29:37  skipped plugin [failed to start or connect to the browser]
+#             in 48.935s with 118 message(s) sent
+#
+# 2.34 GiB -> 11.93 GiB in 78 seconds. DomXssScanRule launches Firefox through
+# Selenium, so 64 threads per host meant up to 64 concurrent browser launches,
+# each failing and retrying. Firefox IS in the image; geckodriver is not on PATH
+# and ZAP runs -silent, so Selenium Manager cannot fetch it. The rule costs
+# ~10 GiB and delivers a *skipped* plugin.
+#
+# THE RULE-DURATION BOUND IS THE GENERAL ONE. Capping threads fixes this rule;
+# capping per-rule runtime stops the NEXT one, whatever it turns out to be. Both
+# are cheap, so both are on.
+
+#: Concurrent active-scan threads per host. ZAP's default is 64.
+ZAP_THREAD_PER_HOST = os.environ.get("ZAP_THREAD_PER_HOST", "8")
+#: Minutes any single active-scan rule may run. ZAP's default is 0 = unlimited.
+ZAP_MAX_RULE_DURATION_MINS = os.environ.get("ZAP_MAX_RULE_DURATION_MINS", "5")
+#: Minutes a whole active scan may run. ZAP's default is 0 = unlimited.
+ZAP_MAX_SCAN_DURATION_MINS = os.environ.get("ZAP_MAX_SCAN_DURATION_MINS", "60")
+
 
 def _as_bool(v, default: bool = False) -> bool:
     """Parse an operator-supplied boolean. Unset/blank -> default."""
@@ -1068,6 +1184,12 @@ class ZapTuning(BaseModel):
     max_alerts_per_rule: Optional[int] = None
     #: Leave passive scanning enabled during the active scan.
     pscan_during_active_scan: Optional[bool] = None
+    #: Concurrent active-scan threads per host (ZAP default 64).
+    thread_per_host: Optional[int] = None
+    #: Minutes one active-scan rule may run; 0 = unlimited (ZAP default).
+    max_rule_duration_mins: Optional[int] = None
+    #: Minutes a whole active scan may run; 0 = unlimited (ZAP default).
+    max_scan_duration_mins: Optional[int] = None
 
     def resolved(self) -> dict:
         """Fold operator values over the env defaults into concrete settings."""
@@ -1082,7 +1204,25 @@ class ZapTuning(BaseModel):
                 f"[ZAP] max_alerts_per_rule {ZAP_MAX_ALERTS_PER_RULE!r} is not a "
                 "number — using 0 (unlimited)")
             max_alerts = 0
+        def _int(name, operator_value, env_value):
+            """Operator value wins; a non-numeric env default is loud, not silent."""
+            if operator_value is not None:
+                return int(operator_value)
+            try:
+                return int(env_value)
+            except (TypeError, ValueError):
+                logger.warning(f"[ZAP] {name} {env_value!r} is not a number — ignoring it")
+                return None
+
         return {
+            "thread_per_host": _int("thread_per_host", self.thread_per_host,
+                                    ZAP_THREAD_PER_HOST),
+            "max_rule_duration_mins": _int("max_rule_duration_mins",
+                                           self.max_rule_duration_mins,
+                                           ZAP_MAX_RULE_DURATION_MINS),
+            "max_scan_duration_mins": _int("max_scan_duration_mins",
+                                           self.max_scan_duration_mins,
+                                           ZAP_MAX_SCAN_DURATION_MINS),
             "disable_pscan_rules": [str(r) for r in rules],
             "pscan_only_in_scope": _as_bool(ZAP_PSCAN_ONLY_IN_SCOPE, True)
                 if self.pscan_only_in_scope is None else bool(self.pscan_only_in_scope),
@@ -1142,11 +1282,30 @@ def apply_zap_tuning(zap, tuning: Optional["ZapTuning"] = None) -> dict:
     _try("max_alerts_per_rule",
          lambda: zap.pscan.set_max_alerts_per_rule(settings["max_alerts_per_rule"]))
 
+    # Active-scanner bounds. A None means "leave ZAP's own default alone",
+    # which is what a malformed env value resolves to — better than substituting
+    # a number nobody chose.
+    if settings["thread_per_host"] is not None:
+        _try("thread_per_host",
+             lambda: zap.ascan.set_option_thread_per_host(settings["thread_per_host"]))
+    if settings["max_rule_duration_mins"] is not None:
+        _try("max_rule_duration_mins",
+             lambda: zap.ascan.set_option_max_rule_duration_in_mins(
+                 settings["max_rule_duration_mins"]))
+    if settings["max_scan_duration_mins"] is not None:
+        _try("max_scan_duration_mins",
+             lambda: zap.ascan.set_option_max_scan_duration_in_mins(
+                 settings["max_scan_duration_mins"]))
+
     logger.info(
         f"[ZAP] passive tuning: only_in_scope={settings['pscan_only_in_scope']} "
         f"max_alerts_per_rule={settings['max_alerts_per_rule']} "
         f"disabled={len(wanted)} rule(s) "
         f"pscan_during_active_scan={settings['pscan_during_active_scan']}")
+    logger.info(
+        f"[ZAP] active bounds: thread_per_host={settings['thread_per_host']} "
+        f"max_rule_duration_mins={settings['max_rule_duration_mins']} "
+        f"max_scan_duration_mins={settings['max_scan_duration_mins']}")
     return applied
 
 
@@ -1183,6 +1342,115 @@ def pscan_paused(zap, resume_setting: bool):
                 f"[ZAP] FAILED to re-enable passive scanning: {exc}. The next scan "
                 "in this ZAP session will have no passive findings until ZAP is "
                 "restarted.")
+
+
+# ── Active scan, split into per-category passes ───────────────────────────────
+#
+# ZAP already partitions every active-scan rule into five policy CATEGORIES, so
+# the natural unit for splitting a scan is the one ZAP itself uses — no custom
+# rule lists to maintain, and `set_enabled_policies` gates them directly.
+#
+# WHY SPLIT AT ALL: a single monolithic active scan is all-or-nothing. When one
+# rule wedged or blew up memory, the whole scan died and everything after it in
+# the run never executed. Observed: DomXssScanRule drove ZAP from 2.34 GiB to
+# 11.93 GiB in 78 seconds, killing a scan that still had rules to run.
+#
+# Split into passes, one bad category costs one category. Each pass drains its
+# findings before the next begins, so a later crash cannot take the earlier
+# passes' results with it.
+#
+# ORDER IS DELIBERATE. Client Browser runs LAST because it is the one that
+# launches a real browser (DomXssScanRule → Firefox via Selenium) and is by far
+# the likeliest to fail. Everything cheap and reliable is already stored by the
+# time it runs.
+#
+#: (policy id, label) in execution order. Ids are ZAP's own — verified live
+#: against ascan/view/policies on 2.16.1.
+ZAP_ASCAN_CATEGORIES = (
+    (4, "Injection"),
+    (2, "Server Security"),
+    (0, "Information Gathering"),
+    (3, "Miscellaneous"),
+    (1, "Client Browser"),
+)
+#: Split the active scan by category. Off keeps the single-pass behaviour.
+ZAP_ASCAN_SPLIT = os.environ.get("ZAP_ASCAN_SPLIT", "true")
+
+
+@contextlib.contextmanager
+def ascan_policies_restored(zap):
+    """Restore whichever active-scan policies were enabled, however we exit.
+
+    Policy enablement is SERVER-global and survives the scan. Leaving a subset
+    enabled would silently cripple every later scan in this ZAP — the same
+    cross-scan capability loss pscan_paused() guards against, and just as
+    invisible from the outside.
+    """
+    before = None
+    try:
+        before = [str(p.get("id")) for p in zap.ascan.policies()
+                  if str(p.get("enabled")).lower() == "true"]
+    except Exception as exc:                                       # noqa: BLE001
+        logger.warning(f"[ZAP] could not read enabled policies: {exc}")
+    try:
+        yield
+    finally:
+        # Fall back to all five rather than leaving a partial set behind: an
+        # unreadable "before" must not become a permanently narrowed scanner.
+        restore = before or [str(pid) for pid, _ in ZAP_ASCAN_CATEGORIES]
+        try:
+            zap.ascan.set_enabled_policies(",".join(restore))
+            logger.info(f"[ZAP] active-scan policies restored: {','.join(restore)}")
+        except Exception as exc:                                   # noqa: BLE001
+            logger.error(
+                f"[ZAP] FAILED to restore active-scan policies ({exc}). This ZAP "
+                f"will run only policies {before} until it is restarted.")
+
+
+def _run_active_pass(zap, url, max_wait, drain_every, progress_callback,
+                     label, drained_so_far=0):
+    """One bounded active scan. Returns (findings_stored, finished_cleanly).
+
+    Never raises for a ZAP-side failure: a pass that dies must not take the
+    passes after it with it — that is the whole point of splitting.
+    """
+    waited, last_cb, drained = 0, 0, 0
+    try:
+        aid = zap.ascan.scan(url, recurse=True, inscopeonly=True)
+    except Exception as exc:                                       # noqa: BLE001
+        logger.warning(f"[ZAP] {label}: could not start ({exc}) — skipping this pass")
+        return 0, False
+
+    while True:
+        try:
+            pct = int(zap.ascan.status(aid))
+        except Exception as exc:                                   # noqa: BLE001
+            logger.warning(
+                f"[ZAP] {label}: unreachable after {waited}s ({exc}). Findings "
+                f"stored so far are safe; continuing with the next pass.")
+            return drained, False
+        if pct >= 100:
+            logger.info(f"[ZAP] {label}: complete ({waited}s, {drained} stored)")
+            return drained, True
+        if waited >= max_wait:
+            logger.warning(f"[ZAP] {label}: budget {max_wait}s spent at {pct}% — "
+                           "stopping this pass and moving on")
+            try:
+                zap.ascan.stop(aid)
+            except Exception:                                      # noqa: BLE001
+                pass
+            return drained, False
+        time.sleep(10)
+        waited += 10
+        if waited % 60 == 0:
+            logger.info(f"[ZAP] {label}: {pct}% ({waited}s, "
+                        f"{drained_so_far + drained} finding(s) stored so far)")
+            if progress_callback and waited - last_cb >= 90:
+                last_cb = waited
+                eta = int(waited / max(pct, 1) * (100 - pct)) if pct > 0 else None
+                progress_callback(pct, eta)
+        if drain_every and waited % drain_every == 0:
+            drained += drain_zap_alerts(url, label=f"{label} {waited}s")
 
 
 # ZAP's spider has no server-side deadline, and neither did our wait loops.
@@ -1448,33 +1716,48 @@ def _zap_scan_with_urls_inner(zap, url, discovered_urls, max_wait, progress_call
     # Passive scanning is paused for this block by default: the active scan is
     # what generates the message volume that overruns the passive queue, and the
     # crawl's passive findings are already banked by the drain above.
-    logger.info(f"[ZAP] Starting active scan on {url} (in-scope, recursive)")
-    waited = 0
-    _last_cb_time = 0
     _drain_every = int(os.environ.get("ZAP_DRAIN_INTERVAL", "60"))
     _drained = 0
-    # `with`, not enter/exit by hand: an exception anywhere in the loop must
-    # still restore passive scanning, or the NEXT scan in this ZAP session
-    # silently produces no passive findings.
+    _split = _as_bool(ZAP_ASCAN_SPLIT, True)
+    # `with`, not enter/exit by hand: an exception anywhere below must still
+    # restore passive scanning, or the NEXT scan in this ZAP session silently
+    # produces no passive findings.
     with pscan_paused(zap, _tuning["requested"]["pscan_during_active_scan"]):
-        aid = zap.ascan.scan(url, recurse=True, inscopeonly=True)
-        while int(zap.ascan.status(aid)) < 100 and waited < max_wait:
-            time.sleep(10)  # Poll every 10s to reduce overhead
-            waited += 10
-            if waited % 60 == 0:
-                pct = int(zap.ascan.status(aid))
-                logger.info(f"[ZAP] Active scan progress: {pct}% ({waited}s elapsed, "
-                            f"{_drained} finding(s) stored so far)")
-                if progress_callback and waited - _last_cb_time >= 90:
-                    _last_cb_time = waited
-                    eta = int(waited / max(pct, 1) * (100 - pct)) if pct > 0 else None
-                    progress_callback(pct, eta)
-            # Store what has been found so far, so a ZAP death costs one interval
-            # rather than the entire scan.
-            if _drain_every and waited % _drain_every == 0:
-                _drained += drain_zap_alerts(url, label=f"active scan {waited}s")
+        if not _split:
+            logger.info(f"[ZAP] Starting active scan on {url} (in-scope, recursive)")
+            n, _ok = _run_active_pass(zap, url, max_wait, _drain_every,
+                                      progress_callback, "active scan")
+            _drained += n
+        else:
+            # Per-category passes. Each pass gets an equal share of the budget so
+            # one slow category cannot consume the whole window and starve the
+            # rest — the failure the split exists to prevent.
+            cats = ZAP_ASCAN_CATEGORIES
+            per_pass = max(60, int(max_wait / max(len(cats), 1)))
+            logger.info(
+                f"[ZAP] Active scan on {url}: {len(cats)} category pass(es), "
+                f"{per_pass}s each, Client Browser last "
+                f"(order: {', '.join(label for _, label in cats)})")
+            completed = []
+            with ascan_policies_restored(zap):
+                for pid, label in cats:
+                    try:
+                        zap.ascan.set_enabled_policies(str(pid))
+                    except Exception as exc:                       # noqa: BLE001
+                        logger.warning(f"[ZAP] could not select policy {label}: {exc}")
+                        continue
+                    n, ok = _run_active_pass(
+                        zap, url, per_pass, _drain_every, progress_callback,
+                        f"active scan [{label}]", drained_so_far=_drained)
+                    _drained += n
+                    completed.append(f"{label}{'' if ok else ' (incomplete)'}")
+                    # Bank this pass before the next one starts. Without it a
+                    # later category that kills ZAP takes the earlier passes'
+                    # findings with it, which is the thing splitting prevents.
+                    _drained += drain_zap_alerts(url, label=f"after {label}")
+            logger.info(f"[ZAP] Active scan passes: {'; '.join(completed) or 'none ran'}")
 
-    logger.info(f"[ZAP] Active scan complete on {url}")
+    logger.info(f"[ZAP] Active scan complete on {url} ({_drained} finding(s) stored)")
 
     # Fetch raw alerts via ZAP Python API (reliable, doesn't use HTTP requests)
     raw_alerts = []
@@ -1555,6 +1838,21 @@ async def startup_event():
     setup_log_capture()
     logging.info("[web-scanner] Service started, log capture initialized")
 
+# Report unusable wordlists at BOOT, not ten minutes into a scan. A missing
+# alias is invisible until gobuster runs, and by then the crawl is already spent.
+try:
+    _missing_wl = missing_wordlists()
+    if _missing_wl:
+        logging.error(
+            "[web-scanner] %d wordlist alias(es) resolve to files that do not "
+            "exist and will fail if selected: %s",
+            len(_missing_wl), ", ".join(f"{k} -> {v}" for k, v in _missing_wl.items()))
+    if not pathlib.Path(WORDLIST).exists():
+        logging.error("[web-scanner] the default WORDLIST %r does not exist; "
+                      "gobuster will fall back (see _resolve_default_wordlist)", WORDLIST)
+except Exception as _wl_exc:                                       # noqa: BLE001
+    logging.warning("[web-scanner] could not check wordlists: %s", _wl_exc)
+
 ALLOWED_WORDLIST_BASE = "/opt/seclists"
 
 def validate_wordlist(wordlist: Optional[str]) -> Optional[str]:
@@ -1608,6 +1906,13 @@ class PipelineReq(BaseModel):
     auth: Optional[ScanAuth] = None
     #: Optional ZAP passive-scan tuning. Omitted -> the env defaults apply.
     zap_tuning: Optional[ZapTuning] = None
+    #: SOCKS proxy for scanning through a remote node, e.g.
+    #: 'socks5://node-manager:10120'. The pipeline route accepted no proxy at
+    #: all until now, while the BFF's block-local-scans gate was satisfied by
+    #: the parameter merely being present — so a gated scan egressed from this
+    #: host's own address. If a proxy is given and cannot be established, the
+    #: job FAILS rather than scanning unproxied.
+    proxy: Optional[str] = None
 
 
 class NiktoReq(BaseModel):
@@ -1615,6 +1920,12 @@ class NiktoReq(BaseModel):
     target_url: str  # Target URL (required, e.g., 'http://192.168.1.150' or 'https://example.com')
     tuning: Optional[str] = None  # Nikto tuning options (e.g., '123' for tests 1,2,3 or 'x6' to skip XSS tests)
     timeout_sec: int = 1800  # Timeout in seconds (default 30 minutes)
+    #: SOCKS proxy for scanning through a remote node. The BFF injects this on
+    #: every scan payload; a model that does not declare it drops it SILENTLY
+    #: (pydantic extra="ignore"), so the block-local-scans gate passes and the
+    #: traffic still leaves from this host's own address.
+    proxy: Optional[str] = None
+  # Timeout in seconds (default 30 minutes)
 
 
 # ── Scope gate ────────────────────────────────────────────────────────────
@@ -1686,6 +1997,154 @@ def _seed_known_apps(base_url: str) -> List[str]:
     return found
 
 
+# ── Scan egress proxy ─────────────────────────────────────────────────────────
+#
+# WHY A CONTEXT MANAGER AND NOT TWO COPIES OF THE SETUP:
+#   /jobs/web-scan honoured `proxy` and /jobs/pipeline-scan had no proxy support
+#   at all — no field on PipelineReq, nothing in the job function. The BFF's
+#   `_check_proxy_required` gate is satisfied by the parameter merely being
+#   PRESENT, and the BFF recorded it in the job file, so a pipeline scan looked
+#   proxied from every angle while egressing from the host address. Duplicated
+#   setup is how that happened; there is one implementation now.
+#
+# FAIL CLOSED. The old code wrapped ZAP proxy configuration in
+# `except Exception: logger.warning(...)` and carried on scanning. An operator
+# who asked for proxied egress and silently got direct egress is the worst
+# possible outcome of this function — worse than no scan — so a proxy that
+# cannot be established raises.
+#
+# RESTORE ON EXIT. ALL_PROXY is process-global and ZAP's SOCKS setting is
+# server-global; neither was ever unset. A later unproxied scan in the same
+# worker inherited both, which is confusing at best and, if the node goes away,
+# a scan that fails for no visible reason.
+
+def _probe_socks(host: str, port: int, timeout: float = 8.0) -> None:
+    """Raise unless a TCP connection to the SOCKS proxy succeeds."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return
+    except OSError as exc:
+        raise RuntimeError(
+            f"proxy {host}:{port} is not reachable ({exc}). Refusing to scan: the "
+            "operator asked for proxied egress, and running unproxied would send "
+            "traffic from this host's own address."
+        ) from exc
+
+
+@contextlib.contextmanager
+def proxied_scan(proxy: Optional[str], job_id: str = ""):
+    """Route sub-tools and ZAP through `proxy` for the enclosed block.
+
+    A falsy `proxy` is a no-op, so callers need no branch. Yields the proxy that
+    was applied (or None), and restores the previous global state on exit.
+    """
+    tag = f"[{job_id[:8]}] " if job_id else ""
+    if not proxy:
+        yield None
+        return
+
+    import urllib.parse as _urlparse
+    pp = _urlparse.urlparse(proxy)
+    host, port = pp.hostname or "", int(pp.port or 1080)
+    if not host:
+        raise ValueError(f"proxy {proxy!r} has no host")
+
+    _probe_socks(host, port)
+
+    # ALL_PROXY is honoured by requests/httpx for EVERY host, internal ones
+    # included. Without a NO_PROXY the scanner's own calls to playwright-scanner,
+    # nuclei-runner, rag-api and ZAP would be sent to the remote node, which
+    # cannot resolve Docker-internal names — the pipeline stages would fail, and
+    # the internal hostnames would be handed to the node in SOCKS CONNECT
+    # requests. Verified: with ALL_PROXY set and no NO_PROXY,
+    # Session.merge_environment_settings('https://playwright-scanner:8014/...')
+    # returns {'all': 'socks5://...'}.
+    prev = {k: os.environ.get(k) for k in
+            ("ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy")}
+    bypass = _internal_no_proxy()
+    os.environ["ALL_PROXY"] = proxy
+    os.environ["all_proxy"] = proxy
+    os.environ["NO_PROXY"] = bypass
+    os.environ["no_proxy"] = bypass
+    logger.info(f"{tag}internal hosts bypassing the proxy: {bypass}")
+
+    zap_base = f"http://{ZAP_ADDR}:{ZAP_PORT}"
+    zap_set = False
+    try:
+        import requests as _req
+        _req.get(f"{zap_base}/JSON/network/action/setConnectionTimeout/",
+                 params={"apikey": ZAP_API_KEY, "timeout": "120"}, timeout=5)
+        _req.get(f"{zap_base}/JSON/network/action/setSocksProxy/", params={
+            "apikey": ZAP_API_KEY, "host": host, "port": str(port),
+            "version": "5", "useDns": "true"}, timeout=5)
+        _req.get(f"{zap_base}/JSON/network/action/setUseSocksProxy/",
+                 params={"apikey": ZAP_API_KEY, "useSocksProxy": "true"}, timeout=5)
+        zap_set = True
+        logger.info(f"{tag}egress proxied through {host}:{port} "
+                    f"(sub-tools via ALL_PROXY, ZAP via upstream SOCKS)")
+    except Exception as exc:                                       # noqa: BLE001
+        # Restore before raising — a half-applied proxy is worse than none.
+        _restore_env(prev)
+        raise RuntimeError(
+            f"could not route ZAP through {host}:{port} ({exc}). Refusing to scan "
+            "rather than sending traffic from this host's own address."
+        ) from exc
+
+    try:
+        yield proxy
+    finally:
+        _restore_env(prev)
+        if zap_set:
+            try:
+                import requests as _req
+                _req.get(f"{zap_base}/JSON/network/action/setUseSocksProxy/",
+                         params={"apikey": ZAP_API_KEY, "useSocksProxy": "false"},
+                         timeout=5)
+            except Exception as exc:                               # noqa: BLE001
+                logger.warning(
+                    f"{tag}could not clear ZAP's SOCKS proxy: {exc}. ZAP will keep "
+                    f"routing through {host}:{port} until it is cleared or restarted.")
+
+
+def _internal_no_proxy() -> str:
+    """Hosts that must NOT go through the scan proxy.
+
+    Derived from the service URLs this module already reads, so adding a service
+    to the stack does not silently start tunnelling its traffic through an
+    operator's egress node.
+    """
+    from urllib.parse import urlparse
+    hosts = {"localhost", "127.0.0.1", "::1", ZAP_ADDR}
+    # NUCLEI_URL / OSINT_RUNNER_URL are read inline elsewhere rather than being
+    # module constants, so read them from the environment here too.
+    urls = (API_BASE, PLAYWRIGHT_URL, PD_RUNNER_URL,
+            os.environ.get("NUCLEI_URL", "https://nuclei-runner:8011"),
+            os.environ.get("OSINT_RUNNER_URL", "https://osint-runner:8024"))
+    for url in urls:
+        h = urlparse(str(url or "")).hostname
+        if h:
+            hosts.add(h)
+    # The DB, which is reached by DSN rather than URL.
+    try:
+        dsn = os.environ.get("DB_DSN", "")
+        h = urlparse(dsn.replace("postgresql://", "http://", 1)).hostname
+        if h:
+            hosts.add(h)
+    except Exception:                                              # noqa: BLE001
+        pass
+    return ",".join(sorted(h for h in hosts if h))
+
+
+def _restore_env(prev: dict) -> None:
+    """Put the proxy environment back exactly the way it was."""
+    for key, val in prev.items():
+        if val is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = val
+
+
 def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_katana: bool, do_zap: bool, limit: Optional[int], wordlist: Optional[str] = None, target_url: Optional[str] = None, target_urls: Optional[List[str]] = None, proxy: Optional[str] = None, zap_tuning: Optional["ZapTuning"] = None):
     """Background task to run web scan with progress tracking.
 
@@ -1712,6 +2171,7 @@ def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_ka
         _job_tracker.update_job(job_id, status="failed", error=str(e))
         return
 
+    _proxy_stack = contextlib.ExitStack()
     try:
         _t0 = time.time()
         # Emit webhook for scan start
@@ -1736,29 +2196,9 @@ def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_ka
         _job_tracker.update_job(job_id, status="running", started_at=datetime.now().isoformat())
         _job_tracker.update_progress(job_id, stage="fetching_targets")
 
-        # Configure SOCKS proxy for sub-tools if set
-        if proxy:
-            logger.info(f"[{job_id[:8]}] Using proxy: {proxy}")
-            # Set ALL_PROXY env for gobuster/katana/curl-based tools
-            os.environ["ALL_PROXY"] = proxy
-            os.environ["all_proxy"] = proxy
-            # Configure ZAP upstream proxy via API
-            try:
-                import urllib.parse as _urlparse
-                _pp = _urlparse.urlparse(proxy)
-                _proxy_host = _pp.hostname or ""
-                _proxy_port = str(_pp.port or 1080)
-                import requests as _req
-                _zap_base = f"http://{ZAP_ADDR}:{ZAP_PORT}"
-                _req.get(f"{_zap_base}/JSON/network/action/setConnectionTimeout/", params={"apikey": ZAP_API_KEY, "timeout": "120"}, timeout=5)
-                _req.get(f"{_zap_base}/JSON/network/action/setSocksProxy/", params={
-                    "apikey": ZAP_API_KEY, "host": _proxy_host, "port": _proxy_port,
-                    "version": "5", "useDns": "true"
-                }, timeout=5)
-                _req.get(f"{_zap_base}/JSON/network/action/setUseSocksProxy/", params={"apikey": ZAP_API_KEY, "useSocksProxy": "true"}, timeout=5)
-                logger.info(f"[{job_id[:8]}] ZAP upstream SOCKS proxy configured: {_proxy_host}:{_proxy_port}")
-            except Exception as _ze:
-                logger.warning(f"[{job_id[:8]}] Could not configure ZAP proxy: {_ze}")
+        # Route every sub-tool and ZAP through the operator's proxy. Fails the
+        # job if the proxy cannot be established — see proxied_scan().
+        _proxy_stack.enter_context(proxied_scan(proxy, job_id))
 
         # Merge target sources: target_urls > target_url > DB fallback
         urls_to_scan = target_urls or ([target_url] if target_url else None)
@@ -2035,6 +2475,9 @@ def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_ka
         # consume one of the service's MAX_CONCURRENT_SCANS slots, and enough
         # crashes would wedge the scanner entirely.
         _slot.__exit__(None, None, None)
+        # Same reasoning for the proxy: ALL_PROXY and ZAP's SOCKS setting are
+        # global, so leaving them set would silently proxy the NEXT scan.
+        _proxy_stack.close()
 
 
 @app.get("/health")
@@ -2236,9 +2679,12 @@ def run_web_scan_sync(req: JobReq):
 # Nikto Scan Endpoints
 # ===============================
 
-def _run_nikto_scan_job(job_id: str, target_url: str, tuning: Optional[str], timeout_sec: int):
+def _run_nikto_scan_job(job_id: str, target_url: str, tuning: Optional[str], timeout_sec: int,
+                        proxy: Optional[str] = None):
     """Background task to run Nikto scan with progress tracking"""
+    _proxy_stack = contextlib.ExitStack()
     try:
+        _proxy_stack.enter_context(proxied_scan(proxy, job_id))
         logger.info(f"[{job_id[:8]}] Starting Nikto scan on {target_url}")
         _job_tracker.update_job(job_id, status="running", started_at=datetime.now().isoformat())
         _job_tracker.update_progress(job_id, stage="nikto", current_target=target_url)
@@ -2299,18 +2745,29 @@ def _run_nikto_scan_job(job_id: str, target_url: str, tuning: Optional[str], tim
             "target_url": target_url,
             "error": str(e)
         })
+    finally:
+        _proxy_stack.close()
 
 
 class GobusterReq(BaseModel):
     """Request model for standalone Gobuster directory scan"""
     target_url: str  # Target URL (required)
     wordlist: Optional[str] = None  # small, medium, big, common, raft-small, etc.
-    timeout_sec: int = 600  # Timeout per target in seconds
+    timeout_sec: int = 600
+    #: SOCKS proxy for scanning through a remote node. The BFF injects this on
+    #: every scan payload; a model that does not declare it drops it SILENTLY
+    #: (pydantic extra="ignore"), so the block-local-scans gate passes and the
+    #: traffic still leaves from this host's own address.
+    proxy: Optional[str] = None
+  # Timeout per target in seconds
 
 
-def _run_gobuster_job(job_id: str, target_url: str, wordlist: Optional[str], timeout_sec: int):
+def _run_gobuster_job(job_id: str, target_url: str, wordlist: Optional[str], timeout_sec: int,
+                      proxy: Optional[str] = None):
     """Background task for standalone gobuster scan."""
+    _proxy_stack = contextlib.ExitStack()
     try:
+        _proxy_stack.enter_context(proxied_scan(proxy, job_id))
         _job_tracker.update_job(job_id, status="running", stage="gobuster")
 
         write_audit("scan_started", "gobuster", "web_scanner", {
@@ -2324,6 +2781,7 @@ def _run_gobuster_job(job_id: str, target_url: str, wordlist: Optional[str], tim
             target_url,
             wordlist=validated_wordlist,
             timeout_sec=timeout_sec,
+            proxy=proxy,
         )
 
         paths_count = result.get("findings_saved", 0)
@@ -2348,6 +2806,8 @@ def _run_gobuster_job(job_id: str, target_url: str, wordlist: Optional[str], tim
         emit_webhook_event("scan_failed", "gobuster", {
             "job_id": job_id, "target_url": target_url, "error": str(e),
         })
+    finally:
+        _proxy_stack.close()
 
 
 @app.post("/jobs/gobuster")
@@ -2384,6 +2844,7 @@ def run_gobuster_scan(req: GobusterReq, background_tasks: BackgroundTasks):
     job_id = _job_tracker.create_job(job_type="gobuster")
     background_tasks.add_task(
         _run_gobuster_job, job_id, req.target_url, req.wordlist, req.timeout_sec,
+        req.proxy,
     )
     return {
         "ok": True,
@@ -3157,7 +3618,7 @@ def run_nikto_scan(req: NiktoReq, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail=f"Invalid target URL: {e}")
 
     job_id = _job_tracker.create_job(job_type="nikto-scan")
-    background_tasks.add_task(_run_nikto_scan_job, job_id, req.target_url, req.tuning, req.timeout_sec)
+    background_tasks.add_task(_run_nikto_scan_job, job_id, req.target_url, req.tuning, req.timeout_sec, req.proxy)
 
     return {
         "ok": True,
@@ -3224,9 +3685,17 @@ def _run_pipeline_scan_job(
     skip_wafw00f: bool = False,
     auth: Optional["ScanAuth"] = None,
     zap_tuning: Optional["ZapTuning"] = None,
+    proxy: Optional[str] = None,
 ):
     """Background task to run sequential scan pipeline with progress tracking"""
+    _proxy_stack = contextlib.ExitStack()
     try:
+        # Route every stage through the operator's proxy BEFORE any stage runs.
+        # Raises if it cannot be established, which fails the job — see
+        # proxied_scan(). Scanning unproxied when the operator asked for a proxy
+        # is the one outcome worse than not scanning.
+        _proxy_stack.enter_context(proxied_scan(proxy, job_id))
+
         # Emit webhook for pipeline scan start
         emit_webhook_event("scan_started", "web-scanner", {
             "job_id": job_id,
@@ -3401,6 +3870,10 @@ def _run_pipeline_scan_job(
             "scan_type": "pipeline-scan",
             "error": str(e)
         })
+    finally:
+        # ALL_PROXY and ZAP's SOCKS setting are global; leaving them set would
+        # silently proxy the next scan through a node it never asked for.
+        _proxy_stack.close()
 
 
 @app.post("/jobs/pipeline-scan")
@@ -3459,6 +3932,7 @@ def run_pipeline_scan(req: PipelineReq, background_tasks: BackgroundTasks):
         req.skip_wafw00f,
         req.auth,
         req.zap_tuning,
+        req.proxy,
     )
 
     return {

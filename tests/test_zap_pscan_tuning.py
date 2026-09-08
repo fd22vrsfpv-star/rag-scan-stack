@@ -201,3 +201,60 @@ def test_a_rejected_setting_does_not_abort_the_scan():
         "one unsupported setting would fail the whole scan; a worse-tuned scan "
         "is better than no scan"
     )
+
+
+# ── active-scanner bounds ─────────────────────────────────────────────────────
+#
+# ZAP ships the active scanner unbounded in all three dimensions that matter:
+# 64 threads per host, no per-rule time limit, no per-scan time limit. One rule
+# that misbehaves therefore misbehaves 64 times at once, for as long as it likes.
+#
+# Measured after wappalyzer was removed: the crawl held FLAT at 2.335 GiB for
+# eight minutes, then DomXssScanRule started and memory went 2.34 -> 11.93 GiB in
+# 78 seconds. It launches Firefox through Selenium, so 64 threads meant up to 64
+# concurrent browser launches, each failing and retrying, and the plugin was then
+# logged as "skipped" — ~10 GiB spent to deliver nothing.
+
+
+def test_active_scan_thread_count_is_bounded():
+    line = [l for l in _src().splitlines()
+            if "ZAP_THREAD_PER_HOST" in l and "environ" in l]
+    assert line, "ZAP_THREAD_PER_HOST has no env default"
+    val = line[0].split('"')[-2]
+    assert val.isdigit() and 0 < int(val) < 64, (
+        f"thread_per_host default is {val!r}; ZAP's own default of 64 is what "
+        "turned one failing browser rule into 64 concurrent browser launches"
+    )
+
+
+def test_a_single_rule_cannot_run_forever():
+    """The GENERAL bound. Thread count fixes the rule we found; this one stops
+    whichever rule runs away next."""
+    line = [l for l in _src().splitlines()
+            if "ZAP_MAX_RULE_DURATION_MINS" in l and "environ" in l]
+    assert line, "ZAP_MAX_RULE_DURATION_MINS has no env default"
+    val = line[0].split('"')[-2]
+    assert val.isdigit() and int(val) > 0, (
+        f"max_rule_duration_mins default is {val!r} — 0 means unlimited, which "
+        "is the setting that let DomXssScanRule burn 48.9s x 64 threads"
+    )
+
+
+def test_the_bounds_are_actually_applied():
+    body = _node(_src(), "apply_zap_tuning")
+    for call in ("set_option_thread_per_host",
+                 "set_option_max_rule_duration_in_mins",
+                 "set_option_max_scan_duration_in_mins"):
+        assert f"ascan.{call}" in body, f"apply_zap_tuning never calls ascan.{call}"
+
+
+def test_a_malformed_bound_leaves_zaps_default_alone():
+    """Substituting a number nobody chose is worse than not setting it.
+
+    resolved() returns None for an unparseable value, and each bound is applied
+    only when it is not None.
+    """
+    body = _node(_src(), "apply_zap_tuning")
+    assert 'settings["thread_per_host"] is not None' in body, (
+        "an unparseable thread_per_host would be passed to ZAP anyway"
+    )

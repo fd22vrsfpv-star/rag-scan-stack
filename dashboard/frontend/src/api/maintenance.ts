@@ -379,13 +379,50 @@ export interface KnowledgeSeedResult {
   errors: string[]
 }
 
+/** What POST /seed returns for a REAL seed: a job, not a result.
+ *
+ *  The bundled corpus is ~585 embedding round-trips (~14 min), so the seed runs
+ *  in the background. A dry run still answers inline with a KnowledgeSeedResult. */
+export interface KnowledgeSeedStarted {
+  ok: boolean
+  job_id: string
+  status: 'running'
+  status_url: string
+  detail: string
+}
+
+export interface KnowledgeSeedJob {
+  known: boolean
+  job_id?: string
+  status?: 'running' | 'completed' | 'completed_with_errors' | 'failed'
+  progress?: {
+    file: string
+    file_index: number
+    files_total: number
+    doc_index?: number
+    docs_in_file?: number
+    docs_done: number
+    prompts_done: number
+  } | null
+  result?: KnowledgeSeedResult | null
+  error?: string | null
+  detail?: string
+}
+
+/** Poll one seed job. Omit jobId for the most recent. */
+export function fetchKnowledgeSeedStatus(jobId?: string) {
+  const q = jobId ? `?job_id=${encodeURIComponent(jobId)}` : ''
+  return apiFetch<KnowledgeSeedJob>(`/maintenance/knowledge/seed/status${q}`)
+}
+
 /** Load knowledge/seed/*.yaml into service_prompts + the RAG store.
- *  Idempotent: an entry whose selector exists is updated, not duplicated. */
+ *  Idempotent: an entry whose selector exists is updated, not duplicated.
+ *  A real seed resolves to KnowledgeSeedStarted; a dry run to KnowledgeSeedResult. */
 export function useKnowledgeSeed() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (body: { dry_run?: boolean; files?: string[] } = {}) =>
-      apiFetch<KnowledgeSeedResult>('/maintenance/knowledge/seed', {
+      apiFetch<KnowledgeSeedResult & Partial<KnowledgeSeedStarted>>('/maintenance/knowledge/seed', {
         method: 'POST',
         body: JSON.stringify(body),
       }),
