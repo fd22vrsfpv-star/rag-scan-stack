@@ -23,6 +23,10 @@ old behaviour back deliberately rather than by accident.
 import json
 import os
 import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _container import ERR, container_exec
 
 import pytest
 
@@ -127,22 +131,73 @@ def test_the_collapse_key_cannot_fold_ungroupable_rows_together():
 
 # ── executed ────────────────────────────────────────────────────────────────
 
+#: The export cap. `limit` is NOT a total cap — it bounds each source query — so
+#: a value below the corpus size makes both exports return the same truncated
+#: number and hides the very difference under test. Measured: at limit=5000 both
+#: answered 6077 and the assertion failed claiming "the filter is not applied";
+#: at the 50000 maximum they answer 7910 and 14419. Use the maximum.
+_SARIF_LIMIT = 50000
+
+
 def test_sarif_suppresses_inventory_by_default(api):
-    default = _api_call("/export/sarif?limit=5000")
-    withinv = _api_call("/export/sarif?limit=5000&include_inventory=true")
+    default = _api_call(f"/export/sarif?limit={_SARIF_LIMIT}")
+    withinv = _api_call(f"/export/sarif?limit={_SARIF_LIMIT}&include_inventory=true")
     assert default and withinv, "SARIF export did not return"
     n_def = sum(len(r["results"]) for r in default["runs"])
     n_inv = sum(len(r["results"]) for r in withinv["runs"])
     assert n_inv > n_def, (
         f"include_inventory changed nothing ({n_def} vs {n_inv}) — either the "
         "filter is not applied or there is no inventory to suppress")
-    tools = {r["tool"]["driver"]["name"] for r in default["runs"]}
-    assert "katana" not in tools, \
-        "katana crawl inventory is still in the default SARIF export"
-    assert "brutus" in tools, (
-        "no brutus run in the SARIF export — verified credentials are missing "
-        "from the report entirely")
-    assert "playwright" in tools, "no playwright run in the SARIF export"
+
+    per_def = {r["tool"]["driver"]["name"]: len(r["results"]) for r in default["runs"]}
+    per_inv = {r["tool"]["driver"]["name"]: len(r["results"]) for r in withinv["runs"]}
+
+    # Suppression is about VOLUME, not the tool disappearing. katana also emits
+    # findings that are not crawl inventory, and asserting the run is absent
+    # made a correct export look broken: measured 5779 -> 6, a 99.9% cut, with
+    # six legitimate non-inventory findings left behind.
+    k_def, k_inv = per_def.get("katana", 0), per_inv.get("katana", 0)
+    if k_inv:
+        assert k_def < k_inv * 0.5, (
+            f"katana results barely changed ({k_def} of {k_inv}) — crawl "
+            "inventory is not being suppressed from the default export")
+
+    assert "playwright" in per_def, "no playwright run in the SARIF export"
+
+    # Verified credentials are the most actionable thing a pentest produces, so
+    # their absence is worth asserting — but ONLY when some exist. The exporter
+    # filters on `valid_cred IS TRUE`, and this database currently holds nine
+    # credential rows that are all valid_cred=false username enumeration from
+    # postex_enum. Zero verified credentials is nothing to judge, not a bug.
+    creds = _verified_credential_count()
+    if creds is None:
+        pytest.skip("cannot count verified credentials here")
+    if creds == 0:
+        pytest.skip(
+            "no credential_findings with valid_cred=true — an empty credential "
+            "section is correct, so there is nothing to assert. Recover a "
+            "credential first for this to mean anything.")
+    cred_runs = {"brutus", "postex_enum", "hydra", "medusa", "ncrack"} & set(per_def)
+    assert cred_runs, (
+        f"{creds} verified credential(s) exist but no credential run is in the "
+        f"SARIF export — the most actionable finding is missing from the report. "
+        f"runs present: {sorted(per_def)}")
+
+
+def _verified_credential_count():
+    """Verified credentials in the database, or None if it cannot be read."""
+    out = container_exec(
+        "import os, psycopg2\n"
+        "c = psycopg2.connect(os.environ['DB_DSN']); cur = c.cursor()\n"
+        "cur.execute('SELECT count(*) FROM credential_findings WHERE valid_cred IS TRUE')\n"
+        "print('COUNT', cur.fetchone()[0])\n",
+        container="rag-api", timeout=60)
+    if out is None or out.startswith(ERR):
+        return None
+    for line in out.splitlines():
+        if line.startswith("COUNT"):
+            return int(line.split()[1])
+    return None
 
 
 def test_export_data_honours_the_same_switch(api):

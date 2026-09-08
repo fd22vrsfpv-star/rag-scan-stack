@@ -51,19 +51,31 @@ def is_unreachable(stderr: str) -> bool:
 
 
 def container_exec(script, container="rag-api", runner=("python3", "-c"),
-                   timeout=120, stdin=False, tail=1200):
+                   timeout=120, stdin=False, tail=1200, timeout_is_error=False):
     """Run `script` inside `container`.
 
     Returns:
-        None            — the container/daemon is unreachable (caller should SKIP)
+        None            — the container/daemon is unreachable (caller should SKIP).
+                          Also a timeout, unless timeout_is_error=True.
         "__ERR__ ..."   — the command ran and failed  (caller should FAIL)
         str             — stdout on success
     """
     cmd = ["docker", "exec"] + (["-i"] if stdin else []) + [container] + list(runner) + [script]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # A TIMEOUT IS NOT UNREACHABILITY. The container answered; the command
+        # just did not finish. Collapsing the two into None means a caller that
+        # skips on None silently skips a genuine hang — the same "unreachable
+        # reported as absent" mistake this module exists to prevent, inverted.
+        #
+        # Default stays None so the ~20 existing callers keep their behaviour;
+        # opt in with timeout_is_error=True to tell the difference.
+        if timeout_is_error:
+            return f"{ERR} timed out after {timeout}s (the container WAS reachable)"
+        return None
     except (OSError, subprocess.SubprocessError):
-        # docker binary missing, or the call timed out — cannot run here.
+        # docker binary missing or unusable — genuinely cannot run here.
         return None
     if out.returncode != 0:
         if is_unreachable(out.stderr):
