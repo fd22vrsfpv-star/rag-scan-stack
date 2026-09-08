@@ -125,7 +125,7 @@ class WebScanPipeline:
     """
 
     def __init__(self, job_tracker, gobuster_func, zap_func, nikto_func=None,
-                 auth=None):
+                 auth=None, tuning=None):
         """
         Initialize pipeline with required dependencies.
 
@@ -134,6 +134,8 @@ class WebScanPipeline:
             gobuster_func: Function to run Gobuster scans
             zap_func: Function to run ZAP scans
             nikto_func: Function to run Nikto scans (optional)
+            auth: Optional ScanAuth for authenticated scanning
+            tuning: Optional ZapTuning for ZAP passive-scan control
         """
         self.job_tracker = job_tracker
         self.gobuster_func = gobuster_func
@@ -142,6 +144,9 @@ class WebScanPipeline:
         # Optional ScanAuth. Held on the pipeline rather than threaded through
         # run_pipeline's already long signature; _run_zap reads it.
         self.auth = auth
+        # Optional ZapTuning, held for the same reason. None means the ZAP
+        # stage falls back to the env defaults.
+        self.tuning = tuning
         self.client = httpx.Client(verify=False, timeout=300.0)
 
     def run_pipeline(
@@ -859,7 +864,8 @@ class WebScanPipeline:
         """
         from web_scan import zap_scan_with_urls
         zap_result = zap_scan_with_urls(base_url, discovered_urls=discovered_urls,
-                                        auth=getattr(self, "auth", None))
+                                        auth=getattr(self, "auth", None),
+                                        tuning=getattr(self, "tuning", None))
 
         result = {
             "alerts_found": zap_result["count"],
