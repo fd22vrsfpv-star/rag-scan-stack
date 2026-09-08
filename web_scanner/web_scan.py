@@ -87,6 +87,52 @@ WORDLISTS = {
     "quickhits": "/opt/seclists/Discovery/Web-Content/quickhits.txt",
     "api": "/opt/seclists/Discovery/Web-Content/common-api-endpoints-mazen160.txt",
 }
+
+
+def _resolve_default_wordlist() -> str:
+    """Resolve the gobuster default ONCE, at import, and say so if it is wrong.
+
+    WHY THIS IS NOT LEFT TO THE SCAN:
+        `WORDLIST` is operator-set and was stale on this stack — it named
+        `directory-list-2.3-medium.txt` while the image ships
+        `DirBuster-2007_directory-list-2.3-medium.txt`. Nothing checked it until
+        gobuster ran, so a full pipeline crawled, rendered and spidered the
+        target, then failed its content-discovery stage on a path that had been
+        wrong since boot. Ten minutes of real traffic to learn a config typo.
+
+    The substitution is LOUD, never silent: an operator reading the log sees
+    exactly what was asked for, what was used instead, and how to fix it. The
+    alternative — refusing to start — would take ZAP, nikto and nuclei down over
+    a wordlist, and the alternative to THAT (carry on quietly) is what produced
+    the wasted scan.
+    """
+    if pathlib.Path(WORDLIST).exists():
+        return WORDLIST
+    fallback = next((p for p in (WORDLISTS.get("medium"), WORDLISTS.get("common"),
+                                 WORDLISTS.get("small"))
+                     if p and pathlib.Path(p).exists()), None)
+    if fallback:
+        logger.error(
+            f"[gobuster] WORDLIST={WORDLIST!r} does not exist in this image. "
+            f"Using {fallback!r} instead so content discovery still runs. Fix the "
+            f"WORDLIST value in .env (docker-compose's own default is correct) "
+            f"and recreate web-scanner.")
+        return fallback
+    logger.error(
+        f"[gobuster] WORDLIST={WORDLIST!r} does not exist AND no built-in "
+        f"wordlist alias resolves either — is /opt/seclists mounted? Every "
+        f"gobuster run will fail until this is fixed.")
+    return WORDLIST
+
+
+def missing_wordlists() -> dict:
+    """Declared alias -> path, for every alias whose file is absent.
+
+    Surfaced at startup and asserted by tests/test_wordlists_exist.py. An alias
+    that resolves to nothing is indistinguishable from a scan that found nothing.
+    """
+    return {name: path for name, path in WORDLISTS.items()
+            if not pathlib.Path(path).exists()}
 REPORT_DIR  = pathlib.Path(os.environ.get("REPORT_DIR", "/reports"))
 SCHEME_HINT = os.environ.get("SCHEME_HINT", "auto")
 ZAP_ADDR    = os.environ.get("ZAP_ADDR", "zap")
@@ -481,7 +527,7 @@ def gobuster_dir(url: str, wordlist: Optional[str] = None, timeout_sec=600):
         else:
             raise ValueError(f"Invalid wordlist: {wordlist}. Use one of: {', '.join(WORDLISTS.keys())} or a full path under {ALLOWED_WORDLIST_BASE}")
     else:
-        wordlist_path = WORDLIST  # Default from env
+        wordlist_path = _resolve_default_wordlist()
 
     if not pathlib.Path(wordlist_path).exists():
         raise RuntimeError(f"wordlist not found: {wordlist_path}")
@@ -552,7 +598,7 @@ def gobuster_dir_with_paths(url: str, wordlist: Optional[str] = None, timeout_se
         else:
             raise ValueError(f"Invalid wordlist: {wordlist}. Use one of: {', '.join(WORDLISTS.keys())} or a full path under {ALLOWED_WORDLIST_BASE}")
     else:
-        wordlist_path = WORDLIST  # Default from env
+        wordlist_path = _resolve_default_wordlist()
 
     if not pathlib.Path(wordlist_path).exists():
         raise RuntimeError(f"wordlist not found: {wordlist_path}")
@@ -589,13 +635,42 @@ def gobuster_dir_with_paths(url: str, wordlist: Optional[str] = None, timeout_se
     t_err = threading.Thread(target=_read_stderr, daemon=True)
     t_out.start()
     t_err.start()
-    proc.wait(timeout=timeout_sec)
+    # A timeout must NOT discard what gobuster already found.
+    #
+    # `proc.wait(timeout=...)` raises TimeoutExpired, and the old code let that
+    # propagate — past the parse, past the DB write — so a run that had already
+    # discovered paths recorded exactly nothing. Measured: `big` is 1,273,832
+    # entries and the stage runs it with -x php,html,txt, so ~5.1M requests; at
+    # the 600s default, through a SOCKS proxy, a timeout is not an edge case, it
+    # is the expected outcome. Ten minutes of real traffic thrown away each time.
+    #
+    # Same reasoning as the ZAP progressive drain: partial results beat none, and
+    # the caller is told plainly that they are partial.
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        logger.warning(
+            f"[gobuster] {timeout_sec}s budget spent on {url} — keeping the paths "
+            f"found so far. A larger wordlist needs a larger timeout_sec; "
+            f"{wordlist_path.rsplit('/', 1)[-1]} may simply not fit this window.")
+        try:
+            proc.kill()
+        except Exception:                                          # noqa: BLE001
+            pass
+        try:
+            proc.wait(timeout=10)
+        except Exception:                                          # noqa: BLE001
+            pass
     t_out.join(timeout=5)
     t_err.join(timeout=5)
 
     out = "".join(stdout_lines)
     err = "".join(stderr_buf)
-    if proc.returncode not in (0, 1):
+    # A killed process has no meaningful return code; only judge it when it ran
+    # to completion of its own accord.
+    if not timed_out and proc.returncode not in (0, 1):
         raise RuntimeError(f"gobuster exit {proc.returncode}: {err or out}")
 
     # Strip ANSI escape codes from output
@@ -619,9 +694,18 @@ def gobuster_dir_with_paths(url: str, wordlist: Optional[str] = None, timeout_se
             """, (url, p["path"], f"size={p['size']}", p["status_code"]))
         c.commit()
 
+    if timed_out:
+        logger.info(f"[gobuster] partial run on {url}: {len(paths)} path(s) kept "
+                    f"from {timeout_sec}s of scanning")
     return {
         "paths": paths,
-        "findings_saved": len(paths)
+        "findings_saved": len(paths),
+        # Told plainly rather than inferred: a caller that treats a partial run
+        # as a complete one concludes "there is nothing else here".
+        "timed_out": timed_out,
+        "complete": not timed_out,
+        "wordlist": wordlist_path,
+        "timeout_sec": timeout_sec,
     }
 
 
@@ -1753,6 +1837,21 @@ except ImportError:
 async def startup_event():
     setup_log_capture()
     logging.info("[web-scanner] Service started, log capture initialized")
+
+# Report unusable wordlists at BOOT, not ten minutes into a scan. A missing
+# alias is invisible until gobuster runs, and by then the crawl is already spent.
+try:
+    _missing_wl = missing_wordlists()
+    if _missing_wl:
+        logging.error(
+            "[web-scanner] %d wordlist alias(es) resolve to files that do not "
+            "exist and will fail if selected: %s",
+            len(_missing_wl), ", ".join(f"{k} -> {v}" for k, v in _missing_wl.items()))
+    if not pathlib.Path(WORDLIST).exists():
+        logging.error("[web-scanner] the default WORDLIST %r does not exist; "
+                      "gobuster will fall back (see _resolve_default_wordlist)", WORDLIST)
+except Exception as _wl_exc:                                       # noqa: BLE001
+    logging.warning("[web-scanner] could not check wordlists: %s", _wl_exc)
 
 ALLOWED_WORDLIST_BASE = "/opt/seclists"
 
