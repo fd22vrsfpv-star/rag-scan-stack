@@ -463,6 +463,16 @@ services:
       ZAP_API_KEY: ${ZAP_API_KEY:-changeme}
       ZAP_ADDR: ${ZAP_ADDR:-zap}
       ZAP_PORT: ${ZAP_PORT:-8090}
+      # ZAP passive-scan tuning. The passive queue is UNBOUNDED and holds whole
+      # HTTP messages, so a slow rule accumulates memory rather than costing
+      # time. See "ZAP passive-scan tuning" in web_scanner/web_scan.py.
+      ZAP_PSCAN_DURING_ACTIVE_SCAN: ${ZAP_PSCAN_DURING_ACTIVE_SCAN:-false}
+      ZAP_PSCAN_ONLY_IN_SCOPE: ${ZAP_PSCAN_ONLY_IN_SCOPE:-true}
+      ZAP_MAX_ALERTS_PER_RULE: ${ZAP_MAX_ALERTS_PER_RULE:-0}
+      ZAP_DISABLE_PSCAN_RULES: ${ZAP_DISABLE_PSCAN_RULES:-}
+      # How often findings are stored mid-scan, so a ZAP death costs one
+      # interval rather than the whole scan.
+      ZAP_DRAIN_INTERVAL: ${ZAP_DRAIN_INTERVAL:-60}
       SCHEME_HINT: ${SCHEME_HINT:-auto}
       REPORT_DIR: /reports
       PD_RUNNER_URL: "https://pd-runner:8023"
