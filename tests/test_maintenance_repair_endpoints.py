@@ -32,6 +32,7 @@ operation. Nothing here runs in CI, where the stack is absent and every test
 skips.
 """
 import os
+import time
 
 import pytest
 
@@ -137,17 +138,55 @@ def test_knowledge_seed_dry_run_changes_nothing(live):
     assert after == before, f"dry run changed the prompt count {before} -> {after}"
 
 
+#: A representative subset for the idempotency test: one file of prompts and one
+#: of service docs, so both write paths are exercised. The FULL corpus is 36
+#: prompts + 585 docs at ~1.4s per doc — 13m12s, measured — and running it twice
+#: to prove idempotency would put 27 minutes into the suite to test a property
+#: two files demonstrate just as well.
+SEED_SUBSET = ["knowledge-base.yaml", "htb-attack-paths.yaml"]
+
+
+def _seed_and_wait(payload=None, budget_sec=2400):
+    """Start a seed job and poll it to a terminal state.
+
+    A real seed is ~585 embedding round-trips (measured: 9 docs in 13.05s, so
+    ~1.45s each, ~14 minutes for the corpus). It used to run inside one HTTP
+    request behind a 900s timeout, so the request was abandoned mid-flight and
+    the work discarded — which read as a hang and wedged this whole file.
+    """
+    r = _post("/api/maintenance/knowledge/seed", json=payload or {}, timeout=60)
+    assert r.status_code == 200, r.text[:300]
+    started = r.json()
+    job_id = started.get("job_id")
+    assert job_id, f"seed did not return a job id — did it go back to running inline? {started}"
+
+    deadline = time.time() + budget_sec
+    last = None
+    while time.time() < deadline:
+        time.sleep(5)
+        job = _get(f"/api/maintenance/knowledge/seed/status?job_id={job_id}").json()
+        assert job.get("known"), f"seed job vanished (service restart?): {job}"
+        last = job
+        if job.get("status") != "running":
+            break
+    else:
+        pytest.fail(f"seed still running after {budget_sec}s; last state {last}")
+
+    assert last["status"] != "failed", f"seed job failed: {last.get('error')}"
+    result = last.get("result")
+    assert result, f"terminal seed job carries no result: {last}"
+    return result
+
+
 def test_knowledge_seed_executes_and_is_idempotent(live):
     """Re-seeding must UPDATE in place, never duplicate: the selector is the
     identity of a rule and a second insert would collide on its unique index."""
-    r = _post("/api/maintenance/knowledge/seed", json={})
-    assert r.status_code == 200, r.text[:300]
-    body = r.json()
+    body = _seed_and_wait({"files": SEED_SUBSET})
     assert body.get("failed", 1) == 0, f"seed reported failures: {body.get('errors')}"
     count_1 = _get("/api/maintenance/knowledge/status").json()["prompt_count"]
     assert count_1 > 0, "seeding ran but no prompt rules exist"
 
-    again = _post("/api/maintenance/knowledge/seed", json={}).json()
+    again = _seed_and_wait({"files": SEED_SUBSET})
     assert again.get("failed", 1) == 0, again.get("errors")
     assert again.get("created", 0) == 0, (
         f"a re-seed created {again.get('created')} new rule(s) — it should update in place"
