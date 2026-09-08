@@ -2,6 +2,13 @@ fastapi
 uvicorn
 psycopg2-binary
 python-owasp-zap-v2.4
-httpx
+httpx[socks]
+# SOCKS support for `requests`. Without it ALL_PROXY=socks5://... does not
+# merely go unused — every requests call raises
+# "InvalidSchema: Missing dependencies for SOCKS support", so a proxied scan
+# fails on its first python-driven HTTP request. CLI tools (gobuster, katana,
+# gowitness, curl) carry their own SOCKS support, which is why this stayed
+# hidden.
+PySocks
 pdfplumber
 Pillow

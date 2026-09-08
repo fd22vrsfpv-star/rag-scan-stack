@@ -1608,6 +1608,13 @@ class PipelineReq(BaseModel):
     auth: Optional[ScanAuth] = None
     #: Optional ZAP passive-scan tuning. Omitted -> the env defaults apply.
     zap_tuning: Optional[ZapTuning] = None
+    #: SOCKS proxy for scanning through a remote node, e.g.
+    #: 'socks5://node-manager:10120'. The pipeline route accepted no proxy at
+    #: all until now, while the BFF's block-local-scans gate was satisfied by
+    #: the parameter merely being present — so a gated scan egressed from this
+    #: host's own address. If a proxy is given and cannot be established, the
+    #: job FAILS rather than scanning unproxied.
+    proxy: Optional[str] = None
 
 
 class NiktoReq(BaseModel):
@@ -1615,6 +1622,12 @@ class NiktoReq(BaseModel):
     target_url: str  # Target URL (required, e.g., 'http://192.168.1.150' or 'https://example.com')
     tuning: Optional[str] = None  # Nikto tuning options (e.g., '123' for tests 1,2,3 or 'x6' to skip XSS tests)
     timeout_sec: int = 1800  # Timeout in seconds (default 30 minutes)
+    #: SOCKS proxy for scanning through a remote node. The BFF injects this on
+    #: every scan payload; a model that does not declare it drops it SILENTLY
+    #: (pydantic extra="ignore"), so the block-local-scans gate passes and the
+    #: traffic still leaves from this host's own address.
+    proxy: Optional[str] = None
+  # Timeout in seconds (default 30 minutes)
 
 
 # ── Scope gate ────────────────────────────────────────────────────────────
@@ -1686,6 +1699,154 @@ def _seed_known_apps(base_url: str) -> List[str]:
     return found
 
 
+# ── Scan egress proxy ─────────────────────────────────────────────────────────
+#
+# WHY A CONTEXT MANAGER AND NOT TWO COPIES OF THE SETUP:
+#   /jobs/web-scan honoured `proxy` and /jobs/pipeline-scan had no proxy support
+#   at all — no field on PipelineReq, nothing in the job function. The BFF's
+#   `_check_proxy_required` gate is satisfied by the parameter merely being
+#   PRESENT, and the BFF recorded it in the job file, so a pipeline scan looked
+#   proxied from every angle while egressing from the host address. Duplicated
+#   setup is how that happened; there is one implementation now.
+#
+# FAIL CLOSED. The old code wrapped ZAP proxy configuration in
+# `except Exception: logger.warning(...)` and carried on scanning. An operator
+# who asked for proxied egress and silently got direct egress is the worst
+# possible outcome of this function — worse than no scan — so a proxy that
+# cannot be established raises.
+#
+# RESTORE ON EXIT. ALL_PROXY is process-global and ZAP's SOCKS setting is
+# server-global; neither was ever unset. A later unproxied scan in the same
+# worker inherited both, which is confusing at best and, if the node goes away,
+# a scan that fails for no visible reason.
+
+def _probe_socks(host: str, port: int, timeout: float = 8.0) -> None:
+    """Raise unless a TCP connection to the SOCKS proxy succeeds."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return
+    except OSError as exc:
+        raise RuntimeError(
+            f"proxy {host}:{port} is not reachable ({exc}). Refusing to scan: the "
+            "operator asked for proxied egress, and running unproxied would send "
+            "traffic from this host's own address."
+        ) from exc
+
+
+@contextlib.contextmanager
+def proxied_scan(proxy: Optional[str], job_id: str = ""):
+    """Route sub-tools and ZAP through `proxy` for the enclosed block.
+
+    A falsy `proxy` is a no-op, so callers need no branch. Yields the proxy that
+    was applied (or None), and restores the previous global state on exit.
+    """
+    tag = f"[{job_id[:8]}] " if job_id else ""
+    if not proxy:
+        yield None
+        return
+
+    import urllib.parse as _urlparse
+    pp = _urlparse.urlparse(proxy)
+    host, port = pp.hostname or "", int(pp.port or 1080)
+    if not host:
+        raise ValueError(f"proxy {proxy!r} has no host")
+
+    _probe_socks(host, port)
+
+    # ALL_PROXY is honoured by requests/httpx for EVERY host, internal ones
+    # included. Without a NO_PROXY the scanner's own calls to playwright-scanner,
+    # nuclei-runner, rag-api and ZAP would be sent to the remote node, which
+    # cannot resolve Docker-internal names — the pipeline stages would fail, and
+    # the internal hostnames would be handed to the node in SOCKS CONNECT
+    # requests. Verified: with ALL_PROXY set and no NO_PROXY,
+    # Session.merge_environment_settings('https://playwright-scanner:8014/...')
+    # returns {'all': 'socks5://...'}.
+    prev = {k: os.environ.get(k) for k in
+            ("ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy")}
+    bypass = _internal_no_proxy()
+    os.environ["ALL_PROXY"] = proxy
+    os.environ["all_proxy"] = proxy
+    os.environ["NO_PROXY"] = bypass
+    os.environ["no_proxy"] = bypass
+    logger.info(f"{tag}internal hosts bypassing the proxy: {bypass}")
+
+    zap_base = f"http://{ZAP_ADDR}:{ZAP_PORT}"
+    zap_set = False
+    try:
+        import requests as _req
+        _req.get(f"{zap_base}/JSON/network/action/setConnectionTimeout/",
+                 params={"apikey": ZAP_API_KEY, "timeout": "120"}, timeout=5)
+        _req.get(f"{zap_base}/JSON/network/action/setSocksProxy/", params={
+            "apikey": ZAP_API_KEY, "host": host, "port": str(port),
+            "version": "5", "useDns": "true"}, timeout=5)
+        _req.get(f"{zap_base}/JSON/network/action/setUseSocksProxy/",
+                 params={"apikey": ZAP_API_KEY, "useSocksProxy": "true"}, timeout=5)
+        zap_set = True
+        logger.info(f"{tag}egress proxied through {host}:{port} "
+                    f"(sub-tools via ALL_PROXY, ZAP via upstream SOCKS)")
+    except Exception as exc:                                       # noqa: BLE001
+        # Restore before raising — a half-applied proxy is worse than none.
+        _restore_env(prev)
+        raise RuntimeError(
+            f"could not route ZAP through {host}:{port} ({exc}). Refusing to scan "
+            "rather than sending traffic from this host's own address."
+        ) from exc
+
+    try:
+        yield proxy
+    finally:
+        _restore_env(prev)
+        if zap_set:
+            try:
+                import requests as _req
+                _req.get(f"{zap_base}/JSON/network/action/setUseSocksProxy/",
+                         params={"apikey": ZAP_API_KEY, "useSocksProxy": "false"},
+                         timeout=5)
+            except Exception as exc:                               # noqa: BLE001
+                logger.warning(
+                    f"{tag}could not clear ZAP's SOCKS proxy: {exc}. ZAP will keep "
+                    f"routing through {host}:{port} until it is cleared or restarted.")
+
+
+def _internal_no_proxy() -> str:
+    """Hosts that must NOT go through the scan proxy.
+
+    Derived from the service URLs this module already reads, so adding a service
+    to the stack does not silently start tunnelling its traffic through an
+    operator's egress node.
+    """
+    from urllib.parse import urlparse
+    hosts = {"localhost", "127.0.0.1", "::1", ZAP_ADDR}
+    # NUCLEI_URL / OSINT_RUNNER_URL are read inline elsewhere rather than being
+    # module constants, so read them from the environment here too.
+    urls = (API_BASE, PLAYWRIGHT_URL, PD_RUNNER_URL,
+            os.environ.get("NUCLEI_URL", "https://nuclei-runner:8011"),
+            os.environ.get("OSINT_RUNNER_URL", "https://osint-runner:8024"))
+    for url in urls:
+        h = urlparse(str(url or "")).hostname
+        if h:
+            hosts.add(h)
+    # The DB, which is reached by DSN rather than URL.
+    try:
+        dsn = os.environ.get("DB_DSN", "")
+        h = urlparse(dsn.replace("postgresql://", "http://", 1)).hostname
+        if h:
+            hosts.add(h)
+    except Exception:                                              # noqa: BLE001
+        pass
+    return ",".join(sorted(h for h in hosts if h))
+
+
+def _restore_env(prev: dict) -> None:
+    """Put the proxy environment back exactly the way it was."""
+    for key, val in prev.items():
+        if val is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = val
+
+
 def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_katana: bool, do_zap: bool, limit: Optional[int], wordlist: Optional[str] = None, target_url: Optional[str] = None, target_urls: Optional[List[str]] = None, proxy: Optional[str] = None, zap_tuning: Optional["ZapTuning"] = None):
     """Background task to run web scan with progress tracking.
 
@@ -1712,6 +1873,7 @@ def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_ka
         _job_tracker.update_job(job_id, status="failed", error=str(e))
         return
 
+    _proxy_stack = contextlib.ExitStack()
     try:
         _t0 = time.time()
         # Emit webhook for scan start
@@ -1736,29 +1898,9 @@ def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_ka
         _job_tracker.update_job(job_id, status="running", started_at=datetime.now().isoformat())
         _job_tracker.update_progress(job_id, stage="fetching_targets")
 
-        # Configure SOCKS proxy for sub-tools if set
-        if proxy:
-            logger.info(f"[{job_id[:8]}] Using proxy: {proxy}")
-            # Set ALL_PROXY env for gobuster/katana/curl-based tools
-            os.environ["ALL_PROXY"] = proxy
-            os.environ["all_proxy"] = proxy
-            # Configure ZAP upstream proxy via API
-            try:
-                import urllib.parse as _urlparse
-                _pp = _urlparse.urlparse(proxy)
-                _proxy_host = _pp.hostname or ""
-                _proxy_port = str(_pp.port or 1080)
-                import requests as _req
-                _zap_base = f"http://{ZAP_ADDR}:{ZAP_PORT}"
-                _req.get(f"{_zap_base}/JSON/network/action/setConnectionTimeout/", params={"apikey": ZAP_API_KEY, "timeout": "120"}, timeout=5)
-                _req.get(f"{_zap_base}/JSON/network/action/setSocksProxy/", params={
-                    "apikey": ZAP_API_KEY, "host": _proxy_host, "port": _proxy_port,
-                    "version": "5", "useDns": "true"
-                }, timeout=5)
-                _req.get(f"{_zap_base}/JSON/network/action/setUseSocksProxy/", params={"apikey": ZAP_API_KEY, "useSocksProxy": "true"}, timeout=5)
-                logger.info(f"[{job_id[:8]}] ZAP upstream SOCKS proxy configured: {_proxy_host}:{_proxy_port}")
-            except Exception as _ze:
-                logger.warning(f"[{job_id[:8]}] Could not configure ZAP proxy: {_ze}")
+        # Route every sub-tool and ZAP through the operator's proxy. Fails the
+        # job if the proxy cannot be established — see proxied_scan().
+        _proxy_stack.enter_context(proxied_scan(proxy, job_id))
 
         # Merge target sources: target_urls > target_url > DB fallback
         urls_to_scan = target_urls or ([target_url] if target_url else None)
@@ -2035,6 +2177,9 @@ def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_ka
         # consume one of the service's MAX_CONCURRENT_SCANS slots, and enough
         # crashes would wedge the scanner entirely.
         _slot.__exit__(None, None, None)
+        # Same reasoning for the proxy: ALL_PROXY and ZAP's SOCKS setting are
+        # global, so leaving them set would silently proxy the NEXT scan.
+        _proxy_stack.close()
 
 
 @app.get("/health")
@@ -2236,9 +2381,12 @@ def run_web_scan_sync(req: JobReq):
 # Nikto Scan Endpoints
 # ===============================
 
-def _run_nikto_scan_job(job_id: str, target_url: str, tuning: Optional[str], timeout_sec: int):
+def _run_nikto_scan_job(job_id: str, target_url: str, tuning: Optional[str], timeout_sec: int,
+                        proxy: Optional[str] = None):
     """Background task to run Nikto scan with progress tracking"""
+    _proxy_stack = contextlib.ExitStack()
     try:
+        _proxy_stack.enter_context(proxied_scan(proxy, job_id))
         logger.info(f"[{job_id[:8]}] Starting Nikto scan on {target_url}")
         _job_tracker.update_job(job_id, status="running", started_at=datetime.now().isoformat())
         _job_tracker.update_progress(job_id, stage="nikto", current_target=target_url)
@@ -2299,18 +2447,29 @@ def _run_nikto_scan_job(job_id: str, target_url: str, tuning: Optional[str], tim
             "target_url": target_url,
             "error": str(e)
         })
+    finally:
+        _proxy_stack.close()
 
 
 class GobusterReq(BaseModel):
     """Request model for standalone Gobuster directory scan"""
     target_url: str  # Target URL (required)
     wordlist: Optional[str] = None  # small, medium, big, common, raft-small, etc.
-    timeout_sec: int = 600  # Timeout per target in seconds
+    timeout_sec: int = 600
+    #: SOCKS proxy for scanning through a remote node. The BFF injects this on
+    #: every scan payload; a model that does not declare it drops it SILENTLY
+    #: (pydantic extra="ignore"), so the block-local-scans gate passes and the
+    #: traffic still leaves from this host's own address.
+    proxy: Optional[str] = None
+  # Timeout per target in seconds
 
 
-def _run_gobuster_job(job_id: str, target_url: str, wordlist: Optional[str], timeout_sec: int):
+def _run_gobuster_job(job_id: str, target_url: str, wordlist: Optional[str], timeout_sec: int,
+                      proxy: Optional[str] = None):
     """Background task for standalone gobuster scan."""
+    _proxy_stack = contextlib.ExitStack()
     try:
+        _proxy_stack.enter_context(proxied_scan(proxy, job_id))
         _job_tracker.update_job(job_id, status="running", stage="gobuster")
 
         write_audit("scan_started", "gobuster", "web_scanner", {
@@ -2324,6 +2483,7 @@ def _run_gobuster_job(job_id: str, target_url: str, wordlist: Optional[str], tim
             target_url,
             wordlist=validated_wordlist,
             timeout_sec=timeout_sec,
+            proxy=proxy,
         )
 
         paths_count = result.get("findings_saved", 0)
@@ -2348,6 +2508,8 @@ def _run_gobuster_job(job_id: str, target_url: str, wordlist: Optional[str], tim
         emit_webhook_event("scan_failed", "gobuster", {
             "job_id": job_id, "target_url": target_url, "error": str(e),
         })
+    finally:
+        _proxy_stack.close()
 
 
 @app.post("/jobs/gobuster")
@@ -2384,6 +2546,7 @@ def run_gobuster_scan(req: GobusterReq, background_tasks: BackgroundTasks):
     job_id = _job_tracker.create_job(job_type="gobuster")
     background_tasks.add_task(
         _run_gobuster_job, job_id, req.target_url, req.wordlist, req.timeout_sec,
+        req.proxy,
     )
     return {
         "ok": True,
@@ -3157,7 +3320,7 @@ def run_nikto_scan(req: NiktoReq, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail=f"Invalid target URL: {e}")
 
     job_id = _job_tracker.create_job(job_type="nikto-scan")
-    background_tasks.add_task(_run_nikto_scan_job, job_id, req.target_url, req.tuning, req.timeout_sec)
+    background_tasks.add_task(_run_nikto_scan_job, job_id, req.target_url, req.tuning, req.timeout_sec, req.proxy)
 
     return {
         "ok": True,
@@ -3224,9 +3387,17 @@ def _run_pipeline_scan_job(
     skip_wafw00f: bool = False,
     auth: Optional["ScanAuth"] = None,
     zap_tuning: Optional["ZapTuning"] = None,
+    proxy: Optional[str] = None,
 ):
     """Background task to run sequential scan pipeline with progress tracking"""
+    _proxy_stack = contextlib.ExitStack()
     try:
+        # Route every stage through the operator's proxy BEFORE any stage runs.
+        # Raises if it cannot be established, which fails the job — see
+        # proxied_scan(). Scanning unproxied when the operator asked for a proxy
+        # is the one outcome worse than not scanning.
+        _proxy_stack.enter_context(proxied_scan(proxy, job_id))
+
         # Emit webhook for pipeline scan start
         emit_webhook_event("scan_started", "web-scanner", {
             "job_id": job_id,
@@ -3401,6 +3572,10 @@ def _run_pipeline_scan_job(
             "scan_type": "pipeline-scan",
             "error": str(e)
         })
+    finally:
+        # ALL_PROXY and ZAP's SOCKS setting are global; leaving them set would
+        # silently proxy the next scan through a node it never asked for.
+        _proxy_stack.close()
 
 
 @app.post("/jobs/pipeline-scan")
@@ -3459,6 +3634,7 @@ def run_pipeline_scan(req: PipelineReq, background_tasks: BackgroundTasks):
         req.skip_wafw00f,
         req.auth,
         req.zap_tuning,
+        req.proxy,
     )
 
     return {
