@@ -70,6 +70,24 @@ async def zap_status():
             f"numberOfMessages did not answer ({str(exc)[:80]}) — the session store is "
             "already too large to query. ZAP's context API will hang; restart it or "
             "start a new session.")
+    # Passive-scan queue depth. THE number that predicts the memory death: the
+    # passive scanner's queue is unbounded and holds whole HTTP messages, so a
+    # rule that is slow does not burn CPU, it accumulates messages. A depth that
+    # climbs and does not come back down is the failure in progress — measured
+    # here as ZAP growing to 11.98 GiB and dying mid-active-scan.
+    try:
+        out["pscan_queue"] = int((await _view("pscan/view/recordsToScan")).get("recordsToScan", 0))
+        out["pscan_only_in_scope"] = str((await _view("pscan/view/scanOnlyInScope")).get(
+            "scanOnlyInScope", "")) or None
+    except Exception as exc:                                       # noqa: BLE001
+        out["pscan_queue"] = None
+        out["pscan_error"] = str(exc)[:160]
+    if isinstance(out.get("pscan_queue"), int) and out["pscan_queue"] > 5000:
+        out["pscan_warning"] = (
+            f"{out['pscan_queue']} messages are waiting to be passive-scanned. The "
+            "queue holds whole messages, so this is memory growth in progress, not "
+            "a backlog that costs only time.")
+
     for key, path in (("spider", "spider/view/scans"),
                       ("active_scan", "ascan/view/scans")):
         try:
