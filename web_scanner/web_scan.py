@@ -1006,6 +1006,185 @@ def configure_zap_auth(zap, context_name: str, auth: "ScanAuth", scope_regex: st
             "source": source, "authenticated": authenticated}
 
 
+# ── ZAP passive-scan tuning ───────────────────────────────────────────────────
+#
+# WHY THIS EXISTS: ZAP's passive scanner runs every enabled rule against EVERY
+# message ZAP sees, on a bounded thread pool fed by an UNBOUNDED queue. When one
+# rule is slow, the queue is what grows — and the queue holds whole HTTP messages.
+# That is a memory sink, not a CPU one, which is why raising the heap from 3g to
+# 8g did not help: ZAP grew to 11.98 GiB and died at the same point in the scan.
+#
+# Measured on demo.testfire.net: 327 "Passive Scan rule ... took N seconds"
+# warnings, every one naming the SAME rule — "Tech Detection Passive Scanner",
+# at 40-51 seconds per message across 30 passive threads.
+#
+# WHAT CANNOT BE DONE, stated plainly so nobody re-derives it:
+#   `pscan.disableScanners` CANNOT disable that rule. It only accepts rules in
+#   the registry (`pscan.scanners` — 70 of them here), and Tech Detection is not
+#   one. Its add-on manifest (wappalyzer-release-21.50.0) declares only
+#   <extensions>, no <pscanrules>, so the scanner is registered directly by the
+#   extension as a raw PassiveScanner with no rule id to address. Verified live:
+#   no entry matching "tech" or "wappalyzer" in the 70 listed scanners.
+#
+# So the lever that reaches it is PSCAN_DURING_ACTIVE_SCAN. Passive scanning runs
+# through the crawl — which is where it earns its keep, and where the post-spider
+# drain already banks its findings — and is switched off for the active scan,
+# which is the phase that produces the message volume that kills ZAP. The add-on
+# stays installed and technology fingerprinting is preserved.
+
+#: CSV of pscan rule ids to disable for every scan.
+ZAP_DISABLE_PSCAN_RULES = os.environ.get("ZAP_DISABLE_PSCAN_RULES", "")
+#: Passive-scan only messages inside the context. ZAP's default is false, i.e.
+#: it passive-scans third-party resources the target merely links to.
+ZAP_PSCAN_ONLY_IN_SCOPE = os.environ.get("ZAP_PSCAN_ONLY_IN_SCOPE", "true")
+#: Cap alerts kept per rule. ZAP's default of 0 means unlimited.
+ZAP_MAX_ALERTS_PER_RULE = os.environ.get("ZAP_MAX_ALERTS_PER_RULE", "0")
+#: Keep passive scanning on during the active scan. Default off — see above.
+ZAP_PSCAN_DURING_ACTIVE_SCAN = os.environ.get("ZAP_PSCAN_DURING_ACTIVE_SCAN", "false")
+
+
+def _as_bool(v, default: bool = False) -> bool:
+    """Parse an operator-supplied boolean. Unset/blank -> default."""
+    if v is None or v == "":
+        return default
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+class ZapTuning(BaseModel):
+    """Per-scan control over ZAP's passive scanner.
+
+    Every field defaults to None meaning "use the env default", so a caller that
+    passes nothing gets today's configured behaviour and no scan changes shape by
+    accident.
+    """
+    #: Rule ids to disable, e.g. ["10096", "10027"]. Ids are validated against
+    #: ZAP's own registry; an id ZAP does not know is reported, never ignored.
+    disable_pscan_rules: Optional[List[str]] = None
+    #: Restrict passive scanning to in-context messages.
+    pscan_only_in_scope: Optional[bool] = None
+    #: Max alerts retained per rule (0 = unlimited).
+    max_alerts_per_rule: Optional[int] = None
+    #: Leave passive scanning enabled during the active scan.
+    pscan_during_active_scan: Optional[bool] = None
+
+    def resolved(self) -> dict:
+        """Fold operator values over the env defaults into concrete settings."""
+        rules = self.disable_pscan_rules
+        if rules is None:
+            rules = [r.strip() for r in ZAP_DISABLE_PSCAN_RULES.split(",") if r.strip()]
+        try:
+            max_alerts = (int(ZAP_MAX_ALERTS_PER_RULE)
+                          if self.max_alerts_per_rule is None else int(self.max_alerts_per_rule))
+        except (TypeError, ValueError):
+            logger.warning(
+                f"[ZAP] max_alerts_per_rule {ZAP_MAX_ALERTS_PER_RULE!r} is not a "
+                "number — using 0 (unlimited)")
+            max_alerts = 0
+        return {
+            "disable_pscan_rules": [str(r) for r in rules],
+            "pscan_only_in_scope": _as_bool(ZAP_PSCAN_ONLY_IN_SCOPE, True)
+                if self.pscan_only_in_scope is None else bool(self.pscan_only_in_scope),
+            "max_alerts_per_rule": max_alerts,
+            "pscan_during_active_scan": _as_bool(ZAP_PSCAN_DURING_ACTIVE_SCAN, False)
+                if self.pscan_during_active_scan is None else bool(self.pscan_during_active_scan),
+        }
+
+
+def apply_zap_tuning(zap, tuning: Optional["ZapTuning"] = None) -> dict:
+    """Apply passive-scan settings to a ZAP instance. Returns what was applied.
+
+    Each setting is applied independently: one that ZAP rejects is logged and the
+    rest still land. Nothing here is fatal to a scan — a scan with default passive
+    settings is worse-tuned, not wrong.
+    """
+    settings = (tuning or ZapTuning()).resolved()
+    applied = {"requested": settings, "failed": []}
+
+    def _try(name, fn):
+        try:
+            fn()
+            return True
+        except Exception as exc:                                   # noqa: BLE001
+            logger.warning(f"[ZAP] could not apply {name}: {exc}")
+            applied["failed"].append(name)
+            return False
+
+    wanted = settings["disable_pscan_rules"]
+    if wanted:
+        # Validate against ZAP's own registry FIRST. disableScanners returns OK
+        # for an id it does not know, so an unvalidated typo is a rule that
+        # silently stays enabled — the failure this project keeps re-learning.
+        known = {}
+        try:
+            known = {str(sc.get("id")): sc.get("name") for sc in zap.pscan.scanners}
+        except Exception as exc:                                   # noqa: BLE001
+            logger.warning(f"[ZAP] could not read the passive rule registry: {exc}")
+        if known:
+            unknown = [r for r in wanted if r not in known]
+            if unknown:
+                logger.warning(
+                    f"[ZAP] passive rule id(s) {unknown} are not in ZAP's registry "
+                    f"({len(known)} rules) and CANNOT be disabled this way. Note that "
+                    "add-on-registered scanners such as 'Tech Detection Passive "
+                    "Scanner' have no rule id at all — use "
+                    "pscan_during_active_scan=false or uninstall the add-on.")
+            wanted = [r for r in wanted if r in known]
+            applied["unknown_rules"] = unknown
+        if wanted and _try("disable_pscan_rules", lambda: zap.pscan.disable_scanners(",".join(wanted))):
+            logger.info(f"[ZAP] passive rules disabled: "
+                        + ", ".join(f"{r} ({known.get(r, '?')})" for r in wanted))
+    applied["disabled_rules"] = wanted
+
+    _try("pscan_only_in_scope",
+         lambda: zap.pscan.set_scan_only_in_scope(str(settings["pscan_only_in_scope"]).lower()))
+    _try("max_alerts_per_rule",
+         lambda: zap.pscan.set_max_alerts_per_rule(settings["max_alerts_per_rule"]))
+
+    logger.info(
+        f"[ZAP] passive tuning: only_in_scope={settings['pscan_only_in_scope']} "
+        f"max_alerts_per_rule={settings['max_alerts_per_rule']} "
+        f"disabled={len(wanted)} rule(s) "
+        f"pscan_during_active_scan={settings['pscan_during_active_scan']}")
+    return applied
+
+
+@contextlib.contextmanager
+def pscan_paused(zap, resume_setting: bool):
+    """Switch passive scanning off for the enclosed block, then restore it.
+
+    `resume_setting` is what the operator asked for: when True this is a no-op
+    and passive scanning simply stays on. Re-enabling happens in a finally, so a
+    scan that raises does not leave ZAP permanently deaf for the next one — that
+    would be a silent, cross-scan capability loss.
+    """
+    if resume_setting:
+        yield False
+        return
+    paused = False
+    try:
+        zap.pscan.set_enabled("false")
+        paused = True
+        logger.info("[ZAP] passive scanning paused for the active scan "
+                    "(crawl findings already stored; set "
+                    "pscan_during_active_scan=true to keep it on)")
+    except Exception as exc:                                       # noqa: BLE001
+        logger.warning(f"[ZAP] could not pause passive scanning: {exc}")
+    try:
+        yield paused
+    finally:
+        try:
+            zap.pscan.set_enabled("true")
+            if paused:
+                logger.info("[ZAP] passive scanning re-enabled")
+        except Exception as exc:                                   # noqa: BLE001
+            logger.error(
+                f"[ZAP] FAILED to re-enable passive scanning: {exc}. The next scan "
+                "in this ZAP session will have no passive findings until ZAP is "
+                "restarted.")
+
+
 # ZAP's spider has no server-side deadline, and neither did our wait loops.
 #
 # `max_wait` bounds only the ACTIVE scan (see its docstring); both spider loops
@@ -1129,7 +1308,8 @@ def zap_scan(url: str, max_wait=900):
 
 def zap_scan_with_urls(url: str, discovered_urls: Optional[List[str]] = None, max_wait=900,
                        auth: Optional["ScanAuth"] = None,
-                       progress_callback=None) -> Dict[str, Any]:
+                       progress_callback=None,
+                       tuning: Optional["ZapTuning"] = None) -> Dict[str, Any]:
     """Run ZAP scan with pre-seeded URLs from Gobuster/Playwright.
 
     This variant accepts discovered URLs and seeds them into ZAP's site tree
@@ -1163,11 +1343,11 @@ def zap_scan_with_urls(url: str, discovered_urls: Optional[List[str]] = None, ma
 
     with bounded_zap_http():
         return _zap_scan_with_urls_inner(zap, url, discovered_urls, max_wait,
-                                         progress_callback, auth)
+                                         progress_callback, auth, tuning)
 
 
 def _zap_scan_with_urls_inner(zap, url, discovered_urls, max_wait, progress_callback,
-                              auth=None):
+                              auth=None, tuning=None):
     """The body of zap_scan_with_urls, run with every ZAP HTTP call bounded."""
     # SCOPE FIRST: the active scanner only attacks what is IN A CONTEXT/SCOPE.
     # Seeding the site tree (urlopen) is not enough — without scope, ascan skips
@@ -1191,6 +1371,10 @@ def _zap_scan_with_urls_inner(zap, url, discovered_urls, max_wait, progress_call
         except Exception as e:
             logger.debug(f"[ZAP] include_in_context {pat}: {e}")
     logger.info(f"[ZAP] scope: {len(scope_pats)} host pattern(s) added to context '{ctx_name}'")
+
+    # Passive-scan tuning. AFTER the context (scan_only_in_scope is meaningless
+    # without one) and BEFORE any seeding, so it governs every message ZAP sees.
+    _tuning = apply_zap_tuning(zap, tuning)
 
     # Authentication, if the caller supplied any. Configured BEFORE seeding and
     # spidering so every request from here on carries the session — configuring
@@ -1260,27 +1444,35 @@ def _zap_scan_with_urls_inner(zap, url, discovered_urls, max_wait, progress_call
     drain_zap_alerts(url, label="post-spider")
 
     # Active-scan the in-scope tree (recurse covers the seeded, now-spidered apps).
+    #
+    # Passive scanning is paused for this block by default: the active scan is
+    # what generates the message volume that overruns the passive queue, and the
+    # crawl's passive findings are already banked by the drain above.
     logger.info(f"[ZAP] Starting active scan on {url} (in-scope, recursive)")
-    aid = zap.ascan.scan(url, recurse=True, inscopeonly=True)
     waited = 0
     _last_cb_time = 0
     _drain_every = int(os.environ.get("ZAP_DRAIN_INTERVAL", "60"))
     _drained = 0
-    while int(zap.ascan.status(aid)) < 100 and waited < max_wait:
-        time.sleep(10)  # Poll every 10s to reduce overhead
-        waited += 10
-        if waited % 60 == 0:
-            pct = int(zap.ascan.status(aid))
-            logger.info(f"[ZAP] Active scan progress: {pct}% ({waited}s elapsed, "
-                        f"{_drained} finding(s) stored so far)")
-            if progress_callback and waited - _last_cb_time >= 90:
-                _last_cb_time = waited
-                eta = int(waited / max(pct, 1) * (100 - pct)) if pct > 0 else None
-                progress_callback(pct, eta)
-        # Store what has been found so far, so a ZAP death costs one interval
-        # rather than the entire scan.
-        if _drain_every and waited % _drain_every == 0:
-            _drained += drain_zap_alerts(url, label=f"active scan {waited}s")
+    # `with`, not enter/exit by hand: an exception anywhere in the loop must
+    # still restore passive scanning, or the NEXT scan in this ZAP session
+    # silently produces no passive findings.
+    with pscan_paused(zap, _tuning["requested"]["pscan_during_active_scan"]):
+        aid = zap.ascan.scan(url, recurse=True, inscopeonly=True)
+        while int(zap.ascan.status(aid)) < 100 and waited < max_wait:
+            time.sleep(10)  # Poll every 10s to reduce overhead
+            waited += 10
+            if waited % 60 == 0:
+                pct = int(zap.ascan.status(aid))
+                logger.info(f"[ZAP] Active scan progress: {pct}% ({waited}s elapsed, "
+                            f"{_drained} finding(s) stored so far)")
+                if progress_callback and waited - _last_cb_time >= 90:
+                    _last_cb_time = waited
+                    eta = int(waited / max(pct, 1) * (100 - pct)) if pct > 0 else None
+                    progress_callback(pct, eta)
+            # Store what has been found so far, so a ZAP death costs one interval
+            # rather than the entire scan.
+            if _drain_every and waited % _drain_every == 0:
+                _drained += drain_zap_alerts(url, label=f"active scan {waited}s")
 
     logger.info(f"[ZAP] Active scan complete on {url}")
 
@@ -1394,6 +1586,8 @@ class JobReq(BaseModel):
     limit: Optional[int] = None
     wordlist: Optional[str] = None  # small, medium, big, common, raft-small, raft-medium, raft-large, quickhits, api, or full path
     proxy: Optional[str] = None  # SOCKS proxy URL for scanning through remote nodes (e.g., 'socks5://host:port')
+    #: Optional ZAP passive-scan tuning. Omitted -> the env defaults apply.
+    zap_tuning: Optional[ZapTuning] = None
 
 
 class PipelineReq(BaseModel):
@@ -1412,6 +1606,8 @@ class PipelineReq(BaseModel):
     #: spider and active scan as that user, which is what makes the ATHN/SESS/IDNT
     #: family testable at all.
     auth: Optional[ScanAuth] = None
+    #: Optional ZAP passive-scan tuning. Omitted -> the env defaults apply.
+    zap_tuning: Optional[ZapTuning] = None
 
 
 class NiktoReq(BaseModel):
@@ -1490,7 +1686,7 @@ def _seed_known_apps(base_url: str) -> List[str]:
     return found
 
 
-def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_katana: bool, do_zap: bool, limit: Optional[int], wordlist: Optional[str] = None, target_url: Optional[str] = None, target_urls: Optional[List[str]] = None, proxy: Optional[str] = None):
+def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_katana: bool, do_zap: bool, limit: Optional[int], wordlist: Optional[str] = None, target_url: Optional[str] = None, target_urls: Optional[List[str]] = None, proxy: Optional[str] = None, zap_tuning: Optional["ZapTuning"] = None):
     """Background task to run web scan with progress tracking.
 
     When proxy is set (SOCKS URL), Gobuster gets --proxy flag and ZAP gets
@@ -1742,7 +1938,8 @@ def _run_web_scan_job(job_id: str, do_gobuster: bool, do_playwright: bool, do_ka
                     _job_tracker.update_progress(job_id, stage="zap")
                     logger.info(f"[{job_id[:8]}] Running ZAP scan on {url} (seeding {len(discovered_urls)} discovered URLs)")
                     zap_result = zap_scan_with_urls(url, discovered_urls=discovered_urls or None,
-                                                    progress_callback=_update_scan_progress("zap"))
+                                                    progress_callback=_update_scan_progress("zap"),
+                                                    tuning=zap_tuning)
                     stats["zap_alerts"] += zap_result["count"]
                     target_data["zap_alerts"] = zap_result["alerts"]
                     logger.info(f"[{job_id[:8]}] ZAP found {zap_result['count']} alerts on {url}")
@@ -1944,7 +2141,7 @@ def run_web_scan(req: JobReq, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail=str(e))
 
     job_id = _job_tracker.create_job(job_type="web-scan")
-    background_tasks.add_task(_run_web_scan_job, job_id, req.do_gobuster, req.do_playwright, req.do_katana, req.do_zap, req.limit, req.wordlist, req.target_url, req.target_urls, req.proxy)
+    background_tasks.add_task(_run_web_scan_job, job_id, req.do_gobuster, req.do_playwright, req.do_katana, req.do_zap, req.limit, req.wordlist, req.target_url, req.target_urls, req.proxy, req.zap_tuning)
     return {
         "ok": True,
         "job_id": job_id,
@@ -3026,6 +3223,7 @@ def _run_pipeline_scan_job(
     skip_katana: bool = False,
     skip_wafw00f: bool = False,
     auth: Optional["ScanAuth"] = None,
+    zap_tuning: Optional["ZapTuning"] = None,
 ):
     """Background task to run sequential scan pipeline with progress tracking"""
     try:
@@ -3049,6 +3247,7 @@ def _run_pipeline_scan_job(
             zap_func=zap_scan_with_urls,
             nikto_func=nikto_scan,
             auth=auth,
+            tuning=zap_tuning,
         )
 
         # Run the pipeline
@@ -3259,6 +3458,7 @@ def run_pipeline_scan(req: PipelineReq, background_tasks: BackgroundTasks):
         req.skip_katana,
         req.skip_wafw00f,
         req.auth,
+        req.zap_tuning,
     )
 
     return {
