@@ -117,12 +117,35 @@ async def knowledge_status():
 
 @router.post("/api/maintenance/knowledge/seed")
 async def knowledge_seed(body: Optional[dict] = None):
-    """Load the bundled knowledge corpus. Idempotent — re-seeding updates."""
+    """Start a knowledge-corpus seed. Idempotent — re-seeding updates in place.
+
+    Returns a `job_id` immediately for a real seed; poll
+    `GET /api/maintenance/knowledge/seed/status`. A `dry_run` still answers
+    inline with its counts.
+
+    The 900s timeout this used to carry was not a safety margin, it was the
+    symptom: the full corpus is ~585 embedding round-trips (~14 minutes), so the
+    request was abandoned mid-flight and the work discarded. 60s is now ample
+    because the upstream hands back a job id.
+    """
     s = get_settings()
-    async with httpx.AsyncClient(timeout=900, verify=False) as c:
+    async with httpx.AsyncClient(timeout=60, verify=False) as c:
         resp = await c.post(
             f"{s.scan_recommender_url}/kb/seed",
             json=body or {},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
+@router.get("/api/maintenance/knowledge/seed/status")
+async def knowledge_seed_status(job_id: Optional[str] = None):
+    """Progress of a seed job. Omit job_id for the most recent."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=30, verify=False) as c:
+        resp = await c.get(
+            f"{s.scan_recommender_url}/kb/seed/status",
+            params={"job_id": job_id} if job_id else None,
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
