@@ -391,8 +391,26 @@ def _listener(probe):
     return out.stdout
 
 
-U = "/wordlists/generated/users_192.168.1.150_smb.txt"
-P = "/wordlists/generated/passwords_192.168.1.150_smb.txt"
+# The lockout tests build their OWN lists rather than pointing at generated
+# engagement files.
+#
+# They used to reference /wordlists/generated/{users,passwords}_192.168.1.150_smb.txt.
+# The lab moved to 172.18.0.32 and only *_ftp.txt lists were ever generated, so
+# those paths did not exist — estimate_candidate_space() returned None, both
+# tests short-circuited before reaching the logic they exist to check, and they
+# failed claiming the refusal was broken. It was not.
+#
+# The property here — "50 users x 82 passwords against a threshold of 3 must be
+# refused" — is pure arithmetic over two line counts. Tying it to whatever the
+# engagement happens to have generated made it fragile for no benefit.
+U = "/tmp/pytest_lockout_users.txt"
+P = "/tmp/pytest_lockout_passwords.txt"
+#: Prepended to any probe that needs the lists. 50 x 82 are the numbers in the
+#: original docstring: 16 minutes of volume, and a lockout for every account.
+_MAKE_LISTS = (
+    f"open({U!r},'w').write('\\n'.join(f'user{{i}}' for i in range(50))+'\\n')\n"
+    f"open({P!r},'w').write('\\n'.join(f'pw{{i}}' for i in range(82))+'\\n')\n"
+)
 
 
 def test_a_spray_that_would_lock_every_account_is_refused():
@@ -400,6 +418,7 @@ def test_a_spray_that_would_lock_every_account_is_refused():
     ever asked. 50 users x 82 passwords finishes in 16 minutes AND locks out all
     50 accounts against a threshold of 3."""
     out = _listener(
+        _MAKE_LISTS +
         f"m._lockout_cache={{'192.168.1.150':'3'}}\n"
         f"r,w=m.check_account_lockout('hydra','hydra -L {U} -P {P} smb://192.168.1.150','192.168.1.150')\n"
         "print('REFUSED', bool(r))\n")
@@ -408,6 +427,7 @@ def test_a_spray_that_would_lock_every_account_is_refused():
 
 def test_a_threshold_larger_than_the_list_is_allowed():
     out = _listener(
+        _MAKE_LISTS +
         f"m._lockout_cache={{'192.168.1.150':'200'}}\n"
         f"r,w=m.check_account_lockout('hydra','hydra -L {U} -P {P} smb://192.168.1.150','192.168.1.150')\n"
         "print('REFUSED', bool(r), 'WARNED', bool(w))\n")
@@ -418,6 +438,7 @@ def test_a_measured_absence_of_lockout_is_allowed():
     """'None' is a measured answer, not a missing one."""
     for value in ("None", "Not Set", "0"):
         out = _listener(
+            _MAKE_LISTS +
             f"m._lockout_cache={{'192.168.1.150':{value!r}}}\n"
             f"r,w=m.check_account_lockout('hydra','hydra -L {U} -P {P} smb://192.168.1.150','192.168.1.150')\n"
             "print('REFUSED', bool(r), 'WARNED', bool(w))\n")
@@ -428,6 +449,7 @@ def test_an_unmeasured_policy_warns_rather_than_refusing():
     """Refusing every brute force against a host nobody ran --pass-pol on would
     block real work on a guess. The warning names the command that resolves it."""
     out = _listener(
+        _MAKE_LISTS +
         "m._lockout_cache={'10.99.99.99': None}\n"
         f"r,w=m.check_account_lockout('hydra','hydra -L {U} -P {P} smb://10.99.99.99','10.99.99.99')\n"
         "print('REFUSED', bool(r), 'WARNED', bool(w))\n"

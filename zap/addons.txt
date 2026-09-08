@@ -10,8 +10,31 @@ ascanrulesAlpha
 pscanrulesBeta
 pscanrulesAlpha
 
-# Technology Detection
-wappalyzer
+# Technology Detection (wappalyzer) — DELIBERATELY NOT INSTALLED.
+#
+# Its passive rule, "Tech Detection Passive Scanner", is the single cause of
+# ZAP's memory exhaustion on this stack. Measured against demo.testfire.net:
+# 327 "Passive Scan rule ... took N seconds" warnings, EVERY ONE naming that
+# rule, at 40-110 seconds per message across 30 passive threads — including
+# 110s on an 8.8 KB JPEG. ZAP then grew to 11.98 GiB and died mid-scan.
+#
+# Things that did NOT fix it, so nobody repeats them:
+#   * Raising the heap 3g -> 8g and the limit 6g -> 12g. ZAP filled the new
+#     ceiling and died at the same point; the growth is unbounded, not large.
+#   * `pscan.disableScanners`. The add-on registers the scanner directly as a
+#     raw PassiveScanner, so it has NO rule id and never appears in
+#     pscan/view/scanners (70 rules listed, none matching "tech").
+#   * Pausing passive scanning for the active scan. Real, but partial — the
+#     rule dominates the SPIDER phase, which that pause leaves enabled.
+#
+# Cost of removing it: ZAP no longer fingerprints technologies on the site
+# tree. Coverage is unaffected — WSTG INFO-08/09 are credited from whatweb and
+# httpx evidence, not from this rule.
+#
+# The base ZAP image does NOT ship it (verified: only the zapv2 python client
+# stub is present), so leaving it out here is sufficient for a fresh build.
+# On an EXISTING install the `zap-plugins` named volume keeps the old copy —
+# uninstall it at runtime with POST /api/zap/addons/uninstall id=wappalyzer.
 
 # Vulnerable JS Libraries
 retire

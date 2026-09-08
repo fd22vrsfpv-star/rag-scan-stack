@@ -473,6 +473,15 @@ services:
       # How often findings are stored mid-scan, so a ZAP death costs one
       # interval rather than the whole scan.
       ZAP_DRAIN_INTERVAL: ${ZAP_DRAIN_INTERVAL:-60}
+      # Active-scanner bounds. ZAP's own defaults are 64 threads/host and NO
+      # time limit at all, per rule or per scan — one bad rule then runs 64-wide
+      # for as long as it likes. See "Active-scanner bounds" in web_scan.py.
+      ZAP_THREAD_PER_HOST: ${ZAP_THREAD_PER_HOST:-8}
+      ZAP_MAX_RULE_DURATION_MINS: ${ZAP_MAX_RULE_DURATION_MINS:-5}
+      ZAP_MAX_SCAN_DURATION_MINS: ${ZAP_MAX_SCAN_DURATION_MINS:-60}
+      # Split the active scan into per-category passes (Client Browser last),
+      # banking findings between each. false = the old single-pass behaviour.
+      ZAP_ASCAN_SPLIT: ${ZAP_ASCAN_SPLIT:-true}
       SCHEME_HINT: ${SCHEME_HINT:-auto}
       REPORT_DIR: /reports
       PD_RUNNER_URL: "https://pd-runner:8023"

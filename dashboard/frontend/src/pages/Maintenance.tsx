@@ -12,6 +12,7 @@ import {
   useSchemaApply,
   useKnowledgeStatus,
   useKnowledgeSeed,
+  fetchKnowledgeSeedStatus,
   useZapStatus,
   ImportResult,
 } from '@/api/maintenance'
@@ -311,6 +312,7 @@ export default function Maintenance() {
   const knowledgeStatus = useKnowledgeStatus()
   const knowledgeSeed = useKnowledgeSeed()
   const [repairMsg, setRepairMsg] = useState('')
+  const [seeding, setSeeding] = useState(false)
   const zapStatus = useZapStatus()
   const [rotateMsg, setRotateMsg] = useState<string>('')
 
@@ -758,7 +760,7 @@ export default function Maintenance() {
           )}
           <div className="ml-auto flex items-center gap-2">
             <button
-              disabled={knowledgeSeed.isPending}
+              disabled={knowledgeSeed.isPending || seeding}
               onClick={async () => {
                 setRepairMsg('Previewing seed…')
                 try {
@@ -776,26 +778,73 @@ export default function Maintenance() {
               Dry run
             </button>
             <button
-              disabled={knowledgeSeed.isPending}
+              disabled={knowledgeSeed.isPending || seeding}
               onClick={async () => {
                 if (!window.confirm(
                   'Seed the bundled knowledge corpus into service_prompts and the RAG store?\n\n' +
                   'Existing rules with the same selector are updated in place.'
                 )) return
-                setRepairMsg('Seeding knowledge…')
+                setRepairMsg('Starting seed…')
                 try {
-                  const r = await knowledgeSeed.mutateAsync({})
-                  setRepairMsg(
-                    `Seeded: ${r.created} new, ${r.updated} updated, ${r.docs} doc(s)` +
-                    (r.failed ? `, ${r.failed} failed — ${r.errors[0] ?? ''}` : '')
-                  )
+                  const started = await knowledgeSeed.mutateAsync({})
+                  // A real seed is a background job: ~585 embedding round-trips,
+                  // about 14 minutes. Holding the request open is what used to
+                  // make this look hung and throw the work away on timeout.
+                  if (!started.job_id) {
+                    setRepairMsg(
+                      `Seeded: ${started.created} new, ${started.updated} updated, ${started.docs} doc(s)` +
+                      (started.failed ? `, ${started.failed} failed — ${started.errors[0] ?? ''}` : '')
+                    )
+                    return
+                  }
+                  setSeeding(true)
+                  try {
+                    // Poll to completion. 40 min of headroom over the ~14 min
+                    // the full corpus takes, so a slow embedding backend does
+                    // not read as a failure.
+                    for (let i = 0; i < 800; i++) {
+                      await new Promise(res => setTimeout(res, 3000))
+                      const job = await fetchKnowledgeSeedStatus(started.job_id)
+                      if (!job.known) {
+                        setRepairMsg(`Seed job lost: ${job.detail ?? 'unknown job'}`)
+                        return
+                      }
+                      if (job.status === 'running') {
+                        const p = job.progress
+                        setRepairMsg(
+                          p
+                            ? `Seeding ${p.file} (${p.file_index}/${p.files_total})` +
+                              (p.doc_index ? ` doc ${p.doc_index}/${p.docs_in_file}` : '') +
+                              ` — ${p.docs_done} doc(s), ${p.prompts_done} rule(s) so far`
+                            : 'Seeding knowledge…'
+                        )
+                        continue
+                      }
+                      if (job.status === 'failed') {
+                        setRepairMsg(`Seed failed: ${job.error ?? 'unknown error'}`)
+                        return
+                      }
+                      const r = job.result
+                      setRepairMsg(
+                        r
+                          ? `Seeded: ${r.created} new, ${r.updated} updated, ${r.docs} doc(s)` +
+                            (r.failed ? `, ${r.failed} failed — ${r.errors[0] ?? ''}` : '')
+                          : `Seed ${job.status}`
+                      )
+                      knowledgeStatus.refetch()
+                      return
+                    }
+                    setRepairMsg('Seed still running — check back shortly (it was not cancelled)')
+                  } finally {
+                    setSeeding(false)
+                  }
                 } catch (e) {
                   setRepairMsg(`Failed: ${e instanceof Error ? e.message : String(e)}`)
                 }
               }}
               className="h-7 px-3 text-xs rounded border border-primary/40 bg-primary/10 text-primary hover:bg-primary/20 disabled:opacity-50"
             >
-              {knowledgeSeed.isPending ? 'Seeding…' : 'Seed knowledge'}
+              {knowledgeSeed.isPending || seeding ? 'Seeding…' : 'Seed knowledge'}
             </button>
           </div>
         </div>

@@ -40,9 +40,21 @@ REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 MODULE = os.path.join(REPO, "app", "rag-api", "scope_classifier.py")
 
 
-def _run(script):
+#: The roundtrip calls classify_and_assign_engagement(), which sweeps EVERY
+#: unassigned row in the database, not just the three this test seeds. Measured
+#: on this stack: 4,932 in-scope + 117 unknown in 284.8 seconds — all assertions
+#: passing. The old 120s budget therefore timed out, container_exec returned
+#: None, and `assert out is not None` reported it as a failure of the feature.
+#:
+#: The cost grows with accumulated engagement data, so this will need raising
+#: again. When it does, the message says so rather than looking like a hang.
+_ROUNDTRIP_TIMEOUT = int(os.environ.get("SCOPE_LEARN_TIMEOUT", "600"))
+
+
+def _run(script, timeout=120, timeout_is_error=False):
     """Execute a python snippet inside the rag-api container. None if unreachable."""
-    return container_exec(script, stdin=True, timeout=120, tail=800)
+    return container_exec(script, stdin=True, timeout=timeout, tail=800,
+                          timeout_is_error=timeout_is_error)
 
 
 @pytest.fixture(scope="module")
@@ -155,8 +167,16 @@ finally:
 
 
 def test_generate_classify_and_distill_roundtrip(container):
-    out = _run(_DB_ROUNDTRIP)
-    assert out is not None
+    out = _run(_DB_ROUNDTRIP, timeout=_ROUNDTRIP_TIMEOUT, timeout_is_error=True)
+    assert out is not None, (
+        "rag-api became unreachable mid-test — the module fixture had already "
+        "reached it, so this is not a 'cannot run here'")
+    if out.startswith("__ERR__") and "timed out" in out:
+        pytest.fail(
+            f"{out}\n\nclassify_and_assign_engagement() sweeps every unassigned "
+            f"row, so this test's cost grows with the database (measured: 4,932 "
+            f"in-scope rows in 284.8s). Raise SCOPE_LEARN_TIMEOUT, currently "
+            f"{_ROUNDTRIP_TIMEOUT}s.")
     if out.startswith("__ERR__"):
         if "DB_DSN" in out or "could not connect" in out or "connection" in out.lower():
             pytest.skip("database not reachable: " + out)
