@@ -55,8 +55,9 @@ EMBEDDER_URL = os.environ.get("EMBEDDER_URL", "https://embedder:8030")
 CHUNK_CHARS = int(os.environ.get("RAG_CHUNK_CHARS", "3000"))
 EMBED_BATCH = int(os.environ.get("RAG_EMBED_BATCH", "64"))
 
-# The API the webhook allow-list has to know about, or the event is answered 200
-# and discarded (see app/rag-api/webhooks/router.py::_ALL_EVENT_TYPES).
+# Audit events go to the RAG API. The event-log webhook records every type
+# (no allow-list since 2026-09-09), but `source` is required and a non-2xx
+# must be reported — see emit_webhook below.
 RAG_API_URL = os.environ.get("RAG_API_URL", "https://rag-api:8000")
 API_KEY = os.environ.get("API_KEY", "")
 
@@ -207,9 +208,8 @@ def emit_webhook(event_type: str, data: Dict) -> None:
         found by querying webhook_events. CLAUDE.md: silence around an HTTP call
         turns a broken endpoint into "it returned zero results".
 
-    The event TYPE must also be in the router's allow-list (`_ALL_EVENT_TYPES`),
-    or it is accepted with 200 and silently discarded — and the running rag-api
-    image must be new enough to contain it.
+    The event-log webhook records every event type since the allow-list was
+    removed; before that, an unlisted type was accepted with 200 and dropped.
     """
     if not API_KEY:
         print("  [warn] API_KEY unset — audit event not emitted", file=sys.stderr)
