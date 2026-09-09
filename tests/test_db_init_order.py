@@ -390,3 +390,100 @@ def test_the_expected_tables_all_exist(fresh_postgres):
         "post-install-check.sh expects these tables but a fresh application of "
         "ensure_all_tables.sql does not create them:\n  " + "\n  ".join(missing)
     )
+
+
+# ── The exploits database: two copies of one DDL ───────────────────────────
+#
+# db_init/create_exploits.sh runs INSIDE the postgres container on first init.
+# It cannot run in remote DB mode at all: there is no local container, and the
+# stack's role on a managed server has neither CREATEROLE nor CREATEDB
+# (observed on this deployment: app | rolsuper=f | rolcreatedb=f |
+# rolcreaterole=f). scripts/create-exploits-remote.sql is the superuser-side
+# copy for that case.
+#
+# Two copies of the same DDL drift. CLAUDE.md: duplicated SQL needs an agreement
+# test. This pins the parts that must match — if they diverge, the remote
+# database gets a different edb.exploits from the local one and
+# etl/edb_ingest_json.py starts failing on whichever it was not written for.
+CREATE_SH = os.path.join(DB_INIT, "create_exploits.sh")
+CREATE_REMOTE = os.path.join(REPO, "scripts", "create-exploits-remote.sql")
+
+_EDB_COLUMNS = re.compile(
+    r"CREATE TABLE IF NOT EXISTS edb\.exploits \((.*?)\n\);", re.S)
+
+
+def _edb_column_names(text):
+    m = _EDB_COLUMNS.search(text)
+    assert m, "edb.exploits CREATE TABLE not found"
+    names = []
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if not line or line.startswith("--"):
+            continue
+        word = line.split()[0]
+        if word.upper() in {"SETWEIGHT(TO_TSVECTOR('SIMPLE',", ")", "||"}:
+            continue
+        if re.match(r"^[a-z_][a-z0-9_]*$", word):
+            names.append(word)
+    return names
+
+
+def test_the_two_exploits_ddls_agree():
+    local = _read(CREATE_SH)
+    remote = _read(CREATE_REMOTE)
+
+    lc, rc = _edb_column_names(local), _edb_column_names(remote)
+    assert lc == rc, (
+        "edb.exploits has different columns in db_init/create_exploits.sh and "
+        f"scripts/create-exploits-remote.sql:\n  local:  {lc}\n  remote: {rc}"
+    )
+    assert len(lc) >= 10, f"only {len(lc)} columns parsed — the scan is broken"
+
+    # Compare EXTRACTED names, not substrings. `"idx_edb_exploits_cves" in
+    # text` is satisfied by `idx_edb_exploits_cves_v2`, and a role renamed at
+    # one of its several mentions leaves the old name elsewhere in the file —
+    # both sabotages walked straight past the first version of this check.
+    def roles(text):
+        return set(re.findall(r"CREATE ROLE (edb_[a-z_]+)", text))
+
+    def indexes(text):
+        return set(re.findall(r"CREATE INDEX IF NOT EXISTS (\w+)\s+ON edb\.", text))
+
+    assert roles(local) == roles(remote), (
+        "the two scripts create different edb_* roles:\n"
+        f"  local:  {sorted(roles(local))}\n  remote: {sorted(roles(remote))}"
+    )
+    assert roles(local) == {"edb_owner", "edb_rw", "edb_ro"}, (
+        f"unexpected role set {sorted(roles(local))} — docker-compose.yml's "
+        "PG_DSN authenticates as edb_rw, so that one is load-bearing"
+    )
+    assert indexes(local) == indexes(remote), (
+        "the two scripts create different indexes on edb.exploits:\n"
+        f"  local:  {sorted(indexes(local))}\n  remote: {sorted(indexes(remote))}"
+    )
+    assert len(indexes(local)) >= 2, (
+        f"only {len(indexes(local))} index(es) parsed — the scan is broken"
+    )
+    # The generated FTS column is the part most likely to be copied wrongly.
+    for frag in ("GENERATED ALWAYS AS", "setweight(to_tsvector"):
+        assert frag in local and frag in remote, (
+            f"the generated fts column differs: {frag!r} missing from one copy"
+        )
+
+
+def test_the_installer_says_the_exploit_corpus_is_not_loaded():
+    """A completed install has an EMPTY exploit corpus and nothing used to say
+    so: searchsploit-updater and exploitdb-etl are one-shot services that no
+    phase runs, because the updater apt-installs exploitdb inside a Kali image.
+    """
+    text = _read(SETUP_SH)
+    code = "\n".join(l for l in text.splitlines()
+                     if not l.strip().startswith("#"))
+    assert "exploitdb-etl" in code, (
+        "scripts/setup.sh never mentions exploitdb-etl, so an operator finishes "
+        "the install with no exploit corpus and no way to know it"
+    )
+    assert "searchsploit-updater" in code, (
+        "the corpus load needs searchsploit-updater too — it writes the JSON "
+        "that exploitdb-etl ingests"
+    )
