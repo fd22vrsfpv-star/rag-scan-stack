@@ -6,6 +6,13 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# Containers are addressed by (compose project, service), never by
+# `container_name` or a published host port — both are global, so a check run
+# from a second project would happily verify the FIRST stack and report it as
+# this install's result. See scripts/lib/compose-target.sh.
+# shellcheck source=lib/compose-target.sh
+. "$(pwd)/scripts/lib/compose-target.sh"
+
 PASS=0
 FAIL=0
 WARN=0
@@ -38,36 +45,19 @@ warn() { echo "  [WARN] $1"; ((WARN++)); }
 #
 # "could not query" must never be reported as "missing" — that is the same
 # skip-vs-fail confusion that kept CI red (see tests/_container.py).
-_run_sql() {
-  local sql="$1" out=""
-  if docker ps --format '{{.Names}}' | grep -q '^rag-postgres$'; then
-    if out=$(docker exec rag-postgres psql -U app -d scans -tAc "$sql" 2>&1); then
-      printf '%s' "$out"; return 0
-    fi
-  fi
-  local c
-  for c in rag-api autogen-agents; do
-    docker ps --format '{{.Names}}' | grep -q "^${c}$" || continue
-    if out=$(docker exec -e SQL="$sql" "$c" python3 -c '
-import os, sys, psycopg2
-try:
-    conn = psycopg2.connect(os.environ["DB_DSN"])
-except Exception as exc:
-    sys.stderr.write("connect: %s" % exc); sys.exit(3)
-cur = conn.cursor()
-cur.execute(os.environ["SQL"])
-if cur.description:
-    for row in cur.fetchall():
-        print("|".join(
-            "t" if v is True else "f" if v is False else "" if v is None else str(v)
-            for v in row))
-' 2>&1); then
-      printf '%s' "$out"; return 0
-    fi
-  done
-  printf '%s' "${out:-no database reachable (tried rag-postgres, rag-api, autogen-agents)}"
-  return 1
-}
+#
+# The two routes and their rationale now live in ct_sql (scripts/lib/
+# compose-target.sh) so setup.sh's Phase 7 uses the same resolution instead of
+# its own `docker exec rag-postgres`. The only behavioural change is that the
+# lookup is scoped to THIS compose project: grepping `docker ps` for the NAME
+# rag-postgres matched whichever stack owned it, which under a rehearsal is the
+# live one — so a fresh-install check would have verified the live database and
+# passed.
+#
+# ct_sql returns 2 for "no database reachable" where this used to return 1;
+# every caller here tests `rc != 0`, and _check_object's "could not query"
+# branch covers both.
+_run_sql() { ct_sql "$1"; }
 
 # Numeric guard. `[[ "$x" -eq 0 ]]` on a non-numeric string sends bash into
 # arithmetic evaluation, where a bare word is a VARIABLE NAME — under `set -u`
@@ -342,15 +332,15 @@ fi
 # Tool registry (node_manager) reachable + Kali allowlist reconciled
 echo ""
 echo "  -- tool registry / Kali allowlist --"
-if docker ps --format '{{.Names}}' | grep -q '^rag-api$'; then
-  REG_COUNT=$(docker exec rag-api sh -c 'curl -sk -H "x-api-key: $API_KEY" https://node-manager:8027/tools/registry 2>/dev/null' \
+if ct_cid rag-api >/dev/null 2>&1; then
+  REG_COUNT=$(ct_exec rag-api sh -c 'curl -sk -H "x-api-key: $API_KEY" https://node-manager:8027/tools/registry 2>/dev/null' \
     | python3 -c "import sys,json;print(json.load(sys.stdin).get('count',0))" 2>/dev/null || echo 0)
   if [[ "${REG_COUNT:-0}" -gt 0 ]]; then
     pass "node_manager /tools/registry reachable ($REG_COUNT tools)"
   else
     warn "node_manager /tools/registry not reachable (capability checks degraded)"
   fi
-  KALI_COUNT=$(docker exec rag-api sh -c 'curl -sk -H "x-api-key: $API_KEY" https://kali-listener:8019/tools/allowed 2>/dev/null' \
+  KALI_COUNT=$(ct_exec rag-api sh -c 'curl -sk -H "x-api-key: $API_KEY" https://kali-listener:8019/tools/allowed 2>/dev/null' \
     | python3 -c "import sys,json;print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
   if [[ "${KALI_COUNT:-0}" -gt 0 ]]; then
     # Reconciled if Kali allowlist is at least as large as the fallback (23).
@@ -370,52 +360,51 @@ fi
 echo ""
 echo "=== Go Tool Binaries ==="
 
-echo "  -- pd-runner --"
-PD_TOOLS=(httpx naabu katana tlsx ffuf)
-for tool in "${PD_TOOLS[@]}"; do
-  if docker exec pd-runner which "$tool" >/dev/null 2>&1; then
-    pass "pd-runner: $tool"
-  else
-    fail "pd-runner: $tool — binary missing (run scripts/build-go-tools.sh)"
+# Tool presence, per service.
+#
+# $1 service  $2 label  $3 missing severity (fail|warn)  $4 hint  $5.. tools
+#
+# The five loops this replaces each ran `docker exec <name> which X` and
+# reported ANY failure as "binary missing" — so a runner that was not up, or
+# not part of this project at all, produced a screenful of false FAILs about
+# binaries that are present in the image. Resolve the container once: no
+# container is a SKIP, and only a resolved container can fail a tool.
+_check_tools() {
+  local service="$1" label="$2" sev="$3" hint="$4"; shift 4
+  if ! ct_cid "$service" >/dev/null 2>&1; then
+    warn "${label}: no container in project '$(ct_project)' — tool check skipped"
+    return
   fi
-done
+  local tool
+  for tool in "$@"; do
+    if ct_exec "$service" which "$tool" >/dev/null 2>&1; then
+      pass "${label}: $tool"
+    elif [[ "$sev" == "warn" ]]; then
+      warn "${label}: $tool — ${hint}"
+    else
+      fail "${label}: $tool — ${hint}"
+    fi
+  done
+}
+
+GO_HINT="binary missing (run scripts/build-go-tools.sh)"
+
+echo "  -- pd-runner --"
+_check_tools pd-runner "pd-runner" fail "$GO_HINT" httpx naabu katana tlsx ffuf
 
 echo "  -- osint-runner --"
-OSINT_TOOLS=(subfinder dnsx httpx tlsx asnmap uncover cloudlist alterx mapcidr chaos shuffledns amass gau waybackurls gowitness massdns trufflehog)
-for tool in "${OSINT_TOOLS[@]}"; do
-  if docker exec osint-runner which "$tool" >/dev/null 2>&1; then
-    pass "osint-runner: $tool"
-  else
-    fail "osint-runner: $tool — binary missing (run scripts/build-go-tools.sh)"
-  fi
-done
+_check_tools osint-runner "osint-runner" fail "$GO_HINT" \
+  subfinder dnsx httpx tlsx asnmap uncover cloudlist alterx mapcidr chaos \
+  shuffledns amass gau waybackurls gowitness massdns trufflehog
 
 echo "  -- nmap-scanner --"
-for tool in masscan nmap; do
-  if docker exec nmap_scanner which "$tool" >/dev/null 2>&1; then
-    pass "nmap-scanner: $tool"
-  else
-    fail "nmap-scanner: $tool — binary missing"
-  fi
-done
+_check_tools nmap_scanner "nmap-scanner" fail "binary missing" masscan nmap
 
 echo "  -- web-scanner --"
-for tool in gobuster nikto; do
-  if docker exec web-scanner which "$tool" >/dev/null 2>&1; then
-    pass "web-scanner: $tool"
-  else
-    fail "web-scanner: $tool — binary missing"
-  fi
-done
+_check_tools web-scanner "web-scanner" fail "binary missing" gobuster nikto
 
 echo "  -- brutus-runner --"
-for tool in hydra medusa ncrack; do
-  if docker exec brutus-runner which "$tool" >/dev/null 2>&1; then
-    pass "brutus-runner: $tool"
-  else
-    warn "brutus-runner: $tool — not installed (optional)"
-  fi
-done
+_check_tools brutus-runner "brutus-runner" warn "not installed (optional)" hydra medusa ncrack
 
 # ── 3. Container Health ──
 echo ""
@@ -442,7 +431,7 @@ try:
 except Exception:
     d = {}
 print(d.get('mode') or (d.get('config') or {}).get('mode') or 'local')" 2>/dev/null || echo local)
-if docker ps --format '{{.Names}}' | grep -q '^rag-postgres$'; then
+if ct_cid rag-postgres >/dev/null 2>&1; then
   pgstatus=$(docker inspect --format='{{.State.Health.Status}}' rag-postgres 2>/dev/null)
   if [[ "$pgstatus" == "healthy" || -z "$pgstatus" ]]; then
     pass "rag-postgres: present (db mode: $DB_MODE)"
@@ -500,60 +489,66 @@ if [ -z "${API_KEY:-}" ] && [ -f ".env" ]; then
 fi
 API_KEY="${API_KEY:-changeme}"
 
+# Paths, not URLs: each is probed inside this project's rag-api on its
+# CONTAINER port. `https://localhost:8000` belongs to the host — under a second
+# stack, or after an operator remaps the port, every one of these would have
+# swept the OTHER stack's API and passed.
 endpoints=(
-  "GET|https://localhost:8000/health|RAG API health"
-  "GET|https://localhost:8000/assets?limit=1|Assets endpoint"
-  "GET|https://localhost:8000/software|Software inventory"
-  "GET|https://localhost:8000/content-extractions?limit=1|Content extractions"
-  "GET|https://localhost:8000/content-intel/patterns|Content patterns"
-  "GET|https://localhost:8000/wordlists|Wordlists"
-  "GET|https://localhost:8000/opsec/timeline?hours=1|OpSec timeline"
-  "GET|https://localhost:8000/follow-ups?limit=1|Follow-ups"
-  "GET|https://localhost:8000/health/database|Health DB schema"
-  "GET|https://localhost:8000/software/cve-prompt|CVE prompt config"
-  "GET|https://localhost:8000/software/vendor-pages|Vendor pages config"
-  "GET|https://localhost:8000/software/ddg-jobs|AI check jobs"
+  "/health|RAG API health"
+  "/assets?limit=1|Assets endpoint"
+  "/software|Software inventory"
+  "/content-extractions?limit=1|Content extractions"
+  "/content-intel/patterns|Content patterns"
+  "/wordlists|Wordlists"
+  "/opsec/timeline?hours=1|OpSec timeline"
+  "/follow-ups?limit=1|Follow-ups"
+  "/health/database|Health DB schema"
+  "/software/cve-prompt|CVE prompt config"
+  "/software/vendor-pages|Vendor pages config"
+  "/software/ddg-jobs|AI check jobs"
 )
 
-for entry in "${endpoints[@]}"; do
-  IFS='|' read -r method url label <<< "$entry"
-  code=$(curl -sk -o /dev/null -w '%{http_code}' -H "x-api-key: $API_KEY" "$url" 2>/dev/null)
-  if [[ "$code" == "200" ]]; then
-    pass "$label ($code)"
-  else
-    fail "$label — HTTP $code"
-  fi
-done
+if ! ct_cid rag-api >/dev/null 2>&1; then
+  warn "RAG API endpoint sweep skipped — no rag-api container in project '$(ct_project)'"
+else
+  for entry in "${endpoints[@]}"; do
+    IFS='|' read -r path label <<< "$entry"
+    code=$(ct_http_code rag-api 8000 "$path" -H "x-api-key: $API_KEY")
+    if [[ "$code" == "200" ]]; then
+      pass "$label ($code)"
+    else
+      fail "$label — HTTP $code"
+    fi
+  done
+fi
 
 # BFF endpoints
-# The dashboard serves over HTTPS (container port 443) and 301-redirects plain
-# HTTP to HTTPS, so hit the HTTPS-mapped port directly with -k. Fall back to the
-# HTTP port only if no 443 mapping is published.
-BFF_PORT=$(docker port pentest-dashboard 443 2>/dev/null | head -1 | sed 's/.*://')
-BFF_SCHEME="https"
-if [ -z "$BFF_PORT" ]; then
-  BFF_PORT=$(docker port pentest-dashboard 80 2>/dev/null | head -1 | sed 's/.*://')
-  BFF_SCHEME="http"
-fi
-BFF_PORT="${BFF_PORT:-3002}"
-
+# The dashboard serves HTTPS on container port 443 and 301-redirects plain HTTP
+# to it. Probing inside the container removes the published-port guesswork this
+# block used to carry (`docker port` for 443, then 80, then a hardcoded 3002
+# fallback that was simply wrong on a stack publishing neither) — and, like the
+# sweep above, keeps it from reaching another project's dashboard.
 bff_endpoints=(
-  "GET|${BFF_SCHEME}://localhost:${BFF_PORT}/api/health|BFF health"
-  "GET|${BFF_SCHEME}://localhost:${BFF_PORT}/api/content-extractions?limit=1|BFF content extractions"
-  "GET|${BFF_SCHEME}://localhost:${BFF_PORT}/api/content-intel/patterns|BFF content patterns"
-  "GET|${BFF_SCHEME}://localhost:${BFF_PORT}/api/software|BFF software inventory"
-  "GET|${BFF_SCHEME}://localhost:${BFF_PORT}/api/follow-ups?limit=1|BFF follow-ups"
+  "/api/health|BFF health"
+  "/api/content-extractions?limit=1|BFF content extractions"
+  "/api/content-intel/patterns|BFF content patterns"
+  "/api/software|BFF software inventory"
+  "/api/follow-ups?limit=1|BFF follow-ups"
 )
 
-for entry in "${bff_endpoints[@]}"; do
-  IFS='|' read -r method url label <<< "$entry"
-  code=$(curl -sk -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)
-  if [[ "$code" == "200" ]]; then
-    pass "$label ($code)"
-  else
-    fail "$label — HTTP $code"
-  fi
-done
+if ! ct_cid pentest-dashboard >/dev/null 2>&1; then
+  warn "BFF endpoint sweep skipped — no pentest-dashboard container in project '$(ct_project)'"
+else
+  for entry in "${bff_endpoints[@]}"; do
+    IFS='|' read -r path label <<< "$entry"
+    code=$(ct_http_code pentest-dashboard 443 "$path")
+    if [[ "$code" == "200" ]]; then
+      pass "$label ($code)"
+    else
+      fail "$label — HTTP $code"
+    fi
+  done
+fi
 
 # ── 5. Webhook Registration ──
 echo ""
@@ -641,7 +636,8 @@ fi
 # ── 8. New BFF endpoints (sanity) ──
 echo ""
 echo "=== New API endpoints ==="
-DASH=$(docker ps --filter "name=^pentest-dashboard$" --format '{{.Names}}')
+# The container ID of THIS project's dashboard, not whatever owns the name.
+DASH=$(ct_cid pentest-dashboard || true)
 if [[ -n "$DASH" ]]; then
   for ep in /api/settings/scan-timeouts /api/scans/limits /api/port-profiles /api/kb/prompts \
             /api/web-profiles /api/import/web-scan/formats /api/rag/service-docs \
@@ -684,12 +680,12 @@ if [[ -n "$DASH" ]]; then
   #
   # CLAUDE.md: "A fallback leg is an endpoint. Verify every leg or delete it."
   # Deleted, because nothing else in the repo ever called that path.
-  CAP_JSON=$(docker exec scan-recommender curl -sk --max-time 15 \
+  CAP_JSON=$(ct_exec scan-recommender curl -sk --max-time 15 \
       "https://127.0.0.1:8013/next_scan/capacity" 2>/dev/null || true)
   if ! echo "$CAP_JSON" | grep -q '"engagement_scan_limit"'; then
     # Retry over plain HTTP once: TLS on this port is the norm, but a dev
     # container may serve http and a wrong-scheme miss should not read as down.
-    CAP_JSON=$(docker exec scan-recommender curl -s --max-time 15 \
+    CAP_JSON=$(ct_exec scan-recommender curl -s --max-time 15 \
         "http://127.0.0.1:8013/next_scan/capacity" 2>/dev/null || true)
   fi
   if echo "$CAP_JSON" | grep -q '"engagement_scan_limit"'; then
@@ -733,8 +729,8 @@ if [[ -n "$DASH" ]]; then
     else
       fail "certs/ca-bundle.crt looks wrong (${bundle_n} certs, internal cert marker missing) — rerun scripts/generate-ca-bundle.sh"
     fi
-    if docker ps --format '{{.Names}}' | grep -q '^rag-api$'; then
-      if docker exec rag-api test -r /certs/ca-bundle.crt 2>/dev/null; then
+    if ct_cid rag-api >/dev/null 2>&1; then
+      if ct_exec rag-api test -r /certs/ca-bundle.crt 2>/dev/null; then
         pass "rag-api can read /certs/ca-bundle.crt"
       else
         fail "rag-api cannot read /certs/ca-bundle.crt — REQUESTS_CA_BUNDLE points at a missing file; every verifying HTTPS call in it will fail"
@@ -749,8 +745,8 @@ if [[ -n "$DASH" ]]; then
   # sequential 1-1000 range — which still returns HTTP 200 and still produces
   # results, just results that miss mysql/postgresql/vnc/tomcat. Nothing else in
   # this script would catch that.
-  if docker ps --format '{{.Names}}' | grep -q '^nmap_scanner$'; then
-    if docker exec nmap_scanner test -r /knowledge/port_profiles.yaml 2>/dev/null; then
+  if ct_cid nmap_scanner >/dev/null 2>&1; then
+    if ct_exec nmap_scanner test -r /knowledge/port_profiles.yaml 2>/dev/null; then
       pass "nmap_scanner can read knowledge/port_profiles.yaml"
     else
       fail "nmap_scanner cannot read /knowledge/port_profiles.yaml — add ./knowledge:/knowledge:ro to the nmap_scanner volumes; its default quick scan will silently fall back to the sequential 1-1000 range"
@@ -759,7 +755,7 @@ if [[ -n "$DASH" ]]; then
     # The deep sweep must cover the full range. 1001-65535 was correct only while
     # the quick pass was sequential 1-1000; against the frequency-ranked top-1000
     # it leaves the low ports outside that list unscanned by either phase.
-    DEEP=$(docker exec nmap_scanner printenv DEEP_SCAN_PORTS 2>/dev/null || echo "")
+    DEEP=$(ct_exec nmap_scanner printenv DEEP_SCAN_PORTS 2>/dev/null || echo "")
     if [[ "$DEEP" == "1001-65535" ]]; then
       fail "nmap_scanner DEEP_SCAN_PORTS=1001-65535 — stale value; set DEEP_SCAN_PORTS=1-65535 in .env and recreate the container"
     else
