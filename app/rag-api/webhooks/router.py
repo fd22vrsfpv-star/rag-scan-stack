@@ -568,14 +568,24 @@ _BFF_EVENT_TYPES = [
 ]
 
 
-def ensure_default_webhook():
+def ensure_default_webhook() -> bool:
     """
     Create the catch-all 'event-log' webhook and BFF dashboard webhook
     if they don't already exist.
 
-    Called once at application startup so every scanner event is recorded
-    in the webhook_events table automatically, and the dashboard BFF
-    receives events for real-time WebSocket push to the frontend.
+    Called at application startup so every scanner event is recorded in the
+    webhook_events table automatically, and the dashboard BFF receives events
+    for real-time WebSocket push to the frontend.
+
+    Returns True when both webhooks are in place, False when the attempt could
+    not complete.
+
+    WHY IT RETURNS A STATUS: on a FRESH install this runs during phase 6, before
+    phase 7 has created the `webhooks` table. The attempt failed, the exception
+    was logged and dropped, and nothing ever tried again — so neither webhook
+    was ever registered. Every event was then accepted with 200 and silently
+    discarded, and the Agent Activity timeline stayed empty. The caller retries
+    on False (see api.py's startup_event).
     """
     import logging
     log = logging.getLogger("webhooks.init")
@@ -632,4 +642,9 @@ def ensure_default_webhook():
             conn.commit()
         conn.close()
     except Exception as e:
-        log.error("Failed to register default webhooks: %s", e)
+        # Debug, not error: the expected cause is "the schema is not there yet",
+        # and the caller retries. A failure that outlives the retries is logged
+        # as an error by the retry loop itself.
+        log.warning("Could not register default webhooks (will retry): %s", e)
+        return False
+    return True

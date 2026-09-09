@@ -59,7 +59,7 @@ echo "Found $EXISTING_TABLES existing tables"
 
 echo ""
 echo -e "${YELLOW}Applying migration...${NC}"
-docker exec -i rag-postgres psql -U app -d scans < /utils/agents/db_init/add_missing_tables.sql
+docker exec -i rag-postgres psql -U app -d scans < /utils/agents/db_init/migrations/add_missing_tables.sql
 
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}Migration completed successfully!${NC}"

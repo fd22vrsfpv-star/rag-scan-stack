@@ -275,7 +275,7 @@ Every result passes `filter_recommendations()`, which rejects unrunnable tool na
 
 ### 3.4 Persistence
 
-`scan_recommendations` (`db_init/add_missing_tables.sql:65`):
+`scan_recommendations` (`db_init/migrations/add_missing_tables.sql:65`):
 
 ```sql
 INSERT INTO public.scan_recommendations

@@ -75,12 +75,12 @@ If you're **upgrading from an older version**, you need to run the database migr
 **Quick Migration:**
 ```bash
 cd /utils/agents
-./db_init/run_migration.sh
+./db_init/migrations/run_migration.sh
 ```
 
 Or manually:
 ```bash
-docker exec -i rag-postgres psql -U app -d scans < db_init/add_missing_tables.sql
+docker exec -i rag-postgres psql -U app -d scans < db_init/migrations/add_missing_tables.sql
 ```
 
 **What's Added:**
@@ -92,7 +92,7 @@ docker exec -i rag-postgres psql -U app -d scans < db_init/add_missing_tables.sq
 
 **Fresh installations** automatically include all tables via `setup_alldb.sql`.
 
-**See:** `db_init/MIGRATION_GUIDE.md` for detailed instructions and troubleshooting.
+**See:** `db_init/migrations/MIGRATION_GUIDE.md` for detailed instructions and troubleshooting.
 
 ## Typical flow
 ```bash 
