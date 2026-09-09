@@ -52,6 +52,33 @@ reads the ExploitDB **CSV** from disk instead (`rule_engine._load_exploitdb`;
 database prepares the FTS / CVE-array search path; it does not change behaviour
 until something reads it.
 
+### Populating `rag_documents`
+
+    docker exec autogen-agents python3 /app/etl/backfill_rag_documents.py --dry-run
+    docker exec autogen-agents python3 /app/etl/backfill_rag_documents.py
+
+Defaults to `vulns`, `web_findings` (excluding `record_kind='inventory'`) and
+`playwright_findings` — 7,910 rows to 8,284 chunks on this deployment.
+`recon_findings` is opt-in via `--sources`: 22,278 rows of subdomain/host
+enumeration would bury the 297 vulns.
+
+Idempotent — each chunk carries `metadata->>'source'` and `row_id`, and a row's
+chunks are deleted before rewriting, so a re-run updates in place.
+
+Two things about where it runs:
+
+- it lives in `etl/` because that directory is bind-mounted into the containers
+  that have `psycopg2` and `requests`. `app/` is host-only and is not shipped
+  into any image;
+- embeddings come from the embedder **service** (`POST /embed`), not an
+  in-process model: no container has both `sentence_transformers` and
+  `psycopg2`. The service runs all-MiniLM-L6-v2 = the 384 dimensions the column
+  declares.
+
+`app/load_all.py::backfill_findings_into_rag` is the historical entry point and
+could never run: it imported a module that does not exist, selected three
+columns `findings` does not have, and read `findings`, which holds 0 rows.
+
 ### Migration Scripts
 - **`db_init/ensure_all_tables.sql`** - Idempotent schema update
   - Safe to run multiple times (uses `IF NOT EXISTS`)
