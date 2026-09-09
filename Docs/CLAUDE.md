@@ -272,6 +272,23 @@ Two rules that cut across all tiers:
   `COALESCE(auth_type, '')`, with `etl/parse_brutus.py`'s `ON CONFLICT` updated
   to match the expression exactly.
 
+### Installer isolation
+- Phases 6-10 of `scripts/setup.sh` must address the stack they just started by
+  **(compose project, compose service)** — `scripts/lib/compose-target.sh` — and
+  never by `container_name` or a published host port. Both are global: under a
+  second project a literal `docker exec rag-postgres` applies the schema to the
+  LIVE database, and `curl localhost:8000/health` reports the LIVE stack healthy.
+- Every service that sets `container_name:` or publishes a port MUST be reset in
+  `docker-compose.rehearsal.yml`. A new one fails by name.
+- A rehearsal NEVER enables the `optional` profile (`host-helper` is privileged,
+  host-networked, and writes `/etc/systemd/system`).
+- Rehearse with `./scripts/rehearse-install.sh`; it fingerprints every
+  non-rehearsal container before and after and exits 3 if any changed.
+- *Enforced by:* `tests/test_rehearsal_isolation.py`.
+- *Why:* the first rehearsal could only run phases 1-5, and the reason recorded
+  ("41 hardcoded container names") understated it — starting a second stack
+  would have been indistinguishable from the live one, schema writes included.
+
 ### Known-debt lists
 `tests/test_dispatch_invariants.py` carries `SCOPE_DEBT` and `LIMIT_DEBT`,
 `tests/test_proxy_contracts.py` carries `PROXY_DYNAMIC` and `PROXY_DEBT`, and

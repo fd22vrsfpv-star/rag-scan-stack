@@ -29,6 +29,7 @@ import pytest
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 SCRIPT = os.path.join(REPO, "scripts", "post-install-check.sh")
+LIB = os.path.join(REPO, "scripts", "lib", "compose-target.sh")
 DDL = os.path.join(REPO, "db_init", "ensure_all_tables.sql")
 
 
@@ -36,6 +37,16 @@ def _src():
     if not os.path.exists(SCRIPT):
         pytest.skip("post-install-check.sh not present")
     with open(SCRIPT, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _lib_src():
+    """The SQL resolver moved to scripts/lib/compose-target.sh (2026-09-09) so
+    setup.sh's Phase 7 uses the same one instead of its own `docker exec
+    rag-postgres`. The invariants below did not change — they follow the code."""
+    if not os.path.exists(LIB):
+        pytest.skip("scripts/lib/compose-target.sh not present")
+    with open(LIB, encoding="utf-8") as fh:
         return fh.read()
 
 
@@ -48,22 +59,54 @@ def _function_body(src, name):
 
 
 def test_no_hardcoded_db_container():
-    """Only _run_sql may name the postgres container. Every other call site broke
-    the moment the database moved off-box."""
-    src = _src()
-    helper = _function_body(src, "_run_sql")
+    """No call site in the verifier may name the postgres container.
+
+    Originally this allowed _run_sql to do so; the resolver now lives in
+    ct_sql, so the script itself should contain none at all. `docker exec
+    rag-postgres` is doubly wrong now: it breaks when the database moves
+    off-box, AND it addresses a GLOBAL name, so under a second compose project
+    a fresh-install check verifies the LIVE database and passes.
+    """
     offenders = []
-    for i, line in enumerate(src.splitlines(), 1):
+    for i, line in enumerate(_src().splitlines(), 1):
         if "docker exec rag-postgres" not in line:
             continue
         if line.strip().startswith("#"):
             continue
-        if line in helper:
+        offenders.append(f"line {i}: {line.strip()[:90]}")
+    assert not offenders, (
+        "these call sites name the postgres container directly instead of going "
+        f"through ct_sql / ct_exec: {offenders}"
+    )
+
+
+def test_only_ct_sql_names_the_db_container():
+    """In the shared helper, exactly one function may name rag-postgres."""
+    lib = _lib_src()
+    body = _function_body(lib, "ct_sql")
+    offenders = []
+    for i, line in enumerate(lib.splitlines(), 1):
+        if "rag-postgres" not in line or line.strip().startswith("#"):
+            continue
+        if line in body:
             continue
         offenders.append(f"line {i}: {line.strip()[:90]}")
     assert not offenders, (
-        "these call sites bypass _run_sql and only work when Postgres runs in a "
-        f"local container: {offenders}"
+        "only ct_sql may name the postgres container in compose-target.sh: "
+        f"{offenders}"
+    )
+
+
+def test_run_sql_delegates_to_the_shared_resolver():
+    """If _run_sql stopped delegating, the verifier and setup.sh Phase 7 would
+    drift apart again — and the copy that lost the DSN fallback would report
+    every table as missing in remote DB mode."""
+    src = _src()
+    m = re.search(r"^_run_sql\(\)\s*\{(.*?)\}", src, re.M | re.S)
+    assert m, "_run_sql() not found in post-install-check.sh"
+    assert "ct_sql" in m.group(1), (
+        "_run_sql no longer calls ct_sql — it must not grow a second copy of "
+        "the resolution logic"
     )
 
 
@@ -87,13 +130,23 @@ def test_sql_results_are_not_compared_arithmetically_unguarded():
 
 
 def test_run_sql_reports_failure_by_exit_status():
-    """A global set inside `x=$(_run_sql …)` is lost — it runs in a subshell."""
-    body = _function_body(_src(), "_run_sql")
-    assert "return 1" in body, "_run_sql must signal failure with a non-zero status"
-    assert "return 0" in body, "_run_sql must signal success with a zero status"
+    """A global set inside `x=$(ct_sql …)` is lost — it runs in a subshell.
+
+    Checked on ct_sql, where the logic now lives. It must also distinguish
+    "ran but failed" (1) from "no database reachable" (2): _check_object turns
+    a non-zero status into "could not query", and conflating that with
+    "missing" is the defect this whole file exists for.
+    """
+    body = _function_body(_lib_src(), "ct_sql")
+    assert "return 0" in body, "ct_sql must signal success with a zero status"
+    assert "return 1" in body, "ct_sql must signal a failed query with status 1"
+    assert "return 2" in body, (
+        "ct_sql must signal 'no database reachable' with status 2 — distinct "
+        "from a query that ran and failed"
+    )
     for setter in ("_SQL_OK=", "_SQL_ERR="):
         assert setter not in body, (
-            f"{setter} is set inside _run_sql, but callers invoke it in a command "
+            f"{setter} is set inside ct_sql, but callers invoke it in a command "
             "substitution (a subshell) where the assignment cannot propagate"
         )
 
