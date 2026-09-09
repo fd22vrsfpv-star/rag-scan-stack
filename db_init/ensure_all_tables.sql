@@ -180,6 +180,87 @@ CREATE TABLE IF NOT EXISTS public.raw_output (
     created_at   timestamptz DEFAULT now()
 );
 
+-- ── rag_documents: findings, chunked and embedded for similarity search ──
+--
+-- MOVED HERE 2026-09-09 from setup_alldb.sql, where it was created under
+-- `\connect n8n` — i.e. in the WORKFLOW AUTOMATION database. Three things said
+-- that was wrong:
+--
+--   * its only writer, app/load_all.py, connects with DB_DSN like every other
+--     ETL module, which is `scans`. The INSERT could only ever fail with
+--     "relation rag_documents does not exist";
+--   * Docs/ARCHITECTURE.md lists it under Intelligence beside
+--     scan_recommendations and cve, both of which live here;
+--   * the live deployment has no `n8n` database at all, so the table existed
+--     nowhere.
+--
+-- It is the findings-level RAG store. The knowledge-level one is
+-- exploit_chunks (wstg / gtfobins / training docs); nothing embedded FINDINGS
+-- text before this. Both are vector(384) — MiniLM L6, matching EMBED_MODEL.
+--
+-- Declared before scan_targets so it follows assets/findings/ports/scans,
+-- which its foreign keys need (see tests/test_db_init_order.py).
+CREATE TABLE IF NOT EXISTS public.rag_documents (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    asset_id    uuid REFERENCES public.assets(id) ON DELETE SET NULL,
+    finding_id  uuid REFERENCES public.findings(id) ON DELETE SET NULL,
+    port_id     uuid REFERENCES public.ports(id) ON DELETE SET NULL,
+    scan_id     uuid REFERENCES public.scans(id) ON DELETE SET NULL,
+    title       text,
+    text_chunk  text NOT NULL,
+    metadata    jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- The embedding column is separate because pgvector may be absent: the
+-- extension above is itself guarded, and a bare `vector(384)` in the CREATE
+-- TABLE would take the whole table down with it on a server without pgvector.
+DO $RAGEMB$ BEGIN
+    ALTER TABLE public.rag_documents ADD COLUMN IF NOT EXISTS embedding vector(384);
+EXCEPTION WHEN undefined_object OR undefined_file THEN
+    RAISE NOTICE 'rag_documents.embedding not created (pgvector missing): %', SQLERRM;
+END $RAGEMB$;
+
+-- Generated tsvector. ADD COLUMN IF NOT EXISTS cannot be used with GENERATED,
+-- so the existence check is explicit.
+DO $RAGFTS$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+         WHERE attrelid = 'public.rag_documents'::regclass AND attname = 'fts'
+           AND NOT attisdropped
+    ) THEN
+        ALTER TABLE public.rag_documents
+          ADD COLUMN fts tsvector GENERATED ALWAYS AS
+            (to_tsvector('english', coalesce(title,'') || ' ' || text_chunk)) STORED;
+    END IF;
+END $RAGFTS$;
+
+CREATE INDEX IF NOT EXISTS rag_docs_meta_gin ON public.rag_documents USING GIN (metadata);
+CREATE INDEX IF NOT EXISTS rag_docs_fts_idx  ON public.rag_documents USING GIN (fts);
+CREATE INDEX IF NOT EXISTS rag_docs_finding_idx ON public.rag_documents(finding_id);
+CREATE INDEX IF NOT EXISTS rag_docs_asset_idx   ON public.rag_documents(asset_id);
+
+-- The ANN index Docs/README.md has always claimed ("Index via IVFFLAT is
+-- included") and which did not exist. Guarded twice: pgvector may be absent,
+-- and ivfflat needs the column. lists=100 suits the ~10^4-10^5 rows a
+-- findings backfill produces; an ivfflat index built on an empty table is
+-- valid but unselective until there is data, so re-create it (or REINDEX)
+-- after a large backfill.
+DO $RAGIVF$ BEGIN
+    CREATE INDEX IF NOT EXISTS rag_docs_embedding_ivfflat
+      ON public.rag_documents USING ivfflat (embedding vector_cosine_ops)
+      WITH (lists = 100);
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'rag_documents ivfflat index not created: %', SQLERRM;
+END $RAGIVF$;
+
+-- Moved with the table: it lived in n8n, where nothing queries it.
+CREATE OR REPLACE VIEW public.rag_recent_high AS
+SELECT title, text_chunk, metadata, created_at
+  FROM public.rag_documents
+ WHERE (metadata->>'severity') IN ('high','critical')
+   AND created_at >= now() - interval '30 days';
+
 -- scan_targets
 CREATE TABLE IF NOT EXISTS public.scan_targets (
     id       uuid DEFAULT gen_random_uuid() PRIMARY KEY,
