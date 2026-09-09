@@ -33,6 +33,7 @@ the caller has to retry rather than assume one attempt is enough.
 Static — reads the source, no rag-api import (it needs fastapi and the app
 package) and no database.
 """
+import ast
 import os
 import re
 
@@ -154,4 +155,99 @@ def test_the_task_global_is_declared():
     text = _read(API)
     assert re.search(r"^_webhook_registration_task\s*=\s*None", text, re.M), (
         "_webhook_registration_task has no module-level declaration"
+    )
+
+# ── The allow-list, for the event types this session added ─────────────────
+#
+# `_ALL_EVENT_TYPES` in the router is an ALLOW-LIST held on the `event-log`
+# webhook row. A type missing from it is emitted, answered **200**, and then
+# silently discarded — nothing appears in webhook_events and nothing appears on
+# the Agent Activity timeline. There is no error anywhere.
+#
+# Narrow on purpose. A repo-wide version of this check finds **113** literal
+# event types that are emitted and NOT listed, so asserting the general rule
+# here would land red, and CLAUDE.md is explicit that a permanently red
+# baseline makes a new failure invisible. That backlog wants a
+# WEBHOOK_UNLISTED_DEBT ratchet of its own, in its own change; this pins the
+# family added alongside etl/backfill_rag_documents.py so it cannot rot the way
+# the other 113 did. Precedent: test_langgraph_phases.py does the same for the
+# langgraph_surface_* family.
+MAINTENANCE_EVENTS = (
+    "maintenance_schema_applied", "maintenance_schema_apply_failed",
+    "maintenance_knowledge_seeded", "maintenance_knowledge_seed_failed",
+    "maintenance_rag_backfilled", "maintenance_rag_backfill_failed",
+)
+
+
+def test_maintenance_event_types_are_allow_listed():
+    src = _read(ROUTER)
+    listed = src.split("_ALL_EVENT_TYPES = [", 1)[-1].split("]", 1)[0]
+    missing = [ev for ev in MAINTENANCE_EVENTS if f'"{ev}"' not in listed]
+    assert not missing, (
+        "these event types are emitted by maintenance actions but are absent "
+        f"from _ALL_EVENT_TYPES, so they are accepted with 200 and dropped: "
+        f"{missing}"
+    )
+
+
+def test_the_rag_backfill_emits_its_own_event():
+    """A backfill rewrites a shared corpus. CLAUDE.md wants that on the
+    timeline, and the emit has to name a type the allow-list carries."""
+    tool = os.path.join(REPO, "etl", "backfill_rag_documents.py")
+    if not os.path.exists(tool):
+        pytest.skip("etl/backfill_rag_documents.py not present")
+    src = _read(tool)
+    assert "webhooks/emit" in src, (
+        "the backfill does not emit a webhook event, so a corpus rewrite leaves "
+        "no audit trail"
+    )
+    assert "maintenance_rag_backfilled" in src, (
+        "the backfill emits some other event type than the allow-listed one"
+    )
+
+
+def test_the_rag_backfill_does_not_embed_in_process():
+    """No container in this stack has BOTH sentence_transformers and psycopg2 —
+    the embedder image has the model and no driver, everything else has the
+    driver and no model. That is why the predecessor could not run anywhere."""
+    tool = os.path.join(REPO, "etl", "backfill_rag_documents.py")
+    if not os.path.exists(tool):
+        pytest.skip("etl/backfill_rag_documents.py not present")
+    # Parsed, not grepped: this file's own docstring NAMES
+    # sentence_transformers while explaining why it does not use it, and a
+    # text scan failed on that immediately. Comments and docstrings must never
+    # be able to trip a guard — the same trap this session hit three times.
+    tree = ast.parse(_read(tool))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert "sentence_transformers" not in imported, (
+        "the backfill imports sentence_transformers, i.e. loads the embedding "
+        "model in-process. It must POST to the embedder service, which is also "
+        "the only place the model version is defined"
+    )
+    calls = {getattr(n.func, "id", None) or getattr(n.func, "attr", None)
+             for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    assert "SentenceTransformer" not in calls, (
+        "the backfill instantiates SentenceTransformer directly"
+    )
+    assert "/embed" in _read(tool), "the backfill does not call the embedder service"
+
+
+def test_the_rag_backfill_is_idempotent():
+    """The predecessor appended chunks, so a second run doubled the corpus."""
+    tool = os.path.join(REPO, "etl", "backfill_rag_documents.py")
+    if not os.path.exists(tool):
+        pytest.skip("etl/backfill_rag_documents.py not present")
+    src = _read(tool)
+    assert re.search(r"DELETE FROM public\.rag_documents", src), (
+        "no delete before insert — re-running would append a second copy of "
+        "every chunk"
+    )
+    assert "row_id" in src and "'source'" in src, (
+        "the delete is not keyed on (source, row_id), so it cannot target just "
+        "the rows being rewritten"
     )
