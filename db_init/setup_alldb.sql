@@ -47,8 +47,15 @@ END$$;
 -------------------------
 -- DATABASE: n8n
 -------------------------
--- Create DB (may error if exists)
-CREATE DATABASE n8n OWNER n8n TEMPLATE template0 ENCODING 'UTF8';
+-- Conditional via \gexec: under the docker entrypoint this file runs with
+-- ON_ERROR_STOP=1, and POSTGRES_DB has ALREADY created `scans`. A bare
+-- CREATE DATABASE then fails with "database scans already exists" and aborts
+-- the ENTIRE init — every remaining file included, so create_exploits.sh never
+-- ran and the `exploits` database was missing from every fresh install. The
+-- comment at the top of this file ("may error if exists. That's safe") was
+-- true when it was run by hand and false under the entrypoint.
+SELECT 'CREATE DATABASE n8n OWNER n8n TEMPLATE template0 ENCODING ''UTF8'''
+ WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'n8n')\gexec
 
 -- Switch to n8n DB (psql meta-command)
 \connect n8n
@@ -213,7 +220,8 @@ GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO n8n;
 -- DATABASE: exploitdb
 -------------------------
 \connect postgres
-CREATE DATABASE exploitdb OWNER exploitdb TEMPLATE template0 ENCODING 'UTF8';
+SELECT 'CREATE DATABASE exploitdb OWNER exploitdb TEMPLATE template0 ENCODING ''UTF8'''
+ WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'exploitdb')\gexec
 \connect exploitdb
 
 -- Ensure extensions in exploitdb
@@ -293,7 +301,8 @@ GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO exploitdb;
 -- DATABASE: scans
 -------------------------
 \connect postgres
-CREATE DATABASE scans OWNER scans TEMPLATE template0 ENCODING 'UTF8';
+SELECT 'CREATE DATABASE scans OWNER scans TEMPLATE template0 ENCODING ''UTF8'''
+ WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'scans')\gexec
 \connect scans
 
 -- extensions
@@ -1956,8 +1965,13 @@ FROM public.exploit_results er
 JOIN public.pending_exploits pe ON er.pending_exploit_id = pe.id
 WHERE er.executed_at IS NOT NULL;
 
--- GRPO training infrastructure tables
-\i /docker-entrypoint-initdb.d/grpo_migration.sql
+-- GRPO training infrastructure tables.
+-- grpo_migration.sql lives in migrations/ because the entrypoint would
+-- otherwise run it standalone, out of dependency order. It is INCLUDED here,
+-- at the point where its prerequisites exist. A missing include is fatal to the
+-- whole init (`\i` respects ON_ERROR_STOP), so this path and the file's
+-- location must move together.
+\i /docker-entrypoint-initdb.d/migrations/grpo_migration.sql
 
 -- End of file
 

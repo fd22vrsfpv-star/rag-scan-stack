@@ -29,7 +29,7 @@ The stack uses PostgreSQL with pgvector extension for storing:
   - `agent_sessions` and `agent_messages`
   - Can be run independently if only these are missing
 
-- **`db_init/add_missing_tables.sql`** - Legacy migration script
+- **`db_init/migrations/add_missing_tables.sql`** - Legacy migration script
   - Adds tables that were missing in older versions
   - Now superseded by `ensure_all_tables.sql`
 
@@ -365,5 +365,5 @@ WHERE schemaname = 'public'
 For database issues:
 1. Check logs: `docker compose logs rag-postgres`
 2. Verify schema: `./scripts/ensure_db_schema.sh`
-3. Review migration guide: `db_init/MIGRATION_GUIDE.md`
+3. Review migration guide: `db_init/migrations/MIGRATION_GUIDE.md`
 4. Report issues with full error output and schema state

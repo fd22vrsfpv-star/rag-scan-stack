@@ -1,5 +1,37 @@
 # OS Changes for Migration
 
+## 2026-09-09 — Rehearsal isolation: one ordering rule to mirror
+
+### Files Changed
+`scripts/lib/compose-target.sh` (new), `scripts/setup.sh`,
+`scripts/post-install-check.sh`, `docker-compose.rehearsal.yml` (new),
+`scripts/rehearse-install.sh` (new), `tests/test_rehearsal_isolation.py` (new).
+Full detail in Docs/CHANGES_MADE.md (2026-09-09).
+
+### Platforms Affected
+**One real item.**
+
+1. **`docker-compose.rehearsal.yml` must stay LAST in `COMPOSE_FILES`.**
+   On macOS, setup.sh swaps the base file for
+   `-f docker-compose.yml -f docker-compose.mac.yml`; the rehearsal override is
+   appended after platform detection so it applies over both. If a future
+   platform file is added earlier in that string, nothing breaks visibly — but
+   if one is added AFTER the override and it re-declares `container_name:` or
+   `ports:` for a service, that service silently regains the collision and only
+   the rehearsal fails, with an "address already in use" that points at the
+   wrong file. `tests/test_rehearsal_isolation.py` cannot see this: it compares
+   the base file against the override, not the assembled command line.
+
+### Notes, no action needed
+- The helper is POSIX-ish bash and uses only `docker ps/exec/port` — no
+  GNU-specific flags, so it works with Docker Desktop on macOS unchanged.
+- `docker-compose.azure.yml` and `docker-compose.mac.yml` do not set
+  `container_name:` or `ports:` today, so they need no rehearsal entries.
+  Verify that before a port: `grep -nE 'container_name|ports' docker-compose.*.yml`.
+- Windows (`scripts/setup.ps1`) has no rehearsal path at all. It does not source
+  the shell helper, so nothing there is broken by this change — but a Windows
+  fresh-install rehearsal remains unavailable.
+
 ## 2026-08-28 (part 2) — embedder TLS mount is the one thing to mirror
 
 ### Files Changed
