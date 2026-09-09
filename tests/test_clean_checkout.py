@@ -70,11 +70,25 @@ def test_build_copies_at_least_one_bin_dir():
     )
 
 
+# `git` itself may be absent — the standard test container has no git, and
+# `subprocess.run` then raises FileNotFoundError, which pytest reports as a
+# FAILURE. "Cannot run here" must be a skip: a red baseline makes a genuinely
+# new failure invisible, which is the same skip-vs-fail confusion that kept CI
+# red for weeks (see tests/_container.py).
+def _git(*args):
+    """Run a git command. Returns None when git cannot be run at all."""
+    try:
+        return subprocess.run(("git",) + args, cwd=REPO,
+                              capture_output=True, text=True)
+    except (FileNotFoundError, OSError):
+        return None
+
 @pytest.mark.parametrize("rel", sorted(_copied_dirs()))
 def test_copied_bin_dir_survives_a_clean_checkout(rel):
     """`git ls-files` is the question that matters: what a fresh clone gets."""
-    out = subprocess.run(["git", "ls-files", rel], cwd=REPO,
-                         capture_output=True, text=True)
+    out = _git("ls-files", rel)
+    if out is None:
+        pytest.skip("git is not installed")
     if out.returncode != 0:
         pytest.skip("not a git checkout")
     assert out.stdout.strip(), (
@@ -89,8 +103,9 @@ def test_copied_bin_dir_survives_a_clean_checkout(rel):
 def test_the_binaries_themselves_stay_ignored(rel):
     """The marker must not become a licence to commit build output."""
     probe = os.path.join(rel, "__probe_binary__")
-    out = subprocess.run(["git", "check-ignore", probe], cwd=REPO,
-                         capture_output=True, text=True)
+    out = _git("check-ignore", probe)
+    if out is None:
+        pytest.skip("git is not installed")
     if out.returncode == 128:
         pytest.skip("not a git checkout")
     assert out.returncode == 0, (

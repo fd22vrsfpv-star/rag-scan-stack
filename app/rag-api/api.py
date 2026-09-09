@@ -5291,6 +5291,10 @@ def _run_takeover_hunter_if_enabled(engagement_id: Optional[str] = None) -> None
 _STUCK_JOB_TIMEOUT_S = int(os.environ.get("STUCK_JOB_TIMEOUT_S", "300"))   # 5 min default
 _STUCK_JOB_SWEEP_S   = int(os.environ.get("STUCK_JOB_SWEEP_S", "600"))    # check every 10 min
 _stuck_sweeper_task = None
+# Holds the background task that keeps retrying default-webhook registration
+# (None once registration has succeeded). Declared at module level so
+# startup_event's `global` binding has something to bind.
+_webhook_registration_task = None
 
 
 def _sweep_stuck_jobs_once():
@@ -5349,15 +5353,49 @@ async def _stuck_sweeper_loop():
             log.exception("stuck-job sweeper iteration failed")
 
 
+async def _retry_default_webhooks(attempts: int = 30, delay: float = 10.0):
+    """Keep trying to register the default webhooks until the schema exists.
+
+    On a fresh install this service starts in phase 6 and the `webhooks` table
+    is created in phase 7, so the startup attempt necessarily fails. It used to
+    fail silently and never retry, leaving 'event-log' and 'dashboard-bff'
+    unregistered for the life of the install — every emitted event answered 200
+    and was dropped, so webhook_events stayed empty and so did the Agent
+    Activity timeline.
+
+    30 x 10s covers the gap between phases 6 and 7 with room to spare. Giving up
+    is logged as an ERROR, because at that point events really are being lost.
+    """
+    import asyncio
+    for n in range(1, attempts + 1):
+        await asyncio.sleep(delay)
+        if ensure_default_webhook():
+            log.info("Default webhooks registered on retry %d", n)
+            return
+    log.error(
+        "Default webhooks still unregistered after %d attempts (%.0fs). Events "
+        "are being accepted and DISCARDED — check that the webhooks table "
+        "exists (scripts/ensure_db_schema.sh) and restart this service.",
+        attempts, attempts * delay,
+    )
+
+
 @app.on_event("startup")
 async def startup_event():
     ensure_phase0_schema()
     # Start webhook retry worker for failed delivery retries
     start_retry_worker()
-    # Register default catch-all event-log webhook so all events are recorded
-    ensure_default_webhook()
     # Sweep stuck/abandoned running jobs on startup, then every 60s
     import asyncio
+    # Register default catch-all event-log webhook so all events are recorded.
+    # Retried in the background when it cannot succeed yet: on a fresh install
+    # the webhooks table does not exist until phase 7.
+    global _webhook_registration_task
+    if ensure_default_webhook():
+        _webhook_registration_task = None
+    else:
+        log.warning("Default webhooks not registered yet — retrying in the background")
+        _webhook_registration_task = asyncio.create_task(_retry_default_webhooks())
     global _stuck_sweeper_task
     try:
         _sweep_stuck_jobs_once()  # immediate sweep covers crashes pre-restart
@@ -5376,6 +5414,11 @@ async def shutdown_event():
     global _stuck_sweeper_task
     if _stuck_sweeper_task is not None:
         _stuck_sweeper_task.cancel()
+    # Cancelled alongside it — an un-cancelled retry task keeps sleeping through
+    # shutdown and logs its give-up error into a process that is already gone.
+    global _webhook_registration_task
+    if _webhook_registration_task is not None:
+        _webhook_registration_task.cancel()
 
 class Job(BaseModel):
     id: str = Field(..., description="Unique identifier for the job")

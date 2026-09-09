@@ -65,6 +65,13 @@ DIRECT_EXEC_DEBT = {
 DIRECT_EXEC_OK = {
     "_container.py",             # the shared helper itself
     "test_target_wordlists.py",  # consults returncode + is_unreachable()
+    # Starts its own throwaway postgres and execs into it by id. The helper
+    # exists to stop "no such container" being read as a negative result, and
+    # that cannot arise here: the fixture skips when docker is unusable or the
+    # image will not start, so by the time anything execs, the container is
+    # known to exist. Using container_exec() would mean pretending a container
+    # this test created is a live service it might have to skip over.
+    "test_db_init_order.py",
 }
 
 

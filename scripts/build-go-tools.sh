@@ -40,20 +40,52 @@ done
 OSINT_BIN="osint_runner/bin"
 PD_BIN="pd_runner/bin"
 
+# The image the per-arch builds run in. Named once so the cross-arch capability
+# probe below uses the SAME image the build would — probing a different image
+# proves nothing about whether the build can run.
+GO_IMAGE="golang:1.25"
+
 # Detect host arch — used to determine which is the "local" build
 HOST_ARCH="amd64"
 case "$(uname -m)" in
     aarch64|arm64) HOST_ARCH="arm64" ;;
 esac
 
-# Determine which arches to build
+# Determine which arches to build.
+#
+# HOST ARCH FIRST, always. `both` used to be a literal ("arm64" "amd64"), so on
+# an amd64 host the CROSS build ran first — and under `set -e` its failure killed
+# the script before the local binaries, the only ones `docker compose build`
+# copies, were ever built. A fresh install then shipped 0/18 osint tools and
+# 0/5 pd tools, reported as a WARNING that does not stop the install.
 ARCHES=()
 case "$BUILD_ARCH" in
-    both)  ARCHES=("arm64" "amd64") ;;
+    both)
+        OTHER_ARCH="amd64"
+        [[ "$HOST_ARCH" == "amd64" ]] && OTHER_ARCH="arm64"
+        ARCHES=("$HOST_ARCH" "$OTHER_ARCH")
+        ;;
     arm64) ARCHES=("arm64") ;;
     amd64) ARCHES=("amd64") ;;
     *)     echo "Invalid arch: $BUILD_ARCH (use arm64, amd64, or both)"; exit 1 ;;
 esac
+
+# Can this host execute containers for a FOREIGN architecture at all?
+#
+# `docker run --platform linux/arm64` on an amd64 host needs qemu registered
+# with the kernel's binfmt_misc. Without it the container starts and then dies
+# with `exec /usr/bin/bash: exec format error`. WSL2 loses those registrations
+# on restart, so a machine that cross-built yesterday cannot today — which is
+# exactly how this defect stayed hidden.
+#
+# "cannot cross-build here" is a SKIP, not a failure: the cross binaries are
+# for deploying to remote nodes of the other arch, and nothing on this host
+# needs them.
+can_build_arch() {
+    local arch="$1"
+    [[ "$arch" == "$HOST_ARCH" ]] && return 0
+    docker run --rm --platform "linux/${arch}" "$GO_IMAGE" true >/dev/null 2>&1
+}
 
 echo "=== Building Go security tools ==="
 echo "Host: $(uname -m) | Building for: ${ARCHES[*]}"
@@ -148,7 +180,7 @@ build_for_arch() {
         -v "$(pwd)/$OSINT_OUT:/output" \
         -e "GOARCH=$ARCH" \
         -e "GOOS=linux" \
-        golang:1.25 bash -c '
+        "$GO_IMAGE" bash -c '
 set -e
 apt-get update -qq && apt-get install -y -qq --no-install-recommends git ca-certificates build-essential musl >/dev/null 2>&1
 export GONOSUMCHECK="*" GONOSUMDB="*" GOTOOLCHAIN=auto
@@ -214,7 +246,7 @@ ls -la /output/
         -v "$(pwd)/$PD_OUT:/output" \
         -e "GOARCH=$ARCH" \
         -e "GOOS=linux" \
-        golang:1.25 bash -c '
+        "$GO_IMAGE" bash -c '
 set -e
 apt-get update -qq && apt-get install -y -qq --no-install-recommends git libpcap-dev build-essential >/dev/null 2>&1
 # GOTOOLCHAIN=auto is load-bearing: the official golang image pins it to
@@ -260,9 +292,44 @@ ls -la /output/
     echo "  PD:    $(ls "$PD_OUT"/ 2>/dev/null | wc -l | tr -d ' ') binaries in $PD_OUT/"
 }
 
-# Build for each requested architecture
+# Build for each requested architecture.
+#
+# The host arch decides this script's exit status: setup.sh treats a non-zero
+# exit as "Go tool build failed" and carries on with whatever is on disk, so a
+# cross-build that cannot run here must not spend that signal.
+HOST_RC=0
+SKIPPED_ARCHES=()
 for arch in "${ARCHES[@]}"; do
-    build_for_arch "$arch"
+    if ! can_build_arch "$arch"; then
+        echo ""
+        echo "[$arch] SKIPPED — this host cannot execute linux/${arch} containers."
+        # An arch the operator asked for BY NAME is different from one implied
+        # by the `both` default: silently skipping what was explicitly requested
+        # would report success for work that did not happen.
+        if [[ "$BUILD_ARCH" != "both" ]]; then
+            echo "         You asked for ${arch} explicitly, so this is a failure."
+            echo "         Register qemu and retry:"
+            echo "           docker run --privileged --rm tonistiigi/binfmt --install ${arch}"
+            exit 1
+        fi
+        echo "         qemu is not registered with binfmt_misc (WSL2 loses this on restart)."
+        echo "         Register it, then re-run with --arch ${arch}:"
+        echo "           docker run --privileged --rm tonistiigi/binfmt --install ${arch}"
+        echo "         Nothing on this host needs these binaries — they are for"
+        echo "         deploying to remote ${arch} nodes."
+        SKIPPED_ARCHES+=("$arch")
+        continue
+    fi
+    if [[ "$arch" == "$HOST_ARCH" ]]; then
+        build_for_arch "$arch" || HOST_RC=$?
+    else
+        # A cross build that starts and then fails is still not this host's
+        # problem to fail on — report it and move on.
+        build_for_arch "$arch" || {
+            echo "[$arch] cross build FAILED (non-fatal — local binaries are unaffected)"
+            SKIPPED_ARCHES+=("$arch")
+        }
+    fi
 done
 
 echo ""
@@ -285,5 +352,19 @@ for arch in arm64 amd64; do
     fi
 done
 
+if (( ${#SKIPPED_ARCHES[@]} > 0 )); then
+    echo ""
+    echo "Not built (cross-arch, non-fatal): ${SKIPPED_ARCHES[*]}"
+fi
+
 echo ""
 echo "Next: run 'docker compose build osint-runner pd-runner' to build the containers."
+
+# Only the host arch decides success.
+if (( HOST_RC != 0 )); then
+    echo ""
+    echo "ERROR: the ${HOST_ARCH} build failed — docker compose build will produce"
+    echo "       runners with missing tools. Fix this before continuing."
+    exit "$HOST_RC"
+fi
+exit 0

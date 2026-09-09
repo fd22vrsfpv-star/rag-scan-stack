@@ -1,0 +1,246 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  docker-compose.rehearsal.yml — start this stack BESIDE a running one
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#   docker compose -f docker-compose.yml -f docker-compose.rehearsal.yml up -d
+#
+# Do not use this by hand: scripts/rehearse-install.sh drives it, and it is the
+# only thing that also sets COMPOSE_PROJECT_NAME and guards the live stack.
+#
+# WHY
+# ---
+# The first fresh-install rehearsal could only run phases 1-5 (`--no-start`),
+# because three things in docker-compose.yml are GLOBAL rather than per-project:
+#
+#   1. `container_name:` on 41 services. Container names are unique per DAEMON,
+#      so the second stack does not start — and every `docker exec <name>` in
+#      the installer silently addresses the FIRST stack.
+#   2. Published host ports on 35 services. Ports belong to the host, so the
+#      second stack's `up` fails on "address already in use" — and any
+#      `curl localhost:<port>` health check passes by probing the first stack.
+#   3. `agents_net` is `external: true`. Both stacks would join the SAME bridge,
+#      where the second one's containers claim the `rag-postgres` and `embedder`
+#      network aliases beside the live ones. That is the alias split-brain that
+#      has already cost us a debugging session, except self-inflicted.
+#
+# This file removes all three. Named volumes need no help: compose already
+# scopes them to the project, as it does the network created below.
+#
+# WHAT IT COSTS
+# -------------
+# * No published ports means the rehearsal stack is NOT reachable from the host.
+#   Verify it with `docker compose exec` / in-container probes — which is what
+#   scripts/lib/compose-target.sh does, so setup.sh phases 7-10 and
+#   post-install-check.sh work unchanged. Phase 10's seeding is the exception:
+#   it shells out to import-knowledge.sh on the host, so it reports DEFERRED.
+# * The docker.sock mounts are dropped (see below), so container-log streaming,
+#   node provisioning and the WireGuard status panel are not exercised.
+# * The `optional` profile stays off, which is what keeps `host-helper` out —
+#   it is `privileged: true`, `network_mode: host`, and mounts
+#   /etc/systemd/system. Two stacks writing host systemd units is not a
+#   rehearsal, it is an outage. Never add --profile optional to a rehearsal.
+#
+# INVARIANT
+# ---------
+# Every service that sets `container_name:` or publishes a port MUST appear
+# below. tests/test_rehearsal_isolation.py fails by name when one does not, so
+# a new service cannot quietly reintroduce a collision.
+
+networks:
+  # Replaces the `external: true` declaration in docker-compose.yml. Compose
+  # now CREATES this network, named <project>_agents_net, and tears it down
+  # with the project. Services still reference the key `agents_net`, so no
+  # service needs to change.
+  agents_net: !override
+    driver: bridge
+
+services:
+  rag-postgres:
+    container_name: !reset null
+
+  vault:
+    container_name: !reset null
+    ports: !reset []
+
+  vault-init:
+    container_name: !reset null
+
+  wait-for-db:
+    container_name: !reset null
+
+  rag-api:
+    container_name: !reset null
+    ports: !reset []
+
+  embedder:
+    container_name: !reset null
+    ports: !reset []
+
+  embedder-gpu:
+    container_name: !reset null
+    ports: !reset []
+
+  zap:
+    container_name: !reset null
+    ports: !reset []
+
+  web-scanner:
+    container_name: !reset null
+    ports: !reset []
+
+  nuclei-runner:
+    container_name: !reset null
+    ports: !reset []
+
+  osint-runner:
+    container_name: !reset null
+    ports: !reset []
+
+  pd-runner:
+    container_name: !reset null
+    ports: !reset []
+
+  news-runner:
+    container_name: !reset null
+    ports: !reset []
+
+  brutus-runner:
+    container_name: !reset null
+    ports: !reset []
+
+  nmap_scanner:
+    container_name: !reset null
+    ports: !reset []
+
+  scan-recommender:
+    container_name: !reset null
+    ports: !reset []
+
+  playwright-scanner:
+    container_name: !reset null
+    ports: !reset []
+
+  autogen-agents:
+    container_name: !reset null
+    ports: !reset []
+
+  mcp-server:
+    container_name: !reset null
+    ports: !reset []
+
+  mcp-test:
+    container_name: !reset null
+    ports: !reset []
+
+  mcp-streamable:
+    container_name: !reset null
+    ports: !reset []
+
+  burp-mcp-proxy:
+    container_name: !reset null
+
+  mcpo:
+    container_name: !reset null
+    ports: !reset []
+
+  host-helper:
+    container_name: !reset null
+
+  exploit-runner:
+    container_name: !reset null
+    ports: !reset []
+
+  container-logs:
+    container_name: !reset null
+    ports: !reset []
+    volumes: !override
+      # /var/run/docker.sock deliberately absent: container-logs enumerates
+      # containers BY NAME, and in a rehearsal those names belong to the live
+      # stack — it would stream the live containers' logs into this database.
+      - .:/project
+      - ./certs:/certs:ro
+      - ./db-config.json:/app/db-config.json:rw
+
+  kali-listener:
+    container_name: !reset null
+    ports: !reset []
+
+  metasploit:
+    container_name: !reset null
+    ports: !reset []
+
+  ollama:
+    container_name: !reset null
+    ports: !reset []
+
+  vllm:
+    container_name: !reset null
+    ports: !reset []
+
+  grpo-trainer:
+    container_name: !reset null
+    ports: !reset []
+
+  llm_query:
+    container_name: !reset null
+    ports: !reset []
+
+  kong:
+    container_name: !reset null
+    ports: !reset []
+
+  specs:
+    container_name: !reset null
+
+  wg-server:
+    container_name: !reset null
+    ports: !reset []
+
+  open-webui:
+    container_name: !reset null
+    ports: !reset []
+
+  sliver-server:
+    container_name: !reset null
+    ports: !reset []
+
+  chisel-server:
+    container_name: !reset null
+    ports: !reset []
+
+  ssh-tunnel:
+    container_name: !reset null
+    ports: !reset []
+
+  node-manager:
+    container_name: !reset null
+    ports: !reset []
+    volumes: !override
+      # /var/run/docker.sock deliberately absent: node provisioning acts on
+      # containers by name and is not part of verifying an install.
+      - ./etl:/app/etl:ro
+      - ./common:/app/common:ro
+      - ${SSH_KEY_PATH:-./ssh-keys}:/ssh-keys:ro
+      - ./certs:/certs:ro
+      - ./wireguard:/opt/rag-scan-stack/wireguard:rw
+      - /tmp:/tmp
+
+  pentest-dashboard:
+    container_name: !reset null
+    ports: !reset []
+    volumes: !override
+      # /var/run/docker.sock deliberately absent: only the WireGuard status
+      # panel needs it, and /api/health does not — the phase-9 check still
+      # works. Everything else below is byte-for-byte the base list.
+      - ./scan_results:/scan_results
+      - ./scan_audit:/scan_audit
+      - ./osint_reports:/osint_reports:ro
+      - ./Docs:/docs:ro
+      - ./mcp:/mcp:ro
+      - ./mcp/third_party:/mcp/third_party
+      - ./mcpo/config.json:/mcpo/config.json
+      - ./db-config.json:/app/db-config.json:rw
+      - ./certs:/certs:ro
+      - ./knowledge:/knowledge:ro
+      - ./etl:/app/bff/etl:ro
+

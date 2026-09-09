@@ -33,6 +33,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 PROJECT_ROOT="$(pwd)"
 
+# ── Container addressing ──────────────────────────────────────────────────
+# Phases 7-10 talk to the stack they just started. They MUST address it by
+# (compose project, service) rather than by `container_name` or a published
+# host port, both of which are global: under a second compose project (a
+# fresh-install rehearsal beside a live stack) a literal `docker exec
+# rag-postgres` applies the schema to the LIVE database, and a literal
+# `curl https://localhost:8000/health` reports the LIVE stack healthy.
+# See scripts/lib/compose-target.sh.
+# shellcheck source=lib/compose-target.sh
+. "${PROJECT_ROOT}/scripts/lib/compose-target.sh"
+
 # ── Install log (single file, timestamped) ────────────────────────────────
 # Everything from this point is tee'd to logs/setup-<ts>.log so a failing
 # run leaves behind a complete transcript that's easy to attach to a bug
@@ -85,10 +96,16 @@ GPU_OVERRIDE=auto   # auto | force | skip — Phase 1 sets GPU_AVAILABLE; Phase 
 # as a failed install. Initialise it here so it is always defined.
 ENABLE_GPU=false
 SKIP_DEP_INSTALL=false   # Phase 1 auto-installs missing host deps (Docker, CLIs); --no-install disables
+# --rehearsal layers docker-compose.rehearsal.yml over the base file so this
+# install can run BESIDE an existing stack: no container_name, no published
+# ports, its own network. Set by scripts/rehearse-install.sh, which is what
+# should be run — it also sets COMPOSE_PROJECT_NAME and guards the live stack.
+REHEARSAL=false
 
 for arg in "$@"; do
     case "$arg" in
         --skip-go-tools)  SKIP_GO_TOOLS=true ;;
+        --rehearsal)      REHEARSAL=true ;;
         --force)          FORCE_GO_TOOLS=true ;;
         --no-start)       NO_START=true ;;
         --non-interactive) NON_INTERACTIVE=true ;;
@@ -106,6 +123,8 @@ for arg in "$@"; do
             echo "  --gpu              Force-enable the gpu compose profile (ollama + embedder-gpu)"
             echo "  --no-gpu           Skip the gpu profile even if a GPU is detected"
             echo "  --no-install       Do NOT auto-install missing host deps (Docker, CLIs, GPU toolkit)"
+            echo "  --rehearsal        Isolate this install so it can run beside a live stack"
+            echo "                     (use scripts/rehearse-install.sh, which sets this for you)"
             echo "  -h, --help         Show this help"
             exit 0
             ;;
@@ -124,10 +143,16 @@ BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# The banner said "[N/9]" while the script has ten phases, so a completed
+# install ended with "[10/9] Seeding knowledge base" — which reads as an
+# off-by-one somewhere in the installer at the exact moment an operator is
+# deciding whether to trust the run.
+TOTAL_PHASES=10
+
 banner() {
     echo ""
     echo -e "${BOLD}${BLUE}══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${BLUE}  [$1/9] $2${NC}"
+    echo -e "${BOLD}${BLUE}  [$1/${TOTAL_PHASES}] $2${NC}"
     echo -e "${BOLD}${BLUE}══════════════════════════════════════════════════════════════${NC}"
     echo ""
 }
@@ -152,6 +177,9 @@ PLATFORM_LABEL="linux"
 MAC_CHIP_NAME=""
 MAC_TOTAL_RAM_GB=0
 COMPOSE_FILES="-f docker-compose.yml"
+# Appended after platform detection (which may swap in docker-compose.mac.yml)
+# so the isolation override is always LAST and therefore wins.
+REHEARSAL_COMPOSE_FILE="docker-compose.rehearsal.yml"
 
 # Compose profiles to include. `local-db` is on by default so a fresh install
 # brings up rag-postgres without the user knowing about profiles. When DB_DSN
@@ -199,6 +227,19 @@ detect_platform() {
 }
 
 detect_platform
+
+# Isolation override goes on LAST so it overrides both the base file and the
+# macOS one. Refuse rather than silently install a colliding stack if the file
+# is missing — the whole point of --rehearsal is that it cannot touch the live
+# stack, and without this file it would do exactly that.
+if [ "$REHEARSAL" = true ]; then
+    if [ ! -f "$REHEARSAL_COMPOSE_FILE" ]; then
+        echo "--rehearsal requires ${REHEARSAL_COMPOSE_FILE}, which is missing."
+        echo "Without it this install would claim the live stack's container names."
+        exit 1
+    fi
+    COMPOSE_FILES="${COMPOSE_FILES} -f ${REHEARSAL_COMPOSE_FILE}"
+fi
 
 # ══════════════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════════
@@ -1459,7 +1500,15 @@ fi
 banner 4 "Setting up infrastructure"
 
 # Docker network
-if docker network inspect agents_net &>/dev/null; then
+# docker-compose.yml declares agents_net as `external: true`, so it must exist
+# before `up`. A rehearsal is the exception: the isolation override replaces it
+# with a project-local network compose creates itself. Saying "already exists"
+# there is true but misleading — it names the LIVE network, which the rehearsal
+# will not join, and that is the one thing an operator reading this output most
+# needs to be sure of.
+if [ "$REHEARSAL" = true ]; then
+    log_skip "Shared 'agents_net' not used — this rehearsal gets its own project network"
+elif docker network inspect agents_net &>/dev/null; then
     log_skip "Docker network 'agents_net' already exists"
 else
     docker network create agents_net
@@ -1671,6 +1720,23 @@ if [ "$NO_START" = true ]; then
     log_skip "Database schema skipped (services not started)"
     record_phase "DB Schema: SKIPPED"
 else
+    # Is there a local postgres in THIS project at all?  In remote /
+    # remote_direct mode the local-db profile is off (see Phase 6), so there is
+    # no rag-postgres container to wait for — and waiting out the full 60s
+    # before warning reads as "the database is broken" when the truth is
+    # "the database is elsewhere".  Ask once, up front.
+    #
+    # ct_cid distinguishes the three answers that matter: this project has one
+    # (0), this project has none (1), docker could not be asked (2).  Only the
+    # first justifies the wait loop.
+    PG_PRESENT=true
+    ct_cid rag-postgres >/dev/null 2>&1 || PG_PRESENT=false
+
+    if [ "$PG_PRESENT" = false ]; then
+        log_info "No rag-postgres container in project '$(ct_project)' — remote database mode"
+        log_info "  Apply/repair the remote schema with: ./scripts/ensure_db_schema.sh"
+        record_phase "DB Schema: SKIPPED (remote DB)"
+    else
     # Wait for postgres to be ready
     log_info "Waiting for PostgreSQL to become ready..."
     PG_TIMEOUT=60
@@ -1678,7 +1744,7 @@ else
     PG_READY=false
 
     while [ $PG_ELAPSED -lt $PG_TIMEOUT ]; do
-        if docker exec rag-postgres pg_isready -U app -d scans &>/dev/null; then
+        if ct_exec rag-postgres pg_isready -U app -d scans &>/dev/null; then
             PG_READY=true
             break
         fi
@@ -1698,21 +1764,47 @@ else
         log_ok "PostgreSQL is ready (${PG_ELAPSED}s)"
 
         # Count tables before
-        BEFORE=$(docker exec rag-postgres psql -U app -d scans -t -c \
+        BEFORE=$(ct_exec rag-postgres psql -U app -d scans -t -c \
             "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
 
-        # Apply schema
-        if docker exec rag-postgres psql -U app -d scans \
-            -f /docker-entrypoint-initdb.d/ensure_all_tables.sql >/dev/null 2>&1; then
-            AFTER=$(docker exec rag-postgres psql -U app -d scans -t -c \
-                "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
-            ADDED=$((AFTER - BEFORE))
-            log_ok "Schema applied: $AFTER tables ($ADDED new)"
+        # Apply schema.
+        #
+        # psql's OUTPUT is the only place a failed statement is reported: it
+        # runs without ON_ERROR_STOP, so it continues past errors and still
+        # exits 0. This used to be `>/dev/null 2>&1`, which is how a fresh
+        # install reported "Schema applied: 114 tables" and OK while silently
+        # missing security_tests, security_test_runs, 11 indexes and the
+        # assets_hostname_not_ip CHECK — 43 error lines, all discarded. Keep the
+        # log and count them.
+        SCHEMA_LOG="logs/schema-apply-$(date +%Y%m%d-%H%M%S).log"
+        mkdir -p logs
+        ct_exec rag-postgres psql -U app -d scans \
+            -f /docker-entrypoint-initdb.d/ensure_all_tables.sql \
+            >"$SCHEMA_LOG" 2>&1 || true
+
+        AFTER=$(ct_exec rag-postgres psql -U app -d scans -t -c \
+            "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
+        ADDED=$((AFTER - BEFORE))
+
+        # "current transaction is aborted" lines are consequences of an earlier
+        # failure, not separate faults — counting them buries the real cause.
+        SCHEMA_ERRS=$(grep -c 'ERROR:' "$SCHEMA_LOG" 2>/dev/null || echo 0)
+        SCHEMA_CAUSES=$(grep 'ERROR:' "$SCHEMA_LOG" 2>/dev/null \
+                        | grep -vc 'current transaction is aborted' || echo 0)
+
+        if [ "${SCHEMA_ERRS:-0}" -eq 0 ]; then
+            log_ok "Schema applied: $AFTER tables ($ADDED new), no errors"
             record_phase "DB Schema: OK ($AFTER tables)"
         else
-            log_warn "Schema applied with warnings (non-fatal)"
-            record_phase "DB Schema: OK (with warnings)"
+            log_err "Schema applied with ${SCHEMA_ERRS} error(s) — the schema is INCOMPLETE"
+            log_err "  ${SCHEMA_CAUSES} root cause(s); full log: ${SCHEMA_LOG}"
+            grep 'ERROR:' "$SCHEMA_LOG" \
+                | grep -v 'current transaction is aborted' \
+                | head -5 | sed 's/^/    /' || true
+            log_warn "  Repair with: ./scripts/ensure_db_schema.sh"
+            record_phase "DB Schema: INCOMPLETE (${SCHEMA_CAUSES} error(s), $AFTER tables)"
         fi
+    fi
     fi
 fi
 
@@ -1780,8 +1872,8 @@ else
             # "everything works from the host, nothing works from
             # containers" failure mode that the Phase 1 host-side check
             # cannot see.
-            if docker ps --format '{{.Names}}' | grep -q "^scan-recommender$"; then
-                if docker exec scan-recommender curl -sf --max-time 5 \
+            if ct_cid scan-recommender >/dev/null 2>&1; then
+                if ct_exec scan-recommender curl -sf --max-time 5 \
                    http://host.docker.internal:11434/api/version >/dev/null 2>&1; then
                     log_ok "Containers can reach Ollama via host.docker.internal:11434"
                 else
@@ -1835,22 +1927,33 @@ else
     log_info "Waiting 10s for services to initialize..."
     sleep 10
 
-    # rag-api now serves over TLS (https) on :8000; the dashboard BFF is http on
-    # :3001. Use -k for the self-signed cert. Wrong scheme = false negative.
+    # Probed from INSIDE each container, by compose service and CONTAINER port
+    # (rag-api 8000, the dashboard's nginx 80 — published as 3001 on the host).
+    #
+    # Not `curl https://localhost:8000/health`: a published port belongs to the
+    # host, not to a project.  Under a second stack — or simply after an
+    # operator remaps a port — that literal probes whatever already owns 8000
+    # and reports THAT stack's health as this install's result.  A health check
+    # that cannot fail is worse than none.
+    #
+    # ct_curl tries https then http, so a TLS service is not mistaken for a
+    # dead one (the "wrong scheme = false negative" trap this list used to
+    # carry as a comment).
     HEALTH_ENDPOINTS=(
-        "RAG API|https://localhost:8000/health"
-        "Dashboard BFF|http://localhost:3001/health"
+        "RAG API|rag-api|8000|/health"
+        "Dashboard BFF|pentest-dashboard|80|/health"
     )
 
     HEALTHY=0
     TOTAL=${#HEALTH_ENDPOINTS[@]}
 
     for entry in "${HEALTH_ENDPOINTS[@]}"; do
-        NAME="${entry%%|*}"
-        URL="${entry##*|}"
-        if curl -sfk --max-time 5 "$URL" >/dev/null 2>&1; then
+        IFS='|' read -r NAME SVC CPORT HPATH <<< "$entry"
+        if ct_curl "$SVC" "$CPORT" "$HPATH" >/dev/null 2>&1; then
             log_ok "$NAME — healthy"
             HEALTHY=$((HEALTHY + 1))
+        elif ! ct_cid "$SVC" >/dev/null 2>&1; then
+            log_warn "$NAME — no ${SVC} container in project '$(ct_project)'"
         else
             log_warn "$NAME — not responding yet (may still be starting)"
         fi
@@ -1891,19 +1994,43 @@ elif ! compgen -G "knowledge/seed/*.yaml" >/dev/null 2>&1; then
 else
     # scan-recommender owns service_prompts. Wait briefly: it may still be
     # coming up behind the phase-9 checks, which only probe rag-api and the BFF.
-    SEED_API="${KNOWLEDGE_API:-https://localhost:8013}"
+    # import-knowledge.sh runs on the HOST, so this phase is the one place that
+    # genuinely needs a published port — but it must be the port THIS project
+    # publishes, resolved from the container, not the literal 8013. An operator
+    # who remapped it used to get a silent "scan-recommender not responding",
+    # and a second stack would have seeded the live one's knowledge base.
+    if [ -n "${KNOWLEDGE_API:-}" ]; then
+        SEED_API="$KNOWLEDGE_API"
+    else
+        SEED_PORT="$(ct_hostport scan-recommender 8013 2>/dev/null || true)"
+        SEED_API=""
+        [ -n "$SEED_PORT" ] && SEED_API="https://localhost:${SEED_PORT}"
+    fi
+
     SEED_READY=false
-    for _ in $(seq 1 12); do
-        if curl -sk --max-time 5 -o /dev/null "${SEED_API}/kb/prompts" 2>/dev/null; then
-            SEED_READY=true; break
-        fi
-        sleep 5
-    done
+    if [ -n "$SEED_API" ]; then
+        for _ in $(seq 1 12); do
+            if curl -sk --max-time 5 -o /dev/null "${SEED_API}/kb/prompts" 2>/dev/null; then
+                SEED_READY=true; break
+            fi
+            sleep 5
+        done
+    fi
 
     if [ "$SEED_READY" != true ]; then
-        log_warn "scan-recommender not responding — skipping knowledge seeding (non-fatal)"
-        log_warn "  Seed it later with: ./scripts/import-knowledge.sh --file knowledge/seed/<file>.yaml"
-        record_phase "Knowledge: DEFERRED"
+        if [ -z "$SEED_API" ] && ct_curl scan-recommender 8013 /kb/prompts >/dev/null 2>&1; then
+            # The service is healthy; it just isn't reachable from the host.
+            # That is the normal state of a rehearsal stack (ports are
+            # unpublished so it cannot collide with the live one), and calling
+            # it a failure would make every rehearsal look broken.
+            log_info "scan-recommender is up but publishes no host port — seeding deferred"
+            log_info "  Seed it with a published port, or: ./scripts/import-knowledge.sh --api <url>"
+            record_phase "Knowledge: DEFERRED (no published port)"
+        else
+            log_warn "scan-recommender not responding — skipping knowledge seeding (non-fatal)"
+            log_warn "  Seed it later with: ./scripts/import-knowledge.sh --file knowledge/seed/<file>.yaml"
+            record_phase "Knowledge: DEFERRED"
+        fi
     else
         SEED_OK=0; SEED_FAIL=0
         for seed_file in knowledge/seed/*.yaml; do
