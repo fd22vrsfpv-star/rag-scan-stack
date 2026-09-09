@@ -93,11 +93,43 @@ if [ "$WORK_DIR" = "$REPO_ROOT" ]; then
 fi
 
 # ── Live-stack fingerprint ────────────────────────────────────────────────
-# Everything running that is NOT ours. Sorted so the diff is stable.
+# Every running container that is not labelled with the rehearsal's compose
+# project, as `id|name|startedAt|restartCount`.
+#
+# Two corrections over the obvious version:
+#
+#   * Ours is identified by the compose project LABEL, not by a name prefix.
+#     Compose writes that label even when `container_name:` is set, so a
+#     service whose name somehow survived the override is still recognised as
+#     ours instead of being reported as a mysterious new live container.
+#   * The timestamp is `.State.StartedAt`, not `docker ps`'s CreatedAt. A
+#     RESTART leaves CreatedAt untouched, so the first version of this guard
+#     could not have detected the very thing it claims to: the rehearsal
+#     bouncing a live container. RestartCount is included for the same reason.
 live_fingerprint() {
-    docker ps --format '{{.ID}} {{.Names}} {{.CreatedAt}}' 2>/dev/null \
-        | grep -v "^[0-9a-f]* ${PROJECT}[-_]" \
-        | sort -k2
+    local ids id
+    ids=$(docker ps -q 2>/dev/null) || return 0
+    for id in $ids; do
+        docker inspect "$id" --format \
+            '{{index .Config.Labels "com.docker.compose.project"}}|{{.Id}}|{{.Name}}|{{.State.StartedAt}}|{{.RestartCount}}' \
+            2>/dev/null
+    done | grep -v "^${PROJECT}|" | sort -t'|' -k3
+}
+
+# Any rehearsal container attached to the SHARED external network is the
+# failure mode the override exists to prevent: on `agents_net` it would claim
+# the `rag-postgres` / `embedder` aliases beside the live ones. A name
+# collision announces itself (docker refuses duplicate names, so `up` fails);
+# this one is silent, so it gets its own check.
+rehearsal_on_live_network() {
+    local ids id nets
+    ids=$(docker ps -q --filter "label=com.docker.compose.project=${PROJECT}" 2>/dev/null) || return 0
+    for id in $ids; do
+        nets=$(docker inspect "$id" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null)
+        case " $nets " in
+            *" agents_net "*) docker inspect "$id" --format '{{.Name}}' 2>/dev/null ;;
+        esac
+    done
 }
 
 # ── Teardown ──────────────────────────────────────────────────────────────
@@ -187,12 +219,48 @@ fi
 AFTER="$(live_fingerprint)"
 AFTER_N=$(printf '%s\n' "$AFTER" | grep -c . || true)
 LIVE_RC=0
-if [ "$BEFORE" = "$AFTER" ]; then
-    ok "live stack untouched: ${AFTER_N} container(s), same ids and start times"
-else
-    err "LIVE STACK CHANGED — ${BEFORE_N} container(s) before, ${AFTER_N} after"
-    diff <(printf '%s\n' "$BEFORE") <(printf '%s\n' "$AFTER") | head -40 || true
+
+# A container that VANISHED or was RESTARTED is the rehearsal disturbing the
+# live stack. A container that merely APPEARED is usually not: anything else on
+# the host — an operator, CI, this repo's own `docker run` build helpers — can
+# start one while the rehearsal runs, and failing on that trains people to
+# ignore this check. Appearances are reported, not fatal; the rehearsal's own
+# containers cannot hide among them, because they carry its project label and
+# are filtered out above.
+GONE=$(comm -23 <(printf '%s\n' "$BEFORE" | cut -d'|' -f2 | sort) \
+                <(printf '%s\n' "$AFTER"  | cut -d'|' -f2 | sort))
+# Same container id in both snapshots, but a different start time or restart
+# count: it was bounced. Output is `name|was|count|now|count`.
+CHANGED=$(join -t'|' -j2 -o '1.3 1.4 1.5 2.4 2.5' \
+               <(printf '%s\n' "$BEFORE" | sort -t'|' -k2) \
+               <(printf '%s\n' "$AFTER"  | sort -t'|' -k2) 2>/dev/null \
+          | awk -F'|' '$2 != $4 || $3 != $5')
+APPEARED=$(comm -13 <(printf '%s\n' "$BEFORE" | cut -d'|' -f2 | sort) \
+                    <(printf '%s\n' "$AFTER"  | cut -d'|' -f2 | sort))
+ON_LIVE_NET="$(rehearsal_on_live_network)"
+
+if [ -n "$GONE" ]; then
+    err "live containers DISAPPEARED during the rehearsal:"
+    printf '%s\n' "$BEFORE" | grep -F -f <(printf '%s\n' "$GONE") | cut -d'|' -f3 | sed 's/^/    /'
     LIVE_RC=1
+fi
+if [ -n "$CHANGED" ]; then
+    err "live containers RESTARTED during the rehearsal (name / was / now):"
+    printf '%s\n' "$CHANGED" | sed 's/^/    /'
+    LIVE_RC=1
+fi
+if [ -n "$ON_LIVE_NET" ]; then
+    err "rehearsal containers are attached to the SHARED agents_net:"
+    printf '%s\n' "$ON_LIVE_NET" | sed 's/^/    /'
+    err "  the isolation override is not doing its job — check its networks: block"
+    LIVE_RC=1
+fi
+if [ "$LIVE_RC" -eq 0 ]; then
+    ok "live stack untouched: ${AFTER_N} container(s), same ids, start times and restart counts"
+fi
+if [ -n "$APPEARED" ]; then
+    warn "unrelated container(s) appeared during the run (not a failure):"
+    printf '%s\n' "$AFTER" | grep -F -f <(printf '%s\n' "$APPEARED") | cut -d'|' -f3 | sed 's/^/    /'
 fi
 
 # ── Teardown ──────────────────────────────────────────────────────────────
