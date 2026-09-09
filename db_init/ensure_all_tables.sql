@@ -136,377 +136,6 @@ DO $$ BEGIN ALTER TABLE public.ports ADD COLUMN IF NOT EXISTS updated_at timesta
 DO $$ BEGIN ALTER TABLE public.ports ADD COLUMN IF NOT EXISTS modified_by text; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE public.ports ADD COLUMN IF NOT EXISTS node_id text DEFAULT 'local'; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 
--- ── Normalize asset identity so port data is not duplicated per IP ──
---
--- ix_assets_ip_hostname is UNIQUE(ip, COALESCE(hostname,'')) on purpose, so one
--- IP may legitimately hold several asset rows (virtual hosts). But a hostname
--- that is merely the IP string is not a vhost — it is "hostname unknown"
--- written the wrong way, and it counts as a DIFFERENT row from hostname=NULL.
--- Ports hang off asset_id, so each such row carried its own copy of that host's
--- ports: this deployment had 99 port rows for 59 real (ip, proto, port) tuples.
---
--- Root cause was playwright_scanner calling
--- get_or_create_asset(netloc, hostname=netloc). Fixed there and in both asset
--- helpers, with CHECK assets_hostname_not_ip as the schema-level backstop.
---
--- Runs as ONE transaction so a partial remap can never be left behind, and the
--- scratch tables use ON COMMIT DROP so the block is re-runnable in a session.
--- Idempotent: a no-op once normalized.
-BEGIN;
-
--- 1. hostname == the IP means "hostname unknown". Normalize to NULL where that
---    does not collide with an existing NULL-hostname row for the same IP
---    (step 5 merges those).
-UPDATE assets a
-   SET hostname = NULL
- WHERE a.hostname = host(a.ip)
-   AND NOT EXISTS (SELECT 1 FROM assets b
-                    WHERE b.ip = a.ip AND b.hostname IS NULL AND b.id <> a.id);
-
--- 2. One canonical asset per IP owns that IP's network-level data. Ports are a
---    property of the host, not of a virtual host. Preference: the NULL-hostname
---    (IP-level) row, then oldest, id as a strict final tiebreaker.
-CREATE TEMP TABLE canonical_asset ON COMMIT DROP AS
-SELECT DISTINCT ON (ip) ip, id AS keep_id
-  FROM assets ORDER BY ip, (hostname IS NULL) DESC, first_seen NULLS LAST, id;
-
-CREATE TEMP TABLE asset_remap ON COMMIT DROP AS
-SELECT a.id AS from_id, c.keep_id AS to_id
-  FROM assets a JOIN canonical_asset c ON c.ip = a.ip
- WHERE a.id <> c.keep_id;
-
--- 3. Resolve each port to its DESTINATION asset first, then pick one winner per
---    (destination, proto, port). Deduping only against rows already at the
---    target is not enough: several source assets can remap to the same
---    canonical, and their port sets then collide with each other rather than
---    with the target. That is exactly how the first draft of this migration
---    failed, on ux_ports_asset_proto_port_scans.
-CREATE TEMP TABLE port_target ON COMMIT DROP AS
-SELECT p.id, COALESCE(r.to_id, p.asset_id) AS target_asset, p.proto, p.port
-  FROM ports p LEFT JOIN asset_remap r ON r.from_id = p.asset_id;
-
-CREATE TEMP TABLE port_keep ON COMMIT DROP AS
-SELECT DISTINCT ON (t.target_asset, t.proto, t.port) t.id
-  FROM port_target t JOIN ports p ON p.id = t.id
- ORDER BY t.target_asset, t.proto, t.port, p.last_seen DESC NULLS LAST, p.id;
-
--- Fold the losers' detail into the winner, so a merge never loses a banner or
--- version that only the duplicate row happened to carry.
-UPDATE ports w
-   SET first_seen = LEAST(w.first_seen, agg.min_first),
-       last_seen  = GREATEST(w.last_seen, agg.max_last),
-       service    = COALESCE(w.service, agg.service),
-       product    = COALESCE(w.product, agg.product),
-       version    = COALESCE(w.version, agg.version),
-       banner     = COALESCE(w.banner,  agg.banner),
-       is_open    = w.is_open OR agg.any_open
-  FROM (SELECT k.id AS win_id,
-               MIN(p.first_seen) AS min_first, MAX(p.last_seen) AS max_last,
-               MIN(p.service) AS service, MIN(p.product) AS product,
-               MIN(p.version) AS version, MIN(p.banner) AS banner,
-               bool_or(COALESCE(p.is_open, false)) AS any_open
-          FROM port_keep k
-          JOIN port_target t  ON t.id = k.id
-          JOIN port_target t2 ON t2.target_asset = t.target_asset
-                             AND t2.proto = t.proto AND t2.port = t.port
-          JOIN ports p ON p.id = t2.id
-         GROUP BY k.id) agg
- WHERE w.id = agg.win_id;
-
-DELETE FROM ports WHERE id IN (
-    SELECT id FROM port_target EXCEPT SELECT id FROM port_keep);
-
-UPDATE ports p SET asset_id = r.to_id
-  FROM asset_remap r WHERE p.asset_id = r.from_id;
-
--- 4. port_observation is an append-only observation log with no uniqueness on
---    (asset_id, proto, port) — many rows per port is the point. Repoint only.
-UPDATE port_observation o SET asset_id = r.to_id
-  FROM asset_remap r WHERE o.asset_id = r.from_id;
-
--- 5. A "hostname = the IP" row is the same host as its NULL-hostname sibling.
---    Repoint its remaining children and drop it. `ports` is the ONLY child with
---    a unique index on asset_id and is already handled above, so the rest
---    cannot collide. scan_recommendations.fingerprint is generated from
---    ip/service/scanner/action/script/template — not asset_id — so repointing
---    does not change it.
-CREATE TEMP TABLE phantom_remap ON COMMIT DROP AS
-SELECT a.id AS from_id, b.id AS to_id
-  FROM assets a
-  JOIN assets b ON b.ip = a.ip AND b.hostname IS NULL AND b.id <> a.id
- WHERE a.hostname = host(a.ip);
-
-UPDATE web_findings         t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
-UPDATE vulns                t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
-UPDATE playwright_scans     t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
-UPDATE playwright_findings  t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
-UPDATE dom_analysis         t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
-UPDATE content_extractions  t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
-UPDATE discovered_params    t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
-UPDATE credential_findings  t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
-UPDATE recon_findings       t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
-UPDATE scan_recommendations t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
-UPDATE scan_targets         t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
-UPDATE findings             t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
-UPDATE attack_vectors       t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
-UPDATE attack_path_edges    t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
-UPDATE port_observation     t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
-UPDATE ports                t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
-
-UPDATE assets k
-   SET first_seen = LEAST(k.first_seen, a.first_seen),
-       last_seen  = GREATEST(k.last_seen, a.last_seen),
-       os         = COALESCE(k.os, a.os)
-  FROM phantom_remap p JOIN assets a ON a.id = p.from_id
- WHERE k.id = p.to_id;
-
-DELETE FROM assets WHERE id IN (SELECT from_id FROM phantom_remap);
-
--- 5b. One address, two asset rows — the SAME machine recorded twice.
---
--- Step 5 above only merges the "hostname = the IP" phantom. It deliberately
--- leaves a genuinely-named row alone, to protect virtual hosts. But a row with
--- NO hostname is not a virtual host: it is the same machine before its name was
--- known. ix_assets_ip_hostname is UNIQUE(ip, COALESCE(hostname,'')), so
--- (192.168.1.150, '') and (192.168.1.150, 'metasploitable') are two legal rows,
--- and this deployment had exactly that:
---
---     nameless row     57 ports,  6 vulns,   1 web,   0 creds,  39 recon
---     'metasploitable'  0 ports,  2 vulns, 758 web,   7 creds, 110 recon
---
--- Step 2 puts ports on the NULL-hostname row by preference, so the host's ports
--- lived on one row and its findings on the other. Anything joining ports to
--- findings through asset_id returned nothing, and credential_findings.port_id
--- was NULL on every row because parse_brutus looks the port up under the
--- finding's own asset_id.
---
--- Merging is only safe when at most ONE distinct hostname is involved. Two
--- different names on one address IS a multi-name host, where picking a survivor
--- would be arbitrary — those are reported and left alone.
---
--- The child tables come from the CATALOG, not from the foreign-key list:
--- pending_exploits.asset_id has no FK, so an FK-driven merge would silently
--- orphan it, and step 5's hand-written list of 16 tables omits it for that
--- reason. Anything that grows an asset_id later is covered without edits here.
-CREATE OR REPLACE FUNCTION public.merge_duplicate_assets()
-RETURNS TABLE(address inet, winner uuid, losers integer, rows_repointed bigint)
-LANGUAGE plpgsql AS $MDA$
-DECLARE
-    child_tables text[];
-    grp          record;
-    cand         record;
-    tbl          text;
-    n            bigint;
-    kids         bigint;
-    best_kids    bigint;
-    win          uuid;
-    losers_arr   uuid[];
-    moved        bigint;
-    rid          uuid;
-    agg          record;
-BEGIN
-    SELECT array_agg(c.table_name::text ORDER BY c.table_name) INTO child_tables
-      FROM information_schema.columns c
-      JOIN information_schema.tables t
-        ON t.table_schema = c.table_schema AND t.table_name = c.table_name
-     WHERE c.table_schema = 'public'
-       AND c.column_name = 'asset_id'
-       AND t.table_type = 'BASE TABLE';
-
-    FOR grp IN
-        SELECT a.ip
-          FROM public.assets a
-         GROUP BY a.ip
-        HAVING count(*) > 1
-           -- count(DISTINCT ...) ignores NULLs, so (NULL, 'name') counts as one
-           -- name and merges; ('a', 'b') counts as two and does not.
-           AND count(DISTINCT NULLIF(btrim(a.hostname), '')) <= 1
-         ORDER BY a.ip
-    LOOP
-        -- Survivor: the row carrying the most dependent rows, so the merge moves
-        -- as little as possible. The ORDER BY makes ties deterministic and
-        -- prefers keeping the NAMED row, which holds strictly more information.
-        best_kids := -1;
-        win       := NULL;
-        FOR cand IN
-            SELECT id FROM public.assets
-             WHERE ip = grp.ip
-             ORDER BY (NULLIF(btrim(hostname), '') IS NOT NULL) DESC,
-                      first_seen NULLS LAST, id
-        LOOP
-            kids := 0;
-            FOREACH tbl IN ARRAY child_tables LOOP
-                EXECUTE format('SELECT count(*) FROM public.%I WHERE asset_id = $1', tbl)
-                   INTO n USING cand.id;
-                kids := kids + n;
-            END LOOP;
-            IF kids > best_kids THEN
-                best_kids := kids;
-                win       := cand.id;
-            END IF;
-        END LOOP;
-
-        SELECT array_agg(id) INTO losers_arr
-          FROM public.assets WHERE ip = grp.ip AND id <> win;
-        IF losers_arr IS NULL THEN
-            CONTINUE;
-        END IF;
-
-        moved := 0;
-        FOREACH tbl IN ARRAY child_tables LOOP
-            BEGIN
-                EXECUTE format(
-                    'UPDATE public.%I SET asset_id = $1 WHERE asset_id = ANY($2)', tbl)
-                  USING win, losers_arr;
-                GET DIAGNOSTICS n = ROW_COUNT;
-                moved := moved + n;
-            EXCEPTION WHEN unique_violation THEN
-                -- Today only ports has a unique index naming asset_id, but do not
-                -- depend on that staying true. Move what can move; a child that
-                -- already exists on the survivor is the same fact twice, so the
-                -- loser's copy goes rather than blocking the whole merge.
-                FOR rid IN EXECUTE format(
-                        'SELECT id FROM public.%I WHERE asset_id = ANY($1)', tbl)
-                        USING losers_arr
-                LOOP
-                    BEGIN
-                        EXECUTE format(
-                            'UPDATE public.%I SET asset_id = $1 WHERE id = $2', tbl)
-                          USING win, rid;
-                        moved := moved + 1;
-                    EXCEPTION WHEN unique_violation THEN
-                        EXECUTE format('DELETE FROM public.%I WHERE id = $1', tbl)
-                          USING rid;
-                    END;
-                END LOOP;
-            END;
-        END LOOP;
-
-        -- Read the losers' attributes BEFORE deleting them, then apply them AFTER.
-        --
-        -- The order is load-bearing. When the nameless row is the one carrying
-        -- the children it wins, and giving it the loser's hostname while that
-        -- loser still exists violates ix_assets_ip_hostname:
-        --     duplicate key value ... (198.51.100.11, merge-probe.test)
-        -- The live split happened to have the NAMED row winning, so its hostname
-        -- never changed and this never fired there — a synthetic case found it.
-        SELECT min(NULLIF(btrim(a.hostname), ''))       AS hostname,
-               min(a.os)                                AS os,
-               min(a.env)                               AS env,
-               min(a.content_hash)                      AS content_hash,
-               min(a.engagement_id::text)::uuid         AS engagement_id,
-               array_agg(DISTINCT t)  FILTER (WHERE t  IS NOT NULL) AS tags,
-               array_agg(DISTINCT pr) FILTER (WHERE pr IS NOT NULL) AS provider,
-               min(a.provider_evidence::text)::jsonb    AS provider_evidence,
-               min(a.first_seen)                        AS first_seen,
-               max(a.last_seen)                         AS last_seen
-          INTO agg
-          FROM public.assets a
-          LEFT JOIN LATERAL unnest(COALESCE(a.tags, '{}'::text[]))     t  ON true
-          LEFT JOIN LATERAL unnest(COALESCE(a.provider, '{}'::text[])) pr ON true
-         WHERE a.id = ANY(losers_arr);
-
-        DELETE FROM public.assets WHERE id = ANY(losers_arr);
-
-        -- A merge must never drop the one attribute a duplicate row happened to
-        -- be the only carrier of — the hostname above all, which is the whole
-        -- reason the second row existed.
-        UPDATE public.assets w
-           SET hostname          = COALESCE(NULLIF(btrim(w.hostname), ''), agg.hostname),
-               os                = COALESCE(w.os, agg.os),
-               env               = COALESCE(w.env, agg.env),
-               content_hash      = COALESCE(w.content_hash, agg.content_hash),
-               engagement_id     = COALESCE(w.engagement_id, agg.engagement_id),
-               tags              = (SELECT array_agg(DISTINCT x) FROM unnest(
-                                       COALESCE(w.tags, '{}'::text[])
-                                    || COALESCE(agg.tags, '{}'::text[])) x),
-               provider          = (SELECT array_agg(DISTINCT x) FROM unnest(
-                                       COALESCE(w.provider, '{}'::text[])
-                                    || COALESCE(agg.provider, '{}'::text[])) x),
-               -- winner's keys win on conflict
-               provider_evidence = COALESCE(agg.provider_evidence, '{}'::jsonb)
-                                || COALESCE(w.provider_evidence, '{}'::jsonb),
-               first_seen        = LEAST(w.first_seen, agg.first_seen),
-               last_seen         = GREATEST(w.last_seen, agg.last_seen),
-               modified_at       = now()
-         WHERE w.id = win;
-
-        address        := grp.ip;
-        winner         := win;
-        losers         := array_length(losers_arr, 1);
-        rows_repointed := moved;
-        RETURN NEXT;
-    END LOOP;
-
-    -- Report rather than silently skip. An address holding two DIFFERENT
-    -- hostnames is a real multi-name host, and an operator should know it is
-    -- being left alone instead of wondering why the count never drops.
-    FOR grp IN
-        SELECT a.ip, count(*) AS n
-          FROM public.assets a
-         GROUP BY a.ip
-        HAVING count(*) > 1
-           AND count(DISTINCT NULLIF(btrim(a.hostname), '')) > 1
-    LOOP
-        RAISE NOTICE 'assets: % has % rows with different hostnames (virtual hosts) - left unmerged', grp.ip, grp.n;
-    END LOOP;
-END $MDA$;
-
-DO $RUNMDA$
-DECLARE r record; BEGIN
-    FOR r IN SELECT * FROM public.merge_duplicate_assets() LOOP
-        RAISE NOTICE 'assets: merged % duplicate row(s) for % into %, repointed % child row(s)',
-                     r.losers, r.address, r.winner, r.rows_repointed;
-    END LOOP;
-END $RUNMDA$;
-
-
--- 5c. Backfill credential_findings.port_id, which was NULL on every row.
---
--- parse_brutus resolves the port with
---     SELECT id FROM ports WHERE asset_id = <finding's asset> AND port = <port>
--- and the finding attached to the nameless asset row that had no ports, so the
--- lookup found nothing and the column stayed empty. 5b puts the ports and the
--- credentials on the same asset, which makes the lookup work — but only for rows
--- ingested from here on. This fills in the ones already stored.
---
--- Matched on (asset, port) only: ports.proto is the TRANSPORT ('tcp'), while
--- credential_findings.protocol is the SERVICE ('ftp', 'telnet'), so they are not
--- comparable. tcp is preferred because credential testing is TCP.
-UPDATE public.credential_findings cf
-   SET port_id = p.id
-  FROM public.ports p
- WHERE cf.port_id IS NULL
-   AND p.asset_id = cf.asset_id
-   AND p.port     = cf.port
-   AND p.id = (SELECT p2.id FROM public.ports p2
-                WHERE p2.asset_id = cf.asset_id AND p2.port = cf.port
-                ORDER BY (p2.proto = 'tcp') DESC, p2.last_seen DESC NULLS LAST, p2.id
-                LIMIT 1);
-
--- A scan refused by the scope gate is 'blocked', not 'failed'.
---
--- CLAUDE.md: "Blocked items MUST be labelled in the UI, not silently dropped."
--- Folding a refusal into 'failed' invites a retry of something that will never
--- be allowed to run. The CREATE TABLE above predates the gate, so the value is
--- added here for databases that already exist.
-DO $PWB$ BEGIN
-    ALTER TABLE public.playwright_scans
-        DROP CONSTRAINT IF EXISTS playwright_scans_status_check;
-    ALTER TABLE public.playwright_scans
-        ADD CONSTRAINT playwright_scans_status_check
-        CHECK (status IN ('queued','running','completed','failed','blocked'));
-EXCEPTION WHEN undefined_table THEN NULL; END $PWB$;
-
--- 6. Prevent recurrence. NOT VALID so a pre-existing violation can never block
---    this migration; steps 1 and 5 have already cleared them.
-DO $NORM$ BEGIN
-    ALTER TABLE public.assets
-      ADD CONSTRAINT assets_hostname_not_ip
-      CHECK (hostname IS NULL OR hostname <> host(ip)) NOT VALID;
-EXCEPTION WHEN duplicate_object THEN NULL; END $NORM$;
-
-COMMIT;
 
 -- findings
 CREATE TABLE IF NOT EXISTS public.findings (
@@ -653,15 +282,6 @@ WHERE port IS NULL AND url LIKE 'https://%';
 UPDATE public.web_findings SET port = 80
 WHERE port IS NULL AND url LIKE 'http://%';
 
--- Backfill port in vulns metadata for tools that didn't store it
-UPDATE public.vulns SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{port}', to_jsonb(p.port))
-FROM public.ports p WHERE vulns.port_id = p.id AND (vulns.metadata->>'port') IS NULL;
-
-UPDATE public.vulns SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{port}', '22'::jsonb)
-WHERE script LIKE 'ssh-audit:%' AND port_id IS NULL AND (metadata->>'port') IS NULL;
-
-UPDATE public.vulns SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{port}', '443'::jsonb)
-WHERE script LIKE ANY(ARRAY['sslscan:%','testssl:%','sslyze:%']) AND port_id IS NULL AND (metadata->>'port') IS NULL;
 
 -- discovered_params (Paramalyzer-style catalog from katana crawls)
 CREATE TABLE IF NOT EXISTS public.discovered_params (
@@ -1607,7 +1227,15 @@ CREATE TABLE IF NOT EXISTS public.security_tests (
     attack_vector_id      uuid REFERENCES public.attack_vectors(id) ON DELETE SET NULL,
     pending_exploit_id    uuid REFERENCES public.pending_exploits(id) ON DELETE SET NULL,
     created_by_session    uuid REFERENCES public.agent_sessions(id) ON DELETE SET NULL,
-    engagement_id         uuid REFERENCES public.engagements(id) ON DELETE SET NULL,
+    -- No inline REFERENCES public.engagements(id): that table is created ~1000
+    -- lines below, so on a FRESH database this CREATE TABLE failed outright
+    -- ("relation public.engagements does not exist") and took security_tests,
+    -- its six indexes, security_test_runs and its five with it. psql runs
+    -- without ON_ERROR_STOP and setup.sh discarded its output, so phase 7
+    -- reported "Schema applied: 114 tables" and OK. The FK is added after
+    -- engagements exists, which is this file's convention for every other
+    -- table (see the ALTER block below it).
+    engagement_id         uuid,
     enabled               boolean NOT NULL DEFAULT true,
     -- Latest-run rollup for cheap list rendering (updated by record_test_run).
     last_run_at           timestamptz,
@@ -1644,11 +1272,14 @@ CREATE TABLE IF NOT EXISTS public.security_test_runs (
     result_summary       text,
     assertion_eval       jsonb DEFAULT '{}'::jsonb,
     -- Exactly one is set per lane (enforced in record_test_run).
-    tool_execution_id    uuid REFERENCES public.tool_executions(id) ON DELETE SET NULL,
+    -- FK attached after public.tool_executions is created (it is below this
+    -- point in the file). Inline, it failed the whole CREATE TABLE on a fresh
+    -- database and took security_test_runs' five indexes with it.
+    tool_execution_id    uuid,
     exploit_result_id    uuid REFERENCES public.exploit_results(id) ON DELETE SET NULL,
     triggered_by         text,
     triggered_by_session uuid REFERENCES public.agent_sessions(id) ON DELETE SET NULL,
-    engagement_id        uuid REFERENCES public.engagements(id) ON DELETE SET NULL,
+    engagement_id        uuid,          -- FK added below, after engagements exists
     output               text,
     metadata             jsonb DEFAULT '{}'::jsonb,
     created_at           timestamptz NOT NULL DEFAULT now()
@@ -1734,6 +1365,14 @@ CREATE TABLE IF NOT EXISTS public.tool_executions (
     started_at     timestamptz DEFAULT now(),
     completed_at   timestamptz
 );
+-- security_test_runs.tool_execution_id declares no FK at its own definition
+-- (it is created earlier in this file). Attach it now that the target exists.
+DO $STRTE$ BEGIN
+    ALTER TABLE public.security_test_runs
+      ADD CONSTRAINT security_test_runs_tool_execution_fk
+      FOREIGN KEY (tool_execution_id) REFERENCES public.tool_executions(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; WHEN undefined_table THEN NULL; END $STRTE$;
+
 CREATE INDEX IF NOT EXISTS idx_tool_executions_tool ON public.tool_executions(tool);
 CREATE INDEX IF NOT EXISTS idx_tool_executions_target ON public.tool_executions(target);
 CREATE INDEX IF NOT EXISTS idx_tool_executions_status ON public.tool_executions(status);
@@ -2652,6 +2291,22 @@ ALTER TABLE public.recon_findings     ADD COLUMN IF NOT EXISTS engagement_id uui
 ALTER TABLE public.credential_findings ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id);
 ALTER TABLE public.assets             ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id);
 ALTER TABLE public.playwright_findings ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id);
+
+-- security_tests / security_test_runs declare engagement_id WITHOUT the FK,
+-- because they are created before this point. Attach it here.
+-- ADD COLUMN IF NOT EXISTS would not do it: the column already exists, so the
+-- statement is a no-op and the constraint never appears.
+DO $STFK$ BEGIN
+    ALTER TABLE public.security_tests
+      ADD CONSTRAINT security_tests_engagement_fk
+      FOREIGN KEY (engagement_id) REFERENCES public.engagements(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; WHEN undefined_table THEN NULL; END $STFK$;
+
+DO $STRFK$ BEGIN
+    ALTER TABLE public.security_test_runs
+      ADD CONSTRAINT security_test_runs_engagement_fk
+      FOREIGN KEY (engagement_id) REFERENCES public.engagements(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; WHEN undefined_table THEN NULL; END $STRFK$;
 
 -- Scan-execution tables: engagement_id for cross-engagement isolation.
 -- ON DELETE SET NULL keeps scan history intact when an engagement is deleted
@@ -5442,3 +5097,416 @@ CREATE TABLE IF NOT EXISTS wstg_manual_reviews (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_wstg_manual_reviews
   ON wstg_manual_reviews (COALESCE(engagement_id,'00000000-0000-0000-0000-000000000000'::uuid), wstg_id);
+
+
+-- ============================================================================
+--  DATA REPAIR — runs LAST, because it touches tables created above
+-- ============================================================================
+--
+-- Everything below repairs EXISTING rows. It used to sit near the top of this
+-- file, where none of the ~16 tables it updates existed yet. On a fresh
+-- database the first statement failed, and because the whole thing is one
+-- transaction, every statement to the COMMIT was skipped with "current
+-- transaction is aborted" — including the assets_hostname_not_ip CHECK, which
+-- is the entire point of step 6.
+--
+-- psql runs without ON_ERROR_STOP and setup.sh's Phase 7 discarded its output,
+-- so a fresh install reported "Schema applied: 114 tables" and OK while
+-- missing that constraint, security_tests, security_test_runs and 11 indexes.
+--
+-- On an existing database the behaviour is unchanged: the same statements
+-- against the same tables. On a fresh one they now hit real, empty tables and
+-- update 0 rows, which is the correct outcome for a repair with nothing to
+-- repair.
+-- ============================================================================
+-- ── Normalize asset identity so port data is not duplicated per IP ──
+--
+-- ix_assets_ip_hostname is UNIQUE(ip, COALESCE(hostname,'')) on purpose, so one
+-- IP may legitimately hold several asset rows (virtual hosts). But a hostname
+-- that is merely the IP string is not a vhost — it is "hostname unknown"
+-- written the wrong way, and it counts as a DIFFERENT row from hostname=NULL.
+-- Ports hang off asset_id, so each such row carried its own copy of that host's
+-- ports: this deployment had 99 port rows for 59 real (ip, proto, port) tuples.
+--
+-- Root cause was playwright_scanner calling
+-- get_or_create_asset(netloc, hostname=netloc). Fixed there and in both asset
+-- helpers, with CHECK assets_hostname_not_ip as the schema-level backstop.
+--
+-- Runs as ONE transaction so a partial remap can never be left behind, and the
+-- scratch tables use ON COMMIT DROP so the block is re-runnable in a session.
+-- Idempotent: a no-op once normalized.
+BEGIN;
+
+-- 1. hostname == the IP means "hostname unknown". Normalize to NULL where that
+--    does not collide with an existing NULL-hostname row for the same IP
+--    (step 5 merges those).
+UPDATE assets a
+   SET hostname = NULL
+ WHERE a.hostname = host(a.ip)
+   AND NOT EXISTS (SELECT 1 FROM assets b
+                    WHERE b.ip = a.ip AND b.hostname IS NULL AND b.id <> a.id);
+
+-- 2. One canonical asset per IP owns that IP's network-level data. Ports are a
+--    property of the host, not of a virtual host. Preference: the NULL-hostname
+--    (IP-level) row, then oldest, id as a strict final tiebreaker.
+CREATE TEMP TABLE canonical_asset ON COMMIT DROP AS
+SELECT DISTINCT ON (ip) ip, id AS keep_id
+  FROM assets ORDER BY ip, (hostname IS NULL) DESC, first_seen NULLS LAST, id;
+
+CREATE TEMP TABLE asset_remap ON COMMIT DROP AS
+SELECT a.id AS from_id, c.keep_id AS to_id
+  FROM assets a JOIN canonical_asset c ON c.ip = a.ip
+ WHERE a.id <> c.keep_id;
+
+-- 3. Resolve each port to its DESTINATION asset first, then pick one winner per
+--    (destination, proto, port). Deduping only against rows already at the
+--    target is not enough: several source assets can remap to the same
+--    canonical, and their port sets then collide with each other rather than
+--    with the target. That is exactly how the first draft of this migration
+--    failed, on ux_ports_asset_proto_port_scans.
+CREATE TEMP TABLE port_target ON COMMIT DROP AS
+SELECT p.id, COALESCE(r.to_id, p.asset_id) AS target_asset, p.proto, p.port
+  FROM ports p LEFT JOIN asset_remap r ON r.from_id = p.asset_id;
+
+CREATE TEMP TABLE port_keep ON COMMIT DROP AS
+SELECT DISTINCT ON (t.target_asset, t.proto, t.port) t.id
+  FROM port_target t JOIN ports p ON p.id = t.id
+ ORDER BY t.target_asset, t.proto, t.port, p.last_seen DESC NULLS LAST, p.id;
+
+-- Fold the losers' detail into the winner, so a merge never loses a banner or
+-- version that only the duplicate row happened to carry.
+UPDATE ports w
+   SET first_seen = LEAST(w.first_seen, agg.min_first),
+       last_seen  = GREATEST(w.last_seen, agg.max_last),
+       service    = COALESCE(w.service, agg.service),
+       product    = COALESCE(w.product, agg.product),
+       version    = COALESCE(w.version, agg.version),
+       banner     = COALESCE(w.banner,  agg.banner),
+       is_open    = w.is_open OR agg.any_open
+  FROM (SELECT k.id AS win_id,
+               MIN(p.first_seen) AS min_first, MAX(p.last_seen) AS max_last,
+               MIN(p.service) AS service, MIN(p.product) AS product,
+               MIN(p.version) AS version, MIN(p.banner) AS banner,
+               bool_or(COALESCE(p.is_open, false)) AS any_open
+          FROM port_keep k
+          JOIN port_target t  ON t.id = k.id
+          JOIN port_target t2 ON t2.target_asset = t.target_asset
+                             AND t2.proto = t.proto AND t2.port = t.port
+          JOIN ports p ON p.id = t2.id
+         GROUP BY k.id) agg
+ WHERE w.id = agg.win_id;
+
+DELETE FROM ports WHERE id IN (
+    SELECT id FROM port_target EXCEPT SELECT id FROM port_keep);
+
+UPDATE ports p SET asset_id = r.to_id
+  FROM asset_remap r WHERE p.asset_id = r.from_id;
+
+-- 4. port_observation is an append-only observation log with no uniqueness on
+--    (asset_id, proto, port) — many rows per port is the point. Repoint only.
+-- Guarded: this is a REPAIR of existing rows, and on a fresh database
+-- port_observation does not exist yet (it is created below). Unguarded it
+-- aborted this transaction, and every statement between here and COMMIT was
+-- skipped with "current transaction is aborted" — 24 of them, including the
+-- assets_hostname_not_ip CHECK that is the whole point of step 6.
+DO $POBS$ BEGIN
+    UPDATE port_observation o SET asset_id = r.to_id
+      FROM asset_remap r WHERE o.asset_id = r.from_id;
+EXCEPTION WHEN undefined_table THEN NULL; END $POBS$;
+
+-- 5. A "hostname = the IP" row is the same host as its NULL-hostname sibling.
+--    Repoint its remaining children and drop it. `ports` is the ONLY child with
+--    a unique index on asset_id and is already handled above, so the rest
+--    cannot collide. scan_recommendations.fingerprint is generated from
+--    ip/service/scanner/action/script/template — not asset_id — so repointing
+--    does not change it.
+CREATE TEMP TABLE phantom_remap ON COMMIT DROP AS
+SELECT a.id AS from_id, b.id AS to_id
+  FROM assets a
+  JOIN assets b ON b.ip = a.ip AND b.hostname IS NULL AND b.id <> a.id
+ WHERE a.hostname = host(a.ip);
+
+UPDATE web_findings         t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE vulns                t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE playwright_scans     t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE playwright_findings  t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE dom_analysis         t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE content_extractions  t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE discovered_params    t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE credential_findings  t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE recon_findings       t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE scan_recommendations t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE scan_targets         t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE findings             t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE attack_vectors       t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE attack_path_edges    t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE port_observation     t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+UPDATE ports                t SET asset_id = p.to_id FROM phantom_remap p WHERE t.asset_id = p.from_id;
+
+UPDATE assets k
+   SET first_seen = LEAST(k.first_seen, a.first_seen),
+       last_seen  = GREATEST(k.last_seen, a.last_seen),
+       os         = COALESCE(k.os, a.os)
+  FROM phantom_remap p JOIN assets a ON a.id = p.from_id
+ WHERE k.id = p.to_id;
+
+DELETE FROM assets WHERE id IN (SELECT from_id FROM phantom_remap);
+
+-- 5b. One address, two asset rows — the SAME machine recorded twice.
+--
+-- Step 5 above only merges the "hostname = the IP" phantom. It deliberately
+-- leaves a genuinely-named row alone, to protect virtual hosts. But a row with
+-- NO hostname is not a virtual host: it is the same machine before its name was
+-- known. ix_assets_ip_hostname is UNIQUE(ip, COALESCE(hostname,'')), so
+-- (192.168.1.150, '') and (192.168.1.150, 'metasploitable') are two legal rows,
+-- and this deployment had exactly that:
+--
+--     nameless row     57 ports,  6 vulns,   1 web,   0 creds,  39 recon
+--     'metasploitable'  0 ports,  2 vulns, 758 web,   7 creds, 110 recon
+--
+-- Step 2 puts ports on the NULL-hostname row by preference, so the host's ports
+-- lived on one row and its findings on the other. Anything joining ports to
+-- findings through asset_id returned nothing, and credential_findings.port_id
+-- was NULL on every row because parse_brutus looks the port up under the
+-- finding's own asset_id.
+--
+-- Merging is only safe when at most ONE distinct hostname is involved. Two
+-- different names on one address IS a multi-name host, where picking a survivor
+-- would be arbitrary — those are reported and left alone.
+--
+-- The child tables come from the CATALOG, not from the foreign-key list:
+-- pending_exploits.asset_id has no FK, so an FK-driven merge would silently
+-- orphan it, and step 5's hand-written list of 16 tables omits it for that
+-- reason. Anything that grows an asset_id later is covered without edits here.
+CREATE OR REPLACE FUNCTION public.merge_duplicate_assets()
+RETURNS TABLE(address inet, winner uuid, losers integer, rows_repointed bigint)
+LANGUAGE plpgsql AS $MDA$
+DECLARE
+    child_tables text[];
+    grp          record;
+    cand         record;
+    tbl          text;
+    n            bigint;
+    kids         bigint;
+    best_kids    bigint;
+    win          uuid;
+    losers_arr   uuid[];
+    moved        bigint;
+    rid          uuid;
+    agg          record;
+BEGIN
+    SELECT array_agg(c.table_name::text ORDER BY c.table_name) INTO child_tables
+      FROM information_schema.columns c
+      JOIN information_schema.tables t
+        ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+     WHERE c.table_schema = 'public'
+       AND c.column_name = 'asset_id'
+       AND t.table_type = 'BASE TABLE';
+
+    FOR grp IN
+        SELECT a.ip
+          FROM public.assets a
+         GROUP BY a.ip
+        HAVING count(*) > 1
+           -- count(DISTINCT ...) ignores NULLs, so (NULL, 'name') counts as one
+           -- name and merges; ('a', 'b') counts as two and does not.
+           AND count(DISTINCT NULLIF(btrim(a.hostname), '')) <= 1
+         ORDER BY a.ip
+    LOOP
+        -- Survivor: the row carrying the most dependent rows, so the merge moves
+        -- as little as possible. The ORDER BY makes ties deterministic and
+        -- prefers keeping the NAMED row, which holds strictly more information.
+        best_kids := -1;
+        win       := NULL;
+        FOR cand IN
+            SELECT id FROM public.assets
+             WHERE ip = grp.ip
+             ORDER BY (NULLIF(btrim(hostname), '') IS NOT NULL) DESC,
+                      first_seen NULLS LAST, id
+        LOOP
+            kids := 0;
+            FOREACH tbl IN ARRAY child_tables LOOP
+                EXECUTE format('SELECT count(*) FROM public.%I WHERE asset_id = $1', tbl)
+                   INTO n USING cand.id;
+                kids := kids + n;
+            END LOOP;
+            IF kids > best_kids THEN
+                best_kids := kids;
+                win       := cand.id;
+            END IF;
+        END LOOP;
+
+        SELECT array_agg(id) INTO losers_arr
+          FROM public.assets WHERE ip = grp.ip AND id <> win;
+        IF losers_arr IS NULL THEN
+            CONTINUE;
+        END IF;
+
+        moved := 0;
+        FOREACH tbl IN ARRAY child_tables LOOP
+            BEGIN
+                EXECUTE format(
+                    'UPDATE public.%I SET asset_id = $1 WHERE asset_id = ANY($2)', tbl)
+                  USING win, losers_arr;
+                GET DIAGNOSTICS n = ROW_COUNT;
+                moved := moved + n;
+            EXCEPTION WHEN unique_violation THEN
+                -- Today only ports has a unique index naming asset_id, but do not
+                -- depend on that staying true. Move what can move; a child that
+                -- already exists on the survivor is the same fact twice, so the
+                -- loser's copy goes rather than blocking the whole merge.
+                FOR rid IN EXECUTE format(
+                        'SELECT id FROM public.%I WHERE asset_id = ANY($1)', tbl)
+                        USING losers_arr
+                LOOP
+                    BEGIN
+                        EXECUTE format(
+                            'UPDATE public.%I SET asset_id = $1 WHERE id = $2', tbl)
+                          USING win, rid;
+                        moved := moved + 1;
+                    EXCEPTION WHEN unique_violation THEN
+                        EXECUTE format('DELETE FROM public.%I WHERE id = $1', tbl)
+                          USING rid;
+                    END;
+                END LOOP;
+            END;
+        END LOOP;
+
+        -- Read the losers' attributes BEFORE deleting them, then apply them AFTER.
+        --
+        -- The order is load-bearing. When the nameless row is the one carrying
+        -- the children it wins, and giving it the loser's hostname while that
+        -- loser still exists violates ix_assets_ip_hostname:
+        --     duplicate key value ... (198.51.100.11, merge-probe.test)
+        -- The live split happened to have the NAMED row winning, so its hostname
+        -- never changed and this never fired there — a synthetic case found it.
+        SELECT min(NULLIF(btrim(a.hostname), ''))       AS hostname,
+               min(a.os)                                AS os,
+               min(a.env)                               AS env,
+               min(a.content_hash)                      AS content_hash,
+               min(a.engagement_id::text)::uuid         AS engagement_id,
+               array_agg(DISTINCT t)  FILTER (WHERE t  IS NOT NULL) AS tags,
+               array_agg(DISTINCT pr) FILTER (WHERE pr IS NOT NULL) AS provider,
+               min(a.provider_evidence::text)::jsonb    AS provider_evidence,
+               min(a.first_seen)                        AS first_seen,
+               max(a.last_seen)                         AS last_seen
+          INTO agg
+          FROM public.assets a
+          LEFT JOIN LATERAL unnest(COALESCE(a.tags, '{}'::text[]))     t  ON true
+          LEFT JOIN LATERAL unnest(COALESCE(a.provider, '{}'::text[])) pr ON true
+         WHERE a.id = ANY(losers_arr);
+
+        DELETE FROM public.assets WHERE id = ANY(losers_arr);
+
+        -- A merge must never drop the one attribute a duplicate row happened to
+        -- be the only carrier of — the hostname above all, which is the whole
+        -- reason the second row existed.
+        UPDATE public.assets w
+           SET hostname          = COALESCE(NULLIF(btrim(w.hostname), ''), agg.hostname),
+               os                = COALESCE(w.os, agg.os),
+               env               = COALESCE(w.env, agg.env),
+               content_hash      = COALESCE(w.content_hash, agg.content_hash),
+               engagement_id     = COALESCE(w.engagement_id, agg.engagement_id),
+               tags              = (SELECT array_agg(DISTINCT x) FROM unnest(
+                                       COALESCE(w.tags, '{}'::text[])
+                                    || COALESCE(agg.tags, '{}'::text[])) x),
+               provider          = (SELECT array_agg(DISTINCT x) FROM unnest(
+                                       COALESCE(w.provider, '{}'::text[])
+                                    || COALESCE(agg.provider, '{}'::text[])) x),
+               -- winner's keys win on conflict
+               provider_evidence = COALESCE(agg.provider_evidence, '{}'::jsonb)
+                                || COALESCE(w.provider_evidence, '{}'::jsonb),
+               first_seen        = LEAST(w.first_seen, agg.first_seen),
+               last_seen         = GREATEST(w.last_seen, agg.last_seen),
+               modified_at       = now()
+         WHERE w.id = win;
+
+        address        := grp.ip;
+        winner         := win;
+        losers         := array_length(losers_arr, 1);
+        rows_repointed := moved;
+        RETURN NEXT;
+    END LOOP;
+
+    -- Report rather than silently skip. An address holding two DIFFERENT
+    -- hostnames is a real multi-name host, and an operator should know it is
+    -- being left alone instead of wondering why the count never drops.
+    FOR grp IN
+        SELECT a.ip, count(*) AS n
+          FROM public.assets a
+         GROUP BY a.ip
+        HAVING count(*) > 1
+           AND count(DISTINCT NULLIF(btrim(a.hostname), '')) > 1
+    LOOP
+        RAISE NOTICE 'assets: % has % rows with different hostnames (virtual hosts) - left unmerged', grp.ip, grp.n;
+    END LOOP;
+END $MDA$;
+
+DO $RUNMDA$
+DECLARE r record; BEGIN
+    FOR r IN SELECT * FROM public.merge_duplicate_assets() LOOP
+        RAISE NOTICE 'assets: merged % duplicate row(s) for % into %, repointed % child row(s)',
+                     r.losers, r.address, r.winner, r.rows_repointed;
+    END LOOP;
+END $RUNMDA$;
+
+
+-- 5c. Backfill credential_findings.port_id, which was NULL on every row.
+--
+-- parse_brutus resolves the port with
+--     SELECT id FROM ports WHERE asset_id = <finding's asset> AND port = <port>
+-- and the finding attached to the nameless asset row that had no ports, so the
+-- lookup found nothing and the column stayed empty. 5b puts the ports and the
+-- credentials on the same asset, which makes the lookup work — but only for rows
+-- ingested from here on. This fills in the ones already stored.
+--
+-- Matched on (asset, port) only: ports.proto is the TRANSPORT ('tcp'), while
+-- credential_findings.protocol is the SERVICE ('ftp', 'telnet'), so they are not
+-- comparable. tcp is preferred because credential testing is TCP.
+UPDATE public.credential_findings cf
+   SET port_id = p.id
+  FROM public.ports p
+ WHERE cf.port_id IS NULL
+   AND p.asset_id = cf.asset_id
+   AND p.port     = cf.port
+   AND p.id = (SELECT p2.id FROM public.ports p2
+                WHERE p2.asset_id = cf.asset_id AND p2.port = cf.port
+                ORDER BY (p2.proto = 'tcp') DESC, p2.last_seen DESC NULLS LAST, p2.id
+                LIMIT 1);
+
+-- A scan refused by the scope gate is 'blocked', not 'failed'.
+--
+-- CLAUDE.md: "Blocked items MUST be labelled in the UI, not silently dropped."
+-- Folding a refusal into 'failed' invites a retry of something that will never
+-- be allowed to run. The CREATE TABLE above predates the gate, so the value is
+-- added here for databases that already exist.
+DO $PWB$ BEGIN
+    ALTER TABLE public.playwright_scans
+        DROP CONSTRAINT IF EXISTS playwright_scans_status_check;
+    ALTER TABLE public.playwright_scans
+        ADD CONSTRAINT playwright_scans_status_check
+        CHECK (status IN ('queued','running','completed','failed','blocked'));
+EXCEPTION WHEN undefined_table THEN NULL; END $PWB$;
+
+-- 6. Prevent recurrence. NOT VALID so a pre-existing violation can never block
+--    this migration; steps 1 and 5 have already cleared them.
+DO $NORM$ BEGIN
+    ALTER TABLE public.assets
+      ADD CONSTRAINT assets_hostname_not_ip
+      CHECK (hostname IS NULL OR hostname <> host(ip)) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL; END $NORM$;
+
+COMMIT;
+
+-- Backfill port in vulns metadata for tools that didn't store it. Moved here
+-- with the rest of the repairs — it ran 29 lines BEFORE public.vulns was
+-- created, so all three of these failed on every fresh install.
+-- Backfill port in vulns metadata for tools that didn't store it
+UPDATE public.vulns SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{port}', to_jsonb(p.port))
+FROM public.ports p WHERE vulns.port_id = p.id AND (vulns.metadata->>'port') IS NULL;
+
+UPDATE public.vulns SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{port}', '22'::jsonb)
+WHERE script LIKE 'ssh-audit:%' AND port_id IS NULL AND (metadata->>'port') IS NULL;
+
+UPDATE public.vulns SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{port}', '443'::jsonb)
+WHERE script LIKE ANY(ARRAY['sslscan:%','testssl:%','sslyze:%']) AND port_id IS NULL AND (metadata->>'port') IS NULL;

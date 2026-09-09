@@ -1767,17 +1767,42 @@ else
         BEFORE=$(ct_exec rag-postgres psql -U app -d scans -t -c \
             "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
 
-        # Apply schema
-        if ct_exec rag-postgres psql -U app -d scans \
-            -f /docker-entrypoint-initdb.d/ensure_all_tables.sql >/dev/null 2>&1; then
-            AFTER=$(ct_exec rag-postgres psql -U app -d scans -t -c \
-                "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
-            ADDED=$((AFTER - BEFORE))
-            log_ok "Schema applied: $AFTER tables ($ADDED new)"
+        # Apply schema.
+        #
+        # psql's OUTPUT is the only place a failed statement is reported: it
+        # runs without ON_ERROR_STOP, so it continues past errors and still
+        # exits 0. This used to be `>/dev/null 2>&1`, which is how a fresh
+        # install reported "Schema applied: 114 tables" and OK while silently
+        # missing security_tests, security_test_runs, 11 indexes and the
+        # assets_hostname_not_ip CHECK — 43 error lines, all discarded. Keep the
+        # log and count them.
+        SCHEMA_LOG="logs/schema-apply-$(date +%Y%m%d-%H%M%S).log"
+        mkdir -p logs
+        ct_exec rag-postgres psql -U app -d scans \
+            -f /docker-entrypoint-initdb.d/ensure_all_tables.sql \
+            >"$SCHEMA_LOG" 2>&1 || true
+
+        AFTER=$(ct_exec rag-postgres psql -U app -d scans -t -c \
+            "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
+        ADDED=$((AFTER - BEFORE))
+
+        # "current transaction is aborted" lines are consequences of an earlier
+        # failure, not separate faults — counting them buries the real cause.
+        SCHEMA_ERRS=$(grep -c 'ERROR:' "$SCHEMA_LOG" 2>/dev/null || echo 0)
+        SCHEMA_CAUSES=$(grep 'ERROR:' "$SCHEMA_LOG" 2>/dev/null \
+                        | grep -vc 'current transaction is aborted' || echo 0)
+
+        if [ "${SCHEMA_ERRS:-0}" -eq 0 ]; then
+            log_ok "Schema applied: $AFTER tables ($ADDED new), no errors"
             record_phase "DB Schema: OK ($AFTER tables)"
         else
-            log_warn "Schema applied with warnings (non-fatal)"
-            record_phase "DB Schema: OK (with warnings)"
+            log_err "Schema applied with ${SCHEMA_ERRS} error(s) — the schema is INCOMPLETE"
+            log_err "  ${SCHEMA_CAUSES} root cause(s); full log: ${SCHEMA_LOG}"
+            grep 'ERROR:' "$SCHEMA_LOG" \
+                | grep -v 'current transaction is aborted' \
+                | head -5 | sed 's/^/    /' || true
+            log_warn "  Repair with: ./scripts/ensure_db_schema.sh"
+            record_phase "DB Schema: INCOMPLETE (${SCHEMA_CAUSES} error(s), $AFTER tables)"
         fi
     fi
     fi

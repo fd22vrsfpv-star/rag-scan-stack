@@ -613,6 +613,39 @@ else
   warn "db-config.json missing — run ./scripts/setup.sh or seed: echo '{\"mode\":\"local\"}' > db-config.json"
 fi
 
+# Exactly one container may answer to `rag-postgres`.
+#
+# In remote / remote_direct mode the `rag-db-tunnel` sidecar takes that NETWORK
+# ALIAS and forwards to the remote database. The local postgres claims the same
+# alias, and if both run, Docker's DNS hands out both addresses: roughly half
+# of all new connections land on the local server, which has no SSL, and fail
+# with "server does not support SSL, but SSL was required" — a message that
+# reads like a TLS misconfiguration and is actually two containers wearing one
+# name.
+#
+# This is easy to cause by accident: `.env` sets COMPOSE_PROFILES=local-db, so
+# ANY `docker compose up` in this project — even `up -d --no-deps <one service>`
+# — starts rag-postgres as part of reconciling the active profile. Applying an
+# env change to a single service is enough to do it.
+ALIAS_OWNERS=""
+for _cid in $(docker ps -q 2>/dev/null); do
+  if docker inspect "$_cid" \
+       --format '{{range .NetworkSettings.Networks}}{{.Aliases}}{{end}}' 2>/dev/null \
+     | grep -q 'rag-postgres'; then
+    ALIAS_OWNERS="${ALIAS_OWNERS} $(docker inspect "$_cid" --format '{{.Name}}' 2>/dev/null | tr -d '/')"
+  fi
+done
+ALIAS_N=$(echo $ALIAS_OWNERS | wc -w)
+if ! command -v docker >/dev/null 2>&1; then
+  warn "rag-postgres alias check skipped (no docker CLI)"
+elif [[ "$ALIAS_N" -eq 1 ]]; then
+  pass "rag-postgres alias claimed by exactly one container ($(echo $ALIAS_OWNERS))"
+elif [[ "$ALIAS_N" -eq 0 ]]; then
+  warn "nothing claims the rag-postgres alias — the database is unreachable by name"
+else
+  fail "rag-postgres alias claimed by ${ALIAS_N} containers ($(echo $ALIAS_OWNERS)) — about half of all DB connections will fail with a misleading \"server does not support SSL\". Stop the one that should not be running: docker compose stop rag-postgres"
+fi
+
 echo ""
 echo "=== Vault layout (only required if using --profile vault) ==="
 for d in vault/config vault/data vault/init vault/logs; do

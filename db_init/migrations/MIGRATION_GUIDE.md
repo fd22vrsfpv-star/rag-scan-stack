@@ -51,7 +51,7 @@ docker compose up -d rag-postgres
 sleep 10
 
 # Apply migration
-docker exec -i rag-postgres psql -U app -d scans < /utils/agents/db_init/add_missing_tables.sql
+docker exec -i rag-postgres psql -U app -d scans < /utils/agents/db_init/migrations/add_missing_tables.sql
 
 # Verify tables were created
 docker exec -it rag-postgres psql -U app -d scans -c "\dt" | grep -E "web_findings|vulns|scan_recommendations|playwright"
