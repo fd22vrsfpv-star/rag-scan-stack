@@ -860,9 +860,10 @@ def _emit_maintenance_event(event_type: str, data: dict) -> None:
     silently swallowed, because `except: pass` around an HTTP call hides a dead
     endpoint forever.
 
-    NOTE: `_ALL_EVENT_TYPES` in webhooks/router.py is an ALLOW-LIST. A type that
-    is not listed there is accepted with 200 and then discarded, so the event
-    never reaches the timeline. Both types below are registered.
+    NOTE (2026-09-09): the event-log webhook used to carry an event-type
+    ALLOW-LIST, and a type missing from it was accepted with 200 and discarded.
+    That list is gone — the sink now filters nothing — so an event type no
+    longer has to be registered anywhere to reach the timeline.
     """
     try:
         from webhooks import emit_webhook

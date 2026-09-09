@@ -811,17 +811,32 @@ def test_safe_lane_poll_is_deadline_based_not_a_fixed_60s():
         "empty errors")
 
 
-def test_surface_event_types_are_in_the_allowlist():
-    """A langgraph_surface_* event not in _ALL_EVENT_TYPES is emitted, 200'd and
-    silently dropped from the Agent Activity timeline."""
+def test_the_event_log_sink_has_no_event_type_filter():
+    """The langgraph_surface_* events reach the timeline because the event-log
+    webhook filters NOTHING — not because they appear on a list.
+
+    This test used to assert each type was present in `_ALL_EVENT_TYPES`. That
+    list was removed on 2026-09-09: it had turned a catch-all sink into an
+    allow-list, and 113 emitted event types were absent from it and silently
+    discarded. dispatcher.emit_webhook skips a webhook only when
+    `event_types` is non-empty, so the sink must be created and kept with NO
+    filter — which is the property worth pinning, and it covers every event
+    type rather than the five named here.
+    """
     router = _autogen_dir().parent / "app" / "rag-api" / "webhooks" / "router.py"
     if not router.exists():
         pytest.skip("webhooks/router.py not present")
     src = router.read_text(encoding="utf-8")
-    for ev in ("langgraph_surface_analyzed", "langgraph_surface_test_planned",
-               "langgraph_surface_test_executed", "langgraph_surface_test_completed",
-               "langgraph_surface_decision"):
-        assert f'"{ev}"' in src, f"{ev} missing from _ALL_EVENT_TYPES — it will be dropped"
+    assert "_ALL_EVENT_TYPES" not in src, (
+        "the event-type allow-list is back. Every emitter now has to remember "
+        "to append to it, and the ones that do not are accepted with 200 and "
+        "dropped — that is how 113 event types went missing"
+    )
+    assert re.search(r"UPDATE webhooks SET event_types = NULL", src), (
+        "ensure_default_webhook no longer clears the event-log webhook's "
+        "event_types, so a stale filter on an existing row keeps dropping "
+        "everything it does not name"
+    )
 
 
 # ── 7. opt-in LLM synthesis in the surface phase ─────────────────────────────
