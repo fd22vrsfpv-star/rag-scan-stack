@@ -105,10 +105,19 @@ dashboard/frontend/tsconfig.tsbuildinfo
 
 # OSINT output & runner binaries
 osint_reports/
-osint_runner/bin/
+# Ignore the CONTENTS, not the directories. The Dockerfiles do
+# `COPY <svc>/bin/ ...` and COPY of an ABSENT directory fails the build outright
+# ("failed to calculate checksum ... /pd_runner/bin: not found"), while an EMPTY
+# one builds fine because each tool is guarded by `if [ -f ... ]`. Ignoring the
+# directory itself also makes the !.gitkeep negation impossible — git cannot
+# re-include a file under an excluded directory. Found by the first
+# fresh-install rehearsal.
+osint_runner/bin/*
+pd_runner/bin/*
 osint_runner/bin-*/
-pd_runner/bin/
 pd_runner/bin-*/
+!osint_runner/bin/.gitkeep
+!pd_runner/bin/.gitkeep
 pd_runner/tlsx
 
 # SSH keys (secrets)

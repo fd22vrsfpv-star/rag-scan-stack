@@ -217,7 +217,18 @@ ls -la /output/
         golang:1.25 bash -c '
 set -e
 apt-get update -qq && apt-get install -y -qq --no-install-recommends git libpcap-dev build-essential >/dev/null 2>&1
-export GONOSUMCHECK="*" GONOSUMDB="*"
+# GOTOOLCHAIN=auto is load-bearing: the official golang image pins it to
+# "local", so a tool whose go.mod requires a NEWER Go than the image simply
+# fails to build. The osint block has always set it; this one did not, and
+# the result was two tools silently missing from every fresh install:
+#
+#   httpx@v1.12.0 requires go >= 1.26.0 (running go 1.25.9; GOTOOLCHAIN=local)
+#   [httpx] FAILED — skipping      [katana] FAILED — skipping
+#
+# The failure is a warning, not an error, so the install "succeeds" with a
+# pd-runner that cannot probe HTTP or crawl. Found by the first
+# fresh-install rehearsal.
+export GONOSUMCHECK="*" GONOSUMDB="*" GOTOOLCHAIN=auto
 
 TOOLS=(
     "github.com/projectdiscovery/httpx/cmd/httpx"
