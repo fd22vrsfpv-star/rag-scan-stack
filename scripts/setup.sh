@@ -2085,6 +2085,26 @@ echo "  docker compose ${COMPOSE_FILES} ${COMPOSE_PROFILES} ps        # service 
 echo "  docker compose ${COMPOSE_FILES} ${COMPOSE_PROFILES} logs -f   # follow logs"
 echo "  docker compose ${COMPOSE_FILES} ${COMPOSE_PROFILES} down      # stop all"
 echo "  ./scripts/ensure_db_schema.sh  # re-apply DB schema"
+echo "  docker compose ${COMPOSE_FILES} up -d searchsploit-updater exploitdb-etl   # load exploits"
+echo ""
+
+# ── The exploit corpus is NOT loaded by this installer ────────────────────
+#
+# `searchsploit-updater` writes searchsploit.json into a shared volume and
+# `exploitdb-etl` ingests it into edb.exploits. Both are one-shot and neither is
+# part of phases 1-10: the updater apt-installs exploitdb inside a Kali image
+# (several minutes and a large download), so the install does not block on it.
+#
+# The consequence is that a completed install has an EMPTY exploit corpus and
+# nothing says so. Say so here.
+#
+# In remote DB mode this needs the `edb_rw` role and a pg_hba entry for the
+# `exploits` database ON THE REMOTE SERVER, which `create_exploits.sh` can only
+# create where it has superuser access — see Docs/DATABASE_SCHEMA.md.
+echo -e "${BOLD}${YELLOW}Exploit corpus: not loaded by this installer${NC}"
+echo "  Run it when convenient (one-shot, several minutes):"
+echo "    docker compose ${COMPOSE_FILES} up -d searchsploit-updater exploitdb-etl"
+echo "  Then confirm:  ./scripts/ensure_db_schema.sh   (reports edb.exploits rows)"
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2098,7 +2118,7 @@ case "$PLATFORM_LABEL" in
 esac
 
 echo -e "${BOLD}${YELLOW}══════════════════════════════════════════════════════════════${NC}"
-echo -e "${BOLD}${YELLOW}  First time here? Start with these 4 steps                    ${NC}"
+echo -e "${BOLD}${YELLOW}  First time here? Start with these 5 steps                    ${NC}"
 echo -e "${BOLD}${YELLOW}══════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  Detected platform: ${BOLD}${PLATFORM_PRETTY}${NC}"
@@ -2107,6 +2127,9 @@ echo -e "  ${BOLD}1.${NC} Open the dashboard:    ${BLUE}http://localhost:3002${N
 echo -e "  ${BOLD}2.${NC} Create an engagement:  Engagements → New (sets the scope for every scan)"
 echo -e "  ${BOLD}3.${NC} Configure your proxy:  Settings → General → Burp/ZAP preset + Test Proxy"
 echo -e "  ${BOLD}4.${NC} Launch your first scan:  Scans → choose target → category → scan"
+echo ""
+echo -e "  ${BOLD}5.${NC} Load the exploit corpus: ${BLUE}docker compose up -d searchsploit-updater exploitdb-etl${NC}"
+echo -e "     (one-shot, not run by the installer — until it runs, edb.exploits is empty)"
 echo ""
 echo -e "  ${BOLD}Read these next${NC} (in this order):"
 echo -e "    • ${BOLD}Docs/README.md${NC}                     — project overview"

@@ -19,6 +19,39 @@ The stack uses PostgreSQL with pgvector extension for storing:
   - Defines all 21+ tables with indexes, triggers, and views
   - Runs automatically on first container startup
 
+### The `exploits` database (separate, and not created by the installer)
+
+`db_init/create_exploits.sh` creates the `exploits` database, the `edb` schema,
+`edb.exploits`, and the `edb_owner` / `edb_rw` / `edb_ro` roles. It runs INSIDE
+the postgres container on first init, as the local superuser.
+
+**In `remote` / `remote_direct` mode it cannot run at all.** There is no local
+postgres container, and the stack's role (`app`) on a managed server typically
+has neither CREATEROLE nor CREATEDB:
+
+    app | rolsuper=f | rolcreatedb=f | rolcreaterole=f
+
+Use `scripts/create-exploits-remote.sql` on the database host as a superuser,
+then add a `pg_hba.conf` entry for the `exploits` database — a database can
+exist while `app` is refused by pg_hba, which is the confusing state to be in:
+
+    FATAL: no pg_hba.conf entry for host "...", user "app", database "exploits"
+
+Loading the corpus is a separate, one-shot step the installer deliberately does
+NOT run (the updater apt-installs exploitdb inside a Kali image):
+
+    docker compose up -d searchsploit-updater exploitdb-etl
+
+`scripts/ensure_db_schema.sh` reports the row count, and distinguishes "absent"
+from "cannot verify from here".
+
+**Worth knowing:** `edb.exploits` currently has one user in this repo — its
+writer, `etl/edb_ingest_json.py`. Nothing queries it. rag-api's exploit matching
+reads the ExploitDB **CSV** from disk instead (`rule_engine._load_exploitdb`;
+`/health` reports that as `exploitdb.loaded`, 47,087 entries). Populating the
+database prepares the FTS / CVE-array search path; it does not change behaviour
+until something reads it.
+
 ### Migration Scripts
 - **`db_init/ensure_all_tables.sql`** - Idempotent schema update
   - Safe to run multiple times (uses `IF NOT EXISTS`)
