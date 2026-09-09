@@ -143,11 +143,21 @@ not draining regardless of what the other counters say.
 Dispatches per cycle are capped by **both**:
 
 - `config.max_dispatches_per_cycle` (default 5 for `pentest`, 2 otherwise)
-- `MAX_CONCURRENT_RECON_SCANS` minus jobs already running (`RECON_AGENT_MAX_CONCURRENT`, default 3)
+- the concurrent-scan ceiling minus jobs already running
 
-So the effective per-cycle ceiling is usually 3. At 3 per 5 minutes a
-144-recommendation queue takes roughly four hours, though `skipped` rows clear
-almost instantly.
+The ceiling is `MAX_CONCURRENT_SCANS` — the same number the operator sets for
+every other component (default 5), read at call time so a change from the UI
+takes effect immediately. `RECON_AGENT_MAX_CONCURRENT` is an OPTIONAL downward
+override for OPSEC trickling; it can lower the ceiling but never raise it.
+Unset, there is no separate recon number at all.
+
+Before 2026-09-09 this was a private `RECON_AGENT_MAX_CONCURRENT` defaulting to
+3, so raising `MAX_CONCURRENT_SCANS` changed nothing here — and the BFF was not
+even passed `MAX_CONCURRENT_SCANS`, so it silently used the hardcoded 5.
+
+So the effective per-cycle ceiling is usually 5. At 5 per 5 minutes a
+144-recommendation queue takes roughly two and a half hours, though `skipped`
+rows clear almost instantly.
 
 ---
 
@@ -169,7 +179,8 @@ Environment:
 | Variable | Default | Effect |
 |---|---|---|
 | `RECON_AGENT_BASE_INTERVAL` | `30` | agent poll interval (seconds) |
-| `RECON_AGENT_MAX_CONCURRENT` | `3` | global cap on concurrent recon scans |
+| `MAX_CONCURRENT_SCANS` | `5` | the shared concurrent-scan ceiling (all components) |
+| `RECON_AGENT_MAX_CONCURRENT` | unset | optional DOWNWARD override of that ceiling; cannot raise it |
 | `RECON_AGENT_MAX_DISPATCH_ATTEMPTS` | `3` | transient failures before a rec is retired |
 
 ## Endpoints
@@ -245,8 +256,9 @@ from collections import Counter
 print(Counter(j.get('status') for j in active_jobs.values()))"
 ```
 
-`running` + `queued` at or above `RECON_AGENT_MAX_CONCURRENT` zeroes the KB
-budget and every cycle reports `dispatched=0`.
+`running` + `queued` at or above the ceiling (`_recon_concurrency()`, i.e.
+`MAX_CONCURRENT_SCANS` unless overridden downward) zeroes the KB budget and
+every cycle reports `dispatched=0`.
 
 ### Historical failure modes
 
