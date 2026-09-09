@@ -487,3 +487,81 @@ def test_the_installer_says_the_exploit_corpus_is_not_loaded():
         "the corpus load needs searchsploit-updater too — it writes the JSON "
         "that exploitdb-etl ingests"
     )
+
+
+# ── rag_documents belongs to the scans schema ──────────────────────────────
+#
+# It was created in setup_alldb.sql under `\connect n8n` — the workflow
+# automation database — while its only writer, app/load_all.py, connects with
+# DB_DSN like every other ETL module, i.e. `scans`. The INSERT could only ever
+# fail with "relation rag_documents does not exist", and on the live deployment
+# (which has no n8n database at all) the table existed nowhere.
+#
+# Moved 2026-09-09. These pin the arrangement, because re-adding it to
+# setup_alldb.sql would recreate the exact confusion: two declarations, in two
+# databases, one of which nothing can reach.
+LOAD_ALL = os.path.join(REPO, "app", "load_all.py")
+
+
+def _connect_sections(text):
+    """Map each `\\connect <db>` region of a psql script to its SQL."""
+    parts = re.split(r"^\\connect\s+(\w+)\s*$", text, flags=re.M)
+    out = {}
+    # parts = [preamble, db1, sql1, db2, sql2, ...]
+    for i in range(1, len(parts) - 1, 2):
+        out.setdefault(parts[i], "")
+        out[parts[i]] += parts[i + 1]
+    return out
+
+
+def test_rag_documents_is_declared_in_the_scans_schema():
+    schema = _read(SCHEMA)
+    # \b matters: without it this matched `rag_documents_disabled` and the
+    # sabotage that renamed the table walked straight past — the third time
+    # this exact substring trap has bitten in this session.
+    assert re.search(r"CREATE TABLE IF NOT EXISTS public\.rag_documents\b", schema), (
+        "rag_documents is not declared in ensure_all_tables.sql, so it is not "
+        "created on a fresh install and scripts/ensure_db_schema.sh cannot "
+        "repair it either"
+    )
+    for want in ("vector(384)", "GENERATED ALWAYS AS", "rag_recent_high"):
+        assert want in schema, f"rag_documents moved without its {want!r}"
+
+
+def test_rag_documents_is_not_declared_in_another_database():
+    """One declaration, one database."""
+    sections = _connect_sections(_read(SETUP_ALL))
+    offenders = [db for db, sql in sections.items()
+                 if re.search(r"CREATE TABLE (?:IF NOT EXISTS )?public\.rag_documents\b", sql)]
+    assert not offenders, (
+        "rag_documents is declared in setup_alldb.sql under these databases: "
+        f"{offenders}. It belongs only in ensure_all_tables.sql (the scans "
+        "schema) — a second copy in `n8n` is what made it unreachable to its "
+        "own writer"
+    )
+    # The view has to move with it, or it silently disappears.
+    view_owners = [db for db, sql in sections.items() if "rag_recent_high" in sql
+                   and "CREATE OR REPLACE VIEW" in sql]
+    assert not view_owners, (
+        f"the rag_recent_high view is still created in {view_owners}"
+    )
+
+
+def test_the_rag_writer_can_actually_connect():
+    """app/load_all.py imported `etl.db`, which does not exist — so the module
+    raised ModuleNotFoundError and the backfill had never once run."""
+    if not os.path.exists(LOAD_ALL):
+        pytest.skip("app/load_all.py not present")
+    src = _read(LOAD_ALL)
+    code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    assert "from etl.db import" not in code, (
+        "app/load_all.py imports etl.db, which is not a module in this repo — "
+        "the file cannot be imported at all"
+    )
+    assert "psycopg2.connect(DB_DSN)" in code, (
+        "the backfill does not open its own connection with DB_DSN, the way "
+        "every other ETL module does"
+    )
+    assert re.search(r"^DB_DSN\s*=", code, re.M), (
+        "DB_DSN is used but never defined in app/load_all.py"
+    )

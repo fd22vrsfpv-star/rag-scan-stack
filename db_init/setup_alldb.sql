@@ -160,55 +160,18 @@ CREATE TABLE IF NOT EXISTS public.web_findings (
   last_seen    TIMESTAMPTZ DEFAULT now()
   );
 
--- RAG documents (embedding column only if vector installed)
-DO $$
-BEGIN
-  IF to_regclass('public.rag_documents') IS NULL THEN
-CREATE TABLE public.rag_documents (
-                                    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-                                    asset_id    UUID REFERENCES public.assets(id) ON DELETE SET NULL,
-                                    finding_id  UUID REFERENCES public.findings(id) ON DELETE SET NULL,
-                                    port_id     UUID REFERENCES public.ports(id) ON DELETE SET NULL,
-                                    scan_id     UUID REFERENCES public.scans(id) ON DELETE SET NULL,
-                                    title       TEXT,
-                                    text_chunk  TEXT NOT NULL,
-                                    metadata    JSONB NOT NULL DEFAULT '{}'::jsonb,
-                                    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-END IF;
-END$$;
-
--- try to add an embedding column if vector exists (safe to fail)
-DO $$
-BEGIN
-BEGIN
-ALTER TABLE public.rag_documents ADD COLUMN IF NOT EXISTS embedding vector(384);
-EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'embedding column not created (vector missing?) - %', SQLERRM;
-END;
-END$$;
-
--- FTS column and indexes for rag_documents if present
-DO $$
-BEGIN
-  IF to_regclass('public.rag_documents') IS NOT NULL THEN
-    IF NOT EXISTS (
-      SELECT 1 FROM pg_attribute
-      WHERE attrelid = 'public.rag_documents'::regclass AND attname = 'fts'
-    ) THEN
-ALTER TABLE public.rag_documents
-  ADD COLUMN fts tsvector
-    GENERATED ALWAYS AS (to_tsvector('english', coalesce(title,'') || ' ' || text_chunk)) STORED;
-END IF;
-    -- indexes
-    IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'rag_docs_meta_gin') THEN
-CREATE INDEX rag_docs_meta_gin ON public.rag_documents USING GIN (metadata);
-END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'rag_docs_fts_idx') THEN
-CREATE INDEX rag_docs_fts_idx ON public.rag_documents USING GIN (fts);
-END IF;
-END IF;
-END$$;
+-- RAG documents: MOVED to db_init/ensure_all_tables.sql (2026-09-09).
+--
+-- rag_documents was created here, in the `n8n` WORKFLOW AUTOMATION database,
+-- while its only writer (app/load_all.py) connects with DB_DSN — i.e. `scans`
+-- — so the INSERT could only fail with "relation rag_documents does not
+-- exist". Docs/ARCHITECTURE.md lists it beside scan_recommendations and cve,
+-- both of which live in `scans`, and the live deployment has no `n8n`
+-- database at all, so the table existed nowhere.
+--
+-- It is now declared once, in the scans schema, with its embedding, fts and
+-- index blocks and the rag_recent_high view. Do not re-add it here: two
+-- copies in two databases is what caused the confusion.
 
 -- default privileges
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE, TRIGGER ON TABLES TO n8n;
@@ -1454,17 +1417,7 @@ GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO scans;
 -- Final notes / helper views
 -------------------------
 \connect n8n
--- recent high severity rag docs view (if rag_documents present)
-DO $$
-BEGIN
-  IF to_regclass('public.rag_documents') IS NOT NULL THEN
-    CREATE OR REPLACE VIEW public.rag_recent_high AS
-SELECT title, text_chunk, metadata, created_at
-FROM public.rag_documents
-WHERE (metadata->>'severity') IN ('high','critical')
-  AND created_at >= now() - interval '30 days';
-END IF;
-END$$;
+-- rag_recent_high view: moved to ensure_all_tables.sql with rag_documents.
 
 \connect scans
 -- helpful indexes that may be missing (safety)

@@ -160,12 +160,18 @@ EXPECTED_TABLES=(
   scan_parameters
   # TIER 28: WSTG guided manual checklist sign-off (app/rag-api/wstg_coverage.py)
   wstg_manual_reviews
+  # TIER 29: findings-level RAG store (app/load_all.py). Declared in the SCANS
+  # schema since 2026-09-09 — it used to be created in the `n8n` database while
+  # its writer connected to `scans`, so it existed nowhere the code could see.
+  rag_documents
 )
 
 # Views that reports and the spray list depend on. A missing view fails only when
 # a page queries it, which reads as "no results" rather than "not installed".
 EXPECTED_VIEWS=(
   v_identity_credential_state
+  # Moved out of the n8n database with rag_documents.
+  rag_recent_high
 )
 
 for table in "${EXPECTED_TABLES[@]}"; do
