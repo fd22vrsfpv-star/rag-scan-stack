@@ -143,10 +143,16 @@ BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# The banner said "[N/9]" while the script has ten phases, so a completed
+# install ended with "[10/9] Seeding knowledge base" — which reads as an
+# off-by-one somewhere in the installer at the exact moment an operator is
+# deciding whether to trust the run.
+TOTAL_PHASES=10
+
 banner() {
     echo ""
     echo -e "${BOLD}${BLUE}══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${BLUE}  [$1/9] $2${NC}"
+    echo -e "${BOLD}${BLUE}  [$1/${TOTAL_PHASES}] $2${NC}"
     echo -e "${BOLD}${BLUE}══════════════════════════════════════════════════════════════${NC}"
     echo ""
 }
@@ -1494,7 +1500,15 @@ fi
 banner 4 "Setting up infrastructure"
 
 # Docker network
-if docker network inspect agents_net &>/dev/null; then
+# docker-compose.yml declares agents_net as `external: true`, so it must exist
+# before `up`. A rehearsal is the exception: the isolation override replaces it
+# with a project-local network compose creates itself. Saying "already exists"
+# there is true but misleading — it names the LIVE network, which the rehearsal
+# will not join, and that is the one thing an operator reading this output most
+# needs to be sure of.
+if [ "$REHEARSAL" = true ]; then
+    log_skip "Shared 'agents_net' not used — this rehearsal gets its own project network"
+elif docker network inspect agents_net &>/dev/null; then
     log_skip "Docker network 'agents_net' already exists"
 else
     docker network create agents_net
