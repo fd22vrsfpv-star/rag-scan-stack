@@ -604,6 +604,10 @@ echo ""
 echo "🔍 Verifying critical views..."
 CRITICAL_VIEWS=(
     "detected_software"
+    # Moved out of the n8n database with rag_documents (2026-09-09). Listed
+    # here so a repair run reports it: the whole reason it went unnoticed for
+    # so long is that nothing ever asked whether it existed.
+    "rag_recent_high"
 )
 
 for view in "${CRITICAL_VIEWS[@]}"; do
