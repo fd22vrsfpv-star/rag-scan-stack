@@ -78,6 +78,12 @@ FORCE_GO_TOOLS=false
 NO_START=false
 NON_INTERACTIVE=false
 GPU_OVERRIDE=auto   # auto | force | skip — Phase 1 sets GPU_AVAILABLE; Phase 6 honors this
+# Resolved in Phase 6, but READ by the closing summary at the end of the script.
+# With --no-start Phase 6 is skipped, so under `set -euo pipefail` the summary
+# aborted the whole run with "ENABLE_GPU: unbound variable" on the very last
+# line — a completed install that exits non-zero, which any wrapper or CI reads
+# as a failed install. Initialise it here so it is always defined.
+ENABLE_GPU=false
 SKIP_DEP_INSTALL=false   # Phase 1 auto-installs missing host deps (Docker, CLIs); --no-install disables
 
 for arg in "$@"; do
@@ -431,14 +437,33 @@ gate_os_supported() {
         preflight_block "WSL distro is not Ubuntu (got '${distro:-unknown}')"
         return
     fi
+    # Validated releases pass silently. A NEWER LTS warns and proceeds; it does
+    # not block.
+    #
+    # This gate hard-blocked 22.04|24.04 only, so when the host moved to 26.04
+    # LTS the installer refused to run on the very machine the stack was already
+    # running on. A fresh install became impossible, and nothing noticed because
+    # nobody had rehearsed one. Blocking an untested LTS is the wrong trade:
+    # "we have not validated this" is a warning, not a stop, and the same
+    # staleness would otherwise return with 28.04.
     case "$version" in
-        22.04|24.04)
+        22.04|24.04|26.04)
             log_ok "Host: WSL2 Ubuntu $version"
             ;;
         *)
-            log_err "WSL Ubuntu version $version is not supported -- need 22.04 or 24.04 (LTS only)."
-            log_err "  20.04 is past mainstream support; non-LTS versions are not validated."
-            preflight_block "Unsupported Ubuntu version ($version)"
+            # Even-year .04 releases are Ubuntu's LTS cadence; confirm against
+            # os-release rather than trusting the number alone.
+            _yy="${version%%.*}"
+            if [ "${version#*.}" = "04" ] && [ -n "$_yy" ] && [ $((_yy % 2)) -eq 0 ] \
+               && /usr/bin/grep -qi "LTS" /etc/os-release 2>/dev/null \
+               && [ "$_yy" -ge 22 ] 2>/dev/null; then
+                log_warn "Host: WSL2 Ubuntu $version -- an LTS, but newer than the"
+                log_warn "  validated set (22.04, 24.04, 26.04). Proceeding; report anything odd."
+            else
+                log_err "WSL Ubuntu version $version is not supported -- need an LTS >= 22.04."
+                log_err "  20.04 is past mainstream support; non-LTS versions are not validated."
+                preflight_block "Unsupported Ubuntu version ($version)"
+            fi
             ;;
     esac
 }

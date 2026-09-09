@@ -1,0 +1,12 @@
+# Keeps this directory in git.
+#
+# The binaries here are build output (scripts/build-go-tools.sh) and are
+# gitignored, but the DIRECTORY must exist in a clean checkout: the
+# Dockerfile does `COPY pd_runner/bin/ ...`, and COPY of an absent
+# directory fails the build outright with an opaque
+#   "failed to calculate checksum ... /pd_runner/bin: not found"
+#
+# The Dockerfile guards each tool with `if [ -f ... ]`, so an EMPTY
+# directory builds fine and degrades at runtime, which is what its
+# comment ("the build succeeds even if some binaries are missing")
+# always intended. Found by the first fresh-install rehearsal.
