@@ -117,7 +117,40 @@ def _guess_target_type(target: str) -> str:
     return "domain"
 
 
-MAX_CONCURRENT_RECON_SCANS = int(os.environ.get("RECON_AGENT_MAX_CONCURRENT", "3"))
+# The recon agent used a private ceiling of 3 (RECON_AGENT_MAX_CONCURRENT),
+# resolved at import time and independent of the number the operator actually
+# sets — CLAUDE.md: "No component invents a private concurrency number."
+#
+# It is now the MINIMUM of the shared cap and an OPTIONAL downward override, in
+# the same shape as _pipeline_concurrency() in pipeline_orchestrator.py: the
+# agent can be trickled for OPSEC with its own knob, but can never exceed what
+# the operator set for the engagement. With no override it simply IS the shared
+# cap — which is what "keep it common" has to mean to be worth anything.
+#
+# Unset by default rather than defaulting to 3: a private default that is lower
+# than the shared cap is still a private number deciding the answer, and the
+# operator who raises MAX_CONCURRENT_SCANS would have seen nothing change.
+_RECON_OWN_CAP = os.environ.get("RECON_AGENT_MAX_CONCURRENT", "").strip()
+
+
+def _recon_concurrency() -> int:
+    """The recon agent's concurrent-scan ceiling.
+
+    Read at CALL time, not import time: the BFF's set_max_concurrent() rebinds
+    the module global, so a value captured at import ignores every runtime
+    change the operator makes from the UI.
+    """
+    from routers.scans import get_max_concurrent
+    shared = max(1, get_max_concurrent())
+    if not _RECON_OWN_CAP:
+        return shared
+    try:
+        own = int(_RECON_OWN_CAP)
+    except ValueError:
+        log.warning("RECON_AGENT_MAX_CONCURRENT=%r is not an integer — using "
+                    "the shared cap of %d", _RECON_OWN_CAP, shared)
+        return shared
+    return max(1, min(own, shared))
 
 # Engagement-scoping predicate for pending KB recommendations.
 #
@@ -281,14 +314,15 @@ class ReconAgent:
             from polling import active_jobs
             running_count = sum(1 for j in active_jobs.values()
                                 if j.get("status") in ("running", "queued"))
-            if running_count >= MAX_CONCURRENT_RECON_SCANS:
+            max_concurrent = _recon_concurrency()
+            if running_count >= max_concurrent:
                 log.info("Agent tick: skipping %s — %d scans already running (max %d)",
-                         eid[:8], running_count, MAX_CONCURRENT_RECON_SCANS)
+                         eid[:8], running_count, max_concurrent)
                 continue
 
             log.info("Agent tick: running cycle for %s (%s) [%d/%d running]",
                      eid[:8], agent.get("engagement_name", "?"),
-                     running_count, MAX_CONCURRENT_RECON_SCANS)
+                     running_count, max_concurrent)
             try:
                 await self._agent_cycle(eid, agent.get("config") or {}, agent)
             except Exception:
@@ -678,9 +712,9 @@ class ReconAgent:
                 # Respect global concurrent limit
                 current_running = sum(1 for j in active_jobs.values()
                                       if j.get("status") in ("running", "queued"))
-                if current_running >= MAX_CONCURRENT_RECON_SCANS:
+                if current_running >= _recon_concurrency():
                     log.info("[recon:%s] stopping — hit max concurrent (%d)",
-                             eid[:8], MAX_CONCURRENT_RECON_SCANS)
+                             eid[:8], _recon_concurrency())
                     break
                 # Skip if already in-flight
                 if (target, scan_type) in in_flight_targets:
@@ -947,7 +981,7 @@ class ReconAgent:
                 )
                 kb_budget = max(0, min(
                     max_dispatches - dispatched,
-                    MAX_CONCURRENT_RECON_SCANS - current_running,
+                    _recon_concurrency() - current_running,
                 ))
                 recs_to_dispatch = pending_recs[:kb_budget]
                 kb_skipped_pending = max(

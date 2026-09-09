@@ -999,6 +999,11 @@ services:
       PYTHONHTTPSVERIFY: "0"
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
+      # The operator's shared ceiling. This service READS it (directly, via
+      # common/tool_job.py, or via routers/scans.get_max_concurrent) and used to
+      # fall back to a hardcoded 5 because it was never passed in — so raising
+      # MAX_CONCURRENT_SCANS in .env changed nothing here.
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
       TZ: ${TZ:-America/New_York}
       # Trust the stack's self-signed cert WITHOUT disabling verification.
       # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
@@ -1081,6 +1086,11 @@ services:
       PYTHONHTTPSVERIFY: "0"
       SSL_KEYFILE: /certs/server.key
       BUILD_VERSION: ${BUILD_VERSION:-dev}
+      # The operator's shared ceiling. This service READS it (directly, via
+      # common/tool_job.py, or via routers/scans.get_max_concurrent) and used to
+      # fall back to a hardcoded 5 because it was never passed in — so raising
+      # MAX_CONCURRENT_SCANS in .env changed nothing here.
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
       TZ: ${TZ:-America/New_York}
       # Trust the stack's self-signed cert WITHOUT disabling verification.
       # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
@@ -2291,6 +2301,11 @@ services:
     cpus: ${DEFAULT_CPUS:-2.0}
     environment:
       BUILD_VERSION: ${BUILD_VERSION:-dev}
+      # The operator's shared ceiling. This service READS it (directly, via
+      # common/tool_job.py, or via routers/scans.get_max_concurrent) and used to
+      # fall back to a hardcoded 5 because it was never passed in — so raising
+      # MAX_CONCURRENT_SCANS in .env changed nothing here.
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
       TZ: ${TZ:-America/New_York}
       # Trust the stack's self-signed cert WITHOUT disabling verification.
       # 14 other services already had this; pentest-dashboard did not, and it
