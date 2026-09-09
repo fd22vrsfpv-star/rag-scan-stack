@@ -553,6 +553,10 @@ _ALL_EVENT_TYPES = [
     # in the append-only webhook_events audit log.
     "maintenance_schema_applied", "maintenance_schema_apply_failed",
     "maintenance_knowledge_seeded", "maintenance_knowledge_seed_failed",
+    # etl/backfill_rag_documents.py — embeds findings into rag_documents. It
+    # rewrites a shared corpus, so it belongs in the append-only audit log for
+    # the same reason the two above do.
+    "maintenance_rag_backfilled", "maintenance_rag_backfill_failed",
 ]
 
 
