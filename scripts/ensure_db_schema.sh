@@ -583,10 +583,18 @@ elif printf '%s' "$EDB_PROBE" | grep -qiE 'pg_hba|no pg_hba.conf entry|permissio
     echo "     $(printf '%s' "$EDB_PROBE" | tr '\n' ' ' | cut -c1-140)"
     echo "     Not counted as missing: it may exist and simply be unreachable."
 else
-    echo "❌ Missing exploits database — CVE/exploit matching has no data"
-    echo "   Create it with:"
+    echo "❌ Missing exploits database — the exploit corpus has nowhere to load"
+    echo ""
+    echo "   LOCAL DB mode — create it inside the postgres container:"
     echo "     docker exec -e EDB_RW_PASSWORD=\"\$EDB_RW_PASSWORD\" -e POSTGRES_USER=app \\"
     echo "       rag-postgres bash /docker-entrypoint-initdb.d/create_exploits.sh"
+    echo ""
+    echo "   REMOTE DB mode — that command cannot work: there is no local"
+    echo "   postgres container, and create_exploits.sh needs CREATEROLE and"
+    echo "   CREATEDB, which the app role on a managed server does not have."
+    echo "   Run scripts/create-exploits-remote.sql on the DB host as a"
+    echo "   superuser, then add a pg_hba entry for the exploits database."
+    echo "   See Docs/DATABASE_SCHEMA.md (\"exploits database\")."
     MISSING=$((MISSING + 1))
 fi
 
