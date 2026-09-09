@@ -290,7 +290,12 @@ curl -X POST "http://<your-api-host>:8000/jobs/masscan-nmap/upload" \
 ## Notes
 - `findings` has `created_at` and `updated_at` (trigger updates on write).
 - UUIDs generated using `gen_random_uuid()` (**pgcrypto**), enabled in `setup_alldb.sql`.
-- `rag_documents.embedding` uses `vector(384)` (MiniLM L6). Index via IVFFLAT is included.
+- `rag_documents.embedding` uses `vector(384)` (MiniLM L6), with an IVFFLAT index
+  (`rag_docs_embedding_ivfflat`, `lists=100`). The table lives in the **scans**
+  database (`db_init/ensure_all_tables.sql`); until 2026-09-09 it was declared in
+  the `n8n` database while its writer connected to `scans`, so it existed nowhere
+  the code could reach — and the IVFFLAT index this line promised did not exist at
+  all. Populate it with `app/load_all.py` (re-runnable, not idempotent).
 - Only scan assets you are authorized to test.
 
 ## add extra software
