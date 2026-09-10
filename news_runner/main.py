@@ -49,7 +49,35 @@ class DeepSearchBody(BaseModel):
 
 
 class ItemActionBody(BaseModel):
-    item_id: str
+    """One item, or many. `item_id` is kept for the existing single-item
+    callers (rag-api's /news/items/{id}/enrich); `item_ids` carries an
+    operator's multi-select from the News page."""
+    item_id: Optional[str] = None
+    item_ids: Optional[list] = None
+
+
+# Enrichment is an LLM call per item. A select-all over thousands of rows must
+# not turn into thousands of LLM calls, so a batch beyond this is REFUSED
+# (429) rather than accepted and abandoned half-way.
+MAX_ENRICH_BATCH = int(os.environ.get("NEWS_MAX_ENRICH_BATCH", "100"))
+
+
+def _ids_from(body: "ItemActionBody") -> list:
+    """Collapse item_id + item_ids into one de-duplicated, order-stable list."""
+    seen, out = set(), []
+    for i in ([body.item_id] if body.item_id else []) + list(body.item_ids or []):
+        i = str(i).strip()
+        if i and i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
+def _require_one(body: "ItemActionBody") -> str:
+    ids = _ids_from(body)
+    if not ids:
+        raise HTTPException(400, "item_id is required")
+    return ids[0]
 
 
 @app.on_event("startup")
@@ -119,8 +147,9 @@ def jobs_deep_search(body: DeepSearchBody, background_tasks: BackgroundTasks,
 def jobs_match_assets(body: ItemActionBody, x_api_key: Optional[str] = None):
     _check_key(x_api_key)
     import psycopg2
+    item_id = _require_one(body)
     with psycopg2.connect(news_agent.DB_DSN) as conn:
-        hits = news_agent._match_assets(conn, body.item_id)
+        hits = news_agent._match_assets(conn, item_id)
     return {"ok": True, "asset_hits": hits}
 
 
@@ -128,16 +157,99 @@ def jobs_match_assets(body: ItemActionBody, x_api_key: Optional[str] = None):
 def jobs_github_search(body: ItemActionBody, x_api_key: Optional[str] = None):
     _check_key(x_api_key)
     import psycopg2
+    item_id = _require_one(body)
     with psycopg2.connect(news_agent.DB_DSN) as conn:
-        repos = news_agent._github_search(conn, body.item_id)
+        repos = news_agent._github_search(conn, item_id)
     return {"ok": True, "repos": repos}
 
 
 @app.post("/jobs/enrich")
-def jobs_enrich(body: ItemActionBody, x_api_key: Optional[str] = None):
+def jobs_enrich(body: ItemActionBody, background_tasks: BackgroundTasks,
+                x_api_key: Optional[str] = None):
+    """Enrich the items the operator selected — nothing else.
+
+    Ingest no longer LLM-enriches anything, so this is the only path that
+    spends an LLM call on a news item (plus deep-search's topic fan-out).
+
+    One id runs inline so the row is updated by the time the UI refetches.
+    Many run in the background: N LLM calls will outlive any sane HTTP
+    timeout, and admitting a request we then abandon wastes the work twice.
+    """
     _check_key(x_api_key)
-    n = news_agent._enrich_pending(limit=1, item_ids=[body.item_id])
-    return {"ok": True, "enriched": n}
+    ids = _ids_from(body)
+    if not ids:
+        raise HTTPException(400, "item_id or item_ids is required")
+    if len(ids) > MAX_ENRICH_BATCH:
+        raise HTTPException(
+            429,
+            f"{len(ids)} items exceeds NEWS_MAX_ENRICH_BATCH={MAX_ENRICH_BATCH}; "
+            f"narrow the selection and retry",
+        )
+
+    if len(ids) == 1:
+        r = news_agent._enrich_pending(limit=1, item_ids=ids)
+        news_agent._emit_webhook("news_items_enriched", "news_runner",
+                                 {**r, "item_ids": ids, "mode": "inline"})
+        # 429 upward: llm_query already retried with the provider's Retry-After,
+        # so reaching here means the quota is genuinely gone. Saying so beats
+        # returning enriched:0 and letting it read as "nothing to do".
+        if r["rate_limited"] and not r["enriched"]:
+            raise HTTPException(
+                429,
+                "LLM provider quota exhausted (rate limited after retries) — "
+                "the item was not enriched; retry later or lower load",
+            )
+        return {"ok": True, "requested": 1, "enriched": r["enriched"],
+                "rate_limited": r["rate_limited"], "failed": r["failed"],
+                "queued": 0}
+
+    def _bg():
+        try:
+            r = news_agent._enrich_pending(limit=len(ids), item_ids=ids)
+            news_agent._emit_webhook("news_items_enriched", "news_runner",
+                                     {**r, "item_ids": ids,
+                                      "mode": "background"})
+            if r["rate_limited"]:
+                # The operator cannot see a background return value, so the
+                # quota condition has to reach them another way.
+                news_agent._emit_webhook(
+                    "news_items_enrich_rate_limited", "news_runner",
+                    {**r, "note": "provider quota exhausted; some items "
+                                  "were not enriched"})
+        except Exception as e:
+            log.exception("bulk enrich failed")
+            news_agent._emit_webhook("news_items_enrich_failed", "news_runner",
+                                     {"requested": len(ids), "error": str(e)})
+
+    background_tasks.add_task(_bg)
+    news_agent._emit_webhook("news_items_enrich_dispatched", "news_runner",
+                             {"requested": len(ids), "item_ids": ids})
+    return {"ok": True, "requested": len(ids), "enriched": None,
+            "queued": len(ids)}
+
+
+@app.post("/jobs/stage2")
+def jobs_stage2(background_tasks: BackgroundTasks, x_api_key: Optional[str] = None):
+    """Asset-match + GitHub-PoC across items ALREADY flagged kev/rce.
+
+    This used to fire automatically at the end of every ingest. It is now
+    operator-triggered: the work is a GitHub API call plus an asset query per
+    item, and it is only meaningful once enrichment has flagged something.
+    """
+    _check_key(x_api_key)
+
+    def _bg():
+        try:
+            n = news_agent._stage2_for_flagged_items()
+            news_agent._emit_webhook("news_stage2_completed", "news_runner",
+                                     {"items_processed": n})
+        except Exception as e:
+            log.exception("stage2 failed")
+            news_agent._emit_webhook("news_stage2_failed", "news_runner",
+                                     {"error": str(e)})
+
+    background_tasks.add_task(_bg)
+    return {"ok": True, "queued": True}
 
 
 @app.post("/jobs/refresh-kev")

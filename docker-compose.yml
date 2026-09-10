@@ -712,7 +712,10 @@ services:
       retries: 15
 
   news-runner:
-    # Pulls 16 security feeds, dedupes by CVE/topic, LLM-enriches, runs daily.
+    # Pulls 16 security feeds, dedupes by CVE/topic, runs daily.
+    # Ingest does NOT LLM-enrich (changed 2026-09-10): it applies only the free
+    # deterministic KEV flag. Enrichment is operator-driven on selected items
+    # via POST /jobs/enrich, bounded by NEWS_MAX_ENRICH_BATCH.
     # Lives in its own container so feed scraping + LLM enrichment can't take
     # down rag-api. Communicates with rag-api over HTTP only for webhook emit.
     build:
@@ -741,6 +744,26 @@ services:
       # override would look broken rather than misconfigured.
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
       NEWS_AGENT_MODEL: ${NEWS_AGENT_MODEL:-gemma4:26b}
+      # Most items an operator can enrich in one selection. Beyond this the
+      # request is SHED with 429 rather than accepted and abandoned.
+      # 25, not 100: at the current Azure Foundry per-deployment TPM one big
+      # selection would monopolise the quota and 429 the agent sessions.
+      NEWS_MAX_ENRICH_BATCH: ${NEWS_MAX_ENRICH_BATCH:-25}
+      # Per-consumer model. Empty = the operator's default from
+      # Settings -> LLM Tuning. News does not need the frontier model the
+      # agents use, so give it a cheaper one here.
+      NEWS_LLM_MODEL: ${NEWS_LLM_MODEL:-}
+      # Point this at a LOCAL ollama to take news off the Azure quota entirely:
+      #   NEWS_LLM_URL=http://host.docker.internal:11434/api/generate
+      # (with NEWS_LLM_MODEL set to an ollama tag). Ollama's native
+      # /api/generate takes the same payload and returns the same
+      # {"response": ...}, so nothing else changes.
+      NEWS_LLM_URL: ${NEWS_LLM_URL:-}
+      # LLM goes through llm_query, which resolves the backend the operator
+      # actually configured (Settings -> LLM Tuning, app_settings.llm.*).
+      # Talking straight to ${OLLAMA_URL} silently failed every call here:
+      # there is no `ollama` container in this deployment.
+      LLM_QUERY_URL: ${LLM_QUERY_URL:-http://llm_query:8002}
       NEWS_AUTO_FETCH: ${NEWS_AUTO_FETCH:-1}
       NEWS_FETCH_INTERVAL_HOURS: ${NEWS_FETCH_INTERVAL_HOURS:-24}
       NEWS_FETCH_HOUR_LOCAL: ${NEWS_FETCH_HOUR_LOCAL:-6}
@@ -1808,6 +1831,11 @@ services:
           max-size: "50m"
           max-file: "5"
       environment:
+        # 429 backoff at the Azure chokepoint (see _post_with_429_retry).
+        # Waits honour the provider Retry-After when it sends one.
+        LLM_429_MAX_RETRIES: ${LLM_429_MAX_RETRIES:-3}
+        LLM_429_BASE_WAIT: ${LLM_429_BASE_WAIT:-5}
+        LLM_429_MAX_WAIT: ${LLM_429_MAX_WAIT:-60}
         BUILD_VERSION: ${BUILD_VERSION:-dev}
         TZ: ${TZ:-America/New_York}
         OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}

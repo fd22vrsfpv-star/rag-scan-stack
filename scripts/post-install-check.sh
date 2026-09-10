@@ -315,6 +315,78 @@ else
   warn "raw_artifacts.note/item_count check skipped (no DB connection helper available)"
 fi
 
+# RAG_API_URL must be https:// wherever it is set. rag-api is TLS-only, so an
+# http:// value returns an empty reply — and the fire-and-forget webhook
+# emitters swallow that, so the only symptom is "no webhook events ever".
+# Found 2026-09-10: .env had http://, and every news webhook silently vanished.
+for _svc in news-runner kali-listener; do
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$_svc"; then
+    _url=$(docker exec "$_svc" sh -c 'echo $RAG_API_URL' 2>/dev/null | tr -d '\r')
+    case "$_url" in
+      https://*) pass "$_svc RAG_API_URL is https ($_url)" ;;
+      http://*)  fail "$_svc RAG_API_URL is $_url — rag-api is TLS-only; webhook emits will fail SILENTLY. Set RAG_API_URL=https://rag-api:8000 in .env and recreate." ;;
+      "")        warn "$_svc RAG_API_URL is unset (falls back to the code default)" ;;
+      *)         warn "$_svc RAG_API_URL has an unexpected form: $_url" ;;
+    esac
+  else
+    warn "$_svc not running — RAG_API_URL scheme not checked"
+  fi
+done
+
+# Per-task LLM routing: the endpoint must respond AND llm_query must be able to
+# import the resolver. The import is soft in the code (a broken one degrades to
+# the global model silently), so it needs asserting here or per-task selection
+# stops working with no visible symptom.
+# Addressed by (project, service) via compose-target.sh — never `localhost:3002`
+# or `docker exec llm_query`. Both are GLOBAL: under a second compose project a
+# literal host port or container name reaches the LIVE stack and reports IT
+# healthy. Enforced by tests/test_rehearsal_isolation.py.
+for _ep in /api/settings/llm/routes /api/settings/llm/providers; do
+  _code=$(ct_http_code pentest-dashboard 443 "$_ep" 2>/dev/null || echo "000")
+  if [[ "$_code" =~ ^(200|401|403)$ ]]; then
+    pass "$_ep responding (HTTP $_code)"
+  elif [[ "$_code" != "000" ]]; then
+    fail "$_ep returned HTTP $_code — per-task model selection unavailable"
+  else
+    warn "$_ep not checked (dashboard unreachable)"
+  fi
+done
+
+# llm_query must be able to IMPORT the resolver. That import is soft in the
+# code (a failure degrades to the global model silently), so without this the
+# whole routing feature can stop working with no visible symptom.
+if ct_cid llm_query >/dev/null 2>&1; then
+  if ct_exec llm_query python -c "import sys; sys.path.insert(0,'/app'); from common.llm_settings import get_route; get_route('news')" >/dev/null 2>&1; then
+    pass "llm_query can resolve per-task LLM routes"
+  else
+    fail "llm_query cannot import common.llm_settings.get_route — per-task routing silently falls back to the global model. Check the ./common bind-mount."
+  fi
+else
+  warn "llm_query not running — per-task route resolution not checked"
+fi
+
+# news_items.published_at — the ARTICLE's publication date, distinct from
+# first_seen/last_seen (which are ingest times). Added 2026-09-10. Without it
+# GET /news/items returns published_at:null for every row and sort=published
+# raises "column does not exist".
+HAS_NEWS_PUB=$(_run_sql "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_items' AND column_name='published_at')")
+if [[ "$HAS_NEWS_PUB" == "t" ]]; then
+  pass "news_items.published_at column present"
+elif [[ "$HAS_NEWS_PUB" == "f" ]]; then
+  fail "news_items.published_at missing — run ./scripts/ensure_db_schema.sh"
+else
+  warn "news_items.published_at check skipped (no DB connection helper available)"
+fi
+
+HAS_NEWS_PUB_IDX=$(_run_sql "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename='news_items' AND indexname='idx_news_items_published_at')")
+if [[ "$HAS_NEWS_PUB_IDX" == "t" ]]; then
+  pass "idx_news_items_published_at present"
+elif [[ "$HAS_NEWS_PUB_IDX" == "f" ]]; then
+  fail "idx_news_items_published_at missing — run ./scripts/ensure_db_schema.sh"
+else
+  warn "idx_news_items_published_at check skipped (no DB connection helper available)"
+fi
+
 # idx_assets_engagement_ip — G3 discovery scan-loop hot lookup
 HAS_ENG_IDX=$(_run_sql "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename='assets' AND indexname='idx_assets_engagement_ip')")
 if [[ "$HAS_ENG_IDX" == "t" ]]; then

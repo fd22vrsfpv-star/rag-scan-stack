@@ -4,6 +4,19 @@ An open-source **workflow collector for authorized penetration testing and red t
 
 > **Authorized testing only.** This tool is built for engagements you have written permission to perform. Read [Authorized use](#authorized-use) before running it.
 
+> **New — multiple LLM backends, per-task routing, and rate-limit fallback.**
+> Configure **several named LLM providers at once** (two different Azure
+> resources, a local Ollama, OpenAI, Anthropic, vLLM — each with its own
+> endpoint, key and default model), then choose **which model each task uses**:
+> a frontier model for the exploit and analysis phases, something cheap or
+> local for high-volume news enrichment. Every task can name a **fallback
+> model used when its primary is rate-limited** past its retries, so a provider
+> quota limit degrades instead of failing. Model dropdowns list only models
+> that are **actually deployed**, and each provider has a **Test** button that
+> checks endpoint, auth, deployments and a real completion separately.
+> Configured in *Settings → LLM Tuning*; see
+> [`Docs/LLM-ROUTING.md`](Docs/LLM-ROUTING.md).
+
 ![RAG Scan Stack dashboard](presentation-materials/dashboard.png)
 
 *The main dashboard — engagement-scoped totals, findings-by-severity, live scans, and the most recent findings across every tool.*
@@ -89,7 +102,22 @@ A detection-rules engine raises **Follow-Ups** for items needing human attention
 
 ### (Optional) RAG-grounded AI agents — off by default
 
-LLM agents grounded in *your engagement's own findings* via RAG over **pgvector** — not generic CVE prose. Used for scan recommendation and analysis. Every recommendation is a reviewable timeline entry; every action is auditable. Runs against a local LLM (Ollama) so engagement data never leaves the host.
+LLM agents grounded in *your engagement's own findings* via RAG over **pgvector** — not generic CVE prose. Used for scan recommendation and analysis. Every recommendation is a reviewable timeline entry; every action is auditable.
+
+**Backends and per-task routing.** Several providers can be configured at once,
+each named, with its own endpoint, key and default model — so two separate
+Azure resources, or Azure alongside a local Ollama, work side by side. Each
+task (`recon`, `analyze`, `exploit`, `scan`, `postex`, `news`, `recommend`,
+`exploit_gen`, `extract`, `triage`, `chat`) picks its own model, and each can
+name a fallback used when the primary returns a rate limit its retries could
+not absorb. A task with no route configured uses the global model, so routing
+is opt-in.
+
+> **Data locality is your choice, and it is a real one.** Routing a task to a
+> local Ollama keeps that task's engagement data on the host. Routing it to
+> Azure, OpenAI or Anthropic sends the prompt — which includes findings,
+> hostnames and tool output — to that provider. Nothing is routed off-host
+> unless you configure a provider that is off-host.
 
 ---
 
@@ -178,6 +206,7 @@ The database can run **local** (default), **remote over an SSH tunnel**, or **re
 - [`Docs/KNOWLEDGE_BASE_GUIDE.md`](Docs/KNOWLEDGE_BASE_GUIDE.md) — teaching the AI: playbooks, per-service/port/technology prompts, training data, and converting lab walkthroughs into reusable rules
 - [`Docs/API_ENDPOINTS.md`](Docs/API_ENDPOINTS.md) / [`Docs/RAG_STACK_API_REFERENCE.md`](Docs/RAG_STACK_API_REFERENCE.md) — API reference
 - [`Docs/DEPLOYMENT.md`](Docs/DEPLOYMENT.md), [`Docs/QUICKSTART-MACOS.md`](Docs/QUICKSTART-MACOS.md), [`Docs/QUICKSTART-WINDOWS.md`](Docs/QUICKSTART-WINDOWS.md) — deployment guides
+- [`Docs/LLM-ROUTING.md`](Docs/LLM-ROUTING.md) — multiple LLM providers, per-task model routing, and rate-limit fallback
 - [`Docs/HEALTH_CHECK_GUIDE.md`](Docs/HEALTH_CHECK_GUIDE.md) — health checks and diagnostics
 
 ### Illustrated guides (PDF)

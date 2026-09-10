@@ -16,6 +16,10 @@ export interface NewsRunsResponse {
   results: NewsRun[]
 }
 
+/** relevance = offensive flags first (the default); published = newest
+ *  publication date first; last_seen = most recently re-seen first. */
+export type NewsSort = 'relevance' | 'published' | 'last_seen'
+
 export interface NewsListFilters {
   status?: NewsStatus
   hide_statuses?: string  // CSV
@@ -25,6 +29,8 @@ export interface NewsListFilters {
   red_team_only?: boolean
   q?: string
   since?: string  // ISO timestamp; items with last_seen >= since
+  published_since?: string  // ISO timestamp; items PUBLISHED at/after this
+  sort?: NewsSort
   include_deleted?: boolean
   limit?: number
   offset?: number
@@ -124,8 +130,22 @@ export function useUpdateNewsItem() {
 export function useBulkNewsAction() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (body: { ids: string[]; action: string; value?: string }) =>
-      apiFetch<{ updated: number }>('/news/items/bulk', {
+    mutationFn: (body: {
+      ids: string[]
+      action: 'set_status' | 'delete' | 'acknowledge' | 'clear_acknowledge' | 'enrich'
+      value?: string
+    }) =>
+      apiFetch<{
+        updated: number
+        // enrich only: `enriched` is null when the batch was backgrounded.
+        requested?: number
+        enriched?: number | null
+        // >0 means the LLM provider's quota ran out part-way through; the
+        // items are untouched and retrying later will work.
+        rate_limited?: number
+        failed?: number
+        queued?: number
+      }>('/news/items/bulk', {
         method: 'POST',
         body: JSON.stringify(body),
       }),
@@ -159,6 +179,19 @@ export function useGithubSearch() {
       }),
     onSuccess: (_data, id) => {
       qc.invalidateQueries({ queryKey: ['news', 'item', id] })
+      qc.invalidateQueries({ queryKey: ['news', 'items'] })
+    },
+  })
+}
+
+export function useNewsStage2() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () =>
+      apiFetch<{ ok: boolean; queued: boolean }>('/news/items/stage2', {
+        method: 'POST',
+      }),
+    onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['news', 'items'] })
     },
   })

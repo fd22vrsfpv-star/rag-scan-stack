@@ -1,14 +1,17 @@
 import httpx
 import json
+import logging
 import os
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from config import get_settings
 from engagement import engagement_headers
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from timeouts import TIMEOUT_NORMAL
 import time
 from utils import safe_json
+
+log = logging.getLogger("settings")
 
 router = APIRouter()
 
@@ -845,6 +848,597 @@ async def save_llm_settings(body: LlmSettingsBody):
                 if resp.status_code < 400:
                     updates[field] = True
     return {"ok": True, "updated": updates}
+
+
+# --- Per-task model routing -----------------------------------------------
+# One model for the whole stack is wrong in both directions: the frontier model
+# is wasted summarising news, and a cheap model fumbles tool calls in the
+# exploit phase. `llm.route.<task>` picks a model (optionally "backend:model")
+# per task, and `llm.route.<task>.fallback` says where to go when the primary is
+# rate-limited past its retries. Resolution lives in common/llm_settings.py so
+# every service agrees; this endpoint only reads and writes the keys.
+
+# Kept in sync with common/llm_settings.LLM_TASKS. Duplicated because the BFF
+# does not mount ./common — tests/test_llm_routing.py pins the two together.
+LLM_ROUTE_TASKS = [
+    ("recon", "Reconnaissance agent — host/service discovery reasoning"),
+    ("analyze", "Analyzer agent — findings triage and correlation"),
+    ("exploit", "Exploit agent — exploit selection and chain construction"),
+    ("scan", "Scanner agent — scan planning and next-step selection"),
+    ("postex", "Post-exploitation review"),
+    ("news", "Security-news enrichment (high volume, low difficulty)"),
+    ("recommend", "Scan recommender — per-service tool suggestions"),
+    ("exploit_gen", "Exploit/PoC script generation"),
+    ("extract", "Extractor learning — parsing tool output into fields"),
+    ("triage", "Cloud/artifact triage"),
+    ("chat", "Operator chat in the dashboard"),
+]
+
+
+async def _read_config(c, s, key: str) -> str:
+    """One app_settings value, or "" — a missing key is not an error here."""
+    try:
+        resp = await c.get(f"{s.rag_api_url}/settings/config/{key}",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code == 200:
+            return resp.json().get("value", "") or ""
+    except Exception as e:
+        log.warning("read %s failed: %s", key, str(e) or type(e).__name__)
+    return ""
+
+
+# --- Named provider instances ---------------------------------------------
+# The per-type keys (llm.azure_*, ...) allow exactly ONE config per backend
+# type, so two Azure resources cannot both be reachable. `llm.providers` holds
+# a JSON array of named instances; a route then names the INSTANCE
+# ("azure-claude:claude-sonnet-5"). The per-type keys remain honoured as
+# implicit providers, so nothing existing breaks.
+
+_PROVIDER_TYPES = ("azure", "openai", "anthropic", "ollama", "vllm")
+
+# Most catalog entries to return per provider. An Azure Foundry resource lists
+# 414 models of which one is deployed; the dropdown has to stay usable.
+CATALOG_CAP = 60
+_KEY_MASK = "********"
+
+
+def _mask_key(v: str) -> str:
+    """Never return a full API key to the browser."""
+    if not v:
+        return ""
+    return v[:4] + "..." + v[-4:] if len(v) > 10 else _KEY_MASK
+
+
+def _provider_choices(raw: str):
+    """[{id, type, default_model}] for the routing dropdowns.
+
+    Includes the implicit per-type providers, because those are what a
+    deployment with no llm.providers row has and a route may name them.
+    """
+    out = []
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            for e in parsed or []:
+                if isinstance(e, dict) and e.get("id") and e.get("enabled", True) is not False:
+                    out.append({"id": e["id"], "type": e.get("type", ""),
+                                "default_model": e.get("default_model", "")})
+        except Exception:
+            pass
+    have = {p["id"] for p in out}
+    for t in _PROVIDER_TYPES:
+        if t not in have:
+            out.append({"id": t, "type": t, "default_model": ""})
+    return out
+
+
+@router.get("/api/settings/llm/providers")
+async def get_llm_providers():
+    """Configured provider instances. API keys are masked."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15) as c:
+        raw = await _read_config(c, s, "llm.providers")
+    items, error = [], None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            for e in parsed or []:
+                if not isinstance(e, dict):
+                    continue
+                items.append({
+                    "id": e.get("id", ""),
+                    "type": e.get("type", ""),
+                    "endpoint": e.get("endpoint", ""),
+                    "api_key_masked": _mask_key(e.get("api_key") or ""),
+                    "has_api_key": bool(e.get("api_key")),
+                    "api_version": e.get("api_version", ""),
+                    "default_model": e.get("default_model", ""),
+                    "enabled": e.get("enabled", True) is not False,
+                })
+        except Exception as e:
+            # Surface a malformed blob instead of silently showing none — the
+            # resolver falls back to implicit providers, so the stack keeps
+            # working and this would otherwise look like "nothing configured".
+            error = f"llm.providers is not valid JSON: {str(e) or type(e).__name__}"
+    return {"providers": items, "types": list(_PROVIDER_TYPES), "error": error}
+
+
+class LlmProvider(BaseModel):
+    id: str
+    type: str
+    endpoint: Optional[str] = ""
+    # Omit or send the masked value to KEEP the stored key; send a new string
+    # to replace it. Without this a round-trip through the UI would overwrite
+    # every key with its own mask.
+    api_key: Optional[str] = None
+    api_version: Optional[str] = ""
+    default_model: Optional[str] = ""
+    enabled: Optional[bool] = True
+
+
+class LlmProvidersBody(BaseModel):
+    providers: List[LlmProvider]
+
+
+@router.put("/api/settings/llm/providers")
+async def put_llm_providers(body: LlmProvidersBody):
+    """Replace the provider list. Validates before writing anything."""
+    s = get_settings()
+
+    ids = [p.id.strip() for p in body.providers]
+    if any(not i for i in ids):
+        raise HTTPException(400, "every provider needs an id")
+    dupes = sorted({i for i in ids if ids.count(i) > 1})
+    if dupes:
+        raise HTTPException(400, f"duplicate provider id(s): {', '.join(dupes)}")
+    for p in body.providers:
+        if p.type not in _PROVIDER_TYPES:
+            raise HTTPException(400, f"provider {p.id!r}: unknown type {p.type!r}")
+        # A provider id containing ':' would break route parsing, which splits
+        # "<provider>:<model>" on the first colon.
+        if ":" in p.id:
+            raise HTTPException(400, f"provider id {p.id!r} may not contain ':'")
+
+    async with httpx.AsyncClient(timeout=15) as c:
+        existing_raw = await _read_config(c, s, "llm.providers")
+        existing = {}
+        if existing_raw:
+            try:
+                for e in json.loads(existing_raw) or []:
+                    if isinstance(e, dict) and e.get("id"):
+                        existing[e["id"]] = e
+            except Exception:
+                existing = {}
+
+        out = []
+        for p in body.providers:
+            prev = existing.get(p.id.strip(), {})
+            key = p.api_key
+            if key is None or key == _KEY_MASK or (
+                    prev.get("api_key") and key == _mask_key(prev["api_key"])):
+                key = prev.get("api_key", "")  # unchanged
+            out.append({
+                "id": p.id.strip(), "type": p.type,
+                "endpoint": (p.endpoint or "").strip(),
+                "api_key": key or "",
+                "api_version": (p.api_version or "").strip(),
+                "default_model": (p.default_model or "").strip(),
+                "enabled": p.enabled is not False,
+            })
+
+        resp = await c.put(
+            f"{s.rag_api_url}/settings/config/llm.providers",
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+            json={"value": json.dumps(out)})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:300])
+
+    return {"ok": True, "count": len(out),
+            "ids": [p["id"] for p in out],
+            "note": "takes effect within 30s (resolver cache TTL)"}
+
+
+@router.post("/api/settings/llm/providers/{provider_id}/test")
+async def test_llm_provider(provider_id: str):
+    """Connectivity check for ONE named provider, step by step.
+
+    Reports each stage separately, because "it does not work" has very
+    different causes that look identical from outside — and diagnosing two
+    misconfigured providers by hand is what prompted this:
+
+      * endpoint    — is the URL a shape we can build from? (a Foundry
+                      PROJECT url or the Responses-API url needs normalising)
+      * auth        — does the key work at all?
+      * deployments — how many models are actually deployed on the resource?
+                      A resource can authenticate fine and serve NOTHING.
+      * generate    — a real minimal completion on the default model. This is
+                      the only check that proves end-to-end usability;
+                      `404 DeploymentNotFound` here with deployments > 0 means
+                      the default_model names something not on THIS resource.
+
+    Uses the STORED key, never one from the browser.
+    """
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15) as c:
+        raw = await _read_config(c, s, "llm.providers")
+        legacy_ep = await _read_config(c, s, "llm.azure_endpoint")
+        legacy_key = await _read_config(c, s, "llm.azure_api_key")
+        legacy_model = await _read_config(c, s, "llm.azure_model")
+
+    prov = None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            for e in parsed or []:
+                if isinstance(e, dict) and e.get("id") == provider_id:
+                    prov = e
+                    break
+        except Exception as e:
+            raise HTTPException(400, f"llm.providers is not valid JSON: {e}")
+    if prov is None and provider_id == "azure":
+        prov = {"id": "azure", "type": "azure", "endpoint": legacy_ep,
+                "api_key": legacy_key, "default_model": legacy_model}
+    if prov is None:
+        raise HTTPException(404, f"no provider {provider_id!r}")
+
+    ptype = prov.get("type")
+    ep = (prov.get("endpoint") or "").strip()
+    key = prov.get("api_key") or ""
+    model = (prov.get("default_model") or "").strip()
+    checks = []
+
+    def add(name, ok, detail):
+        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    if not ep.startswith(("http://", "https://")):
+        add("endpoint", False, f"{ep!r} is not an http(s) URL")
+        return {"provider": provider_id, "type": ptype, "ok": False, "checks": checks}
+
+    root = _azure_root(ep) if ptype in ("azure", "openai") else ep.rstrip("/")
+    add("endpoint", True,
+        f"root {root}" + ("" if root == ep.rstrip("/") else f"  (normalised from {ep})"))
+
+    async with httpx.AsyncClient(timeout=45, verify=False) as c:
+        if ptype in ("azure", "openai"):
+            hdr = ({"api-key": key} if ptype == "azure"
+                   else {"Authorization": f"Bearer {key}"})
+            try:
+                r = await c.get(f"{root}/openai/deployments",
+                                params={"api-version": "2023-03-15-preview"},
+                                headers=hdr)
+                if r.status_code == 200:
+                    names = [d.get("id") for d in (r.json().get("data") or [])
+                             if isinstance(d, dict)
+                             and (d.get("status") or "succeeded") == "succeeded"]
+                    add("auth", True, "key accepted")
+                    add("deployments", bool(names),
+                        (", ".join(names) if names else
+                         "NONE — this resource authenticates but serves no "
+                         "models; the model you want is probably on a "
+                         "different resource"))
+                elif r.status_code in (401, 403):
+                    add("auth", False, f"HTTP {r.status_code} — key rejected")
+                else:
+                    add("auth", True, "reachable")
+                    add("deployments", False,
+                        f"listing returned HTTP {r.status_code}: {r.text[:120]}")
+            except Exception as e:
+                add("auth", False, f"unreachable: {str(e) or type(e).__name__}")
+        elif ptype == "ollama":
+            try:
+                r = await c.get(f"{root}/api/tags")
+                names = [m.get("name") for m in (r.json().get("models") or [])] \
+                    if r.status_code == 200 else []
+                add("reachable", r.status_code == 200, f"HTTP {r.status_code}")
+                add("models", bool(names), ", ".join(n for n in names if n) or "none installed")
+            except Exception as e:
+                add("reachable", False, f"unreachable: {str(e) or type(e).__name__}")
+
+        # The end-to-end check. Nothing else proves usability.
+        if not model:
+            add("generate", False, "no default model set — nothing to test")
+        else:
+            try:
+                if ptype in ("azure", "openai"):
+                    hdr = ({"api-key": key, "Content-Type": "application/json"}
+                           if ptype == "azure"
+                           else {"Authorization": f"Bearer {key}",
+                                 "Content-Type": "application/json"})
+                    body = {"model": model,
+                            "messages": [{"role": "user", "content": "Reply with only: OK"}],
+                            "max_tokens": 16}
+                    r = await c.post(f"{root}/openai/v1/chat/completions",
+                                     headers=hdr, json=body)
+                    # Same swap llm_query performs: the gpt-5 / o-series
+                    # families reject max_tokens.
+                    if r.status_code == 400 and "max_completion_tokens" in (r.text or ""):
+                        body.pop("max_tokens")
+                        body["max_completion_tokens"] = 2000
+                        r = await c.post(f"{root}/openai/v1/chat/completions",
+                                         headers=hdr, json=body)
+                    if r.status_code == 200:
+                        txt = r.json()["choices"][0]["message"]["content"]
+                        add("generate", True, f"{model} answered {txt.strip()[:40]!r}")
+                    else:
+                        code = ""
+                        try:
+                            code = r.json().get("error", {}).get("code", "")
+                        except Exception:
+                            pass
+                        add("generate", False,
+                            f"HTTP {r.status_code} {code} for model {model!r}"
+                            + (" — that model is not deployed on THIS resource"
+                               if str(code) == "DeploymentNotFound" else ""))
+                else:
+                    r = await c.post(f"{root}/api/generate",
+                                     json={"model": model, "prompt": "Reply with only: OK",
+                                           "stream": False})
+                    if r.status_code == 200:
+                        add("generate", True,
+                            f"{model} answered {str(r.json().get('response',''))[:40]!r}")
+                    else:
+                        add("generate", False, f"HTTP {r.status_code}: {r.text[:120]}")
+            except Exception as e:
+                add("generate", False, f"{str(e) or type(e).__name__}")
+
+    return {"provider": provider_id, "type": ptype,
+            "ok": all(ch["ok"] for ch in checks), "checks": checks}
+
+
+@router.get("/api/settings/llm/available-models")
+async def list_available_models():
+    """Selectable models per provider — ONLY ones that can actually be used.
+
+    The distinction that matters: `/openai/v1/models` on an Azure Foundry
+    resource returns the REGIONAL CATALOG (414 entries here) of which only the
+    DEPLOYED ones answer; picking any other gives DeploymentNotFound. The
+    deployments themselves come from
+
+        GET {endpoint}/openai/deployments?api-version=2023-03-15-preview
+
+    which is the only endpoint on this resource that lists them (the 2024-08-01
+    api-version returns 404). Deployment `id` is the name to send as the model.
+
+    Per type:
+      * azure (and an openai-typed provider pointing at an Azure host) ->
+        deployments, filtered to status == succeeded
+      * ollama -> /api/tags, which IS the real installed list
+      * openai (genuine) -> /v1/models, which is the usable list there
+      * anything unverifiable -> just the provider's configured default_model
+
+    `catalog_total` is returned for information only and is NOT selectable.
+    Always returns a list; discovery failing must not break the form.
+    """
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15) as c:
+        raw = await _read_config(c, s, "llm.providers")
+        legacy = {}
+        for k in ("llm.azure_endpoint", "llm.azure_api_key", "llm.azure_model",
+                  "llm.openai_base_url", "llm.openai_api_key", "llm.openai_model",
+                  "llm.ollama_url", "llm.ollama_model", "llm.anthropic_model"):
+            legacy[k.replace("llm.", "")] = await _read_config(c, s, k)
+
+    provs = []
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            for e in parsed or []:
+                if isinstance(e, dict) and e.get("id") and e.get("enabled", True) is not False:
+                    provs.append(e)
+        except Exception:
+            provs = []
+    have = {p["id"] for p in provs}
+    for t in _PROVIDER_TYPES:
+        if t in have:
+            continue
+        if t == "azure":
+            provs.append({"id": t, "type": t, "endpoint": legacy.get("azure_endpoint", ""),
+                          "api_key": legacy.get("azure_api_key", ""),
+                          "default_model": legacy.get("azure_model", "")})
+        elif t == "openai":
+            provs.append({"id": t, "type": t, "endpoint": legacy.get("openai_base_url", ""),
+                          "api_key": legacy.get("openai_api_key", ""),
+                          "default_model": legacy.get("openai_model", "")})
+        elif t == "ollama":
+            provs.append({"id": t, "type": t, "endpoint": legacy.get("ollama_url", ""),
+                          "api_key": "", "default_model": legacy.get("ollama_model", "")})
+        elif t == "anthropic":
+            provs.append({"id": t, "type": t, "endpoint": "", "api_key": "",
+                          "default_model": legacy.get("anthropic_model", "")})
+        else:
+            provs.append({"id": t, "type": t, "endpoint": "", "api_key": "",
+                          "default_model": ""})
+
+    out = []
+    async with httpx.AsyncClient(timeout=15, verify=False) as c:
+        for p in provs:
+            models, verified, err, note = [], False, None, None
+            catalog_total = 0
+            ptype = p.get("type")
+            ep = (p.get("endpoint") or "").rstrip("/")
+            key = p.get("api_key") or ""
+            dm = (p.get("default_model") or "").strip()
+
+            # An openai-typed provider whose base URL is an Azure host is still
+            # Azure underneath — its /v1/models is that same regional catalog.
+            azure_host = any(h in ep.lower() for h in
+                             ("services.ai.azure.com", "openai.azure.com"))
+            treat_as_azure = ptype == "azure" or (ptype == "openai" and azure_host)
+
+            try:
+                if treat_as_azure and ep.startswith(("http://", "https://")):
+                    root = _azure_root(ep)
+                    r = await c.get(
+                        f"{root}/openai/deployments",
+                        params={"api-version": "2023-03-15-preview"},
+                        headers={"api-key": key})
+                    if r.status_code == 200:
+                        for d in (r.json().get("data") or []):
+                            if not isinstance(d, dict):
+                                continue
+                            if (d.get("status") or "succeeded") != "succeeded":
+                                continue
+                            name = d.get("id") or d.get("model")
+                            if name and name not in models:
+                                models.append(name)
+                        verified = True
+                        note = f"{len(models)} deployment(s) on this resource"
+                    else:
+                        err = (f"deployments listing returned HTTP "
+                               f"{r.status_code}")
+                    # Informational only — never offered for selection.
+                    try:
+                        rc = await c.get(f"{root}/openai/v1/models",
+                                         headers={"api-key": key})
+                        if rc.status_code == 200:
+                            catalog_total = len(rc.json().get("data") or [])
+                    except Exception:
+                        pass
+                elif ptype == "ollama" and ep.startswith(("http://", "https://")):
+                    r = await c.get(f"{ep}/api/tags")
+                    if r.status_code == 200:
+                        for m in r.json().get("models", []):
+                            n = m.get("name") or m.get("model")
+                            if n and n not in models:
+                                models.append(n)
+                        verified = True
+                        note = f"{len(models)} model(s) installed"
+                elif ptype == "openai" and ep.startswith(("http://", "https://")):
+                    r = await c.get(f"{ep.rstrip('/')}/v1/models",
+                                    headers={"Authorization": f"Bearer {key}"})
+                    if r.status_code == 200:
+                        for m in (r.json().get("data") or []):
+                            n = m.get("id") if isinstance(m, dict) else None
+                            if n and n not in models:
+                                models.append(n)
+                        verified = True
+            except Exception as e:
+                err = str(e) or type(e).__name__
+
+            # The configured default is always selectable: it is what the
+            # provider uses today, so hiding it would make the current setting
+            # unpickable. Listed first.
+            if dm and dm not in models:
+                models.insert(0, dm)
+
+            out.append({
+                "provider": p["id"], "type": ptype,
+                "models": models,
+                "verified": verified,
+                "catalog_total": catalog_total,
+                "note": note,
+                "error": err,
+            })
+    return {"providers": out}
+
+
+def _azure_root(ep: str) -> str:
+    """Resource root from an Azure endpoint however it was typed.
+
+    Mirrors llm_query._azure_foundry_root, and additionally strips /responses --
+    which that function does NOT, so pasting the Responses-API URL there yields
+    a doubled path.
+    """
+    import re
+    b = ep.rstrip("/")
+    # A Foundry PROJECT endpoint (.../api/projects/<name>) is a shape the portal
+    # hands out; the deployments API lives on the RESOURCE, so strip it or the
+    # listing 400s.
+    b = re.sub(r"/api/projects/[^/]+/?$", "", b, flags=re.I)
+    return re.sub(r"(/openai)?(/v1)?(/chat/completions|/embeddings|/responses|/deployments)?/?$",
+                  "", b.rstrip("/"), flags=re.I).rstrip("/")
+
+
+@router.get("/api/settings/llm/routes")
+async def get_llm_routes():
+    """Per-task model routes, plus the global default and rate-limit fallback."""
+    s = get_settings()
+    out = []
+    async with httpx.AsyncClient(timeout=15) as c:
+        global_default = await _read_config(c, s, "llm.route.default")
+        global_fallback = await _read_config(c, s, "llm.route.default.fallback")
+        global_model = await _read_config(c, s, "llm.azure_model")
+        providers_raw = await _read_config(c, s, "llm.providers")
+        for task, desc in LLM_ROUTE_TASKS:
+            model = await _read_config(c, s, f"llm.route.{task}")
+            fb = await _read_config(c, s, f"llm.route.{task}.fallback")
+            out.append({
+                "task": task,
+                "description": desc,
+                "model": model,
+                "fallback": fb,
+                # What actually runs today, so a blank row is not ambiguous.
+                "effective": model or global_default or global_model or "",
+                "effective_fallback": fb or global_fallback or "",
+                "inherited": not model,
+            })
+    return {"tasks": out, "default": global_default,
+            "fallback": global_fallback, "global_model": global_model,
+            # So the UI can offer "<provider>:<model>" without the operator
+            # having to remember what is configured.
+            "providers": _provider_choices(providers_raw)}
+
+
+class LlmRouteBody(BaseModel):
+    """A partial update: only the tasks present are written.
+
+    An empty string CLEARS a route (the task goes back to inheriting), which is
+    why this cannot use exclude_none semantics alone — "" is meaningful.
+    """
+    routes: Optional[Dict[str, str]] = None
+    fallbacks: Optional[Dict[str, str]] = None
+    default: Optional[str] = None
+    default_fallback: Optional[str] = None
+
+
+@router.put("/api/settings/llm/routes")
+async def put_llm_routes(body: LlmRouteBody):
+    """Write per-task routes. Unknown task names are REJECTED rather than
+    silently stored — a typo'd task would create a key nothing ever reads."""
+    s = get_settings()
+    known = {t for t, _ in LLM_ROUTE_TASKS}
+    bad = sorted((set(body.routes or {}) | set(body.fallbacks or {})) - known)
+    if bad:
+        raise HTTPException(400, f"unknown task(s): {', '.join(bad)}")
+
+    writes = {}
+    for task, val in (body.routes or {}).items():
+        writes[f"llm.route.{task}"] = (val or "").strip()
+    for task, val in (body.fallbacks or {}).items():
+        writes[f"llm.route.{task}.fallback"] = (val or "").strip()
+    if body.default is not None:
+        writes["llm.route.default"] = body.default.strip()
+    if body.default_fallback is not None:
+        writes["llm.route.default.fallback"] = body.default_fallback.strip()
+
+    saved, failed = [], {}
+    async with httpx.AsyncClient(timeout=15) as c:
+        for key, val in writes.items():
+            try:
+                resp = await c.put(
+                    f"{s.rag_api_url}/settings/config/{key}",
+                    headers={"x-api-key": s.api_key, **engagement_headers()},
+                    json={"value": val})
+                if resp.status_code < 400:
+                    saved.append(key)
+                else:
+                    failed[key] = f"HTTP {resp.status_code}"
+            except Exception as e:
+                failed[key] = str(e) or type(e).__name__
+    if failed and not saved:
+        raise HTTPException(502, f"no routes saved: {failed}")
+    # Resolvers cache for 30s (common/llm_settings.CACHE_TTL), so a save is not
+    # instantly visible everywhere. Say so rather than letting it look ignored.
+    return {"ok": not failed, "saved": saved, "failed": failed,
+            "note": "takes effect within 30s (resolver cache TTL)"}
 
 
 @router.post("/api/settings/llm/test")

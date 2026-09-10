@@ -4,6 +4,7 @@
 # When LLM_BACKEND=azure, translates Ollama-format requests to Azure OpenAI / AI Foundry API.
 
 import os
+import time
 import logging
 import json
 from typing import Any, Dict, List, Optional, Iterator, Union
@@ -172,16 +173,30 @@ def _azure_is_foundry(base: str) -> bool:
 
 
 def _azure_foundry_root(base: str) -> str:
-    """Resource root for a Foundry endpoint, however it was typed
-    (…, …/openai, …/openai/v1, …/openai/v1/chat/completions)."""
+    """Resource root for a Foundry endpoint, however it was typed.
+
+    Handles …, …/openai, …/openai/v1, …/openai/v1/chat/completions,
+    …/openai/v1/responses (the Responses-API URL the portal shows, which is
+    NOT what this stack speaks) and …/api/projects/<name> (a Foundry PROJECT
+    endpoint). Each of those is something an operator can legitimately paste;
+    without stripping them the built URL doubles up and returns 400/404.
+    """
     import re
-    return re.sub(r'(/openai)?(/v1)?(/chat/completions|/embeddings)?/?$', '',
-                  base.rstrip('/'), flags=re.I).rstrip('/')
+    b = base.rstrip('/')
+    b = re.sub(r'/api/projects/[^/]+/?$', '', b, flags=re.I)
+    return re.sub(
+        r'(/openai)?(/v1)?(/chat/completions|/embeddings|/responses|/deployments)?/?$',
+        '', b.rstrip('/'), flags=re.I).rstrip('/')
 
 
-def _azure_chat_url(model: Optional[str] = None) -> str:
-    """Build Azure chat completions URL based on endpoint pattern."""
-    base = AZURE_ENDPOINT.rstrip("/")
+def _azure_chat_url(model: Optional[str] = None,
+                    endpoint: Optional[str] = None) -> str:
+    """Build Azure chat completions URL based on endpoint pattern.
+
+    `endpoint` overrides the global one so a named provider instance targets
+    its own resource.
+    """
+    base = (endpoint or AZURE_ENDPOINT).rstrip("/")
     mdl = model or AZURE_MODEL
     if _azure_is_foundry(base):
         # OpenAI-compatible: model goes in the body (see _azure_json_post).
@@ -202,19 +217,106 @@ def _azure_embed_url(model: Optional[str] = None) -> str:
     return f"{base}/openai/deployments/{mdl}/embeddings?api-version={AZURE_API_VERSION}"
 
 
-def _azure_headers() -> Dict[str, str]:
-    return {"api-key": AZURE_API_KEY, "Content-Type": "application/json"}
+def _azure_headers(api_key: Optional[str] = None) -> Dict[str, str]:
+    """Auth for one Azure call. `api_key` lets a named provider instance use
+    its OWN key instead of the global one -- required for two Azure resources
+    to be usable at the same time."""
+    return {"api-key": api_key or AZURE_API_KEY,
+            "Content-Type": "application/json"}
 
 
-def _azure_json_post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _caller_model(m):
+    """The model the caller asked for, or "" when it left the choice to us.
+
+    Consumers that do not care send "" (or omit it) and get the operator's
+    configured default; consumers that DO care -- news enrichment on a cheap
+    or local model, agents on a strong one -- name their own. An empty value
+    must stay empty rather than defaulting here, or "I don't care" and
+    "I want X" become indistinguishable one layer down.
+    """
+    m = (m or "").strip()
+    return _normalize_model(m) if m else ""
+
+
+# 429 backoff. Azure Foundry quota is per-deployment TPM, so a burst gets
+# RateLimitReached and the correct response is to wait, not to fail. This is
+# the single chokepoint every non-agent service reaches Azure through, so one
+# implementation here covers news, scan-recommender and anything added later.
+# The agents keep their own governor because they talk to Azure directly via
+# langchain (see autogen_agents/langgraph_engine.py::_RateLimitGovernor).
+LLM_429_MAX_RETRIES = int(os.environ.get("LLM_429_MAX_RETRIES") or 3)
+LLM_429_BASE_WAIT = float(os.environ.get("LLM_429_BASE_WAIT") or 5)
+LLM_429_MAX_WAIT = float(os.environ.get("LLM_429_MAX_WAIT") or 60)
+
+
+def _retry_after_seconds(resp):
+    """The provider's stated cool-down, if it gave one. Honouring what the
+    server says beats guessing at it."""
+    for h in ("retry-after", "Retry-After", "x-ratelimit-reset-requests"):
+        v = (resp.headers or {}).get(h)
+        if not v:
+            continue
+        try:
+            return max(0.0, float(str(v).rstrip("s")))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _post_with_429_retry(url: str, payload: Dict[str, Any],
+                         headers: Dict[str, str]):
+    """POST, retrying ONLY on 429.
+
+    Every other status is returned untouched for the caller's normal error
+    mapping: a 400 is a contract bug and retrying it just burns more quota.
+    """
+    wait = LLM_429_BASE_WAIT
+    resp = None
+    for attempt in range(LLM_429_MAX_RETRIES + 1):
+        resp = requests.post(url, json=payload, headers=headers,
+                             timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 429:
+            return resp
+        if attempt == LLM_429_MAX_RETRIES:
+            logger.warning("429 from %s after %s attempts - giving up",
+                           url, attempt + 1)
+            return resp
+        server = _retry_after_seconds(resp)
+        sleep_for = min(server if server is not None else wait, LLM_429_MAX_WAIT)
+        logger.warning("429 from %s (attempt %s/%s) - waiting %.1fs%s",
+                       url, attempt + 1, LLM_429_MAX_RETRIES + 1, sleep_for,
+                       " (server Retry-After)" if server is not None else "")
+        time.sleep(sleep_for)
+        wait = min(wait * 2, LLM_429_MAX_WAIT)
+    return resp
+
+
+def _azure_json_post(url: str, payload: Dict[str, Any],
+                     api_key: Optional[str] = None) -> Dict[str, Any]:
     """POST to Azure endpoint with API key auth."""
     # OpenAI-compatible Azure endpoints (Foundry /openai/v1, models.ai.azure.com)
     # take the model in the BODY; classic deployment URLs carry it in the path
     # (their URL ends with ?api-version=…, so this correctly skips them).
     if url.endswith("/chat/completions"):
-        payload = {**payload, "model": AZURE_MODEL}
+        # Only fill the model in when the caller did not set one -- this used to
+        # overwrite it unconditionally, discarding the per-request model that
+        # generate()/chat() had just resolved.
+        payload = {**payload, "model": payload.get("model") or AZURE_MODEL}
     try:
-        r = requests.post(url, json=payload, headers=_azure_headers(), timeout=REQUEST_TIMEOUT)
+        r = _post_with_429_retry(url, payload, _azure_headers(api_key))
+        # The gpt-5 / o-series families REJECT `max_tokens` and require
+        # `max_completion_tokens`; older deployments accept only `max_tokens`.
+        # Rather than maintain a model list that goes stale, swap the parameter
+        # once when the provider tells us to. Verified against gpt-5-mini:
+        # max_tokens -> 400 unsupported_parameter, max_completion_tokens -> 200.
+        if r.status_code == 400 and "max_tokens" in payload:
+            body = (r.text or "")
+            if "max_completion_tokens" in body:
+                retry = {k: v for k, v in payload.items() if k != "max_tokens"}
+                retry["max_completion_tokens"] = payload["max_tokens"]
+                logger.info("retrying %s with max_completion_tokens (model %r "
+                            "rejects max_tokens)", url, payload.get("model"))
+                r = _post_with_429_retry(url, retry, _azure_headers(api_key))
         r.raise_for_status()
         return r.json()
     except requests.HTTPError as e:
@@ -227,22 +329,27 @@ def _azure_json_post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 # ---------- OpenAI Helpers ----------
 
-def _openai_headers() -> Dict[str, str]:
-    return {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+def _openai_headers(api_key: Optional[str] = None) -> Dict[str, str]:
+    """`api_key` lets a named provider instance use its own key."""
+    return {"Authorization": f"Bearer {api_key or OPENAI_API_KEY}",
+            "Content-Type": "application/json"}
 
 
-def _openai_chat_url() -> str:
-    return f"{OPENAI_API_BASE.rstrip('/')}/v1/chat/completions"
+def _openai_chat_url(base: Optional[str] = None) -> str:
+    return f"{(base or OPENAI_API_BASE).rstrip('/')}/v1/chat/completions"
 
 
 def _openai_embed_url() -> str:
     return f"{OPENAI_API_BASE.rstrip('/')}/v1/embeddings"
 
 
-def _openai_json_post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _openai_json_post(url: str, payload: Dict[str, Any],
+                      api_key: Optional[str] = None) -> Dict[str, Any]:
     """POST to OpenAI endpoint."""
     try:
-        r = requests.post(url, json=payload, headers=_openai_headers(), timeout=REQUEST_TIMEOUT)
+        # 429 retry here too: OpenAI-compatible endpoints rate-limit the same
+        # way, and this is the same chokepoint.
+        r = _post_with_429_retry(url, payload, _openai_headers(api_key))
         r.raise_for_status()
         return r.json()
     except requests.HTTPError as e:
@@ -292,6 +399,11 @@ def _anthropic_extract_text(data: Dict) -> str:
 class GenerateRequest(BaseModel):
     prompt: str
     model: Optional[str] = Field(default=DEFAULT_MODEL, description="Default LLM model")
+    # Per-task routing. Naming a task ("news", "exploit", ...) lets the operator
+    # choose that task's model AND backend in Settings -> LLM Tuning without the
+    # caller knowing anything about models. An explicit `model` still wins, and
+    # no task at all behaves exactly as before.
+    task: Optional[str] = Field(default=None, description="Routing task name")
     stream: bool = False
     # any extra ollama options (temperature, top_p, seed, mirostat, etc.)
     options: Optional[Dict[str, Any]] = None
@@ -305,6 +417,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
     model: Optional[str] = Field(default=DEFAULT_MODEL, description="Default LLM model")
+    task: Optional[str] = Field(default=None, description="Routing task name")
     stream: bool = False
     options: Optional[Dict[str, Any]] = None
 
@@ -456,12 +569,175 @@ def ps():
         return {"models": [{"name": AZURE_MODEL, "backend": "azure"}]}
     return _json_get(_endpoint("/ps"))
 
+def _route_for(task: Optional[str], explicit_model: Optional[str]):
+    """Resolve (backend, model, fallback) for this request.
+
+    Precedence: an explicit `model` from the caller wins outright -- a service
+    that names a model has already decided. Otherwise the task's route decides.
+    With neither, the active globals apply, i.e. today's behaviour.
+    """
+    caller = _caller_model(explicit_model)
+    if caller:
+        return {"backend": LLM_BACKEND, "model": caller,
+                "source": "caller", "fallback": None}
+    if not task or get_llm_settings is None:
+        return {"backend": LLM_BACKEND, "model": AZURE_MODEL or DEFAULT_MODEL,
+                "source": "global", "fallback": None}
+    try:
+        from common.llm_settings import get_route
+        r = get_route(task)
+        logger.info("route task=%s -> %s:%s (%s)",
+                    task, r["backend"], r["model"], r["source"])
+        return r
+    except Exception as e:
+        # Routing must never take the LLM path down; fall back to the globals.
+        logger.warning("route lookup for task=%r failed (%s); using globals",
+                       task, e)
+        return {"backend": LLM_BACKEND, "model": AZURE_MODEL or DEFAULT_MODEL,
+                "source": "global", "fallback": None}
+
+
+def _generate_text(backend: str, model: str, prompt: str,
+                   options: Optional[Dict[str, Any]],
+                   endpoint: Optional[str] = None,
+                   api_key: Optional[str] = None) -> str:
+    """One prompt -> text, on an EXPLICITLY named backend and model.
+
+    Separate from generate() so a route can send a request to a backend other
+    than the globally-selected one -- that is what makes "news on a local
+    ollama while the agents stay on Azure" possible.
+    """
+    backend = (backend or "").lower()
+    temp = (options or {}).get("temperature")
+    top_p = (options or {}).get("top_p")
+
+    if backend == "azure":
+        payload: Dict[str, Any] = {
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 2048, "model": model,
+        }
+        if temp is not None:
+            payload["temperature"] = temp
+        if top_p is not None:
+            payload["top_p"] = top_p
+        # endpoint/api_key come from the named provider instance, so two
+        # Azure resources can be used side by side.
+        data = _azure_json_post(_azure_chat_url(model, endpoint), payload,
+                                api_key)
+        return data["choices"][0]["message"]["content"]
+
+    if backend == "openai":
+        payload = {"model": model,
+                   "messages": [{"role": "user", "content": prompt}],
+                   "max_tokens": 2048}
+        if temp is not None:
+            payload["temperature"] = temp
+        data = _openai_json_post(_openai_chat_url(endpoint), payload, api_key)
+        return data["choices"][0]["message"]["content"]
+
+    if backend == "anthropic":
+        data = _anthropic_json_post({
+            "model": model, "max_tokens": 2048,
+            "messages": [{"role": "user", "content": prompt}],
+        })
+        return _anthropic_extract_text(data)
+
+    # ollama / vllm — the native /api/generate shape. The provider's endpoint
+    # wins, which is how "news on a local ollama" works while the global
+    # OLLAMA_URL still points at a host that does not exist here.
+    base = endpoint or OLLAMA_URL
+    if not endpoint and backend == "vllm" and get_llm_settings is not None:
+        try:
+            base = get_llm_settings().get("vllm_url") or base
+        except Exception:
+            pass
+    body: Dict[str, Any] = {"model": model, "prompt": prompt, "stream": False}
+    if options:
+        body.update(options)
+    url = base.rstrip("/") + "/api/generate"
+    try:
+        r = _post_with_429_retry(url, body, {"Content-Type": "application/json"})
+        r.raise_for_status()
+        return r.json().get("response", "")
+    except requests.HTTPError as e:
+        raise _http_error_from_requests(e)
+    except requests.RequestException as e:
+        # A named provider pointing somewhere unreachable produced a bare 500
+        # ("Internal Server Error", no reason) because this branch was the only
+        # one without error mapping. Say WHICH provider and WHERE.
+        raise HTTPException(
+            502,
+            f"{backend} endpoint {url} unreachable: {str(e) or type(e).__name__}")
+
+
+def _generate_routed(route: Dict[str, Any], prompt: str,
+                     options: Optional[Dict[str, Any]]):
+    """Generate on the route's primary, failing over to its fallback on 429.
+
+    `_post_with_429_retry` has already waited out the provider's Retry-After by
+    the time a 429 reaches here, so the quota is genuinely gone and waiting
+    longer will not help -- a DIFFERENT model is the only thing that will. The
+    response says which one answered, because silently substituting a model the
+    operator did not choose would otherwise be invisible.
+    """
+    primary = (route.get("backend"), route.get("model"))
+    try:
+        text = _generate_text(primary[0], primary[1], prompt, options,
+                              route.get("endpoint"), route.get("api_key"))
+        return text, primary, False
+    except HTTPException as e:
+        fb = route.get("fallback")
+        if e.status_code != 429 or not fb:
+            # Failover is for 429 ONLY. Anything else is re-raised with the
+            # provider and task named: "provider X for task Y said Z" is
+            # actionable, a bare status code is not.
+            if e.status_code != 429:
+                raise HTTPException(
+                    e.status_code,
+                    f"provider {route.get('provider')!r} (task {route.get('task')!r}): "
+                    f"{e.detail}")
+            raise
+        logger.warning(
+            "429 exhausted on %s/%s:%s for task=%s — failing over to %s/%s:%s",
+            route.get("provider"), primary[0], primary[1], route.get("task"),
+            fb.get("provider"), fb["backend"], fb["model"])
+        text = _generate_text(fb["backend"], fb["model"], prompt, options,
+                              fb.get("endpoint"), fb.get("api_key"))
+        return text, (fb["backend"], fb["model"]), True
+
+
 @router.post("/generate")
 
 
 def generate(req: GenerateRequest):
+    # Per-task routing takes over whenever the caller names a task. It handles
+    # every backend itself (including one different from the global default)
+    # and fails over to the task's fallback model on an exhausted 429, so it
+    # short-circuits the per-backend branches below.
+    if req.task and not req.stream:
+        route = _route_for(req.task, req.model)
+        text, used, failed_over = _generate_routed(route, req.prompt, req.options)
+        return JSONResponse(content={
+            "model": used[1], "response": text, "done": True,
+            # Diagnostics: which route answered, and whether the primary was
+            # skipped. An operator debugging "why does this read like a small
+            # model" needs to see a failover happened.
+            "backend": used[0],
+            "provider": (route.get("fallback") or {}).get("provider")
+                        if failed_over else route.get("provider"),
+            "task": req.task,
+            "route_source": route.get("source"),
+            "failed_over": failed_over,
+        })
+
     if LLM_BACKEND == "azure":
-        model = AZURE_MODEL or _normalize_model(req.model)
+        # A model named by the CALLER wins; AZURE_MODEL is only the default.
+        # It used to be `AZURE_MODEL or req.model`, so the global model always
+        # won and no consumer could pick its own -- which is what made a cheap
+        # model for news and a strong one for the agents impossible.
+        # NOTE: embeddings() deliberately keeps the old behaviour; its model is
+        # a separate deployment and a chat model name there breaks the embedder.
+        model = _caller_model(req.model) or AZURE_MODEL
         payload: Dict[str, Any] = {
             "messages": [{"role": "user", "content": req.prompt}],
             "max_tokens": 2048,
@@ -471,6 +747,7 @@ def generate(req: GenerateRequest):
                 payload["temperature"] = req.options["temperature"]
             if "top_p" in req.options:
                 payload["top_p"] = req.options["top_p"]
+        payload["model"] = model
         url = _azure_chat_url(model)
         data = _azure_json_post(url, payload)
         content = data["choices"][0]["message"]["content"]
@@ -522,7 +799,13 @@ def generate(req: GenerateRequest):
 
 def chat(req: ChatRequest):
     if LLM_BACKEND == "azure":
-        model = AZURE_MODEL or _normalize_model(req.model)
+        # A model named by the CALLER wins; AZURE_MODEL is only the default.
+        # It used to be `AZURE_MODEL or req.model`, so the global model always
+        # won and no consumer could pick its own -- which is what made a cheap
+        # model for news and a strong one for the agents impossible.
+        # NOTE: embeddings() deliberately keeps the old behaviour; its model is
+        # a separate deployment and a chat model name there breaks the embedder.
+        model = _caller_model(req.model) or AZURE_MODEL
         payload: Dict[str, Any] = {
             "messages": [m.dict() for m in req.messages],
             "max_tokens": 2048,
@@ -532,6 +815,7 @@ def chat(req: ChatRequest):
                 payload["temperature"] = req.options["temperature"]
             if "top_p" in req.options:
                 payload["top_p"] = req.options["top_p"]
+        payload["model"] = model
         url = _azure_chat_url(model)
         data = _azure_json_post(url, payload)
         content = data["choices"][0]["message"]["content"]
