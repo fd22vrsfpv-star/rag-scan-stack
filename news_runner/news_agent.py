@@ -32,7 +32,30 @@ log.setLevel(logging.INFO)
 
 DB_DSN = os.environ.get("DB_DSN", "postgresql://app:app@rag-postgres:5432/scans")
 
-# LLM — mirror cloud_triage_agent's resolution chain.
+# LLM — route through the llm_query service, NOT straight at ollama.
+#
+# This module used to POST to `${OLLAMA_URL}/api/generate`, which resolves to
+# `http://ollama:11434` from .env. There is no `ollama` container in this
+# deployment, so EVERY news LLM call failed with NameResolutionError and was
+# swallowed by _call_llm's `except` -- 0 of 892 items had ever been enriched,
+# while the UI showed a permanent "enriching…" label.
+#
+# The effective backend lives in the dashboard DB (`app_settings.llm.*`, here
+# Azure/DeepSeek), not in env vars, and `llm_query` is the service that already
+# resolves it via common/llm_settings.py. Its /ollama/generate route returns
+# the same {"response": ...} shape this module already parses, so pointing at
+# it needs no change below.
+#
+# Override with NEWS_LLM_URL to talk to something else directly -- e.g. a local
+# ollama at http://host.docker.internal:11434/api/generate, whose native
+# /api/generate takes exactly the payload below and returns the same
+# {"response": ...}, so no code change is needed to move news off Azure.
+LLM_GENERATE_URL = (
+    os.environ.get("NEWS_LLM_URL")
+    or f'{os.environ.get("LLM_QUERY_URL", "http://llm_query:8002").rstrip("/")}/ollama/generate'
+)
+
+# Kept for the legacy direct-ollama path and for log/debug context only.
 OLLAMA_BASE = (
     os.environ.get("OLLAMA_BASE_URL")
     or os.environ.get("OLLAMA_URL")
@@ -43,6 +66,18 @@ LLM_MODEL = os.environ.get(
     os.environ.get("OLLAMA_MODEL", os.environ.get("LLM_MODEL", "gemma4:31b")),
 )
 LLM_TIMEOUT_S = int(os.environ.get("NEWS_AGENT_TIMEOUT_S", "240"))
+
+# Per-consumer model. "" = use whatever the operator configured in
+# Settings -> LLM Tuning (llm_query resolves it). Name a model here to give
+# news its own -- a cheap Azure deployment, or an ollama tag when NEWS_LLM_URL
+# points at a local ollama.
+NEWS_LLM_MODEL = (os.environ.get("NEWS_LLM_MODEL")
+                  or os.environ.get("NEWS_AGENT_MODEL_OVERRIDE") or "")
+
+# Distinct from None: None means "the call failed / gave unusable output" and
+# the item is skipped; _RATE_LIMITED means "the provider told us to slow down",
+# which is a quota condition the operator needs surfaced, not a bad item.
+_RATE_LIMITED = object()
 
 # Scheduler knobs.
 NEWS_AUTO_FETCH = os.environ.get("NEWS_AUTO_FETCH", "1") not in ("0", "false", "False", "")
@@ -102,16 +137,28 @@ _github_rate = {"remaining": 30, "reset": 0}
 
 def _emit_webhook(event_type: str, source: str, data: dict) -> None:
     """Fire-and-forget webhook — POST to rag-api which owns the webhook
-    dispatcher. Errors are swallowed so feed-fetch doesn't break on them."""
+    dispatcher. A failure must not break feed-fetch, so it is caught -- but it
+    is logged at WARNING with the URL, not debug.
+
+    Why: RAG_API_URL was `http://rag-api:8000` while rag-api is TLS-only. Every
+    emit failed on transport, the old `log.debug` hid it at the default level,
+    and the result was zero news webhook events with nothing in the log to say
+    so. A swallowed error still has to be audible.
+    """
+    url = f"{RAG_API_URL}/webhooks/emit"
     try:
-        requests.post(
-            f"{RAG_API_URL}/webhooks/emit",
+        resp = requests.post(
+            url,
             headers={"x-api-key": RAG_API_KEY, "Content-Type": "application/json"},
             json={"event_type": event_type, "source": source, "data": data},
             timeout=5, verify=False,
         )
+        # A 4xx here is a contract bug (missing `source` gives 422), not a blip.
+        if resp.status_code >= 400:
+            log.warning("[news] emit %s -> HTTP %s from %s: %s",
+                        event_type, resp.status_code, url, resp.text[:200])
     except Exception as e:
-        log.debug("emit_webhook failed (%s): %s", event_type, e)
+        log.warning("[news] emit %s to %s FAILED: %s", event_type, url, e)
 
 
 def _github_exploit_search(product: str, version: str, cve_ids: Optional[list] = None) -> list:
@@ -212,6 +259,7 @@ def _fetch_feed(url: str, parser: str) -> list:
             "title": title,
             "link": link,
             "published": published,
+            "published_at": _parse_published(entry, published),
             "raw_excerpt": excerpt,
         })
     return articles
@@ -221,7 +269,11 @@ def fetch_all_sources(run_id: Optional[str] = None,
                      enabled_only: bool = True,
                      source_id: Optional[str] = None) -> dict:
     """Walk every enabled source, normalize articles, dedupe-and-upsert into
-    news_items, then enrich. Returns aggregate counters."""
+    news_items, then apply the cheap deterministic KEV flag.
+
+    Does NOT LLM-enrich: that is operator-driven per selected item. Returns
+    aggregate counters (items_enriched is always 0 here, kept so existing
+    run-summary readers and the news_runs row keep their shape)."""
     stats = {"sources_fetched": 0, "articles_seen": 0, "items_new": 0,
              "items_updated": 0, "items_enriched": 0, "per_source": []}
     new_item_ids: list[str] = []
@@ -284,12 +336,36 @@ def fetch_all_sources(run_id: Optional[str] = None,
             if run_id:
                 _update_run(conn, run_id, stats)
 
-    # Stage 1 — LLM-enrich every freshly-touched item (capped).
-    enriched = _enrich_pending(limit=200)
-    stats["items_enriched"] = enriched
+    # LLM enrichment is deliberately NOT run here. Ingest used to LLM-enrich
+    # every freshly-touched item (up to 200) and then auto-run stage 2
+    # (asset-match + GitHub PoC) on everything it flagged kev/rce -- an
+    # unbounded LLM bill on every cycle, mostly spent on stories the operator
+    # never looks at. Enrichment is now operator-driven: select items in the
+    # News page and enrich those. See POST /jobs/enrich (one or many ids),
+    # /jobs/match-assets and /jobs/github-search, or deep_search() for a
+    # topic-wide fan-out.
+    #
+    # The one thing that DOES still run is the KEV flag: it is a local indexed
+    # lookup with no LLM call, and it is the signal the operator selects on --
+    # with no flags at all, every row looks alike.
+    try:
+        with _connect() as kconn:
+            stats["kev_flagged"] = _apply_kev_flags(kconn)
+    except Exception as e:
+        log.warning("[news] kev pass failed: %s", e)
+        stats["kev_flagged"] = 0
 
-    # Stage 2 — only on items where stage 1 flagged kev/rce.
-    _stage2_for_flagged_items()
+    stats["items_enriched"] = 0
+
+    _emit_webhook("news_ingest_completed", "news_agent", {
+        "run_id": run_id,
+        "sources_fetched": stats["sources_fetched"],
+        "articles_seen": stats["articles_seen"],
+        "items_new": stats["items_new"],
+        "items_updated": stats["items_updated"],
+        "kev_flagged": stats.get("kev_flagged", 0),
+        "auto_enriched": False,
+    })
 
     return stats
 
@@ -298,17 +374,62 @@ def fetch_all_sources(run_id: Optional[str] = None,
 # Dedup + upsert
 # ---------------------------------------------------------------------------
 
+def _parse_published(entry, raw: str):
+    """Best-effort ARTICLE publication date -> aware datetime, or None.
+
+    Three sources, in order of reliability:
+      1. feedparser's *_parsed struct_time (already normalized to UTC),
+      2. RFC-822 / RFC-2822 date strings (what RSS pubDate actually carries),
+      3. ISO-8601 (what Atom carries).
+
+    Returns None when the feed omits a date or it cannot be parsed. None is a
+    real answer here -- "this feed does not tell us" -- and must not be
+    silently replaced with now(), which would date every undated story to its
+    ingest time and make the column a duplicate of first_seen.
+    """
+    for key in ("published_parsed", "updated_parsed", "created_parsed"):
+        st = None
+        try:
+            st = entry.get(key)
+        except Exception:
+            st = None
+        if st:
+            try:
+                return datetime(*st[:6], tzinfo=timezone.utc)
+            except Exception:
+                pass
+
+    if not raw:
+        return None
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(raw)
+        if dt is not None:
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+    try:
+        dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+    log.debug("[news] unparseable published date %r", raw[:60])
+    return None
+
+
 def _dedupe_and_upsert(conn, article: dict, source_name: str) -> tuple[str, bool]:
     """Insert or update one news_items row. Returns (id, was_new)."""
     cves = _extract_cves(article["title"], article.get("raw_excerpt", ""))
     primary_cve = cves[0] if cves else None
     fp = _fingerprint(primary_cve, _normalize_title(article["title"]))
 
+    pub = article.get("published_at")
     article_obj = {
         "source": source_name,
         "title": article["title"],
         "link": article["link"],
         "published": article.get("published") or "",
+        "published_at": pub.isoformat() if pub else None,
         "raw_excerpt": (article.get("raw_excerpt") or "")[:1000],
     }
 
@@ -327,24 +448,28 @@ def _dedupe_and_upsert(conn, article: dict, source_name: str) -> tuple[str, bool
                     """UPDATE news_items
                           SET articles = articles || %s::jsonb,
                               all_cves = ARRAY(SELECT DISTINCT unnest(all_cves || %s::text[])),
+                              published_at = LEAST(published_at, %s),
                               last_seen = now()
                         WHERE id = %s""",
-                    (Json([article_obj]), cves, row["id"]),
+                    (Json([article_obj]), cves, pub, row["id"]),
                 )
             else:
                 cur.execute(
-                    "UPDATE news_items SET last_seen = now() WHERE id = %s",
-                    (row["id"],),
+                    """UPDATE news_items
+                          SET published_at = LEAST(published_at, %s),
+                              last_seen = now()
+                        WHERE id = %s""",
+                    (pub, row["id"]),
                 )
             conn.commit()
             return str(row["id"]), False
 
         cur.execute(
             """INSERT INTO news_items
-                (fingerprint, title, primary_cve, all_cves, articles)
-               VALUES (%s, %s, %s, %s, %s)
+                (fingerprint, title, primary_cve, all_cves, articles, published_at)
+               VALUES (%s, %s, %s, %s, %s, %s)
                RETURNING id""",
-            (fp, article["title"], primary_cve, cves, Json([article_obj])),
+            (fp, article["title"], primary_cve, cves, Json([article_obj]), pub),
         )
         new_id = str(cur.fetchone()["id"])
         conn.commit()
@@ -440,17 +565,40 @@ def _call_llm(prompt: str) -> Optional[dict]:
     """Returns the parsed JSON object, or None on any failure."""
     try:
         resp = requests.post(
-            f"{OLLAMA_BASE}/api/generate",
-            json={"model": LLM_MODEL, "prompt": prompt, "stream": False,
+            LLM_GENERATE_URL,
+            # NEWS_LLM_MODEL is the per-consumer choice: news does not need the
+            # frontier model the agents use. Empty means "operator's default",
+            # which llm_query resolves. Set it to an ollama tag together with
+            # NEWS_LLM_URL to run news enrichment on a LOCAL model and keep it
+            # off the Azure quota entirely.
+            json={"model": NEWS_LLM_MODEL,
+                  # Routing task: with NEWS_LLM_MODEL empty the operator's
+                  # `llm.route.news` decides the model AND backend, and its
+                  # fallback covers an exhausted rate limit. An explicit
+                  # NEWS_LLM_MODEL still wins. Harmless when talking straight
+                  # to a native ollama, which ignores unknown fields.
+                  "task": "news",
+                  "prompt": prompt, "stream": False,
                   "format": "json",
                   "options": {"temperature": 0.2, "num_predict": 1024}},
             timeout=LLM_TIMEOUT_S, verify=False,
         )
+        # 429 is NOT a failed item -- it is "come back later". llm_query already
+        # retries with the provider's Retry-After; if it still comes back 429
+        # the quota is genuinely exhausted, and the caller has to be told so
+        # instead of the item being recorded as simply not enriched.
+        if resp.status_code == 429:
+            log.warning("[news] LLM rate-limited (429) at %s: %s",
+                        LLM_GENERATE_URL, resp.text[:200])
+            return _RATE_LIMITED
         resp.raise_for_status()
         body = resp.json().get("response", "")
         return _extract_json(body)
     except Exception as e:
-        log.warning("[news] LLM call failed: %s", e)
+        # Loud, and naming the URL: the previous message said only
+        # "LLM call failed: <resolution error>", which read as a transient
+        # network blip rather than "this endpoint does not exist here".
+        log.warning("[news] LLM call to %s failed: %s", LLM_GENERATE_URL, e)
         return None
 
 
@@ -496,11 +644,102 @@ def _coerce_bool_or_null(v):
     return None
 
 
-def _enrich_pending(limit: int = 200, item_ids: Optional[list] = None) -> int:
+def _kev_for_cves(conn, cves: Iterable) -> Optional[bool]:
+    """Deterministic KEV decision: is any of these CVEs in the local CISA cache?
+
+    Returns None when there is nothing to check -- no CVEs means "unknown",
+    NOT "not in KEV". Writing False there would claim a fact we never
+    established, and the UI renders NULL as UNKNOWN for exactly this reason.
+
+    This is the ONLY place the KEV rule is expressed. Both the on-demand LLM
+    enrichment and the cheap ingest-time pass call it, so the two cannot drift.
+    """
+    checkable = sorted({str(c).upper().strip() for c in (cves or [])
+                        if c and str(c).upper().strip() not in ("", "UNKNOWN")})
+    if not checkable:
+        return None
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM cisa_kev_cache WHERE cve_id = ANY(%s) LIMIT 1",
+            (checkable,),
+        )
+        return cur.fetchone() is not None
+
+
+def _apply_kev_flags(conn, item_ids: Optional[list] = None, limit: int = 500) -> int:
+    """Flip kev_listed for items whose CVEs are in the KEV cache.
+
+    Costs one indexed lookup per item and NO LLM call, which is why this still
+    runs automatically at ingest while the LLM enrichment does not: without it
+    a freshly-ingested item carries no flags at all and the operator has
+    nothing to triage on when choosing what to enrich.
+
+    With no item_ids, sweeps items still awaiting a KEV decision (bounded by
+    `limit`), which also backfills rows ingested before this ran.
+    Returns the number of rows whose flag actually changed.
+    """
+    flipped = 0
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        if item_ids:
+            placeholders = ",".join(["%s::uuid"] * len(item_ids))
+            cur.execute(
+                f"""SELECT id, title, all_cves, primary_cve, kev_listed
+                      FROM news_items
+                     WHERE id IN ({placeholders})""",
+                [str(i) for i in item_ids],
+            )
+        else:
+            cur.execute(
+                """SELECT id, title, all_cves, primary_cve, kev_listed
+                     FROM news_items
+                    WHERE status <> 'deleted'
+                      AND kev_listed IS NULL
+                      AND (cardinality(all_cves) > 0 OR primary_cve IS NOT NULL)
+                    ORDER BY last_seen DESC
+                    LIMIT %s""",
+                (limit,),
+            )
+        rows = cur.fetchall()
+
+    for row in rows:
+        try:
+            cves = list(row["all_cves"] or [])
+            if row["primary_cve"]:
+                cves.append(row["primary_cve"])
+            kev = _kev_for_cves(conn, cves)
+            if kev is None or kev == row["kev_listed"]:
+                continue
+            with conn.cursor() as cur2:
+                cur2.execute(
+                    "UPDATE news_items SET kev_listed = %s WHERE id = %s::uuid",
+                    (kev, str(row["id"])),
+                )
+                conn.commit()
+            flipped += 1
+            if kev:
+                _emit_webhook("news_kev_match", "news_agent",
+                              {"id": str(row["id"]), "title": row["title"],
+                               "primary_cve": row["primary_cve"]})
+        except Exception as e:
+            log.warning("[news] kev flag failed for %s: %s", row["id"], e)
+            conn.rollback()
+    return flipped
+
+
+def _enrich_pending(limit: int = 200, item_ids: Optional[list] = None) -> dict:
     """LLM-enrich items where enriched_at IS NULL or last_seen > enriched_at.
-    Also flips kev_listed deterministically based on cisa_kev_cache.
-    Returns count of items successfully enriched."""
+
+    Returns {"enriched", "rate_limited", "failed", "requested"} rather than a
+    bare count. A bare count could not distinguish "3 of 5 items were bad" from
+    "the Azure quota ran out after 3" -- the operator sees a lower number in
+    both cases and cannot tell whether retrying would help.
+
+    Stops early once rate-limited: the remaining items would each burn another
+    request against an exhausted quota to learn the same thing.
+    """
     enriched = 0
+    rate_limited = 0
+    failed = 0
     with _connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             if item_ids:
@@ -531,7 +770,14 @@ def _enrich_pending(limit: int = 200, item_ids: Optional[list] = None) -> int:
                 )[:8000]
                 prompt = _ENRICH_PROMPT.format(articles_block=articles_block)
                 obj = _call_llm(prompt)
+                if obj is _RATE_LIMITED:
+                    rate_limited += 1
+                    log.warning("[news] stopping enrichment: provider quota "
+                                "exhausted after %s enriched, %s item(s) left",
+                                enriched, len(rows) - enriched - failed)
+                    break
                 if not obj:
+                    failed += 1
                     continue
 
                 # Some local LLMs spit long runs of newlines/whitespace into
@@ -548,29 +794,16 @@ def _enrich_pending(limit: int = 200, item_ids: Optional[list] = None) -> int:
                 breach = _coerce_bool_or_null(obj.get("active_internet_breach"))
                 patch = _coerce_bool_or_null(obj.get("patch_available"))
 
-                # Deterministic KEV flag — any matching CVE in the local cache flips it.
-                cves_to_check = list(row["all_cves"] or [])
-                if pcve and pcve != "UNKNOWN":
-                    cves_to_check.append(pcve)
-                kev = None
-                if cves_to_check:
-                    with conn.cursor() as cur2:
-                        cur2.execute(
-                            "SELECT 1 FROM cisa_kev_cache WHERE cve_id = ANY(%s) LIMIT 1",
-                            (cves_to_check,),
-                        )
-                        kev = cur2.fetchone() is not None
-
                 with conn.cursor() as cur2:
                     # Only overwrite primary_cve if we don't already have one and the LLM gave us a real CVE.
                     set_pcve = ""
                     args: list = [
-                        summary, rce, easy, mal, breach, patch, kev, str(row["id"]),
+                        summary, rce, easy, mal, breach, patch, str(row["id"]),
                     ]
                     if pcve and pcve != "UNKNOWN" and not row["primary_cve"]:
                         set_pcve = ", primary_cve = %s"
                         args = [
-                            summary, rce, easy, mal, breach, patch, kev, pcve, str(row["id"]),
+                            summary, rce, easy, mal, breach, patch, pcve, str(row["id"]),
                         ]
                     cur2.execute(
                         f"""UPDATE news_items
@@ -579,8 +812,7 @@ def _enrich_pending(limit: int = 200, item_ids: Optional[list] = None) -> int:
                                   easily_exploitable = %s,
                                   malware_exploitable = %s,
                                   active_internet_breach = %s,
-                                  patch_available = %s,
-                                  kev_listed = %s
+                                  patch_available = %s
                                   {set_pcve},
                                   enriched_at = now()
                             WHERE id = %s::uuid""",
@@ -589,14 +821,17 @@ def _enrich_pending(limit: int = 200, item_ids: Optional[list] = None) -> int:
                     conn.commit()
                 enriched += 1
 
-                if kev:
-                    _emit_webhook("news_kev_match", "news_agent",
-                                  {"id": str(row["id"]), "title": row["title"],
-                                   "primary_cve": pcve or row["primary_cve"]})
+                # KEV is decided by _apply_kev_flags, not here — it runs after
+                # the UPDATE so an LLM-discovered primary_cve is included, and
+                # it owns the news_kev_match emit so it fires once per flip.
+                _apply_kev_flags(conn, item_ids=[str(row["id"])])
             except Exception as e:
+                failed += 1
                 log.warning("[news] enrich failed for %s: %s", row["id"], e)
                 conn.rollback()
-    return enriched
+
+    return {"requested": len(rows), "enriched": enriched,
+            "rate_limited": rate_limited, "failed": failed}
 
 
 # ---------------------------------------------------------------------------

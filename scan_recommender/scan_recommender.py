@@ -2368,7 +2368,16 @@ def list_all_recommendations(
                        -- empty output box and no reason at all.
                        left(COALESCE(NULLIF(te.output, ''), te.error, ''), 400)
                                            AS result_preview,
-                       NULLIF(te.error, '') AS result_error,
+                       -- CAPPED. This was an uncapped NULLIF(te.error, ''),
+                       -- while result_preview immediately above it is capped at
+                       -- 400. A tool wrote a 27MB error blob and five failed
+                       -- rows made this response 133MB / 10.7s -- past the BFF's
+                       -- 10s httpx timeout, whose ReadTimeout stringifies to ""
+                       -- so the page showed "no recommendations" with an empty
+                       -- error. A listing endpoint must never return an
+                       -- unbounded column.
+                       left(NULLIF(te.error, ''), 2000) AS result_error,
+                       length(coalesce(te.error, '')) AS result_error_bytes,
                        -- Why a recommendation was suppressed. Without this the UI
                        -- can filter to status='skipped' but cannot say WHY, which
                        -- makes the decision unreviewable — and the operator has to
