@@ -3703,6 +3703,12 @@ CREATE TABLE IF NOT EXISTS public.news_items (
     github_links             jsonb NOT NULL DEFAULT '[]'::jsonb,
     asset_matches            jsonb NOT NULL DEFAULT '[]'::jsonb,
     -- Timestamps.
+    -- published_at is the ARTICLE's own publication date, parsed from the feed
+    -- (RSS pubDate / Atom updated). first_seen/last_seen are ingest times and
+    -- say nothing about how old the story is. NULL when the feed omits a date
+    -- or it cannot be parsed. For a multi-article item this is the EARLIEST
+    -- publication date, i.e. when the story first broke.
+    published_at             timestamptz,
     first_seen               timestamptz NOT NULL DEFAULT now(),
     last_seen                timestamptz NOT NULL DEFAULT now(),
     enriched_at              timestamptz,
@@ -3721,6 +3727,10 @@ CREATE INDEX IF NOT EXISTS idx_news_items_all_cves_gin
     ON public.news_items USING GIN(all_cves);
 CREATE INDEX IF NOT EXISTS idx_news_items_kev
     ON public.news_items(kev_listed) WHERE kev_listed = true;
+-- Added 2026-09-10: published_at for installs that predate the column.
+DO $$ BEGIN ALTER TABLE public.news_items ADD COLUMN IF NOT EXISTS published_at timestamptz; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+CREATE INDEX IF NOT EXISTS idx_news_items_published_at
+    ON public.news_items(published_at DESC NULLS LAST);
 
 -- Default news sources seeded on fresh install.  ON CONFLICT (url) DO
 -- NOTHING means existing installs aren't disturbed: only sources whose

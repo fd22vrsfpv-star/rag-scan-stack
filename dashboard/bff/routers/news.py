@@ -95,6 +95,8 @@ async def news_items_list(
     red_team_only: bool = Query(False),
     q: Optional[str] = Query(None),
     since: Optional[str] = Query(None),
+    published_since: Optional[str] = Query(None),
+    sort: str = Query("relevance"),
     include_deleted: bool = Query(False),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
@@ -102,9 +104,11 @@ async def news_items_list(
     params: dict[str, Any] = {
         "limit": limit, "offset": offset,
         "include_deleted": include_deleted, "red_team_only": red_team_only,
+        "sort": sort,
     }
     for k, v in (("status", status), ("hide_statuses", hide_statuses),
-                 ("cve", cve), ("q", q), ("since", since)):
+                 ("cve", cve), ("q", q), ("since", since),
+                 ("published_since", published_since)):
         if v is not None:
             params[k] = v
     if kev_listed is not None:
@@ -142,6 +146,15 @@ async def news_items_bulk(body: NewsBulkBody):
     async with _client() as c:
         resp = await c.post(_u("/news/items/bulk"),
                             json=body.model_dump(), headers=_h())
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.post("/api/news/items/stage2")
+async def news_items_stage2():
+    async with _client() as c:
+        resp = await c.post(_u("/news/items/stage2"), headers=_h())
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
         return safe_json(resp)

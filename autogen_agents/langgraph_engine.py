@@ -197,13 +197,71 @@ def _prompt_for(agent_name: str, default: str) -> str:
 
 
 # ── LLM client + metrics parity ──────────────────────────────────────────────
-def _chat_model():
+# Agent name -> routing task. The agents are the only LLM consumers whose
+# "task" is not obvious from the call site, because one engine runs all of
+# them; this is the mapping the operator's per-task model selection keys on.
+# An agent absent from here uses the global model, i.e. today's behaviour.
+_AGENT_TASK = {
+    "Reconnaissance": "recon",
+    "Recon": "recon",
+    "Analyzer": "analyze",
+    "Analysis": "analyze",
+    "Exploit": "exploit",
+    "Exploitation": "exploit",
+    "Scanner": "scan",
+    "PostExploitation": "postex",
+    "PostEx": "postex",
+    "Report": "analyze",
+}
+
+
+def task_for_agent(agent_name):
+    """The routing task for an agent, or None when it has no dedicated route."""
+    if not agent_name:
+        return None
+    return _AGENT_TASK.get(agent_name) or _AGENT_TASK.get(str(agent_name).strip())
+
+
+def _model_override_for_task(task):
+    """(model, backend) the operator selected for this task, or (None, None).
+
+    Soft import and never raises: a broken resolver must degrade to the global
+    model, not take the agent phase down.
+    """
+    if not task:
+        return None, None
+    try:
+        from common.llm_settings import get_route
+        r = get_route(task)
+        if r.get("source", "").startswith("route."):
+            return r.get("model"), r.get("backend")
+    except Exception as e:
+        _log.warning("route lookup for task=%r failed: %s", task, e)
+    return None, None
+
+
+def _chat_model(task=None):
     """A LangChain chat model targeting the SAME active backend AutoGen uses
-    (get_llm_config resolves dashboard-DB over env: Azure DeepSeek here)."""
+    (get_llm_config resolves dashboard-DB over env: Azure DeepSeek here).
+
+    When `task` has an operator-configured route, its MODEL replaces the global
+    one. The backend is deliberately NOT switched here: these agents need
+    reliable tool calling and each backend needs its own LangChain client, so
+    cross-backend agent routing is a separate change -- a route naming a
+    different backend logs and keeps the model only.
+    """
     from agent_config import get_llm_config
     cfg = (get_llm_config() or [{}])[0]
     at = (cfg.get("api_type") or "openai").lower()
     model, base_url, api_key = cfg.get("model"), cfg.get("base_url"), cfg.get("api_key")
+    routed_model, routed_backend = _model_override_for_task(task)
+    if routed_model:
+        if routed_backend and routed_backend != at:
+            _log.warning(
+                "route for task=%s names backend %r but the agent engine is on "
+                "%r; using the routed MODEL only", task, routed_backend, at)
+        _log.info("task=%s -> model %s (was %s)", task, routed_model, model)
+        model = routed_model
     temperature = cfg.get("temperature", 0.1)
     timeout = cfg.get("timeout", 120)
     if at == "azure":
@@ -582,7 +640,10 @@ def _llm_phase(session_id, *, agent_name: str, system: str, tool_names,
     # langchain meta-package.
     from langgraph.prebuilt import create_react_agent
     tools = _tools_for(tool_names)
-    agent = create_react_agent(_chat_model(), tools,
+    # Per-task model: _llm_phase knows the agent, and the agent decides the
+    # task (see _AGENT_TASK). This is the single place every agent phase builds
+    # its model, so routing here covers recon/analyze/exploit/scan/postex.
+    agent = create_react_agent(_chat_model(task_for_agent(agent_name)), tools,
                                prompt=_prompt_for(agent_name, system))
     out = _invoke_with_backoff(
         agent,

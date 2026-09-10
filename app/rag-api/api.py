@@ -2766,7 +2766,7 @@ def list_cloud_tenants(
 
 class NewsBulkBody(BaseModel):
     ids: list[str]
-    action: str  # 'set_status' | 'delete' | 'acknowledge' | 'clear_acknowledge'
+    action: str  # 'set_status' | 'delete' | 'acknowledge' | 'clear_acknowledge' | 'enrich'
     value: Optional[str] = None  # status name when action='set_status'
 
 
@@ -2801,6 +2801,24 @@ _NEWS_VALID_STATUSES = {"new", "reviewed", "follow_up", "applies",
                          "research", "future", "deleted"}
 
 
+# Sort modes for GET /news/items. Fixed table, never interpolated from user
+# input — `sort` is validated against these keys before the ORDER BY is built.
+# NULLS LAST on published_at: an item whose feed gave no date must not sort
+# above one that is genuinely today's news.
+_NEWS_SORTS = {
+    "relevance": (
+        "(CASE WHEN kev_listed             IS TRUE THEN 1 ELSE 0 END"
+        " + CASE WHEN rce                    IS TRUE THEN 1 ELSE 0 END"
+        " + CASE WHEN active_internet_breach IS TRUE THEN 1 ELSE 0 END"
+        " + CASE WHEN easily_exploitable     IS TRUE THEN 1 ELSE 0 END"
+        " + CASE WHEN malware_exploitable    IS TRUE THEN 1 ELSE 0 END) DESC,"
+        " last_seen DESC"
+    ),
+    "published": "published_at DESC NULLS LAST, last_seen DESC",
+    "last_seen": "last_seen DESC",
+}
+
+
 def _ser_news_item(r: dict) -> dict:
     return {
         "id": str(r["id"]),
@@ -2820,6 +2838,7 @@ def _ser_news_item(r: dict) -> dict:
         "articles": r["articles"] or [],
         "github_links": r["github_links"] or [],
         "asset_matches": r["asset_matches"] or [],
+        "published_at": r["published_at"].isoformat() if r.get("published_at") else None,
         "first_seen": r["first_seen"].isoformat() if r["first_seen"] else None,
         "last_seen": r["last_seen"].isoformat() if r["last_seen"] else None,
         "enriched_at": r["enriched_at"].isoformat() if r["enriched_at"] else None,
@@ -2921,6 +2940,8 @@ def news_items_list(
     red_team_only: bool = Query(False, description="Only items with at least one offensive flag (kev/rce/easy/itw/malware)"),
     q: Optional[str] = Query(None, description="Substring on title/summary"),
     since: Optional[str] = Query(None, description="ISO timestamp; only items with last_seen >= since"),
+    published_since: Optional[str] = Query(None, description="ISO timestamp; only items PUBLISHED at or after this (items with no published_at are excluded)"),
+    sort: str = Query("relevance", description="relevance (offensive flags first, then last_seen) | published (newest publication date first) | last_seen"),
     include_deleted: bool = Query(False),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
@@ -2957,7 +2978,15 @@ def news_items_list(
         params.extend([f"%{q}%", f"%{q}%"])
     if since:
         conds.append("last_seen >= %s::timestamptz"); params.append(since)
+    if published_since:
+        # An item with no published_at cannot be shown to satisfy "published
+        # since X" — NULL means the feed never told us, not "recent".
+        conds.append("published_at >= %s::timestamptz"); params.append(published_since)
     where = (" WHERE " + " AND ".join(conds)) if conds else ""
+
+    if sort not in _NEWS_SORTS:
+        raise HTTPException(400, f"sort must be one of {sorted(_NEWS_SORTS)}")
+    order_by = _NEWS_SORTS[sort]
 
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(f"SELECT count(*) AS n FROM news_items{where}", params)
@@ -2967,13 +2996,7 @@ def news_items_list(
         # when red_team_only is off.
         cur.execute(
             f"""SELECT * FROM news_items {where}
-                ORDER BY
-                    (CASE WHEN kev_listed             IS TRUE THEN 1 ELSE 0 END
-                   + CASE WHEN rce                    IS TRUE THEN 1 ELSE 0 END
-                   + CASE WHEN active_internet_breach IS TRUE THEN 1 ELSE 0 END
-                   + CASE WHEN easily_exploitable     IS TRUE THEN 1 ELSE 0 END
-                   + CASE WHEN malware_exploitable    IS TRUE THEN 1 ELSE 0 END) DESC,
-                    last_seen DESC
+                ORDER BY {order_by}
                 LIMIT %s OFFSET %s""",
             list(params) + [limit, offset],
         )
@@ -3054,6 +3077,24 @@ def news_items_bulk(body: NewsBulkBody, authorized: bool = Depends(auth)):
                     SET acknowledged_by = %s, acknowledged_at = now()
                   WHERE id = ANY(%s::uuid[])"""
         params = [ack, body.ids]
+    elif body.action == "enrich":
+        # The whole point of dropping auto-enrich: enrichment happens on the
+        # items the operator picked. news-runner runs >1 in the background and
+        # sheds (429) past NEWS_MAX_ENRICH_BATCH, so this returns fast.
+        out = _news_runner_post("/jobs/enrich", {"item_ids": list(body.ids)},
+                                timeout=300)
+        # Shape-compatible with the other actions ({"updated": n}) so existing
+        # callers keep working; `enriched` is null when it was backgrounded.
+        return {"updated": out.get("requested", len(body.ids)),
+                "requested": out.get("requested", len(body.ids)),
+                "enriched": out.get("enriched"),
+                # Passed through so the UI can say "3 enriched, 2 rate-limited"
+                # rather than showing a number lower than the selection with no
+                # explanation. A 429 from news-runner (quota gone, nothing
+                # enriched) propagates as a 429 via _news_runner_post.
+                "rate_limited": out.get("rate_limited", 0),
+                "failed": out.get("failed", 0),
+                "queued": out.get("queued", 0)}
     elif body.action == "clear_acknowledge":
         sql = """UPDATE news_items
                     SET acknowledged_by = NULL, acknowledged_at = NULL
@@ -3081,6 +3122,15 @@ def news_item_github_search(item_id: str, authorized: bool = Depends(auth)):
 @app.post("/news/items/{item_id}/enrich", tags=["News"])
 def news_item_enrich(item_id: str, authorized: bool = Depends(auth)):
     return _news_runner_post("/jobs/enrich", {"item_id": item_id}, timeout=300)
+
+
+@app.post("/news/items/stage2", tags=["News"])
+def news_items_stage2(authorized: bool = Depends(auth)):
+    """Run asset-match + GitHub-PoC across items already flagged kev/rce.
+
+    Previously fired automatically at the end of every ingest; now explicit.
+    """
+    return _news_runner_post("/jobs/stage2", {}, timeout=30)
 
 
 @app.post("/news/deep-search", tags=["News"])

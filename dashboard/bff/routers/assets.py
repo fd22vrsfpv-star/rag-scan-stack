@@ -618,7 +618,14 @@ async def list_scan_recommendations(
                 return safe_json(resp)
             return {"recommendations": [], "error": f"recommender returned {resp.status_code}"}
     except Exception as e:
-        return {"recommendations": [], "error": str(e)}
+        # `str(e)` is EMPTY for httpx timeouts, so this used to return
+        # {"recommendations": [], "error": ""} -- a page showing nothing with no
+        # stated reason, which is how a 133MB result_error column stayed hidden.
+        # Always give the exception type when there is no message.
+        detail = str(e) or type(e).__name__
+        log.warning("scan-recommendations listing failed (status=%s): %s",
+                    status, detail)
+        return {"recommendations": [], "error": detail}
 
 
 class AddScanRecommendationRequest(BaseModel):
@@ -2566,15 +2573,26 @@ TOOL_INSTALL_MAP = {
 async def list_tool_executions(limit: int = 50):
     """Recent Kali tool executions (the output of Kali-dispatched recs)."""
     s = get_settings()
-    async with httpx.AsyncClient(timeout=10) as c:
-        resp = await c.get(
-            f"{s.kali_listener_url}/tools/executions",
-            params={"limit": limit},
-            headers={"x-api-key": s.api_key, **engagement_headers()},
-        )
-        if resp.status_code >= 400:
-            raise HTTPException(resp.status_code, resp.text[:300])
-        return safe_json(resp)
+    # 30s, not 10: a listing of 50 executions is normally milliseconds, but this
+    # had no error handling at all, so an upstream timeout surfaced as a bare
+    # 500 with no reason. The real fix is upstream (output/error are capped now);
+    # this makes the failure legible if it happens again.
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            resp = await c.get(
+                f"{s.kali_listener_url}/tools/executions",
+                params={"limit": limit},
+                headers={"x-api-key": s.api_key, **engagement_headers()},
+            )
+            if resp.status_code >= 400:
+                raise HTTPException(resp.status_code, resp.text[:300])
+            return safe_json(resp)
+    except HTTPException:
+        raise
+    except Exception as e:
+        detail = str(e) or type(e).__name__
+        log.warning("tool executions listing failed: %s", detail)
+        raise HTTPException(502, f"kali-listener unreachable: {detail}")
 
 
 @router.get("/api/tools/executions/{exec_id}")
