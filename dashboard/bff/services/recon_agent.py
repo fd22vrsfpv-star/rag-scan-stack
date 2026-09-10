@@ -133,6 +133,47 @@ def _guess_target_type(target: str) -> str:
 _RECON_OWN_CAP = os.environ.get("RECON_AGENT_MAX_CONCURRENT", "").strip()
 
 
+# Per-cycle dispatch budget.
+#
+# Raised from 5/2 to 10/4 (2026-09-10, carrying the finding from PR #37):
+# live-watching the agent drain a large KB queue showed it was always
+# CONCURRENT-CAP-bound, never dispatch-budget-bound. Most real scans
+# (nmap/nuclei/hydra) run 30s-3min, so with the shared cap freeing a slot every
+# ~90s the old 5/2 budget was never the limiter -- it just made the intent of
+# the setting misleading.
+#
+# Raising it cannot raise scan volume: every dispatch site clamps to
+# `min(max_dispatches - dispatched, _recon_concurrency() - current_running)`,
+# and `_recon_concurrency()` IS the operator's MAX_CONCURRENT_SCANS. This is a
+# budget on how much work one cycle may CONSIDER, not on how much may run.
+#
+# NB: PR #37 also proposed bumping a private MAX_CONCURRENT_RECON_SCANS default
+# 3 -> 6. That constant no longer exists: commit 9eb36b8 removed it precisely
+# because a private concurrency number defeats the shared cap. Only the
+# dispatch-budget half of that PR is carried here.
+_DISPATCH_BUDGET_DEFAULTS = {"pentest": 10, "redteam": 4}
+_DISPATCH_BUDGET_FALLBACK = 4
+
+
+def _dispatch_budget(config: dict, profile: str) -> int:
+    """How many dispatches one cycle may make, before the concurrency clamp.
+
+    An explicit `max_dispatches_per_cycle` in the engagement config always
+    wins. Redteam stays lower than pentest for OPSEC, and an unknown profile
+    gets the CONSERVATIVE default rather than the permissive one -- a typo in
+    the profile name must not quietly widen the budget.
+    """
+    explicit = (config or {}).get("max_dispatches_per_cycle")
+    if explicit is not None:
+        try:
+            return max(0, int(explicit))
+        except (TypeError, ValueError):
+            log.warning("max_dispatches_per_cycle=%r is not an integer — "
+                        "using the %s default", explicit, profile)
+    return _DISPATCH_BUDGET_DEFAULTS.get(
+        (profile or "").strip().lower(), _DISPATCH_BUDGET_FALLBACK)
+
+
 def _recon_concurrency() -> int:
     """The recon agent's concurrent-scan ceiling.
 
@@ -423,7 +464,7 @@ class ReconAgent:
         headers = {"x-api-key": s.api_key}
         profile = config.get("profile", "pentest")
         interval = agent_state.get("interval_sec", 300)
-        max_dispatches = config.get("max_dispatches_per_cycle", 5 if profile == "pentest" else 2)
+        max_dispatches = _dispatch_budget(config, profile)
         dispatched = 0
         # KB-driven recon: skip the legacy hardcoded stage 3 (httpx) / stage 4
         # (nuclei) dispatches and instead drain the scan_recommendations queue
