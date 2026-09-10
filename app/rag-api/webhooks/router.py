@@ -514,50 +514,33 @@ _SELF_SINK_URL = os.environ.get(
     "https://127.0.0.1:8000/webhooks/sink",
 )
 
-# Every event type emitted by any scanner
-_ALL_EVENT_TYPES = [
-    "scan_started", "scan_completed", "scan_failed", "scan_stopped",
-    "scan_summary",
-    "platform_halted", "platform_resumed",
-    "stage_started", "stage_completed", "stage_failed",
-    "finding_high", "finding_critical", "finding_exploitable",
-    "ingest_completed",
-    # Audit trail for operator/agent review actions (self-adapting extractors +
-    # agent-to-agent feedback). Captured in webhook_events as an append-only log.
-    "extractor_rule_reviewed", "agent_flag_reviewed", "agent_flag",
-    # LangGraph agent engine (Docs/LANGGRAPH_MIGRATION_PLAN.md). This list is an
-    # ALLOW-LIST, not a catch-all: an event type missing from it is emitted,
-    # answered 200, and then silently dropped — so the langgraph events were
-    # firing correctly and never reaching the Agent Activity timeline that reads
-    # webhook_events. Every new emitter must add its types here.
-    "langgraph_session_started", "langgraph_session_completed",
-    "langgraph_session_failed", "langgraph_session_resumed",
-    "langgraph_phase_completed", "langgraph_scan_dispatched",
-    "langgraph_awaiting_approval", "langgraph_exploit_decision",
-    "langgraph_exploit_executed",
-    # Surface-test phase (attack-surface analysis + custom test generation).
-    "langgraph_surface_analyzed", "langgraph_surface_test_planned",
-    "langgraph_surface_test_executed", "langgraph_surface_test_completed",
-    "langgraph_surface_decision",
-    # Phase 0 orchestration seam: the recon loop hands off to a full session.
-    "recon_agent_pipeline_launched",
-    "credential_reuse_sprayed",
-    "postex_enumerated", "langgraph_postex_enumerated",
-    # WSTG-CONF-06 webshell-upload proof (exploit-runner source=webshell). A
-    # writable WebDAV collection uploaded a shell and executed a command.
-    "webshell_proven", "webshell_deploy_failed",
-    "langgraph_web_pipeline_dispatched",
-    # Operator maintenance actions surfaced in the dashboard (Maintenance page):
-    # applying the canonical schema DDL, and seeding knowledge/seed/*.yaml into
-    # service_prompts + the RAG store. Both mutate shared state, so they belong
-    # in the append-only webhook_events audit log.
-    "maintenance_schema_applied", "maintenance_schema_apply_failed",
-    "maintenance_knowledge_seeded", "maintenance_knowledge_seed_failed",
-    # etl/backfill_rag_documents.py — embeds findings into rag_documents. It
-    # rewrites a shared corpus, so it belongs in the append-only audit log for
-    # the same reason the two above do.
-    "maintenance_rag_backfilled", "maintenance_rag_backfill_failed",
-]
+# There is deliberately NO event-type list for the event-log webhook.
+#
+# dispatcher.emit_webhook filters like this:
+#
+#     if webhook["event_types"] and event_type not in webhook["event_types"]:
+#         continue
+#
+# so an EMPTY event_types means "match everything" — which is what a catch-all
+# sink wants, and what this webhook's own docstring has always claimed to be.
+#
+# It used to be created with a hand-maintained list of 44 types instead, and
+# that turned the catch-all into an ALLOW-LIST. Every emitter added since then
+# had to remember to append its type here, and a repo-wide scan on 2026-09-09
+# found **113 literal event types that were emitted and not listed** —
+# agent_scan_completed, artifacts_pruned, bulk_check_completed,
+# credential_bridge_completed and 109 more. Each was accepted with HTTP 200 and
+# then silently discarded: nothing in webhook_events, nothing on the Agent
+# Activity timeline, no error anywhere. Two separate sessions have debugged an
+# empty timeline caused by this.
+#
+# The list is gone rather than completed, because completing it would only work
+# until the next emitter is written. Filtering belongs on OPERATOR-configured
+# webhooks (Slack, n8n), which set their own event_types; the internal audit
+# sink records what actually happened.
+#
+# `_BFF_EVENT_TYPES` below is a genuine filter and stays: the dashboard pushes a
+# deliberately small set to the browser over its WebSocket.
 
 
 _BFF_WEBHOOK_NAME = "dashboard-bff"
@@ -602,20 +585,24 @@ def ensure_default_webhook() -> bool:
                 (_DEFAULT_WEBHOOK_NAME,),
             )
             if cur.fetchone():
-                # Update event_types in case new ones were added
+                # Clear any event-type filter left over from when this was an
+                # allow-list. NULL = catch-all, which is the whole point of
+                # this webhook; a stale 44-entry array here silently drops
+                # everything that is not in it.
                 cur.execute(
-                    "UPDATE webhooks SET event_types = %s WHERE name = %s",
-                    (_ALL_EVENT_TYPES, _DEFAULT_WEBHOOK_NAME),
+                    "UPDATE webhooks SET event_types = NULL WHERE name = %s",
+                    (_DEFAULT_WEBHOOK_NAME,),
                 )
-                log.info("Default '%s' webhook updated with current event types", _DEFAULT_WEBHOOK_NAME)
+                log.info("Default '%s' webhook set to catch-all (no event-type filter)",
+                         _DEFAULT_WEBHOOK_NAME)
             else:
                 cur.execute("""
                     INSERT INTO webhooks
                         (name, url, secret, enabled, event_types, sources, severities,
                          max_retries, timeout_ms)
-                    VALUES (%s, %s, NULL, true, %s, NULL, NULL, 0, 3000)
+                    VALUES (%s, %s, NULL, true, NULL, NULL, NULL, 0, 3000)
                     RETURNING id
-                """, (_DEFAULT_WEBHOOK_NAME, _SELF_SINK_URL, _ALL_EVENT_TYPES))
+                """, (_DEFAULT_WEBHOOK_NAME, _SELF_SINK_URL))
                 wh_id = cur.fetchone()["id"]
                 log.info("Registered default '%s' webhook (id=%s) → %s",
                          _DEFAULT_WEBHOOK_NAME, wh_id, _SELF_SINK_URL)
