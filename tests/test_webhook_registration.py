@@ -157,36 +157,68 @@ def test_the_task_global_is_declared():
         "_webhook_registration_task has no module-level declaration"
     )
 
-# ── The allow-list, for the event types this session added ─────────────────
+# ── The event-log sink must filter NOTHING ─────────────────────────────────
 #
-# `_ALL_EVENT_TYPES` in the router is an ALLOW-LIST held on the `event-log`
-# webhook row. A type missing from it is emitted, answered **200**, and then
-# silently discarded — nothing appears in webhook_events and nothing appears on
-# the Agent Activity timeline. There is no error anywhere.
+# dispatcher.emit_webhook:
 #
-# Narrow on purpose. A repo-wide version of this check finds **113** literal
-# event types that are emitted and NOT listed, so asserting the general rule
-# here would land red, and CLAUDE.md is explicit that a permanently red
-# baseline makes a new failure invisible. That backlog wants a
-# WEBHOOK_UNLISTED_DEBT ratchet of its own, in its own change; this pins the
-# family added alongside etl/backfill_rag_documents.py so it cannot rot the way
-# the other 113 did. Precedent: test_langgraph_phases.py does the same for the
-# langgraph_surface_* family.
-MAINTENANCE_EVENTS = (
-    "maintenance_schema_applied", "maintenance_schema_apply_failed",
-    "maintenance_knowledge_seeded", "maintenance_knowledge_seed_failed",
-    "maintenance_rag_backfilled", "maintenance_rag_backfill_failed",
-)
-
-
-def test_maintenance_event_types_are_allow_listed():
+#     if webhook["event_types"] and event_type not in webhook["event_types"]:
+#         continue
+#
+# So an EMPTY event_types matches everything. The `event-log` webhook is the
+# internal audit sink and is supposed to be exactly that — its own docstring
+# says "catch-all" — but ensure_default_webhook used to write a hand-maintained
+# 44-entry list into it, which made it an ALLOW-LIST.
+#
+# A repo-wide scan on 2026-09-09 found **113** literal event types that were
+# emitted and not on that list: agent_scan_completed, artifacts_pruned,
+# bulk_check_completed, credential_bridge_completed and 109 more. Every one was
+# accepted with HTTP 200 and discarded — nothing in webhook_events, nothing on
+# the Agent Activity timeline, no error. Two sessions have chased an empty
+# timeline caused by it.
+#
+# Completing the list would have worked until the next emitter was written, so
+# the list is gone. These pin the property that replaces it.
+def test_the_event_log_webhook_filters_nothing():
     src = _read(ROUTER)
-    listed = src.split("_ALL_EVENT_TYPES = [", 1)[-1].split("]", 1)[0]
-    missing = [ev for ev in MAINTENANCE_EVENTS if f'"{ev}"' not in listed]
-    assert not missing, (
-        "these event types are emitted by maintenance actions but are absent "
-        f"from _ALL_EVENT_TYPES, so they are accepted with 200 and dropped: "
-        f"{missing}"
+    assert "_ALL_EVENT_TYPES" not in src, (
+        "the event-type allow-list is back. It cannot be kept correct by hand: "
+        "the last attempt left 113 emitted event types silently dropped"
+    )
+    # Created with no filter. Scoped to ensure_default_webhook(): a loose
+    # search matched the generic create-webhook endpoint's INSERT 14,000
+    # characters earlier and asserted nothing about this one.
+    fn = _function_source(src, "ensure_default_webhook")
+    assert "(_DEFAULT_WEBHOOK_NAME, _SELF_SINK_URL)" in fn, (
+        "the event-log INSERT still passes an event_types argument; it takes "
+        "the name and URL only, so the column stays NULL and the sink records "
+        "every event type"
+    )
+    assert "VALUES (%s, %s, NULL, true, NULL, NULL, NULL, 0, 3000)" in fn, (
+        "the event-log row is not created with a NULL event_types column"
+    )
+    # ...and any filter on an existing row is cleared, because deployments that
+    # already ran the old code carry the stale 44-entry array.
+    assert re.search(r"UPDATE webhooks SET event_types = NULL\s+WHERE name = %s",
+                     src), (
+        "ensure_default_webhook does not clear a stale event_types filter, so "
+        "existing installs keep dropping what the old list did not name"
+    )
+
+
+def test_the_bff_webhook_keeps_its_filter():
+    """The catch-all change must not leak into the operator-facing webhooks.
+
+    The dashboard pushes a deliberately small set to the browser over its
+    WebSocket; making THAT a catch-all would flood the UI. Filtering belongs on
+    configured webhooks, recording belongs on the sink.
+    """
+    src = _read(ROUTER)
+    m = re.search(r"_BFF_EVENT_TYPES\s*=\s*\[(.*?)\]", src, re.S)
+    assert m, "_BFF_EVENT_TYPES is gone — the dashboard webhook now has no filter"
+    types = re.findall(r'"([a-z0-9_]+)"', m.group(1))
+    assert 2 <= len(types) <= 12, (
+        f"the BFF webhook filters {len(types)} event types; that list is meant "
+        "to stay small and deliberate"
     )
 
 
