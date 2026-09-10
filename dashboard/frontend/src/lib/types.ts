@@ -529,6 +529,9 @@ export interface NewsItem {
   articles: NewsArticle[]
   github_links: NewsGithubLink[]
   asset_matches: NewsAssetMatch[]
+  /** The ARTICLE's own publication date, parsed from the feed. null when the
+   *  feed omitted it — first_seen/last_seen are ingest times, not story age. */
+  published_at: string | null
   first_seen: string
   last_seen: string
   enriched_at: string | null

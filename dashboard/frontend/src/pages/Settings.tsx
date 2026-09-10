@@ -3864,9 +3864,533 @@ function LLMTuningTab() {
         </button>
       </div>
 
+      {/* Named provider instances */}
+      <div className="pt-6 mt-6 border-t border-border">
+        <ProvidersSection />
+      </div>
+
+      {/* Per-task model routing */}
+      <div className="pt-6 mt-6 border-t border-border">
+        <TaskRoutingSection />
+      </div>
+
       {/* Per-agent model selection */}
       <div className="pt-6 mt-6 border-t border-border">
         <AgentModelsSection />
+      </div>
+    </div>
+  )
+}
+
+
+// ─── Named provider instances (LLM Tuning) ───────────
+type ProviderRow = {
+  id: string
+  type: string
+  endpoint: string
+  api_key_masked?: string
+  has_api_key?: boolean
+  api_key?: string          // only set when the operator types a new one
+  api_version: string
+  default_model: string
+  enabled: boolean
+}
+
+type ProviderTest = {
+  provider: string
+  type: string
+  ok: boolean
+  checks: { name: string; ok: boolean; detail: string }[]
+}
+
+const BLANK_PROVIDER: ProviderRow = {
+  id: '', type: 'azure', endpoint: '', api_version: '',
+  default_model: '', enabled: true,
+}
+
+function ProvidersSection() {
+  const [rows, setRows] = useState<ProviderRow[] | null>(null)
+  const [types, setTypes] = useState<string[]>([])
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
+  const [testing, setTesting] = useState<string | null>(null)
+  const [results, setResults] = useState<Record<string, ProviderTest>>({})
+
+  const runTest = async (id: string) => {
+    setTesting(id)
+    try {
+      const r = await apiFetch<ProviderTest>(
+        `/settings/llm/providers/${encodeURIComponent(id)}/test`,
+        { method: 'POST' },
+      )
+      setResults(p => ({ ...p, [id]: r }))
+    } catch (e) {
+      setResults(p => ({
+        ...p,
+        [id]: { provider: id, type: '', ok: false, checks: [{ name: 'request', ok: false, detail: String(e) }] },
+      }))
+    } finally {
+      setTesting(null)
+    }
+  }
+
+  const load = async () => {
+    try {
+      const r = await apiFetch<{ providers: ProviderRow[]; types: string[]; error: string | null }>(
+        '/settings/llm/providers'
+      )
+      setRows(r.providers)
+      setTypes(r.types || [])
+      setLoadError(r.error ?? null)
+      setMsg(null)
+    } catch (e) {
+      setMsg({ kind: 'err', text: `Load failed: ${String(e)}` })
+      setRows([])
+    }
+  }
+  useEffect(() => { load() }, [])
+
+  const update = (i: number, patch: Partial<ProviderRow>) =>
+    setRows(rs => (rs ?? []).map((r, j) => (j === i ? { ...r, ...patch } : r)))
+
+  const save = async () => {
+    setSaving(true)
+    try {
+      const r = await apiFetch<{ ok: boolean; count: number; ids: string[]; note?: string }>(
+        '/settings/llm/providers',
+        {
+          method: 'PUT',
+          body: JSON.stringify({
+            providers: (rows ?? []).map(r => ({
+              id: r.id, type: r.type, endpoint: r.endpoint,
+              // Omitting api_key keeps the stored one; only send what was typed.
+              ...(r.api_key ? { api_key: r.api_key } : {}),
+              api_version: r.api_version, default_model: r.default_model,
+              enabled: r.enabled,
+            })),
+          }),
+        },
+      )
+      setMsg({ kind: 'ok', text: `Saved ${r.count} provider(s). ${r.note ?? ''}` })
+      await load()
+    } catch (e) {
+      setMsg({ kind: 'err', text: `Save failed: ${String(e)}` })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (!rows) {
+    return <div className="text-sm text-muted-foreground">{msg?.text ?? 'Loading providers…'}</div>
+  }
+
+  return (
+    <div className="space-y-3">
+      <div>
+        <h3 className="text-sm font-semibold">LLM providers</h3>
+        <p className="text-xs text-muted-foreground mt-1 max-w-3xl leading-relaxed">
+          Named backend instances, each with its own endpoint, key and default model — so you can
+          run <strong>two Azure resources side by side</strong> (one serving DeepSeek, another
+          serving Claude) plus a local Ollama. The per-task routing table below addresses these by
+          id, e.g. <code>azure-claude:claude-sonnet-5</code>. The single-backend fields elsewhere in
+          Settings still work and appear as implicit providers named after their type
+          (<code>azure</code>, <code>ollama</code>, …), so nothing you have configured stops working.
+          Ids may not contain <code>:</code>.
+        </p>
+      </div>
+
+      {loadError && (
+        <div className="text-xs text-red-400 border border-red-500/40 bg-red-500/10 rounded px-2 py-1">
+          {loadError} — the stack is falling back to the implicit per-type providers.
+        </div>
+      )}
+
+      <div className="overflow-x-auto border border-border rounded">
+        <table className="w-full text-sm">
+          <thead className="bg-muted/40 text-xs uppercase text-muted-foreground">
+            <tr>
+              <th className="px-2 py-2 text-left">Id</th>
+              <th className="px-2 py-2 text-left">Type</th>
+              <th className="px-2 py-2 text-left">Endpoint</th>
+              <th className="px-2 py-2 text-left">API key</th>
+              <th className="px-2 py-2 text-left">Default model</th>
+              <th className="px-2 py-2 text-left">On</th>
+              <th className="px-2 py-2"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 && (
+              <tr><td colSpan={7} className="px-3 py-6 text-center text-muted-foreground text-xs">
+                No named providers yet — the per-type settings are in use. Add one to run several
+                models at once.
+              </td></tr>
+            )}
+            {rows.map((r, i) => (
+              <tr key={i} className="border-t border-border">
+                <td className="px-2 py-1">
+                  <input value={r.id} onChange={e => update(i, { id: e.target.value })}
+                    placeholder="azure-claude"
+                    className="w-32 bg-muted rounded px-2 py-1 text-xs font-mono outline-none border border-transparent focus:border-border" />
+                </td>
+                <td className="px-2 py-1">
+                  <select value={r.type} onChange={e => update(i, { type: e.target.value })}
+                    className="bg-muted rounded px-1.5 py-1 text-xs outline-none border border-transparent focus:border-border">
+                    {(types.length ? types : ['azure']).map(t => <option key={t} value={t}>{t}</option>)}
+                  </select>
+                </td>
+                <td className="px-2 py-1">
+                  <input value={r.endpoint} onChange={e => update(i, { endpoint: e.target.value })}
+                    placeholder="https://…  (bare resource URL)"
+                    className="w-64 bg-muted rounded px-2 py-1 text-xs font-mono outline-none border border-transparent focus:border-border" />
+                </td>
+                <td className="px-2 py-1">
+                  <input type="password" value={r.api_key ?? ''}
+                    onChange={e => update(i, { api_key: e.target.value })}
+                    placeholder={r.has_api_key ? (r.api_key_masked || 'stored') : 'none'}
+                    className="w-36 bg-muted rounded px-2 py-1 text-xs font-mono outline-none border border-transparent focus:border-border" />
+                </td>
+                <td className="px-2 py-1">
+                  <input value={r.default_model} onChange={e => update(i, { default_model: e.target.value })}
+                    placeholder="claude-sonnet-5"
+                    className="w-44 bg-muted rounded px-2 py-1 text-xs font-mono outline-none border border-transparent focus:border-border" />
+                </td>
+                <td className="px-2 py-1 text-center">
+                  <input type="checkbox" checked={r.enabled}
+                    onChange={e => update(i, { enabled: e.target.checked })} />
+                </td>
+                <td className="px-2 py-1 text-right whitespace-nowrap">
+                  <button onClick={() => runTest(r.id)} disabled={!r.id || testing === r.id}
+                    title="Check endpoint, auth, deployments and a real completion"
+                    className="text-xs px-2 py-1 rounded border border-border bg-card hover:bg-muted disabled:opacity-50 mr-1">
+                    {testing === r.id ? 'Testing…' : 'Test'}
+                  </button>
+                  <button onClick={() => setRows(rs => (rs ?? []).filter((_, j) => j !== i))}
+                    className="text-xs text-red-400 hover:text-red-300">Remove</button>
+                </td>
+              </tr>
+            ))}
+            {/* Results are rendered as their own row so the step-by-step
+                detail has room — "it does not work" has several very
+                different causes that look identical from outside. */}
+            {rows.map((r, i) => results[r.id] && (
+              <tr key={`res-${i}`} className="border-t border-border/50 bg-muted/20">
+                <td colSpan={7} className="px-3 py-2">
+                  <div className="text-xs">
+                    <span className={cn('font-medium', results[r.id].ok ? 'text-green-400' : 'text-red-400')}>
+                      {r.id}: {results[r.id].ok ? 'all checks passed' : 'failed'}
+                    </span>
+                    <ul className="mt-1 space-y-0.5">
+                      {results[r.id].checks.map((c, k) => (
+                        <li key={k} className="flex gap-2">
+                          <span className={c.ok ? 'text-green-400' : 'text-red-400'}>
+                            {c.ok ? '✓' : '✗'}
+                          </span>
+                          <span className="text-muted-foreground w-24 shrink-0">{c.name}</span>
+                          <span className="flex-1 break-all">{c.detail}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="flex items-center gap-3">
+        <button onClick={() => setRows(rs => [...(rs ?? []), { ...BLANK_PROVIDER }])}
+          className="px-3 py-1.5 text-sm rounded border border-border bg-card hover:bg-muted">
+          Add provider
+        </button>
+        <button onClick={save} disabled={saving}
+          className="px-3 py-1.5 text-sm rounded bg-primary text-primary-foreground disabled:opacity-50">
+          {saving ? 'Saving…' : 'Save providers'}
+        </button>
+        {msg && (
+          <span className={cn('text-xs', msg.kind === 'ok' ? 'text-green-400' : 'text-red-400')}>
+            {msg.text}
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+
+// ─── Per-task model routing (LLM Tuning) ───────────
+type AvailModels = {
+  provider: string
+  type: string
+  /** Selectable models — DEPLOYED/installed only. For Azure these come from
+   *  the deployments API, not /models (which is the regional catalog where
+   *  undeployed entries return DeploymentNotFound). */
+  models: string[]
+  verified: boolean
+  catalog_total?: number
+  note: string | null
+  error: string | null
+}
+
+type ModelOption = { value: string; label: string; group: string }
+
+/** Flatten per-provider models into "<provider>:<model>" options.
+ *
+ *  `configured` models are known usable. `catalog` entries are what a
+ *  provider's /models endpoint lists — for Azure Foundry that is the regional
+ *  catalog, where only DEPLOYED models answer — so they are grouped
+ *  separately and labelled, rather than being offered as equals.
+ */
+function buildOptions(provs: AvailModels[]): ModelOption[] {
+  const out: ModelOption[] = []
+  for (const p of provs ?? []) {
+    // Only what is actually deployed/installed. The regional catalog is NOT
+    // offered: picking an undeployed model gives DeploymentNotFound at run
+    // time, which is a worse outcome than not seeing it in the list.
+    for (const m of p.models ?? []) {
+      out.push({ value: `${p.provider}:${m}`, label: `${p.provider} · ${m}`, group: p.provider })
+    }
+  }
+  return out
+}
+
+/** A model picker that never traps the operator: the dropdown lists what we
+ *  found, and "Custom…" switches to free text for anything we did not. */
+function ModelSelect({ value, onChange, opts, placeholder }: {
+  value: string
+  onChange: (v: string) => void
+  opts: ModelOption[]
+  placeholder: string
+}) {
+  const known = opts.some(o => o.value === value)
+  const [custom, setCustom] = useState(!!value && !known)
+  const groups = Array.from(new Set(opts.map(o => o.group)))
+
+  if (custom) {
+    return (
+      <div className="flex items-center gap-1">
+        <input
+          value={value}
+          onChange={e => onChange(e.target.value)}
+          placeholder={placeholder}
+          className="w-44 bg-muted rounded px-2 py-1 text-xs font-mono outline-none border border-transparent focus:border-border"
+        />
+        <button onClick={() => { setCustom(false); onChange('') }}
+          title="Back to the list"
+          className="text-[11px] text-muted-foreground hover:text-foreground">list</button>
+      </div>
+    )
+  }
+
+  return (
+    <select
+      value={value}
+      onChange={e => {
+        if (e.target.value === '__custom__') { setCustom(true); onChange('') } else onChange(e.target.value)
+      }}
+      className="w-52 bg-muted rounded px-1.5 py-1 text-xs font-mono outline-none border border-transparent focus:border-border"
+    >
+      <option value="">{placeholder}</option>
+      {groups.map(g => (
+        <optgroup key={g} label={g}>
+          {opts.filter(o => o.group === g).map(o => (
+            <option key={o.value} value={o.value}>{o.label}</option>
+          ))}
+        </optgroup>
+      ))}
+      <option value="__custom__">Custom…</option>
+    </select>
+  )
+}
+
+type RouteEntry = {
+  task: string
+  description: string
+  model: string
+  fallback: string
+  effective: string
+  effective_fallback: string
+  inherited: boolean
+}
+
+function TaskRoutingSection() {
+  const [tasks, setTasks] = useState<RouteEntry[] | null>(null)
+  const [globalModel, setGlobalModel] = useState('')
+  const [dflt, setDflt] = useState('')
+  const [dfltFb, setDfltFb] = useState('')
+  const [routes, setRoutes] = useState<Record<string, string>>({})
+  const [fallbacks, setFallbacks] = useState<Record<string, string>>({})
+  const [opts, setOpts] = useState<ModelOption[]>([])
+  const [avail, setAvail] = useState<AvailModels[]>([])
+  const [saving, setSaving] = useState(false)
+  const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
+
+  const load = async () => {
+    try {
+      const r = await apiFetch<{
+        tasks: RouteEntry[]; default: string; fallback: string; global_model: string
+      }>('/settings/llm/routes')
+      setTasks(r.tasks)
+      // Dropdown options come from a separate probe so a slow provider cannot
+      // delay the routes table itself.
+      try {
+        const am = await apiFetch<{ providers: AvailModels[] }>('/settings/llm/available-models')
+        setAvail(am.providers ?? [])
+        setOpts(buildOptions(am.providers))
+      } catch {
+        setAvail([])
+        setOpts([])   // Custom… still works; the select just has fewer entries
+      }
+      setDflt(r.default || '')
+      setDfltFb(r.fallback || '')
+      setGlobalModel(r.global_model || '')
+      setRoutes(Object.fromEntries(r.tasks.map(t => [t.task, t.model || ''])))
+      setFallbacks(Object.fromEntries(r.tasks.map(t => [t.task, t.fallback || ''])))
+      setMsg(null)
+    } catch (e) {
+      setMsg({ kind: 'err', text: `Load failed: ${String(e)}` })
+    }
+  }
+  useEffect(() => { load() }, [])
+
+  const save = async () => {
+    setSaving(true)
+    try {
+      const r = await apiFetch<{ ok: boolean; saved: string[]; failed: Record<string, string>; note?: string }>(
+        '/settings/llm/routes',
+        {
+          method: 'PUT',
+          body: JSON.stringify({
+            routes, fallbacks, default: dflt, default_fallback: dfltFb,
+          }),
+        },
+      )
+      setMsg(r.ok
+        ? { kind: 'ok', text: `Saved ${r.saved.length} route setting(s). ${r.note ?? ''}` }
+        : { kind: 'err', text: `Some routes failed: ${JSON.stringify(r.failed)}` })
+      await load()
+    } catch (e) {
+      setMsg({ kind: 'err', text: `Save failed: ${String(e)}` })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (!tasks) {
+    return <div className="text-sm text-muted-foreground">{msg?.text ?? 'Loading routes…'}</div>
+  }
+
+  return (
+    <div className="space-y-3">
+      <div>
+        <h3 className="text-sm font-semibold">Per-task model routing</h3>
+        <p className="text-xs text-muted-foreground mt-1 max-w-3xl leading-relaxed">
+          One model for everything is wrong in both directions: the frontier model is wasted
+          summarising news, and a cheap model fumbles tool calls in the exploit phase. Leave a row
+          blank to inherit the default. Prefix with a backend to move a task to a different
+          provider entirely — <code>azure:claude-sonnet-5</code>, or{' '}
+          <code>ollama:qwen2.5:14b</code> to run it on a local Ollama and off the Azure quota.
+          The <strong>fallback</strong> is used when the primary is rate-limited past its retries.
+          Changes take effect within 30s (resolver cache).
+        </p>
+        {avail.length > 0 && (
+          <p className="text-xs text-muted-foreground mt-1">
+            {avail.filter(a => (a.models ?? []).length).map((a, i) => (
+              <span key={a.provider}>
+                {i > 0 && ' · '}
+                <code>{a.provider}</code>{' '}
+                {(a.models ?? []).length} model{(a.models ?? []).length === 1 ? '' : 's'}
+                {a.verified ? '' : ' (unverified)'}
+                {a.catalog_total
+                  ? <span className="opacity-60"> of {a.catalog_total} in the regional catalog</span>
+                  : null}
+              </span>
+            ))}
+          </p>
+        )}
+        {avail.some(a => a.error) && (
+          <p className="text-xs text-amber-400/80 mt-1">
+            {avail.filter(a => a.error).map(a => (
+              <span key={a.provider} className="block">
+                <code>{a.provider}</code>: {a.error} — only its configured default is listed.
+              </span>
+            ))}
+          </p>
+        )}
+      </div>
+
+      <div className="grid gap-2 sm:grid-cols-2 max-w-3xl">
+        <div className="text-xs">
+          <div className="text-muted-foreground mb-1">Default for all tasks</div>
+          <ModelSelect value={dflt} onChange={setDflt} opts={opts}
+            placeholder={globalModel || 'backend model'} />
+        </div>
+        <div className="text-xs">
+          <div className="text-muted-foreground mb-1">Default rate-limit fallback</div>
+          <ModelSelect value={dfltFb} onChange={setDfltFb} opts={opts}
+            placeholder="none" />
+        </div>
+      </div>
+
+      <div className="overflow-x-auto border border-border rounded">
+        <table className="w-full text-sm">
+          <thead className="bg-muted/40 text-xs uppercase text-muted-foreground">
+            <tr>
+              <th className="px-3 py-2 text-left">Task</th>
+              <th className="px-3 py-2 text-left">Model</th>
+              <th className="px-3 py-2 text-left">Fallback on rate limit</th>
+              <th className="px-3 py-2 text-left">Effective</th>
+            </tr>
+          </thead>
+          <tbody>
+            {tasks.map(t => (
+              <tr key={t.task} className="border-t border-border align-top">
+                <td className="px-3 py-2">
+                  <div className="font-mono text-xs">{t.task}</div>
+                  <div className="text-[11px] text-muted-foreground max-w-xs">{t.description}</div>
+                </td>
+                <td className="px-3 py-2">
+                  <ModelSelect
+                    value={routes[t.task] ?? ''}
+                    onChange={v => setRoutes({ ...routes, [t.task]: v })}
+                    opts={opts}
+                    placeholder="inherit"
+                  />
+                </td>
+                <td className="px-3 py-2">
+                  <ModelSelect
+                    value={fallbacks[t.task] ?? ''}
+                    onChange={v => setFallbacks({ ...fallbacks, [t.task]: v })}
+                    opts={opts}
+                    placeholder="inherit"
+                  />
+                </td>
+                <td className="px-3 py-2 text-xs">
+                  <span className="font-mono">{t.effective || '—'}</span>
+                  {t.inherited && <span className="ml-1 text-muted-foreground">(inherited)</span>}
+                  {t.effective_fallback && (
+                    <div className="text-[11px] text-muted-foreground">
+                      → {t.effective_fallback}
+                    </div>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="flex items-center gap-3">
+        <button onClick={save} disabled={saving}
+          className="px-3 py-1.5 text-sm rounded bg-primary text-primary-foreground disabled:opacity-50">
+          {saving ? 'Saving…' : 'Save routes'}
+        </button>
+        {msg && (
+          <span className={cn('text-xs', msg.kind === 'ok' ? 'text-green-400' : 'text-red-400')}>
+            {msg.text}
+          </span>
+        )}
       </div>
     </div>
   )

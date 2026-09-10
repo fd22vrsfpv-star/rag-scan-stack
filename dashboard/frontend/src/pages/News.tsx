@@ -3,16 +3,17 @@ import { useQueryClient } from '@tanstack/react-query'
 import {
   Newspaper, Search, RefreshCw, Loader2, X, ExternalLink, Github, Server,
   Trash2, CheckSquare, Square, Eye, Settings as SettingsIcon, Wand2,
-  HelpCircle, Globe, ShieldAlert, Plus,
+  HelpCircle, Globe, ShieldAlert, Plus, Sparkles, CalendarClock,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import PageHelp from '@/components/PageHelp'
 import {
   useNewsItems, useNewsItem, useNewsStats, useNewsSources, useNewsRun,
   useTriggerIngest, useUpdateNewsItem, useBulkNewsAction,
-  useMatchAssets, useGithubSearch, useEnrichItem,
+  useMatchAssets, useGithubSearch, useEnrichItem, useNewsStage2,
   useDeepSearch, useUpdateSource, useRefetchSource, useCreateSource,
 } from '@/api/news'
+import type { NewsSort } from '@/api/news'
 import type { NewsItem, NewsStatus, NewsSource } from '@/lib/types'
 
 const STATUS_TABS: { id: NewsStatus; label: string }[] = [
@@ -61,6 +62,7 @@ export default function News() {
   const [redTeamOnly, setRedTeamOnly] = useState(true)
   const [hideStatuses, setHideStatuses] = useState<Set<NewsStatus>>(new Set(['deleted']))
   const [maxAgeDays, setMaxAgeDays] = useState<number | null>(30)
+  const [sort, setSort] = useState<NewsSort>('relevance')
   const [hideDeleted] = useState(true)
 
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
@@ -103,6 +105,7 @@ export default function News() {
       red_team_only: redTeamOnly || undefined,
       q: search || undefined,
       since,
+      sort,
       // Show deleted items only when explicitly tabbed-to OR when 'all'-view
       // and the hide-list does not include 'deleted'.
       include_deleted: activeStatus === 'deleted'
@@ -110,7 +113,7 @@ export default function News() {
       limit: 200,
       offset: 0,
     }
-  }, [activeStatus, hideStatuses, maxAgeDays, cveFilter, kevOnly, rceOnly, redTeamOnly, search])
+  }, [activeStatus, hideStatuses, maxAgeDays, cveFilter, kevOnly, rceOnly, redTeamOnly, search, sort])
 
   const itemsQ = useNewsItems(filters)
   const statsQ = useNewsStats()
@@ -125,6 +128,7 @@ export default function News() {
   const matchAssets = useMatchAssets()
   const githubSearch = useGithubSearch()
   const enrichItem = useEnrichItem()
+  const runStage2 = useNewsStage2()
   const deepSearch = useDeepSearch()
   const updateSource = useUpdateSource()
   const refetchSource = useRefetchSource()
@@ -174,6 +178,32 @@ export default function News() {
       { ids: [...selectedIds], action: 'delete' },
       { onSuccess: clearSelection },
     )
+  // Enrichment is operator-driven: ingest no longer LLM-enriches anything, so
+  // this is how a selected item gets its flags and summary.
+  const [enrichNote, setEnrichNote] = useState<string | null>(null)
+  const enrichSelected = () =>
+    bulkAction.mutate(
+      { ids: [...selectedIds], action: 'enrich' },
+      {
+        onSuccess: (r) => {
+          clearSelection()
+          // A quota stall must not look like "it just didn't do much".
+          if (r.rate_limited) {
+            setEnrichNote(
+              `${r.enriched ?? 0} enriched, ${r.rate_limited} skipped — LLM provider quota exhausted. Retry later, or give news its own model (NEWS_LLM_MODEL).`,
+            )
+          } else if (r.queued) {
+            setEnrichNote(`${r.queued} queued for enrichment in the background.`)
+          } else {
+            setEnrichNote(null)
+          }
+        },
+        onError: (e: unknown) => setEnrichNote(
+          `Enrichment failed: ${e instanceof Error ? e.message : String(e)}`,
+        ),
+      },
+    )
+
   const acknowledgeSelected = () =>
     bulkAction.mutate(
       { ids: [...selectedIds], action: 'acknowledge', value: 'operator' },
@@ -188,7 +218,7 @@ export default function News() {
   return (
     <div className="space-y-4">
       <PageHelp id="news" title="How to use News">
-        <p>Pulls from {sources.length} security news sources, dedupes by vulnerability/CVE, and LLM-enriches each item with structured flags (CVE, KEV, RCE, easily exploitable, malware exploitable, active in-the-wild, patch available). Move items through the triage pipeline (NEW → Reviewed → Follow-up → Applies → Research → Future) and run per-item asset-match + GitHub PoC search. Use <strong>Topic Deep Search</strong> to fan out asset/PoC hunting across every story matching a free-text term (e.g. "ScreenConnect"). Daily auto-fetch — operator-triggered ingest also available.</p>
+        <p>Pulls from {sources.length} security news sources and dedupes by vulnerability/CVE. Ingest does <strong>not</strong> LLM-enrich: it applies only the free, deterministic <strong>KEV</strong> flag (CISA catalog lookup). To get a summary and the remaining flags (RCE, easily exploitable, malware exploitable, active in-the-wild, patch available), <strong>select the items you care about and click Enrich</strong> — that keeps the LLM spend on stories you are actually triaging. Move items through the pipeline (NEW → Reviewed → Follow-up → Applies → Research → Future) and run per-item asset-match + GitHub PoC search. <strong>Topic Deep Search</strong> fans out asset/PoC hunting across every story matching a free-text term (e.g. "ScreenConnect"). Sort by <strong>Published</strong> to rank by the article's own date rather than when we last re-read the feed. Daily auto-fetch — operator-triggered ingest also available.</p>
       </PageHelp>
 
       <div className="flex items-center gap-2">
@@ -252,9 +282,18 @@ export default function News() {
             {ingestRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
             Run ingest now
           </button>
+          <button
+            onClick={() => runStage2.mutate()}
+            disabled={runStage2.isPending}
+            title="Asset-match + GitHub PoC search across items already flagged KEV/RCE. No longer runs automatically after ingest."
+            className="mt-1 px-3 py-1.5 rounded border border-border bg-card text-xs flex items-center gap-2 disabled:opacity-60 hover:bg-muted"
+          >
+            {runStage2.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Server className="h-3.5 w-3.5" />}
+            Assets + PoC for flagged
+          </button>
           <div className="mt-1 text-[11px] text-muted-foreground">
             {ingestRunning && runQ.data
-              ? `${runQ.data.sources_fetched}/${sources.length} sources · ${runQ.data.items_new} new · ${runQ.data.items_updated} updated · ${runQ.data.items_enriched} enriched`
+              ? `${runQ.data.sources_fetched}/${sources.length} sources · ${runQ.data.items_new} new · ${runQ.data.items_updated} updated · KEV-flagged only (enrich on demand)`
               : lastFetched
                 ? `Last fetched: ${new Date(lastFetched).toLocaleString()} · Daily auto-refresh`
                 : 'Never fetched yet'}
@@ -354,6 +393,21 @@ export default function News() {
             <option value="all">All time</option>
           </select>
         </label>
+        {/* Sort — 'published' uses the article's own date from the feed, which
+            is what you want when triaging by how fresh a story actually is;
+            'last seen' only says when we last re-read the feed. */}
+        <label className="flex items-center gap-1 text-sm" title="relevance = offensive flags first; published = newest publication date first">
+          <CalendarClock className="h-3.5 w-3.5 text-muted-foreground" />
+          <select
+            value={sort}
+            onChange={e => setSort(e.target.value as NewsSort)}
+            className="bg-muted rounded px-1.5 py-0.5 outline-none border border-transparent focus:border-border"
+          >
+            <option value="relevance">Relevance</option>
+            <option value="published">Published</option>
+            <option value="last_seen">Last seen</option>
+          </select>
+        </label>
         <span className="ml-auto text-xs text-muted-foreground">
           {itemsQ.isFetching ? 'loading…' : `${(itemsQ.data?.total ?? 0).toLocaleString()} matching`}
         </span>
@@ -396,6 +450,14 @@ export default function News() {
       </div>
 
       {/* Bulk action toolbar */}
+      {enrichNote && (
+        <div className="flex items-start gap-2 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          <ShieldAlert className="h-4 w-4 shrink-0 mt-0.5" />
+          <span className="flex-1">{enrichNote}</span>
+          <button onClick={() => setEnrichNote(null)} className="opacity-70 hover:opacity-100"><X className="h-3.5 w-3.5" /></button>
+        </div>
+      )}
+
       {selectedIds.size > 0 && (
         <div className="bg-primary/10 border border-primary/30 rounded-lg p-2 flex flex-wrap items-center gap-2">
           <span className="text-sm font-medium">{selectedIds.size} selected</span>
@@ -404,6 +466,7 @@ export default function News() {
           <button onClick={() => moveSelectedTo('applies')} className="px-2 py-1 text-xs rounded border border-border bg-card hover:bg-muted">→ Applies</button>
           <button onClick={() => moveSelectedTo('research')} className="px-2 py-1 text-xs rounded border border-border bg-card hover:bg-muted">→ Research</button>
           <button onClick={() => moveSelectedTo('future')} className="px-2 py-1 text-xs rounded border border-border bg-card hover:bg-muted">→ Future</button>
+          <button onClick={enrichSelected} disabled={bulkAction.isPending} className="px-2 py-1 text-xs rounded border border-primary/40 bg-primary/10 text-primary hover:bg-primary/20 disabled:opacity-50 flex items-center gap-1" title="Run LLM enrichment on the selected items — ingest does not do this automatically"><Sparkles className="h-3 w-3" />Enrich</button>
           <button onClick={acknowledgeSelected} className="px-2 py-1 text-xs rounded border border-border bg-card hover:bg-muted flex items-center gap-1"><Eye className="h-3 w-3" />Acknowledge</button>
           <button onClick={deleteSelected} className="px-2 py-1 text-xs rounded border border-red-500/40 bg-red-500/10 text-red-300 hover:bg-red-500/20 flex items-center gap-1"><Trash2 className="h-3 w-3" />Delete</button>
           <button onClick={clearSelection} className="ml-auto px-2 py-1 text-xs text-muted-foreground hover:text-foreground">Clear</button>
@@ -427,12 +490,13 @@ export default function News() {
                 <th className="px-3 py-2 text-left">CVE</th>
                 <th className="px-3 py-2 text-left">Flags</th>
                 <th className="px-3 py-2 text-left">Sources</th>
+                <th className="px-3 py-2 text-left">Published</th>
                 <th className="px-3 py-2 text-left">Last Seen</th>
               </tr>
             </thead>
             <tbody>
               {items.length === 0 && !itemsQ.isFetching && (
-                <tr><td colSpan={6} className="px-3 py-8 text-center text-muted-foreground">
+                <tr><td colSpan={7} className="px-3 py-8 text-center text-muted-foreground">
                   No items in <strong>{activeStatus}</strong>. Click <em>Run ingest now</em> to pull the feeds.
                 </td></tr>
               )}
@@ -458,7 +522,7 @@ export default function News() {
                       ? <div className="text-xs text-muted-foreground mt-1 leading-relaxed line-clamp-3" title={item.summary.replace(/\s+/g, ' ').trim()}>{item.summary.replace(/\s+/g, ' ').trim()}</div>
                       : item.enriched_at
                         ? <div className="text-xs text-muted-foreground italic mt-1">no summary returned</div>
-                        : <div className="text-xs text-amber-500/70 italic mt-1">enriching…</div>}
+                        : <div className="text-xs text-muted-foreground/70 italic mt-1">not enriched — select and click Enrich</div>}
                   </td>
                   <td className="px-3 py-2 text-xs">
                     {item.primary_cve
@@ -485,6 +549,13 @@ export default function News() {
                       ))}
                       {item.articles.length > 4 && <span className="text-muted-foreground">+{item.articles.length - 4}</span>}
                     </div>
+                  </td>
+                  <td className="px-3 py-2 text-xs text-muted-foreground whitespace-nowrap">
+                    {item.published_at
+                      ? <span title={`Published ${new Date(item.published_at).toLocaleString()}`}>
+                          {new Date(item.published_at).toLocaleDateString()}
+                        </span>
+                      : <span className="italic opacity-60" title="This feed did not supply a publication date">—</span>}
                   </td>
                   <td className="px-3 py-2 text-xs text-muted-foreground whitespace-nowrap">
                     {new Date(item.last_seen).toLocaleString()}

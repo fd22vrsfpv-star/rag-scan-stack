@@ -418,10 +418,38 @@ def db_create_tool_execution(exec_id: str, tool: str, command: str, target: str,
         conn.close()
 
 
+# Hard ceiling on what one execution may STORE per field. A single
+# smtp-user-enum run wrote 15MB of stdout and 127MB of stderr, which then made
+# every listing endpoint that returned those columns unservable. Truncating at
+# the write is the durable fix: nothing downstream has to defend against a
+# row that cannot exist. Raise it if a tool legitimately needs more, but keep
+# it bounded -- unbounded tool stderr is a bug in the tool invocation, and the
+# preserved head is enough to see what it was.
+TOOL_OUTPUT_STORE_CAP = int(os.environ.get("TOOL_OUTPUT_STORE_CAP") or 1_000_000)
+
+
+def _cap_for_storage(v, field: str, exec_id: str):
+    """Truncate an oversized output/error before it reaches the database.
+
+    Marks the truncation in the stored text and logs it, so a partial capture
+    is never mistaken for the tool's complete output.
+    """
+    if not isinstance(v, str) or len(v) <= TOOL_OUTPUT_STORE_CAP:
+        return v
+    logger.warning(
+        "tool_executions %s: %s was %s bytes, truncated to %s for storage",
+        exec_id, field, f"{len(v):,}", f"{TOOL_OUTPUT_STORE_CAP:,}")
+    return (v[:TOOL_OUTPUT_STORE_CAP]
+            + f"\n\n[TRUNCATED: {field} was {len(v):,} bytes, stored "
+              f"{TOOL_OUTPUT_STORE_CAP:,}]")
+
+
 def db_update_tool_execution(exec_id: str, status: str, exit_code: Optional[int] = None,
                              output: Optional[str] = None, error: Optional[str] = None,
                              parsed_results: Optional[Dict] = None) -> None:
     """Update tool execution with results."""
+    output = _cap_for_storage(output, "output", exec_id)
+    error = _cap_for_storage(error, "error", exec_id)
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -2279,6 +2307,26 @@ async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: B
     )
 
 
+# Per-field cap for LIST responses. Generous enough to be useful in the UI,
+# bounded so no single runaway execution can make the listing unservable.
+TOOL_LISTING_FIELD_CAP = int(os.environ.get("TOOL_LISTING_FIELD_CAP") or 4000)
+
+
+def _truncate_for_listing(v):
+    """Cap a possibly-enormous output/error field for a LIST response.
+
+    Returns the value unchanged when it is small (the overwhelming majority),
+    otherwise the first TOOL_LISTING_FIELD_CAP chars plus an explicit marker --
+    silently truncating would leave the operator reading a partial command
+    output believing it complete.
+    """
+    if not isinstance(v, str) or len(v) <= TOOL_LISTING_FIELD_CAP:
+        return v
+    return (v[:TOOL_LISTING_FIELD_CAP]
+            + f"\n\n[truncated for listing — {len(v):,} bytes total; "
+              f"GET /tools/executions/<id> for the full output]")
+
+
 @app.get("/tools/executions", response_model=ToolExecutionListResponse)
 async def list_tool_executions(
     limit: int = 50,
@@ -2298,6 +2346,10 @@ async def list_tool_executions(
         if ex.get("started_at") and ex.get("completed_at"):
             duration = (ex["completed_at"] - ex["started_at"]).total_seconds()
 
+        # LISTING = previews only. One smtp-user-enum row held 15MB of stdout
+        # and 127MB of stderr, so this endpoint returned ~133MB, took >10s and
+        # 500'd behind the BFF's timeout. Callers wanting the whole thing use
+        # GET /tools/executions/{id}, which returns a single row.
         result.append(ToolExecutionResponse(
             id=str(ex["id"]),
             tool=ex["tool"],
@@ -2306,8 +2358,8 @@ async def list_tool_executions(
             port=ex.get("port"),
             status=ex["status"],
             exit_code=ex.get("exit_code"),
-            output=ex.get("output"),
-            error=ex.get("error"),
+            output=_truncate_for_listing(ex.get("output")),
+            error=_truncate_for_listing(ex.get("error")),
             parsed_results=ex.get("parsed_results"),
             started_at=ex["started_at"].isoformat() if ex.get("started_at") else None,
             completed_at=ex["completed_at"].isoformat() if ex.get("completed_at") else None,
