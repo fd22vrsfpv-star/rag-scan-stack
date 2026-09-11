@@ -276,6 +276,7 @@ CRITICAL_TABLES=(
     "lateral_movement"
     "credential_spray_attempts"
     "credential_spray_approvals"
+    "exploit_approval_rules"
     "password_policies"
     "platform_control"
     "security_tests"
