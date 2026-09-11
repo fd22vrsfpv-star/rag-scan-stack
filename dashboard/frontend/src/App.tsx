@@ -3,6 +3,7 @@ import { BUILD_VERSION } from '@/lib/constants'
 if (typeof window !== 'undefined') (window as any).__BUILD__ = BUILD_VERSION
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { useEngagementCacheReset } from '@/hooks/useEngagementCacheReset'
 import { AppShell } from '@/components/layout/AppShell'
 
 const Dashboard = lazy(() => import('@/pages/Dashboard'))
@@ -141,10 +142,22 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boole
   }
 }
 
+/** Drops cached data when the engagement or scope changes.
+ *
+ *  Renders nothing; it exists so the hook runs INSIDE QueryClientProvider,
+ *  which is where useQueryClient is available. Mounted once at the root so
+ *  every page — present and future — is covered without each query having to
+ *  remember to key on the engagement. */
+function EngagementCacheReset() {
+  useEngagementCacheReset()
+  return null
+}
+
 export default function App() {
   return (
     <ErrorBoundary>
     <QueryClientProvider client={queryClient}>
+      <EngagementCacheReset />
       <BrowserRouter>
         <Routes>
           {/* Standalone chat popup — sibling of AppShell so no Sidebar/TopBar render */}

@@ -12,10 +12,12 @@
  * component's surface.
  */
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useScanRecommendations, useGenerateRecommendations, useReorderRecommendations,
          useRecommendationBlockers, type StoredRecommendation } from '@/api/assets'
 import { useUIStore } from '@/stores/ui'
+import { ScopeFilter } from '@/components/common/ScopeFilter'
+import { useScopeFilter } from '@/hooks/useScopeFilter'
 import { Wand2, ChevronDown, ChevronRight, Eye, Play, Loader2, ExternalLink, ShieldAlert, ChevronUp, ListOrdered } from 'lucide-react'
 
 // ---- grouping helpers ----
@@ -268,8 +270,21 @@ export function ScanRecommendationsPanel({
   const generateRecs = useGenerateRecommendations()
   const allRecs = data?.recommendations ?? []
 
+  // Restrict to ONE scope list inside the engagement.
+  //
+  // This table DISPATCHES scans, so an out-of-scope row here is not a display
+  // problem — it is a click away from touching a host we are not authorised to
+  // touch. The dispatch scope gate still refuses those server-side and always
+  // will; this keeps them off the screen so the operator is not selecting them
+  // in the first place.
+  const globalScope = useUIStore(s => s.selectedScopeName)
+  const [scopeFilter, setScopeFilter] = useState(globalScope || '')
+  useEffect(() => { setScopeFilter(globalScope || '') }, [globalScope, engagementId])
+  const { matchesAnyScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilter)
+
   // Apply optional client-side filters.
   const recs = allRecs.filter(r => {
+    if (isScopeFiltering && !matchesAnyScope(r.ip, (r as any).hostname)) return false
     if (filters?.status && r.status !== filters.status) return false
     if (filters?.service && !(r.service || '').toLowerCase().includes(filters.service.toLowerCase())) return false
     if (filters?.ip && !(r.ip || '').includes(filters.ip)) return false
@@ -444,6 +459,12 @@ export function ScanRecommendationsPanel({
             onChange={toggleAll} className="rounded" />
           Select all pending
         </label>
+        <ScopeFilter value={scopeFilter} onChange={setScopeFilter} />
+        {isScopeFiltering && (
+          <span className="text-[10px] text-muted-foreground">
+            {recs.length} of {allRecs.length} in {scopeFilter}
+          </span>
+        )}
         <label className="flex items-center gap-1 text-[10px] cursor-pointer" title="Route manual tools (hydra, ssh-audit, etc.) to internal Kali container">
           <input type="checkbox" checked={useKali} onChange={() => setUseKali(!useKali)} className="rounded" />
           Use Kali
