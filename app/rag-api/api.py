@@ -17396,6 +17396,73 @@ def get_engagement(eid: str, _: bool = Depends(auth)):
             eng["scopes"] = []
     return eng
 
+class ExploitPreapprovalBody(BaseModel):
+    enabled: bool
+    approved_by: Optional[str] = None
+    note: Optional[str] = None
+
+
+@app.get("/engagements/{eid}/exploit-preapproval", tags=["Engagements"])
+def get_exploit_preapproval(eid: str, _: bool = Depends(auth)):
+    """Whether exploit execution is pre-approved for this engagement."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT COALESCE((metadata->>'exploit_preapproved')::boolean, false) AS enabled,
+                      metadata->'exploit_preapproval_meta' AS meta
+                 FROM engagements WHERE id = %s::uuid""", (eid,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, f"no engagement {eid}")
+    return {"engagement_id": eid, "enabled": bool(row["enabled"]),
+            "meta": row["meta"] or {}}
+
+
+@app.put("/engagements/{eid}/exploit-preapproval", tags=["Engagements"])
+def set_exploit_preapproval(eid: str, body: ExploitPreapprovalBody,
+                            x_operator: str = Header("operator", alias="X-Operator"),
+                            _: bool = Depends(auth)):
+    """Pre-approve exploit execution for ONE engagement.
+
+    With this on, a LangGraph session does not pause at the exploit gate: the
+    operator has already authorised this engagement, so there is nobody to wait
+    for. That is authorization given in advance, not an override of it — see
+    langgraph_engine._engagement_preapproval.
+
+    Deliberately its own endpoint rather than PUT /engagements/{eid}: that one
+    REPLACES `metadata` wholesale, so setting one key through it would silently
+    drop every other key the engagement holds. This merges.
+
+    Scope is untouched. execute_approved_exploit still fails closed on scope, so
+    pre-approval can never make an out-of-scope target runnable.
+    """
+    meta = {"enabled": bool(body.enabled), "approved_by": body.approved_by or x_operator,
+            "note": body.note, "set_at": datetime.now(timezone.utc).isoformat()}
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """UPDATE engagements
+                  SET metadata = COALESCE(metadata, '{}'::jsonb)
+                                 || jsonb_build_object('exploit_preapproved', %s::boolean,
+                                                       'exploit_preapproval_meta', %s::jsonb)
+                WHERE id = %s::uuid
+            RETURNING id, name,
+                      COALESCE((metadata->>'exploit_preapproved')::boolean, false) AS enabled""",
+            (bool(body.enabled), Json(meta), eid))
+        row = cur.fetchone()
+        conn.commit()
+    if not row:
+        raise HTTPException(404, f"no engagement {eid}")
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("engagement_exploit_preapproval_changed", "engagements",
+                     {"engagement_id": eid, "name": row["name"],
+                      "enabled": bool(row["enabled"]), "actor": meta["approved_by"]},
+                     severity="high")
+    except Exception as e:  # noqa: BLE001
+        log.warning("preapproval webhook failed: %s", e)
+    return {"ok": True, "engagement_id": eid, "name": row["name"],
+            "enabled": bool(row["enabled"]), "meta": meta}
+
+
 @app.put("/engagements/{eid}", tags=["Engagements"])
 def update_engagement(eid: str, body: EngagementUpdate, _: bool = Depends(auth)):
     """Update an engagement."""

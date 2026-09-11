@@ -757,6 +757,39 @@ active_sessions: Dict[str, Dict] = {}
 # Session Watchdog
 # ===============================
 
+def _session_recently_active(session_id: str, within_s: float) -> bool:
+    """True if the session did something in the last `within_s` seconds.
+
+    WHY: the watchdog measured progress ONLY by new session messages. A phase
+    that is genuinely working without narrating — the surface phase executing 26
+    safe tests, a long scan ingest — looks identical to a hung LLM call, and a
+    session was marked `stalled` at ~7 minutes while it was emitting a
+    `langgraph_surface_test_completed` webhook every 1-2 seconds. It then carried
+    on and parked for approval perfectly normally, having already been labelled
+    broken.
+
+    webhook_events is the cheapest honest signal: every phase, test and scan
+    emits one, and the table is already indexed on created_at.
+    """
+    try:
+        from db_utils import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT 1 FROM webhook_events
+                    WHERE created_at > now() - (%s || ' seconds')::interval
+                      AND payload::text LIKE %s
+                    LIMIT 1""",
+                (int(within_s), f"%{session_id}%"))
+            return cur.fetchone() is not None
+    except Exception as e:  # noqa: BLE001
+        # Reported, and treated as "cannot tell" rather than "no activity":
+        # guessing "idle" here is what marks a working session stalled.
+        watchdog_logger.warning(
+            "[%s] activity probe failed (%s) — not stalling on an unreadable signal",
+            session_id[:8], e)
+        return True
+
+
 async def session_watchdog():
     """
     Enhanced AI Agent Watchdog - monitors both AI sessions and scan jobs.
@@ -828,6 +861,35 @@ async def session_watchdog():
                     session_timeout = get_session_timeout(session_id)
 
                     if stall_time >= session_timeout:
+                        # A session PARKED FOR APPROVAL is not stalled.
+                        #
+                        # It is waiting for a human, who may not look at it until
+                        # tomorrow. The list above was taken as `active`, and the
+                        # session can park between that snapshot and here, so the
+                        # status is re-read rather than trusted.
+                        try:
+                            live = get_agent_session(uuid.UUID(session_id)) or {}
+                            live_status = live.get("status")
+                        except Exception:  # noqa: BLE001
+                            live_status = None
+                        if live_status in ("awaiting_approval", "completed",
+                                           "failed", "stopped"):
+                            watchdog_logger.debug(
+                                "[%s] status is %s — not a stall", session_id[:8],
+                                live_status)
+                            session_last_activity[session_id] = now
+                            continue
+
+                        # Still working, just not talking. See
+                        # _session_recently_active for why messages alone are not
+                        # a progress signal.
+                        if _session_recently_active(session_id, session_timeout):
+                            watchdog_logger.info(
+                                "[%s] no new messages for %.0fs but still emitting "
+                                "events — not stalling", session_id[:8], stall_time)
+                            session_last_activity[session_id] = now
+                            continue
+
                         # Session has stalled!
                         recovery_attempts = session_recovery_attempts.get(session_id, 0)
 
