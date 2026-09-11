@@ -121,8 +121,31 @@ def test_policy_overrides_to_stay_under_lockout():
 
 
 def test_approval_is_tied_to_account_and_service():
+    """Approval must consider BOTH the account and the service — never the run.
+
+    The lookup used to be an exact dict hit, `approvals.get((uname.lower(),
+    proto))`. It is now `best_match(spray_rules, [uname, proto], ...)` so an
+    approval can be a pattern ('all', 'ssh,smb', 'svc_*') instead of forcing the
+    operator to re-approve the same account once per service. The INTENT is
+    unchanged and is what this pins: two dimensions, ANDed. A test that pinned
+    the old expression would have blocked the feature while proving nothing
+    about the property it was named for.
+    """
     body, src = _fn_src()
-    assert 'approvals.get((uname.lower(), proto)' in body, (
-        "approval must be keyed on (account, service), not the whole run")
+    assert "best_match(spray_rules" in body, (
+        "the spray approval lookup is gone; approval must still be resolved "
+        "per (account, service)")
+    assert 'pattern_fields=["username", "service"]' in body, (
+        "approval must be keyed on (account, service), not the whole run — "
+        "both dimensions must be matched, and they are ANDed by match_score()")
     assert "held_needs_approval" in body
     assert "credentials_spray_approval" in src, "an approval endpoint must exist"
+
+
+def test_spray_approval_denies_when_no_rule_matches():
+    """Fail closed. `best_match` returns None for 'no rule matched', and None
+    must never be read as approval — an unapproved spray is held, not sent."""
+    body, _src = _fn_src()
+    assert "approved = bool(_rule and _rule[\"approved\"])" in body, (
+        "an unmatched (account, service) pair must resolve to NOT approved; "
+        "treating a None match as approved would spray every account")

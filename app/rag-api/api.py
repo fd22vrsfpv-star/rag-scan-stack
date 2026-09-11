@@ -8029,6 +8029,7 @@ def credentials_reuse(body: CredentialReuseRequest, authorized: bool = Depends(a
     import sys as _sys
     _sys.path.insert(0, "/app")
     from etl.scope_gate import load_dispatch_scope, check_dispatch
+    from etl.approval_match import best_match
 
     eid = body.engagement_id
     with get_db(autocommit=True) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -8056,12 +8057,18 @@ def credentials_reuse(body: CredentialReuseRequest, authorized: bool = Depends(a
                     "target_host, target_port FROM public.credential_spray_attempts")
         attempted = {(r["username"], r["fp"], r["target_host"], r["target_port"])
                      for r in cur.fetchall()}
-        # approvals: (lower username, lower service) -> approved
-        cur.execute("SELECT lower(username) u, lower(service) s, approved "
+        # Approvals are PATTERNS now, not exact pairs: 'all' / '*' / 'svc_*' /
+        # 'ssh,smb' all select (etl/approval_match.py). This used to be a dict
+        # keyed on (lower username, lower service), which meant an operator had
+        # to re-approve the same account once per service it appeared on.
+        # Rows are kept whole so best_match() can rank them: the most specific
+        # rule wins, and at equal specificity a DENY beats an allow, so
+        # "approve all, except this account" is expressible.
+        cur.execute("SELECT username, service, approved "
                     "FROM public.credential_spray_approvals "
                     "WHERE (%(eid)s IS NULL OR engagement_id = %(eid)s::uuid OR engagement_id IS NULL)",
                     {"eid": eid})
-        approvals = {(r["u"], r["s"]): r["approved"] for r in cur.fetchall()}
+        spray_rules = [dict(r) for r in cur.fetchall()]
 
         plan, refused_scope, skipped_dedup, throttled, needs_approval = [], 0, 0, 0, 0
         for cred in creds:
@@ -8094,7 +8101,9 @@ def credentials_reuse(body: CredentialReuseRequest, authorized: bool = Depends(a
                 if remaining <= 0:
                     throttled += 1
                     continue
-                approved = approvals.get((uname.lower(), proto), False)
+                _rule = best_match(spray_rules, [uname, proto],
+                                   pattern_fields=["username", "service"])
+                approved = bool(_rule and _rule["approved"])
                 if body.require_approval and not approved:
                     needs_approval += 1
                     continue
@@ -8396,6 +8405,272 @@ def cleanup_exploits(
         conn.commit()
 
     return {"dry_run": False, "exploit_results": results_deleted, "pending_exploits": pending_deleted, "exploit_chunks": chunks_deleted}
+
+
+# ── Standing exploit-approval rules ─────────────────────────────────────────
+# Declared BEFORE the /exploits/{exploit_id}/... routes on purpose: FastAPI
+# matches in declaration order, so a literal segment must precede the parameter
+# that could swallow it (tests/test_route_contracts.py pins this).
+#
+# A rule is an operator approval for a CLASS of finding rather than one row.
+# What it can never do is widen SCOPE: the sweep re-checks every target through
+# etl.scope_gate.check_dispatch, so a wildcard authorizes a kind of exploit, not
+# a kind of target. CLAUDE.md: override flags overrule the platform's
+# suppression judgement, never the operator's authorization.
+
+class ExploitApprovalRuleRequest(BaseModel):
+    engagement_id: Optional[str] = None
+    name: Optional[str] = None
+    # Patterns — 'all' / '*' / 'web*' / 'rce,sqli'. See etl/approval_match.py.
+    exploit_type: str = "all"
+    source: str = "all"
+    target: str = "all"
+    min_confidence: Optional[float] = None
+    approved: bool = True          # False = standing DENY
+    auto_execute: bool = False     # approving and firing are different decisions
+    enabled: bool = True
+    created_by: Optional[str] = None
+    note: Optional[str] = None
+    apply_now: bool = True         # sweep the currently-pending rows immediately
+
+
+def _sweep_exploit_approval_rules(engagement_id=None, dry_run=False,
+                                  actor="exploit_approval_rule"):
+    """Apply every enabled rule to the pending queue.
+
+    Returns a report rather than a bare count, because an operator who fires a
+    wildcard needs to see what it did NOT do as much as what it did. Blocked
+    items are listed, never silently dropped (CLAUDE.md).
+
+    Order of decisions per pending exploit, all of which can stop it:
+      1. no rule matches                      -> unmatched
+      2. the winning rule is a DENY           -> held (NOT rejected: a deny
+         withholds approval so the operator can still review; auto-rejecting
+         would remove that chance and is not what "don't approve these" means)
+      3. below the rule's min_confidence      -> below_confidence
+      4. the scope gate refuses the target    -> refused_scope  ← never overridable
+      5. otherwise                            -> approved
+    """
+    from etl.approval_match import best_match
+    from etl.scope_gate import load_dispatch_scope, check_dispatch
+
+    eid = _validate_engagement_uuid(engagement_id) if engagement_id else None
+    report = {"approved": [], "held": [], "refused_scope": [],
+              "below_confidence": [], "unmatched": 0, "to_execute": [],
+              "rules_considered": 0, "dry_run": bool(dry_run)}
+
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT * FROM public.exploit_approval_rules
+                WHERE enabled = true
+                  AND (%(eid)s IS NULL OR engagement_id = %(eid)s::uuid
+                       OR engagement_id IS NULL)""",
+            {"eid": str(eid) if eid else None})
+        rules = [dict(r) for r in cur.fetchall()]
+        report["rules_considered"] = len(rules)
+        if not rules:
+            return report
+
+        cur.execute(
+            """SELECT id, source, exploit_id, exploit_title, exploit_type,
+                      target_ip, target_port, match_confidence, engagement_id
+                 FROM public.pending_exploits
+                WHERE status = 'pending'
+                  AND (%(eid)s IS NULL OR engagement_id = %(eid)s::uuid
+                       OR engagement_id IS NULL)""",
+            {"eid": str(eid) if eid else None})
+        pending = [dict(r) for r in cur.fetchall()]
+        if not pending:
+            return report
+
+        # Fail closed: an empty scope means check_dispatch refuses everything,
+        # which is the correct answer for an unconfigured engagement.
+        scope_rows, scope_source = load_dispatch_scope(cur, eid)
+        report["scope_source"] = scope_source
+
+        approved_ids = []
+        for p in pending:
+            target = str(p["target_ip"]) if p["target_ip"] is not None else ""
+            rule = best_match(
+                rules,
+                [p["exploit_type"], p["source"], target],
+                pattern_fields=["exploit_type", "source", "target"])
+            if rule is None:
+                report["unmatched"] += 1
+                continue
+
+            label = {"id": str(p["id"]), "title": p["exploit_title"],
+                     "exploit_type": p["exploit_type"], "source": p["source"],
+                     "target": target, "rule_id": str(rule["id"]),
+                     "rule_name": rule.get("name")}
+
+            if not rule["approved"]:
+                report["held"].append({**label, "reason": "a standing deny rule matched"})
+                continue
+
+            minc = rule.get("min_confidence")
+            if minc is not None and float(p["match_confidence"] or 0) < float(minc):
+                report["below_confidence"].append(
+                    {**label, "confidence": float(p["match_confidence"] or 0),
+                     "required": float(minc)})
+                continue
+
+            # THE GATE. A rule is an approval, never a scope override; a forced
+            # or wildcarded out-of-scope dispatch must still be refused.
+            refusal = check_dispatch(target, scope_rows)
+            if refusal:
+                report["refused_scope"].append({**label, "reason": refusal})
+                continue
+
+            report["approved"].append(label)
+            approved_ids.append((str(p["id"]), str(rule["id"])))
+            if rule["auto_execute"]:
+                report["to_execute"].append(str(p["id"]))
+
+        if approved_ids and not dry_run:
+            for pid, rid in approved_ids:
+                cur.execute(
+                    """UPDATE public.pending_exploits
+                          SET status = 'approved',
+                              reviewed_by = %s,
+                              reviewed_at = now(),
+                              metadata = COALESCE(metadata, '{}'::jsonb)
+                                         || jsonb_build_object('approval_rule_id', %s)
+                        WHERE id = %s::uuid AND status = 'pending'""",
+                    (f"rule:{rid}", rid, pid))
+            cur.execute(
+                """UPDATE public.exploit_approval_rules
+                      SET applied_count = applied_count + %s, last_applied_at = now()
+                    WHERE id = ANY(%s::uuid[])""",
+                (1, list({rid for _, rid in approved_ids})))
+            conn.commit()
+
+    if report["approved"] and not dry_run:
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("exploit_rule_auto_approved", "exploit_approval_rules", {
+                "engagement_id": str(eid) if eid else None,
+                "approved": len(report["approved"]),
+                "queued_for_execution": len(report["to_execute"]),
+                "held_by_deny_rule": len(report["held"]),
+                "refused_scope": len(report["refused_scope"]),
+                "below_confidence": len(report["below_confidence"]),
+                "unmatched": report["unmatched"],
+                "actor": actor,
+            })
+        except Exception as e:                              # noqa: BLE001
+            log.warning("exploit_rule_auto_approved webhook failed: %s", e)
+    if report["refused_scope"]:
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("exploit_rule_scope_refused", "exploit_approval_rules", {
+                "engagement_id": str(eid) if eid else None,
+                "refused": len(report["refused_scope"]),
+                "targets": sorted({r["target"] for r in report["refused_scope"]})[:20],
+            }, severity="high")
+        except Exception as e:                              # noqa: BLE001
+            log.warning("exploit_rule_scope_refused webhook failed: %s", e)
+    return report
+
+
+@app.get("/exploits/approval-rules", tags=["Exploits"])
+def list_exploit_approval_rules(engagement_id: Optional[str] = Query(None),
+                                _: bool = Depends(auth)):
+    """Standing approval rules, newest first."""
+    eid = _validate_engagement_uuid(engagement_id) if engagement_id else None
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT * FROM public.exploit_approval_rules
+                WHERE (%(eid)s IS NULL OR engagement_id = %(eid)s::uuid
+                       OR engagement_id IS NULL)
+                ORDER BY created_at DESC""",
+            {"eid": str(eid) if eid else None})
+        rules = [dict(r) for r in cur.fetchall()]
+    return {"rules": rules, "total": len(rules)}
+
+
+@app.post("/exploits/approval-rules", tags=["Exploits"])
+def upsert_exploit_approval_rule(body: ExploitApprovalRuleRequest,
+                                 _: bool = Depends(auth)):
+    """Create or update a standing approval rule, and (by default) apply it now.
+
+    `apply_now` exists because a rule that only affects FUTURE arrivals would
+    leave the operator staring at the queue that made them write it.
+    """
+    eid = _validate_engagement_uuid(body.engagement_id) if body.engagement_id else None
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            # The ON CONFLICT target repeats the unique index expression EXACTLY.
+            # Anything else raises "no unique or exclusion constraint matching
+            # the ON CONFLICT specification".
+            """INSERT INTO public.exploit_approval_rules
+                 (engagement_id, name, exploit_type, source, target,
+                  min_confidence, approved, auto_execute, enabled, created_by, note)
+               VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (COALESCE(engagement_id::text,''), lower(exploit_type),
+                            lower(source), lower(target))
+                 DO UPDATE SET name = EXCLUDED.name,
+                               min_confidence = EXCLUDED.min_confidence,
+                               approved = EXCLUDED.approved,
+                               auto_execute = EXCLUDED.auto_execute,
+                               enabled = EXCLUDED.enabled,
+                               created_by = EXCLUDED.created_by,
+                               note = EXCLUDED.note,
+                               updated_at = now()
+               RETURNING *""",
+            (str(eid) if eid else None, body.name, body.exploit_type, body.source,
+             body.target, body.min_confidence, body.approved, body.auto_execute,
+             body.enabled, body.created_by, body.note))
+        rule = dict(cur.fetchone())
+        conn.commit()
+
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("exploit_approval_rule_saved", "exploit_approval_rules", {
+            "rule_id": str(rule["id"]), "name": rule.get("name"),
+            "exploit_type": rule["exploit_type"], "source": rule["source"],
+            "target": rule["target"], "approved": rule["approved"],
+            "auto_execute": rule["auto_execute"], "enabled": rule["enabled"],
+            "engagement_id": str(eid) if eid else None,
+        })
+    except Exception as e:                                  # noqa: BLE001
+        log.warning("exploit_approval_rule_saved webhook failed: %s", e)
+
+    report = (_sweep_exploit_approval_rules(body.engagement_id)
+              if (body.apply_now and body.enabled) else None)
+    return {"ok": True, "rule": rule, "applied": report}
+
+
+@app.delete("/exploits/approval-rules/{rule_id}", tags=["Exploits"])
+def delete_exploit_approval_rule(rule_id: str, _: bool = Depends(auth)):
+    """Remove a standing rule. Already-approved exploits keep their status —
+    deleting a rule stops it applying in future, it does not un-approve history."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("DELETE FROM public.exploit_approval_rules WHERE id = %s::uuid "
+                    "RETURNING id, name", (rule_id,))
+        row = cur.fetchone()
+        conn.commit()
+    if not row:
+        raise HTTPException(404, f"no approval rule {rule_id}")
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("exploit_approval_rule_deleted", "exploit_approval_rules",
+                     {"rule_id": rule_id, "name": (dict(row)).get("name")})
+    except Exception as e:                                  # noqa: BLE001
+        log.warning("exploit_approval_rule_deleted webhook failed: %s", e)
+    return {"ok": True, "deleted": rule_id}
+
+
+@app.post("/exploits/approval-rules/apply", tags=["Exploits"])
+def apply_exploit_approval_rules(engagement_id: Optional[str] = Query(None),
+                                 dry_run: bool = Query(False),
+                                 _: bool = Depends(auth)):
+    """Sweep the pending queue against every enabled rule.
+
+    `dry_run=true` reports exactly what would happen and writes nothing — the
+    honest way to find out what a wildcard is about to approve.
+    """
+    return _sweep_exploit_approval_rules(engagement_id, dry_run=dry_run)
 
 
 @app.put("/exploits/{exploit_id}/status", tags=["Exploits"])
