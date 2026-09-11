@@ -3314,6 +3314,99 @@ DROP TRIGGER IF EXISTS trg_findings_engagement ON findings;
 CREATE TRIGGER trg_findings_engagement
     BEFORE INSERT ON findings FOR EACH ROW EXECUTE FUNCTION propagate_engagement_to_findings();
 
+-- assets: inherit the engagement from the scope list that names this host.
+--
+-- WHY THIS EXISTS: assets had NO engagement propagation at all — a row got an
+-- engagement only if the inserting code happened to supply one. Measured on the
+-- live DB 2026-09-11: 137 of 1831 assets carried none, and those 137 were the
+-- reason 897 unattributed follow-ups could not be fixed by resolving their
+-- hostname to an asset (the asset itself knew nothing). Everything downstream
+-- that groups by engagement silently lost those hosts.
+--
+-- Scope is the authority, same as for follow_up_items. All 135 of the 137 that
+-- resolve do so via an EXACT scope entry, not a suffix guess.
+--
+-- ATTRIBUTION IS NOT AUTHORIZATION: the scope gate reads scope_targets, never
+-- assets.engagement_id, so stamping a row here never makes a host scannable. It
+-- decides which engagement's reports and views the host appears in.
+CREATE OR REPLACE FUNCTION propagate_engagement_to_assets()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.engagement_id IS NULL THEN
+        -- 1. Hostname against the scope list (exact, or dot-boundary suffix).
+        IF NEW.hostname IS NOT NULL AND btrim(NEW.hostname) <> '' THEN
+            SELECT st.engagement_id INTO NEW.engagement_id
+            FROM scope_targets st
+            WHERE st.engagement_id IS NOT NULL
+              -- A blank scope target is NOT a wildcard. Four such rows exist
+              -- live (blackbaud, customer, customer_scope, msf); without this
+              -- every host matches them all and is attributed at random.
+              AND st.target IS NOT NULL AND btrim(st.target) <> ''
+              AND (lower(NEW.hostname) = lower(st.target)
+                   -- Suffix matching is for domains only, never IP octets.
+                   OR (lower(NEW.hostname) !~ '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+                       AND lower(NEW.hostname) LIKE '%.' || lower(st.target)))
+            ORDER BY length(st.target) DESC   -- most specific scope rule wins
+            LIMIT 1;
+        END IF;
+        -- 2. The address itself, for assets that have no hostname yet.
+        IF NEW.engagement_id IS NULL AND NEW.ip IS NOT NULL THEN
+            SELECT st.engagement_id INTO NEW.engagement_id
+            FROM scope_targets st
+            WHERE st.engagement_id IS NOT NULL
+              AND st.target IS NOT NULL AND btrim(st.target) <> ''
+              AND lower(st.target) = host(NEW.ip)
+            LIMIT 1;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+-- INSERT OR UPDATE: a hostname often arrives after the row does (nmap finds the
+-- address, reverse DNS names it later), and an UPDATE is the only chance to
+-- attribute those. Guarded on engagement_id IS NULL, so it never re-attributes
+-- a row that already has an answer.
+DROP TRIGGER IF EXISTS trg_assets_engagement ON assets;
+CREATE TRIGGER trg_assets_engagement
+    BEFORE INSERT OR UPDATE ON assets FOR EACH ROW EXECUTE FUNCTION propagate_engagement_to_assets();
+
+-- Backfill the rows that predate the trigger. Idempotent; only touches NULLs.
+DO $$ BEGIN
+    UPDATE assets a
+       SET engagement_id = (
+            SELECT st.engagement_id FROM scope_targets st
+             WHERE st.engagement_id IS NOT NULL
+               AND st.target IS NOT NULL AND btrim(st.target) <> ''
+               AND (lower(a.hostname) = lower(st.target)
+                    OR (lower(a.hostname) !~ '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+                        AND lower(a.hostname) LIKE '%.' || lower(st.target)))
+             ORDER BY length(st.target) DESC LIMIT 1)
+     WHERE a.engagement_id IS NULL
+       AND a.hostname IS NOT NULL AND btrim(a.hostname) <> ''
+       AND EXISTS (
+            SELECT 1 FROM scope_targets st
+             WHERE st.engagement_id IS NOT NULL
+               AND st.target IS NOT NULL AND btrim(st.target) <> ''
+               AND (lower(a.hostname) = lower(st.target)
+                    OR (lower(a.hostname) !~ '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+                        AND lower(a.hostname) LIKE '%.' || lower(st.target))));
+
+    UPDATE assets a
+       SET engagement_id = (
+            SELECT st.engagement_id FROM scope_targets st
+             WHERE st.engagement_id IS NOT NULL
+               AND st.target IS NOT NULL AND btrim(st.target) <> ''
+               AND lower(st.target) = host(a.ip) LIMIT 1)
+     WHERE a.engagement_id IS NULL AND a.ip IS NOT NULL
+       AND EXISTS (
+            SELECT 1 FROM scope_targets st
+             WHERE st.engagement_id IS NOT NULL
+               AND st.target IS NOT NULL AND btrim(st.target) <> ''
+               AND lower(st.target) = host(a.ip));
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'assets engagement backfill skipped: %', SQLERRM;
+END $$;
+
 -- follow_up_items: match target to an asset, by IP literal or by hostname.
 --
 -- WHY THE HOSTNAME LEG EXISTS: this trigger used to extract an IPv4 literal and
