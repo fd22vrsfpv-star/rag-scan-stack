@@ -308,6 +308,16 @@ export interface CredentialFinding {
   duration_ms: number | null
   metadata: CredentialMetadata
   created_at: string
+  /** The harvested secret itself — password, hash, or key material.
+   *
+   *  This was missing from the type because the server never populated the
+   *  column: POST /credentials wrote the secret into `metadata` and left
+   *  secret_value out of its INSERT entirely, so the panel had nothing to
+   *  render. The column is now the source of truth; older rows are lifted out
+   *  of metadata by the backfill in db_init/ensure_all_tables.sql, and the UI
+   *  still falls back to `metadata.secret_value` for any install that has not
+   *  applied it yet. */
+  secret_value: string | null
 }
 
 export function useAllCredentials(status?: string, protocol?: string, source?: string) {
@@ -493,14 +503,19 @@ export interface SoftwareSummary {
   source_count: number
 }
 
-export function useDetectedSoftware(search?: string, product?: string, source?: string) {
+/** @param excludeScope comma-separated scope list names whose hosts to omit.
+ *  'customer_scope' drops customer-hosted sites — 3165 of 5572 detections on
+ *  the live data, so without it the inventory is mostly third-party estate. */
+export function useDetectedSoftware(search?: string, product?: string, source?: string,
+                                    excludeScope?: string) {
   const params = new URLSearchParams()
   if (search) params.set('search', search)
   else if (product) params.set('product', product)
   if (source) params.set('source', source)
+  if (excludeScope) params.set('exclude_scope', excludeScope)
   const qs = params.toString()
   return useQuery({
-    queryKey: ['detected-software', search, product, source],
+    queryKey: ['detected-software', search, product, source, excludeScope],
     queryFn: () => apiFetch<{ count: number; summary: SoftwareSummary; items: DetectedSoftware[] }>(
       `/software${qs ? '?' + qs : ''}`
     ),

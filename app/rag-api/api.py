@@ -324,6 +324,44 @@ def _resolve_engagement_id(explicit: Optional[str] = None) -> Optional[str]:
         return None
 
 
+#: How a follow-up target resolves to a bare host. The same SQL function the
+#: engagement-attribution trigger uses, so "which host is this?" cannot come to
+#: mean two different things in two places.
+# QUALIFIED on purpose. The exclusion is a NOT EXISTS subquery over
+# scope_targets, which ALSO has a column called `target` — so a bare `target`
+# inside it binds to scope_targets.target, not the follow-up's. That compared
+# each scope row against itself, was true for nearly every row, and excluded the
+# ENTIRE list: 1516 rows in, 0 out. Caught by checking the numbers rather than
+# trusting the query.
+HOST_EXPR_FOLLOWUP = "followup_target_host(follow_up_items.target)"
+
+
+def _scope_exclusion_clause(host_expr: str, exclude_scope: Optional[str]):
+    """(sql_fragment, params) dropping rows whose host sits in a named scope list.
+
+    WHY: `customer_scope` holds customer-hosted sites that the mark-customer-sites
+    flow moved OUT of the scanned scope — they belong to the engagement's data but
+    are not ours to test or report on. On the live database they are 1310 of 1516
+    follow-ups (86%) and 3165 of 5572 software detections (57%), so without a way
+    to drop them both lists are mostly other people's estate.
+
+    EXACT match, deliberately. customer_scope holds specific hostnames; a
+    dot-boundary suffix match would let one broad entry ('blackbaud.com') hide the
+    entire engagement, which is the opposite of a filter. The same reasoning as
+    the blank-target guard elsewhere: a matcher that is too generous silently
+    removes the operator's real work.
+
+    Returns ("", []) when nothing is excluded, so callers can append
+    unconditionally.
+    """
+    names = [n.strip() for n in (exclude_scope or "").split(",") if n.strip()]
+    if not names:
+        return "", []
+    return (f"NOT EXISTS (SELECT 1 FROM scope_targets st "
+            f"WHERE st.name = ANY(%s) AND st.target <> '' "
+            f"AND lower(st.target) = {host_expr})"), [names]
+
+
 def _validate_engagement_uuid(eid: Optional[str]) -> Optional[str]:
     """Validate that a resolved engagement_id is a well-formed UUID before it
     reaches the SQL layer (the column is ``uuid``). Returns the value unchanged
@@ -1643,10 +1681,21 @@ def create_credential(
                 except _socket.gaierror:
                     # Can't resolve — store as 0.0.0.0, keep hostname in metadata
                     ip = "0.0.0.0"
-    # Store secret_value and original hostname in metadata
+    # The secret goes in the secret_value COLUMN, not in metadata.
+    #
+    # It used to be written to metadata only, and the INSERT below simply had no
+    # secret_value in its column list — so the dedicated column was NULL on every
+    # row this endpoint created. That is not a display quirk: etl/credential_bridge.py
+    # selects `cf.secret_value`, so every post-ex harvested credential was
+    # invisible to the bridge and to anything reading the column. Verified on the
+    # live DB: 9 of 9 rows from source='postex_enum' had the column NULL and the
+    # material only in metadata->>'secret_value'.
+    #
+    # Not written to both: a secret duplicated in two places is one more copy to
+    # leak and two places to keep in sync. ensure_all_tables.sql backfills the
+    # historical rows, and the UI falls back to metadata for any install that has
+    # not applied it yet.
     metadata = {}
-    if secret_value:
-        metadata["secret_value"] = secret_value
     if original_host and original_host != ip:
         metadata["hostname"] = original_host
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -1666,13 +1715,15 @@ def create_credential(
         cur.execute("""
             INSERT INTO credential_findings
                 (id, asset_id, ip, port, protocol, username, valid_cred, auth_type,
-                 secret_type, source, banner, status, discovered_at, metadata)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), %s)
+                 secret_type, source, banner, status, discovered_at, metadata,
+                 secret_value)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), %s, %s)
             RETURNING id, host(ip)::text as ip, port, protocol, username, valid_cred,
-                      auth_type, secret_type, source, banner, status, discovered_at, created_at
+                      auth_type, secret_type, source, banner, status, discovered_at,
+                      created_at, secret_value
         """, (cred_id, asset_id, ip or '0.0.0.0', port, protocol, username,
               status == 'valid', secret_type, secret_type, source, banner, status,
-              Json(metadata)))
+              Json(metadata), secret_value or None))
         row = cur.fetchone()
         conn.commit()
     return dict(row)
@@ -1796,7 +1847,16 @@ def get_asset_credentials(ip: str, authorized: bool = Depends(auth)):
         cur.execute("""
             SELECT id, host(ip)::text as ip, port, protocol, username, valid_cred,
                    auth_type, secret_type, severity, banner, source, status,
-                   discovered_at, last_verified_at, duration_ms, metadata, created_at
+                   discovered_at, last_verified_at, duration_ms, metadata, created_at,
+                   -- The recovered secret, in PLAINTEXT, for the same reason the
+                   -- list endpoint above returns it: the operator's next step is
+                   -- to authenticate with it, and a credential they cannot read
+                   -- is a credential they cannot use. Authenticated endpoint.
+                   --
+                   -- This column was missing here while the list endpoint had it,
+                   -- so the Assets > Credentials drill-down showed an account with
+                   -- no secret and no way to see one.
+                   secret_value
             FROM credential_findings
             WHERE host(ip)::text = %s
             ORDER BY created_at DESC
@@ -10967,6 +11027,9 @@ def get_detected_software(
     product: Optional[str] = Query(None, description="Filter by product name (substring)"),
     search: Optional[str] = Query(None, description="Search across product, version, hostname, IP"),
     source: Optional[str] = Query(None, description="Filter by detection source"),
+    exclude_scope: Optional[str] = Query(
+        None, description="Comma-separated scope list names whose hosts to omit, "
+                          "e.g. 'customer_scope' to drop customer-hosted sites"),
     limit: int = Query(2000, ge=1, le=10000),
     authorized: bool = Depends(auth),
 ):
@@ -10987,6 +11050,10 @@ def get_detected_software(
         if source:
             where.append("source = %s")
             params.append(source)
+        _ex, _exp = _scope_exclusion_clause("lower(detected_software.hostname)", exclude_scope)
+        if _ex:
+            where.append(_ex)
+            params.extend(_exp)
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
         # Deduplicate: group by host + product + version + source, keep latest
         sql = f"""
@@ -20186,14 +20253,25 @@ def rescope_follow_ups(req: RescopeRequest, authorized: bool = Depends(auth)):
 @app.get("/follow-ups/stats", tags=["Follow-Ups"])
 def follow_up_stats(
     engagement_id: Optional[str] = Query(None),
+    exclude_scope: Optional[str] = Query(
+        None, description="Comma-separated scope list names whose hosts to omit"),
     _: bool = Depends(auth),
 ):
-    """Aggregate counts by status, priority, and flagged_by."""
-    eng_clause = ""
+    """Aggregate counts by status, priority, and flagged_by.
+
+    Takes the same exclude_scope as the list endpoint on purpose: a header that
+    counted rows the table refuses to show would contradict the table under it.
+    """
+    stat_clauses = []
     params = []
     if engagement_id:
-        eng_clause = "WHERE engagement_id = %s::uuid"
+        stat_clauses.append("engagement_id = %s::uuid")
         params.append(engagement_id)
+    _ex, _exp = _scope_exclusion_clause(HOST_EXPR_FOLLOWUP, exclude_scope)
+    if _ex:
+        stat_clauses.append(_ex)
+        params.extend(_exp)
+    eng_clause = ("WHERE " + " AND ".join(stat_clauses)) if stat_clauses else ""
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(f"""
             SELECT
@@ -20251,6 +20329,8 @@ def follow_ups_grouped(
     status: Optional[str] = Query(None),
     exclude_status: Optional[str] = Query(None),
     engagement_id: Optional[str] = Query(None),
+    exclude_scope: Optional[str] = Query(
+        None, description="Comma-separated scope list names whose hosts to omit"),
     authorized: bool = Depends(auth),
 ):
     """Return follow-ups grouped by finding name or target host with counts."""
@@ -20266,6 +20346,10 @@ def follow_ups_grouped(
         if engagement_id:
             where_clauses.append("engagement_id = %s::uuid")
             params.append(engagement_id)
+        _ex, _exp = _scope_exclusion_clause(HOST_EXPR_FOLLOWUP, exclude_scope)
+        if _ex:
+            where_clauses.append(_ex)
+            params.extend(_exp)
         where = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
         if group_by == "target":
@@ -20353,6 +20437,9 @@ def list_follow_ups(
     engagement_id: Optional[str] = Query(None),
     rule_id: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
+    exclude_scope: Optional[str] = Query(
+        None, description="Comma-separated scope list names whose hosts to omit, "
+                          "e.g. 'customer_scope' to drop customer-hosted sites"),
     limit: int = Query(10000),
     offset: int = Query(0),
     _: bool = Depends(auth),
@@ -20376,6 +20463,10 @@ def list_follow_ups(
     if search:
         clauses.append("(title ILIKE %s OR target ILIKE %s OR reason ILIKE %s OR rule_id ILIKE %s)")
         params.extend([f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%"])
+    _ex, _exp = _scope_exclusion_clause(HOST_EXPR_FOLLOWUP, exclude_scope)
+    if _ex:
+        clauses.append(_ex)
+        params.extend(_exp)
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     params.extend([limit, offset])
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:

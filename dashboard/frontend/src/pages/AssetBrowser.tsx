@@ -11,7 +11,7 @@ import { DataTable } from '@/components/common/DataTable'
 import { StatusDot } from '@/components/common/StatusDot'
 import type { ColumnDef, RowSelectionState } from '@tanstack/react-table'
 import type { Asset, Port, Vuln, ScanRecommendation } from '@/lib/types'
-import { X, Trash2, Key, Plus, ShieldCheck, ShieldX, ShieldQuestion, ShieldOff, AlertTriangle, Globe, Camera, Cpu, Settings2, Search, ExternalLink, Cloud, Server, ChevronDown, ChevronRight } from 'lucide-react'
+import { X, Trash2, Key, Plus, ShieldCheck, ShieldX, ShieldQuestion, ShieldOff, AlertTriangle, Globe, Camera, Cpu, Settings2, Search, ExternalLink, Cloud, Server, ChevronDown, ChevronRight, Eye, EyeOff, Copy, Check } from 'lucide-react'
 import { ScopeAssignModal } from '@/components/common/ScopeAssignModal'
 import { ScopeFilter } from '@/components/common/ScopeFilter'
 import { KbSuggestionsModal } from '@/components/recommendations/KbSuggestionsModal'
@@ -294,6 +294,56 @@ function AddCredentialModal({ onClose }: { onClose: () => void }) {
   )
 }
 
+/** The harvested secret, hidden until asked for.
+ *
+ *  Masked by default rather than shown: this panel is often on screen while
+ *  screen-sharing or writing a report, and key material or a reused password
+ *  does not belong in a screenshot by accident. Revealing is one click and the
+ *  value is always copyable without being displayed.
+ *
+ *  Reads the column first and falls back to metadata.secret_value, because rows
+ *  created before the writer was fixed carry it there until the backfill in
+ *  db_init/ensure_all_tables.sql has been applied.
+ */
+function SecretValue({ value, secretType }: { value: string; secretType?: string }) {
+  const [shown, setShown] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const multiline = value.includes('\n')
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch { /* clipboard blocked (no https / no permission) — the reveal still works */ }
+  }
+  return (
+    <div className="col-span-2 space-y-1">
+      <div className="flex items-center gap-2">
+        <span className="text-muted-foreground">Secret{secretType ? ` (${secretType})` : ''}:</span>
+        <button onClick={() => setShown(!shown)}
+          className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-border text-[10px] hover:bg-accent">
+          {shown ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+          {shown ? 'Hide' : 'Reveal'}
+        </button>
+        <button onClick={copy}
+          className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-border text-[10px] hover:bg-accent">
+          {copied ? <Check className="h-3 w-3 text-green-400" /> : <Copy className="h-3 w-3" />}
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+        <span className="text-[10px] text-muted-foreground">{value.length} chars</span>
+      </div>
+      {shown ? (
+        <pre className="text-foreground font-mono text-[10px] whitespace-pre-wrap break-all
+                        bg-muted/40 border border-border rounded p-2 max-h-56 overflow-auto">{value}</pre>
+      ) : (
+        <div className="text-foreground font-mono bg-muted/40 border border-border rounded px-2 py-1">
+          {multiline ? '•••••••••  (multi-line key material — reveal to view)' : '•'.repeat(Math.min(value.length, 24))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function CredentialSection({ ip }: { ip: string }) {
   const { data: credData } = useAssetCredentials(ip)
   const updateStatus = useUpdateCredentialStatus()
@@ -336,6 +386,34 @@ function CredentialSection({ ip }: { ip: string }) {
                 {c.last_verified_at ? new Date(c.last_verified_at).toLocaleString() : '—'}
               </span></div>
               {c.banner && <div className="col-span-2">Banner: <span className="text-foreground font-mono">{c.banner}</span></div>}
+              {/* The secret itself. Falls back to metadata for rows written
+                  before the server populated the column. */}
+              {(() => {
+                const secret = c.secret_value ?? (typeof c.metadata?.secret_value === 'string'
+                  ? c.metadata.secret_value as string : null)
+                return secret
+                  ? <SecretValue value={secret} secretType={c.secret_type} />
+                  : <div className="col-span-2 text-muted-foreground">
+                      Secret: <span className="text-foreground">not captured</span>
+                      <span className="text-[10px]"> — this finding recorded the account but no secret material</span>
+                    </div>
+              })()}
+              {/* Raw evidence: everything the collector recorded, minus the
+                  secret (shown above) and the audit (its own panel below). */}
+              {(() => {
+                const rest = Object.fromEntries(Object.entries(c.metadata || {})
+                  .filter(([k]) => k !== 'secret_value' && k !== 'audit'))
+                return Object.keys(rest).length > 0 ? (
+                  <details className="col-span-2">
+                    <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
+                      Raw evidence ({Object.keys(rest).length} field{Object.keys(rest).length === 1 ? '' : 's'})
+                    </summary>
+                    <pre className="mt-1 text-foreground font-mono text-[10px] whitespace-pre-wrap break-all
+                                    bg-muted/40 border border-border rounded p-2 max-h-56 overflow-auto">
+{JSON.stringify(rest, null, 2)}</pre>
+                  </details>
+                ) : null
+              })()}
             </div>
             <div className="flex items-center gap-1.5 pt-1">
               <span className="text-muted-foreground mr-1">Set status:</span>
@@ -542,6 +620,11 @@ export default function AssetBrowser() {
 
   const [tab, setTab] = useState(initialTab)
   const [softwareSourceFilter, setSoftwareSourceFilter] = useState<string>('')
+  // Customer-hosted sites (the `customer_scope` list) are hosts moved OUT of the
+  // scanned scope by the mark-customer-sites flow — part of the engagement's
+  // data, but not ours to test or report on. 3165 of 5572 detections on the live
+  // database, so hidden by default; the toggle says how many.
+  const [hideCustomerHostedSw, setHideCustomerHostedSw] = useState(true)
   const [softwareProductFilter, setSoftwareProductFilter] = useState<string>(initialSearch)
   const [softwareProductInput, setSoftwareProductInput] = useState<string>(initialSearch)
   const [expandedHosts, setExpandedHosts] = useState<Set<string>>(new Set())
@@ -620,7 +703,13 @@ export default function AssetBrowser() {
   const { data: allCredsData, isLoading: credsLoading } = useAllCredentials(credStatusFilter || undefined)
   // Unified search — sent to API search param (ORs across product, version, hostname, IP)
   const _apiSearch = softwareProductFilter.length >= 2 ? softwareProductFilter : undefined
-  const { data: softwareData, isLoading: softwareLoading } = useDetectedSoftware(_apiSearch, undefined, softwareSourceFilter || undefined)
+  const { data: softwareData, isLoading: softwareLoading } = useDetectedSoftware(
+    _apiSearch, undefined, softwareSourceFilter || undefined,
+    hideCustomerHostedSw ? 'customer_scope' : undefined)
+  // Unfiltered counts, so the toggle can report what it is hiding instead of
+  // the inventory silently shrinking.
+  const { data: softwareAllData } = useDetectedSoftware(
+    _apiSearch, undefined, softwareSourceFilter || undefined, undefined)
   const updateCredStatus = useUpdateCredentialStatus()
   const deleteCred = useDeleteCredential()
   const deleteAssets = useDeleteAssets()
@@ -1212,6 +1301,22 @@ export default function AssetBrowser() {
               >{s || 'All'}</button>
             ))}
             <div className="ml-auto flex items-center gap-2">
+              {(() => {
+                const hidden = (softwareAllData?.count ?? 0) - (softwareData?.count ?? 0)
+                return (
+                  <button
+                    onClick={() => setHideCustomerHostedSw(!hideCustomerHostedSw)}
+                    title={'Customer-hosted sites are hosts in this engagement\'s customer_scope '
+                      + 'list — out of the scanned scope, so not yours to test or report on. '
+                      + 'Hidden by default; nothing is deleted.'}
+                    className={`px-2.5 py-0.5 text-xs font-medium rounded border ${hideCustomerHostedSw
+                      ? 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                      : 'border-border text-muted-foreground hover:text-foreground'}`}
+                  >{hideCustomerHostedSw
+                    ? `Customer-hosted hidden${hidden > 0 ? ` (${hidden})` : ''}`
+                    : 'Customer-hosted shown'}</button>
+                )
+              })()}
               <button
                 onClick={() => setHideBlankProductVersion(!hideBlankProductVersion)}
                 className={`px-2.5 py-0.5 text-xs font-medium rounded border ${hideBlankProductVersion ? 'bg-primary/20 text-primary border-primary/50' : 'border-border text-muted-foreground hover:text-foreground'}`}

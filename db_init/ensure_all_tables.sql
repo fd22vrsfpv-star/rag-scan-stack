@@ -4751,6 +4751,31 @@ DELETE FROM public.credential_findings a
 DROP INDEX IF EXISTS public.uq_credential_findings_identity;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_credential_findings_identity
     ON public.credential_findings(ip, port, username, COALESCE(auth_type, ''));
+-- ── credential_findings: lift the secret out of metadata into its column ────
+--
+-- POST /credentials wrote the harvested secret ONLY into metadata and left the
+-- secret_value column out of its INSERT column list entirely. The column existed
+-- the whole time, etl/parse_brutus.py populated it correctly, and
+-- etl/credential_bridge.py SELECTs `cf.secret_value` — so every credential this
+-- endpoint created (all post-ex harvests) was invisible to the bridge and to
+-- anything else reading the column, and the Assets > Credentials panel had
+-- nothing to show. Measured live: 9 of 9 rows from source='postex_enum' had the
+-- column NULL and the material only in metadata->>'secret_value'.
+--
+-- Idempotent: only touches rows where the column is still NULL and metadata
+-- actually carries the key. The key is then REMOVED from metadata so the secret
+-- is not stored in two places — one copy to protect, one place to keep current.
+DO $$ BEGIN
+    UPDATE public.credential_findings
+       SET secret_value = NULLIF(metadata->>'secret_value', ''),
+           metadata     = metadata - 'secret_value'
+     WHERE secret_value IS NULL
+       AND metadata ? 'secret_value'
+       AND NULLIF(metadata->>'secret_value', '') IS NOT NULL;
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'credential_findings secret_value backfill skipped: %', SQLERRM;
+END $$;
+
 -- ── credential_findings: fingerprint dedup, matching the other finding tables ──
 --
 -- This table deduped on an identity INDEX while vulns, web_findings and
