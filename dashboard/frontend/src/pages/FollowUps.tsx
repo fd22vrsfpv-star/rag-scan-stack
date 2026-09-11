@@ -61,6 +61,12 @@ export default function FollowUps() {
   const [filterByEngagement, setFilterByEngagement] = useState(false)
   const activeEngagementId = filterByEngagement && engagementId ? engagementId : undefined
   const { data: statsData } = useFollowUpStats(activeEngagementId)
+  // Unfiltered totals, so an empty list can say WHICH empty it is: nothing
+  // exists, or everything is filtered out. Those look identical on screen,
+  // which is what made unattributed data read as a broken filter. When the
+  // toggle is off this shares a query key with the line above, so it costs
+  // nothing until the operator actually filters.
+  const { data: allStatsData } = useFollowUpStats(undefined)
   const excludeStatus = hideDismissed && filters.status !== 'dismissed' ? 'dismissed' : undefined
   const { data: groupedData } = useFollowUpGrouped(groupBy, filters.status, activeEngagementId, excludeStatus)
   const { data, isLoading } = useFollowUps({
@@ -477,6 +483,9 @@ export default function FollowUps() {
         {engagementId && (
           <button
             onClick={() => setFilterByEngagement(!filterByEngagement)}
+            title={filterByEngagement
+              ? 'Showing only follow-ups linked to the selected engagement. A follow-up links when its target matches an asset in that engagement by IP or hostname; unattributed rows are hidden.'
+              : 'Showing follow-ups from every engagement, including ones not linked to any.'}
             className={cn(
               'h-7 px-2 text-xs rounded border',
               filterByEngagement
@@ -772,7 +781,21 @@ export default function FollowUps() {
         <div className="text-sm text-muted-foreground">Loading...</div>
       ) : items.length === 0 ? (
         <div className="text-sm text-muted-foreground p-8 text-center border border-dashed border-border rounded-lg">
-          No follow-up items yet. Run the agent or add items manually.
+          {filterByEngagement && (allStatsData?.stats?.total ?? 0) > 0 ? (
+            <>
+              <div className="text-foreground mb-1">No follow-ups are linked to this engagement.</div>
+              <div className="max-w-xl mx-auto">
+                {allStatsData?.stats?.total} exist across all engagements. A follow-up is
+                linked when its target matches an asset in this engagement by IP or
+                hostname; rows flagged before that hostname match existed stay
+                unattributed until{' '}
+                <code className="px-1 rounded bg-muted">scripts/ensure_db_schema.sh</code>{' '}
+                backfills them. Switch to <b>All Engagements</b> to see them now.
+              </div>
+            </>
+          ) : (
+            'No follow-up items yet. Run the agent or add items manually.'
+          )}
         </div>
       ) : (
         <div className="border border-border rounded-lg overflow-x-auto">
