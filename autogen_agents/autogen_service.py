@@ -2366,6 +2366,23 @@ async def resume_pentest(session_id: str, request: ResumeRequest):
     )
 
 
+@app.get("/llm/ratelimit")
+async def llm_ratelimit_config():
+    """The agents' 429 knobs and the live governor state.
+
+    A missing langgraph is reported as an ERROR, not as an absent governor: a
+    panel that renders "no throttling" when it simply could not ask is the
+    unreachable-is-not-absent bug this repo keeps re-learning.
+    """
+    try:
+        from langgraph_engine import get_ratelimit_config
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503,
+            detail=f"LangGraph engine unavailable, cannot read the governor: {e}")
+    return get_ratelimit_config()
+
+
 @app.get("/pentest/mcp-tools")
 async def list_mcp_tools_for_agents():
     """List MCP tools available to the autogen agents."""
