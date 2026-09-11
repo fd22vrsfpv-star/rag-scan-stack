@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import operator
 import os
+import threading
 import time
 import uuid
 from typing import Annotated, Any, Dict, List, Optional, TypedDict
@@ -981,6 +982,99 @@ def analyze(state: PentestState) -> dict:
         _emit("langgraph_phase_completed", sid,
               {"phase": "analyze", "mode": "fallback", "error": str(e)[:200]})
         return _analyze_deterministic(state, note=f"[LLM analyze unavailable: {e}] ")
+
+
+#: How long a post-scan re-analysis will wait for the session's scans, and how
+#: often it checks. A full 1-65535 sweep is genuinely slow, so the ceiling is
+#: generous; the poll is cheap because get_session_scan_status only asks the
+#: scanner services for the jobs this session started.
+RESCAN_ANALYSIS_MAX_WAIT_S = int(os.environ.get("RESCAN_ANALYSIS_MAX_WAIT_S") or 2400)
+RESCAN_ANALYSIS_POLL_S = int(os.environ.get("RESCAN_ANALYSIS_POLL_S") or 20)
+
+_TERMINAL_SCAN_STATES = {"completed", "failed", "cancelled", "stopped",
+                         "completed_with_errors", "partial"}
+
+
+def _running_scans(sid: str) -> list:
+    """The session's scans that have not reached a terminal state.
+
+    Goes through get_session_scan_status because that also REFRESHES each job
+    from its scanner service and restores the session from session_scan_metrics
+    when the in-memory registry is gone — which it always is by the time this
+    runs, since teardown has already cleaned up.
+    """
+    try:
+        status = json.loads(scan_tools.get_session_scan_status(sid))
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for s in (status.get("scans") or []):
+        if str(s.get("status") or "running").lower() not in _TERMINAL_SCAN_STATES:
+            out.append(s)
+    return out
+
+
+def _rerun_analysis_when_scans_finish(sid: str, base_state: dict) -> None:
+    """Re-run analysis once the scans this session started have finished.
+
+    WHY THIS EXISTS: the graph is deliberately non-blocking — the scan node
+    dispatches and returns, so `analyze` reads the database as it was BEFORE the
+    scan ran. Against a host with no prior data that means it analyses nothing,
+    reports nothing, and the exploit planner correctly refuses to queue. The run
+    looks like a failure when in fact its scans were still in flight.
+
+    Rather than block the session for the length of a 65535-port sweep, the run
+    finishes as normal and this waits in the background, then re-runs the
+    analysis phases and appends their messages to the SAME session. The operator
+    sees the session complete promptly and the real analysis arrive when there is
+    something to analyse.
+
+    Bounded and best-effort: it never raises into the caller, and on timeout it
+    says so rather than silently doing nothing.
+    """
+    import time as _time
+    deadline = _time.monotonic() + RESCAN_ANALYSIS_MAX_WAIT_S
+    waited_for = []
+    try:
+        while _time.monotonic() < deadline:
+            running = _running_scans(sid)
+            if not running:
+                break
+            waited_for = [s.get("job_id") for s in running]
+            _time.sleep(RESCAN_ANALYSIS_POLL_S)
+        else:
+            _msg(sid, "Analyzer",
+                 f"[post-scan] Gave up waiting after "
+                 f"{RESCAN_ANALYSIS_MAX_WAIT_S}s; {len(waited_for)} scan(s) still "
+                 f"running. Re-run the analysis once they finish.")
+            _emit("langgraph_rescan_analysis_timeout", sid,
+                  {"still_running": len(waited_for)})
+            return
+
+        # Re-establish the context: this thread is not the one that ran the graph.
+        scan_tracker.set_session(sid)
+        scan_tracker.register_run(sid)
+        _msg(sid, "Analyzer",
+             "[post-scan] Scans finished — re-running analysis over the results "
+             "they produced.")
+        _emit("langgraph_rescan_analysis_started", sid,
+              {"scans_awaited": len(waited_for)})
+
+        state = dict(base_state)
+        analyze(state)
+        if base_state.get("exploit_phase"):
+            try:
+                exploit_plan(state)
+            except Exception as e:  # noqa: BLE001
+                _msg(sid, "Exploit", f"[post-scan] exploit planning failed: {e}")
+        _emit("langgraph_rescan_analysis_completed", sid, {})
+    except Exception as e:  # noqa: BLE001
+        _log.warning("[%s] post-scan re-analysis failed: %s", sid, e)
+    finally:
+        try:
+            scan_tracker.unregister_run(sid)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _analyze_deterministic(state: PentestState, note: str = "") -> dict:
@@ -2145,6 +2239,14 @@ def surface_plan(state: PentestState) -> dict:
         except Exception:  # noqa: BLE001
             host = None
     if not host:
+        # The session's OWN target, which was here all along.
+        #
+        # Without this the phase skipped a host it had been given: with an empty
+        # database there are no ranked attack vectors to fall back to, so a run
+        # against a freshly-wiped target reported "No target host given" while
+        # state["target"] held it.
+        host = _host_of(state.get("target"))
+    if not host:
         _msg(sid, "SurfaceTester",
              "No target host given and no ranked attack vector to fall back on — "
              "skipping surface tests.")
@@ -2745,6 +2847,27 @@ def _teardown(sid: str, auto_run_recommendations) -> None:
         _log.warning("[%s] teardown failed: %s", sid, e)
 
 
+def _maybe_schedule_rescan_analysis(sid: str, base_state: dict) -> None:
+    """Start the post-scan re-analysis, but only if something is still running.
+
+    A session whose scans all finished inside the run needs nothing; spawning a
+    thread to discover that would just add noise.
+    """
+    try:
+        running = _running_scans(sid)
+    except Exception:  # noqa: BLE001
+        return
+    if not running:
+        return
+    _msg(sid, "Analyzer",
+         f"[post-scan] {len(running)} scan(s) still running. The session is "
+         f"complete; analysis will re-run automatically when they finish.")
+    t = threading.Thread(target=_rerun_analysis_when_scans_finish,
+                         args=(sid, base_state), daemon=True,
+                         name=f"rescan-analysis-{sid[:8]}")
+    t.start()
+
+
 def run_langgraph_session_sync(
     session_id,
     target_description: str,
@@ -2784,6 +2907,11 @@ def run_langgraph_session_sync(
     # session, port_profile/web_profile are silently ignored, and no
     # llm_request_metrics row can be attributed.
     scan_tracker.set_session(sid, port_profile=port_profile, web_profile=web_profile)
+    # set_session only reaches THIS thread. LangGraph runs its nodes on executor
+    # threads, which inherit neither the thread-local nor the contextvar, so the
+    # run is registered explicitly — otherwise every scan a node dispatches is
+    # dropped by track_scan and the session reports zero.
+    scan_tracker.register_run(sid)
     LLMMetricsContext.set_session(sid)
     _transcript.clear()
 
@@ -2826,6 +2954,13 @@ def run_langgraph_session_sync(
             return _park_for_approval(sid, payload)
         result = _finish(sid, final, session_name)
         _teardown(sid, auto_run_recommendations)
+        # AFTER teardown on purpose: teardown persists the session's scans, and
+        # the watcher restores them from that table to poll their progress.
+        _maybe_schedule_rescan_analysis(sid, {
+            "session_id": sid, "target": target_description, "task": task,
+            "auto_execute": bool(auto_execute_scans),
+            "exploit_phase": bool(exploit_phase),
+        })
         return result
     except Exception as e:  # noqa: BLE001
         update_agent_session(_sid(sid), status="failed",
@@ -2839,6 +2974,12 @@ def run_langgraph_session_sync(
         try:
             LLMMetricsContext.flush_buffer()
             LLMMetricsContext.clear_session()
+        except Exception:
+            pass
+        try:
+            # Leaving a finished run registered would make it the "single active
+            # run" that a LATER session's scans get attributed to.
+            scan_tracker.unregister_run(sid)
         except Exception:
             pass
 
@@ -2881,6 +3022,7 @@ def resume_langgraph_session_sync(session_id, approved: bool,
     config = row.get("configuration") or {}
     scan_tracker.set_session(sid, port_profile=config.get("port_profile"),
                              web_profile=config.get("web_profile"))
+    scan_tracker.register_run(sid)
     LLMMetricsContext.set_session(sid)
     if config.get("proxy"):
         try:
@@ -2917,5 +3059,11 @@ def resume_langgraph_session_sync(session_id, approved: bool,
         try:
             LLMMetricsContext.flush_buffer()
             LLMMetricsContext.clear_session()
+        except Exception:
+            pass
+        try:
+            # Leaving a finished run registered would make it the "single active
+            # run" that a LATER session's scans get attributed to.
+            scan_tracker.unregister_run(sid)
         except Exception:
             pass
