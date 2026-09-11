@@ -8677,6 +8677,7 @@ def apply_exploit_approval_rules(engagement_id: Optional[str] = Query(None),
 def update_exploit_status(
     exploit_id: str,
     request: dict,
+    x_operator: str = Header("operator", alias="X-Operator"),
     authorized: bool = Depends(auth),
 ):
     """Update the status of a pending exploit (approve, reject, etc.)"""
@@ -8690,8 +8691,24 @@ def update_exploit_status(
 
     with get_db() as conn, conn.cursor() as cur:
         cur.execute(
-            "UPDATE pending_exploits SET status = %s WHERE id = %s",
-            (status, exploit_id)
+            # Record WHO decided, not just what was decided.
+            #
+            # This path used to write `status` alone. It is the one the UI's
+            # Approve / Reject / bulk-action buttons take, so the overwhelming
+            # majority of approvals in a live database had reviewed_by NULL and
+            # no timestamp — 42 such rows when this was found. The standing-rule
+            # sweep records 'rule:<id>'; a human decision deserves at least as
+            # much. Only stamped for the decision statuses: 'executed'/'failed'
+            # are outcomes reported by the runner, not review decisions, and
+            # overwriting the reviewer with them would erase who approved it.
+            """UPDATE pending_exploits
+                  SET status = %s,
+                      reviewed_by = CASE WHEN %s IN ('approved','rejected')
+                                         THEN %s ELSE reviewed_by END,
+                      reviewed_at = CASE WHEN %s IN ('approved','rejected')
+                                         THEN now() ELSE reviewed_at END
+                WHERE id = %s""",
+            (status, status, x_operator, status, exploit_id)
         )
 
         if cur.rowcount == 0:
