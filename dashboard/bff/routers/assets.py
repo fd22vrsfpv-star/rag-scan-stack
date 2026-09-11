@@ -233,6 +233,7 @@ async def detected_software(
     product: str = Query(None),
     search: str = Query(None),
     source: str = Query(None),
+    exclude_scope: str = Query(None),
     limit: int = Query(2000, le=10000),
 ):
     s = get_settings()
@@ -241,6 +242,7 @@ async def detected_software(
     elif ip: params["ip"] = ip
     if product and not search: params["product"] = product
     if source: params["source"] = source
+    if exclude_scope: params["exclude_scope"] = exclude_scope
     async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/software",
