@@ -1151,6 +1151,68 @@ EXCEPTION WHEN OTHERS THEN
   RAISE WARNING 'Could not convert pending_exploits.target_ip to inet: %', SQLERRM;
 END $$;
 
+-- ── Standing exploit-approval rules ─────────────────────────────────────────
+-- An operator approval that applies to a CLASS rather than to one row. A rule
+-- names patterns ('all', '*', 'web*', 'rce,sqli' — see etl/approval_match.py for
+-- the grammar) and the sweep approves every pending_exploit that matches.
+--
+-- WHY: approving 200 pending exploits one id at a time is not a workflow. The
+-- per-id endpoints stay exactly as they are; this sits beside them.
+--
+-- THE THINGS A RULE CANNOT DO, because approval is authorization:
+--   * it NEVER bypasses the scope gate. The sweep re-checks every target with
+--     etl/scope_gate.check_dispatch and refuses out-of-scope matches, so a
+--     wildcard authorizes a class of FINDING, never a class of TARGET.
+--   * `approved = false` is a standing DENY and outranks a broader allow at the
+--     same specificity (see best_match()), so "approve all except X" works.
+--   * `auto_execute` defaults FALSE. A rule marks rows approved; running them is
+--     a separate, explicit opt-in, because "approve" and "fire at the host" are
+--     different decisions and the blast radius of conflating them is a live
+--     engagement.
+-- Every application is audited: pending_exploits.reviewed_by records 'rule:<id>'
+-- and a webhook is emitted.
+CREATE TABLE IF NOT EXISTS public.exploit_approval_rules (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id   uuid,
+    name            text,
+    -- Patterns. 'all' is the catch-all; see etl/approval_match.py.
+    exploit_type    text NOT NULL DEFAULT 'all',
+    source          text NOT NULL DEFAULT 'all',   -- exploitdb | metasploit | webshell
+    target          text NOT NULL DEFAULT 'all',   -- host / IP pattern
+    min_confidence  numeric,                       -- only at or above this score
+    approved        boolean NOT NULL DEFAULT true, -- false = standing DENY
+    auto_execute    boolean NOT NULL DEFAULT false,
+    enabled         boolean NOT NULL DEFAULT true,
+    created_by      text,
+    note            text,
+    last_applied_at timestamptz,
+    applied_count   integer NOT NULL DEFAULT 0,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now()
+);
+-- COALESCE rather than a WHERE predicate: in Postgres a NULL in any indexed
+-- column makes rows non-equal, so a partial index would leave every
+-- engagement-less rule unconstrained. Any ON CONFLICT must repeat this
+-- expression EXACTLY or the insert raises "no unique or exclusion constraint
+-- matching the ON CONFLICT specification".
+CREATE UNIQUE INDEX IF NOT EXISTS uq_exploit_approval_rule ON public.exploit_approval_rules
+    (COALESCE(engagement_id::text,''), lower(exploit_type), lower(source), lower(target));
+CREATE INDEX IF NOT EXISTS idx_exploit_approval_rules_enabled
+    ON public.exploit_approval_rules(enabled) WHERE enabled;
+CREATE INDEX IF NOT EXISTS idx_exploit_approval_rules_engagement
+    ON public.exploit_approval_rules(engagement_id);
+
+DROP TRIGGER IF EXISTS trg_exploit_approval_rules_updated ON public.exploit_approval_rules;
+CREATE TRIGGER trg_exploit_approval_rules_updated
+    BEFORE UPDATE ON public.exploit_approval_rules
+    FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+
+-- credential_spray_approvals gains the same wildcard vocabulary. No DDL is
+-- needed — username and service are already text — but the LOOKUP changed: it
+-- was an exact dict hit on (lower(username), lower(service)) and is now a
+-- best_match() over the rows, so 'all'/'*' and globs select. Recorded here so
+-- the two approval surfaces are findable together.
+
 -- exploit_results
 CREATE TABLE IF NOT EXISTS public.exploit_results (
     id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
