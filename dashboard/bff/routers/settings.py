@@ -15,6 +15,12 @@ log = logging.getLogger("settings")
 
 router = APIRouter()
 
+# llm_query serves PLAIN HTTP: its Dockerfile runs `uvicorn --host 0.0.0.0
+# --port 8002` with no ssl_keyfile/ssl_certfile, so an https:// URL fails with
+# "[SSL: WRONG_VERSION_NUMBER] wrong version number". Env-overridable, matching
+# news_runner's LLM_QUERY_URL convention.
+LLM_QUERY_URL = os.environ.get("LLM_QUERY_URL", "http://llm_query:8002").rstrip("/")
+
 # db-config.json is bind-mounted from the host into this container at
 # /app/db-config.json. If the host path was missing at the first
 # `docker compose up`, Docker silently creates it as a *directory*, which makes
@@ -1518,7 +1524,10 @@ async def test_llm_backend(body: dict):
                         "response": resp.json()["choices"][0]["message"]["content"]}
 
             else:
-                resp = await c.get("https://llm_query:8002/ollama/health")
+                # Was https:// — llm_query serves plain HTTP, so this leg
+                # always failed with SSL WRONG_VERSION_NUMBER and the
+                # ollama backend test could never pass.
+                resp = await c.get(f"{LLM_QUERY_URL}/ollama/health")
                 data = resp.json()
                 return {"ok": data.get("ok", False), "backend": "ollama",
                         "model": os.environ.get("OLLAMA_MODEL", ""), "detail": data}
@@ -1703,6 +1712,52 @@ LLM_TUNING_KEYS = {
     "llm.seed":           {"type": int,   "default": 0,    "min": 0,   "max": 999999999,
                            "help": "Random seed. 0=random. Set >0 for reproducible output (debugging)."},
 }
+
+
+# ── 429 backoff, reported by the processes that actually apply it ──────────
+#
+# There are TWO independent mechanisms because there are two paths to the
+# provider, and conflating them in the UI would be a lie:
+#   llm_query       — retry-on-429 at the shared HTTP chokepoint (news,
+#                     scan-recommender, anything routed through the service)
+#   autogen-agents  — an adaptive AIMD governor on the direct langchain path
+#
+# Values come from each PROCESS, never from .env on disk. They diverge the
+# moment someone edits .env without recreating the container, and a panel that
+# shows the file would confirm a setting that is not in force.
+#
+# Each source reports one of three outcomes — ok / error / unreachable — rather
+# than collapsing "could not ask" into "nothing configured". That collapse is
+# the recurring bug in this repo, and it reads as "no throttling" on a stack
+# that is throttling hard.
+@router.get("/api/settings/llm-backoff")
+async def get_llm_backoff():
+    """Effective 429 backoff knobs + live governor state, per service."""
+    s = get_settings()
+    targets = [("llm_query", f"{LLM_QUERY_URL}/config/backoff"),
+               ("autogen-agents", f"{s.autogen_url}/llm/ratelimit")]
+    out = []
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL, verify=False) as c:
+        for name, url in targets:
+            try:
+                resp = await c.get(url, headers={"x-api-key": s.api_key})
+            except Exception as e:  # noqa: BLE001
+                out.append({"service": name, "status": "unreachable",
+                            "error": f"{type(e).__name__}: {e}"[:200]})
+                continue
+            if resp.status_code >= 400:
+                out.append({"service": name, "status": "error",
+                            "error": f"HTTP {resp.status_code}: {resp.text[:200]}"})
+                continue
+            try:
+                out.append({"service": name, "status": "ok", **resp.json()})
+            except Exception as e:  # noqa: BLE001
+                out.append({"service": name, "status": "error",
+                            "error": f"bad JSON: {e}"})
+    return {"sources": out,
+            "note": ("These are environment variables read at process start. "
+                     "Changing them means editing .env and RECREATING the "
+                     "container (restart alone keeps the old values).")}
 
 
 @router.get("/api/settings/llm-tuning")

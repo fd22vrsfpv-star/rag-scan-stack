@@ -554,8 +554,46 @@ class _RateLimitGovernor:
         with self._lock:
             return self._base_wait
 
+    def snapshot(self) -> dict:
+        """Live governor state for the Settings panel.
+
+        The static env knobs are only the ceiling; what an operator actually
+        needs to see when agents feel slow is the interval the governor has
+        currently backed off to, and the base wait it LEARNED from the
+        provider's Retry-After (which overrides the configured one).
+        """
+        with self._lock:
+            return {
+                "current_interval_sec": round(self._interval, 2),
+                "learned_base_wait_sec": round(self._base_wait, 2),
+                "interval_cap_sec": self._interval_cap,
+                "throttling": self._interval > 0,
+            }
+
 
 _rl_governor = _RateLimitGovernor()
+
+
+def get_ratelimit_config() -> dict:
+    """Effective 429 knobs + live governor state for THIS process.
+
+    The agents do not go through llm_query — they reach the provider directly
+    via langchain — so these knobs are separate from LLM_429_* on purpose, and
+    an operator comparing the two needs both reported side by side.
+    """
+    return {
+        "service": "autogen-agents",
+        "mechanism": "adaptive governor (AIMD) on the direct langchain path",
+        "adaptive": _LLM_RATELIMIT_ADAPTIVE,
+        "honours_retry_after": True,
+        "env": {
+            "LLM_RATELIMIT_MAX_RETRIES": _LLM_RATELIMIT_MAX_RETRIES,
+            "LLM_RATELIMIT_BASE_WAIT": _LLM_RATELIMIT_BASE_WAIT,
+            "LLM_RATELIMIT_MAX_WAIT": _LLM_RATELIMIT_MAX_WAIT,
+            "LLM_RATELIMIT_ADAPTIVE": _LLM_RATELIMIT_ADAPTIVE,
+        },
+        "live": _rl_governor.snapshot(),
+    }
 
 
 def _is_rate_limit_error(exc: Exception) -> Optional[float]:

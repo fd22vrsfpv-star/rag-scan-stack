@@ -3738,6 +3738,136 @@ function ScanTimeoutsTab() {
 // ─── LLM Tuning Tab ─────────────────────────────────
 type TuningEntry = { value: number; default: number; min: number; max: number; help: string; source: string }
 
+interface BackoffSource {
+  service: string
+  status: 'ok' | 'error' | 'unreachable'
+  error?: string
+  mechanism?: string
+  adaptive?: boolean
+  honours_retry_after?: boolean
+  env?: Record<string, string | number | boolean>
+  live?: {
+    current_interval_sec: number
+    learned_base_wait_sec: number
+    interval_cap_sec: number
+    throttling: boolean
+  }
+}
+
+/** Rate-limit (429) backoff — read-only, reported by the running processes.
+ *
+ *  Two mechanisms because there are two paths to the provider: llm_query is
+ *  the shared HTTP chokepoint, the agents reach the provider directly via
+ *  langchain and carry their own adaptive governor. Showing them as one number
+ *  would be a lie.
+ *
+ *  These are environment variables read at process start, NOT database
+ *  settings, so they are deliberately not editable here — a field that saved
+ *  to a table nothing reads would be worse than no field. The values come from
+ *  the processes rather than from .env on disk, because those diverge the
+ *  moment someone edits .env without recreating the container.
+ */
+function RateLimitBackoffSection() {
+  const [sources, setSources] = useState<BackoffSource[] | null>(null)
+  const [note, setNote] = useState('')
+  const [err, setErr] = useState('')
+
+  const load = async () => {
+    try {
+      const r = await apiFetch<{ sources: BackoffSource[]; note: string }>('/settings/llm-backoff')
+      setSources(r.sources); setNote(r.note); setErr('')
+    } catch (e) {
+      setErr(String(e))
+    }
+  }
+  useEffect(() => { load() }, [])
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold">Rate-limit (429) backoff</h3>
+        <button onClick={load} className="text-[11px] px-2 py-0.5 rounded border border-border hover:bg-accent">
+          Refresh
+        </button>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        What happens when the provider returns <code>429 RateLimitReached</code>. Two
+        independent mechanisms, because there are two paths to the provider:{' '}
+        <code>llm_query</code> is the shared HTTP chokepoint (news, scan-recommender),
+        while the agents reach the provider directly and carry their own adaptive
+        governor. Both honour a server <code>Retry-After</code> over the configured wait.
+      </p>
+
+      {err && <div className="text-xs text-red-400">Could not load: {err}</div>}
+      {!sources && !err && <div className="text-xs text-muted-foreground">Loading...</div>}
+
+      {sources?.map(s => (
+        <div key={s.service} className="border border-border rounded-lg p-3 space-y-2">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium">{s.service}</span>
+            <span className={cn('text-[10px] px-1.5 rounded border',
+              s.status === 'ok' ? 'border-green-500/30 text-green-400'
+                : s.status === 'unreachable' ? 'border-amber-500/30 text-amber-400'
+                : 'border-red-500/30 text-red-400')}>
+              {s.status}
+            </span>
+            {s.adaptive && <span className="text-[10px] text-primary">adaptive</span>}
+          </div>
+
+          {s.status !== 'ok' ? (
+            /* "Could not ask" is shown as exactly that, never as "no throttling". */
+            <p className="text-xs text-amber-400/90">
+              {s.status === 'unreachable'
+                ? 'This service could not be reached, so its backoff settings are unknown — not "none".'
+                : 'This service answered with an error, so its settings are unknown.'}
+              {s.error && <span className="block text-muted-foreground mt-0.5">{s.error}</span>}
+            </p>
+          ) : (
+            <>
+              {s.mechanism && <p className="text-[11px] text-muted-foreground">{s.mechanism}</p>}
+              <div className="grid grid-cols-[minmax(220px,auto)_1fr] gap-x-4 gap-y-1 text-xs">
+                {Object.entries(s.env || {}).map(([k, v]) => (
+                  <div key={k} className="contents">
+                    <code className="text-muted-foreground">{k}</code>
+                    <span className="font-mono text-foreground">{String(v)}</span>
+                  </div>
+                ))}
+              </div>
+              {s.live && (
+                <div className="text-xs border-t border-border pt-2">
+                  <div className="text-muted-foreground mb-1">Live governor state</div>
+                  <div className="grid grid-cols-[minmax(220px,auto)_1fr] gap-x-4 gap-y-1">
+                    <span className="text-muted-foreground">current spacing between calls</span>
+                    <span className={cn('font-mono', s.live.throttling ? 'text-amber-400' : 'text-green-400')}>
+                      {s.live.current_interval_sec}s {s.live.throttling ? '(throttling)' : '(not throttling)'}
+                    </span>
+                    <span className="text-muted-foreground">learned base wait</span>
+                    <span className="font-mono">{s.live.learned_base_wait_sec}s</span>
+                    <span className="text-muted-foreground">ceiling</span>
+                    <span className="font-mono">{s.live.interval_cap_sec}s</span>
+                  </div>
+                  <p className="text-[11px] text-muted-foreground mt-1">
+                    The governor raises spacing on each 429 and bleeds it back down on
+                    success, so steady-state overhead returns to zero when the provider
+                    is healthy. A server <code>Retry-After</code> replaces the learned
+                    base wait. The ceiling comes from <code>LLM_RATELIMIT_MAX_WAIT</code>.
+                  </p>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      ))}
+
+      {note && (
+        <p className="text-[11px] text-amber-400/80 border border-amber-500/20 bg-amber-500/5 rounded px-2 py-1.5">
+          {note}
+        </p>
+      )}
+    </div>
+  )
+}
+
 function LLMTuningTab() {
   const [data, setData] = useState<Record<string, TuningEntry> | null>(null)
   const [draft, setDraft] = useState<Record<string, string>>({})
@@ -3862,6 +3992,11 @@ function LLMTuningTab() {
           className="px-3 py-1.5 text-sm border border-border rounded disabled:opacity-50">
           Reset to anti-hallucination defaults
         </button>
+      </div>
+
+      {/* 429 backoff — read-only, reported by the running processes */}
+      <div className="pt-6 mt-6 border-t border-border">
+        <RateLimitBackoffSection />
       </div>
 
       {/* Named provider instances */}
@@ -5207,6 +5342,15 @@ function SearchResults({ query, onNavigate }: {
       title: 'Agent Model Selection',
       description: 'Configure AI models for different agent types',
       keywords: ['llm', 'model', 'agent', 'ai', 'tuning', 'selection', 'gemma', 'qwen']
+    },
+    {
+      tab: 'llm-tuning',
+      tabLabel: 'LLM Tuning',
+      title: 'Rate-limit (429) backoff',
+      description: 'How long each service waits out a provider rate limit, and the agents\u2019 live adaptive governor (read-only; set via .env)',
+      keywords: ['429', 'backoff', 'rate', 'ratelimit', 'rate limit', 'retry', 'throttle',
+                 'governor', 'quota', 'tpm', 'retry-after', 'wait', 'llm_429_max_retries',
+                 'llm_ratelimit_base_wait', 'adaptive']
     },
 
     // Scope Tab
