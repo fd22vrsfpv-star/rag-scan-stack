@@ -2257,7 +2257,24 @@ services:
       timeout: 10s
       retries: 5
     networks: [agents_net]
-    ports: ["8027:8027"]
+    ports:
+      - "8027:8027"
+      # Exit-node SOCKS proxies, so the OPERATOR's own tools can use them:
+      # Burp as an upstream SOCKS, or a browser launched with
+      # --proxy-server="socks5://127.0.0.1:10120". Without this the proxies exist
+      # only on the Docker network, so "open this site through the node" from the
+      # dashboard would have gone DIRECT from the operator's machine — exactly
+      # what the exit nodes exist to prevent.
+      #
+      # BOUND TO 127.0.0.1 ON PURPOSE. A 0.0.0.0 bind would publish an open SOCKS
+      # proxy to every host that can reach this machine — an open relay into the
+      # engagement's tunnels. Localhost only.
+      #
+      # SSH range only (10120-10149). The sliver (10000-10099) and chisel
+      # (10100-10119) ranges are deliberately not published: 150 published ports
+      # means 150 docker-proxy processes at every compose up, and every node in
+      # use today is an SSH tunnel. Extend the range here if that changes.
+      - "127.0.0.1:10120-10149:10120-10149"
     depends_on:
       wait-for-db:
         condition: service_completed_successfully

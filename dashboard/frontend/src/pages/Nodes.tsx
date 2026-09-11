@@ -75,6 +75,68 @@ export default function Nodes() {
 }
 
 // ── Tool Selection Modal ──────────────────────────────────────────
+/** One copy-to-clipboard chip. */
+function CopyChip({ label, value, title }: { label: string; value: string; title?: string }) {
+  const [copied, setCopied] = useState(false)
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch { /* clipboard needs https or a permission — the value is still readable */ }
+  }
+  return (
+    <button onClick={copy} title={title || `Copy ${label}`}
+      className="group flex items-center gap-1.5 px-2 py-1 rounded border border-border bg-muted/40
+                 hover:border-primary/50 hover:bg-muted text-left">
+      <span className="text-[9px] uppercase tracking-wide text-muted-foreground">{label}</span>
+      <code className="text-[11px] text-foreground font-mono">{value}</code>
+      {copied
+        ? <CheckCircle className="h-3 w-3 text-green-400 shrink-0" />
+        : <Copy className="h-3 w-3 text-muted-foreground group-hover:text-primary shrink-0" />}
+    </button>
+  )
+}
+
+/** The node's SOCKS5 proxy, in the shape Burp Suite actually asks for.
+ *
+ *  Burp wants HOST and PORT in separate fields (Settings > Network >
+ *  Connections > SOCKS proxy), so those are offered as separate chips rather
+ *  than only as a URI the operator would have to split by hand.
+ *
+ *  The host is 127.0.0.1, not node-manager: docker-compose publishes the SSH
+ *  proxy range on localhost so the OPERATOR's own tools can reach it.
+ *  `node-manager:PORT` is the in-container form and is useless from Burp — one
+ *  string looks as plausible as the other, which is exactly why both are
+ *  labelled here instead of leaving the operator to guess.
+ */
+function BurpProxyBlock({ port, online }: { port: number; online: boolean }) {
+  const uri = `socks5://127.0.0.1:${port}`
+  return (
+    <div className={cn('rounded-md border p-2.5 space-y-2',
+      online ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-border bg-muted/20 opacity-60')}>
+      <div className="flex items-center gap-1.5">
+        <Shield className="h-3.5 w-3.5 text-emerald-400" />
+        <span className="text-xs font-medium text-foreground">SOCKS5 proxy — Burp / browser</span>
+        {!online && <span className="text-[10px] text-amber-400">node offline</span>}
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        <CopyChip label="host" value="127.0.0.1" title="Burp: Settings > Network > Connections > SOCKS proxy > Host" />
+        <CopyChip label="port" value={String(port)} title="Burp: Settings > Network > Connections > SOCKS proxy > Port" />
+        <CopyChip label="uri" value={uri} title="For curl --socks5-hostname, or a browser --proxy-server flag" />
+      </div>
+      <p className="text-[10px] text-muted-foreground leading-snug">
+        Burp: <span className="text-foreground">Settings → Network → Connections → SOCKS proxy</span> —
+        tick <span className="text-foreground">Use SOCKS proxy</span>, host <code>127.0.0.1</code>, port <code>{port}</code>,
+        and tick <span className="text-foreground">Do DNS lookups over SOCKS</span> so the target name resolves
+        at the exit node instead of from here.
+        <br />
+        Published on localhost only — it is not reachable from anywhere else on the network.
+      </p>
+    </div>
+  )
+}
+
 function ToolSelectionModal({
   nodeId,
   availableTools,
@@ -347,6 +409,11 @@ function NodeGrid() {
                 )}
               </div>
             </div>
+
+            {/* SOCKS5 for the operator's own tools (Burp, browser) */}
+            {!!node.proxy_port && (
+              <BurpProxyBlock port={node.proxy_port} online={node.status === 'online'} />
+            )}
 
             {/* Details */}
             <div className="grid grid-cols-2 gap-1 text-xs text-muted-foreground">

@@ -396,3 +396,52 @@ export function useUpdateScreenshotMetadata() {
     },
   })
 }
+
+// ── Browsing a target through an exit node ────────────────────────────────
+// Following a link from the dashboard fetches the page from the OPERATOR's own
+// browser and address — exactly what the exit nodes exist to prevent. These
+// render it headless from the node instead, and hand back the proxy strings the
+// operator's own tools need.
+
+export interface ProxyEndpoint {
+  id: string
+  name: string
+  status: string
+  proxy_port: number
+  proxy_type: string
+  /** What containers in this stack dial: socks5://node-manager:PORT */
+  internal: string
+  /** What Burp or a browser on the HOST dials: socks5://127.0.0.1:PORT */
+  operator: string
+}
+
+export interface ProxiedPreview {
+  url: string
+  final_url: string | null
+  status: number | null
+  title: string | null
+  headers: Record<string, string>
+  screenshot_b64: string | null
+  via_proxy: string | null
+  error: string | null
+}
+
+export function useProxyEndpoints() {
+  return useQuery({
+    queryKey: ['recon', 'proxy-endpoints'],
+    queryFn: () => apiFetch<{ proxies: ProxyEndpoint[] }>('/recon/proxy-endpoints'),
+    staleTime: 30_000,
+  })
+}
+
+/** Render a URL through an exit node. Scope-gated server-side: an out-of-scope
+ *  host comes back 403 with the refusal, and no traffic is sent. */
+export function useProxiedPreview() {
+  return useMutation({
+    mutationFn: ({ url, proxy }: { url: string; proxy?: string }) =>
+      apiFetch<ProxiedPreview>('/recon/preview', {
+        method: 'POST',
+        body: JSON.stringify({ url, proxy, timeout: 30 }),
+      }),
+  })
+}

@@ -18,6 +18,7 @@ import { KbSuggestionsModal } from '@/components/recommendations/KbSuggestionsMo
 import { CredentialAuditPanel } from '@/components/credentials/CredentialAuditPanel'
 import { useScopeFilter } from '@/hooks/useScopeFilter'
 import { useUIStore } from '@/stores/ui'
+import { useProxyEndpoints, useProxiedPreview } from '@/api/recon'
 import { useScreenshots, useReconDomainOverview } from '@/api/recon'
 import { apiUrl } from '@/api/client'
 import { ScreenshotThumbnail } from '@/components/common/ScreenshotThumbnail'
@@ -726,7 +727,28 @@ export default function AssetBrowser() {
 
   const allAssets = assetsData?.assets ?? []
   const allSubdomainsList = subdomainsData?.subdomains ?? []
-  const allCredentials = allCredsData?.credentials ?? []
+  // Scope-filter software and credentials the same way assets and subdomains
+  // already are.
+  //
+  // The ScopeFilter control lives in the SHARED page header, so it is on screen
+  // for all four tabs, and the count line appends "in <scope>" whatever tab is
+  // open. Only Assets and Subdomains actually honoured it — Software and
+  // Credentials ignored the scope completely while the label claimed they were
+  // filtered. Changing the scope on those tabs looked like nothing refreshed,
+  // because nothing did.
+  const softwareItems = useMemo(() => {
+    const items = softwareData?.items ?? []
+    if (!isScopeFiltering) return items
+    return items.filter(sw => matchesAnyScope(sw.hostname, sw.ip))
+  }, [softwareData, isScopeFiltering, matchesAnyScope])
+
+  const allCredentials = useMemo(() => {
+    const creds = allCredsData?.credentials ?? []
+    if (!isScopeFiltering) return creds
+    // Credentials carry an IP; the hostname, when known, is in metadata.
+    return creds.filter(c => matchesAnyScope(
+      c.ip, typeof c.metadata?.hostname === 'string' ? c.metadata.hostname : undefined))
+  }, [allCredsData, isScopeFiltering, matchesAnyScope])
 
   // When searching, bypass scope filter to find items across all scopes
   const assets = useMemo(() => {
@@ -849,7 +871,7 @@ export default function AssetBrowser() {
         <div className="flex items-center gap-3">
           <ScopeFilter value={scopeFilter} onChange={setScopeFilter} />
           <span className="text-xs text-muted-foreground">
-            {tab === 'assets' ? `${assets.length} assets` : tab === 'subdomains' ? `${subdomains.length} subdomains` : tab === 'credentials' ? `${allCredentials.length} credentials` : `${softwareData?.count ?? 0} detections`}
+            {tab === 'assets' ? `${assets.length} assets` : tab === 'subdomains' ? `${subdomains.length} subdomains` : tab === 'credentials' ? `${allCredentials.length} credentials` : `${softwareItems.length} detections`}
             {isScopeFiltering ? ` in ${scopeFilter}` : ''}
           </span>
         </div>
@@ -1353,12 +1375,16 @@ export default function AssetBrowser() {
           )}
           {softwareLoading ? (
             <p className="text-sm text-muted-foreground">Loading...</p>
-          ) : !softwareData?.items?.length ? (
-            <p className="text-sm text-muted-foreground">No software detected yet. Run Nmap, httpx, or WhatWeb scans to populate.</p>
+          ) : !softwareItems.length ? (
+            <p className="text-sm text-muted-foreground">
+              {isScopeFiltering
+                ? `No software detected on hosts in ${scopeFilter}. Clear the scope filter to see the rest.`
+                : 'No software detected yet. Run Nmap, httpx, or WhatWeb scans to populate.'}
+            </p>
           ) : (() => {
             // Deduplicate: one row per hostname+product+version
             const deduped = Object.values(
-              softwareData.items.reduce<Record<string, DetectedSoftware & { sources: string[] }>>((acc, sw) => {
+              softwareItems.reduce<Record<string, DetectedSoftware & { sources: string[] }>>((acc, sw) => {
                 const key = `${sw.hostname || sw.ip}|${sw.product}|${sw.version || ''}`
                 if (!acc[key]) {
                   acc[key] = { ...sw, sources: [sw.source] }
@@ -1954,7 +1980,129 @@ function CloudImportFindings({ assetId, hostname }: { assetId: string; hostname?
   )
 }
 
+/** Browse a discovered URL WITHOUT the operator's own address touching it.
+ *
+ *  Primary path: render it headless at the exit node and show the result here.
+ *  Secondary path: copy the URL (and a ready-made proxied curl) for Burp.
+ *
+ *  There is no plain link on purpose. An <a href> would be fetched by the
+ *  operator's browser from the operator's IP — the one thing the exit nodes
+ *  exist to avoid — and it would look identical to a proxied fetch in the UI.
+ */
+function UrlProxyActions({ url, proxy }: { url: string; proxy?: string }) {
+  const preview = useProxiedPreview()
+  const [open, setOpen] = useState(false)
+  const [copied, setCopied] = useState<string | null>(null)
+
+  const copy = async (what: string, value: string) => {
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopied(what)
+      setTimeout(() => setCopied(null), 1500)
+    } catch { /* clipboard needs https or a permission */ }
+  }
+  const operatorProxy = proxy ? proxy.replace('node-manager', '127.0.0.1') : null
+  const curlCmd = operatorProxy
+    ? `curl -sS --socks5-hostname ${operatorProxy.replace(/^socks5:\/\//, '')} '${url}'`
+    : `curl -sS '${url}'`
+
+  const look = () => { setOpen(true); preview.mutate({ url, proxy }) }
+
+  return (
+    <>
+      <div className="flex items-center gap-1 shrink-0">
+        <button onClick={look} disabled={preview.isPending}
+          title={proxy ? `Render at the exit node (${proxy}) — your browser never touches the target`
+                       : 'No online exit node selected; this would render from the scanner container'}
+          className="px-1.5 py-0.5 rounded border border-border text-[10px] hover:border-primary/50 hover:bg-muted disabled:opacity-50">
+          {preview.isPending ? '...' : 'Open via proxy'}
+        </button>
+        <button onClick={() => copy('url', url)} title="Copy the URL for Burp"
+          className="px-1.5 py-0.5 rounded border border-border text-[10px] hover:border-primary/50 hover:bg-muted">
+          {copied === 'url' ? 'Copied' : 'Copy URL'}
+        </button>
+        <button onClick={() => copy('curl', curlCmd)} title={curlCmd}
+          className="px-1.5 py-0.5 rounded border border-border text-[10px] hover:border-primary/50 hover:bg-muted">
+          {copied === 'curl' ? 'Copied' : 'Copy curl'}
+        </button>
+      </div>
+
+      {open && (
+        <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-6"
+             onClick={() => setOpen(false)}>
+          <div className="bg-card border border-border rounded-lg max-w-5xl w-full max-h-[90vh] overflow-auto"
+               onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-4 py-2 border-b border-border">
+              <div className="min-w-0">
+                <div className="text-sm font-medium truncate">{url}</div>
+                <div className="text-[10px] text-muted-foreground">
+                  {proxy ? <>via <code>{proxy}</code></> : 'NOT proxied — rendered from the scanner container'}
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)} className="text-muted-foreground hover:text-foreground">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="p-4 space-y-3">
+              {preview.isPending && <p className="text-xs text-muted-foreground">Loading through the exit node...</p>}
+              {preview.isError && (
+                <p className="text-xs text-red-400">
+                  {String((preview.error as Error)?.message || preview.error)}
+                </p>
+              )}
+              {preview.data && (
+                <>
+                  <div className="flex flex-wrap gap-3 text-xs">
+                    <span>Status: <span className="text-foreground font-mono">{preview.data.status ?? '—'}</span></span>
+                    <span>Title: <span className="text-foreground">{preview.data.title || '—'}</span></span>
+                    {preview.data.final_url && preview.data.final_url !== url && (
+                      <span className="text-amber-400">redirected to <code>{preview.data.final_url}</code></span>
+                    )}
+                    {preview.data.headers?.server && (
+                      <span>Server: <span className="text-foreground font-mono">{preview.data.headers.server}</span></span>
+                    )}
+                  </div>
+                  {/* An error is REPORTED, never rendered as a blank page: "could
+                      not load" and "loaded but empty" are different answers. */}
+                  {preview.data.error && (
+                    <p className="text-xs text-red-400 font-mono">{preview.data.error}</p>
+                  )}
+                  {preview.data.screenshot_b64 ? (
+                    <img alt={`Rendered ${url}`} className="w-full rounded border border-border"
+                         src={`data:image/png;base64,${preview.data.screenshot_b64}`} />
+                  ) : !preview.data.error ? (
+                    <p className="text-xs text-muted-foreground">No screenshot returned.</p>
+                  ) : null}
+                  {preview.data.headers && Object.keys(preview.data.headers).length > 0 && (
+                    <details>
+                      <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
+                        Response headers ({Object.keys(preview.data.headers).length})
+                      </summary>
+                      <pre className="mt-1 text-[10px] font-mono whitespace-pre-wrap break-all bg-muted/40
+                                      border border-border rounded p-2 max-h-56 overflow-auto">
+{JSON.stringify(preview.data.headers, null, 2)}</pre>
+                    </details>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  )
+}
+
 function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip: string; asset?: Asset }) {
+  // The exit node to browse through: whatever the operator already set as the
+  // scan default, so what they see comes out of the same address their scans
+  // do. Falls back to the first online node rather than silently going direct.
+  const defaultNodeId = useUIStore(s => s.defaultNodeId)
+  const { data: proxyData } = useProxyEndpoints()
+  const proxies = proxyData?.proxies ?? []
+  const chosenProxy = (proxies.find(p => p.id === defaultNodeId) ?? proxies[0])
+  const proxyInternal = chosenProxy?.internal
+
   // Query domain overview for the hostname (falls back to IP)
   const lookupDomain = hostname || ip
   const { data: overview, isLoading } = useReconDomainOverview(lookupDomain)
@@ -2031,7 +2179,22 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
       {/* HTTP Services */}
       {httpSvc.length > 0 && (
         <div>
-          <h5 className="text-xs font-medium text-muted-foreground mb-2">HTTP Services ({httpSvc.length})</h5>
+          <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
+            <h5 className="text-xs font-medium text-muted-foreground">HTTP Services ({httpSvc.length})</h5>
+            {/* Say which address these will be fetched from. "Open via proxy"
+                with no named exit node would be indistinguishable from going
+                direct, which is the mistake worth preventing. */}
+            {chosenProxy ? (
+              <span className="text-[10px] text-emerald-400">
+                browsing via <span className="font-mono">{chosenProxy.name}</span>
+                {' '}· Burp SOCKS <code className="text-foreground">127.0.0.1:{chosenProxy.proxy_port}</code>
+              </span>
+            ) : (
+              <span className="text-[10px] text-amber-400">
+                no online exit node — previews would leave from the scanner container
+              </span>
+            )}
+          </div>
           <div className="space-y-1 max-h-48 overflow-y-auto">
             {httpSvc.map((s, i) => (
               <div key={i} className="flex items-center gap-2 text-xs bg-muted/50 rounded px-2 py-1">
@@ -2043,6 +2206,7 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
                 <span className="font-mono truncate flex-1">{s.url}</span>
                 <span className="text-muted-foreground">{s.webserver || ''}</span>
                 {s.title ? <span className="text-muted-foreground truncate max-w-[150px]">{s.title}</span> : null}
+                <UrlProxyActions url={s.url} proxy={proxyInternal} />
               </div>
             ))}
           </div>

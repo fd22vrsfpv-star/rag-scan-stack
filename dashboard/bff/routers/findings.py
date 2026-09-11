@@ -148,6 +148,90 @@ async def search_recon(
 
 # ── Domain Overview ──
 
+class ProxiedPreviewBody(BaseModel):
+    url: str
+    proxy: Optional[str] = None
+    timeout: int = 20
+
+
+@router.post("/api/recon/preview")
+async def proxied_preview(body: ProxiedPreviewBody):
+    """Render a URL through an exit-node proxy and return a look at it.
+
+    The operator triaging Recon Intel needs to see what is on a host before
+    deciding it matters. Following a link would fetch it from the operator's own
+    browser and address — exactly what the exit nodes exist to prevent — so this
+    renders it headless from the node instead.
+
+    Scope-gated twice, on purpose: here, so the refusal is fast and legible in
+    the UI, and again inside playwright-scanner, which is the process that
+    actually opens the socket. The second one is the load-bearing gate; this one
+    means the operator gets a reason instead of a timeout.
+    """
+    from urllib.parse import urlparse
+    from scope_guard import scope_rows_for, refusal_for
+
+    host = urlparse(body.url or "").hostname
+    if not host:
+        raise HTTPException(400, f"not a URL with a host: {body.url!r}")
+    try:
+        # (rows, source) — NOT just rows. Passing the tuple straight through
+        # raised "too many values to unpack" and the gate failed closed, which
+        # was correct but is not a reason to leave the call wrong.
+        rows, scope_source = scope_rows_for(None)
+        refusal = refusal_for(host, rows, command=f"preview {body.url}")
+    except Exception as e:  # noqa: BLE001
+        # Fail CLOSED. An unavailable scope gate is not permission to browse.
+        raise HTTPException(503, f"scope gate unavailable, refusing to browse: {e}")
+    if refusal:
+        raise HTTPException(403, refusal)
+
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=body.timeout + 20, verify=False) as c:
+        resp = await c.post(
+            f"{s.playwright_scanner_url}/preview",
+            json={"url": body.url, "proxy": body.proxy, "timeout": body.timeout},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:400])
+        return safe_json(resp)
+
+
+@router.get("/api/recon/proxy-endpoints")
+async def proxy_endpoints():
+    """The exit-node SOCKS proxies, in both forms the operator needs.
+
+    `internal` is what the stack's own containers dial (node-manager:PORT).
+    `operator` is what Burp or a browser on the HOST dials — the same tunnel,
+    published on 127.0.0.1 by docker-compose. They are different strings for the
+    same proxy, and handing back only one of them is how somebody ends up
+    pasting an unreachable host into Burp.
+    """
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15, verify=False) as c:
+        # tunnel_manager_url, matching routers/nodes.py::_nm_get — node_manager_url
+        # is only a backward-compatibility alias and two names for one service is
+        # how they drift.
+        resp = await c.get(f"{s.tunnel_manager_url}/nodes",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:300])
+        nodes = (safe_json(resp) or {}).get("nodes") or []
+    out = []
+    for n in nodes:
+        port = n.get("proxy_port")
+        if not port or n.get("status") != "online":
+            continue
+        out.append({
+            "id": n.get("id"), "name": n.get("name"), "status": n.get("status"),
+            "proxy_port": port, "proxy_type": n.get("proxy_type") or "socks5",
+            "internal": f"{n.get('proxy_type') or 'socks5'}://node-manager:{port}",
+            "operator": f"{n.get('proxy_type') or 'socks5'}://127.0.0.1:{port}",
+        })
+    return {"proxies": out}
+
+
 @router.get("/api/recon/domains")
 async def list_recon_domains(
     search: Optional[str] = None,

@@ -275,3 +275,23 @@ Authentication succeeds first, so the failure looks like a credentials problem a
 Linux host `/tmp` is an ordinary container filesystem and the original path works, which is why
 this never appeared there. Overridable via `SSH_CONTROL_DIR`; falls back to `/var/tmp/ssh-ctrl`
 if `/dev/shm` is unavailable.
+
+## 2026-09-11 — Exit-node SOCKS proxies published to the host
+Files: `docker-compose.yml` (node-manager `ports:`)
+Platforms: Linux (done), macOS / Windows (verify)
+
+old: `ports: ["8027:8027"]`
+new: adds `- "127.0.0.1:10120-10149:10120-10149"`
+
+Why: so the operator's own Burp/browser can use the exit-node SOCKS proxies.
+Previously they existed only on the Docker network.
+
+Platform notes to check when migrating:
+- The `127.0.0.1` bind is REQUIRED, not cosmetic. A `0.0.0.0` bind publishes an
+  open SOCKS relay into the engagement's tunnels. Docker Desktop on macOS and
+  Windows honours the bind address the same way, but confirm with
+  `docker port node-manager` after the first `compose up`.
+- 30 published ports means 30 docker-proxy processes. On Docker Desktop this is
+  noticeably slower to start than on native Linux; narrow the range if only one
+  or two nodes are ever used.
+- On Windows, a host firewall prompt may appear the first time the range binds.
