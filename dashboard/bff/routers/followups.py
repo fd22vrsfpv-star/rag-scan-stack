@@ -47,11 +47,15 @@ class FeedbackBody(BaseModel):
 # --- Endpoints ---
 
 @router.get("/api/follow-ups/stats")
-async def follow_up_stats(engagement_id: Optional[str] = Query(None)):
+async def follow_up_stats(engagement_id: Optional[str] = Query(None),
+                          exclude_scope: Optional[str] = Query(None)):
     s = get_settings()
     params = {}
     if engagement_id:
         params["engagement_id"] = engagement_id
+    # Same exclusion as the list, or the header contradicts the table below it.
+    if exclude_scope:
+        params["exclude_scope"] = exclude_scope
     async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/follow-ups/stats",
@@ -168,9 +172,12 @@ async def follow_ups_grouped(
     status: Optional[str] = Query(None),
     exclude_status: Optional[str] = Query(None),
     engagement_id: Optional[str] = Query(None),
+    exclude_scope: Optional[str] = Query(None),
 ):
     s = get_settings()
     params: dict = {"group_by": group_by}
+    if exclude_scope:
+        params["exclude_scope"] = exclude_scope
     if status:
         params["status"] = status
     if exclude_status:
@@ -196,11 +203,14 @@ async def list_follow_ups(
     rule_id: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     exclude_status: Optional[str] = Query(None),
+    exclude_scope: Optional[str] = Query(None),
     limit: int = Query(10000),
     offset: int = Query(0),
 ):
     s = get_settings()
     params = {"limit": limit, "offset": offset}
+    if exclude_scope:
+        params["exclude_scope"] = exclude_scope
     if exclude_status:
         params["exclude_status"] = exclude_status
     if status:
