@@ -987,6 +987,28 @@ def install(req: PullRequest):
     else:
         return _json_post(_endpoint("/pull"), payload)
 
+# Effective 429 backoff, for the Settings > LLM Tuning panel.
+#
+# Reported by the PROCESS, not read from .env on disk, because those differ the
+# moment someone edits .env without recreating the container — and a panel that
+# shows the file rather than the running value would confirm a setting that is
+# not actually in force.
+@app.get("/config/backoff")
+def backoff_config():
+    return {
+        "service": "llm_query",
+        "mechanism": "retry-on-429 at the shared HTTP chokepoint "
+                     "(news, scan-recommender, and anything else routed here)",
+        "adaptive": False,
+        "honours_retry_after": True,
+        "env": {
+            "LLM_429_MAX_RETRIES": LLM_429_MAX_RETRIES,
+            "LLM_429_BASE_WAIT": LLM_429_BASE_WAIT,
+            "LLM_429_MAX_WAIT": LLM_429_MAX_WAIT,
+        },
+    }
+
+
 # Root-level kube-style health
 
 @app.get("/healthz", response_model=HealthResponse)
