@@ -3314,21 +3314,94 @@ DROP TRIGGER IF EXISTS trg_findings_engagement ON findings;
 CREATE TRIGGER trg_findings_engagement
     BEFORE INSERT ON findings FOR EACH ROW EXECUTE FUNCTION propagate_engagement_to_findings();
 
--- follow_up_items: extract IP from target, match to asset
+-- follow_up_items: match target to an asset, by IP literal or by hostname.
+--
+-- WHY THE HOSTNAME LEG EXISTS: this trigger used to extract an IPv4 literal and
+-- nothing else. A follow-up whose target is a hostname or URL — which is most of
+-- them, since the osint agent, the cert rules and software_known_cve all flag by
+-- host — therefore kept engagement_id NULL. `GET /follow-ups?engagement_id=...`
+-- filters on `engagement_id = %s::uuid`, and NULL is never equal to anything, so
+-- those rows silently vanished the moment an operator pressed "Engagement Only".
+-- The filter looked broken; it was the data that was unattributed.
+--
+-- WHY `engagement_id IS NOT NULL` IS IN BOTH LOOKUPS: assets is unique on
+-- (ip, COALESCE(hostname,'')), so one IP legitimately has several rows (virtual
+-- hosts). An unordered LIMIT 1 could pick the row that has no engagement and
+-- stamp NULL even though a sibling row knew the answer.
+
+-- Host part of a follow-up target, shared by the trigger and the backfill below
+-- so the two can never disagree about what "the host" means.
+--   'https://shop.example.com:8443/admin?x=1' -> 'shop.example.com'
+--   'user@host.example.com.'                  -> 'host.example.com'
+--   '10.0.0.5:8080'                           -> '10.0.0.5'
+CREATE OR REPLACE FUNCTION followup_target_host(_target text)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+    SELECT NULLIF(
+        rtrim(
+            regexp_replace(                                   -- strip :port
+                regexp_replace(                               -- strip user@
+                    split_part(                               -- strip ?query
+                        split_part(                           -- strip /path
+                            regexp_replace(lower(coalesce(_target, '')),
+                                           '^[a-z][a-z0-9+.-]*://', ''),
+                            '/', 1),
+                        '?', 1),
+                    '^[^@]*@', ''),
+                ':[0-9]+$', ''),
+            '.'),
+        '');
+$$;
+
 CREATE OR REPLACE FUNCTION propagate_engagement_to_followups()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
-DECLARE _ip text;
+DECLARE _ip text; _host text;
 BEGIN
     IF NEW.engagement_id IS NULL AND NEW.target IS NOT NULL THEN
-        -- Extract IPv4 with strict 1-3 digit octets to avoid matching hex strings
+        -- 1. IPv4 literal, with strict 1-3 digit octets to avoid hex strings
         _ip := substring(NEW.target from '(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})');
-        IF _ip IS NOT NULL AND _ip ~ '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$' THEN
+        IF _ip IS NOT NULL THEN
             BEGIN
                 SELECT engagement_id INTO NEW.engagement_id
-                FROM assets WHERE ip = _ip::inet LIMIT 1;
+                FROM assets
+                WHERE ip = _ip::inet AND engagement_id IS NOT NULL
+                LIMIT 1;
             EXCEPTION WHEN OTHERS THEN
-                NULL;  -- skip if cast fails (not a valid IP)
+                NULL;  -- skip if the cast fails (not a valid IP after all)
             END;
+        END IF;
+        -- 2. Hostname, for the URL/FQDN targets the IP leg can never resolve
+        IF NEW.engagement_id IS NULL THEN
+            _host := followup_target_host(NEW.target);
+            IF _host IS NOT NULL THEN
+                SELECT engagement_id INTO NEW.engagement_id
+                FROM assets
+                WHERE lower(hostname) = _host AND engagement_id IS NOT NULL
+                LIMIT 1;
+            END IF;
+        END IF;
+        -- 3. Scope membership — the engagement whose scope CONTAINS this host.
+        --    Measured on the live DB: legs 1+2 resolved 0 of 915 unattributed
+        --    follow-ups, because 897 of them DO have an asset row and it is the
+        --    ASSET that carries no engagement (137 such assets). Scope is the
+        --    authority on which engagement a host belongs to, and it resolved
+        --    all 915. Without this leg the fix is cosmetic.
+        IF NEW.engagement_id IS NULL AND _host IS NOT NULL THEN
+            SELECT s.engagement_id INTO NEW.engagement_id
+            FROM scope_targets s
+            WHERE s.engagement_id IS NOT NULL
+              -- A BLANK TARGET IS NOT A WILDCARD. There are live scope_targets
+              -- rows with target='' (blackbaud, customer, customer_scope, msf);
+              -- without this guard every host suffix-matches all four and gets
+              -- attributed to whichever sorts first. Same class of bug as
+              -- tests/test_scope_placeholder_filtering.py.
+              AND s.target IS NOT NULL AND btrim(s.target) <> ''
+              AND (_host = lower(s.target)
+                   -- Suffix matching is for domains only: an IP host must never
+                   -- match a scope row because its last octets happen to align.
+                   OR (_host !~ '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+                       AND _host LIKE '%.' || lower(s.target)))
+            ORDER BY length(s.target) DESC   -- most specific scope rule wins
+            LIMIT 1;
         END IF;
     END IF;
     RETURN NEW;
@@ -3337,6 +3410,55 @@ $$;
 DROP TRIGGER IF EXISTS trg_followups_engagement ON follow_up_items;
 CREATE TRIGGER trg_followups_engagement
     BEFORE INSERT ON follow_up_items FOR EACH ROW EXECUTE FUNCTION propagate_engagement_to_followups();
+
+-- Backfill rows stored while the trigger was IP-only, or stamped NULL by the
+-- unordered LIMIT 1. BEFORE INSERT triggers do not fire retroactively, so
+-- without this every follow-up already in the table stays invisible to the
+-- engagement filter. Idempotent: only touches rows that are still NULL.
+DO $$ BEGIN
+    UPDATE follow_up_items f
+       SET engagement_id = a.engagement_id
+      FROM assets a
+     WHERE f.engagement_id IS NULL
+       AND a.engagement_id IS NOT NULL
+       AND f.target IS NOT NULL
+       AND lower(a.hostname) = followup_target_host(f.target);
+
+    UPDATE follow_up_items f
+       SET engagement_id = a.engagement_id
+      FROM assets a
+     WHERE f.engagement_id IS NULL
+       AND a.engagement_id IS NOT NULL
+       AND f.target IS NOT NULL
+       AND host(a.ip) = substring(f.target from '(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})');
+
+    -- Leg 3: scope membership. This is the one that actually recovers the rows —
+    -- see the trigger comment above for the measured numbers.
+    UPDATE follow_up_items f
+       SET engagement_id = (
+            SELECT st.engagement_id
+              FROM scope_targets st
+             WHERE st.engagement_id IS NOT NULL
+               AND st.target IS NOT NULL AND btrim(st.target) <> ''
+               AND (followup_target_host(f.target) = lower(st.target)
+                    OR (followup_target_host(f.target) !~ '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+                        AND followup_target_host(f.target) LIKE '%.' || lower(st.target)))
+             ORDER BY length(st.target) DESC
+             LIMIT 1)
+     WHERE f.engagement_id IS NULL
+       AND f.target IS NOT NULL
+       -- Only touch rows scope can actually answer for, so a no-match stays
+       -- NULL rather than being rewritten to NULL.
+       AND EXISTS (
+            SELECT 1 FROM scope_targets st
+             WHERE st.engagement_id IS NOT NULL
+               AND st.target IS NOT NULL AND btrim(st.target) <> ''
+               AND (followup_target_host(f.target) = lower(st.target)
+                    OR (followup_target_host(f.target) !~ '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+                        AND followup_target_host(f.target) LIKE '%.' || lower(st.target))));
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'follow_up_items engagement backfill skipped: %', SQLERRM;
+END $$;
 
 -- recon_findings: inherit from asset_id (G3 — discovery findings should
 -- carry their asset's engagement so they're scoped consistently with
