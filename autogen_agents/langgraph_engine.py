@@ -1131,6 +1131,66 @@ def exploit_plan(state: PentestState) -> dict:
                 "log": [f"exploit_plan skipped: {e}"]}
 
 
+def _engagement_preapproval(sid: str):
+    """(enabled, engagement_id) — has the operator pre-approved exploit
+    execution for THIS session's engagement?
+
+    WHY THIS IS NOT AN OVERRIDE. CLAUDE.md draws the line at override flags
+    overruling the operator's AUTHORIZATION. Pre-approval is the opposite: the
+    operator selecting it, for one named engagement, IS the authorization —
+    given in advance rather than at the interrupt. Same reasoning as the standing
+    rules in exploit_approval_rules.
+
+    What it deliberately does NOT do:
+      * it is per ENGAGEMENT, never global — other engagements are unaffected;
+      * it is off unless explicitly set;
+      * it does not touch the scope gate. execute_approved_exploit still fails
+        closed on scope, so a pre-approved out-of-scope target stays refused;
+      * it is recorded, not silent — reviewed_by names the engagement, a session
+        message says it happened, and a webhook event carries it.
+    """
+    try:
+        cfg = (get_agent_session(_sid(sid)) or {}).get("configuration") or {}
+        eid = cfg.get("engagement_id")
+        if not eid:
+            return False, None
+        from db_utils import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE((metadata->>'exploit_preapproved')::boolean, false) "
+                "FROM engagements WHERE id = %s::uuid", (str(eid),))
+            row = cur.fetchone()
+        return (bool(row[0]) if row else False), str(eid)
+    except Exception as e:  # noqa: BLE001
+        # Fail CLOSED: an unreadable setting is not pre-approval.
+        _log.warning("[%s] pre-approval lookup failed (%s) — parking as usual",
+                     sid, e)
+        return False, None
+
+
+def _pending_exploit_for_session(sid: str):
+    """The newest exploit THIS session queued and has not had decided.
+
+    Resolved here because nothing in graph state carries the id — exploit_plan
+    stores the LLM's text, and at the interrupt the operator supplies the id by
+    hand. Pre-approval has no operator to ask, so it looks up what the session
+    itself queued; scoping the query to session_id is what stops it approving
+    some other run's exploit.
+    """
+    try:
+        from db_utils import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM pending_exploits "
+                " WHERE session_id = %s::uuid AND status = 'pending' "
+                " ORDER BY created_at DESC LIMIT 1", (str(sid),))
+            row = cur.fetchone()
+        return str(row[0]) if row else None
+    except Exception as e:  # noqa: BLE001
+        _log.warning("[%s] pending-exploit lookup failed: %s", sid, e)
+        return None
+
+
 def exploit_approval(state: PentestState) -> dict:
     """The human-in-the-loop gate: `interrupt()` parks the graph in Postgres until
     the operator answers via POST /pentest/{id}/approve.
@@ -1138,7 +1198,44 @@ def exploit_approval(state: PentestState) -> dict:
     Override flags do NOT apply here — this gate is the operator's authorization,
     and there is no 'run anyway'. Everything before the pause lives in
     exploit_plan, so a resume re-entering this node repeats nothing.
+
+    The ONE thing that skips the pause is engagement pre-approval, and that is
+    not an override: it is the same operator's authorization, given in advance
+    for one named engagement. See _engagement_preapproval.
     """
+    sid = state["session_id"]
+
+    # Pre-approval short-circuit: the operator already authorised this
+    # engagement, so there is nobody to wait for. Parking here would hold an
+    # otherwise finished run open until a human came back, possibly next day.
+    preapproved, eid = _engagement_preapproval(sid)
+    if preapproved:
+        pending_id = _pending_exploit_for_session(sid)
+        who = f"engagement_preapproval:{eid}"
+        if pending_id:
+            try:
+                _mark_approved(pending_id, who,
+                               note="pre-approved for this engagement")
+            except Exception as e:  # noqa: BLE001
+                _log.warning("[%s] pre-approval mark failed: %s", sid, e)
+        _msg(sid, "Exploit",
+             f"[pre-approved] Exploit execution is pre-approved for this "
+             f"engagement ({eid}), so the run is not pausing for a decision. "
+             + (f"Approving {pending_id}. " if pending_id
+                else "No queued exploit id was found to approve. ")
+             + "Scope is still enforced at execution — an out-of-scope target "
+               "is refused regardless of pre-approval.",
+             role="system")
+        _emit("langgraph_exploit_preapproved", sid,
+              {"engagement_id": eid, "pending_exploit_id": str(pending_id or ""),
+               "approved_by": who})
+        return {"phase": "exploit_exec" if pending_id else "report",
+                "exploit_decision": {"approved": True,
+                                     "note": f"pre-approved ({who})",
+                                     "pending_exploit_id": pending_id},
+                "findings": [f"exploit_approval: pre-approved ({who})"],
+                "log": [f"exploit_approval: pre-approved ({who})"]}
+
     from langgraph.types import interrupt
     decision = interrupt({
         "kind": "exploit_approval",
@@ -1155,7 +1252,6 @@ def exploit_approval(state: PentestState) -> dict:
         pending_id = decision.get("pending_exploit_id")
     else:
         approved, note, pending_id = bool(decision), "", None
-    sid = state["session_id"]
     _msg(sid, "Exploit",
          f"[operator decision] approved={approved}"
          f"{' pending_exploit_id=' + str(pending_id) if pending_id else ''}"
@@ -2746,6 +2842,40 @@ def _saver_cm():
     return PostgresSaver.from_conn_string(os.environ.get("DB_DSN"))
 
 
+def _interim_report(sid: str, final: dict, target: str, task: str,
+                    auto_execute: bool, exploit_phase: bool) -> None:
+    """Write the report BEFORE parking for approval.
+
+    WHY: `report` sits after `exploit_approval` in the graph, so an approval
+    interrupt held the finished work hostage — recon, the scans, the analysis and
+    the whole surface phase were done, and none of it was written up until a
+    human came back. That human may not look until tomorrow.
+
+    Everything that does not need a human should land now. The exploit execution
+    is the only thing that waits, and the resume writes the final report over the
+    top with the operator's decision included.
+
+    Best-effort: a reporting failure must never stop the session parking, because
+    parking is what keeps the approval safe.
+    """
+    try:
+        state = dict(final or {})
+        state.setdefault("session_id", sid)
+        state["target"] = state.get("target") or target or ""
+        state["task"] = state.get("task") or task or ""
+        state.setdefault("findings", [])
+        state.setdefault("auto_execute", bool(auto_execute))
+        state.setdefault("exploit_phase", bool(exploit_phase))
+        report(state)
+        _msg(sid, "Reporter",
+             "[interim] Report written for everything that did not need "
+             "approval. The exploit above is the only outstanding item; "
+             "approving it resumes the session and rewrites this report.")
+        _emit("langgraph_interim_report", sid, {"reason": "awaiting_approval"})
+    except Exception as e:  # noqa: BLE001
+        _log.warning("[%s] interim report failed: %s", sid, e)
+
+
 def _park_for_approval(sid: str, payload: dict) -> dict:
     """Record the pause so it is visible everywhere the operator looks: session
     status, a session message, session metadata and a webhook event. A blocked /
@@ -2843,8 +2973,39 @@ def _teardown(sid: str, auto_run_recommendations) -> None:
         return
     try:
         _finalize_session(_sid(sid), auto_run_recommendations)
+        # Schedule the post-scan re-analysis HERE rather than on the success
+        # path, because a run does not always end successfully.
+        #
+        # A live test caught this: the graph never returned (the watchdog marked
+        # the session `stalled` after 14 minutes) so teardown ran but the
+        # scheduler, which sat after _finish() in the success branch, never did.
+        # A session whose scans outlive it is EXACTLY the case that needs the
+        # re-analysis, and a stalled run is one of the likeliest ways to get
+        # there. _teardown is the one place all four exit paths meet.
+        _maybe_schedule_rescan_analysis(sid, _rescan_state_for(sid))
     except Exception as e:  # noqa: BLE001
         _log.warning("[%s] teardown failed: %s", sid, e)
+
+
+def _rescan_state_for(sid: str) -> dict:
+    """The minimal state the re-analysis needs, read back from the session row.
+
+    Read rather than passed so _teardown — which every exit path reaches — can
+    schedule the re-analysis without each caller having to carry the state.
+    """
+    try:
+        row = get_agent_session(_sid(sid)) or {}
+        cfg = row.get("configuration") or {}
+        return {
+            "session_id": sid,
+            "target": row.get("target_description") or cfg.get("target_description") or "",
+            "task": cfg.get("initial_task") or "",
+            "auto_execute": bool(cfg.get("auto_execute_scans")),
+            "exploit_phase": bool(cfg.get("enable_exploit_phase")),
+        }
+    except Exception:  # noqa: BLE001
+        return {"session_id": sid, "target": "", "task": "",
+                "auto_execute": False, "exploit_phase": False}
 
 
 def _maybe_schedule_rescan_analysis(sid: str, base_state: dict) -> None:
@@ -2951,16 +3112,14 @@ def run_langgraph_session_sync(
         if payload is not None:
             # Parked, NOT finished: the tracker context and the transcript must
             # survive for the resume, so no teardown here.
+            #
+            # But everything that did NOT need a human is already done, so it is
+            # written up now rather than waiting on the approval.
+            _interim_report(sid, final, target_description, task,
+                            auto_execute_scans, exploit_phase)
             return _park_for_approval(sid, payload)
         result = _finish(sid, final, session_name)
-        _teardown(sid, auto_run_recommendations)
-        # AFTER teardown on purpose: teardown persists the session's scans, and
-        # the watcher restores them from that table to poll their progress.
-        _maybe_schedule_rescan_analysis(sid, {
-            "session_id": sid, "target": target_description, "task": task,
-            "auto_execute": bool(auto_execute_scans),
-            "exploit_phase": bool(exploit_phase),
-        })
+        _teardown(sid, auto_run_recommendations)   # also schedules the re-analysis
         return result
     except Exception as e:  # noqa: BLE001
         update_agent_session(_sid(sid), status="failed",

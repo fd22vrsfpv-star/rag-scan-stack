@@ -130,13 +130,34 @@ def test_rescan_reports_a_timeout_rather_than_going_quiet():
         "indistinguishable from the bug this fixes")
 
 
-def test_rescan_is_scheduled_after_teardown():
-    """Teardown persists the scans; the watcher restores them from that table to
-    poll. Scheduling before teardown would leave it with nothing to poll."""
+def test_rescan_is_scheduled_from_teardown():
+    """From _teardown, not from the success path.
+
+    A live run caught this: the graph never returned, the watchdog marked the
+    session `stalled`, and teardown ran — but the scheduler sat after _finish()
+    in the success branch and never did. A session whose scans outlive it is
+    exactly the case that needs the re-analysis, and a stalled run is one of the
+    likeliest ways to get there. _teardown is where all four exit paths meet.
+    """
     src = _read(ENGINE)
-    i = src.index("_teardown(sid, auto_run_recommendations)\n        # AFTER teardown")
-    assert i > 0, "the re-analysis is no longer scheduled after teardown"
-    assert "_maybe_schedule_rescan_analysis" in src[i:i + 400]
+    fn = _func(src, "_teardown")
+    assert fn, "_teardown() is gone"
+    assert "_maybe_schedule_rescan_analysis" in fn, (
+        "the re-analysis is not scheduled from _teardown, so a run that stalls "
+        "or raises never gets one")
+    # And it must come after _finalize_session, which persists the scans the
+    # watcher then restores to poll.
+    assert fn.index("_finalize_session") < fn.index("_maybe_schedule_rescan_analysis"), (
+        "scheduling before the scans are persisted leaves the watcher nothing "
+        "to poll")
+
+
+def test_rescan_state_is_read_back_from_the_session():
+    """_teardown does not carry the graph state, so it reads what it needs."""
+    fn = _func(_read(ENGINE), "_rescan_state_for")
+    assert fn, "_rescan_state_for() is gone"
+    for key in ("target", "task", "exploit_phase"):
+        assert f'"{key}"' in fn, f"the rebuilt state is missing {key}"
 
 
 def test_rescan_only_spawns_when_something_is_running():
