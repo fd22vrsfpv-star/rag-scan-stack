@@ -956,6 +956,87 @@ class PoCRequest(BaseModel):
     timeout: int = Field(15, description="Page load timeout in seconds")
 
 
+class PreviewRequest(BaseModel):
+    """Render one page through a proxy and hand back what it looks like."""
+    url: str = Field(..., description="Absolute URL to load")
+    proxy: Optional[str] = Field(
+        None, description="SOCKS/HTTP proxy, e.g. socks5://node-manager:10120. "
+                          "Omitted means the request leaves from THIS container.")
+    timeout: int = Field(20, ge=5, le=60, description="Page load timeout (seconds)")
+    width: int = Field(1280, ge=320, le=2560)
+    height: int = Field(800, ge=240, le=2000)
+
+
+@app.post("/preview")
+async def preview_page(req: PreviewRequest):
+    """Load a URL through the exit-node proxy and return a look at it.
+
+    WHY THIS EXISTS: an operator triaging Recon Intel wants to see what is on a
+    host before deciding whether it matters. Clicking a link in the dashboard
+    would fetch it from the OPERATOR'S OWN browser and address — precisely what
+    the exit nodes exist to prevent. This renders it headless, from the node, so
+    the only traffic the target sees comes from the proxy.
+
+    Scope-gated like every other path here: a preview is traffic to a host, so
+    it goes through the same refusal as a scan. There is no override.
+    """
+    refusal = _scope_refusal_for_url(req.url, f"preview {req.url}")
+    if refusal:
+        logger.warning("REFUSED preview of %s: %s", req.url, refusal)
+        raise HTTPException(403, refusal)
+
+    import base64
+    browser = None
+    out = {
+        "url": req.url, "final_url": None, "status": None, "title": None,
+        "headers": {}, "screenshot_b64": None, "via_proxy": req.proxy or None,
+        "error": None,
+    }
+    try:
+        async with async_playwright() as p:
+            launch_kwargs = {"headless": HEADLESS}
+            if req.proxy:
+                # Playwright takes the proxy at LAUNCH for socks5://; a
+                # context-level socks proxy is ignored by Chromium, which is the
+                # kind of silent no-op that would send the request out of this
+                # container's own address while the UI claimed it was proxied.
+                launch_kwargs["proxy"] = {"server": req.proxy}
+            browser = await p.chromium.launch(**launch_kwargs)
+            context = await browser.new_context(
+                viewport={"width": req.width, "height": req.height},
+                user_agent=USER_AGENT,
+                ignore_https_errors=True,
+            )
+            page = await context.new_page()
+            resp = await page.goto(req.url, timeout=req.timeout * 1000,
+                                   wait_until="domcontentloaded")
+            if resp is not None:
+                out["status"] = resp.status
+                try:
+                    out["headers"] = dict(resp.headers)
+                except Exception:  # noqa: BLE001
+                    out["headers"] = {}
+            out["final_url"] = page.url
+            try:
+                out["title"] = await page.title()
+            except Exception:  # noqa: BLE001
+                out["title"] = None
+            shot = await page.screenshot(full_page=False)
+            out["screenshot_b64"] = base64.b64encode(shot).decode("ascii")
+    except Exception as e:  # noqa: BLE001
+        # Reported, never swallowed: "could not load" and "loaded but empty" are
+        # different answers and the operator has to be able to tell them apart.
+        out["error"] = f"{type(e).__name__}: {e}"[:400]
+        logger.warning("preview of %s failed: %s", req.url, out["error"])
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:  # noqa: BLE001
+                pass
+    return out
+
+
 @app.post("/poc")
 async def execute_poc(req: PoCRequest):
     """

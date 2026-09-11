@@ -16,6 +16,8 @@ import { ScanRecommendationsPanel } from '@/components/recommendations/ScanRecom
 import { useExcludeFromScope } from '@/api/findings'
 import { useScopeNames, useAddToScope } from '@/api/scope'
 import { useUIStore } from '@/stores/ui'
+import { ScopeFilter } from '@/components/common/ScopeFilter'
+import { useScopeFilter } from '@/hooks/useScopeFilter'
 import {
   Flag, Plus, X, CheckCircle, XCircle, Clock, AlertTriangle, Loader2,
   ChevronRight, ChevronDown, Bot, RefreshCw, Eye, Trash2, Play, Wand2, RotateCcw, Pencil, ExternalLink, Send, Download,
@@ -65,6 +67,20 @@ export default function FollowUps() {
   // 1516 follow-ups on the live database, so hiding them is the default and
   // the count of what is hidden is always on screen.
   const [hideCustomerHosted, setHideCustomerHosted] = useState(true)
+  // Restrict to ONE scope list within the engagement.
+  //
+  // An engagement holds several scope lists — the scanned scope, customer_scope,
+  // unknown_scope — and a follow-up in the wrong one is a host we are not
+  // authorised to touch. Hiding customer-hosted (the toggle above) removes the
+  // known-third-party ones; this picks the list to work FROM, so triage cannot
+  // wander onto a host outside the list the operator chose.
+  //
+  // Client-side, matching how Assets and Subdomains already filter, so it
+  // applies to whatever the server returned rather than needing a new param.
+  const globalScope = useUIStore(s => s.selectedScopeName)
+  const [scopeFilter, setScopeFilter] = useState(globalScope || '')
+  useEffect(() => { setScopeFilter(globalScope || '') }, [globalScope, engagementId])
+  const { matchesAnyScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilter)
   const excludeScope = hideCustomerHosted ? 'customer_scope' : undefined
   const activeEngagementId = filterByEngagement && engagementId ? engagementId : undefined
   const { data: statsData } = useFollowUpStats(activeEngagementId, excludeScope)
@@ -112,7 +128,7 @@ export default function FollowUps() {
   // Parse search: "+term" include, "-term" exclude, plain = include
   const items = useMemo(() => {
     const q = searchFilter.trim()
-    if (!q) return allItems
+    if (!q) return isScopeFiltering ? allItems.filter(i => matchesAnyScope(i.target)) : allItems
     const tokens = q.split(/\s+/)
     const include: string[] = []
     const exclude: string[] = []
@@ -122,12 +138,17 @@ export default function FollowUps() {
       else include.push(tok.toLowerCase())
     }
     return allItems.filter(item => {
+      // Scope FIRST, and not bypassable by the search box. A text search that
+      // could pull in a host outside the chosen scope list would defeat the
+      // point of choosing one — the operator picked a list precisely so triage
+      // cannot wander onto something they are not authorised to touch.
+      if (isScopeFiltering && !matchesAnyScope(item.target)) return false
       const text = `${item.title} ${item.target} ${item.reason || ''} ${item.rule_id || ''} ${(item.tags || []).join(' ')}`.toLowerCase()
       if (exclude.some(ex => text.includes(ex))) return false
       if (include.length > 0 && !include.some(inc => text.includes(inc))) return false
       return true
     })
-  }, [allItems, searchFilter])
+  }, [allItems, searchFilter, isScopeFiltering, matchesAnyScope])
 
   // Extract host from target URL
   const extractHost = (target: string | null) => {
@@ -507,6 +528,7 @@ export default function FollowUps() {
             {filterByEngagement ? 'Engagement Only' : 'All Engagements'}
           </button>
         )}
+        <ScopeFilter value={scopeFilter} onChange={setScopeFilter} />
         {(() => {
           const hidden = (unscopedStats?.stats?.total ?? 0) - (statsData?.stats?.total ?? 0)
           return (
