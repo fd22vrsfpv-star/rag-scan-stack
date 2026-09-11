@@ -135,6 +135,11 @@ export function useFollowUps(filters: {
   engagement_id?: string
   rule_id?: string
   search?: string
+  /** Comma-separated scope list names whose hosts to omit — 'customer_scope'
+   *  drops customer-hosted sites, which the mark-customer-sites flow moved out
+   *  of the scanned scope. They were 1310 of 1516 follow-ups on the live data,
+   *  so without this the list is mostly someone else's estate. */
+  exclude_scope?: string
 } = {}) {
   const params = new URLSearchParams()
   if (filters.status) params.set('status', filters.status)
@@ -145,6 +150,7 @@ export function useFollowUps(filters: {
   if (filters.engagement_id) params.set('engagement_id', filters.engagement_id)
   if (filters.rule_id) params.set('rule_id', filters.rule_id)
   if (filters.search) params.set('search', filters.search)
+  if (filters.exclude_scope) params.set('exclude_scope', filters.exclude_scope)
   return useQuery({
     queryKey: ['follow-ups', filters],
     queryFn: () => apiFetch<{ follow_ups: FollowUpItem[] }>(`/follow-ups?${params}`),
@@ -153,12 +159,15 @@ export function useFollowUps(filters: {
   })
 }
 
-export function useFollowUpStats(engagement_id?: string) {
+export function useFollowUpStats(engagement_id?: string, exclude_scope?: string) {
   const params = new URLSearchParams()
   if (engagement_id) params.set('engagement_id', engagement_id)
+  // Same exclusion as the list: a header counting rows the table refuses to
+  // show is worse than no header.
+  if (exclude_scope) params.set('exclude_scope', exclude_scope)
   const qs = params.toString()
   return useQuery({
-    queryKey: ['follow-ups', 'stats', engagement_id],
+    queryKey: ['follow-ups', 'stats', engagement_id, exclude_scope],
     queryFn: () => apiFetch<{ stats: FollowUpStats }>(`/follow-ups/stats${qs ? '?' + qs : ''}`),
     refetchInterval: POLL.NORMAL,
     placeholderData: (prev) => prev as any,
@@ -177,13 +186,14 @@ export interface FollowUpGroup {
   finding_names?: string[]
 }
 
-export function useFollowUpGrouped(groupBy: string, status?: string, engagement_id?: string, exclude_status?: string) {
+export function useFollowUpGrouped(groupBy: string, status?: string, engagement_id?: string, exclude_status?: string, exclude_scope?: string) {
   const params = new URLSearchParams({ group_by: groupBy })
   if (status) params.set('status', status)
   if (exclude_status) params.set('exclude_status', exclude_status)
   if (engagement_id) params.set('engagement_id', engagement_id)
+  if (exclude_scope) params.set('exclude_scope', exclude_scope)
   return useQuery({
-    queryKey: ['follow-ups', 'grouped', groupBy, status, engagement_id, exclude_status],
+    queryKey: ['follow-ups', 'grouped', groupBy, status, engagement_id, exclude_status, exclude_scope],
     queryFn: () => apiFetch<{ groups: FollowUpGroup[]; total_groups: number }>(`/follow-ups/grouped?${params}`),
     refetchInterval: POLL.NORMAL,
     placeholderData: (prev) => prev as any,

@@ -59,8 +59,18 @@ export default function FollowUps() {
   const [searchFilter, setSearchFilter] = useState(() => searchParams.get('search') || '')
   const [groupBy, setGroupBy] = useState<'none' | 'title' | 'target'>('title')
   const [filterByEngagement, setFilterByEngagement] = useState(false)
+  // Customer-hosted sites (the `customer_scope` list) are hosts the
+  // mark-customer-sites flow moved OUT of the scanned scope — part of the
+  // engagement's data, but not ours to test or report on. They were 1310 of
+  // 1516 follow-ups on the live database, so hiding them is the default and
+  // the count of what is hidden is always on screen.
+  const [hideCustomerHosted, setHideCustomerHosted] = useState(true)
+  const excludeScope = hideCustomerHosted ? 'customer_scope' : undefined
   const activeEngagementId = filterByEngagement && engagementId ? engagementId : undefined
-  const { data: statsData } = useFollowUpStats(activeEngagementId)
+  const { data: statsData } = useFollowUpStats(activeEngagementId, excludeScope)
+  // Unfiltered-by-scope counts, so the toggle can say how many it is hiding
+  // rather than silently shrinking the list.
+  const { data: unscopedStats } = useFollowUpStats(activeEngagementId, undefined)
   // Unfiltered totals, so an empty list can say WHICH empty it is: nothing
   // exists, or everything is filtered out. Those look identical on screen,
   // which is what made unattributed data read as a broken filter. When the
@@ -68,12 +78,13 @@ export default function FollowUps() {
   // nothing until the operator actually filters.
   const { data: allStatsData } = useFollowUpStats(undefined)
   const excludeStatus = hideDismissed && filters.status !== 'dismissed' ? 'dismissed' : undefined
-  const { data: groupedData } = useFollowUpGrouped(groupBy, filters.status, activeEngagementId, excludeStatus)
+  const { data: groupedData } = useFollowUpGrouped(groupBy, filters.status, activeEngagementId, excludeStatus, excludeScope)
   const { data, isLoading } = useFollowUps({
     ...filters,
     exclude_status: excludeStatus,
     search: searchFilter.trim() || undefined,
     engagement_id: filterByEngagement && engagementId ? engagementId : undefined,
+    exclude_scope: excludeScope,
   })
   const { data: agentStatsData } = useAgentStats()
   const { data: rulesData } = useAgentRules()
@@ -496,6 +507,27 @@ export default function FollowUps() {
             {filterByEngagement ? 'Engagement Only' : 'All Engagements'}
           </button>
         )}
+        {(() => {
+          const hidden = (unscopedStats?.stats?.total ?? 0) - (statsData?.stats?.total ?? 0)
+          return (
+            <button
+              onClick={() => setHideCustomerHosted(!hideCustomerHosted)}
+              title={'Customer-hosted sites are hosts moved into this engagement\'s '
+                + 'customer_scope list — out of the scanned scope, so they are not '
+                + 'yours to test or report on. Hidden by default; nothing is deleted.'}
+              className={cn(
+                'h-7 px-2 text-xs rounded border',
+                hideCustomerHosted
+                  ? 'border-amber-500/30 bg-amber-500/15 text-amber-400'
+                  : 'border-border bg-background text-muted-foreground hover:bg-accent'
+              )}
+            >
+              {hideCustomerHosted
+                ? `Customer-hosted hidden${hidden > 0 ? ` (${hidden})` : ''}`
+                : 'Customer-hosted shown'}
+            </button>
+          )
+        })()}
         <button
           onClick={() => setHideDismissed(!hideDismissed)}
           className={cn(
