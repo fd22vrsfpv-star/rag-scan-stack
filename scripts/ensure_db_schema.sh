@@ -553,6 +553,36 @@ done
 
 echo ""
 
+# ── Engagement attribution ────────────────────────────────────────────────
+# Every row that carries an engagement_id gets it from one of these triggers.
+# When one is missing the write still succeeds and the column is simply NULL, so
+# nothing errors — the host just disappears from every engagement-filtered view.
+# That is exactly how 137 assets and 915 follow-ups came to be unattributed while
+# the stack reported healthy.
+echo "🔍 Verifying engagement attribution triggers..."
+for trg in trg_assets_engagement trg_followups_engagement; do
+    if _psql -tAc \
+         "SELECT 1 FROM pg_trigger WHERE tgname='${trg}' AND NOT tgisinternal;" | grep -q 1; then
+        echo "✓ ${trg}"
+    else
+        echo "❌ Missing ${trg} — rows will store with engagement_id NULL and vanish from engagement-filtered views"
+        MISSING=$((MISSING + 1))
+    fi
+done
+if _psql -tAc "SELECT 1 FROM pg_proc WHERE proname='followup_target_host';" | grep -q 1; then
+    echo "✓ followup_target_host() (shared host extractor)"
+else
+    echo "❌ Missing followup_target_host() — the follow-up trigger and its backfill cannot agree on what 'the host' is"
+    MISSING=$((MISSING + 1))
+fi
+# Report drift rather than fail: new rows arrive constantly and a host that is
+# genuinely in no scope is CORRECTLY unattributed. A rising count is the signal.
+UNATTRIBUTED_ASSETS=$(_psql -tAc "SELECT count(*) FROM assets WHERE engagement_id IS NULL;" | tr -d '[:space:]')
+UNATTRIBUTED_FU=$(_psql -tAc "SELECT count(*) FROM follow_up_items WHERE engagement_id IS NULL;" | tr -d '[:space:]')
+echo "   unattributed: ${UNATTRIBUTED_ASSETS:-?} asset(s), ${UNATTRIBUTED_FU:-?} follow-up(s) (hosts in no scope; not an error)"
+
+echo ""
+
 # ── ExploitDB (separate database) ─────────────────────────────────────────
 # Not part of the `scans` schema, so the table loop above cannot see it. It was
 # absent entirely on a live install: db_init/create_exploits.sh began with
