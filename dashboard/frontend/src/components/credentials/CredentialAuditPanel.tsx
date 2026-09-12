@@ -89,6 +89,45 @@ export function CredentialAuditPanel({ audit }: Props) {
         </div>
       </div>
 
+      {/* Proof, before anything else.
+          "We tried 8 pairs and one worked" is a claim; the tool's own sentence
+          is what an operator quotes into a report. This is the first question
+          asked of any credential finding, so it goes above the counts. */}
+      {(audit.evidence || []).length > 0 && (
+        <div>
+          <div className="text-muted-foreground mb-1 flex items-center gap-1">
+            <CheckCircle2 className="h-3 w-3 text-green-400" />
+            What confirmed it
+          </div>
+          <div className="space-y-1">
+            {(audit.evidence || []).map((e, i) => (
+              <div key={i} className="border border-green-500/20 bg-green-500/5 rounded p-2 space-y-1">
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-foreground">{e.username || '(no user)'}</span>
+                  {e.method && (
+                    <span className="px-1.5 py-0.5 rounded text-[10px] border bg-blue-500/15 text-blue-300 border-blue-500/30 font-mono">
+                      {e.method}
+                    </span>
+                  )}
+                </div>
+                {e.output
+                  ? <pre className="text-foreground font-mono text-[10px] whitespace-pre-wrap break-all
+                                    bg-black/30 border border-border rounded p-1.5 max-h-32 overflow-auto">{e.output}</pre>
+                  : <div className="text-muted-foreground italic text-[10px]">
+                      This run recorded no output for the accepted account — it predates the
+                      collector keeping one, or the tool printed nothing quotable.
+                    </div>}
+                {e.command && (
+                  <div className="text-[10px] text-muted-foreground font-mono break-all">
+                    <span className="not-italic">ran:</span> {e.command}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Source + counts */}
       <div className="grid grid-cols-3 gap-x-4 gap-y-1 text-muted-foreground">
         <div>Source: <span className="text-foreground font-mono">{audit.credential_source || '(unknown)'}</span></div>

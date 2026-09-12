@@ -1,0 +1,54 @@
+# GENERATED from code_injection.md by scripts/playbooks_to_yaml.py — do not hand-edit.
+#
+# The markdown stays authoritative: it is what a human reads and what RAG
+# ingests. This is an EXTRACT of the steps in it, so that something other
+# than a language model can act on them. Re-generate after editing the
+# markdown; tests/test_playbooks.py fails if the two drift.
+#
+# access_required is a conservative heuristic, recorded so a consumer can
+# FILTER — never so anything can decide to run. Authorisation stays with
+# the scope gate and the engagement's approval.
+name: code_injection
+title: Code Injection & Process Injection Techniques
+source: code_injection.md
+generated_by: scripts/playbooks_to_yaml.py
+phases:
+- id: classic-dll-injection
+  name: Classic DLL Injection
+  steps:
+  - id: classic-dll-injection.createremotethread-method
+    title: CreateRemoteThread Method
+    access_required: none
+    mutates: false
+    source_line: 12
+  - id: classic-dll-injection.using-ntcreatethreadex
+    title: Using NtCreateThreadEx
+    access_required: none
+    mutates: false
+    source_line: 33
+- id: shellcode-injection
+  name: Shellcode Injection
+  steps:
+  - id: shellcode-injection.basic-shellcode-injection
+    title: Basic Shellcode Injection
+    access_required: none
+    mutates: false
+    source_line: 50
+  - id: shellcode-injection.using-ntwritevirtualmemory-ntcreatethreadex
+    title: Using NtWriteVirtualMemory + NtCreateThreadEx
+    access_required: none
+    mutates: false
+    source_line: 62
+- id: apc-injection
+  name: APC Injection
+  steps:
+  - id: apc-injection.queueuserapc
+    title: QueueUserAPC
+    access_required: none
+    mutates: false
+    source_line: 183
+  - id: apc-injection.early-bird-apc-injection
+    title: Early Bird APC Injection
+    access_required: none
+    mutates: false
+    source_line: 198

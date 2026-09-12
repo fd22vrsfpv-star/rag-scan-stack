@@ -261,6 +261,9 @@ export interface CredentialAttempt {
   success: boolean
   failure_mode: string | null  // "kex_mismatch" | "connection_error" | "auth_failed" | "timeout" | "unknown"
   error_excerpt: string | null
+  /** Present only on a successful attempt. */
+  evidence?: string | null
+  command?: string | null
 }
 
 export interface CredentialMethodAudit {
@@ -269,6 +272,18 @@ export interface CredentialMethodAudit {
   attempts: CredentialAttempt[]
   kex_legacy_detected?: boolean        // hydra-only signal
   unsupported_service?: string | null  // populated when the service had no module map
+}
+
+/** What the tool actually SAID when it accepted an account.
+ *
+ *  "The audit recorded success: true and nothing else" is the platform asking
+ *  to be taken on faith. A credential that goes into a report needs the tool's
+ *  own sentence behind it, which is what an operator quotes. */
+export interface CredentialEvidence {
+  username: string | null
+  method: string | null                     // which tool confirmed it
+  output: string | null                     // the confirming line, verbatim
+  command: string | null                    // sanitised argv (secret redacted)
 }
 
 export interface CredentialAudit {
@@ -281,6 +296,12 @@ export interface CredentialAudit {
   kex_legacy_detected: boolean              // OR of per-method signals
   fell_back_to_nmap: boolean
   summary: string                           // human-readable
+  /** Rolled up from method_audits[*].attempts[*] so the UI does not have to
+   *  walk two levels to answer the first question anyone asks. Absent on rows
+   *  written before the collector captured it. */
+  evidence?: CredentialEvidence[]
+  /** Which tool was chosen and why — see etl/tool_learning.py. */
+  selection?: Record<string, unknown>
 }
 
 export interface CredentialMetadata {
