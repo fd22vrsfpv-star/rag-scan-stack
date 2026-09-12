@@ -9,6 +9,11 @@ from unittest.mock import MagicMock, patch
 # Ensure app/rag-api is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app", "rag-api"))
 
+# cloud_suggestor reads its catalogue with PyYAML. A bare checkout has no yaml,
+# and a module-level ImportError there is a COLLECTION ERROR, not a skip — which
+# reddens the whole run and hides real breakage behind "cannot run here".
+pytest.importorskip("yaml", reason="cloud_suggestor needs PyYAML")
+
 import cloud_suggestor
 
 

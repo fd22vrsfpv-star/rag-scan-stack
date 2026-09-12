@@ -17,13 +17,23 @@ import pytest
 KL_DIR = Path(__file__).parent.parent / "kali_listener"
 sys.path.insert(0, str(KL_DIR))  # for the module's `from log_manager import ...`
 
-_spec = importlib.util.spec_from_file_location("kl_listener", KL_DIR / "listener_service.py")
+_LISTENER = KL_DIR / "listener_service.py"
+# The FILE being gone is a real defect and must fail loudly. A DEPENDENCY being
+# absent is "cannot run here" and must skip. Collapsing the two into one
+# collection error reddens the suite permanently, and a permanently red baseline
+# makes a genuine new failure invisible.
+if not _LISTENER.exists():
+    raise AssertionError(f"{_LISTENER} is missing — the module under test was moved")
+
+_spec = importlib.util.spec_from_file_location("kl_listener", _LISTENER)
 kl = importlib.util.module_from_spec(_spec)
 # listener_service mkdir's /reports at import (read-only in the test env) — no-op it.
 _orig_mkdir = pathlib.Path.mkdir
 pathlib.Path.mkdir = lambda self, *a, **k: None
 try:
     _spec.loader.exec_module(kl)
+except ModuleNotFoundError as exc:
+    pytest.skip(f"listener_service needs {exc.name}", allow_module_level=True)
 finally:
     pathlib.Path.mkdir = _orig_mkdir
 # kali_listener/ and scan_recommender/ both ship a `log_manager` module; drop the
