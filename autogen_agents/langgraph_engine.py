@@ -1551,6 +1551,23 @@ def post_enumeration(state: PentestState) -> dict:
             "post_enumeration: rules no longer firing (tried and never "
             "produced): " + ", ".join(sorted(set(swept["suppressed"]))[:5]))
 
+    # Run the checklist through the best shell we hold, if we hold one. This is
+    # enumeration through access already obtained by an approved exploit, not a
+    # new dispatch — so it runs rather than being queued for someone to press.
+    through = _enumerate_through_best_access(sid, target)
+    if through.get("ran"):
+        a = through["access"]
+        findings.append(
+            f"post_enumeration: ran {through['ran']} post-access check(s) "
+            f"through {a['kind']} {a['handle']} "
+            f"(whoami={a.get('whoami') or '?'}, root={a.get('is_root')})")
+        for stp in through["steps"]:
+            if stp["ok"] and stp["output"].strip():
+                _msg(sid, "PostEnumeration",
+                     f"[{stp['title']}] {stp['command']}\n{stp['output'][:900]}")
+    elif through.get("reason"):
+        findings.append(f"post_enumeration: {through['reason']}")
+
     enumerated = _enumerate_post_access(sid, target)
     if enumerated.get("queued"):
         findings.append(
@@ -1574,6 +1591,7 @@ def post_enumeration(state: PentestState) -> dict:
         "queued": (swept.get("queued", 0) + enumerated.get("queued", 0)),
         "refused": swept.get("refused", 0),
         "remaining": analysed.get("unanalysed", 0),
+        "ran_through_access": through.get("ran", 0),
     }
     if not findings:
         # A pass that did nothing must still say so, or the history reads as a
@@ -1776,6 +1794,73 @@ def _wrap_remote(protocol: str, ip: str, port, command: str) -> Optional[str]:
     safe = command.replace("'", "'\\''")
     return (f"sshpass -p '{{password}}' ssh {' '.join(opts)} "
             f"-p {port or 22} {{username}}@{ip} '{safe}' < /dev/null")
+
+
+def _enumerate_through_best_access(sid, target: str) -> dict:
+    """Run the methodology's post-access checklist through the BEST shell we hold.
+
+    Every exploit that succeeded left something behind, and running the
+    checklist through all of them would be slow, noisy on the target, and would
+    produce several partial answers to one question instead of one complete one.
+    So the access is measured first — `id` for privilege, repeated probes for
+    stability — and the checklist runs once, through the winner.
+
+    A root shell that dies on the second command loses to a user shell that
+    holds: the checklist is a SEQUENCE, and one that drops halfway through
+    produces a half-finished enumeration that looks complete.
+
+    Read-only steps only. `steps_for()` excludes mutating ones by default and
+    this does not ask for them — running the checklist through access we already
+    hold is enumeration; adding a backdoor while we are in there is not.
+    """
+    out = {"ran": 0, "failed": 0, "access": None, "steps": [], "reason": ""}
+    try:
+        from etl import access as ax
+        from etl import playbooks as pb
+    except Exception as e:  # noqa: BLE001
+        out["reason"] = f"unavailable: {e}"
+        return out
+
+    try:
+        measured = ax.refresh(target)
+        best = ax.best_for(target)
+    except Exception as e:  # noqa: BLE001
+        out["reason"] = f"access measurement failed: {str(e)[:160]}"
+        return out
+    if not best:
+        # Distinct from "nothing to enumerate": we looked for access and found
+        # none that answered. The candidate count says whether that is because
+        # there was nothing, or because nothing worked.
+        out["reason"] = (f"no live access on {target} "
+                         f"({measured.get('discovered', 0)} candidate(s) probed, "
+                         f"{measured.get('live', 0)} answered)")
+        return out
+
+    out["access"] = {k: best[k] for k in ("kind", "handle", "whoami", "is_root",
+                                          "score")}
+    _msg(sid, "PostEnumeration",
+         f"[access] Using {best['kind']} {best['handle']} "
+         f"(whoami={best.get('whoami') or '?'}, root={best.get('is_root')}, "
+         f"score={best['score']}) for post-enumeration — chosen from "
+         f"{measured.get('discovered', 0)} candidate(s) by measured privilege "
+         f"and stability.")
+
+    for st in pb.steps_for("ssh", access="shell"):
+        if st["access_required"] != "shell":
+            continue
+        for c in st["commands"]:
+            cmd = (c.get("command") or "").strip()
+            if not cmd or "{" in cmd:
+                continue
+            res = ax.run(best, cmd)
+            out["steps"].append({"step": st["id"], "title": st["title"],
+                                 "command": cmd, "ok": res["ok"],
+                                 "output": (res["output"] or "")[:1200]})
+            if res["ok"]:
+                out["ran"] += 1
+            else:
+                out["failed"] += 1
+    return out
 
 
 def _enumerate_post_access(sid, target: str) -> dict:

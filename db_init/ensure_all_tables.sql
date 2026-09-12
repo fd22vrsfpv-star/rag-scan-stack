@@ -3070,6 +3070,68 @@ CREATE TRIGGER trg_enumeration_rule_learned_updated
   BEFORE UPDATE ON public.enumeration_rule_learned
   FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
 
+-- ============================================================================
+-- Access the platform actually holds, and how good each one is
+-- ----------------------------------------------------------------------------
+-- Exploits were run and shells were obtained, and the platform had no concept
+-- of either. The vsftpd backdoor opened a root shell on port 6200 and the row
+-- in pending_exploits said `executed`; nothing recorded that access existed,
+-- what privilege it had, or whether it still worked.
+--
+-- With one exploit that was merely a gap. Now that the planner queues every
+-- well-evidenced candidate, several succeed and each leaves something behind —
+-- and running the post-enumeration checklist through all of them would be both
+-- slow and pointless. The checklist wants ONE shell: the highest privilege that
+-- is actually stable.
+--
+-- So each access is MEASURED rather than assumed. `id` says the privilege;
+-- repeated probes say whether it survives. A root shell that dies on the second
+-- command is worse than a user shell that holds, and only a probe can tell them
+-- apart.
+CREATE TABLE IF NOT EXISTS public.obtained_access (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    target          text NOT NULL,
+    port            integer,
+    -- 'msf_session' | 'bind_shell' | 'ssh_credential'
+    kind            text NOT NULL,
+    -- How to reach it again: an msf session id, a host:port, a credential id.
+    handle          text NOT NULL,
+    transport       text NOT NULL DEFAULT '',
+    source_exploit  uuid,
+
+    -- MEASURED, never assumed. NULL means "not probed yet", which is a third
+    -- state and must not read as "unprivileged".
+    whoami          text,
+    uid             integer,
+    is_root         boolean,
+    os_info         text,
+
+    -- Stability: how many probes were attempted and how many answered. A shell
+    -- that answers once and dies scores differently from one that answers five
+    -- times, and the difference only shows up if you ask more than once.
+    probes          integer NOT NULL DEFAULT 0,
+    probes_ok       integer NOT NULL DEFAULT 0,
+    last_probe_at   timestamptz,
+    last_error      text,
+
+    -- Composite, recomputed on every probe. Privilege dominates; stability
+    -- breaks ties and demotes a root shell that will not hold.
+    score           integer NOT NULL DEFAULT 0,
+    status          text NOT NULL DEFAULT 'unverified'
+                    CHECK (status IN ('unverified','live','dead','rejected')),
+    engagement_id   uuid,
+    created_at      timestamptz DEFAULT now(),
+    updated_at      timestamptz DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_obtained_access
+  ON public.obtained_access (target, kind, handle);
+CREATE INDEX IF NOT EXISTS idx_obtained_access_best
+  ON public.obtained_access (target, status, score DESC);
+DROP TRIGGER IF EXISTS trg_obtained_access_updated ON public.obtained_access;
+CREATE TRIGGER trg_obtained_access_updated
+  BEFORE UPDATE ON public.obtained_access
+  FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+
 -- Agent-to-agent feedback channel. One agent flags something interesting (a
 -- finding worth another run, a coverage gap); a coordinator turns approved flags
 -- into scan_recommendations (which the recon agent dispatches through the scope
