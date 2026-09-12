@@ -5,14 +5,18 @@ Tests database operations for scans, findings, screenshots, and DOM analysis.
 import uuid
 from unittest.mock import patch, MagicMock, call
 import pytest
-from psycopg2.extras import Json
+
+# psycopg2 is a dependency of the code under test. Without the skip its absence
+# is a collection error rather than "cannot run here".
+pytest.importorskip("psycopg2", reason="db_utils writes through psycopg2")
+from psycopg2.extras import Json  # noqa: E402
 
 # Import the module under test
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from playwright_scanner import db_utils
+from playwright_scanner import db_utils  # noqa: E402
 
 
 @pytest.mark.unit

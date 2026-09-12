@@ -21,11 +21,20 @@ import pytest
 SR_DIR = Path(__file__).parent.parent / "scan_recommender"
 sys.path.insert(0, str(SR_DIR))  # let the module's bare imports resolve
 
-from tool_kb import ToolKnowledgeBase, get_high_value_port_info  # noqa: E402
+for _needed in (SR_DIR / "tool_kb.py", SR_DIR / "scan_recommender.py"):
+    if not _needed.exists():
+        raise AssertionError(f"{_needed} is missing — the module under test was moved")
 
-_spec = importlib.util.spec_from_file_location("sr_module", SR_DIR / "scan_recommender.py")
-sr = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(sr)
+try:
+    from tool_kb import ToolKnowledgeBase, get_high_value_port_info  # noqa: E402
+
+    _spec = importlib.util.spec_from_file_location("sr_module", SR_DIR / "scan_recommender.py")
+    sr = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(sr)
+except ModuleNotFoundError as exc:  # a DEPENDENCY, not the module itself
+    # Both files exist (checked above), so the runner is missing a package the
+    # recommender needs. "Cannot run here" is a skip; only "broken" is an error.
+    pytest.skip(f"scan_recommender needs {exc.name}", allow_module_level=True)
 # kali_listener/ and scan_recommender/ both ship a `log_manager` module; drop the
 # cached one so a sibling test re-imports its own copy cleanly (test isolation).
 sys.modules.pop("log_manager", None)
