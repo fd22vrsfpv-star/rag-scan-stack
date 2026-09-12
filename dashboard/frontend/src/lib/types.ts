@@ -14,6 +14,11 @@ export interface Asset {
   // HTTP header signals — covers vanity domains the hostname doesn't reveal.
   provider?: string[]
   provider_evidence?: Record<string, string[]>
+  // Access the platform currently HOLDS on this host, merged in client-side
+  // from /assets/access/summary. Drives the asset-list shell badge and the
+  // "held access" filter. Absent means not looked up / none held.
+  access_live?: number
+  access_total?: number
 }
 
 export interface Port {
