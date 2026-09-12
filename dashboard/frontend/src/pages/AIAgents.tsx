@@ -7,7 +7,9 @@ import {
   useDrainArtifacts, useAgentFlags, useActAgentFlag,
   useLearnedExtractors, useReviewExtractor, useExportExtractors,
   useAgentActivity,
-  type AgentInfo, type GapReport, type GapTargetDetail,
+  useToolSelectionRules, useReviewToolSelectionRule, useToolAttempts,
+  useBackfillToolSelection,
+  type AgentInfo, type GapReport, type GapTargetDetail, type ToolSelectionRule,
 } from '@/api/agents'
 import { useUIStore } from '@/stores/ui'
 import { cn } from '@/lib/utils'
@@ -15,6 +17,7 @@ import {
   Bot, Cpu, Search, Shield, Loader2, Play, ExternalLink,
   CheckCircle2, XCircle, RefreshCw, Zap, Settings, Clock, Cloud,
   FileSearch, ShieldCheck, Globe, MessageSquare, Wand2, Activity, ChevronDown, ChevronRight,
+  GitBranch,
 } from 'lucide-react'
 
 const AGENT_ICONS: Record<string, typeof Bot> = {
@@ -132,6 +135,7 @@ export default function AIAgents() {
 
       <AgentFlagsPanel />
       <LearnedExtractorsPanel />
+      <ToolSelectionPanel />
       <ActivityTimelinePanel />
 
       {selectedEngagement && (
@@ -758,5 +762,183 @@ function TargetRow({ target, info }: { target: string; info: GapTargetDetail }) 
         </span>
       </td>
     </tr>
+  )
+}
+
+
+/** Learned tool selection — what the platform concluded from tool error output.
+ *
+ *  These rules are DERIVED, not authored: when a tool fails with a given error
+ *  and another one then succeeds on the same target, that pair becomes a rule
+ *  and the winner is tried first from then on. So the operator's job here is
+ *  correction — see the conclusion, and overrule it when it is wrong.
+ *
+ *  Rejecting is permanent: etl/tool_learning.py preserves 'rejected' on upsert,
+ *  so new evidence will not quietly reinstate a rule you ruled out. Before this
+ *  panel existed, undoing a bad conclusion meant a psql session.
+ *
+ *  A rule decides which AUTHORISED tool is tried first. It never decides whether
+ *  something may run — that is the scope gate and the phase's approval, and
+ *  approving here grants no permission. */
+function ToolSelectionPanel() {
+  const { data } = useToolSelectionRules()
+  const review = useReviewToolSelectionRule()
+  const backfill = useBackfillToolSelection()
+  const [open, setOpen] = useState<string | null>(null)
+  const rows = data?.learned ?? []
+  if (!rows.length) return null
+
+  const counts = data?.by_status ?? {}
+  const pct = (r: ToolSelectionRule) =>
+    r.confidence == null ? '—' : `${Math.round(r.confidence * 100)}%`
+
+  return (
+    <div className="bg-card border border-border rounded-lg p-3 space-y-2">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <h3 className="text-sm font-semibold flex items-center gap-2">
+          <GitBranch className="h-4 w-4" /> Learned Tool Selection
+          {(counts.active ?? 0) > 0 && (
+            <span className="px-1.5 py-0.5 rounded-full bg-green-500/10 text-green-400 text-[10px]">
+              {counts.active} in use
+            </span>
+          )}
+          {(counts.proposed ?? 0) > 0 && (
+            <span className="px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-400 text-[10px]">
+              {counts.proposed} proposed
+            </span>
+          )}
+          {(counts.rejected ?? 0) > 0 && (
+            <span className="px-1.5 py-0.5 rounded-full bg-red-500/10 text-red-400 text-[10px]">
+              {counts.rejected} rejected
+            </span>
+          )}
+        </h3>
+        <button onClick={() => backfill.mutate({ reset: true })} disabled={backfill.isPending}
+          title="Re-derive every rule from tool_executions. Reads history only — runs nothing against any target."
+          className="h-6 px-2 text-[10px] rounded border border-border hover:bg-accent">
+          {backfill.isPending ? 'Re-deriving…' : 'Re-derive from history'}
+        </button>
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        Derived from tool error output, not written by anyone: when a tool fails a given way and
+        another succeeds on the same target, the winner is tried first next time. Rejecting is
+        permanent — new evidence will not reinstate it. These rules choose between{' '}
+        <em>already-authorised</em> tools; approving one grants no permission.
+      </p>
+      {backfill.data && (
+        <p className="text-[11px] text-muted-foreground font-mono">
+          examined {backfill.data.examined} · errored {backfill.data.failures} ·
+          {' '}produced nothing {backfill.data.fruitless} · rules {backfill.data.rules}
+          {backfill.data.cleared ? ` · cleared ${backfill.data.cleared}` : ''}
+        </p>
+      )}
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[760px] text-xs">
+          <thead className="text-muted-foreground">
+            <tr className="border-b border-border">
+              <th className="text-left py-1 px-2">When this fails</th>
+              <th className="text-left px-2">Try instead</th>
+              <th className="text-left px-2">Service</th>
+              <th className="text-right px-2">Worked</th>
+              <th className="text-left px-2">Status</th>
+              <th className="text-right px-2">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(r => (
+              <>
+                <tr key={r.id} className="border-b border-border/40">
+                  <td className="py-1 px-2">
+                    <button onClick={() => setOpen(open === r.id ? null : r.id)}
+                      className="inline-flex items-center gap-1 hover:text-foreground">
+                      {open === r.id ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                      <span className="font-mono">{r.failed_tool}</span>
+                    </button>
+                  </td>
+                  <td className="px-2 font-mono text-green-400">{r.preferred_tool}</td>
+                  <td className="px-2 font-mono text-muted-foreground">{r.service || '—'}</td>
+                  <td className="px-2 text-right font-mono" title={`${r.successes} of ${r.attempts} attempts`}>
+                    {pct(r)} <span className="text-muted-foreground">({r.successes}/{r.attempts})</span>
+                  </td>
+                  <td className="px-2">
+                    <span className={cn('px-1.5 py-0.5 rounded text-[10px]',
+                      r.status === 'active' ? 'bg-green-500/10 text-green-400'
+                        : r.status === 'rejected' ? 'bg-red-500/10 text-red-400'
+                          : 'bg-amber-500/10 text-amber-400')}>{r.status}</span>
+                    {r.reviewed_by && <span className="ml-1 text-[10px] text-muted-foreground">by {r.reviewed_by}</span>}
+                  </td>
+                  <td className="px-2 text-right whitespace-nowrap">
+                    <span className="inline-flex gap-1">
+                      {r.status !== 'active' && (
+                        <button onClick={() => review.mutate({ id: r.id, action: 'approve' })} disabled={review.isPending}
+                          className="px-2 py-0.5 text-[10px] rounded bg-green-600 hover:bg-green-500 text-white">Use it</button>
+                      )}
+                      {r.status !== 'rejected' && (
+                        <button onClick={() => review.mutate({ id: r.id, action: 'reject' })} disabled={review.isPending}
+                          title="Permanent — new evidence will not reinstate this rule"
+                          className="px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">Reject</button>
+                      )}
+                      {r.status === 'rejected' && (
+                        <button onClick={() => review.mutate({ id: r.id, action: 'reset' })} disabled={review.isPending}
+                          className="px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">Reset</button>
+                      )}
+                    </span>
+                  </td>
+                </tr>
+                {open === r.id && (
+                  <tr key={`${r.id}-detail`} className="border-b border-border/40 bg-black/20">
+                    <td colSpan={6} className="px-4 py-2 space-y-2">
+                      <div>
+                        <div className="text-[10px] text-muted-foreground uppercase tracking-wide">What it learned from</div>
+                        <pre className="text-[10px] font-mono whitespace-pre-wrap text-amber-300/90">
+                          {r.failure_phrase || '(no message recorded)'}
+                        </pre>
+                        <div className="text-[10px] text-muted-foreground font-mono mt-1">
+                          signature {r.failure_signature} · seen {r.support}× · last {new Date(r.last_seen_at).toLocaleString()}
+                        </div>
+                      </div>
+                      <ToolAttemptEvidence signature={r.failure_signature} />
+                    </td>
+                  </tr>
+                )}
+              </>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+/** The raw observations a rule was derived from. A conclusion nobody can check
+ *  is not reviewable, so the rule row expands into its own evidence. */
+function ToolAttemptEvidence({ signature }: { signature: string }) {
+  const { data, isLoading } = useToolAttempts(signature)
+  if (isLoading) return <p className="text-[10px] text-muted-foreground">Loading observations…</p>
+  const attempts = data?.attempts ?? []
+  if (!attempts.length) return <p className="text-[10px] text-muted-foreground">No recorded observations.</p>
+  return (
+    <div>
+      <div className="text-[10px] text-muted-foreground uppercase tracking-wide mb-1">
+        Observations ({data?.count})
+      </div>
+      <table className="text-[10px] font-mono w-full">
+        <tbody>
+          {attempts.slice(0, 10).map(a => (
+            <tr key={a.id} className="border-b border-border/20">
+              <td className="py-0.5 pr-3">{new Date(a.created_at).toLocaleString()}</td>
+              <td className="pr-3">{a.tool}</td>
+              <td className="pr-3 text-muted-foreground">{a.target || '—'}{a.port ? `:${a.port}` : ''}</td>
+              <td className="pr-3">
+                {a.success
+                  ? <span className="text-green-400">worked ({a.result_count})</span>
+                  : <span className="text-red-400">nothing</span>}
+              </td>
+              <td className="text-muted-foreground">{a.chosen_because || ''}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   )
 }
