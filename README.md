@@ -74,6 +74,57 @@ Every tool's output is parsed by a dedicated, pluggable ETL module (**38 parsers
 
 Unknown tools fall back to structured text extraction (JSON, tables, CVEs, key/value pairs) so nothing is lost. Finding **sources are attributed correctly** — ssh-audit findings show as `ssh-audit`, sslscan as `sslscan`, never lumped under nmap.
 
+When no parser exists for a tool, that is reported as its own state rather than
+as an empty result — `GET /parsers/missing` ranks the gaps by how much output is
+going unread and carries a sample execution, and `POST /parsers/draft` drafts a
+parser from that real sample. "Nobody has parsed this yet" and "the parser found
+nothing" are different facts, and only the first is something you can act on.
+
+### Post-enumeration — read the output, decide the next action
+
+Every command the platform runs goes through the same analysis when it finishes.
+Not a phase at the end of a pipeline: the hook sits at the single point every
+tool passes through, so a scan launched from the dashboard, an agent session and
+a queued recommendation all feed it.
+
+```
+command finishes → parse → facts → rules → scope-gated proposals
+                 → observation recorded → outcome written back → learn
+```
+
+The platform could already parse a tool's output and already queue a
+recommendation. What it could not do was get from one to the other: NetExec
+would report `tmp  READ,WRITE` and nothing followed. A tester reading that share
+table knows instantly what it means — post-enumeration is that step.
+
+- **Facts are tool-independent.** A writable share is the same fact whether it
+  came from NetExec, smbmap or CrackMapExec, so a rule is written once.
+- **Web findings count.** `web_findings` holds more rows than every other
+  finding table combined; they are analysed alongside command output, not
+  separately.
+- **Rules are data** — [`knowledge/enumeration_rules.yaml`](knowledge/enumeration_rules.yaml).
+  The *implication* ("a writable share is worth listing") is domain knowledge you
+  write down. Whether acting on it pays off **in this environment** is learned:
+  every firing is recorded, the outcome is written back when the proposal runs,
+  and a rule that keeps costing dispatches without producing anything stops
+  firing.
+- **It proposes; it never dispatches.** Proposals land `status='pending'` for a
+  human to run, and every one passes the scope gate first — a host discovered in
+  a `known_hosts` file is a lead, not a licence, and refusals are recorded rather
+  than dropped.
+
+It runs as a **cycle**: review the evidence that earlier proposals produced,
+analyse what is new, decide what follows, and go round again — settling when a
+pass analyses nothing, proposes nothing and resolves nothing. The cycle lives in
+the LangGraph session, so it is checkpointed: a run interrupted at an approval
+gate and resumed later knows how many passes it made and what each one found.
+
+Post-access steps come from the methodology playbooks
+([`knowledge/playbooks/`](knowledge/playbooks)), which are extracted into 266
+machine-readable steps. Steps that **modify** a target — persistence, backdoors —
+are classified and excluded by default; that is a deliberate operator action, not
+a pipeline's.
+
 ### Deduplicate + delta — nothing lost, nothing double-counted
 
 - **Stable fingerprinting** dedups the same vulnerability found by multiple tools or across multiple runs into one finding.
@@ -170,6 +221,23 @@ make clean          # reset everything (destroys local DB data)
    └──────────┘   └─────────────┘
 ```
 
+Every finished command also feeds **post-enumeration**, which closes the loop
+back to the top:
+
+```
+   ┌──────────────────────────────────────────────────────────┐
+   │                                                          │
+   ▼                                                          │
+ scan ──▶ enumerate ──▶ review evidence ──▶ decide next ──────┘
+                                             │
+                                             ▼  settles when a pass
+                                          report    analyses, proposes and
+                                                    resolves nothing
+```
+
+Proposals are queued `pending` and scope-gated; a human runs them. The outcome
+of each is written back, so a rule that never produces anything stops firing.
+
 ---
 
 ## Components
@@ -186,7 +254,7 @@ make clean          # reset everything (destroys local DB data)
 | `autogen_agents/`, `scan_recommender/` | LangGraph agent sessions (the directory keeps the historical `autogen` name; `pyautogen` is retired) and RAG-grounded scan recommendation. |
 | `burp-extension/` | Jython extension that ingests findings into Burp Issues (with real request/response). |
 | `db_init/` | Postgres schema (`ensure_all_tables.sql`) + verification (`ensure_db_schema.sh`). |
-| `knowledge/` | Scope rules and playbook content used by the recommender's RAG retrieval. |
+| `knowledge/` | Scope rules, methodology playbooks (prose **and** 266 machine-readable steps), tool option syntax, and the enumeration rules that decide what follows from a finding. |
 | `mcp/` | MCP tool servers exposing stack capabilities to LLM clients. |
 
 The dashboard surfaces this through ~40 pages including Scan Launcher, Findings Explorer, Asset Browser, Attack Map, Target Board, Delta Compare, Follow-Ups, Recommendations, Engagements, Reports, Nodes, OPSEC, Cloud Posture, Knowledge Base, and Services/Diagnostics.
