@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect, Fragment } from 'react'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
 import PageHelp from '@/components/PageHelp'
-import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useAssetAccess, useRefreshAccess, useReviewAccess,
+import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary,
   type ObtainedAccess, type DdgSearchResponse } from '@/api/assets'
 import { apiFetch } from '@/api/client'
 import { useTargetedReconLookup, useTargetedReconExecute } from '@/api/targeted-recon'
@@ -93,6 +93,24 @@ const assetColumns: ColumnDef<Asset, unknown>[] = [
   { accessorKey: 'recon_findings_count', header: 'Findings', size: 80, cell: ({ getValue }) => {
     const v = Number(getValue() ?? 0)
     return <span className={`text-sm font-medium ${v > 0 ? 'text-primary' : 'text-muted-foreground'}`}>{v.toLocaleString()}</span>
+  }},
+  // Access we HOLD on the host — a shell icon + live count. Absent/zero shows
+  // nothing so the column stays quiet for the many hosts we are not inside;
+  // where present it is the fast answer to "which boxes do we have a shell on".
+  { accessorKey: 'access_live', header: 'Access', size: 80, cell: ({ row }) => {
+    const live = Number(row.original.access_live ?? 0)
+    const total = Number(row.original.access_total ?? 0)
+    if (total === 0) return <span className="text-xs text-muted-foreground">—</span>
+    const rooted = live > 0
+    return (
+      <span
+        title={`${live} live of ${total} access candidate(s) held here — open the host's Current Access tab`}
+        className={`inline-flex items-center gap-1 text-xs font-medium px-1.5 py-0.5 rounded border ${
+          rooted ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                 : 'bg-zinc-500/15 text-zinc-400 border-zinc-500/30'}`}>
+        <Terminal className="h-3 w-3" />{live > 0 ? `${live} live` : `${total} held`}
+      </span>
+    )
   }},
   { accessorKey: 'discovered_by', header: 'Discovered By', size: 200, cell: ({ getValue }) => {
     const sources = (getValue() as string[] | undefined) ?? []
@@ -829,6 +847,10 @@ export default function AssetBrowser() {
   // provider tags (often legacy IP-only hosts); other values match assets
   // whose provider[] array contains the selected tag.
   const [providerFilter, setProviderFilter] = useState<'any' | 'untagged' | string>('any')
+  // Access filter — 'any' means no filter; 'held' shows only hosts the platform
+  // currently holds a live shell/login on (drives, and is driven by, the same
+  // access-summary that feeds the Access column).
+  const [accessFilter, setAccessFilter] = useState<'any' | 'held'>('any')
 
   // Sync with global engagement scope changes. Depends on selectedEngagementId
   // too: scope names are per-engagement, so a scope picked under one engagement
@@ -851,6 +873,7 @@ export default function AssetBrowser() {
   // Use server-side filtering for asset kinds to improve performance and consistency
   const serverAssetKind = assetKindFilter === 'all' ? undefined : assetKindFilter
   const { data: assetsData, isLoading } = useAssets(5000, serverAssetKind)
+  const { data: accessSummary } = useAccessSummary()
   const { data: portsData } = useAssetPorts(selectedIp || '')
   const { data: vulnsData } = useAssetVulns(selectedIp || '')
   const { data: subdomainsData, isLoading: subdomainsLoading } = useSubdomains()
@@ -939,11 +962,26 @@ export default function AssetBrowser() {
       filtered = filtered.filter(a => (a.provider || []).includes(providerFilter))
     }
 
+    // Attach held-access counts (from the per-host summary) so the Access column
+    // and the "held access" filter read the same source. Keyed by IP, which is
+    // the same target string obtained_access stores.
+    const sum = accessSummary?.summary || {}
+    filtered = filtered.map(a => {
+      const s = sum[a.ip]
+      return s ? { ...a, access_live: s.live, access_total: s.total }
+               : (a.access_live === undefined ? a : { ...a, access_live: undefined, access_total: undefined })
+    })
+
+    // Apply access filter last so it sees the attached counts.
+    if (accessFilter === 'held') {
+      filtered = filtered.filter(a => (a.access_total ?? 0) > 0)
+    }
+
     return filtered
     // scopeFilter is included for parity with the `subdomains` memo below and
     // to guarantee invalidation when the local scope dropdown changes, even
     // though matchesScope identity would normally cover it.
-  }, [allAssets, isScopeFiltering, matchesScope, search, portsFilter, providerFilter, assetKindFilter, scopeFilter])
+  }, [allAssets, isScopeFiltering, matchesScope, search, portsFilter, providerFilter, assetKindFilter, scopeFilter, accessSummary, accessFilter])
 
   // Available provider chips derived from the current asset set, sorted by
   // count desc — operators see what tags exist without us hardcoding the list.
@@ -1048,6 +1086,21 @@ export default function AssetBrowser() {
                 >{f === 'all' ? 'All' : f === 'with-ports' ? 'With Ports' : 'No Ports'}</button>
               ))}
             </div>
+            {(() => {
+              const heldHosts = Object.keys(accessSummary?.summary || {}).length
+              return (
+                <button onClick={() => setAccessFilter(accessFilter === 'held' ? 'any' : 'held')}
+                  disabled={heldHosts === 0 && accessFilter !== 'held'}
+                  title={heldHosts === 0
+                    ? 'No hosts currently hold access'
+                    : `Show only the ${heldHosts} host(s) we currently hold access on`}
+                  className={`px-2 py-1 text-xs rounded border flex items-center gap-1 disabled:opacity-40 ${
+                    accessFilter === 'held'
+                      ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300'
+                      : 'border-border text-muted-foreground hover:text-foreground'}`}
+                ><Terminal className="h-3 w-3" />Held access{heldHosts > 0 ? ` (${heldHosts})` : ''}</button>
+              )
+            })()}
             <div className="flex items-center gap-1" title="Cloud imports use synthetic IPs (127.0.x.x) as placeholders — not real hosts. Use these chips to isolate or hide them.">
               {([
                 { id: 'all',         label: 'Hosts + Cloud', icon: null },
