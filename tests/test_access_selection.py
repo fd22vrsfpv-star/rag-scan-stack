@@ -158,6 +158,29 @@ def test_a_dead_probe_leaves_privilege_unknown():
     assert res["status"] == "dead" and res["score"] == 0
 
 
+def test_a_connection_that_never_connected_is_not_an_answer():
+    """Caught by CI, which has `nc` and no listener — so it took the local path
+    and probed 203.0.113.1 (TEST-NET) successfully.
+
+    `subprocess.run` does not raise on a non-zero exit, so a refused or
+    black-holed port returned "" and `run()` reported ok=True. A dead address
+    was being recorded as a shell that replied, scored "answered, unknown
+    privilege", and ranked above no access at all.
+    """
+    import subprocess
+    with pytest.raises((ConnectionError, subprocess.TimeoutExpired, OSError)):
+        ax.TRANSPORTS["bind_shell"]("203.0.113.1:1", "id")
+
+
+def test_an_empty_reply_is_not_a_reply():
+    """A channel that succeeds and says nothing has not demonstrated it is a
+    shell. Counting it would rank silence above no access."""
+    src = _func_src(os.path.join(REPO, "etl", "access.py"), "probe")
+    assert "empty response" in src, (
+        "an empty output counts as a successful probe, so a socket that accepts "
+        "and closes scores as live access")
+
+
 # ── Selection and use ──────────────────────────────────────────────────────
 
 def test_only_live_access_can_be_selected():
