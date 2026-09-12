@@ -153,14 +153,30 @@ _ANALYZE_SYSTEM = (
     "which services they sit on, any credible attack chains, and which findings "
     "have known public exploits. Do NOT launch scans or exploits."
 )
+# Why this asks for EVERY candidate rather than the best one.
+#
+# It used to say "the single best-evidenced candidate ... EXACTLY ONCE". A host
+# with 26 open services — vsftpd, distcc, samba, java-rmi, irc, all of them
+# known-vulnerable — produced one queued exploit, and the other twenty-five were
+# never evaluated, never queued, never rejected and never reported. They were
+# invisible: an operator reading the session could not tell whether the agent had
+# considered and dismissed them or simply never looked.
+#
+# Queueing is not executing. Every row lands `pending` behind the same approval
+# gate, so the cost of naming more candidates is a list the operator chooses
+# from, and the cost of naming fewer is a foothold nobody was told about.
 _EXPLOIT_SYSTEM = (
-    "You are the Exploit agent in a penetration-testing platform. Identify the "
-    "single best-evidenced exploitation candidate for this target from existing "
-    "findings, then call queue_exploit_for_approval EXACTLY ONCE for it — a human "
-    "operator reviews and approves before anything executes, and you must never "
-    "execute anything yourself. If no candidate is well-evidenced enough to be "
-    "worth an operator's time, queue nothing and say so. Reply with the candidate, "
-    "the pending exploit id you queued (if any), and your reasoning."
+    "You are the Exploit agent in a penetration-testing platform. Identify EVERY "
+    "well-evidenced exploitation candidate for this target from existing findings "
+    "— not just the best one — and call queue_exploit_for_approval once for each, "
+    "strongest evidence first. A human operator reviews and approves before "
+    "anything executes, and you must never execute anything yourself. "
+    "Queueing is not executing: it is how a candidate becomes visible to the "
+    "operator, so a service you considered and dismissed should be SAID so in "
+    "your reply rather than silently dropped. If nothing is well-evidenced enough "
+    "to be worth an operator's time, queue nothing and say which services you "
+    "looked at and why none qualified. Reply with the candidates, the pending "
+    "exploit ids you queued, and your reasoning for each."
 )
 
 
@@ -1152,8 +1168,10 @@ def exploit_plan(state: PentestState) -> dict:
     try:
         task = (f"Target: {state['target'][:300]}\nTask: {state['task'][:300]}\n"
                 f"Session id (pass as session_id when queueing): {sid}\n"
-                "Identify the best exploitation candidate and queue it for "
-                "operator approval.")
+                "Identify EVERY well-evidenced exploitation candidate and queue "
+                "each one for operator approval, strongest evidence first. Name "
+                "the services you examined and dismissed, so the operator can "
+                "tell 'considered and rejected' from 'never looked at'.")
         final, used = _llm_phase(sid, agent_name="Exploit", system=_EXPLOIT_SYSTEM,
                                  tool_names=EXPLOIT_PLAN_TOOLS, task=task,
                                  recursion_limit=PHASE_STEP_BUDGET["Exploit"])
@@ -1218,8 +1236,14 @@ def _engagement_preapproval(sid: str):
         return False, None
 
 
-def _pending_exploit_for_session(sid: str):
-    """The newest exploit THIS session queued and has not had decided.
+# A ceiling on how many exploits one session may execute, even with every one
+# approved. Exploits are heavier and less reversible than scans, and a planner
+# that queues thirty against one host should still not fire thirty unattended.
+MAX_EXPLOITS_PER_SESSION = int(os.environ.get("MAX_EXPLOITS_PER_SESSION", "10"))
+
+
+def _pending_exploits_for_session(sid: str):
+    """Every exploit THIS session queued and has not had decided, newest first.
 
     Resolved here because nothing in graph state carries the id — exploit_plan
     stores the LLM's text, and at the interrupt the operator supplies the id by
@@ -1233,9 +1257,9 @@ def _pending_exploit_for_session(sid: str):
             cur.execute(
                 "SELECT id FROM pending_exploits "
                 " WHERE session_id = %s::uuid AND status = 'pending' "
-                " ORDER BY created_at DESC LIMIT 1", (str(sid),))
-            row = cur.fetchone()
-        return str(row[0]) if row else None
+                " ORDER BY created_at DESC LIMIT %s", (str(sid), MAX_EXPLOITS_PER_SESSION))
+            rows = cur.fetchall()
+        return [str(r[0]) for r in rows]
     except Exception as e:  # noqa: BLE001
         _log.warning("[%s] pending-exploit lookup failed: %s", sid, e)
         return None
@@ -1260,60 +1284,75 @@ def exploit_approval(state: PentestState) -> dict:
     # otherwise finished run open until a human came back, possibly next day.
     preapproved, eid = _engagement_preapproval(sid)
     if preapproved:
-        pending_id = _pending_exploit_for_session(sid)
+        pending_ids = _pending_exploits_for_session(sid)
         who = f"engagement_preapproval:{eid}"
-        if pending_id:
+        for pid in pending_ids:
             try:
-                _mark_approved(pending_id, who,
-                               note="pre-approved for this engagement")
+                _mark_approved(pid, who, note="pre-approved for this engagement")
             except Exception as e:  # noqa: BLE001
-                _log.warning("[%s] pre-approval mark failed: %s", sid, e)
+                _log.warning("[%s] pre-approval mark failed for %s: %s", sid, pid, e)
         _msg(sid, "Exploit",
              f"[pre-approved] Exploit execution is pre-approved for this "
              f"engagement ({eid}), so the run is not pausing for a decision. "
-             + (f"Approving {pending_id}. " if pending_id
-                else "No queued exploit id was found to approve. ")
+             + (f"Approving {len(pending_ids)} queued exploit(s). "
+                if pending_ids else "No queued exploit was found to approve. ")
              + "Scope is still enforced at execution — an out-of-scope target "
                "is refused regardless of pre-approval.",
              role="system")
         _emit("langgraph_exploit_preapproved", sid,
-              {"engagement_id": eid, "pending_exploit_id": str(pending_id or ""),
+              {"engagement_id": eid, "pending_exploit_ids": pending_ids,
                "approved_by": who})
-        return {"phase": "exploit_exec" if pending_id else "report",
+        return {"phase": "exploit_exec" if pending_ids else "report",
                 "exploit_decision": {"approved": True,
                                      "note": f"pre-approved ({who})",
-                                     "pending_exploit_id": pending_id},
-                "findings": [f"exploit_approval: pre-approved ({who})"],
-                "log": [f"exploit_approval: pre-approved ({who})"]}
+                                     "pending_exploit_ids": pending_ids},
+                "findings": [f"exploit_approval: pre-approved ({who}), "
+                             f"{len(pending_ids)} exploit(s)"],
+                "log": [f"exploit_approval: pre-approved ({who}) x{len(pending_ids)}"]}
 
     from langgraph.types import interrupt
+    # Every queued candidate is named, not just the one the planner liked most.
+    # An operator shown a single id cannot tell what else was found, and the
+    # others sit `pending` for ever with nothing pointing at them.
+    queued = _pending_exploits_for_session(sid)
     decision = interrupt({
         "kind": "exploit_approval",
         "session_id": str(state["session_id"]),
         "target": state.get("target", "")[:300],
         "candidate": (state.get("exploit_candidate") or "")[:2000],
-        "prompt": ("Approve execution of the queued exploit? Reply via "
+        "queued_exploit_ids": queued,
+        "prompt": ("Approve execution of the queued exploit(s)? Reply via "
                    "POST /pentest/{session_id}/approve with "
-                   '{"approved": true|false, "pending_exploit_id": "<uuid>"}'),
+                   '{"approved": true|false, "pending_exploit_ids": ["<uuid>", ...]}'
+                   " — omit the ids to approve everything queued, or pass a "
+                   "subset to run only those."),
     })
     if isinstance(decision, dict):
         approved = bool(decision.get("approved"))
         note = str(decision.get("note") or "")
-        pending_id = decision.get("pending_exploit_id")
+        ids = decision.get("pending_exploit_ids")
+        if ids is None:
+            one = decision.get("pending_exploit_id")
+            # Omitting the ids entirely means "all of them". Naming one means
+            # exactly that one — a subset is a deliberate operator choice and
+            # must not silently widen.
+            ids = [one] if one else list(queued)
+        pending_ids = [str(i) for i in (ids or []) if i]
     else:
-        approved, note, pending_id = bool(decision), "", None
+        approved, note, pending_ids = bool(decision), "", (list(queued) if decision else [])
     _msg(sid, "Exploit",
          f"[operator decision] approved={approved}"
-         f"{' pending_exploit_id=' + str(pending_id) if pending_id else ''}"
+         f"{' exploits=' + str(len(pending_ids)) if pending_ids else ''}"
          f"{chr(10) + 'note: ' + note[:500] if note else ''}",
          role="user")
     _emit("langgraph_exploit_decision", sid,
-          {"approved": approved, "pending_exploit_id": str(pending_id or "")})
-    return {"phase": "exploit_exec" if approved else "report",
+          {"approved": approved, "pending_exploit_ids": pending_ids})
+    return {"phase": "exploit_exec" if (approved and pending_ids) else "report",
             "exploit_decision": {"approved": approved, "note": note[:500],
-                                 "pending_exploit_id": str(pending_id or "") or None},
-            "findings": [f"exploit_approval: approved={approved}"],
-            "log": [f"exploit_approval: approved={approved}"]}
+                                 "pending_exploit_ids": pending_ids},
+            "findings": [f"exploit_approval: approved={approved}, "
+                         f"{len(pending_ids)} exploit(s)"],
+            "log": [f"exploit_approval: approved={approved} x{len(pending_ids)}"]}
 
 
 def _mark_approved(pending_id, who: str, note: str = None) -> None:
@@ -1331,28 +1370,57 @@ def _mark_approved(pending_id, who: str, note: str = None) -> None:
 
 
 def exploit_exec(state: PentestState) -> dict:
-    """Execute the operator-approved exploit through the SAME gated tool body."""
+    """Execute the operator-approved exploits through the SAME gated tool body.
+
+    Every approved id, not just the first. A host with 26 open services yielded
+    one queued exploit and one execution, and the operator had no way to tell
+    whether the rest had been considered or never looked at.
+
+    Sequential and bounded on purpose. Exploits are heavier and less reversible
+    than scans, so they are not fired in parallel, and MAX_EXPLOITS_PER_SESSION
+    caps the run even when everything is approved — a planner that queues thirty
+    against one host should still not fire thirty unattended.
+    """
     sid = state["session_id"]
     decision = state.get("exploit_decision") or {}
-    pending_id = decision.get("pending_exploit_id")
-    if not pending_id:
+    pending_ids = decision.get("pending_exploit_ids")
+    if pending_ids is None:
+        # Resumed from a checkpoint written before this took a list.
+        one = decision.get("pending_exploit_id")
+        pending_ids = [one] if one else []
+    pending_ids = [str(p) for p in pending_ids if p][:MAX_EXPLOITS_PER_SESSION]
+
+    if not pending_ids:
         _msg(sid, "Exploit",
              "[approved but no pending_exploit_id supplied] Nothing executed. "
-             "Re-approve with the id from list_pending_exploits.")
-        _emit("langgraph_exploit_executed", sid, {"executed": False,
-                                                 "reason": "no pending_exploit_id"})
-        return {"phase": "report",
+             "Re-approve with the ids from list_pending_exploits.")
+        _emit("langgraph_exploit_executed", sid, {"executed": 0,
+                                                  "reason": "no pending_exploit_id"})
+        return {"phase": "post_enumeration",
                 "findings": ["exploit_exec: skipped (no id)"],
                 "log": ["exploit_exec skipped: no pending_exploit_id"]}
-    _mark_approved(pending_id, "operator (exploit approval)",
-                   (state.get("exploit_decision") or {}).get("note"))
-    result = _tool(scan_tools.execute_approved_exploit, pending_id)
-    _msg(sid, "Exploit", f"[execute_approved_exploit {pending_id}]\n{result[:2000]}")
+
+    executed, failed = [], []
+    for pid in pending_ids:
+        try:
+            _mark_approved(pid, "operator (exploit approval)", decision.get("note"))
+            result = _tool(scan_tools.execute_approved_exploit, pid)
+            _msg(sid, "Exploit", f"[execute_approved_exploit {pid}]\n{result[:1200]}")
+            executed.append(pid)
+        except Exception as e:  # noqa: BLE001
+            # One failure must not abandon the rest. An exploit that errors is a
+            # result; the ones after it never running is a gap.
+            _msg(sid, "Exploit", f"[execute_approved_exploit {pid}] FAILED: {e}")
+            failed.append(pid)
+
     _emit("langgraph_exploit_executed", sid,
-          {"executed": True, "pending_exploit_id": str(pending_id)})
-    return {"phase": "report",
-            "findings": [f"exploit_exec: executed {pending_id}"],
-            "log": [f"exploit_exec: execute_approved_exploit({pending_id})"]}
+          {"executed": len(executed), "failed": len(failed),
+           "pending_exploit_ids": executed})
+    findings = [f"exploit_exec: executed {len(executed)} of {len(pending_ids)}"]
+    if failed:
+        findings.append(f"exploit_exec: {len(failed)} failed to execute")
+    return {"phase": "post_enumeration", "findings": findings,
+            "log": [f"exploit_exec: executed={executed} failed={failed}"]}
 
 
 # How many passes the loop may make before it reports regardless.
@@ -1442,9 +1510,17 @@ def post_enumeration(state: PentestState) -> dict:
 
     analysed = _analyse_session_output(sid)
     if analysed.get("examined"):
-        findings.append(
-            f"post_enumeration: re-read {analysed['examined']} tool outputs, "
-            f"{analysed['parsed']} parsed, {analysed['productive']} produced results")
+        if analysed.get("backfilled"):
+            findings.append(
+                f"post_enumeration[{cycle}]: read {analysed['backfilled']} tool "
+                f"outputs nobody had parsed "
+                f"({analysed['productive']} produced results)")
+        else:
+            # Say that there was nothing new, rather than repeating the same
+            # totals every cycle as if work were happening.
+            findings.append(
+                f"post_enumeration[{cycle}]: nothing new to parse "
+                f"({analysed['parsed']} of {analysed['examined']} already read)")
         log.append(f"post_enumeration: analysis {analysed}")
         if analysed.get("unparsed_tools"):
             # Named, not counted. "17 unparsed" is not actionable; the tool
@@ -1475,6 +1551,23 @@ def post_enumeration(state: PentestState) -> dict:
             "post_enumeration: rules no longer firing (tried and never "
             "produced): " + ", ".join(sorted(set(swept["suppressed"]))[:5]))
 
+    # Run the checklist through the best shell we hold, if we hold one. This is
+    # enumeration through access already obtained by an approved exploit, not a
+    # new dispatch — so it runs rather than being queued for someone to press.
+    through = _enumerate_through_best_access(sid, target)
+    if through.get("ran"):
+        a = through["access"]
+        findings.append(
+            f"post_enumeration: ran {through['ran']} post-access check(s) "
+            f"through {a['kind']} {a['handle']} "
+            f"(whoami={a.get('whoami') or '?'}, root={a.get('is_root')})")
+        for stp in through["steps"]:
+            if stp["ok"] and stp["output"].strip():
+                _msg(sid, "PostEnumeration",
+                     f"[{stp['title']}] {stp['command']}\n{stp['output'][:900]}")
+    elif through.get("reason"):
+        findings.append(f"post_enumeration: {through['reason']}")
+
     enumerated = _enumerate_post_access(sid, target)
     if enumerated.get("queued"):
         findings.append(
@@ -1490,10 +1583,15 @@ def post_enumeration(state: PentestState) -> dict:
         "cycle": cycle,
         "resolved": resolved.get("resolved", 0),
         "produced": resolved.get("produced", 0),
-        "analysed": analysed.get("parsed", 0),
+        # What this pass ACTUALLY DID, not what it looked at. `parsed` counts
+        # every row re-read and never falls to zero, so using it meant the loop
+        # could never settle.
+        "analysed": analysed.get("backfilled", 0),
+        "re_read": analysed.get("parsed", 0),
         "queued": (swept.get("queued", 0) + enumerated.get("queued", 0)),
         "refused": swept.get("refused", 0),
         "remaining": analysed.get("unanalysed", 0),
+        "ran_through_access": through.get("ran", 0),
     }
     if not findings:
         # A pass that did nothing must still say so, or the history reads as a
@@ -1598,8 +1696,8 @@ def _analyse_session_output(sid) -> dict:
     stored taught nothing — a netexec run wrote 6,816 bytes and was recorded as
     an unmeasured success.
     """
-    out = {"examined": 0, "parsed": 0, "productive": 0, "unparsed_tools": [],
-           "results": 0, "available": False}
+    out = {"examined": 0, "parsed": 0, "backfilled": 0, "productive": 0,
+           "unparsed_tools": [], "results": 0, "available": False}
     try:
         import psycopg2
         from psycopg2.extras import RealDictCursor
@@ -1633,6 +1731,12 @@ def _analyse_session_output(sid) -> dict:
                 if parsed is None:
                     parsed = parse_for(r["tool"], r["output"], r["error"])
                     if parsed is not None:
+                        # NEW work, as distinct from re-reading something that
+                        # was already parsed. The loop's stopping condition
+                        # depends on this: counting re-reads made every cycle
+                        # report the same 32 and the loop burned its whole
+                        # budget doing identical work.
+                        out["backfilled"] += 1
                         # Backfill: the output was already stored, so the only
                         # thing missing was somebody reading it.
                         cur.execute(
@@ -1690,6 +1794,73 @@ def _wrap_remote(protocol: str, ip: str, port, command: str) -> Optional[str]:
     safe = command.replace("'", "'\\''")
     return (f"sshpass -p '{{password}}' ssh {' '.join(opts)} "
             f"-p {port or 22} {{username}}@{ip} '{safe}' < /dev/null")
+
+
+def _enumerate_through_best_access(sid, target: str) -> dict:
+    """Run the methodology's post-access checklist through the BEST shell we hold.
+
+    Every exploit that succeeded left something behind, and running the
+    checklist through all of them would be slow, noisy on the target, and would
+    produce several partial answers to one question instead of one complete one.
+    So the access is measured first — `id` for privilege, repeated probes for
+    stability — and the checklist runs once, through the winner.
+
+    A root shell that dies on the second command loses to a user shell that
+    holds: the checklist is a SEQUENCE, and one that drops halfway through
+    produces a half-finished enumeration that looks complete.
+
+    Read-only steps only. `steps_for()` excludes mutating ones by default and
+    this does not ask for them — running the checklist through access we already
+    hold is enumeration; adding a backdoor while we are in there is not.
+    """
+    out = {"ran": 0, "failed": 0, "access": None, "steps": [], "reason": ""}
+    try:
+        from etl import access as ax
+        from etl import playbooks as pb
+    except Exception as e:  # noqa: BLE001
+        out["reason"] = f"unavailable: {e}"
+        return out
+
+    try:
+        measured = ax.refresh(target)
+        best = ax.best_for(target)
+    except Exception as e:  # noqa: BLE001
+        out["reason"] = f"access measurement failed: {str(e)[:160]}"
+        return out
+    if not best:
+        # Distinct from "nothing to enumerate": we looked for access and found
+        # none that answered. The candidate count says whether that is because
+        # there was nothing, or because nothing worked.
+        out["reason"] = (f"no live access on {target} "
+                         f"({measured.get('discovered', 0)} candidate(s) probed, "
+                         f"{measured.get('live', 0)} answered)")
+        return out
+
+    out["access"] = {k: best[k] for k in ("kind", "handle", "whoami", "is_root",
+                                          "score")}
+    _msg(sid, "PostEnumeration",
+         f"[access] Using {best['kind']} {best['handle']} "
+         f"(whoami={best.get('whoami') or '?'}, root={best.get('is_root')}, "
+         f"score={best['score']}) for post-enumeration — chosen from "
+         f"{measured.get('discovered', 0)} candidate(s) by measured privilege "
+         f"and stability.")
+
+    for st in pb.steps_for("ssh", access="shell"):
+        if st["access_required"] != "shell":
+            continue
+        for c in st["commands"]:
+            cmd = (c.get("command") or "").strip()
+            if not cmd or "{" in cmd:
+                continue
+            res = ax.run(best, cmd)
+            out["steps"].append({"step": st["id"], "title": st["title"],
+                                 "command": cmd, "ok": res["ok"],
+                                 "output": (res["output"] or "")[:1200]})
+            if res["ok"]:
+                out["ran"] += 1
+            else:
+                out["failed"] += 1
+    return out
 
 
 def _enumerate_post_access(sid, target: str) -> dict:
@@ -3673,7 +3844,7 @@ def get_pending_approval(session_id) -> Optional[dict]:
 
 
 def resume_langgraph_session_sync(session_id, approved: bool,
-                                  pending_exploit_id: Optional[str] = None,
+                                  pending_exploit_ids=None,
                                   note: Optional[str] = None):
     """Resume a session parked on an approval interrupt.
 
@@ -3697,10 +3868,18 @@ def resume_langgraph_session_sync(session_id, approved: bool,
         except Exception:
             pass
 
+    # A single id from an older caller is still accepted; the graph works in
+    # lists now because the planner queues every candidate.
+    if pending_exploit_ids is None:
+        ids = []
+    elif isinstance(pending_exploit_ids, (list, tuple)):
+        ids = [str(i) for i in pending_exploit_ids if i]
+    else:
+        ids = [str(pending_exploit_ids)]
+
     update_agent_session(_sid(sid), status="active")
     _emit("langgraph_session_resumed", sid,
-          {"approved": bool(approved),
-           "pending_exploit_id": str(pending_exploit_id or "")})
+          {"approved": bool(approved), "pending_exploit_ids": ids})
     try:
         with _saver_cm() as saver:
             saver.setup()
@@ -3708,7 +3887,7 @@ def resume_langgraph_session_sync(session_id, approved: bool,
             cfg = {"configurable": {"thread_id": sid}}
             final = graph.invoke(
                 Command(resume={"approved": bool(approved),
-                                "pending_exploit_id": pending_exploit_id,
+                                "pending_exploit_ids": ids,
                                 "note": note or ""}), cfg)
             payload = _interrupt_payload(final, graph, cfg)
         if payload is not None:

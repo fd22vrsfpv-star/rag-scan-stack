@@ -121,6 +121,49 @@ async def analyze_extractor(body: dict):
         return safe_json(resp)
 
 
+# ── Access the platform holds ───────────────────────────────────────────
+#
+# Shown beside credentials in the asset view: credentials are what we can log
+# in with, access is what we are already inside.
+
+@router.get("/api/assets/{ip}/access")
+async def asset_access(ip: str, include_dead: bool = False):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/assets/{ip}/access",
+                           params={"include_dead": str(bool(include_dead)).lower()},
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.post("/api/assets/{ip}/access/refresh")
+async def asset_access_refresh(ip: str, rounds: Optional[int] = None):
+    """Re-probe every access on this host. Touches the target, so it gets the
+    long timeout — several candidates times several probes each."""
+    s = get_settings()
+    params = {"rounds": rounds} if rounds else {}
+    async with httpx.AsyncClient(timeout=TIMEOUT_LONG) as c:
+        resp = await c.post(f"{s.rag_api_url}/assets/{ip}/access/refresh",
+                            params=params,
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.post("/api/assets/access/{access_id}/{action}")
+async def review_access(access_id: str, action: str):
+    if action not in ("reject", "reinstate"):
+        raise HTTPException(400, "action must be reject or reinstate")
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.post(f"{s.rag_api_url}/assets/access/{access_id}/{action}",
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
 # ── Parser coverage ─────────────────────────────────────────────────────
 #
 # "No parser exists" is a different state from "the parser found nothing", and

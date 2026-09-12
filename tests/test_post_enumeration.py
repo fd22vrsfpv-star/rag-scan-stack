@@ -676,3 +676,203 @@ def test_adding_an_evidence_source_is_one_entry():
     assert isinstance(ev.SOURCES, list) and len(ev.SOURCES) >= 5
     for s in ev.SOURCES:
         assert s.table and s.host_sql, s.table
+
+
+# ── Found by watching a live session ───────────────────────────────────────
+
+def test_the_loop_counts_new_work_not_re_reads():
+    """A live session ran post_enumeration five times with identical output and
+    hit the cycle budget instead of settling.
+
+    `parsed` counts every row RE-READ and never falls to zero, so the stopping
+    condition could never be met. What the pass actually DID is the backfill.
+    """
+    src = _read(ENGINE)
+    fn = src[src.index("def _analyse_session_output"):]
+    fn = fn[:fn.index("\ndef ", 10)]
+    assert 'out["backfilled"] += 1' in fn, (
+        "nothing counts new parses, so the loop cannot tell work from re-reading")
+
+    node = src[src.index("def post_enumeration(state: PentestState)"):]
+    node = node[:node.index("\ndef _resolve_outcomes")]
+    assert '"analysed": analysed.get("backfilled", 0)' in node, (
+        "the history entry still records re-reads as work, so the loop burns "
+        "its whole budget repeating itself")
+
+
+def test_a_pass_that_did_nothing_says_so():
+    """Five identical lines in a transcript read as work happening."""
+    src = _read(ENGINE)
+    node = src[src.index("def post_enumeration(state: PentestState)"):]
+    node = node[:node.index("\ndef _resolve_outcomes")]
+    assert "nothing new to parse" in node
+
+
+def test_a_successful_exploit_is_a_fact():
+    """The vsftpd backdoor was executed against 192.168.1.150, opened a root
+    shell on 6200, and nothing enumerated through it — the exploit was marked
+    `executed` and that was the end of it."""
+    pe = pytest.importorskip("etl.post_enumeration")
+    assert hasattr(pe, "facts_from_exploits")
+    assert hasattr(pe, "facts_from_open_ports")
+    import yaml as _yaml
+    with open(_catalogue_rules(), encoding="utf-8") as fh:
+        rules = (_yaml.safe_load(fh) or {}).get("rules") or []
+    ids = {r["id"] for r in rules}
+    assert "exploit-find-the-listener" in ids
+    assert "unidentified-port-enumerate" in ids
+
+
+def test_an_unidentified_port_is_not_dated():
+    """This started as "ports that appeared after the exploit", which does not
+    work: `ports` is upserted, so created_at is the FIRST sighting. 6200 had
+    been seen on an earlier scan while port 21 — the exploit's own target —
+    matched the window."""
+    src = _read(os.path.join(REPO, "etl", "post_enumeration.py"))
+    # Docstring-stripped. The docstring EXPLAINS why created_at is not used, and
+    # matching prose instead of code is how the first version of this passed
+    # while asserting nothing — the fifth time that has happened in this repo.
+    tree = ast.parse(src)
+    fn = ""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "facts_from_open_ports":
+            node.body = node.body[1:] or [ast.Pass()]
+            fn = ast.unparse(node)
+    assert fn, "facts_from_open_ports is gone"
+    assert "created_at" not in fn, (
+        "the fact is timing-based again, which the ports table cannot support")
+    assert "_UNIDENTIFIED" in fn
+    assert "lm-x" in src, (
+        "6200 on Metasploitable reads as lm-x and is a root shell; dropping it "
+        "from the unidentified set makes the case that motivated this invisible")
+
+
+def test_a_session_resolves_its_engagement_without_the_header():
+    """A live session sat at an exploit gate for an hour on an engagement that
+    HAD pre-approval, because it could not tell which engagement it was in."""
+    svc = os.path.join(REPO, "autogen_agents", "autogen_service.py")
+    src = _read(svc)
+    assert "def _engagement_from_target" in src, (
+        "a session with no X-Engagement-Id still gets engagement_id NULL, so "
+        "pre-approval can never resolve")
+    fn = src[src.index("def _engagement_from_target"):]
+    fn = fn[:fn.index("\ndef ", 10)]
+    assert "resolve_engagement_for_ip" in fn, (
+        "it resolves by some other means than scope — scope is the "
+        "authoritative statement of what belongs to an engagement")
+
+
+def _catalogue_rules():
+    for candidate in (os.path.join(REPO, "knowledge", "enumeration_rules.yaml"),
+                      "/knowledge/enumeration_rules.yaml"):
+        if os.path.exists(candidate):
+            return candidate
+    pytest.skip("enumeration_rules.yaml not reachable")
+
+
+# ── Why only one exploit was ever considered ───────────────────────────────
+
+def _func_src(path, name):
+    """One function's source, by name.
+
+    Slicing a file between two string markers breaks the moment either moves,
+    and a slice whose end precedes its start is silently EMPTY — which is how a
+    replace() prepended a whole function to the top of the engine earlier today.
+    """
+    tree = ast.parse(_read(path))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return ast.unparse(node)
+    pytest.fail(f"{name} not found in {os.path.basename(path)}")
+
+
+def _exploit_system() -> str:
+    """The _EXPLOIT_SYSTEM constant's VALUE, not its source text.
+
+    It is written as adjacent string literals, so a phrase can span the join and
+    be absent from the source while present in the string. Grepping source for a
+    prompt is the same mistake as grepping it for code.
+    """
+    tree = ast.parse(_read(ENGINE))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                getattr(t, "id", "") == "_EXPLOIT_SYSTEM" for t in node.targets):
+            return ast.literal_eval(node.value)
+    pytest.fail("_EXPLOIT_SYSTEM not found")
+
+
+def test_the_planner_is_asked_for_every_candidate():
+    """A host with 26 open services — vsftpd, distcc, samba, java-rmi, irc —
+    produced ONE queued exploit, and the other twenty-five were never
+    evaluated, queued, rejected or reported.
+
+    That was not a bug in the model's judgement. The system prompt said
+    "the single best-evidenced candidate ... EXACTLY ONCE", so it did exactly
+    what it was told.
+    """
+    sysmsg = _exploit_system()
+    assert "EXACTLY ONCE" not in sysmsg, (
+        "the planner is told to queue exactly one candidate again")
+    assert "single best-evidenced" not in sysmsg
+    assert "EVERY" in sysmsg, "the planner is no longer asked for every candidate"
+    assert "dismissed" in sysmsg, (
+        "nothing asks it to say what it considered and rejected, so an operator "
+        "still cannot tell 'rejected' from 'never looked at'")
+
+
+def test_queueing_is_not_executing():
+    """The reason asking for more candidates is safe: every one lands behind
+    the same approval gate."""
+    sysmsg = _exploit_system()
+    assert "never execute anything yourself" in sysmsg
+    assert "approves before anything executes" in sysmsg
+
+
+def test_every_approved_exploit_runs():
+    fn = _func_src(ENGINE, "exploit_exec")
+    assert "for pid in pending_ids:" in fn, (
+        "only the first approved exploit runs, so approving several does "
+        "nothing for the rest")
+    assert "MAX_EXPLOITS_PER_SESSION" in fn, (
+        "unbounded: a planner that queues thirty would fire thirty unattended")
+    assert "failed.append(pid)" in fn, (
+        "one failure abandons the rest — an exploit that errors is a result, "
+        "the ones after it never running is a gap")
+
+
+def test_a_single_id_still_works():
+    """A checkpoint written before this took a list must still resume."""
+    fn = _func_src(ENGINE, "exploit_exec")
+    assert "decision.get('pending_exploit_id')" in fn
+
+
+def test_omitting_the_ids_approves_everything_queued():
+    """An operator approving one id would silently leave the rest pending for
+    ever, which is how twenty-five candidates become invisible."""
+    svc = _read(os.path.join(REPO, "autogen_agents", "autogen_service.py"))
+    assert "def _queued_exploit_ids" in svc
+    assert "pending_exploit_ids" in svc
+    fn = svc[svc.index("def _queued_exploit_ids"):]
+    fn = fn[:fn.index("\n@app.post")]
+    assert "status = 'pending'" in fn and "session_id = %s::uuid" in fn, (
+        "it approves exploits from other sessions, or ones already decided")
+
+
+def test_a_named_subset_is_not_widened():
+    """Naming a subset is a deliberate operator choice."""
+    src = _read(ENGINE)
+    node = src[src.index("def exploit_approval"):]
+    node = node[:node.index("\ndef _mark_approved")]
+    assert "ids = [one] if one else list(queued)" in node, (
+        "the subset/all distinction is gone — either everything widens or "
+        "nothing does")
+
+
+def test_the_operator_is_shown_every_candidate():
+    """An operator shown a single id cannot tell what else was found."""
+    src = _read(ENGINE)
+    node = src[src.index("def exploit_approval"):]
+    node = node[:node.index("\ndef _mark_approved")]
+    assert '"queued_exploit_ids": queued' in node, (
+        "the approval prompt names one candidate, so the others sit pending "
+        "with nothing pointing at them")

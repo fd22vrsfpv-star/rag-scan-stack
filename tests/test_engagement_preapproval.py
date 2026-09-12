@@ -98,13 +98,20 @@ def test_preapproval_fails_closed():
 
 # ── It approves the right thing, and says so ───────────────────────────────
 
-def test_preapproval_only_approves_this_sessions_exploit():
-    fn = _func(_read(ENGINE), "_pending_exploit_for_session")
-    assert fn, "_pending_exploit_for_session() is gone"
+def test_preapproval_only_approves_this_sessions_exploits():
+    """Renamed from the singular when the planner started queueing every
+    well-evidenced candidate rather than the best one. The property is
+    unchanged and is the one that matters: pre-approval reaches only what THIS
+    session queued and has not had decided."""
+    fn = _func(_read(ENGINE), "_pending_exploits_for_session")
+    assert fn, "_pending_exploits_for_session() is gone"
     assert "session_id = %s::uuid" in fn, (
         "the pending-exploit lookup is no longer scoped to the session, so a "
         "pre-approved run could approve an exploit some OTHER session queued")
     assert "status = 'pending'" in fn, "it could re-approve an already-decided exploit"
+    assert "MAX_EXPLOITS_PER_SESSION" in fn, (
+        "the lookup is unbounded, so pre-approval could fire every exploit a "
+        "planner ever queued for the session in one go")
 
 
 def test_preapproval_is_audited():
