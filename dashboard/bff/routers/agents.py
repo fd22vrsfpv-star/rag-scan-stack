@@ -121,6 +121,34 @@ async def analyze_extractor(body: dict):
         return safe_json(resp)
 
 
+# ── Parser coverage ─────────────────────────────────────────────────────
+#
+# "No parser exists" is a different state from "the parser found nothing", and
+# only the first is actionable. These make the gap visible and give it a fix.
+
+@router.get("/api/parsers/missing")
+async def parsers_missing(limit: int = 20, min_bytes: int = 200):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/parsers/missing",
+                           params={"limit": limit, "min_bytes": min_bytes},
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.post("/api/parsers/draft")
+async def draft_parser(body: dict):
+    """Preview by default; `learn: true` authors rules from a stored sample and
+    may call the LLM, so it gets the long timeout."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_LONG) as c:
+        resp = await c.post(f"{s.rag_api_url}/parsers/draft", json=body,
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
 # ── Methodology playbooks ───────────────────────────────────────────────
 #
 # The playbooks were RAG context only. These proxies make the extracted steps
