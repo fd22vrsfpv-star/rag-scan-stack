@@ -220,7 +220,7 @@ _AGENT_TASK = {
     "Exploit": "exploit",
     "Exploitation": "exploit",
     "Scanner": "scan",
-    "PostExploitation": "postex",
+    "PostEnumerationation": "postex",
     "PostEx": "postex",
     "Report": "analyze",
 }
@@ -1345,7 +1345,7 @@ def exploit_exec(state: PentestState) -> dict:
             "log": [f"exploit_exec: execute_approved_exploit({pending_id})"]}
 
 
-def post_exploit(state: PentestState) -> dict:
+def post_enumeration(state: PentestState) -> dict:
     """Post-exploitation enumeration: read what every tool produced, and do the
     checklist the methodology already specifies.
 
@@ -1387,31 +1387,103 @@ def post_exploit(state: PentestState) -> dict:
     analysed = _analyse_session_output(sid)
     if analysed.get("examined"):
         findings.append(
-            f"post_exploit: re-read {analysed['examined']} tool outputs, "
+            f"post_enumeration: re-read {analysed['examined']} tool outputs, "
             f"{analysed['parsed']} parsed, {analysed['productive']} produced results")
-        log.append(f"post_exploit: analysis {analysed}")
+        log.append(f"post_enumeration: analysis {analysed}")
         if analysed.get("unparsed_tools"):
             # Named, not counted. "17 unparsed" is not actionable; the tool
             # names are, because each one is a parser somebody can write.
             findings.append(
-                "post_exploit: no parser for " +
+                "post_enumeration: no parser for " +
                 ", ".join(sorted(analysed["unparsed_tools"])[:8]))
+
+    # The same analysis every individual command already went through, run once
+    # more over the session as a whole. The per-command hook in kali_listener is
+    # the primary path; this catches anything that did not go through it — a
+    # tool dispatched by another runner, or a command that finished while the
+    # listener was restarting.
+    swept = _sweep_enumeration(target)
+    if swept.get("queued"):
+        findings.append(
+            f"post_enumeration: {swept['queued']} follow-on checks proposed from "
+            f"what {swept['examined']} commands found")
+    if swept.get("refused"):
+        # Refusals are REPORTED. A known_hosts entry naming an out-of-scope host
+        # is a real finding about the engagement's boundary, and dropping it
+        # silently makes it look like nothing was found.
+        findings.append(
+            f"post_enumeration: {swept['refused']} follow-ons refused by the "
+            f"scope gate (leads outside scope)")
+    if swept.get("suppressed"):
+        findings.append(
+            "post_enumeration: rules no longer firing (tried and never "
+            "produced): " + ", ".join(sorted(set(swept["suppressed"]))[:5]))
 
     enumerated = _enumerate_post_access(sid, target)
     if enumerated.get("queued"):
         findings.append(
-            f"post_exploit: queued {enumerated['queued']} post-access checks "
+            f"post_enumeration: queued {enumerated['queued']} post-access checks "
             f"from the methodology for {', '.join(enumerated['services'])}")
     elif enumerated.get("reason"):
         # A phase that did nothing must say why. "Nothing to enumerate" and
         # "we hold no credential" are different states and only one is a gap.
-        findings.append(f"post_exploit: nothing enumerated ({enumerated['reason']})")
-    log.append(f"post_exploit: enumeration {enumerated}")
+        findings.append(f"post_enumeration: nothing enumerated ({enumerated['reason']})")
+    log.append(f"post_enumeration: enumeration {enumerated}")
 
-    _msg(sid, "PostExploit", "\n".join(findings) or "post_exploit: nothing to do")
-    _emit("langgraph_post_exploit", sid, {
+    _msg(sid, "PostEnumeration", "\n".join(findings) or "post_enumeration: nothing to do")
+    _emit("langgraph_post_enumeration", sid, {
         "target": target, "analysed": analysed, "enumerated": enumerated})
     return {"phase": "report", "findings": findings, "log": log}
+
+
+def _sweep_enumeration(target: str) -> dict:
+    """Run the post-enumeration analysis over recent commands.
+
+    One function, two callers: kali_listener runs it per command as each
+    finishes, and this runs it over the session. Two analyses that had to agree
+    would drift, and the one that drifted would be the one nobody watched.
+    """
+    out = {"examined": 0, "queued": 0, "refused": 0, "suppressed": [],
+           "facts": 0, "available": False}
+    try:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        from etl.post_enumeration import analyse
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"unavailable: {e}"
+        return out
+    dsn = os.environ.get("DB_DSN") or os.environ.get("DATABASE_URL")
+    if not dsn:
+        out["error"] = "no DB_DSN"
+        return out
+    try:
+        with psycopg2.connect(dsn, connect_timeout=5) as conn, \
+                conn.cursor(cursor_factory=RealDictCursor) as cur:
+            params = []
+            where = ["started_at > now() - interval '12 hours'",
+                     "COALESCE(output,'') <> ''"]
+            if target:
+                where.append("target = %s")
+                params.append(target)
+            cur.execute(
+                f"""SELECT id::text, tool, target, port, service,
+                           COALESCE(output,'') AS output,
+                           COALESCE(error,'') AS error, parsed_results
+                      FROM tool_executions
+                     WHERE {' AND '.join(where)}
+                     ORDER BY started_at DESC LIMIT 100""", params)
+            rows = cur.fetchall()
+        out["available"] = True
+        for r in rows:
+            out["examined"] += 1
+            res = analyse(dict(r))
+            out["facts"] += res.get("facts", 0)
+            out["queued"] += res.get("queued", 0)
+            out["refused"] += res.get("refused", 0)
+            out["suppressed"].extend(res.get("suppressed") or [])
+    except Exception as e:  # noqa: BLE001
+        out["error"] = str(e)[:200]
+    return out
 
 
 def _analyse_session_output(sid) -> dict:
@@ -1587,7 +1659,7 @@ def _enumerate_post_access(sid, target: str) -> dict:
                             INSERT INTO scan_recommendations
                                 (ip, service, scanner, action, script, source,
                                  priority, status, extra)
-                            VALUES (%s,%s,%s,%s,%s,'post_exploit',30,'pending',%s)
+                            VALUES (%s,%s,%s,%s,%s,'post_enumeration',30,'pending',%s)
                             ON CONFLICT (fingerprint) DO NOTHING
                             """,
                             (ip, protocol, rendered["command"].split()[0],
@@ -1599,7 +1671,7 @@ def _enumerate_post_access(sid, target: str) -> dict:
                                    "source": st["source"],
                                    "credential_id": cred_id,
                                    "remote_command": c.get("command"),
-                                   "queued_by": "post_exploit"})))
+                                   "queued_by": "post_enumeration"})))
                         if cur.rowcount:
                             out["queued"] += 1
             conn.commit()
@@ -3076,7 +3148,7 @@ def build_graph(checkpointer=None):
     g.add_node("exploit_plan", exploit_plan)
     g.add_node("exploit_approval", exploit_approval)
     g.add_node("exploit_exec", exploit_exec)
-    g.add_node("post_exploit", post_exploit)
+    g.add_node("post_enumeration", post_enumeration)
     g.add_node("surface_plan", surface_plan)
     g.add_node("surface_safe_exec", surface_safe_exec)
     g.add_node("surface_approval", surface_approval)
@@ -3088,29 +3160,29 @@ def build_graph(checkpointer=None):
     g.add_edge("scan", "analyze")
     g.add_conditional_edges("analyze", _after_analyze,
                             {"surface_plan": "surface_plan",
-                             "exploit_plan": "exploit_plan", "report": "post_exploit"})
+                             "exploit_plan": "exploit_plan", "report": "post_enumeration"})
     # Surface-test phase: plan -> safe-exec (side effects here, before the
     # checkpointed interrupt) -> approval -> exec, then chain onward.
     g.add_conditional_edges("surface_plan", _after_surface_plan,
                             {"surface_safe_exec": "surface_safe_exec",
-                             "exploit_plan": "exploit_plan", "report": "post_exploit"})
+                             "exploit_plan": "exploit_plan", "report": "post_enumeration"})
     g.add_conditional_edges("surface_safe_exec", _after_surface_safe,
                             {"surface_approval": "surface_approval",
                              "surface_auto_exec": "surface_auto_exec",
-                             "exploit_plan": "exploit_plan", "report": "post_exploit"})
+                             "exploit_plan": "exploit_plan", "report": "post_enumeration"})
     g.add_conditional_edges("surface_auto_exec", _surface_onward,
-                            {"exploit_plan": "exploit_plan", "report": "post_exploit"})
+                            {"exploit_plan": "exploit_plan", "report": "post_enumeration"})
     g.add_conditional_edges("surface_approval", _after_surface_approval,
                             {"surface_exec": "surface_exec",
-                             "exploit_plan": "exploit_plan", "report": "post_exploit"})
+                             "exploit_plan": "exploit_plan", "report": "post_enumeration"})
     g.add_conditional_edges("surface_exec", _surface_onward,
-                            {"exploit_plan": "exploit_plan", "report": "post_exploit"})
+                            {"exploit_plan": "exploit_plan", "report": "post_enumeration"})
     g.add_conditional_edges("exploit_plan", _after_exploit_plan,
-                            {"exploit_approval": "exploit_approval", "report": "post_exploit"})
+                            {"exploit_approval": "exploit_approval", "report": "post_enumeration"})
     g.add_conditional_edges("exploit_approval", _after_exploit_approval,
                             {"exploit_exec": "exploit_exec",
-                             "report": "post_exploit"})
-    # EVERY terminal route goes through post_exploit, not just the exploit one.
+                             "report": "post_enumeration"})
+    # EVERY terminal route goes through post_enumeration, not just the exploit one.
     #
     # The graph used to send each of these straight to report, so a run that
     # recovered ten working credentials and never found an exploit candidate —
@@ -3118,10 +3190,10 @@ def build_graph(checkpointer=None):
     # of the access it had just obtained.
     #
     # The routing FUNCTIONS still return "report"; only where that lands
-    # changes. post_exploit no-ops cleanly and says WHY when there is nothing to
+    # changes. post_enumeration no-ops cleanly and says WHY when there is nothing to
     # enumerate, so a run that found nothing pays nothing for passing through.
-    g.add_edge("exploit_exec", "post_exploit")
-    g.add_edge("post_exploit", "report")
+    g.add_edge("exploit_exec", "post_enumeration")
+    g.add_edge("post_enumeration", "report")
     g.add_edge("report", END)
     return g.compile(checkpointer=checkpointer)
 

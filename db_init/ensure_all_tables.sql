@@ -2999,6 +2999,77 @@ CREATE TRIGGER trg_target_tool_settings_updated
   BEFORE UPDATE ON public.target_tool_settings
   FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
 
+-- ============================================================================
+-- Post-enumeration: what every finished command implied, and what came of it
+-- ----------------------------------------------------------------------------
+-- The platform could parse a tool's output and could queue a recommendation. It
+-- could not get from one to the other: netexec reported `tmp  READ,WRITE` and
+-- nothing followed. A pentester reading that share table knows what it means;
+-- the platform stored it and stopped.
+--
+-- Every finished command now passes through the same analysis, and each firing
+-- of a rule is recorded here with what it proposed. The point of recording it is
+-- the second half of the loop: when the proposal is executed, whether it
+-- produced anything is written back, so a rule that keeps firing and never
+-- yields stops firing.
+--
+-- That is the "carry forward": the typed rule says a writable share is worth
+-- listing, and the observations say whether listing one has ever been worth it
+-- HERE.
+CREATE TABLE IF NOT EXISTS public.enumeration_observations (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    rule_id         text NOT NULL,
+    -- The execution whose output fired the rule.
+    source_execution uuid,
+    tool            text NOT NULL DEFAULT '',
+    target          text NOT NULL DEFAULT '',
+    service         text NOT NULL DEFAULT '',
+    fact            jsonb NOT NULL DEFAULT '{}'::jsonb,
+    proposed_command text,
+    recommendation_id uuid,
+    -- Filled in when the proposal is executed. NULL means "not yet run", which
+    -- is a third state and must not read as "produced nothing".
+    produced        boolean,
+    result_count    integer,
+    refused_reason  text,
+    engagement_id   uuid,
+    created_at      timestamptz DEFAULT now(),
+    resolved_at     timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_enumeration_obs_rule
+  ON public.enumeration_observations (rule_id, produced);
+CREATE INDEX IF NOT EXISTS idx_enumeration_obs_rec
+  ON public.enumeration_observations (recommendation_id);
+CREATE INDEX IF NOT EXISTS idx_enumeration_obs_created
+  ON public.enumeration_observations (created_at DESC);
+
+-- Derived from those observations: is this rule worth firing here?
+--
+-- Same discipline as tool_selection_learned — both outcomes counted, an operator
+-- rejection durable, counters forward-only. A rule decides what to PROPOSE; it
+-- has never decided what may run, and the scope gate is unchanged.
+CREATE TABLE IF NOT EXISTS public.enumeration_rule_learned (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    rule_id       text NOT NULL,
+    service       text NOT NULL DEFAULT '',
+    fired         integer NOT NULL DEFAULT 0,
+    executed      integer NOT NULL DEFAULT 0,
+    produced      integer NOT NULL DEFAULT 0,
+    confidence    numeric,
+    status        text NOT NULL DEFAULT 'active'
+                  CHECK (status IN ('active','proposed','rejected')),
+    reviewed_by   text,
+    created_at    timestamptz DEFAULT now(),
+    updated_at    timestamptz DEFAULT now(),
+    last_fired_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_enumeration_rule_learned
+  ON public.enumeration_rule_learned (rule_id, service);
+DROP TRIGGER IF EXISTS trg_enumeration_rule_learned_updated ON public.enumeration_rule_learned;
+CREATE TRIGGER trg_enumeration_rule_learned_updated
+  BEFORE UPDATE ON public.enumeration_rule_learned
+  FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+
 -- Agent-to-agent feedback channel. One agent flags something interesting (a
 -- finding worth another run, a coverage gap); a coordinator turns approved flags
 -- into scan_recommendations (which the recon agent dispatches through the scope

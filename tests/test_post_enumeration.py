@@ -3,7 +3,7 @@ re-run proposer sees what the review sees.
 
 Run on demand:
 
-    pytest tests/test_post_exploit.py -v
+    pytest tests/test_post_enumeration.py -v
 
 WHY THIS EXISTS
 ---------------
@@ -31,7 +31,7 @@ CLAUDE.md: fixtures come from real captured tool output, not invented shapes.
 SABOTAGE PROOF
 --------------
 Point any conditional edge back at `"report"` and
-`test_every_route_passes_through_post_exploit` fails. Make the parser count
+`test_every_route_passes_through_post_enumeration` fails. Make the parser count
 traceback lines as output and `test_a_traceback_is_not_a_result` fails. Narrow
 the proposer's query and `test_the_proposer_and_the_review_agree` fails.
 """
@@ -74,20 +74,20 @@ def _graph_block():
 
 def test_the_phase_is_a_node():
     src = _read(ENGINE)
-    assert "def post_exploit(state: PentestState)" in src, "the phase is gone"
-    assert 'g.add_node("post_exploit", post_exploit)' in src
+    assert "def post_enumeration(state: PentestState)" in src, "the phase is gone"
+    assert 'g.add_node("post_enumeration", post_enumeration)' in src
 
 
-def test_every_route_passes_through_post_exploit():
+def test_every_route_passes_through_post_enumeration():
     """A route that goes straight to report is a run that finishes without
     enumerating access it holds — which is the whole defect."""
     block = _graph_block()
     assert '"report": "report"' not in block, (
         "a conditional edge still routes straight to report, so that path "
-        "finishes without post-exploitation enumeration")
-    assert block.count('"report": "post_exploit"') >= 7, block.count('"report": "post_exploit"')
-    assert 'g.add_edge("exploit_exec", "post_exploit")' in block
-    assert 'g.add_edge("post_exploit", "report")' in block
+        "finishes without post-enumerationation enumeration")
+    assert block.count('"report": "post_enumeration"') >= 7, block.count('"report": "post_enumeration"')
+    assert 'g.add_edge("exploit_exec", "post_enumeration")' in block
+    assert 'g.add_edge("post_enumeration", "report")' in block
 
 
 def test_the_phase_never_proposes_a_mutating_step():
@@ -107,7 +107,7 @@ def test_the_phase_says_why_it_did_nothing():
     """"Nothing to enumerate" and "we hold no credential" are different states
     and only one of them is a gap."""
     src = _read(ENGINE)
-    fn = src[src.index("def post_exploit(state: PentestState)"):]
+    fn = src[src.index("def post_enumeration(state: PentestState)"):]
     fn = fn[:fn.index("\ndef _analyse_session_output")]
     assert 'enumerated["reason"]' in fn or "enumerated.get(\"reason\")" in fn
 
@@ -175,7 +175,7 @@ def test_unparsed_tools_are_named_not_counted():
     """"17 unparsed" is not actionable. The tool names are — each one is a
     parser somebody can write."""
     src = _read(ENGINE)
-    fn = src[src.index("def post_exploit(state: PentestState)"):]
+    fn = src[src.index("def post_enumeration(state: PentestState)"):]
     assert "unparsed_tools" in fn
 
 
@@ -253,7 +253,7 @@ def test_a_traceback_is_not_a_result():
 
 
 def test_command_output_from_dash_x_survives():
-    """For a post-exploitation run the unprefixed lines ARE the entire result."""
+    """For a post-enumerationation run the unprefixed lines ARE the entire result."""
     r = _parse("SSH   10.0.0.5   22   10.0.0.5   [+] msfadmin:msfadmin\n"
                "uid=1000(msfadmin) gid=1000(msfadmin) groups=4(adm),112(admin)\n"
                "Linux metasploitable 2.6.24-16-server")
@@ -319,3 +319,236 @@ def test_the_proposer_and_the_review_agree():
         "the proposer classifies a truncated prefix, so it classifies something "
         "different from what the review classified")
     assert "classify_execution(row, catalogue)" in fn
+
+
+# ── Every command goes through it, and the loop closes ─────────────────────
+
+def test_every_command_goes_through_post_enumeration():
+    """Not just a phase at the end of a pipeline. The hook is the single point
+    every tool the platform runs passes through."""
+    listener = os.path.join(REPO, "kali_listener", "listener_service.py")
+    src = _read(listener)
+    fn = src[src.index("def db_update_tool_execution("):]
+    fn = fn[:fn.index("\ndef ", 10)]
+    assert "_post_enumerate(exec_id" in fn, (
+        "commands no longer feed post-enumeration, so only a pipeline phase "
+        "would analyse anything and every other dispatch path is blind")
+
+
+def test_the_phase_and_the_hook_share_one_analysis():
+    """Two analyses that had to agree would drift, and the one that drifted
+    would be the one nobody watched."""
+    engine = _read(ENGINE)
+    assert "from etl.post_enumeration import analyse" in engine
+    listener = _read(os.path.join(REPO, "kali_listener", "listener_service.py"))
+    assert "from etl.post_enumeration import analyse" in listener
+
+
+def test_rules_are_data():
+    """The implication is domain knowledge an operator can write down. A dict in
+    a module is the thing this replaces."""
+    pe = pytest.importorskip("etl.post_enumeration")
+    src = _read(os.path.join(REPO, "etl", "post_enumeration.py"))
+    tree = ast.parse(src)
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if getattr(t, "id", "").isupper() and isinstance(node.value, ast.List) \
+                        and node.value.elts:
+                    pytest.fail(f"{t.id} is a module-level rule list — rules "
+                                "belong in knowledge/enumeration_rules.yaml")
+    assert "yaml" in src and "load_rules" in src
+
+
+def test_the_real_output_fires_the_rules_it_should():
+    """netexec reported `tmp READ,WRITE` and nothing followed. That is the
+    defect this exists to fix, so it is tested against the real output."""
+    pe = pytest.importorskip("etl.post_enumeration")
+    pn = pytest.importorskip("etl.parse_netexec")
+    parsed = pn.parse_netexec_output(_fixture("netexec_smb_shares.txt"))
+    facts = pe.facts_from(parsed, target="192.168.1.150", service="smb")
+    assert len(facts) >= 10, facts
+
+    rules = pe.load_rules()
+    assert rules, "no rules loaded"
+    fired = {r["id"] for f in facts for r in rules if pe._matches(r, f)}
+    assert "writable-share-list" in fired, (
+        "a writable share no longer proposes anything — the original defect")
+    assert "null-session-enumerate" in fired
+    assert "smbv1-only" in fired
+
+
+def test_the_secret_is_not_written_into_a_proposal():
+    """A stored command is shown in the UI, written into reports and exported."""
+    pe = pytest.importorskip("etl.post_enumeration")
+    fact = {"fact": "share", "target": "10.0.0.1", "share": "tmp", "writable": True,
+            "username": "alice", "password": "hunter2"}
+    out = pe.render("smbclient //{target}/{share} -U {username}%{password} -c 'ls'",
+                    fact)
+    assert "hunter2" not in out, out
+    assert "{password}" in out and "{username}" in out, out
+    assert "//10.0.0.1/tmp" in out
+
+
+def test_the_fact_recorded_with_an_observation_carries_no_secret():
+    src = _read(os.path.join(REPO, "etl", "post_enumeration.py"))
+    assert 'k != "password"' in src, (
+        "the observation stores the whole fact including the password, in a "
+        "jsonb column the UI dumps unmasked")
+
+
+def test_proposals_pass_the_scope_gate():
+    """A known_hosts entry is a lead, not a licence."""
+    pe = pytest.importorskip("etl.post_enumeration")
+    src = _read(os.path.join(REPO, "etl", "post_enumeration.py"))
+    fn = src[src.index("def analyse("):]
+    assert "check_dispatch(" in fn and "command=command" in fn
+    assert 'scope_source == "unavailable"' in fn, (
+        "an unloadable scope no longer stops proposals — fail closed")
+    assert 'out["refusals"].append' in fn, "refusals are dropped"
+
+
+def test_the_loop_carries_forward():
+    """Without the write-back every rule stays at "fired N, outcome unknown"
+    forever: the loop would propose and never find out."""
+    pe = pytest.importorskip("etl.post_enumeration")
+    assert hasattr(pe, "record_outcome_for_command")
+    listener = _read(os.path.join(REPO, "kali_listener", "listener_service.py"))
+    assert "record_outcome_for_command(" in listener
+
+
+def test_an_unmeasured_outcome_is_not_recorded_as_zero():
+    """Third time this conflation has surfaced.
+
+    enum4linux-ng returned 9,525 bytes of real findings and was recorded
+    produced=false purely because no parser exists for it — which would have
+    suppressed a working rule after five runs.
+    """
+    listener = _read(os.path.join(REPO, "kali_listener", "listener_service.py"))
+    fn = listener[listener.index("def _post_enumerate("):]
+    fn = fn[:fn.index("\ndef ", 10)]
+    assert "if n is not None:" in fn, (
+        "an unmeasured run is written back as 'produced nothing', which "
+        "suppresses rules whose tools simply have no parser")
+
+
+def test_a_rule_is_only_suppressed_after_it_was_actually_tried():
+    """A rule nobody ran has not been disproved — it has been ignored."""
+    pe = pytest.importorskip("etl.post_enumeration")
+    src = _read(os.path.join(REPO, "etl", "post_enumeration.py"))
+    fn = src[src.index("def rule_status("):]
+    fn = fn[:fn.index("\ndef ", 10)]
+    assert "executed >= SUPPRESS_AFTER" in fn, (
+        "suppression counts firings rather than outcomes, so a rule nobody "
+        "acted on gets killed")
+
+
+# ── "No parser" is a different error, with a fix ───────────────────────────
+
+def test_a_missing_parser_is_a_distinct_state():
+    """"No parser exists for this tool" and "the parser found nothing" are
+    different facts. Only the first is actionable — somebody can write one, and
+    the output to write it from is already stored."""
+    reg = pytest.importorskip("etl.tool_output_parsers")
+    st = reg.parse_status("netexec")
+    assert st["has_parser"] is True and st["kind"] == "registry"
+    gap = reg.parse_status("a-tool-nobody-has-parsed")
+    assert gap["has_parser"] is False and gap["kind"] is None
+
+
+def test_an_extractor_spec_counts_as_a_parser():
+    """Authoring a spec through Extract & Learn is the supported way to close a
+    parser gap. If a spec did not count, authoring one would change nothing."""
+    reg = pytest.importorskip("etl.tool_output_parsers")
+    spec_dir = reg.SPEC_DIR if os.path.isdir(reg.SPEC_DIR) else \
+        os.path.join(REPO, "knowledge", "extractors")
+    if not os.path.isdir(spec_dir):
+        pytest.skip("no extractor specs available here")
+    reg.SPEC_DIR = spec_dir
+    reg._SPEC_CACHE.clear()
+    st = reg.parse_status("hydra")
+    assert st["has_parser"] is True and st["kind"] == "extractor", st
+
+
+def test_a_spec_that_matched_nothing_is_still_a_measurement():
+    """That is the whole difference from having no parser: the output was read."""
+    reg = pytest.importorskip("etl.tool_output_parsers")
+    spec_dir = os.path.join(REPO, "knowledge", "extractors")
+    if not os.path.isdir(spec_dir):
+        pytest.skip("no extractor specs")
+    reg.SPEC_DIR = spec_dir
+    reg._SPEC_CACHE.clear()
+    parsed = reg.parse_for("hydra", "nothing a hydra spec would ever match")
+    assert parsed is not None, "a tool WITH a spec must not report as unparsed"
+    assert parsed["parser"] == "extractor_spec"
+    assert reg.result_count(parsed) == 0, (
+        "a spec that read the output and found nothing must count zero, not "
+        "unknown — that is what lets a rule be judged")
+
+
+def test_the_listener_flags_a_missing_parser_loudly():
+    """Logged at WARNING, not debug: it is a gap somebody can close."""
+    src = _read(os.path.join(REPO, "kali_listener", "listener_service.py"))
+    fn = src[src.index("def _post_enumerate("):]
+    fn = fn[:fn.index("\ndef ", 10)]
+    assert "PARSER MISSING" in fn, "the gap is no longer flagged distinctly"
+    assert "logger.warning" in fn
+    assert "/parsers/draft" in fn, (
+        "the flag does not say how to fix it, which makes it a complaint")
+
+
+def test_there_is_a_way_to_see_the_gaps_and_close_them():
+    api = _read(os.path.join(REPO, "app", "rag-api", "api.py"))
+    assert '@app.get("/parsers/missing"' in api, "the gaps are not listable"
+    assert '@app.post("/parsers/draft"' in api, "there is no way to create one"
+    fn = api[api.index('@app.get("/parsers/missing"'):]
+    fn = fn[:fn.index("@app.post")]
+    assert "sample_execution" in fn, (
+        "a gap with no sample cannot be acted on — a parser written against an "
+        "invented format is the defect this repo keeps finding")
+    assert "covered_count" in fn, (
+        "a list of gaps with no denominator cannot be read as progress or as a "
+        "crisis")
+
+
+def test_drafting_uses_a_real_stored_sample():
+    api = _read(os.path.join(REPO, "app", "rag-api", "api.py"))
+    fn = api[api.index('@app.post("/parsers/draft"'):]
+    fn = fn[:fn.index("\n@app.")]
+    assert "FROM tool_executions" in fn, (
+        "the draft is not taken from stored output, so it is written against a "
+        "guess at the format")
+    assert "extractor_learn.distill_artifact" in fn, (
+        "a second authoring path would be a second thing to keep correct — it "
+        "must use the same distiller as Extract & Learn")
+    assert "body.learn" in fn, "there is no preview; the default writes"
+
+
+def test_the_two_spec_runners_agree():
+    """etl/ applies specs and app/rag-api/ authors and applies them. A
+    duplicated rule that drifts is worse than one never shared, so they are
+    pinned to the same output for the same input."""
+    reg = pytest.importorskip("etl.tool_output_parsers")
+    spec_dir = os.path.join(REPO, "knowledge", "extractors")
+    hydra = os.path.join(spec_dir, "hydra.yaml")
+    if not os.path.exists(hydra):
+        pytest.skip("hydra spec not present")
+    import re as _re
+    import yaml as _yaml
+    with open(hydra, encoding="utf-8") as fh:
+        spec = _yaml.safe_load(fh)
+    sample = "0 of 1 target completed, 3 valid passwords found"
+
+    reg.SPEC_DIR = spec_dir
+    reg._SPEC_CACHE.clear()
+    mine = (reg.parse_for("hydra", sample) or {}).get("extracted") or {}
+
+    theirs = {}
+    for name, decl in (spec.get("deterministic") or {}).items():
+        pattern = decl.get("pattern") if isinstance(decl, dict) else decl
+        if not pattern:
+            continue
+        m = _re.search(pattern, sample, _re.M | _re.I)
+        if m:
+            theirs[name] = m.group(1) if m.groups() else m.group(0)
+    assert mine == theirs, (mine, theirs)
