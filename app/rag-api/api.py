@@ -21469,6 +21469,145 @@ def export_extractor_learned(tool: Optional[str] = None, _: bool = Depends(auth)
     return {"ok": True, "tools": list(out), "yaml": out}
 
 
+# ── Parser coverage (which tools nobody can read) ──────────────────────────
+#
+# "No parser exists for this tool" is a DIFFERENT state from "the parser found
+# nothing", and until now only the second was visible. The first is actionable —
+# somebody can write one, and the output to write it from is already stored —
+# while the second is just a result.
+#
+# Conflating them cost real work: enum4linux-ng returned 9,525 bytes of findings
+# and the run was recorded as having produced nothing, which would have
+# suppressed a working enumeration rule after five tries.
+
+@app.get("/parsers/missing", tags=["Parsers"])
+def parsers_missing(limit: int = Query(20, ge=1, le=100),
+                    min_bytes: int = Query(200, ge=0),
+                    _: bool = Depends(auth)):
+    """Tools whose output nobody can read, worst first.
+
+    Ranked by how much output is going unread, because that is the size of the
+    prize. Each row carries a sample execution so the parser can be written from
+    real captured output rather than from a guess at the format — which is the
+    rule for fixtures in this repo and the reason the Extract & Learn surface
+    takes an artifact.
+    """
+    from etl.tool_output_parsers import parse_status
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT tool,
+                   count(*)                              AS runs,
+                   sum(octet_length(COALESCE(output,''))) AS unread_bytes,
+                   max(id::text)                          AS sample_execution,
+                   min(target)                            AS sample_target
+              FROM tool_executions
+             WHERE octet_length(COALESCE(output,'')) >= %s
+             GROUP BY tool
+             ORDER BY 3 DESC
+             LIMIT %s
+            """, (min_bytes, limit * 4))
+        rows = [dict(r) for r in cur.fetchall()]
+
+    missing, covered = [], []
+    for r in rows:
+        st = parse_status(r["tool"])
+        (covered if st["has_parser"] else missing).append({**r, **st})
+    return {
+        "missing": missing[:limit],
+        "missing_count": len(missing),
+        # Reported alongside on purpose: a list of gaps with no denominator
+        # cannot be read as progress or as a crisis.
+        "covered_count": len(covered),
+        "covered": [{"tool": c["tool"], "kind": c["kind"]} for c in covered],
+        "how_to_fix": ("POST /parsers/draft?tool=<tool> drafts an extractor spec "
+                       "from a stored sample; approve it under /extractors/learned "
+                       "and export it to knowledge/extractors/<tool>.yaml"),
+    }
+
+
+class ParserDraftBody(BaseModel):
+    tool: Optional[str] = None
+    execution_id: Optional[str] = None
+    # What the operator wants pulled out, in their own words. The distiller is
+    # far better with a hint than without one, and the hint is the part a human
+    # is uniquely able to supply.
+    focus: Optional[str] = None
+    learn: bool = False
+
+
+@app.post("/parsers/draft", tags=["Parsers"])
+def draft_parser(body: ParserDraftBody,
+                 x_operator: str = Header("operator", alias="X-Operator"),
+                 _: bool = Depends(auth)):
+    """Draft a parser for a tool, from output it has already produced.
+
+    `learn=false` (the default) is a PREVIEW: it shows what the current profile
+    extracts and what the output looks like, and writes nothing. `learn=true`
+    sends a real stored sample to the distiller, which authors deterministic
+    rules into `extractor_learned` for review — the same path the Extract & Learn
+    surface uses, because a second way to author parsers would be a second thing
+    to keep correct.
+
+    The sample is REAL captured output. A parser written against an invented
+    format is the defect this repo keeps finding, and it passes review because
+    nobody can tell by looking.
+    """
+    if not (body.tool or body.execution_id):
+        raise HTTPException(400, "provide tool or execution_id")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        if body.execution_id:
+            cur.execute("SELECT id::text, tool, target, COALESCE(output,'') AS output "
+                        "FROM tool_executions WHERE id = %s::uuid", (body.execution_id,))
+        else:
+            cur.execute(
+                """SELECT id::text, tool, target, COALESCE(output,'') AS output
+                     FROM tool_executions
+                    WHERE tool = %s AND octet_length(COALESCE(output,'')) > 0
+                    ORDER BY octet_length(output) DESC LIMIT 1""", (body.tool,))
+        row = cur.fetchone()
+    if not row:
+        # Distinct from "the draft failed": there is nothing to write a parser
+        # FROM, and the fix is to run the tool, not to try again.
+        raise HTTPException(404, "no stored output for that tool — run it once "
+                                 "first, so the parser can be written from real "
+                                 "output rather than a guess at the format")
+
+    from etl.tool_output_parsers import parse_status
+    out = {
+        "ok": True, "tool": row["tool"], "sample_execution": row["id"],
+        "sample_target": row["target"],
+        "sample_bytes": len(row["output"]),
+        "sample_head": row["output"][:1500],
+        "current": parse_status(row["tool"]),
+        "actor": x_operator,
+    }
+    if not body.learn:
+        out["next"] = ("re-POST with learn=true to author deterministic rules "
+                       "from this sample; add a focus to say what to pull out")
+        return out
+
+    import extractor_learn
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            out["learned"] = extractor_learn.distill_artifact(
+                cur, row["tool"], row["output"], target=row["target"] or "",
+                port=None, command="", focus=body.focus)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            log.exception("parser draft failed")
+            raise HTTPException(500, f"draft failed: {type(e).__name__}: {e}")
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("parser_drafted", "parsers", {
+            "tool": row["tool"], "actor": x_operator,
+            "sample_execution": row["id"], "focus": body.focus})
+    except Exception:
+        log.warning("parser draft webhook emit failed", exc_info=True)
+    return out
+
+
 # ── Tool settings derived from recon (target_tool_settings) ────────────────
 #
 # The reactive half lives in tool_remediation_learned: something failed, what

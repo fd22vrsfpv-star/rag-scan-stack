@@ -26,6 +26,7 @@ results is a reason to try another tool.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable, Dict, Optional
 
 log = logging.getLogger("tool_output_parsers")
@@ -49,22 +50,115 @@ PARSERS: Dict[str, Callable[..., Dict[str, Any]]] = {
 }
 
 
+# ── The extractor specs, as a second tier of parser ────────────────────────
+#
+# knowledge/extractors/*.yaml already describes how to read fourteen tools, as
+# named regexes over their output. Those specs are authored through the
+# Extract & Learn surface from real captured output, which is exactly the
+# "create a parser" path — so a tool with a spec is a tool with a parser, and
+# wiring them in here is what makes authoring one actually close the gap.
+#
+# This APPLIES a spec; it does not author one. Authoring lives in
+# app/rag-api/extractor_learn.py and is unchanged. The two implementations of
+# "run the deterministic patterns" are pinned to each other by
+# tests/test_post_enumeration.py::test_the_two_spec_runners_agree, because a
+# duplicated rule that drifts is worse than one that was never shared.
+
+SPEC_DIR = os.environ.get("EXTRACTOR_SPEC_DIR", "/knowledge/extractors")
+_SPEC_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
+
+
+def _spec_for(tool: str) -> Optional[Dict[str, Any]]:
+    """The extractor spec for a tool, honouring `aliases:`."""
+    tool = (tool or "").strip().lower()
+    if not tool:
+        return None
+    if tool in _SPEC_CACHE:
+        return _SPEC_CACHE[tool]
+    found = None
+    try:
+        import yaml
+        if os.path.isdir(SPEC_DIR):
+            for fn in sorted(os.listdir(SPEC_DIR)):
+                if not fn.endswith((".yaml", ".yml")) or fn.startswith("_"):
+                    continue
+                with open(os.path.join(SPEC_DIR, fn), encoding="utf-8") as fh:
+                    spec = yaml.safe_load(fh) or {}
+                names = [str(spec.get("tool") or "").lower()]
+                names += [str(a).lower() for a in (spec.get("aliases") or [])]
+                if tool in names and spec.get("enabled", True):
+                    found = spec
+                    break
+    except Exception as e:  # noqa: BLE001
+        log.debug("extractor spec lookup for %s failed: %s", tool, e)
+    _SPEC_CACHE[tool] = found
+    return found
+
+
+def _from_spec(tool: str, output: str, error: str = "") -> Optional[Dict[str, Any]]:
+    """Run a spec's deterministic patterns over the output."""
+    import re as _re
+    spec = _spec_for(tool)
+    if not spec:
+        return None
+    text = f"{output}\n{error}" if error else output
+    fields: Dict[str, Any] = {}
+    for name, decl in (spec.get("deterministic") or {}).items():
+        pattern = decl.get("pattern") if isinstance(decl, dict) else decl
+        if not pattern:
+            continue
+        try:
+            m = _re.search(pattern, text, _re.M | _re.I)
+        except _re.error:
+            continue
+        if m:
+            fields[name] = m.group(1) if m.groups() else m.group(0)
+    return {
+        "tool": tool, "parser": "extractor_spec",
+        "spec": spec.get("tool"),
+        "extracted": fields,
+        "counts": {"fields": len(fields)},
+        # A spec that matched nothing read the output and found nothing, which
+        # is a measurement. That is the whole difference from having no parser.
+        "productive": bool(fields),
+    }
+
+
+def parse_status(tool: str) -> Dict[str, Any]:
+    """Whether this tool can be read at all, and by what.
+
+    ``{"tool", "has_parser", "kind"}`` where kind is `registry`, `extractor` or
+    None. The distinction is the point: "no parser exists for this tool" is a
+    DIFFERENT state from "the parser found nothing", it is actionable in a way
+    the other is not, and until now it was invisible.
+    """
+    name = (tool or "").strip().lower()
+    if name in PARSERS:
+        return {"tool": name, "has_parser": True, "kind": "registry"}
+    if _spec_for(name):
+        return {"tool": name, "has_parser": True, "kind": "extractor"}
+    return {"tool": name, "has_parser": False, "kind": None}
+
+
 def parse_for(tool: str, output: str = "", error: str = "") -> Optional[Dict[str, Any]]:
     """Structured results for this tool's output, or None if unparsed.
 
     Never raises: a parser defect must not fail a tool run that already
     completed, and returning None then is honest — the run really is unmeasured.
     """
-    fn = PARSERS.get((tool or "").strip().lower())
-    if not fn:
-        return None
     if not (output or "").strip() and not (error or "").strip():
         return None
-    try:
-        return fn(output or "", error or "")
-    except Exception as e:  # noqa: BLE001
-        log.warning("parser for %s failed: %s", tool, e)
-        return None
+    fn = PARSERS.get((tool or "").strip().lower())
+    if fn:
+        try:
+            return fn(output or "", error or "")
+        except Exception as e:  # noqa: BLE001
+            log.warning("parser for %s failed: %s", tool, e)
+            return None
+    # Second tier: an extractor spec. Authoring one through Extract & Learn is
+    # the supported way to close a parser gap, so a spec has to count as a
+    # parser or authoring one would change nothing.
+    return _from_spec(tool, output or "", error or "")
 
 
 def result_count(parsed: Optional[Dict[str, Any]]) -> Optional[int]:

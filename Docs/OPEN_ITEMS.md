@@ -132,7 +132,7 @@ decision, not a code default.
 
 ### Post-access steps needing sudo cannot elevate
 **Found:** 2026-09-12
-**Evidence:** The post-exploitation phase queued `sudo -l` from
+**Evidence:** The post-enumerationation phase queued `sudo -l` from
 `ssh_methodology.md`, wrapped it for remote execution, and it reached the host —
 `Warning: Permanently added '192.168.1.150' (RSA)` then
 `[sudo] password for msfadmin:` on stderr, exit 1, no output. Transport,
@@ -157,8 +157,71 @@ across ten protocols; only ssh's can currently run.
 **Done when:** the wrapper covers the protocols whose tools are already
 allow-listed — `netexec smb -x`, `mysql -e`, `psql -c` all exist and are
 allowed.
-**Enforced by:** `tests/test_post_exploit.py::test_an_unreachable_protocol_queues_nothing`
+**Enforced by:** `tests/test_post_enumeration.py::test_an_unreachable_protocol_queues_nothing`
 (pins that an unwrappable protocol queues nothing rather than something broken)
+
+### Post-enumeration outcomes only carry forward for Kali-dispatched commands
+**Found:** 2026-09-12
+**Evidence:** Acting on the `smbv1-only` proposal dispatched it to the **native
+nmap runner** (`Scan started: 0ea66fb6`), which writes to `scans` and never
+calls `kali_listener.db_update_tool_execution` — where the write-back hook
+lives. The rule stayed `fired=1 executed=0`. Calling
+`record_outcome_for_command()` directly resolves it correctly
+(`fired=1 executed=1 produced=1 conf=1.0`), so the mechanism works and only the
+native path is unhooked.
+**Where:** `kali_listener/listener_service.py::_post_enumerate` is the only
+caller; the native runners (`nmap_scanner`, `nuclei-runner`, ...) have no
+equivalent.
+**Done when:** a command completed by any runner resolves its enumeration
+observation. The native path finishes in `scans`, so it needs its own hook
+rather than a shared one.
+**Enforced by:** not enforced
+
+### Six tools still have no parser, 632 KB of output unread
+**Found:** 2026-09-12
+**Evidence:** `GET /parsers/missing` reports **3 covered, 6 missing** —
+`nuclei` (4 runs, 515,491 bytes), `curl` (16 runs, 79,383), `ssh-audit` (2 runs,
+18,218), `nmap` (38 runs, 14,259), `sqlmap` (3), `whatweb` (2). Wiring the
+extractor specs in as a second parser tier already covered `enum4linux-ng`,
+`smbclient`, `hydra`, `sslscan`, `medusa` and `gobuster`.
+**Where:** `etl/tool_output_parsers.py::PARSERS` and
+`knowledge/extractors/*.yaml`.
+**Done when:** each tool has a registry parser or an extractor spec.
+`POST /parsers/draft?tool=<tool>` drafts one from a stored sample; the gap is
+now visible and has a fix rather than being silent.
+**Enforced by:** `tests/test_post_enumeration.py::test_a_missing_parser_is_a_distinct_state`
+(pins that the absence is a distinct, reportable state and not a zero)
+
+### Post-enumeration outcomes only carry forward for Kali-dispatched commands
+**Found:** 2026-09-12
+**Evidence:** Acting on the `smbv1-only` proposal dispatched it to the **native
+nmap runner** (`Scan started: 0ea66fb6`), which writes to `scans` and never
+calls `kali_listener.db_update_tool_execution` — where the write-back hook
+lives. The rule stayed `fired=1 executed=0`. Calling
+`record_outcome_for_command()` directly resolves it correctly
+(`fired=1 executed=1 produced=1 conf=1.0`), so the mechanism works and only the
+native path is unhooked.
+**Where:** `kali_listener/listener_service.py::_post_enumerate` is the only
+caller; the native runners (`nmap_scanner`, `nuclei-runner`, ...) have no
+equivalent.
+**Done when:** a command completed by any runner resolves its enumeration
+observation. The native path finishes in `scans`, so it needs its own hook
+rather than a shared one.
+**Enforced by:** not enforced
+
+### Most tools have no parser, so their outcomes stay unresolved
+**Found:** 2026-09-12
+**Evidence:** `enum4linux-ng` returned **9,525 bytes** of real findings and
+`result_count()` returned None because only netexec has a parser. That is now
+recorded as *unresolved* rather than `produced=false` — correct, but it means
+`smbclient`, `enum4linux-ng` and `nmap` proposals can never resolve, so rules
+proposing them can never be judged.
+**Where:** `etl/tool_output_parsers.py::PARSERS` has three entries, all netexec.
+**Done when:** the tools the enumeration rules propose (`smbclient`,
+`enum4linux-ng`, `nmap`) have parsers, or `output_analysis.analyse_output()` is
+used as the fallback judge.
+**Enforced by:** `tests/test_post_enumeration.py::test_an_unmeasured_outcome_is_not_recorded_as_zero`
+(pins that the absence is not recorded as a zero)
 
 ## Data and deployment
 

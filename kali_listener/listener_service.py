@@ -480,6 +480,80 @@ def _cap_for_storage(v, field: str, exec_id: str):
               f"{TOOL_OUTPUT_STORE_CAP:,}]")
 
 
+def _post_enumerate(exec_id: str, output, error, parsed_results) -> None:
+    """Analyse what this command found and queue what follows from it.
+
+    Best-effort by construction: an analysis failure must not fail a tool run
+    that already completed, and a proposal that cannot be queued is a lost
+    opportunity rather than a lost result.
+
+    It proposes only — rows land status='pending' and every one passes the scope
+    gate first.
+    """
+    try:
+        from etl.post_enumeration import analyse
+    except Exception as e:  # noqa: BLE001 - etl/ not mounted is a valid deployment
+        logger.debug("post-enumeration unavailable for %s: %s", exec_id, e)
+        return
+    try:
+        row = db_get_tool_execution(exec_id) or {}
+
+        # CARRY FORWARD. If this command was itself proposed by a rule, write
+        # back whether it produced anything. Without this every rule stays at
+        # "fired N times, outcome unknown" forever — the loop would propose and
+        # never find out, which is the difference between a rule catalogue and
+        # something that learns.
+        try:
+            from etl.post_enumeration import record_outcome_for_command
+            from etl.tool_output_parsers import result_count as _rc
+            n = _rc(parsed_results if parsed_results is not None
+                    else row.get("parsed_results"))
+            # None means UNMEASURED — nobody wrote a parser for this tool — and
+            # it must not be written back as "produced nothing".
+            #
+            # enum4linux-ng returned 9,525 bytes of real findings and was
+            # recorded produced=false purely because it has no parser, which
+            # would have suppressed a working rule after five runs. Leaving the
+            # observation unresolved keeps the rule at "not yet known", which is
+            # the truth. This is the third time this conflation has surfaced;
+            # the fix is always the same, and it is always to refuse to guess.
+            if n is not None:
+                record_outcome_for_command(row.get("command") or "",
+                                           produced=bool(n), result_count=n)
+            else:
+                # A DISTINCT state, logged at WARNING rather than debug: nobody
+                # can read this tool's output, which is actionable — somebody can
+                # write a parser, and the output to write it from is already
+                # stored. "The parser found nothing" is just a result and needs
+                # no action. See GET /parsers/missing and POST /parsers/draft.
+                logger.warning(
+                    "PARSER MISSING for %s: %d bytes of output nobody can read. "
+                    "The enumeration observation stays unresolved rather than "
+                    "being recorded as a zero. Draft one: "
+                    "POST /parsers/draft?tool=%s",
+                    row.get("tool"), len(output or ""), row.get("tool"))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("outcome write-back failed for %s: %s", exec_id, e)
+
+        result = analyse({
+            "id": exec_id,
+            "tool": row.get("tool") or "",
+            "target": row.get("target") or "",
+            "port": row.get("port"),
+            "service": row.get("service") or "",
+            "output": output or "",
+            "error": error or "",
+            "parsed_results": parsed_results if parsed_results is not None
+                              else row.get("parsed_results"),
+        })
+        if result.get("queued") or result.get("refused"):
+            logger.info("post-enumeration %s: %d facts, %d queued, %d refused",
+                        row.get("tool"), result.get("facts", 0),
+                        result.get("queued", 0), result.get("refused", 0))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("post-enumeration failed for %s: %s", exec_id, e)
+
+
 def _learn_from_execution(exec_id: str, status: str, exit_code: Optional[int],
                           output: Optional[str], error: Optional[str],
                           parsed_results: Optional[Dict]) -> None:
@@ -588,9 +662,14 @@ def db_update_tool_execution(exec_id: str, status: str, exit_code: Optional[int]
         conn.commit()
     finally:
         conn.close()
-    # After the row is committed, so the learner reads the same thing an
-    # operator would.
+    # After the row is committed, so both readers see the same thing an operator
+    # would.
     _learn_from_execution(exec_id, status, exit_code, output, error, parsed_results)
+    # EVERY command goes through post-enumeration, not just the ones at the end
+    # of a pipeline. This is the single point every tool the platform runs passes
+    # through, so hooking it here is what makes "analyse the output and act on
+    # what it implies" true of all of them rather than of a phase.
+    _post_enumerate(exec_id, output, error, parsed_results)
 
 
 def db_get_tool_execution(exec_id: str) -> Optional[Dict]:
