@@ -622,6 +622,12 @@ def observe_execution(
     """
     failed = execution_failed(status, exit_code, error, output)
     fruitless = (not failed) and result_count is not None and result_count <= 0
+    # Nobody measured this run. That is NOT a success, and it must not be able
+    # to act as one: a live netexec run against a legacy SSH host exited 0 with
+    # a Python traceback in its output and no parser to read it, and was
+    # recorded `success: true` — where it could then have ACTIVATED a rule as
+    # proof that netexec works after some other tool failed.
+    unmeasured = (not failed) and result_count is None
     sig = phrase = None
     if failed:
         # The tool's complaint first; its normal output only if it said nothing
@@ -630,7 +636,7 @@ def observe_execution(
     elif fruitless:
         sig, phrase = error_signature(UNPRODUCTIVE_PHRASE)
     out: Dict[str, Any] = {"recorded": False, "failed": failed,
-                           "fruitless": fruitless,
+                           "fruitless": fruitless, "unmeasured": unmeasured,
                            "signature": sig, "phrase": phrase, "learned": []}
     try:
         with _connect() as conn:
@@ -645,12 +651,19 @@ def observe_execution(
                     RETURNING id
                     """,
                     (phase, tool, service or "", target, port,
-                     not (failed or fruitless), int(result_count or 0), sig,
-                     phrase, engagement_id),
+                     # An unmeasured run is recorded as NOT a success. It has no
+                     # signature either, so it teaches nothing in either
+                     # direction — which is the honest position when no parser
+                     # looked at the output.
+                     not (failed or fruitless or unmeasured),
+                     int(result_count or 0), sig, phrase, engagement_id),
                 )
                 out["recorded"] = True
                 out["attempt_id"] = str(cur.fetchone()[0])
-                out["learned"] = _learn_against_recent(
+                # An unmeasured run pairs with nothing. Letting it act as the
+                # "later success" would manufacture a rule out of a run nobody
+                # read.
+                out["learned"] = [] if unmeasured else _learn_against_recent(
                     cur, phase=phase, service=service or "", target=target,
                     port=port, tool=tool, succeeded=not (failed or fruitless))
             conn.commit()
@@ -884,6 +897,347 @@ def _emit_webhook(rule: Dict[str, Any], phase: str) -> None:
         )
     except Exception as e:  # noqa: BLE001
         log.debug("tool_learning webhook emit failed: %s", e)
+
+
+# ── Fixing the tool instead of replacing it ────────────────────────────────
+#
+# Everything above answers "which OTHER tool should I reach for". This answers
+# the question that comes first: can this tool be made to work by telling it
+# something the target already told us?
+#
+# The case that produced it: netexec and hydra both fail against an OpenSSH
+# 4.7p1 that offers only ssh-rsa and ssh-dss host keys. ssh-audit had already
+# recorded exactly that — 24 findings — BEFORE either failure. The information
+# needed to fix the failure was collected before the failure happened and
+# nothing read it back, so the platform kept discovering by trial what it had
+# already measured.
+#
+# Two halves, and only one of them is typed:
+#   * WHAT a tool's option looks like is a fact (knowledge/tool_options.yaml),
+#     checkable against its man page.
+#   * WHETHER adding it fixes a given failure is a judgement, and it is observed
+#     here, never written down.
+#
+# Candidates are ranked by how much the error text actually talks about the
+# category — "no acceptable host key" against `host-key` — which needs no
+# protocol vocabulary and works for a category nobody anticipated.
+
+TOOL_OPTIONS = os.environ.get("TOOL_OPTIONS_YAML", "/knowledge/tool_options.yaml")
+_TOOL_OPTIONS_REPO = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "knowledge", "tool_options.yaml")
+
+
+def load_tool_options() -> Dict[str, Dict[str, str]]:
+    """`{tool: {category: option_template}}`, or empty if unreadable."""
+    for candidate in (TOOL_OPTIONS, _TOOL_OPTIONS_REPO):
+        if not candidate or not os.path.exists(candidate):
+            continue
+        try:
+            import yaml
+            with open(candidate, encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+            return {t: {k: v for k, v in (opts or {}).items()
+                        if k not in ("note", "probe")}
+                    for t, opts in (data.get("tools") or {}).items()}
+        except Exception as e:  # noqa: BLE001
+            log.warning("tool options catalogue %s unreadable: %s", candidate, e)
+            return {}
+    return {}
+
+
+_probe_cache: Dict[str, Optional[List[str]]] = {}
+
+
+def _load_probes() -> Dict[str, Dict[str, str]]:
+    for candidate in (TOOL_OPTIONS, _TOOL_OPTIONS_REPO):
+        if not candidate or not os.path.exists(candidate):
+            continue
+        try:
+            import yaml
+            with open(candidate, encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+            return {t: (opts or {}).get("probe") or {}
+                    for t, opts in (data.get("tools") or {}).items()}
+        except Exception:  # noqa: BLE001
+            return {}
+    return {}
+
+
+def client_capabilities(tool: str, category: str) -> Optional[List[str]]:
+    """What the TOOL says it supports, by asking it. None when it cannot be asked.
+
+    None and `[]` are different answers and the caller acts differently on each:
+    None means the tool is not installed here so the intersection cannot be
+    computed, `[]` means it was asked and supports nothing in this category.
+    Collapsing them would either constrain a tool to nothing or silently skip a
+    check that could have run.
+    """
+    probe = (_load_probes().get((tool or "").lower()) or {}).get(category)
+    if not probe:
+        return None
+    key = f"{tool}:{category}"
+    if key in _probe_cache:
+        return _probe_cache[key]
+    # Locally first — whoever is asking may well have the tool.
+    try:
+        import shlex
+        import subprocess
+        argv = shlex.split(probe)
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            values = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+            if values:
+                _probe_cache[key] = values
+                return values
+    except Exception as e:  # noqa: BLE001
+        log.debug("local capability probe %r failed: %s", probe, e)
+
+    # Otherwise ask the machine that will actually RUN the tool. rag-api has no
+    # ssh, so deriving from its view produced `+ssh-rsa,ssh-dss` — which the
+    # listener's ssh rejects. The listener is the authority on what its own
+    # tools support and nothing else is.
+    remote = _ask_listener(tool, category)
+    _probe_cache[key] = remote
+    return remote
+
+
+def _ask_listener(tool: str, category: str) -> Optional[List[str]]:
+    """`GET /tools/capabilities` on the kali listener. None if it cannot answer."""
+    base = os.environ.get("KALI_LISTENER_URL") or ""
+    if not base:
+        return None
+    try:
+        import requests
+        r = requests.get(
+            f"{base.rstrip('/')}/tools/capabilities",
+            params={"tool": tool, "category": category},
+            headers={"x-api-key": os.environ.get("API_KEY", "")},
+            timeout=15,
+            verify=os.environ.get("REQUESTS_CA_BUNDLE", False),
+        )
+        if r.status_code != 200:
+            return None
+        values = (r.json().get("categories") or {}).get(category)
+        return values or None
+    except Exception as e:  # noqa: BLE001
+        log.debug("listener capability probe failed for %s/%s: %s", tool, category, e)
+        return None
+
+
+def _category_relevance(error_text: str, category: str, values: List[str]) -> float:
+    """How much this error is talking about this capability category.
+
+    Deliberately lexical and vocabulary-free: it scores the category NAME and the
+    advertised VALUES against the error text. "no acceptable host key" scores on
+    `host-key`; "no match for method server host key algo: server
+    [ssh-rsa,ssh-dss]" scores on both the name and the values. A category nobody
+    anticipated is ranked the same way, which a typed
+    `if "kex" in error: use KexAlgorithms` rule could never do.
+    """
+    low = (error_text or "").lower()
+    if not low:
+        return 0.0
+    score = 0.0
+    words = [w for w in re.split(r"[^a-z0-9]+", category.lower()) if len(w) > 2]
+    if words and all(w in low for w in words):
+        score += 2.0
+    else:
+        score += sum(0.5 for w in words if w in low)
+    # The host's own advertised values appearing in the error is the strongest
+    # signal there is: the tool is quoting them back at us.
+    score += sum(1.0 for v in values if v and v.lower() in low)
+    return score
+
+
+def propose_remediations(
+    tool: str,
+    error_text: str,
+    *,
+    target: str = "",
+    service: str = "",
+    capabilities: Optional[Dict[str, List[str]]] = None,
+    limit: int = 3,
+) -> Dict[str, Any]:
+    """Options worth adding to THIS tool for THIS failure, best first.
+
+    ``{"signature", "phrase", "tool_has_options", "capabilities_available",
+    "candidates": [{"category", "option", "values", "score", "learned"}]}``.
+
+    `tool_has_options` False means the catalogue says this tool takes no
+    algorithm flags — `hydra` and `netexec` genuinely do not — and the answer is
+    a different tool, which `next_tool()` already provides. That is a real
+    answer and distinct from "we have not looked".
+    """
+    sig, phrase = error_signature(error_text)
+    options = load_tool_options().get((tool or "").strip().lower(), {})
+    out: Dict[str, Any] = {
+        "signature": sig, "phrase": phrase,
+        "tool_has_options": bool(options),
+        "capabilities_available": capabilities is not None,
+        "candidates": [],
+    }
+    if not options:
+        return out
+
+    if capabilities is None and target:
+        try:
+            try:
+                from etl.target_capabilities import capabilities as _caps
+            except ImportError:  # pragma: no cover - bare import from within etl/
+                from target_capabilities import capabilities as _caps
+            found = _caps(target, service=service)
+            out["capabilities_available"] = bool(found.get("available"))
+            capabilities = found.get("categories") or {}
+        except Exception as e:  # noqa: BLE001
+            log.debug("capability lookup failed for %s: %s", target, e)
+            capabilities = {}
+    capabilities = capabilities or {}
+
+    learned = {r["option_template"]: r
+               for r in remediations_for(tool, sig, service=service)}
+    scored = []
+    for category, template in options.items():
+        values = capabilities.get(category) or []
+        if not values:
+            # No measurement for this category means no value to fill in. A
+            # template with an empty list would constrain the tool to nothing.
+            continue
+        # Intersect with what the CLIENT knows, when it can be asked. The host
+        # offering ssh-dss does not help if this ssh has removed it: the whole
+        # option is then rejected as `Bad key types '+ssh-rsa,ssh-dss'` and the
+        # connection that +ssh-rsa alone would have made never happens.
+        known = client_capabilities(tool, category)
+        usable = [v for v in values if v in known] if known is not None else list(values)
+        if known is not None and not usable:
+            # Asked, and there is no overlap. That is a finding in its own
+            # right — this client cannot negotiate with this host at all — and
+            # proposing an empty option would just fail differently.
+            scored.append({
+                "category": category, "option": None, "values": values,
+                "client_supports": known[:12],
+                "score": _category_relevance(error_text, category, values),
+                "learned": None,
+                "note": ("no overlap between what the host offers and what this "
+                         "client supports — a different tool is needed, not a "
+                         "different argument"),
+            })
+            continue
+        option = template.replace("{values}", ",".join(usable))
+        scored.append({
+            "category": category,
+            "option": option,
+            "values": usable,
+            "host_offers": list(values),
+            "client_verified": known is not None,
+            "score": _category_relevance(error_text, category, values),
+            "learned": learned.get(option),
+        })
+    # A rule that has already worked outranks any lexical score.
+    scored.sort(key=lambda c: (
+        -(c["learned"]["successes"] if c["learned"] else 0), -c["score"], c["category"]))
+    out["candidates"] = scored[:limit]
+    return out
+
+
+def remediations_for(tool: str, signature: Optional[str], *,
+                     service: str = "") -> List[Dict[str, Any]]:
+    """Every recorded remediation for this exact failure, any status."""
+    if not signature:
+        return []
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, category, option_template, support, attempts,
+                       successes, confidence, status, failure_phrase
+                  FROM public.tool_remediation_learned
+                 WHERE tool = %s AND service = %s AND failure_signature = %s
+                 ORDER BY successes DESC, confidence DESC NULLS LAST
+                """,
+                (tool, service or "", signature),
+            )
+            rows = cur.fetchall()
+    except Exception as e:  # noqa: BLE001
+        log.debug("remediations_for failed: %s", e)
+        return []
+    return [{"id": str(r[0]), "category": r[1], "option_template": r[2],
+             "support": r[3], "attempts": r[4], "successes": r[5],
+             "confidence": float(r[6]) if r[6] is not None else None,
+             "status": r[7], "failure_phrase": r[8]} for r in rows]
+
+
+def best_remediation(tool: str, signature: Optional[str], *,
+                     service: str = "") -> Optional[Dict[str, Any]]:
+    """The option already observed to fix this failure, if there is one."""
+    for r in remediations_for(tool, signature, service=service):
+        if r["status"] == "active" and (r["successes"] or 0) > 0:
+            return r
+    return None
+
+
+def record_remediation(tool: str, signature: str, option: str, *,
+                       category: str = "", service: str = "",
+                       phrase: Optional[str] = None, worked: bool = False,
+                       emit: bool = True) -> Optional[Dict[str, Any]]:
+    """Remember whether adding `option` fixed this failure.
+
+    Both outcomes are recorded. An option tried three times that never helps
+    should stop being offered, and learning only the successes would leave the
+    platform re-adding a useless flag forever.
+    """
+    if not (tool and signature and option):
+        return None
+    try:
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.tool_remediation_learned
+                      (tool, service, failure_signature, category,
+                       option_template, failure_phrase, support, attempts,
+                       successes, confidence, status)
+                    VALUES (%s,%s,%s,%s,%s,%s,1,1,%s,%s,%s)
+                    ON CONFLICT (tool, service, failure_signature, option_template)
+                    DO UPDATE SET
+                      support   = public.tool_remediation_learned.support + 1,
+                      attempts  = public.tool_remediation_learned.attempts + 1,
+                      successes = public.tool_remediation_learned.successes
+                                  + EXCLUDED.successes,
+                      confidence = (public.tool_remediation_learned.successes
+                                    + EXCLUDED.successes)::numeric
+                                   / (public.tool_remediation_learned.attempts + 1),
+                      failure_phrase = COALESCE(
+                          public.tool_remediation_learned.failure_phrase,
+                          EXCLUDED.failure_phrase),
+                      last_seen_at = now(),
+                      status = CASE
+                          WHEN public.tool_remediation_learned.status = 'rejected'
+                               THEN 'rejected'
+                          WHEN public.tool_remediation_learned.successes
+                               + EXCLUDED.successes > 0 THEN 'active'
+                          ELSE public.tool_remediation_learned.status END
+                    RETURNING id, support, attempts, successes, confidence,
+                              status, (xmax = 0) AS inserted
+                    """,
+                    (tool, service or "", signature, category, option, phrase,
+                     1 if worked else 0, 1.0 if worked else 0.0,
+                     "active" if worked else "proposed"),
+                )
+                r = cur.fetchone()
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        log.debug("record_remediation failed: %s", e)
+        return None
+    rule = {"id": str(r[0]), "tool": tool, "option": option, "category": category,
+            "support": r[1], "attempts": r[2], "successes": r[3],
+            "confidence": float(r[4]) if r[4] is not None else None,
+            "status": r[5], "new": bool(r[6]), "service": service,
+            "signature": signature, "phrase": phrase}
+    if emit and rule["new"] and rule["status"] == "active":
+        _emit_webhook({**rule, "failed_tool": tool, "preferred_tool": tool},
+                      "remediation")
+    return rule
 
 
 def rules(

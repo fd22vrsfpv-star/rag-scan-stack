@@ -73,6 +73,37 @@ observed far fewer times.
 column is renamed to say what it counts.
 **Enforced by:** not enforced
 
+### `ssh` is not installed in the Kali container, so the derived fix cannot run
+**Found:** 2026-09-12
+**Evidence:** The correct option is now derived automatically —
+`-oHostKeyAlgorithms=+ssh-rsa` from the intersection of what recon recorded
+(`ssh-audit:host-key-ssh-rsa`, `ssh-audit:host-key-ssh-dss`) and what the client
+supports (`ssh -Q key`) — and it is **verified to work**: from the host,
+`ssh -oHostKeyAlgorithms=+ssh-rsa msfadmin@192.168.1.150` negotiates, while the
+same command without it gives
+`no matching host key type found. Their offer: ssh-rsa,ssh-dss`.
+But `docker exec kali-listener ssh` returns
+`failed to run command 'ssh': No such file or directory`, which is why `ssh` is
+not on the 50-tool allow-list.
+**Where:** `kali_listener/Dockerfile`; `_FALLBACK_ALLOWED_TOOLS`.
+**Done when:** `openssh-client` is installed in the listener image and `ssh` is
+on the allow-list. Both are operator decisions — `ssh host '<command>'` is
+general-purpose remote execution — so they are stated here rather than taken.
+**Enforced by:** `tests/test_credential_followups.py::test_every_followup_names_a_tool_the_platform_can_run`
+(keeps the catalogue honest about what is runnable today)
+
+### A tool with no parser is recorded as having produced nothing measurable
+**Found:** 2026-09-12
+**Evidence:** the netexec run above wrote 6,816 bytes and `parsed_results` was
+NULL, because no parser handles netexec output. It is now recorded
+`success = false, failure_signature = NULL` — honest, but it means the learner
+gets no signal at all from any tool without a parser.
+**Where:** `etl/parse_tool_output.py` (no netexec branch);
+`kali_listener/listener_service.py::_learn_from_execution`.
+**Done when:** netexec output is parsed, or the generic parser extracts enough
+that a run can be judged productive or fruitless.
+**Enforced by:** not enforced
+
 ## Post-execution review
 
 ### The re-run proposer sees a narrower set than the classifier

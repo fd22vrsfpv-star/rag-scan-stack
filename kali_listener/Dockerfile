@@ -125,6 +125,40 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rmg --help 2>&1 | grep -q "remote-method-guesser" \
  || (echo "ERROR: rmg did not install correctly" && exit 1)
 
+# SSH client, for reaching hosts whose algorithms nothing modern will negotiate
+# by default.
+#
+# WHY: 192.168.1.150 is an OpenSSH 4.7p1 offering only ssh-rsa and ssh-dss host
+# keys. hydra fails at key exchange and netexec's paramiko raises
+# `IncompatiblePeer: no acceptable host key`, and neither takes an algorithm
+# flag — so the whole SSH post-access checklist was queued and unrunnable. The
+# real ssh client does take one, and the correct value is derived from what
+# ssh-audit already recorded about the host intersected with `ssh -Q key`:
+#
+#     ssh -oHostKeyAlgorithms=+ssh-rsa msfadmin@192.168.1.150   # connects
+#     ssh msfadmin@192.168.1.150                                 # refuses
+#
+# sshpass comes with it because ssh cannot take a password non-interactively and
+# a credential follow-up has nothing else to offer. It reads the secret from the
+# environment (`-e`), never from argv, so the password does not appear in the
+# process list of a shared host.
+#
+# THIS IS GENERAL-PURPOSE REMOTE EXECUTION. It is allow-listed deliberately and
+# at the operator's request; every dispatch still passes the scope gate, and the
+# stored command is sanitised by _redacted() before it reaches
+# tool_executions.command.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-client sshpass \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+ # Verify both, on output rather than exit status — `ssh -V` prints to stderr
+ # and sshpass exits non-zero with no arguments.
+ && ssh -V 2>&1 | grep -q "OpenSSH" \
+ && ssh -Q key 2>/dev/null | grep -q "ssh-ed25519" \
+ && (sshpass -h 2>&1 | grep -qi "sshpass" || true) \
+ && command -v sshpass >/dev/null \
+ || (echo "ERROR: ssh/sshpass did not install correctly" && exit 1)
+
 # Deliberately NOT installed here:
 #   metasploit-framework (~2GB) — the stack already runs a dedicated `metasploit`
 #     container with msfrpcd, which exploit-runner drives over RPC. A second copy

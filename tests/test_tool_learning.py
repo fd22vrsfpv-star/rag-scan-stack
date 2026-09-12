@@ -499,3 +499,43 @@ def test_an_unmeasured_run_teaches_nothing_about_fruitlessness(store):
                              status="completed", exit_code=0, output="done",
                              emit=False)
     assert a["recorded"] and not a["fruitless"] and a["signature"] is None, a
+    assert a["unmeasured"] is True, a
+
+
+def test_an_unmeasured_run_is_not_recorded_as_a_success(store):
+    """Caught on a live run, not by reading.
+
+    netexec against a legacy-SSH host exited 0 with a Python traceback in its
+    output — `IncompatiblePeer: no acceptable host key` — and no parser to read
+    it. `parsed_results` was NULL, so the run was "unmeasured", and unmeasured
+    collapsed to `success = true`. It could then have ACTIVATED a rule as proof
+    that netexec works after some other tool failed, out of a run nobody read.
+    """
+    import psycopg2
+    target = f"198.51.100.{uuid.uuid4().int % 200 + 1}"
+    a = tl.observe_execution("netexec", service=store, target=target, port=22,
+                             status="completed", exit_code=0,
+                             output="IncompatiblePeer: no acceptable host key",
+                             emit=False)
+    assert a["unmeasured"] and not a["failed"]
+    with psycopg2.connect(tl.DB_DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT success, failure_signature FROM public.tool_attempts "
+                    "WHERE id = %s::uuid", (a["attempt_id"],))
+        success, sig = cur.fetchone()
+    assert success is False, "an unmeasured run was recorded as a success"
+    assert sig is None, "an unmeasured run acquired a failure signature"
+
+
+def test_an_unmeasured_run_cannot_activate_a_rule(store):
+    """It must not be the 'later success' that makes a rule active."""
+    target = f"198.51.100.{uuid.uuid4().int % 200 + 1}"
+    tl.observe_execution("toolX", service=store, target=target, port=22,
+                         status="failed", exit_code=1,
+                         error="connection reset by peer", emit=False)
+    later = tl.observe_execution("toolY", service=store, target=target, port=22,
+                                 status="completed", exit_code=0,
+                                 output="ran, nobody parsed it", emit=False)
+    assert later["unmeasured"]
+    assert later["learned"] == [], (
+        "an unmeasured run taught a rule — a run nobody read became proof that "
+        "toolY works")
