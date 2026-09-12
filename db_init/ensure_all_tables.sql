@@ -2892,6 +2892,62 @@ CREATE TRIGGER trg_tool_selection_learned_updated
   BEFORE UPDATE ON public.tool_selection_learned
   FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
 
+-- ============================================================================
+-- Learned remediations: the ARGUMENT that fixes a failure, not just the tool
+-- ----------------------------------------------------------------------------
+-- tool_selection_learned answers "which other tool should I reach for". This
+-- answers the question before it: "can this tool be made to work by telling it
+-- something the target already told us".
+--
+-- The case that produced it: netexec and hydra both fail against
+-- 192.168.1.150 because the host is an OpenSSH 4.7p1 offering only ssh-rsa and
+-- ssh-dss host keys. ssh-audit had ALREADY recorded exactly that, 24 findings
+-- of it, before either failure happened. Nothing read it back, so the platform
+-- kept discovering by trial what it had already measured.
+--
+-- A row here pairs a failure signature with an option string, and counts
+-- whether adding it helped. The option is PROPOSED from the target's advertised
+-- capabilities (etl/target_capabilities.py) and the tool's own syntax
+-- (knowledge/tool_options.yaml); only whether it WORKED is learned.
+--
+-- Same discipline as tool_selection_learned: an operator rejection is durable,
+-- counters only move forward, and this decides an argument — never whether
+-- something may run.
+CREATE TABLE IF NOT EXISTS public.tool_remediation_learned (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tool              text NOT NULL,
+    service           text NOT NULL DEFAULT '',
+    failure_signature text NOT NULL,
+    -- The capability category the option expresses, e.g. 'host-key'. Kept so a
+    -- rule can be read without parsing the option string.
+    category          text NOT NULL DEFAULT '',
+    option_template   text NOT NULL,
+    failure_phrase    text,
+    support           integer NOT NULL DEFAULT 0,
+    attempts          integer NOT NULL DEFAULT 0,
+    successes         integer NOT NULL DEFAULT 0,
+    confidence        numeric,
+    status            text NOT NULL DEFAULT 'proposed'
+                      CHECK (status IN ('active','proposed','rejected')),
+    source            text NOT NULL DEFAULT 'observed',
+    reviewed_by       text,
+    created_at        timestamptz DEFAULT now(),
+    updated_at        timestamptz DEFAULT now(),
+    last_seen_at      timestamptz DEFAULT now()
+);
+-- Every key column is NOT NULL with a '' default so the index constrains every
+-- row: in Postgres a NULL makes rows non-equal and the constraint would not
+-- apply to exactly the rows most likely to be duplicated.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_tool_remediation_learned_rule
+  ON public.tool_remediation_learned
+     (tool, service, failure_signature, option_template);
+CREATE INDEX IF NOT EXISTS idx_tool_remediation_lookup
+  ON public.tool_remediation_learned (tool, service, failure_signature, status);
+DROP TRIGGER IF EXISTS trg_tool_remediation_learned_updated ON public.tool_remediation_learned;
+CREATE TRIGGER trg_tool_remediation_learned_updated
+  BEFORE UPDATE ON public.tool_remediation_learned
+  FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+
 -- Agent-to-agent feedback channel. One agent flags something interesting (a
 -- finding worth another run, a coverage gap); a coordinator turns approved flags
 -- into scan_recommendations (which the recon agent dispatches through the scope
