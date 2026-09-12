@@ -121,6 +121,67 @@ async def analyze_extractor(body: dict):
         return safe_json(resp)
 
 
+# ── Methodology playbooks ───────────────────────────────────────────────
+#
+# The playbooks were RAG context only. These proxies make the extracted steps
+# reachable from the dashboard. They answer questions and dispatch nothing.
+
+@router.get("/api/playbooks")
+async def list_playbooks():
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/playbooks",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.get("/api/playbooks/checklist")
+async def playbook_checklist(service: str = "", playbook: Optional[str] = None,
+                             access: str = "none", target: Optional[str] = None,
+                             port: Optional[int] = None, username: Optional[str] = None,
+                             include_mutating: bool = False):
+    """What the methodology says to check on this host, target filled in."""
+    s = get_settings()
+    params: dict = {"service": service, "access": access,
+                    "include_mutating": str(bool(include_mutating)).lower()}
+    for k, v in (("playbook", playbook), ("target", target),
+                 ("port", port), ("username", username)):
+        if v is not None:
+            params[k] = v
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/playbooks/checklist", params=params,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.get("/api/playbooks/coverage")
+async def playbook_coverage(service: str, access: str = "shell",
+                            done: Optional[str] = None):
+    s = get_settings()
+    params: dict = {"service": service, "access": access}
+    if done:
+        params["done"] = done
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/playbooks/coverage", params=params,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.get("/api/playbooks/{name}")
+async def get_playbook(name: str):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/playbooks/{name}",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
 # ── Post-execution review (post_review_agent) ───────────────────────────
 #
 # The agent has existed for a while and had NO proxy, so none of it was reachable

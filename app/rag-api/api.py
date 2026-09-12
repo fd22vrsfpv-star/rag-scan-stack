@@ -21469,6 +21469,109 @@ def export_extractor_learned(tool: Optional[str] = None, _: bool = Depends(auth)
     return {"ok": True, "tools": list(out), "yaml": out}
 
 
+# ── Methodology playbooks (knowledge/playbooks) ────────────────────────────
+#
+# 3,896 lines of methodology across twelve services were RAG context and nothing
+# else: a model could be told about a step, but nothing could enumerate the steps
+# for a host, run one, or record whether any had been done. The markdown stays
+# authoritative; scripts/playbooks_to_yaml.py extracts the steps and
+# etl/playbooks.py reads them.
+#
+# These endpoints ANSWER QUESTIONS. They dispatch nothing. A step a caller
+# chooses to run still passes the scope gate and its phase's approval, and
+# mutating steps — 45 of 266, `useradd backdoor` among them — are excluded
+# unless asked for explicitly.
+
+@app.get("/playbooks", tags=["Playbooks"])
+def list_playbooks(_: bool = Depends(auth)):
+    """Available playbooks, with their phase and step counts."""
+    from etl import playbooks as pb
+    out = []
+    for name in pb.available():
+        doc = pb.load(name)
+        phases = doc.get("phases") or []
+        out.append({
+            "name": name,
+            "title": doc.get("title"),
+            "source": doc.get("source"),
+            "phases": len(phases),
+            "steps": sum(len(p.get("steps") or []) for p in phases),
+            # Present when the extractor could not structure the file. Reported
+            # rather than shown as an empty playbook, which reads as "nothing to
+            # do here" instead of "this file needs headings".
+            "unstructured": doc.get("unstructured"),
+        })
+    return {"count": len(out), "playbooks": out}
+
+
+@app.get("/playbooks/checklist", tags=["Playbooks"])
+def playbook_checklist(
+    service: str = Query("", description="ssh, smb, mysql, http, ftp, ..."),
+    playbook: Optional[str] = Query(None, description="explicit playbook name"),
+    access: str = Query("none", description="what you HAVE: none | credential | shell"),
+    target: Optional[str] = Query(None),
+    port: Optional[int] = Query(None),
+    username: Optional[str] = Query(None),
+    include_mutating: bool = Query(False, description="include steps that CHANGE the target"),
+    _: bool = Depends(auth),
+):
+    """What the methodology says to check here, with the target filled in.
+
+    `access` is what the caller already has, and steps needing more are filtered
+    out — a recon consumer must not be handed post-exploitation commands. This
+    is the answer to "what is the post-enumeration list for this host", which
+    nothing could produce while the playbooks were prose.
+    """
+    from etl import playbooks as pb
+    try:
+        # The flag has to reach steps_for(): filtering the RESULT is a no-op,
+        # because checklist() has already excluded mutating steps by default.
+        # That made include_mutating=true silently identical to false.
+        items = pb.checklist(service, playbook=playbook, access=access,
+                             include_mutating=include_mutating,
+                             target=target, port=port, username=username)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {
+        "service": service, "access": access,
+        "count": len(items),
+        # Distinct from an empty list: no playbook COVERS this service, versus
+        # the playbook has nothing at this access level.
+        "covered_by": pb.playbooks_for(service) if not playbook else [playbook],
+        "items": items,
+    }
+
+
+@app.get("/playbooks/coverage", tags=["Playbooks"])
+def playbook_coverage(
+    service: str = Query(...),
+    access: str = Query("shell"),
+    done: Optional[str] = Query(None, description="comma-separated step ids already done"),
+    _: bool = Depends(auth),
+):
+    """How much of the methodology has been done, and what is left.
+
+    A report that cannot say what was SKIPPED is not a report of coverage, and
+    nothing could answer this before because nothing could enumerate the steps.
+    """
+    from etl import playbooks as pb
+    done_ids = [d.strip() for d in (done or "").split(",") if d.strip()]
+    try:
+        return pb.coverage(service, done_ids=done_ids, access=access)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/playbooks/{name}", tags=["Playbooks"])
+def get_playbook(name: str, _: bool = Depends(auth)):
+    """One playbook in full, phases and steps as extracted."""
+    from etl import playbooks as pb
+    doc = pb.load(name)
+    if not doc:
+        raise HTTPException(404, f"playbook {name} not found")
+    return doc
+
+
 # ── Learned tool selection (tool_selection_learned) ────────────────────────
 #
 # The review surface for etl/tool_learning.py. Those rules are derived from what

