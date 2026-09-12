@@ -1239,7 +1239,25 @@ def _engagement_preapproval(sid: str):
 # A ceiling on how many exploits one session may execute, even with every one
 # approved. Exploits are heavier and less reversible than scans, and a planner
 # that queues thirty against one host should still not fire thirty unattended.
-MAX_EXPLOITS_PER_SESSION = int(os.environ.get("MAX_EXPLOITS_PER_SESSION", "10"))
+# Sanity bound on how many queued candidates pre-approval (or the operator's
+# "approve everything") will approve for one session. Generous on purpose: the
+# real execution governor is now MAX_EXPLOITS_PER_PORT (below). A flat session
+# total was the wrong shape — it dropped whole ports (the first N by age),
+# leaving a foothold on a later service never tried. This only stops a
+# pathological queue of thousands being approved in one go.
+MAX_EXPLOITS_PER_SESSION = int(os.environ.get("MAX_EXPLOITS_PER_SESSION", "200"))
+
+# How many exploits may be attempted against a SINGLE unique port before moving
+# on. Per-port, not per-session: every unique port gets its shell-yielding
+# exploits attempted. A port stops early the moment one attempt yields a shell —
+# there is no value in a second foothold on a port we already hold, and the
+# access ranker measures and picks among shells across ports afterwards.
+MAX_EXPLOITS_PER_PORT = int(os.environ.get("MAX_EXPLOITS_PER_PORT", "25"))
+
+# Exploit types that can hand back an interactive shell / session. Only these
+# satisfy the "stop this port on first shell" condition; dos and pure scanners
+# never do, so on a port they are attempted only after the shell-yielding ones.
+_SHELL_EXPLOIT_TYPES = {"rce", "file_upload"}
 
 
 def _pending_exploits_for_session(sid: str):
@@ -1369,17 +1387,65 @@ def _mark_approved(pending_id, who: str, note: str = None) -> None:
         _log.warning("approve_exploit(%s) failed: %s", pending_id, _e)
 
 
+def _gave_shell(result_str: str) -> bool:
+    """True when an exploit attempt actually got us in.
+
+    execute_approved_exploit returns JSON with ok/success, and for Metasploit a
+    session_id/session_type when a session opened. ok+success is the foothold
+    signal — a Metasploit session, or an exploitdb script that ran and reported
+    success. The caller only asks this for shell-yielding exploit types, so a
+    scanner's 'success' can never be mistaken for a shell here.
+    """
+    try:
+        d = json.loads(result_str)
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(d.get("ok") and d.get("success"))
+
+
+def _exploit_meta(ids):
+    """Per-exploit facts needed to group and order execution: unique port,
+    whether the type can yield a shell, and evidence strength.
+
+    One query keyed by id. Ids the query does not return are simply absent, and
+    the caller treats an absent id as a port-less, non-shell candidate — so a
+    lookup failure degrades to "attempt each once", never to "attempt nothing".
+    """
+    out = {}
+    if not ids:
+        return out
+    try:
+        from db_utils import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id::text, target_port, exploit_type, exploit_category, "
+                "       match_confidence "
+                "  FROM pending_exploits WHERE id = ANY(%s::uuid[])",
+                ([str(i) for i in ids],))
+            for rid, port, etype, cat, conf in cur.fetchall():
+                out[rid] = {"port": port, "etype": etype,
+                            "category": cat, "confidence": conf}
+    except Exception as e:  # noqa: BLE001
+        _log.warning("exploit metadata lookup failed: %s", e)
+    return out
+
+
 def exploit_exec(state: PentestState) -> dict:
-    """Execute the operator-approved exploits through the SAME gated tool body.
+    """Execute the operator-approved exploits, grouped by UNIQUE PORT.
 
     Every approved id, not just the first. A host with 26 open services yielded
     one queued exploit and one execution, and the operator had no way to tell
     whether the rest had been considered or never looked at.
 
-    Sequential and bounded on purpose. Exploits are heavier and less reversible
-    than scans, so they are not fired in parallel, and MAX_EXPLOITS_PER_SESSION
-    caps the run even when everything is approved — a planner that queues thirty
-    against one host should still not fire thirty unattended.
+    Grouped by unique port, shell-yielding candidates first (strongest evidence
+    first), and a port STOPS the moment one attempt lands a shell — a second
+    foothold on a port we already hold is wasted noise on the target, and the
+    access ranker measures and picks among shells across ports afterwards.
+
+    Sequential on purpose (exploits are heavier and less reversible than scans,
+    so never fired in parallel), and bounded PER PORT by MAX_EXPLOITS_PER_PORT
+    rather than by a flat session total — a flat total dropped whole ports, so a
+    foothold on a late service was never tried. Every unique port is covered.
     """
     sid = state["session_id"]
     decision = state.get("exploit_decision") or {}
@@ -1388,7 +1454,7 @@ def exploit_exec(state: PentestState) -> dict:
         # Resumed from a checkpoint written before this took a list.
         one = decision.get("pending_exploit_id")
         pending_ids = [one] if one else []
-    pending_ids = [str(p) for p in pending_ids if p][:MAX_EXPLOITS_PER_SESSION]
+    pending_ids = [str(p) for p in pending_ids if p]
 
     if not pending_ids:
         _msg(sid, "Exploit",
@@ -1400,27 +1466,83 @@ def exploit_exec(state: PentestState) -> dict:
                 "findings": ["exploit_exec: skipped (no id)"],
                 "log": ["exploit_exec skipped: no pending_exploit_id"]}
 
-    executed, failed = [], []
+    # Group by unique port; a port-less exploit is its own group so it still runs
+    # exactly once. Order preserved so the operator's evidence ordering shows.
+    metas = _exploit_meta(pending_ids)
+    groups, order = {}, []
     for pid in pending_ids:
+        m = metas.get(pid) or {}
+        port = m.get("port")
+        key = port if port is not None else f"_noport:{pid}"
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(pid)
+
+    def _rank(pid):
+        # Shell-yielding first (only these can end the port early), then by
+        # evidence strength descending.
+        m = metas.get(pid) or {}
+        is_shell = 0 if (m.get("etype") in _SHELL_EXPLOIT_TYPES
+                         and m.get("category") != "dos") else 1
         try:
-            _mark_approved(pid, "operator (exploit approval)", decision.get("note"))
-            result = _tool(scan_tools.execute_approved_exploit, pid)
-            _msg(sid, "Exploit", f"[execute_approved_exploit {pid}]\n{result[:1200]}")
-            executed.append(pid)
-        except Exception as e:  # noqa: BLE001
-            # One failure must not abandon the rest. An exploit that errors is a
-            # result; the ones after it never running is a gap.
-            _msg(sid, "Exploit", f"[execute_approved_exploit {pid}] FAILED: {e}")
-            failed.append(pid)
+            conf = float(m.get("confidence") or 0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        return (is_shell, -conf)
+
+    executed, failed, shells, per_port = [], [], [], []
+    for key in order:
+        ids = sorted(groups[key], key=_rank)
+        port = None if str(key).startswith("_noport:") else key
+        got_shell, attempted = False, 0
+        for pid in ids:
+            if attempted >= MAX_EXPLOITS_PER_PORT:
+                _msg(sid, "Exploit",
+                     f"[port {port}] reached MAX_EXPLOITS_PER_PORT="
+                     f"{MAX_EXPLOITS_PER_PORT}; {len(ids) - attempted} "
+                     f"candidate(s) not attempted on this port.")
+                break
+            attempted += 1
+            try:
+                _mark_approved(pid, "operator (exploit approval)",
+                               decision.get("note"))
+                result = _tool(scan_tools.execute_approved_exploit, pid)
+                _msg(sid, "Exploit",
+                     f"[execute_approved_exploit {pid} port={port}]\n"
+                     f"{result[:1200]}")
+                executed.append(pid)
+                m = metas.get(pid) or {}
+                if (m.get("etype") in _SHELL_EXPLOIT_TYPES
+                        and m.get("category") != "dos" and _gave_shell(result)):
+                    got_shell = True
+                    shells.append(pid)
+                    _msg(sid, "Exploit",
+                         f"[port {port}] shell obtained via {pid} — stopping this "
+                         f"port; {len(ids) - attempted} remaining candidate(s) "
+                         f"not needed.")
+                    break
+            except Exception as e:  # noqa: BLE001
+                # One failure must not abandon the rest — of this port OR the
+                # ports after it. An exploit that errors is a result; the ones
+                # after it never running is a gap.
+                _msg(sid, "Exploit",
+                     f"[execute_approved_exploit {pid} port={port}] FAILED: {e}")
+                failed.append(pid)
+        per_port.append({"port": port, "candidates": len(ids),
+                         "attempted": attempted, "shell": got_shell})
 
     _emit("langgraph_exploit_executed", sid,
           {"executed": len(executed), "failed": len(failed),
+           "shells": len(shells), "ports": len(order), "per_port": per_port,
            "pending_exploit_ids": executed})
-    findings = [f"exploit_exec: executed {len(executed)} of {len(pending_ids)}"]
+    findings = [f"exploit_exec: {len(order)} unique port(s); {len(executed)} run, "
+                f"{len(shells)} shell(s), {len(failed)} failed"]
     if failed:
         findings.append(f"exploit_exec: {len(failed)} failed to execute")
     return {"phase": "post_enumeration", "findings": findings,
-            "log": [f"exploit_exec: executed={executed} failed={failed}"]}
+            "log": [f"exploit_exec: ports={len(order)} executed={executed} "
+                    f"shells={shells} failed={failed}"]}
 
 
 # How many passes the loop may make before it reports regardless.
