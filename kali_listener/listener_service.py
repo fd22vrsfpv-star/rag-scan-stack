@@ -2731,6 +2731,54 @@ async def wordlist_inventory(max_files: int = 2000, min_lines: int = 2,
             "wordlists": out}
 
 
+class AccessRunRequest(BaseModel):
+    """Run one command through access the platform already holds."""
+    kind: str = Field(..., description="msf_session | bind_shell | ssh_credential | listener_callback")
+    handle: str = Field(..., description="session id, host:port, or user:secret")
+    command: str = Field(..., description="the command to run through it")
+    target: Optional[str] = Field(None)
+    port: Optional[int] = Field(None)
+
+
+@app.post("/access/run")
+def access_run(request: AccessRunRequest):
+    """Execute a command through access that already exists.
+
+    WHY THIS IS NOT /tools/execute. That endpoint dispatches a TOOL at a target
+    and is governed by the allow-list, which is the right control for starting
+    new activity. This is a different operation: the access was already obtained
+    by an approved exploit or a discovered credential, and the command runs
+    inside it. `nc` is not on the allow-list and should not be — but reaching a
+    bind shell we already have is not the same as handing an operator netcat.
+
+    WHY IT LIVES HERE. This container is the one with the tools. autogen-agents
+    has `nc` but no `ssh` and no `sshpass`, so probing from there would score
+    every SSH credential zero and rank the access wrongly — a shell would be
+    chosen because the others could not be tested, not because it was better.
+
+    Bounded and non-interactive: one command, one timeout, output returned. It
+    opens nothing and starts nothing.
+    """
+    try:
+        from etl.access import TRANSPORTS
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(503, f"access transports unavailable: {e}")
+    fn = TRANSPORTS.get(request.kind)
+    if not fn:
+        # Refused, never guessed. A fallback would run the command through a
+        # different transport than the caller chose.
+        raise HTTPException(400, f"unsupported transport: {request.kind!r}")
+    try:
+        out = fn(request.handle, request.command,
+                 target=request.target, port=request.port)
+        return {"ok": True, "kind": request.kind, "output": out or "", "error": ""}
+    except Exception as e:  # noqa: BLE001
+        # A dead shell is a RESULT, not a server error: the caller is probing
+        # precisely to find out whether it answers.
+        return {"ok": False, "kind": request.kind, "output": "",
+                "error": f"{type(e).__name__}: {e}"[:300]}
+
+
 @app.get("/tools/capabilities")
 def tool_capabilities(tool: str, category: str = ""):
     """What a tool installed HERE says it supports.

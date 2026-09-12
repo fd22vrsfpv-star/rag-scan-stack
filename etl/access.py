@@ -149,24 +149,89 @@ TRANSPORTS: Dict[str, Callable[..., str]] = {
 }
 
 
+# Prefer the Kali container. It is the one with the tools: autogen-agents has
+# `nc` but no `ssh` and no `sshpass`, so probing from there scores every SSH
+# credential zero and ranks the access wrongly — a shell gets chosen because the
+# others could not be tested, not because it was better.
+#
+# Local execution stays as the fallback for when the listener is unreachable,
+# and says so, because a probe that could not run is not a shell that did not
+# answer.
+PREFER_LISTENER = os.environ.get("ACCESS_PREFER_LISTENER", "1") != "0"
+
+
+def _run_via_listener(access: Dict[str, Any], command: str) -> Optional[Dict[str, Any]]:
+    """Ask the Kali container to run it. None when the listener cannot be asked."""
+    if not (PREFER_LISTENER and KALI_LISTENER_URL):
+        return None
+    try:
+        import requests
+        r = requests.post(
+            f"{KALI_LISTENER_URL.rstrip('/')}/access/run",
+            json={"kind": access.get("kind"), "handle": access.get("handle"),
+                  "command": command, "target": access.get("target"),
+                  "port": access.get("port")},
+            timeout=PROBE_TIMEOUT + 10,
+            headers={"x-api-key": os.environ.get("API_KEY", "")},
+            verify=os.environ.get("REQUESTS_CA_BUNDLE", False))
+        if r.status_code == 400:
+            # The listener refused the transport. That is an answer, not a
+            # reason to try it locally with a different one.
+            return {"ok": False, "output": "", "error": r.text[:300],
+                    "via": "kali-listener"}
+        if r.status_code != 200:
+            return None
+        body = r.json() or {}
+        return {"ok": bool(body.get("ok")), "output": body.get("output") or "",
+                "error": body.get("error") or "", "via": "kali-listener"}
+    except Exception as e:  # noqa: BLE001
+        log.debug("listener access run failed, falling back locally: %s", e)
+        return None
+
+
+def _have_local_tool(kind: str) -> bool:
+    """Whether THIS container can run that transport at all.
+
+    Saying "the shell did not answer" when the tool to reach it is not installed
+    is the same mistake as recording an unparsed run as fruitless — a probe that
+    could not run is not a negative result.
+    """
+    import shutil
+    needed = {"bind_shell": "nc", "ssh_credential": "sshpass"}.get(kind)
+    return needed is None or shutil.which(needed) is not None
+
+
 def run(access: Dict[str, Any], command: str) -> Dict[str, Any]:
     """Run one command through one access. Never raises.
 
-    ``{"ok", "output", "error"}``. A transport with no runner reports
-    `unsupported transport` rather than falling back to something else — a
-    silent fallback would mean the operator believes a command ran through the
-    access they chose when it ran through a different one.
+    ``{"ok", "output", "error", "via"}``. Routed through the Kali container by
+    preference; a transport with no runner is refused rather than falling back
+    to something else, because a silent fallback would mean the operator
+    believes a command ran through the access they chose when it ran through a
+    different one.
     """
-    fn = TRANSPORTS.get(access.get("kind") or "")
-    if not fn:
-        return {"ok": False, "output": "",
-                "error": f"unsupported transport: {access.get('kind')!r}"}
+    kind = access.get("kind") or ""
+    if kind not in TRANSPORTS:
+        return {"ok": False, "output": "", "via": "none",
+                "error": f"unsupported transport: {kind!r}"}
+
+    remote = _run_via_listener(access, command)
+    if remote is not None:
+        return remote
+
+    if not _have_local_tool(kind):
+        return {"ok": False, "output": "", "via": "local",
+                "error": (f"cannot reach a {kind} from this container and the "
+                          f"kali-listener is unavailable — not probed, which is "
+                          f"not the same as not answering")}
     try:
-        out = fn(access.get("handle") or "", command,
-                 target=access.get("target"), port=access.get("port"))
-        return {"ok": True, "output": out or "", "error": ""}
+        out = TRANSPORTS[kind](access.get("handle") or "", command,
+                               target=access.get("target"),
+                               port=access.get("port"))
+        return {"ok": True, "output": out or "", "error": "", "via": "local"}
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"[:300]}
+        return {"ok": False, "output": "", "via": "local",
+                "error": f"{type(e).__name__}: {e}"[:300]}
 
 
 # ── Ranking ────────────────────────────────────────────────────────────────

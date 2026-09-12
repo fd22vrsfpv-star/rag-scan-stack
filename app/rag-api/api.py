@@ -21469,6 +21469,100 @@ def export_extractor_learned(tool: Optional[str] = None, _: bool = Depends(auth)
     return {"ok": True, "tools": list(out), "yaml": out}
 
 
+# ── Access the platform holds (obtained_access) ────────────────────────────
+#
+# Shells obtained by an approved exploit, credentials that work, reverse shells
+# caught by the listener. Every one is MEASURED — `id` for privilege, repeated
+# probes for stability — so post-enumeration can run through the best one rather
+# than through all of them.
+#
+# Surfaced next to credentials because it is the same question at a later stage:
+# credentials are what we can log in with, access is what we are already inside.
+
+@app.get("/assets/{ip}/access", tags=["Access"])
+def asset_access(ip: str, include_dead: bool = Query(False),
+                 _: bool = Depends(auth)):
+    """Access currently held on this host, best first."""
+    where, params = ["target = %s"], [ip]
+    if not include_dead:
+        # A dead access is still worth showing on request: "we had a shell here
+        # and it stopped answering" is a finding about the host.
+        where.append("status <> 'dead'")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""SELECT id::text, target, port, kind, handle, transport, whoami,
+                       uid, is_root, os_info, probes, probes_ok, last_probe_at,
+                       last_error, score, status, source_exploit::text,
+                       created_at, updated_at
+                  FROM obtained_access
+                 WHERE {' AND '.join(where)}
+                 ORDER BY (status = 'live') DESC, score DESC, updated_at DESC""",
+            params)
+        rows = [dict(r) for r in cur.fetchall()]
+    # The handle for an ssh_credential is `user:secret`. It is shown in a UI
+    # panel, so the secret is masked here the same way the credential row's is —
+    # the password is already available, deliberately, behind a Reveal click.
+    for r in rows:
+        if r.get("kind") == "ssh_credential" and ":" in (r.get("handle") or ""):
+            user, _, secret = r["handle"].partition(":")
+            r["username"] = user
+            r["handle"] = f"{user}:{'*' * min(len(secret), 8)}"
+    live = [r for r in rows if r["status"] == "live" and r["score"]]
+    return {
+        "target": ip, "count": len(rows), "live": len(live),
+        "best": live[0] if live else None,
+        "access": rows,
+    }
+
+
+@app.post("/assets/{ip}/access/refresh", tags=["Access"])
+def asset_access_refresh(ip: str, rounds: int = Query(None, ge=1, le=10),
+                         x_operator: str = Header("operator", alias="X-Operator"),
+                         _: bool = Depends(auth)):
+    """Re-discover and re-probe every access on this host.
+
+    Probing costs a few commands per candidate through access that already
+    exists. It opens nothing and starts nothing — but it does touch the host, so
+    it is an explicit action rather than something a page load does.
+    """
+    from etl import access as ax
+    result = ax.refresh(ip, rounds=rounds)
+    if not result.get("available") and result.get("discovered"):
+        raise HTTPException(503, "access store unreachable; nothing was recorded")
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("access_probed", "access", {
+            "target": ip, "actor": x_operator, "discovered": result["discovered"],
+            "live": result["live"], "best": result.get("best")})
+    except Exception:
+        log.warning("access probe webhook emit failed", exc_info=True)
+    return {"ok": True, "actor": x_operator, **result}
+
+
+@app.post("/assets/access/{access_id}/{action}", tags=["Access"])
+def review_access(access_id: str, action: str,
+                  x_operator: str = Header("operator", alias="X-Operator"),
+                  _: bool = Depends(auth)):
+    """Reject an access so nothing uses it, or reinstate one.
+
+    A rejection is durable: `refresh()` will not un-reject it when the shell
+    answers again. An operator who rules a shell out — noisy, monitored, someone
+    else's — is not overruled by it being reachable.
+    """
+    statuses = {"reject": "rejected", "reinstate": "unverified"}
+    if action not in statuses:
+        raise HTTPException(400, "action must be reject or reinstate")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("UPDATE obtained_access SET status = %s "
+                    " WHERE id = %s::uuid RETURNING id::text, kind, handle, status",
+                    (statuses[action], access_id))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"access {access_id} not found")
+        conn.commit()
+    return {"ok": True, "actor": x_operator, **dict(row)}
+
+
 # ── Parser coverage (which tools nobody can read) ──────────────────────────
 #
 # "No parser exists for this tool" is a DIFFERENT state from "the parser found
