@@ -28,6 +28,15 @@ import pytest
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 _MODULE = os.path.join(REPO, "common", "tool_job.py")
 
+# The module under test pulls in third-party packages a bare checkout does not
+# have. Two different things can go wrong and they must not look the same:
+#   * the FILE is gone            -> a real defect, fail loudly
+#   * a DEPENDENCY is missing     -> "cannot run here", skip
+# A bare ModuleNotFoundError at collection time collapses both into a red suite,
+# and a permanently red baseline makes a new failure invisible.
+if not os.path.exists(_MODULE):
+    raise AssertionError(f"{_MODULE} is missing — common/tool_job.py was moved or deleted")
+
 
 def _load(limit):
     """Fresh import with MAX_CONCURRENT_SCANS set — the semaphore is built at
@@ -171,7 +180,15 @@ def test_slots_are_released_when_a_tool_fails(monkeypatch):
 # fastapi + the app package), no docker.
 import re
 
-import yaml as _yaml  # noqa: E402  (optional; guarded below)
+# Genuinely optional: only the compose-wiring tests below need it, and the
+# concurrency tests above must still run without it. The comment here used to
+# say "guarded below" while the import was bare, so a runner without PyYAML got
+# a COLLECTION ERROR and lost the whole module — including the tests that had no
+# use for yaml at all.
+try:
+    import yaml as _yaml  # noqa: E402
+except ModuleNotFoundError:  # pragma: no cover - depends on the runner
+    _yaml = None
 
 _COMPOSE = os.path.join(REPO, "docker-compose.yml")
 _RECON = os.path.join(REPO, "dashboard", "bff", "services", "recon_agent.py")
@@ -195,6 +212,8 @@ _BOUNDED_VIA_MOUNTED_COMMON = {
 
 
 def _read_compose():
+    if _yaml is None:
+        pytest.skip("PyYAML not installed; compose wiring cannot be parsed here")
     if not os.path.exists(_COMPOSE):
         pytest.skip("docker-compose.yml not present")
     with open(_COMPOSE, encoding="utf-8") as fh:
