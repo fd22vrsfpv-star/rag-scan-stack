@@ -2007,6 +2007,49 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                        .replace("{password_list}", _STATIC_PASSWORD_LIST),
                 "static_fallback")
 
+    def _resolve_credential(rec) -> dict:
+        """The credential a follow-up recommendation was queued for.
+
+        `etl/credential_followups.py` deliberately does NOT write the secret into
+        the stored command — a command string is rendered in the UI, written into
+        reports and exported. It stores `credential_id` in `extra` and leaves
+        `{password}` literal for resolution HERE, at dispatch, in memory.
+
+        Without this the whole feature was inert: `_fill_placeholders` found an
+        unresolved `{password}`, and every credential follow-up was skipped with
+        "no value known for it". Ten queued follow-ups, none runnable.
+
+        Returns `{}` when there is nothing to resolve, which leaves `{password}`
+        unresolved and the dispatch correctly skipped.
+        """
+        extra = rec.get("extra") or {}
+        if isinstance(extra, str):
+            try:
+                import json as _json
+                extra = _json.loads(extra)
+            except Exception:  # noqa: BLE001
+                return {}
+        cred_id = (extra or {}).get("credential_id")
+        if not cred_id:
+            return {}
+        try:
+            from db import get_db
+            with get_db() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT username, secret_value FROM credential_findings "
+                    "WHERE id = %s::uuid", (cred_id,))
+                row = cur.fetchone()
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not resolve credential %s for recommendation %s: %s",
+                        cred_id, rec.get("id"), e)
+            return {}
+        if not row:
+            # The credential was deleted after the follow-up was queued. Leaving
+            # it unresolved is correct: the dispatch is skipped with a message,
+            # rather than running against a credential that no longer exists.
+            return {}
+        return {"username": row[0], "password": row[1]}
+
     def _fill_placeholders(command: str, rec) -> tuple:
         """Substitute {target}/{ip}/{port}/{service} in a recommendation's script.
 
@@ -2031,8 +2074,34 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             out = out.replace("{port}", str(port))
         if service:
             out = out.replace("{service}", service)
+        # Credential follow-ups carry the secret by reference, not by value.
+        # Resolved here and only here — the substituted string never goes back
+        # to the database, and `_secrets_in` below names it for redaction so it
+        # does not reach tool_executions.command either.
+        if "{password}" in out or "{username}" in out or "{credential_id}" in out:
+            cred = _resolve_credential(rec)
+            if cred.get("username"):
+                out = out.replace("{username}", cred["username"])
+            if cred.get("password") is not None:
+                out = out.replace("{password}", cred["password"])
+            extra = rec.get("extra") or {}
+            if isinstance(extra, dict) and extra.get("credential_id"):
+                out = out.replace("{credential_id}", str(extra["credential_id"]))
         unresolved = re.findall(r"\{[a-zA-Z_]+\}", out)
         return out, unresolved
+
+    def _secrets_in(rec) -> list:
+        """Literal secrets that must be masked before the command is recorded.
+
+        CLAUDE.md lists provenance as "command line (sanitized)". A resolved
+        follow-up command contains the password, and kali_listener stores what it
+        runs in tool_executions.command — which the scans UI, the post-review
+        agent and every export read. Naming the literal here is what keeps the
+        secret out of all of them.
+        """
+        cred = _resolve_credential(rec)
+        pw = cred.get("password")
+        return [pw] if pw else []
 
     async def _dispatch_via_kali(rec, scanner, ip, result):
         """Route tool execution to the internal Kali container."""
@@ -2096,13 +2165,24 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
             async with httpx.AsyncClient(timeout=60) as client:
                 r = await client.post(
                     f"{s.kali_listener_url}/tools/execute",
-                    json={"tool": scanner, "command": command, "target": ip},
+                    json={"tool": scanner, "command": command, "target": ip,
+                          # Literal secrets the listener must mask before it
+                          # records the command. A resolved credential follow-up
+                          # carries the password, and tool_executions.command is
+                          # read by the scans UI, the post-review agent and every
+                          # export.
+                          "redact": _secrets_in(rec)},
                     headers=headers,
                 )
                 if r.status_code == 200:
                     data = r.json()
                     result["status"] = "dispatched"
-                    result["detail"] = f"Kali: {command[:50]}"
+                    # The detail line is shown in the UI and stored in the run
+                    # result, so it gets the same treatment as the command.
+                    _shown = command
+                    for _sec in _secrets_in(rec):
+                        _shown = _shown.replace(_sec, "<redacted>")
+                    result["detail"] = f"Kali: {_shown[:50]}"
                     exec_id = data.get("execution_id", data.get("id", ""))
                     result["exec_id"] = exec_id
                     result["via"] = "kali"

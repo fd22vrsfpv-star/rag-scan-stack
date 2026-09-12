@@ -219,6 +219,105 @@ def test_the_writer_uses_the_stored_id_not_the_generated_one():
     assert "stored_id" in src and "SELECT id::text" in src
 
 
+# ── The queue must actually run them ───────────────────────────────────────
+
+def test_lower_priority_runs_first():
+    """The convention is ascending, and getting it backwards is silent.
+
+    The recon agent's drain orders `sr.priority ASC`, the recommender uses
+    `base_priority = 5 if msf else 10`, and every ORDER BY priority in the
+    codebase agrees. The first version of the catalogue used "higher first", so
+    nxc at 90 sorted BEHIND an nmap script at 55 — the follow-up that confirms
+    command execution would have run last, and nothing would have looked wrong.
+    """
+    import yaml
+    with open(_catalogue_path(), encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    by_name = {e["name"]: e["priority"]
+               for entries in data["protocols"].values() for e in entries}
+    assert by_name["nxc"] < by_name["nmap"], (
+        "an enumeration script outranks the follow-up that proves command "
+        "execution — the priority scale is inverted")
+
+    drain = os.path.join(REPO, "dashboard", "bff", "services", "recon_agent.py")
+    if os.path.exists(drain):
+        assert "ORDER BY sr.priority ASC" in _read(drain), (
+            "the drain no longer orders ascending; this catalogue's numbers "
+            "now mean the opposite of what they say")
+
+
+def test_the_dispatcher_resolves_the_password():
+    """Without this the feature is inert.
+
+    `_fill_placeholders` reports any surviving `{...}` as unresolved and the
+    dispatch is SKIPPED — so ten queued follow-ups were all skipped with "no
+    value known for it". The secret is resolved at dispatch, in memory, from the
+    credential_id the row carries.
+    """
+    path = os.path.join(REPO, "dashboard", "bff", "routers", "assets.py")
+    src = _read(path)
+    assert "def _resolve_credential" in src, (
+        "nothing resolves {password}, so every credential follow-up is skipped")
+    fn = _func(src, "_fill_placeholders")
+    assert "_resolve_credential(rec)" in fn
+    assert '"{password}"' in fn
+
+
+def test_the_resolved_secret_is_not_recorded():
+    """CLAUDE.md: provenance is the "command line (sanitized)".
+
+    kali_listener stores what it runs in tool_executions.command, which the
+    scans UI, the post-review agent and every export read. Making follow-ups
+    runnable without this would have published the password to all three.
+    """
+    bff = _read(os.path.join(REPO, "dashboard", "bff", "routers", "assets.py"))
+    assert "def _secrets_in" in bff
+    assert '"redact": _secrets_in(rec)' in bff, (
+        "the dispatcher no longer tells the listener what to mask")
+
+    listener = _read(os.path.join(REPO, "kali_listener", "listener_service.py"))
+    assert "redact: List[str]" in listener, "the listener dropped the redact field"
+    assert "stored_command = _redacted(" in listener, (
+        "the listener records the raw command again — the secret reaches "
+        "tool_executions.command")
+    # The command that RUNS must still be the real one.
+    assert 'active_executions[exec_id] = {' in listener
+
+
+def test_redaction_masks_the_whole_secret():
+    import re as _re
+    from typing import List as _List
+    src = _read(os.path.join(REPO, "kali_listener", "listener_service.py"))
+    ns = {"List": _List}
+    start = src.index("def _redacted(")
+    exec(src[start:src.index("def db_create_tool_execution(")], ns)
+    redacted = ns["_redacted"]
+
+    cmd = "nxc ssh 10.0.0.1 -u msfadmin -p 'msfadmin' -x id"
+    out = redacted(cmd, ["msfadmin"])
+    assert "'<redacted>'" in out, out
+    # A one-character secret would shred the command into noise and tell the
+    # operator nothing, so it is deliberately not masked.
+    assert redacted("a b c", ["a"]) == "a b c"
+    # Longest first: a secret containing another must be masked whole.
+    assert "<redacted>" in redacted("p=supersecret", ["secret", "supersecret"])
+    assert "super<redacted>" not in redacted("p=supersecret", ["secret", "supersecret"])
+
+
+def test_the_post_enum_checklist_is_covered():
+    """knowledge/playbooks/ssh_methodology.md has a "Post-Exploitation / If
+    Access Gained" list. It was prose for RAG context: nothing executed it and
+    nothing tracked whether any of it had been done."""
+    import yaml
+    with open(_catalogue_path(), encoding="utf-8") as fh:
+        ssh = yaml.safe_load(fh)["protocols"]["ssh"]
+    commands = " ".join(e["command"] for e in ssh)
+    for step in ("sudo -n -l", "authorized_keys", "known_hosts", "sshd_config"):
+        assert step in commands, (
+            f"the post-access checklist no longer covers {step!r} — it is in "
+            "the playbook and nothing would run it")
+
+
 # ── Captured evidence must not re-expose the secret ────────────────────────
 
 def test_the_confirming_line_masks_the_password():
