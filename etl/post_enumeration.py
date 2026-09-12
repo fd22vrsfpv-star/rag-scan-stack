@@ -382,6 +382,96 @@ def resolve_pending_observations(*, limit: int = 200,
     return out
 
 
+def facts_from_exploits(cur, *, target: str = "", hours: int = 24,
+                        limit: int = 50) -> List[Dict[str, Any]]:
+    """A successful exploit is ACCESS, and access is a fact.
+
+    The vsftpd 2.3.4 backdoor was executed against 192.168.1.150, opened a root
+    shell on port 6200, and nothing enumerated through it: the exploit was
+    marked `executed` and that was the end of it. `exploit_callbacks` had zero
+    rows, so there was no session to find — but the listener was right there on
+    a port that had not been there before.
+
+    Two facts come out of this, and the second is the useful one:
+      * `exploit_executed` — we ran something and it reported success
+      * `open_port` — a port that appeared AFTER the exploit, which is the
+        listener it opened
+
+    The second needs no knowledge of which module opens which port. A port that
+    was not there before the exploit and is there afterwards is the thing worth
+    looking at, whatever module produced it.
+    """
+    facts: List[Dict[str, Any]] = []
+    where, params = ["pe.status = 'executed'",
+                     "pe.updated_at > now() - (%s || ' hours')::interval"], [hours]
+    if target:
+        where.append("host(pe.target_ip) = %s")
+        params.append(target)
+    params.append(limit)
+    try:
+        cur.execute(
+            f"""SELECT pe.id::text, host(pe.target_ip), pe.exploit_id,
+                       pe.target_port, COALESCE(pe.target_service,''), pe.updated_at
+                  FROM pending_exploits pe
+                 WHERE {' AND '.join(where)}
+                 ORDER BY pe.updated_at DESC
+                 LIMIT %s""", params)
+        rows = cur.fetchall()
+    except Exception as e:  # noqa: BLE001
+        log.debug("exploit facts unavailable: %s", e)
+        return facts
+
+    for pid, host, exploit_id, port, service, executed_at in rows:
+        facts.append({"fact": "exploit_executed", "target": host,
+                      "service": service, "port": port,
+                      "exploit_id": exploit_id, "pending_exploit_id": pid,
+                      "executed_at": str(executed_at)})
+    return facts
+
+
+# What "nothing has identified this" looks like in the service column. `lm-x`
+# is what nmap calls 6200 on Metasploitable, which is the vsftpd backdoor's root
+# shell; `tcpwrapped` means the handshake completed and nothing else was learned.
+_UNIDENTIFIED = {"", "?", "unknown", "lm-x", "tcpwrapped", "status"}
+
+
+def facts_from_open_ports(cur, *, target: str = "", limit: int = 60) -> List[Dict[str, Any]]:
+    """Open ports nothing has identified.
+
+    This started as "ports that appeared after the exploit", which does not
+    work: `ports` is upserted, so `created_at` is the FIRST time a port was ever
+    seen, not the last. Port 6200 had been seen on an earlier scan and matched
+    nothing, while port 21 — the exploit's own target — matched the window.
+
+    So the honest signal is the one that does not depend on timing at all: an
+    open port with no identified service is worth a banner grab whether an
+    exploit opened it or not. The full re-scan proposed by
+    `exploit-find-the-listener` is what actually finds something NEW.
+    """
+    facts: List[Dict[str, Any]] = []
+    where, params = ["COALESCE(p.is_open, true)"], []
+    if target:
+        where.append("host(a.ip) = %s")
+        params.append(target)
+    params.append(limit)
+    try:
+        cur.execute(
+            f"""SELECT host(a.ip), p.port, COALESCE(p.service,''),
+                       COALESCE(p.banner,'')
+                  FROM ports p JOIN assets a ON a.id = p.asset_id
+                 WHERE {' AND '.join(where)}
+                 ORDER BY p.port LIMIT %s""", params)
+        for host, port, service, banner in cur.fetchall():
+            if service.strip().lower() not in _UNIDENTIFIED:
+                continue
+            facts.append({"fact": "open_port", "target": host, "port": port,
+                          "service": service, "banner": banner[:120],
+                          "unidentified": True})
+    except Exception as e:  # noqa: BLE001
+        log.debug("open port facts unavailable: %s", e)
+    return facts
+
+
 def facts_from_web_findings(cur, *, target: str = "", limit: int = 200,
                             engagement_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Evidence that never came from a command's stdout.
@@ -581,6 +671,13 @@ def analyse_findings(*, target: str = "", engagement_id: Optional[str] = None,
             with conn.cursor() as cur:
                 facts = facts_from_web_findings(cur, target=target, limit=limit,
                                                 engagement_id=engagement_id)
+                # A successful exploit is access, and nothing was enumerating
+                # through it.
+                facts += facts_from_exploits(cur, target=target)
+                # An open port nothing has identified is worth a look whatever
+                # opened it — 6200 on this host reads as `lm-x` and is a root
+                # shell.
+                facts += facts_from_open_ports(cur, target=target)
                 out["facts"] = len(facts)
                 if facts:
                     _propose_from_facts(cur, facts, context, rules, out)

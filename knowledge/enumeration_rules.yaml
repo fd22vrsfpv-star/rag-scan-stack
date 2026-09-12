@@ -147,3 +147,37 @@ rules:
       A critical finding needs its evidence captured at the URL, not inferred
       from a scanner's summary line. The headers are the cheapest thing that
       proves the endpoint is still live and still responding that way.
+
+  # ── After an exploit succeeds ─────────────────────────────────────────────
+  #
+  # The vsftpd 2.3.4 backdoor was executed against 192.168.1.150, opened a root
+  # shell on 6200, and nothing enumerated through it — the exploit was marked
+  # `executed` and that was the end of it. A successful exploit is access, and
+  # access is the thing the whole engagement is for.
+
+  - id: exploit-find-the-listener
+    when:
+      fact: exploit_executed
+    propose:
+      tool: nmap
+      command: "nmap -p- --open -T4 -sV {target}"
+      priority: 8
+    why: >-
+      An exploit that succeeded usually left something listening, and no
+      module-to-port table is needed to find it — a full re-scan says what is
+      open now that was not open before. This runs first because everything
+      else about the access depends on knowing where it is.
+
+  - id: unidentified-port-enumerate
+    when:
+      fact: open_port
+      where: {unidentified: true}
+    propose:
+      tool: nmap
+      command: "nmap -p {port} -sV --script banner {target}"
+      priority: 9
+    why: >-
+      An open port with no identified service is worth a banner grab whatever
+      opened it. 6200 on Metasploitable reads as `lm-x` and is the vsftpd
+      backdoor's root shell — it had been seen by an earlier scan and nothing
+      had ever looked at it.
