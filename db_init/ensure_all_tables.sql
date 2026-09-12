@@ -3645,6 +3645,39 @@ CREATE TABLE IF NOT EXISTS scope_suggestions (
 CREATE INDEX IF NOT EXISTS idx_scope_suggestions_status ON scope_suggestions(status);
 
 -- ============================================================================
+-- SCOPE CONFLICTS (a target claimed by more than one engagement)
+-- ============================================================================
+-- When a scan or agent session resolves its engagement from the target's scope
+-- and the target is in MORE THAN ONE engagement's scope, resolution returns
+-- NULL — it will not guess an owner, because attributing a whole session to the
+-- wrong engagement is worse than leaving it unstamped. That is correct but was
+-- INVISIBLE: the session silently ran unattached, lost its engagement's
+-- pre-approval, and nobody was told the scope needed fixing. This table records
+-- each conflict at the moment it is detected so an operator can resolve the
+-- duplicate. One row per target (COALESCE'd), refreshed on each detection.
+CREATE TABLE IF NOT EXISTS public.scope_conflicts (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    target            text NOT NULL,
+    target_type       text NOT NULL DEFAULT 'ip',
+    engagement_ids    uuid[] NOT NULL,
+    engagement_names  text[] NOT NULL DEFAULT '{}',
+    detections        integer NOT NULL DEFAULT 1,
+    -- Where it was last seen: 'agent_session' (scan start), 'ingest', etc.
+    last_detected_by  text NOT NULL DEFAULT '',
+    last_session_id   uuid,
+    resolved          boolean NOT NULL DEFAULT false,
+    first_seen        timestamptz NOT NULL DEFAULT now(),
+    last_seen         timestamptz NOT NULL DEFAULT now()
+);
+-- One row per target: a NULL-free COALESCE key so the unique index actually
+-- constrains (a plain UNIQUE(target) would too, but this mirrors the repo's
+-- COALESCE-the-nullable rule and leaves room if target_type joins the key).
+CREATE UNIQUE INDEX IF NOT EXISTS ux_scope_conflicts_target
+  ON public.scope_conflicts (target);
+CREATE INDEX IF NOT EXISTS idx_scope_conflicts_open
+  ON public.scope_conflicts (resolved, last_seen DESC);
+
+-- ============================================================================
 -- ENGAGEMENT PROPAGATION TRIGGERS
 -- Auto-inherit engagement_id from asset when inserting findings/follow-ups
 -- ============================================================================

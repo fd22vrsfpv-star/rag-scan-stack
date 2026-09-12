@@ -252,3 +252,37 @@ export function useLearnRules() {
       apiFetch<{ suggested_rules: Array<Record<string, unknown>>; total: number }>('/scope/rules/learn', { method: 'POST' }),
   })
 }
+
+// ── Scope conflicts (a target in more than one engagement scope) ────────────
+
+export interface ScopeConflict {
+  id: string
+  target: string
+  target_type: string
+  engagement_ids: string[]
+  engagement_names: string[]
+  detections: number
+  last_detected_by: string
+  last_session_id: string | null
+  resolved: boolean
+  first_seen: string
+  last_seen: string
+}
+
+export function useScopeConflicts(includeResolved = false) {
+  return useQuery({
+    queryKey: ['scope-conflicts', includeResolved],
+    queryFn: () => apiFetch<{ count: number; open: number; conflicts: ScopeConflict[] }>(
+      `/scope/conflicts?include_resolved=${includeResolved}`),
+    refetchInterval: 60_000,
+  })
+}
+
+export function useResolveScopeConflict() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) =>
+      apiFetch<{ ok: boolean; resolved: boolean }>(`/scope/conflicts/${id}/resolve`, { method: 'POST' }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['scope-conflicts'] }),
+  })
+}
