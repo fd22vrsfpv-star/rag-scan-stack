@@ -1040,6 +1040,12 @@ _FALLBACK_ALLOWED_TOOLS = {
     "smbclient", "smbmap", "ssh-audit", "netexec", "crackmapexec", "nbtscan",
     "snmpwalk", "onesixtyone", "ldapsearch", "dig", "host", "nslookup",
     "redis-cli", "psql", "mysql", "rpcclient", "showmount",
+    # Added at the operator's request so the SSH post-access checklist can run
+    # against hosts whose algorithms nothing modern negotiates by default. This
+    # IS general-purpose remote execution: the scope gate and the phase's
+    # approval are what bound it, and the stored command is sanitised.
+    # sshpass because ssh takes no password non-interactively.
+    "ssh", "sshpass",
     # Baked into this image (see kali_listener/Dockerfile). Present in the
     # node-manager registry too; listed here so a registry fetch failure does not
     # reject a tool the image demonstrably has.
@@ -2612,6 +2618,67 @@ async def wordlist_inventory(max_files: int = 2000, min_lines: int = 2,
     return {"ok": True, "count": len(out), "truncated": len(out) >= max_files,
             "thresholds": {"warn": CANDIDATE_WARN, "refuse": CANDIDATE_REFUSE},
             "wordlists": out}
+
+
+@app.get("/tools/capabilities")
+def tool_capabilities(tool: str, category: str = ""):
+    """What a tool installed HERE says it supports.
+
+    The listener is the authority on this and nothing else is. rag-api can work
+    out that a host offers `ssh-rsa,ssh-dss` from recon, but only the machine
+    that will run the command knows whether its ssh still has ssh-dss — and it
+    does not, so `-oHostKeyAlgorithms=+ssh-rsa,ssh-dss` is rejected outright
+    while `+ssh-rsa` connects. Deriving an option without asking produced
+    exactly that broken value.
+
+    The probe command comes from knowledge/tool_options.yaml, never from the
+    request: this endpoint runs a declared, read-only query against a tool, and
+    accepting a command from the caller would make it arbitrary execution.
+    """
+    tool = (tool or "").strip().lower()
+    if tool not in get_allowed_tools():
+        raise HTTPException(400, f"tool {tool!r} is not allowed here")
+    probes = _load_capability_probes().get(tool) or {}
+    if not probes:
+        # A real answer: this tool declares no capability probe, which is not
+        # the same as the probe having failed.
+        return {"tool": tool, "probes_declared": False, "categories": {}}
+    wanted = [category] if category else list(probes)
+    out = {}
+    for cat in wanted:
+        cmd = probes.get(cat)
+        if not cmd:
+            continue
+        try:
+            import shlex
+            proc = subprocess.run(shlex.split(cmd), capture_output=True,
+                                  text=True, timeout=10)
+            if proc.returncode == 0:
+                out[cat] = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+        except Exception as e:  # noqa: BLE001
+            logger.debug("capability probe %r failed: %s", cmd, e)
+    return {"tool": tool, "probes_declared": True, "categories": out}
+
+
+_CAPABILITY_PROBES = None
+
+
+def _load_capability_probes() -> dict:
+    """`{tool: {category: probe command}}` from the knowledge mount."""
+    global _CAPABILITY_PROBES
+    if _CAPABILITY_PROBES is not None:
+        return _CAPABILITY_PROBES
+    path = os.environ.get("TOOL_OPTIONS_YAML", "/knowledge/tool_options.yaml")
+    try:
+        import yaml
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        _CAPABILITY_PROBES = {t: (o or {}).get("probe") or {}
+                              for t, o in (data.get("tools") or {}).items()}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("tool options catalogue %s unreadable: %s", path, e)
+        _CAPABILITY_PROBES = {}
+    return _CAPABILITY_PROBES
 
 
 @app.get("/tools/allowed")
