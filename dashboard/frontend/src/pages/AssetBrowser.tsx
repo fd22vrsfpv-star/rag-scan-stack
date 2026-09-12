@@ -1257,6 +1257,22 @@ export default function AssetBrowser() {
                       {c.last_verified_at ? new Date(c.last_verified_at).toLocaleString() : '—'}
                     </span></div>
                     {c.banner && <div>Banner: <span className="text-foreground font-mono">{c.banner}</span></div>}
+                    {/* The secret. This tab showed type, source, protocol and
+                        timestamps but never the password itself — the one thing
+                        the row exists to record. The per-asset panel had it and
+                        this one did not, so whether an operator could see a
+                        credential depended on which way they navigated to it.
+                        Masked by default, same component, same rules. */}
+                    {(() => {
+                      const secret = c.secret_value ?? (typeof c.metadata?.secret_value === 'string'
+                        ? c.metadata.secret_value as string : null)
+                      return secret
+                        ? <div className="col-span-3 grid grid-cols-2"><SecretValue value={secret} secretType={c.secret_type} /></div>
+                        : <div className="col-span-3 text-muted-foreground">
+                            Secret: <span className="text-foreground">not captured</span>
+                            <span className="text-[10px]"> — this finding recorded the account but no secret material</span>
+                          </div>
+                    })()}
                   </div>
                   <div className="flex items-center gap-1.5 pt-1">
                     <span className="text-muted-foreground mr-1">Set status:</span>

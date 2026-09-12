@@ -4,6 +4,7 @@ Tests default and weak credentials for common services.
 """
 
 import os
+import re
 import threading      # scan-slot semaphore, see _cred_scan_slot()
 from contextlib import contextmanager
 import subprocess
@@ -215,6 +216,83 @@ def _mask_password(password: str) -> str:
     return password[:keep] + ("*" * (n - keep))
 
 
+# How much of a tool's own output is kept as proof that a credential works.
+# Bounded because this lands in a jsonb column that is read by every listing
+# endpoint: 127MB of stderr once made two pages unservable, and an operator does
+# not need the whole run to believe one line.
+EVIDENCE_CHARS = 400
+
+
+def _redact_secret(line: str, username: str, password: str) -> str:
+    """Mask the password inside a tool's own output line.
+
+    Capturing the tool's proof re-exposed the secret somewhere the UI does not
+    mask it: hydra prints "login: msfadmin   password: msfadmin" and nmap prints
+    "msfadmin:msfadmin - Valid credentials", and the evidence block renders both
+    verbatim. `SecretValue` hides the password behind a deliberate Reveal click
+    precisely because this panel is on screen during screen-shares and report
+    writing; an unmasked copy two rows above it defeats that entirely.
+
+    Only the password is touched, and only where a label or the `user:pass`
+    separator identifies it as the password. A blunt string replacement would
+    mangle `anonymous` / `anonymous@`, where the username and secret overlap.
+    """
+    if not line or not password:
+        return line
+    masked = _mask_password(password)
+    esc_pw = re.escape(password)
+    patterns = [
+        # hydra:  "... password: msfadmin"
+        (re.compile(rf"((?:pass(?:word)?|passwd)\s*[:=]\s*){esc_pw}", re.I), masked),
+    ]
+    if username:
+        # nmap NSE: "msfadmin:msfadmin - Valid credentials"
+        patterns.append(
+            (re.compile(rf"({re.escape(username)}\s*:\s*){esc_pw}\b"), masked))
+    for rx, repl in patterns:
+        line = rx.sub(lambda m: m.group(1) + repl, line)
+    return line
+
+
+def _confirming_line(output: str, username: str, markers: Tuple[str, ...],
+                     password: str = "") -> Optional[str]:
+    """The line where the tool said this account worked.
+
+    An audit that records `success: true` and nothing else asks the operator to
+    take the platform's word for it. What makes a credential reportable is the
+    tool's own sentence, so keep that sentence rather than the name of the
+    script that produced it.
+    """
+    if not output or not username:
+        return None
+    for line in output.splitlines():
+        low = line.lower()
+        if username.lower() in low and any(m in low for m in markers):
+            return _redact_secret(line.strip(), username, password)[:EVIDENCE_CHARS]
+    # The account matched nothing quotable; fall back to any line that announced
+    # a success, which is still better than asserting it with no text at all.
+    for line in output.splitlines():
+        if any(m in line.lower() for m in markers):
+            return _redact_secret(line.strip(), username, password)[:EVIDENCE_CHARS]
+    return None
+
+
+def _sanitised_command(cmd: List[str], secrets: Tuple[str, ...] = ()) -> str:
+    """The command line, with any literal secret replaced.
+
+    Provenance is part of the finding (CLAUDE.md: "command line (sanitized)"),
+    but hydra takes the password as an argument, so the raw argv would put the
+    secret into an audit blob that is shown on screen and exported.
+    """
+    out = []
+    for part in cmd:
+        for sec in secrets:
+            if sec and part == sec:
+                part = "<redacted>"
+        out.append(part)
+    return " ".join(out)[:EVIDENCE_CHARS]
+
+
 def _classify_hydra_failure(output: str) -> Tuple[str, Optional[str]]:
     """Inspect hydra stdout+stderr to LABEL why a single attempt failed.
 
@@ -376,6 +454,9 @@ def _check_credentials_slotted(target, port, service, credentials, timeout):
             success = "successfully" in output.lower() or "1 valid password" in output.lower()
 
             if success:
+                proof = _confirming_line(
+                    output, username,
+                    ("successfully", "valid password", "login:", "host:"), password)
                 result = CredentialResult(
                     service=service,
                     target=target,
@@ -384,10 +465,17 @@ def _check_credentials_slotted(target, port, service, credentials, timeout):
                     password=password if password else "(empty)",
                     success=True,
                     method="hydra",
-                    details=output.strip()[:200]
+                    details=proof or _redact_secret(
+                        output.strip(), username, password)[:EVIDENCE_CHARS]
                 )
                 results.append(result)
                 attempt["success"] = True
+                # The sentence hydra printed when it accepted the account, and
+                # the command that produced it. An audit that says success and
+                # shows nothing asks the operator to take it on faith.
+                attempt["evidence"] = proof or _redact_secret(
+                    output.strip(), username, password)[:EVIDENCE_CHARS]
+                attempt["command"] = _sanitised_command(cmd, (password,))
                 logger.info(f"[+] Valid credentials found: {username}:{password} on {target}:{port} ({service})")
             else:
                 # Classify the failure so the operator can distinguish
@@ -506,6 +594,7 @@ def check_credentials_nmap(
         # Default all to failure; flip to success below for matches found in
         # nmap's output.
         successful_pairs: List[Tuple[str, str]] = []
+        evidence_by_pair: Dict[Tuple[str, str], Optional[str]] = {}
         if "Valid credentials" in output or "Accounts:" in output:
             import re
             patterns = [
@@ -517,6 +606,12 @@ def check_credentials_nmap(
                 for match in matches:
                     username, password = match
                     successful_pairs.append((username, password))
+                    # The tool's own words, not "nmap <script>". `details` used
+                    # to name the script that ran, which is provenance, not
+                    # proof — an operator writing this up had nothing to quote.
+                    proof = _confirming_line(output, username,
+                                             ("valid", "accounts:"), password)
+                    evidence_by_pair[(username, password)] = proof
                     result = CredentialResult(
                         service=service,
                         target=target,
@@ -525,7 +620,7 @@ def check_credentials_nmap(
                         password=password if password else "(empty)",
                         success=True,
                         method="nmap",
-                        details=f"nmap {script}"
+                        details=proof or f"nmap {script}"
                     )
                     results.append(result)
                     logger.info(f"[+] Valid credentials found: {username}:{password} on {target}:{port}")
@@ -543,6 +638,9 @@ def check_credentials_nmap(
                 # auth_failed unless something at the script level errored.
                 "failure_mode": None if is_success else "auth_failed",
                 "error_excerpt": None,
+                # What the tool said when it accepted this account. Only ever
+                # present on a success; a failure has nothing to prove.
+                "evidence": evidence_by_pair.get((username, password)),
             })
 
     except subprocess.TimeoutExpired:
@@ -919,6 +1017,22 @@ def check_default_credentials(
 
         audit["fell_back_to_nmap"] = (
             len(audit["methods_used"]) > 1 and "nmap" in audit["methods_used"][1:])
+
+    # Roll the per-attempt proof up to one place. The UI should not have to
+    # walk method_audits[*].attempts[*] to answer "what makes you say this
+    # password works" — that is the first question anyone asks of a credential
+    # finding, and it belongs one level from the top.
+    audit["evidence"] = [
+        {
+            "username": a.get("username"),
+            "method": ma.get("method"),
+            "output": a.get("evidence"),
+            "command": a.get("command"),
+        }
+        for ma in audit["method_audits"]
+        for a in ma.get("attempts", [])
+        if a.get("success")
+    ]
 
     # Human-readable summary for the audit panel. Built from what actually ran
     # rather than from a named pair of tools, so a new method needs no edit here

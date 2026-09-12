@@ -27,18 +27,6 @@ named tests exist).
 
 ## Pipeline coverage
 
-### Credential findings do not surface as recommendations
-**Found:** 2026-09-11
-**Evidence:** A run against 192.168.1.150 found 10 valid credentials (ssh 3,
-ftp 4, telnet 3) and produced no entry in the recommendation queue. The operator
-had to read the audit panel to learn they existed.
-**Where:** `autogen_agents/langgraph_engine.py` credential phase;
-`scan_recommendations` is written by `scan_recommender` and `post_review_agent`
-but by nothing on the credential path.
-**Done when:** a valid credential produces a pending recommendation for the
-follow-on it enables, through the scope gate like any other.
-**Enforced by:** not enforced
-
 ### Post-exploitation enumeration never runs
 **Found:** 2026-09-11
 **Evidence:** With pre-approval on for `lab` and a reachable exploit target, the
