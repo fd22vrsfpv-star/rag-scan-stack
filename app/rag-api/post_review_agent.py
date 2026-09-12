@@ -440,11 +440,23 @@ def classify_execution(row, catalogue=None):
         evidence = (f"exit={exit_code}"
                     + (f": {m.group(0).strip()[:80]}" if m else " (killed by signal)"))
     else:
-        for pattern, label in _BROKEN:
-            m = pattern.search(haystack)
-            if m:
-                category, evidence = "broken_invocation", f"{label}: {m.group(0)}"
-                break
+        # Only when the tool produced nothing substantive on stdout. A run that
+        # wrote real results did not have its invocation rejected, whatever its
+        # stderr says — and stderr says a lot. nuclei logs
+        # "nuclei-templates are not installed, installing..." on startup, which
+        # matched the "no binary" pattern and labelled a run that went on to
+        # write 165KB of CVE hits as a broken invocation. An operator acting on
+        # that re-runs a scan that worked.
+        #
+        # Only stdout counts here: a tool that genuinely rejects its arguments
+        # writes usage to stderr and nothing to stdout, so this does not hide
+        # the case the patterns are for.
+        if len(output.strip()) < _SUBSTANTIVE_OUTPUT_BYTES:
+            for pattern, label in _BROKEN:
+                m = pattern.search(haystack)
+                if m:
+                    category, evidence = "broken_invocation", f"{label}: {m.group(0)}"
+                    break
         if category is None and status == "failed" \
                 and len(output.strip()) >= _SUBSTANTIVE_OUTPUT_BYTES:
             category = "output_despite_failure"

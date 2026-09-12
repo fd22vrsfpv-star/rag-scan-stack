@@ -201,6 +201,38 @@ def test_missing_file_is_a_broken_invocation():
 
 
 @pytest.mark.unit
+def test_a_startup_banner_is_not_a_broken_invocation():
+    """Real false positive, caught by running the review on stored data.
+
+    nuclei logs "nuclei-templates are not installed, installing..." on startup,
+    which matched the "no binary" pattern. The run then loaded 6133 templates
+    and wrote 165KB of CVE hits to stdout — and was reported as a broken
+    invocation whose remedy is "rerun". An operator acting on that re-runs a
+    scan that worked perfectly.
+
+    Only stdout gates this. A tool that genuinely rejects its arguments writes
+    usage to stderr and nothing to stdout, so the patterns still fire where they
+    should — test_missing_file_is_a_broken_invocation covers that side.
+    """
+    banner = ("[INF] nuclei-templates are not installed, installing...\n"
+              "[INF] Templates loaded for current scan: 6133")
+    findings = '{"template":"http/cves/2012/CVE-2012-1823.yaml","host":"x"}' * 20
+    assert len(findings) > pr._SUBSTANTIVE_OUTPUT_BYTES
+
+    v = pr.classify_execution(_row(tool="nuclei", status="completed", exit_code=0,
+                                   output=findings, error=banner))
+    assert v["category"] != "broken_invocation", v
+    assert v["remedy"] != "rerun", (
+        "the review would tell an operator to re-run a scan that produced "
+        "165KB of findings")
+
+    # Same banner, nothing produced: that IS worth flagging.
+    v = pr.classify_execution(_row(tool="nuclei", status="completed", exit_code=0,
+                                   output="", error=banner))
+    assert v["category"] == "broken_invocation", v
+
+
+@pytest.mark.unit
 def test_every_category_declares_a_remedy_and_a_reason():
     """A category with no remedy is a count, which is what this replaces."""
     for name, meta in pr.CATEGORIES.items():

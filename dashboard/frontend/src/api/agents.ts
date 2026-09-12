@@ -297,6 +297,68 @@ export function useExportExtractors() {
   })
 }
 
+// ── Post-execution review (post_review_agent) ─────────────────────────────
+//
+// Classifies executed work and finds results that were captured but never
+// interpreted. It proposes and never dispatches: re-runs land as PENDING
+// recommendations a human still has to run, and every proposed target passes
+// the scope gate first.
+
+export interface PostReviewFact {
+  id: string
+  tool: string
+  target: string
+  severity: string
+  title: string
+  detail?: string | null
+  seen_in?: number
+}
+
+export interface PostReviewSummary {
+  executions_reviewed: number
+  actionable: number
+  correct_but_empty: number
+  results_not_ingested: number
+  notable_facts_in_output: number
+  notable_facts_stored: number
+  notable_facts_unstored: number
+  high_or_worse_unstored: number
+  stuck_recommendations: number
+  reruns_proposed: number
+  reruns_queued: number
+  scope_refusals: number
+}
+
+export interface PostReviewReport {
+  ok: boolean
+  report_id: string
+  summary: PostReviewSummary
+  notable_in_output: PostReviewFact[]
+  executions: { groups: Array<{ category: string; remedy: string; actionable: boolean; why: string; count: number; tools: Array<{ tool: string; count: number }> }> }
+  reruns: { proposed: number; inserted: number; refused: number; dry_run: boolean }
+}
+
+export function useRunPostReview() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ queueReruns = false }: { queueReruns?: boolean } = {}) =>
+      apiFetch<PostReviewReport>(
+        `/agent/post-review?queue_reruns=${queueReruns}`, { method: 'POST' }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['post-review-reports'] }),
+  })
+}
+
+/** Defaults to a dry run, matching the API. This writes findings that appear in
+ *  reports and exports, so the default must not be the destructive one. */
+export function useIngestPostReviewFacts() {
+  return useMutation({
+    mutationFn: ({ dryRun = true }: { dryRun?: boolean } = {}) =>
+      apiFetch<{ ok: boolean; facts_found: number; new: number; inserted: number
+                 already_stored: number; by_severity: Record<string, number> }>(
+        `/agent/post-review/ingest-facts?dry_run=${dryRun}`, { method: 'POST' }),
+  })
+}
+
 // ── Learned tool selection (tool_selection_learned) ───────────────────────
 //
 // Rules the platform derived from what tools actually did — nobody typed them.
