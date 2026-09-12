@@ -288,6 +288,41 @@ def test_the_hook_cannot_fail_a_command_that_already_ran():
         "a learning store that is down would fail a tool run that completed")
 
 
+def test_an_unparseable_run_is_not_a_success():
+    """A tool that ran clean and produced nothing a parser could use is the
+    single most useful signal for 'try something else'.
+
+    Recording it as a success was worse than useless: it teaches the platform
+    that a tool finding nothing here is fine, and suppresses the fallback that
+    would have found something. 34 of this stack's 76 completed runs (45%)
+    parsed to nothing.
+    """
+    assert not tl.execution_failed(status="completed", exit_code=0, output="done"), (
+        "a clean run must not be labelled an error just because it found "
+        "nothing — an operator reading the rule would be told the wrong thing")
+    assert tl.UNPRODUCTIVE_PHRASE, "the fruitless outcome has no label"
+    sig, _ = tl.error_signature(tl.UNPRODUCTIVE_PHRASE)
+    assert sig, "the fruitless outcome has no signature, so nothing can learn it"
+
+
+def test_unknown_result_count_is_not_zero():
+    """`None` means no parser ran. Treating it as zero would record every
+    uninstrumented runner's output as fruitless."""
+    src = _strip_docstrings(_read(MODULE))
+    fn = _func(src, "observe_execution")
+    assert re.search(r"result_count is not None\s*and\s*\(?result_count <= 0", fn), (
+        "the fruitless test no longer distinguishes 'nothing parsed' from "
+        "'nobody parsed'")
+
+
+def test_the_listener_passes_unknown_rather_than_zero():
+    hook = _func(_strip_docstrings(_read(LISTENER)), "_learn_from_execution")
+    assert "count = None" in hook, (
+        "the listener guesses zero when no parsed_results exist, which makes "
+        "every unparsed run look fruitless")
+    assert "if parsed_results is not None:" in hook
+
+
 def test_the_general_entry_points_exist():
     for name in ("observe_execution", "suggest_alternatives",
                  "learn_from_tool_executions", "execution_failed"):
@@ -421,3 +456,28 @@ def test_observe_execution_learns_across_separate_commands(store):
                                      service=store)
     assert advice["available"]
     assert [s["tool"] for s in advice["suggestions"]] == ["curl"], advice
+
+
+def test_a_fruitless_run_teaches_the_next_tool(store):
+    """The parser gap, end to end: nuclei runs clean and parses to nothing,
+    curl then finds something, and the pair becomes a rule."""
+    target = f"198.51.100.{uuid.uuid4().int % 200 + 1}"
+    a = tl.observe_execution("nuclei", service=store, target=target, port=443,
+                             status="completed", exit_code=0,
+                             output="no results found", result_count=0, emit=False)
+    assert a["recorded"] and not a["failed"] and a["fruitless"], a
+    assert a["signature"], "a fruitless run must be learnable"
+
+    b = tl.observe_execution("curl", service=store, target=target, port=443,
+                             status="completed", exit_code=0,
+                             output="HTTP/1.1 200", result_count=3, emit=False)
+    assert any(r["failed_tool"] == "nuclei" and r["preferred_tool"] == "curl"
+               and r["status"] == "active" for r in b["learned"]), b["learned"]
+
+
+def test_an_unmeasured_run_teaches_nothing_about_fruitlessness(store):
+    target = f"198.51.100.{uuid.uuid4().int % 200 + 1}"
+    a = tl.observe_execution("gobuster", service=store, target=target, port=80,
+                             status="completed", exit_code=0, output="done",
+                             emit=False)
+    assert a["recorded"] and not a["fruitless"] and a["signature"] is None, a

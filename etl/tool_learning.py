@@ -545,6 +545,20 @@ CORRELATION_WINDOW_MINUTES = int(
     os.environ.get("TOOL_LEARNING_WINDOW_MINUTES", "360"))
 
 
+# A tool that ran cleanly and produced nothing a parser could use is its own
+# outcome — not an error, and emphatically not a success. It is the single most
+# useful signal for "reach for a different tool", and treating it as a success
+# was actively harmful: it would teach the platform that a tool which finds
+# nothing here is fine, and suppress the fallback that would have found
+# something. Measured on this stack: 34 of 76 completed runs (45%) parsed to
+# nothing.
+#
+# All such runs for one (tool, service) share this signature deliberately. It is
+# one condition, not many, and the phrase says so in words an operator reading
+# the learned rule will understand — they must not think the tool errored.
+UNPRODUCTIVE_PHRASE = "ran to completion and produced no parseable result"
+
+
 def execution_failed(status: Optional[str] = None, exit_code: Optional[int] = None,
                      error: str = "", output: str = "") -> bool:
     """Did this command fail? Three independent signals, any one is enough.
@@ -571,25 +585,44 @@ def observe_execution(
     exit_code: Optional[int] = None,
     output: str = "",
     error: str = "",
-    result_count: int = 0,
+    # None means "the caller does not know how many results this produced".
+    # That is NOT the same as zero, and conflating them would record every
+    # uninstrumented runner's output as fruitless. Pass a number only when the
+    # parser actually ran.
+    result_count: Optional[int] = None,
     engagement_id: Optional[str] = None,
     phase: str = TOOL_EXECUTION_PHASE,
     emit: bool = True,
 ) -> Dict[str, Any]:
     """Record one finished command and learn from it. Never raises.
 
-    Returns ``{"recorded": bool, "failed": bool, "signature": str|None,
-    "phrase": str|None, "learned": [rules]}``. A caller that gets
-    ``recorded: False`` knows the platform did not observe this run — which is
-    not the same as the run having taught it nothing.
+    Three outcomes, not two:
+
+      * **errored**   — status/exit code/stderr says so; signature from the
+        tool's own words.
+      * **fruitless** — ran clean, and the parser got nothing out of it. Learned
+        from, under `UNPRODUCTIVE_PHRASE`, because that is precisely when
+        another tool is worth trying.
+      * **productive** — ran clean and produced something.
+
+    A `result_count` of None means the caller does not know, and the run is
+    recorded as a plain success rather than being guessed at either way.
+
+    Returns ``{"recorded", "failed", "fruitless", "signature", "phrase",
+    "learned"}``. ``recorded: False`` means the platform did not observe this
+    run — which is not the same as the run having taught it nothing.
     """
     failed = execution_failed(status, exit_code, error, output)
+    fruitless = (not failed) and result_count is not None and result_count <= 0
     sig = phrase = None
     if failed:
         # The tool's complaint first; its normal output only if it said nothing
         # on stderr. Mixing the two would let a noisy success drown the error.
         sig, phrase = error_signature(error or output)
+    elif fruitless:
+        sig, phrase = error_signature(UNPRODUCTIVE_PHRASE)
     out: Dict[str, Any] = {"recorded": False, "failed": failed,
+                           "fruitless": fruitless,
                            "signature": sig, "phrase": phrase, "learned": []}
     try:
         with _connect() as conn:
@@ -603,14 +636,15 @@ def observe_execution(
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'observed',%s)
                     RETURNING id
                     """,
-                    (phase, tool, service or "", target, port, not failed,
-                     int(result_count or 0), sig, phrase, engagement_id),
+                    (phase, tool, service or "", target, port,
+                     not (failed or fruitless), int(result_count or 0), sig,
+                     phrase, engagement_id),
                 )
                 out["recorded"] = True
                 out["attempt_id"] = str(cur.fetchone()[0])
                 out["learned"] = _learn_against_recent(
                     cur, phase=phase, service=service or "", target=target,
-                    port=port, tool=tool, succeeded=not failed)
+                    port=port, tool=tool, succeeded=not (failed or fruitless))
             conn.commit()
     except Exception as e:  # noqa: BLE001
         log.debug("observe_execution failed: %s", e)
@@ -710,6 +744,31 @@ def suggest_alternatives(
     return res
 
 
+def _parsed_anything(parsed: Any) -> bool:
+    """Did the parser get anything out of this run?
+
+    Deliberately permissive about shape — `parsed_results` is written by a dozen
+    runners and is a dict, a list, or NULL depending on which. Anything
+    non-empty counts; only NULL, {} and [] are "nothing".
+    """
+    if parsed is None:
+        return False
+    if isinstance(parsed, str):
+        parsed = parsed.strip()
+        if parsed in ("", "null", "{}", "[]"):
+            return False
+        try:
+            import json
+            parsed = json.loads(parsed)
+        except Exception:  # noqa: BLE001
+            return True
+    if isinstance(parsed, dict):
+        return any(v not in (None, "", [], {}) for v in parsed.values())
+    if isinstance(parsed, (list, tuple)):
+        return len(parsed) > 0
+    return bool(parsed)
+
+
 def learn_from_tool_executions(
     *, since_hours: Optional[int] = None, limit: int = 5000,
     phase: str = TOOL_EXECUTION_PHASE, emit: bool = False,
@@ -724,7 +783,8 @@ def learn_from_tool_executions(
     Idempotent in effect, not in counters: re-running it re-counts the same
     pairs, so it is a backfill to run once per window, not a cron job.
     """
-    out = {"examined": 0, "failures": 0, "rules": 0, "available": False}
+    out = {"examined": 0, "failures": 0, "fruitless": 0, "rules": 0,
+           "available": False}
     where = "WHERE started_at > now() - (%s || ' hours')::interval" if since_hours else ""
     params: List[Any] = [since_hours] if since_hours else []
     params.append(limit)
@@ -734,7 +794,7 @@ def learn_from_tool_executions(
                 cur.execute(
                     f"""
                     SELECT tool, COALESCE(service, ''), target, port, status,
-                           exit_code, output, error, started_at
+                           exit_code, output, error, parsed_results, started_at
                       FROM public.tool_executions
                       {where}
                      ORDER BY target, port NULLS FIRST, started_at
@@ -749,16 +809,21 @@ def learn_from_tool_executions(
                 # Group by what a fallback would actually be a fallback FOR: the
                 # same service on the same target and port.
                 groups: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
-                for tool, service, target, port, status, code, output, error, ts in rows:
+                for (tool, service, target, port, status, code, output, error,
+                     parsed, ts) in rows:
                     if not target:
                         continue
                     failed = execution_failed(status, code, error or "", output or "")
+                    fruitless = (not failed) and not _parsed_anything(parsed)
                     sig = ph = None
                     if failed:
                         sig, ph = error_signature((error or "") or (output or ""))
                         out["failures"] += 1
+                    elif fruitless:
+                        sig, ph = error_signature(UNPRODUCTIVE_PHRASE)
+                        out["fruitless"] += 1
                     groups.setdefault((service, target, port), []).append({
-                        "tool": tool, "success": not failed,
+                        "tool": tool, "success": not (failed or fruitless),
                         "signature": sig, "phrase": ph, "ts": ts,
                     })
 
