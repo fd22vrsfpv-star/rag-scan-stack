@@ -622,6 +622,12 @@ def observe_execution(
     """
     failed = execution_failed(status, exit_code, error, output)
     fruitless = (not failed) and result_count is not None and result_count <= 0
+    # Nobody measured this run. That is NOT a success, and it must not be able
+    # to act as one: a live netexec run against a legacy SSH host exited 0 with
+    # a Python traceback in its output and no parser to read it, and was
+    # recorded `success: true` — where it could then have ACTIVATED a rule as
+    # proof that netexec works after some other tool failed.
+    unmeasured = (not failed) and result_count is None
     sig = phrase = None
     if failed:
         # The tool's complaint first; its normal output only if it said nothing
@@ -630,7 +636,7 @@ def observe_execution(
     elif fruitless:
         sig, phrase = error_signature(UNPRODUCTIVE_PHRASE)
     out: Dict[str, Any] = {"recorded": False, "failed": failed,
-                           "fruitless": fruitless,
+                           "fruitless": fruitless, "unmeasured": unmeasured,
                            "signature": sig, "phrase": phrase, "learned": []}
     try:
         with _connect() as conn:
@@ -645,12 +651,19 @@ def observe_execution(
                     RETURNING id
                     """,
                     (phase, tool, service or "", target, port,
-                     not (failed or fruitless), int(result_count or 0), sig,
-                     phrase, engagement_id),
+                     # An unmeasured run is recorded as NOT a success. It has no
+                     # signature either, so it teaches nothing in either
+                     # direction — which is the honest position when no parser
+                     # looked at the output.
+                     not (failed or fruitless or unmeasured),
+                     int(result_count or 0), sig, phrase, engagement_id),
                 )
                 out["recorded"] = True
                 out["attempt_id"] = str(cur.fetchone()[0])
-                out["learned"] = _learn_against_recent(
+                # An unmeasured run pairs with nothing. Letting it act as the
+                # "later success" would manufacture a rule out of a run nobody
+                # read.
+                out["learned"] = [] if unmeasured else _learn_against_recent(
                     cur, phase=phase, service=service or "", target=target,
                     port=port, tool=tool, succeeded=not (failed or fruitless))
             conn.commit()

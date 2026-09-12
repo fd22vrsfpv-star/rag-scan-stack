@@ -73,6 +73,37 @@ observed far fewer times.
 column is renamed to say what it counts.
 **Enforced by:** not enforced
 
+### No allowed tool can execute a command over legacy SSH
+**Found:** 2026-09-12
+**Evidence:** `netexec ssh 192.168.1.150 --port 22 -u msfadmin -x 'id; uname -a'`
+ran to completion, **exit 0**, and produced
+`IncompatiblePeer: Incompatible ssh peer (no acceptable host key)` in 6,816
+bytes of output. hydra fails the same way on this host (`kex error : no match
+for method server host key algo: server [ssh-rsa,ssh-dss]`). `ssh` itself is not
+on the listener's allowed-tool list (50 tools; `nxc`, `impacket-secretsdump`
+and `vncsnapshot` are not on it either).
+**Where:** `kali_listener/listener_service.py::_FALLBACK_ALLOWED_TOOLS`;
+`knowledge/credential_followups.yaml` ssh entries.
+**Done when:** there is an allowed way to run a command over SSH against a host
+offering only `ssh-rsa`/`ssh-dss` — either `ssh` on the allow-list with
+`-oHostKeyAlgorithms=+ssh-rsa`, or a netexec invocation that negotiates it. Until
+then the SSH post-access checklist is queued and cannot execute, and the run
+looks successful because the tool exits 0.
+**Enforced by:** `tests/test_credential_followups.py::test_every_followup_names_a_tool_the_platform_can_run`
+(catches the tool-name half; the negotiation half is not enforced)
+
+### A tool with no parser is recorded as having produced nothing measurable
+**Found:** 2026-09-12
+**Evidence:** the netexec run above wrote 6,816 bytes and `parsed_results` was
+NULL, because no parser handles netexec output. It is now recorded
+`success = false, failure_signature = NULL` — honest, but it means the learner
+gets no signal at all from any tool without a parser.
+**Where:** `etl/parse_tool_output.py` (no netexec branch);
+`kali_listener/listener_service.py::_learn_from_execution`.
+**Done when:** netexec output is parsed, or the generic parser extracts enough
+that a run can be judged productive or fruitless.
+**Enforced by:** not enforced
+
 ## Post-execution review
 
 ### The re-run proposer sees a narrower set than the classifier
