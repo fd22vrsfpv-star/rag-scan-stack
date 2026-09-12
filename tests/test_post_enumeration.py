@@ -757,9 +757,16 @@ def test_a_session_resolves_its_engagement_without_the_header():
         "pre-approval can never resolve")
     fn = src[src.index("def _engagement_from_target"):]
     fn = fn[:fn.index("\ndef ", 10)]
-    assert "resolve_engagement_for_ip" in fn, (
+    # Scope is the authority. Either scope resolver counts — engagements_for_ip
+    # (the multi-match view) or resolve_engagement_for_ip — both query
+    # scope_targets; anything else would resolve by some other means.
+    assert ("engagements_for_ip" in fn or "resolve_engagement_for_ip" in fn), (
         "it resolves by some other means than scope — scope is the "
         "authoritative statement of what belongs to an engagement")
+    # And a target in more than one scope must be flagged, not silently dropped:
+    # that ambiguity is what left a session unattached and un-pre-approved.
+    assert "record_scope_conflict" in fn, (
+        "a target in two scopes runs unattached and nobody is told to fix it")
 
 
 def _catalogue_rules():
