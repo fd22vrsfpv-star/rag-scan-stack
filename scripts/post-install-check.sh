@@ -137,6 +137,7 @@ EXPECTED_TABLES=(
   sync_nodes sync_state sync_log sync_conflicts
   # TIER 18: Scope
   scope_targets scope_classification_rules scope_decisions scope_suggestions
+  scope_conflicts
   # Self-adapting extractors + agent-to-agent feedback channel
   extractor_learned agent_flags
   # TIER 18: Scan pipelines
