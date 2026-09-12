@@ -400,6 +400,20 @@ export function useAssetAccess(ip: string, includeDead = false) {
   })
 }
 
+/** Per-host access counts, keyed by target, for the asset-list badge and the
+ *  "held access" filter. One grouped query rather than a probe listing per row —
+ *  the list has hundreds of hosts and a handful ever hold access. `live` agrees
+ *  with the detail endpoint (status='live' AND score>0). */
+export function useAccessSummary() {
+  return useQuery({
+    queryKey: ['access-summary'],
+    queryFn: () => apiFetch<{
+      summary: Record<string, { live: number; total: number }>; hosts: number
+    }>(`/assets/access/summary`),
+    staleTime: 30_000,
+  })
+}
+
 /** Re-discover and re-probe. Touches the host, so it is an explicit button
  *  rather than something a page load does. */
 export function useRefreshAccess() {

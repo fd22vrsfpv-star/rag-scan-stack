@@ -126,6 +126,20 @@ async def analyze_extractor(body: dict):
 # Shown beside credentials in the asset view: credentials are what we can log
 # in with, access is what we are already inside.
 
+@router.get("/api/assets/access/summary")
+async def asset_access_summary():
+    """Per-host access counts for the asset-list badge and 'held access' filter.
+    One grouped query upstream, keyed by target for per-row lookup.
+
+    Declared BEFORE /api/assets/{ip}/access so the literal is not claimed by the
+    dynamic route (FastAPI matches in declaration order)."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/assets/access/summary",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
 @router.get("/api/assets/{ip}/access")
 async def asset_access(ip: str, include_dead: bool = False):
     s = get_settings()
