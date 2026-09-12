@@ -676,3 +676,95 @@ def test_adding_an_evidence_source_is_one_entry():
     assert isinstance(ev.SOURCES, list) and len(ev.SOURCES) >= 5
     for s in ev.SOURCES:
         assert s.table and s.host_sql, s.table
+
+
+# ── Found by watching a live session ───────────────────────────────────────
+
+def test_the_loop_counts_new_work_not_re_reads():
+    """A live session ran post_enumeration five times with identical output and
+    hit the cycle budget instead of settling.
+
+    `parsed` counts every row RE-READ and never falls to zero, so the stopping
+    condition could never be met. What the pass actually DID is the backfill.
+    """
+    src = _read(ENGINE)
+    fn = src[src.index("def _analyse_session_output"):]
+    fn = fn[:fn.index("\ndef ", 10)]
+    assert 'out["backfilled"] += 1' in fn, (
+        "nothing counts new parses, so the loop cannot tell work from re-reading")
+
+    node = src[src.index("def post_enumeration(state: PentestState)"):]
+    node = node[:node.index("\ndef _resolve_outcomes")]
+    assert '"analysed": analysed.get("backfilled", 0)' in node, (
+        "the history entry still records re-reads as work, so the loop burns "
+        "its whole budget repeating itself")
+
+
+def test_a_pass_that_did_nothing_says_so():
+    """Five identical lines in a transcript read as work happening."""
+    src = _read(ENGINE)
+    node = src[src.index("def post_enumeration(state: PentestState)"):]
+    node = node[:node.index("\ndef _resolve_outcomes")]
+    assert "nothing new to parse" in node
+
+
+def test_a_successful_exploit_is_a_fact():
+    """The vsftpd backdoor was executed against 192.168.1.150, opened a root
+    shell on 6200, and nothing enumerated through it — the exploit was marked
+    `executed` and that was the end of it."""
+    pe = pytest.importorskip("etl.post_enumeration")
+    assert hasattr(pe, "facts_from_exploits")
+    assert hasattr(pe, "facts_from_open_ports")
+    import yaml as _yaml
+    with open(_catalogue_rules(), encoding="utf-8") as fh:
+        rules = (_yaml.safe_load(fh) or {}).get("rules") or []
+    ids = {r["id"] for r in rules}
+    assert "exploit-find-the-listener" in ids
+    assert "unidentified-port-enumerate" in ids
+
+
+def test_an_unidentified_port_is_not_dated():
+    """This started as "ports that appeared after the exploit", which does not
+    work: `ports` is upserted, so created_at is the FIRST sighting. 6200 had
+    been seen on an earlier scan while port 21 — the exploit's own target —
+    matched the window."""
+    src = _read(os.path.join(REPO, "etl", "post_enumeration.py"))
+    # Docstring-stripped. The docstring EXPLAINS why created_at is not used, and
+    # matching prose instead of code is how the first version of this passed
+    # while asserting nothing — the fifth time that has happened in this repo.
+    tree = ast.parse(src)
+    fn = ""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "facts_from_open_ports":
+            node.body = node.body[1:] or [ast.Pass()]
+            fn = ast.unparse(node)
+    assert fn, "facts_from_open_ports is gone"
+    assert "created_at" not in fn, (
+        "the fact is timing-based again, which the ports table cannot support")
+    assert "_UNIDENTIFIED" in fn
+    assert "lm-x" in src, (
+        "6200 on Metasploitable reads as lm-x and is a root shell; dropping it "
+        "from the unidentified set makes the case that motivated this invisible")
+
+
+def test_a_session_resolves_its_engagement_without_the_header():
+    """A live session sat at an exploit gate for an hour on an engagement that
+    HAD pre-approval, because it could not tell which engagement it was in."""
+    svc = os.path.join(REPO, "autogen_agents", "autogen_service.py")
+    src = _read(svc)
+    assert "def _engagement_from_target" in src, (
+        "a session with no X-Engagement-Id still gets engagement_id NULL, so "
+        "pre-approval can never resolve")
+    fn = src[src.index("def _engagement_from_target"):]
+    fn = fn[:fn.index("\ndef ", 10)]
+    assert "resolve_engagement_for_ip" in fn, (
+        "it resolves by some other means than scope — scope is the "
+        "authoritative statement of what belongs to an engagement")
+
+
+def _catalogue_rules():
+    for candidate in (os.path.join(REPO, "knowledge", "enumeration_rules.yaml"),
+                      "/knowledge/enumeration_rules.yaml"):
+        if os.path.exists(candidate):
+            return candidate
+    pytest.skip("enumeration_rules.yaml not reachable")

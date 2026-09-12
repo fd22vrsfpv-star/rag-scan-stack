@@ -1442,9 +1442,17 @@ def post_enumeration(state: PentestState) -> dict:
 
     analysed = _analyse_session_output(sid)
     if analysed.get("examined"):
-        findings.append(
-            f"post_enumeration: re-read {analysed['examined']} tool outputs, "
-            f"{analysed['parsed']} parsed, {analysed['productive']} produced results")
+        if analysed.get("backfilled"):
+            findings.append(
+                f"post_enumeration[{cycle}]: read {analysed['backfilled']} tool "
+                f"outputs nobody had parsed "
+                f"({analysed['productive']} produced results)")
+        else:
+            # Say that there was nothing new, rather than repeating the same
+            # totals every cycle as if work were happening.
+            findings.append(
+                f"post_enumeration[{cycle}]: nothing new to parse "
+                f"({analysed['parsed']} of {analysed['examined']} already read)")
         log.append(f"post_enumeration: analysis {analysed}")
         if analysed.get("unparsed_tools"):
             # Named, not counted. "17 unparsed" is not actionable; the tool
@@ -1490,7 +1498,11 @@ def post_enumeration(state: PentestState) -> dict:
         "cycle": cycle,
         "resolved": resolved.get("resolved", 0),
         "produced": resolved.get("produced", 0),
-        "analysed": analysed.get("parsed", 0),
+        # What this pass ACTUALLY DID, not what it looked at. `parsed` counts
+        # every row re-read and never falls to zero, so using it meant the loop
+        # could never settle.
+        "analysed": analysed.get("backfilled", 0),
+        "re_read": analysed.get("parsed", 0),
         "queued": (swept.get("queued", 0) + enumerated.get("queued", 0)),
         "refused": swept.get("refused", 0),
         "remaining": analysed.get("unanalysed", 0),
@@ -1598,8 +1610,8 @@ def _analyse_session_output(sid) -> dict:
     stored taught nothing — a netexec run wrote 6,816 bytes and was recorded as
     an unmeasured success.
     """
-    out = {"examined": 0, "parsed": 0, "productive": 0, "unparsed_tools": [],
-           "results": 0, "available": False}
+    out = {"examined": 0, "parsed": 0, "backfilled": 0, "productive": 0,
+           "unparsed_tools": [], "results": 0, "available": False}
     try:
         import psycopg2
         from psycopg2.extras import RealDictCursor
@@ -1633,6 +1645,12 @@ def _analyse_session_output(sid) -> dict:
                 if parsed is None:
                     parsed = parse_for(r["tool"], r["output"], r["error"])
                     if parsed is not None:
+                        # NEW work, as distinct from re-reading something that
+                        # was already parsed. The loop's stopping condition
+                        # depends on this: counting re-reads made every cycle
+                        # report the same 32 and the loop burned its whole
+                        # budget doing identical work.
+                        out["backfilled"] += 1
                         # Backfill: the output was already stored, so the only
                         # thing missing was somebody reading it.
                         cur.execute(

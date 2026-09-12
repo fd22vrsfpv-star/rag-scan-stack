@@ -1629,6 +1629,31 @@ def _emit_flow_summary(session_id) -> dict:
 
 
 
+def _engagement_from_target(target_description: str):
+    """The engagement whose scope contains the target, when exactly one does.
+
+    Best-effort and deliberately conservative. An unresolvable target leaves the
+    session unattached, which is the behaviour that existed before — no worse,
+    and never a wrong attribution.
+    """
+    import re as _re
+    text = target_description or ""
+    m = _re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", text)
+    if not m:
+        return None
+    try:
+        import psycopg2
+        from etl.asset_utils import resolve_engagement_for_ip
+        dsn = os.environ.get("DB_DSN") or os.environ.get("DATABASE_URL")
+        if not dsn:
+            return None
+        with psycopg2.connect(dsn, connect_timeout=5) as conn, conn.cursor() as cur:
+            return resolve_engagement_for_ip(cur, m.group(0))
+    except Exception as e:  # noqa: BLE001
+        session_logger.debug("engagement resolution from target failed: %s", e)
+        return None
+
+
 def _enable_recon_agent_if_requested(engagement_id, enabled, interval_sec) -> None:
     """Turn on the continuous recon agent for this engagement at session launch.
 
@@ -2232,6 +2257,28 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
             _eid = (http_request.headers.get("x-engagement-id")
                     or http_request.headers.get("X-Engagement-Id"))
         _eid = (_eid or "").strip() or None
+
+        # No header? Resolve the engagement from the TARGET's scope.
+        #
+        # The header arrives from the dashboard's active engagement, so a
+        # session started with none selected got engagement_id NULL — and
+        # everything keyed on it silently got None, including the pre-approval
+        # lookup. A live session sat at an exploit gate for an hour on an
+        # engagement that HAD pre-approval, because it could not tell which
+        # engagement it was in.
+        #
+        # Scope is the authoritative statement of what belongs to an
+        # engagement, which is why the same resolver already stamps assets and
+        # why the queued exploit for that session DID carry the right one.
+        # resolve_engagement_for_ip returns None when no scope matches and also
+        # when more than one does: guessing an owner for a host two engagements
+        # both claim would attribute a whole session to the wrong one.
+        if not _eid:
+            _eid = _engagement_from_target(request.target_description)
+            if _eid:
+                session_logger.info(
+                    "no X-Engagement-Id supplied; resolved engagement %s from "
+                    "the target's scope", _eid)
 
         session_id = create_agent_session(
             request.session_name,
