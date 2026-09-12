@@ -356,6 +356,72 @@ export function useAllCredentials(status?: string, protocol?: string, source?: s
   })
 }
 
+/** Access the platform currently HOLDS on a host — shells from approved
+ *  exploits, working credentials, reverse shells caught by the listener.
+ *
+ *  Beside credentials because it is the same question one stage later:
+ *  credentials are what we can log in with, access is what we are already
+ *  inside. Every row is MEASURED — `id` for privilege, repeated probes for
+ *  stability — so `is_root` and `score` mean something rather than being a
+ *  guess from which exploit ran. */
+export interface ObtainedAccess {
+  id: string
+  target: string
+  port: number | null
+  /** msf_session | bind_shell | ssh_credential | listener_callback */
+  kind: string
+  handle: string
+  transport: string
+  username?: string
+  whoami: string | null
+  uid: number | null
+  /** null means NOT PROBED — distinct from "not root". */
+  is_root: boolean | null
+  os_info: string | null
+  probes: number
+  probes_ok: number
+  last_probe_at: string | null
+  last_error: string | null
+  score: number
+  status: 'unverified' | 'live' | 'dead' | 'rejected'
+  source_exploit: string | null
+  created_at: string
+  updated_at: string
+}
+
+export function useAssetAccess(ip: string, includeDead = false) {
+  return useQuery({
+    queryKey: ['asset-access', ip, includeDead],
+    queryFn: () => apiFetch<{
+      target: string; count: number; live: number
+      best: ObtainedAccess | null; access: ObtainedAccess[]
+    }>(`/assets/${encodeURIComponent(ip)}/access?include_dead=${includeDead}`),
+    enabled: !!ip,
+  })
+}
+
+/** Re-discover and re-probe. Touches the host, so it is an explicit button
+ *  rather than something a page load does. */
+export function useRefreshAccess() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (ip: string) =>
+      apiFetch<{ ok: boolean; discovered: number; live: number; best: unknown }>(
+        `/assets/${encodeURIComponent(ip)}/access/refresh`, { method: 'POST' }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['asset-access'] }),
+  })
+}
+
+export function useReviewAccess() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, action }: { id: string; action: 'reject' | 'reinstate' }) =>
+      apiFetch<{ ok: boolean; status: string }>(
+        `/assets/access/${id}/${action}`, { method: 'POST' }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['asset-access'] }),
+  })
+}
+
 export function useAssetCredentials(ip: string) {
   return useQuery({
     queryKey: ['asset-credentials', ip],

@@ -128,8 +128,15 @@ def test_run_never_raises():
 
 
 def test_a_malformed_handle_is_reported():
-    res = ax.run({"kind": "bind_shell", "handle": "no-port-here"}, "id")
-    assert res["ok"] is False and "host:port" in res["error"]
+    """Asserted on the transport directly.
+
+    Going through run() reports "cannot reach a bind_shell from this container"
+    wherever `nc` is absent — which is correct behaviour and a different
+    message, so testing through run() would test the environment rather than
+    the handle parsing.
+    """
+    with pytest.raises(ValueError, match="host:port"):
+        ax.TRANSPORTS["bind_shell"]("no-port-here", "id")
 
 
 # ── Probing ────────────────────────────────────────────────────────────────
@@ -198,3 +205,91 @@ def test_the_chosen_access_is_recorded_in_the_transcript():
     fn = _func_src(ENGINE, "_enumerate_through_best_access")
     assert "[access] Using" in fn
     assert "score=" in fn and "whoami=" in fn
+
+
+# ── Run it where the tools are ─────────────────────────────────────────────
+
+def test_commands_prefer_the_kali_container():
+    """autogen-agents has `nc` but no `ssh` and no `sshpass`.
+
+    Probing from there scores every SSH credential zero, so a shell would be
+    chosen because the others could not be TESTED rather than because it was
+    better — a ranking of tool availability wearing the costume of a ranking of
+    access.
+    """
+    src = _read(os.path.join(REPO, "etl", "access.py"))
+    assert "def _run_via_listener" in src
+    fn = _func_src(os.path.join(REPO, "etl", "access.py"), "run")
+    assert "_run_via_listener(access, command)" in fn
+    assert fn.index("_run_via_listener") < fn.index("_have_local_tool"), (
+        "it runs locally first and only asks the listener as a fallback, which "
+        "is backwards")
+
+
+def test_a_missing_local_tool_is_not_a_dead_shell():
+    """"We could not probe this" and "it did not answer" are different, and
+    recording the first as the second is the same mistake as an unparsed run
+    counted as fruitless."""
+    fn = _func_src(os.path.join(REPO, "etl", "access.py"), "run")
+    assert "_have_local_tool(kind)" in fn
+    assert "not probed" in fn, (
+        "the error does not distinguish 'no tool here' from 'no answer'")
+
+
+def test_the_listener_exposes_an_access_endpoint():
+    """Not /tools/execute: that dispatches a TOOL at a target and is governed by
+    the allow-list, which `nc` is deliberately not on. Running a command inside
+    access we already hold is a different operation."""
+    listener = os.path.join(REPO, "kali_listener", "listener_service.py")
+    src = _read(listener)
+    assert '@app.post("/access/run")' in src
+    assert "from etl.access import TRANSPORTS" in src, (
+        "the listener has its own copy of the transports, which will drift")
+
+
+def test_the_listener_refuses_an_unknown_transport():
+    listener = _read(os.path.join(REPO, "kali_listener", "listener_service.py"))
+    fn = listener[listener.index("def access_run("):]
+    fn = fn[:fn.index("\n@app.")] if "\n@app." in fn else fn
+    assert "unsupported transport" in fn
+    assert 'return {"ok": False' in fn, (
+        "a dead shell raises a 500 instead of being reported as a result — the "
+        "caller is probing precisely to find out whether it answers")
+
+
+# ── Surfaced where an operator will look ───────────────────────────────────
+
+def test_access_is_listed_beside_credentials():
+    """Credentials are what we can log in with; access is what we are already
+    inside. Same asset, same panel area."""
+    page = os.path.join(REPO, "dashboard", "frontend", "src", "pages", "AssetBrowser.tsx")
+    src = _read(page)
+    assert "Current Access" in src, "the tab is gone"
+    assert "function AccessSection" in src
+    assert "detailTab === 'access'" in src
+    # Ordering, in the TAB BAR — the panel's own definition appears earlier in
+    # the file and comparing against that tests nothing about the tab order.
+    bar = src[src.index(">Credentials</button>"):]
+    bar = bar[:bar.index("Screenshots")]
+    assert "Current Access" in bar, (
+        "the tab is not between Credentials and Screenshots — access belongs "
+        "next to credentials, being the same question one stage later")
+
+
+def test_the_panel_distinguishes_unknown_from_not_root():
+    page = _read(os.path.join(REPO, "dashboard", "frontend", "src", "pages",
+                              "AssetBrowser.tsx"))
+    fn = page[page.index("function AccessSection"):]
+    fn = fn[:fn.index("\nfunction ", 10)]
+    assert "a.is_root === null" in fn and "unknown" in fn, (
+        "a never-probed access renders as 'not root', which is a different "
+        "claim and the wrong one")
+    assert "probes_ok" in fn, "stability is not shown, so the score is unexplained"
+
+
+def test_the_nodes_page_points_at_it():
+    """Remote NODES and remote SHELLS are different things with close enough
+    names to send someone to the wrong page."""
+    page = _read(os.path.join(REPO, "dashboard", "frontend", "src", "pages", "Nodes.tsx"))
+    assert "Current Access" in page, "nothing points from Nodes to where shells live"
+    assert "/assets" in page

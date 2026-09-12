@@ -1,4 +1,5 @@
 import { useState, useRef } from 'react'
+import { Link } from 'react-router-dom'
 import PageHelp from '@/components/PageHelp'
 import QRCode from 'react-qr-code'
 import { WireGuardDiagnostics } from '@/components/WireGuardDiagnostics'
@@ -37,6 +38,24 @@ export default function Nodes() {
       <div className="flex items-center gap-3">
         <Wifi className="h-6 w-6 text-primary" />
         <h1 className="text-2xl font-bold">Remote Nodes</h1>
+      </div>
+
+      {/* Remote NODES and remote SHELLS are different things and the names are
+          close enough to send people here looking for the wrong one. A node is
+          infrastructure we own and scan FROM; a shell is access we obtained on
+          a target and scan THROUGH. Pointing at the right page costs a line. */}
+      <div className="flex items-start gap-2 rounded-md border border-border bg-muted/30 px-3 py-2 text-xs">
+        <Terminal className="h-4 w-4 text-primary mt-0.5 shrink-0" />
+        <p className="text-muted-foreground">
+          <span className="text-foreground font-medium">Looking for a shell on a target?</span>{' '}
+          This page is for scan boxes we own and run tools <em>from</em>. Shells and logins
+          obtained <em>on</em> a target — from an approved exploit, a working credential, or a
+          reverse shell caught by the listener — live under{' '}
+          <Link to="/assets?tab=assets" className="text-primary hover:underline">
+            Assets → (pick a host) → Current Access
+          </Link>
+          , with the measured privilege and stability of each.
+        </p>
       </div>
 
       {/* Tabs */}
