@@ -289,6 +289,27 @@ Two rules that cut across all tiers:
   ("41 hardcoded container names") understated it — starting a second stack
   would have been indistinguishable from the live one, schema writes included.
 
+### Open items (things found but not fixed)
+When you find a real problem that is **out of scope for what you are doing**,
+record it in `Docs/OPEN_ITEMS.md` instead of fixing it silently or losing it.
+Fixing every incidental discovery turns a small change into an unreviewable one;
+not recording it means the finding dies with the session. Several entries in that
+file were each rediscovered more than once before it existed.
+
+Every item carries **Found / Evidence / Where / Done when / Enforced by**.
+`Evidence` is an observation — a count, a query result, quoted output — never
+"this looks wrong", because nobody can verify or close that. `Enforced by` is
+either a test that fails while the item is open or the literal `not enforced`,
+which is an honest and common answer. **Resolved items are deleted, not struck
+through**; git history keeps the record.
+
+Do not use it as a parking space for work the user asked for. It is for findings
+the current change should not carry.
+- *Enforced by:* `tests/test_open_items.py`.
+- *Why:* the credential phase being unreachable, post-ex never running and the
+  manual approve path recording no reviewer were each noticed and then lost more
+  than once, because there was nowhere to put them.
+
 ### Known-debt lists
 `tests/test_dispatch_invariants.py` carries `SCOPE_DEBT` and `LIMIT_DEBT`,
 `tests/test_proxy_contracts.py` carries `PROXY_DYNAMIC` and `PROXY_DEBT`, and

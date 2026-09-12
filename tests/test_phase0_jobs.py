@@ -6,9 +6,14 @@ import types
 import pathlib
 import importlib.util
 
-import psycopg2
 import pytest
-from fastapi.testclient import TestClient
+
+# These are real runtime dependencies of the code under test, not of the test.
+# Importing them bare turns "this runner lacks the deps" into a collection error
+# that reddens the suite; a skip says "cannot run here", which is the truth.
+psycopg2 = pytest.importorskip("psycopg2", reason="phase-0 jobs talk to Postgres")
+pytest.importorskip("fastapi", reason="the API app is a FastAPI app")
+from fastapi.testclient import TestClient  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 API_FILE = REPO_ROOT / "app" / "rag-api" / "api.py"

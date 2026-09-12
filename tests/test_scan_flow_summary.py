@@ -21,7 +21,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "autogen_agents"))
 os.environ.setdefault("PORT_PROFILES_PATH",
                       str(Path(__file__).parent.parent / "knowledge" / "port_profiles.yaml"))
 
-from scan_tools import SessionScanTracker as T  # noqa: E402
+_SCAN_TOOLS = Path(__file__).parent.parent / "autogen_agents" / "scan_tools.py"
+if not _SCAN_TOOLS.exists():
+    raise AssertionError(f"{_SCAN_TOOLS} is missing — the module under test was moved")
+try:
+    from scan_tools import SessionScanTracker as T  # noqa: E402
+except ModuleNotFoundError as exc:  # a DEPENDENCY, not the module itself
+    # The file is there (checked above), so this is the runner lacking a package
+    # scan_tools needs. That is "cannot run here" — a skip — not "broken".
+    pytest.skip(f"scan_tools needs {exc.name}", allow_module_level=True)
 
 
 def _session(scans):
