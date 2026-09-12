@@ -1650,17 +1650,56 @@ def _engagement_from_target(target_description: str):
     m = _re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", text)
     if not m:
         return None
+    ip = m.group(0)
     try:
         import psycopg2
-        from etl.asset_utils import resolve_engagement_for_ip
+        from etl.asset_utils import engagements_for_ip, record_scope_conflict
         dsn = os.environ.get("DB_DSN") or os.environ.get("DATABASE_URL")
         if not dsn:
             return None
         with psycopg2.connect(dsn, connect_timeout=5) as conn, conn.cursor() as cur:
-            return resolve_engagement_for_ip(cur, m.group(0))
+            matches = engagements_for_ip(cur, ip)
+        if len(matches) == 1:
+            return matches[0][0]
+        if len(matches) > 1:
+            # The target belongs to two engagements — resolution cannot pick one,
+            # so the session runs unattached and loses its engagement's
+            # pre-approval. FLAG it (persist + webhook) at scan start so the
+            # duplicate scope can be fixed, rather than letting it stay invisible.
+            names = [n for _, n in matches]
+            session_logger.warning(
+                "scan target %s is in %d engagement scopes (%s) — running "
+                "unattached; recording scope conflict", ip, len(matches),
+                ", ".join(n or "?" for n in names))
+            record_scope_conflict(ip, matches, detected_by="agent_session")
+            _emit_scope_conflict_webhook(ip, matches)
+        return None
     except Exception as e:  # noqa: BLE001
         session_logger.debug("engagement resolution from target failed: %s", e)
         return None
+
+
+def _emit_scope_conflict_webhook(ip, matches) -> None:
+    """Alert external tools (Slack/n8n) that a scan started on a target claimed
+    by more than one engagement. Fire-and-forget; a webhook failure never blocks
+    the scan."""
+    try:
+        api_base = os.environ.get("API_BASE", "https://rag-api:8000")
+        with httpx.Client(verify=False, timeout=10) as c:
+            c.post(f"{api_base}/webhooks/emit",
+                   headers={"x-api-key": os.environ.get("API_KEY", "changeme")},
+                   json={"event_type": "scan_target_scope_conflict",
+                         "source": "autogen-agents",
+                         "severity": "warning",
+                         "data": {"target": ip,
+                                  "engagement_ids": [e for e, _ in matches],
+                                  "engagement_names": [n for _, n in matches],
+                                  "count": len(matches),
+                                  "effect": ("scan runs unattached; engagement "
+                                             "pre-approval does not apply until "
+                                             "the duplicate scope is fixed")}})
+    except Exception as e:  # noqa: BLE001
+        session_logger.debug("scope-conflict webhook emit failed: %s", e)
 
 
 def _enable_recon_agent_if_requested(engagement_id, enabled, interval_sec) -> None:

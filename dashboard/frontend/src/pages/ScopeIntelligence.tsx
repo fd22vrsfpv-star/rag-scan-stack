@@ -11,6 +11,7 @@ import {
   useScopeSuggestions, useClassifyUnknown, useAcceptSuggestion, useRejectSuggestion,
   useBulkAcceptSuggestions, useScopeClassificationRules, useCreateClassificationRule,
   useDeleteClassificationRule, useLearnRules,
+  useScopeConflicts, useResolveScopeConflict,
   type ScopeSuggestion, type ScopeClassificationRule,
 } from '@/api/scope'
 import { SourceBadge } from '@/components/common/SourceBadge'
@@ -30,6 +31,7 @@ export default function ScopeIntelligence() {
 
   return (
     <div className="space-y-4">
+      <ScopeConflictsBanner />
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold flex items-center gap-2">
           <Crosshair className="h-5 w-5" /> Scope Intelligence
@@ -1357,6 +1359,54 @@ function Section({
           {children}
         </div>
       )}
+    </div>
+  )
+}
+
+/** ScopeConflictsBanner — targets claimed by more than one engagement.
+ *
+ *  A target in two scopes cannot be attributed to an engagement, so a scan on
+ *  it runs unattached and silently loses that engagement's exploit pre-approval.
+ *  This surfaces each one at the top of the scope page so the duplicate can be
+ *  removed. Renders nothing when there are no open conflicts. */
+function ScopeConflictsBanner() {
+  const { data } = useScopeConflicts(false)
+  const resolve = useResolveScopeConflict()
+  const conflicts = data?.conflicts ?? []
+  if (!conflicts.length) return null
+  return (
+    <div className="rounded border border-amber-500/40 bg-amber-500/10 p-3 space-y-2">
+      <div className="flex items-center gap-2 text-amber-400 font-medium text-sm">
+        <AlertTriangle className="h-4 w-4" />
+        {conflicts.length} target{conflicts.length > 1 ? 's' : ''} in more than one engagement scope
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        A target claimed by two engagements can't be attributed to one, so a scan on it runs
+        <span className="font-medium"> unattached</span> and loses that engagement's exploit
+        pre-approval. Remove the duplicate from all but the correct engagement, then dismiss.
+      </p>
+      <div className="space-y-1.5">
+        {conflicts.map(c => (
+          <div key={c.id} className="flex items-center justify-between gap-3 rounded bg-background/60 border border-border px-2 py-1.5">
+            <div className="min-w-0">
+              <span className="font-mono text-sm">{c.target}</span>
+              <span className="text-[11px] text-muted-foreground ml-2">
+                in {(c.engagement_names.filter(Boolean).length ? c.engagement_names.filter(Boolean) : c.engagement_ids).join(', ')}
+              </span>
+              <span className="text-[10px] text-muted-foreground ml-2">
+                · seen {c.detections}× · last {formatDate(c.last_seen)}
+                {c.last_detected_by ? ` · ${c.last_detected_by}` : ''}
+              </span>
+            </div>
+            <button
+              onClick={() => resolve.mutate(c.id)}
+              disabled={resolve.isPending}
+              title="Mark resolved. If the duplicate still exists, the next scan reopens it."
+              className="shrink-0 h-6 px-2 text-[10px] rounded border border-border hover:bg-accent"
+            >Dismiss</button>
+          </div>
+        ))}
+      </div>
     </div>
   )
 }
