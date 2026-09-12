@@ -1,0 +1,11 @@
+SMB                      192.168.1.150   445    METASPLOITABLE   [*] Unix (name:METASPLOITABLE) (domain:localdomain) (signing:False) (SMBv1:True) (Null Auth:True)
+SMB                      192.168.1.150   445    METASPLOITABLE   [+] localdomain\msfadmin:msfadmin 
+SMB                      192.168.1.150   445    METASPLOITABLE   [*] Enumerated shares
+SMB                      192.168.1.150   445    METASPLOITABLE   Share           Permissions     Remark
+SMB                      192.168.1.150   445    METASPLOITABLE   -----           -----------     ------
+SMB                      192.168.1.150   445    METASPLOITABLE   print$          READ            Printer Drivers
+SMB                      192.168.1.150   445    METASPLOITABLE   tmp             READ,WRITE      oh noes!
+SMB                      192.168.1.150   445    METASPLOITABLE   opt             READ            
+SMB                      192.168.1.150   445    METASPLOITABLE   IPC$                            IPC Service (metasploitable server (Samba 3.0.20-Debian))
+SMB                      192.168.1.150   445    METASPLOITABLE   ADMIN$                          IPC Service (metasploitable server (Samba 3.0.20-Debian))
+SMB                      192.168.1.150   445    METASPLOITABLE   msfadmin        READ,WRITE      Home Directories

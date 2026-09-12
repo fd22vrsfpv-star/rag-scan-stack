@@ -1,0 +1,96 @@
+[*] First time use detected
+[*] Creating home directory structure
+[*] Creating missing folder logs
+[*] Creating missing folder modules
+[*] Creating missing folder workspaces
+[*] Creating missing folder obfuscated_scripts
+[*] Creating missing folder screenshots
+[*] Creating missing folder logs/sam
+[*] Creating missing folder logs/lsa
+[*] Creating missing folder logs/ntds
+[*] Creating missing folder logs/dpapi
+[*] Creating default workspace
+[*] Initializing WINRM protocol database
+[*] Initializing RDP protocol database
+[*] Initializing WMI protocol database
+[*] Initializing SMB protocol database
+[*] Initializing NFS protocol database
+[*] Initializing FTP protocol database
+[*] Initializing LDAP protocol database
+[*] Initializing VNC protocol database
+[*] Initializing SSH protocol database
+[*] Initializing MSSQL protocol database
+[*] Copying default configuration file
+SSH                      192.168.1.150   22     192.168.1.150    [*] SSH-2.0-OpenSSH_4.7p1 Debian-8ubuntu1
+[23:15:19] ERROR    Incompatible ssh peer (no acceptable host key)    ssh.py:136
+                    ╭────── Traceback (most recent call last) ──────╮           
+                    │ /usr/lib/python3/dist-packages/nxc/protocols/ │           
+                    │ ssh.py:107 in plaintext_login                 │           
+                    │                                               │           
+                    │   104 │   │   │   │   cred_id = self.db.add_c │           
+                    │       key=private_key)                        │           
+                    │   105 │   │   │   else:                       │           
+                    │   106 │   │   │   │   self.logger.debug(f"Log │           
+                    │       password: {self.password}")             │           
+                    │ ❱ 107 │   │   │   │   self.conn.connect(      │           
+                    │   108 │   │   │   │   │   self.host,          │           
+                    │   109 │   │   │   │   │   port=self.port,     │           
+                    │   110 │   │   │   │   │   username=username,  │           
+                    │                                               │           
+                    │ /usr/lib/python3/dist-packages/paramiko/clien │           
+                    │ t.py:443 in connect                           │           
+                    │                                               │           
+                    │   440 │   │   │   other_types = [x for x in s │           
+                    │   441 │   │   │   sec_opts.key_types = [keyty │           
+                    │   442 │   │                                   │           
+                    │ ❱ 443 │   │   t.start_client(timeout=timeout) │           
+                    │   444 │   │                                   │           
+                    │   445 │   │   server_key = t.get_remote_serve │           
+                    │   446 │   │   if our_server_keys is None:     │           
+                    │                                               │           
+                    │ /usr/lib/python3/dist-packages/paramiko/trans │           
+                    │ port.py:701 in start_client                   │           
+                    │                                               │           
+                    │    698 │   │   │   if not self.active:        │           
+                    │    699 │   │   │   │   e = self.get_exception │           
+                    │    700 │   │   │   │   if e is not None:      │           
+                    │ ❱  701 │   │   │   │   │   raise e            │           
+                    │    702 │   │   │   │   raise SSHException("Ne │           
+                    │    703 │   │   │   if event.is_set() or (     │           
+                    │    704 │   │   │   │   timeout is not None an │           
+                    │                                               │           
+                    │ /usr/lib/python3/dist-packages/paramiko/trans │           
+                    │ port.py:2080 in run                           │           
+                    │                                               │           
+                    │   2077 │   │   │   │   │   │   if error_msg:  │           
+                    │   2078 │   │   │   │   │   │   │   self._send │           
+                    │   2079 │   │   │   │   │   │   else:          │           
+                    │ ❱ 2080 │   │   │   │   │   │   │   self._hand │           
+                    │   2081 │   │   │   │   │   elif ptype in self │           
+                    │   2082 │   │   │   │   │   │   chanid = m.get │           
+                    │   2083 │   │   │   │   │   │   chan = self._c │           
+                    │                                               │           
+                    │ /usr/lib/python3/dist-packages/paramiko/trans │           
+                    │ port.py:2200 in _negotiate_keys               │           
+                    │                                               │           
+                    │   2197 │   │   if self.local_kex_init is None │           
+                    │   2198 │   │   │   # remote side wants to ren │           
+                    │   2199 │   │   │   self._send_kex_init()      │           
+                    │ ❱ 2200 │   │   self._parse_kex_init(m)        │           
+                    │   2201 │   │   self.kex_engine.start_kex()    │           
+                    │   2202 │                                      │           
+                    │   2203 │   def _check_banner(self):           │           
+                    │                                               │           
+                    │ /usr/lib/python3/dist-packages/paramiko/trans │           
+                    │ port.py:2451 in _parse_kex_init               │           
+                    │                                               │           
+                    │   2448 │   │   │   │   filter(server_key_algo │           
+                    │   2449 │   │   │   )                          │           
+                    │   2450 │   │   if len(agreed_keys) == 0:      │           
+                    │ ❱ 2451 │   │   │   raise IncompatiblePeer(    │           
+                    │   2452 │   │   │   │   "Incompatible ssh peer │           
+                    │   2453 │   │   │   )  # noqa                  │           
+                    │   2454 │   │   self.host_key_type = agreed_ke │           
+                    ╰───────────────────────────────────────────────╯           
+                    IncompatiblePeer: Incompatible ssh peer (no                 
+                    acceptable host key)                                        

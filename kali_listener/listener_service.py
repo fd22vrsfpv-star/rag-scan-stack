@@ -510,6 +510,12 @@ def _learn_from_execution(exec_id: str, status: str, exit_code: Optional[int],
         # another tool and must not be handed the first dressed up as it.
         count = None
         if parsed_results is not None:
+            try:
+                from etl.tool_output_parsers import result_count as _rc
+                count = _rc(parsed_results)
+            except Exception:  # noqa: BLE001
+                count = None
+        if count is None and parsed_results is not None:
             count = 0
             if isinstance(parsed_results, dict):
                 for key in ("findings", "results", "hosts", "credentials",
@@ -537,12 +543,38 @@ def _learn_from_execution(exec_id: str, status: str, exit_code: Optional[int],
         logger.debug("learning from execution %s failed: %s", exec_id, e)
 
 
+def _parse_output_for(exec_id: str, output: Optional[str],
+                      error: Optional[str]) -> Optional[Dict]:
+    """Structured results for this execution's tool, or None if unparsed.
+
+    None rather than {}: "nobody wrote a parser for this tool" and "the parser
+    ran and found nothing" are different facts, and the learner acts differently
+    on each.
+    """
+    try:
+        from etl.tool_output_parsers import parse_for
+    except Exception:  # noqa: BLE001 - etl/ not mounted is a valid deployment
+        return None
+    try:
+        row = db_get_tool_execution(exec_id) or {}
+        return parse_for(row.get("tool") or "", output or "", error or "")
+    except Exception as e:  # noqa: BLE001
+        logger.debug("output parse for %s failed: %s", exec_id, e)
+        return None
+
+
 def db_update_tool_execution(exec_id: str, status: str, exit_code: Optional[int] = None,
                              output: Optional[str] = None, error: Optional[str] = None,
                              parsed_results: Optional[Dict] = None) -> None:
     """Update tool execution with results."""
     output = _cap_for_storage(output, "output", exec_id)
     error = _cap_for_storage(error, "error", exec_id)
+    # Parse it if the caller did not. This argument has existed since the table
+    # did and no caller ever passed one, so parsed_results was NULL for every
+    # run — which made every run "unmeasured" and taught the learner nothing
+    # from output it had already captured and stored.
+    if parsed_results is None:
+        parsed_results = _parse_output_for(exec_id, output, error)
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:

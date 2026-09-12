@@ -807,7 +807,7 @@ _BRUTE_TOOLS = {"hydra", "medusa", "ncrack", "crowbar",
 
 
 def propose_reruns(cur, catalogue=None, limit=100, dry_run=True,
-                   engagement_id=None):
+                   engagement_id=None, since_days=None, target=None):
     """Queue one pending recommendation per (tool, target) worth re-running.
 
     This function does not dispatch: rows land `status='pending'`,
@@ -851,16 +851,40 @@ def propose_reruns(cur, catalogue=None, limit=100, dry_run=True,
         return {"proposed": 0, "refused": 0, "proposals": [], "refusals": [],
                 "error": f"scope gate unavailable, refusing to propose: {exc}"}
 
-    cur.execute("""
+    # The SAME candidate set the review classifies, deliberately.
+    #
+    # This used to select only `status IN ('failed','timeout') OR (completed AND
+    # output = '')` while review_executions() selects every row. So an execution
+    # the review reported as `remedy: rerun` could be invisible here — the
+    # report told the operator to re-run something the proposer could not see,
+    # and there was no way to tell from either side.
+    #
+    # classify_execution() is the one filter now: it decides what needs a re-run
+    # and _RERUN_REMEDIES decides which remedies qualify. Two queries that must
+    # agree about "needs a re-run" is one query too many.
+    #
+    # FULL output rather than a 400-byte prefix, matching the review. The
+    # crackmapexec share table begins ~1 KB in, so a prefix read "no results"
+    # on output that named five shares — and classify_execution() branches on
+    # how much output there is.
+    where, params = ["1=1"], []
+    if since_days:
+        where.append("started_at > now() - (%s || ' days')::interval")
+        params.append(int(since_days))
+    if target:
+        where.append("target = %s")
+        params.append(target)
+    cur.execute(f"""
         SELECT DISTINCT ON (tool, target, command)
                id, tool, command, target, port, service, status, exit_code,
-               left(COALESCE(output, ''), 400) AS output,
-               COALESCE(error, '') AS error, started_at
+               COALESCE(output, '') AS output,
+               COALESCE(error, '') AS error,
+               octet_length(COALESCE(output, '')) AS output_bytes,
+               started_at
         FROM tool_executions
-        WHERE status IN ('failed', 'timeout')
-           OR (status = 'completed' AND COALESCE(output, '') = '')
+        WHERE {' AND '.join(where)}
         ORDER BY tool, target, command, started_at DESC
-    """)
+    """, params)
     candidates = [dict(r) for r in cur.fetchall()]
 
     proposals, refusals, needs_input, seen = [], [], [], set()
@@ -1024,9 +1048,12 @@ def run_post_review(triggered_by="manual", since_days=None, target=None,
             unparsed = find_unparsed_output(cur)
             not_ingested = find_results_not_ingested(cur)
             stuck = find_stuck_recommendations(cur)
+            # Same window and target as the review above, or the report and the
+            # proposals it offers would describe different sets of executions.
             reruns = propose_reruns(cur, catalogue=catalogue,
                                    dry_run=not queue_reruns,
-                                   engagement_id=engagement_id)
+                                   engagement_id=engagement_id,
+                                   since_days=since_days, target=target)
 
             actionable = sum(g["count"] for g in executions["groups"]
                              if g["actionable"])
