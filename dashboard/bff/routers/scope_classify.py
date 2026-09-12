@@ -108,3 +108,23 @@ async def list_decisions(limit: int = Query(50)):
     async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.rag_api_url}/scope/decisions", params={"limit": limit}, headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
+
+
+@router.get("/api/scope/conflicts")
+async def list_scope_conflicts(include_resolved: bool = Query(False)):
+    """Targets in more than one engagement scope — the fix-me list for the UI."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.get(f"{s.rag_api_url}/scope/conflicts",
+                           params={"include_resolved": str(bool(include_resolved)).lower()},
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.post("/api/scope/conflicts/{conflict_id}/resolve")
+async def resolve_scope_conflict(conflict_id: str):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.post(f"{s.rag_api_url}/scope/conflicts/{conflict_id}/resolve",
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)

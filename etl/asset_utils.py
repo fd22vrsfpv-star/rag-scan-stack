@@ -8,6 +8,106 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+def engagements_for_ip(cur, ip: str):
+    """Every engagement whose SCOPE contains `ip`, as a list of (id, name).
+
+    The raw multi-match view that both resolve_engagement_for_ip and the
+    scope-conflict flag build on. Empty on no match or on error (fail safe).
+    """
+    if not ip:
+        return []
+    try:
+        cur.execute(
+            """
+            SELECT st.engagement_id::text AS eid,
+                   COALESCE(max(e.name), '') AS name
+              FROM public.scope_targets st
+              LEFT JOIN public.engagements e ON e.id = st.engagement_id
+             WHERE st.engagement_id IS NOT NULL
+               AND st.target <> ''
+               AND (
+                    (st.target_type = 'ip' AND st.target = host(%s::inet)::text)
+                 OR (st.target_type = 'cidr'
+                     AND st.target ~ '^[0-9]+([.][0-9]+){3}/[0-9]+$'
+                     AND %s::inet <<= st.target::inet)
+               )
+             GROUP BY st.engagement_id
+            """,
+            (ip, ip),
+        )
+        out = []
+        for r in cur.fetchall():
+            eid = r.get("eid") if isinstance(r, dict) else r[0]
+            name = r.get("name") if isinstance(r, dict) else r[1]
+            if eid:
+                out.append((eid, name or ""))
+        return out
+    except Exception as e:
+        logger.debug("engagement lookup failed for %s: %s", ip, e)
+        return []
+
+
+def record_scope_conflict(ip, engagements, *, target_type="ip",
+                          detected_by="", session_id=None):
+    """Persist a 'target in more than one engagement scope' finding so an
+    operator can fix the duplicate.
+
+    Uses its OWN connection on purpose. resolve_engagement_for_ip runs inside
+    ingest transactions with a shared cursor, and in Postgres a failed statement
+    aborts the WHOLE transaction — so an INSERT here (e.g. against a DB not yet
+    migrated to have scope_conflicts) would poison the caller's ingest. A
+    separate connection isolates it completely: it commits on its own and its
+    failure never reaches the caller.
+
+    Upserts one row per target (refreshing last_seen / names / detection count
+    on a re-detection). Best-effort; returns True when a row was written.
+    """
+    import os
+    ids = [e[0] for e in engagements]
+    names = [e[1] for e in engagements]
+    dsn = os.environ.get("DB_DSN") or os.environ.get("DATABASE_URL")
+    if not dsn:
+        return False
+    conn = None
+    try:
+        import psycopg2
+        conn = psycopg2.connect(dsn, connect_timeout=5)
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.scope_conflicts
+                  (target, target_type, engagement_ids, engagement_names,
+                   detections, last_detected_by, last_session_id, resolved,
+                   first_seen, last_seen)
+                VALUES (%s, %s, %s::uuid[], %s::text[], 1, %s, %s, false,
+                        now(), now())
+                ON CONFLICT (target) DO UPDATE SET
+                  target_type      = EXCLUDED.target_type,
+                  engagement_ids   = EXCLUDED.engagement_ids,
+                  engagement_names = EXCLUDED.engagement_names,
+                  detections       = public.scope_conflicts.detections + 1,
+                  last_detected_by = EXCLUDED.last_detected_by,
+                  last_session_id  = EXCLUDED.last_session_id,
+                  -- A re-detection means the duplicate still exists: reopen it,
+                  -- so a prematurely-dismissed conflict resurfaces not hides.
+                  resolved         = false,
+                  last_seen        = now()
+                """,
+                (ip, target_type, ids, names, detected_by,
+                 str(session_id) if session_id else None),
+            )
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("scope-conflict recording failed for %s: %s", ip, e)
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def resolve_engagement_for_ip(cur, ip: str):
     """The engagement whose SCOPE contains `ip`, when exactly one does.
 
@@ -22,37 +122,19 @@ def resolve_engagement_for_ip(cur, ip: str):
     is what resolves the link. Returns None when NO scope matches, and also when
     MORE THAN ONE does: guessing an owner for a host two engagements both claim
     would silently attribute findings to the wrong engagement, which is worse
-    than leaving it unstamped.
+    than leaving it unstamped. In that MORE-THAN-ONE case it also RECORDS the
+    conflict (see record_scope_conflict) so the duplicate does not stay invisible.
     """
     if not ip:
         return None
-    try:
-        cur.execute(
-            """
-            SELECT DISTINCT st.engagement_id::text
-              FROM public.scope_targets st
-             WHERE st.engagement_id IS NOT NULL
-               AND st.target <> ''
-               AND (
-                    (st.target_type = 'ip' AND st.target = host(%s::inet)::text)
-                 OR (st.target_type = 'cidr'
-                     AND st.target ~ '^[0-9]+([.][0-9]+){3}/[0-9]+$'
-                     AND %s::inet <<= st.target::inet)
-               )
-             LIMIT 2
-            """,
-            (ip, ip),
-        )
-        rows = cur.fetchall()
-    except Exception as e:
-        logger.debug("engagement resolution failed for %s: %s", ip, e)
-        return None
-    if len(rows) != 1:
-        if len(rows) > 1:
-            logger.info("ip %s is in more than one engagement scope — leaving unstamped", ip)
-        return None
-    r = rows[0]
-    return (r.get("engagement_id") if isinstance(r, dict) else r[0])
+    matches = engagements_for_ip(cur, ip)
+    if len(matches) == 1:
+        return matches[0][0]
+    if len(matches) > 1:
+        logger.info("ip %s is in %d engagement scopes — leaving unstamped, "
+                    "recording conflict", ip, len(matches))
+        record_scope_conflict(ip, matches, detected_by="ingest")
+    return None
 
 
 def ensure_asset(cur, ip: str = None, hostname: str = None) -> str:

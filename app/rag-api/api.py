@@ -14235,6 +14235,53 @@ def _infer_target_type(target: str) -> str:
         return "domain"
 
 
+@app.get("/scope/conflicts", tags=["Scope"])
+def list_scope_conflicts(include_resolved: bool = Query(False),
+                         _: bool = Depends(auth)):
+    """Targets claimed by MORE THAN ONE engagement's scope, worst/newest first.
+
+    A target in two scopes cannot be attributed to an engagement (the resolver
+    refuses to guess), so a scan on it runs unattached and loses its engagement's
+    pre-approval. Each row names the conflicting engagements so the operator can
+    remove the duplicate. Recorded at detection time by record_scope_conflict.
+    """
+    where = "" if include_resolved else "WHERE resolved = false"
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""SELECT id::text, target, target_type,
+                       array(SELECT x::text FROM unnest(engagement_ids) x) AS engagement_ids,
+                       engagement_names, detections, last_detected_by,
+                       last_session_id::text, resolved, first_seen, last_seen
+                  FROM scope_conflicts
+                  {where}
+                 ORDER BY resolved ASC, last_seen DESC
+                 LIMIT 500""")
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"count": len(rows), "open": sum(1 for r in rows if not r["resolved"]),
+            "conflicts": rows}
+
+
+@app.post("/scope/conflicts/{conflict_id}/resolve", tags=["Scope"])
+def resolve_scope_conflict(conflict_id: str,
+                           x_operator: str = Header("operator", alias="X-Operator"),
+                           _: bool = Depends(auth)):
+    """Mark a scope conflict resolved (the operator fixed the duplicate).
+
+    Durable only until the duplicate recurs: if a scan later resolves the same
+    target and STILL finds two scopes, record_scope_conflict reopens it — so
+    dismissing without actually fixing the scope brings it straight back.
+    """
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("UPDATE scope_conflicts SET resolved = true "
+                    " WHERE id = %s::uuid RETURNING id::text, target, resolved",
+                    (conflict_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"scope conflict {conflict_id} not found")
+        conn.commit()
+    return {"ok": True, "actor": x_operator, **dict(row)}
+
+
 @app.post("/scope/add", tags=["Scope"])
 def add_to_scope(
     body: dict,
