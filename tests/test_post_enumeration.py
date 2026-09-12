@@ -829,12 +829,26 @@ def test_queueing_is_not_executing():
 
 
 def test_every_approved_exploit_runs():
+    """Grouped by unique port, every port covered, stop-on-first-shell, bounded
+    PER PORT — not truncated as a flat session total (which dropped whole ports).
+
+    Sabotage proof: put back `[:MAX_EXPLOITS_PER_SESSION]` and the per-port
+    grouping assertion below fails; drop the stop-on-shell break and its
+    assertion fails; drop MAX_EXPLOITS_PER_PORT and the per-port bound fails.
+    """
     fn = _func_src(ENGINE, "exploit_exec")
-    assert "for pid in pending_ids:" in fn, (
-        "only the first approved exploit runs, so approving several does "
-        "nothing for the rest")
-    assert "MAX_EXPLOITS_PER_SESSION" in fn, (
-        "unbounded: a planner that queues thirty would fire thirty unattended")
+    # Iterates the per-port candidate list, not a flat truncated session list.
+    assert "for pid in ids:" in fn and "for key in order:" in fn, (
+        "exploit_exec no longer walks every candidate grouped by port, so a "
+        "later port's foothold is never tried")
+    assert "[:MAX_EXPLOITS_PER_SESSION]" not in fn, (
+        "a flat session-total truncation drops whole ports — the bound must be "
+        "per port")
+    assert "MAX_EXPLOITS_PER_PORT" in fn, (
+        "unbounded per port: a port with thirty candidates would fire thirty")
+    assert "got_shell" in fn and "break" in fn, (
+        "no stop-on-first-shell: a port we already hold keeps getting hit with "
+        "redundant exploits")
     assert "failed.append(pid)" in fn, (
         "one failure abandons the rest — an exploit that errors is a result, "
         "the ones after it never running is a gap")
