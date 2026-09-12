@@ -2948,6 +2948,57 @@ CREATE TRIGGER trg_tool_remediation_learned_updated
   BEFORE UPDATE ON public.tool_remediation_learned
   FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
 
+-- ============================================================================
+-- Tool settings derived from what recon measured
+-- ----------------------------------------------------------------------------
+-- tool_remediation_learned is REACTIVE: a tool failed, what argument fixes it.
+-- This is the same knowledge applied BEFORE the first attempt, so the failure
+-- does not have to happen at all.
+--
+-- Every row is derived, never typed: the VALUES come from what the target
+-- advertised (ssh-audit / nmap ssh2-enum-algos, read by
+-- etl/target_capabilities.py) intersected with what the client supports (the
+-- tool's own `-Q`-style probe), and the SYNTAX comes from
+-- knowledge/tool_options.yaml. Both halves are measurements.
+--
+-- `status` exists because a derived setting is still a judgement about what to
+-- do with a measurement: an operator can reject one and the derivation will not
+-- quietly reinstate it.
+--
+-- This decides an ARGUMENT. It has never decided whether something may run, and
+-- the scope gate and the phase's approval are unchanged.
+CREATE TABLE IF NOT EXISTS public.target_tool_settings (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    target        text NOT NULL,
+    port          integer,
+    service       text NOT NULL DEFAULT '',
+    tool          text NOT NULL,
+    category      text NOT NULL,
+    option_text   text NOT NULL,
+    -- What each side contributed, so a reader can see WHY this value and not
+    -- another one -- and see what was dropped in the intersection.
+    host_offers   text[] NOT NULL DEFAULT '{}',
+    client_supports text[] NOT NULL DEFAULT '{}',
+    source        text NOT NULL DEFAULT 'derived',
+    status        text NOT NULL DEFAULT 'active'
+                  CHECK (status IN ('active','proposed','rejected')),
+    reviewed_by   text,
+    derived_at    timestamptz DEFAULT now(),
+    updated_at    timestamptz DEFAULT now()
+);
+-- COALESCE the nullable port: a NULL makes rows non-equal for uniqueness, so
+-- without it the constraint would not apply to exactly the rows most likely to
+-- be re-derived.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_target_tool_settings
+  ON public.target_tool_settings
+     (target, COALESCE(port, -1), service, tool, category);
+CREATE INDEX IF NOT EXISTS idx_target_tool_settings_lookup
+  ON public.target_tool_settings (tool, target, status);
+DROP TRIGGER IF EXISTS trg_target_tool_settings_updated ON public.target_tool_settings;
+CREATE TRIGGER trg_target_tool_settings_updated
+  BEFORE UPDATE ON public.target_tool_settings
+  FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+
 -- Agent-to-agent feedback channel. One agent flags something interesting (a
 -- finding worth another run, a coverage gap); a coordinator turns approved flags
 -- into scan_recommendations (which the recon agent dispatches through the scope

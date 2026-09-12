@@ -312,3 +312,95 @@ def test_a_learned_remediation_outranks_a_lexical_guess(store):
                                 capabilities=HOST_CAPS)
     assert r["candidates"][0]["category"] == "key-exchange", (
         "an option already observed to work did not outrank a lexical score")
+
+
+# ── Derived before the failure, not after ──────────────────────────────────
+
+def test_settings_are_derived_from_both_measurements():
+    """The whole point: the option is the intersection of what the host
+    advertised and what the client supports, and neither is guessed."""
+    tl._probe_cache["ssh:host-key"] = ["ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa"]
+    d = tc.derive_tool_settings("h", tools=["ssh"], caps={
+        "available": True, "categories": {"host-key": ["ssh-rsa", "ssh-dss"]}})
+    hk = next(s for s in d["settings"] if s["category"] == "host-key")
+    assert hk["option"] == "-oHostKeyAlgorithms=+ssh-rsa", hk
+    assert hk["client_verified"] is True
+    assert hk["host_offers"] == ["ssh-rsa", "ssh-dss"], (
+        "what the host offered is no longer recorded, so nobody can see what "
+        "was dropped in the intersection or why")
+
+
+def test_a_tool_with_no_options_is_skipped_with_a_reason():
+    """"no flag exists for this" and "nobody derived anything" look identical
+    as an absent row."""
+    d = tc.derive_tool_settings("h", tools=["hydra"], caps={
+        "available": True, "categories": {"host-key": ["ssh-rsa"]}})
+    assert d["settings"] == []
+    assert any(s["tool"] == "hydra" and "different tool" in s["reason"]
+               for s in d["skipped"]), d["skipped"]
+
+
+def test_no_overlap_is_skipped_with_both_sides_recorded():
+    tl._probe_cache["ssh:host-key"] = ["ssh-ed25519"]
+    d = tc.derive_tool_settings("h", tools=["ssh"], caps={
+        "available": True, "categories": {"host-key": ["ssh-dss"]}})
+    skipped = next(s for s in d["skipped"] if s.get("category") == "host-key")
+    assert skipped["host_offers"] == ["ssh-dss"]
+    assert skipped["client_supports"] == ["ssh-ed25519"]
+    assert "no overlap" in skipped["reason"]
+
+
+def test_an_unavailable_store_derives_nothing():
+    """"The database is down" must not read as "this host supports nothing" —
+    that would constrain a tool to an empty list."""
+    d = tc.derive_tool_settings("h", caps={"available": False, "categories": {}})
+    assert d["available"] is False and d["settings"] == []
+
+
+def test_the_dispatcher_applies_them_before_the_first_attempt():
+    bff = os.path.join(REPO, "dashboard", "bff", "routers", "assets.py")
+    if not os.path.exists(bff):
+        pytest.skip("BFF not present")
+    with open(bff, encoding="utf-8") as fh:
+        src = fh.read()
+    assert "def _with_derived_settings" in src, (
+        "derived settings are no longer applied at dispatch, so a tool has to "
+        "fail before it is told what the host supports")
+    assert "_with_derived_settings(command, scanner, rec)" in src
+    assert "settings_for" in src
+
+
+def test_options_go_after_the_tool_not_after_the_target():
+    """Plenty of tools stop parsing options at the first positional argument."""
+    bff = os.path.join(REPO, "dashboard", "bff", "routers", "assets.py")
+    if not os.path.exists(bff):
+        pytest.skip("BFF not present")
+    with open(bff, encoding="utf-8") as fh:
+        src = fh.read()
+    fn = src[src.index("def _with_derived_settings"):]
+    fn = fn[:fn.index("def _secrets_in")]
+    assert 'command.split(" ", 1)' in fn, (
+        "the options are appended rather than inserted after the tool name")
+
+
+def test_ssh_is_allowed_and_installed():
+    """The derived fix is worthless if the tool is not there — which is exactly
+    why `ssh` was off the allow-list in the first place."""
+    listener = os.path.join(REPO, "kali_listener", "listener_service.py")
+    dockerfile = os.path.join(REPO, "kali_listener", "Dockerfile")
+    for path in (listener, dockerfile):
+        if not os.path.exists(path):
+            pytest.skip(f"{path} not present")
+    with open(listener, encoding="utf-8") as fh:
+        src = fh.read()
+    block = src[src.index("_FALLBACK_ALLOWED_TOOLS = {"):]
+    block = block[:block.index("}")]
+    assert '"ssh"' in block, "ssh is not allow-listed"
+    assert '"sshpass"' in block, (
+        "sshpass is not allow-listed — ssh cannot take a password "
+        "non-interactively, so a credential follow-up has nothing to offer")
+    with open(dockerfile, encoding="utf-8") as fh:
+        df = fh.read()
+    assert "openssh-client" in df and "sshpass" in df, (
+        "the image does not install them, so allow-listing them is a promise "
+        "the container cannot keep")

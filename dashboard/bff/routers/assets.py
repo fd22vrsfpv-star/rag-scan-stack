@@ -2090,6 +2090,44 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         unresolved = re.findall(r"\{[a-zA-Z_]+\}", out)
         return out, unresolved
 
+    def _derived_settings(scanner: str, rec) -> list:
+        """Options this tool should use against this target, derived from recon.
+
+        A tool that has to FAIL before it is told what the host supports wastes
+        a dispatch and leaves a confusing `exit 0 but nothing worked` row. The
+        measurement already exists — ssh-audit recorded what 192.168.1.150
+        offers long before anything tried to connect — so it is applied before
+        the first attempt rather than after the first failure.
+
+        Returns [] when nothing was derived or the store cannot be reached.
+        Both leave the command exactly as it was, which is the behaviour before
+        any of this existed.
+        """
+        try:
+            from etl.target_capabilities import settings_for
+        except Exception:  # noqa: BLE001 - etl/ not mounted is a valid deployment
+            return []
+        try:
+            return settings_for(scanner, rec.get("ip") or "", port=rec.get("port"))
+        except Exception as e:  # noqa: BLE001
+            log.debug("derived settings lookup failed: %s", e)
+            return []
+
+    def _with_derived_settings(command: str, scanner: str, rec) -> tuple:
+        """`(command, applied)` — the command with its derived options inserted.
+
+        Inserted after the tool name rather than appended, because a command
+        whose last argument is the target would otherwise get the flags after
+        it, and plenty of tools stop parsing options at the first positional.
+        """
+        opts = [o for o in _derived_settings(scanner, rec) if o and o not in command]
+        if not opts or not command:
+            return command, []
+        parts = command.split(" ", 1)
+        head = parts[0]
+        tail = parts[1] if len(parts) > 1 else ""
+        return (f"{head} {' '.join(opts)} {tail}".strip(), opts)
+
     def _secrets_in(rec) -> list:
         """Literal secrets that must be masked before the command is recorded.
 
@@ -2115,6 +2153,9 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         if _list_source:
             result["wordlist_source"] = _list_source
         command, _unresolved = _fill_placeholders(command, rec)
+        command, _applied = _with_derived_settings(command, scanner, rec)
+        if _applied:
+            result["derived_settings"] = _applied
         if _unresolved:
             result["status"] = "skipped"
             result["detail"] = (f"command still contains {', '.join(sorted(set(_unresolved)))} "

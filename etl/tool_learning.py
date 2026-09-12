@@ -979,20 +979,49 @@ def client_capabilities(tool: str, category: str) -> Optional[List[str]]:
     key = f"{tool}:{category}"
     if key in _probe_cache:
         return _probe_cache[key]
+    # Locally first — whoever is asking may well have the tool.
     try:
         import shlex
         import subprocess
         argv = shlex.split(probe)
         r = subprocess.run(argv, capture_output=True, text=True, timeout=10)
-        if r.returncode != 0:
-            _probe_cache[key] = None
-            return None
-        values = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
-        _probe_cache[key] = values or None
-        return _probe_cache[key]
+        if r.returncode == 0:
+            values = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+            if values:
+                _probe_cache[key] = values
+                return values
     except Exception as e:  # noqa: BLE001
-        log.debug("client capability probe %r failed: %s", probe, e)
-        _probe_cache[key] = None
+        log.debug("local capability probe %r failed: %s", probe, e)
+
+    # Otherwise ask the machine that will actually RUN the tool. rag-api has no
+    # ssh, so deriving from its view produced `+ssh-rsa,ssh-dss` — which the
+    # listener's ssh rejects. The listener is the authority on what its own
+    # tools support and nothing else is.
+    remote = _ask_listener(tool, category)
+    _probe_cache[key] = remote
+    return remote
+
+
+def _ask_listener(tool: str, category: str) -> Optional[List[str]]:
+    """`GET /tools/capabilities` on the kali listener. None if it cannot answer."""
+    base = os.environ.get("KALI_LISTENER_URL") or ""
+    if not base:
+        return None
+    try:
+        import requests
+        r = requests.get(
+            f"{base.rstrip('/')}/tools/capabilities",
+            params={"tool": tool, "category": category},
+            headers={"x-api-key": os.environ.get("API_KEY", "")},
+            timeout=15,
+            verify=os.environ.get("REQUESTS_CA_BUNDLE", False),
+        )
+        if r.status_code != 200:
+            return None
+        values = (r.json().get("categories") or {}).get(category)
+        return values or None
+    except Exception as e:  # noqa: BLE001
+        log.debug("listener capability probe failed for %s/%s: %s", tool, category, e)
         return None
 
 
