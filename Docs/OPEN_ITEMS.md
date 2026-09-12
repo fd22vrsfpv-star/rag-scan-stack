@@ -132,7 +132,7 @@ decision, not a code default.
 
 ### Post-access steps needing sudo cannot elevate
 **Found:** 2026-09-12
-**Evidence:** The post-enumerationation phase queued `sudo -l` from
+**Evidence:** The post-enumeration phase queued `sudo -l` from
 `ssh_methodology.md`, wrapped it for remote execution, and it reached the host —
 `Warning: Permanently added '192.168.1.150' (RSA)` then
 `[sudo] password for msfadmin:` on stderr, exit 1, no output. Transport,
@@ -159,23 +159,6 @@ allow-listed — `netexec smb -x`, `mysql -e`, `psql -c` all exist and are
 allowed.
 **Enforced by:** `tests/test_post_enumeration.py::test_an_unreachable_protocol_queues_nothing`
 (pins that an unwrappable protocol queues nothing rather than something broken)
-
-### Post-enumeration outcomes only carry forward for Kali-dispatched commands
-**Found:** 2026-09-12
-**Evidence:** Acting on the `smbv1-only` proposal dispatched it to the **native
-nmap runner** (`Scan started: 0ea66fb6`), which writes to `scans` and never
-calls `kali_listener.db_update_tool_execution` — where the write-back hook
-lives. The rule stayed `fired=1 executed=0`. Calling
-`record_outcome_for_command()` directly resolves it correctly
-(`fired=1 executed=1 produced=1 conf=1.0`), so the mechanism works and only the
-native path is unhooked.
-**Where:** `kali_listener/listener_service.py::_post_enumerate` is the only
-caller; the native runners (`nmap_scanner`, `nuclei-runner`, ...) have no
-equivalent.
-**Done when:** a command completed by any runner resolves its enumeration
-observation. The native path finishes in `scans`, so it needs its own hook
-rather than a shared one.
-**Enforced by:** not enforced
 
 ### Six tools still have no parser, 632 KB of output unread
 **Found:** 2026-09-12
