@@ -73,24 +73,24 @@ observed far fewer times.
 column is renamed to say what it counts.
 **Enforced by:** not enforced
 
-### No allowed tool can execute a command over legacy SSH
+### `ssh` is not installed in the Kali container, so the derived fix cannot run
 **Found:** 2026-09-12
-**Evidence:** `netexec ssh 192.168.1.150 --port 22 -u msfadmin -x 'id; uname -a'`
-ran to completion, **exit 0**, and produced
-`IncompatiblePeer: Incompatible ssh peer (no acceptable host key)` in 6,816
-bytes of output. hydra fails the same way on this host (`kex error : no match
-for method server host key algo: server [ssh-rsa,ssh-dss]`). `ssh` itself is not
-on the listener's allowed-tool list (50 tools; `nxc`, `impacket-secretsdump`
-and `vncsnapshot` are not on it either).
-**Where:** `kali_listener/listener_service.py::_FALLBACK_ALLOWED_TOOLS`;
-`knowledge/credential_followups.yaml` ssh entries.
-**Done when:** there is an allowed way to run a command over SSH against a host
-offering only `ssh-rsa`/`ssh-dss` — either `ssh` on the allow-list with
-`-oHostKeyAlgorithms=+ssh-rsa`, or a netexec invocation that negotiates it. Until
-then the SSH post-access checklist is queued and cannot execute, and the run
-looks successful because the tool exits 0.
+**Evidence:** The correct option is now derived automatically —
+`-oHostKeyAlgorithms=+ssh-rsa` from the intersection of what recon recorded
+(`ssh-audit:host-key-ssh-rsa`, `ssh-audit:host-key-ssh-dss`) and what the client
+supports (`ssh -Q key`) — and it is **verified to work**: from the host,
+`ssh -oHostKeyAlgorithms=+ssh-rsa msfadmin@192.168.1.150` negotiates, while the
+same command without it gives
+`no matching host key type found. Their offer: ssh-rsa,ssh-dss`.
+But `docker exec kali-listener ssh` returns
+`failed to run command 'ssh': No such file or directory`, which is why `ssh` is
+not on the 50-tool allow-list.
+**Where:** `kali_listener/Dockerfile`; `_FALLBACK_ALLOWED_TOOLS`.
+**Done when:** `openssh-client` is installed in the listener image and `ssh` is
+on the allow-list. Both are operator decisions — `ssh host '<command>'` is
+general-purpose remote execution — so they are stated here rather than taken.
 **Enforced by:** `tests/test_credential_followups.py::test_every_followup_names_a_tool_the_platform_can_run`
-(catches the tool-name half; the negotiation half is not enforced)
+(keeps the catalogue honest about what is runnable today)
 
 ### A tool with no parser is recorded as having produced nothing measurable
 **Found:** 2026-09-12

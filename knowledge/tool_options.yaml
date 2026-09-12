@@ -1,0 +1,92 @@
+# How each tool expresses "restrict yourself to what this host actually offers".
+#
+# WHY THIS IS DATA
+#   This file records tool SYNTAX — a fact about the tool, checkable against its
+#   man page, the same kind of thing as service_tools.yaml. It does NOT decide
+#   when to apply an option: that is learned from whether applying it turned a
+#   failure into a result (etl/tool_learning.py, tool_remediation_learned).
+#
+#   The distinction matters and it is the whole design. "ssh takes
+#   -oHostKeyAlgorithms" is a fact. "when you see this error, add that option"
+#   is a judgement, and judgements here are observed, not typed.
+#
+# CATEGORIES
+#   Must match the capability categories etl/target_capabilities.py reads out of
+#   recon — `host-key`, `key-exchange`, `encryption`, `mac-algorithm` — because
+#   the VALUES come from what the target advertised, not from this file. A
+#   category a tool has no option for is simply absent, and the proposer then
+#   has nothing to offer for that tool, which is the correct answer rather than
+#   a guess.
+#
+# {values} is replaced with a comma-separated list of what the host supports.
+
+version: 1
+
+tools:
+
+  ssh:
+    host-key:      "-oHostKeyAlgorithms=+{values}"
+    key-exchange:  "-oKexAlgorithms=+{values}"
+    encryption:    "-oCiphers=+{values}"
+    mac-algorithm: "-oMACs=+{values}"
+    # What the CLIENT knows about, asked rather than assumed. The host advertised
+    # `ssh-rsa,ssh-dss`, and `-oHostKeyAlgorithms=+ssh-rsa,ssh-dss` is rejected
+    # outright — `Bad key types '+ssh-rsa,ssh-dss'` — because modern OpenSSH has
+    # removed ssh-dss and will not accept a name it does not know. `+ssh-rsa`
+    # alone connects.
+    #
+    # So the option is the INTERSECTION of two measurements: what the host
+    # offers (recon) and what the client supports (this probe). Neither is
+    # guessed, and an intersection that comes out empty is the honest answer
+    # "this client cannot talk to this host at all" — which is a different
+    # finding, and a real one.
+    probe:
+      host-key:      "ssh -Q key"
+      key-exchange:  "ssh -Q kex"
+      encryption:    "ssh -Q cipher"
+      mac-algorithm: "ssh -Q mac"
+    note: >-
+      The `+` form APPENDS to the client default rather than replacing it, so a
+      host that also supports something modern is not forced onto the legacy
+      algorithm. Replacing the list outright would downgrade every connection
+      this command makes.
+
+  scp:
+    host-key:      "-oHostKeyAlgorithms=+{values}"
+    key-exchange:  "-oKexAlgorithms=+{values}"
+
+  sftp:
+    host-key:      "-oHostKeyAlgorithms=+{values}"
+    key-exchange:  "-oKexAlgorithms=+{values}"
+
+  ssh-audit:
+    # Diagnostic tool: it reports what the host offers and never needs to
+    # negotiate down to it. Listed so its absence is a statement rather than an
+    # oversight.
+    note: needs no algorithm constraints — it enumerates rather than connects as a client
+
+  openssl:
+    encryption: "-cipher {values}"
+
+  # Tools with NO option for this, recorded explicitly. An empty entry is the
+  # answer "this tool cannot be fixed with a flag; reach for another one", which
+  # is what etl/tool_learning.py's tool selection is for. Without these rows a
+  # reader cannot tell "no option exists" from "nobody has filled this in yet".
+  hydra:
+    note: >-
+      libssh negotiates on its own and exposes no algorithm flags. When hydra
+      fails at key exchange the remedy is a different tool, not a different
+      argument — which is exactly what the learned tool selection found on
+      192.168.1.150 (hydra -> nmap, confidence 1.0).
+
+  netexec:
+    note: >-
+      Its SSH backend (paramiko) raises `IncompatiblePeer: no acceptable host
+      key` against legacy servers and takes no algorithm flags. Same conclusion
+      as hydra: another tool, not another argument.
+
+  medusa:
+    note: no algorithm selection flags
+
+  ncrack:
+    note: no algorithm selection flags
