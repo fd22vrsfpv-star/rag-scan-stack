@@ -130,6 +130,36 @@ row in `tool_executions`.
 decision, not a code default.
 **Enforced by:** not enforced
 
+### Post-access steps needing sudo cannot elevate
+**Found:** 2026-09-12
+**Evidence:** The post-exploitation phase queued `sudo -l` from
+`ssh_methodology.md`, wrapped it for remote execution, and it reached the host —
+`Warning: Permanently added '192.168.1.150' (RSA)` then
+`[sudo] password for msfadmin:` on stderr, exit 1, no output. Transport,
+authentication and the recon-derived algorithm options all worked; only the
+elevation did not. `sudo -n` is unavailable on this 2008-vintage host
+(`illegal option -n`).
+**Where:** `autogen_agents/langgraph_engine.py::_wrap_remote`.
+**Done when:** a step that needs elevation can use the credential the platform
+already holds. Piping the password to `sudo -S` inside a nested single-quoted
+remote command is the obvious route and is quoting-fragile — a password
+containing a quote would break the command or worse — so it is stated here
+rather than done hastily.
+**Enforced by:** not enforced
+
+### Only ssh post-access steps can be reached
+**Found:** 2026-09-12
+**Evidence:** `_wrap_remote()` returns None for every protocol but ssh, so
+post-access steps for smb, mysql, postgresql and the rest are counted in
+`unwrappable` and queued for nothing. The playbooks contain 221 read-only steps
+across ten protocols; only ssh's can currently run.
+**Where:** `autogen_agents/langgraph_engine.py::_wrap_remote`.
+**Done when:** the wrapper covers the protocols whose tools are already
+allow-listed — `netexec smb -x`, `mysql -e`, `psql -c` all exist and are
+allowed.
+**Enforced by:** `tests/test_post_exploit.py::test_an_unreachable_protocol_queues_nothing`
+(pins that an unwrappable protocol queues nothing rather than something broken)
+
 ## Data and deployment
 
 ### One asset carries no engagement
