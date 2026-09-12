@@ -121,6 +121,191 @@ async def analyze_extractor(body: dict):
         return safe_json(resp)
 
 
+# ── Post-execution review (post_review_agent) ───────────────────────────
+#
+# The agent has existed for a while and had NO proxy, so none of it was reachable
+# from the dashboard — /api/agent/post-review was a 404 and the only way to run a
+# review was curl against rag-api with the API key. It classifies executed work
+# and finds results that were captured but never interpreted; on this stack that
+# was four SMB findings sitting in raw output, one of them high severity.
+#
+# It proposes and never dispatches: re-runs land as pending recommendations that
+# a human still has to run, and every proposed target passes the scope gate
+# first with refusals reported rather than dropped.
+
+@router.post("/api/agent/post-review")
+async def run_post_review(queue_reruns: bool = False, since_days: Optional[int] = None,
+                          target: Optional[str] = None):
+    """Classify every stored execution and report what was missed.
+
+    Synchronous upstream — the report IS the answer — so it gets the long
+    timeout rather than a fast fail that would abandon work already done."""
+    s = get_settings()
+    params: dict = {"queue_reruns": str(bool(queue_reruns)).lower()}
+    if since_days is not None:
+        params["since_days"] = since_days
+    if target:
+        params["target"] = target
+    async with httpx.AsyncClient(timeout=TIMEOUT_LONG) as c:
+        resp = await c.post(f"{s.rag_api_url}/agent/post-review", params=params,
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.post("/api/agent/post-review/ingest-facts")
+async def ingest_post_review_facts(dry_run: bool = True, target: Optional[str] = None,
+                                   limit: int = 4000):
+    """Store facts the review found in raw output as real findings.
+
+    Defaults to a dry run, matching upstream: this writes findings that appear
+    in reports and exports, so the default must not be the destructive one."""
+    s = get_settings()
+    params: dict = {"dry_run": str(bool(dry_run)).lower(), "limit": limit}
+    if target:
+        params["target"] = target
+    async with httpx.AsyncClient(timeout=TIMEOUT_LONG) as c:
+        resp = await c.post(f"{s.rag_api_url}/agent/post-review/ingest-facts",
+                            params=params,
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.get("/api/agent/post-review/executions/{execution_id}")
+async def get_reviewed_execution(execution_id: str):
+    """One execution in full, for manual review: the complete output, the return
+    code, the flags it was actually called with, what the analysis extracted, and
+    what the tool-selection learner made of it.
+
+    The three verdicts answer different questions and a reviewer needs all of
+    them: `classification` says what to DO about the run, `analysis` says what
+    was IN its output, `learning` says what the platform learned from it."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_LONG) as c:
+        resp = await c.get(
+            f"{s.rag_api_url}/agent/post-review/executions/{execution_id}",
+            headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.get("/api/agent/post-review/invocations")
+async def post_review_invocations(tool: Optional[str] = None, limit: int = 200):
+    """Return code x option signature per tool — which invocation form works.
+    "nmap failed" was never a usable statement; this is what makes it one."""
+    s = get_settings()
+    params: dict = {"limit": max(1, min(limit, 2000))}
+    if tool:
+        params["tool"] = tool
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/agent/post-review/invocations",
+                           params=params,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.get("/api/agent/post-review/reports")
+async def list_post_review_reports(limit: int = 20):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/agent/post-review/reports",
+                           params={"limit": limit},
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.get("/api/agent/post-review/reports/{report_id}")
+async def get_post_review_report(report_id: str):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/agent/post-review/reports/{report_id}",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.get("/api/agent/post-review/analysis-coverage")
+async def post_review_analysis_coverage():
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/agent/post-review/analysis-coverage",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+# ── Learned tool selection (tool_selection_learned) ─────────────────────
+#
+# Review surface for etl/tool_learning.py. These rules decide which authorised
+# tool is tried FIRST when another one fails; they never decide whether
+# something may run. Approving one grants no permission.
+
+@router.get("/api/tool-selection/learned")
+async def list_tool_selection_learned(
+        phase: Optional[str] = None, service: Optional[str] = None,
+        status: Optional[str] = None, failed_tool: Optional[str] = None,
+        limit: int = 200):
+    s = get_settings()
+    params = {k: v for k, v in (("phase", phase), ("service", service),
+                                ("status", status), ("failed_tool", failed_tool))
+              if v is not None}
+    params["limit"] = max(1, min(limit, 1000))
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/tool-selection/learned", params=params,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.get("/api/tool-selection/attempts")
+async def list_tool_selection_attempts(
+        phase: Optional[str] = None, service: Optional[str] = None,
+        tool: Optional[str] = None, target: Optional[str] = None,
+        signature: Optional[str] = None, limit: int = 100):
+    """The raw observations behind a rule — a conclusion nobody can check is not
+    reviewable."""
+    s = get_settings()
+    params = {k: v for k, v in (("phase", phase), ("service", service),
+                                ("tool", tool), ("target", target),
+                                ("signature", signature)) if v is not None}
+    params["limit"] = max(1, min(limit, 1000))
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/tool-selection/attempts", params=params,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.post("/api/tool-selection/learned/{rule_id}/{action}")
+async def review_tool_selection_learned(rule_id: str, action: str):
+    if action not in ("approve", "reject", "reset"):
+        raise HTTPException(400, "action must be approve, reject or reset")
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/tool-selection/learned/{rule_id}/{action}",
+            headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.post("/api/tool-selection/backfill")
+async def backfill_tool_selection(body: dict):
+    """Re-derive rules from tool_executions. Reads history only — dispatches
+    nothing — but it can rewrite every rule for a phase, so it gets the long
+    timeout rather than a fast fail."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_LONG) as c:
+        resp = await c.post(f"{s.rag_api_url}/tool-selection/backfill", json=body,
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
 # ── Gap Analysis ───────────────────────────────────────────────────────
 
 @router.post("/api/gap-analysis/{eid}")

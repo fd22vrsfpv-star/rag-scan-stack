@@ -17396,6 +17396,73 @@ def get_engagement(eid: str, _: bool = Depends(auth)):
             eng["scopes"] = []
     return eng
 
+class ExploitPreapprovalBody(BaseModel):
+    enabled: bool
+    approved_by: Optional[str] = None
+    note: Optional[str] = None
+
+
+@app.get("/engagements/{eid}/exploit-preapproval", tags=["Engagements"])
+def get_exploit_preapproval(eid: str, _: bool = Depends(auth)):
+    """Whether exploit execution is pre-approved for this engagement."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT COALESCE((metadata->>'exploit_preapproved')::boolean, false) AS enabled,
+                      metadata->'exploit_preapproval_meta' AS meta
+                 FROM engagements WHERE id = %s::uuid""", (eid,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, f"no engagement {eid}")
+    return {"engagement_id": eid, "enabled": bool(row["enabled"]),
+            "meta": row["meta"] or {}}
+
+
+@app.put("/engagements/{eid}/exploit-preapproval", tags=["Engagements"])
+def set_exploit_preapproval(eid: str, body: ExploitPreapprovalBody,
+                            x_operator: str = Header("operator", alias="X-Operator"),
+                            _: bool = Depends(auth)):
+    """Pre-approve exploit execution for ONE engagement.
+
+    With this on, a LangGraph session does not pause at the exploit gate: the
+    operator has already authorised this engagement, so there is nobody to wait
+    for. That is authorization given in advance, not an override of it — see
+    langgraph_engine._engagement_preapproval.
+
+    Deliberately its own endpoint rather than PUT /engagements/{eid}: that one
+    REPLACES `metadata` wholesale, so setting one key through it would silently
+    drop every other key the engagement holds. This merges.
+
+    Scope is untouched. execute_approved_exploit still fails closed on scope, so
+    pre-approval can never make an out-of-scope target runnable.
+    """
+    meta = {"enabled": bool(body.enabled), "approved_by": body.approved_by or x_operator,
+            "note": body.note, "set_at": datetime.now(timezone.utc).isoformat()}
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """UPDATE engagements
+                  SET metadata = COALESCE(metadata, '{}'::jsonb)
+                                 || jsonb_build_object('exploit_preapproved', %s::boolean,
+                                                       'exploit_preapproval_meta', %s::jsonb)
+                WHERE id = %s::uuid
+            RETURNING id, name,
+                      COALESCE((metadata->>'exploit_preapproved')::boolean, false) AS enabled""",
+            (bool(body.enabled), Json(meta), eid))
+        row = cur.fetchone()
+        conn.commit()
+    if not row:
+        raise HTTPException(404, f"no engagement {eid}")
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("engagement_exploit_preapproval_changed", "engagements",
+                     {"engagement_id": eid, "name": row["name"],
+                      "enabled": bool(row["enabled"]), "actor": meta["approved_by"]},
+                     severity="high")
+    except Exception as e:  # noqa: BLE001
+        log.warning("preapproval webhook failed: %s", e)
+    return {"ok": True, "engagement_id": eid, "name": row["name"],
+            "enabled": bool(row["enabled"]), "meta": meta}
+
+
 @app.put("/engagements/{eid}", tags=["Engagements"])
 def update_engagement(eid: str, body: EngagementUpdate, _: bool = Depends(auth)):
     """Update an engagement."""
@@ -21402,6 +21469,169 @@ def export_extractor_learned(tool: Optional[str] = None, _: bool = Depends(auth)
     return {"ok": True, "tools": list(out), "yaml": out}
 
 
+# ── Learned tool selection (tool_selection_learned) ────────────────────────
+#
+# The review surface for etl/tool_learning.py. Those rules are derived from what
+# tools actually did — they are not typed by anyone — so the operator's job here
+# is correction, not authoring: see what the platform concluded, and overrule it
+# when the conclusion is wrong.
+#
+# A rejected rule is never consulted again and new evidence does not reinstate it
+# (the upsert in etl/tool_learning.py preserves 'rejected'), which is the whole
+# reason this surface has to exist: before it, undoing a bad conclusion meant a
+# psql session.
+#
+# NOTE these rules govern which authorised tool is tried FIRST, never whether
+# something may run. Approving one grants no permission; the scope gate and the
+# phase's approval are unchanged and enforced elsewhere.
+
+@app.get("/tool-selection/learned", tags=["Tool Learning"])
+def list_tool_selection_learned(
+    phase: Optional[str] = None, service: Optional[str] = None,
+    status: Optional[str] = None, failed_tool: Optional[str] = None,
+    limit: int = 200, _: bool = Depends(auth)):
+    """Learned tool-selection rules, most recently corroborated first."""
+    where, params = ["1=1"], []
+    if phase:
+        where.append("phase = %s"); params.append(phase)
+    if service is not None:
+        where.append("service = %s"); params.append(service)
+    if status:
+        where.append("status = %s"); params.append(status)
+    if failed_tool:
+        where.append("failed_tool = %s"); params.append(failed_tool)
+    params.append(max(1, min(limit, 1000)))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""SELECT id::text, phase, service, failed_tool, failure_signature,
+                       preferred_tool, failure_phrase, support, attempts,
+                       successes, confidence, status, source, reviewed_by,
+                       created_at, updated_at, last_seen_at
+                  FROM tool_selection_learned
+                 WHERE {' AND '.join(where)}
+                 ORDER BY last_seen_at DESC LIMIT %s""", params)
+        rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        if r.get("confidence") is not None:
+            r["confidence"] = float(r["confidence"])
+    counts = {"active": 0, "proposed": 0, "rejected": 0}
+    for r in rows:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    return {"count": len(rows), "by_status": counts, "learned": rows}
+
+
+@app.get("/tool-selection/attempts", tags=["Tool Learning"])
+def list_tool_attempts(phase: Optional[str] = None, service: Optional[str] = None,
+                       tool: Optional[str] = None, target: Optional[str] = None,
+                       signature: Optional[str] = None, limit: int = 100,
+                       _: bool = Depends(auth)):
+    """The raw observations a rule was derived from.
+
+    A rule the operator cannot trace back to attempts is one they have to take
+    on faith, and a conclusion nobody can check is not reviewable."""
+    where, params = ["1=1"], []
+    if phase:
+        where.append("phase = %s"); params.append(phase)
+    if service is not None:
+        where.append("service = %s"); params.append(service)
+    if tool:
+        where.append("tool = %s"); params.append(tool)
+    if target:
+        where.append("target = %s"); params.append(target)
+    if signature:
+        where.append("failure_signature = %s"); params.append(signature)
+    params.append(max(1, min(limit, 1000)))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""SELECT id::text, phase, tool, service, target, port, success,
+                       result_count, failure_signature, failure_phrase,
+                       chosen_because, rule_id::text, created_at
+                  FROM tool_attempts
+                 WHERE {' AND '.join(where)}
+                 ORDER BY created_at DESC LIMIT %s""", params)
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"count": len(rows), "attempts": rows}
+
+
+@app.post("/tool-selection/learned/{rule_id}/{action}", tags=["Tool Learning"])
+def review_tool_selection_learned(
+    rule_id: str, action: str,
+    x_operator: str = Header("operator", alias="X-Operator"),
+    _: bool = Depends(auth)):
+    """Overrule the platform: approve, reject or reset one learned rule.
+
+    - **approve** forces 'active' even with no observed successes yet. The
+      operator knows something the observations do not.
+    - **reject** takes it out of service permanently. New evidence will NOT
+      reinstate it — etl/tool_learning.py preserves 'rejected' on upsert — so
+      this is the durable way to say "that conclusion is wrong".
+    - **reset** returns it to 'proposed' so the evidence can speak again.
+
+    Records the actor and emits a `tool_selection_rule_reviewed` audit event."""
+    statuses = {"approve": "active", "reject": "rejected", "reset": "proposed"}
+    if action not in statuses:
+        raise HTTPException(400, "action must be approve, reject or reset")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """UPDATE tool_selection_learned
+                  SET status = %s, reviewed_by = %s
+                WHERE id = %s::uuid
+            RETURNING id::text, phase, service, failed_tool, preferred_tool,
+                      failure_phrase, status, support, successes""",
+            (statuses[action], x_operator, rule_id))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"learned rule {rule_id} not found")
+        conn.commit()
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("tool_selection_rule_reviewed", "tool_learning", {
+            "rule_id": rule_id, "action": action, "actor": x_operator,
+            "service": row["service"], "failed_tool": row["failed_tool"],
+            "preferred_tool": row["preferred_tool"], "status": row["status"]})
+    except Exception:
+        log.warning("tool_selection review webhook emit failed", exc_info=True)
+    return {"ok": True, "actor": x_operator, **dict(row)}
+
+
+class ToolSelectionBackfillBody(BaseModel):
+    since_hours: Optional[int] = None
+    # Counters are pair-wise and not idempotent, so re-running layers onto the
+    # previous derivation. `reset` clears the phase first, which is what you
+    # want after changing how an outcome is judged.
+    reset: bool = False
+    phase: str = "tool_execution"
+
+
+@app.post("/tool-selection/backfill", tags=["Tool Learning"])
+def backfill_tool_selection(body: ToolSelectionBackfillBody,
+                            x_operator: str = Header("operator", alias="X-Operator"),
+                            _: bool = Depends(auth)):
+    """Re-derive rules from `tool_executions`, which already holds every command
+    the platform has run with its stderr, exit code and parsed results.
+
+    Reads history only — it dispatches nothing and touches no target."""
+    from etl import tool_learning
+    cleared = 0
+    if body.reset:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM tool_selection_learned WHERE phase = %s",
+                        (body.phase,))
+            cleared = cur.rowcount
+            conn.commit()
+    result = tool_learning.learn_from_tool_executions(
+        since_hours=body.since_hours, phase=body.phase)
+    if not result.get("available"):
+        raise HTTPException(503, "learning store unreachable; nothing was derived")
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("tool_selection_backfill", "tool_learning", {
+            "actor": x_operator, "cleared": cleared, **result})
+    except Exception:
+        log.warning("tool_selection backfill webhook emit failed", exc_info=True)
+    return {"ok": True, "cleared": cleared, "actor": x_operator, **result}
+
+
 # ── Agent-to-agent feedback channel (agent_flags) ───────────────────────────
 
 class AgentFlagBody(BaseModel):
@@ -21557,7 +21787,75 @@ def get_reviewed_execution(execution_id: str, _: bool = Depends(auth)):
                     "pipeline": opts["pipeline"], "parse_ok": opts["parse_ok"]},
         "classification": verdict,
         "analysis": analysis,
+        # What the tool-selection learner made of this run, so a manual reviewer
+        # sees ONE coherent status instead of having to reconcile three modules.
+        # classification says what to DO about it, analysis says what was IN it,
+        # and this says what the platform LEARNED from it — including which
+        # other tool has worked after this exact failure before.
+        "learning": _execution_learning_verdict(r),
     }
+
+
+def _execution_learning_verdict(r: Dict[str, Any]) -> Dict[str, Any]:
+    """The learner's read on one execution, for manual review.
+
+    Three outcomes, matching etl/tool_learning.py exactly rather than
+    re-deriving them here — a second copy of this judgement would drift from the
+    one that actually trains the rules, and then the panel would show a status
+    the platform never acted on.
+    """
+    try:
+        from etl import tool_learning as tl
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "reason": f"tool_learning unimportable: {e}"}
+
+    output = r.get("output") or ""
+    error = r.get("error") or ""
+    failed = tl.execution_failed(r.get("status"), r.get("exit_code"), error, output)
+    parsed = r.get("parsed_results")
+    produced = tl._parsed_anything(parsed)
+    fruitless = (not failed) and (parsed is not None) and not produced
+
+    if failed:
+        outcome, sig_src = "errored", (error or output)
+    elif fruitless:
+        outcome, sig_src = "fruitless", tl.UNPRODUCTIVE_PHRASE
+    elif parsed is None:
+        outcome, sig_src = "unmeasured", ""
+    else:
+        outcome, sig_src = "productive", ""
+
+    signature, phrase = tl.error_signature(sig_src) if sig_src else (None, None)
+    out = {
+        "available": True,
+        "outcome": outcome,
+        "why": {
+            "errored": "the tool reported a failure, or exited 0 saying nothing "
+                       "useful while complaining on stderr",
+            "fruitless": "it ran cleanly and the parser got nothing out of it — "
+                         "not an error, and not a success either",
+            "unmeasured": "no parser ran on this output, so the platform has no "
+                          "opinion on whether it produced anything",
+            "productive": "it ran and produced parseable results",
+        }[outcome],
+        "failure_signature": signature,
+        "failure_phrase": phrase,
+        "suggestions": [],
+        # Three states, not two. An empty list means something different in each
+        # case and a reviewer acts differently on each: there was nothing to ask
+        # about, nobody has learned anything yet, or the store could not be
+        # reached. Collapsing them into a boolean is the bug this repo keeps
+        # shipping — a probe that could not run reported as a negative result.
+        "suggestions_state": "not_applicable",
+    }
+    if signature:
+        advice = tl.suggest_alternatives(
+            r.get("tool") or "", service=r.get("service") or "",
+            signature=signature)
+        out["suggestions"] = advice.get("suggestions") or []
+        out["suggestions_state"] = (
+            "looked" if advice.get("available") else "store_unreachable")
+    return out
 
 
 @app.get("/agent/post-review/invocations", tags=["Post Review"])

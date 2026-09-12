@@ -37,6 +37,7 @@ from typing import Dict, List, Optional, Any
 import time
 import logging
 import traceback
+import contextvars
 import threading
 from datetime import datetime
 import uuid
@@ -185,6 +186,27 @@ class SessionScanTracker:
     # Thread-local storage for current session context
     _local = threading.local()
 
+    # The SAME session id, carried where thread-local cannot reach.
+    #
+    # WHY: track_scan() resolves the session from thread-local. LangGraph runs
+    # its nodes on executor threads, so the context set once at session start
+    # was invisible to every tool call, track_scan returned early, and the scan
+    # was never recorded. The registry then had nothing to persist,
+    # cleanup_session deleted the empty entry, and /scans reported
+    # "total_scans: 0" for a session that had really dispatched two scans.
+    # session_scan_metrics held ONE row for the whole table.
+    #
+    # Three lookups, most specific first:
+    #   1. thread-local        — set explicitly on this thread
+    #   2. contextvar          — survives asyncio.to_thread (it copies context)
+    #   3. the single active run — covers executor threads, which copy neither
+    # Step 3 applies ONLY when exactly one run is active. With two concurrent
+    # runs the attribution is genuinely ambiguous, and guessing would file one
+    # session's scans under another; that case warns and skips instead.
+    _ctx_session: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+        "scan_tracker_session", default=None)
+    _active_runs: set = set()
+
     # Global registry of all session scans (thread-safe via lock)
     _registry: Dict[str, Dict[str, Any]] = {}
     _lock = threading.Lock()
@@ -220,6 +242,7 @@ class SessionScanTracker:
         to pass port ranges — which is where it hallucinates most.
         """
         cls._local.session_id = session_id
+        cls._ctx_session.set(session_id)
         cls._local.started_at = datetime.utcnow().isoformat() + "Z"
 
         cls._local.port_profile = port_profile or None
@@ -278,8 +301,33 @@ class SessionScanTracker:
 
     @classmethod
     def get_current_session(cls) -> Optional[str]:
-        """Get the current session ID for this thread."""
-        return getattr(cls._local, 'session_id', None)
+        """The session this call belongs to, or None if it cannot be resolved.
+
+        See the comment on _ctx_session for why one lookup is not enough.
+        """
+        sid = getattr(cls._local, 'session_id', None)
+        if sid:
+            return sid
+        sid = cls._ctx_session.get()
+        if sid:
+            return sid
+        with cls._lock:
+            if len(cls._active_runs) == 1:
+                return next(iter(cls._active_runs))
+        return None
+
+    @classmethod
+    def register_run(cls, session_id: str):
+        """Mark a session as actively running, so tool calls on threads that
+        inherit neither the thread-local nor the contextvar can still resolve
+        it. Paired with unregister_run in the session's finally block."""
+        with cls._lock:
+            cls._active_runs.add(str(session_id))
+
+    @classmethod
+    def unregister_run(cls, session_id: str):
+        with cls._lock:
+            cls._active_runs.discard(str(session_id))
 
     @classmethod
     def get_port_scope(cls) -> Optional[str]:
@@ -337,7 +385,13 @@ class SessionScanTracker:
         """
         session_id = cls.get_current_session()
         if not session_id:
-            logger.debug(f"[SessionScanTracker] No session context, not tracking {scan_type} job {job_id}")
+            # WARNING, not DEBUG. This silently dropped every LangGraph scan for
+            # weeks: the session reported "0 scans" while the jobs were really
+            # running, and nothing above DEBUG ever said so.
+            logger.warning(
+                "[SessionScanTracker] No session context — NOT tracking %s job %s. "
+                "The scan is running but will not appear against any session.",
+                scan_type, job_id)
             return
 
         scan_entry = {
@@ -1438,7 +1492,10 @@ class ScanTools:
         targets: List[str],
         ports: Optional[List[int]] = None,
         services: Optional[List[str]] = None,
-        method: str = "hydra"
+        # "auto", not "hydra": cred_checker only runs its documented
+        # hydra-then-nmap fallback in the `else` branch, so "hydra" silently
+        # disabled it. See the note on CredentialCheckRequest.method.
+        method: str = "auto"
     ) -> Dict:
         """
         Start credential testing for default/weak passwords.
@@ -3283,7 +3340,10 @@ def start_credential_check(
     target: str = None,
     ports: str = None,
     services: str = None,
-    method: str = "hydra"
+    # "auto" so the hydra-then-nmap fallback actually runs — "hydra" takes
+    # cred_checker's first branch and never falls back, which is why legacy-SSH
+    # hosts reported kex_mismatch on every attempt and zero credentials.
+    method: str = "auto"
 ) -> str:
     """
     Start credential testing for default/weak passwords.

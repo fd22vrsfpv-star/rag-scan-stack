@@ -757,6 +757,39 @@ active_sessions: Dict[str, Dict] = {}
 # Session Watchdog
 # ===============================
 
+def _session_recently_active(session_id: str, within_s: float) -> bool:
+    """True if the session did something in the last `within_s` seconds.
+
+    WHY: the watchdog measured progress ONLY by new session messages. A phase
+    that is genuinely working without narrating — the surface phase executing 26
+    safe tests, a long scan ingest — looks identical to a hung LLM call, and a
+    session was marked `stalled` at ~7 minutes while it was emitting a
+    `langgraph_surface_test_completed` webhook every 1-2 seconds. It then carried
+    on and parked for approval perfectly normally, having already been labelled
+    broken.
+
+    webhook_events is the cheapest honest signal: every phase, test and scan
+    emits one, and the table is already indexed on created_at.
+    """
+    try:
+        from db_utils import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT 1 FROM webhook_events
+                    WHERE created_at > now() - (%s || ' seconds')::interval
+                      AND payload::text LIKE %s
+                    LIMIT 1""",
+                (int(within_s), f"%{session_id}%"))
+            return cur.fetchone() is not None
+    except Exception as e:  # noqa: BLE001
+        # Reported, and treated as "cannot tell" rather than "no activity":
+        # guessing "idle" here is what marks a working session stalled.
+        watchdog_logger.warning(
+            "[%s] activity probe failed (%s) — not stalling on an unreadable signal",
+            session_id[:8], e)
+        return True
+
+
 async def session_watchdog():
     """
     Enhanced AI Agent Watchdog - monitors both AI sessions and scan jobs.
@@ -828,6 +861,35 @@ async def session_watchdog():
                     session_timeout = get_session_timeout(session_id)
 
                     if stall_time >= session_timeout:
+                        # A session PARKED FOR APPROVAL is not stalled.
+                        #
+                        # It is waiting for a human, who may not look at it until
+                        # tomorrow. The list above was taken as `active`, and the
+                        # session can park between that snapshot and here, so the
+                        # status is re-read rather than trusted.
+                        try:
+                            live = get_agent_session(uuid.UUID(session_id)) or {}
+                            live_status = live.get("status")
+                        except Exception:  # noqa: BLE001
+                            live_status = None
+                        if live_status in ("awaiting_approval", "completed",
+                                           "failed", "stopped"):
+                            watchdog_logger.debug(
+                                "[%s] status is %s — not a stall", session_id[:8],
+                                live_status)
+                            session_last_activity[session_id] = now
+                            continue
+
+                        # Still working, just not talking. See
+                        # _session_recently_active for why messages alone are not
+                        # a progress signal.
+                        if _session_recently_active(session_id, session_timeout):
+                            watchdog_logger.info(
+                                "[%s] no new messages for %.0fs but still emitting "
+                                "events — not stalling", session_id[:8], stall_time)
+                            session_last_activity[session_id] = now
+                            continue
+
                         # Session has stalled!
                         recovery_attempts = session_recovery_attempts.get(session_id, 0)
 
@@ -2156,6 +2218,21 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
         # session that ran on autogen must still say so after AGENT_ENGINE is
         # flipped, or the A/B comparison the canary exists for is unreadable.
         engine = resolve_agent_engine(request.engine)
+        # The active engagement, carried into the session's own configuration.
+        #
+        # It arrives as the X-Engagement-Id header and was read ONLY to decide
+        # whether to start the recon agent — it never reached the session, so
+        # `configuration.engagement_id` was None on every session ever created.
+        # Everything in the engine keyed on it silently got None: the web
+        # pipeline's engagement, security_tests.engagement_id, and (once it
+        # existed) the engagement pre-approval lookup, which could therefore
+        # never resolve an engagement to check.
+        _eid = None
+        if http_request is not None:
+            _eid = (http_request.headers.get("x-engagement-id")
+                    or http_request.headers.get("X-Engagement-Id"))
+        _eid = (_eid or "").strip() or None
+
         session_id = create_agent_session(
             request.session_name,
             request.target_description,
@@ -2167,6 +2244,7 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
                 "port_profile": request.port_profile,
                 "web_profile": request.web_profile,
                 "engine": engine,
+                "engagement_id": _eid,
                 "enable_exploit_phase": bool(request.enable_exploit_phase),
                 "enable_surface_test_phase": bool(request.enable_surface_test_phase),
                 "surface_target_host": request.surface_target_host,
@@ -2183,10 +2261,9 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
         # Start the pentest session in background using asyncio.to_thread
         # This runs the synchronous function in a thread pool to avoid blocking the event loop
         # Launch option: turn on the continuous recon agent for this engagement.
-        _eid = None
-        if http_request is not None:
-            _eid = (http_request.headers.get("x-engagement-id")
-                    or http_request.headers.get("X-Engagement-Id"))
+        # Same _eid resolved above when the session was created — read once so
+        # the recon agent and the session's configuration cannot disagree about
+        # which engagement this run belongs to.
         _enable_recon_agent_if_requested(
             _eid, request.enable_recon_agent, request.recon_agent_interval_sec)
 
@@ -2314,6 +2391,10 @@ async def resume_pentest(session_id: str, request: ResumeRequest):
             "surface_target_host": config.get('surface_target_host'),
             "enable_test_synthesis": bool(config.get('enable_test_synthesis')),
             "enable_auto_exploit": bool(config.get('enable_auto_exploit')),
+            # Inherited, like the engine above: a resume that lands in a
+            # different engagement than its parent is not a resume of the same
+            # test, and would consult the wrong engagement's pre-approval.
+            "engagement_id": config.get('engagement_id'),
         }
     )
 
