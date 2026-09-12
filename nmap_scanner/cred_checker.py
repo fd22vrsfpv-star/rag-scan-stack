@@ -809,8 +809,11 @@ def check_default_credentials(
         }
 
     results: List[CredentialResult] = []
-    # Merged audit across whichever method(s) ran.  Built up as the
-    # method choices fan out (hydra-then-nmap-on-kex-fallback etc.).
+    # Merged audit across whichever method(s) ran, in the order they ran.
+    # kex_legacy_detected and fell_back_to_nmap are LABELS the UI reads
+    # (dashboard/frontend/src/components/credentials/CredentialAuditPanel.tsx);
+    # nothing selects a tool from them any more. audit["selection"] below is
+    # where the actual decisions and their reasons are recorded.
     audit: Dict[str, Any] = {
         "credential_source": "cred_checker:default_credentials_dict",
         "users_tried":            sorted({u for u, _ in credentials if u}),
