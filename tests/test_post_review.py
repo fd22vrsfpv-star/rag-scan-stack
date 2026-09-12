@@ -233,6 +233,39 @@ def test_a_startup_banner_is_not_a_broken_invocation():
 
 
 @pytest.mark.unit
+def test_the_proposer_and_the_review_see_the_same_executions():
+    """Two queries that must agree about "needs a re-run" is one query too many.
+
+    propose_reruns selected only `failed`/`timeout`/empty-output rows while
+    review_executions selects every row. So the report could say
+    `remedy: rerun` about an execution the proposer could not see — the operator
+    was told to re-run something nothing would queue, with no way to tell from
+    either side.
+    """
+    import inspect
+    src = inspect.getsource(pr.propose_reruns)
+    assert "status IN ('failed', 'timeout')" not in src, (
+        "the proposer has its own narrower candidate set again")
+    assert "WHERE {' AND '.join(where)}" in src, (
+        "the proposer no longer uses the same filter shape as the review")
+    # classify_execution is the one filter.
+    assert "classify_execution(row, catalogue)" in src
+    assert "_RERUN_REMEDIES" in src
+
+
+@pytest.mark.unit
+def test_the_proposer_reads_full_output_not_a_prefix():
+    """classify_execution branches on how much output there is, and the
+    crackmapexec share table begins ~1 KB in — a 400-byte prefix read
+    "no results" on output that named five shares."""
+    import inspect
+    src = inspect.getsource(pr.propose_reruns)
+    assert "left(COALESCE(output, ''), 400)" not in src, (
+        "the proposer truncates output before classifying it, so it classifies "
+        "something different from what the review classified")
+
+
+@pytest.mark.unit
 def test_every_category_declares_a_remedy_and_a_reason():
     """A category with no remedy is a count, which is what this replaces."""
     for name, meta in pr.CATEGORIES.items():

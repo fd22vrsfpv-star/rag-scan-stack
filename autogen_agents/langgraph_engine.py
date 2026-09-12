@@ -220,7 +220,7 @@ _AGENT_TASK = {
     "Exploit": "exploit",
     "Exploitation": "exploit",
     "Scanner": "scan",
-    "PostExploitation": "postex",
+    "PostEnumerationation": "postex",
     "PostEx": "postex",
     "Report": "analyze",
 }
@@ -407,6 +407,16 @@ class PentestState(TypedDict):
     surface_safe_results: Optional[list]
     pending_surface_tests: Optional[list]
     surface_decision: Optional[dict]
+    # Post-enumeration is a CYCLE, so its progress has to live in the
+    # checkpointed state rather than in a local variable: a session that is
+    # interrupted at an approval gate and resumed hours later must know how many
+    # passes it has made and what each one found.
+    #
+    # `enumeration_cycles` bounds it. LangGraph enforces a recursion limit, but
+    # hitting that raises rather than finishing, and a run that ends in an
+    # exception produces no report.
+    enumeration_cycles: int
+    enumeration_history: Annotated[List[dict], operator.add]
     report: Optional[str]
 
 
@@ -1343,6 +1353,440 @@ def exploit_exec(state: PentestState) -> dict:
     return {"phase": "report",
             "findings": [f"exploit_exec: executed {pending_id}"],
             "log": [f"exploit_exec: execute_approved_exploit({pending_id})"]}
+
+
+# How many passes the loop may make before it reports regardless.
+#
+# It normally settles on its own — a pass that analyses nothing new and proposes
+# nothing new is the stopping condition — but "normally" is not a guarantee, and
+# a cycle that cannot terminate is worse than one that stops early and says so.
+MAX_ENUMERATION_CYCLES = int(os.environ.get("MAX_ENUMERATION_CYCLES", "5"))
+
+
+def _after_post_enumeration(state: PentestState) -> str:
+    """Go round again, or report.
+
+    The loop settles when a pass produced no new analysis AND no new proposals:
+    at that point there is nothing left that this cycle can act on, which is
+    what "everything has been analysed" means operationally. Without a
+    measurable stopping condition the loop would either run forever or stop
+    after a fixed count and call that done.
+    """
+    cycles = int(state.get("enumeration_cycles") or 0)
+    if cycles >= MAX_ENUMERATION_CYCLES:
+        return "report"
+    history = state.get("enumeration_history") or []
+    if not history:
+        return "report"
+    last = history[-1]
+    if (last.get("analysed") or 0) == 0 and (last.get("queued") or 0) == 0 \
+            and (last.get("resolved") or 0) == 0:
+        return "report"
+    return "post_enumeration"
+
+
+def post_enumeration(state: PentestState) -> dict:
+    """Post-exploitation enumeration: read what every tool produced, and do the
+    checklist the methodology already specifies.
+
+    WHY THIS PHASE EXISTS
+    ---------------------
+    The graph went `exploit_exec -> report`. A run could execute an exploit, or
+    recover ten working credentials, and then stop — nothing enumerated the
+    access, nothing read back the output the session's own tools had produced,
+    and the report could not say what had been skipped because nothing could
+    enumerate the steps.
+
+    `knowledge/playbooks/*.yaml` now can. The SSH "Post-Exploitation / If Access
+    Gained" checklist — sudo rights, authorized_keys, known_hosts, sshd_config —
+    was prose for a language model until `scripts/playbooks_to_yaml.py` extracted
+    it, and this is the phase that acts on it.
+
+    WHAT IT DOES
+    ------------
+      1. ANALYSE. Every tool_executions row for this session is re-read through
+         the parser registry, so output nobody looked at becomes counted
+         results. A run that produced something nobody parsed is the defect this
+         whole area keeps producing.
+      2. ENUMERATE. For each service where the session actually holds a working
+         credential, the playbook's post-access steps are proposed as PENDING
+         recommendations through the scope gate.
+
+    WHAT IT DOES NOT DO
+    -------------------
+    It does not dispatch, and it never proposes a MUTATING step. 45 of the 266
+    extracted steps write to the target — `useradd backdoor`, `>> authorized_keys`
+    — and `steps_for()` excludes them unless asked; this phase does not ask.
+    Persistence is an operator's deliberate act, not a pipeline's default.
+    """
+    sid = state["session_id"]
+    target = state.get("target") or ""
+    cycle = int(state.get("enumeration_cycles") or 0) + 1
+    log: List[str] = []
+    findings: List[str] = []
+
+    # REVIEW EVIDENCE FIRST. Anything proposed on an earlier pass may have run
+    # by now, and knowing whether it produced something is what makes the next
+    # decision different from the last one. Without this the loop would propose
+    # the same things forever and never learn that they did not help.
+    resolved = _resolve_outcomes()
+    if resolved.get("resolved"):
+        findings.append(
+            f"post_enumeration[{cycle}]: reviewed {resolved['resolved']} earlier "
+            f"proposals, {resolved['produced']} produced new evidence")
+    if resolved.get("still_running"):
+        # A third state. Recording "not finished yet" as "produced nothing"
+        # would suppress rules for being slow.
+        log.append(f"post_enumeration: {resolved['still_running']} proposals "
+                   f"still running, left unresolved")
+
+    analysed = _analyse_session_output(sid)
+    if analysed.get("examined"):
+        findings.append(
+            f"post_enumeration: re-read {analysed['examined']} tool outputs, "
+            f"{analysed['parsed']} parsed, {analysed['productive']} produced results")
+        log.append(f"post_enumeration: analysis {analysed}")
+        if analysed.get("unparsed_tools"):
+            # Named, not counted. "17 unparsed" is not actionable; the tool
+            # names are, because each one is a parser somebody can write.
+            findings.append(
+                "post_enumeration: no parser for " +
+                ", ".join(sorted(analysed["unparsed_tools"])[:8]))
+
+    # The same analysis every individual command already went through, run once
+    # more over the session as a whole. The per-command hook in kali_listener is
+    # the primary path; this catches anything that did not go through it — a
+    # tool dispatched by another runner, or a command that finished while the
+    # listener was restarting.
+    swept = _sweep_enumeration(target)
+    if swept.get("queued"):
+        findings.append(
+            f"post_enumeration: {swept['queued']} follow-on checks proposed from "
+            f"what {swept['examined']} commands found")
+    if swept.get("refused"):
+        # Refusals are REPORTED. A known_hosts entry naming an out-of-scope host
+        # is a real finding about the engagement's boundary, and dropping it
+        # silently makes it look like nothing was found.
+        findings.append(
+            f"post_enumeration: {swept['refused']} follow-ons refused by the "
+            f"scope gate (leads outside scope)")
+    if swept.get("suppressed"):
+        findings.append(
+            "post_enumeration: rules no longer firing (tried and never "
+            "produced): " + ", ".join(sorted(set(swept["suppressed"]))[:5]))
+
+    enumerated = _enumerate_post_access(sid, target)
+    if enumerated.get("queued"):
+        findings.append(
+            f"post_enumeration: queued {enumerated['queued']} post-access checks "
+            f"from the methodology for {', '.join(enumerated['services'])}")
+    elif enumerated.get("reason"):
+        # A phase that did nothing must say why. "Nothing to enumerate" and
+        # "we hold no credential" are different states and only one is a gap.
+        findings.append(f"post_enumeration: nothing enumerated ({enumerated['reason']})")
+    log.append(f"post_enumeration: enumeration {enumerated}")
+
+    entry = {
+        "cycle": cycle,
+        "resolved": resolved.get("resolved", 0),
+        "produced": resolved.get("produced", 0),
+        "analysed": analysed.get("parsed", 0),
+        "queued": (swept.get("queued", 0) + enumerated.get("queued", 0)),
+        "refused": swept.get("refused", 0),
+        "remaining": analysed.get("unanalysed", 0),
+    }
+    if not findings:
+        # A pass that did nothing must still say so, or the history reads as a
+        # gap rather than as a settled loop.
+        findings.append(
+            f"post_enumeration[{cycle}]: nothing new to analyse or propose")
+    _msg(sid, "PostEnumeration", "\n".join(findings))
+    _emit("langgraph_post_enumeration", sid, {
+        "target": target, "cycle": cycle, "analysed": analysed,
+        "enumerated": enumerated, "swept": swept, "resolved": resolved})
+    return {"phase": "report", "findings": findings, "log": log,
+            "enumeration_cycles": cycle, "enumeration_history": [entry]}
+
+
+def _resolve_outcomes() -> dict:
+    """Close out proposals whose dispatch has finished, whatever ran them.
+
+    Path-independent on purpose: a proposal sent to a native runner finishes in
+    `scans` and never reaches the listener's hook, so reading one command's
+    stdout left those observations unresolved forever. This asks whether new
+    EVIDENCE appeared for the target instead — which counts web_findings too.
+    """
+    try:
+        from etl.post_enumeration import resolve_pending_observations
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"unavailable: {e}", "resolved": 0, "produced": 0}
+    try:
+        return resolve_pending_observations()
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:200], "resolved": 0, "produced": 0}
+
+
+def _sweep_enumeration(target: str) -> dict:
+    """Run the post-enumeration analysis over recent commands.
+
+    One function, two callers: kali_listener runs it per command as each
+    finishes, and this runs it over the session. Two analyses that had to agree
+    would drift, and the one that drifted would be the one nobody watched.
+    """
+    out = {"examined": 0, "queued": 0, "refused": 0, "suppressed": [],
+           "facts": 0, "available": False}
+    try:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        from etl.post_enumeration import analyse
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"unavailable: {e}"
+        return out
+    dsn = os.environ.get("DB_DSN") or os.environ.get("DATABASE_URL")
+    if not dsn:
+        out["error"] = "no DB_DSN"
+        return out
+    try:
+        with psycopg2.connect(dsn, connect_timeout=5) as conn, \
+                conn.cursor(cursor_factory=RealDictCursor) as cur:
+            params = []
+            where = ["started_at > now() - interval '12 hours'",
+                     "COALESCE(output,'') <> ''"]
+            if target:
+                where.append("target = %s")
+                params.append(target)
+            cur.execute(
+                f"""SELECT id::text, tool, target, port, service,
+                           COALESCE(output,'') AS output,
+                           COALESCE(error,'') AS error, parsed_results
+                      FROM tool_executions
+                     WHERE {' AND '.join(where)}
+                     ORDER BY started_at DESC LIMIT 100""", params)
+            rows = cur.fetchall()
+        out["available"] = True
+        for r in rows:
+            out["examined"] += 1
+            res = analyse(dict(r))
+            out["facts"] += res.get("facts", 0)
+            out["queued"] += res.get("queued", 0)
+            out["refused"] += res.get("refused", 0)
+            out["suppressed"].extend(res.get("suppressed") or [])
+
+        # Evidence that never came from a command's stdout. web_findings alone
+        # holds more rows than every other finding table combined, and none of
+        # it was reachable while this loop read tool output rather than results.
+        try:
+            from etl.post_enumeration import analyse_findings
+            fres = analyse_findings(target=target)
+            out["examined"] += fres.get("facts", 0)
+            out["facts"] += fres.get("facts", 0)
+            out["queued"] += fres.get("queued", 0)
+            out["refused"] += fres.get("refused", 0)
+            out["suppressed"].extend(fres.get("suppressed") or [])
+        except Exception as e:  # noqa: BLE001
+            out.setdefault("errors", []).append(f"findings: {str(e)[:120]}")
+    except Exception as e:  # noqa: BLE001
+        out["error"] = str(e)[:200]
+    return out
+
+
+def _analyse_session_output(sid) -> dict:
+    """Re-read every tool output this session produced, through the parsers.
+
+    The point is the ones nobody looked at. `tool_executions.parsed_results` was
+    NULL for every run until recently, so output that had been captured and
+    stored taught nothing — a netexec run wrote 6,816 bytes and was recorded as
+    an unmeasured success.
+    """
+    out = {"examined": 0, "parsed": 0, "productive": 0, "unparsed_tools": [],
+           "results": 0, "available": False}
+    try:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        from etl.tool_output_parsers import parse_for, result_count
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"unavailable: {e}"
+        return out
+    dsn = os.environ.get("DB_DSN") or os.environ.get("DATABASE_URL")
+    if not dsn:
+        out["error"] = "no DB_DSN"
+        return out
+    try:
+        with psycopg2.connect(dsn, connect_timeout=5) as conn, \
+                conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id::text, tool, COALESCE(output,'') AS output,
+                       COALESCE(error,'') AS error, parsed_results
+                  FROM tool_executions
+                 WHERE started_at > now() - interval '12 hours'
+                   AND COALESCE(output,'') <> ''
+                 ORDER BY started_at DESC
+                 LIMIT 200
+                """)
+            rows = cur.fetchall()
+            out["available"] = True
+            unparsed = set()
+            for r in rows:
+                out["examined"] += 1
+                parsed = r["parsed_results"]
+                if parsed is None:
+                    parsed = parse_for(r["tool"], r["output"], r["error"])
+                    if parsed is not None:
+                        # Backfill: the output was already stored, so the only
+                        # thing missing was somebody reading it.
+                        cur.execute(
+                            "UPDATE tool_executions SET parsed_results = %s "
+                            "WHERE id = %s::uuid",
+                            (psycopg2.extras.Json(parsed), r["id"]))
+                if parsed is None:
+                    unparsed.add(r["tool"])
+                    continue
+                out["parsed"] += 1
+                n = result_count(parsed)
+                if n:
+                    out["productive"] += 1
+                    out["results"] += n
+            out["unparsed_tools"] = sorted(unparsed)
+            try:
+                from etl.evidence import unanalysed
+                out["unanalysed"] = unanalysed(cur).get("total", 0)
+            except Exception:  # noqa: BLE001
+                out["unanalysed"] = 0
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        out["error"] = str(e)[:200]
+    return out
+
+
+# How to reach a service with a credential and run one command on it.
+#
+# Only ssh today, and that is stated rather than left as an empty dict: a
+# protocol with no wrapper produces no queued steps, and "we cannot reach this
+# service" is a real answer that belongs in the report.
+#
+# {password} stays LITERAL — the recommendation carries credential_id and the
+# dispatcher resolves it in memory, so the secret never reaches the stored
+# command. Same contract as etl/credential_followups.py.
+def _wrap_remote(protocol: str, ip: str, port, command: str) -> Optional[str]:
+    """A locally-written playbook step, wrapped to run on the target."""
+    proto = (protocol or "").strip().lower()
+    if proto != "ssh":
+        return None
+    opts = ["-oStrictHostKeyChecking=no", "-oConnectTimeout=10"]
+    try:
+        # Algorithm options derived from what recon measured about this host.
+        # Without them ssh refuses to negotiate with a legacy server at all,
+        # and every one of these steps fails before it runs.
+        from etl.target_capabilities import settings_for
+        opts = list(settings_for("ssh", ip, port=port)) + opts
+    except Exception:  # noqa: BLE001
+        pass
+    # stdin closed. `sudo -l` on the target prompts for a password, and over a
+    # non-interactive ssh channel that HANGS until the job times out rather than
+    # failing — the run reported `[sudo] password for msfadmin:` on stderr and
+    # nothing else after burning the whole timeout. Closing stdin makes anything
+    # that prompts fail immediately and say so, which is a result.
+    safe = command.replace("'", "'\\''")
+    return (f"sshpass -p '{{password}}' ssh {' '.join(opts)} "
+            f"-p {port or 22} {{username}}@{ip} '{safe}' < /dev/null")
+
+
+def _enumerate_post_access(sid, target: str) -> dict:
+    """Queue the methodology's post-access checks for services we can reach.
+
+    Only where a working credential is actually held: a post-access step against
+    a service nobody has access to is noise in the queue, and a queue that fills
+    with noise stops being read.
+    """
+    out = {"queued": 0, "services": [], "steps": 0, "reason": ""}
+    try:
+        import psycopg2
+        from etl import playbooks as pb
+        from etl.credential_followups import queue_followups  # noqa: F401
+    except Exception as e:  # noqa: BLE001
+        out["reason"] = f"unavailable: {e}"
+        return out
+    dsn = os.environ.get("DB_DSN") or os.environ.get("DATABASE_URL")
+    if not dsn:
+        out["reason"] = "no DB_DSN"
+        return out
+    try:
+        with psycopg2.connect(dsn, connect_timeout=5) as conn, conn.cursor() as cur:
+            params = [target] if target else []
+            cur.execute(
+                """
+                SELECT DISTINCT ON (protocol, host(ip), port)
+                       protocol, host(ip)::text, port, id::text
+                  FROM credential_findings
+                 WHERE valid_cred = true
+                   AND status IN ('valid', 'unknown')
+                """ + ("   AND host(ip) = %s" if target else "") + """
+                 ORDER BY protocol, host(ip), port, created_at DESC
+                """,
+                params)
+            creds = cur.fetchall()
+            if not creds:
+                out["reason"] = "no working credential is held for any service"
+                return out
+
+            from psycopg2.extras import Json
+            for protocol, ip, port, cred_id in creds:
+                steps = pb.steps_for(protocol or "", access="shell")
+                post = [s for s in steps if s["access_required"] == "shell"]
+                if not post:
+                    continue
+                if protocol not in out["services"]:
+                    out["services"].append(protocol)
+                out["steps"] += len(post)
+                for st in post:
+                    for c in st["commands"]:
+                        rendered = pb.render(c.get("command", ""), target=ip,
+                                             port=port, service=protocol)
+                        if rendered["unresolved"]:
+                            continue
+                        # WRAP IT FOR REMOTE EXECUTION.
+                        #
+                        # A playbook post-access step is written for someone who
+                        # is already on the host: `sudo -l`, `cat ~/.ssh/id_rsa`.
+                        # Queued verbatim they name `sudo` and `cat` as the tool,
+                        # which the listener refuses — work that looks queued and
+                        # can never run, the same defect the credential
+                        # follow-ups had.
+                        wrapped = _wrap_remote(protocol, ip, port,
+                                               rendered["command"])
+                        if not wrapped:
+                            # No way to reach this service with a credential.
+                            # Skipping is right; queueing something unrunnable
+                            # is not.
+                            out.setdefault("unwrappable", []).append(
+                                {"protocol": protocol, "step": st["id"]})
+                            continue
+                        rendered["command"] = wrapped
+                        cur.execute(
+                            """
+                            INSERT INTO scan_recommendations
+                                (ip, service, scanner, action, script, source,
+                                 priority, status, extra)
+                            VALUES (%s,%s,%s,%s,%s,'post_enumeration',30,'pending',%s)
+                            ON CONFLICT (fingerprint) DO NOTHING
+                            """,
+                            (ip, protocol, rendered["command"].split()[0],
+                             rendered["command"], rendered["command"],
+                             Json({"playbook": st["playbook"],
+                                   "playbook_step": st["id"],
+                                   "title": st["title"],
+                                   "phase": st["phase"],
+                                   "source": st["source"],
+                                   "credential_id": cred_id,
+                                   "remote_command": c.get("command"),
+                                   "queued_by": "post_enumeration"})))
+                        if cur.rowcount:
+                            out["queued"] += 1
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        out["reason"] = str(e)[:200]
+    return out
 
 
 def report(state: PentestState) -> dict:
@@ -2813,6 +3257,7 @@ def build_graph(checkpointer=None):
     g.add_node("exploit_plan", exploit_plan)
     g.add_node("exploit_approval", exploit_approval)
     g.add_node("exploit_exec", exploit_exec)
+    g.add_node("post_enumeration", post_enumeration)
     g.add_node("surface_plan", surface_plan)
     g.add_node("surface_safe_exec", surface_safe_exec)
     g.add_node("surface_approval", surface_approval)
@@ -2824,28 +3269,47 @@ def build_graph(checkpointer=None):
     g.add_edge("scan", "analyze")
     g.add_conditional_edges("analyze", _after_analyze,
                             {"surface_plan": "surface_plan",
-                             "exploit_plan": "exploit_plan", "report": "report"})
+                             "exploit_plan": "exploit_plan", "report": "post_enumeration"})
     # Surface-test phase: plan -> safe-exec (side effects here, before the
     # checkpointed interrupt) -> approval -> exec, then chain onward.
     g.add_conditional_edges("surface_plan", _after_surface_plan,
                             {"surface_safe_exec": "surface_safe_exec",
-                             "exploit_plan": "exploit_plan", "report": "report"})
+                             "exploit_plan": "exploit_plan", "report": "post_enumeration"})
     g.add_conditional_edges("surface_safe_exec", _after_surface_safe,
                             {"surface_approval": "surface_approval",
                              "surface_auto_exec": "surface_auto_exec",
-                             "exploit_plan": "exploit_plan", "report": "report"})
+                             "exploit_plan": "exploit_plan", "report": "post_enumeration"})
     g.add_conditional_edges("surface_auto_exec", _surface_onward,
-                            {"exploit_plan": "exploit_plan", "report": "report"})
+                            {"exploit_plan": "exploit_plan", "report": "post_enumeration"})
     g.add_conditional_edges("surface_approval", _after_surface_approval,
                             {"surface_exec": "surface_exec",
-                             "exploit_plan": "exploit_plan", "report": "report"})
+                             "exploit_plan": "exploit_plan", "report": "post_enumeration"})
     g.add_conditional_edges("surface_exec", _surface_onward,
-                            {"exploit_plan": "exploit_plan", "report": "report"})
+                            {"exploit_plan": "exploit_plan", "report": "post_enumeration"})
     g.add_conditional_edges("exploit_plan", _after_exploit_plan,
-                            {"exploit_approval": "exploit_approval", "report": "report"})
+                            {"exploit_approval": "exploit_approval", "report": "post_enumeration"})
     g.add_conditional_edges("exploit_approval", _after_exploit_approval,
-                            {"exploit_exec": "exploit_exec", "report": "report"})
-    g.add_edge("exploit_exec", "report")
+                            {"exploit_exec": "exploit_exec",
+                             "report": "post_enumeration"})
+    # EVERY terminal route goes through post_enumeration, not just the exploit one.
+    #
+    # The graph used to send each of these straight to report, so a run that
+    # recovered ten working credentials and never found an exploit candidate —
+    # exactly what happened on 192.168.1.150 — stopped without enumerating any
+    # of the access it had just obtained.
+    #
+    # The routing FUNCTIONS still return "report"; only where that lands
+    # changes. post_enumeration no-ops cleanly and says WHY when there is nothing to
+    # enumerate, so a run that found nothing pays nothing for passing through.
+    g.add_edge("exploit_exec", "post_enumeration")
+    # THE CYCLE. post_enumeration goes round again while a pass is still
+    # analysing or proposing something new, and reports once it settles —
+    # "everything has been analysed" made operational rather than assumed.
+    # MAX_ENUMERATION_CYCLES is the backstop: LangGraph's recursion limit RAISES,
+    # and a run that ends in an exception produces no report at all.
+    g.add_conditional_edges("post_enumeration", _after_post_enumeration,
+                            {"post_enumeration": "post_enumeration",
+                             "report": "report"})
     g.add_edge("report", END)
     return g.compile(checkpointer=checkpointer)
 
@@ -3147,6 +3611,10 @@ def run_langgraph_session_sync(
                 "surface_decision": None, "phase": "recon",
                 "findings": [], "log": [], "exploit_candidate": None,
                 "exploit_decision": None, "report": None,
+                # Seeded so the cycle counter starts at a number rather than
+                # None. operator.add on enumeration_history needs a list to
+                # append onto.
+                "enumeration_cycles": 0, "enumeration_history": [],
             }, cfg)
             payload = _interrupt_payload(final, graph, cfg)
         if payload is not None:

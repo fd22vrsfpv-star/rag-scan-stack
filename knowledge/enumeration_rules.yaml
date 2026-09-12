@@ -1,0 +1,149 @@
+# What a finished command implies about what to do next.
+#
+# WHY THIS IS DATA
+#   The platform could already parse a tool's output and could already queue a
+#   recommendation. What it could not do is get from one to the other: netexec
+#   reported `tmp  READ,WRITE` and nothing followed from it. A pentester read the
+#   share table and knew what it meant; the platform stored it and stopped.
+#
+#   These rules are that step, and they are data so the operator who recognises
+#   a pattern can write it down without touching Python.
+#
+# WHAT IS TYPED AND WHAT IS LEARNED
+#   The IMPLICATION is typed here — "a writable share is worth listing" is
+#   domain knowledge, the same kind as service_tools.yaml. Whether acting on it
+#   ever produces anything is LEARNED: etl/post_enumeration.py records every
+#   firing and what came of it, and a rule that has fired enough times with
+#   nothing to show for it stops firing. A rule nobody can disprove is a rule
+#   that fills the queue forever.
+#
+# MATCHING
+#   `when.fact` is the kind of observation, `when.where` are field values that
+#   must all match. Facts come from the tool parsers (etl/tool_output_parsers.py)
+#   normalised by etl/post_enumeration.py, so a rule is written against
+#   observations rather than against one tool's text format.
+#
+# THE COMMAND
+#   Templated from the fact's own fields plus {target} and {port}. {password} and
+#   {username} stay LITERAL and the proposal carries credential_id — the secret is
+#   resolved at dispatch and never stored, the same contract as
+#   knowledge/credential_followups.yaml.
+#
+#   Every proposal passes the scope gate before it is queued, and lands
+#   status='pending' for a human to run. Nothing here dispatches.
+
+version: 1
+
+rules:
+
+  - id: writable-share-list
+    when:
+      fact: share
+      where: {writable: true}
+    propose:
+      tool: smbclient
+      command: "smbclient //{target}/{share} -U {username}%{password} -c 'ls'"
+      priority: 15
+    why: >-
+      A writable share is a route to code execution wherever its contents are
+      served or executed, and it is the difference between "SMB is readable" and
+      "we can put a file on this host". netexec named `tmp` and `msfadmin` as
+      READ,WRITE on 192.168.1.150 and nothing followed from it.
+
+  - id: null-session-enumerate
+    when:
+      fact: host_fact
+      where: {key: "null_auth", value: "True"}
+    propose:
+      tool: enum4linux-ng
+      command: "enum4linux-ng -A {target}"
+      priority: 20
+    why: >-
+      An accepted null session means users, groups and shares are enumerable
+      with no credential at all. The full enumeration is what turns that from a
+      configuration note into a username list.
+
+  - id: smbv1-only
+    when:
+      fact: host_fact
+      where: {key: "smbv1", value: "True"}
+    propose:
+      tool: nmap
+      command: "nmap -p {port} --script smb-vuln-ms17-010,smb-vuln-ms08-067 {target}"
+      priority: 25
+    why: >-
+      SMBv1 carries known remote-code-execution families. Checking for them is
+      the follow-on the dialect finding exists to trigger.
+
+  - id: credential-spray-candidates
+    when:
+      fact: credential
+      where: {pwned: true}
+    propose:
+      tool: netexec
+      command: "netexec smb {target} -u {username} -p '{password}' --sam"
+      priority: 10
+    why: >-
+      Administrative access is where credential material becomes available, and
+      that material is what makes the next host reachable.
+
+  - id: private-key-found
+    when:
+      fact: file
+      where: {kind: "private_key"}
+    propose:
+      tool: nmap
+      command: "nmap -p 22 --script ssh-auth-methods --script-args ssh.user={username} {target}"
+      priority: 12
+    why: >-
+      A readable private key is lateral movement without another password. Which
+      hosts accept it is the question that follows, and it is the one that
+      changes the scope of an engagement.
+
+  - id: known-host-discovered
+    when:
+      fact: host
+      where: {source: "known_hosts"}
+    propose:
+      tool: nmap
+      command: "nmap -sV -Pn --top-ports 100 {target}"
+      priority: 30
+    why: >-
+      A host in known_hosts is somewhere this account already reaches. It is a
+      lead, not a licence — the scope gate refuses it like any other target, and
+      a refusal is recorded rather than dropped so an out-of-scope lead is
+      visible instead of silently missing.
+
+  # ── Web findings ─────────────────────────────────────────────────────────
+  #
+  # web_findings holds more rows than every other finding table combined — 7,641
+  # against 301 vulns — and nothing in this loop could see any of it, because
+  # the loop read tool stdout rather than results. A finding is a fact whatever
+  # produced it.
+
+  - id: web-high-severity-verify
+    when:
+      fact: web_finding
+      where: {severity: "high"}
+    propose:
+      tool: nuclei
+      command: "nuclei -u {url} -severity critical,high -silent"
+      priority: 18
+    why: >-
+      A high-severity web finding from a crawler or a passive check is a lead
+      that has not been confirmed against the live endpoint. Confirming it is
+      what makes it reportable, and failing to confirm it is equally worth
+      knowing.
+
+  - id: web-finding-content-review
+    when:
+      fact: web_finding
+      where: {severity: "critical"}
+    propose:
+      tool: curl
+      command: "curl -skI {url}"
+      priority: 14
+    why: >-
+      A critical finding needs its evidence captured at the URL, not inferred
+      from a scanner's summary line. The headers are the cheapest thing that
+      proves the endpoint is still live and still responding that way.
