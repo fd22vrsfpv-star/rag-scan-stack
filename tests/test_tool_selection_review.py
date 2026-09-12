@@ -198,3 +198,67 @@ def test_backfill_reset_clears_before_deriving(live):
                                                 "phase": "__pytest_phase"})
     assert r.status_code == 200, r.text
     assert r.json()["ok"] is True
+
+
+# ── One coherent status per execution, for manual review ───────────────────
+
+def _any_execution_id():
+    import psycopg2
+    with psycopg2.connect(tl.DB_DSN) as conn, conn.cursor() as cur:
+        cur.execute("""SELECT id::text FROM tool_executions
+                        WHERE COALESCE(output,'') <> '' ORDER BY started_at DESC LIMIT 1""")
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def test_an_execution_reports_what_the_learner_made_of_it(live):
+    """A reviewer reading a tool's output needs to know what the platform
+    concluded about it. Three modules each hold a piece of that — what to DO
+    about the run, what was IN it, what was LEARNED from it — and a reviewer
+    who has to reconcile three answers by hand will not do it."""
+    eid = _any_execution_id()
+    if not eid:
+        pytest.skip("no stored executions with output")
+    r = _get(f"/agent/post-review/executions/{eid}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    for block in ("classification", "analysis", "learning"):
+        assert block in body, f"{block} is missing from the manual-review payload"
+
+    learning = body["learning"]
+    assert learning["available"] is True, learning
+    assert learning["outcome"] in ("errored", "fruitless", "unmeasured", "productive"), learning
+    assert learning["why"], "the outcome has no explanation, so it cannot be reviewed"
+
+
+def test_the_outcome_matches_the_learner_rather_than_being_re_derived(live):
+    """A second copy of this judgement would drift from the one that actually
+    trains the rules, and the panel would then show a status the platform never
+    acted on."""
+    eid = _any_execution_id()
+    if not eid:
+        pytest.skip("no stored executions with output")
+    body = _get(f"/agent/post-review/executions/{eid}").json()
+    ex, learning = body["execution"], body["learning"]
+    failed = tl.execution_failed(ex.get("status"), ex.get("exit_code"),
+                                 ex.get("error") or "", ex.get("output") or "")
+    assert (learning["outcome"] == "errored") == failed, (learning, ex.get("status"),
+                                                          ex.get("exit_code"))
+
+
+def test_no_suggestions_is_not_the_same_as_could_not_look(live):
+    eid = _any_execution_id()
+    if not eid:
+        pytest.skip("no stored executions with output")
+    learning = _get(f"/agent/post-review/executions/{eid}").json()["learning"]
+    assert learning.get("suggestions_state") in (
+        "not_applicable", "looked", "store_unreachable"), learning
+    if learning["outcome"] in ("productive", "unmeasured"):
+        assert learning["suggestions_state"] == "not_applicable", (
+            "a run with no failure signature reports the store as unreachable, "
+            "which reads as 'we looked and nothing has ever worked after this' "
+            "— a different claim entirely, and the reviewer acts on it wrongly")
+
+
+def test_an_unknown_execution_is_a_404(live):
+    assert _get(f"/agent/post-review/executions/{uuid.uuid4()}").status_code == 404

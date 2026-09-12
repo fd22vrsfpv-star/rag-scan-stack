@@ -166,6 +166,24 @@ def test_failure_is_detected_from_any_of_three_signals():
     assert not tl.execution_failed(status="completed", exit_code=0, output="ok")
 
 
+def test_a_banner_on_stderr_is_not_a_failure():
+    """Real regression. nuclei prints its banner, its version and its progress
+    to stderr, exits 0, and writes 165KB of CVE hits to stdout. Treating any
+    stderr as an error made every nuclei run look failed and derived rules from
+    its startup log — the phrase one of them learned from was an [INF] line.
+
+    Stderr counts only when the tool ALSO produced nothing. That is the "exited
+    0 and died quietly" case the signal is actually for.
+    """
+    banner = ("[INF] nuclei-templates are not installed, installing...\n"
+              "[INF] Templates loaded for current scan: 6133")
+    assert not tl.execution_failed(status="completed", exit_code=0,
+                                   error=banner, output='{"template":"CVE-2012-1823"}')
+    assert tl.execution_failed(status="completed", exit_code=0,
+                               error=banner, output=""), (
+        "a tool that exited 0, wrote nothing and complained is still a failure")
+
+
 # ── The invariant: selection is not authorisation ──────────────────────────
 
 def test_a_rule_can_only_reorder_what_was_offered():

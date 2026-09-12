@@ -21787,7 +21787,75 @@ def get_reviewed_execution(execution_id: str, _: bool = Depends(auth)):
                     "pipeline": opts["pipeline"], "parse_ok": opts["parse_ok"]},
         "classification": verdict,
         "analysis": analysis,
+        # What the tool-selection learner made of this run, so a manual reviewer
+        # sees ONE coherent status instead of having to reconcile three modules.
+        # classification says what to DO about it, analysis says what was IN it,
+        # and this says what the platform LEARNED from it — including which
+        # other tool has worked after this exact failure before.
+        "learning": _execution_learning_verdict(r),
     }
+
+
+def _execution_learning_verdict(r: Dict[str, Any]) -> Dict[str, Any]:
+    """The learner's read on one execution, for manual review.
+
+    Three outcomes, matching etl/tool_learning.py exactly rather than
+    re-deriving them here — a second copy of this judgement would drift from the
+    one that actually trains the rules, and then the panel would show a status
+    the platform never acted on.
+    """
+    try:
+        from etl import tool_learning as tl
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "reason": f"tool_learning unimportable: {e}"}
+
+    output = r.get("output") or ""
+    error = r.get("error") or ""
+    failed = tl.execution_failed(r.get("status"), r.get("exit_code"), error, output)
+    parsed = r.get("parsed_results")
+    produced = tl._parsed_anything(parsed)
+    fruitless = (not failed) and (parsed is not None) and not produced
+
+    if failed:
+        outcome, sig_src = "errored", (error or output)
+    elif fruitless:
+        outcome, sig_src = "fruitless", tl.UNPRODUCTIVE_PHRASE
+    elif parsed is None:
+        outcome, sig_src = "unmeasured", ""
+    else:
+        outcome, sig_src = "productive", ""
+
+    signature, phrase = tl.error_signature(sig_src) if sig_src else (None, None)
+    out = {
+        "available": True,
+        "outcome": outcome,
+        "why": {
+            "errored": "the tool reported a failure, or exited 0 saying nothing "
+                       "useful while complaining on stderr",
+            "fruitless": "it ran cleanly and the parser got nothing out of it — "
+                         "not an error, and not a success either",
+            "unmeasured": "no parser ran on this output, so the platform has no "
+                          "opinion on whether it produced anything",
+            "productive": "it ran and produced parseable results",
+        }[outcome],
+        "failure_signature": signature,
+        "failure_phrase": phrase,
+        "suggestions": [],
+        # Three states, not two. An empty list means something different in each
+        # case and a reviewer acts differently on each: there was nothing to ask
+        # about, nobody has learned anything yet, or the store could not be
+        # reached. Collapsing them into a boolean is the bug this repo keeps
+        # shipping — a probe that could not run reported as a negative result.
+        "suggestions_state": "not_applicable",
+    }
+    if signature:
+        advice = tl.suggest_alternatives(
+            r.get("tool") or "", service=r.get("service") or "",
+            signature=signature)
+        out["suggestions"] = advice.get("suggestions") or []
+        out["suggestions_state"] = (
+            "looked" if advice.get("available") else "store_unreachable")
+    return out
 
 
 @app.get("/agent/post-review/invocations", tags=["Post Review"])

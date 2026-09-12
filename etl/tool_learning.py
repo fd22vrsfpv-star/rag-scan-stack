@@ -570,7 +570,15 @@ def execution_failed(status: Optional[str] = None, exit_code: Optional[int] = No
         return True
     if exit_code not in (None, 0):
         return True
-    if (error or "").strip():
+    # Stderr alone is NOT a failure. Plenty of tools log their banner, their
+    # version and their progress there and exit 0 having done the job — nuclei
+    # prints "nuclei-templates are not installed, installing..." on stderr and
+    # then writes 165KB of findings to stdout. Reading that as an error made
+    # every nuclei run look failed and taught rules from its startup log.
+    #
+    # It only counts when the tool ALSO produced nothing: exited 0, wrote
+    # nothing, complained. That is the "died quietly" case the signal is for.
+    if (error or "").strip() and not (output or "").strip():
         return True
     return False
 
