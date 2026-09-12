@@ -21479,6 +21479,34 @@ def export_extractor_learned(tool: Optional[str] = None, _: bool = Depends(auth)
 # Surfaced next to credentials because it is the same question at a later stage:
 # credentials are what we can log in with, access is what we are already inside.
 
+@app.get("/assets/access/summary", tags=["Access"])
+def access_summary(_: bool = Depends(auth)):
+    """Per-host access counts, so the asset list can flag hosts we are inside.
+
+    One grouped query for the whole store rather than one probe-listing per row:
+    the asset list has hundreds of hosts and only a handful ever hold access, so
+    this returns a map keyed by target that the UI looks up per row. `live`
+    matches the detail endpoint's definition exactly — `status='live'` AND a
+    non-zero score — so the badge count agrees with what the host's Current
+    Access tab shows. `total` excludes dead the same way the default listing
+    does; a dead access is shown on request there, not counted here.
+
+    Declared BEFORE /assets/{ip}/access so the literal path is not claimed by the
+    dynamic route (FastAPI matches in declaration order).
+    """
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT target,
+                      count(*) FILTER (WHERE status = 'live' AND score > 0) AS live,
+                      count(*) FILTER (WHERE status <> 'dead')              AS total
+                 FROM obtained_access
+                GROUP BY target
+                HAVING count(*) FILTER (WHERE status <> 'dead') > 0""")
+        summary = {r["target"]: {"live": int(r["live"]), "total": int(r["total"])}
+                   for r in cur.fetchall()}
+    return {"summary": summary, "hosts": len(summary)}
+
+
 @app.get("/assets/{ip}/access", tags=["Access"])
 def asset_access(ip: str, include_dead: bool = Query(False),
                  _: bool = Depends(auth)):
