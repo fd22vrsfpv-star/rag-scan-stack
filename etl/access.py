@@ -103,7 +103,16 @@ def _run_bind_shell(handle: str, command: str, **_) -> str:
         ["nc", "-w", str(min(PROBE_TIMEOUT, 15)), host, port],
         input=f"{command}\nexit\n", capture_output=True, text=True,
         timeout=PROBE_TIMEOUT)
-    return (proc.stdout or "") + (proc.stderr or "")
+    out = (proc.stdout or "") + (proc.stderr or "")
+    # A connection that never connected is NOT an answer. subprocess.run does
+    # not raise on a non-zero exit, so without this a refused or black-holed
+    # port returned "" and was recorded as a shell that replied — scoring a dead
+    # address as "answered, unknown privilege" and ranking it above nothing.
+    # Caught by CI probing 203.0.113.1 (TEST-NET) and getting ok=True.
+    if proc.returncode != 0 and not out.strip():
+        raise ConnectionError(
+            f"nc exited {proc.returncode} with no output from {host}:{port}")
+    return out
 
 
 def _run_ssh_credential(handle: str, command: str, **kw) -> str:
@@ -126,7 +135,12 @@ def _run_ssh_credential(handle: str, command: str, **kw) -> str:
         ["sshpass", "-e", "ssh", *opts, "-p", str(port),
          f"{username}@{target}", command],
         capture_output=True, text=True, timeout=PROBE_TIMEOUT, env=env)
-    return (proc.stdout or "") + (proc.stderr or "")
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode != 0 and not (proc.stdout or "").strip():
+        # stderr alone is ssh explaining why it could not log in, not output.
+        raise ConnectionError(
+            f"ssh exited {proc.returncode}: {out.strip()[:160] or 'no output'}")
+    return out
 
 
 def _run_listener_callback(handle: str, command: str, **_) -> str:
@@ -274,6 +288,12 @@ def probe(access: Dict[str, Any], *, rounds: int = None) -> Dict[str, Any]:
             last_error = res["error"]
             continue
         text = res["output"]
+        if not text.strip():
+            # It "succeeded" and said nothing. A channel that returns an empty
+            # string has not demonstrated it is a shell, and counting it would
+            # rank silence above no access at all.
+            last_error = "empty response"
+            continue
         m = _UID_RE.search(text)
         if not m:
             # It answered, but not with anything recognisable. That is a
