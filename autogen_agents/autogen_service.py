@@ -576,9 +576,18 @@ class ApprovalRequest(BaseModel):
     pending_exploit_id: Optional[str] = Field(
         None,
         description=(
-            "The pending_exploits row to execute. REQUIRED when approved=true — "
-            "without it there is nothing to execute and the graph records the "
-            "approval as a no-op rather than guessing which exploit was meant."
+            "A single pending_exploits row to execute. Kept for callers that "
+            "already send it; prefer pending_exploit_ids."
+        ),
+    )
+    pending_exploit_ids: Optional[List[str]] = Field(
+        None,
+        description=(
+            "The pending_exploits rows to execute. OMIT to approve everything "
+            "the session queued — the planner now queues every well-evidenced "
+            "candidate, so approving one by id would silently leave the rest "
+            "pending for ever. Pass a subset to run only those, which is a "
+            "deliberate operator choice and never widened."
         ),
     )
     note: Optional[str] = Field(None, description="Operator note recorded on the session timeline.")
@@ -3317,6 +3326,30 @@ async def get_session_pending_approval(session_id: str):
     }
 
 
+def _queued_exploit_ids(session_uuid) -> List[str]:
+    """Every exploit this session queued and has not had decided.
+
+    Used when an approval names no ids. The planner queues every well-evidenced
+    candidate, so "approved" with nothing named means all of them — the previous
+    behaviour of demanding one id meant an operator could approve a single
+    exploit and never learn the others existed.
+    """
+    try:
+        import psycopg2
+        dsn = os.environ.get("DB_DSN") or os.environ.get("DATABASE_URL")
+        if not dsn:
+            return []
+        with psycopg2.connect(dsn, connect_timeout=5) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id::text FROM pending_exploits "
+                " WHERE session_id = %s::uuid AND status = 'pending' "
+                " ORDER BY created_at DESC LIMIT 10", (str(session_uuid),))
+            return [r[0] for r in cur.fetchall()]
+    except Exception as e:  # noqa: BLE001
+        session_logger.warning("queued exploit lookup failed: %s", e)
+        return []
+
+
 @app.post("/pentest/{session_id}/approve")
 async def approve_session_step(session_id: str, request: ApprovalRequest):
     """Answer a paused LangGraph approval interrupt and continue the SAME session.
@@ -3350,24 +3383,34 @@ async def approve_session_step(session_id: str, request: ApprovalRequest):
             detail=f"Session {session_id} is not paused on an approval "
                    f"(status='{session.get('status')}'). Nothing to approve.")
 
-    if request.approved and not request.pending_exploit_id:
-        # Fail loudly rather than resuming into a no-op the operator would read
-        # as "approved and executed".
-        raise HTTPException(
-            status_code=400,
-            detail="approved=true requires pending_exploit_id (the pending_exploits "
-                   "row to execute). List candidates with GET /api/exploits/pending.")
+    # Which rows to run. Omitting the ids now means "everything this session
+    # queued", because the planner queues every well-evidenced candidate — an
+    # operator approving one id would silently leave the rest pending for ever.
+    # Naming a subset still means exactly that subset.
+    ids = list(request.pending_exploit_ids or [])
+    if request.pending_exploit_id and request.pending_exploit_id not in ids:
+        ids.append(request.pending_exploit_id)
+
+    if request.approved and not ids:
+        ids = _queued_exploit_ids(session_uuid)
+        if not ids:
+            # Fail loudly rather than resuming into a no-op the operator would
+            # read as "approved and executed".
+            raise HTTPException(
+                status_code=400,
+                detail="approved=true but this session has no pending exploits to "
+                       "execute. List candidates with GET /api/exploits/pending.")
 
     session_logger.info(
-        "[%s] Operator approval: approved=%s pending_exploit_id=%s",
-        session_id, request.approved, request.pending_exploit_id)
+        "[%s] Operator approval: approved=%s exploits=%s",
+        session_id, request.approved, ids)
 
     asyncio.create_task(
         asyncio.to_thread(
             resume_langgraph_session_sync,
             session_uuid,
             bool(request.approved),
-            request.pending_exploit_id,
+            ids,
             request.note,
         )
     )
@@ -3375,7 +3418,7 @@ async def approve_session_step(session_id: str, request: ApprovalRequest):
     return {
         "session_id": session_id,
         "approved": bool(request.approved),
-        "pending_exploit_id": request.pending_exploit_id,
+        "pending_exploit_ids": ids,
         "status": "resuming",
         "message": ("Approved — resuming from the Postgres checkpoint and executing "
                     "the approved exploit." if request.approved else

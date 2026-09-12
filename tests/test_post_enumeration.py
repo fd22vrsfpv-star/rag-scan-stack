@@ -768,3 +768,111 @@ def _catalogue_rules():
         if os.path.exists(candidate):
             return candidate
     pytest.skip("enumeration_rules.yaml not reachable")
+
+
+# ── Why only one exploit was ever considered ───────────────────────────────
+
+def _func_src(path, name):
+    """One function's source, by name.
+
+    Slicing a file between two string markers breaks the moment either moves,
+    and a slice whose end precedes its start is silently EMPTY — which is how a
+    replace() prepended a whole function to the top of the engine earlier today.
+    """
+    tree = ast.parse(_read(path))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return ast.unparse(node)
+    pytest.fail(f"{name} not found in {os.path.basename(path)}")
+
+
+def _exploit_system() -> str:
+    """The _EXPLOIT_SYSTEM constant's VALUE, not its source text.
+
+    It is written as adjacent string literals, so a phrase can span the join and
+    be absent from the source while present in the string. Grepping source for a
+    prompt is the same mistake as grepping it for code.
+    """
+    tree = ast.parse(_read(ENGINE))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                getattr(t, "id", "") == "_EXPLOIT_SYSTEM" for t in node.targets):
+            return ast.literal_eval(node.value)
+    pytest.fail("_EXPLOIT_SYSTEM not found")
+
+
+def test_the_planner_is_asked_for_every_candidate():
+    """A host with 26 open services — vsftpd, distcc, samba, java-rmi, irc —
+    produced ONE queued exploit, and the other twenty-five were never
+    evaluated, queued, rejected or reported.
+
+    That was not a bug in the model's judgement. The system prompt said
+    "the single best-evidenced candidate ... EXACTLY ONCE", so it did exactly
+    what it was told.
+    """
+    sysmsg = _exploit_system()
+    assert "EXACTLY ONCE" not in sysmsg, (
+        "the planner is told to queue exactly one candidate again")
+    assert "single best-evidenced" not in sysmsg
+    assert "EVERY" in sysmsg, "the planner is no longer asked for every candidate"
+    assert "dismissed" in sysmsg, (
+        "nothing asks it to say what it considered and rejected, so an operator "
+        "still cannot tell 'rejected' from 'never looked at'")
+
+
+def test_queueing_is_not_executing():
+    """The reason asking for more candidates is safe: every one lands behind
+    the same approval gate."""
+    sysmsg = _exploit_system()
+    assert "never execute anything yourself" in sysmsg
+    assert "approves before anything executes" in sysmsg
+
+
+def test_every_approved_exploit_runs():
+    fn = _func_src(ENGINE, "exploit_exec")
+    assert "for pid in pending_ids:" in fn, (
+        "only the first approved exploit runs, so approving several does "
+        "nothing for the rest")
+    assert "MAX_EXPLOITS_PER_SESSION" in fn, (
+        "unbounded: a planner that queues thirty would fire thirty unattended")
+    assert "failed.append(pid)" in fn, (
+        "one failure abandons the rest — an exploit that errors is a result, "
+        "the ones after it never running is a gap")
+
+
+def test_a_single_id_still_works():
+    """A checkpoint written before this took a list must still resume."""
+    fn = _func_src(ENGINE, "exploit_exec")
+    assert "decision.get('pending_exploit_id')" in fn
+
+
+def test_omitting_the_ids_approves_everything_queued():
+    """An operator approving one id would silently leave the rest pending for
+    ever, which is how twenty-five candidates become invisible."""
+    svc = _read(os.path.join(REPO, "autogen_agents", "autogen_service.py"))
+    assert "def _queued_exploit_ids" in svc
+    assert "pending_exploit_ids" in svc
+    fn = svc[svc.index("def _queued_exploit_ids"):]
+    fn = fn[:fn.index("\n@app.post")]
+    assert "status = 'pending'" in fn and "session_id = %s::uuid" in fn, (
+        "it approves exploits from other sessions, or ones already decided")
+
+
+def test_a_named_subset_is_not_widened():
+    """Naming a subset is a deliberate operator choice."""
+    src = _read(ENGINE)
+    node = src[src.index("def exploit_approval"):]
+    node = node[:node.index("\ndef _mark_approved")]
+    assert "ids = [one] if one else list(queued)" in node, (
+        "the subset/all distinction is gone — either everything widens or "
+        "nothing does")
+
+
+def test_the_operator_is_shown_every_candidate():
+    """An operator shown a single id cannot tell what else was found."""
+    src = _read(ENGINE)
+    node = src[src.index("def exploit_approval"):]
+    node = node[:node.index("\ndef _mark_approved")]
+    assert '"queued_exploit_ids": queued' in node, (
+        "the approval prompt names one candidate, so the others sit pending "
+        "with nothing pointing at them")
