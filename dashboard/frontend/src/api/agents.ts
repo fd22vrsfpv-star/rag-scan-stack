@@ -297,6 +297,96 @@ export function useExportExtractors() {
   })
 }
 
+// ── Learned tool selection (tool_selection_learned) ───────────────────────
+//
+// Rules the platform derived from what tools actually did — nobody typed them.
+// The operator's job here is correction, not authoring. Rejecting one is
+// permanent: new evidence does not reinstate it.
+//
+// These rules decide which authorised tool is tried FIRST, never whether
+// something may run. Approving one grants no permission.
+
+export interface ToolSelectionRule {
+  id: string
+  phase: string
+  service: string
+  failed_tool: string
+  failure_signature: string
+  preferred_tool: string
+  failure_phrase?: string | null
+  support: number
+  attempts: number
+  successes: number
+  confidence?: number | null
+  status: 'active' | 'proposed' | 'rejected'
+  source: string
+  reviewed_by?: string | null
+  created_at: string
+  last_seen_at: string
+}
+
+export interface ToolAttempt {
+  id: string
+  phase: string
+  tool: string
+  service: string
+  target?: string | null
+  port?: number | null
+  success: boolean
+  result_count: number
+  failure_signature?: string | null
+  failure_phrase?: string | null
+  chosen_because?: string | null
+  created_at: string
+}
+
+export function useToolSelectionRules(status?: string) {
+  const params = status ? `?status=${status}` : ''
+  return useQuery({
+    queryKey: ['tool-selection-learned', status ?? 'all'],
+    queryFn: () => apiFetch<{
+      count: number
+      by_status: Record<string, number>
+      learned: ToolSelectionRule[]
+    }>(`/tool-selection/learned${params}`),
+    refetchInterval: POLL.SLOW,
+  })
+}
+
+/** The observations behind one rule. Only fetched once a row is expanded — a
+ *  rule nobody opened does not need its evidence loaded. */
+export function useToolAttempts(signature?: string) {
+  return useQuery({
+    queryKey: ['tool-selection-attempts', signature ?? 'none'],
+    queryFn: () => apiFetch<{ count: number; attempts: ToolAttempt[] }>(
+      `/tool-selection/attempts?signature=${encodeURIComponent(signature!)}&limit=25`),
+    enabled: !!signature,
+  })
+}
+
+export function useReviewToolSelectionRule() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, action }: { id: string; action: 'approve' | 'reject' | 'reset' }) =>
+      apiFetch<{ ok: boolean; status: string }>(
+        `/tool-selection/learned/${id}/${action}`, { method: 'POST', headers: ACTOR_HEADER }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['tool-selection-learned'] }),
+  })
+}
+
+export function useBackfillToolSelection() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body: { reset?: boolean; since_hours?: number } = {}) =>
+      apiFetch<{ ok: boolean; examined: number; failures: number; fruitless: number; rules: number; cleared: number }>(
+        '/tool-selection/backfill', {
+          method: 'POST', headers: { 'Content-Type': 'application/json', ...ACTOR_HEADER },
+          body: JSON.stringify(body),
+        }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['tool-selection-learned'] }),
+  })
+}
+
 // ── Agent activity timeline (webhook event-log) ───────────────────────────
 export interface AgentActivityEvent {
   id: string
