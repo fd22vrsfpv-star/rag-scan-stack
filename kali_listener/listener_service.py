@@ -469,12 +469,23 @@ def _learn_from_execution(exec_id: str, status: str, exit_code: Optional[int],
         return
     try:
         row = db_get_tool_execution(exec_id) or {}
-        count = 0
-        if isinstance(parsed_results, dict):
-            for key in ("findings", "results", "hosts", "credentials", "items"):
-                v = parsed_results.get(key)
-                if isinstance(v, list):
-                    count = max(count, len(v))
+        # None means "no parser ran here", which is NOT the same as "the parser
+        # found nothing" — the learner treats the second as a reason to try
+        # another tool and must not be handed the first dressed up as it.
+        count = None
+        if parsed_results is not None:
+            count = 0
+            if isinstance(parsed_results, dict):
+                for key in ("findings", "results", "hosts", "credentials",
+                            "items", "vulnerabilities", "ports", "services"):
+                    v = parsed_results.get(key)
+                    if isinstance(v, list):
+                        count = max(count, len(v))
+                if count == 0 and tool_learning._parsed_anything(parsed_results):
+                    # A shape this function does not know, but not empty.
+                    count = 1
+            elif isinstance(parsed_results, list):
+                count = len(parsed_results)
         tool_learning.observe_execution(
             row.get("tool") or "unknown",
             service=row.get("service") or "",
