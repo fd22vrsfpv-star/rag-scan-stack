@@ -576,9 +576,18 @@ class ApprovalRequest(BaseModel):
     pending_exploit_id: Optional[str] = Field(
         None,
         description=(
-            "The pending_exploits row to execute. REQUIRED when approved=true — "
-            "without it there is nothing to execute and the graph records the "
-            "approval as a no-op rather than guessing which exploit was meant."
+            "A single pending_exploits row to execute. Kept for callers that "
+            "already send it; prefer pending_exploit_ids."
+        ),
+    )
+    pending_exploit_ids: Optional[List[str]] = Field(
+        None,
+        description=(
+            "The pending_exploits rows to execute. OMIT to approve everything "
+            "the session queued — the planner now queues every well-evidenced "
+            "candidate, so approving one by id would silently leave the rest "
+            "pending for ever. Pass a subset to run only those, which is a "
+            "deliberate operator choice and never widened."
         ),
     )
     note: Optional[str] = Field(None, description="Operator note recorded on the session timeline.")
@@ -1629,6 +1638,31 @@ def _emit_flow_summary(session_id) -> dict:
 
 
 
+def _engagement_from_target(target_description: str):
+    """The engagement whose scope contains the target, when exactly one does.
+
+    Best-effort and deliberately conservative. An unresolvable target leaves the
+    session unattached, which is the behaviour that existed before — no worse,
+    and never a wrong attribution.
+    """
+    import re as _re
+    text = target_description or ""
+    m = _re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", text)
+    if not m:
+        return None
+    try:
+        import psycopg2
+        from etl.asset_utils import resolve_engagement_for_ip
+        dsn = os.environ.get("DB_DSN") or os.environ.get("DATABASE_URL")
+        if not dsn:
+            return None
+        with psycopg2.connect(dsn, connect_timeout=5) as conn, conn.cursor() as cur:
+            return resolve_engagement_for_ip(cur, m.group(0))
+    except Exception as e:  # noqa: BLE001
+        session_logger.debug("engagement resolution from target failed: %s", e)
+        return None
+
+
 def _enable_recon_agent_if_requested(engagement_id, enabled, interval_sec) -> None:
     """Turn on the continuous recon agent for this engagement at session launch.
 
@@ -2232,6 +2266,28 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
             _eid = (http_request.headers.get("x-engagement-id")
                     or http_request.headers.get("X-Engagement-Id"))
         _eid = (_eid or "").strip() or None
+
+        # No header? Resolve the engagement from the TARGET's scope.
+        #
+        # The header arrives from the dashboard's active engagement, so a
+        # session started with none selected got engagement_id NULL — and
+        # everything keyed on it silently got None, including the pre-approval
+        # lookup. A live session sat at an exploit gate for an hour on an
+        # engagement that HAD pre-approval, because it could not tell which
+        # engagement it was in.
+        #
+        # Scope is the authoritative statement of what belongs to an
+        # engagement, which is why the same resolver already stamps assets and
+        # why the queued exploit for that session DID carry the right one.
+        # resolve_engagement_for_ip returns None when no scope matches and also
+        # when more than one does: guessing an owner for a host two engagements
+        # both claim would attribute a whole session to the wrong one.
+        if not _eid:
+            _eid = _engagement_from_target(request.target_description)
+            if _eid:
+                session_logger.info(
+                    "no X-Engagement-Id supplied; resolved engagement %s from "
+                    "the target's scope", _eid)
 
         session_id = create_agent_session(
             request.session_name,
@@ -3270,6 +3326,30 @@ async def get_session_pending_approval(session_id: str):
     }
 
 
+def _queued_exploit_ids(session_uuid) -> List[str]:
+    """Every exploit this session queued and has not had decided.
+
+    Used when an approval names no ids. The planner queues every well-evidenced
+    candidate, so "approved" with nothing named means all of them — the previous
+    behaviour of demanding one id meant an operator could approve a single
+    exploit and never learn the others existed.
+    """
+    try:
+        import psycopg2
+        dsn = os.environ.get("DB_DSN") or os.environ.get("DATABASE_URL")
+        if not dsn:
+            return []
+        with psycopg2.connect(dsn, connect_timeout=5) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id::text FROM pending_exploits "
+                " WHERE session_id = %s::uuid AND status = 'pending' "
+                " ORDER BY created_at DESC LIMIT 10", (str(session_uuid),))
+            return [r[0] for r in cur.fetchall()]
+    except Exception as e:  # noqa: BLE001
+        session_logger.warning("queued exploit lookup failed: %s", e)
+        return []
+
+
 @app.post("/pentest/{session_id}/approve")
 async def approve_session_step(session_id: str, request: ApprovalRequest):
     """Answer a paused LangGraph approval interrupt and continue the SAME session.
@@ -3303,24 +3383,34 @@ async def approve_session_step(session_id: str, request: ApprovalRequest):
             detail=f"Session {session_id} is not paused on an approval "
                    f"(status='{session.get('status')}'). Nothing to approve.")
 
-    if request.approved and not request.pending_exploit_id:
-        # Fail loudly rather than resuming into a no-op the operator would read
-        # as "approved and executed".
-        raise HTTPException(
-            status_code=400,
-            detail="approved=true requires pending_exploit_id (the pending_exploits "
-                   "row to execute). List candidates with GET /api/exploits/pending.")
+    # Which rows to run. Omitting the ids now means "everything this session
+    # queued", because the planner queues every well-evidenced candidate — an
+    # operator approving one id would silently leave the rest pending for ever.
+    # Naming a subset still means exactly that subset.
+    ids = list(request.pending_exploit_ids or [])
+    if request.pending_exploit_id and request.pending_exploit_id not in ids:
+        ids.append(request.pending_exploit_id)
+
+    if request.approved and not ids:
+        ids = _queued_exploit_ids(session_uuid)
+        if not ids:
+            # Fail loudly rather than resuming into a no-op the operator would
+            # read as "approved and executed".
+            raise HTTPException(
+                status_code=400,
+                detail="approved=true but this session has no pending exploits to "
+                       "execute. List candidates with GET /api/exploits/pending.")
 
     session_logger.info(
-        "[%s] Operator approval: approved=%s pending_exploit_id=%s",
-        session_id, request.approved, request.pending_exploit_id)
+        "[%s] Operator approval: approved=%s exploits=%s",
+        session_id, request.approved, ids)
 
     asyncio.create_task(
         asyncio.to_thread(
             resume_langgraph_session_sync,
             session_uuid,
             bool(request.approved),
-            request.pending_exploit_id,
+            ids,
             request.note,
         )
     )
@@ -3328,7 +3418,7 @@ async def approve_session_step(session_id: str, request: ApprovalRequest):
     return {
         "session_id": session_id,
         "approved": bool(request.approved),
-        "pending_exploit_id": request.pending_exploit_id,
+        "pending_exploit_ids": ids,
         "status": "resuming",
         "message": ("Approved — resuming from the Postgres checkpoint and executing "
                     "the approved exploit." if request.approved else

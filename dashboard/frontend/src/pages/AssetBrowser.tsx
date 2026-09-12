@@ -1,7 +1,8 @@
 import { useState, useMemo, useEffect, Fragment } from 'react'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
 import PageHelp from '@/components/PageHelp'
-import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, type DdgSearchResponse } from '@/api/assets'
+import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useAssetAccess, useRefreshAccess, useReviewAccess,
+  type ObtainedAccess, type DdgSearchResponse } from '@/api/assets'
 import { apiFetch } from '@/api/client'
 import { useTargetedReconLookup, useTargetedReconExecute } from '@/api/targeted-recon'
 import { cn } from '@/lib/utils'
@@ -11,7 +12,7 @@ import { DataTable } from '@/components/common/DataTable'
 import { StatusDot } from '@/components/common/StatusDot'
 import type { ColumnDef, RowSelectionState } from '@tanstack/react-table'
 import type { Asset, Port, Vuln, ScanRecommendation } from '@/lib/types'
-import { X, Trash2, Key, Plus, ShieldCheck, ShieldX, ShieldQuestion, ShieldOff, AlertTriangle, Globe, Camera, Cpu, Settings2, Search, ExternalLink, Cloud, Server, ChevronDown, ChevronRight, Eye, EyeOff, Copy, Check } from 'lucide-react'
+import { X, Trash2, Key, Plus, ShieldCheck, ShieldX, ShieldQuestion, ShieldOff, AlertTriangle, Globe, Camera, Cpu, Settings2, Search, ExternalLink, Cloud, Server, ChevronDown, ChevronRight, Eye, EyeOff, Copy, Check, Terminal} from 'lucide-react'
 import { ScopeAssignModal } from '@/components/common/ScopeAssignModal'
 import { ScopeFilter } from '@/components/common/ScopeFilter'
 import { KbSuggestionsModal } from '@/components/recommendations/KbSuggestionsModal'
@@ -345,6 +346,158 @@ function SecretValue({ value, secretType }: { value: string; secretType?: string
   )
 }
 
+/** Current Access — the shells and logins the platform actually HOLDS here.
+ *
+ *  Sits beside Credentials because it is the same question one stage later:
+ *  credentials are what we can log in with, access is what we are already
+ *  inside.
+ *
+ *  Every row is MEASURED rather than inferred from which exploit ran. `id`
+ *  gives the privilege and repeated probes give the stability, and the score is
+ *  the two combined — which is why a flaky root can rank below a stable user
+ *  shell. The post-enumeration checklist runs through the top row only, so this
+ *  panel is also the explanation of where those results came from.
+ *
+ *  `is_root: null` means NOT PROBED. It is shown as "unknown", never as "no". */
+function AccessSection({ ip }: { ip: string }) {
+  const [includeDead, setIncludeDead] = useState(false)
+  const { data, isLoading } = useAssetAccess(ip, includeDead)
+  const refresh = useRefreshAccess()
+  const review = useReviewAccess()
+  const rows = data?.access ?? []
+
+  const kindLabel: Record<string, string> = {
+    msf_session: 'Metasploit session',
+    bind_shell: 'bind shell',
+    ssh_credential: 'SSH login',
+    listener_callback: 'reverse shell',
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <h4 className="text-xs font-medium text-muted-foreground flex items-center gap-1.5">
+          <Terminal className="h-3.5 w-3.5" /> Current Access ({data?.live ?? 0} live
+          {rows.length !== (data?.live ?? 0) ? ` of ${rows.length}` : ''})
+        </h4>
+        <span className="inline-flex items-center gap-2">
+          <label className="text-[11px] text-muted-foreground inline-flex items-center gap-1">
+            <input type="checkbox" checked={includeDead}
+                   onChange={e => setIncludeDead(e.target.checked)} />
+            show dead
+          </label>
+          <button onClick={() => refresh.mutate(ip)} disabled={refresh.isPending}
+            title="Re-discover and re-probe. Runs a few commands through access that already exists — it opens nothing."
+            className="h-6 px-2 text-[10px] rounded border border-border hover:bg-accent">
+            {refresh.isPending ? 'Probing…' : 'Probe access'}
+          </button>
+        </span>
+      </div>
+
+      <p className="text-[11px] text-muted-foreground">
+        Measured, not assumed: <span className="font-mono">id</span> gives the privilege and
+        repeated probes give the stability. Post-enumeration runs through the highest-scoring
+        row only — a <em>flaky root</em> ranks below a <em>stable user</em> shell, because the
+        checklist is a sequence and one that drops halfway looks complete.
+      </p>
+
+      {refresh.data && (
+        <p className="text-[11px] font-mono text-muted-foreground">
+          probed {refresh.data.discovered} candidate(s) · {refresh.data.live} answered
+        </p>
+      )}
+
+      {isLoading ? (
+        <p className="text-xs text-muted-foreground">Loading…</p>
+      ) : rows.length === 0 ? (
+        <p className="text-xs text-muted-foreground">
+          No access held on this host. Exploits that succeed and credentials that work show up
+          here once probed.
+        </p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[760px] text-xs">
+            <thead className="text-muted-foreground">
+              <tr className="border-b border-border">
+                <th className="text-right py-1 px-2 w-14">Score</th>
+                <th className="text-left px-2">Access</th>
+                <th className="text-left px-2">Privilege</th>
+                <th className="text-left px-2">Stability</th>
+                <th className="text-left px-2">Host</th>
+                <th className="text-right px-2">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((a: ObtainedAccess, i: number) => (
+                <tr key={a.id} className={cn('border-b border-border/40',
+                  i === 0 && a.status === 'live' && a.score > 0 && 'bg-green-500/5')}>
+                  <td className="py-1 px-2 text-right font-mono">
+                    {a.score}
+                    {i === 0 && a.status === 'live' && a.score > 0 && (
+                      <div className="text-[9px] text-green-400">in use</div>
+                    )}
+                  </td>
+                  <td className="px-2">
+                    <div className="font-mono">{a.handle}</div>
+                    <div className="text-[10px] text-muted-foreground">
+                      {kindLabel[a.kind] || a.kind}{a.transport ? ` · ${a.transport}` : ''}
+                    </div>
+                  </td>
+                  <td className="px-2">
+                    {a.is_root === true && (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] bg-red-500/15 text-red-300">root</span>
+                    )}
+                    {a.is_root === false && (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-400">user</span>
+                    )}
+                    {a.is_root === null && (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] bg-gray-500/10 text-gray-400"
+                            title="It answered but said nothing recognisable, or it was never probed. Not the same as 'not root'.">
+                        unknown
+                      </span>
+                    )}
+                    {a.whoami && <span className="ml-1.5 font-mono text-[10px]">{a.whoami}</span>}
+                  </td>
+                  <td className="px-2 font-mono">
+                    {a.probes_ok}/{a.probes}
+                    {a.last_error && (
+                      <div className="text-[10px] text-red-400/80 truncate max-w-[180px]"
+                           title={a.last_error}>{a.last_error}</div>
+                    )}
+                  </td>
+                  <td className="px-2 text-[10px] text-muted-foreground truncate max-w-[200px]"
+                      title={a.os_info || ''}>{a.os_info || '—'}</td>
+                  <td className="px-2 text-right whitespace-nowrap">
+                    <span className={cn('px-1.5 py-0.5 rounded text-[10px] mr-1',
+                      a.status === 'live' ? 'bg-green-500/10 text-green-400'
+                        : a.status === 'rejected' ? 'bg-red-500/10 text-red-400'
+                          : 'bg-gray-500/10 text-gray-400')}>{a.status}</span>
+                    {a.status !== 'rejected' ? (
+                      <button onClick={() => review.mutate({ id: a.id, action: 'reject' })}
+                        disabled={review.isPending}
+                        title="Nothing will use this access. Durable — re-probing will not un-reject it."
+                        className="px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">
+                        <ShieldOff className="h-3 w-3 inline" /> Reject
+                      </button>
+                    ) : (
+                      <button onClick={() => review.mutate({ id: a.id, action: 'reinstate' })}
+                        disabled={review.isPending}
+                        className="px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">
+                        Reinstate
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+
 function CredentialSection({ ip }: { ip: string }) {
   const { data: credData } = useAssetCredentials(ip)
   const updateStatus = useUpdateCredentialStatus()
@@ -647,7 +800,7 @@ export default function AssetBrowser() {
   const [selectedIp, setSelectedIp] = useState<string | null>(null)
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null)
   const [selectedPort, setSelectedPort] = useState<Port | null>(null)
-  const [detailTab, setDetailTab] = useState<'ports' | 'credentials' | 'screenshots' | 'recon'>('ports')
+  const [detailTab, setDetailTab] = useState<'ports' | 'credentials' | 'access' | 'screenshots' | 'recon'>('ports')
   const [search, setSearch] = useState('')
   const [credStatusFilter, setCredStatusFilter] = useState<string>('')
   // Track which credential rows have their audit panel expanded.  Keyed by
@@ -1781,12 +1934,17 @@ export default function AssetBrowser() {
               className={`px-3 py-1.5 text-xs font-medium rounded-t-md border border-b-0 ${detailTab === 'credentials' ? 'bg-card text-foreground border-border' : 'bg-muted/50 text-muted-foreground border-transparent hover:text-foreground'}`}
             >Credentials</button>
             <button
+              onClick={() => setDetailTab('access')}
+              className={`px-3 py-1.5 text-xs font-medium rounded-t-md border border-b-0 ${detailTab === 'access' ? 'bg-card text-foreground border-border' : 'bg-muted/50 text-muted-foreground border-transparent hover:text-foreground'}`}
+            ><Terminal className="h-3 w-3 inline mr-1" />Current Access</button>
+            <button
               onClick={() => setDetailTab('screenshots')}
               className={`px-3 py-1.5 text-xs font-medium rounded-t-md border border-b-0 ${detailTab === 'screenshots' ? 'bg-card text-foreground border-border' : 'bg-muted/50 text-muted-foreground border-transparent hover:text-foreground'}`}
             ><Camera className="h-3 w-3 inline mr-1" />Screenshots</button>
           </div>
 
           <div className="p-4 space-y-6">
+            {detailTab === 'access' && <AccessSection ip={selectedIp} />}
             {detailTab === 'ports' && (
               <div>
                 {portsData?.items?.length ? (
