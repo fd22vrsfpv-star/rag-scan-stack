@@ -95,6 +95,17 @@ class ToolExecuteRequest(BaseModel):
     timeout: int = Field(default=300, ge=30, le=3600, description="Execution timeout in seconds")
     scan_id: Optional[str] = Field(None, description="Associated scan ID for result linking")
     service: Optional[str] = Field(None, description="Service being tested")
+    # Literal strings to mask before the command is STORED. The command still
+    # runs verbatim; only the recorded copy is sanitised.
+    #
+    # CLAUDE.md lists provenance as "command line (sanitized)", and this is the
+    # one place every tool's command line is written down. A resolved credential
+    # follow-up carries the password in its argv, and tool_executions.command is
+    # read by the scans UI, the post-review agent and every export — so without
+    # this, making follow-ups runnable would have published the secret to all
+    # three.
+    redact: List[str] = Field(default_factory=list,
+                              description="Literal substrings to mask in the stored command")
 
 
 class ToolInstallRequest(BaseModel):
@@ -400,6 +411,31 @@ def db_get_callback_by_exploit(pending_exploit_id: str) -> Optional[Dict]:
 
 
 # --- Tool Execution Database Functions ---
+
+def _redacted(command: str, secrets: List[str]) -> str:
+    """Mask literal secrets in a command before it is written down.
+
+    Longest first, so a password that contains another one is masked whole
+    rather than leaving a fragment behind. Empty and one-character entries are
+    ignored: masking "a" would shred the command into noise and tell an operator
+    nothing.
+
+    Deliberately blunt. When the password equals the username — `user:user`,
+    which is exactly the kind of credential this platform finds — every
+    occurrence is masked, so the stored command reads
+    `-u <redacted> -p '<redacted>'` and loses a detail that was not secret.
+    Over-redacting is the safe direction and the alternative is a per-tool
+    understanding of which argument position holds the password, which would be
+    wrong for the next tool added. The command that RUNS is untouched, and the
+    username is on the recommendation row either way.
+    """
+    if not command or not secrets:
+        return command
+    out = command
+    for secret in sorted({s for s in secrets if s and len(s) > 1}, key=len, reverse=True):
+        out = out.replace(secret, "<redacted>")
+    return out
+
 
 def db_create_tool_execution(exec_id: str, tool: str, command: str, target: str,
                              port: Optional[int], scan_id: Optional[str],
@@ -2327,21 +2363,28 @@ async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: B
 
     exec_id = str(uuid.uuid4())
 
-    # Create database record
+    # Create database record.
+    #
+    # The STORED command is sanitised; the one that runs is not. A resolved
+    # credential follow-up carries the password in its argv, and this column is
+    # read by the scans UI, the post-review agent and every export.
+    stored_command = _redacted(request.command, request.redact)
     try:
         db_create_tool_execution(
-            exec_id, request.tool, request.command, request.target,
+            exec_id, request.tool, stored_command, request.target,
             request.port, request.scan_id, request.service
         )
     except Exception as e:
         logger.error(f"Failed to create execution record: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
-    # Track in memory
+    # Track in memory. The redacted form here too: /tools/executions/{id} serves
+    # this dict straight to the Scan Monitor, so leaving the raw command would
+    # have put the secret back on screen by another route.
     active_executions[exec_id] = {
         "id": exec_id,
         "tool": request.tool,
-        "command": request.command,
+        "command": stored_command,
         "target": request.target,
         "port": request.port,
         "status": "pending",
