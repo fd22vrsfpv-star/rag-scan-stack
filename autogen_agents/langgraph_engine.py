@@ -91,6 +91,16 @@ SCAN_TOOLS_DISPATCH = {
     "start_smb_vuln_scan", "start_full_scan",
 }
 
+# Credential discovery. Kept OUT of SCAN_TOOLS_DISPATCH above and added only for
+# an engagement the operator pre-approved — see the scan node.
+#
+# The comment above says these "stay behind the human-approved exploit phase",
+# but EXPLOIT_PLAN_TOOLS never contained them, so in practice no phase could
+# reach them at all: a run against a host with ftp, ssh, telnet and vnc open
+# produced zero credential_findings. That is not caution, it is a gap — the
+# tools existed, the services were found, and nothing ever tried.
+SCAN_TOOLS_CREDENTIAL = {"start_credential_check", "start_brutus"}
+
 ANALYZE_TOOLS = _READ_ONLY | {"match_vuln_to_exploits", "search_msf_modules",
                               "get_tool_recommendations"}
 
@@ -762,11 +772,41 @@ def scan(state: PentestState) -> dict:
     sid = state["session_id"]
     auto = bool(state.get("auto_execute"))
     names = SCAN_TOOLS_READONLY | (SCAN_TOOLS_DISPATCH if auto else set())
+
+    # Credential tools, only for an engagement the operator pre-approved.
+    #
+    # SCAN_TOOLS_DISPATCH excludes them because they "stay behind the
+    # human-approved exploit phase" — but EXPLOIT_PLAN_TOOLS never contained
+    # them either, so no phase of this pipeline could reach them and credential
+    # discovery simply never happened. A run against a host with ftp/ssh/telnet/
+    # vnc wide open produced zero credential_findings, which reads as "nothing
+    # to find" rather than "never looked".
+    #
+    # Pre-approval is what makes them reachable, for the same reason it skips
+    # the exploit interrupt: the operator authorised this engagement in advance.
+    # Without it they stay out, exactly as before. Both tools remain scope-gated
+    # and MAX_CONCURRENT_SCANS-bounded in their own bodies.
+    creds_enabled = False
+    if auto:
+        preapproved, _eid = _engagement_preapproval(sid)
+        if preapproved:
+            names = names | SCAN_TOOLS_CREDENTIAL
+            creds_enabled = True
+
     system = _SCAN_SYSTEM_DISPATCH if auto else _SCAN_SYSTEM_PLAN
     try:
+        # Say the credential tools exist when they do. A tool the agent is never
+        # told about tends not to get chosen: the previous run had ftp, ssh,
+        # telnet and vnc open and still ran no credential check.
+        cred_note = ("\nCredential testing IS authorised for this engagement "
+                     "(operator pre-approval). If you find authentication "
+                     "services — ftp, ssh, telnet, smb, vnc, rdp, mysql, "
+                     "postgres — run start_credential_check on them, and "
+                     "start_brutus where a wordlist attack is warranted. Both "
+                     "are scope-gated and rate-bounded." if creds_enabled else "")
         task = (f"Target: {state['target'][:300]}\nTask: {state['task'][:300]}\n"
                 f"auto_execute={'ON' if auto else 'OFF'}. Decide what to scan next"
-                f"{' and launch it' if auto else ''}.")
+                f"{' and launch it' if auto else ''}.{cred_note}")
         final, used = _llm_phase(sid, agent_name="Scanner", system=system,
                                  tool_names=names, task=task,
                                  recursion_limit=(24 if auto

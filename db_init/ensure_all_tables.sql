@@ -2802,6 +2802,96 @@ CREATE TRIGGER trg_extractor_learned_updated
   BEFORE UPDATE ON public.extractor_learned
   FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
 
+-- ============================================================================
+-- Learned tool selection (etl/tool_learning.py)
+-- ----------------------------------------------------------------------------
+-- WHY: cred_checker had a hardcoded rule -- "if hydra's output mentions a KEX
+-- mismatch, fall back to nmap". That rule only exists because a human read one
+-- error message once. Every other tool/error pair got no rule at all, so the
+-- platform kept re-running a tool that could never work on that service.
+--
+-- These two tables replace the hardcoded rule with an observation loop:
+--   1. tool_attempts records EVERY attempt -- which tool, against what service,
+--      whether it produced anything, and a normalised SIGNATURE of the error
+--      text it printed. The signature function (etl/tool_learning.error_signature)
+--      knows no protocol vocabulary; it strips volatile tokens (ips, ports,
+--      digits, paths, hex) and hashes the salient diagnostic lines, so the same
+--      failure from the same tool hashes the same way whatever the target.
+--   2. tool_selection_learned is derived from those rows: when tool A failed
+--      with signature S on a (target, port, service) and tool B then succeeded
+--      on the same one, that pair becomes a rule. Later runs that see signature
+--      S again go straight to B, and once a rule has enough support B is tried
+--      FIRST so the dead round-trip through A stops happening.
+--
+-- AUTHORISATION IS NOT AFFECTED. A rule only reorders tools the operator has
+-- already authorised for that engagement; it can never add a tool, a target or
+-- a port. Rules are per (phase, service, failed_tool, signature) and carry a
+-- status so an operator can reject one -- a rejected rule is never consulted.
+CREATE TABLE IF NOT EXISTS public.tool_attempts (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    phase             text NOT NULL DEFAULT 'credential_check',
+    tool              text NOT NULL,
+    service           text NOT NULL DEFAULT '',
+    target            text,
+    port              integer,
+    success           boolean NOT NULL DEFAULT false,
+    result_count      integer NOT NULL DEFAULT 0,
+    -- Hash of the normalised diagnostic lines; NULL when the attempt succeeded
+    -- or printed nothing classifiable.
+    failure_signature text,
+    -- The human-readable line the signature was computed from, so an operator
+    -- reviewing a learned rule can see WHICH message taught it.
+    failure_phrase    text,
+    -- 'default_order' | 'learned:<rule id>' | 'exploration' | 'only_candidate'
+    chosen_because    text,
+    rule_id           uuid,
+    engagement_id     uuid,
+    created_at        timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_tool_attempts_phase_service
+  ON public.tool_attempts (phase, service, tool);
+CREATE INDEX IF NOT EXISTS idx_tool_attempts_signature
+  ON public.tool_attempts (failure_signature);
+CREATE INDEX IF NOT EXISTS idx_tool_attempts_created
+  ON public.tool_attempts (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.tool_selection_learned (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    phase             text NOT NULL DEFAULT 'credential_check',
+    service           text NOT NULL DEFAULT '',
+    failed_tool       text NOT NULL,
+    failure_signature text NOT NULL,
+    preferred_tool    text NOT NULL,
+    failure_phrase    text,
+    -- support   = times this (failure -> preferred_tool) pair was observed
+    -- attempts  = times preferred_tool was tried after this failure
+    -- successes = times preferred_tool then produced a result
+    -- confidence = successes / attempts
+    support           integer NOT NULL DEFAULT 0,
+    attempts          integer NOT NULL DEFAULT 0,
+    successes         integer NOT NULL DEFAULT 0,
+    confidence        numeric,
+    status            text NOT NULL DEFAULT 'proposed'
+                      CHECK (status IN ('active','proposed','rejected')),
+    source            text NOT NULL DEFAULT 'observed',
+    reviewed_by       text,
+    created_at        timestamptz DEFAULT now(),
+    updated_at        timestamptz DEFAULT now(),
+    last_seen_at      timestamptz DEFAULT now()
+);
+-- Every column in the key is NOT NULL with a '' default, so this constrains
+-- every row. (A nullable column here would let unlimited duplicates through --
+-- in Postgres a NULL makes rows non-equal for uniqueness purposes.)
+CREATE UNIQUE INDEX IF NOT EXISTS ux_tool_selection_learned_rule
+  ON public.tool_selection_learned
+     (phase, service, failed_tool, failure_signature, preferred_tool);
+CREATE INDEX IF NOT EXISTS idx_tool_selection_learned_lookup
+  ON public.tool_selection_learned (phase, service, failed_tool, status);
+DROP TRIGGER IF EXISTS trg_tool_selection_learned_updated ON public.tool_selection_learned;
+CREATE TRIGGER trg_tool_selection_learned_updated
+  BEFORE UPDATE ON public.tool_selection_learned
+  FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+
 -- Agent-to-agent feedback channel. One agent flags something interesting (a
 -- finding worth another run, a coverage gap); a coordinator turns approved flags
 -- into scan_recommendations (which the recon agent dispatches through the scope

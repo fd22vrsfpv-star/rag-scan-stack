@@ -444,6 +444,52 @@ def _cap_for_storage(v, field: str, exec_id: str):
               f"{TOOL_OUTPUT_STORE_CAP:,}]")
 
 
+def _learn_from_execution(exec_id: str, status: str, exit_code: Optional[int],
+                          output: Optional[str], error: Optional[str],
+                          parsed_results: Optional[Dict]) -> None:
+    """Feed one finished command to the learned tool-selection loop.
+
+    This is the chokepoint every tool the platform runs passes through, which is
+    why the hook lives here rather than in each runner: a command that errors
+    anywhere post-analysis teaches the platform something without that runner
+    needing to know the loop exists.
+
+    What it learns is which tool to reach for when a given error text shows up
+    again — see etl/tool_learning.py. It never decides that something may run;
+    that stays with the scope gate and the phase's approval.
+
+    Best-effort by construction. A learning store that is down must not fail a
+    tool run that already completed, so every failure here is swallowed after a
+    debug line.
+    """
+    try:
+        from etl import tool_learning
+    except Exception as e:  # noqa: BLE001 - etl/ not mounted is a valid deployment
+        logger.debug("tool_learning unavailable, not learning from %s: %s", exec_id, e)
+        return
+    try:
+        row = db_get_tool_execution(exec_id) or {}
+        count = 0
+        if isinstance(parsed_results, dict):
+            for key in ("findings", "results", "hosts", "credentials", "items"):
+                v = parsed_results.get(key)
+                if isinstance(v, list):
+                    count = max(count, len(v))
+        tool_learning.observe_execution(
+            row.get("tool") or "unknown",
+            service=row.get("service") or "",
+            target=row.get("target"),
+            port=row.get("port"),
+            status=status,
+            exit_code=exit_code,
+            output=output or "",
+            error=error or "",
+            result_count=count,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("learning from execution %s failed: %s", exec_id, e)
+
+
 def db_update_tool_execution(exec_id: str, status: str, exit_code: Optional[int] = None,
                              output: Optional[str] = None, error: Optional[str] = None,
                              parsed_results: Optional[Dict] = None) -> None:
@@ -463,6 +509,9 @@ def db_update_tool_execution(exec_id: str, status: str, exit_code: Optional[int]
         conn.commit()
     finally:
         conn.close()
+    # After the row is committed, so the learner reads the same thing an
+    # operator would.
+    _learn_from_execution(exec_id, status, exit_code, output, error, parsed_results)
 
 
 def db_get_tool_execution(exec_id: str) -> Optional[Dict]:

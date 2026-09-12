@@ -1492,7 +1492,10 @@ class ScanTools:
         targets: List[str],
         ports: Optional[List[int]] = None,
         services: Optional[List[str]] = None,
-        method: str = "hydra"
+        # "auto", not "hydra": cred_checker only runs its documented
+        # hydra-then-nmap fallback in the `else` branch, so "hydra" silently
+        # disabled it. See the note on CredentialCheckRequest.method.
+        method: str = "auto"
     ) -> Dict:
         """
         Start credential testing for default/weak passwords.
@@ -3337,7 +3340,10 @@ def start_credential_check(
     target: str = None,
     ports: str = None,
     services: str = None,
-    method: str = "hydra"
+    # "auto" so the hydra-then-nmap fallback actually runs — "hydra" takes
+    # cred_checker's first branch and never falls back, which is why legacy-SSH
+    # hosts reported kex_mismatch on every attempt and zero credentials.
+    method: str = "auto"
 ) -> str:
     """
     Start credential testing for default/weak passwords.

@@ -216,7 +216,13 @@ def _mask_password(password: str) -> str:
 
 
 def _classify_hydra_failure(output: str) -> Tuple[str, Optional[str]]:
-    """Inspect hydra stdout+stderr to label why a single attempt failed.
+    """Inspect hydra stdout+stderr to LABEL why a single attempt failed.
+
+    This is presentation, not policy. It exists so the audit panel can say
+    "couldn't even handshake" instead of "wrong password", and nothing branches
+    on its answer any more. Which tool to try next is decided from the raw error
+    text by etl/tool_learning.py, which knows no protocol vocabulary — so a
+    service this function has never heard of still gets a working fallback.
 
     Returns ``(failure_mode, error_excerpt)``.  failure_mode is one of:
       - "kex_mismatch": SSH key-exchange / host-key-algorithm negotiation
@@ -659,11 +665,86 @@ def check_bindshell(target: str, port: int = 1524, timeout: int = 5) -> Credenti
     return None
 
 
+# ── Learned tool selection ─────────────────────────────────────────────────
+#
+# Which tool to reach for when another one fails is LEARNED from the error text
+# (etl/tool_learning.py), not written down here. The rule this replaced —
+# "if hydra's output mentions a KEX mismatch, use nmap" — was correct and still
+# wrong in kind: it only existed because a human read one message from one tool
+# on one protocol once. Nothing taught the platform anything about telnet,
+# mysql, vnc or the next tool added, so those kept re-running something that
+# could not work and reporting "nothing found".
+#
+# Adding a method here is now the whole integration: it is offered, tried, and
+# its failures are learned from, with no per-service branch to write.
+CRED_METHODS = {
+    "hydra": check_credentials_hydra,
+    "nmap":  check_credentials_nmap,
+}
+# Declared order for a service nothing has been learned about yet. It is a
+# starting point, not a decision — preferred_order() reorders it as soon as the
+# observations justify that.
+DEFAULT_METHOD_ORDER = ["hydra", "nmap"]
+
+
+def _method_error_text(m_audit: Dict[str, Any]) -> str:
+    """Everything a method said about why it produced nothing.
+
+    Feeds the signature, so it must be the tool's own words. Deliberately
+    includes the coarse `failure_mode` label as a line of its own: a tool that
+    fails silently still fails the same way twice, and a signature computed from
+    an empty string would merge every silent failure into one bucket.
+    """
+    parts: List[str] = []
+    unsupported = m_audit.get("unsupported_service")
+    if unsupported:
+        parts.append(f"tool does not support service {unsupported}")
+    if m_audit.get("error"):
+        parts.append(str(m_audit["error"]))
+    for a in m_audit.get("attempts", []):
+        if a.get("success"):
+            continue
+        if a.get("error_excerpt"):
+            parts.append(str(a["error_excerpt"]))
+        elif a.get("failure_mode"):
+            parts.append(f"attempt failed: {a['failure_mode']}")
+    return "\n".join(parts)
+
+
+def _tool_learning():
+    """The learning module, or None when it cannot be imported.
+
+    Optional by design: cred_checker must keep working — with its declared tool
+    order — in an environment where etl/ is not mounted. Selection is not
+    authorisation, so degrading here is safe; the scope gate and the engagement
+    pre-approval are enforced elsewhere and are not optional.
+    """
+    try:
+        from etl import tool_learning
+        return tool_learning
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[cred_checker] tool_learning unavailable: {e}")
+        return None
+
+
 def check_default_credentials(
     target: str,
     port: int,
     service: str = None,
-    method: str = "hydra"
+    # "auto" — work through the authorised methods, learning from each failure
+    # which one to reach for next. It defaulted to "hydra", which returned after
+    # one tool and never reached the fallback at all. Worse, the caller could not
+    # override it: check_all_default_credentials() takes no `method` argument, so
+    # the value plumbed down from the API request was dropped and this default was
+    # what every credential check actually used.
+    #
+    # Measured against Metasploitable: ssh reported 0 valid credentials.
+    # msfadmin:msfadmin WAS tried; it lost to SSH key-exchange negotiation, not to
+    # a wrong password, and nmap's NSE brute scripts handle that legacy KEX fine.
+    # Fixing the default took the host from 3 valid credentials to 10.
+    #
+    # Pass "hydra" or "nmap" to force one method and suppress the fallback.
+    method: str = "auto"
 ) -> Dict[str, Any]:
     """
     Check default credentials for a service.
@@ -672,7 +753,10 @@ def check_default_credentials(
         target: Target IP address
         port: Target port
         service: Service type (auto-detected from port if not provided)
-        method: Testing method ('hydra' or 'nmap')
+        method: 'auto' (default) tries each authorised method in the order
+            etl/tool_learning.py has learned for this service, stopping at the
+            first that finds something. Naming a method ('hydra' / 'nmap')
+            forces it and disables the fallback.
 
     Returns:
         Dictionary with check results
@@ -738,68 +822,126 @@ def check_default_credentials(
         "fell_back_to_nmap":      False,
     }
 
-    if method == "hydra":
-        results, m_audit = check_credentials_hydra(target, port, service, credentials)
-        audit["methods_used"].append("hydra")
+    learn = _tool_learning()
+
+    if method in CRED_METHODS:
+        # An explicit method is an operator instruction, so it is obeyed as
+        # given — no reordering, no fallback. The attempt is still recorded, so
+        # a forced run still teaches the platform something.
+        results, m_audit = CRED_METHODS[method](target, port, service, credentials)
+        audit["methods_used"].append(method)
         audit["method_audits"].append(m_audit)
         audit["kex_legacy_detected"] = bool(m_audit.get("kex_legacy_detected"))
-    elif method == "nmap":
-        results, m_audit = check_credentials_nmap(target, port, service, credentials)
-        audit["methods_used"].append("nmap")
-        audit["method_audits"].append(m_audit)
+        if learn:
+            err = _method_error_text(m_audit)
+            sig, phrase = learn.error_signature(err) if not results else (None, None)
+            learn.record_attempt(
+                method, service=service, target=target, port=port,
+                success=bool(results), result_count=len(results),
+                signature=sig, phrase=phrase, chosen_because="operator_forced")
     else:
-        # Default behaviour: try hydra first, fall back to nmap.  Also auto-
-        # fall back to nmap when hydra detected SSH KEX-mismatch on every
-        # attempt (the Metasploitable2 / legacy-OpenSSH case) -- nmap's
-        # NSE brute scripts handle legacy KEX correctly where hydra/libssh
-        # can't negotiate.  Record the fallback in the audit so operators
-        # see *why* nmap was invoked.
-        results, h_audit = check_credentials_hydra(target, port, service, credentials)
-        audit["methods_used"].append("hydra")
-        audit["method_audits"].append(h_audit)
-        audit["kex_legacy_detected"] = bool(h_audit.get("kex_legacy_detected"))
+        # Default behaviour: work through the authorised methods, learning from
+        # each failure which one to reach for next.
+        candidates = [m for m in DEFAULT_METHOD_ORDER if m in CRED_METHODS]
+        store_ok = bool(learn) and learn.available()
+        if learn and store_ok:
+            candidates, notes = learn.preferred_order(candidates, service=service)
+        else:
+            notes = ["learning store unavailable; declared order used"] if learn \
+                else ["etl/tool_learning not importable; declared order used"]
 
-        should_fallback = (
-            not results
-            and (h_audit.get("kex_legacy_detected") or
-                 all((a.get("failure_mode") == "kex_mismatch")
-                     for a in h_audit.get("attempts", [])
-                     if not a.get("success")))
-        )
-        if not results and not should_fallback:
-            # Plain "nothing worked" case -- still try nmap once
-            should_fallback = True
+        selection: Dict[str, Any] = {
+            "candidates": list(candidates),
+            "learning_available": store_ok,   # NOT the same as "no rule matched"
+            "notes": notes,
+            "decisions": [],
+            "learned": [],
+        }
+        audit["selection"] = selection
 
-        if should_fallback:
-            logger.info(
-                f"[cred_checker] {service}://{target}:{port} hydra returned "
-                f"0 valid creds (kex_legacy_detected="
-                f"{h_audit.get('kex_legacy_detected')}); falling back to nmap"
-            )
-            n_results, n_audit = check_credentials_nmap(target, port, service, credentials)
-            audit["methods_used"].append("nmap")
-            audit["method_audits"].append(n_audit)
-            audit["fell_back_to_nmap"] = True
-            if n_results:
-                results = n_results
+        sequence: List[Dict[str, Any]] = []
+        remaining = list(candidates)
+        tool: Optional[str] = remaining[0] if remaining else None
+        reason, rule_id = "default_order", None
 
-    # Human-readable summary for the audit panel.
+        while tool:
+            t_results, t_audit = CRED_METHODS[tool](target, port, service, credentials)
+            audit["methods_used"].append(tool)
+            audit["method_audits"].append(t_audit)
+            if t_audit.get("kex_legacy_detected"):
+                audit["kex_legacy_detected"] = True
+
+            ok = bool(t_results)
+            sig = phrase = None
+            if not ok and learn:
+                sig, phrase = learn.error_signature(_method_error_text(t_audit))
+            sequence.append({"tool": tool, "success": ok,
+                             "result_count": len(t_results),
+                             "signature": sig, "phrase": phrase})
+            selection["decisions"].append({
+                "tool": tool, "chosen_because": reason, "rule_id": rule_id,
+                "valid_credentials": len(t_results),
+                "failure_signature": sig, "failure_phrase": phrase,
+            })
+            if learn:
+                learn.record_attempt(
+                    tool, service=service, target=target, port=port,
+                    success=ok, result_count=len(t_results),
+                    signature=sig, phrase=phrase,
+                    chosen_because=(f"learned:{rule_id}" if rule_id else reason))
+
+            if ok:
+                results = t_results
+                break
+
+            remaining.remove(tool)
+            if not remaining:
+                tool, reason, rule_id = None, "exhausted", None
+                break
+            if learn:
+                tool, reason, rule_id = learn.next_tool(
+                    tool, sig, remaining, service=service, store_available=store_ok)
+            else:
+                tool, reason, rule_id = remaining[0], "default_order", None
+            if tool:
+                logger.info(
+                    f"[cred_checker] {service}://{target}:{port} {sequence[-1]['tool']} "
+                    f"found nothing; trying {tool} ({reason})")
+
+        selection["stopped_because"] = reason
+        # Teach: within this run, a tool that failed with signature S followed by
+        # one that succeeded IS the rule. Nothing to type.
+        if learn:
+            selection["learned"] = learn.observe_sequence(sequence, service=service)
+
+        audit["fell_back_to_nmap"] = (
+            len(audit["methods_used"]) > 1 and "nmap" in audit["methods_used"][1:])
+
+    # Human-readable summary for the audit panel. Built from what actually ran
+    # rather than from a named pair of tools, so a new method needs no edit here
+    # and the line never claims a fallback that did not happen.
     total_attempts = sum(
         len(ma.get("attempts", [])) for ma in audit["method_audits"]
     )
-    if results:
-        summary = f"{len(results)} valid / {total_attempts} attempts"
-        if audit["fell_back_to_nmap"]:
-            summary += " (hydra→nmap fallback)"
-    elif audit["kex_legacy_detected"]:
-        summary = (
-            f"0 valid / {total_attempts} attempts — every hydra attempt "
-            f"failed at SSH key exchange (target uses legacy ssh-rsa/dss)"
-        )
-        if audit["fell_back_to_nmap"]:
-            summary += "; nmap fallback also found no valid creds"
-    else:
-        summary = f"0 valid / {total_attempts} attempts"
+    chain = "\u2192".join(audit["methods_used"]) or "no method"
+    summary = f"{len(results)} valid / {total_attempts} attempts via {chain}"
+    sel = audit.get("selection") or {}
+    learned_from = [d for d in sel.get("decisions", [])
+                    if d.get("chosen_because") == "learned"]
+    if learned_from:
+        summary += f" ({learned_from[0]['tool']} chosen by a learned rule)"
+    elif sel.get("stopped_because") == "learned_dead_end":
+        summary += " (no further method: every fallback has failed this way before)"
+    elif not sel.get("learning_available", True):
+        summary += " (learning store unavailable \u2014 declared order used)"
+    # The failure each method reported, in its own words. This used to be a
+    # hardcoded sentence about SSH key exchange; it now shows whatever the tool
+    # actually said, for any service.
+    if not results:
+        phrases = [d["failure_phrase"] for d in sel.get("decisions", [])
+                   if d.get("failure_phrase")]
+        if phrases:
+            summary += " \u2014 " + "; ".join(dict.fromkeys(phrases))[:300]
     audit["summary"] = summary
 
     return {
