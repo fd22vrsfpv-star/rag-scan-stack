@@ -2892,6 +2892,113 @@ CREATE TRIGGER trg_tool_selection_learned_updated
   BEFORE UPDATE ON public.tool_selection_learned
   FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
 
+-- ============================================================================
+-- Learned remediations: the ARGUMENT that fixes a failure, not just the tool
+-- ----------------------------------------------------------------------------
+-- tool_selection_learned answers "which other tool should I reach for". This
+-- answers the question before it: "can this tool be made to work by telling it
+-- something the target already told us".
+--
+-- The case that produced it: netexec and hydra both fail against
+-- 192.168.1.150 because the host is an OpenSSH 4.7p1 offering only ssh-rsa and
+-- ssh-dss host keys. ssh-audit had ALREADY recorded exactly that, 24 findings
+-- of it, before either failure happened. Nothing read it back, so the platform
+-- kept discovering by trial what it had already measured.
+--
+-- A row here pairs a failure signature with an option string, and counts
+-- whether adding it helped. The option is PROPOSED from the target's advertised
+-- capabilities (etl/target_capabilities.py) and the tool's own syntax
+-- (knowledge/tool_options.yaml); only whether it WORKED is learned.
+--
+-- Same discipline as tool_selection_learned: an operator rejection is durable,
+-- counters only move forward, and this decides an argument — never whether
+-- something may run.
+CREATE TABLE IF NOT EXISTS public.tool_remediation_learned (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tool              text NOT NULL,
+    service           text NOT NULL DEFAULT '',
+    failure_signature text NOT NULL,
+    -- The capability category the option expresses, e.g. 'host-key'. Kept so a
+    -- rule can be read without parsing the option string.
+    category          text NOT NULL DEFAULT '',
+    option_template   text NOT NULL,
+    failure_phrase    text,
+    support           integer NOT NULL DEFAULT 0,
+    attempts          integer NOT NULL DEFAULT 0,
+    successes         integer NOT NULL DEFAULT 0,
+    confidence        numeric,
+    status            text NOT NULL DEFAULT 'proposed'
+                      CHECK (status IN ('active','proposed','rejected')),
+    source            text NOT NULL DEFAULT 'observed',
+    reviewed_by       text,
+    created_at        timestamptz DEFAULT now(),
+    updated_at        timestamptz DEFAULT now(),
+    last_seen_at      timestamptz DEFAULT now()
+);
+-- Every key column is NOT NULL with a '' default so the index constrains every
+-- row: in Postgres a NULL makes rows non-equal and the constraint would not
+-- apply to exactly the rows most likely to be duplicated.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_tool_remediation_learned_rule
+  ON public.tool_remediation_learned
+     (tool, service, failure_signature, option_template);
+CREATE INDEX IF NOT EXISTS idx_tool_remediation_lookup
+  ON public.tool_remediation_learned (tool, service, failure_signature, status);
+DROP TRIGGER IF EXISTS trg_tool_remediation_learned_updated ON public.tool_remediation_learned;
+CREATE TRIGGER trg_tool_remediation_learned_updated
+  BEFORE UPDATE ON public.tool_remediation_learned
+  FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+
+-- ============================================================================
+-- Tool settings derived from what recon measured
+-- ----------------------------------------------------------------------------
+-- tool_remediation_learned is REACTIVE: a tool failed, what argument fixes it.
+-- This is the same knowledge applied BEFORE the first attempt, so the failure
+-- does not have to happen at all.
+--
+-- Every row is derived, never typed: the VALUES come from what the target
+-- advertised (ssh-audit / nmap ssh2-enum-algos, read by
+-- etl/target_capabilities.py) intersected with what the client supports (the
+-- tool's own `-Q`-style probe), and the SYNTAX comes from
+-- knowledge/tool_options.yaml. Both halves are measurements.
+--
+-- `status` exists because a derived setting is still a judgement about what to
+-- do with a measurement: an operator can reject one and the derivation will not
+-- quietly reinstate it.
+--
+-- This decides an ARGUMENT. It has never decided whether something may run, and
+-- the scope gate and the phase's approval are unchanged.
+CREATE TABLE IF NOT EXISTS public.target_tool_settings (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    target        text NOT NULL,
+    port          integer,
+    service       text NOT NULL DEFAULT '',
+    tool          text NOT NULL,
+    category      text NOT NULL,
+    option_text   text NOT NULL,
+    -- What each side contributed, so a reader can see WHY this value and not
+    -- another one -- and see what was dropped in the intersection.
+    host_offers   text[] NOT NULL DEFAULT '{}',
+    client_supports text[] NOT NULL DEFAULT '{}',
+    source        text NOT NULL DEFAULT 'derived',
+    status        text NOT NULL DEFAULT 'active'
+                  CHECK (status IN ('active','proposed','rejected')),
+    reviewed_by   text,
+    derived_at    timestamptz DEFAULT now(),
+    updated_at    timestamptz DEFAULT now()
+);
+-- COALESCE the nullable port: a NULL makes rows non-equal for uniqueness, so
+-- without it the constraint would not apply to exactly the rows most likely to
+-- be re-derived.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_target_tool_settings
+  ON public.target_tool_settings
+     (target, COALESCE(port, -1), service, tool, category);
+CREATE INDEX IF NOT EXISTS idx_target_tool_settings_lookup
+  ON public.target_tool_settings (tool, target, status);
+DROP TRIGGER IF EXISTS trg_target_tool_settings_updated ON public.target_tool_settings;
+CREATE TRIGGER trg_target_tool_settings_updated
+  BEFORE UPDATE ON public.target_tool_settings
+  FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+
 -- Agent-to-agent feedback channel. One agent flags something interesting (a
 -- finding worth another run, a coverage gap); a coordinator turns approved flags
 -- into scan_recommendations (which the recon agent dispatches through the scope

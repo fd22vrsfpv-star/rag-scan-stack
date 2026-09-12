@@ -234,6 +234,11 @@ services:
       NMAP_SCRIPTS: ${NMAP_SCRIPTS:-banner,http-title,ssl-cert,ssl-enum-ciphers,ssh2-enum-algos}
       NMAP_SCANNER_URL: ${NMAP_SCANNER_URL:-https://nmap_scanner:8012}
       SCAN_RECOMMENDER_URL: ${SCAN_RECOMMENDER_URL:-https://scan-recommender:8013}
+      # So etl/target_capabilities.py can ask the machine that will RUN a tool
+      # what that tool supports. rag-api has no ssh, and deriving an option from
+      # its own view produced `-oHostKeyAlgorithms=+ssh-rsa,ssh-dss`, which the
+      # listener's ssh rejects outright.
+      KALI_LISTENER_URL: ${KALI_LISTENER_URL:-https://kali-listener:8019}
       DETECTION_RULES_DIR: /knowledge/detection_rules
       SCOPE_RULES_DIR: /knowledge/scope_rules
       EXPLOITDB_CSV: /exploitdb/files_exploits.csv
@@ -1609,6 +1614,13 @@ services:
     volumes:
       - ./etl:/app/etl:ro                             # shared scope gate (etl/scope_gate.py)
       - ./common:/app/common:ro                        # shared scan-slot ceiling (common/tool_job.py)
+      # Tool option syntax + capability probes (knowledge/tool_options.yaml).
+      # The listener is the AUTHORITY on what its tools support — rag-api can
+      # derive an option from what a host advertises, but only the machine that
+      # will run the tool can say what that tool actually knows. Deriving
+      # without it produced `-oHostKeyAlgorithms=+ssh-rsa,ssh-dss`, which this
+      # image's ssh rejects outright.
+      - ./knowledge:/knowledge:ro
       - ${WORDLISTS_DIR:-./wordlists}:/wordlists:ro    # generated per-target user/password lists (target_wordlists.py)
       - ./certs:/certs:ro
     cap_add:

@@ -135,6 +135,58 @@ def test_an_unknown_protocol_proposes_nothing():
     assert cf.followups_for("gopher", cf.load_catalogue(_catalogue_path())) == []
 
 
+def test_every_followup_names_a_tool_the_platform_can_run():
+    """Ten of the first fourteen named a tool the listener does not allow.
+
+    `nxc` is the modern short name for netexec and the allow-list has
+    `netexec`; `ssh`, `impacket-secretsdump` and `vncsnapshot` are not on it at
+    all. So the queue filled with work that could only ever come back
+    `Tool 'nxc' is not in allowed list` — which looks like a tool problem and is
+    really a catalogue that was never checked against reality.
+
+    The allow-list is read from the listener's own fallback set, so this runs on
+    a bare checkout with no stack up. The live set is a superset (registry plus
+    operator additions), so passing here cannot become a false negative there.
+    """
+    import re as _re
+    import yaml
+    listener = os.path.join(REPO, "kali_listener", "listener_service.py")
+    if not os.path.exists(listener):
+        pytest.skip("kali_listener not present")
+    src = _read(listener)
+    block = src[src.index("_FALLBACK_ALLOWED_TOOLS = {"):]
+    block = block[:block.index("}")]
+    allowed = set(_re.findall(r'"([a-z0-9._-]+)"', block))
+    assert len(allowed) > 20, "the allow-list could not be parsed"
+
+    with open(_catalogue_path(), encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    offenders = {}
+    for proto, entries in data["protocols"].items():
+        for e in entries:
+            tool = e["command"].strip().split()[0]
+            if tool not in allowed:
+                offenders[f"{proto}/{e['name']}"] = tool
+    assert not offenders, (
+        f"these follow-ups name a tool the listener will refuse: {offenders}\n"
+        "They queue as pending, get dispatched, and come back "
+        "\"is not in allowed list\" — work that looks queued and can never run.")
+
+
+def test_the_command_starts_with_the_tool():
+    """The allow-list checks the FIRST token. `PGPASSWORD='...' psql ...` read
+    as a tool named after the password."""
+    import yaml
+    with open(_catalogue_path(), encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    for proto, entries in data["protocols"].items():
+        for e in entries:
+            first = e["command"].strip().split()[0]
+            assert "=" not in first and "{" not in first, (
+                f"{proto}/{e['name']} starts with {first!r}, not a tool name — "
+                "an env-var prefix makes the allow-list check nonsense")
+
+
 # ── The secret ─────────────────────────────────────────────────────────────
 
 def test_the_secret_never_reaches_the_command():
@@ -235,7 +287,7 @@ def test_lower_priority_runs_first():
         data = yaml.safe_load(fh)
     by_name = {e["name"]: e["priority"]
                for entries in data["protocols"].values() for e in entries}
-    assert by_name["nxc"] < by_name["nmap"], (
+    assert by_name["netexec"] < by_name["nmap"], (
         "an enumeration script outranks the follow-up that proves command "
         "execution — the priority scale is inverted")
 

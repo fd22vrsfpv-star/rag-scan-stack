@@ -21469,6 +21469,97 @@ def export_extractor_learned(tool: Optional[str] = None, _: bool = Depends(auth)
     return {"ok": True, "tools": list(out), "yaml": out}
 
 
+# ── Tool settings derived from recon (target_tool_settings) ────────────────
+#
+# The reactive half lives in tool_remediation_learned: something failed, what
+# argument fixes it. This is the same knowledge applied BEFORE the first
+# attempt, so the failure does not have to happen.
+#
+# Nothing here is typed. The VALUES come from what the target advertised
+# (ssh-audit / nmap ssh2-enum-algos) intersected with what the tool says it
+# supports — asked of the machine that will run it, because rag-api has no ssh
+# and deriving from its own view produced an option the listener's ssh rejects.
+# The SYNTAX comes from knowledge/tool_options.yaml.
+
+@app.get("/targets/{target}/capabilities", tags=["Tool Settings"])
+def target_capabilities_endpoint(target: str, port: int = Query(None),
+                                 service: str = Query(""),
+                                 _: bool = Depends(auth)):
+    """What recon recorded that this target supports."""
+    from etl import target_capabilities as tc
+    return tc.capabilities(target, port=port, service=service)
+
+
+@app.post("/targets/{target}/tool-settings/derive", tags=["Tool Settings"])
+def derive_target_tool_settings(target: str, port: int = Query(None),
+                                service: str = Query(""),
+                                store: bool = Query(True),
+                                x_operator: str = Header("operator", alias="X-Operator"),
+                                _: bool = Depends(auth)):
+    """Work out, from recon, what options each tool should use against this host.
+
+    Reads measurements and writes settings. It dispatches nothing and touches no
+    target — the capability data was collected by an earlier, already-authorised
+    scan."""
+    from etl import target_capabilities as tc
+    derived = tc.derive_tool_settings(target, port=port, service=service)
+    written = tc.store_tool_settings(target, derived, port=port, service=service) if store else 0
+    if not derived.get("available"):
+        # Distinct from "this host supports nothing": the store could not be
+        # read, and constraining a tool on that basis would fail worse.
+        raise HTTPException(503, "capability data unavailable for this target")
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("tool_settings_derived", "target_capabilities", {
+            "target": target, "stored": written, "actor": x_operator,
+            "settings": len(derived.get("settings") or []),
+            "skipped": len(derived.get("skipped") or [])})
+    except Exception:
+        log.warning("tool settings webhook emit failed", exc_info=True)
+    return {"ok": True, "stored": written, **derived}
+
+
+@app.get("/targets/{target}/tool-settings", tags=["Tool Settings"])
+def list_target_tool_settings(target: str, tool: str = Query(None),
+                              _: bool = Depends(auth)):
+    """Settings currently in force for this target, with what each side offered."""
+    where, params = ["target = %s"], [target]
+    if tool:
+        where.append("tool = %s"); params.append(tool)
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""SELECT id::text, target, port, service, tool, category,
+                       option_text, host_offers, client_supports, source,
+                       status, reviewed_by, derived_at
+                  FROM target_tool_settings
+                 WHERE {' AND '.join(where)}
+                 ORDER BY tool, category""", params)
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"count": len(rows), "settings": rows}
+
+
+@app.post("/targets/tool-settings/{setting_id}/{action}", tags=["Tool Settings"])
+def review_target_tool_setting(setting_id: str, action: str,
+                               x_operator: str = Header("operator", alias="X-Operator"),
+                               _: bool = Depends(auth)):
+    """Approve or reject one derived setting.
+
+    A rejection is durable: re-deriving from the same measurement will not
+    quietly reinstate a setting an operator ruled out."""
+    statuses = {"approve": "active", "reject": "rejected", "reset": "proposed"}
+    if action not in statuses:
+        raise HTTPException(400, "action must be approve, reject or reset")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("UPDATE target_tool_settings SET status = %s, reviewed_by = %s "
+                    "WHERE id = %s::uuid RETURNING id::text, tool, category, status",
+                    (statuses[action], x_operator, setting_id))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"setting {setting_id} not found")
+        conn.commit()
+    return {"ok": True, "actor": x_operator, **dict(row)}
+
+
 # ── Methodology playbooks (knowledge/playbooks) ────────────────────────────
 #
 # 3,896 lines of methodology across twelve services were RAG context and nothing
