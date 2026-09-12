@@ -301,6 +301,122 @@ def record_outcome_for_command(command: str, *, produced: bool,
         return 0
 
 
+def resolve_pending_observations(*, limit: int = 200,
+                                 engagement_id: Optional[str] = None) -> Dict[str, Any]:
+    """Close out proposals whose dispatch has finished, whatever ran them.
+
+    Reading one command's stdout only resolves what the Kali listener ran. A
+    proposal dispatched to a native runner finishes in `scans`, never touches
+    `tool_executions`, and its observation stayed unresolved forever — so a rule
+    proposing nmap could never be judged.
+
+    This asks a path-independent question instead: after we asked for this, did
+    new evidence appear for that target? That counts `web_findings` too, which
+    hold more rows than every other finding table combined and which nothing in
+    this loop could previously see.
+
+    A recommendation still queued is left alone. "Not finished yet" is a third
+    state and recording it as "produced nothing" would suppress rules for being
+    slow.
+    """
+    out = {"examined": 0, "resolved": 0, "produced": 0, "still_running": 0,
+           "available": False}
+    try:
+        try:
+            from etl.evidence import evidence_since
+        except ImportError:  # pragma: no cover
+            from evidence import evidence_since
+    except Exception as e:  # noqa: BLE001
+        out["error"] = str(e)
+        return out
+    try:
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT eo.id::text, eo.rule_id, eo.service, eo.target,
+                           sr.status, sr.executed_at
+                      FROM public.enumeration_observations eo
+                      JOIN scan_recommendations sr ON sr.id = eo.recommendation_id
+                     WHERE eo.produced IS NULL
+                       AND sr.executed_at IS NOT NULL
+                     ORDER BY sr.executed_at
+                     LIMIT %s
+                    """, (limit,))
+                rows = cur.fetchall()
+                out["available"] = True
+                for obs_id, rule_id, service, target, status, executed_at in rows:
+                    out["examined"] += 1
+                    if status in ("queued", "running", "pending"):
+                        out["still_running"] += 1
+                        continue
+                    ev = evidence_since(target, executed_at, cur=cur)
+                    if not ev.get("available"):
+                        # Could not ask. Leaving it unresolved is the honest
+                        # answer; recording a zero here would be the same
+                        # mistake as recording an unparsed run as fruitless.
+                        continue
+                    produced = ev["total"] > 0
+                    cur.execute(
+                        """UPDATE public.enumeration_observations
+                              SET produced = %s, result_count = %s,
+                                  resolved_at = now()
+                            WHERE id = %s::uuid""",
+                        (produced, ev["total"], obs_id))
+                    cur.execute(
+                        """
+                        UPDATE public.enumeration_rule_learned
+                           SET executed = executed + 1,
+                               produced = produced + %s,
+                               confidence = (produced + %s)::numeric
+                                            / GREATEST(executed + 1, 1)
+                         WHERE rule_id = %s AND service = %s
+                        """,
+                        (1 if produced else 0, 1 if produced else 0,
+                         rule_id, service or ""))
+                    out["resolved"] += 1
+                    out["produced"] += 1 if produced else 0
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        log.warning("resolve_pending_observations failed: %s", e)
+    return out
+
+
+def facts_from_web_findings(cur, *, target: str = "", limit: int = 200,
+                            engagement_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Evidence that never came from a command's stdout.
+
+    `web_findings` holds more rows than every other finding table combined and
+    the loop could not see any of it, because it was reading tool output rather
+    than results. A finding is a fact whatever produced it.
+    """
+    facts: List[Dict[str, Any]] = []
+    where, params = ["wf.created_at > now() - interval '30 days'"], []
+    if target:
+        where.append("host(a.ip) = %s")
+        params.append(target)
+    params.append(limit)
+    try:
+        cur.execute(
+            f"""SELECT wf.id::text, host(a.ip), wf.url, wf.severity,
+                       COALESCE(wf.name,'')
+                  FROM web_findings wf
+                  JOIN assets a ON a.id = wf.asset_id
+                 WHERE {' AND '.join(where)}
+                   AND NOT EXISTS (SELECT 1 FROM public.enumeration_observations eo
+                                    WHERE eo.fact->>'web_finding_id' = wf.id::text)
+                 ORDER BY wf.created_at DESC
+                 LIMIT %s""", params)
+        for wid, host, url, severity, name in cur.fetchall():
+            facts.append({"fact": "web_finding", "target": host, "service": "http",
+                          "web_finding_id": wid, "url": url,
+                          "severity": (severity or "").lower(),
+                          "name": name})
+    except Exception as e:  # noqa: BLE001
+        log.debug("web finding facts unavailable: %s", e)
+    return facts
+
+
 # ── The analysis every command goes through ────────────────────────────────
 
 def analyse(execution: Dict[str, Any], *, queue: bool = True) -> Dict[str, Any]:
@@ -353,76 +469,125 @@ def analyse(execution: Dict[str, Any], *, queue: bool = True) -> Dict[str, Any]:
                     out["refused"] = len(facts)
                     return out
 
-                from psycopg2.extras import Json
-                seen = set()
-                for fact in facts:
-                    for rule in rules:
-                        if not _matches(rule, fact):
-                            continue
-                        rule_id = rule.get("id") or "unnamed"
-                        st = rule_status(cur, rule_id, service)
-                        if st["suppressed"]:
-                            if rule_id not in out["suppressed"]:
-                                out["suppressed"].append(rule_id)
-                            continue
-
-                        proposal = rule.get("propose") or {}
-                        command = render(proposal.get("command") or "", fact,
-                                         target=target,
-                                         port=execution.get("port"))
-                        fact_target = fact.get("target") or target
-                        key = (command, fact_target)
-                        if key in seen:
-                            continue
-                        seen.add(key)
-
-                        refusal = check_dispatch(str(fact_target), scope_rows,
-                                                 command=command)
-                        if refusal:
-                            out["refused"] += 1
-                            out["refusals"].append(
-                                {"target": fact_target, "rule": rule_id,
-                                 "reason": str(refusal)})
-                            _observe(cur, rule_id, execution, fact, command,
-                                     None, refused=str(refusal))
-                            continue
-
-                        out["proposals"].append(
-                            {"rule": rule_id, "tool": proposal.get("tool"),
-                             "target": fact_target, "command": command,
-                             "why": rule.get("why")})
-                        if not queue:
-                            continue
-
-                        cur.execute(
-                            """
-                            INSERT INTO scan_recommendations
-                                (ip, service, scanner, action, script, source,
-                                 priority, status, engagement_id, extra)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s)
-                            ON CONFLICT (fingerprint) DO NOTHING
-                            RETURNING id::text
-                            """,
-                            (fact_target, fact.get("service") or service,
-                             proposal.get("tool"), command, command, SOURCE,
-                             int(proposal.get("priority") or 40),
-                             execution.get("engagement_id"),
-                             Json({"enumeration_rule": rule_id,
-                                   "why": rule.get("why"),
-                                   "fact": {k: v for k, v in fact.items()
-                                            if k != "password"},
-                                   "source_execution": execution.get("id"),
-                                   "credential_id": execution.get("credential_id"),
-                                   "queued_by": SOURCE})))
-                        row = cur.fetchone()
-                        rec_id = row[0] if row else None
-                        if rec_id:
-                            out["queued"] += 1
-                        _record_firing(cur, rule_id, service)
-                        _observe(cur, rule_id, execution, fact, command, rec_id)
+                _propose_from_facts(cur, facts, execution, rules, out,
+                                    scope_rows=scope_rows)
             conn.commit()
     except Exception as e:  # noqa: BLE001
         log.warning("post-enumeration analysis failed for %s: %s", tool, e)
+    return out
+
+
+def _propose_from_facts(cur, facts, context, rules, out, scope_rows=None):
+    """Match facts against rules, gate them, queue them, and record the firing.
+
+    One implementation for every source of facts. A second copy for findings
+    would drift from the one for command output, and the drifted one would be
+    the one nobody was watching.
+    """
+    from psycopg2.extras import Json
+    try:
+        from etl.scope_gate import check_dispatch, load_dispatch_scope
+    except ImportError:  # pragma: no cover
+        from scope_gate import check_dispatch, load_dispatch_scope
+    if scope_rows is None:
+        scope_rows, scope_source = load_dispatch_scope(
+            cur, context.get("engagement_id"))
+        if scope_source == "unavailable":
+            out["refusals"].append({"reason": "scope could not be loaded"})
+            out["refused"] = len(facts)
+            return
+
+    service = context.get("service") or ""
+    seen = set()
+    for fact in facts:
+        for rule in rules:
+            if not _matches(rule, fact):
+                continue
+            rule_id = rule.get("id") or "unnamed"
+            st = rule_status(cur, rule_id, service)
+            if st["suppressed"]:
+                if rule_id not in out["suppressed"]:
+                    out["suppressed"].append(rule_id)
+                continue
+
+            proposal = rule.get("propose") or {}
+            command = render(proposal.get("command") or "", fact,
+                             target=context.get("target") or "",
+                             port=context.get("port"))
+            fact_target = fact.get("target") or context.get("target") or ""
+            key = (command, fact_target)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            refusal = check_dispatch(str(fact_target), scope_rows, command=command)
+            if refusal:
+                out["refused"] += 1
+                out["refusals"].append({"target": fact_target, "rule": rule_id,
+                                        "reason": str(refusal)})
+                _observe(cur, rule_id, context, fact, command, None,
+                         refused=str(refusal))
+                continue
+
+            out["proposals"].append({"rule": rule_id, "tool": proposal.get("tool"),
+                                     "target": fact_target, "command": command,
+                                     "why": rule.get("why")})
+            cur.execute(
+                """
+                INSERT INTO scan_recommendations
+                    (ip, service, scanner, action, script, source, priority,
+                     status, engagement_id, extra)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s)
+                ON CONFLICT (fingerprint) DO NOTHING
+                RETURNING id::text
+                """,
+                (fact_target, fact.get("service") or service,
+                 proposal.get("tool"), command, command, SOURCE,
+                 int(proposal.get("priority") or 40),
+                 context.get("engagement_id"),
+                 Json({"enumeration_rule": rule_id, "why": rule.get("why"),
+                       "fact": {k: v for k, v in fact.items() if k != "password"},
+                       "source_execution": context.get("id"),
+                       "credential_id": context.get("credential_id"),
+                       "queued_by": SOURCE})))
+            row = cur.fetchone()
+            rec_id = row[0] if row else None
+            if rec_id:
+                out["queued"] += 1
+            _record_firing(cur, rule_id, service)
+            _observe(cur, rule_id, context, fact, command, rec_id)
+
+
+def analyse_findings(*, target: str = "", engagement_id: Optional[str] = None,
+                     limit: int = 200) -> Dict[str, Any]:
+    """Analyse evidence that never came from a command's stdout.
+
+    `web_findings` alone holds more rows than every other finding table
+    combined, and the loop could not see any of it because it read tool output
+    rather than results. A finding is a fact whatever produced it, and it goes
+    through exactly the same rules and the same scope gate as one extracted from
+    a command.
+    """
+    context = {"id": None, "tool": "findings", "target": target,
+               "service": "http", "engagement_id": engagement_id}
+    out: Dict[str, Any] = {"facts": 0, "proposals": [], "queued": 0,
+                           "refused": 0, "refusals": [], "suppressed": [],
+                           "available": False}
+    rules = load_rules()
+    if not rules:
+        return out
+    try:
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                facts = facts_from_web_findings(cur, target=target, limit=limit,
+                                                engagement_id=engagement_id)
+                out["facts"] = len(facts)
+                if facts:
+                    _propose_from_facts(cur, facts, context, rules, out)
+                out["available"] = True
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        log.warning("finding analysis failed: %s", e)
     return out
 
 

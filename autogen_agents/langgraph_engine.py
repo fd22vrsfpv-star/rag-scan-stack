@@ -407,6 +407,16 @@ class PentestState(TypedDict):
     surface_safe_results: Optional[list]
     pending_surface_tests: Optional[list]
     surface_decision: Optional[dict]
+    # Post-enumeration is a CYCLE, so its progress has to live in the
+    # checkpointed state rather than in a local variable: a session that is
+    # interrupted at an approval gate and resumed hours later must know how many
+    # passes it has made and what each one found.
+    #
+    # `enumeration_cycles` bounds it. LangGraph enforces a recursion limit, but
+    # hitting that raises rather than finishing, and a run that ends in an
+    # exception produces no report.
+    enumeration_cycles: int
+    enumeration_history: Annotated[List[dict], operator.add]
     report: Optional[str]
 
 
@@ -1345,6 +1355,36 @@ def exploit_exec(state: PentestState) -> dict:
             "log": [f"exploit_exec: execute_approved_exploit({pending_id})"]}
 
 
+# How many passes the loop may make before it reports regardless.
+#
+# It normally settles on its own — a pass that analyses nothing new and proposes
+# nothing new is the stopping condition — but "normally" is not a guarantee, and
+# a cycle that cannot terminate is worse than one that stops early and says so.
+MAX_ENUMERATION_CYCLES = int(os.environ.get("MAX_ENUMERATION_CYCLES", "5"))
+
+
+def _after_post_enumeration(state: PentestState) -> str:
+    """Go round again, or report.
+
+    The loop settles when a pass produced no new analysis AND no new proposals:
+    at that point there is nothing left that this cycle can act on, which is
+    what "everything has been analysed" means operationally. Without a
+    measurable stopping condition the loop would either run forever or stop
+    after a fixed count and call that done.
+    """
+    cycles = int(state.get("enumeration_cycles") or 0)
+    if cycles >= MAX_ENUMERATION_CYCLES:
+        return "report"
+    history = state.get("enumeration_history") or []
+    if not history:
+        return "report"
+    last = history[-1]
+    if (last.get("analysed") or 0) == 0 and (last.get("queued") or 0) == 0 \
+            and (last.get("resolved") or 0) == 0:
+        return "report"
+    return "post_enumeration"
+
+
 def post_enumeration(state: PentestState) -> dict:
     """Post-exploitation enumeration: read what every tool produced, and do the
     checklist the methodology already specifies.
@@ -1381,8 +1421,24 @@ def post_enumeration(state: PentestState) -> dict:
     """
     sid = state["session_id"]
     target = state.get("target") or ""
+    cycle = int(state.get("enumeration_cycles") or 0) + 1
     log: List[str] = []
     findings: List[str] = []
+
+    # REVIEW EVIDENCE FIRST. Anything proposed on an earlier pass may have run
+    # by now, and knowing whether it produced something is what makes the next
+    # decision different from the last one. Without this the loop would propose
+    # the same things forever and never learn that they did not help.
+    resolved = _resolve_outcomes()
+    if resolved.get("resolved"):
+        findings.append(
+            f"post_enumeration[{cycle}]: reviewed {resolved['resolved']} earlier "
+            f"proposals, {resolved['produced']} produced new evidence")
+    if resolved.get("still_running"):
+        # A third state. Recording "not finished yet" as "produced nothing"
+        # would suppress rules for being slow.
+        log.append(f"post_enumeration: {resolved['still_running']} proposals "
+                   f"still running, left unresolved")
 
     analysed = _analyse_session_output(sid)
     if analysed.get("examined"):
@@ -1430,10 +1486,44 @@ def post_enumeration(state: PentestState) -> dict:
         findings.append(f"post_enumeration: nothing enumerated ({enumerated['reason']})")
     log.append(f"post_enumeration: enumeration {enumerated}")
 
-    _msg(sid, "PostEnumeration", "\n".join(findings) or "post_enumeration: nothing to do")
+    entry = {
+        "cycle": cycle,
+        "resolved": resolved.get("resolved", 0),
+        "produced": resolved.get("produced", 0),
+        "analysed": analysed.get("parsed", 0),
+        "queued": (swept.get("queued", 0) + enumerated.get("queued", 0)),
+        "refused": swept.get("refused", 0),
+        "remaining": analysed.get("unanalysed", 0),
+    }
+    if not findings:
+        # A pass that did nothing must still say so, or the history reads as a
+        # gap rather than as a settled loop.
+        findings.append(
+            f"post_enumeration[{cycle}]: nothing new to analyse or propose")
+    _msg(sid, "PostEnumeration", "\n".join(findings))
     _emit("langgraph_post_enumeration", sid, {
-        "target": target, "analysed": analysed, "enumerated": enumerated})
-    return {"phase": "report", "findings": findings, "log": log}
+        "target": target, "cycle": cycle, "analysed": analysed,
+        "enumerated": enumerated, "swept": swept, "resolved": resolved})
+    return {"phase": "report", "findings": findings, "log": log,
+            "enumeration_cycles": cycle, "enumeration_history": [entry]}
+
+
+def _resolve_outcomes() -> dict:
+    """Close out proposals whose dispatch has finished, whatever ran them.
+
+    Path-independent on purpose: a proposal sent to a native runner finishes in
+    `scans` and never reaches the listener's hook, so reading one command's
+    stdout left those observations unresolved forever. This asks whether new
+    EVIDENCE appeared for the target instead — which counts web_findings too.
+    """
+    try:
+        from etl.post_enumeration import resolve_pending_observations
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"unavailable: {e}", "resolved": 0, "produced": 0}
+    try:
+        return resolve_pending_observations()
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:200], "resolved": 0, "produced": 0}
 
 
 def _sweep_enumeration(target: str) -> dict:
@@ -1481,6 +1571,20 @@ def _sweep_enumeration(target: str) -> dict:
             out["queued"] += res.get("queued", 0)
             out["refused"] += res.get("refused", 0)
             out["suppressed"].extend(res.get("suppressed") or [])
+
+        # Evidence that never came from a command's stdout. web_findings alone
+        # holds more rows than every other finding table combined, and none of
+        # it was reachable while this loop read tool output rather than results.
+        try:
+            from etl.post_enumeration import analyse_findings
+            fres = analyse_findings(target=target)
+            out["examined"] += fres.get("facts", 0)
+            out["facts"] += fres.get("facts", 0)
+            out["queued"] += fres.get("queued", 0)
+            out["refused"] += fres.get("refused", 0)
+            out["suppressed"].extend(fres.get("suppressed") or [])
+        except Exception as e:  # noqa: BLE001
+            out.setdefault("errors", []).append(f"findings: {str(e)[:120]}")
     except Exception as e:  # noqa: BLE001
         out["error"] = str(e)[:200]
     return out
@@ -1544,6 +1648,11 @@ def _analyse_session_output(sid) -> dict:
                     out["productive"] += 1
                     out["results"] += n
             out["unparsed_tools"] = sorted(unparsed)
+            try:
+                from etl.evidence import unanalysed
+                out["unanalysed"] = unanalysed(cur).get("total", 0)
+            except Exception:  # noqa: BLE001
+                out["unanalysed"] = 0
             conn.commit()
     except Exception as e:  # noqa: BLE001
         out["error"] = str(e)[:200]
@@ -3193,7 +3302,14 @@ def build_graph(checkpointer=None):
     # changes. post_enumeration no-ops cleanly and says WHY when there is nothing to
     # enumerate, so a run that found nothing pays nothing for passing through.
     g.add_edge("exploit_exec", "post_enumeration")
-    g.add_edge("post_enumeration", "report")
+    # THE CYCLE. post_enumeration goes round again while a pass is still
+    # analysing or proposing something new, and reports once it settles —
+    # "everything has been analysed" made operational rather than assumed.
+    # MAX_ENUMERATION_CYCLES is the backstop: LangGraph's recursion limit RAISES,
+    # and a run that ends in an exception produces no report at all.
+    g.add_conditional_edges("post_enumeration", _after_post_enumeration,
+                            {"post_enumeration": "post_enumeration",
+                             "report": "report"})
     g.add_edge("report", END)
     return g.compile(checkpointer=checkpointer)
 
@@ -3495,6 +3611,10 @@ def run_langgraph_session_sync(
                 "surface_decision": None, "phase": "recon",
                 "findings": [], "log": [], "exploit_candidate": None,
                 "exploit_decision": None, "report": None,
+                # Seeded so the cycle counter starts at a number rather than
+                # None. operator.add on enumeration_history needs a list to
+                # append onto.
+                "enumeration_cycles": 0, "enumeration_history": [],
             }, cfg)
             payload = _interrupt_payload(final, graph, cfg)
         if payload is not None:

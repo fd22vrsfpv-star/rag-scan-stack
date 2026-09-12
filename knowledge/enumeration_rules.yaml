@@ -113,3 +113,37 @@ rules:
       lead, not a licence — the scope gate refuses it like any other target, and
       a refusal is recorded rather than dropped so an out-of-scope lead is
       visible instead of silently missing.
+
+  # ── Web findings ─────────────────────────────────────────────────────────
+  #
+  # web_findings holds more rows than every other finding table combined — 7,641
+  # against 301 vulns — and nothing in this loop could see any of it, because
+  # the loop read tool stdout rather than results. A finding is a fact whatever
+  # produced it.
+
+  - id: web-high-severity-verify
+    when:
+      fact: web_finding
+      where: {severity: "high"}
+    propose:
+      tool: nuclei
+      command: "nuclei -u {url} -severity critical,high -silent"
+      priority: 18
+    why: >-
+      A high-severity web finding from a crawler or a passive check is a lead
+      that has not been confirmed against the live endpoint. Confirming it is
+      what makes it reportable, and failing to confirm it is equally worth
+      knowing.
+
+  - id: web-finding-content-review
+    when:
+      fact: web_finding
+      where: {severity: "critical"}
+    propose:
+      tool: curl
+      command: "curl -skI {url}"
+      priority: 14
+    why: >-
+      A critical finding needs its evidence captured at the URL, not inferred
+      from a scanner's summary line. The headers are the cheapest thing that
+      proves the endpoint is still live and still responding that way.

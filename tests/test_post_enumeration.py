@@ -80,14 +80,23 @@ def test_the_phase_is_a_node():
 
 def test_every_route_passes_through_post_enumeration():
     """A route that goes straight to report is a run that finishes without
-    enumerating access it holds — which is the whole defect."""
+    enumerating the access it holds — which is the whole defect."""
     block = _graph_block()
-    assert '"report": "report"' not in block, (
+
+    # post_enumeration's OWN exit legitimately maps "report" -> "report": that
+    # is the loop settling, not a bypass. Every other route must land on the
+    # phase first, so that one edge is excluded rather than the check weakened.
+    own_exit = block[block.index('g.add_conditional_edges("post_enumeration"'):]
+    own_exit = own_exit[:own_exit.index(")\n", own_exit.index("{")) + 1]
+    others = block.replace(own_exit, "")
+    assert '"report": "report"' not in others, (
         "a conditional edge still routes straight to report, so that path "
-        "finishes without post-enumerationation enumeration")
-    assert block.count('"report": "post_enumeration"') >= 7, block.count('"report": "post_enumeration"')
+        "finishes without post-enumeration")
+    assert others.count('"report": "post_enumeration"') >= 7, \
+        others.count('"report": "post_enumeration"')
     assert 'g.add_edge("exploit_exec", "post_enumeration")' in block
-    assert 'g.add_edge("post_enumeration", "report")' in block
+    assert '"report": "report"' in own_exit, (
+        "post_enumeration has no way out — the loop cannot terminate")
 
 
 def test_the_phase_never_proposes_a_mutating_step():
@@ -253,7 +262,7 @@ def test_a_traceback_is_not_a_result():
 
 
 def test_command_output_from_dash_x_survives():
-    """For a post-enumerationation run the unprefixed lines ARE the entire result."""
+    """For a post-enumeration run the unprefixed lines ARE the entire result."""
     r = _parse("SSH   10.0.0.5   22   10.0.0.5   [+] msfadmin:msfadmin\n"
                "uid=1000(msfadmin) gid=1000(msfadmin) groups=4(adm),112(admin)\n"
                "Linux metasploitable 2.6.24-16-server")
@@ -552,3 +561,118 @@ def test_the_two_spec_runners_agree():
         if m:
             theirs[name] = m.group(1) if m.groups() else m.group(0)
     assert mine == theirs, (mine, theirs)
+
+
+# ── The loop: scan -> enumerate -> review evidence -> decide -> repeat ──────
+
+def test_the_loop_is_a_graph_cycle_with_history():
+    """In LangGraph, so it is checkpointed and has history.
+
+    A session interrupted at an approval gate and resumed hours later must know
+    how many passes it has made and what each one found. A local variable would
+    not survive that.
+    """
+    src = _read(ENGINE)
+    assert "enumeration_cycles: int" in src, "the cycle counter is not in the state"
+    assert "enumeration_history: Annotated[List[dict], operator.add]" in src, (
+        "the per-cycle history is not accumulated in checkpointed state")
+    assert 'g.add_conditional_edges("post_enumeration", _after_post_enumeration' in src, (
+        "post_enumeration no longer loops — it is a single pass again")
+    block = _graph_block()
+    assert '"post_enumeration": "post_enumeration"' in block, (
+        "the cycle cannot go round; the edge back to itself is gone")
+
+
+def test_the_loop_settles_when_there_is_nothing_left():
+    """"Until everything has been analysed" has to be measurable, or the loop
+    either runs forever or stops after a fixed count and calls that done."""
+    lg = pytest.importorskip("langgraph_engine", reason="engine not importable here")
+    assert lg._after_post_enumeration(
+        {"enumeration_cycles": 1,
+         "enumeration_history": [{"analysed": 0, "queued": 0, "resolved": 0}]}) == "report"
+    assert lg._after_post_enumeration(
+        {"enumeration_cycles": 1,
+         "enumeration_history": [{"analysed": 3, "queued": 2, "resolved": 0}]}) == "post_enumeration"
+
+
+def test_the_loop_is_bounded():
+    """LangGraph's recursion limit RAISES, and a run that ends in an exception
+    produces no report at all."""
+    lg = pytest.importorskip("langgraph_engine", reason="engine not importable here")
+    assert lg._after_post_enumeration(
+        {"enumeration_cycles": lg.MAX_ENUMERATION_CYCLES,
+         "enumeration_history": [{"analysed": 9, "queued": 9, "resolved": 9}]}) == "report"
+
+
+def test_evidence_is_reviewed_before_deciding_again():
+    """Without this the loop proposes the same things forever and never learns
+    that they did not help."""
+    src = _read(ENGINE)
+    fn = src[src.index("def post_enumeration(state: PentestState)"):]
+    fn = fn[:fn.index("\ndef _resolve_outcomes")]
+    assert "_resolve_outcomes()" in fn
+    assert fn.index("_resolve_outcomes()") < fn.index("_analyse_session_output"), (
+        "evidence is reviewed after the next decision is made, which makes the "
+        "review pointless for that decision")
+
+
+def test_outcomes_resolve_whatever_dispatched_them():
+    """A proposal sent to a native runner finishes in `scans` and never reaches
+    the listener's hook. Reading one command's stdout left those unresolved
+    forever, so a rule proposing nmap could never be judged."""
+    pe = pytest.importorskip("etl.post_enumeration")
+    assert hasattr(pe, "resolve_pending_observations")
+    src = _read(os.path.join(REPO, "etl", "post_enumeration.py"))
+    fn = src[src.index("def resolve_pending_observations("):]
+    fn = fn[:fn.index("\ndef ", 10)]
+    assert "evidence_since(" in fn, (
+        "resolution still reads one command's output instead of asking whether "
+        "evidence appeared, so the native path stays unresolvable")
+    assert 'status in ("queued", "running", "pending")' in fn, (
+        "a proposal still running is recorded as having produced nothing, "
+        "which suppresses rules for being slow")
+
+
+def test_an_unaskable_question_is_not_a_zero():
+    pe = pytest.importorskip("etl.post_enumeration")
+    src = _read(os.path.join(REPO, "etl", "post_enumeration.py"))
+    fn = src[src.index("def resolve_pending_observations("):]
+    fn = fn[:fn.index("\ndef ", 10)]
+    assert 'ev.get("available")' in fn, (
+        "an unreachable evidence store is recorded as 'produced nothing'")
+
+
+# ── Web findings and the other sources ─────────────────────────────────────
+
+def test_web_findings_are_evidence_too():
+    """7,641 rows — more than every other finding table combined — and none of
+    it was reachable while the loop read tool stdout rather than results."""
+    ev = pytest.importorskip("etl.evidence")
+    tables = {s.table for s in ev.SOURCES}
+    for expected in ("web_findings", "vulns", "recon_findings",
+                     "credential_findings", "ports"):
+        assert expected in tables, f"{expected} is not counted as evidence"
+
+
+def test_a_finding_is_a_fact_whatever_produced_it():
+    pe = pytest.importorskip("etl.post_enumeration")
+    assert hasattr(pe, "facts_from_web_findings")
+    assert hasattr(pe, "analyse_findings")
+
+
+def test_one_proposer_serves_every_fact_source():
+    """A second copy for findings would drift from the one for command output,
+    and the drifted one would be the one nobody was watching."""
+    src = _read(os.path.join(REPO, "etl", "post_enumeration.py"))
+    assert src.count("def _propose_from_facts(") == 1
+    assert src.count("_propose_from_facts(cur,") >= 2, (
+        "only one caller uses the shared proposer, so the other has its own copy")
+
+
+def test_adding_an_evidence_source_is_one_entry():
+    """A hard-coded union would have to be found and edited in several places,
+    and the one that was missed would be the one that mattered."""
+    ev = pytest.importorskip("etl.evidence")
+    assert isinstance(ev.SOURCES, list) and len(ev.SOURCES) >= 5
+    for s in ev.SOURCES:
+        assert s.table and s.host_sql, s.table
