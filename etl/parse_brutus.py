@@ -1,6 +1,8 @@
-import os, json, uuid
+import os, json, logging, uuid
 import psycopg2
 from psycopg2.extras import RealDictCursor
+
+log = logging.getLogger("parse_brutus")
 
 DB_DSN = os.environ.get("DB_DSN", "postgresql://app:app@rag-postgres:5432/scans")
 
@@ -19,7 +21,8 @@ VALID_SECRET_TYPES = {"password", "aws_key", "azure_key", "ssh_key", "api_token"
 def parse_brutus(path: str, profile: str = "upload", job_id: str = None, secret_type: str = "password"):
     if secret_type not in VALID_SECRET_TYPES:
         secret_type = "password"
-    stats = dict(records_seen=0, credentials_found=0, skipped=0, errors=0, error_examples=[])
+    stats = dict(records_seen=0, credentials_found=0, skipped=0, errors=0, error_examples=[],
+                 followups_queued=0, followups_refused=0, followup_refusals=[])
     records = _load_jsonl(path); stats["records_seen"] = len(records)
     if not records: return stats
     conn = psycopg2.connect(DB_DSN)
@@ -105,6 +108,7 @@ def parse_brutus(path: str, profile: str = "upload", job_id: str = None, secret_
                     #              Optional -- the brutus runner JSONL omits
                     #              it, in which case the row just has no
                     #              audit panel in the UI.
+                    cred_uuid = str(uuid.uuid4())
                     meta = {}
                     if job_id:
                         meta["job_id"] = job_id
@@ -142,9 +146,66 @@ def parse_brutus(path: str, profile: str = "upload", job_id: str = None, secret_
                             -- password must not erase the one we already have.
                             secret_value     = COALESCE(EXCLUDED.secret_value,
                                                         credential_findings.secret_value)
-                    """, (str(uuid.uuid4()), asset_id, port_id, ip, int(port), protocol, username,
+                    """, (cred_uuid, asset_id, port_id, ip, int(port), protocol, username,
                           secret_type, secret_type, json.dumps(meta), secret_value))
                     stats["credentials_found"] += 1
+
+                    # A working credential should queue the work it unlocks.
+                    # Before this, a run could recover ten valid credentials and
+                    # leave the recommendation queue empty — the pentester had to
+                    # spot them in the assets panel and drive every follow-on by
+                    # hand, so the ones nobody scrolled to were never used.
+                    #
+                    # Inside the same savepoint as the credential on purpose: the
+                    # credential and the work it unlocks commit together or not
+                    # at all. Proposals only — status='pending', and every one
+                    # passes the scope gate first.
+                    try:
+                        from etl.credential_followups import queue_followups
+                    except ImportError:          # imported bare from within etl/
+                        try:
+                            from credential_followups import queue_followups
+                        except ImportError:      # pragma: no cover
+                            queue_followups = None
+                    if queue_followups is not None:
+                        try:
+                            # Read the id back rather than trusting cred_uuid:
+                            # trg_credential_findings_dedup is a BEFORE INSERT
+                            # trigger that UPDATES the existing row and returns
+                            # NULL, cancelling the insert — so on a re-verified
+                            # credential the uuid generated above was never
+                            # stored, and a follow-up carrying it would point at
+                            # a row that does not exist.
+                            cur.execute(
+                                "SELECT id::text, engagement_id::text "
+                                "FROM credential_findings "
+                                "WHERE ip = %s AND port = %s AND username = %s "
+                                "ORDER BY created_at DESC LIMIT 1",
+                                (ip, int(port), username))
+                            row = cur.fetchone()
+                            if isinstance(row, dict):
+                                stored_id = row.get("id") or cred_uuid
+                                eid = row.get("engagement_id")
+                            elif row:
+                                stored_id, eid = row[0] or cred_uuid, row[1]
+                            else:
+                                stored_id, eid = cred_uuid, None
+                            fu = queue_followups(
+                                cur, ip=ip, port=int(port), protocol=protocol,
+                                username=username, credential_id=stored_id,
+                                engagement_id=eid or None)
+                            stats["followups_queued"] += fu.get("queued", 0)
+                            stats["followups_refused"] += fu.get("refused", 0)
+                            # Refusals are CARRIED, not dropped. A scope refusal
+                            # nobody sees is indistinguishable from a proposal
+                            # that was never made.
+                            for r in fu.get("refusals", [])[:5]:
+                                if len(stats["followup_refusals"]) < 20:
+                                    stats["followup_refusals"].append(r)
+                        except Exception as e:
+                            log.warning("credential follow-ups failed for %s:%s %s: %s",
+                                        ip, port, username, e)
+
                     cur.execute("RELEASE SAVEPOINT rec_sp")
                 except Exception as e:
                     cur.execute("ROLLBACK TO SAVEPOINT rec_sp")
