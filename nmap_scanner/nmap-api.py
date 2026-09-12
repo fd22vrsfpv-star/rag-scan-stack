@@ -3258,7 +3258,17 @@ class CredentialCheckRequest(BaseModel):
     targets: List[str] = Field(..., description="List of IPs to check")
     ports: Optional[List[int]] = Field(None, description="Specific ports to check (auto-detects service)")
     services: Optional[List[str]] = Field(None, description="Specific services to check (ssh, ftp, mysql, etc.)")
-    method: str = Field("hydra", description="Testing method: 'hydra' or 'nmap'")
+    # "auto" is the DEFAULT BEHAVIOUR cred_checker documents: hydra first, then
+    # nmap when hydra returns nothing — including the legacy-SSH case where
+    # every attempt fails KEX negotiation rather than authentication.
+    #
+    # This defaulted to "hydra", which takes cred_checker's `if method ==
+    # "hydra"` branch and NEVER reaches the fallback. Against Metasploitable that
+    # meant ssh reported kex_legacy_detected=True, fell_back_to_nmap=False and
+    # 0 credentials — msfadmin:msfadmin was tried and lost to KEX, not to a wrong
+    # password. The fallback existed the whole time and was unreachable.
+    method: str = Field("auto", description="Testing method: 'auto' (hydra, then "
+                                            "nmap fallback), 'hydra' or 'nmap'")
 
     def validate_inputs(self):
         """Validate all inputs for security"""

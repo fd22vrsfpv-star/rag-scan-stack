@@ -7,7 +7,10 @@ import {
   useDrainArtifacts, useAgentFlags, useActAgentFlag,
   useLearnedExtractors, useReviewExtractor, useExportExtractors,
   useAgentActivity,
-  type AgentInfo, type GapReport, type GapTargetDetail,
+  useToolSelectionRules, useReviewToolSelectionRule, useToolAttempts,
+  useBackfillToolSelection,
+  useRunPostReview, useIngestPostReviewFacts,
+  type AgentInfo, type GapReport, type GapTargetDetail, type ToolSelectionRule,
 } from '@/api/agents'
 import { useUIStore } from '@/stores/ui'
 import { cn } from '@/lib/utils'
@@ -15,6 +18,7 @@ import {
   Bot, Cpu, Search, Shield, Loader2, Play, ExternalLink,
   CheckCircle2, XCircle, RefreshCw, Zap, Settings, Clock, Cloud,
   FileSearch, ShieldCheck, Globe, MessageSquare, Wand2, Activity, ChevronDown, ChevronRight,
+  GitBranch, ClipboardCheck, AlertTriangle,
 } from 'lucide-react'
 
 const AGENT_ICONS: Record<string, typeof Bot> = {
@@ -131,7 +135,9 @@ export default function AIAgents() {
       )}
 
       <AgentFlagsPanel />
+      <PostReviewPanel />
       <LearnedExtractorsPanel />
+      <ToolSelectionPanel />
       <ActivityTimelinePanel />
 
       {selectedEngagement && (
@@ -758,5 +764,326 @@ function TargetRow({ target, info }: { target: string; info: GapTargetDetail }) 
         </span>
       </td>
     </tr>
+  )
+}
+
+
+/** Learned tool selection — what the platform concluded from tool error output.
+ *
+ *  These rules are DERIVED, not authored: when a tool fails with a given error
+ *  and another one then succeeds on the same target, that pair becomes a rule
+ *  and the winner is tried first from then on. So the operator's job here is
+ *  correction — see the conclusion, and overrule it when it is wrong.
+ *
+ *  Rejecting is permanent: etl/tool_learning.py preserves 'rejected' on upsert,
+ *  so new evidence will not quietly reinstate a rule you ruled out. Before this
+ *  panel existed, undoing a bad conclusion meant a psql session.
+ *
+ *  A rule decides which AUTHORISED tool is tried first. It never decides whether
+ *  something may run — that is the scope gate and the phase's approval, and
+ *  approving here grants no permission. */
+function ToolSelectionPanel() {
+  const { data } = useToolSelectionRules()
+  const review = useReviewToolSelectionRule()
+  const backfill = useBackfillToolSelection()
+  const [open, setOpen] = useState<string | null>(null)
+  const rows = data?.learned ?? []
+  if (!rows.length) return null
+
+  const counts = data?.by_status ?? {}
+  const pct = (r: ToolSelectionRule) =>
+    r.confidence == null ? '—' : `${Math.round(r.confidence * 100)}%`
+
+  return (
+    <div className="bg-card border border-border rounded-lg p-3 space-y-2">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <h3 className="text-sm font-semibold flex items-center gap-2">
+          <GitBranch className="h-4 w-4" /> Learned Tool Selection
+          {(counts.active ?? 0) > 0 && (
+            <span className="px-1.5 py-0.5 rounded-full bg-green-500/10 text-green-400 text-[10px]">
+              {counts.active} in use
+            </span>
+          )}
+          {(counts.proposed ?? 0) > 0 && (
+            <span className="px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-400 text-[10px]">
+              {counts.proposed} proposed
+            </span>
+          )}
+          {(counts.rejected ?? 0) > 0 && (
+            <span className="px-1.5 py-0.5 rounded-full bg-red-500/10 text-red-400 text-[10px]">
+              {counts.rejected} rejected
+            </span>
+          )}
+        </h3>
+        <button onClick={() => backfill.mutate({ reset: true })} disabled={backfill.isPending}
+          title="Re-derive every rule from tool_executions. Reads history only — runs nothing against any target."
+          className="h-6 px-2 text-[10px] rounded border border-border hover:bg-accent">
+          {backfill.isPending ? 'Re-deriving…' : 'Re-derive from history'}
+        </button>
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        Derived from tool error output, not written by anyone: when a tool fails a given way and
+        another succeeds on the same target, the winner is tried first next time. Rejecting is
+        permanent — new evidence will not reinstate it. These rules choose between{' '}
+        <em>already-authorised</em> tools; approving one grants no permission.
+      </p>
+      {backfill.data && (
+        <p className="text-[11px] text-muted-foreground font-mono">
+          examined {backfill.data.examined} · errored {backfill.data.failures} ·
+          {' '}produced nothing {backfill.data.fruitless} · rules {backfill.data.rules}
+          {backfill.data.cleared ? ` · cleared ${backfill.data.cleared}` : ''}
+        </p>
+      )}
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[760px] text-xs">
+          <thead className="text-muted-foreground">
+            <tr className="border-b border-border">
+              <th className="text-left py-1 px-2">When this fails</th>
+              <th className="text-left px-2">Try instead</th>
+              <th className="text-left px-2">Service</th>
+              <th className="text-right px-2">Worked</th>
+              <th className="text-left px-2">Status</th>
+              <th className="text-right px-2">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(r => (
+              <>
+                <tr key={r.id} className="border-b border-border/40">
+                  <td className="py-1 px-2">
+                    <button onClick={() => setOpen(open === r.id ? null : r.id)}
+                      className="inline-flex items-center gap-1 hover:text-foreground">
+                      {open === r.id ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                      <span className="font-mono">{r.failed_tool}</span>
+                    </button>
+                  </td>
+                  <td className="px-2 font-mono text-green-400">{r.preferred_tool}</td>
+                  <td className="px-2 font-mono text-muted-foreground">{r.service || '—'}</td>
+                  <td className="px-2 text-right font-mono" title={`${r.successes} of ${r.attempts} attempts`}>
+                    {pct(r)} <span className="text-muted-foreground">({r.successes}/{r.attempts})</span>
+                  </td>
+                  <td className="px-2">
+                    <span className={cn('px-1.5 py-0.5 rounded text-[10px]',
+                      r.status === 'active' ? 'bg-green-500/10 text-green-400'
+                        : r.status === 'rejected' ? 'bg-red-500/10 text-red-400'
+                          : 'bg-amber-500/10 text-amber-400')}>{r.status}</span>
+                    {r.reviewed_by && <span className="ml-1 text-[10px] text-muted-foreground">by {r.reviewed_by}</span>}
+                  </td>
+                  <td className="px-2 text-right whitespace-nowrap">
+                    <span className="inline-flex gap-1">
+                      {r.status !== 'active' && (
+                        <button onClick={() => review.mutate({ id: r.id, action: 'approve' })} disabled={review.isPending}
+                          className="px-2 py-0.5 text-[10px] rounded bg-green-600 hover:bg-green-500 text-white">Use it</button>
+                      )}
+                      {r.status !== 'rejected' && (
+                        <button onClick={() => review.mutate({ id: r.id, action: 'reject' })} disabled={review.isPending}
+                          title="Permanent — new evidence will not reinstate this rule"
+                          className="px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">Reject</button>
+                      )}
+                      {r.status === 'rejected' && (
+                        <button onClick={() => review.mutate({ id: r.id, action: 'reset' })} disabled={review.isPending}
+                          className="px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">Reset</button>
+                      )}
+                    </span>
+                  </td>
+                </tr>
+                {open === r.id && (
+                  <tr key={`${r.id}-detail`} className="border-b border-border/40 bg-black/20">
+                    <td colSpan={6} className="px-4 py-2 space-y-2">
+                      <div>
+                        <div className="text-[10px] text-muted-foreground uppercase tracking-wide">What it learned from</div>
+                        <pre className="text-[10px] font-mono whitespace-pre-wrap text-amber-300/90">
+                          {r.failure_phrase || '(no message recorded)'}
+                        </pre>
+                        <div className="text-[10px] text-muted-foreground font-mono mt-1">
+                          signature {r.failure_signature} · seen {r.support}× · last {new Date(r.last_seen_at).toLocaleString()}
+                        </div>
+                      </div>
+                      <ToolAttemptEvidence signature={r.failure_signature} />
+                    </td>
+                  </tr>
+                )}
+              </>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+/** The raw observations a rule was derived from. A conclusion nobody can check
+ *  is not reviewable, so the rule row expands into its own evidence. */
+function ToolAttemptEvidence({ signature }: { signature: string }) {
+  const { data, isLoading } = useToolAttempts(signature)
+  if (isLoading) return <p className="text-[10px] text-muted-foreground">Loading observations…</p>
+  const attempts = data?.attempts ?? []
+  if (!attempts.length) return <p className="text-[10px] text-muted-foreground">No recorded observations.</p>
+  return (
+    <div>
+      <div className="text-[10px] text-muted-foreground uppercase tracking-wide mb-1">
+        Observations ({data?.count})
+      </div>
+      <table className="text-[10px] font-mono w-full">
+        <tbody>
+          {attempts.slice(0, 10).map(a => (
+            <tr key={a.id} className="border-b border-border/20">
+              <td className="py-0.5 pr-3">{new Date(a.created_at).toLocaleString()}</td>
+              <td className="pr-3">{a.tool}</td>
+              <td className="pr-3 text-muted-foreground">{a.target || '—'}{a.port ? `:${a.port}` : ''}</td>
+              <td className="pr-3">
+                {a.success
+                  ? <span className="text-green-400">worked ({a.result_count})</span>
+                  : <span className="text-red-400">nothing</span>}
+              </td>
+              <td className="text-muted-foreground">{a.chosen_because || ''}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+const SEV_CLASS: Record<string, string> = {
+  critical: 'bg-red-500/15 text-red-300',
+  high: 'bg-red-500/10 text-red-400',
+  medium: 'bg-amber-500/10 text-amber-400',
+  low: 'bg-blue-500/10 text-blue-400',
+  info: 'bg-gray-500/10 text-gray-400',
+}
+
+/** Post-execution review — what the stored scan data says was missed.
+ *
+ *  Until now this agent had no proxy at all: /api/agent/post-review was a 404
+ *  and the only way to run a review was curl against rag-api with the API key.
+ *
+ *  The value is the CLASSIFICATION, not a count. "228 executions produced no
+ *  output" is true and useless — a third of that is correct behaviour and the
+ *  rest need three different fixes. So the panel leads with the facts found
+ *  sitting in raw output that were never stored, which is the part nothing else
+ *  in the UI can show you.
+ *
+ *  It proposes and never dispatches. Queued re-runs are PENDING
+ *  recommendations; a human still presses Run, and every proposed target passes
+ *  the scope gate first. */
+function PostReviewPanel() {
+  const review = useRunPostReview()
+  const ingest = useIngestPostReviewFacts()
+  const r = review.data
+  const s = r?.summary
+  const unstored = s?.notable_facts_unstored ?? 0
+
+  return (
+    <div className="bg-card border border-border rounded-lg p-3 space-y-2">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <h3 className="text-sm font-semibold flex items-center gap-2">
+          <ClipboardCheck className="h-4 w-4" /> Post-Execution Review
+          {s && unstored > 0 && (
+            <span className="px-1.5 py-0.5 rounded-full bg-red-500/10 text-red-400 text-[10px]">
+              {unstored} finding{unstored === 1 ? '' : 's'} not stored
+            </span>
+          )}
+        </h3>
+        <span className="inline-flex gap-1">
+          <button onClick={() => review.mutate({})} disabled={review.isPending}
+            className="h-6 px-2 text-[10px] rounded border border-border hover:bg-accent">
+            {review.isPending ? 'Reviewing…' : 'Review stored data'}
+          </button>
+          <button onClick={() => review.mutate({ queueReruns: true })} disabled={review.isPending}
+            title="Queue the proposed re-runs as PENDING recommendations. Dispatches nothing; every target passes the scope gate first."
+            className="h-6 px-2 text-[10px] rounded border border-border hover:bg-accent">
+            Review + queue re-runs
+          </button>
+        </span>
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        Classifies every stored execution and finds work that ran but was never interpreted.
+        Proposes only — re-runs land as pending recommendations you still have to run.
+      </p>
+
+      {review.isError && (
+        <p className="text-[11px] text-red-400">Review failed: {String((review.error as Error)?.message)}</p>
+      )}
+
+      {s && (
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
+          {([
+            ['Executions reviewed', s.executions_reviewed, ''],
+            ['Actionable', s.actionable, s.actionable ? 'text-amber-400' : ''],
+            ['Found but not stored', s.notable_facts_unstored, s.notable_facts_unstored ? 'text-red-400' : 'text-green-400'],
+            ['High+ not stored', s.high_or_worse_unstored, s.high_or_worse_unstored ? 'text-red-400' : 'text-green-400'],
+            ['Results not ingested', s.results_not_ingested, s.results_not_ingested ? 'text-amber-400' : ''],
+            ['Re-runs proposed', s.reruns_proposed, ''],
+            ['Re-runs queued', s.reruns_queued, ''],
+            ['Scope refusals', s.scope_refusals, s.scope_refusals ? 'text-red-400' : ''],
+          ] as Array<[string, number, string]>).map(([label, value, cls]) => (
+            <div key={label} className="border border-border/60 rounded px-2 py-1">
+              <div className="text-muted-foreground text-[10px]">{label}</div>
+              <div className={cn('font-mono text-sm', cls)}>{value}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {r && r.notable_in_output.length > 0 && (
+        <div className="space-y-1">
+          <div className="flex items-center justify-between">
+            <div className="text-[10px] text-muted-foreground uppercase tracking-wide flex items-center gap-1">
+              <AlertTriangle className="w-3 h-3" /> Sitting in raw output
+            </div>
+            {unstored > 0 && (
+              <span className="inline-flex gap-1">
+                <button onClick={() => ingest.mutate({ dryRun: true })} disabled={ingest.isPending}
+                  className="h-6 px-2 text-[10px] rounded border border-border hover:bg-accent">
+                  Preview ingest
+                </button>
+                <button onClick={() => ingest.mutate({ dryRun: false })} disabled={ingest.isPending}
+                  title="Writes these as findings. They will appear in reports and exports."
+                  className="h-6 px-2 text-[10px] rounded bg-green-600 hover:bg-green-500 text-white">
+                  {ingest.isPending ? 'Storing…' : 'Store as findings'}
+                </button>
+              </span>
+            )}
+          </div>
+          {ingest.data && (
+            <p className="text-[11px] text-muted-foreground font-mono">
+              found {ingest.data.facts_found} · new {ingest.data.new} · already stored{' '}
+              {ingest.data.already_stored} · inserted {ingest.data.inserted}
+            </p>
+          )}
+          <table className="w-full text-xs">
+            <tbody>
+              {r.notable_in_output.map(f => (
+                <tr key={f.id} className="border-b border-border/40">
+                  <td className="py-1 pr-2 w-16">
+                    <span className={cn('px-1.5 py-0.5 rounded text-[10px]',
+                      SEV_CLASS[f.severity] ?? SEV_CLASS.info)}>{f.severity}</span>
+                  </td>
+                  <td className="pr-2">{f.title}</td>
+                  <td className="pr-2 font-mono text-muted-foreground whitespace-nowrap">{f.target}</td>
+                  <td className="font-mono text-muted-foreground text-[10px] whitespace-nowrap">{f.tool}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {r && r.executions?.groups?.some(g => g.actionable) && (
+        <div>
+          <div className="text-[10px] text-muted-foreground uppercase tracking-wide mb-1">Needs attention</div>
+          <ul className="text-[11px] space-y-0.5">
+            {r.executions.groups.filter(g => g.actionable).map(g => (
+              <li key={g.category} className="text-muted-foreground">
+                <span className="font-mono text-foreground">{g.category}</span> ×{g.count}
+                {' — '}{g.why}{' · remedy: '}<span className="text-amber-400">{g.remedy}</span>
+                {' · '}{g.tools.map(t => `${t.tool}(${t.count})`).join(', ')}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
   )
 }
