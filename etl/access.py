@@ -414,7 +414,9 @@ def refresh(target: str, *, rounds: int = None,
     try:
         with _connect() as conn:
             with conn.cursor() as cur:
+                probed = set()
                 for cand in candidates:
+                    probed.add((cand["kind"], cand["handle"]))
                     result = probe(cand, rounds=rounds)
                     cur.execute(
                         """
@@ -452,6 +454,38 @@ def refresh(target: str, *, rounds: int = None,
                         "whoami": result["whoami"], "is_root": result["is_root"],
                         "probes": f"{result['probes_ok']}/{result['probes']}",
                         "score": result["score"]})
+
+                # Reconcile what we still THINK we hold. A row that drops out of
+                # discovery (a candidate we no longer offer — e.g. a UDP port we
+                # used to mis-offer as a bind shell) would otherwise linger as a
+                # phantom "live", outranking real access, because nothing
+                # re-probes it. refresh means "re-verify everything on this
+                # target", so re-probe those too; a refused/silent one goes dead.
+                cur.execute(
+                    "SELECT kind, handle, port, transport "
+                    "  FROM public.obtained_access "
+                    " WHERE target = %s AND status = 'live'", (target,))
+                stale = [r for r in cur.fetchall() if (r[0], r[1]) not in probed]
+                for kind, handle, port, transport in stale:
+                    result = probe({"kind": kind, "handle": handle, "port": port,
+                                    "transport": transport or ""}, rounds=rounds)
+                    cur.execute(
+                        """
+                        UPDATE public.obtained_access SET
+                          whoami = %s, uid = %s, is_root = %s, os_info = %s,
+                          probes = probes + %s, probes_ok = probes_ok + %s,
+                          last_probe_at = now(), last_error = %s, score = %s,
+                          status = CASE WHEN status = 'rejected' THEN 'rejected'
+                                        ELSE %s END
+                         WHERE target = %s AND kind = %s AND handle = %s
+                        """,
+                        (result["whoami"], result["uid"], result["is_root"],
+                         result["os_info"], result["probes"], result["probes_ok"],
+                         result["last_error"], result["score"], result["status"],
+                         target, kind, handle))
+                    if result["status"] != "live":
+                        out["dead"] += 1
+                        out["reconciled_dead"] = out.get("reconciled_dead", 0) + 1
             conn.commit()
         out["available"] = True
     except Exception as e:  # noqa: BLE001

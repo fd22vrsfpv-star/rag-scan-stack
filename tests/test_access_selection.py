@@ -226,6 +226,21 @@ def test_bind_shell_discovery_is_tcp_only():
         "are offered as bind-shell candidates again")
 
 
+def test_refresh_reconciles_rows_that_drop_out_of_discovery():
+    """A row we no longer offer as a candidate (e.g. a UDP port we used to
+    mis-offer) must be RE-PROBED, not left as a phantom 'live' outranking real
+    access. Without this the discovery fix stops new ghosts but never clears the
+    ones already recorded.
+
+    Verified live: reconciling 192.168.1.150 flipped the four score-10 ghosts
+    (68/138/162/4500) to dead while leaving the real root shell on 1524 live.
+    """
+    src = _func_src(os.path.join(REPO, "etl", "access.py"), "refresh")
+    assert "status = 'live'" in src and "not in probed" in src, (
+        "refresh no longer re-probes existing live rows that fell out of "
+        "discovery, so a stale phantom shell lingers forever")
+
+
 # ── Selection and use ──────────────────────────────────────────────────────
 
 def test_only_live_access_can_be_selected():
