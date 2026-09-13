@@ -1574,7 +1574,8 @@ class ScanTools:
         skip_playwright: bool = False,
         skip_zap: bool = False,
         skip_nuclei: bool = False,
-        skip_katana: bool = False
+        skip_katana: bool = False,
+        skip_nikto: bool = False
     ) -> Dict:
         """
         Start a sequential web scan pipeline: Gobuster → Nikto → Playwright → Katana → ZAP → Nuclei
@@ -1614,7 +1615,12 @@ class ScanTools:
                 "skip_playwright": skip_playwright,
                 "skip_zap": skip_zap,
                 "skip_nuclei": skip_nuclei,
-                "skip_katana": skip_katana
+                "skip_katana": skip_katana,
+                # Passed explicitly so the web profile controls nikto like every
+                # other stage. Omitting it meant the web-scanner's default (run)
+                # always won, so 'quick'/'standard' ran nikto against the profile
+                # and the profile's nikto selection was silently ignored.
+                "skip_nikto": skip_nikto
             }
         )
 
@@ -3474,7 +3480,8 @@ def start_pipeline_scan(
     skip_playwright: bool = False,
     skip_zap: bool = False,
     skip_nuclei: bool = False,
-    skip_katana: bool = False
+    skip_katana: bool = False,
+    skip_nikto: bool = False
 ) -> str:
     """
     Start a sequential web scan pipeline: Gobuster → Nikto → Playwright → Katana → ZAP → Nuclei
@@ -3511,6 +3518,11 @@ def start_pipeline_scan(
         skip_zap = "zap" not in stages
         skip_nuclei = "nuclei" not in stages
         skip_katana = "katana" not in stages
+        # nikto was missing here, so its profile membership was ignored: the
+        # web-scanner defaulted to running it regardless, so 'deep' and 'quick'
+        # behaved the same for nikto and the profile could neither guarantee nor
+        # suppress it.
+        skip_nikto = "nikto" not in stages
         wordlist = wordlist or web_scope["wordlist"] or None
         max_paths_to_visit = web_scope["max_paths"]
         logger.info(
@@ -3521,7 +3533,8 @@ def start_pipeline_scan(
 
     result = get_scan_tools().start_pipeline_scan(
         target_url, wordlist, max_paths_to_visit,
-        skip_gobuster, skip_playwright, skip_zap, skip_nuclei, skip_katana
+        skip_gobuster, skip_playwright, skip_zap, skip_nuclei, skip_katana,
+        skip_nikto
     )
 
     # Track the scan job
