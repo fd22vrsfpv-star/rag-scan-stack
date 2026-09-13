@@ -111,3 +111,30 @@ def test_previously_missing_tools_are_installed(tool):
         f"{tool} is installed but not in _FALLBACK_ALLOWED_TOOLS, so "
         f"/tools/execute rejects it with 400"
     )
+
+
+#: Offensive service-vector clients (Stage 2): installed so the non-MSF
+#: `attempt`s in knowledge/service_access_methods.yaml can run, but they route
+#: through the scope-gated /vectors/run and must NOT be in the /tools/execute
+#: allowlist. (Dockerfile package line, binary name.)
+VECTOR_TOOLS_IN_KALI_IMAGE = (("rsh-client", "rsh"), ("distcc", "distcc"))
+
+
+@pytest.mark.parametrize("pkg,binary", VECTOR_TOOLS_IN_KALI_IMAGE)
+def test_vector_tools_installed_but_not_allowlisted(pkg, binary):
+    """The opposite obligation from the allowlisted tools: installed in the image
+    (so the attempt runs) AND absent from the allowlist (so it can never reach the
+    read-only /tools/execute lane — offensive attempts go through /vectors/run)."""
+    if not os.path.exists(KALI_DOCKERFILE):
+        pytest.skip("kali_listener/Dockerfile not present")
+    with open(KALI_DOCKERFILE, encoding="utf-8") as fh:
+        body = "\n".join(l.split("#", 1)[0] for l in fh.read().splitlines())
+    assert re.search(rf"^\s*{re.escape(pkg)}\s*\\?\s*$", body, re.M), (
+        f"{pkg} is not installed by kali_listener/Dockerfile — the non-MSF "
+        f"attempt using {binary} will fail with 'not found'"
+    )
+    assert binary not in _allowlist(), (
+        f"{binary} is an offensive vector client and must NOT be in "
+        f"_FALLBACK_ALLOWED_TOOLS — it runs via the scope-gated /vectors/run, "
+        f"not the read-only /tools/execute lane"
+    )

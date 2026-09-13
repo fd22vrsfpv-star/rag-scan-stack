@@ -3397,6 +3397,18 @@ _PROVISION_TOOLS = {
                   "kali": f"{_APT_INSTALL} telnet", "ubuntu": f"{_APT_INSTALL} telnet", "debian": f"{_APT_INSTALL} telnet"},
     "ftp":       {"check": "which ftp", "verify": "echo 'ftp installed'",
                   "kali": f"{_APT_INSTALL} ftp", "ubuntu": f"{_APT_INSTALL} ftp", "debian": f"{_APT_INSTALL} ftp"},
+    # Offensive service-vector clients (Stage 2). Installed on nodes so the
+    # non-MSF `attempt`s in knowledge/service_access_methods.yaml can run, but
+    # kept OUT of the dispatchable allowlist (see _NON_DISPATCHABLE_TOOLS) —
+    # they route through the scope-gated /vectors/run, not /tools/execute.
+    # rsh-client pulls netbase so /etc/services has `shell 514/tcp`.
+    "rsh":       {"check": "which rsh", "verify": "which rsh && echo 'rsh installed'",
+                  "kali": f"{_APT_INSTALL} rsh-client netbase",
+                  "ubuntu": f"{_APT_INSTALL} rsh-client netbase",
+                  "debian": f"{_APT_INSTALL} rsh-client netbase"},
+    "distcc":    {"check": "which distcc", "verify": "distcc --version 2>&1 | head -1",
+                  "kali": f"{_APT_INSTALL} distcc", "ubuntu": f"{_APT_INSTALL} distcc",
+                  "debian": f"{_APT_INSTALL} distcc"},
     "wireguard": {"check": "which wg", "verify": "wg --version 2>&1 | head -1",
                   "kali": f"{_APT_CLEANUP}; {_APT_INSTALL} wireguard-tools",
                   "ubuntu": f"{_APT_CLEANUP}; {_APT_INSTALL} wireguard-tools",
@@ -3957,6 +3969,7 @@ _NON_DISPATCHABLE_TOOLS = {
     "seclists", "rockyou",                            # wordlists
     "wireguard", "mcp-kali-server",                   # infrastructure
     "chromium",                                       # headless-browser dep (used by gowitness)
+    "rsh", "distcc",                                  # offensive vectors: run via /vectors/run, never allowlisted
 }
 
 
