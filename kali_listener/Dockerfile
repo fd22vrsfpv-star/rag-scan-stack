@@ -168,16 +168,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # through the scope-gated, un-allowlisted /vectors/run (same trust model as
 # /access/run), never the read-only enumeration lane.
 #
-#   rsh-client -> rsh / rlogin / rcp   the r-services vector (512/513/514). The
-#                 rsh binary resolves the port from /etc/services (`shell 514`),
-#                 which netbase provides; the check below fails the build if it
-#                 is ever missing rather than letting `rsh` die with
+#   rsh-redone-client -> rsh / rlogin  the r-services vector (512/513/514). On
+#                 Kali the netkit `rsh-client` package has no install candidate;
+#                 `rsh-redone-client` is the maintained replacement and provides
+#                 the same /usr/bin/rsh. It resolves the port from /etc/services
+#                 (`shell 514`), which netbase provides; the check below fails the
+#                 build if it is ever missing rather than letting `rsh` die with
 #                 "shell/tcp: unknown service" at runtime.
 #   distcc     -> distcc client        distccd CVE-2004-2687 (3632). The client
 #                 is installed for the native path; the verified shell path today
 #                 is the MSF module (see the catalogue's `msf:` seed).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    rsh-client \
+    rsh-redone-client \
     distcc \
     netbase \
     && apt-get clean \

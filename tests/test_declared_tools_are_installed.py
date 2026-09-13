@@ -117,7 +117,7 @@ def test_previously_missing_tools_are_installed(tool):
 #: `attempt`s in knowledge/service_access_methods.yaml can run, but they route
 #: through the scope-gated /vectors/run and must NOT be in the /tools/execute
 #: allowlist. (Dockerfile package line, binary name.)
-VECTOR_TOOLS_IN_KALI_IMAGE = (("rsh-client", "rsh"), ("distcc", "distcc"))
+VECTOR_TOOLS_IN_KALI_IMAGE = (("rsh-redone-client", "rsh"), ("distcc", "distcc"))
 
 
 @pytest.mark.parametrize("pkg,binary", VECTOR_TOOLS_IN_KALI_IMAGE)

@@ -3402,10 +3402,13 @@ _PROVISION_TOOLS = {
     # kept OUT of the dispatchable allowlist (see _NON_DISPATCHABLE_TOOLS) —
     # they route through the scope-gated /vectors/run, not /tools/execute.
     # rsh-client pulls netbase so /etc/services has `shell 514/tcp`.
+    # Kali dropped netkit `rsh-client`; `rsh-redone-client` is the replacement
+    # and provides the same /usr/bin/rsh. Try it first, fall back to rsh-client
+    # on distros that still carry the old name (Debian/Ubuntu).
     "rsh":       {"check": "which rsh", "verify": "which rsh && echo 'rsh installed'",
-                  "kali": f"{_APT_INSTALL} rsh-client netbase",
-                  "ubuntu": f"{_APT_INSTALL} rsh-client netbase",
-                  "debian": f"{_APT_INSTALL} rsh-client netbase"},
+                  "kali": f"{_APT_INSTALL} rsh-redone-client netbase || {_APT_INSTALL} rsh-client netbase",
+                  "ubuntu": f"{_APT_INSTALL} rsh-client netbase || {_APT_INSTALL} rsh-redone-client netbase",
+                  "debian": f"{_APT_INSTALL} rsh-client netbase || {_APT_INSTALL} rsh-redone-client netbase"},
     "distcc":    {"check": "which distcc", "verify": "distcc --version 2>&1 | head -1",
                   "kali": f"{_APT_INSTALL} distcc", "ubuntu": f"{_APT_INSTALL} distcc",
                   "debian": f"{_APT_INSTALL} distcc"},
