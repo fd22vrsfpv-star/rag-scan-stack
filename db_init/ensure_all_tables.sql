@@ -3132,6 +3132,39 @@ CREATE TRIGGER trg_obtained_access_updated
   BEFORE UPDATE ON public.obtained_access
   FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
 
+-- ============================================================================
+-- PORT ACCESS ADVICE (what to try on a port the default probe could not reach)
+-- ============================================================================
+-- The bind-shell probe sends `id` over a raw socket, which only speaks to a raw
+-- bind shell. Real services (an FTP with a trigger-only backdoor, rsh, an RPC
+-- program, a web server) come back dead even when there is a real path in — the
+-- path is just not the default. This records the NON-DEFAULT method for each
+-- dead port (from knowledge/service_access_methods.yaml, matched on the port's
+-- identified service/product/version) so enumeration is not stuck on the
+-- default. Advice only; nothing here runs. See etl/dead_port_advisor.py.
+CREATE TABLE IF NOT EXISTS public.port_access_advice (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    target       text NOT NULL,
+    port         integer NOT NULL,
+    service      text,
+    product      text,
+    version      text,
+    probe_error  text,        -- why the default probe failed (from obtained_access)
+    method_id    text,        -- catalogue id, NULL when no method matched
+    method       text,        -- short label, e.g. 'backdoor-trigger'
+    summary      text,
+    steps        text[] NOT NULL DEFAULT '{}',
+    tool         text,        -- a ready module that implements it, if any
+    opens        integer,     -- port the method yields access on, if different
+    caution      text,
+    first_seen   timestamptz NOT NULL DEFAULT now(),
+    last_seen    timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_port_access_advice_target_port
+  ON public.port_access_advice (target, port);
+CREATE INDEX IF NOT EXISTS idx_port_access_advice_target
+  ON public.port_access_advice (target);
+
 -- Agent-to-agent feedback channel. One agent flags something interesting (a
 -- finding worth another run, a coverage gap); a coordinator turns approved flags
 -- into scan_recommendations (which the recon agent dispatches through the scope
