@@ -150,6 +150,16 @@ async def asset_access(ip: str, include_dead: bool = False):
         return safe_json(resp)
 
 
+@router.get("/api/assets/{ip}/port-advice")
+async def asset_port_advice(ip: str):
+    """Non-default methods for dead ports the probe could not reach."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/assets/{ip}/port-advice",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
 @router.post("/api/assets/{ip}/access/refresh")
 async def asset_access_refresh(ip: str, rounds: Optional[int] = None):
     """Re-probe every access on this host. Touches the target, so it gets the

@@ -389,6 +389,27 @@ export interface ObtainedAccess {
   updated_at: string
 }
 
+export interface PortAdvice {
+  target: string; port: number
+  service: string | null; product: string | null; version: string | null
+  probe_error: string | null
+  method_id: string | null; method: string | null; summary: string | null
+  steps: string[]; tool: string | null; opens: number | null; caution: string | null
+}
+
+/** Non-default methods for dead ports the probe could not reach (vsftpd
+ *  backdoor trigger, rsh, rpc, web enumeration). Advice only — nothing runs. */
+export function useAssetPortAdvice(ip: string) {
+  return useQuery({
+    queryKey: ['asset-port-advice', ip],
+    queryFn: () => apiFetch<{
+      target: string; count: number; with_method: number; advice: PortAdvice[]
+    }>(`/assets/${encodeURIComponent(ip)}/port-advice`),
+    enabled: !!ip,
+    staleTime: 60_000,
+  })
+}
+
 export function useAssetAccess(ip: string, includeDead = false) {
   return useQuery({
     queryKey: ['asset-access', ip, includeDead],
