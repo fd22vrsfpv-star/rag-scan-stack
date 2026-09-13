@@ -125,8 +125,12 @@ class TestHighValuePortRecs:
         assert all(r["scanner"] != "metasploit" for r in recs)
 
     def test_non_high_value_port_noop(self):
+        # 9999 has no catalogue vector and no curated entry. (80 USED to be the
+        # example here, but the service-vector catalogue now makes it high-value
+        # via the php-cgi RCE — a deliberate improvement, so it is no longer a
+        # valid "nothing here" port.)
         recs = [{"scanner": "nmap", "action": "banner"}]
-        assert sr._append_high_value_port_recs(recs, 80) is None
+        assert sr._append_high_value_port_recs(recs, 9999) is None
         assert "priority" not in recs[0]
 
     def test_does_not_raise_priority(self):

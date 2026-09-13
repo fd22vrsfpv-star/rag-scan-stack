@@ -257,3 +257,37 @@ which task lives only in each caller's hardcoded choice.
 **Where:** the LLM selection path.
 **Done when:** routing is data rather than each caller's guess.
 **Enforced by:** not enforced
+
+## Vector coverage
+
+### The NFS no_root_squash mutating chain cannot run from the unprivileged kali container
+**Found:** 2026-09-13
+**Evidence:** The kali-listener container runs unprivileged (`docker inspect
+kali-listener` → `Privileged=false`, `CapAdd=[CAP_NET_ADMIN CAP_NET_RAW]`), and a
+mount attempt from inside it fails: `mount -o nfsvers=3 192.168.1.150:/ /tmp/nfstest`
+→ `mount.nfs: failed to prepare mount: Operation not permitted`. So the
+`nfs_no_root_squash` vector can only enumerate (`showmount -e`) — the full chain
+(mount export → write `~/.ssh/authorized_keys` → record a `credential_finding` so
+`discover()` sees an `ssh_credential`) has nowhere to run.
+**Where:** `knowledge/service_access_methods.yaml` (`nfs_no_root_squash`),
+`docker-compose.yml` (`kali-listener` capabilities), `etl/access.py` (would source
+the resulting credential).
+**Done when:** either the kali container is granted `CAP_SYS_ADMIN` (a deliberate
+privilege decision for the operator) and a helper performs the mount+write+record
+chain, or the chain is dispatched from a node that can mount; and the resulting
+credential is verified to become held `ssh_credential` access on the lab.
+**Enforced by:** not enforced
+
+### distcc_exec has no verified non-MSF attempt
+**Found:** 2026-09-13
+**Evidence:** The `distcc` client is installed (Stage 2) but `distccd_exec`
+dispatches via Metasploit only. A native attempt needs the CVE-2004-2687 DIST
+protocol job format, which was not verified against the live daemon this session
+(the ad-hoc protocol probe was blocked by the auto-mode classifier as RCE
+surface). Shipping an unverified exploit format would violate the repo's
+"unreachable is not absent / no silent-success probe" norm.
+**Where:** `knowledge/service_access_methods.yaml` (`distccd_exec`).
+**Done when:** a native distcc job is verified to return command output from the
+lab daemon (192.168.1.150:3632) through the scope-gated `/vectors/run`, then added
+as the vector's `attempt` with an `expect_shell` assertion.
+**Enforced by:** not enforced

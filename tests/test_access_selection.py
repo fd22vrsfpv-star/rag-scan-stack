@@ -113,6 +113,48 @@ def test_sessions_outside_metasploit_are_supported():
         assert kind in ax.TRANSPORTS, f"{kind} has no runner"
 
 
+def test_webshell_is_a_held_access_transport():
+    """A planted web shell is held access too — proven RCE that survives as long
+    as the dropped file is on disk, so it belongs in obtained_access ranked next
+    to bind/ssh/msf, not lost as a one-off exploit result."""
+    assert "webshell" in ax.TRANSPORTS, "a planted web shell has no runner"
+
+
+def test_webshell_substitutes_cmd_and_reads_the_body(monkeypatch):
+    """The command goes into the URL's {cmd} slot (url-quoted) and the response
+    body is the shell's output. A 5xx is the server erroring, not the shell
+    answering — same rule as stderr-only on the other transports — so it raises
+    rather than returning an empty "it replied"."""
+    import requests
+
+    class _Resp:
+        def __init__(self, code, text):
+            self.status_code, self.text = code, text
+
+    seen = {}
+
+    def _ok_get(url, **kw):
+        seen["url"] = url
+        return _Resp(200, "uid=33(www-data) gid=33(www-data)")
+
+    monkeypatch.setattr(requests, "get", _ok_get)
+    out = ax._run_webshell("http://h/s.php?c={cmd}", "id; uname -a")
+    assert "uid=33" in out
+    assert "{cmd}" not in seen["url"], "the {cmd} slot was not filled"
+    assert "%3B" in seen["url"] or "%20" in seen["url"], "command was not url-quoted"
+
+    monkeypatch.setattr(requests, "get", lambda url, **kw: _Resp(500, ""))
+    with pytest.raises(Exception):
+        ax._run_webshell("http://h/s.php?c={cmd}", "id")
+
+
+def test_webshell_handle_without_cmd_slot_is_reported():
+    """A URL with no {cmd} slot cannot carry a command — refuse it, do not GET a
+    fixed URL and call the result a shell."""
+    res = ax.run({"kind": "webshell", "handle": "http://h/no-slot.php"}, "id")
+    assert res["ok"] is False and res["error"], res
+
+
 def test_an_unknown_transport_is_refused_not_guessed():
     """A silent fallback would mean the operator believes a command ran through
     the access they chose when it ran through a different one."""

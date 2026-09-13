@@ -67,7 +67,7 @@ def test_command_attempts_use_available_tools():
     """A non-MSF `attempt`'s tool must be one the kali image actually has."""
     have = {"nc", "printf", "sh", "smbclient", "rpcclient", "showmount", "mount",
             "rpcinfo", "nuclei", "curl", "sqlmap", "hydra", "ffuf", "gobuster",
-            "vncviewer", "ssh", "sshpass"}
+            "vncviewer", "ssh", "sshpass", "rsh", "distcc", "nfs-vector"}
     for m in _catalogue():
         att = m.get("attempt")
         if not att:

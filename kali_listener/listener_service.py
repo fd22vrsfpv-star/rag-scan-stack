@@ -1177,6 +1177,98 @@ _FALLBACK_ALLOWED_TOOLS = {
 # Metasploit is never auto-dispatchable here.
 _MSF_DENY = {"metasploit", "msfconsole", "msfvenom", "msf"}
 
+# ── The no-approval execution gate (the SAFE lane) ───────────────────────────
+#
+# get_allowed_tools() above is the INSTALL MANIFEST — the universe of tools this
+# image knows and can install, minus Metasploit. It answers "is this a tool we
+# have", NOT "may this run without human approval". Those are different questions
+# and conflating them was the bug: the manifest admits sqlmap (--os-shell → RCE),
+# ssh/sshpass (general-purpose remote exec), hydra/medusa/ncrack (credential
+# attacks, lockouts), netexec (-x command exec), nc, the DB clients, smbclient
+# (upload) — every one an offensive capability with its OWN flags, defeating the
+# dangerous-char filter which only stops shell chaining.
+#
+# So /tools/execute (which runs WITHOUT the exploit approval gate) is bounded by
+# this explicit READ-ONLY set instead. Anything offensive is not refused work —
+# it must go through the impactful lane (pending_exploits → approval/pre-approval
+# → exploit-runner / the scope-gated /vectors/run). Fail closed: a tool not
+# listed here cannot run on the no-approval lane.
+#
+# Kept in lockstep with the agent-side `_SAFE_TOOL_HINTS`
+# (autogen_agents/langgraph_engine.py) — an agreement test
+# (tests/test_safe_lane_tools.py) pins both to one table so they cannot drift.
+_SAFE_READONLY_TOOLS = {
+    # HTTP/TLS read-only clients — GET only, enforced by _readonly_arg_violation.
+    "curl", "wget", "httpx",
+    # Detection scanners — nuclei/nmap constrained by _readonly_arg_violation.
+    "nuclei", "nikto", "whatweb", "wafw00f",
+    "sslscan", "testssl.sh", "testssl", "sslyze",
+    # Content / path discovery (reads).
+    "gobuster", "feroxbuster", "ffuf", "dirb", "dirsearch",
+    # Port / service enumeration.
+    "nmap",
+    # DNS.
+    "dig", "host", "nslookup", "dnsrecon", "dnsenum", "dnsx",
+    # SMB / RPC / NetBIOS read-only enumeration (smbmap constrained: no -x/upload).
+    "enum4linux", "enum4linux-ng", "smbmap", "nbtscan", "rpcclient",
+    # SNMP / LDAP / NTP / mDNS / SMTP-user read-only enumeration.
+    "snmpwalk", "snmpcheck", "onesixtyone", "ldapsearch", "ntpq",
+    "avahi-browse", "smtp-user-enum",
+    # SSH host-key / algorithm audit — read-only, and NOT ssh/sshpass.
+    "ssh-audit",
+    # NFS export list + java-rmi enumeration.
+    "showmount", "rmg",
+}
+
+
+def get_safe_execution_tools() -> set:
+    """Tools the no-approval /tools/execute lane may run. The safe set INTERSECT
+    the install manifest — a tool we do not actually have never counts as safe,
+    and a tool that is offensive is never safe even if installed."""
+    return set(_SAFE_READONLY_TOOLS) & set(get_allowed_tools())
+
+
+# Per-tool argument guards for the borderline read-only tools kept on the safe
+# lane. Each is read-only in normal use but offensive with specific flags, so the
+# no-approval lane blocks those flags. Returns a reason string when a command
+# must be refused, or "" when it is allowed. Fail-closed reasoning: block the
+# known mutation/exec flags rather than trying to prove a command is safe.
+def _readonly_arg_violation(tool: str, command: str) -> str:
+    c = f" {command.lower()} "
+    def has(*flags):
+        return next((f for f in flags if f" {f} " in c or f" {f}=" in c), "")
+    if tool in ("curl", "wget"):
+        # GET/HEAD only: no request body, no upload, no non-idempotent method.
+        bad = has("-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
+                  "-f", "--form", "-t", "--upload-file", "--upload")
+        if bad:
+            return f"{tool} {bad} sends a body/upload — not read-only"
+        m = re.search(r"(?:-x|--request)[= ]+([a-z]+)", c)
+        if m and m.group(1).upper() not in ("GET", "HEAD"):
+            return f"{tool} -X {m.group(1).upper()} is not an idempotent read"
+    elif tool == "nmap":
+        # Block the offensive NSE categories; default/safe/discovery scripts and
+        # -sC (the "default" category) stay allowed.
+        m = re.search(r"--script[= ]+([^ ]+)", c)
+        if m and re.search(r"exploit|intrusive|vuln|dos|brute|malware|fuzzer",
+                           m.group(1)):
+            return f"nmap --script {m.group(1)} runs an offensive NSE category"
+    elif tool == "nuclei":
+        # nuclei is a detector: its template TAGS (sqli/rce/cmdi/...) describe
+        # what a template *detects*, not an attack, so tags are not filtered. The
+        # one offensive switch is -code, which runs code-protocol templates that
+        # execute code locally rather than probing the target.
+        if has("-code", "-code=true"):
+            return "nuclei -code executes code templates"
+    elif tool == "smbmap":
+        # smbmap enumerates shares read-only, but -x runs a command and
+        # --upload/--download move files.
+        bad = has("-x", "--upload", "--download")
+        if bad:
+            return f"smbmap {bad} executes/transfers — not read-only"
+    return ""
+
+
 # Alias -> canonical tool name, applied only when the alias itself is not
 # allowlisted. Purely a naming fix: the canonical name must still be present in
 # the allowlist for the call to proceed, so this cannot grant a capability that
@@ -2446,25 +2538,41 @@ async def execute_tool_endpoint(request: ToolExecuteRequest, background_tasks: B
         raise HTTPException(status_code=400,
                             detail=f"Invalid tool name: '{request.tool}'")
     # Validate tool is allowed (registry-derived, minus Metasploit).
-    allowed = get_allowed_tools()
+    # This lane runs WITHOUT the exploit approval gate, so it is bounded to the
+    # explicit read-only set — not the install manifest, which admits offensive
+    # tools (sqlmap/ssh/hydra/nc/...). An offensive tool is not refused work; it
+    # must be queued through the Exploit Manager (impactful lane) instead.
+    allowed = get_safe_execution_tools()
     # Canonicalise well-known aliases before the check.
     #
-    # This does NOT widen the allowlist: every alias resolves to a name that had
-    # to be allowed on its own merits, and an alias whose canonical name is not
-    # allowed is still rejected. It only stops the same tool being accepted or
-    # refused depending on which of its two names the caller happened to use.
+    # This does NOT widen the set: every alias resolves to a name that had to be
+    # allowed on its own merits, and an alias whose canonical name is not allowed
+    # is still rejected. It only stops the same tool being accepted or refused
+    # depending on which of its two names the caller happened to use.
     #
     # Real case: the KB recommender emits `nc`, the registry lists `netcat`, and
-    # the binary in this image is `nc` (from netcat-traditional). Dispatches were
-    # rejected with "Tool 'nc' is not in allowed list" while `netcat` — the same
-    # binary, the same capability — was permitted. Same failure shape as the
-    # tool-name vs apt-package-name mismatches in Docs/TOOL_ROUTING.md.
+    # the binary in this image is `nc` (from netcat-traditional). (nc is offensive
+    # and no longer on the safe lane, but the alias resolution is retained for the
+    # read-only tools that have two names.)
     if tool_lower not in allowed:
         tool_lower = TOOL_ALIASES.get(tool_lower, tool_lower)
     if tool_lower not in allowed:
         raise HTTPException(
             status_code=400,
-            detail=f"Tool '{request.tool}' is not in allowed list ({len(allowed)} allowed; Metasploit excluded — use the Exploit Manager)."
+            detail=(f"Tool '{request.tool}' is not on the read-only safe lane "
+                    f"({len(allowed)} allowed). Offensive tools (RCE, credential "
+                    f"attacks, uploads) and Metasploit run through the Exploit "
+                    f"Manager's approval queue, not /tools/execute.")
+        )
+
+    # Borderline read-only tools (curl/wget/nmap/nuclei/smbmap) are offensive
+    # with specific flags; the no-approval lane blocks those flags.
+    arg_violation = _readonly_arg_violation(tool_lower, request.command)
+    if arg_violation:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Refused on the read-only safe lane: {arg_violation}. "
+                    f"Queue this through the Exploit Manager if it is intended.")
         )
 
     # Basic command validation - prevent obvious shell injection
@@ -2883,8 +2991,10 @@ def _load_capability_probes() -> dict:
 
 @app.get("/tools/allowed")
 async def list_allowed_tools():
-    """List all allowed tools that can be executed (registry-derived, minus MSF)."""
-    allowed = get_allowed_tools()
+    """List the tools the no-approval /tools/execute lane can run — the read-only
+    safe set intersected with the install manifest. (The full installable
+    universe is /tools/registry; offensive tools run via the Exploit Manager.)"""
+    allowed = get_safe_execution_tools()
     return {
         "tools": sorted(allowed),
         "total": len(allowed),
@@ -3193,9 +3303,13 @@ async def execute_recommended_tools(
     executions = []
     tools_data = recommendations.get("tools", [])
 
+    safe_tools = get_safe_execution_tools()
     for tool_info in tools_data:
         tool_name = tool_info.get("name", "").lower()
-        if tool_name not in ALLOWED_TOOLS:
+        # Recommender auto-exec runs WITHOUT approval, so it is bounded to the
+        # read-only safe lane; an offensive recommendation is skipped here (it
+        # belongs in the Exploit Manager queue), not auto-run.
+        if tool_name not in safe_tools:
             continue
 
         # Build command from template
@@ -3205,6 +3319,8 @@ async def execute_recommended_tools(
 
         # Replace placeholders
         command = command_template.replace("{target}", target).replace("{port}", str(port))
+        if _readonly_arg_violation(tool_name, command):
+            continue
 
         exec_id = str(uuid.uuid4())
 

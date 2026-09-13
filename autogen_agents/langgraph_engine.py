@@ -1154,6 +1154,43 @@ def _analyze_deterministic(state: PentestState, note: str = "") -> dict:
             "log": ["analyze deterministic: query_vulnerabilities + get_web_findings"]}
 
 
+def _catalogue_hint_for_target(target: str) -> str:
+    """A checklist of the KNOWN service vectors that apply to this target's open
+    services, from the same catalogue + generator the surface phase uses
+    (knowledge/service_access_methods.yaml via _service_vector_tests). Injected
+    into the LLM planner's task so the LLM lane and the surface lane share one
+    source of truth — the planner is told the marquee vectors up front rather
+    than rediscovering them, and must queue or explicitly dismiss each.
+
+    Deliberately does NOT queue anything itself: create_pending_exploit has no
+    dedup, so the authoritative deterministic queueing stays in surface_plan.
+    This closes the "LLM never picked it" gap without double-queuing.
+    """
+    try:
+        ports = json.loads(_tool(scan_tools.query_open_ports, target=target, limit=100))
+        items = ports.get("items") or []
+        cands = _service_vector_tests(items)
+    except Exception:  # noqa: BLE001
+        return ""
+    seen, lines = set(), []
+    for c in cands:
+        vec = c.get("vector") or {}
+        vid = vec.get("vector_id")
+        if not vid or vid in seen:
+            continue
+        seen.add(vid)
+        ref = c.get("exploit_ref") or {}
+        how = ref.get("module") or c.get("command") or ""
+        lines.append(f"  - {vid} on {c.get('service') or '?'}:{c.get('port') or '?'} "
+                     f"({ref.get('source')}: {str(how)[:70]})")
+    if not lines:
+        return ""
+    return ("\nKNOWN high-value vectors that apply to this target's open services "
+            "(from the service-vector catalogue). Queue each one for approval or "
+            "state explicitly why it does not apply — do not silently skip:\n"
+            + "\n".join(lines))
+
+
 def exploit_plan(state: PentestState) -> dict:
     """Pick a candidate and queue it for approval. Read-only + a pending_exploits
     row; nothing is executed here.
@@ -1166,12 +1203,14 @@ def exploit_plan(state: PentestState) -> dict:
     """
     sid = state["session_id"]
     try:
+        catalogue_hint = _catalogue_hint_for_target(state["target"])
         task = (f"Target: {state['target'][:300]}\nTask: {state['task'][:300]}\n"
                 f"Session id (pass as session_id when queueing): {sid}\n"
                 "Identify EVERY well-evidenced exploitation candidate and queue "
                 "each one for operator approval, strongest evidence first. Name "
                 "the services you examined and dismissed, so the operator can "
-                "tell 'considered and rejected' from 'never looked at'.")
+                "tell 'considered and rejected' from 'never looked at'."
+                + catalogue_hint)
         final, used = _llm_phase(sid, agent_name="Exploit", system=_EXPLOIT_SYSTEM,
                                  tool_names=EXPLOIT_PLAN_TOOLS, task=task,
                                  recursion_limit=PHASE_STEP_BUDGET["Exploit"])
@@ -2149,13 +2188,22 @@ _EDB_PER_SERVICE = int(os.environ.get("SURFACE_EDB_LIMIT", "3"))
 # Read-only tools the safe lane may dispatch. The /tools/execute endpoint is the
 # real authority (Metasploit excluded there); this is a conservative agent-side
 # snapshot so a tool we do not list is treated as impactful (fails safe).
+# MUST stay identical to the listener's `_SAFE_READONLY_TOOLS` — an agreement
+# test (tests/test_safe_lane_tools.py) pins both to one table. sqlmap (--os-shell
+# → RCE) and smbclient (upload) were removed: they are offensive with their own
+# flags, so a test using them now classifies IMPACTFUL and takes the approval
+# lane instead of running unapproved through /tools/execute.
 _SAFE_TOOL_HINTS = {
-    "curl", "wget", "httpx", "nuclei", "nikto", "whatweb", "sslscan",
-    "testssl.sh", "testssl", "sslyze", "gobuster", "feroxbuster", "dirb",
-    "dirsearch", "ffuf", "sqlmap", "nmap", "dig", "host", "nslookup",
-    "enum4linux", "enum4linux-ng", "smbmap", "smbclient", "snmpwalk",
-    "onesixtyone", "ldapsearch", "dnsrecon", "dnsenum", "wafw00f", "ssh-audit",
-    "nbtscan", "showmount", "rpcclient",
+    "curl", "wget", "httpx", "nuclei", "nikto", "whatweb", "wafw00f",
+    "sslscan", "testssl.sh", "testssl", "sslyze",
+    "gobuster", "feroxbuster", "ffuf", "dirb", "dirsearch",
+    "nmap",
+    "dig", "host", "nslookup", "dnsrecon", "dnsenum", "dnsx",
+    "enum4linux", "enum4linux-ng", "smbmap", "nbtscan", "rpcclient",
+    "snmpwalk", "snmpcheck", "onesixtyone", "ldapsearch", "ntpq",
+    "avahi-browse", "smtp-user-enum",
+    "ssh-audit",
+    "showmount", "rmg",
 }
 # Cap per host — this is a single-host exhaustive sweep, not the cross-host
 # _DETERMINISTIC_PLAN_LIMIT that bounds recommender calls across many hosts.
