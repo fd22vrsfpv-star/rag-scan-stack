@@ -1,0 +1,114 @@
+# How to reach a service that the DEFAULT bind-shell probe cannot.
+#
+# WHY THIS IS DATA
+#   The access probe opens a TCP socket and sends `id`. That only works on a raw
+#   bind shell. A real service (FTP, rsh, an RPC program, a backdoor that needs a
+#   trigger) is dead to that probe even when there is a real path in — the path
+#   just is not the default one. This file records, as DATA, the NON-DEFAULT
+#   option/trigger each service needs, the same way tool_options.yaml records ssh
+#   algorithm syntax. It is a fact ("vsftpd 2.3.4 has a backdoor triggered by a
+#   smiley in USER"), checkable against the exploit's own description.
+#
+#   It does NOT decide to run anything. It answers the operator's question "this
+#   port is dead to the probe — is there a way in, and what is it?" so
+#   enumeration is not stuck on the default. Whether a method actually works
+#   HERE stays measured, not asserted.
+#
+# MATCHING
+#   Each entry matches on `service` (nmap's service name) and/or a `product`
+#   substring and an optional `version` regex. The most specific match wins
+#   (product+version beats service alone). `id` is a stable key for the advice.
+#
+# FIELDS
+#   method   : short label for the non-default approach
+#   summary  : one line an operator reads
+#   steps    : the concrete non-default actions/options (list)
+#   tool     : a ready tool/module that already implements it, if any
+#   opens    : port the method yields access on, when different from the probed one
+#   caution  : anything destructive/stateful about it
+
+version: 1
+
+methods:
+
+  - id: vsftpd_234_backdoor
+    service: ftp
+    product: vsftpd
+    version: '^2\.3\.4'
+    method: backdoor-trigger
+    summary: >-
+      vsftpd 2.3.4 ships a backdoor: a USER whose name ends in ":)" opens a root
+      shell on port 6200. A raw connect to 6200 is silent because it only spawns
+      AFTER the port-21 trigger.
+    steps:
+      - "connect to 21, send `USER anything:)` then `PASS anything`"
+      - "the backdoor opens a root shell on 6200 — connect there for the shell"
+    tool: "metasploit exploit/unix/ftp/vsftpd_234_backdoor"
+    opens: 6200
+    caution: >-
+      one-shot per service lifetime; once fired it can enter a
+      priv_sock_get_result stuck state until vsftpd is restarted on the target.
+
+  - id: rservices_rsh
+    service: shell
+    method: rservices
+    summary: >-
+      An r-services shell (rsh/rexec) has its own wire protocol
+      (\0localuser\0remoteuser\0command\0) — sending `id` over a raw socket does
+      nothing. It needs an rsh client and a trust relationship.
+    steps:
+      - "use an rsh/rlogin client, not raw nc"
+      - "Metasploitable trusts `+ +` in .rhosts, so `rsh -l root <host> id` works"
+    tool: "metasploit auxiliary/scanner/rservices/rsh_login"
+
+  - id: rpc_status
+    service: status
+    method: rpc
+    summary: >-
+      An RPC `status` program (rpc.statd) reached through rpcbind. It is not a
+      shell and its port is rpcbind-assigned, so it moves between scans — probe
+      it through rpcbind (111), not the fixed high port.
+    steps:
+      - "enumerate with `rpcinfo -p <host>` (port 111) to find the live statd port"
+      - "target rpc.statd's format-string bug for RCE where the version is vulnerable"
+    tool: "rpcinfo / nmap --script nfs-* ; metasploit for statd RCE"
+
+  - id: rpcbind
+    service: rpcbind
+    method: rpc
+    summary: >-
+      rpcbind (portmapper) is the directory for RPC programs, not a shell.
+      Enumerate the programs it exposes and target those.
+    steps:
+      - "`rpcinfo -p <host>` lists program/version/port"
+      - "follow NFS (mountd/nfs) or statd from there"
+    tool: "rpcinfo ; nmap --script rpcinfo,nfs-showmount"
+
+  - id: http_web
+    service: http
+    method: web-enumeration
+    summary: >-
+      An HTTP service is a web target, never a shell — the `id` probe just makes a
+      malformed request. Enumeration is the web pipeline, not a bind-shell probe.
+    steps:
+      - "run the web pipeline (gobuster, katana, nikto, nuclei, ZAP)"
+      - "for Apache 2.2.x + php-cgi, check CVE-2012-1823 (argument injection RCE)"
+    tool: "web_scanner pipeline"
+
+  - id: https_web
+    service: https
+    method: web-enumeration
+    summary: "As http, over TLS — a web target, not a shell."
+    steps:
+      - "run the web pipeline against the https URL"
+    tool: "web_scanner pipeline"
+
+  - id: distccd
+    service: distccd
+    method: exploit
+    summary: >-
+      distccd allows remote command execution by design when misconfigured
+      (CVE-2004-2687) — a shell path, but through the distcc protocol, not raw id.
+    steps:
+      - "use the distcc_exec module; the port is often an ephemeral one"
+    tool: "metasploit exploit/unix/misc/distcc_exec"
