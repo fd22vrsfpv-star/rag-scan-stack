@@ -21573,6 +21573,51 @@ def asset_port_advice(ip: str, _: bool = Depends(auth)):
             "with_method": len(with_method), "advice": advice}
 
 
+@app.get("/vector-coverage", tags=["Access"])
+def vector_coverage(target: str = Query(None), engagement_id: str = Query(None),
+                    include_not_attempted: bool = Query(True),
+                    _: bool = Depends(auth)):
+    """Per-host known-vector coverage — the loop made visible.
+
+    For every catalogue vector applicable to a target's open services, did we
+    attempt it and what happened (shell / no_shell / blocked / not_attempted /
+    planned)? A row is written at plan time, so a vector we NEVER tried shows as
+    `planned`/`not_attempted` rather than being silently absent — which is the
+    whole point (the Metasploitable-2 gap was silence, not failure).
+    """
+    where, params = [], []
+    if target:
+        where.append("target = %s")
+        params.append(target)
+    if engagement_id:
+        where.append("engagement_id = %s::uuid")
+        params.append(engagement_id)
+    if not include_not_attempted:
+        where.append("result <> 'not_attempted'")
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""SELECT target, port, service, vector_id, result, source_path,
+                       mutates, attempted, engagement_id::text,
+                       pending_exploit_id::text, exploit_result_id::text,
+                       first_seen, last_attempt_at
+                  FROM vector_coverage
+                  {clause}
+                 ORDER BY target, port NULLS LAST, vector_id
+                 LIMIT 2000""", params)
+        rows = [dict(r) for r in cur.fetchall()]
+    shells = [r for r in rows if r["result"] == "shell"]
+    return {"target": target, "count": len(rows), "shells": len(shells),
+            "by_result": _count_by(rows, "result"), "coverage": rows}
+
+
+def _count_by(rows, key):
+    out = {}
+    for r in rows:
+        out[r.get(key)] = out.get(r.get(key), 0) + 1
+    return out
+
+
 @app.get("/assets/{ip}/access", tags=["Access"])
 def asset_access(ip: str, include_dead: bool = Query(False),
                  _: bool = Depends(auth)):

@@ -160,6 +160,23 @@ async def asset_port_advice(ip: str):
         return safe_json(resp)
 
 
+@router.get("/api/vector-coverage")
+async def coverage_vectors(target: Optional[str] = None,
+                           engagement_id: Optional[str] = None,
+                           include_not_attempted: bool = True):
+    """Known-vector coverage per host: attempted? shell/no_shell/blocked/not_attempted."""
+    s = get_settings()
+    params = {"include_not_attempted": str(bool(include_not_attempted)).lower()}
+    if target:
+        params["target"] = target
+    if engagement_id:
+        params["engagement_id"] = engagement_id
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/vector-coverage", params=params,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
 @router.post("/api/assets/{ip}/access/refresh")
 async def asset_access_refresh(ip: str, rounds: Optional[int] = None):
     """Re-probe every access on this host. Touches the target, so it gets the

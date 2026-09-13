@@ -60,9 +60,14 @@ def test_a_precise_product_version_beats_a_generic_service():
 
 
 def test_http_is_web_not_a_shell():
+    """An HTTP service resolves to a WEB method, never a bind-shell probe. With a
+    product hint (Apache) the more-specific web-RCE vector (php-cgi) wins over the
+    generic web-enumeration fallback — both are web methods."""
     m = dpa.match_method(dpa.load_methods(), service="http",
                          product="Apache httpd", version="2.2.8")
-    assert m and m["method"] == "web-enumeration"
+    assert m and str(m["method"]).startswith("web")
+    generic = dpa.match_method(dpa.load_methods(), service="http")
+    assert generic and generic["method"] == "web-enumeration"
 
 
 def test_rsh_and_rpc_match_by_service():

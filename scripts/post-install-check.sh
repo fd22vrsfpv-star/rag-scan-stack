@@ -137,7 +137,7 @@ EXPECTED_TABLES=(
   sync_nodes sync_state sync_log sync_conflicts
   # TIER 18: Scope
   scope_targets scope_classification_rules scope_decisions scope_suggestions
-  scope_conflicts port_access_advice
+  scope_conflicts port_access_advice vector_coverage
   # Self-adapting extractors + agent-to-agent feedback channel
   extractor_learned agent_flags
   # TIER 18: Scan pipelines
@@ -234,6 +234,18 @@ elif [[ "$HAS_NEW" == "f" ]]; then
   fail "scope_targets: missing ux_scope_targets_eng_name_target — run ./scripts/ensure_db_schema.sh"
 else
   warn "scope_targets: index check skipped (no DB connection helper available)"
+fi
+
+# pending_exploits.source must allow 'command' — the non-MSF vector dispatch
+# source. If the CHECK is un-migrated, every command-vector insert fails and
+# surface_plan silently swallows it (no coverage). See vector_coverage feature.
+HAS_CMD_SRC=$(_run_sql "SELECT (pg_get_constraintdef(oid) LIKE '%command%') FROM pg_constraint WHERE conname='pending_exploits_source_check'")
+if [[ "$HAS_CMD_SRC" == "t" ]]; then
+  pass "pending_exploits.source CHECK allows 'command' (non-MSF vectors dispatch)"
+elif [[ "$HAS_CMD_SRC" == "f" ]]; then
+  fail "pending_exploits.source CHECK does NOT allow 'command' — run ./scripts/ensure_db_schema.sh (non-MSF vector attempts will silently fail)"
+else
+  warn "pending_exploits.source CHECK check skipped (no DB connection)"
 fi
 
 # scan_recommendations.target_kind — dispatch refuses non-'service' kinds rather
