@@ -181,6 +181,66 @@ def test_an_empty_reply_is_not_a_reply():
         "and closes scores as live access")
 
 
+def test_nc_stderr_is_not_counted_as_a_shell_reply(monkeypatch):
+    """A refused port makes nc write 'Connection refused' to STDERR and exit
+    non-zero with empty STDOUT. That is nc explaining there is no shell, not a
+    shell answering — merging it scored UDP-only/closed ports 10 ('answered,
+    unknown privilege'), ranking them ABOVE a genuinely-open silent port.
+
+    Sabotage proof: put `+ (proc.stderr or "")` back on the `out =` line and this
+    fails — the refused port returns a non-empty string instead of raising.
+    """
+    import subprocess
+
+    class _P:
+        returncode = 1
+        stdout = ""
+        stderr = "(UNKNOWN) [192.168.1.150] 4500 (?) : Connection refused"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _P())
+    with pytest.raises(ConnectionError):
+        ax.TRANSPORTS["bind_shell"]("192.168.1.150:4500", "id")
+
+
+def test_a_real_stdout_reply_is_still_returned(monkeypatch):
+    """The fix must not swallow a genuine shell reply that arrives on stdout."""
+    import subprocess
+
+    class _P:
+        returncode = 0
+        stdout = "uid=0(root) gid=0(root)\nLinux metasploitable 2.6.24\n"
+        stderr = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _P())
+    out = ax.TRANSPORTS["bind_shell"]("192.168.1.150:1524", "id")
+    assert "uid=0(root)" in out
+
+
+def test_bind_shell_discovery_is_tcp_only():
+    """UDP-only ports (DHCP/NetBIOS/SNMP-trap/IPsec) are not TCP bind shells;
+    offering them as candidates produced dead-on-arrival score-10 'shells'."""
+    src = _func_src(os.path.join(REPO, "etl", "post_enumeration.py"),
+                    "facts_from_open_ports")
+    assert "proto" in src and "'tcp'" in src, (
+        "facts_from_open_ports no longer restricts to TCP, so UDP-only ports "
+        "are offered as bind-shell candidates again")
+
+
+def test_refresh_reconciles_rows_that_drop_out_of_discovery():
+    """A row we no longer offer as a candidate (e.g. a UDP port we used to
+    mis-offer) must be RE-PROBED, not left as a phantom 'live' outranking real
+    access. Without this the discovery fix stops new ghosts but never clears the
+    ones already recorded.
+
+    Verified live: reconciling 192.168.1.150 flipped the four score-10 ghosts
+    (68/138/162/4500) to dead while leaving the real root shell on 1524 live.
+    """
+    src = _func_src(os.path.join(REPO, "etl", "access.py"), "refresh")
+    assert "status = 'live'" in src and "not in probed" in src, (
+        "refresh no longer re-probes existing live rows that fell out of "
+        "discovery, so a stale phantom shell lingers forever")
+
+
 # ── Selection and use ──────────────────────────────────────────────────────
 
 def test_only_live_access_can_be_selected():
