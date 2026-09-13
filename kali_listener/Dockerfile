@@ -159,6 +159,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && command -v sshpass >/dev/null \
  || (echo "ERROR: ssh/sshpass did not install correctly" && exit 1)
 
+# Offensive service-vector clients (Stage 2 of the vector-coverage feature).
+#
+# These run KNOWN non-MSF exploitation attempts against a discovered service —
+# the catalogue's `attempt` commands (knowledge/service_access_methods.yaml). They
+# are DELIBERATELY NOT in the /tools/execute allow-list: an offensive attempt
+# carries shell metacharacters and opens/mutates the target, so it dispatches
+# through the scope-gated, un-allowlisted /vectors/run (same trust model as
+# /access/run), never the read-only enumeration lane.
+#
+#   rsh-redone-client -> rsh / rlogin  the r-services vector (512/513/514). On
+#                 Kali the netkit `rsh-client` package has no install candidate;
+#                 `rsh-redone-client` is the maintained replacement and provides
+#                 the same /usr/bin/rsh. It resolves the port from /etc/services
+#                 (`shell 514`), which netbase provides; the check below fails the
+#                 build if it is ever missing rather than letting `rsh` die with
+#                 "shell/tcp: unknown service" at runtime.
+#   distcc     -> distcc client        distccd CVE-2004-2687 (3632). The client
+#                 is installed for the native path; the verified shell path today
+#                 is the MSF module (see the catalogue's `msf:` seed).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    rsh-redone-client \
+    distcc \
+    netbase \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+ && command -v rsh >/dev/null \
+ && command -v distcc >/dev/null \
+ && grep -qE '^shell[[:space:]]+514/tcp' /etc/services \
+ || (echo "ERROR: rsh-client/distcc/netbase did not install correctly" && exit 1)
+
 # Deliberately NOT installed here:
 #   metasploit-framework (~2GB) — the stack already runs a dedicated `metasploit`
 #     container with msfrpcd, which exploit-runner drives over RPC. A second copy

@@ -17,8 +17,15 @@ logger = logging.getLogger("tool_kb")
 # High-Value Port Knowledge Base
 # =============================================================================
 
-# Ports commonly missed by 1-1000 scans but critical for exploitation
-HIGH_VALUE_PORTS = {
+# Curated high-value-port intel that SUPPLEMENTS the service-vector catalogue
+# (knowledge/service_access_methods.yaml). The catalogue is the single source of
+# truth for which port carries which service + MSF module; this dict only adds
+# what the catalogue does not carry yet — CVE lists, human notes, and a few
+# ports the catalogue has no vector for (e.g. 6697 irc-ssl, 8009 ghostcat).
+# `HIGH_VALUE_PORTS` below is BUILT from the catalogue merged with this, so a new
+# vector added to the YAML becomes high-value automatically, with no silo to
+# drift. Shrink this dict as entries migrate into the catalogue.
+_CURATED_HIGH_VALUE_PORTS = {
     1099: {
         "service": "java-rmi",
         "vulns": ["CVE-2011-3556"],
@@ -87,144 +94,69 @@ HIGH_VALUE_PORTS = {
     },
 }
 
+# Where the service-vector catalogue lives (bind-mounted into every container at
+# /knowledge; the repo path is the fallback for a bare checkout / tests).
+_CATALOGUE_YAML = os.getenv(
+    "SERVICE_VECTORS_YAML", "/knowledge/service_access_methods.yaml")
+_REPO_CATALOGUE_YAML = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "knowledge", "service_access_methods.yaml")
 
-# Known vulnerabilities for Metasploitable2 target
-METASPLOITABLE2_VULNS = {
-    "vsftpd": {
-        "port": 21,
-        "cve": "CVE-2011-2523",
-        "msf": "exploit/unix/ftp/vsftpd_234_backdoor",
-        "severity": "critical",
-        "note": "Backdoor triggered by :) in username"
-    },
-    "samba_usermap": {
-        "port": 445,
-        "cve": "CVE-2007-2447",
-        "msf": "exploit/multi/samba/usermap_script",
-        "severity": "critical",
-        "note": "Samba 3.0.20-3.0.25rc3 - username map script RCE"
-    },
-    "distcc": {
-        "port": 3632,
-        "cve": "CVE-2004-2687",
-        "msf": "exploit/unix/misc/distcc_exec",
-        "severity": "critical",
-        "note": "Unauthenticated remote code execution"
-    },
-    "java_rmi": {
-        "port": 1099,
-        "cve": "CVE-2011-3556",
-        "msf": "exploit/multi/misc/java_rmi_server",
-        "severity": "critical",
-        "note": "Java RMI Registry RCE"
-    },
-    "postgres": {
-        "port": 5432,
-        "cve": None,
-        "default_creds": "postgres:postgres",
-        "msf": "auxiliary/scanner/postgres/postgres_login",
-        "severity": "high",
-        "note": "Default credentials"
-    },
-    "mysql": {
-        "port": 3306,
-        "cve": None,
-        "default_creds": "root:",
-        "msf": "auxiliary/scanner/mysql/mysql_login",
-        "severity": "high",
-        "note": "Root with empty password"
-    },
-    "vnc": {
-        "port": 5900,
-        "cve": None,
-        "default_creds": "password",
-        "msf": "auxiliary/scanner/vnc/vnc_login",
-        "severity": "high",
-        "note": "Password-only auth, common passwords"
-    },
-    "tomcat": {
-        "port": 8180,
-        "cve": None,
-        "default_creds": "tomcat:tomcat",
-        "msf": "exploit/multi/http/tomcat_mgr_deploy",
-        "severity": "high",
-        "note": "Default manager credentials"
-    },
-    "bindshell": {
-        "port": 1524,
-        "cve": None,
-        "msf": None,
-        "severity": "critical",
-        "note": "Instant root shell: nc target 1524"
-    },
-    "ircd_backdoor": {
-        "port": 6667,
-        "cve": "CVE-2010-2075",
-        "msf": "exploit/unix/irc/unreal_ircd_3281_backdoor",
-        "severity": "critical",
-        "note": "UnrealIRCd 3.2.8.1 backdoor"
-    },
-    "php_cgi": {
-        "port": 80,
-        "cve": "CVE-2012-1823",
-        "msf": "exploit/multi/http/php_cgi_arg_injection",
-        "severity": "critical",
-        "note": "PHP CGI argument injection RCE"
-    },
-    "ssh_msfadmin": {
-        "port": 22,
-        "cve": None,
-        "default_creds": "msfadmin:msfadmin",
-        "msf": "auxiliary/scanner/ssh/ssh_login",
-        "severity": "high",
-        "note": "Default msfadmin credentials"
-    },
-    "telnet_msfadmin": {
-        "port": 23,
-        "cve": None,
-        "default_creds": "msfadmin:msfadmin",
-        "msf": "auxiliary/scanner/telnet/telnet_login",
-        "severity": "high",
-        "note": "Default msfadmin credentials"
-    },
-    "nfs_no_root_squash": {
-        "port": 2049,
-        "cve": None,
-        "msf": None,
-        "severity": "high",
-        "note": "NFS share with no_root_squash - privesc via SUID"
-    },
-    "rexec": {
-        "port": 512,
-        "cve": None,
-        "default_creds": "msfadmin:msfadmin",
-        "msf": "auxiliary/scanner/rservices/rexec_login",
-        "severity": "medium",
-        "note": "Remote exec with default credentials"
-    },
-    "rlogin": {
-        "port": 513,
-        "cve": None,
-        "default_creds": "msfadmin:msfadmin",
-        "msf": "auxiliary/scanner/rservices/rlogin_login",
-        "severity": "medium",
-        "note": "Remote login with default credentials"
-    },
-    "rsh": {
-        "port": 514,
-        "cve": None,
-        "msf": "auxiliary/scanner/rservices/rsh_login",
-        "severity": "medium",
-        "note": "Remote shell - may allow passwordless access"
-    },
-    "drb": {
-        "port": 8787,
-        "cve": None,
-        "msf": "exploit/linux/misc/drb_remote_codeexec",
-        "severity": "critical",
-        "note": "Ruby DRb service RCE"
-    },
-}
+
+def _catalogue_port_index() -> Dict[int, Dict[str, Any]]:
+    """Port -> {service, msf, vulns, note} derived from the service-vector
+    catalogue. This is the single source of truth; a vector added to the YAML
+    becomes a high-value port with no code change. Empty (not an error) if the
+    catalogue is unreadable — the curated supplement below still stands."""
+    for path in (_CATALOGUE_YAML, _REPO_CATALOGUE_YAML):
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                methods = (yaml.safe_load(fh) or {}).get("methods") or []
+        except Exception as e:  # noqa: BLE001
+            logger.warning("service-vector catalogue %s unreadable: %s", path, e)
+            return {}
+        idx: Dict[int, Dict[str, Any]] = {}
+        for m in methods:
+            port = m.get("port")
+            if not isinstance(port, int):
+                continue
+            svc = m.get("service")
+            if isinstance(svc, (list, tuple)):
+                svc = svc[0] if svc else ""
+            # First vector wins per port; a later one only fills a missing msf.
+            cur = idx.setdefault(port, {"service": svc, "msf": m.get("msf"),
+                                        "vulns": [], "note": m.get("summary") or ""})
+            if not cur.get("msf") and m.get("msf"):
+                cur["msf"] = m.get("msf")
+        return idx
+    return {}
+
+
+def _build_high_value_ports() -> Dict[int, Dict[str, Any]]:
+    """The catalogue-derived index MERGED with the curated supplement. Catalogue
+    wins for service/msf (it is authoritative); the curated dict fills CVE lists,
+    notes, and ports the catalogue has no vector for. One dict, two inputs, no
+    second hand-maintained source of what-is-exploitable-where."""
+    merged: Dict[int, Dict[str, Any]] = {}
+    for port, info in _CURATED_HIGH_VALUE_PORTS.items():
+        merged[port] = dict(info)
+    for port, info in _catalogue_port_index().items():
+        row = merged.setdefault(port, {"vulns": [], "note": ""})
+        if info.get("service"):
+            row["service"] = info["service"]
+        if info.get("msf"):
+            row["msf"] = info["msf"]          # catalogue is authoritative
+        row.setdefault("msf", None)
+        if not row.get("note") and info.get("note"):
+            row["note"] = info["note"]
+    return merged
+
+
+# Built once at import from the catalogue + curated supplement.
+HIGH_VALUE_PORTS = _build_high_value_ports()
+
 
 
 def get_high_value_port_info(port: int) -> Optional[Dict[str, Any]]:
@@ -232,32 +164,10 @@ def get_high_value_port_info(port: int) -> Optional[Dict[str, Any]]:
     return HIGH_VALUE_PORTS.get(port)
 
 
-def get_msf2_vuln_info(vuln_name: str) -> Optional[Dict[str, Any]]:
-    """Get Metasploitable2 vulnerability information by name."""
-    return METASPLOITABLE2_VULNS.get(vuln_name)
-
-
 def get_all_high_value_ports() -> List[int]:
     """Get list of all high-value ports that should be scanned."""
     return list(HIGH_VALUE_PORTS.keys())
 
-
-def get_msf2_vulns_by_port(port: int) -> List[Dict[str, Any]]:
-    """Get all known Metasploitable2 vulnerabilities for a given port."""
-    results = []
-    for name, info in METASPLOITABLE2_VULNS.items():
-        if info.get("port") == port:
-            results.append({"name": name, **info})
-    return results
-
-
-def get_critical_msf2_vulns() -> List[Dict[str, Any]]:
-    """Get all critical severity Metasploitable2 vulnerabilities."""
-    results = []
-    for name, info in METASPLOITABLE2_VULNS.items():
-        if info.get("severity") == "critical":
-            results.append({"name": name, **info})
-    return results
 
 # Default path to the knowledge base
 DEFAULT_KB_PATH = os.getenv("TOOL_KB_PATH", "/knowledge/service_tools.yaml")

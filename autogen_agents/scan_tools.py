@@ -4298,14 +4298,18 @@ def match_vuln_to_exploits(
     try:
         msf_results = []
 
-        # Search by CVE if provided
-        if cve:
-            msf_by_cve = search_msf_modules(cve=cve, module_type="exploit", limit=10)
-            msf_results.extend(msf_by_cve)
-
-        # Search by service name
-        msf_by_service = search_msf_modules(query=service, module_type="exploit", limit=10)
-        msf_results.extend(msf_by_service)
+        # Search exploit AND auxiliary modules. Restricting to module_type=
+        # "exploit" meant the r-services login modules (auxiliary/scanner/
+        # rservices/rsh_login), the DB/VNC login scanners (mysql/postgres/vnc)
+        # and other auxiliary attack modules could NEVER be returned — so a
+        # service whose known vector is an auxiliary module matched nothing. Post
+        # modules stay excluded (they run after access, not to gain it).
+        for _mtype in ("exploit", "auxiliary"):
+            if cve:
+                msf_results.extend(
+                    search_msf_modules(cve=cve, module_type=_mtype, limit=10))
+            msf_results.extend(
+                search_msf_modules(query=service, module_type=_mtype, limit=10))
 
         # Deduplicate by module_path
         seen = set()

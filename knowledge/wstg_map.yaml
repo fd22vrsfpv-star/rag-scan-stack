@@ -31,11 +31,15 @@ entries:
       name_contains: [sql injection]
     tier: safe
     category: sqli_detect
-    tool: sqlmap
-    command: "sqlmap -u {url} --batch --smart --level 1 --risk 1 --answers='quit=N' --flush-session"
+    # DETECTION only, and read-only: nuclei's sqli templates flag an injectable
+    # parameter without dumping or running code. sqlmap (which sends live
+    # injection payloads and can dump/os-shell) is offensive — it is the separate
+    # IMPACTFUL sqli_dump entry below, behind the approval gate.
+    tool: nuclei
+    command: "nuclei -u {url} -tags sqli,sql-injection -severity low,medium,high,critical -silent"
     assertion:
-      expect_regex: "(?i)(is vulnerable|appears to be injectable|parameter .* is|back-end DBMS)"
-    wstg_note: "WSTG-INPV-05: error-based, boolean and time-delay detection before any dump."
+      expect_regex: "\\[[a-z0-9-]+\\].*(sqli|sql-injection|sql injection)"
+    wstg_note: "WSTG-INPV-05: read-only detection via nuclei; sqli_dump does the exploitation."
 
   - id: sqli_dump
     wstg_id: [WSTG-INPV-05]
