@@ -449,7 +449,13 @@ def facts_from_open_ports(cur, *, target: str = "", limit: int = 60) -> List[Dic
     `exploit-find-the-listener` is what actually finds something NEW.
     """
     facts: List[Dict[str, Any]] = []
-    where, params = ["COALESCE(p.is_open, true)"], []
+    # TCP only. A bind shell is a TCP socket the probe reaches with `nc <host>
+    # <port>`; a UDP-only port (68/138/162/4500 on Metasploitable — DHCP,
+    # NetBIOS-dgm, SNMP-trap, IPsec-NAT) has nothing on TCP, so the probe gets
+    # "Connection refused". Offering those as bind-shell candidates produced
+    # four dead-on-arrival "shells" per host. proto NULL defaults to tcp.
+    where, params = ["COALESCE(p.is_open, true)",
+                     "LOWER(COALESCE(p.proto, 'tcp')) = 'tcp'"], []
     if target:
         where.append("host(a.ip) = %s")
         params.append(target)

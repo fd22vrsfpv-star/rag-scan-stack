@@ -103,15 +103,23 @@ def _run_bind_shell(handle: str, command: str, **_) -> str:
         ["nc", "-w", str(min(PROBE_TIMEOUT, 15)), host, port],
         input=f"{command}\nexit\n", capture_output=True, text=True,
         timeout=PROBE_TIMEOUT)
-    out = (proc.stdout or "") + (proc.stderr or "")
-    # A connection that never connected is NOT an answer. subprocess.run does
-    # not raise on a non-zero exit, so without this a refused or black-holed
-    # port returned "" and was recorded as a shell that replied — scoring a dead
-    # address as "answered, unknown privilege" and ranking it above nothing.
-    # Caught by CI probing 203.0.113.1 (TEST-NET) and getting ok=True.
+    # The shell's reply is STDOUT. nc writes its OWN diagnostics to STDERR —
+    # "Connection refused", "forward host lookup failed" — which are nc
+    # explaining why there is no shell, not the shell answering. Merging them
+    # counted a refused port's "Connection refused" as a non-empty reply with no
+    # uid, scoring a UDP-only / closed port 10 ("answered, unknown privilege")
+    # and ranking it ABOVE a genuinely-open silent port. Same reasoning as the
+    # ssh transport: stderr alone is not output. So the reply is stdout only.
+    out = proc.stdout or ""
+    # A connection that never connected is NOT an answer. subprocess.run does not
+    # raise on a non-zero exit, so without this a refused or black-holed port
+    # returned "" and was recorded as a shell that replied. Now that stderr is
+    # excluded, an empty stdout on a non-zero exit is exactly that case.
     if proc.returncode != 0 and not out.strip():
+        why = (proc.stderr or "").strip().splitlines()
         raise ConnectionError(
-            f"nc exited {proc.returncode} with no output from {host}:{port}")
+            f"nc exited {proc.returncode} from {host}:{port}"
+            + (f": {why[-1][:120]}" if why else " with no output"))
     return out
 
 
