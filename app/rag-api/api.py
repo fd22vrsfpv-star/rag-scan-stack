@@ -21554,6 +21554,25 @@ def access_summary(_: bool = Depends(auth)):
     return {"summary": summary, "hosts": len(summary)}
 
 
+@app.get("/assets/{ip}/port-advice", tags=["Access"])
+def asset_port_advice(ip: str, _: bool = Depends(auth)):
+    """What to try on each DEAD port the default probe could not reach.
+
+    The bind-shell probe sends `id` over a raw socket; a real service (an FTP with
+    a trigger-only backdoor, rsh, an RPC program, a web server) is dead to it even
+    when there is a real path in. This joins each dead port to its identified
+    service and returns the non-default method for it (vsftpd backdoor trigger,
+    rservices, rpc, web enumeration, ...). Advice only — nothing runs. A port
+    with no matching method is returned with method=null: "we have no non-default
+    method for this" is an honest answer, not silence.
+    """
+    from etl import dead_port_advisor as dpa
+    advice = dpa.advise(ip)
+    with_method = [a for a in advice if a.get("method")]
+    return {"target": ip, "count": len(advice),
+            "with_method": len(with_method), "advice": advice}
+
+
 @app.get("/assets/{ip}/access", tags=["Access"])
 def asset_access(ip: str, include_dead: bool = Query(False),
                  _: bool = Depends(auth)):
