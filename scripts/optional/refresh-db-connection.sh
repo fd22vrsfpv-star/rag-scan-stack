@@ -146,6 +146,25 @@ if [[ "$DRY_RUN" == "1" ]]; then
   exit 0
 fi
 
+# ── Keep the local postgres out of the way in remote modes ──────────────────
+# In remote / remote_direct mode the rag-db-tunnel sidecar holds the
+# `rag-postgres` network alias. If the LOCAL postgres also runs, both answer to
+# that name and ~half of all connections hit the no-SSL local one and fail with
+# "server does not support SSL" — the split brain. So in a remote mode: drop
+# `local-db` from COMPOSE_PROFILES (compose reads it from .env, so any later
+# `up` would otherwise re-start it) and stop the local container if it is up.
+if [[ "$MODE" == "remote" || "$MODE" == "remote_direct" ]]; then
+  if grep -qE "^COMPOSE_PROFILES=.*local-db" "$ENV_FILE" 2>/dev/null; then
+    sed -i -E 's/(^COMPOSE_PROFILES=.*)local-db,?/\1/; s/^COMPOSE_PROFILES=,/COMPOSE_PROFILES=/' "$ENV_FILE"
+    echo "🧹 Removed local-db from COMPOSE_PROFILES ($MODE mode)"
+  fi
+  if docker ps --format '{{.Names}}' | grep -qx "rag-postgres"; then
+    echo "🛑 Stopping local rag-postgres — the tunnel holds the alias in $MODE mode"
+    docker stop rag-postgres >/dev/null 2>&1 || true
+    docker rm rag-postgres   >/dev/null 2>&1 || true
+  fi
+fi
+
 # ── Force-recreate DB-consumer containers so they re-read DB_DSN ────────────
 if [[ "$DO_RECREATE" == "1" ]]; then
   AVAILABLE="$(docker compose -p "$COMPOSE_PROJECT" --env-file "$ENV_FILE" config --services 2>/dev/null || true)"

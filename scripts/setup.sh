@@ -1676,13 +1676,26 @@ if [ "$NO_START" = true ]; then
     log_skip "Service start skipped (--no-start)"
     record_phase "Start: SKIPPED"
 else
-    # If DB_DSN points at a non-rag-postgres host (i.e., remote DB), skip the
-    # local-db profile so we don't waste resources on an unused postgres.
-    if [ -f .env ]; then
-        DSN_LINE=$(grep -E "^DB_DSN=" .env || true)
-        if [ -n "$DSN_LINE" ] && ! echo "$DSN_LINE" | grep -q "rag-postgres"; then
-            log_info "DB_DSN does not reference rag-postgres — disabling local-db profile"
-            COMPOSE_PROFILES=""
+    # Whether to run the LOCAL postgres is decided by the db-config.json MODE,
+    # not by the DSN hostname. In remote / remote_direct mode the rag-db-tunnel
+    # sidecar takes the `rag-postgres` NETWORK ALIAS and forwards to the remote,
+    # so DB_DSN still says `...@rag-postgres:5432/...` — the old heuristic
+    # ("DB_DSN mentions rag-postgres ⟹ local") was fooled by exactly that and
+    # left local-db ON, so the local postgres and the tunnel both answered to
+    # `rag-postgres` and ~half of all connections hit the no-SSL local one and
+    # failed with "server does not support SSL". Key off the mode instead.
+    DB_MODE="local"
+    if [ -f "$DB_CONFIG_FILE" ]; then
+        DB_MODE=$(python3 -c "import json,sys;d=json.load(open('$DB_CONFIG_FILE'));print(d.get('mode') or (d.get('config') or {}).get('mode') or 'local')" 2>/dev/null || echo local)
+    fi
+    if [ "$DB_MODE" = "remote" ] || [ "$DB_MODE" = "remote_direct" ]; then
+        log_info "DB mode is '$DB_MODE' — disabling local-db profile (the rag-db-tunnel sidecar holds the rag-postgres alias)"
+        COMPOSE_PROFILES=""
+        # Persist it so ad-hoc `docker compose up` never re-starts the local
+        # postgres: compose reads COMPOSE_PROFILES from .env, and any `up` that
+        # reconciles the local-db profile would recreate the split brain.
+        if [ -f .env ] && grep -qE "^COMPOSE_PROFILES=" .env; then
+            sed -i 's/^COMPOSE_PROFILES=.*/COMPOSE_PROFILES=/' .env
         fi
     fi
 
