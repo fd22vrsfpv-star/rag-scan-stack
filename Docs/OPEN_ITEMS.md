@@ -257,3 +257,28 @@ which task lives only in each caller's hardcoded choice.
 **Where:** the LLM selection path.
 **Done when:** routing is data rather than each caller's guess.
 **Enforced by:** not enforced
+
+### The rag-postgres alias is split-brained in remote_direct mode
+**Found:** 2026-09-12
+**Evidence:** With `db-config.json` mode `remote_direct`, a LOCAL `rag-postgres`
+container (172.18.0.13) is up alongside the remote path and both answer to the
+`rag-postgres` alias. Connections with `sslmode=require` intermittently resolve
+to the local one, which does not support SSL, and fail with
+`connection to server at "rag-postgres" (172.18.0.13) ... server does not
+support SSL, but SSL was required`. Observed repeatedly this session: several DB
+queries failed and had to be retried, `etl/access.py::refresh` aborted mid-run,
+and a `/jobs/pipeline-scan` run aborted at the scope gate (`stages: {}`,
+`error: "scope cannot be verified: ... does not support SSL"`).
+**Impact:** any component whose DSN uses the `rag-postgres` hostname is a coin
+flip. `nikto_scan` saves findings through it, so a web run that resolves to the
+local container ingests **0 nikto findings** even though nikto ran and parsed
+31 items — the reason port 80 has katana/zap findings but no nikto ones for
+192.168.1.150.
+**Where:** the `rag-postgres` service alias; DSNs defaulting to
+`postgresql://app:app@rag-postgres:5432/scans?sslmode=require` while a local
+rag-postgres also runs in remote_direct mode.
+**Done when:** in remote_direct mode exactly one endpoint answers to
+`rag-postgres` (the SSL-terminating path to the remote), or those DSNs point at
+the remote directly — a connection to `rag-postgres` with `sslmode=require`
+never lands on a non-SSL server.
+**Enforced by:** not enforced
