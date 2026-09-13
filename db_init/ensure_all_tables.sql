@@ -1085,7 +1085,7 @@ CREATE TABLE IF NOT EXISTS public.pending_exploits (
     id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     asset_id           uuid REFERENCES public.assets(id) ON DELETE CASCADE,
     port_id            uuid REFERENCES public.ports(id) ON DELETE SET NULL,
-    source             text NOT NULL CHECK (source IN ('exploitdb', 'metasploit', 'webshell')),
+    source             text NOT NULL CHECK (source IN ('exploitdb', 'metasploit', 'webshell', 'command')),
     exploit_id         text NOT NULL,
     exploit_title      text NOT NULL,
     exploit_type       text CHECK (exploit_type IN ('rce', 'auth_bypass', 'info_disclosure', 'other')),
@@ -3164,6 +3164,65 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_port_access_advice_target_port
   ON public.port_access_advice (target, port);
 CREATE INDEX IF NOT EXISTS idx_port_access_advice_target
   ON public.port_access_advice (target);
+
+-- ============================================================================
+-- VECTOR COVERAGE (did we independently attempt each known service vector?)
+-- ============================================================================
+-- The platform must not depend on the MSF planner incidentally picking known
+-- exploitation vectors. For every catalogue vector (knowledge/service_access_
+-- methods.yaml) that matches an open service on a target, a row is written at
+-- plan time as 'planned'/'not_attempted' — so "applicable but never attempted"
+-- (the whole Metasploitable-2 gap) is visible, not silent. The result is updated
+-- to 'shell'/'no_shell'/'blocked' when the attempt runs. This row is also the
+-- dedup anchor: a vector already proven 'shell' (or with a live pending attempt)
+-- is not re-queued, which protects one-shot mutating backdoors. See
+-- autogen_agents/langgraph_engine.py::_service_vector_tests / surface_plan.
+--
+-- Idempotent migration for the widened pending_exploits.source CHECK (adds the
+-- non-MSF 'command' dispatch source on already-created databases).
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pending_exploits_source_check') THEN
+    ALTER TABLE public.pending_exploits DROP CONSTRAINT pending_exploits_source_check;
+  END IF;
+  ALTER TABLE public.pending_exploits
+    ADD CONSTRAINT pending_exploits_source_check
+    CHECK (source IN ('exploitdb', 'metasploit', 'webshell', 'command'));
+EXCEPTION WHEN undefined_table THEN
+  NULL;  -- pending_exploits not created yet on this pass
+END $$;
+
+CREATE TABLE IF NOT EXISTS public.vector_coverage (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id     uuid,
+    target            text NOT NULL,
+    port              integer,
+    vector_id         text NOT NULL,          -- catalogue id (service_access_methods.yaml)
+    service           text,
+    attempted         boolean NOT NULL DEFAULT false,
+    result            text NOT NULL DEFAULT 'not_attempted'
+                      CHECK (result IN ('shell','no_shell','blocked','not_attempted','planned')),
+    source_path       text CHECK (source_path IN ('msf','command','webshell')),
+    mutates           boolean NOT NULL DEFAULT false,
+    pending_exploit_id uuid,
+    exploit_result_id  uuid,
+    first_seen        timestamptz NOT NULL DEFAULT now(),
+    last_attempt_at   timestamptz
+);
+-- One row per (engagement, target, port, vector). COALESCE the nullable columns
+-- so NULL engagement_id / port still constrain (a partial/plain unique index
+-- would let NULL-bearing rows duplicate — the repo's stated rule).
+CREATE UNIQUE INDEX IF NOT EXISTS ux_vector_coverage_identity
+  ON public.vector_coverage
+     (COALESCE(engagement_id, '00000000-0000-0000-0000-000000000000'::uuid),
+      target, COALESCE(port, -1), vector_id);
+CREATE INDEX IF NOT EXISTS idx_vector_coverage_target
+  ON public.vector_coverage (target, result);
+
+CREATE OR REPLACE VIEW public.v_vector_coverage AS
+  SELECT target, port, service, vector_id, result, source_path, mutates,
+         attempted, engagement_id, last_attempt_at, first_seen
+    FROM public.vector_coverage;
 
 -- Agent-to-agent feedback channel. One agent flags something interesting (a
 -- finding worth another run, a coverage gap); a coordinator turns approved flags

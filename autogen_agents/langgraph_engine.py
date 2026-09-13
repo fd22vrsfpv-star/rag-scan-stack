@@ -2874,6 +2874,190 @@ def _param_test(category, tool, base, pname, port, command, assertion,
             "source_finding_id": None, "source_finding_source": "crawl-param"}
 
 
+def _vector_catalog():
+    """(load_methods, match_method) from the shared vector catalogue, or (None,
+    None) if unavailable. Reused so advice and attempts never drift."""
+    try:
+        from etl.dead_port_advisor import load_methods, match_method
+        return load_methods, match_method
+    except Exception:  # noqa: BLE001
+        try:
+            from dead_port_advisor import load_methods, match_method  # type: ignore
+            return load_methods, match_method
+        except Exception:  # noqa: BLE001
+            return None, None
+
+
+def _vector_covered_keys(target: str):
+    """(target-scoped) set of vector_ids already proven `shell` or with a live
+    (planned/not_attempted after a pending) attempt — the dedup guard so a
+    one-shot mutating backdoor is never re-fired and pending_exploits don't churn."""
+    keys = set()
+    try:
+        from db_utils import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT vector_id FROM vector_coverage "
+                        "WHERE target = %s AND result = 'shell'", (target,))
+            keys = {r[0] for r in cur.fetchall()}
+    except Exception as e:  # noqa: BLE001
+        _log.debug("vector coverage read failed for %s: %s", target, e)
+    return keys
+
+
+def _vector_coverage_upsert(engagement_id, target, port, vector_id, service,
+                            source_path, mutates, result, *,
+                            pending_exploit_id=None, exploit_result_id=None):
+    """Record/refresh a vector_coverage row. Applicability is written at plan time
+    (`planned`) so 'applicable but never attempted' is visible, not silent — the
+    whole point of closing the loop. Best-effort; never breaks the caller."""
+    try:
+        from db_utils import get_db
+        attempted = result not in ("planned", "not_attempted")
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.vector_coverage
+                  (engagement_id, target, port, vector_id, service, attempted,
+                   result, source_path, mutates, pending_exploit_id,
+                   exploit_result_id, last_attempt_at)
+                VALUES (%s::uuid,%s,%s,%s,%s,%s,%s,%s,%s,%s::uuid,%s::uuid,
+                        CASE WHEN %s THEN now() ELSE NULL END)
+                ON CONFLICT (COALESCE(engagement_id,
+                    '00000000-0000-0000-0000-000000000000'::uuid),
+                    target, COALESCE(port,-1), vector_id) DO UPDATE SET
+                  service = EXCLUDED.service,
+                  attempted = public.vector_coverage.attempted OR EXCLUDED.attempted,
+                  -- never downgrade a proven shell
+                  result = CASE WHEN public.vector_coverage.result = 'shell'
+                                THEN 'shell' ELSE EXCLUDED.result END,
+                  source_path = COALESCE(EXCLUDED.source_path, public.vector_coverage.source_path),
+                  mutates = EXCLUDED.mutates,
+                  pending_exploit_id = COALESCE(EXCLUDED.pending_exploit_id, public.vector_coverage.pending_exploit_id),
+                  exploit_result_id = COALESCE(EXCLUDED.exploit_result_id, public.vector_coverage.exploit_result_id),
+                  last_attempt_at = COALESCE(EXCLUDED.last_attempt_at, public.vector_coverage.last_attempt_at)
+                """,
+                (engagement_id, target, port, vector_id, service, attempted,
+                 result, source_path, bool(mutates),
+                 str(pending_exploit_id) if pending_exploit_id else None,
+                 str(exploit_result_id) if exploit_result_id else None, attempted))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        _log.debug("vector coverage upsert failed (%s/%s): %s", target, vector_id, e)
+
+
+def _update_vector_coverage_from_run(sid, test, success, session_id, output,
+                                     pending_id, exploit_result_id):
+    """Update vector_coverage after a vector attempt ran. Reuses the session's
+    engagement_id so the ON CONFLICT identity matches the plan-time `planned` row
+    (a different engagement_id would insert a duplicate instead of updating)."""
+    vec = (test or {}).get("vector")
+    if not vec:
+        return
+    try:
+        cfg = (get_agent_session(_sid(sid)) or {}).get("configuration") or {}
+        eid = cfg.get("engagement_id") if isinstance(cfg, dict) else None
+        assertion = test.get("assertion") or {}
+        got_shell = bool(success) and (bool(session_id) or bool(assertion.get("expect_shell")))
+        low = (output or "").lower()
+        blocked = ("out-of-scope" in low or "out of scope" in low
+                   or ("scope" in low and "refus" in low))
+        result = "shell" if got_shell else ("blocked" if blocked else "no_shell")
+        _vector_coverage_upsert(
+            eid, test.get("host"), test.get("port"), vec["vector_id"],
+            test.get("service"), vec.get("source_path"), vec.get("mutates"),
+            result, pending_exploit_id=pending_id, exploit_result_id=exploit_result_id)
+    except Exception as e:  # noqa: BLE001
+        _log.debug("vector coverage run-update failed: %s", e)
+
+
+def _service_vector_tests(items: list) -> list:
+    """Independent, data-driven attempts of KNOWN service vectors — the platform
+    trying the vectors itself rather than hoping the MSF planner picks them.
+
+    For each open service that matches a catalogue vector (knowledge/
+    service_access_methods.yaml, via the advisor's most-specific-wins matcher)
+    emit up to two IMPACTFUL candidates: the runnable NON-MSF `attempt`
+    (dispatch=command, the primary lane) and an MSF seed (`msf`). Both route to
+    the approval/pre-approval gate via surface_plan. Each candidate carries a
+    `vector` block so surface_plan records vector_coverage.
+    """
+    load_methods, match_method = _vector_catalog()
+    if not (load_methods and match_method):
+        return []
+    methods = load_methods()
+    if not methods:
+        return []
+    out, seen = [], set()
+
+    def _render(t, ip, port, vec):
+        if not t:
+            return t
+        return (str(t).replace("{target}", str(ip))
+                .replace("{port}", str(port or vec.get("port") or ""))
+                .replace("{opens}", str(vec.get("opens") or "")))
+
+    for row in items:
+        ip = row.get("ip")
+        if not ip:
+            continue
+        port = row.get("port")
+        svc = (row.get("service") or "").strip().lower()
+        product = (row.get("product") or "").strip()
+        version = (row.get("version") or "").strip()
+        matched = []
+        best = match_method(methods, service=svc, product=product, version=version)
+        if best:
+            matched.append(best)
+        # Port-keyed vectors too — catches nmap mislabels (e.g. 6200 as lm-x).
+        for e in methods:
+            if e.get("port") == port and e not in matched:
+                matched.append(e)
+        for vec in matched:
+            vid = vec.get("id")
+            eport = port or vec.get("port")
+            svc_out = svc or vec.get("service")
+            mutates = bool(vec.get("mutates"))
+            disp = vec.get("dispatch")
+            # NON-MSF command (primary lane)
+            if vec.get("attempt") and disp in (None, "command"):
+                k = (ip, eport, vid, "command")
+                if k not in seen:
+                    seen.add(k)
+                    cmd = _render(vec["attempt"], ip, eport, vec)
+                    out.append({
+                        "name": f"vector {vid} (command) @ {ip}:{eport}",
+                        "host": ip, "service": svc_out, "port": eport,
+                        "tool": (cmd.split() or ["sh"])[0], "command": cmd,
+                        "category": "vector_attempt", "tier": "impactful",
+                        "assertion": vec.get("success") or {"expect_shell": True},
+                        "exploit_ref": {"source": "command", "dispatch_source": "command",
+                                        "exploit_type": "rce", "module": vid,
+                                        "parameters": {"vector_id": vid,
+                                                       "success": vec.get("success"),
+                                                       "opens": vec.get("opens"),
+                                                       "mutates": mutates}},
+                        "vector": {"vector_id": vid, "source_path": "command",
+                                   "mutates": mutates},
+                    })
+            # MSF seed (complementary)
+            if vec.get("msf"):
+                k = (ip, eport, vid, "msf")
+                if k not in seen:
+                    seen.add(k)
+                    out.append({
+                        "name": f"vector {vid} (msf {vec['msf']}) @ {ip}:{eport}",
+                        "host": ip, "service": svc_out, "port": eport,
+                        "tool": "metasploit", "command": None,
+                        "category": "vector_attempt", "tier": "impactful",
+                        "assertion": vec.get("success") or {"expect_shell": True},
+                        "exploit_ref": {"source": "metasploit", "dispatch_source": "metasploit",
+                                        "exploit_type": "rce", "module": vec["msf"]},
+                        "vector": {"vector_id": vid, "source_path": "msf",
+                                   "mutates": mutates},
+                    })
+    return out
+
+
 def _build_surface_tests(host: str, synthesize: bool = None) -> list:
     """Deterministic (no LLM) custom tests for ONE host's surface.
 
@@ -2898,6 +3082,13 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
 
     # Non-MSF exploit coverage: ExploitDB scripts matched by (product, version).
     tests.extend(_exploitdb_tests(items))
+
+    # Independent known-vector coverage: for each open service that matches the
+    # vector catalogue, try its NON-MSF command AND seed the MSF module — so the
+    # classic vectors (samba usermap, rsh, nfs, unrealircd, distcc, drb, vnc,
+    # mysql/postgres/tomcat, vsftpd, php-cgi) are attempted every run, not left
+    # to the LLM planner's incidental coverage.
+    tests.extend(_service_vector_tests(items))
 
     # Discover known vulnerable web apps (DVWA/Mutillidae/etc.) that generic
     # wordlists miss — so their app-layer surface can then be crawled + tested.
@@ -3144,8 +3335,15 @@ def surface_plan(state: PentestState) -> dict:
 
     candidates = _build_surface_tests(host, synthesize=state.get("surface_synthesize"))
 
+    # Dedup guard: a vector already proven `shell` is not re-queued (protects a
+    # one-shot mutating backdoor and stops pending_exploits/coverage churn).
+    covered_shell = _vector_covered_keys(host)
+
     persisted, pending = [], []
     for c in candidates:
+        vec = c.get("vector")
+        if vec and vec.get("vector_id") in covered_shell:
+            continue  # already have a shell from this vector — do not re-fire
         pending_exploit_id = None
         if c["tier"] == "impactful":
             # Queue the exploit for approval FIRST (side effect lives here, before
@@ -3192,6 +3390,14 @@ def surface_plan(state: PentestState) -> dict:
             continue
         rec = {**c, "test_id": test_id, "pending_exploit_id": pending_exploit_id}
         persisted.append(rec)
+        if vec:
+            # Applicability is recorded now (planned) so "applicable but never
+            # attempted" is visible even if the attempt never runs. The result is
+            # updated to shell/no_shell/blocked when it executes.
+            _vector_coverage_upsert(
+                engagement_id, c["host"], c.get("port"), vec["vector_id"],
+                c.get("service"), vec.get("source_path"), vec.get("mutates"),
+                "planned", pending_exploit_id=pending_exploit_id)
         if c["tier"] == "impactful":
             pending.append(rec)
             try:
@@ -3368,6 +3574,7 @@ def surface_exec(state: PentestState) -> dict:
                 has_shell=bool(success),
                 status_override=("pass" if success else "fail"),
                 triggered_by="agent", triggered_by_session=sid)
+            _update_vector_coverage_from_run(sid, test, success, session_id, out, pending_id, er_id)
             if success:
                 _postex_enumerate(test.get("host"), session_type, session_id, sid)
         except Exception as e:  # noqa: BLE001
@@ -3451,6 +3658,7 @@ def _exec_one_impactful(sid, pending_id, test):
             output=(out or "")[:20000], exploit_result_id=er_id,
             has_shell=bool(success), triggered_by="agent",
             triggered_by_session=sid)
+        _update_vector_coverage_from_run(sid, test, success, session_id, out, pending_id, er_id)
         if success:
             _postex_enumerate(test.get("host"), session_type, session_id, sid)
         return rec.get("status")

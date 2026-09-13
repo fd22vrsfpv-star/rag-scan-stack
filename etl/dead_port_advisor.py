@@ -70,11 +70,18 @@ def match_method(methods: List[Dict[str, Any]], *, service: str = "",
     best, best_score = None, -1
     for m in methods:
         score = 0
-        msvc = (m.get("service") or "").strip().lower()
+        # `service` may be a single name, a list, or a "|"-separated string, so
+        # one entry can cover a service's aliases (r-services exec/login/shell).
+        raw_svc = m.get("service") or ""
+        if isinstance(raw_svc, (list, tuple)):
+            msvcs = [str(s).strip().lower() for s in raw_svc if str(s).strip()]
+        else:
+            msvcs = [s.strip().lower() for s in str(raw_svc).split("|") if s.strip()]
+        msvc = msvcs[0] if msvcs else ""
         mprod = (m.get("product") or "").strip().lower()
         mver = m.get("version") or ""
-        if msvc:
-            if msvc != service:
+        if msvcs:
+            if service not in msvcs:
                 continue
             score += 1
         if mprod:

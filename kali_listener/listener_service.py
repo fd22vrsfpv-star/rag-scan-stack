@@ -2779,6 +2779,47 @@ def access_run(request: AccessRunRequest):
                 "error": f"{type(e).__name__}: {e}"[:300]}
 
 
+class VectorRunRequest(BaseModel):
+    command: str
+    target: str = ""
+    port: Optional[int] = None
+    timeout: int = 60
+
+
+@app.post("/vectors/run")
+def vectors_run(request: VectorRunRequest):
+    """Run ONE approved NON-MSF vector command in the kali container.
+
+    Like /access/run — and UNLIKE /tools/execute — this is NOT allow-listed and
+    NOT dangerous-char filtered: an offensive vector (a samba usermap trigger, an
+    nfs mount, an nc backdoor kick) needs shell metacharacters, and the command
+    has already cleared the operator approval gate AND the exploit-runner's
+    fail-closed scope check before it reaches here. It is re-gated here (the
+    second fail-closed check) and bounded to one command + one timeout. It is
+    reached only by the exploit-runner's source='command' branch.
+    """
+    cmd = (request.command or "").strip()
+    if not cmd:
+        raise HTTPException(400, "no command")
+    refusal = enforce_scope(request.target, cmd)
+    if refusal:
+        logger.warning("REFUSED vector run on %s: %s", request.target, refusal)
+        raise HTTPException(403, f"out of scope: {refusal}")
+    to = max(5, min(int(request.timeout or 60), 180))
+    try:
+        proc = subprocess.run(cmd, shell=True, capture_output=True,
+                              text=True, timeout=to)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        return {"ok": True, "exit_code": proc.returncode, "output": out[:20000]}
+    except subprocess.TimeoutExpired as e:  # noqa: BLE001
+        partial = (e.stdout or "") if isinstance(e.stdout, str) else ""
+        return {"ok": False, "exit_code": None,
+                "output": f"[timeout after {to}s]\n{partial[:4000]}"}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "exit_code": None,
+                "output": f"[error] {type(e).__name__}: {e}"[:2000]}
+
+
 @app.get("/tools/capabilities")
 def tool_capabilities(tool: str, category: str = ""):
     """What a tool installed HERE says it supports.
