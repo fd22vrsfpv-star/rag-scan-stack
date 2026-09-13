@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect, Fragment } from 'react'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
 import PageHelp from '@/components/PageHelp'
-import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary,
+import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, useAssetPortAdvice,
   type ObtainedAccess, type DdgSearchResponse } from '@/api/assets'
 import { apiFetch } from '@/api/client'
 import { useTargetedReconLookup, useTargetedReconExecute } from '@/api/targeted-recon'
@@ -12,7 +12,7 @@ import { DataTable } from '@/components/common/DataTable'
 import { StatusDot } from '@/components/common/StatusDot'
 import type { ColumnDef, RowSelectionState } from '@tanstack/react-table'
 import type { Asset, Port, Vuln, ScanRecommendation } from '@/lib/types'
-import { X, Trash2, Key, Plus, ShieldCheck, ShieldX, ShieldQuestion, ShieldOff, AlertTriangle, Globe, Camera, Cpu, Settings2, Search, ExternalLink, Cloud, Server, ChevronDown, ChevronRight, Eye, EyeOff, Copy, Check, Terminal} from 'lucide-react'
+import { X, Trash2, Key, Plus, ShieldCheck, ShieldX, ShieldQuestion, ShieldOff, AlertTriangle, Globe, Camera, Cpu, Settings2, Search, ExternalLink, Cloud, Server, ChevronDown, ChevronRight, Eye, EyeOff, Copy, Check, Terminal, Zap} from 'lucide-react'
 import { ScopeAssignModal } from '@/components/common/ScopeAssignModal'
 import { ScopeFilter } from '@/components/common/ScopeFilter'
 import { KbSuggestionsModal } from '@/components/recommendations/KbSuggestionsModal'
@@ -511,6 +511,52 @@ function AccessSection({ ip }: { ip: string }) {
           </table>
         </div>
       )}
+      <PortAdviceSection ip={ip} />
+    </div>
+  )
+}
+
+/** PortAdviceSection — how to reach DEAD ports the default probe could not.
+ *
+ *  The bind-shell probe sends `id` over a raw socket; a real service (an FTP
+ *  with a trigger-only backdoor, rsh, an RPC program, a web server) is dead to
+ *  it even when there is a real path in — the path just is not the default. This
+ *  surfaces the non-default method per dead port so enumeration is not stuck on
+ *  the default. Advice only; nothing here runs. Shows only ports we have a
+ *  method for; renders nothing when there are none. */
+function PortAdviceSection({ ip }: { ip: string }) {
+  const { data } = useAssetPortAdvice(ip)
+  const withMethod = (data?.advice ?? []).filter(a => a.method)
+  if (!withMethod.length) return null
+  return (
+    <div className="space-y-2 pt-2 border-t border-border">
+      <h4 className="text-xs font-medium text-muted-foreground flex items-center gap-1.5">
+        <Zap className="h-3.5 w-3.5" /> Dead ports — non-default ways in ({withMethod.length})
+      </h4>
+      <p className="text-[11px] text-muted-foreground">
+        The probe sends <span className="font-mono">id</span> over a raw socket, which only speaks
+        to a bind shell. These ports are dead to that but have a real, non-default path in:
+      </p>
+      <div className="space-y-1.5">
+        {withMethod.map(a => (
+          <div key={a.port} className="rounded border border-border bg-muted/40 px-2 py-1.5">
+            <div className="flex items-center gap-2 flex-wrap text-xs">
+              <span className="font-mono font-medium">{a.port}</span>
+              <span className="text-muted-foreground">{a.service}{a.product ? ` · ${a.product}${a.version ? ` ${a.version}` : ''}` : ''}</span>
+              <span className="px-1.5 py-0.5 rounded border bg-amber-500/15 text-amber-400 border-amber-500/30 text-[10px]">{a.method}</span>
+              {a.opens ? <span className="text-[10px] text-emerald-400">→ opens {a.opens}</span> : null}
+            </div>
+            {a.summary && <p className="text-[11px] text-foreground mt-1">{a.summary}</p>}
+            {a.steps.length > 0 && (
+              <ul className="text-[11px] text-muted-foreground mt-1 list-disc pl-4 space-y-0.5">
+                {a.steps.map((s, i) => <li key={i} className="font-mono">{s}</li>)}
+              </ul>
+            )}
+            {a.tool && <p className="text-[10px] text-muted-foreground mt-1">tool: <span className="font-mono">{a.tool}</span></p>}
+            {a.caution && <p className="text-[10px] text-orange-400 mt-1">⚠ {a.caution}</p>}
+          </div>
+        ))}
+      </div>
     </div>
   )
 }
