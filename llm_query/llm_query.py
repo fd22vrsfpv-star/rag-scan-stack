@@ -866,10 +866,50 @@ def generate(req: GenerateRequest):
         data = _json_post(url, payload_ollama)
         return JSONResponse(content=data)
 
+def _messages_to_prompt(messages) -> str:
+    """Flatten chat messages into one prompt for the routed provider path.
+
+    The per-backend chat branches below already collapse to a single user
+    message on Azure/OpenAI, so nothing is lost by flattening here -- system
+    turns are preserved as a labelled preamble.
+    """
+    parts = []
+    for m in messages:
+        d = m.dict() if hasattr(m, "dict") else dict(m)
+        role = (d.get("role") or "user").strip().lower()
+        content = d.get("content") or ""
+        if role == "system":
+            parts.append(content)
+        elif role == "assistant":
+            parts.append(f"Assistant: {content}")
+        else:
+            parts.append(f"User: {content}")
+    return "\n\n".join(p for p in parts if p)
+
+
 @router.post("/chat")
-
-
 def chat(req: ChatRequest):
+    # Per-task routing, consistent with generate(): whenever the caller names a
+    # task OR passes a "provider:model" model (both carry an explicit endpoint)
+    # and is not streaming, route through the resolved provider instead of the
+    # global backend. A task-less, model-less non-streaming call falls through
+    # to the per-backend branches below exactly as before.
+    route = _route_for(req.task, req.model)
+    if (req.task or route.get("endpoint")) and not req.stream:
+        text, used, failed_over = _generate_routed(
+            route, _messages_to_prompt(req.messages), req.options)
+        return JSONResponse(content={
+            "model": used[1],
+            "message": {"role": "assistant", "content": text},
+            "done": True,
+            "backend": used[0],
+            "provider": (route.get("fallback") or {}).get("provider")
+                        if failed_over else route.get("provider"),
+            "task": req.task,
+            "route_source": route.get("source"),
+            "failed_over": failed_over,
+        })
+
     if LLM_BACKEND == "azure":
         # A model named by the CALLER wins; AZURE_MODEL is only the default.
         # It used to be `AZURE_MODEL or req.model`, so the global model always

@@ -26,7 +26,10 @@ DB_DSN = os.environ.get("DB_DSN", "postgresql://app:app@rag-postgres:5432/scans"
 
 # Optional LLM advisory and vector context settings
 LLM_ENDPOINT = os.environ.get("LLM_ENDPOINT", "").strip()
-LLM_MODEL = os.environ.get("LLM_MODEL", "llama3")
+# Empty default so an unset model routes by task ("recommend") through llm_query
+# rather than forcing an ollama tag the active backend may not serve. Set
+# LLM_MODEL explicitly to pin a model (e.g. when LLM_ENDPOINT is a raw ollama).
+LLM_MODEL = os.environ.get("LLM_MODEL", "").strip()
 USE_LLM_FOR_RULES = os.environ.get("FOLLOWUP_USE_LLM", "0") == "1"
 RAG_API_BASE = os.environ.get("RAG_API_BASE", "https://rag-api:8000").rstrip("/")
 
@@ -180,7 +183,9 @@ def _llm_choose_extra_actions(ctx: PortCtx) -> List[FollowupAction]:
             f"- service: {ctx.service}\n- product: {ctx.product}\n- version: {ctx.version}\n- banner: {ctx.banner}\n\n"
             f"Vector context (top similar):\n{context_snippets}\n"
         )
-        payload = {"model": LLM_MODEL, "prompt": prompt}
+        payload = {"prompt": prompt, "task": "recommend"}
+        if LLM_MODEL:
+            payload["model"] = LLM_MODEL
         r = requests.post(f"{LLM_ENDPOINT}/api/generate", json=payload, timeout=8)
         text = (r.text or "").strip()
         import json as _json

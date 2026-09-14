@@ -106,6 +106,20 @@ def test_routing_models_do_not_default_the_model():
         f"Default `model` to None.")
 
 
+def test_chat_handler_routes_by_task():
+    """The chat handler must route by task like generate() -- it used to ignore
+    `task` and go straight to the global-backend branch, so a non-streaming chat
+    caller naming a task (web_payload_generator: exploit_gen) never reached its
+    configured model."""
+    src = _source()
+    m = re.search(r"\ndef chat\(req: ChatRequest\):(.*?)\n(?:@router|def )", src, re.S)
+    assert m, "chat(req: ChatRequest) handler not found -- guard is stale"
+    body = m.group(1)
+    assert "_route_for(" in body, (
+        "chat() must call _route_for(req.task, req.model) so a task/provider:model "
+        "chat request routes through the resolved provider, not the global backend.")
+
+
 def test_azure_post_strips_unsupported_sampling_params():
     """gpt-5/o-series reject temperature/top_p overrides; the single Azure post
     chokepoint must strip them and retry, not surface the 400."""
