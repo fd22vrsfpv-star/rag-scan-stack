@@ -120,7 +120,13 @@ def test_rescan_analysis_exists_and_is_bounded():
     fn = _func(src, "_rerun_analysis_when_scans_finish")
     assert fn, "the post-scan re-analysis is gone"
     assert "RESCAN_ANALYSIS_MAX_WAIT_S" in fn, "the wait is unbounded"
-    assert "analyze(state)" in fn, "it no longer re-runs the analysis"
+    # The analyze re-run now lives in the shared _run_analysis_pass helper that
+    # both the early (quick-scan) and final passes call — so assert the rescan
+    # thread invokes it AND that the helper actually re-runs analyze.
+    assert "_run_analysis_pass" in fn, "it no longer re-runs the analysis"
+    pass_fn = _func(src, "_run_analysis_pass")
+    assert pass_fn and "analyze(state)" in pass_fn, (
+        "_run_analysis_pass must actually re-run analyze over the results")
 
 
 def test_rescan_reports_a_timeout_rather_than_going_quiet():
