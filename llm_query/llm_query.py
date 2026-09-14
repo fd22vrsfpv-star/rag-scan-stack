@@ -1038,6 +1038,13 @@ api_router.add_api_route("/generate", generate, methods=["POST"])
 api_router.add_api_route("/chat", chat, methods=["POST"])
 api_router.add_api_route("/embeddings", embeddings, methods=["POST"])
 api_router.add_api_route("/embed", embeddings, methods=["POST"])
+# The rest of Ollama's native surface, so a drop-in client that probes model
+# info or manages models (POST /api/show is the common one — clients call it to
+# read a model's parameters before generating) gets a real answer instead of a
+# 404. These were exposed under /ollama/* but not /api/*, so /api callers 404'd.
+api_router.add_api_route("/show", show, methods=["POST"])
+api_router.add_api_route("/pull", pull, methods=["POST"])
+api_router.add_api_route("/delete", delete, methods=["POST"])
 app.include_router(api_router)
 
 # ---------- Local dev ----------
