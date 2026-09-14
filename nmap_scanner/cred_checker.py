@@ -825,6 +825,35 @@ def _tool_learning():
         return None
 
 
+def _dedup_valid_results(results: List[Any]) -> List[Any]:
+    """Collapse duplicate success rows to DISTINCT credentials.
+
+    A tool can report one credential on several lines — hydra prints an extra
+    "login: <user>" line for an anonymous/empty-password login, and a retry can
+    re-report the same pair — so a raw len(results) over-counts. The credential
+    store dedups on (ip, port, username, auth_type) via
+    uq_credential_findings_identity, and one check_default_credentials call is a
+    single (port, service), so the distinguishing identity here is the USERNAME.
+    When a username appears more than once, keep the row that actually carries a
+    password (so the stored secret is the real one, not an empty first line).
+    Order is preserved. This makes the summary count, the emitted
+    valid_credentials, and the count the store keeps all agree.
+    """
+    distinct: List[Any] = []
+    at: Dict[str, int] = {}
+    for r in results or []:
+        key = (getattr(r, "username", "") or "").strip().lower()
+        if key in at:
+            prev = distinct[at[key]]
+            if not (getattr(prev, "password", "") or "").strip() \
+                    and (getattr(r, "password", "") or "").strip():
+                distinct[at[key]] = r  # upgrade to the row with a password
+            continue
+        at[key] = len(distinct)
+        distinct.append(r)
+    return distinct
+
+
 def check_default_credentials(
     target: str,
     port: int,
@@ -1033,6 +1062,12 @@ def check_default_credentials(
         for a in ma.get("attempts", [])
         if a.get("success")
     ]
+
+    # Collapse duplicate success rows to DISTINCT credentials before counting or
+    # emitting (see _dedup_valid_results). Without this the summary claimed "4
+    # valid" on an FTP that stored 3 (anonymous printed twice), and the completion
+    # count (11) disagreed with the findings (8).
+    results = _dedup_valid_results(results)
 
     # Human-readable summary for the audit panel. Built from what actually ran
     # rather than from a named pair of tools, so a new method needs no edit here

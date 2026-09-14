@@ -5430,11 +5430,21 @@ def get_session_scan_status(session_id: str = None) -> str:
                         if live_status in ("completed", "failed"):
                             result_summary = None
                             if live_status == "completed":
+                                _res = live_data.get("result", {}) or {}
                                 result_summary = {
-                                    "ports_found": live_data.get("result", {}).get("ports_found"),
-                                    "hosts_found": live_data.get("result", {}).get("hosts_found"),
-                                    "vulnerabilities": live_data.get("result", {}).get("vulnerabilities_found"),
+                                    "ports_found": _res.get("ports_found"),
+                                    "hosts_found": _res.get("hosts_found"),
+                                    "vulnerabilities": _res.get("vulnerabilities_found"),
                                 }
+                                # A credential-check reports valid_credentials, not
+                                # ports/hosts — without this its summary was all
+                                # nulls and the scan card read as empty/failed even
+                                # when it recovered real logins.
+                                creds = _res.get("total_valid_credentials")
+                                if creds is not None:
+                                    result_summary["valid_credentials"] = creds
+                                if _res.get("reconciliation") is not None:
+                                    result_summary["reconciliation"] = _res.get("reconciliation")
                             scan_tracker.update_scan_status(job_id, live_status, result_summary)
 
                 except Exception as e:
