@@ -16,6 +16,8 @@ import {
   useZapStatus,
   ImportResult,
 } from '@/api/maintenance'
+import { useScopeNames } from '@/api/scope'
+import { apiFetch } from '@/api/client'
 
 interface CleanupAction {
   key: string
@@ -1097,6 +1099,9 @@ export default function Maintenance() {
         </div>
       </div>
 
+      {/* Purge a scope's findings/follow-ups/recommendations (fresh-rerun) */}
+      <ScopePurgeCard />
+
       {/* Cleanup Actions */}
       <div className="bg-card border border-border rounded-lg p-4">
         <h3 className="text-sm font-semibold mb-3">Cleanup Actions</h3>
@@ -1149,6 +1154,107 @@ export default function Maintenance() {
           ))}
         </div>
       </div>
+    </div>
+  )
+}
+
+interface ScopePurgeResult {
+  ok: boolean
+  scope: string
+  dry_run: boolean
+  targets: number
+  total: number
+  deleted: Record<string, number>
+  note?: string
+}
+
+// Delete all findings, follow-ups, and recommendations for a named scope so a
+// lab rerun starts from a clean baseline. Assets/ports/scope membership are kept
+// (the scan re-observes them and the target stays authorised). Preview first.
+function ScopePurgeCard() {
+  const { data: scopeData } = useScopeNames()
+  const names = ((scopeData?.names ?? []) as unknown[]).map(n =>
+    typeof n === 'string' ? n : (n as { name: string }).name)
+  const [scope, setScope] = useState('')
+  const [preview, setPreview] = useState<ScopePurgeResult | null>(null)
+  const [msg, setMsg] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const call = async (dry: boolean): Promise<ScopePurgeResult> =>
+    apiFetch<ScopePurgeResult>(`/scope/${encodeURIComponent(scope)}/purge-data?dry_run=${dry}`,
+      { method: 'POST', body: JSON.stringify({}) })
+
+  const runPreview = async () => {
+    if (!scope) return
+    setBusy(true); setMsg(''); setPreview(null)
+    try { setPreview(await call(true)) }
+    catch (e) { setMsg(`Error: ${e instanceof Error ? e.message : 'failed'}`) }
+    finally { setBusy(false) }
+  }
+
+  const runPurge = async () => {
+    if (!scope) return
+    if (!window.confirm(`Delete ALL findings, follow-ups and recommendations for scope "${scope}"? Assets, ports and scope membership are kept. This cannot be undone.`)) return
+    setBusy(true); setMsg('')
+    try {
+      const r = await call(false)
+      setPreview(null)
+      setMsg(r.targets === 0 ? `Scope "${scope}" has no targets.`
+        : `Deleted ${r.total} row(s) across ${Object.keys(r.deleted).length} table(s) for ${r.targets} target(s).`)
+    } catch (e) { setMsg(`Error: ${e instanceof Error ? e.message : 'failed'}`) }
+    finally { setBusy(false) }
+  }
+
+  return (
+    <div className="bg-card border border-border rounded-lg p-4">
+      <h3 className="text-sm font-semibold mb-3">Purge Scope Data (fresh rerun)</h3>
+      <p className="text-xs text-muted-foreground mb-3">
+        Delete all <strong>findings</strong>, <strong>follow-ups</strong> and{' '}
+        <strong>recommendations</strong> for every target in a scope, so a re-scan
+        of a lab starts clean. Assets, ports and scope membership are kept — the
+        target stays in scope and gets re-observed. Preview the counts first.
+      </p>
+      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3">
+        <div className="flex items-center gap-2">
+          <label className="text-xs text-muted-foreground">Scope:</label>
+          <select value={scope} onChange={e => { setScope(e.target.value); setPreview(null); setMsg('') }}
+            className="h-8 px-2 text-xs rounded-md border border-border bg-background min-w-[10rem]">
+            <option value="">Select a scope…</option>
+            {names.map(n => <option key={n} value={n}>{n}</option>)}
+          </select>
+        </div>
+        <button onClick={runPreview} disabled={!scope || busy}
+          className="h-8 px-4 text-xs rounded-md border border-border bg-background hover:bg-muted disabled:opacity-50">
+          {busy ? 'Working…' : 'Preview'}
+        </button>
+        <button onClick={runPurge} disabled={!scope || busy}
+          className="h-8 px-4 text-xs rounded-md text-white bg-red-600 hover:bg-red-700 disabled:opacity-50">
+          Delete scope data
+        </button>
+        {msg && <span className="text-xs font-mono text-primary">{msg}</span>}
+      </div>
+      {preview && (
+        <div className="mt-3 text-xs">
+          {preview.targets === 0 ? (
+            <span className="text-muted-foreground">Scope "{preview.scope}" has no targets.</span>
+          ) : (
+            <div>
+              <span className="font-medium">{preview.total}</span> row(s) would be deleted
+              across {preview.targets} target(s):
+              <div className="mt-1 flex flex-wrap gap-2">
+                {Object.entries(preview.deleted).map(([t, n]) => (
+                  <span key={t} className="px-1.5 py-0.5 rounded border border-border bg-muted/30 font-mono">
+                    {t}: {n}
+                  </span>
+                ))}
+                {Object.keys(preview.deleted).length === 0 && (
+                  <span className="text-muted-foreground">nothing to delete.</span>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
