@@ -901,7 +901,7 @@ CREATE TABLE IF NOT EXISTS public.agent_sessions (
     session_name       text NOT NULL,
     target_description text NOT NULL,
     status             text NOT NULL DEFAULT 'active'
-                       CHECK (status IN ('active','completed','failed','stopped','stalled','awaiting_approval')),
+                       CHECK (status IN ('active','completed','failed','stopped','stalled','awaiting_approval','scanning')),
     configuration      jsonb DEFAULT '{}'::jsonb,
     summary            text,
     metadata           jsonb DEFAULT '{}'::jsonb,
@@ -912,6 +912,17 @@ CREATE TABLE IF NOT EXISTS public.agent_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_status ON public.agent_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_created_at ON public.agent_sessions(created_at DESC);
+
+-- Migration: widen the status CHECK to allow 'scanning' (a session whose phase
+-- graph finished but whose async scans are still running — langgraph_engine
+-- _finish). CREATE TABLE IF NOT EXISTS does not alter an existing table's
+-- constraint, so an already-provisioned DB rejects the new status until this
+-- drops and re-adds it.
+DO $$ BEGIN
+    ALTER TABLE public.agent_sessions DROP CONSTRAINT IF EXISTS agent_sessions_status_check;
+    ALTER TABLE public.agent_sessions ADD CONSTRAINT agent_sessions_status_check
+        CHECK (status IN ('active','completed','failed','stopped','stalled','awaiting_approval','scanning'));
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
 
 -- agent_messages
 CREATE TABLE IF NOT EXISTS public.agent_messages (
