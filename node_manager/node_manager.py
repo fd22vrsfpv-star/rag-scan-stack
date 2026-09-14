@@ -2267,6 +2267,98 @@ async def ssh_reconnect(node_id: str):
     return {"ok": True, "status": "online", "proxy_port": socks_port}
 
 
+# ── Reverse callback relay ───────────────────────────────────────────────────
+# Central MSF handler the relay forwards to. node-manager is on agents_net and
+# resolves the `metasploit` container; the handler binds there (LPORT) while the
+# payload's LHOST is the node's target-reachable IP. Overridable per-deploy.
+_MSF_CALLBACK_HOST = os.environ.get("MSF_CALLBACK_HOST", "metasploit")
+_MSF_CALLBACK_PORT = int(os.environ.get("MSF_CALLBACK_PORT", os.environ.get("MSF_LPORT", "4444")))
+
+
+class CallbackRelayRequest(BaseModel):
+    lport: Optional[int] = None            # port the node listens on (default MSF_CALLBACK_PORT)
+    callback_host: Optional[str] = None    # node's target-reachable IP (LHOST); default = node host
+
+
+def _node_ssh_meta(node_id: str):
+    """(meta, tunnel_method) for a node, or raise 404/500. meta carries the SSH
+    mgmt creds (host/user/ssh_port/key_file) used for exec AND the relay."""
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT metadata, tunnel_method FROM remote_nodes WHERE id = %s", (node_id,))
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(404, "Node not found")
+    meta, tunnel_method = row
+    if not meta or not isinstance(meta, dict) or not meta.get("host"):
+        raise HTTPException(500, "Node metadata missing SSH host — cannot open a relay")
+    return meta, tunnel_method
+
+
+def _store_relay_meta(node_id: str, relay: Optional[dict]):
+    """Persist relay state into remote_nodes.metadata.callback_relay (or clear)."""
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT metadata FROM remote_nodes WHERE id = %s", (node_id,))
+        row = cur.fetchone()
+        meta = (row[0] if row and isinstance(row[0], dict) else {}) or {}
+        if relay is None:
+            meta.pop("callback_relay", None)
+        else:
+            meta["callback_relay"] = relay
+        cur.execute("UPDATE remote_nodes SET metadata = %s, updated_at = now() WHERE id = %s",
+                    (psycopg2.extras.Json(meta), node_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@app.post("/nodes/{node_id}/callback-relay")
+async def start_callback_relay(node_id: str, req: CallbackRelayRequest = CallbackRelayRequest()):
+    """Open a reverse callback relay on the node: the node listens on lport and
+    forwards every connection back to the central MSF handler. Reverse shells
+    from a target then land on our msfrpcd WITHOUT the target opening a bind port
+    (safer, and works where a bind port would be firewalled). Works for SSH and
+    WireGuard nodes — it rides the SSH mgmt channel."""
+    meta, tunnel_method = _node_ssh_meta(node_id)
+    lport = req.lport or _MSF_CALLBACK_PORT
+    callback_host = req.callback_host or meta["host"]
+    result = await ssh_manager.start_callback_relay(
+        node_id=node_id, host=meta["host"], user=meta.get("user", "root"),
+        ssh_port=meta.get("ssh_port", 22), key_file=meta.get("key_file", "id_rsa"),
+        lport=lport, msf_host=_MSF_CALLBACK_HOST, msf_port=lport,
+    )
+    if not result.get("ok"):
+        raise HTTPException(502, result.get("error", "relay failed to start"))
+    relay = {"active": True, "lport": lport, "callback_host": callback_host,
+             "msf_host": _MSF_CALLBACK_HOST, "msf_port": lport}
+    _store_relay_meta(node_id, relay)
+    # Callbacks are a scan-adjacent action — emit for external subscribers.
+    _emit_ip_event("node_callback_relay_started", node_id,
+                   {"lport": lport, "callback_host": callback_host})
+    return {"ok": True, "relay": relay,
+            "lhost": callback_host,
+            "note": "Set the exploit payload to reverse with LHOST=callback_host; "
+                    "MSF binds the handler centrally (ReverseListenerBindAddress=0.0.0.0)."}
+
+
+@app.delete("/nodes/{node_id}/callback-relay")
+async def stop_callback_relay(node_id: str):
+    await ssh_manager.stop_callback_relay(node_id)
+    _store_relay_meta(node_id, None)
+    return {"ok": True, "stopped": True}
+
+
+@app.get("/nodes/{node_id}/callback-relay")
+async def get_callback_relay(node_id: str):
+    status = ssh_manager.callback_relay_status(node_id)
+    return {"node_id": node_id, **status}
+
+
 @app.post("/ssh/{node_id}/exec")
 async def ssh_exec(node_id: str, req: SSHExecRequest):
     """Execute a command on a remote host via SSH (supports WireGuard nodes with SSH fallback)."""

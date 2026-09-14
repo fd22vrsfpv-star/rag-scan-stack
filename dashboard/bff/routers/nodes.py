@@ -213,6 +213,23 @@ async def stop_socks(node_id: str):
     return await _nm_post(f"/nodes/{node_id}/socks/stop")
 
 
+# Reverse callback relay: node listens and relays reverse shells back to central
+# MSF (no bind port on the target). See node_manager /nodes/{id}/callback-relay.
+@router.post("/api/nodes/{node_id}/callback-relay")
+async def start_callback_relay(node_id: str, payload: dict = {}):
+    return await _nm_post(f"/nodes/{node_id}/callback-relay", payload)
+
+
+@router.delete("/api/nodes/{node_id}/callback-relay")
+async def stop_callback_relay(node_id: str):
+    return await _nm_delete(f"/nodes/{node_id}/callback-relay")
+
+
+@router.get("/api/nodes/{node_id}/callback-relay")
+async def callback_relay_status(node_id: str):
+    return await _nm_get(f"/nodes/{node_id}/callback-relay")
+
+
 # ---------------------------------------------------------------------------
 # Scan through node — routes scan to scanner with SOCKS proxy
 # ---------------------------------------------------------------------------

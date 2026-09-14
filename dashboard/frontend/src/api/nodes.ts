@@ -77,6 +77,38 @@ export function useStopSocks() {
   })
 }
 
+// ── Reverse callback relay (node listens, relays reverse shells to central MSF) ──
+export function useCallbackRelayStatus(nodeId: string, enabled = true) {
+  return useQuery({
+    queryKey: ['callback-relay', nodeId],
+    queryFn: () => apiFetch<{ active: boolean; lport?: number }>(`/nodes/${nodeId}/callback-relay`),
+    enabled: enabled && !!nodeId,
+    refetchInterval: 15000,
+  })
+}
+
+export function useStartCallbackRelay() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ nodeId, lport, callbackHost }: { nodeId: string; lport?: number; callbackHost?: string }) =>
+      apiFetch<{ ok: boolean; relay: { lport: number; callback_host: string } }>(
+        `/nodes/${nodeId}/callback-relay`, {
+          method: 'POST',
+          body: JSON.stringify({ lport, callback_host: callbackHost }),
+        }),
+    onSuccess: (_d, v) => qc.invalidateQueries({ queryKey: ['callback-relay', v.nodeId] }),
+  })
+}
+
+export function useStopCallbackRelay() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (nodeId: string) =>
+      apiFetch<{ ok: boolean }>(`/nodes/${nodeId}/callback-relay`, { method: 'DELETE' }),
+    onSuccess: (_d, nodeId) => qc.invalidateQueries({ queryKey: ['callback-relay', nodeId] }),
+  })
+}
+
 // ── Implants ───────────────────────────────────────────────────────
 export function useGenerateImplant() {
   return useMutation({
