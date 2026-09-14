@@ -76,7 +76,7 @@ def _author_regex(raw: str, field: str, value: str, model: str) -> Optional[str]
     prompt = _AUTHOR_PROMPT.format(field=field, value=value,
                                    output=raw[:MAX_CONTENT_CHARS])
     try:
-        resp, _meta = _call_llm(prompt, model)
+        resp, _meta = _call_llm(prompt, model, task="extract")
     except Exception as e:
         log.warning("regex authoring call failed for %s: %s", field, e)
         return None
@@ -123,7 +123,7 @@ def spec_llm_fill(spec: dict, tool: str, target: str, port, command: str,
         return {}
     prompt = es.build_prompt(spec, tool, target, port, command, raw)
     try:
-        resp, _meta = _call_llm(prompt, model)
+        resp, _meta = _call_llm(prompt, model, task="extract")
     except Exception as e:
         log.warning("spec LLM fill call failed for %s: %s", tool, e)
         return {}
@@ -187,7 +187,7 @@ def _distill_focus(cur, tool: str, raw: str, focus: str, det: dict, model: str,
     from artifact_consumer import _call_llm, _extract_json, MAX_CONTENT_CHARS
     prompt = _FOCUS_PROMPT.format(tool=tool, focus=focus, output=raw[:MAX_CONTENT_CHARS])
     try:
-        resp, _meta = _call_llm(prompt, model)
+        resp, _meta = _call_llm(prompt, model, task="extract")
     except Exception as e:
         log.warning("focus extract call failed for %s: %s", tool, e)
         return {"requested": focus, "found": False, "error": str(e)[:200]}
@@ -223,8 +223,11 @@ def distill_artifact(cur, tool: str, raw: str, target: str = "", port=None,
     Returns {tool, learned:[fields], proposed_notable:[ids], skipped:[...], focus}.
     Idempotent: re-running never re-authors a field already learned (unique index
     on (tool, kind, rule shape) + ON CONFLICT DO NOTHING)."""
-    from artifact_consumer import DEFAULT_MODEL
-    model = model or DEFAULT_MODEL
+    # Do NOT force the env default here — for extraction the model comes from the
+    # "extract" task route (a model the active backend actually serves). `model`
+    # stays None unless the operator explicitly chose one, and the LLM calls below
+    # route by task so an unset model resolves through llm.route.extract rather
+    # than a bare OLLAMA_MODEL tag the Azure backend would 404 on.
     spec = es.spec_for(tool)
     result = {"tool": tool, "learned": [], "proposed_notable": [], "skipped": [],
               "focus": None}

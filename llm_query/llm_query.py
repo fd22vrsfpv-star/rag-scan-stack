@@ -304,19 +304,40 @@ def _azure_json_post(url: str, payload: Dict[str, Any],
         payload = {**payload, "model": payload.get("model") or AZURE_MODEL}
     try:
         r = _post_with_429_retry(url, payload, _azure_headers(api_key))
-        # The gpt-5 / o-series families REJECT `max_tokens` and require
-        # `max_completion_tokens`; older deployments accept only `max_tokens`.
-        # Rather than maintain a model list that goes stale, swap the parameter
-        # once when the provider tells us to. Verified against gpt-5-mini:
-        # max_tokens -> 400 unsupported_parameter, max_completion_tokens -> 200.
-        if r.status_code == 400 and "max_tokens" in payload:
+        # The gpt-5 / o-series reasoning deployments reject several params the
+        # classic chat models accept, and Azure reports only the FIRST offending
+        # one per response. Rather than maintain a model list that goes stale,
+        # adjust the named param and retry -- up to a few times, so a request
+        # that trips over max_tokens THEN temperature THEN top_p still lands.
+        #   * max_tokens        -> must become max_completion_tokens
+        #   * temperature/top_p -> only the default is supported; drop the override
+        # Verified against gpt-5-mini: max_tokens -> 400 unsupported_parameter,
+        # temperature=0.1 -> 400 "does not support 0.1 ... only the default (1)".
+        for _ in range(4):
+            if r.status_code != 400:
+                break
             body = (r.text or "")
-            if "max_completion_tokens" in body:
-                retry = {k: v for k, v in payload.items() if k != "max_tokens"}
-                retry["max_completion_tokens"] = payload["max_tokens"]
-                logger.info("retrying %s with max_completion_tokens (model %r "
-                            "rejects max_tokens)", url, payload.get("model"))
-                r = _post_with_429_retry(url, retry, _azure_headers(api_key))
+            low = body.lower()
+            new = None
+            reason = ""
+            if "max_tokens" in payload and "max_completion_tokens" in body:
+                new = {k: v for k, v in payload.items() if k != "max_tokens"}
+                new["max_completion_tokens"] = payload["max_tokens"]
+                reason = "swapping max_tokens -> max_completion_tokens"
+            elif "temperature" in payload and "'temperature'" in low \
+                    and ("unsupported" in low or "does not support" in low):
+                new = {k: v for k, v in payload.items() if k != "temperature"}
+                reason = "dropping unsupported temperature override"
+            elif "top_p" in payload and "'top_p'" in low \
+                    and ("unsupported" in low or "does not support" in low):
+                new = {k: v for k, v in payload.items() if k != "top_p"}
+                reason = "dropping unsupported top_p override"
+            if new is None:
+                break
+            logger.info("retrying %s (%s; model %r)", url, reason,
+                        payload.get("model"))
+            payload = new
+            r = _post_with_429_retry(url, payload, _azure_headers(api_key))
         r.raise_for_status()
         return r.json()
     except requests.HTTPError as e:
@@ -398,7 +419,15 @@ def _anthropic_extract_text(data: Dict) -> str:
 
 class GenerateRequest(BaseModel):
     prompt: str
-    model: Optional[str] = Field(default=DEFAULT_MODEL, description="Default LLM model")
+    # Default MUST be None, not DEFAULT_MODEL. A concrete default here would turn
+    # an OMITTED model into an explicit caller choice, which _route_for treats as
+    # "the caller decided" and lets win over the task route -- so a request that
+    # sends only task="extract" (no model) would be sent to DEFAULT_MODEL on the
+    # active backend (an Ollama tag the Azure backend 404s on) instead of the
+    # operator's llm.route.extract model. _caller_model / _normalize_model both
+    # fall back to DEFAULT_MODEL when the non-routed passthrough paths need a
+    # concrete model, so None here changes nothing for callers that omit a task.
+    model: Optional[str] = Field(default=None, description="LLM model (None = let the task route or global default decide)")
     # Per-task routing. Naming a task ("news", "exploit", ...) lets the operator
     # choose that task's model AND backend in Settings -> LLM Tuning without the
     # caller knowing anything about models. An explicit `model` still wins, and
@@ -416,7 +445,10 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
-    model: Optional[str] = Field(default=DEFAULT_MODEL, description="Default LLM model")
+    # None, not DEFAULT_MODEL -- see GenerateRequest.model. An omitted model must
+    # stay empty so task routing (and the global default) can decide; a concrete
+    # default would masquerade as an explicit caller choice and defeat the route.
+    model: Optional[str] = Field(default=None, description="LLM model (None = let the task route or global default decide)")
     task: Optional[str] = Field(default=None, description="Routing task name")
     stream: bool = False
     options: Optional[Dict[str, Any]] = None
@@ -569,6 +601,32 @@ def ps():
         return {"models": [{"name": AZURE_MODEL, "backend": "azure"}]}
     return _json_get(_endpoint("/ps"))
 
+def _resolve_caller_provider_model(caller: str):
+    """If `caller` is "provider:model" with a KNOWN provider prefix, resolve it to
+    a full route (that provider's backend/endpoint/api_key + the bare model), the
+    same way a task route is resolved. Returns None for a bare model (e.g.
+    "gpt-5-mini" or an ollama tag "qwen2.5:14b"), which then uses the global
+    backend as before. Never raises — on any error the caller model is used as-is.
+    """
+    if get_llm_settings is None or ":" not in (caller or ""):
+        return None
+    try:
+        from common.llm_settings import parse_route, get_providers, _resolve_one
+        s = get_llm_settings()
+        prefixes = [p.get("id") for p in (get_providers(s) or []) if p.get("id")]
+        prefix, _model = parse_route(caller, prefixes)
+        if not prefix:
+            return None
+        prov, model = _resolve_one(caller, s)
+        return {"backend": prov["type"], "model": model, "provider": prov["id"],
+                "endpoint": prov.get("endpoint"), "api_key": prov.get("api_key"),
+                "source": "caller-route", "fallback": None}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("could not resolve caller model %r as provider:model: %s",
+                       caller, e)
+        return None
+
+
 def _route_for(task: Optional[str], explicit_model: Optional[str]):
     """Resolve (backend, model, fallback) for this request.
 
@@ -578,6 +636,16 @@ def _route_for(task: Optional[str], explicit_model: Optional[str]):
     """
     caller = _caller_model(explicit_model)
     if caller:
+        # A caller may name its model in the route syntax "provider:model"
+        # (that is exactly what a consumer resolving llm.route.<task> yields).
+        # If the prefix is a KNOWN provider, resolve it to that provider's own
+        # endpoint + the bare model — otherwise "azure-main:gpt-5-mini" is sent
+        # to the default backend as a literal deployment name and Azure 404s
+        # (which is precisely what broke the extractor / every consumer passing
+        # a route string without a task).
+        resolved = _resolve_caller_provider_model(caller)
+        if resolved:
+            return resolved
         return {"backend": LLM_BACKEND, "model": caller,
                 "source": "caller", "fallback": None}
     if not task or get_llm_settings is None:
@@ -714,8 +782,12 @@ def generate(req: GenerateRequest):
     # every backend itself (including one different from the global default)
     # and fails over to the task's fallback model on an exhausted 429, so it
     # short-circuits the per-backend branches below.
-    if req.task and not req.stream:
-        route = _route_for(req.task, req.model)
+    route = _route_for(req.task, req.model)
+    # Route through the resolved provider whenever a task named one OR the caller
+    # passed a "provider:model" model (both carry an explicit endpoint). The
+    # per-backend branches below only ever use the GLOBAL backend, so a
+    # cross-provider model must not fall through to them and hit the wrong host.
+    if (req.task or route.get("endpoint")) and not req.stream:
         text, used, failed_over = _generate_routed(route, req.prompt, req.options)
         return JSONResponse(content={
             "model": used[1], "response": text, "done": True,
