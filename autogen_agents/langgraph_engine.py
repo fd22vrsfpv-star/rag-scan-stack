@@ -504,10 +504,10 @@ def _phase_budget(name: str, default: int) -> int:
 
 
 PHASE_STEP_BUDGET = {
-    "Reconnaissance": _phase_budget("Reconnaissance", 30),
-    "Scanner": _phase_budget("Scanner", 24),          # +dispatch tools, see scan()
-    "Analyzer": _phase_budget("Analyzer", 44),
-    "Exploit": _phase_budget("Exploit", 44),
+    "Reconnaissance": _phase_budget("Reconnaissance", 50),
+    "Scanner": _phase_budget("Scanner", 50),          # +dispatch tools, see scan()
+    "Analyzer": _phase_budget("Analyzer", 50),
+    "Exploit": _phase_budget("Exploit", 50),
 }
 # LangGraph's own message when the step budget runs out. Surfaced explicitly
 # rather than persisted as if it were the agent's answer.
