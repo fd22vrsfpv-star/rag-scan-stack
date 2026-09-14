@@ -16,6 +16,7 @@ import {
   useRotateDOIP, useDORotateStatus, useIPHistory,
   useWGPeers, useCreateWGPeer, useDeleteWGPeer, useWGPeerConfig,
   useWGClientStatus, useStartWGClient, useStopWGClient, useRestartWGClient,
+  useCallbackRelayStatus, useStartCallbackRelay, useStopCallbackRelay,
 } from '@/api/nodes'
 import type { IPHistoryEntry, WGPeer, WGPeerConfig } from '@/api/nodes'
 import { AD_ATTACK_TYPES, NODE_STATUS_COLORS } from '@/lib/constants'
@@ -152,6 +153,55 @@ function BurpProxyBlock({ port, online }: { port: number; online: boolean }) {
         <br />
         Published on localhost only — it is not reachable from anywhere else on the network.
       </p>
+    </div>
+  )
+}
+
+// Reverse callback relay for a node: the node listens on a port and hands every
+// reverse shell back through the SSH channel to central MSF. Safer than a bind
+// port on the target (nothing new listens on the target), and it makes reverse
+// shells work from a target that can't route to the NAT'd central handler.
+function CallbackRelayBlock({ nodeId, defaultHost }: { nodeId: string; defaultHost: string }) {
+  const { data } = useCallbackRelayStatus(nodeId)
+  const start = useStartCallbackRelay()
+  const stop = useStopCallbackRelay()
+  const [host, setHost] = useState(defaultHost)
+  const [lport, setLport] = useState<number>(4444)
+  const active = !!data?.active
+  const err = (start.error as any)?.message || (stop.error as any)?.message
+  return (
+    <div className={cn('rounded-md border p-2 mt-2',
+      active ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-border bg-muted/20')}>
+      <div className="flex items-center gap-2">
+        <Send className="h-3.5 w-3.5 text-emerald-400" />
+        <span className="text-xs font-medium text-foreground">Reverse callback relay</span>
+        {active
+          ? <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">live · node:{data?.lport}</span>
+          : <span className="text-[10px] text-muted-foreground">off</span>}
+      </div>
+      <p className="text-[11px] text-muted-foreground mt-1">
+        The node catches reverse shells and relays them to central MSF — no bind port on the target.
+        Reverse payloads use <span className="font-mono">LHOST={host || defaultHost}</span>.
+      </p>
+      {!active ? (
+        <div className="flex items-center gap-2 mt-2">
+          <input value={host} onChange={e => setHost(e.target.value)} placeholder="callback IP (target-reachable)"
+            className="px-2 py-1 bg-card border border-border rounded text-xs font-mono w-56" />
+          <input type="number" value={lport} onChange={e => setLport(Number(e.target.value))}
+            className="px-2 py-1 bg-card border border-border rounded text-xs font-mono w-20" />
+          <button onClick={() => start.mutate({ nodeId, lport, callbackHost: host || undefined })}
+            disabled={start.isPending}
+            className="px-2 py-1 rounded text-xs font-medium bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 disabled:opacity-50">
+            {start.isPending ? 'Starting…' : 'Start relay'}
+          </button>
+        </div>
+      ) : (
+        <button onClick={() => stop.mutate(nodeId)} disabled={stop.isPending}
+          className="mt-2 px-2 py-1 rounded text-xs font-medium bg-red-500/15 text-red-400 border border-red-500/30 disabled:opacity-50">
+          {stop.isPending ? 'Stopping…' : 'Stop relay'}
+        </button>
+      )}
+      {err && <p className="text-[11px] text-red-400 mt-1">{String(err).slice(0, 200)}</p>}
     </div>
   )
 }
@@ -432,6 +482,12 @@ function NodeGrid() {
             {/* SOCKS5 for the operator's own tools (Burp, browser) */}
             {!!node.proxy_port && (
               <BurpProxyBlock port={node.proxy_port} online={node.status === 'online'} />
+            )}
+
+            {/* Reverse callback relay: node catches reverse shells and hands them
+                to central MSF — safer than a bind port on the target. */}
+            {node.status === 'online' && node.metadata?.host && (
+              <CallbackRelayBlock nodeId={node.id} defaultHost={String(node.metadata?.host || '')} />
             )}
 
             {/* Details */}
