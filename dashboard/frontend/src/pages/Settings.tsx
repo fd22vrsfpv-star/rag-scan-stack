@@ -4944,6 +4944,105 @@ function ExploitWatcherTab() {
           </div>
         </div>
       </div>
+
+      <MsfPayloadSettings />
+    </div>
+  )
+}
+
+interface MsfPayloadCfg {
+  connect_style: string
+  payload: string
+  callback_host: string
+  callback_port: number
+  listener_bind_address: string
+  listener_bind_port: number
+  encryption: boolean
+  stage_encoder: string
+}
+
+// MSF payload defaults. Exploits default to a connect-OUT BIND payload because
+// this stack is behind NAT — a reverse shell only works with an external
+// callback host the target can reach. Custom payload + stage encryption are
+// optional.
+function MsfPayloadSettings() {
+  const qc = useQueryClient()
+  const { data, isLoading } = useQuery({
+    queryKey: ['msf-payload-config'],
+    queryFn: () => apiFetch<{ config: MsfPayloadCfg }>('/exploits/payload-config'),
+  })
+  const [form, setForm] = useState<Partial<MsfPayloadCfg>>({})
+  const [err, setErr] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
+  useEffect(() => { if (data?.config) setForm(data.config) }, [data])
+
+  const save = useMutation({
+    mutationFn: (body: Partial<MsfPayloadCfg>) =>
+      apiFetch('/exploits/payload-config', { method: 'PUT', body: JSON.stringify(body) }),
+    onSuccess: () => { setErr(null); setSaved(true); setTimeout(() => setSaved(false), 2000); qc.invalidateQueries({ queryKey: ['msf-payload-config'] }) },
+    onError: (e: any) => setErr(String(e?.message || e)),
+  })
+
+  if (isLoading) return <div className="text-sm text-muted-foreground">Loading payload config…</div>
+  const set = (k: keyof MsfPayloadCfg, v: any) => setForm(p => ({ ...p, [k]: v }))
+  const isReverse = form.connect_style === 'reverse'
+
+  return (
+    <div className="border-t border-border pt-6">
+      <h3 className="text-base font-semibold mb-1">MSF Payload &amp; Callbacks</h3>
+      <p className="text-sm text-muted-foreground mb-4">
+        Exploits default to a connect-out <span className="font-mono">bind</span> payload, which
+        holds through NAT. A <span className="font-mono">reverse</span> shell needs a callback
+        host the target can actually reach. Optionally pin a custom payload or enable stage encryption.
+      </p>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-w-3xl">
+        <label className="text-sm">Connect style
+          <select value={form.connect_style ?? 'auto'} onChange={e => set('connect_style', e.target.value)}
+            className="mt-1 w-full px-2 py-1.5 bg-card border border-border rounded text-sm">
+            <option value="auto">auto (prefer bind)</option>
+            <option value="bind">bind (connect out)</option>
+            <option value="reverse">reverse (callback)</option>
+          </select>
+        </label>
+        <label className="text-sm">Custom payload <span className="text-muted-foreground">(blank = auto)</span>
+          <input value={form.payload ?? ''} onChange={e => set('payload', e.target.value)}
+            placeholder="e.g. java/meterpreter/bind_tcp"
+            className="mt-1 w-full px-2 py-1.5 bg-card border border-border rounded text-sm font-mono" />
+        </label>
+        <label className="text-sm">Callback host (external IP for reverse)
+          <input value={form.callback_host ?? ''} onChange={e => set('callback_host', e.target.value)}
+            placeholder="reachable IP the target can dial back"
+            className={cn('mt-1 w-full px-2 py-1.5 bg-card border rounded text-sm font-mono',
+              isReverse && !form.callback_host ? 'border-red-500/60' : 'border-border')} />
+        </label>
+        <label className="text-sm">Callback / bind port
+          <input type="number" value={form.callback_port ?? 4444} onChange={e => set('callback_port', Number(e.target.value))}
+            className="mt-1 w-full px-2 py-1.5 bg-card border border-border rounded text-sm font-mono" />
+        </label>
+        <label className="text-sm">Listener bind address <span className="text-muted-foreground">(optional)</span>
+          <input value={form.listener_bind_address ?? ''} onChange={e => set('listener_bind_address', e.target.value)}
+            placeholder="ReverseListenerBindAddress (local iface)"
+            className="mt-1 w-full px-2 py-1.5 bg-card border border-border rounded text-sm font-mono" />
+        </label>
+        <label className="text-sm">Stage encoder
+          <input value={form.stage_encoder ?? ''} onChange={e => set('stage_encoder', e.target.value)}
+            placeholder="x86/shikata_ga_nai"
+            className="mt-1 w-full px-2 py-1.5 bg-card border border-border rounded text-sm font-mono" />
+        </label>
+      </div>
+      <label className="flex items-center gap-2 text-sm mt-3">
+        <input type="checkbox" checked={!!form.encryption} onChange={e => set('encryption', e.target.checked)}
+          className="accent-primary h-4 w-4" />
+        Enable stage encryption (MSF stage encoding; meterpreter transport is AES either way)
+      </label>
+      {isReverse && !form.callback_host && (
+        <p className="text-xs text-red-400 mt-2">Reverse shells need a callback host the target can reach.</p>
+      )}
+      {err && <p className="text-xs text-red-400 mt-2">{err}</p>}
+      <button onClick={() => save.mutate(form)} disabled={save.isPending || (isReverse && !form.callback_host)}
+        className="mt-4 px-3 py-1.5 bg-primary text-primary-foreground rounded text-sm font-medium disabled:opacity-50">
+        {save.isPending ? 'Saving…' : saved ? 'Saved ✓' : 'Save payload config'}
+      </button>
     </div>
   )
 }
