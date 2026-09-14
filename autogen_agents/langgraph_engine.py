@@ -3801,23 +3801,44 @@ def _exec_one_impactful(sid, pending_id, test):
         return None
 
 
+# surface_auto_exec fires queued impactful tests SEQUENTIALLY in one graph node,
+# and each MSF exploit can wait out its ~20s session timeout. 74 in one blocking
+# loop is ~25 min, after which the watchdog marks the whole session 'stalled' and
+# the remaining exploits never run. Bound the node by a wall-clock budget AND a
+# count; anything not reached STAYS pending (recorded) for a later surface cycle
+# or a manual run, so the graph advances instead of hanging.
+SURFACE_AUTO_EXEC_BUDGET_S = int(os.environ.get("SURFACE_AUTO_EXEC_BUDGET_S", "1200"))
+SURFACE_AUTO_EXEC_MAX = int(os.environ.get("SURFACE_AUTO_EXEC_MAX", "40"))
+
+
 def surface_auto_exec(state: PentestState) -> dict:
-    """AUTO-EXPLOIT (opt-in): fire every queued impactful test WITHOUT the human
+    """AUTO-EXPLOIT (opt-in): fire queued impactful tests WITHOUT the human
     approval interrupt, capturing proof. The scope gate is NOT bypassed — each
     dispatch still goes through execute_approved_exploit -> the exploit-runner's
     scope gate, which refuses any out-of-scope target; those are recorded as
     blocked, never executed. This node has side effects and NO interrupt, so it
-    replaces surface_approval only when auto-exploit is enabled."""
+    replaces surface_approval only when auto-exploit is enabled.
+
+    Bounded by SURFACE_AUTO_EXEC_MAX and SURFACE_AUTO_EXEC_BUDGET_S so a big queue
+    cannot block the node long enough to be marked 'stalled'; deferred tests stay
+    pending."""
+    import time as _t
     sid = state["session_id"]
     pending = state.get("pending_surface_tests") or []
+    deadline = _t.monotonic() + SURFACE_AUTO_EXEC_BUDGET_S
     _msg(sid, "SurfaceTester",
-         f"[AUTO-EXPLOIT] firing {len(pending)} queued impactful test(s) "
-         "through the scope gate (out-of-scope is refused, not run).")
-    proved, results = 0, []
-    for t in pending:
+         f"[AUTO-EXPLOIT] firing up to {min(len(pending), SURFACE_AUTO_EXEC_MAX)} "
+         f"of {len(pending)} queued impactful test(s) through the scope gate "
+         f"(out-of-scope is refused, not run; budget {SURFACE_AUTO_EXEC_BUDGET_S}s).")
+    proved, results, deferred = 0, [], 0
+    for i, t in enumerate(pending):
         pid = t.get("pending_exploit_id")
         if not pid:
             continue
+        # Stop cleanly on the count cap or the time budget; leave the rest pending.
+        if len(results) >= SURFACE_AUTO_EXEC_MAX or _t.monotonic() >= deadline:
+            deferred = len(pending) - i
+            break
         status = _exec_one_impactful(sid, pid, t)
         results.append({"test": t["name"], "status": status})
         if status == "pass":
@@ -3825,17 +3846,21 @@ def surface_auto_exec(state: PentestState) -> dict:
         _emit("langgraph_surface_test_completed", sid,
               {"executed": True, "auto": True, "pending_exploit_id": str(pid),
                "status": status})
+    tail = (f"; {deferred} deferred (still pending — a later cycle or a manual "
+            f"run picks them up)" if deferred else "")
     _msg(sid, "SurfaceTester",
          f"[AUTO-EXPLOIT] {proved}/{len(results)} impactful test(s) PROVED "
-         "(assertion held on the exploit output).")
+         f"(assertion held on the exploit output){tail}.")
     _emit("langgraph_surface_decision", sid,
           {"approved": True, "auto_exploit": True, "proved": proved,
-           "total": len(results)})
+           "total": len(results), "deferred": deferred})
     return {"phase": "surface_onward",
             "surface_decision": {"approved": True, "auto_exploit": True,
-                                 "proved": proved, "total": len(results)},
+                                 "proved": proved, "total": len(results),
+                                 "deferred": deferred},
             "findings": [f"surface_auto_exec: {proved}/{len(results)} proved"],
-            "log": [f"surface_auto_exec: {proved}/{len(results)} proved"]}
+            "log": [f"surface_auto_exec: {proved}/{len(results)} proved, "
+                    f"{deferred} deferred"]}
 
 
 # ── graph ────────────────────────────────────────────────────────────────────
