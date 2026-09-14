@@ -137,12 +137,50 @@ const severityColor: Record<string, string> = {
   info: 'bg-zinc-500/20 text-zinc-400 border-zinc-500/30',
 }
 
-const portColumns: ColumnDef<Port, unknown>[] = [
-  { accessorKey: 'port', header: 'Port', size: 60, minSize: 40 },
+// Port table columns. Ports where we hold LIVE access are surfaced in green with
+// a "Follow up" affordance that jumps to the Current Access tab — the access
+// count was visible on the host row, but nothing tied it back to WHICH port, so
+// there was no way to act on it from the port list. `accessByPort` maps a port
+// to the best live access row it carries.
+function makePortColumns(
+  accessByPort: Map<number, ObtainedAccess>,
+  onFollowUp: (port: number) => void,
+): ColumnDef<Port, unknown>[] {
+  return [
+  { accessorKey: 'port', header: 'Port', size: 70, minSize: 40, cell: ({ getValue }) => {
+    const p = getValue() as number
+    const held = accessByPort.get(p)
+    if (!held) return <span className="text-sm">{p}</span>
+    return (
+      <span className="inline-flex items-center gap-1 font-medium text-green-400" title="Live access is held on this port">
+        <Terminal className="h-3 w-3" />{p}
+      </span>
+    )
+  }},
   { accessorKey: 'proto', header: 'Proto', size: 55, minSize: 40 },
   { accessorKey: 'service', header: 'Service', size: 100, minSize: 60 },
   { accessorKey: 'product', header: 'Product', size: 140, minSize: 80 },
   { accessorKey: 'version', header: 'Version', size: 160, minSize: 80 },
+  // Held access on this port: a green chip (kind + privilege) and a manual
+  // follow-up button. Blank for ports we hold nothing on.
+  { id: 'access', header: 'Access', size: 200, minSize: 120, cell: ({ row }) => {
+    const held = accessByPort.get(row.original.port)
+    if (!held) return <span className="text-xs text-muted-foreground">—</span>
+    const priv = held.is_root === true ? 'root' : held.is_root === false ? (held.whoami || 'user') : 'unknown'
+    return (
+      <div className="flex items-center gap-2">
+        <span className="inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded border bg-green-500/15 text-green-400 border-green-500/30"
+              title={`${held.kind} · ${priv} · ${held.probes_ok}/${held.probes} probes · score ${held.score}`}>
+          <Terminal className="h-3 w-3" />{held.kind} · {priv}
+        </span>
+        <button
+          onClick={(e) => { e.stopPropagation(); onFollowUp(row.original.port) }}
+          className="text-[10px] font-medium px-1.5 py-0.5 rounded border border-green-500/30 text-green-400 hover:bg-green-500/15"
+          title="Open Current Access to probe or use this shell"
+        >Follow up →</button>
+      </div>
+    )
+  }},
   { accessorKey: 'finding_count', header: 'Findings', size: 75, minSize: 55, cell: ({ getValue }) => {
     const count = getValue() as number | undefined
     return count ? <span className="text-xs font-medium">{count}</span> : <span className="text-xs text-muted-foreground">—</span>
@@ -153,7 +191,8 @@ const portColumns: ColumnDef<Port, unknown>[] = [
     return <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded border ${severityColor[sev] ?? ''}`}>{sev.toUpperCase()}</span>
   }},
   { accessorKey: 'banner', header: 'Banner', size: 300, minSize: 100, cell: ({ getValue }) => <span className="text-xs whitespace-pre-wrap break-all">{String(getValue() ?? '')}</span> },
-]
+  ]
+}
 
 const subdomainColumns: ColumnDef<Subdomain, unknown>[] = [
   { accessorKey: 'subdomain', header: 'Subdomain', cell: ({ getValue }) => <span className="font-mono text-sm font-medium">{String(getValue())}</span> },
@@ -921,6 +960,22 @@ export default function AssetBrowser() {
   const { data: assetsData, isLoading } = useAssets(5000, serverAssetKind)
   const { data: accessSummary } = useAccessSummary()
   const { data: portsData } = useAssetPorts(selectedIp || '')
+  // Access the selected host holds, so the port list can flag WHICH ports carry
+  // a live shell (green) and offer a manual follow-up. Same query key as the
+  // Current Access tab, so react-query dedups the fetch.
+  const { data: hostAccessData } = useAssetAccess(selectedIp || '')
+  const accessByPort = useMemo(() => {
+    const m = new Map<number, ObtainedAccess>()
+    for (const a of hostAccessData?.access ?? []) {
+      if (a.port == null || a.status !== 'live' || a.score <= 0) continue
+      const cur = m.get(a.port)
+      if (!cur || a.score > cur.score) m.set(a.port, a)
+    }
+    return m
+  }, [hostAccessData])
+  const portCols = useMemo(
+    () => makePortColumns(accessByPort, () => setDetailTab('access')),
+    [accessByPort])
   const { data: vulnsData } = useAssetVulns(selectedIp || '')
   const { data: subdomainsData, isLoading: subdomainsLoading } = useSubdomains()
   const { data: allCredsData, isLoading: credsLoading } = useAllCredentials(credStatusFilter || undefined)
@@ -2049,8 +2104,9 @@ export default function AssetBrowser() {
                 {portsData?.items?.length ? (
                   <DataTable
                     data={portsData.items}
-                    columns={portColumns}
+                    columns={portCols}
                     onRowClick={(row) => setSelectedPort(row)}
+                    rowClassName={(p) => accessByPort.has(p.port) ? 'bg-green-500/10 hover:bg-green-500/20' : undefined}
                     resizable
                   />
                 ) : (
