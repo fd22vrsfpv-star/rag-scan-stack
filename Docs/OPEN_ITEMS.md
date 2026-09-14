@@ -295,3 +295,19 @@ surface). Shipping an unverified exploit format would violate the repo's
 lab daemon (192.168.1.150:3632) through the scope-gated `/vectors/run`, then added
 as the vector's `attempt` with an `expect_shell` assertion.
 **Enforced by:** not enforced
+
+### End-to-end reverse shell through a node callback relay is unproven
+**Found:** 2026-09-14
+**Evidence:** The relay (`ssh -R 0.0.0.0:<lport>:metasploit:<lport>`) and the
+reverse-to-node payload wiring are in place and unit-tested, and the relay can be
+started against a live node. But a genuine reverse shell from a REAL target
+arriving at the node, relaying to central MSF, and landing as a held
+`msf_session` has not been observed — the only nodes available are lab SSH nodes
+with no target that egresses to them. Also unverified live: that each node's sshd
+allows the `GatewayPorts` 0.0.0.0 bind (start_callback_relay reports the failure,
+but no lab node has been confirmed either way).
+**Where:** `node_manager/ssh_manager.py` (`start_callback_relay`),
+`exploit_runner/exploit_runner.py` (`_node_callback_config`).
+**Done when:** a target on a node's network throws a reverse shell that arrives via
+the relay and is recorded as a held `msf_session` on the central msfrpcd.
+**Enforced by:** not enforced

