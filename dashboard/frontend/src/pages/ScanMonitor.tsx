@@ -216,7 +216,11 @@ export default function ScanMonitor() {
   const limPendingRecs = limitsData?.pending_recommendations ?? 0
 
   const sessions = sessionsData?.sessions ?? []
-  const activeSessions = sessions.filter(s => s.status === 'active')
+  // 'scanning' = the graph finished its phases but the scans it launched are
+  // still running (a full-port sweep can take hours). Those sessions are still
+  // in progress, so they belong in the active list with their scans rolled up —
+  // not dropped as if done.
+  const activeSessions = sessions.filter(s => s.status === 'active' || s.status === 'scanning')
 
   return (
     <div className="space-y-6">
