@@ -202,21 +202,29 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "gemma4:31b")
 
 
 def llm_generate(prompt: str, caller: str, model: str = None, think: bool = False,
-                 temperature: float = 0.1, num_predict: int = 1024, timeout: int = 120) -> dict:
-    """Call Ollama LLM and log metrics to llm_request_metrics table.
+                 temperature: float = 0.1, num_predict: int = 1024, timeout: int = 120,
+                 task: str = "analyze") -> dict:
+    """Call the LLM (via llm_query) and log metrics to llm_request_metrics.
+
+    Routes by `task` (default "analyze") so llm_query picks the model the
+    operator configured for that task on the ACTIVE backend. An explicit `model`
+    still wins; without one we send NO model, because a forced default
+    (LLM_MODEL=gemma4:31b, an ollama tag) is a deployment name the Azure backend
+    404s on. `model` in the returned dict / metrics is whatever actually answered.
 
     Returns dict with: response, eval_count, tokens_per_sec, latency_ms, ok, error
     """
     import time as _t
-    model = model or LLM_MODEL
     result = {"response": "", "eval_count": 0, "tokens_per_sec": 0, "latency_ms": 0, "ok": False, "error": None}
 
     t0 = _t.time()
+    payload = {"prompt": prompt, "stream": False, "think": think, "task": task,
+               "options": {"temperature": temperature, "num_predict": num_predict}}
+    if model:
+        payload["model"] = model
     try:
         resp = requests.post(
-            f"{OLLAMA_BASE}/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False, "think": think,
-                  "options": {"temperature": temperature, "num_predict": num_predict}},
+            f"{OLLAMA_BASE}/api/generate", json=payload,
             timeout=timeout, verify=False,
         )
         latency_ms = round((_t.time() - t0) * 1000, 1)
@@ -224,6 +232,9 @@ def llm_generate(prompt: str, caller: str, model: str = None, think: bool = Fals
 
         if resp.status_code == 200:
             data = resp.json()
+            # The model that actually answered (the task route may have chosen
+            # it); fall back to the caller's model or the task name for logging.
+            model = data.get("model") or model or task
             result["response"] = data.get("response", "")
             result["eval_count"] = data.get("eval_count", 0)
             eval_dur = data.get("eval_duration", 0)
@@ -248,7 +259,7 @@ def llm_generate(prompt: str, caller: str, model: str = None, think: bool = Fals
                 (caller, model_name, prompt_tokens, completion_tokens, total_tokens, tokens_per_sec,
                  latency_ms, is_error, error_message, request_params)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                (caller, model, result.get("prompt_tokens", 0), result["eval_count"],
+                (caller, model or task, result.get("prompt_tokens", 0), result["eval_count"],
                  result.get("prompt_tokens", 0) + result["eval_count"], result["tokens_per_sec"],
                  result["latency_ms"], not result["ok"], result.get("error"),
                  Json({"temperature": temperature, "num_predict": num_predict, "prompt_len": len(prompt),

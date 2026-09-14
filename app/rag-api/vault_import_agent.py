@@ -64,7 +64,10 @@ def _resolve_model(override: Optional[str] = None) -> str:
             return v
     except Exception:
         pass
-    return DEFAULT_MODEL
+    # Empty, NOT DEFAULT_MODEL: with nothing explicitly chosen the LLM call routes
+    # by task ("extract") so llm_query picks a model the ACTIVE backend serves. A
+    # forced OLLAMA_MODEL tag would 404 on the Azure backend (DeploymentNotFound).
+    return ""
 
 
 def _deterministic_extract(row: dict) -> list[dict]:
@@ -163,17 +166,23 @@ Return the JSON now.
 
 def _call_llm(prompt: str, model: str) -> tuple[str, dict]:
     t0 = time.time()
+    # Route by task ("extract") when no model was explicitly chosen; forward the
+    # model only when the operator picked one (via override or the vault_import
+    # agent setting). See _resolve_model for why an empty model must not become
+    # a forced env default.
+    payload = {"prompt": prompt, "stream": False, "task": "extract",
+               "options": {"temperature": 0.1, "num_predict": 1024}}
+    if model:
+        payload["model"] = model
     resp = requests.post(
-        f"{OLLAMA_BASE}/api/generate",
-        json={"model": model, "prompt": prompt, "stream": False,
-              "options": {"temperature": 0.1, "num_predict": 1024}},
+        f"{OLLAMA_BASE}/api/generate", json=payload,
         timeout=LLM_TIMEOUT_S, verify=False,
     )
     latency_ms = int((time.time() - t0) * 1000)
     resp.raise_for_status()
     data = resp.json()
     return data.get("response", ""), {
-        "model": model, "latency_ms": latency_ms,
+        "model": data.get("model") or model or "extract", "latency_ms": latency_ms,
         "prompt_tokens": data.get("prompt_eval_count", 0),
         "completion_tokens": data.get("eval_count", 0),
     }

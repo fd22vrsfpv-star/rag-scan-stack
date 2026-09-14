@@ -311,3 +311,22 @@ but no lab node has been confirmed either way).
 **Done when:** a target on a node's network throws a reverse shell that arrives via
 the relay and is recorded as a held `msf_session` on the central msfrpcd.
 **Enforced by:** not enforced
+
+## LLM routing
+
+### script_executor's exploit-code generation talks to raw ollama, not the router
+**Found:** 2026-09-14
+**Evidence:** `exploit_runner/script_executor.py:33` sets
+`OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")` and the
+LLM call at ~:371 POSTs there with a forced `model=LLM_MODEL` (`gemma4:26b`).
+docker-compose sets `OLLAMA_URL` to raw ollama for the exploit_runner service,
+and per Docs/Memories no raw ollama exists in this deployment — so this
+exploit-code generation path 404s / never produces output here, and it bypasses
+the per-task LLM router entirely (unlike the analysis callers converted in the
+`route-analysis-callers-by-task` change).
+**Where:** `exploit_runner/script_executor.py` (the `OLLAMA_URL` generate call
+and the two `LLM_URL` `/ollama/chat` calls at ~:857 and ~:1086).
+**Done when:** script_executor routes through llm_query (`OLLAMA_BASE_URL`) with
+`task="exploit_gen"` and no forced env model, the way web_payload_generator now
+does, OR is confirmed dead and removed.
+**Enforced by:** not enforced

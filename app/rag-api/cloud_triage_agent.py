@@ -212,19 +212,26 @@ def _resolve_model(override: Optional[str] = None) -> str:
 
 
 def _call_llm(prompt: str, model_override: Optional[str] = None) -> tuple[str, dict]:
-    model = _resolve_model(model_override)
     t0 = time.time()
+    # Route by task ("triage") so llm_query picks the model the operator
+    # configured for cloud/artifact triage on the ACTIVE backend. An explicit
+    # model_override still wins; without one we send NO model, because a forced
+    # default (OLLAMA_MODEL, a local ollama tag) is a deployment name the Azure
+    # backend 404s on. This also retires _resolve_model's /tags discovery, which
+    # only ever existed to guess a locally-installed model.
+    payload = {"prompt": prompt, "stream": False, "task": "triage",
+               "options": {"temperature": 0.2, "num_predict": 4096}}
+    if model_override:
+        payload["model"] = _resolve_model(model_override)
     resp = requests.post(
-        f"{OLLAMA_BASE}/api/generate",
-        json={"model": model, "prompt": prompt, "stream": False,
-              "options": {"temperature": 0.2, "num_predict": 4096}},
+        f"{OLLAMA_BASE}/api/generate", json=payload,
         timeout=LLM_TIMEOUT_S, verify=False,
     )
     latency_ms = int((time.time() - t0) * 1000)
     resp.raise_for_status()
     data = resp.json()
     return data.get("response", ""), {
-        "model": model,
+        "model": data.get("model") or model_override or "triage",
         "latency_ms": latency_ms,
         "prompt_tokens": data.get("prompt_eval_count", 0),
         "completion_tokens": data.get("eval_count", 0),

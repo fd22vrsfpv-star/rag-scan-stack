@@ -304,8 +304,11 @@ Respond ONLY with valid JSON in this exact format:
 
     # 3. Call Ollama
     try:
-        # Get active model from DB or fall back to config
-        model = s.ollama_model
+        # Honor the operator's explicitly-chosen active model; otherwise leave it
+        # empty and route by task ("analyze") so llm_query picks a model the
+        # ACTIVE backend serves. Forcing s.ollama_model (an env ollama tag) here
+        # 404s on the Azure backend (DeploymentNotFound).
+        model = ""
         try:
             async with httpx.AsyncClient(timeout=5) as c:
                 # Config settings live behind /settings/config/{key}. Calling
@@ -325,14 +328,16 @@ Respond ONLY with valid JSON in this exact format:
 
         async with httpx.AsyncClient(timeout=300) as c:
             try:
+                gen_payload = {
+                    "prompt": prompt,
+                    "stream": False,
+                    "task": "analyze",
+                    "options": {"temperature": 0.7, "num_predict": 2000},
+                }
+                if model:
+                    gen_payload["model"] = model
                 resp = await c.post(
-                    f"{s.ollama_url}/api/generate",
-                    json={
-                        "model": model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {"temperature": 0.7, "num_predict": 2000},
-                    },
+                    f"{s.ollama_url}/api/generate", json=gen_payload,
                 )
             except httpx.ReadTimeout:
                 raise HTTPException(504, "LLM request timed out (model may be loading). Try again in a minute.")
