@@ -26,6 +26,8 @@ interface DataTableProps<T> {
   rowSelection?: RowSelectionState
   onRowSelectionChange?: (sel: RowSelectionState) => void
   getRowId?: (row: T) => string
+  /** Optional per-row className, e.g. to tint rows that hold live access green. */
+  rowClassName?: (row: T) => string | undefined
 }
 
 export function DataTable<T>({
@@ -39,6 +41,7 @@ export function DataTable<T>({
   rowSelection,
   onRowSelectionChange,
   getRowId,
+  rowClassName,
 }: DataTableProps<T>) {
   const [sorting, setSorting] = useState<SortingState>([])
   const [columnResizeMode] = useState<ColumnResizeMode>('onChange')
@@ -147,6 +150,7 @@ export function DataTable<T>({
                   'border-b border-border/50 hover:bg-muted/30 transition-colors',
                   onRowClick && 'cursor-pointer',
                   selectable && row.getIsSelected() && 'bg-primary/10',
+                  rowClassName?.(row.original),
                 )}
                 onClick={() => onRowClick?.(row.original)}
               >
