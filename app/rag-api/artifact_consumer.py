@@ -152,19 +152,29 @@ def _extract_json(text: str) -> Optional[dict]:
     return None
 
 
-def _call_llm(prompt: str, model: str) -> tuple[str, dict]:
+def _call_llm(prompt: str, model: str, task: str = None) -> tuple[str, dict]:
     t0 = time.time()
+    # Route by TASK when one is named: llm_query then picks the model the operator
+    # configured for it (llm.route.<task>), which is a model the ACTIVE backend
+    # actually has. A bare env default like OLLAMA_MODEL=qwen2.5:32b is an Ollama
+    # tag the Azure backend cannot serve — sending it as `model` made every call
+    # 404 (DeploymentNotFound). So `model` is forwarded only when it is a real
+    # caller override; otherwise the task route decides.
+    payload = {"prompt": prompt, "stream": False,
+               "options": {"temperature": 0.1, "num_predict": 900}}
+    if task:
+        payload["task"] = task
+    if model:
+        payload["model"] = model
     resp = requests.post(
-        f"{OLLAMA_BASE}/api/generate",
-        json={"model": model, "prompt": prompt, "stream": False,
-              "options": {"temperature": 0.1, "num_predict": 900}},
+        f"{OLLAMA_BASE}/api/generate", json=payload,
         timeout=LLM_TIMEOUT_S, verify=False,
     )
     latency_ms = int((time.time() - t0) * 1000)
     resp.raise_for_status()
     data = resp.json()
     return data.get("response", ""), {
-        "model": model,
+        "model": data.get("model") or model or task,
         "latency_ms": latency_ms,
         "prompt_tokens": data.get("prompt_eval_count", 0),
         "completion_tokens": data.get("eval_count", 0),
