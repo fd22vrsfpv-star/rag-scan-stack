@@ -1084,6 +1084,47 @@ def _running_scans(sid: str) -> list:
     return out
 
 
+#: Scan types (and port ranges) that constitute the slow full-range sweep. The
+#: whole point of separating these is that analysis should NOT block on them: the
+#: quick discovery scans (masscan top-1000, naabu, targeted nmap, httpx) surface
+#: the actionable services in seconds-to-minutes, while a 1-65535 sweep through a
+#: proxy/node routinely runs for an hour or more.
+_DEEP_SCAN_TYPES = {"full_scan", "deep_port_scan"}
+
+
+def _is_deep_scan(s: dict) -> bool:
+    """True when this scan is the slow full-range port sweep — by declared type
+    or by a full-range `ports` param (so a plain nmap `-p-` counts too)."""
+    if str(s.get("type") or "").lower() in _DEEP_SCAN_TYPES:
+        return True
+    ports = str(((s.get("params") or {}).get("ports")) or "").strip().lower()
+    return ("1-65535" in ports or "0-65535" in ports
+            or ports in ("-", "-p-", "all", "*"))
+
+
+def _run_analysis_pass(sid: str, base_state: dict, note: str) -> None:
+    """Re-run analyze (+ exploit planning when enabled) over whatever results are
+    in the database RIGHT NOW, appending messages to this session. Shared by the
+    early (quick-scan) pass and the final (all-scans-done) pass. Best-effort:
+    never raises into the caller."""
+    scan_tracker.set_session(sid)
+    scan_tracker.register_run(sid)
+    try:
+        _msg(sid, "Analyzer", note)
+        state = dict(base_state)
+        analyze(state)
+        if base_state.get("exploit_phase"):
+            try:
+                exploit_plan(state)
+            except Exception as e:  # noqa: BLE001
+                _msg(sid, "Exploit", f"[post-scan] exploit planning failed: {e}")
+    finally:
+        try:
+            scan_tracker.unregister_run(sid)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _rerun_analysis_when_scans_finish(sid: str, base_state: dict) -> None:
     """Re-run analysis once the scans this session started have finished.
 
@@ -1105,12 +1146,31 @@ def _rerun_analysis_when_scans_finish(sid: str, base_state: dict) -> None:
     import time as _time
     deadline = _time.monotonic() + RESCAN_ANALYSIS_MAX_WAIT_S
     waited_for = []
+    early_done = False
     try:
         while _time.monotonic() < deadline:
             running = _running_scans(sid)
             if not running:
                 break
             waited_for = [s.get("job_id") for s in running]
+            # Don't make the agent wait out the full 1-65535 sweep before it
+            # touches anything. The moment the QUICK discovery scans are done —
+            # even while a deep sweep keeps running — analyse and start exploit
+            # planning over what they already found. The final pass below still
+            # runs when the deep sweep completes, over the fuller result set.
+            deep_running = [s for s in running if _is_deep_scan(s)]
+            quick_pending = [s for s in running if not _is_deep_scan(s)]
+            if deep_running and not quick_pending and not early_done:
+                early_done = True
+                _emit("langgraph_early_analysis_started", sid,
+                      {"deep_scans_running": len(deep_running)})
+                _run_analysis_pass(
+                    sid, base_state,
+                    "[quick-scan] Discovery scans finished — analysing and "
+                    f"planning on them now while {len(deep_running)} full-range "
+                    "sweep(s) keep running in the background.")
+                _emit("langgraph_early_analysis_completed", sid,
+                      {"deep_scans_running": len(deep_running)})
             _time.sleep(RESCAN_ANALYSIS_POLL_S)
         else:
             # Ceiling hit while scans are STILL running. Do NOT force-end the
@@ -1126,22 +1186,15 @@ def _rerun_analysis_when_scans_finish(sid: str, base_state: dict) -> None:
                   {"still_running": len(waited_for)})
             return
 
-        # Re-establish the context: this thread is not the one that ran the graph.
-        scan_tracker.set_session(sid)
-        scan_tracker.register_run(sid)
-        _msg(sid, "Analyzer",
-             "[post-scan] Scans finished — re-running analysis over the results "
-             "they produced.")
+        # All scans (including any deep sweep) are done — the final pass runs
+        # over the complete result set. _run_analysis_pass re-establishes the
+        # session context (this thread is not the one that ran the graph).
         _emit("langgraph_rescan_analysis_started", sid,
               {"scans_awaited": len(waited_for)})
-
-        state = dict(base_state)
-        analyze(state)
-        if base_state.get("exploit_phase"):
-            try:
-                exploit_plan(state)
-            except Exception as e:  # noqa: BLE001
-                _msg(sid, "Exploit", f"[post-scan] exploit planning failed: {e}")
+        _run_analysis_pass(
+            sid, base_state,
+            "[post-scan] Scans finished — re-running analysis over the results "
+            "they produced.")
         # The scans this session started are done and analysis has re-run over
         # their results — NOW the session is truly complete. Flip `scanning` ->
         # `completed` (a status-only update keeps the metadata _finish wrote), and
@@ -1153,6 +1206,7 @@ def _rerun_analysis_when_scans_finish(sid: str, base_state: dict) -> None:
         except Exception:  # noqa: BLE001
             meta = {}
         meta["post_scan_reanalysis"] = "completed"
+        meta["early_analysis"] = "completed" if early_done else "not_triggered"
         meta["scans_in_flight"] = []
         try:
             st = scan_tracker.get_session_status(sid)
