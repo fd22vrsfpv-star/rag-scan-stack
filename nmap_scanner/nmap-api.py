@@ -3466,6 +3466,40 @@ def _run_credential_check_async(
         if ingest_summary is not None:
             final_result["ingest"] = ingest_summary
 
+        # Reconcile what the tool found against what the store actually kept.
+        # `lines` is the DISTINCT valid credentials the check reported (cred_checker
+        # now de-dupes to the store's (ip,port,username,auth_type) identity), and
+        # the ingest stats say how many landed. A gap means credentials the raw
+        # output showed never became findings — the exact "output didn't match the
+        # findings" case that used to pass silently. Surface it, never swallow it.
+        reconciliation = None
+        if total_valid > 0 and isinstance(ingest_summary, dict):
+            sent = len(lines)
+            stored = int(ingest_summary.get("credentials_found") or 0)
+            skipped = int(ingest_summary.get("skipped") or 0)
+            errors = int(ingest_summary.get("errors") or 0)
+            matched = stored >= sent and skipped == 0 and errors == 0
+            reconciliation = {
+                "reported_valid": total_valid,
+                "distinct_sent": sent,
+                "stored": stored,
+                "skipped": skipped,
+                "errors": errors,
+                "matched": matched,
+            }
+            final_result["reconciliation"] = reconciliation
+            if not matched:
+                logging.warning(
+                    "[%s] credential-check RECONCILIATION MISMATCH: reported %d "
+                    "valid / %d distinct sent, but store kept %d (skipped=%d "
+                    "errors=%d) — credentials in the output did not all become "
+                    "findings", job_id, total_valid, sent, stored, skipped, errors)
+                emit_webhook_event("credential_count_mismatch", "credential-check", {
+                    "job_id": job_id,
+                    "targets": targets,
+                    **reconciliation,
+                }, severity="high")
+
         update_job_status(job_id, "completed", "done",
                          f"Credential check complete. Found {total_valid} valid credentials.",
                          result=final_result)
@@ -3473,7 +3507,8 @@ def _run_credential_check_async(
         emit_webhook_event("scan_completed", "credential-check", {
             "job_id": job_id,
             "targets_checked": len(targets),
-            "valid_credentials_found": total_valid
+            "valid_credentials_found": total_valid,
+            "reconciliation": reconciliation,
         }, severity="high" if total_valid > 0 else None)
 
     except Exception as e:
