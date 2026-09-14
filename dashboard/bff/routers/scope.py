@@ -52,6 +52,22 @@ async def add_to_scope(body: AddToScopeBody):
         return safe_json(resp)
 
 
+@router.post("/api/scope/{name}/purge-data")
+async def purge_scope_data(name: str, body: dict = None, dry_run: bool = Query(False)):
+    """Delete all findings, follow-ups, and recommendations for a named scope's
+    targets (dry_run previews counts). Keeps assets/ports/scope so a rerun is
+    authorised and regenerates fresh data."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=60) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/scope/{name}/purge-data",
+            params={"dry_run": str(dry_run).lower()},
+            json=body or {},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
 class RemoveFromScopeBody(BaseModel):
     name: str = "default"
     targets: list[str]

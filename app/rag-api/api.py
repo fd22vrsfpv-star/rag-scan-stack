@@ -14329,6 +14329,82 @@ def add_to_scope(
     return {"ok": True, "name": name, "added": added, "engagement_id": eid}
 
 
+@app.post("/scope/{name}/purge-data", tags=["Scope"])
+def purge_scope_data(name: str, body: dict = None,
+                     dry_run: bool = Query(False),
+                     authorized: bool = Depends(auth)):
+    """Delete all findings, follow-ups, and recommendations for every target in a
+    named scope — so a lab rerun regenerates fresh data from a clean baseline.
+
+    Deliberately does NOT touch assets, ports, or scope membership: the next scan
+    re-observes those, and keeping the scope means the rerun is still authorised.
+    `dry_run=true` returns the counts it WOULD delete, so the operator can preview
+    before committing. Findings are matched to the scope's targets by asset IP /
+    exact hostname; follow-ups and recommendations by their target/ip column.
+    """
+    body = body or {}
+    eid = _resolve_engagement_id(body.get("engagement_id"))
+    with get_db() as conn, conn.cursor() as cur:
+        if eid:
+            cur.execute("SELECT DISTINCT target FROM scope_targets "
+                        "WHERE name = %s AND (engagement_id = %s OR engagement_id IS NULL)",
+                        (name, eid))
+        else:
+            cur.execute("SELECT DISTINCT target FROM scope_targets WHERE name = %s", (name,))
+        targets = [r[0] for r in cur.fetchall() if r[0]]
+        if not targets:
+            return {"ok": True, "scope": name, "dry_run": dry_run, "targets": 0,
+                    "total": 0, "deleted": {}, "note": "scope has no targets"}
+
+        cur.execute("SELECT id::text FROM assets "
+                    "WHERE host(ip)::text = ANY(%s) OR hostname = ANY(%s)",
+                    (targets, targets))
+        aids = [r[0] for r in cur.fetchall()]
+
+        # (table, where, params). Dependents/finding tables + follow-ups + recs.
+        plan = [
+            ("follow_up_items",      "target = ANY(%s)",              (targets,)),
+            ("scan_recommendations", "host(ip)::text = ANY(%s)",      (targets,)),
+            ("vulns",                "asset_id = ANY(%s::uuid[])",    (aids,)),
+            ("web_findings",         "asset_id = ANY(%s::uuid[])",    (aids,)),
+            ("discovered_params",    "asset_id = ANY(%s::uuid[])",    (aids,)),
+            ("attack_vectors",       "asset_id = ANY(%s::uuid[])",    (aids,)),
+            ("credential_findings",  "asset_id = ANY(%s::uuid[])",    (aids,)),
+            ("findings",             "asset_id = ANY(%s::uuid[])",    (aids,)),
+            ("recon_findings",       "target = ANY(%s)",              (targets,)),
+        ]
+        result = {}
+        for table, where, params in plan:
+            try:
+                cur.execute("SAVEPOINT purge_scope")
+                if dry_run:
+                    cur.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}", params)
+                    n = cur.fetchone()[0]
+                else:
+                    cur.execute(f"DELETE FROM {table} WHERE {where}", params)
+                    n = cur.rowcount
+                if n:
+                    result[table] = n
+                cur.execute("RELEASE SAVEPOINT purge_scope")
+            except Exception:  # noqa: BLE001
+                cur.execute("ROLLBACK TO SAVEPOINT purge_scope")
+        if not dry_run:
+            conn.commit()
+
+    total = sum(result.values())
+    if not dry_run:
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("scope_data_purged", "rag-api",
+                         {"scope": name, "engagement_id": eid,
+                          "targets": len(targets), "rows_deleted": total,
+                          "tables": result})
+        except Exception:  # noqa: BLE001
+            pass
+    return {"ok": True, "scope": name, "dry_run": dry_run,
+            "targets": len(targets), "total": total, "deleted": result}
+
+
 @app.delete("/scope/targets", tags=["Scope"])
 def remove_from_scope(
     body: dict,
