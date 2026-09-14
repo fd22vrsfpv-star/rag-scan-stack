@@ -490,11 +490,24 @@ def _tool(fn, *args, **kwargs) -> str:
 # "Sorry, need more steps to process this request." in place of an analysis,
 # which reads like a model refusal rather than a budget. Sized per phase from
 # observed tool use: analyze made 10 calls.
+# One tool-using turn costs TWO super-steps, so a budget of N is ~N/2 tool
+# rounds. The originals were too tight — Analyzer (26) and Exploit (22) ran out
+# mid-work and returned LangGraph's "Sorry, need more steps" instead of a
+# conclusion. Raised so a phase can actually finish, and env-overridable per
+# phase (PHASE_STEP_BUDGET_<PHASE>) so an operator can grant more without a code
+# change when a rich target needs it.
+def _phase_budget(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(f"PHASE_STEP_BUDGET_{name.upper()}") or default)
+    except (TypeError, ValueError):
+        return default
+
+
 PHASE_STEP_BUDGET = {
-    "Reconnaissance": 20,
-    "Scanner": 16,          # 24 with dispatch tools, see scan()
-    "Analyzer": 26,
-    "Exploit": 22,
+    "Reconnaissance": _phase_budget("Reconnaissance", 30),
+    "Scanner": _phase_budget("Scanner", 24),          # +dispatch tools, see scan()
+    "Analyzer": _phase_budget("Analyzer", 44),
+    "Exploit": _phase_budget("Exploit", 44),
 }
 # LangGraph's own message when the step budget runs out. Surfaced explicitly
 # rather than persisted as if it were the agent's answer.
@@ -3423,6 +3436,24 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
     return sorted(tests, key=_test_priority)
 
 
+def _fmt_surface_tests(tests, limit: int = 30) -> str:
+    """One line per surface test: tier, name, service:port and the actual command
+    or MSF module it runs — the detail an operator needs to see what was examined,
+    so the SurfaceTester message explains itself instead of just giving counts."""
+    lines = []
+    for t in (tests or [])[:limit]:
+        svc = f"{t.get('service') or '?'}:{t.get('port') or '?'}"
+        ref = t.get("exploit_ref") or {}
+        what = (t.get("command") or ref.get("module") or "").strip()
+        if len(what) > 140:
+            what = what[:140] + "…"
+        lines.append(f"  - [{t.get('tier', '?')}] {t.get('name', '?')} — {svc}"
+                     + (f" — `{what}`" if what else ""))
+    if tests and len(tests) > limit:
+        lines.append(f"  … and {len(tests) - limit} more")
+    return "\n".join(lines) or "  (none)"
+
+
 def surface_plan(state: PentestState) -> dict:
     """Deterministic: pick+bound the target, build+classify tests, persist each,
     queue impactful ones. NO execution here — safe execution is the next node so
@@ -3545,9 +3576,16 @@ def surface_plan(state: PentestState) -> dict:
                 pass
 
     safe_n = sum(1 for t in persisted if t["tier"] == "safe")
+    # Show WHAT was examined, not just the counts: the distinct services/ports the
+    # surface came from, and every test with its tier, service:port and the actual
+    # command / MSF module it will run — so the message expands to explain itself.
+    services = sorted({f"{t.get('service') or '?'}:{t.get('port') or '?'}"
+                       for t in persisted})
     _msg(sid, "SurfaceTester",
          f"Attack surface of {host}: {len(persisted)} custom test(s) — "
-         f"{safe_n} safe (run now), {len(pending)} impactful (need approval).")
+         f"{safe_n} safe (run now), {len(pending)} impactful (need approval).\n\n"
+         f"Services examined ({len(services)}): {', '.join(services) or 'none'}\n\n"
+         f"Tests:\n{_fmt_surface_tests(persisted)}")
     _emit("langgraph_surface_analyzed", sid,
           {"target": host, "tests": len(persisted), "safe": safe_n,
            "impactful": len(pending)})
@@ -3619,16 +3657,27 @@ def surface_safe_exec(state: PentestState) -> dict:
                 output=body, duration_ms=int((_time.time() - t0) * 1000),
                 tool_execution_id=exec_id, http_status=http_status,
                 triggered_by="agent", triggered_by_session=sid)
-            results.append({"test": t["name"], "status": r["status"]})
+            results.append({"test": t["name"], "status": r["status"],
+                            "service": t.get("service"), "port": t.get("port"),
+                            "command": t.get("command")})
             _emit("langgraph_surface_test_executed", sid,
                   {"test": t["name"], "status": r["status"], "lane": "safe"})
         except Exception as e:  # noqa: BLE001
             _msg(sid, "SurfaceTester", f"[record failed for {t['name']}: {e}]")
 
     passed = sum(1 for r in results if r["status"] == "pass")
+
+    def _fmt_res(r):
+        svc = f"{r.get('service') or '?'}:{r.get('port') or '?'}"
+        mark = "✓ pass" if r.get("status") == "pass" else f"✗ {r.get('status')}"
+        cmd = (r.get("command") or "").strip()
+        cmd = (cmd[:120] + "…") if len(cmd) > 120 else cmd
+        return f"  - {mark} — {r.get('test')} — {svc}" + (f" — `{cmd}`" if cmd else "")
+
+    detail = "\n".join(_fmt_res(r) for r in results) or "  (none)"
     _msg(sid, "SurfaceTester",
          f"Ran {len(results)} safe test(s): {passed} proved (pass), "
-         f"{len(results) - passed} not proven.")
+         f"{len(results) - passed} not proven.\n\n{detail}")
     return {"phase": "surface_safe_done", "surface_safe_results": results,
             "findings": [f"surface: {passed}/{len(results)} safe tests proved"],
             "log": [f"surface_safe_exec: {passed}/{len(results)} pass"]}
@@ -3840,7 +3889,10 @@ def surface_auto_exec(state: PentestState) -> dict:
             deferred = len(pending) - i
             break
         status = _exec_one_impactful(sid, pid, t)
-        results.append({"test": t["name"], "status": status})
+        ref = t.get("exploit_ref") or {}
+        results.append({"test": t["name"], "status": status,
+                        "service": t.get("service"), "port": t.get("port"),
+                        "module": ref.get("module") or t.get("command")})
         if status == "pass":
             proved += 1
         _emit("langgraph_surface_test_completed", sid,
@@ -3848,9 +3900,18 @@ def surface_auto_exec(state: PentestState) -> dict:
                "status": status})
     tail = (f"; {deferred} deferred (still pending — a later cycle or a manual "
             f"run picks them up)" if deferred else "")
+
+    def _fmt_imp(r):
+        svc = f"{r.get('service') or '?'}:{r.get('port') or '?'}"
+        mark = "✓ SHELL/proved" if r.get("status") == "pass" else f"✗ {r.get('status')}"
+        mod = (r.get("module") or "").strip()
+        mod = (mod[:120] + "…") if len(mod) > 120 else mod
+        return f"  - {mark} — {r.get('test')} — {svc}" + (f" — `{mod}`" if mod else "")
+
+    detail = "\n".join(_fmt_imp(r) for r in results) or "  (none)"
     _msg(sid, "SurfaceTester",
          f"[AUTO-EXPLOIT] {proved}/{len(results)} impactful test(s) PROVED "
-         f"(assertion held on the exploit output){tail}.")
+         f"(assertion held on the exploit output){tail}.\n\n{detail}")
     _emit("langgraph_surface_decision", sid,
           {"approved": True, "auto_exploit": True, "proved": proved,
            "total": len(results), "deferred": deferred})
