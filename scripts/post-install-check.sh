@@ -248,6 +248,18 @@ else
   warn "pending_exploits.source CHECK check skipped (no DB connection)"
 fi
 
+# agent_sessions.status must allow 'scanning' — a session whose phase graph
+# finished but whose async scans are still running. Un-migrated, _finish's
+# status write raises a CHECK violation and the LangGraph run errors out.
+HAS_SCANNING=$(_run_sql "SELECT (pg_get_constraintdef(oid) LIKE '%scanning%') FROM pg_constraint WHERE conname='agent_sessions_status_check'")
+if [[ "$HAS_SCANNING" == "t" ]]; then
+  pass "agent_sessions.status CHECK allows 'scanning' (in-progress sessions)"
+elif [[ "$HAS_SCANNING" == "f" ]]; then
+  fail "agent_sessions.status CHECK does NOT allow 'scanning' — run ./scripts/ensure_db_schema.sh (LangGraph sessions with in-flight scans will error)"
+else
+  warn "agent_sessions.status CHECK check skipped (no DB connection)"
+fi
+
 # scan_recommendations.target_kind — dispatch refuses non-'service' kinds rather
 # than firing a file/range/resource recommendation at an IP as a network scan.
 # Missing column means every rec reads as 'service' and that guard cannot work.
