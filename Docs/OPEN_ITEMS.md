@@ -260,22 +260,26 @@ which task lives only in each caller's hardcoded choice.
 
 ## Vector coverage
 
-### The NFS no_root_squash mutating chain cannot run from the unprivileged kali container
+### The NFS no_root_squash mutating chain is not built (privilege deliberately not granted)
 **Found:** 2026-09-13
-**Evidence:** The kali-listener container runs unprivileged (`docker inspect
-kali-listener` → `Privileged=false`, `CapAdd=[CAP_NET_ADMIN CAP_NET_RAW]`), and a
-mount attempt from inside it fails: `mount -o nfsvers=3 192.168.1.150:/ /tmp/nfstest`
-→ `mount.nfs: failed to prepare mount: Operation not permitted`. So the
-`nfs_no_root_squash` vector can only enumerate (`showmount -e`) — the full chain
-(mount export → write `~/.ssh/authorized_keys` → record a `credential_finding` so
-`discover()` sees an `ssh_credential`) has nowhere to run.
+**Evidence:** The chain needs to `mount(2)` an export, which the unprivileged
+kali-listener cannot (`Operation not permitted`). Granting `CAP_SYS_ADMIN` was
+trialled (PR #122) and does clear that barrier, but two facts made it not worth
+carrying: (1) the lab NFS server refuses the mount anyway — from kali AND from a
+host-networked client with `SYS_ADMIN` + a privileged source port,
+`mount -o nfsvers=3 192.168.1.150:/ /mnt` → `access denied by server`, even though
+`showmount -e` advertises `/ *` — so the capability buys nothing against the only
+reachable target; and (2) `SYS_ADMIN` is a broad, near-root-on-host capability on
+the container that runs offensive tooling. **Decision (operator, 2026-09-13): do
+not grant the privilege at this point.** The `nfs_no_root_squash` vector stays
+enumerate-only (`showmount -e`) plus its MSF `nfsmount` seed.
 **Where:** `knowledge/service_access_methods.yaml` (`nfs_no_root_squash`),
-`docker-compose.yml` (`kali-listener` capabilities), `etl/access.py` (would source
-the resulting credential).
-**Done when:** either the kali container is granted `CAP_SYS_ADMIN` (a deliberate
-privilege decision for the operator) and a helper performs the mount+write+record
-chain, or the chain is dispatched from a node that can mount; and the resulting
-credential is verified to become held `ssh_credential` access on the lab.
+`etl/access.py` (would source the resulting `ssh_credential`),
+`docker-compose.yml` (would carry the capability).
+**Done when:** there is a mountable `no_root_squash` target that justifies the
+capability, the operator grants it, a helper performs the mount → write
+`~/.ssh/authorized_keys` → record `credential_finding` chain, and the planted key
+is verified to become held `ssh_credential` access via `discover()`.
 **Enforced by:** not enforced
 
 ### distcc_exec has no verified non-MSF attempt
