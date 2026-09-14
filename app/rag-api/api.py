@@ -2246,6 +2246,32 @@ def _emit_ingest_event(source: str, stats: dict = None):
         emit_webhook("ingest_completed", source, {"stats": stats or {}})
     except Exception:
         pass  # Non-critical — dashboard will still poll
+    # Generic output-vs-findings reconciliation for EVERY scan type. The parser
+    # already reported records it could not ingest (errors / non-dedup skips);
+    # surface that instead of letting it pass silently — dedup and scope filters
+    # are NOT counted as loss (see etl/reconcile). This is the credential-check
+    # reconciliation generalised to the shared ingest chokepoint.
+    try:
+        from etl.reconcile import reconcile_ingest
+        rec = reconcile_ingest(source, stats or {})
+        if not rec["matched"]:
+            logger.warning("[ingest:%s] RECONCILIATION MISMATCH: %s (seen=%s "
+                           "stored=%s dropped=%s deduped=%s)",
+                           source, "; ".join(rec["reasons"]), rec["seen"],
+                           rec["stored"], rec["dropped"], rec["deduped"])
+            try:
+                from webhooks import emit_webhook as _emit
+                _emit("scan_count_mismatch", source, {
+                    "tool": source,
+                    "job_id": (stats or {}).get("job_id"),
+                    "target": (stats or {}).get("target"),
+                    **{k: rec[k] for k in ("seen", "stored", "dropped",
+                                           "deduped", "drop_detail", "reasons")},
+                })
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning("ingest reconciliation failed for source=%s: %s", source, e)
     try:
         _trigger_recommendations_for(source, stats)
     except Exception as e:
