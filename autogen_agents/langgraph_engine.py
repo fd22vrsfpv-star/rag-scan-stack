@@ -1054,7 +1054,11 @@ def analyze(state: PentestState) -> dict:
 #: often it checks. A full 1-65535 sweep is genuinely slow, so the ceiling is
 #: generous; the poll is cheap because get_session_scan_status only asks the
 #: scanner services for the jobs this session started.
-RESCAN_ANALYSIS_MAX_WAIT_S = int(os.environ.get("RESCAN_ANALYSIS_MAX_WAIT_S") or 2400)
+# A full 1-65535 sweep through a proxy/node is genuinely slow — often well over
+# an hour — so the ceiling is a safety net against a leaked thread, not a deadline
+# for the scan. Default 6h, env-overridable. On hitting it the session is NOT
+# force-completed: it stays `scanning` so a long run is never falsely ended.
+RESCAN_ANALYSIS_MAX_WAIT_S = int(os.environ.get("RESCAN_ANALYSIS_MAX_WAIT_S") or 21600)
 RESCAN_ANALYSIS_POLL_S = int(os.environ.get("RESCAN_ANALYSIS_POLL_S") or 20)
 
 _TERMINAL_SCAN_STATES = {"completed", "failed", "cancelled", "stopped",
@@ -1109,10 +1113,15 @@ def _rerun_analysis_when_scans_finish(sid: str, base_state: dict) -> None:
             waited_for = [s.get("job_id") for s in running]
             _time.sleep(RESCAN_ANALYSIS_POLL_S)
         else:
+            # Ceiling hit while scans are STILL running. Do NOT force-end the
+            # session — leave it `scanning` (honest) so a genuinely long sweep is
+            # never falsely marked done. The operator can raise the ceiling or
+            # re-run analysis when the scans finish.
             _msg(sid, "Analyzer",
-                 f"[post-scan] Gave up waiting after "
-                 f"{RESCAN_ANALYSIS_MAX_WAIT_S}s; {len(waited_for)} scan(s) still "
-                 f"running. Re-run the analysis once they finish.")
+                 f"[post-scan] {len(waited_for)} scan(s) still running after "
+                 f"{RESCAN_ANALYSIS_MAX_WAIT_S}s — the session remains IN PROGRESS "
+                 f"(status stays 'scanning'), not force-completed. Analysis will "
+                 f"need a re-run once they finish (or raise RESCAN_ANALYSIS_MAX_WAIT_S).")
             _emit("langgraph_rescan_analysis_timeout", sid,
                   {"still_running": len(waited_for)})
             return
@@ -1133,6 +1142,29 @@ def _rerun_analysis_when_scans_finish(sid: str, base_state: dict) -> None:
                 exploit_plan(state)
             except Exception as e:  # noqa: BLE001
                 _msg(sid, "Exploit", f"[post-scan] exploit planning failed: {e}")
+        # The scans this session started are done and analysis has re-run over
+        # their results — NOW the session is truly complete. Flip `scanning` ->
+        # `completed` (a status-only update keeps the metadata _finish wrote), and
+        # refresh the scan snapshot so the finished session shows finished scans.
+        # Merge onto the metadata _finish wrote (update_agent_session REPLACES
+        # metadata, so read-merge-write to keep engine/steps/etc.).
+        try:
+            meta = dict((get_agent_session(_sid(sid)) or {}).get("metadata") or {})
+        except Exception:  # noqa: BLE001
+            meta = {}
+        meta["post_scan_reanalysis"] = "completed"
+        meta["scans_in_flight"] = []
+        try:
+            st = scan_tracker.get_session_status(sid)
+            if isinstance(st, dict):
+                meta["scans"] = st.get("scans") or meta.get("scans")
+                meta["scan_summary"] = st.get("summary") or meta.get("scan_summary")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            update_agent_session(_sid(sid), status="completed", metadata=meta)
+        except Exception as e:  # noqa: BLE001
+            _log.warning("[%s] could not finalize session status: %s", sid, e)
         _emit("langgraph_rescan_analysis_completed", sid, {})
     except Exception as e:  # noqa: BLE001
         _log.warning("[%s] post-scan re-analysis failed: %s", sid, e)
@@ -3976,14 +4008,29 @@ def _finish(sid: str, final: dict, session_name: str = "unnamed") -> dict:
     except Exception:
         pass
 
+    # Honest status. The graph dispatches scans async and returns, so marking the
+    # session "completed" while a full-port sweep is still running reads to the
+    # operator as "done — and it found nothing" (analyze ran BEFORE the scan). So
+    # if the session's scans have not finished, the session stays in an
+    # in-progress `scanning` state; the post-scan re-analysis
+    # (_rerun_analysis_when_scans_finish) flips it to `completed` once they do —
+    # or leaves it here if they run long, so the session is never force-ended.
+    running_now = []
+    try:
+        running_now = _running_scans(sid)
+    except Exception:  # noqa: BLE001
+        pass
+    session_status = "scanning" if running_now else "completed"
+
     update_agent_session(
-        _sid(sid), status="completed", summary=summary,
+        _sid(sid), status=session_status, summary=summary,
         metadata={"engine": ENGINE_NAME,
                   "total_messages": len(_transcript),
                   "phase": final.get("phase"),
                   "steps": len(final.get("log", [])),
                   "scans": scans_metadata,
-                  "scan_summary": scan_summary},
+                  "scan_summary": scan_summary,
+                  "scans_in_flight": [s.get("job_id") for s in running_now]},
     )
 
     try:
@@ -4074,8 +4121,9 @@ def _maybe_schedule_rescan_analysis(sid: str, base_state: dict) -> None:
     if not running:
         return
     _msg(sid, "Analyzer",
-         f"[post-scan] {len(running)} scan(s) still running. The session is "
-         f"complete; analysis will re-run automatically when they finish.")
+         f"[post-scan] {len(running)} scan(s) still running — the session is IN "
+         f"PROGRESS (status 'scanning'), not complete. It finalizes to 'completed' "
+         f"automatically once the scans finish and analysis re-runs over them.")
     t = threading.Thread(target=_rerun_analysis_when_scans_finish,
                          args=(sid, base_state), daemon=True,
                          name=f"rescan-analysis-{sid[:8]}")
