@@ -29,6 +29,7 @@ export interface NoCallbackRow {
   exploit_title: string
   source: string
   exploit_type: string | null
+  module_class: 'foothold' | 'recon'
   target: string | null
   target_port: number | null
   target_service: string | null
@@ -57,7 +58,7 @@ export function useExploitWatcherStatus() {
 export function useFootholdNoCallback(limit = 50) {
   return useQuery({
     queryKey: ['foothold-no-callback', limit],
-    queryFn: () => apiFetch<{ count: number; rows: NoCallbackRow[] }>(
+    queryFn: () => apiFetch<{ count: number; rows: NoCallbackRow[]; recon_excluded: number }>(
       `/foothold/no-callback?limit=${limit}`),
     refetchInterval: 30_000,
   })
