@@ -843,10 +843,13 @@ def test_every_approved_exploit_runs():
     grouping assertion below fails; drop the stop-on-shell break and its
     assertion fails; drop MAX_EXPLOITS_PER_PORT and the per-port bound fails.
     """
-    fn = _func_src(ENGINE, "exploit_exec")
+    # exploit_exec delegates the port-grouped execution to the shared
+    # _execute_pending_exploits, so the per-port coverage/bound/stop-on-shell
+    # contract must hold THERE.
+    fn = _func_src(ENGINE, "_execute_pending_exploits")
     # Iterates the per-port candidate list, not a flat truncated session list.
     assert "for pid in ids:" in fn and "for key in order:" in fn, (
-        "exploit_exec no longer walks every candidate grouped by port, so a "
+        "the executor no longer walks every candidate grouped by port, so a "
         "later port's foothold is never tried")
     assert "[:MAX_EXPLOITS_PER_SESSION]" not in fn, (
         "a flat session-total truncation drops whole ports — the bound must be "
