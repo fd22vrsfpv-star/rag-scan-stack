@@ -443,6 +443,8 @@ async def create_pending_exploit(
     Returns:
         Pending exploit UUID
     """
+    from db_utils import normalize_confidence  # single source of truth (0-100 -> 0-1)
+    match_confidence = normalize_confidence(match_confidence)
     async with get_db() as conn:
         row = await conn.fetchrow(
             """

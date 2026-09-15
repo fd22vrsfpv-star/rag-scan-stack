@@ -18479,6 +18479,16 @@ def queue_poc_for_finding(
                 "auto_triggered": False,
             }
 
+            # match_confidence is stored 0.0-1.0; an LLM/user value > 1 is a
+            # percentage (95) and would render as 9500%. Normalize.
+            _wc = payload_item.get("confidence", 0.5)
+            try:
+                _wc = float(_wc)
+                _wc = _wc / 100.0 if _wc > 1 else _wc
+                _wc = max(0.0, min(1.0, _wc))
+            except (TypeError, ValueError):
+                _wc = 0.5
+
             cur.execute("""
                 INSERT INTO pending_exploits
                 (id, source, exploit_id, exploit_title, exploit_type, exploit_category,
@@ -18499,7 +18509,7 @@ def queue_poc_for_finding(
                 issue_type,
                 payload_item.get("payload", "")[:500],
                 Json({}),
-                payload_item.get("confidence", 0.5),
+                _wc,
                 payload_item.get("description", "User-selected web PoC payload"),
                 Json(metadata),
             ))

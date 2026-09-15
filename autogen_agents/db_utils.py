@@ -983,6 +983,25 @@ def link_session_to_scans(
 # Exploit Approval Workflow Functions
 # ===============================
 
+def normalize_confidence(v):
+    """Coerce a confidence to the stored 0.0-1.0 contract.
+
+    match_confidence is documented and consumed as a fraction (the UI shows
+    `conf * 100`%, and the min_confidence filter compares against a 0-1 value).
+    But LLM callers of queue_exploit_for_approval pass a 0-100 PERCENTAGE (e.g.
+    95), which rendered as 9500%. Any value > 1 is read as a percentage and
+    divided by 100; the result is clamped to [0, 1]. None passes through."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f > 1.0:
+        f = f / 100.0
+    return max(0.0, min(1.0, f))
+
+
 def create_pending_exploit(
     source: str,
     exploit_id: str,
@@ -1025,6 +1044,7 @@ def create_pending_exploit(
     Returns:
         Pending exploit UUID
     """
+    match_confidence = normalize_confidence(match_confidence)
     with get_db() as conn, conn.cursor() as cur:
         cur.execute(
             """
