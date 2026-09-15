@@ -10,7 +10,7 @@ export interface ReconnectWatcherSettings {
 export function useReconnectWatcherSettings() {
   return useQuery({
     queryKey: ['reconnect-watcher-settings'],
-    queryFn: () => apiFetch<ReconnectWatcherSettings>('/api/settings/reconnect-watcher'),
+    queryFn: () => apiFetch<ReconnectWatcherSettings>('/settings/reconnect-watcher'),
   })
 }
 
@@ -19,7 +19,7 @@ export function useUpdateReconnectWatcherSettings() {
 
   return useMutation({
     mutationFn: (settings: Partial<ReconnectWatcherSettings>) =>
-      apiFetch<{ ok: boolean; updated: string[] }>('/api/settings/reconnect-watcher', {
+      apiFetch<{ ok: boolean; updated: string[] }>('/settings/reconnect-watcher', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(settings),

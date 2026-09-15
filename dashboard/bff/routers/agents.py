@@ -140,6 +140,38 @@ async def asset_access_summary():
         return safe_json(resp)
 
 
+@router.get("/api/foothold/no-callback")
+async def foothold_no_callback(limit: int = 50):
+    """Exploits that ran but produced no live shell — the Foothold Agent 'payload
+    needs tweaking' queue. Thin proxy to rag-api."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/foothold/no-callback",
+                           params={"limit": limit},
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.get("/api/exploit-watcher/status")
+async def exploit_watcher_status():
+    """Exploit watcher runtime status. Thin proxy to autogen-agents."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.autogen_url}/exploit-watcher/status",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.get("/api/reconnect-watcher/status")
+async def reconnect_watcher_status():
+    """Reconnect watcher runtime status. Thin proxy to autogen-agents."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.autogen_url}/reconnect-watcher/status",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
 @router.get("/api/assets/{ip}/access")
 async def asset_access(ip: str, include_dead: bool = False):
     s = get_settings()
