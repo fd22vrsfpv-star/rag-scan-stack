@@ -53,6 +53,16 @@ POLL_INTERVAL = int(os.environ.get("RECONNECT_WATCH_INTERVAL", "120"))
 # Minimum seconds between reconnect attempts for the SAME target, so a host that
 # stays down is retried on a slow cadence instead of every sweep.
 MIN_ATTEMPT_INTERVAL = int(os.environ.get("RECONNECT_MIN_INTERVAL", "300"))
+# Env value is only the DEFAULT for the persisted toggle below. The operator's
+# on/off choice lives in app_settings and is honoured live, every cycle.
+ENABLED_DEFAULT = os.environ.get("RECONNECT_WATCHER_ENABLED", "true").lower() == "true"
+
+# app_settings storage. key is a GLOBAL primary key, so every key is namespaced
+# with this prefix — a bare "enabled" would collide with the exploit watcher's.
+_SETTINGS_CATEGORY = "reconnect_watcher"
+_KEY_ENABLED = "reconnect_watcher.enabled"
+_KEY_POLL = "reconnect_watcher.poll_interval"
+_KEY_MIN_INTERVAL = "reconnect_watcher.min_attempt_interval"
 # Probe rounds to pass to refresh(); None => access.py's own STABILITY_PROBES.
 _rounds_env = os.environ.get("RECONNECT_PROBE_ROUNDS", "").strip()
 PROBE_ROUNDS: Optional[int] = int(_rounds_env) if _rounds_env.isdigit() else None
@@ -86,10 +96,53 @@ class ReconnectWatcher:
         self._reconnected_total = 0
         self._attempts_total = 0
         self._blocked_total = 0
+        # Effective per-target throttle for the current cycle (settings override
+        # the env default); set at the top of each sweep.
+        self._min_attempt_interval = MIN_ATTEMPT_INTERVAL
+        # Whether the loop is currently sweeping or idling because the operator
+        # toggle is off. Distinct from `running` (the task exists).
+        self._active = False
 
     # ── DB ────────────────────────────────────────────────────────────────
     def _conn(self):
         return psycopg2.connect(DB_DSN, connect_timeout=5)
+
+    # ── Persisted settings (operator toggle, honoured live) ─────────────────
+    def _read_settings(self) -> Dict[str, str]:
+        """Raw app_settings values for this watcher. On any DB error return {}
+        so the caller falls back to env defaults rather than crashing the loop."""
+        try:
+            with self._conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT key, value FROM public.app_settings WHERE category = %s",
+                    (_SETTINGS_CATEGORY,))
+                return {k: v for k, v in cur.fetchall()}
+        except Exception:  # noqa: BLE001
+            logger.debug("could not read app_settings; using env defaults", exc_info=True)
+            return {}
+
+    def is_enabled(self) -> bool:
+        """Operator on/off. Persisted value wins; env is only the default when
+        unset. A DB read failure falls back to the env default — it never
+        silently disables a watcher the operator turned on."""
+        val = self._read_settings().get(_KEY_ENABLED)
+        if val is None:
+            return ENABLED_DEFAULT
+        return str(val).lower() in ("true", "1", "yes", "on")
+
+    def _effective_config(self) -> Dict[str, int]:
+        s = self._read_settings()
+
+        def _int(key, default):
+            try:
+                return int(s[key])
+            except (KeyError, TypeError, ValueError):
+                return default
+
+        return {
+            "poll_interval": max(30, _int(_KEY_POLL, POLL_INTERVAL)),
+            "min_attempt_interval": max(30, _int(_KEY_MIN_INTERVAL, MIN_ATTEMPT_INTERVAL)),
+        }
 
     def _dead_targets(self) -> List[Tuple[str, Optional[str]]]:
         """(target, engagement_id) pairs that have at least one dead, non-rejected
@@ -141,7 +194,7 @@ class ReconnectWatcher:
     async def _reconnect_target(self, target: str, engagement_id: Optional[str]) -> Dict[str, Any]:
         now = datetime.now(timezone.utc).timestamp()
         last = self._last_attempt.get(target, 0.0)
-        if now - last < MIN_ATTEMPT_INTERVAL:
+        if now - last < self._min_attempt_interval:
             return {"target": target, "skipped": "throttled"}
 
         refusal = self._scope_refusal(target, engagement_id)
@@ -208,13 +261,33 @@ class ReconnectWatcher:
                     POLL_INTERVAL, MIN_ATTEMPT_INTERVAL, PROBE_ROUNDS or "default")
         logger.info("=" * 60)
         self.running = True
+        was_active = None
         while self.running:
+            sleep_for = POLL_INTERVAL
             try:
+                # Operator toggle, re-read every cycle so enabling/disabling in the
+                # UI takes effect within one interval — no container restart.
+                if not self.is_enabled():
+                    self._active = False
+                    if was_active is not False:
+                        logger.info("Reconnect watcher is DISABLED (operator toggle) — idling")
+                        was_active = False
+                    await asyncio.sleep(sleep_for)
+                    continue
+                self._active = True
+                if was_active is not True:
+                    logger.info("Reconnect watcher is ENABLED — sweeping")
+                    was_active = True
+
+                cfg = self._effective_config()
+                self._min_attempt_interval = cfg["min_attempt_interval"]
+                sleep_for = cfg["poll_interval"]
+
                 self._last_check = datetime.now(timezone.utc)
                 pairs = self._dead_targets()
                 done_targets: set = set()
                 for target, engagement_id in pairs:
-                    if not self.running:
+                    if not self.running or not self.is_enabled():
                         break
                     if target in done_targets:
                         continue  # one refresh per target per sweep
@@ -225,28 +298,32 @@ class ReconnectWatcher:
                         logger.error("Error reconnecting %s: %s", target, e)
                 # Bound the throttle map so a long-lived process does not leak.
                 if len(self._last_attempt) > 2000:
-                    cutoff = datetime.now(timezone.utc).timestamp() - MIN_ATTEMPT_INTERVAL * 4
+                    cutoff = datetime.now(timezone.utc).timestamp() - self._min_attempt_interval * 4
                     self._last_attempt = {k: v for k, v in self._last_attempt.items()
                                           if v > cutoff}
             except Exception as e:  # noqa: BLE001
                 logger.error("Error in reconnect watch loop: %s", e)
-            await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(sleep_for)
 
     def stop(self):
         self.running = False
         logger.info("Reconnect watcher stopping...")
 
     async def get_status(self) -> Dict[str, Any]:
+        cfg = self._effective_config()
         return {
-            "running": self.running,
+            "running": self.running,          # the background task exists
+            "enabled": self.is_enabled(),     # operator toggle (persisted)
+            "active": self._active,           # actually sweeping right now
             "last_check": self._last_check.isoformat() if self._last_check else None,
             "attempts_total": self._attempts_total,
             "reconnected_total": self._reconnected_total,
             "blocked_total": self._blocked_total,
             "config": {
-                "poll_interval": POLL_INTERVAL,
-                "min_attempt_interval": MIN_ATTEMPT_INTERVAL,
+                "poll_interval": cfg["poll_interval"],
+                "min_attempt_interval": cfg["min_attempt_interval"],
                 "probe_rounds": PROBE_ROUNDS,
+                "enabled_default": ENABLED_DEFAULT,
             },
         }
 

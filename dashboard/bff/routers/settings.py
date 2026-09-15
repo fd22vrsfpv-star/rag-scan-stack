@@ -156,6 +156,40 @@ async def update_exploit_watcher_settings(settings: ExploitWatcherSettings):
     return safe_json(resp)
 
 
+class ReconnectWatcherSettings(BaseModel):
+    enabled: bool = Field(default=True, description="Enable/disable the reconnect watcher")
+    poll_interval: int = Field(default=120, ge=30, le=3600, description="Seconds between sweeps")
+    min_attempt_interval: int = Field(default=300, ge=30, le=86400,
+                                      description="Min seconds between attempts on one host")
+
+
+@router.get("/api/settings/reconnect-watcher")
+async def get_reconnect_watcher_settings():
+    """Get the reconnect watcher toggle and cadence."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/settings/reconnect-watcher",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+    if resp.status_code == 404:
+        return ReconnectWatcherSettings().model_dump()
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, resp.text)
+    return safe_json(resp)
+
+
+@router.put("/api/settings/reconnect-watcher")
+async def update_reconnect_watcher_settings(settings: ReconnectWatcherSettings):
+    """Update the reconnect watcher toggle. Takes effect within one poll cycle."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.put(f"{s.rag_api_url}/settings/reconnect-watcher",
+                           json=settings.model_dump(),
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, resp.text)
+    return safe_json(resp)
+
+
 @router.post("/api/settings/test-proxy")
 async def test_proxy(body: ProxyTestBody):
     """Test connectivity through a proxy by making a request to a test URL."""

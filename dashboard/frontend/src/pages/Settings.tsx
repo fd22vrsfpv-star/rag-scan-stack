@@ -11,6 +11,7 @@ import { useApiKeys, useUpsertApiKey, useDeleteApiKey } from '@/api/apiKeys'
 import { useMcpServers, useAddMcpServer, useToggleMcpServer, useDeleteMcpServer, useUpdateMcpoConfig } from '@/api/mcpServers'
 import type { McpServer } from '@/api/mcpServers'
 import { useExploitWatcherSettings, useUpdateExploitWatcherSettings, type ExploitWatcherSettings } from '@/api/exploitWatcher'
+import { useReconnectWatcherSettings, useUpdateReconnectWatcherSettings, type ReconnectWatcherSettings } from '@/api/reconnectWatcher'
 import { useNodeAnalysis, useNodeCleanup, type CleanupOptions, type NodeAnalysis } from '@/api/maintenance'
 import { useScanDefaultsStore, type ScanProfile } from '@/stores/scanDefaults'
 import { useUIStore, ALPHA_FEATURES } from '@/stores/ui'
@@ -19,7 +20,7 @@ import { cn } from '@/lib/utils'
 import { BUILD_VERSION, SCAN_CATEGORIES, SCAN_FIELDS, TARGET_FIELD_KEYS, TOOL_CLI_OPTIONS } from '@/lib/constants'
 import { Trash2, Download, X, Search, RefreshCw, Eye, EyeOff, Plus, Upload, Loader2, CheckCircle2, XCircle, Database, Wifi, Server, ArrowRightLeft, BarChart3, RotateCcw, ChevronDown, ChevronRight, Zap, Power, PowerOff, Shield, Info } from 'lucide-react'
 
-type SettingsTab = 'general' | 'scope' | 'zap-addons' | 'api-keys' | 'database' | 'tool-options' | 'mcp-servers' | 'vendor-pages' | 'scan-timeouts' | 'llm-tuning' | 'exploit-watcher'
+type SettingsTab = 'general' | 'scope' | 'zap-addons' | 'api-keys' | 'database' | 'tool-options' | 'mcp-servers' | 'vendor-pages' | 'scan-timeouts' | 'llm-tuning' | 'exploit-watcher' | 'reconnect-watcher'
 
 export default function Settings() {
   const [tab, setTab] = useState<SettingsTab>('general')
@@ -68,6 +69,7 @@ export default function Settings() {
           ['scan-timeouts', 'Scan Timeouts'],
           ['llm-tuning', 'LLM Tuning'],
           ['exploit-watcher', 'Exploit Watcher'],
+          ['reconnect-watcher', 'Reconnect Watcher'],
         ] as [SettingsTab, string][]).map(([t, label]) => (
           <button
             key={t}
@@ -101,6 +103,7 @@ export default function Settings() {
           {tab === 'scan-timeouts' && <ScanTimeoutsTab />}
           {tab === 'llm-tuning' && <LLMTuningTab />}
           {tab === 'exploit-watcher' && <ExploitWatcherTab />}
+          {tab === 'reconnect-watcher' && <ReconnectWatcherTab />}
         </>
       )}
     </div>
@@ -4946,6 +4949,115 @@ function ExploitWatcherTab() {
       </div>
 
       <MsfPayloadSettings />
+    </div>
+  )
+}
+
+function ReconnectWatcherTab() {
+  const { data: settings, isLoading } = useReconnectWatcherSettings()
+  const updateSettings = useUpdateReconnectWatcherSettings()
+  const [formData, setFormData] = useState<Partial<ReconnectWatcherSettings>>({})
+  const [saved, setSaved] = useState<Record<string, boolean>>({})
+
+  useEffect(() => {
+    if (settings) setFormData(settings)
+  }, [settings])
+
+  const handleSave = async (key: keyof ReconnectWatcherSettings, value: any) => {
+    try {
+      await updateSettings.mutateAsync({ [key]: value })
+      setSaved(prev => ({ ...prev, [key]: true }))
+      setTimeout(() => setSaved(prev => ({ ...prev, [key]: false })), 2000)
+    } catch (error) {
+      console.error('Failed to save setting:', error)
+    }
+  }
+
+  const handleChange = (key: keyof ReconnectWatcherSettings, value: any) => {
+    setFormData(prev => ({ ...prev, [key]: value }))
+  }
+
+  if (isLoading || !formData) {
+    return <div className="text-sm text-muted-foreground">Loading reconnect watcher settings...</div>
+  }
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h3 className="text-base font-semibold mb-2">Reconnect Watcher Configuration</h3>
+        <p className="text-sm text-muted-foreground mb-4">
+          Automatically re-probe access that a host reboot dropped. When enabled, the watcher
+          sweeps for dead sessions and re-establishes them where possible. It is scope-gated
+          (out-of-scope hosts are refused) and recovers credential-backed access; a dead
+          Meterpreter or bind shell stays dead until persistence exists. Changes take effect
+          within one poll cycle — no restart.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        {/* Enabled Toggle */}
+        <div className="space-y-2">
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={formData.enabled ?? true}
+              onChange={(e) => {
+                const enabled = e.target.checked
+                handleChange('enabled', enabled)
+                handleSave('enabled', enabled)
+              }}
+              className="rounded border-border"
+            />
+            <div>
+              <span className="text-sm font-medium">Enable Reconnect Watcher</span>
+              {saved.enabled && <CheckCircle2 size={14} className="inline ml-1 text-green-400" />}
+            </div>
+          </label>
+          <p className="text-xs text-muted-foreground ml-6">
+            Automatically re-probe dead access and reconnect where possible
+          </p>
+        </div>
+
+        {/* Poll Interval */}
+        <div className="space-y-2">
+          <label className="text-sm font-medium">Poll Interval (seconds)</label>
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              min="30"
+              max="3600"
+              value={formData.poll_interval ?? 120}
+              onChange={(e) => handleChange('poll_interval', parseInt(e.target.value))}
+              onBlur={(e) => handleSave('poll_interval', parseInt(e.target.value))}
+              className="w-24 px-2 py-1 text-sm rounded bg-muted border border-border"
+            />
+            {saved.poll_interval && <CheckCircle2 size={14} className="text-green-400" />}
+          </div>
+          <p className="text-xs text-muted-foreground">
+            How often to sweep for dead access (30-3600 seconds)
+          </p>
+        </div>
+
+        {/* Min Attempt Interval */}
+        <div className="space-y-2">
+          <label className="text-sm font-medium">Min Retry Interval (seconds)</label>
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              min="30"
+              max="86400"
+              value={formData.min_attempt_interval ?? 300}
+              onChange={(e) => handleChange('min_attempt_interval', parseInt(e.target.value))}
+              onBlur={(e) => handleSave('min_attempt_interval', parseInt(e.target.value))}
+              className="w-24 px-2 py-1 text-sm rounded bg-muted border border-border"
+            />
+            {saved.min_attempt_interval && <CheckCircle2 size={14} className="text-green-400" />}
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Minimum time between reconnect attempts on the same host (30-86400 seconds)
+          </p>
+        </div>
+      </div>
     </div>
   )
 }

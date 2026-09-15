@@ -157,6 +157,48 @@ def test_throttle_skips_recent_target(monkeypatch):
     assert called["refresh"] == 0
 
 
+def test_persisted_toggle_overrides_default(monkeypatch):
+    """The operator toggle in app_settings wins over the env default, and an
+    unset value falls back to the default — enabling/disabling without a restart."""
+    w = rw.ReconnectWatcher()
+
+    # Explicit off wins even though the env default is on.
+    monkeypatch.setattr(w, "_read_settings",
+                        lambda: {"reconnect_watcher.enabled": "false"})
+    assert w.is_enabled() is False
+
+    # Explicit on.
+    monkeypatch.setattr(w, "_read_settings",
+                        lambda: {"reconnect_watcher.enabled": "true"})
+    assert w.is_enabled() is True
+
+    # Unset => the env-derived default (ENABLED_DEFAULT).
+    monkeypatch.setattr(w, "_read_settings", lambda: {})
+    assert w.is_enabled() is rw.ENABLED_DEFAULT
+
+
+def test_effective_config_reads_overrides(monkeypatch):
+    """poll_interval / min_attempt_interval come from settings when present,
+    clamped to a sane floor, else the env defaults."""
+    w = rw.ReconnectWatcher()
+    monkeypatch.setattr(w, "_read_settings", lambda: {
+        "reconnect_watcher.poll_interval": "45",
+        "reconnect_watcher.min_attempt_interval": "600",
+    })
+    cfg = w._effective_config()
+    assert cfg["poll_interval"] == 45
+    assert cfg["min_attempt_interval"] == 600
+
+    # Garbage / below floor falls back or clamps, never crashes.
+    monkeypatch.setattr(w, "_read_settings", lambda: {
+        "reconnect_watcher.poll_interval": "nonsense",
+        "reconnect_watcher.min_attempt_interval": "5",
+    })
+    cfg = w._effective_config()
+    assert cfg["poll_interval"] == rw.POLL_INTERVAL
+    assert cfg["min_attempt_interval"] == 30  # clamped to floor
+
+
 def test_watcher_module_is_scope_gated_and_emits():
     """Guard: the module must reference the scope gate and the webhook emitter.
     Deleting either would let it touch hosts silently — this fails if it does."""
@@ -165,3 +207,28 @@ def test_watcher_module_is_scope_gated_and_emits():
     assert "scope_gate" in src, "reconnect watcher no longer references the scope gate"
     assert "check_dispatch" in src, "reconnect watcher no longer calls check_dispatch"
     assert "/webhooks/emit" in src, "reconnect watcher no longer emits webhooks"
+
+
+def test_settings_keys_are_namespaced_no_pk_collision():
+    """app_settings.key is a GLOBAL primary key. A bare 'enabled'/'poll_interval'
+    would clobber the exploit watcher's rows, so every reconnect key MUST carry the
+    namespace. Drop the prefix and this fails."""
+    keys = [rw._KEY_ENABLED, rw._KEY_POLL, rw._KEY_MIN_INTERVAL]
+    bare_collisions = {"enabled", "poll_interval", "lookback_minutes",
+                       "min_confidence", "max_exploits_per_vuln", "min_attempt_interval"}
+    for k in keys:
+        assert k.startswith("reconnect_watcher."), f"key {k!r} is not namespaced"
+        assert k not in bare_collisions, f"key {k!r} collides with an exploit-watcher key"
+    assert len(set(keys)) == 3, "namespaced keys must be distinct"
+
+
+def test_ragapi_store_writes_the_keys_the_watcher_reads():
+    """Agreement: the rag-api settings store and the watcher must use the SAME
+    namespaced keys, or the toggle writes rows the watcher never reads. Pin both
+    sides to the watcher's constants."""
+    api = os.path.join(REPO, "app", "rag-api", "api.py")
+    if not os.path.exists(api):
+        pytest.skip("rag-api/api.py not present")
+    src = open(api, encoding="utf-8").read()
+    for k in (rw._KEY_ENABLED, rw._KEY_POLL, rw._KEY_MIN_INTERVAL):
+        assert k in src, f"rag-api store does not write the watcher's key {k!r}"

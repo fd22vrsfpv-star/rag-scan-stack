@@ -1425,13 +1425,15 @@ async def startup_event():
     else:
         print("⚠ Exploit watcher disabled", file=sys.stderr)
 
-    # Start reconnect watcher (Tier 1) if enabled — re-probes dead access so a
-    # host reboot that dropped shells (mainly ssh_credential) recovers itself.
-    if RECONNECT_WATCHER_ENABLED:
-        asyncio.create_task(start_reconnect_watcher())
-        print("✓ Reconnect watcher enabled - will re-probe dead access (scope-gated)", file=sys.stderr)
-    else:
-        print("⚠ Reconnect watcher disabled", file=sys.stderr)
+    # Start the reconnect watcher (Tier 1) task ALWAYS — its actual on/off is the
+    # persisted operator toggle (app_settings 'reconnect_watcher.enabled',
+    # defaulting to RECONNECT_WATCHER_ENABLED), honoured live every cycle. Starting
+    # the task unconditionally lets the UI toggle enable it without a restart; it
+    # idles cheaply while disabled.
+    asyncio.create_task(start_reconnect_watcher())
+    _rc_default = "ON" if RECONNECT_WATCHER_ENABLED else "OFF"
+    print(f"✓ Reconnect watcher task started (default {_rc_default}; operator toggle governs)",
+          file=sys.stderr)
 
     # Register webhook with rag-api for scan completion events
     try:
