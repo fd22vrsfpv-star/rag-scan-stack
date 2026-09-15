@@ -434,6 +434,24 @@ def facts_from_exploits(cur, *, target: str = "", hours: int = 24,
 # shell; `tcpwrapped` means the handshake completed and nothing else was learned.
 _UNIDENTIFIED = {"", "?", "unknown", "lm-x", "tcpwrapped", "status"}
 
+# A port can carry an IDENTIFIED service name that is itself a shell/backdoor —
+# Metasploitable's root shell on 1524 is labelled `bindshell` with a
+# `root@metasploitable:/#` banner. Filtering to only unidentified services drops
+# exactly the ports that ARE shells while offering tcpwrapped/lm-x/status ports
+# that are not. So a port is ALSO a bind-shell candidate when its service name or
+# banner looks like a shell — the probe (`id`) then decides for real.
+_SHELL_SERVICES = {"bindshell", "shell", "rootshell", "backdoor", "ingreslock"}
+_SHELL_BANNER_RE = re.compile(
+    r"(root@|\buid=\d+|/bin/(?:ba)?sh|[\w.-]+@[\w.-]+:[~/][^\n]*[#$]|\$\s*$|#\s*$)",
+    re.I)
+
+
+def _looks_like_shell(service: str, banner: str) -> bool:
+    """A port whose service name or banner betrays a shell/backdoor."""
+    if (service or "").strip().lower() in _SHELL_SERVICES:
+        return True
+    return bool(_SHELL_BANNER_RE.search(banner or ""))
+
 
 def facts_from_open_ports(cur, *, target: str = "", limit: int = 60) -> List[Dict[str, Any]]:
     """Open ports nothing has identified.
@@ -468,11 +486,18 @@ def facts_from_open_ports(cur, *, target: str = "", limit: int = 60) -> List[Dic
                  WHERE {' AND '.join(where)}
                  ORDER BY p.port LIMIT %s""", params)
         for host, port, service, banner in cur.fetchall():
-            if service.strip().lower() not in _UNIDENTIFIED:
+            svc = service.strip().lower()
+            shell_like = _looks_like_shell(service, banner)
+            # Offer a candidate when the service is unidentified OR it looks like
+            # a shell/backdoor. Miss the second and the actual root shell (service
+            # 'bindshell', banner 'root@…:/#') is invisible while dead
+            # tcpwrapped/lm-x ports are offered.
+            if svc not in _UNIDENTIFIED and not shell_like:
                 continue
             facts.append({"fact": "open_port", "target": host, "port": port,
                           "service": service, "banner": banner[:120],
-                          "unidentified": True})
+                          "unidentified": svc in _UNIDENTIFIED,
+                          "shell_like": shell_like})
     except Exception as e:  # noqa: BLE001
         log.debug("open port facts unavailable: %s", e)
     return facts
