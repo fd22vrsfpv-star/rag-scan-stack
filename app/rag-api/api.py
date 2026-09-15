@@ -21735,10 +21735,14 @@ def access_summary(_: bool = Depends(auth)):
 # exploit/* modules (and webshell/command sources) produce footholds. The class
 # is derived from exploit_id (the module path, e.g. 'auxiliary/scanner/ssh/...')
 # and the title, because exploit_type is uniformly mislabelled 'rce' on ingest.
+# NOTE: %% not % — this fragment is embedded in queries executed WITH a params
+# tuple, so psycopg2 does %-substitution and a literal % must be doubled. Every
+# execute() that uses this MUST pass a params tuple (even an empty one) so the
+# %% collapses back to %.
 _RECON_MODULE_SQL = (
-    "(pe.exploit_id ILIKE 'auxiliary/%' OR pe.exploit_id ILIKE 'post/%' "
-    " OR pe.exploit_title ILIKE 'msf_exploit auxiliary/%' "
-    " OR pe.exploit_title ILIKE 'msf_exploit post/%')")
+    "(pe.exploit_id ILIKE 'auxiliary/%%' OR pe.exploit_id ILIKE 'post/%%' "
+    " OR pe.exploit_title ILIKE 'msf_exploit auxiliary/%%' "
+    " OR pe.exploit_title ILIKE 'msf_exploit post/%%')")
 
 
 @app.get("/foothold/no-callback", tags=["Access"])
@@ -21800,7 +21804,8 @@ def foothold_no_callback(limit: int = 50, include_recon: bool = False,
             f"""SELECT count(*) AS n FROM pending_exploits pe
                  WHERE pe.status IN ('executed','failed') AND {recon_pred}
                    AND NOT EXISTS (SELECT 1 FROM obtained_access oa
-                        WHERE oa.source_exploit = pe.id AND oa.status = 'live')""")
+                        WHERE oa.source_exploit = pe.id AND oa.status = 'live')""",
+            ())  # empty params so psycopg2 collapses the %% in recon_pred to %
         recon_excluded = int((cur.fetchone() or {}).get("n", 0))
     return {"count": len(rows), "rows": rows, "recon_excluded": recon_excluded}
 
