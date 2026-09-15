@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useState, Fragment } from 'react'
+import { useNavigate, Link } from 'react-router-dom'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/api/client'
 import {
@@ -234,9 +234,60 @@ function ActivityTimelinePanel() {
 }
 
 
+// Keys rendered explicitly in the expanded detail; everything else in `data`
+// is shown generically so nothing an agent flagged is hidden from review.
+const FLAG_DETAIL_HANDLED = new Set(['reason', 'residual_sample', 'raw', 'output', 'target', 'scanner'])
+
+function FlagDetail({ data }: { data: Record<string, any> }) {
+  const d = data || {}
+  const rawParts: string[] = []
+  for (const k of ['residual_sample', 'raw', 'output']) {
+    const v = d[k]
+    if (Array.isArray(v)) rawParts.push(v.join('\n'))
+    else if (typeof v === 'string' && v.trim()) rawParts.push(v)
+  }
+  const rest = Object.entries(d).filter(([k, v]) =>
+    !FLAG_DETAIL_HANDLED.has(k) && v !== null && v !== undefined && v !== '')
+  return (
+    <div className="px-3 py-3 space-y-3 bg-muted/30">
+      <div>
+        <div className="text-[10px] uppercase tracking-wide text-muted-foreground mb-1">Analysis</div>
+        <p className="text-xs whitespace-pre-wrap break-words">{d.reason || 'No analysis text provided.'}</p>
+      </div>
+      {rawParts.length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-muted-foreground mb-1">Raw output</div>
+          <pre className="text-[11px] font-mono whitespace-pre-wrap break-words max-h-64 overflow-auto rounded bg-background border border-border p-2">
+            {rawParts.join('\n')}
+          </pre>
+        </div>
+      )}
+      {rest.length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-muted-foreground mb-1">Details</div>
+          <dl className="grid grid-cols-[minmax(0,140px)_1fr] gap-x-3 gap-y-1 text-[11px]">
+            {rest.map(([k, v]) => (
+              <div key={k} className="contents">
+                <dt className="font-mono text-muted-foreground truncate">{k}</dt>
+                <dd className="font-mono break-words">
+                  {(k === 'session_id' && v) ? (
+                    <Link to={`/agent-sessions/${v}`} onClick={(e) => e.stopPropagation()}
+                          className="text-primary hover:underline">{String(v)} — open session output</Link>
+                  ) : typeof v === 'object' ? JSON.stringify(v) : String(v)}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function AgentFlagsPanel() {
   const { data } = useAgentFlags()
   const act = useActAgentFlag()
+  const [openId, setOpenId] = useState<string | null>(null)
   const flags = data?.flags ?? []
   const pending = flags.filter(f => f.status === 'pending')
   const recent = flags.filter(f => f.status !== 'pending').slice(0, 8)
@@ -250,12 +301,14 @@ function AgentFlagsPanel() {
         )}
       </h3>
       <p className="text-[11px] text-muted-foreground">
-        One agent flags something worth another run. Approving queues a scope-gated follow-up scan; every action is audited (who + when).
+        One agent flags something worth another run. Click a row to see the raw output and analysis before you act.
+        Approving queues a scope-gated follow-up scan; every action is audited (who + when).
       </p>
       <div className="overflow-x-auto">
         <table className="w-full min-w-[720px] text-xs">
           <thead className="text-muted-foreground">
             <tr className="border-b border-border">
+              <th className="w-6 px-1"></th>
               <th className="text-left py-1 px-2">From</th><th className="text-left px-2">Type</th>
               <th className="text-left px-2">Target</th><th className="text-left px-2">Scanner</th>
               <th className="text-left px-2">Reason</th><th className="text-left px-2">Status</th>
@@ -263,8 +316,17 @@ function AgentFlagsPanel() {
             </tr>
           </thead>
           <tbody>
-            {[...pending, ...recent].map(f => (
-              <tr key={f.id} className="border-b border-border/40">
+            {[...pending, ...recent].map(f => {
+              const isOpen = openId === f.id
+              return (
+              <Fragment key={f.id}>
+              <tr
+                  onClick={() => setOpenId(isOpen ? null : f.id)}
+                  className="border-b border-border/40 cursor-pointer hover:bg-accent/40"
+                  title="Click to view raw output and analysis">
+                <td className="px-1 text-muted-foreground">
+                  {isOpen ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                </td>
                 <td className="py-1 px-2 font-mono">{f.flagging_agent}</td>
                 <td className="px-2">{f.flag_type}</td>
                 <td className="px-2 font-mono truncate max-w-[180px]" title={f.data?.target}>{f.data?.target || '—'}</td>
@@ -280,15 +342,31 @@ function AgentFlagsPanel() {
                 <td className="px-2 text-right">
                   {f.status === 'pending' && (
                     <span className="inline-flex gap-1">
-                      <button onClick={() => act.mutate({ id: f.id, action: 'approve' })} disabled={act.isPending}
+                      <button onClick={(e) => { e.stopPropagation(); act.mutate({ id: f.id, action: 'approve' }) }} disabled={act.isPending}
                         className="px-2 py-0.5 text-[10px] rounded bg-green-600 hover:bg-green-500 text-white">Approve</button>
-                      <button onClick={() => act.mutate({ id: f.id, action: 'dismiss' })} disabled={act.isPending}
+                      <button onClick={(e) => { e.stopPropagation(); act.mutate({ id: f.id, action: 'dismiss' }) }} disabled={act.isPending}
                         className="px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">Dismiss</button>
                     </span>
                   )}
                 </td>
               </tr>
-            ))}
+              {isOpen && (
+                <tr className="border-b border-border/40">
+                  <td colSpan={8} className="p-0">
+                    <FlagDetail data={f.data} />
+                    {f.status === 'pending' && (
+                      <div className="flex justify-end gap-1 px-3 pb-3 bg-muted/30">
+                        <button onClick={(e) => { e.stopPropagation(); act.mutate({ id: f.id, action: 'approve' }) }} disabled={act.isPending}
+                          className="px-3 py-1 text-[11px] rounded bg-green-600 hover:bg-green-500 text-white">Approve — queue follow-up scan</button>
+                        <button onClick={(e) => { e.stopPropagation(); act.mutate({ id: f.id, action: 'dismiss' }) }} disabled={act.isPending}
+                          className="px-3 py-1 text-[11px] rounded border border-border hover:bg-accent">Dismiss</button>
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              )}
+              </Fragment>
+            )})}
           </tbody>
         </table>
       </div>
