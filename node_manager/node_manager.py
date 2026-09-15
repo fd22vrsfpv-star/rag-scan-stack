@@ -2995,6 +2995,27 @@ async def _remote_scan_bounded(node_id: str, req):
                     )
                 if resp.status_code < 300:
                     ingest_result = resp.json()
+                elif resp.status_code == 404:
+                    # No dedicated parser for this tool — fall back to the generic
+                    # structurer so the output is ANALYSED, not discarded. Covers
+                    # subzy/golinkfinder/service-enum/etc. and any future tool.
+                    try:
+                        with open(local_path, "r", errors="replace") as fh:
+                            stdout = fh.read()[:1_000_000]
+                        fb = req_lib.post(
+                            f"{api_base}/ingest/tool-output",
+                            headers={"x-api-key": api_key},
+                            json={"tool_name": req.scan_type, "stdout": stdout,
+                                  "job_id": job_id, "source": "remote-node"},
+                            timeout=300,
+                        )
+                        ingest_result = (fb.json() if fb.status_code < 300
+                                         else {"ok": False, "error": f"tool-output HTTP {fb.status_code}"})
+                        ingest_result["fallback"] = "tool-output"
+                        log.info("ingest %s had no parser; analysed via /ingest/tool-output",
+                                 ingest_type)
+                    except Exception as fe:
+                        ingest_result = {"ok": False, "error": f"fallback failed: {fe}"}
                 else:
                     ingest_result = {"ok": False, "error": f"HTTP {resp.status_code}"}
             except Exception as e:
