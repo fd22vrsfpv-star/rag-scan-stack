@@ -15,6 +15,12 @@ A dead `msf_session` / `bind_shell` stays dead: this watcher does NOT re-exploit
 and does NOT catch persistence callbacks — those are Tier 2/3 and are recorded in
 Docs/OPEN_ITEMS.md.
 
+It re-probes LIVE access too, not only dead rows, so a shell that silently died
+(e.g. a reboot) is DETECTED and flipped to dead (emitting access_dropped) instead
+of lingering as a phantom 'live'. The reconnect is then attempted on the next
+sweep. Access is populated when an exploit succeeds (exploit_runner records it via
+access.refresh); this watcher only maintains what is already recorded.
+
 INVARIANTS HONOURED
 -------------------
 - SCOPE GATE, FAIL CLOSED. Re-probing sends traffic to the target, so every
@@ -23,7 +29,7 @@ INVARIANTS HONOURED
   enforced for free because load_dispatch_scope consults them.
 - WEBHOOKS. Every action emits via POST /webhooks/emit (source "reconnect-watcher"):
   access_reconnect_attempted, access_reconnected, access_reconnect_failed,
-  access_reconnect_blocked.
+  access_reconnect_blocked, access_dropped.
 - NOT A SCAN INITIATOR. It runs `id` through access that already exists; it starts
   no tool and holds no scan slot, so MAX_CONCURRENT_SCANS does not apply. It also
   processes one target at a time, so it cannot amplify concurrency.
@@ -96,6 +102,8 @@ class ReconnectWatcher:
         self._reconnected_total = 0
         self._attempts_total = 0
         self._blocked_total = 0
+        self._probes_total = 0      # every actual re-probe (liveness + reconnect)
+        self._dropped_total = 0     # live access observed to have gone dead
         # Effective per-target throttle for the current cycle (settings override
         # the env default); set at the top of each sweep.
         self._min_attempt_interval = MIN_ATTEMPT_INTERVAL
@@ -144,17 +152,22 @@ class ReconnectWatcher:
             "min_attempt_interval": max(30, _int(_KEY_MIN_INTERVAL, MIN_ATTEMPT_INTERVAL)),
         }
 
-    def _dead_targets(self) -> List[Tuple[str, Optional[str]]]:
-        """(target, engagement_id) pairs that have at least one dead, non-rejected
-        access. engagement_id is the gate's scope selector; NULL means no
-        engagement, which the gate treats as all-engagements and still fails
-        closed on an empty scope."""
+    def _targets_to_probe(self) -> List[Tuple[str, Optional[str]]]:
+        """(target, engagement_id) pairs holding ANY non-rejected access — live,
+        dead, or unverified. GAP 2: we re-probe LIVE access too, not only dead
+        rows, so a shell that silently died (a reboot) is DETECTED (flipped to
+        dead) instead of lingering as a phantom 'live'. Re-probing dead rows then
+        re-establishes what can come back (mainly ssh_credential).
+
+        engagement_id is the gate's scope selector; NULL means no engagement,
+        which the gate treats as all-engagements and still fails closed on an
+        empty scope."""
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT DISTINCT target, engagement_id::text
                   FROM public.obtained_access
-                 WHERE status = 'dead'
+                 WHERE status IN ('live', 'dead', 'unverified')
                    AND target IS NOT NULL AND target <> ''
                 """
             )
@@ -209,29 +222,52 @@ class ReconnectWatcher:
             return {"target": target, "blocked": refusal}
 
         self._last_attempt[target] = now
-        self._attempts_total += 1
         before = self._access_state(target)
         dead_before = before["dead"]
-        logger.info("Reconnect attempt on %s (%d dead access)", target, len(dead_before))
-        _emit_webhook("access_reconnect_attempted", {
-            "target": target, "engagement_id": engagement_id,
-            "dead_before": len(dead_before)})
+        live_before = before["live"]
+        had_dead = bool(dead_before)
+        self._probes_total += 1
+        # An "attempt" is a reconnect of dead access; a pure liveness re-probe of
+        # a healthy target is not, and must not read as a reconnect failure.
+        if had_dead:
+            self._attempts_total += 1
+            logger.info("Reconnect attempt on %s (%d dead, %d live)",
+                        target, len(dead_before), len(live_before))
+            _emit_webhook("access_reconnect_attempted", {
+                "target": target, "engagement_id": engagement_id,
+                "dead_before": len(dead_before), "live_before": len(live_before)})
 
-        # refresh() is synchronous and blocks on probe timeouts (up to
-        # ACCESS_PROBE_TIMEOUT per candidate), so run it off the event loop.
+        # refresh() re-probes ALL access on the target: it re-establishes dead
+        # access (mainly ssh_credential) AND detects a live shell that has
+        # silently died. It blocks on probe timeouts, so run it off the loop.
         try:
             from etl import access as ax
             result = await asyncio.to_thread(
                 ax.refresh, target, rounds=PROBE_ROUNDS, engagement_id=engagement_id)
         except Exception as e:  # noqa: BLE001
             logger.error("refresh() failed for %s: %s", target, e)
-            _emit_webhook("access_reconnect_failed", {
-                "target": target, "engagement_id": engagement_id,
-                "reason": f"refresh error: {str(e)[:200]}"})
+            if had_dead:
+                _emit_webhook("access_reconnect_failed", {
+                    "target": target, "engagement_id": engagement_id,
+                    "reason": f"refresh error: {str(e)[:200]}"})
             return {"target": target, "error": str(e)}
 
         after = self._access_state(target)
         recovered = sorted(dead_before & after["live"])
+        dropped = sorted(live_before & after["dead"])
+
+        # GAP 2: a shell we held stopped answering. Detected now; a reconnect is
+        # attempted on the next sweep (it now has a dead row).
+        if dropped:
+            self._dropped_total += len(dropped)
+            dropped_kinds = sorted({k for k, _ in dropped})
+            logger.warning("DROPPED on %s: %d access went dead (%s)",
+                           target, len(dropped), ", ".join(dropped_kinds))
+            _emit_webhook("access_dropped", {
+                "target": target, "engagement_id": engagement_id,
+                "dropped": len(dropped), "dropped_kinds": dropped_kinds,
+                "live_total": len(after["live"])})
+
         if recovered:
             self._reconnected_total += len(recovered)
             recovered_kinds = sorted({k for k, _ in recovered})
@@ -241,17 +277,19 @@ class ReconnectWatcher:
                 "target": target, "engagement_id": engagement_id,
                 "recovered": len(recovered), "recovered_kinds": recovered_kinds,
                 "live_total": len(after["live"]), "best": result.get("best")})
-            return {"target": target, "recovered": len(recovered),
-                    "kinds": recovered_kinds}
 
-        reason = (f"{result.get('discovered', 0)} candidate(s) probed, "
-                  f"{result.get('live', 0)} answered; "
-                  f"{len(dead_before)} still dead")
-        logger.info("Reconnect on %s recovered nothing: %s", target, reason)
-        _emit_webhook("access_reconnect_failed", {
-            "target": target, "engagement_id": engagement_id, "reason": reason,
-            "still_dead": len(after["dead"])})
-        return {"target": target, "recovered": 0, "reason": reason}
+        if had_dead and not recovered:
+            reason = (f"{result.get('discovered', 0)} candidate(s) probed, "
+                      f"{result.get('live', 0)} answered; "
+                      f"{len(after['dead'])} still dead")
+            logger.info("Reconnect on %s recovered nothing: %s", target, reason)
+            _emit_webhook("access_reconnect_failed", {
+                "target": target, "engagement_id": engagement_id, "reason": reason,
+                "still_dead": len(after["dead"])})
+
+        return {"target": target, "recovered": len(recovered),
+                "dropped": len(dropped),
+                "kinds": sorted({k for k, _ in recovered})}
 
     # ── Loop ──────────────────────────────────────────────────────────────
     async def watch_loop(self):
@@ -284,7 +322,7 @@ class ReconnectWatcher:
                 sleep_for = cfg["poll_interval"]
 
                 self._last_check = datetime.now(timezone.utc)
-                pairs = self._dead_targets()
+                pairs = self._targets_to_probe()
                 done_targets: set = set()
                 for target, engagement_id in pairs:
                     if not self.running or not self.is_enabled():
@@ -319,6 +357,8 @@ class ReconnectWatcher:
             "attempts_total": self._attempts_total,
             "reconnected_total": self._reconnected_total,
             "blocked_total": self._blocked_total,
+            "probes_total": self._probes_total,
+            "dropped_total": self._dropped_total,
             "config": {
                 "poll_interval": cfg["poll_interval"],
                 "min_attempt_interval": cfg["min_attempt_interval"],

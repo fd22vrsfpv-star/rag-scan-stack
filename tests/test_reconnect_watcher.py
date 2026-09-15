@@ -136,6 +136,48 @@ def test_no_recovery_emits_failed(monkeypatch):
     assert w._reconnected_total == 0
 
 
+def test_live_shell_that_died_is_detected_as_dropped(monkeypatch):
+    """GAP 2: a live shell that stops answering is flipped to dead and emits
+    access_dropped — NOT a reconnect failure (nothing was dead before)."""
+    events = _capture_webhooks(monkeypatch)
+    _install_fake_etl_access(
+        monkeypatch, lambda *a, **k: {"discovered": 1, "live": 0, "best": None})
+    w = rw.ReconnectWatcher()
+    monkeypatch.setattr(w, "_scope_refusal", lambda t, e: None)
+    states = iter([
+        {"dead": set(), "live": {("msf_session", "3")}},   # before: live
+        {"dead": {("msf_session", "3")}, "live": set()},   # after: died
+    ])
+    monkeypatch.setattr(w, "_access_state", lambda t: next(states))
+
+    result = asyncio.run(w._reconnect_target("192.168.1.150", "eng-1"))
+
+    assert result["dropped"] == 1
+    kinds = [et for et, _ in events]
+    assert "access_dropped" in kinds
+    assert "access_reconnect_attempted" not in kinds   # nothing was dead before
+    assert "access_reconnect_failed" not in kinds
+    assert w._dropped_total == 1
+
+
+def test_healthy_live_target_is_quiet(monkeypatch):
+    """A live shell that still answers emits nothing — a liveness re-probe of a
+    healthy target must not look like a reconnect attempt or failure."""
+    events = _capture_webhooks(monkeypatch)
+    _install_fake_etl_access(
+        monkeypatch, lambda *a, **k: {"discovered": 1, "live": 1, "best": None})
+    w = rw.ReconnectWatcher()
+    monkeypatch.setattr(w, "_scope_refusal", lambda t, e: None)
+    monkeypatch.setattr(w, "_access_state",
+                        lambda t: {"dead": set(), "live": {("ssh_credential", "root:x")}})
+
+    result = asyncio.run(w._reconnect_target("192.168.1.150", "eng-1"))
+
+    assert result["recovered"] == 0 and result["dropped"] == 0
+    assert events == []   # completely silent for a healthy target
+    assert w._probes_total == 1
+
+
 def test_throttle_skips_recent_target(monkeypatch):
     """A target attempted within MIN_ATTEMPT_INTERVAL is skipped, no refresh."""
     _capture_webhooks(monkeypatch)
