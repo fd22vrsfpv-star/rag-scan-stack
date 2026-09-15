@@ -17452,6 +17452,68 @@ def update_exploit_watcher_settings(body: ExploitWatcherSettingsBody, _: bool = 
     return {"ok": True, "updated": list(settings_data.keys())}
 
 
+# ── Reconnect watcher (Tier 1) ──────────────────────────────────────────────
+# The persisted operator toggle for autogen_agents/reconnect_watcher.py. Keys are
+# namespaced because app_settings.key is a GLOBAL primary key — a bare "enabled"
+# would clobber the exploit watcher's row.
+class ReconnectWatcherSettingsBody(BaseModel):
+    enabled: Optional[bool] = Field(default=True)
+    poll_interval: Optional[int] = Field(default=120, ge=30, le=3600)
+    min_attempt_interval: Optional[int] = Field(default=300, ge=30, le=86400)
+
+
+_RECONNECT_FIELD_TO_KEY = {
+    "enabled": "reconnect_watcher.enabled",
+    "poll_interval": "reconnect_watcher.poll_interval",
+    "min_attempt_interval": "reconnect_watcher.min_attempt_interval",
+}
+
+
+@app.get("/settings/reconnect-watcher", tags=["Settings"])
+def get_reconnect_watcher_settings(_: bool = Depends(auth)):
+    """Get the reconnect watcher operator toggle and cadence."""
+    defaults = {"enabled": True, "poll_interval": 120, "min_attempt_interval": 300}
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT key, value FROM app_settings WHERE category = 'reconnect_watcher'")
+        rows = {r["key"]: r["value"] for r in cur.fetchall()}
+
+    settings = defaults.copy()
+    for field, key in _RECONNECT_FIELD_TO_KEY.items():
+        if key not in rows:
+            continue
+        val = rows[key]
+        if field == "enabled":
+            settings[field] = str(val).lower() in ("true", "1", "yes", "on")
+        else:
+            try:
+                settings[field] = int(val)
+            except (TypeError, ValueError):
+                pass
+    return settings
+
+
+@app.put("/settings/reconnect-watcher", tags=["Settings"])
+def update_reconnect_watcher_settings(body: ReconnectWatcherSettingsBody,
+                                      _: bool = Depends(auth)):
+    """Update the reconnect watcher toggle. Honoured live within one poll cycle;
+    no container restart. Keys are namespaced to avoid the global app_settings PK
+    colliding with the exploit watcher."""
+    data = body.model_dump(exclude_unset=True)
+    with get_db() as conn, conn.cursor() as cur:
+        for field, value in data.items():
+            key = _RECONNECT_FIELD_TO_KEY[field]
+            cur.execute(
+                """
+                INSERT INTO app_settings (key, value, category)
+                VALUES (%s, %s, 'reconnect_watcher')
+                ON CONFLICT (key) DO UPDATE SET
+                    value = EXCLUDED.value, updated_at = now()
+                """, (key, str(value)))
+        conn.commit()
+    return {"ok": True, "updated": list(data.keys())}
+
+
 # ============================================================================
 # ENGAGEMENTS (A1)
 # ============================================================================
@@ -21665,6 +21727,50 @@ def access_summary(_: bool = Depends(auth)):
         summary = {r["target"]: {"live": int(r["live"]), "total": int(r["total"])}
                    for r in cur.fetchall()}
     return {"summary": summary, "hosts": len(summary)}
+
+
+@app.get("/foothold/no-callback", tags=["Access"])
+def foothold_no_callback(limit: int = 50, _: bool = Depends(auth)):
+    """Exploits that RAN but produced no live shell — the 'payload needs tweaking'
+    queue for the Foothold Agent panel.
+
+    An exploit is here when its pending_exploits row is 'executed' or 'failed' AND
+    no LIVE obtained_access rows back to it via source_exploit. `callback_status` is
+    the most recent exploit_callbacks verdict for context (a 'failed'/'pending' one
+    is the clearest 'payload never called back' signal; NULL means no listener row
+    was ever recorded). Because source_exploit can be NULL on a shell we did open,
+    this can over-report — it means 'no shell we can attribute to this exploit',
+    which is exactly what warrants a human look before re-running.
+    """
+    limit = max(1, min(int(limit), 500))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT pe.id::text                AS id,
+                   pe.exploit_title           AS exploit_title,
+                   pe.source                  AS source,
+                   pe.exploit_type            AS exploit_type,
+                   host(pe.target_ip)         AS target,
+                   pe.target_port             AS target_port,
+                   pe.target_service          AS target_service,
+                   pe.status                  AS status,
+                   pe.rejection_reason        AS rejection_reason,
+                   pe.updated_at              AS updated_at,
+                   (SELECT ec.validation_status
+                      FROM exploit_callbacks ec
+                     WHERE ec.pending_exploit_id = pe.id
+                     ORDER BY ec.received_at DESC NULLS LAST
+                     LIMIT 1)                 AS callback_status
+              FROM pending_exploits pe
+             WHERE pe.status IN ('executed', 'failed')
+               AND NOT EXISTS (
+                   SELECT 1 FROM obtained_access oa
+                    WHERE oa.source_exploit = pe.id AND oa.status = 'live')
+             ORDER BY pe.updated_at DESC
+             LIMIT %s
+            """, (limit,))
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"count": len(rows), "rows": rows}
 
 
 @app.get("/assets/{ip}/port-advice", tags=["Access"])

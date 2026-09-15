@@ -330,3 +330,33 @@ and the two `LLM_URL` `/ollama/chat` calls at ~:857 and ~:1086).
 `task="exploit_gen"` and no forced env model, the way web_payload_generator now
 does, OR is confirmed dead and removed.
 **Enforced by:** not enforced
+
+## Access reconnection
+
+### Dropped msf/bind shells are not re-established after a host reboot
+**Found:** 2026-09-15
+**Evidence:** The Tier 1 reconnect watcher recovers only credential-backed
+access: `etl/access.py::refresh` re-opens SSH with the stored credential, but
+`probe()` marks a rebooted host's `msf_session` and `bind_shell` rows `dead` and
+nothing re-establishes them. No persistence step exists to catch a boot callback:
+`grep -n "persist" exploit_runner/postex.py` returns only the forbidden-token
+list, not a persistence installer, and `active_listeners` holds no standing
+listener after an exploit completes.
+**Where:** `exploit_runner/postex.py` (no persistence install) and
+`kali_listener/listener_service.py` (no standing callback listener).
+**Done when:** post-ex can optionally install a boot-survivable callback
+(scope-gated and approval-gated), and the reconnect watcher registers an inbound
+persistence callback in `obtained_access` as recovered access (Tier 2).
+**Enforced by:** not enforced
+
+### The reconnect watcher never re-runs the original exploit
+**Found:** 2026-09-15
+**Evidence:** `autogen_agents/reconnect_watcher.py` is Tier 1 only — it re-probes
+existing access and never re-dispatches `obtained_access.source_exploit`. A dead
+`msf_session`/`bind_shell` whose vulnerability survived patching stays dead with
+no automated re-exploitation, even though `source_exploit` is recorded on the row.
+**Where:** `autogen_agents/reconnect_watcher.py`.
+**Done when:** after a grace window with no Tier 1 recovery, `source_exploit` is
+re-dispatched through the existing scope-gated, `MAX_CONCURRENT_SCANS`-bounded
+approval path, gated behind an explicit policy flag (Tier 3).
+**Enforced by:** not enforced
