@@ -17452,6 +17452,68 @@ def update_exploit_watcher_settings(body: ExploitWatcherSettingsBody, _: bool = 
     return {"ok": True, "updated": list(settings_data.keys())}
 
 
+# ── Reconnect watcher (Tier 1) ──────────────────────────────────────────────
+# The persisted operator toggle for autogen_agents/reconnect_watcher.py. Keys are
+# namespaced because app_settings.key is a GLOBAL primary key — a bare "enabled"
+# would clobber the exploit watcher's row.
+class ReconnectWatcherSettingsBody(BaseModel):
+    enabled: Optional[bool] = Field(default=True)
+    poll_interval: Optional[int] = Field(default=120, ge=30, le=3600)
+    min_attempt_interval: Optional[int] = Field(default=300, ge=30, le=86400)
+
+
+_RECONNECT_FIELD_TO_KEY = {
+    "enabled": "reconnect_watcher.enabled",
+    "poll_interval": "reconnect_watcher.poll_interval",
+    "min_attempt_interval": "reconnect_watcher.min_attempt_interval",
+}
+
+
+@app.get("/settings/reconnect-watcher", tags=["Settings"])
+def get_reconnect_watcher_settings(_: bool = Depends(auth)):
+    """Get the reconnect watcher operator toggle and cadence."""
+    defaults = {"enabled": True, "poll_interval": 120, "min_attempt_interval": 300}
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT key, value FROM app_settings WHERE category = 'reconnect_watcher'")
+        rows = {r["key"]: r["value"] for r in cur.fetchall()}
+
+    settings = defaults.copy()
+    for field, key in _RECONNECT_FIELD_TO_KEY.items():
+        if key not in rows:
+            continue
+        val = rows[key]
+        if field == "enabled":
+            settings[field] = str(val).lower() in ("true", "1", "yes", "on")
+        else:
+            try:
+                settings[field] = int(val)
+            except (TypeError, ValueError):
+                pass
+    return settings
+
+
+@app.put("/settings/reconnect-watcher", tags=["Settings"])
+def update_reconnect_watcher_settings(body: ReconnectWatcherSettingsBody,
+                                      _: bool = Depends(auth)):
+    """Update the reconnect watcher toggle. Honoured live within one poll cycle;
+    no container restart. Keys are namespaced to avoid the global app_settings PK
+    colliding with the exploit watcher."""
+    data = body.model_dump(exclude_unset=True)
+    with get_db() as conn, conn.cursor() as cur:
+        for field, value in data.items():
+            key = _RECONNECT_FIELD_TO_KEY[field]
+            cur.execute(
+                """
+                INSERT INTO app_settings (key, value, category)
+                VALUES (%s, %s, 'reconnect_watcher')
+                ON CONFLICT (key) DO UPDATE SET
+                    value = EXCLUDED.value, updated_at = now()
+                """, (key, str(value)))
+        conn.commit()
+    return {"ok": True, "updated": list(data.keys())}
+
+
 # ============================================================================
 # ENGAGEMENTS (A1)
 # ============================================================================
