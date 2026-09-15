@@ -4684,12 +4684,28 @@ def execute_approved_exploit(pending_exploit_id: str) -> str:
                 # Expected format: "use <module>; set RHOSTS <ip>; set RPORT <port>; ..."
                 params = exploit.get("parameters", {})
 
+                # Derive the MSF module TYPE from the module name when the caller
+                # did not set it explicitly. Blindly defaulting to "exploit" made
+                # MSF reject every auxiliary/post module ("Client provided module
+                # type 'exploit' did not match expected type for
+                # 'auxiliary/scanner/smb/smb_version'") — so the smb/ssh/ftp login
+                # scanners the planner queues all failed with output=null.
+                module_name = params.get("module_path", exploit["exploit_id"]) or ""
+                if params.get("module_type"):
+                    module_type = params["module_type"]
+                elif module_name.startswith("auxiliary/"):
+                    module_type = "auxiliary"
+                elif module_name.startswith("post/"):
+                    module_type = "post"
+                else:
+                    module_type = "exploit"
+
                 # Call the MSF execution endpoint
                 response = httpx.post(
                     f"{exploit_runner_url}/execute/msf",
                     json={
-                        "module_type": params.get("module_type", "exploit"),
-                        "module_name": params.get("module_path", exploit["exploit_id"]),
+                        "module_type": module_type,
+                        "module_name": module_name,
                         "options": {
                             "RHOSTS": str(exploit["target_ip"]),
                             "RPORT": exploit.get("target_port", 0),
