@@ -1769,18 +1769,19 @@ def exploit_exec(state: PentestState) -> dict:
         sid, pending_ids, approver="operator (exploit approval)",
         note=decision.get("note"), agent="Exploit")
     executed, failed, shells = summary["executed"], summary["failed"], summary["shells"]
-    order, per_port = summary["ports"], summary["per_port"]
+    # summary["ports"] is already the COUNT of unique ports (an int), not a list.
+    ports_n, per_port = summary["ports"], summary["per_port"]
 
     _emit("langgraph_exploit_executed", sid,
           {"executed": len(executed), "failed": len(failed),
-           "shells": len(shells), "ports": order, "per_port": per_port,
+           "shells": len(shells), "ports": ports_n, "per_port": per_port,
            "pending_exploit_ids": executed})
-    findings = [f"exploit_exec: {order} unique port(s); {len(executed)} run, "
+    findings = [f"exploit_exec: {ports_n} unique port(s); {len(executed)} run, "
                 f"{len(shells)} shell(s), {len(failed)} failed"]
     if failed:
         findings.append(f"exploit_exec: {len(failed)} failed to execute")
     return {"phase": "post_enumeration", "findings": findings,
-            "log": [f"exploit_exec: ports={len(order)} executed={executed} "
+            "log": [f"exploit_exec: ports={ports_n} executed={executed} "
                     f"shells={shells} failed={failed}"]}
 
 
