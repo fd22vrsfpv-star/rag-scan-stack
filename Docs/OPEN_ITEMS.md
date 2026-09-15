@@ -378,3 +378,18 @@ recommender / ingest that sets `exploit_type`).
 `auxiliary/*` or `post/*` module is not `rce` — so downstream consumers can trust
 the column instead of pattern-matching the module path.
 **Enforced by:** not enforced
+
+### /execute/by-id's Metasploit branch is unreachable (no module_path column)
+**Found:** 2026-09-15
+**Evidence:** `information_schema.columns` for `pending_exploits` has no
+`module_path` column (27 columns; the module path is stored in `exploit_id`).
+`exploit_runner.execute_by_id` sets `module_path = exploit.get("module_path")`
+(always None) and gates the whole Metasploit path on `if source == "metasploit"
+and module_path:` — so a metasploit-source exploit dispatched by id never runs
+that branch. Approved MSF exploits execute via `/execute/msf` (the agent path),
+not by id.
+**Where:** `exploit_runner/exploit_runner.py::execute_by_id`.
+**Done when:** the metasploit branch reads the module path from `exploit_id`
+(or a real `module_path` column is added and populated), so a BFF-approved MSF
+exploit dispatched by id actually runs.
+**Enforced by:** not enforced
