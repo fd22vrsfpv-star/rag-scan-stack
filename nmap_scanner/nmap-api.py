@@ -2723,6 +2723,56 @@ def _run_smb_vuln_scan(ip: str, job_id: str = None) -> Dict:
         return {"error": str(e), "target": ip}
 
 
+def _ingest_masscan_file(job_id: str, masscan_path: Optional[str]) -> bool:
+    """Ingest one masscan JSON (port discovery). Idempotent — masscan ingest
+    dedups — so calling it early (quick ports) and again at the end is safe."""
+    if not masscan_path or not os.path.exists(masscan_path):
+        return False
+    try:
+        with open(masscan_path, "rb") as fh:
+            resp = requests.post(
+                f"{API_BASE}/ingest/masscan",
+                headers={"x-api-key": API_KEY},
+                files={"file": ("masscan.json", fh, "application/json")},
+                timeout=INGEST_TIMEOUT_SHORT, verify=False)
+        if resp.status_code >= 300:
+            logging.warning(f"[{job_id}] Failed to ingest {masscan_path}: {resp.text}")
+            return False
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.error(f"[{job_id}] Failed to ingest {masscan_path}: {e}")
+        return False
+
+
+def _ingest_nmap_results(job_id: str, nmap_results: list) -> int:
+    """Ingest a list of {target, xml_path} nmap results (service detection,
+    vulns, banners). Idempotent via the finding fingerprints. Returns count
+    ingested. Shared by the EARLY (quick-port) ingest and the final ingest so a
+    caller acts on the quick ports without waiting for the full 1-65535 sweep."""
+    n = 0
+    for nmap_result in nmap_results or []:
+        xml_path = (nmap_result or {}).get("xml_path")
+        target = (nmap_result or {}).get("target", "unknown")
+        if not xml_path or not os.path.exists(xml_path):
+            continue
+        try:
+            with open(xml_path, "rb") as fh:
+                resp = requests.post(
+                    f"{API_BASE}/ingest/nmap",
+                    headers={"x-api-key": API_KEY},
+                    files={"file": (os.path.basename(xml_path), fh, "application/xml")},
+                    params={"job_id": job_id, "target": target},
+                    timeout=INGEST_TIMEOUT_SHORT, verify=False)
+            if resp.status_code < 300:
+                n += 1
+                logging.info(f"[{job_id}] Ingested nmap results from {xml_path}")
+            else:
+                logging.warning(f"[{job_id}] Failed to ingest {xml_path}: {resp.text}")
+        except Exception as e:  # noqa: BLE001
+            logging.error(f"[{job_id}] Failed to ingest {xml_path}: {e}")
+    return n
+
+
 def _run_full_scan_async(
     job_id: str,
     targets: List[str],
@@ -2868,6 +2918,26 @@ def _run_full_scan_async(
                 masscan_future = executor.submit(run_full_masscan)
 
                 phase2_nmap_results = nmap_future.result()
+                # EARLY INGEST: the quick ports and their services are known the
+                # moment nmap-on-quick-ports returns — ingest them NOW, while the
+                # full 1-65535 masscan (masscan_future) keeps running in the
+                # background. Otherwise the whole full_scan ingested only at the
+                # very end (after the ~hour-long sweep), so the pipeline's first
+                # analyze/exploit pass ran on an empty inventory. The final
+                # ingest below still runs and is idempotent, so this only makes
+                # the quick services available sooner.
+                try:
+                    update_job_status(job_id, "running", "ingest_quick",
+                                      "Ingesting quick-scan ports (full sweep continues)")
+                    got_ports = _ingest_masscan_file(job_id, quick_path)
+                    got_svcs = _ingest_nmap_results(job_id, phase2_nmap_results)
+                    logging.info(f"[{job_id}] Early ingest: quick ports={got_ports}, "
+                                 f"nmap service batches={got_svcs}")
+                except Exception as e:  # noqa: BLE001
+                    logging.warning(f"[{job_id}] early ingest failed (final ingest "
+                                    f"will still run): {e}")
+                # Now block on the full 1-65535 sweep (it ran in parallel with the
+                # quick nmap + early ingest above).
                 phase2_masscan_path = masscan_future.result()
         else:
             phase2_nmap_results = run_nmap_on_ports()
@@ -2951,45 +3021,16 @@ def _run_full_scan_async(
         # ========================================
         update_job_status(job_id, "running", "ingesting", "Ingesting scan results to database")
 
-        # Ingest masscan results (port discovery)
+        # Ingest masscan results (port discovery). quick_path was already ingested
+        # early (idempotent), so this mainly lands the full-sweep ports.
         for masscan_path in [quick_path, phase2_masscan_path]:
-            if masscan_path and os.path.exists(masscan_path):
-                try:
-                    with open(masscan_path, "rb") as fh:
-                        resp = requests.post(
-                            f"{API_BASE}/ingest/masscan",
-                            headers={"x-api-key": API_KEY},
-                            files={"file": ("masscan.json", fh, "application/json")},
-                            timeout=INGEST_TIMEOUT_SHORT,
-                            verify=False,
-                        )
-                    if resp.status_code >= 300:
-                        logging.warning(f"[{job_id}] Failed to ingest {masscan_path}: {resp.text}")
-                except Exception as e:
-                    logging.error(f"[{job_id}] Failed to ingest {masscan_path}: {e}")
+            _ingest_masscan_file(job_id, masscan_path)
 
-        # Ingest nmap XML results (service detection, vulns, banners)
+        # Ingest nmap XML results (service detection, vulns, banners). The Phase-2
+        # (quick-port) nmap was ingested early; re-ingesting is idempotent, and
+        # the Phase-3 (full-sweep port) service detection lands here.
         all_nmap_results = phase2_nmap_results + (result["phases"].get("phase3", {}).get("nmap_results", []))
-        for nmap_result in all_nmap_results:
-            xml_path = nmap_result.get("xml_path")
-            target = nmap_result.get("target", "unknown")
-            if xml_path and os.path.exists(xml_path):
-                try:
-                    with open(xml_path, "rb") as fh:
-                        resp = requests.post(
-                            f"{API_BASE}/ingest/nmap",
-                            headers={"x-api-key": API_KEY},
-                            files={"file": (os.path.basename(xml_path), fh, "application/xml")},
-                            params={"job_id": job_id, "target": target},
-                            timeout=INGEST_TIMEOUT_SHORT,
-                            verify=False,
-                        )
-                    if resp.status_code < 300:
-                        logging.info(f"[{job_id}] Ingested nmap results from {xml_path}")
-                    else:
-                        logging.warning(f"[{job_id}] Failed to ingest {xml_path}: {resp.text}")
-                except Exception as e:
-                    logging.error(f"[{job_id}] Failed to ingest {xml_path}: {e}")
+        _ingest_nmap_results(job_id, all_nmap_results)
 
         # Ingest SMB vuln scan results if available
         smb_results = result.get("smb_scan") or []
