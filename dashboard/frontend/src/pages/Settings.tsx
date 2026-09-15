@@ -3,7 +3,7 @@ import PageHelp from '@/components/PageHelp'
 import InfoTip from '@/components/InfoTip'
 import KaliAllowlistPanel from '@/components/settings/KaliAllowlistPanel'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useScopeNames, useScope, useAddToScope, useRemoveFromScope } from '@/api/scope'
+import { useScopeNames } from '@/api/scope'
 import { useBurpStatus } from '@/api/burp'
 import { useZapAddons, useInstallAddon, useUninstallAddon } from '@/api/zapAddons'
 import type { ZapAddon } from '@/api/zapAddons'
@@ -20,7 +20,7 @@ import { cn } from '@/lib/utils'
 import { BUILD_VERSION, SCAN_CATEGORIES, SCAN_FIELDS, TARGET_FIELD_KEYS, TOOL_CLI_OPTIONS } from '@/lib/constants'
 import { Trash2, Download, X, Search, RefreshCw, Eye, EyeOff, Plus, Upload, Loader2, CheckCircle2, XCircle, Database, Wifi, Server, ArrowRightLeft, BarChart3, RotateCcw, ChevronDown, ChevronRight, Zap, Power, PowerOff, Shield, Info } from 'lucide-react'
 
-type SettingsTab = 'general' | 'scope' | 'zap-addons' | 'api-keys' | 'database' | 'tool-options' | 'mcp-servers' | 'vendor-pages' | 'scan-timeouts' | 'llm-tuning' | 'exploit-watcher' | 'reconnect-watcher'
+type SettingsTab = 'general' | 'zap-addons' | 'api-keys' | 'database' | 'tool-options' | 'mcp-servers' | 'vendor-pages' | 'scan-timeouts' | 'llm-tuning' | 'exploit-watcher' | 'reconnect-watcher'
 
 export default function Settings() {
   const [tab, setTab] = useState<SettingsTab>('general')
@@ -29,7 +29,7 @@ export default function Settings() {
   return (
     <div className="space-y-4">
       <PageHelp id="settings" title="How to use Settings">
-        <p><strong>General</strong>: proxy config (Burp/ZAP), Docker host IP. <strong>Scope</strong>: define in-scope targets. <strong>Tool Options</strong>: override scan defaults, configure wordlist paths, check files on nodes. <strong>API Keys</strong>: manage keys for cloud providers and external services. <strong>MCP Servers</strong>: add third-party MCP tools.</p>
+        <p><strong>General</strong>: proxy config (Burp/ZAP), Docker host IP. <strong>Tool Options</strong>: override scan defaults, configure wordlist paths, check files on nodes. <strong>API Keys</strong>: manage keys for cloud providers and external services. <strong>MCP Servers</strong>: add third-party MCP tools.</p>
       </PageHelp>
 
       <div className="flex items-center justify-between">
@@ -59,7 +59,6 @@ export default function Settings() {
       <div className="flex gap-1 border-b border-border">
         {([
           ['general', 'General'],
-          ['scope', 'Scope'],
           ['zap-addons', 'ZAP Add-ons'],
           ['api-keys', 'API Keys'],
           ['database', 'Database'],
@@ -93,7 +92,6 @@ export default function Settings() {
       ) : (
         <>
           {tab === 'general' && <GeneralTab />}
-          {tab === 'scope' && <ScopeTab />}
           {tab === 'zap-addons' && <ZapAddonsTab />}
           {tab === 'api-keys' && <ApiKeysTab />}
           {tab === 'database' && <DatabaseTab />}
@@ -586,328 +584,6 @@ function parseTargetLines(text: string) {
     .split(/[\r\n]+/)
     .map(l => l.trim())
     .filter(l => l.length > 0 && !l.startsWith('#'))
-}
-
-// ─── Scope Tab (moved to Engagements page) ──────────
-function ScopeTab() {
-  return (
-    <div className="bg-card border border-border rounded-lg p-6 text-center space-y-3">
-      <p className="text-sm text-muted-foreground">
-        Scope management has moved to the <strong>Engagements</strong> page.
-      </p>
-      <p className="text-xs text-muted-foreground">
-        Scopes are now managed under each engagement. Go to Engagements, select an engagement, and click the <strong>Scope</strong> tab to manage targets.
-      </p>
-      <a href="/engagements" className="inline-flex items-center gap-2 px-4 py-2 text-sm rounded bg-primary text-primary-foreground hover:bg-primary/90">
-        Go to Engagements
-      </a>
-    </div>
-  )
-}
-
-/* eslint-disable @typescript-eslint/no-unused-vars */
-function ScopeTab_Legacy() {
-  const scopeNames = useScopeNames()
-  const [selectedScope, setSelectedScope] = useState('')
-  const scopeData = useScope(selectedScope)
-  const addToScope = useAddToScope()
-  const removeFromScope = useRemoveFromScope()
-
-  // Create-scope form state
-  const [showCreate, setShowCreate] = useState(false)
-  const [newScopeName, setNewScopeName] = useState('')
-  const [newTargetsText, setNewTargetsText] = useState('')
-  const [createStatus, setCreateStatus] = useState<'idle' | 'saving' | 'done' | 'error'>('idle')
-  const [createMsg, setCreateMsg] = useState('')
-  const fileInputRef = useRef<HTMLInputElement>(null)
-
-  const names = scopeNames.data?.names ?? []
-  const targets = scopeData.data?.targets ?? []
-
-  const handleRemoveTarget = (targetValue: string) => {
-    if (!selectedScope) return
-    removeFromScope.mutate({ name: selectedScope, targets: [targetValue] })
-  }
-
-  const handleDeleteScope = () => {
-    if (!selectedScope || targets.length === 0) return
-    const allTargets = targets.map(t => t.target)
-    removeFromScope.mutate({ name: selectedScope, targets: allTargets }, {
-      onSuccess: () => setSelectedScope(''),
-    })
-  }
-
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    const reader = new FileReader()
-    reader.onload = () => {
-      const text = reader.result as string
-      setNewTargetsText(prev => (prev ? prev + '\n' + text : text))
-    }
-    reader.readAsText(file)
-    // reset so the same file can be re-selected
-    e.target.value = ''
-  }
-
-  const parsedTargets = useMemo(() => parseTargetLines(newTargetsText), [newTargetsText])
-
-  const handleCreateScope = () => {
-    const name = newScopeName.trim()
-    if (!name) { setCreateMsg('Scope name is required'); setCreateStatus('error'); return }
-    if (parsedTargets.length === 0) { setCreateMsg('Add at least one target'); setCreateStatus('error'); return }
-
-    const targetsPayload = parsedTargets.map(t => ({
-      target: t,
-      target_type: detectTargetType(t),
-      source: 'manual',
-    }))
-
-    setCreateStatus('saving')
-    addToScope.mutate({ name, targets: targetsPayload }, {
-      onSuccess: (data) => {
-        setCreateStatus('done')
-        setCreateMsg(`Added ${data.added} target${data.added !== 1 ? 's' : ''} to "${name}"`)
-        setNewScopeName('')
-        setNewTargetsText('')
-        setSelectedScope(name)
-        setTimeout(() => { setCreateStatus('idle'); setCreateMsg(''); setShowCreate(false) }, 2000)
-      },
-      onError: (err) => {
-        setCreateStatus('error')
-        setCreateMsg((err as Error).message)
-      },
-    })
-  }
-
-  return (
-    <div className="space-y-4">
-      {/* Create / Add panel */}
-      <div className="bg-card border border-border rounded-lg p-4">
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="text-sm font-semibold">Create / Add to Scope</h3>
-          <button
-            onClick={() => setShowCreate(!showCreate)}
-            className={cn(
-              'flex items-center gap-1 px-2 py-1 text-xs rounded-md border transition-colors',
-              showCreate
-                ? 'border-primary text-primary bg-primary/10'
-                : 'border-border text-muted-foreground hover:text-foreground hover:bg-muted/50',
-            )}
-          >
-            <Plus className="h-3 w-3" />
-            {showCreate ? 'Hide' : 'New Scope'}
-          </button>
-        </div>
-
-        {showCreate && (
-          <div className="space-y-3">
-            <div className="flex gap-3 items-end">
-              <div className="flex-1 max-w-xs">
-                <label className="block text-xs text-muted-foreground mb-1">Scope Name</label>
-                <input
-                  type="text"
-                  placeholder="e.g. acme-external"
-                  value={newScopeName}
-                  onChange={e => setNewScopeName(e.target.value)}
-                  className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border outline-none focus:border-primary"
-                />
-              </div>
-              <div className="flex-1 max-w-xs">
-                <label className="block text-xs text-muted-foreground mb-1">Or add to existing scope</label>
-                <select
-                  value={newScopeName}
-                  onChange={e => setNewScopeName(e.target.value)}
-                  className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border outline-none focus:border-primary"
-                >
-                  <option value="">— type a new name above —</option>
-                  {names.map(s => (
-                    <option key={s.name} value={s.name}>{s.name} ({s.target_count})</option>
-                  ))}
-                </select>
-              </div>
-            </div>
-
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <label className="block text-xs text-muted-foreground">Targets (one per line)</label>
-                <div className="flex items-center gap-2">
-                  {parsedTargets.length > 0 && (
-                    <span className="text-[10px] text-muted-foreground">
-                      {parsedTargets.length} target{parsedTargets.length !== 1 ? 's' : ''} parsed
-                    </span>
-                  )}
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept=".txt,.csv,.list"
-                    onChange={handleFileUpload}
-                    className="hidden"
-                  />
-                  <button
-                    onClick={() => fileInputRef.current?.click()}
-                    className="flex items-center gap-1 px-2 py-0.5 text-xs border border-border rounded-md hover:bg-muted/50 text-muted-foreground hover:text-foreground"
-                  >
-                    <Upload className="h-3 w-3" />
-                    Import .txt
-                  </button>
-                </div>
-              </div>
-              <textarea
-                placeholder={"192.168.1.0/24\n10.0.0.1\nhttps://api.example.com\napp.example.com\n# lines starting with # are ignored"}
-                value={newTargetsText}
-                onChange={e => setNewTargetsText(e.target.value)}
-                rows={8}
-                className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border outline-none focus:border-primary resize-y font-mono"
-              />
-              <p className="text-[10px] text-muted-foreground mt-0.5">
-                IPs, CIDRs, hostnames, host:port, or full URLs. Lines starting with # are ignored.
-              </p>
-            </div>
-
-            {/* Preview parsed targets */}
-            {parsedTargets.length > 0 && (
-              <div className="overflow-auto max-h-[150px] border border-border/50 rounded-md">
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="border-b border-border text-left text-muted-foreground">
-                      <th className="px-2 py-1">Target</th>
-                      <th className="px-2 py-1 w-24">Detected Type</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {parsedTargets.slice(0, 50).map((t, i) => (
-                      <tr key={i} className="border-b border-border/30">
-                        <td className="px-2 py-0.5 font-mono">{t}</td>
-                        <td className="px-2 py-0.5 text-muted-foreground">{detectTargetType(t)}</td>
-                      </tr>
-                    ))}
-                    {parsedTargets.length > 50 && (
-                      <tr><td colSpan={2} className="px-2 py-1 text-muted-foreground">...and {parsedTargets.length - 50} more</td></tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            )}
-
-            <div className="flex items-center gap-3">
-              <button
-                onClick={handleCreateScope}
-                disabled={createStatus === 'saving'}
-                className="px-4 py-1.5 bg-primary text-primary-foreground rounded-md text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
-              >
-                {createStatus === 'saving' ? 'Saving...' : 'Create / Add Targets'}
-              </button>
-              {createMsg && (
-                <span className={cn('text-xs', createStatus === 'error' ? 'text-red-400' : 'text-green-500')}>
-                  {createMsg}
-                </span>
-              )}
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Scope browser */}
-      <div className="flex gap-4 min-h-[400px]">
-        {/* Left sidebar — scope list */}
-        <div className="w-56 shrink-0 bg-card border border-border rounded-lg p-3">
-          <h3 className="text-sm font-semibold mb-2">Scopes</h3>
-          {scopeNames.isLoading ? (
-            <p className="text-xs text-muted-foreground">Loading...</p>
-          ) : names.length === 0 ? (
-            <p className="text-xs text-muted-foreground">No scopes yet. Create one above.</p>
-          ) : (
-            <div className="space-y-1">
-              {names.map(s => (
-                <button
-                  key={s.name}
-                  onClick={() => setSelectedScope(s.name)}
-                  className={cn(
-                    'w-full text-left px-2 py-1.5 rounded-md text-sm transition-colors',
-                    selectedScope === s.name
-                      ? 'bg-primary/10 text-primary border border-primary/30'
-                      : 'hover:bg-muted/50 text-foreground',
-                  )}
-                >
-                  <div className="font-medium truncate">{s.name}</div>
-                  <div className="text-[10px] text-muted-foreground">{s.target_count} targets</div>
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* Right — scope detail */}
-        <div className="flex-1 bg-card border border-border rounded-lg p-4">
-          {!selectedScope ? (
-            <p className="text-sm text-muted-foreground">Select a scope to view its targets</p>
-          ) : scopeData.isLoading ? (
-            <p className="text-sm text-muted-foreground">Loading targets...</p>
-          ) : (
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h3 className="text-sm font-semibold">{selectedScope}</h3>
-                  <p className="text-xs text-muted-foreground">
-                    {targets.length} target{targets.length !== 1 ? 's' : ''}
-                  </p>
-                </div>
-                <button
-                  onClick={handleDeleteScope}
-                  disabled={removeFromScope.isPending}
-                  className="flex items-center gap-1 px-2 py-1 text-xs text-red-400 border border-red-400/30 rounded-md hover:bg-red-400/10 disabled:opacity-50"
-                >
-                  <Trash2 className="h-3 w-3" />
-                  Delete Scope
-                </button>
-              </div>
-
-              {targets.length === 0 ? (
-                <p className="text-xs text-muted-foreground">No targets in this scope</p>
-              ) : (
-                <div className="overflow-auto max-h-[500px]">
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                        <th className="pb-2 pr-3">Target</th>
-                        <th className="pb-2 pr-3">Type</th>
-                        <th className="pb-2 pr-3">Source</th>
-                        <th className="pb-2 pr-3">Added</th>
-                        <th className="pb-2 w-16"></th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {targets.map(t => (
-                        <tr key={t.id} className="border-b border-border/50 hover:bg-muted/30">
-                          <td className="py-1.5 pr-3 font-mono text-xs">{t.target}</td>
-                          <td className="py-1.5 pr-3 text-xs text-muted-foreground">{t.target_type}</td>
-                          <td className="py-1.5 pr-3 text-xs text-muted-foreground">{t.source}</td>
-                          <td className="py-1.5 pr-3 text-xs text-muted-foreground">
-                            {t.added_at ? new Date(t.added_at).toLocaleDateString() : '-'}
-                          </td>
-                          <td className="py-1.5">
-                            <button
-                              onClick={() => handleRemoveTarget(t.target)}
-                              disabled={removeFromScope.isPending}
-                              className="text-red-400 hover:text-red-300 disabled:opacity-50"
-                              title="Remove target"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  )
 }
 
 // ─── ZAP Add-ons Tab ────────────────────────────────
@@ -5562,15 +5238,6 @@ function SearchResults({ query, onNavigate }: {
       keywords: ['429', 'backoff', 'rate', 'ratelimit', 'rate limit', 'retry', 'throttle',
                  'governor', 'quota', 'tpm', 'retry-after', 'wait', 'llm_429_max_retries',
                  'llm_ratelimit_base_wait', 'adaptive']
-    },
-
-    // Scope Tab
-    {
-      tab: 'scope',
-      tabLabel: 'Scope',
-      title: 'Target Scope',
-      description: 'Define in-scope targets and IP ranges for testing',
-      keywords: ['scope', 'target', 'ip', 'range', 'cidr', 'domain', 'in-scope']
     },
 
     // Database Tab
