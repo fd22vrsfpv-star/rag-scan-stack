@@ -221,16 +221,20 @@ def test_engine_source_calls_execute_only_in_the_exec_node():
                     and sub.attr == "execute_approved_exploit"):
                 callers.append(node.name)
     # exploit_exec / surface_exec run after the human approval interrupt.
-    # _exec_one_impactful is the shared executor; its only auto-mode caller is
-    # surface_auto_exec, whose authorization is the runner's scope gate (which
-    # fails CLOSED on out-of-scope) rather than a human interrupt. It must NEVER
-    # be reachable from a planning or safe-execution node — enforced by the graph
-    # topology test (surface_auto_exec is opt-in behind the auto_exploit flag).
-    assert set(callers) <= {"exploit_exec", "surface_exec", "_exec_one_impactful"}, (
+    # _exec_one_impactful is the shared surface executor; its only auto-mode
+    # caller is surface_auto_exec, whose authorization is the runner's scope gate.
+    # _execute_pending_exploits is the shared port-grouped execution loop, called
+    # by exploit_exec (post-interrupt) and _fire_and_enumerate (which gates on
+    # engagement pre-approval before calling it — see the loop-closure guard). All
+    # of these run AFTER an approval gate or the runner's fail-closed scope gate;
+    # none may be reachable from a planning or safe-execution node.
+    assert set(callers) <= {"exploit_exec", "surface_exec", "_exec_one_impactful",
+                            "_execute_pending_exploits"}, (
         f"scan_tools.execute_approved_exploit is called from {callers}; it must be "
-        "called only from exploit_exec / surface_exec / _exec_one_impactful, which "
-        "run AFTER an approval gate (human interrupt) or the runner's fail-closed "
-        "scope gate — never from a planning or safe-execution node")
+        "called only from exploit_exec / surface_exec / _exec_one_impactful / "
+        "_execute_pending_exploits, which run AFTER an approval gate (human "
+        "interrupt / engagement pre-approval) or the runner's fail-closed scope "
+        "gate — never from a planning or safe-execution node")
 
 
 # ── 4. engine resolution (the canary control) ───────────────────────────────
@@ -768,7 +772,9 @@ def test_exec_nodes_approve_before_execute():
     only sets the decision, it does not flip the DB status. Sabotage: drop the
     _mark_approved call in a node → its execute is refused; guard fails."""
     src = _engine_src()
-    for fn_name in ("exploit_exec", "surface_exec", "_exec_one_impactful"):
+    # exploit_exec now delegates the port-grouped loop to _execute_pending_exploits,
+    # so that shared helper is where the mark-approved-before-execute must hold.
+    for fn_name in ("_execute_pending_exploits", "surface_exec", "_exec_one_impactful"):
         fn = src[src.index(f"def {fn_name}("):]
         fn = fn[:fn.index("\ndef ", 1)]
         # Match the actual call, not a docstring mention of the name.

