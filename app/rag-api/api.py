@@ -21729,6 +21729,50 @@ def access_summary(_: bool = Depends(auth)):
     return {"summary": summary, "hosts": len(summary)}
 
 
+@app.get("/foothold/no-callback", tags=["Access"])
+def foothold_no_callback(limit: int = 50, _: bool = Depends(auth)):
+    """Exploits that RAN but produced no live shell — the 'payload needs tweaking'
+    queue for the Foothold Agent panel.
+
+    An exploit is here when its pending_exploits row is 'executed' or 'failed' AND
+    no LIVE obtained_access rows back to it via source_exploit. `callback_status` is
+    the most recent exploit_callbacks verdict for context (a 'failed'/'pending' one
+    is the clearest 'payload never called back' signal; NULL means no listener row
+    was ever recorded). Because source_exploit can be NULL on a shell we did open,
+    this can over-report — it means 'no shell we can attribute to this exploit',
+    which is exactly what warrants a human look before re-running.
+    """
+    limit = max(1, min(int(limit), 500))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT pe.id::text                AS id,
+                   pe.exploit_title           AS exploit_title,
+                   pe.source                  AS source,
+                   pe.exploit_type            AS exploit_type,
+                   host(pe.target_ip)         AS target,
+                   pe.target_port             AS target_port,
+                   pe.target_service          AS target_service,
+                   pe.status                  AS status,
+                   pe.rejection_reason        AS rejection_reason,
+                   pe.updated_at              AS updated_at,
+                   (SELECT ec.validation_status
+                      FROM exploit_callbacks ec
+                     WHERE ec.pending_exploit_id = pe.id
+                     ORDER BY ec.received_at DESC NULLS LAST
+                     LIMIT 1)                 AS callback_status
+              FROM pending_exploits pe
+             WHERE pe.status IN ('executed', 'failed')
+               AND NOT EXISTS (
+                   SELECT 1 FROM obtained_access oa
+                    WHERE oa.source_exploit = pe.id AND oa.status = 'live')
+             ORDER BY pe.updated_at DESC
+             LIMIT %s
+            """, (limit,))
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"count": len(rows), "rows": rows}
+
+
 @app.get("/assets/{ip}/port-advice", tags=["Access"])
 def asset_port_advice(ip: str, _: bool = Depends(auth)):
     """What to try on each DEAD port the default probe could not reach.
