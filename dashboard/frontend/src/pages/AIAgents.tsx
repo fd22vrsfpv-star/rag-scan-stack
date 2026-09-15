@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useState, Fragment } from 'react'
+import { useNavigate, Link } from 'react-router-dom'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/api/client'
 import {
@@ -12,6 +12,10 @@ import {
   useRunPostReview, useIngestPostReviewFacts,
   type AgentInfo, type GapReport, type GapTargetDetail, type ToolSelectionRule,
 } from '@/api/agents'
+import {
+  useReconnectWatcherStatus, useExploitWatcherStatus, useFootholdNoCallback,
+} from '@/api/foothold'
+import { useAccessSummary } from '@/api/assets'
 import { useUIStore } from '@/stores/ui'
 import { cn } from '@/lib/utils'
 import {
@@ -134,6 +138,7 @@ export default function AIAgents() {
         </div>
       )}
 
+      <FootholdAgentPanel />
       <AgentFlagsPanel />
       <PostReviewPanel />
       <LearnedExtractorsPanel />
@@ -234,9 +239,195 @@ function ActivityTimelinePanel() {
 }
 
 
+function FootholdAgentPanel() {
+  const rc = useReconnectWatcherStatus()
+  const ew = useExploitWatcherStatus()
+  const access = useAccessSummary()
+  const noCb = useFootholdNoCallback()
+
+  const summary = access.data?.summary ?? {}
+  const hosts = Object.entries(summary)
+  const liveShells = hosts.reduce((n, [, v]) => n + (v.live || 0), 0)
+  const needsChecked = hosts.reduce((n, [, v]) => n + Math.max(0, (v.total || 0) - (v.live || 0)), 0)
+  const noCbRows = noCb.data?.rows ?? []
+
+  const dot = (ok: boolean, warn = false) => (
+    <span className={cn('inline-block h-2 w-2 rounded-full',
+      ok ? 'bg-green-500' : warn ? 'bg-amber-500' : 'bg-muted-foreground/40')} />
+  )
+
+  return (
+    <div className="bg-card border border-border rounded-lg p-3 space-y-3">
+      <h3 className="text-sm font-semibold flex items-center gap-2">
+        <Zap className="h-4 w-4" /> Foothold Agent
+      </h3>
+      <p className="text-[11px] text-muted-foreground">
+        Live access, sessions that need checking, and exploits that ran but never
+        called back. All actions here are scope-gated and audited.
+      </p>
+
+      {/* Watchers */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+        <div className="rounded border border-border p-2 text-xs space-y-1">
+          <div className="flex items-center gap-2 font-medium">
+            <Activity className="h-3.5 w-3.5" /> Reconnect watcher
+            {rc.isLoading ? <Loader2 className="h-3 w-3 animate-spin" />
+              : dot(!!rc.data?.active, !!rc.data?.enabled && !rc.data?.active)}
+            <Link to="/settings" onClick={e => e.stopPropagation()}
+                  className="ml-auto text-[10px] text-primary hover:underline">Configure</Link>
+          </div>
+          {rc.isError ? <span className="text-muted-foreground">status unavailable</span> : (
+            <div className="text-[11px] text-muted-foreground">
+              {rc.data?.enabled ? (rc.data?.active ? 'enabled, sweeping' : 'enabled, idle') : 'disabled'}
+              {' · '}reconnected {rc.data?.reconnected_total ?? 0}
+              {(rc.data?.blocked_total ?? 0) > 0 && <> · blocked {rc.data?.blocked_total}</>}
+            </div>
+          )}
+        </div>
+        <div className="rounded border border-border p-2 text-xs space-y-1">
+          <div className="flex items-center gap-2 font-medium">
+            <Activity className="h-3.5 w-3.5" /> Exploit watcher
+            {ew.isLoading ? <Loader2 className="h-3 w-3 animate-spin" /> : dot(!!ew.data?.running)}
+          </div>
+          {ew.isError ? <span className="text-muted-foreground">status unavailable</span> : (
+            <div className="text-[11px] text-muted-foreground">
+              {ew.data?.running ? 'running' : 'stopped'}
+              {' · '}ports {ew.data?.processed_port_count ?? 0}
+              {' · '}vulns {ew.data?.processed_vuln_count ?? 0}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Access */}
+      <div className="rounded border border-border p-2">
+        <div className="flex items-center gap-2 text-xs font-medium mb-1">
+          <Shield className="h-3.5 w-3.5" /> Access
+          <span className="ml-auto flex gap-2">
+            <span className="px-1.5 py-0.5 rounded bg-green-500/10 text-green-400 text-[10px]">{liveShells} live</span>
+            <span className={cn('px-1.5 py-0.5 rounded text-[10px]',
+              needsChecked > 0 ? 'bg-amber-500/10 text-amber-400' : 'bg-muted text-muted-foreground')}>
+              {needsChecked} need checking
+            </span>
+          </span>
+        </div>
+        {access.isLoading ? <span className="text-[11px] text-muted-foreground">Loading…</span>
+          : hosts.length === 0 ? <span className="text-[11px] text-muted-foreground">No access recorded yet.</span>
+          : (
+          <div className="flex flex-wrap gap-1">
+            {hosts.slice(0, 24).map(([host, v]) => (
+              <Link key={host} to="/assets"
+                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-border text-[10px] font-mono hover:bg-accent">
+                {host}
+                {v.live > 0 && <span className="text-green-400">●{v.live}</span>}
+                {Math.max(0, v.total - v.live) > 0 && <span className="text-amber-400">○{Math.max(0, v.total - v.live)}</span>}
+              </Link>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* No callback — payload needs tweaking */}
+      <div className="rounded border border-border p-2">
+        <div className="flex items-center gap-2 text-xs font-medium mb-1">
+          <Wand2 className="h-3.5 w-3.5" /> Payload needs tweaking
+          <span className={cn('ml-auto px-1.5 py-0.5 rounded text-[10px]',
+            noCbRows.length > 0 ? 'bg-amber-500/10 text-amber-400' : 'bg-muted text-muted-foreground')}>
+            {noCbRows.length} no callback
+          </span>
+        </div>
+        {noCb.isLoading ? <span className="text-[11px] text-muted-foreground">Loading…</span>
+          : noCbRows.length === 0 ? <span className="text-[11px] text-muted-foreground">Every executed exploit produced a shell (or none have run).</span>
+          : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[560px] text-xs">
+              <thead className="text-muted-foreground">
+                <tr className="border-b border-border">
+                  <th className="text-left py-1 px-2">Exploit</th>
+                  <th className="text-left px-2">Target</th>
+                  <th className="text-left px-2">State</th>
+                  <th className="text-left px-2">Callback</th>
+                  <th className="text-right px-2">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {noCbRows.slice(0, 15).map(r => (
+                  <tr key={r.id} className="border-b border-border/40">
+                    <td className="py-1 px-2 truncate max-w-[220px]" title={r.exploit_title}>{r.exploit_title}</td>
+                    <td className="px-2 font-mono">{r.target || '—'}{r.target_port ? `:${r.target_port}` : ''}</td>
+                    <td className="px-2">{r.status}</td>
+                    <td className="px-2">{r.callback_status || '—'}</td>
+                    <td className="px-2 text-right">
+                      <Link to="/exploits"
+                            className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">
+                        <ExternalLink className="h-3 w-3" /> Tweak
+                      </Link>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// Keys rendered explicitly in the expanded detail; everything else in `data`
+// is shown generically so nothing an agent flagged is hidden from review.
+const FLAG_DETAIL_HANDLED = new Set(['reason', 'residual_sample', 'raw', 'output', 'target', 'scanner'])
+
+function FlagDetail({ data }: { data: Record<string, any> }) {
+  const d = data || {}
+  const rawParts: string[] = []
+  for (const k of ['residual_sample', 'raw', 'output']) {
+    const v = d[k]
+    if (Array.isArray(v)) rawParts.push(v.join('\n'))
+    else if (typeof v === 'string' && v.trim()) rawParts.push(v)
+  }
+  const rest = Object.entries(d).filter(([k, v]) =>
+    !FLAG_DETAIL_HANDLED.has(k) && v !== null && v !== undefined && v !== '')
+  return (
+    <div className="px-3 py-3 space-y-3 bg-muted/30">
+      <div>
+        <div className="text-[10px] uppercase tracking-wide text-muted-foreground mb-1">Analysis</div>
+        <p className="text-xs whitespace-pre-wrap break-words">{d.reason || 'No analysis text provided.'}</p>
+      </div>
+      {rawParts.length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-muted-foreground mb-1">Raw output</div>
+          <pre className="text-[11px] font-mono whitespace-pre-wrap break-words max-h-64 overflow-auto rounded bg-background border border-border p-2">
+            {rawParts.join('\n')}
+          </pre>
+        </div>
+      )}
+      {rest.length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-muted-foreground mb-1">Details</div>
+          <dl className="grid grid-cols-[minmax(0,140px)_1fr] gap-x-3 gap-y-1 text-[11px]">
+            {rest.map(([k, v]) => (
+              <div key={k} className="contents">
+                <dt className="font-mono text-muted-foreground truncate">{k}</dt>
+                <dd className="font-mono break-words">
+                  {(k === 'session_id' && v) ? (
+                    <Link to={`/agent-sessions/${v}`} onClick={(e) => e.stopPropagation()}
+                          className="text-primary hover:underline">{String(v)} — open session output</Link>
+                  ) : typeof v === 'object' ? JSON.stringify(v) : String(v)}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function AgentFlagsPanel() {
   const { data } = useAgentFlags()
   const act = useActAgentFlag()
+  const [openId, setOpenId] = useState<string | null>(null)
   const flags = data?.flags ?? []
   const pending = flags.filter(f => f.status === 'pending')
   const recent = flags.filter(f => f.status !== 'pending').slice(0, 8)
@@ -250,12 +441,14 @@ function AgentFlagsPanel() {
         )}
       </h3>
       <p className="text-[11px] text-muted-foreground">
-        One agent flags something worth another run. Approving queues a scope-gated follow-up scan; every action is audited (who + when).
+        One agent flags something worth another run. Click a row to see the raw output and analysis before you act.
+        Approving queues a scope-gated follow-up scan; every action is audited (who + when).
       </p>
       <div className="overflow-x-auto">
         <table className="w-full min-w-[720px] text-xs">
           <thead className="text-muted-foreground">
             <tr className="border-b border-border">
+              <th className="w-6 px-1"></th>
               <th className="text-left py-1 px-2">From</th><th className="text-left px-2">Type</th>
               <th className="text-left px-2">Target</th><th className="text-left px-2">Scanner</th>
               <th className="text-left px-2">Reason</th><th className="text-left px-2">Status</th>
@@ -263,8 +456,17 @@ function AgentFlagsPanel() {
             </tr>
           </thead>
           <tbody>
-            {[...pending, ...recent].map(f => (
-              <tr key={f.id} className="border-b border-border/40">
+            {[...pending, ...recent].map(f => {
+              const isOpen = openId === f.id
+              return (
+              <Fragment key={f.id}>
+              <tr
+                  onClick={() => setOpenId(isOpen ? null : f.id)}
+                  className="border-b border-border/40 cursor-pointer hover:bg-accent/40"
+                  title="Click to view raw output and analysis">
+                <td className="px-1 text-muted-foreground">
+                  {isOpen ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                </td>
                 <td className="py-1 px-2 font-mono">{f.flagging_agent}</td>
                 <td className="px-2">{f.flag_type}</td>
                 <td className="px-2 font-mono truncate max-w-[180px]" title={f.data?.target}>{f.data?.target || '—'}</td>
@@ -280,15 +482,31 @@ function AgentFlagsPanel() {
                 <td className="px-2 text-right">
                   {f.status === 'pending' && (
                     <span className="inline-flex gap-1">
-                      <button onClick={() => act.mutate({ id: f.id, action: 'approve' })} disabled={act.isPending}
+                      <button onClick={(e) => { e.stopPropagation(); act.mutate({ id: f.id, action: 'approve' }) }} disabled={act.isPending}
                         className="px-2 py-0.5 text-[10px] rounded bg-green-600 hover:bg-green-500 text-white">Approve</button>
-                      <button onClick={() => act.mutate({ id: f.id, action: 'dismiss' })} disabled={act.isPending}
+                      <button onClick={(e) => { e.stopPropagation(); act.mutate({ id: f.id, action: 'dismiss' }) }} disabled={act.isPending}
                         className="px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">Dismiss</button>
                     </span>
                   )}
                 </td>
               </tr>
-            ))}
+              {isOpen && (
+                <tr className="border-b border-border/40">
+                  <td colSpan={8} className="p-0">
+                    <FlagDetail data={f.data} />
+                    {f.status === 'pending' && (
+                      <div className="flex justify-end gap-1 px-3 pb-3 bg-muted/30">
+                        <button onClick={(e) => { e.stopPropagation(); act.mutate({ id: f.id, action: 'approve' }) }} disabled={act.isPending}
+                          className="px-3 py-1 text-[11px] rounded bg-green-600 hover:bg-green-500 text-white">Approve — queue follow-up scan</button>
+                        <button onClick={(e) => { e.stopPropagation(); act.mutate({ id: f.id, action: 'dismiss' }) }} disabled={act.isPending}
+                          className="px-3 py-1 text-[11px] rounded border border-border hover:bg-accent">Dismiss</button>
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              )}
+              </Fragment>
+            )})}
           </tbody>
         </table>
       </div>
