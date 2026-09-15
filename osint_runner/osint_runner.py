@@ -421,17 +421,33 @@ def _ingest_results(tool: str, output_path: str, job_id: str = None, source: str
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
         return {"ok": True, "skipped": "no output"}
     try:
-        files = {"file": (f"{tool}.json", open(output_path, "rb"), "application/json")}
         headers = {"x-api-key": API_KEY}
         params = {}
         if job_id:
             params["job_id"] = job_id
         if source:
             params["source"] = source
-        r = requests.post(f"{API_BASE}/ingest/{tool}", files=files, headers=headers,
-                          params=params, timeout=300, verify=False)
-        r.raise_for_status()
-        return r.json()
+        with open(output_path, "rb") as fh:
+            r = requests.post(f"{API_BASE}/ingest/{tool}",
+                              files={"file": (f"{tool}.json", fh, "application/json")},
+                              headers=headers, params=params, timeout=300, verify=False)
+        if r.status_code < 300:
+            return r.json()
+        if r.status_code == 404:
+            # No dedicated parser for this tool (e.g. subzy) — fall back to the
+            # generic structurer so the output is ANALYSED, not discarded.
+            with open(output_path, "r", errors="replace") as fh:
+                stdout = fh.read()[:1_000_000]
+            fb = requests.post(f"{API_BASE}/ingest/tool-output", headers=headers,
+                               json={"tool_name": tool, "stdout": stdout,
+                                     "job_id": job_id, "source": source or "osint-runner"},
+                               timeout=300, verify=False)
+            res = (fb.json() if fb.status_code < 300
+                   else {"ok": False, "error": f"tool-output HTTP {fb.status_code}"})
+            res["fallback"] = "tool-output"
+            logging.info("no /ingest/%s parser; analysed via /ingest/tool-output", tool)
+            return res
+        return {"ok": False, "error": f"HTTP {r.status_code}"}
     except Exception as e:
         logging.warning(f"Ingest to /ingest/{tool} failed: {e}")
         return {"ok": False, "error": str(e)}
