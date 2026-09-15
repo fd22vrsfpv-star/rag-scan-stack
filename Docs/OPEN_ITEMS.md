@@ -360,3 +360,21 @@ no automated re-exploitation, even though `source_exploit` is recorded on the ro
 re-dispatched through the existing scope-gated, `MAX_CONCURRENT_SCANS`-bounded
 approval path, gated behind an explicit policy flag (Tier 3).
 **Enforced by:** not enforced
+
+## Exploit classification
+
+### exploit_type is uniformly 'rce', even for auxiliary/post scanners
+**Found:** 2026-09-15
+**Evidence:** Every `pending_exploits` row carries `exploit_type='rce'`, including
+pure scanners and info-gathering modules that never open a shell — e.g.
+`auxiliary/scanner/ssh/ssh_login_pubkey`, `auxiliary/gather/dns_info`,
+`auxiliary/scanner/http/robots_txt`. A live query counted 27 executed/failed
+auxiliary/* rows, all tagged `rce`. The Foothold Agent no-callback queue therefore
+has to re-derive the real class from `exploit_id`/`exploit_title` (the module path)
+rather than trusting `exploit_type`.
+**Where:** wherever `pending_exploits` rows are created (the exploit
+recommender / ingest that sets `exploit_type`).
+**Done when:** `exploit_type` reflects the real MSF module class — an
+`auxiliary/*` or `post/*` module is not `rce` — so downstream consumers can trust
+the column instead of pattern-matching the module path.
+**Enforced by:** not enforced
