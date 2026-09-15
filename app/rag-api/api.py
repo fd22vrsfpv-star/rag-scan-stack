@@ -21729,27 +21729,51 @@ def access_summary(_: bool = Depends(auth)):
     return {"summary": summary, "hosts": len(summary)}
 
 
-@app.get("/foothold/no-callback", tags=["Access"])
-def foothold_no_callback(limit: int = 50, _: bool = Depends(auth)):
-    """Exploits that RAN but produced no live shell — the 'payload needs tweaking'
-    queue for the Foothold Agent panel.
+# A Metasploit auxiliary/* or post/* module is a SCANNER or info-gathering /
+# credential-check module — it does NOT open a shell, so it is NOT a foothold
+# attempt and must not appear in the "payload needs tweaking" queue. Only
+# exploit/* modules (and webshell/command sources) produce footholds. The class
+# is derived from exploit_id (the module path, e.g. 'auxiliary/scanner/ssh/...')
+# and the title, because exploit_type is uniformly mislabelled 'rce' on ingest.
+_RECON_MODULE_SQL = (
+    "(pe.exploit_id ILIKE 'auxiliary/%' OR pe.exploit_id ILIKE 'post/%' "
+    " OR pe.exploit_title ILIKE 'msf_exploit auxiliary/%' "
+    " OR pe.exploit_title ILIKE 'msf_exploit post/%')")
 
-    An exploit is here when its pending_exploits row is 'executed' or 'failed' AND
-    no LIVE obtained_access rows back to it via source_exploit. `callback_status` is
-    the most recent exploit_callbacks verdict for context (a 'failed'/'pending' one
-    is the clearest 'payload never called back' signal; NULL means no listener row
-    was ever recorded). Because source_exploit can be NULL on a shell we did open,
-    this can over-report — it means 'no shell we can attribute to this exploit',
-    which is exactly what warrants a human look before re-running.
+
+@app.get("/foothold/no-callback", tags=["Access"])
+def foothold_no_callback(limit: int = 50, include_recon: bool = False,
+                         _: bool = Depends(auth)):
+    """Foothold-producing exploits that RAN but produced no live shell — the
+    'payload needs tweaking' queue for the Foothold Agent panel.
+
+    A row is here when its pending_exploits is 'executed'/'failed', it is a
+    foothold-producing module (an exploit/* module or webshell/command — NOT an
+    auxiliary/post scanner), AND no LIVE obtained_access backs it via
+    source_exploit. `callback_status` is the latest exploit_callbacks verdict.
+
+    auxiliary/* and post/* modules are scanners / info-gathering, not footholds,
+    so they are EXCLUDED and reported separately as `recon_excluded` — the count
+    the UI shows so the operator can see they were run but are not foothold
+    failures. `module_class` labels each returned row ('foothold'). Pass
+    include_recon=true to also return the recon rows (labelled 'recon') for review.
+
+    Because source_exploit can be NULL on a shell we did open, this can
+    over-report — it means 'no shell we can attribute to this exploit', which is
+    what warrants a human look before re-running.
     """
     limit = max(1, min(int(limit), 500))
+    recon_pred = _RECON_MODULE_SQL
+    class_expr = f"CASE WHEN {recon_pred} THEN 'recon' ELSE 'foothold' END"
+    where_class = "" if include_recon else f" AND NOT {recon_pred}"
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            """
+            f"""
             SELECT pe.id::text                AS id,
                    pe.exploit_title           AS exploit_title,
                    pe.source                  AS source,
                    pe.exploit_type            AS exploit_type,
+                   {class_expr}               AS module_class,
                    host(pe.target_ip)         AS target,
                    pe.target_port             AS target_port,
                    pe.target_service          AS target_service,
@@ -21766,11 +21790,19 @@ def foothold_no_callback(limit: int = 50, _: bool = Depends(auth)):
                AND NOT EXISTS (
                    SELECT 1 FROM obtained_access oa
                     WHERE oa.source_exploit = pe.id AND oa.status = 'live')
+               {where_class}
              ORDER BY pe.updated_at DESC
              LIMIT %s
             """, (limit,))
         rows = [dict(r) for r in cur.fetchall()]
-    return {"count": len(rows), "rows": rows}
+        # How many ran-but-no-shell rows were recon modules (excluded above).
+        cur.execute(
+            f"""SELECT count(*) AS n FROM pending_exploits pe
+                 WHERE pe.status IN ('executed','failed') AND {recon_pred}
+                   AND NOT EXISTS (SELECT 1 FROM obtained_access oa
+                        WHERE oa.source_exploit = pe.id AND oa.status = 'live')""")
+        recon_excluded = int((cur.fetchone() or {}).get("n", 0))
+    return {"count": len(rows), "rows": rows, "recon_excluded": recon_excluded}
 
 
 @app.get("/assets/{ip}/port-advice", tags=["Access"])

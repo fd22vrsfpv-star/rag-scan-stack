@@ -331,6 +331,12 @@ function FootholdAgentPanel() {
       <div className="rounded border border-border p-2">
         <div className="flex items-center gap-2 text-xs font-medium mb-1">
           <Wand2 className="h-3.5 w-3.5" /> Payload needs tweaking
+          {(noCb.data?.recon_excluded ?? 0) > 0 && (
+            <span className="px-1.5 py-0.5 rounded bg-muted text-muted-foreground text-[10px]"
+                  title="auxiliary/post modules — scanners and info-gathering, not foothold attempts">
+              {noCb.data?.recon_excluded} recon/aux excluded
+            </span>
+          )}
           <span className={cn('ml-auto px-1.5 py-0.5 rounded text-[10px]',
             noCbRows.length > 0 ? 'bg-amber-500/10 text-amber-400' : 'bg-muted text-muted-foreground')}>
             {noCbRows.length} no callback
