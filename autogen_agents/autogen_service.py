@@ -53,6 +53,7 @@ from feedback_db import (
 )
 from log_manager import get_log_handler, setup_log_capture
 from exploit_watcher import get_exploit_watcher, start_exploit_watcher
+from reconnect_watcher import get_reconnect_watcher, start_reconnect_watcher
 from scan_tools import scan_tracker, get_session_scan_status
 from llm_metrics import LLMMetricsContext
 from report_generator import (
@@ -180,6 +181,7 @@ def get_session_timeout(session_id: str) -> int:
 
 # Exploit Watcher Configuration
 EXPLOIT_WATCHER_ENABLED = os.environ.get("EXPLOIT_WATCHER_ENABLED", "true").lower() == "true"
+RECONNECT_WATCHER_ENABLED = os.environ.get("RECONNECT_WATCHER_ENABLED", "true").lower() == "true"
 
 # Track last activity per session
 session_last_activity: Dict[str, datetime] = {}
@@ -1422,6 +1424,14 @@ async def startup_event():
         print("✓ Exploit watcher enabled - will auto-search for exploits on high-severity vulns", file=sys.stderr)
     else:
         print("⚠ Exploit watcher disabled", file=sys.stderr)
+
+    # Start reconnect watcher (Tier 1) if enabled — re-probes dead access so a
+    # host reboot that dropped shells (mainly ssh_credential) recovers itself.
+    if RECONNECT_WATCHER_ENABLED:
+        asyncio.create_task(start_reconnect_watcher())
+        print("✓ Reconnect watcher enabled - will re-probe dead access (scope-gated)", file=sys.stderr)
+    else:
+        print("⚠ Reconnect watcher disabled", file=sys.stderr)
 
     # Register webhook with rag-api for scan completion events
     try:
@@ -4453,6 +4463,36 @@ async def start_exploit_watcher_endpoint():
 
     asyncio.create_task(start_exploit_watcher())
     return {"message": "Exploit watcher started", "status": "running"}
+
+
+@app.get("/reconnect-watcher/status")
+async def get_reconnect_watcher_status():
+    """Reconnect watcher status: whether it is running, totals, and config."""
+    watcher = get_reconnect_watcher()
+    status = await watcher.get_status()
+    status["enabled"] = RECONNECT_WATCHER_ENABLED
+    return status
+
+
+@app.post("/reconnect-watcher/stop")
+async def stop_reconnect_watcher_endpoint():
+    """Stop the reconnect watcher background task."""
+    watcher = get_reconnect_watcher()
+    if not watcher.running:
+        raise HTTPException(status_code=400, detail="Reconnect watcher is not running")
+    watcher.stop()
+    return {"message": "Reconnect watcher stopped", "status": "stopped"}
+
+
+@app.post("/reconnect-watcher/start")
+async def start_reconnect_watcher_endpoint():
+    """Start the reconnect watcher if it is not already running."""
+    import asyncio
+    watcher = get_reconnect_watcher()
+    if watcher.running:
+        raise HTTPException(status_code=400, detail="Reconnect watcher is already running")
+    asyncio.create_task(start_reconnect_watcher())
+    return {"message": "Reconnect watcher started", "status": "running"}
 
 
 # --- Report Endpoints ---
