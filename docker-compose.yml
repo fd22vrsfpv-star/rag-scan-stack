@@ -1504,6 +1504,7 @@ services:
       # POC_MAX_ATTEMPTS bounds the web-PoC refine loop (total attempts, default 5).
       EXPLOIT_MAX_AUTOCORRECT: ${EXPLOIT_MAX_AUTOCORRECT:-2}
       POC_MAX_ATTEMPTS: ${POC_MAX_ATTEMPTS:-5}
+      EXPLOITDB_MAX_ATTEMPTS: ${EXPLOITDB_MAX_ATTEMPTS:-3}
     depends_on:
       wait-for-db:
         condition: service_completed_successfully
