@@ -8770,6 +8770,86 @@ def apply_exploit_approval_rules(engagement_id: Optional[str] = Query(None),
     return _sweep_exploit_approval_rules(engagement_id, dry_run=dry_run)
 
 
+class ReleaseImpactfulBody(BaseModel):
+    target: str
+    engagement_id: Optional[str] = None
+    include_recon: bool = False          # also release auxiliary/post scanners
+    dry_run: bool = False
+
+
+@app.post("/exploits/release", tags=["Exploits"])
+def release_impactful_tests(body: ReleaseImpactfulBody,
+                            x_operator: str = Header("operator", alias="X-Operator"),
+                            _: bool = Depends(auth)):
+    """Operator-release the impactful (approval-gated) tests for ONE target.
+
+    Impactful tests never auto-run: each is queued as a PENDING exploit waiting
+    for a human. This approves those pending exploits for `target` in one action,
+    so the exploit runner executes them. It is authorization, not a scope
+    override: every release is re-checked against the engagement scope and an
+    out-of-scope target is REFUSED and labelled, never run — execute_approved_exploit
+    also fails closed at execution. Auxiliary/post scanners are excluded by default
+    (they are recon, not impactful footholds); pass include_recon=true to include
+    them. dry_run=true reports what would be released and writes nothing."""
+    target = (body.target or "").strip()
+    if not target:
+        raise HTTPException(400, "target is required")
+    from etl.scope_gate import load_dispatch_scope, check_dispatch
+    recon_pred = _RECON_MODULE_SQL
+    where_recon = "" if body.include_recon else f" AND NOT {recon_pred}"
+    report: Dict[str, Any] = {"target": target, "dry_run": body.dry_run,
+                              "candidates": 0, "released": [], "refused_scope": [],
+                              "scope": "ok"}
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        eid = body.engagement_id
+        scope_rows, scope_src = load_dispatch_scope(cur, eid)
+        if scope_src == "unavailable":
+            # Fail closed: no scope means nothing is authorised to run.
+            raise HTTPException(409, "no dispatch scope configured — cannot release "
+                                     "(fail closed; configure the engagement scope first)")
+        cur.execute(
+            f"""SELECT pe.id::text AS id, pe.exploit_title, pe.exploit_id,
+                       pe.target_port, pe.target_service
+                  FROM pending_exploits pe
+                 WHERE host(pe.target_ip) = %s AND pe.status = 'pending'{where_recon}
+                 ORDER BY pe.target_port""",
+            (target,))
+        rows = cur.fetchall()
+        report["candidates"] = len(rows)
+        to_release = []
+        for p in rows:
+            label = {"id": p["id"], "exploit": p["exploit_title"],
+                     "port": p["target_port"], "service": p["target_service"]}
+            refusal = check_dispatch(target, scope_rows)
+            if refusal:
+                report["refused_scope"].append({**label, "reason": str(refusal)})
+                continue
+            report["released"].append(label)
+            to_release.append(p["id"])
+        if to_release and not body.dry_run:
+            cur.execute(
+                """UPDATE public.pending_exploits
+                      SET status = 'approved', reviewed_by = %s, reviewed_at = now(),
+                          metadata = COALESCE(metadata, '{}'::jsonb)
+                                     || jsonb_build_object('released', true,
+                                                           'released_by', %s)
+                    WHERE id = ANY(%s::uuid[]) AND status = 'pending'""",
+                (f"operator:{x_operator}", x_operator, to_release))
+            conn.commit()
+    report["released_count"] = len(report["released"]) if not body.dry_run else 0
+    report["would_release"] = len(report["released"]) if body.dry_run else None
+    if report["released"] and not body.dry_run:
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("impactful_tests_released", "exploits", {
+                "target": target, "engagement_id": eid, "actor": x_operator,
+                "released": len(report["released"]),
+                "refused_scope": len(report["refused_scope"])})
+        except Exception:
+            log.warning("impactful_tests_released webhook emit failed", exc_info=True)
+    return report
+
+
 @app.put("/exploits/{exploit_id}/status", tags=["Exploits"])
 def update_exploit_status(
     exploit_id: str,
