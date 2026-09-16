@@ -922,7 +922,14 @@ function FlowRow({ rule, editable }: { rule: FlowRule; editable: boolean }) {
   )
 }
 
-function AddFlowForm() {
+// Fact kinds the enumeration engine emits (etl/post_enumeration.py facts_from_*),
+// used to seed the "When fact" searchable list even before any rule uses them.
+const KNOWN_FACT_TYPES = [
+  'login_service', 'open_port', 'unidentified_port', 'share', 'credential',
+  'host_fact', 'host', 'file', 'web_finding', 'exploit_result',
+]
+
+function AddFlowForm({ existingIds, factTypes }: { existingIds: string[]; factTypes: string[] }) {
   const add = useAddFlow()
   const { data: engagements } = useEngagements()
   const selected = useUIStore(s => s.selectedEngagementId)
@@ -983,12 +990,25 @@ function AddFlowForm() {
         <label className="text-[10px] text-muted-foreground">
           Rule id
           <input className={inp} value={id} onChange={e => setId(e.target.value)}
+            list="flow-id-list" autoComplete="off"
             placeholder="e.g. vnc-default-creds" />
+          <datalist id="flow-id-list">
+            {existingIds.map(x => <option key={x} value={x} />)}
+          </datalist>
+          {existingIds.includes(id.trim()) && (
+            <span className="text-[9px] text-yellow-400">
+              Matches an existing flow — saving overwrites it.
+            </span>
+          )}
         </label>
         <label className="text-[10px] text-muted-foreground">
           When fact
           <input className={inp} value={fact} onChange={e => setFact(e.target.value)}
+            list="flow-fact-list" autoComplete="off"
             placeholder="login_service, share, host_fact…" />
+          <datalist id="flow-fact-list">
+            {factTypes.map(x => <option key={x} value={x} />)}
+          </datalist>
         </label>
         <label className="text-[10px] text-muted-foreground sm:col-span-2">
           Where (field=value, comma-separated — optional)
@@ -1113,6 +1133,11 @@ function FlowsPanel() {
   const [showShipped, setShowShipped] = useState(false)
   const custom = data?.custom_rules || []
   const yamlRules = data?.yaml_rules || []
+  const allRules = [...custom, ...yamlRules]
+  const existingIds = Array.from(new Set(allRules.map(r => r.id).filter(Boolean))).sort()
+  const factTypes = Array.from(
+    new Set([...allRules.map(r => r.when?.fact).filter(Boolean) as string[], ...KNOWN_FACT_TYPES]),
+  ).sort()
   return (
     <div className="bg-card border border-border rounded-lg p-3 space-y-3">
       <div className="flex items-center justify-between gap-2 flex-wrap">
@@ -1140,7 +1165,7 @@ function FlowsPanel() {
         <span className="text-[10px] text-red-400 break-words">{String(syncRag.error)}</span>
       )}
 
-      <AddFlowForm />
+      <AddFlowForm existingIds={existingIds} factTypes={factTypes} />
       <TestFlowPanel />
 
       <div className="space-y-1.5">

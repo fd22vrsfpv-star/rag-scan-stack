@@ -21928,6 +21928,66 @@ def sync_flows_to_rag(_: bool = Depends(auth)):
     return {"ok": True, "flows": len(rules), "rag_loaded": loaded}
 
 
+class KnowledgeSearchBody(BaseModel):
+    query: str
+    top_k: int = 6
+    sources: Optional[List[str]] = None    # optional metadata.source filter
+
+
+@app.post("/rag/knowledge/search", tags=["RAG/Knowledge"])
+def rag_knowledge_search(body: KnowledgeSearchBody, _: bool = Depends(auth)):
+    """Source-agnostic semantic search over the rag_documents knowledge corpus.
+
+    This is the retrieval the planner uses to RECALL what to do — agent
+    workflows/capabilities, operator-authored dispatch flows, cracked-credential
+    notes and the findings backfill all live here. It is DISTINCT from
+    /rag/query and /rag/search/enhanced, which search exploit_chunks (ExploitDB /
+    Metasploit) — nothing read the rag_documents corpus before this endpoint.
+
+    Why probes are raised: the ivfflat index is built with lists=100, and at the
+    default probes=1 an approximate search visits a single list and misses the
+    small-minority docs (only ~70 capability/flow rows against thousands of
+    findings). `SET LOCAL ivfflat.probes = 100` makes the search cover every
+    list — exact for this size of corpus — and is transaction-scoped, so it
+    reverts on commit and never leaks onto the pooled connection.
+    """
+    q = (body.query or "").strip()
+    if not q:
+        raise HTTPException(400, "query is required")
+    top_k = max(1, min(int(body.top_k or 6), 25))
+    try:
+        vec = _embed_text(q)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"embedder unavailable: {e}")
+    vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+    where = "embedding IS NOT NULL"
+    params: list = [vec_str]
+    if body.sources:
+        where += " AND metadata->>'source' = ANY(%s)"
+        params.append(list(body.sources))
+    params.append(vec_str)
+    params.append(top_k)
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SET LOCAL ivfflat.probes = 100")
+        cur.execute(
+            f"""SELECT title,
+                       text_chunk,
+                       metadata->>'source'  AS source,
+                       metadata->>'flow_id' AS flow_id,
+                       1 - (embedding <=> %s::vector) AS similarity
+                  FROM rag_documents
+                 WHERE {where}
+                 ORDER BY embedding <=> %s::vector
+                 LIMIT %s""",
+            params)
+        rows = cur.fetchall()
+    results = [{"title": r["title"], "text": r["text_chunk"],
+                "source": r["source"], "flow_id": r["flow_id"],
+                "similarity": round(float(r["similarity"]), 4)}
+               for r in rows]
+    return {"query": q, "count": len(results), "results": results}
+
+
 @app.get("/foothold/no-callback", tags=["Access"])
 def foothold_no_callback(limit: int = 50, include_recon: bool = False,
                          _: bool = Depends(auth)):
