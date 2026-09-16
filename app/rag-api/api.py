@@ -17709,16 +17709,164 @@ def update_engagement(eid: str, body: EngagementUpdate, _: bool = Depends(auth))
         raise HTTPException(404, "Engagement not found")
     return row
 
-@app.delete("/engagements/{eid}", tags=["Engagements"])
-def delete_engagement(eid: str, _: bool = Depends(auth)):
-    """Archive an engagement (sets status to 'archived')."""
+# Asset-child tables cleared BEFORE deleting the assets. `findings` FIRST: its
+# assets FK is NO ACTION, so it BLOCKS the asset delete until cleared (the other
+# asset-children CASCADE). The SET NULL children (recon_findings, port_observation,
+# scan_targets, rag_documents) would be left orphaned with a null asset_id, so
+# clear them too rather than leave dangling rows.
+_PURGE_ASSET_CHILD_TABLES = [
+    "findings", "recon_findings", "port_observation", "scan_targets", "rag_documents",
+]
+# Data rows attributed to the engagement but possibly not via a live asset
+# (asset_id NULL). Best-effort — a table may lack engagement_id on some installs,
+# so each runs inside its own SAVEPOINT.
+_PURGE_DATA_BY_ENGAGEMENT = [
+    "findings", "vulns", "web_findings", "recon_findings", "credential_findings",
+    "playwright_findings", "pending_exploits",
+]
+# Engagement CONFIG (the scope + schedule that DEFINE the engagement). Removed
+# only on a full delete; KEPT when purging data so the engagement can be re-run.
+_PURGE_CONFIG_BY_ENGAGEMENT = ["scope_targets", "scheduled_scans"]
+
+
+def _sp_delete(cur, sql: str, params) -> int:
+    """DELETE inside a SAVEPOINT so a missing table/column does not abort the
+    whole purge transaction. Returns rows deleted (0 on any failure)."""
+    cur.execute("SAVEPOINT purge_sp")
+    try:
+        cur.execute(sql, params)
+        n = cur.rowcount
+        cur.execute("RELEASE SAVEPOINT purge_sp")
+        return n
+    except Exception as e:  # noqa: BLE001
+        cur.execute("ROLLBACK TO SAVEPOINT purge_sp")
+        log.warning("purge step failed (%s): %s", sql.split()[2] if len(sql.split()) > 2 else sql, e)
+        return 0
+
+
+def _purge_engagement_data(cur, eid: str, keep_engagement: bool = False) -> Dict[str, int]:
+    """Delete an engagement's collected DATA — its assets and every row hanging
+    off them (ports, vulns, findings, web/recon/credential/playwright findings,
+    exploits, recommendations, …), plus engagement-attributed orphan findings.
+
+    An asset carries exactly one engagement_id, so this never touches another
+    engagement's inventory. `keep_engagement=True` KEEPS the engagement row and
+    its scope/schedule (so it can be re-run); False also removes the scope and the
+    engagement itself. Returns per-table deleted counts."""
+    counts: Dict[str, int] = {}
+    cur.execute("SELECT id FROM assets WHERE engagement_id = %s::uuid", (eid,))
+    # Cursor may be a RealDictCursor (dict rows) — read by column name, not index.
+    asset_ids = [(r["id"] if isinstance(r, dict) else r[0]) for r in cur.fetchall()]
+    if asset_ids:
+        for tbl in _PURGE_ASSET_CHILD_TABLES:
+            counts[tbl] = _sp_delete(cur, f"DELETE FROM {tbl} WHERE asset_id = ANY(%s)", (asset_ids,))
+        cur.execute("DELETE FROM assets WHERE engagement_id = %s::uuid", (eid,))
+        counts["assets"] = cur.rowcount
+    else:
+        counts["assets"] = 0
+    for tbl in _PURGE_DATA_BY_ENGAGEMENT:
+        n = _sp_delete(cur, f"DELETE FROM {tbl} WHERE engagement_id = %s::uuid", (eid,))
+        counts[tbl] = counts.get(tbl, 0) + n
+    if keep_engagement:
+        return counts
+    for tbl in _PURGE_CONFIG_BY_ENGAGEMENT:
+        counts[tbl] = _sp_delete(cur, f"DELETE FROM {tbl} WHERE engagement_id = %s::uuid", (eid,))
+    # campaign_events, evidence_store and credential_vault CASCADE on the delete.
+    cur.execute("DELETE FROM engagements WHERE id = %s::uuid", (eid,))
+    counts["engagements"] = cur.rowcount
+    return counts
+
+
+def _purge_dry_run(cur, eid: str) -> Dict[str, Any]:
+    """Counts of what a purge would remove, without deleting anything."""
+    cur.execute("SELECT COUNT(*) AS n FROM assets WHERE engagement_id = %s::uuid", (eid,))
+    asset_n = cur.fetchone()["n"]
+    sub = "asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)"
+    counts: Dict[str, int] = {}
+    for tbl, col in (("ports", sub), ("vulns", sub), ("findings", sub),
+                     ("web_findings", sub), ("credential_findings", sub),
+                     ("scope_targets", "engagement_id = %s::uuid")):
+        cur.execute("SAVEPOINT dr_sp")
+        try:
+            cur.execute(f"SELECT COUNT(*) AS n FROM {tbl} WHERE {col}", (eid,))
+            counts[tbl] = cur.fetchone()["n"]
+            cur.execute("RELEASE SAVEPOINT dr_sp")
+        except Exception:  # noqa: BLE001
+            cur.execute("ROLLBACK TO SAVEPOINT dr_sp")
+    return {"assets": asset_n, "would_delete": counts}
+
+
+@app.post("/engagements/{eid}/purge-data", tags=["Engagements"])
+def purge_engagement_data_endpoint(eid: str, dry_run: bool = Query(False),
+                                   x_operator: str = Header("operator", alias="X-Operator"),
+                                   _: bool = Depends(auth)):
+    """Delete the engagement's collected DATA but KEEP the engagement.
+
+    Removes its assets and everything hanging off them (ports, vulns, findings,
+    recon, credentials, exploits, recommendations), so the engagement is emptied
+    and can be re-run — its scope and schedule are preserved. Irreversible; pass
+    dry_run=true to preview the counts first."""
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("UPDATE engagements SET status = 'archived' WHERE id = %s RETURNING id", (eid,))
-        row = cur.fetchone()
+        cur.execute("SELECT id, name FROM engagements WHERE id = %s::uuid", (eid,))
+        eng = cur.fetchone()
+        if not eng:
+            raise HTTPException(404, "Engagement not found")
+        if dry_run:
+            out = _purge_dry_run(cur, eid)
+            return {"ok": True, "id": eid, "dry_run": True, "action": "purge_data", **out}
+        counts = _purge_engagement_data(cur, eid, keep_engagement=True)
         conn.commit()
-    if not row:
-        raise HTTPException(404, "Engagement not found")
-    return {"ok": True, "id": eid}
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("engagement_data_purged", "engagements", {
+            "engagement_id": eid, "name": eng["name"], "actor": x_operator,
+            "assets_deleted": counts.get("assets", 0)})
+    except Exception:
+        log.warning("engagement data-purge webhook emit failed", exc_info=True)
+    return {"ok": True, "id": eid, "action": "data_purged", "kept_engagement": True,
+            "deleted": counts}
+
+
+@app.delete("/engagements/{eid}", tags=["Engagements"])
+def delete_engagement(eid: str, purge: bool = Query(False), dry_run: bool = Query(False),
+                      x_operator: str = Header("operator", alias="X-Operator"),
+                      _: bool = Depends(auth)):
+    """Remove an engagement.
+
+    Default (purge=false): ARCHIVE — sets status='archived', deletes nothing, so
+    the engagement's assets and findings are preserved (the historical behaviour).
+
+    purge=true: HARD DELETE — removes the engagement AND its assets and every row
+    hanging off them, plus its scope and schedule. Irreversible; pass dry_run=true
+    to preview. To keep the engagement and wipe only its data, use
+    POST /engagements/{eid}/purge-data instead. An asset belongs to one
+    engagement, so this never deletes another engagement's hosts."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT id, name, status FROM engagements WHERE id = %s::uuid", (eid,))
+        eng = cur.fetchone()
+        if not eng:
+            raise HTTPException(404, "Engagement not found")
+
+        if not purge:
+            cur.execute("UPDATE engagements SET status = 'archived' WHERE id = %s::uuid "
+                        "RETURNING id", (eid,))
+            conn.commit()
+            return {"ok": True, "id": eid, "action": "archived"}
+
+        if dry_run:
+            out = _purge_dry_run(cur, eid)
+            return {"ok": True, "id": eid, "dry_run": True, "action": "purge", **out}
+
+        counts = _purge_engagement_data(cur, eid, keep_engagement=False)
+        conn.commit()
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("engagement_purged", "engagements", {
+            "engagement_id": eid, "name": eng["name"], "actor": x_operator,
+            "assets_deleted": counts.get("assets", 0)})
+    except Exception:
+        log.warning("engagement purge webhook emit failed", exc_info=True)
+    return {"ok": True, "id": eid, "action": "purged", "deleted": counts}
 
 
 # ── Engagement-Scoped Scopes ────────────────────────────────────────────
@@ -21673,6 +21821,124 @@ def review_extractor_learned(rule_id: str, action: str,
     return {"ok": True, "actor": x_operator, **dict(row)}
 
 
+@app.get("/extractors/learned/{rule_id}/preview", tags=["Extractors"])
+def preview_extractor_learned(rule_id: str, artifact_id: Optional[str] = None,
+                              _: bool = Depends(auth)):
+    """Show WHAT THIS RULE WOULD OUTPUT against a real captured sample, so a
+    reviewer can see the finding (or the extracted values) before approving it.
+
+    Runs the deterministic profile over a recent raw artifact for the tool, then:
+      - notable/follow_on rule: evaluates its `when` and renders the finding it
+        would emit (title with {fields} filled, detail, severity), plus the field
+        values the predicate used and whether it would fire on this sample.
+      - deterministic rule: applies each field pattern and shows what it captures.
+    Read-only: no LLM, no writes, no dispatch."""
+    import extractor_specs as es
+    import re as _re
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT tool, kind, rule FROM extractor_learned WHERE id = %s::uuid",
+                    (rule_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"learned rule {rule_id} not found")
+        tool, kind, rule = row["tool"], row["kind"], row["rule"] or {}
+        if artifact_id:
+            cur.execute("SELECT id::text, content, target, port, command, created_at "
+                        "FROM raw_artifacts WHERE id = %s::uuid", (artifact_id,))
+            candidates = [r for r in [cur.fetchone()] if r]
+        else:
+            # Scan several recent samples and PREFER one this rule actually fires
+            # on, so the reviewer sees a real positive output rather than an empty
+            # "would not fire" from whichever artifact happened to be newest.
+            cur.execute(
+                """SELECT id::text, content, target, port, command, created_at
+                     FROM raw_artifacts
+                    WHERE tool = %s AND content IS NOT NULL AND length(content) > 0
+                    ORDER BY created_at DESC LIMIT 12""", (tool,))
+            candidates = cur.fetchall()
+
+    _spec = es.spec_for(tool)
+
+    def _fires(text: str) -> bool:
+        ex = es.run_deterministic(_spec, text) if (_spec and text) else {}
+        if kind in ("notable", "follow_on"):
+            try:
+                return bool(es.evaluate_predicate(rule.get("when", "") or "", ex))
+            except Exception:  # noqa: BLE001
+                return False
+        for field, fspec in (rule.items() if isinstance(rule, dict) else []):
+            if isinstance(fspec, dict) and fspec.get("pattern"):
+                try:
+                    if _re.findall(fspec["pattern"], text):
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+        return False
+
+    art = None
+    for c in candidates:
+        if _fires(c["content"] or ""):
+            art = c
+            break
+    if art is None and candidates:
+        art = candidates[0]
+
+    out: Dict[str, Any] = {"ok": True, "tool": tool, "kind": kind, "rule": rule,
+                           "has_sample": bool(art)}
+    content = (art["content"] or "") if art else ""
+    if art:
+        snippet = content if len(content) <= 1500 else content[:1500] + "\n…(truncated)"
+        out["sample"] = {
+            "artifact_id": art["id"], "target": art["target"], "port": art["port"],
+            "command": art["command"], "snippet": snippet,
+            "captured_at": art["created_at"].isoformat() if art["created_at"] else None}
+
+    spec = es.spec_for(tool)
+    extracted = es.run_deterministic(spec, content) if (spec and content) else {}
+
+    if kind in ("notable", "follow_on"):
+        when = rule.get("when", "") or ""
+        try:
+            fires = bool(es.evaluate_predicate(when, extracted)) if content else False
+        except Exception:  # noqa: BLE001
+            fires = False
+        # Context (target/port) comes from the artifact, not the extraction, so a
+        # {target} in the title renders to the real host rather than "unknown".
+        render_ctx = dict(extracted)
+        if art:
+            if art.get("target"):
+                render_ctx.setdefault("target", art["target"])
+            if art.get("port"):
+                render_ctx.setdefault("port", art["port"])
+        title = rule.get("title", "") or ""
+        for field in _re.findall(r"\{(\w+)\}", title):
+            val = render_ctx.get(field)
+            if isinstance(val, list):
+                val = len(val)
+            title = title.replace("{" + field + "}",
+                                  "unknown" if val is None else str(val))
+        used = {f: extracted.get(f) for f in set(_re.findall(r"[A-Za-z_]\w*", when))
+                if f in extracted}
+        out["would_fire"] = fires
+        out["finding"] = {"title": title, "detail": rule.get("detail", ""),
+                          "severity": rule.get("severity", "info"), "when": when}
+        out["fields_used"] = used
+    else:  # deterministic field-capture rule
+        captures: Dict[str, Any] = {}
+        for field, fspec in (rule.items() if isinstance(rule, dict) else []):
+            if not isinstance(fspec, dict) or not fspec.get("pattern"):
+                continue
+            try:
+                ms = _re.findall(fspec["pattern"], content)
+            except Exception:  # noqa: BLE001
+                ms = []
+            captures[field] = (ms[:25] if fspec.get("capture") == "all"
+                               else (ms[0] if ms else None))
+        out["captured"] = captures
+        out["would_fire"] = any(v for v in captures.values())
+    return out
+
+
 @app.post("/extractors/export", tags=["Extractors"])
 def export_extractor_learned(tool: Optional[str] = None, _: bool = Depends(auth)):
     """Render ACTIVE learned rules as YAML per tool, for committing into
@@ -22421,6 +22687,53 @@ def list_target_tool_settings(target: str, tool: str = Query(None),
                  ORDER BY tool, category""", params)
         rows = [dict(r) for r in cur.fetchall()]
     return {"count": len(rows), "settings": rows}
+
+
+@app.get("/tool-settings", tags=["Tool Settings"])
+def list_all_tool_settings(tool: str = Query(None), target: str = Query(None),
+                           status: str = Query(None), _: bool = Depends(auth)):
+    """Every derived tool setting across targets — the PROPOSED options each tool
+    should run with — plus the tool_options.yaml catalogue of what options each
+    tool can express (the RUN-option syntax). Powers the Learned Tools tab's
+    run-vs-proposed view. Read-only.
+
+    Each setting carries option_text (the proposed option), host_offers (what the
+    target advertised) and client_supports (what the running client accepts); the
+    proposed option is the intersection, so the operator can see both the raw run
+    material and the value that will be used."""
+    where, params = [], []
+    if tool:
+        where.append("tool = %s"); params.append(tool)
+    if target:
+        where.append("target = %s"); params.append(target)
+    if status:
+        where.append("status = %s"); params.append(status)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""SELECT id::text, target, port, service, tool, category,
+                       option_text, host_offers, client_supports, source,
+                       status, reviewed_by, derived_at
+                  FROM target_tool_settings{clause}
+                 ORDER BY tool, target, category""", params)
+        rows = [dict(r) for r in cur.fetchall()]
+    # The catalogue: what options each tool CAN run with, from tool_options.yaml.
+    catalogue: Dict[str, Any] = {}
+    try:
+        import yaml as _yaml
+        for base in ("/knowledge", os.path.join(os.path.dirname(__file__), "..", "..", "knowledge")):
+            path = os.path.join(base, "tool_options.yaml")
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    doc = _yaml.safe_load(f) or {}
+                for t, cats in (doc.get("tools") or {}).items():
+                    if isinstance(cats, dict):
+                        catalogue[t] = {c: v for c, v in cats.items()
+                                        if isinstance(v, str) and "{values}" in v}
+                break
+    except Exception as e:  # noqa: BLE001
+        log.debug("tool_options catalogue load failed: %s", e)
+    return {"count": len(rows), "settings": rows, "catalogue": catalogue}
 
 
 @app.post("/targets/tool-settings/{setting_id}/{action}", tags=["Tool Settings"])
