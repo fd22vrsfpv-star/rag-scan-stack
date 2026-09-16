@@ -4517,6 +4517,22 @@ nc -lvnp {lport}"""
     return json.dumps(result, indent=2)
 
 
+def _learned_msf_options(module: str) -> dict:
+    """Learned best options for a module from rag-api (deterministic), or {}."""
+    if not module:
+        return {}
+    st = get_scan_tools()
+    try:
+        r = st.client.get(f"{st.rag_api_url}/rag/knowledge/msf-options",
+                          params={"module": module}, headers=st.headers)
+        if r.status_code >= 400:
+            return {}
+        return r.json().get("learned") or {}
+    except Exception as e:  # noqa: BLE001
+        logger.debug("learned msf options fetch failed: %s", e)
+        return {}
+
+
 def _resolve_metasploit_or_none(exploit_id: str, exploit_title: str):
     """(canonical_module_or_None, options, checked).
 
@@ -4615,6 +4631,16 @@ def queue_exploit_for_approval(
             if msf_options:
                 parameters = dict(parameters or {})
                 parameters.setdefault("msf_options", msf_options)
+            # Pre-fill LEARNED best options (from RAG) as overrides, so a rerun
+            # starts from what already worked for this module. Any value the caller
+            # already set wins over the learned one.
+            learned = _learned_msf_options(exploit_id)
+            if learned.get("options"):
+                parameters = dict(parameters or {})
+                ov = dict(parameters.get("msf_option_overrides") or {})
+                for k, v in learned["options"].items():
+                    ov.setdefault(k, v)
+                parameters["msf_option_overrides"] = ov
 
         pending_id = create_pending_exploit(
             source=source,

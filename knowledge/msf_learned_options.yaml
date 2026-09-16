@@ -1,0 +1,22 @@
+# Learned Metasploit module options (RAG-first knowledge)
+#
+# Best-known, non-default Metasploit module options LEARNED from successful runs.
+# The exploit-runner records a winning option set on each successful MSF session
+# (POST /rag/knowledge/msf-options), which embeds it into rag_documents
+# (source=knowledge_msf_learned_options) for retrieval. This file is the
+# human-reviewable mirror: export the current learnings with
+# `GET /rag/knowledge/msf-options/export`, drop them here, and check it in.
+#
+# On queue, these are pre-filled onto a new pending_exploit as
+# parameters.msf_option_overrides so a rerun starts from what already worked.
+#
+# NOT learned (set per target/run, never global): RHOSTS, RHOST, RPORT, LHOST,
+# LPORT, Proxies, and the reverse/bind callback wiring.
+#
+# Shape:
+#   modules:
+#     exploit/multi/http/php_cgi_arg_injection:
+#       service: http
+#       options: { TARGETURI: "/cgi-bin/php", SSL: true }
+#       learned_from: 3        # number of successful runs this reflects
+modules: {}

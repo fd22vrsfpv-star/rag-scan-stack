@@ -22433,6 +22433,128 @@ def _remove_flow_from_rag(flow_id: str) -> None:
         logging.warning("flow->rag delete failed for %s: %s", flow_id, e)
 
 
+MSF_LEARNED_SOURCE = "knowledge_msf_learned_options"
+# Options that are per-target / per-run, never a learnable module property.
+_MSF_UNLEARNABLE = {"RHOSTS", "RHOST", "RPORT", "LHOST", "LPORT", "PROXIES",
+                    "VERBOSE", "WORKSPACE", "SESSION"}
+
+
+def _msf_learned_text(module: str, service: str, options: dict, learned_from: int) -> str:
+    opt_s = "; ".join(f"{k}={v}" for k, v in (options or {}).items()) or "module defaults"
+    return (f"Best-known options for Metasploit module {module}"
+            + (f" (service {service})" if service else "") + f": {opt_s}. "
+            + f"Learned from {learned_from} successful run(s). Apply as "
+            + "msf_option_overrides when running this module; host, port and "
+            + "callback options are set per target, not learned.")
+
+
+def _get_learned_msf_options(module: str) -> dict:
+    """The learned options + metadata for one module, or {} — deterministic
+    lookup by rag_documents metadata (not semantic), for exact prefill."""
+    if not module:
+        return {}
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT metadata FROM rag_documents "
+                "WHERE metadata->>'source' = %s AND metadata->>'module' = %s "
+                "ORDER BY created_at DESC LIMIT 1",
+                (MSF_LEARNED_SOURCE, module))
+            row = cur.fetchone()
+        if row and isinstance(row.get("metadata"), dict):
+            m = row["metadata"]
+            return {"module": module, "service": m.get("service") or "",
+                    "options": m.get("options") or {},
+                    "learned_from": m.get("learned_from") or 0}
+    except Exception as e:  # noqa: BLE001
+        logging.warning("get learned msf options failed for %s: %s", module, e)
+    return {}
+
+
+def _learn_msf_options(module: str, service: str, options: dict) -> dict:
+    """Merge a winning option set into the learned record for a module and embed
+    it into rag_documents (idempotent per module). Per-run/host keys are dropped.
+    Returns the merged record."""
+    module = (module or "").strip()
+    if not module:
+        return {}
+    clean = {k: v for k, v in (options or {}).items()
+             if k and k.upper() not in _MSF_UNLEARNABLE and v not in (None, "")}
+    prev = _get_learned_msf_options(module)
+    merged = dict(prev.get("options") or {})
+    merged.update(clean)                       # newest winning values win
+    learned_from = int(prev.get("learned_from") or 0) + 1
+    service = service or prev.get("service") or ""
+    text = _msf_learned_text(module, service, merged, learned_from)
+    meta = {"source": MSF_LEARNED_SOURCE, "kind": "msf_learned_options",
+            "module": module, "service": service, "options": merged,
+            "learned_from": learned_from}
+    try:
+        vec = _embed_text(f"Learned Metasploit options: {module}\n{text}")
+        vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM rag_documents WHERE metadata->>'source' = %s "
+                "AND metadata->>'module' = %s", (MSF_LEARNED_SOURCE, module))
+            cur.execute(
+                "INSERT INTO rag_documents (title, text_chunk, metadata, embedding) "
+                "VALUES (%s, %s, %s, %s::vector)",
+                (f"Learned Metasploit options: {module}", text, Json(meta), vec_str))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("learn msf options embed failed for %s: %s", module, e)
+    return {"module": module, "service": service, "options": merged,
+            "learned_from": learned_from}
+
+
+class MsfLearnBody(BaseModel):
+    module: str
+    service: Optional[str] = ""
+    options: Dict[str, Any] = {}
+
+
+@app.post("/rag/knowledge/msf-options")
+def learn_msf_options_endpoint(body: MsfLearnBody, _: bool = Depends(auth)):
+    """Record a winning MSF option set for a module (called by exploit-runner on a
+    successful session). Merges + embeds into rag_documents; returns the record."""
+    rec = _learn_msf_options(body.module, body.service or "", body.options or {})
+    return {"ok": bool(rec), "learned": rec}
+
+
+@app.get("/rag/knowledge/msf-options")
+def get_msf_options_endpoint(module: str, _: bool = Depends(auth)):
+    """Learned best options for a module (deterministic), for queue-time prefill."""
+    rec = _get_learned_msf_options(module)
+    return {"ok": bool(rec), "module": module, "learned": rec or None}
+
+
+@app.get("/rag/knowledge/msf-options/export")
+def export_msf_options_endpoint(_: bool = Depends(auth)):
+    """Render ALL learned options as knowledge/msf_learned_options.yaml text, so an
+    operator can review and check it in (knowledge/ is read-only to the services)."""
+    import yaml as _yaml
+    modules = {}
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT metadata FROM rag_documents WHERE metadata->>'source' = %s "
+                "ORDER BY metadata->>'module'", (MSF_LEARNED_SOURCE,))
+            for r in cur.fetchall():
+                m = r.get("metadata") or {}
+                mod = m.get("module")
+                if mod:
+                    modules[mod] = {"service": m.get("service") or "",
+                                    "options": m.get("options") or {},
+                                    "learned_from": m.get("learned_from") or 1}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"export failed: {e}")
+    header = ("# Learned Metasploit module options (RAG-first knowledge)\n"
+              "# Exported from rag_documents. Review and check in.\n")
+    yaml_text = header + _yaml.safe_dump({"modules": modules}, sort_keys=True,
+                                         default_flow_style=False)
+    return {"ok": True, "count": len(modules), "yaml": yaml_text}
+
+
 class FlowRule(BaseModel):
     id: str
     when: Dict[str, Any]
