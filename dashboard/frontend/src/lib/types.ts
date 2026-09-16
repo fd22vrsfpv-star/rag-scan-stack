@@ -22,6 +22,9 @@ export interface Asset {
   // Exploits PENDING approval for this host, merged client-side from
   // /assets/pending-exploit-counts. Drives the "to approve" highlight + link.
   pending_exploits?: number
+  // Open login services with no valid credential yet — a small default-cred
+  // spray is the acceptable first credential step. Same source; drives a badge.
+  spray_ready?: number
 }
 
 export interface Port {

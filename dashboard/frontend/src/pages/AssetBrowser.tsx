@@ -113,20 +113,35 @@ const assetColumns: ColumnDef<Asset, unknown>[] = [
       </span>
     )
   }},
-  // Exploits waiting for approval on this host — highlighted so a box with
-  // impactful tests to release stands out, and links straight to its queue.
-  { accessorKey: 'pending_exploits', header: 'To Approve', size: 110, cell: ({ row }) => {
+  // Releasable actions waiting on this host — exploits pending approval and/or a
+  // small default-cred spray opportunity — highlighted and linked to their queue.
+  { accessorKey: 'pending_exploits', header: 'To Approve', size: 150, cell: ({ row }) => {
     const n = Number(row.original.pending_exploits ?? 0)
-    if (n === 0) return <span className="text-xs text-muted-foreground">—</span>
+    const spray = Number(row.original.spray_ready ?? 0)
+    if (n === 0 && spray === 0) return <span className="text-xs text-muted-foreground">—</span>
     return (
-      <Link
-        to={`/exploits?ip=${encodeURIComponent(row.original.ip)}`}
-        onClick={e => e.stopPropagation()}
-        title={`${n} exploit(s) pending approval on this host — open the Exploits queue to release them`}
-        className="inline-flex items-center gap-1 text-xs font-semibold px-1.5 py-0.5 rounded border bg-amber-500/15 text-amber-400 border-amber-500/40 hover:bg-amber-500/25"
-      >
-        <Zap className="h-3 w-3" />{n} to approve
-      </Link>
+      <span className="inline-flex items-center gap-1 flex-wrap">
+        {n > 0 && (
+          <Link
+            to={`/exploits?ip=${encodeURIComponent(row.original.ip)}`}
+            onClick={e => e.stopPropagation()}
+            title={`${n} exploit(s) pending approval — open the Exploits queue to release them`}
+            className="inline-flex items-center gap-1 text-xs font-semibold px-1.5 py-0.5 rounded border bg-amber-500/15 text-amber-400 border-amber-500/40 hover:bg-amber-500/25"
+          >
+            <Zap className="h-3 w-3" />{n} to approve
+          </Link>
+        )}
+        {spray > 0 && (
+          <Link
+            to={`/exploits?ip=${encodeURIComponent(row.original.ip)}`}
+            onClick={e => e.stopPropagation()}
+            title={`${spray} open login service(s) and no valid credential yet — a small default-credential spray (<=3 tries/account) is the acceptable first step`}
+            className="inline-flex items-center gap-1 text-xs font-semibold px-1.5 py-0.5 rounded border bg-sky-500/15 text-sky-400 border-sky-500/40 hover:bg-sky-500/25"
+          >
+            <Key className="h-3 w-3" />spray
+          </Link>
+        )}
+      </span>
     )
   }},
   { accessorKey: 'discovered_by', header: 'Discovered By', size: 200, cell: ({ getValue }) => {
@@ -1086,11 +1101,12 @@ export default function AssetBrowser() {
     // the same target string obtained_access stores.
     const sum = accessSummary?.summary || {}
     const pex = pendingExploits?.counts || {}
+    const spray = pendingExploits?.spray || {}
     filtered = filtered.map(a => {
       const s = sum[a.ip]
       const withAccess = s ? { ...a, access_live: s.live, access_total: s.total }
                : (a.access_live === undefined ? a : { ...a, access_live: undefined, access_total: undefined })
-      return { ...withAccess, pending_exploits: pex[a.ip] }
+      return { ...withAccess, pending_exploits: pex[a.ip], spray_ready: spray[a.ip] }
     })
 
     // Apply access filter last so it sees the attached counts.
@@ -1507,7 +1523,9 @@ export default function AssetBrowser() {
           onRowSelectionChange={setAssetSelection}
           getRowId={(row) => row.ip}
           rowClassName={(row) => (row.pending_exploits ?? 0) > 0
-            ? 'bg-amber-500/5 border-l-2 border-l-amber-500/60' : undefined}
+            ? 'bg-amber-500/5 border-l-2 border-l-amber-500/60'
+            : (row.spray_ready ?? 0) > 0
+              ? 'bg-sky-500/5 border-l-2 border-l-sky-500/50' : undefined}
         />
       ))}
 

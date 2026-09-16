@@ -443,6 +443,7 @@ export function usePendingExploitCounts(engagementId?: string | null) {
     queryKey: ['assets-pending-exploits', engagementId ?? 'all'],
     queryFn: () => apiFetch<{
       counts: Record<string, number>; hosts: number; total: number
+      spray?: Record<string, number>; spray_hosts?: number
     }>(`/assets/pending-exploit-counts${qs}`),
     staleTime: 30_000,
   })
