@@ -6369,3 +6369,15 @@ WHERE script LIKE 'ssh-audit:%' AND port_id IS NULL AND (metadata->>'port') IS N
 
 UPDATE public.vulns SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{port}', '443'::jsonb)
 WHERE script LIKE ANY(ARRAY['sslscan:%','testssl:%','sslyze:%']) AND port_id IS NULL AND (metadata->>'port') IS NULL;
+
+-- Operator-authored enumeration "flows" (dispatch rules) — the writable overlay
+-- on knowledge/enumeration_rules.yaml. See etl/post_enumeration.load_custom_rules.
+CREATE TABLE IF NOT EXISTS public.custom_enumeration_rules (
+    id            text PRIMARY KEY,
+    rule          jsonb NOT NULL,
+    enabled       boolean NOT NULL DEFAULT true,
+    engagement_id uuid,
+    created_by    text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);

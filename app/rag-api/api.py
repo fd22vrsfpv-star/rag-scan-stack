@@ -21755,6 +21755,77 @@ _RECON_MODULE_SQL = (
     " OR pe.exploit_title ILIKE 'msf_exploit post/%%')")
 
 
+# ── Flow / enumeration-rule authoring + testing ─────────────────────────────
+# Author a dispatch "flow" (an enumeration rule) and dry-run it against an
+# engagement's REAL facts before committing it. Custom rules live in the DB
+# overlay (the knowledge YAML is read-only in the container).
+class FlowRule(BaseModel):
+    id: str
+    when: Dict[str, Any]
+    propose: Dict[str, Any]
+    why: Optional[str] = None
+    enabled: bool = True
+    engagement_id: Optional[str] = None
+
+
+class FlowTestBody(BaseModel):
+    rule: Optional[Dict[str, Any]] = None          # a candidate rule, or None => live catalogue
+    target: str
+    engagement_id: Optional[str] = None
+
+
+@app.get("/rules", tags=["Flows"])
+def list_flow_rules(_: bool = Depends(auth)):
+    """Every enumeration rule (flow): the YAML catalogue plus the DB overlay."""
+    from etl.post_enumeration import load_rules, load_custom_rules
+    yaml_rules = [r for r in load_rules() if r not in load_custom_rules()]
+    return {"yaml_rules": yaml_rules, "custom_rules": load_custom_rules(),
+            "total": len(load_rules())}
+
+
+@app.post("/rules/test", tags=["Flows"])
+def test_flow_rule(body: FlowTestBody, _: bool = Depends(auth)):
+    """DRY-RUN a flow against a host's real facts — what fires and what it would
+    propose. Never queues or dispatches."""
+    from etl.post_enumeration import test_rules
+    rules = [body.rule] if body.rule else None
+    return test_rules(rules=rules, target=body.target, engagement_id=body.engagement_id)
+
+
+@app.post("/rules", tags=["Flows"])
+def add_flow_rule(rule: FlowRule,
+                  x_operator: str = Header("operator", alias="X-Operator"),
+                  _: bool = Depends(auth)):
+    """Add or update a custom flow (enumeration rule) in the DB overlay."""
+    from etl.post_enumeration import _CUSTOM_RULES_DDL
+    if not (rule.when.get("fact") and rule.propose.get("command")):
+        raise HTTPException(400, "rule needs when.fact and propose.command")
+    body = {"id": rule.id, "when": rule.when, "propose": rule.propose, "why": rule.why}
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(_CUSTOM_RULES_DDL)
+        cur.execute(
+            """INSERT INTO custom_enumeration_rules (id, rule, enabled, engagement_id, created_by)
+               VALUES (%s, %s, %s, %s::uuid, %s)
+               ON CONFLICT (id) DO UPDATE SET rule = EXCLUDED.rule,
+                   enabled = EXCLUDED.enabled, engagement_id = EXCLUDED.engagement_id,
+                   updated_at = now()""",
+            (rule.id, json.dumps(body), rule.enabled, rule.engagement_id, x_operator))
+        conn.commit()
+    return {"ok": True, "id": rule.id}
+
+
+@app.delete("/rules/{rule_id}", tags=["Flows"])
+def delete_flow_rule(rule_id: str, _: bool = Depends(auth)):
+    """Remove a custom flow from the DB overlay (YAML rules are not affected)."""
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM custom_enumeration_rules WHERE id = %s", (rule_id,))
+        n = cur.rowcount
+        conn.commit()
+    if not n:
+        raise HTTPException(404, f"custom rule {rule_id} not found")
+    return {"ok": True, "deleted": rule_id}
+
+
 @app.get("/foothold/no-callback", tags=["Access"])
 def foothold_no_callback(limit: int = 50, include_recon: bool = False,
                          _: bool = Depends(auth)):
