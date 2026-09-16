@@ -110,10 +110,28 @@ function useRunReconAgentNow(engagementId: string | null) {
 }
 
 
+type AgentsTab = 'agents' | 'foothold' | 'feedback' | 'extractors' | 'tools'
+
+const AGENTS_TAB_KEY = 'ai-agents-tab'
+
 export default function AIAgents() {
   const { data: agentsData, isLoading } = useAgentsStatus()
   const selectedEngagement = useUIStore(s => s.selectedEngagementId)
   const agents = agentsData?.agents ?? []
+
+  // Remember the selected tab per-viewer so a refresh does not bounce back to
+  // Agents. localStorage may be unavailable (private window) — fail soft.
+  const [tab, setTabState] = useState<AgentsTab>(() => {
+    try {
+      return (localStorage.getItem(AGENTS_TAB_KEY) as AgentsTab) || 'agents'
+    } catch {
+      return 'agents'
+    }
+  })
+  const setTab = (t: AgentsTab) => {
+    setTabState(t)
+    try { localStorage.setItem(AGENTS_TAB_KEY, t) } catch { /* ignore */ }
+  }
 
   return (
     <div className="space-y-4 p-4">
@@ -126,28 +144,52 @@ export default function AIAgents() {
         )}
       </div>
 
-      {isLoading ? (
-        <div className="flex items-center gap-2 text-sm text-muted-foreground">
-          <Loader2 className="h-4 w-4 animate-spin" /> Loading agents...
-        </div>
-      ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-          {agents.map(agent => (
-            <AgentCard key={agent.id} agent={agent} engagementId={selectedEngagement} />
-          ))}
-        </div>
+      <div className="flex gap-1 border-b border-border flex-wrap">
+        {([
+          ['agents', 'Agents', Bot],
+          ['foothold', 'Foothold', Zap],
+          ['feedback', 'Agent Feedback', MessageSquare],
+          ['extractors', 'Learned Extractors', Wand2],
+          ['tools', 'Learned Tools', GitBranch],
+        ] as [AgentsTab, string, typeof Bot][]).map(([t, label, Icon]) => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={cn(
+              'px-3 py-1.5 text-sm border-b-2 transition-colors flex items-center gap-1.5',
+              tab === t ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground',
+            )}
+          >
+            <Icon className="h-3.5 w-3.5" /> {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'agents' && (
+        <>
+          {isLoading ? (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" /> Loading agents...
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+              {agents.map(agent => (
+                <AgentCard key={agent.id} agent={agent} engagementId={selectedEngagement} />
+              ))}
+            </div>
+          )}
+          <PostReviewPanel />
+          <ActivityTimelinePanel />
+          {selectedEngagement && (
+            <GapAnalysisPanel engagementId={selectedEngagement} />
+          )}
+        </>
       )}
 
-      <FootholdAgentPanel />
-      <AgentFlagsPanel />
-      <PostReviewPanel />
-      <LearnedExtractorsPanel />
-      <ToolSelectionPanel />
-      <ActivityTimelinePanel />
-
-      {selectedEngagement && (
-        <GapAnalysisPanel engagementId={selectedEngagement} />
-      )}
+      {tab === 'foothold' && <FootholdAgentPanel />}
+      {tab === 'feedback' && <AgentFlagsPanel />}
+      {tab === 'extractors' && <LearnedExtractorsPanel />}
+      {tab === 'tools' && <ToolSelectionPanel />}
     </div>
   )
 }
