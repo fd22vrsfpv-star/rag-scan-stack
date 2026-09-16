@@ -181,3 +181,18 @@ rules:
       opened it. 6200 on Metasploitable reads as `lm-x` and is the vsftpd
       backdoor's root shell — it had been seen by an earlier scan and nothing
       had ever looked at it.
+
+  - id: login-service-credential-check
+    when:
+      fact: login_service
+      where: {login_service: true}
+    propose:
+      tool: hydra
+      command: "hydra -I -L {user_list} -P {password_list} {service}://{target}:{port}"
+      priority: 25
+    why: >-
+      An open login service (ssh/ftp/database/vnc/…) is worth a default-credential
+      check. Recon found ssh on 192.168.1.150 and the platform never guessed
+      msfadmin:msfadmin — no valid password was ever found. The `hydra` tool routes
+      to the brutus multi-protocol credential tester, which tries the default
+      credential set for the service and stores any that work.

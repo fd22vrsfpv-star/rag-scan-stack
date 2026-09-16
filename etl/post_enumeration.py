@@ -503,6 +503,45 @@ def facts_from_open_ports(cur, *, target: str = "", limit: int = 60) -> List[Dic
     return facts
 
 
+# Services that take a login and are worth a default-credential check.
+_LOGIN_SERVICES = {
+    "ssh": 22, "ftp": 21, "telnet": 23, "mysql": 3306, "mariadb": 3306,
+    "postgresql": 5432, "postgres": 5432, "mssql": 1433, "ms-sql-s": 1433,
+    "vnc": 5900, "rdp": 3389, "ms-wbt-server": 3389, "smb": 445,
+    "microsoft-ds": 445, "netbios-ssn": 139, "redis": 6379, "mongodb": 27017,
+    "mongod": 27017, "rlogin": 513, "rexec": 512, "vnc-http": 5800,
+    "imap": 143, "pop3": 110, "smtp": 25, "ldap": 389, "snmp": 161,
+}
+
+
+def facts_from_login_services(cur, *, target: str = "", limit: int = 60) -> List[Dict[str, Any]]:
+    """Open ports running a service that takes a login — each a candidate for a
+    default-credential check. Emitted as `login_service` facts so a rule can
+    propose the guess. The gap this closes: recon identifies ssh/ftp/db and the
+    platform never tries the defaults, so no valid password is ever found."""
+    facts: List[Dict[str, Any]] = []
+    where = ["COALESCE(p.is_open, true)", "LOWER(COALESCE(p.proto,'tcp')) = 'tcp'"]
+    params: List[Any] = []
+    if target:
+        where.append("host(a.ip) = %s")
+        params.append(target)
+    params.append(limit)
+    try:
+        cur.execute(
+            f"""SELECT host(a.ip), p.port, LOWER(COALESCE(p.service,''))
+                  FROM ports p JOIN assets a ON a.id = p.asset_id
+                 WHERE {' AND '.join(where)}
+                 ORDER BY p.port LIMIT %s""", params)
+        for host, port, service in cur.fetchall():
+            svc = (service or "").strip()
+            if svc in _LOGIN_SERVICES:
+                facts.append({"fact": "login_service", "target": host,
+                              "port": port, "service": svc, "login_service": True})
+    except Exception as e:  # noqa: BLE001
+        log.debug("login-service facts unavailable: %s", e)
+    return facts
+
+
 def facts_from_web_findings(cur, *, target: str = "", limit: int = 200,
                             engagement_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Evidence that never came from a command's stdout.
@@ -709,6 +748,10 @@ def analyse_findings(*, target: str = "", engagement_id: Optional[str] = None,
                 # opened it — 6200 on this host reads as `lm-x` and is a root
                 # shell.
                 facts += facts_from_open_ports(cur, target=target)
+                # An open LOGIN service (ssh/ftp/db/vnc/…) is worth a default-
+                # credential check. Without this the agent found ssh on a host and
+                # never guessed msfadmin:msfadmin.
+                facts += facts_from_login_services(cur, target=target)
                 out["facts"] = len(facts)
                 if facts:
                     _propose_from_facts(cur, facts, context, rules, out)
