@@ -1,7 +1,8 @@
 import { useState, useMemo, useEffect, Fragment } from 'react'
+import { Link } from 'react-router-dom'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
 import PageHelp from '@/components/PageHelp'
-import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, useAssetPortAdvice,
+import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice,
   type ObtainedAccess, type DdgSearchResponse } from '@/api/assets'
 import { apiFetch } from '@/api/client'
 import { useTargetedReconLookup, useTargetedReconExecute } from '@/api/targeted-recon'
@@ -110,6 +111,22 @@ const assetColumns: ColumnDef<Asset, unknown>[] = [
                  : 'bg-zinc-500/15 text-zinc-400 border-zinc-500/30'}`}>
         <Terminal className="h-3 w-3" />{live > 0 ? `${live} live` : `${total} held`}
       </span>
+    )
+  }},
+  // Exploits waiting for approval on this host — highlighted so a box with
+  // impactful tests to release stands out, and links straight to its queue.
+  { accessorKey: 'pending_exploits', header: 'To Approve', size: 110, cell: ({ row }) => {
+    const n = Number(row.original.pending_exploits ?? 0)
+    if (n === 0) return <span className="text-xs text-muted-foreground">—</span>
+    return (
+      <Link
+        to={`/exploits?ip=${encodeURIComponent(row.original.ip)}`}
+        onClick={e => e.stopPropagation()}
+        title={`${n} exploit(s) pending approval on this host — open the Exploits queue to release them`}
+        className="inline-flex items-center gap-1 text-xs font-semibold px-1.5 py-0.5 rounded border bg-amber-500/15 text-amber-400 border-amber-500/40 hover:bg-amber-500/25"
+      >
+        <Zap className="h-3 w-3" />{n} to approve
+      </Link>
     )
   }},
   { accessorKey: 'discovered_by', header: 'Discovered By', size: 200, cell: ({ getValue }) => {
@@ -959,6 +976,7 @@ export default function AssetBrowser() {
   const serverAssetKind = assetKindFilter === 'all' ? undefined : assetKindFilter
   const { data: assetsData, isLoading } = useAssets(5000, serverAssetKind)
   const { data: accessSummary } = useAccessSummary()
+  const { data: pendingExploits } = usePendingExploitCounts()
   const { data: portsData } = useAssetPorts(selectedIp || '')
   // Access the selected host holds, so the port list can flag WHICH ports carry
   // a live shell (green) and offer a manual follow-up. Same query key as the
@@ -1067,10 +1085,12 @@ export default function AssetBrowser() {
     // and the "held access" filter read the same source. Keyed by IP, which is
     // the same target string obtained_access stores.
     const sum = accessSummary?.summary || {}
+    const pex = pendingExploits?.counts || {}
     filtered = filtered.map(a => {
       const s = sum[a.ip]
-      return s ? { ...a, access_live: s.live, access_total: s.total }
+      const withAccess = s ? { ...a, access_live: s.live, access_total: s.total }
                : (a.access_live === undefined ? a : { ...a, access_live: undefined, access_total: undefined })
+      return { ...withAccess, pending_exploits: pex[a.ip] }
     })
 
     // Apply access filter last so it sees the attached counts.
@@ -1082,7 +1102,7 @@ export default function AssetBrowser() {
     // scopeFilter is included for parity with the `subdomains` memo below and
     // to guarantee invalidation when the local scope dropdown changes, even
     // though matchesScope identity would normally cover it.
-  }, [allAssets, isScopeFiltering, matchesScope, search, portsFilter, providerFilter, assetKindFilter, scopeFilter, accessSummary, accessFilter])
+  }, [allAssets, isScopeFiltering, matchesScope, search, portsFilter, providerFilter, assetKindFilter, scopeFilter, accessSummary, pendingExploits, accessFilter])
 
   // Available provider chips derived from the current asset set, sorted by
   // count desc — operators see what tags exist without us hardcoding the list.
@@ -1486,6 +1506,8 @@ export default function AssetBrowser() {
           rowSelection={assetSelection}
           onRowSelectionChange={setAssetSelection}
           getRowId={(row) => row.ip}
+          rowClassName={(row) => (row.pending_exploits ?? 0) > 0
+            ? 'bg-amber-500/5 border-l-2 border-l-amber-500/60' : undefined}
         />
       ))}
 
