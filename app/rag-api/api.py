@@ -8839,9 +8839,13 @@ def release_impactful_tests(body: ReleaseImpactfulBody,
                   FROM pending_exploits pe
                  WHERE host(pe.target_ip) = %s{where_recon}
                    AND (pe.status = 'pending'
+                        -- any APPROVED exploit not yet fired and with no result —
+                        -- covers manual approvals (approve fires only a bounded
+                        -- batch and sheds the rest), not just release's own.
                         OR (pe.status = 'approved'
-                            AND pe.metadata->>'released' = 'true'
-                            AND pe.metadata->>'release_fired' IS NULL))
+                            AND pe.metadata->>'release_fired' IS NULL
+                            AND NOT EXISTS (SELECT 1 FROM exploit_results er
+                                             WHERE er.pending_exploit_id = pe.id)))
                  ORDER BY pe.exploit_id, COALESCE(pe.target_port, 0),
                           CASE pe.status WHEN 'approved' THEN 0 ELSE 1 END,
                           pe.created_at DESC""",
@@ -22298,8 +22302,9 @@ def assets_pending_exploit_counts(engagement_id: Optional[str] = Query(None),
     # matching the release endpoint's candidate set, so the badge tracks the real
     # backlog rather than dropping to zero the moment things are approved.
     status_clause = ("(pe.status = 'pending' OR (pe.status = 'approved' "
-                     "AND pe.metadata->>'released' = 'true' "
-                     "AND pe.metadata->>'release_fired' IS NULL))")
+                     "AND pe.metadata->>'release_fired' IS NULL "
+                     "AND NOT EXISTS (SELECT 1 FROM exploit_results er "
+                     "WHERE er.pending_exploit_id = pe.id)))")
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             f"""SELECT host(pe.target_ip) AS ip,
