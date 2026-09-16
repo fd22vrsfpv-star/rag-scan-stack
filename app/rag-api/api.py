@@ -22130,6 +22130,12 @@ def access_summary(_: bool = Depends(auth)):
     return {"summary": summary, "hosts": len(summary)}
 
 
+# Ports whose service takes a login — a candidate for the small default-cred
+# spray. Port-based (not service-name) so a mislabelled banner does not hide one.
+_LOGIN_SPRAY_PORTS = [21, 22, 23, 139, 389, 445, 636, 1433, 2121, 2222, 3306,
+                      3389, 5432, 5900, 5901, 5902, 5985, 5986, 6379, 27017]
+
+
 @app.get("/assets/pending-exploit-counts", tags=["Assets"])
 def assets_pending_exploit_counts(engagement_id: Optional[str] = Query(None),
                                   include_recon: bool = Query(False),
@@ -22143,23 +22149,50 @@ def assets_pending_exploit_counts(engagement_id: Optional[str] = Query(None),
 
     Declared before any /assets/{ip} dynamic route so the literal path wins
     (FastAPI matches in declaration order)."""
-    where = ["pe.status = 'pending'"]
+    where = ["pe.target_ip IS NOT NULL"]
     params: list = []
     if not include_recon:
         where.append(f"NOT {_RECON_MODULE_SQL}")
     if engagement_id:
         where.append("pe.engagement_id = %s::uuid")
         params.append(engagement_id)
+    # Count what still NEEDS an operator action: pending (needs approval) plus
+    # released-but-unfired (approved, waiting for the next release to fire) —
+    # matching the release endpoint's candidate set, so the badge tracks the real
+    # backlog rather than dropping to zero the moment things are approved.
+    status_clause = ("(pe.status = 'pending' OR (pe.status = 'approved' "
+                     "AND pe.metadata->>'released' = 'true' "
+                     "AND pe.metadata->>'release_fired' IS NULL))")
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             f"""SELECT host(pe.target_ip) AS ip, count(*) AS n
                   FROM pending_exploits pe
-                 WHERE {' AND '.join(where)} AND pe.target_ip IS NOT NULL
+                 WHERE {' AND '.join(where)} AND {status_clause}
                  GROUP BY host(pe.target_ip)""",
             params)
         counts = {r["ip"]: int(r["n"]) for r in cur.fetchall() if r["ip"]}
-    return {"counts": counts, "hosts": len(counts),
-            "total": sum(counts.values())}
+
+        # Spray-ready hosts: an open LOGIN service and NO valid credential yet —
+        # the small default-credential spray (knowledge/credential_spray_policy.yaml)
+        # is the acceptable first credential step there. Port-based so it does not
+        # depend on how a scanner labelled the service.
+        eparams: list = []
+        eclause = ""
+        if engagement_id:
+            eclause = " AND a.engagement_id = %s::uuid"
+            eparams.append(engagement_id)
+        cur.execute(
+            f"""SELECT host(a.ip) AS ip, count(*) AS n
+                  FROM public.ports p JOIN public.assets a ON a.id = p.asset_id
+                 WHERE p.is_open = true
+                   AND p.port = ANY(%s){eclause}
+                   AND NOT EXISTS (SELECT 1 FROM public.credential_findings cf
+                                    WHERE cf.asset_id = a.id AND cf.valid_cred = true)
+                 GROUP BY host(a.ip)""",
+            [_LOGIN_SPRAY_PORTS] + eparams)
+        spray = {r["ip"]: int(r["n"]) for r in cur.fetchall() if r["ip"]}
+    return {"counts": counts, "hosts": len(counts), "total": sum(counts.values()),
+            "spray": spray, "spray_hosts": len(spray)}
 
 
 # A Metasploit auxiliary/* or post/* module is a SCANNER or info-gathering /
