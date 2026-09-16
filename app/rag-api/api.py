@@ -22085,6 +22085,38 @@ def access_summary(_: bool = Depends(auth)):
     return {"summary": summary, "hosts": len(summary)}
 
 
+@app.get("/assets/pending-exploit-counts", tags=["Assets"])
+def assets_pending_exploit_counts(engagement_id: Optional[str] = Query(None),
+                                  include_recon: bool = Query(False),
+                                  _: bool = Depends(auth)):
+    """Per-host count of exploits PENDING approval, so the asset list can
+    highlight hosts with impactful tests to release and link straight to them.
+
+    Foothold-producing modules only by default — auxiliary/post scanners are
+    recon, not approvals a host is waiting on — so the badge count matches the
+    Exploits page's impactful queue. One grouped query for the whole store.
+
+    Declared before any /assets/{ip} dynamic route so the literal path wins
+    (FastAPI matches in declaration order)."""
+    where = ["pe.status = 'pending'"]
+    params: list = []
+    if not include_recon:
+        where.append(f"NOT {_RECON_MODULE_SQL}")
+    if engagement_id:
+        where.append("pe.engagement_id = %s::uuid")
+        params.append(engagement_id)
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""SELECT host(pe.target_ip) AS ip, count(*) AS n
+                  FROM pending_exploits pe
+                 WHERE {' AND '.join(where)} AND pe.target_ip IS NOT NULL
+                 GROUP BY host(pe.target_ip)""",
+            params)
+        counts = {r["ip"]: int(r["n"]) for r in cur.fetchall() if r["ip"]}
+    return {"counts": counts, "hosts": len(counts),
+            "total": sum(counts.values())}
+
+
 # A Metasploit auxiliary/* or post/* module is a SCANNER or info-gathering /
 # credential-check module — it does NOT open a shell, so it is NOT a foothold
 # attempt and must not appear in the "payload needs tweaking" queue. Only

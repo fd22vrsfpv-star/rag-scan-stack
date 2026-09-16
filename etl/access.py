@@ -668,6 +668,126 @@ def discover(target: str, *, cur=None) -> List[Dict[str, Any]]:
     return found
 
 
+# Access kinds that ARE command execution (a shell/session), as opposed to a
+# service credential. A shell is RCE; root makes it critical.
+_SHELL_KINDS = {"bind_shell", "msf_session", "webshell", "listener_callback"}
+
+
+def _access_severity_title(row: Dict[str, Any]) -> tuple:
+    """(severity, title) for a held access, so it reads as a finding.
+
+    A root shell is the highest-impact result there is — critical. A non-root
+    shell or an interactive SSH login is high (command execution / a foothold).
+    A non-shell service credential (db, ftp, vnc, redis, telnet) is medium: real
+    access, but not code execution on its own.
+    """
+    kind = row.get("kind") or ""
+    whoami = row.get("whoami")
+    port = row.get("port")
+    target = row.get("target") or ""
+    transport = row.get("transport") or kind
+    at = f":{port}" if port else ""
+    if row.get("is_root"):
+        return "critical", f"Remote ROOT access on {target}{at} via {kind}"
+    if kind in _SHELL_KINDS:
+        return "high", f"Remote shell ({whoami or 'unknown user'}) on {target}{at} via {kind}"
+    if kind == "ssh_credential":
+        who = f"{whoami}@" if whoami else ""
+        return "high", f"Valid SSH login {who}{target} — interactive access"
+    return "medium", f"Valid {transport} credential on {target}{at}"
+
+
+def _emit_access_finding_webhook(target: str, title: str, severity: str,
+                                 engagement_id: Optional[str]) -> None:
+    """Best-effort webhook for a newly-recorded high/critical access finding."""
+    try:
+        import requests
+        base = os.environ.get("RAG_API_URL", "https://rag-api:8000").rstrip("/")
+        key = os.environ.get("API_KEY", "changeme")
+        requests.post(f"{base}/webhooks/emit",
+                      headers={"x-api-key": key, "Content-Type": "application/json"},
+                      json={"event_type": "access_finding_recorded", "source": "access",
+                            "severity": severity,
+                            "data": {"target": target, "title": title, "severity": severity,
+                                     "engagement_id": engagement_id}},
+                      timeout=5, verify=False)
+    except Exception as e:  # noqa: BLE001
+        log.debug("access finding webhook failed: %s", e)
+
+
+def _sync_access_findings(cur, target: str,
+                          engagement_id: Optional[str] = None) -> int:
+    """Mirror held access into the findings model so a root shell is a CRITICAL
+    finding, not just an obtained_access row.
+
+    For every access on this target: a LIVE one upserts a fingerprinted vuln
+    whose severity tracks the access (root shell → critical); a DEAD one resolves
+    its finding so the severity view stays truthful. The fingerprint is stable
+    per (target, kind, handle), so re-probing updates the same row rather than
+    duplicating. Best-effort and side-channel: never raises into refresh()."""
+    import hashlib
+    from psycopg2.extras import Json
+    cur.execute("SELECT id FROM public.assets WHERE host(ip) = %s "
+                "ORDER BY last_seen DESC NULLS LAST LIMIT 1", (target,))
+    a = cur.fetchone()
+    if not a:
+        return 0
+    asset_id = a[0]
+    cur.execute("SELECT kind, handle, port, transport, whoami, uid, is_root, score, status "
+                "  FROM public.obtained_access WHERE target = %s", (target,))
+    cols = ("kind", "handle", "port", "transport", "whoami", "uid", "is_root",
+            "score", "status")
+    synced = 0
+    for r in cur.fetchall():
+        row = dict(zip(cols, r))
+        row["target"] = target
+        fp = hashlib.md5(
+            f"access|{target}|{row['kind']}|{row['handle']}".encode()).hexdigest()
+        cur.execute("SELECT id FROM public.vulns WHERE fingerprint = %s", (fp,))
+        ex = cur.fetchone()
+        if row["status"] == "live":
+            sev, title = _access_severity_title(row)
+            port_id = None
+            if row.get("port"):
+                cur.execute("SELECT id FROM public.ports WHERE asset_id = %s AND port = %s "
+                            "LIMIT 1", (asset_id, row["port"]))
+                pr = cur.fetchone()
+                port_id = pr[0] if pr else None
+            output = (f"Held access via {row['kind']} ({row.get('transport') or ''}). "
+                      f"whoami={row.get('whoami')}, uid={row.get('uid')}, "
+                      f"is_root={row.get('is_root')}, score={row.get('score')}, status=live.")
+            meta = {"source": "access_bridge", "access_kind": row["kind"],
+                    "handle": row["handle"], "whoami": row.get("whoami"),
+                    "is_root": bool(row.get("is_root")), "score": row.get("score"),
+                    "port": row.get("port"), "transport": row.get("transport")}
+            if ex:
+                cur.execute(
+                    """UPDATE public.vulns
+                          SET severity = %s, title = %s, output = %s, metadata = %s,
+                              port_id = COALESCE(%s, port_id), last_seen = now(),
+                              workflow_status = CASE WHEN workflow_status = 'resolved'
+                                                     THEN 'new' ELSE workflow_status END
+                        WHERE id = %s""",
+                    (sev, title, output, Json(meta), port_id, ex[0]))
+            else:
+                cur.execute(
+                    """INSERT INTO public.vulns
+                          (asset_id, port_id, script, output, severity, title, metadata,
+                           fingerprint, workflow_status, engagement_id, first_seen, last_seen)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'new',%s,now(),now())""",
+                    (asset_id, port_id, f"access:{row['kind']}", output, sev, title,
+                     Json(meta), fp, engagement_id))
+                if sev in ("critical", "high"):
+                    _emit_access_finding_webhook(target, title, sev, engagement_id)
+            synced += 1
+        elif ex:
+            # Access is gone — resolve the finding so it drops off the open view.
+            cur.execute("UPDATE public.vulns SET workflow_status = 'resolved', "
+                        "last_seen = now() WHERE id = %s AND workflow_status <> 'resolved'",
+                        (ex[0],))
+    return synced
+
+
 def refresh(target: str, *, rounds: int = None,
             engagement_id: Optional[str] = None) -> Dict[str, Any]:
     """Discover, probe and record every access on this target.
@@ -757,6 +877,15 @@ def refresh(target: str, *, rounds: int = None,
                     if result["status"] != "live":
                         out["dead"] += 1
                         out["reconciled_dead"] = out.get("reconciled_dead", 0) + 1
+
+                # Mirror held access into the findings model (root shell → a
+                # CRITICAL finding). Side-channel: a failure here must not fail
+                # the refresh, which is the authoritative access record.
+                try:
+                    out["findings_synced"] = _sync_access_findings(
+                        cur, target, engagement_id)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("access->finding sync failed for %s: %s", target, e)
             conn.commit()
         out["available"] = True
     except Exception as e:  # noqa: BLE001

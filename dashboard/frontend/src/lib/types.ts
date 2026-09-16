@@ -19,6 +19,9 @@ export interface Asset {
   // "held access" filter. Absent means not looked up / none held.
   access_live?: number
   access_total?: number
+  // Exploits PENDING approval for this host, merged client-side from
+  // /assets/pending-exploit-counts. Drives the "to approve" highlight + link.
+  pending_exploits?: number
 }
 
 export interface Port {
