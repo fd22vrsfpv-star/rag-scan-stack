@@ -2114,6 +2114,33 @@ export default function AssetBrowser() {
             </button>
           </div>
 
+          {/* Pending exploits / spray banner — actions waiting on this host, with
+              a jump to the Exploits queue to approve/release them. */}
+          {((pendingExploits?.counts?.[selectedIp] ?? 0) > 0 ||
+            (pendingExploits?.spray?.[selectedIp] ?? 0) > 0) && (
+            <div className="mx-4 mt-3 flex items-center justify-between gap-3 flex-wrap rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2">
+              <div className="text-xs text-amber-200">
+                {(pendingExploits?.counts?.[selectedIp] ?? 0) > 0 && (
+                  <span className="font-semibold">
+                    {pendingExploits!.counts[selectedIp]} exploit{pendingExploits!.counts[selectedIp] === 1 ? '' : 's'} awaiting approval
+                  </span>
+                )}
+                {(pendingExploits?.spray?.[selectedIp] ?? 0) > 0 && (
+                  <span className="text-sky-300">
+                    {(pendingExploits?.counts?.[selectedIp] ?? 0) > 0 ? ' · ' : ''}
+                    {pendingExploits!.spray![selectedIp]} login service{pendingExploits!.spray![selectedIp] === 1 ? '' : 's'} ready for a default-credential spray
+                  </span>
+                )}
+              </div>
+              <Link
+                to={`/exploits?ip=${encodeURIComponent(selectedIp)}`}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-amber-600 text-white text-xs font-medium hover:bg-amber-700 whitespace-nowrap"
+              >
+                <Zap className="h-3 w-3" /> Review &amp; approve in Exploits
+              </Link>
+            </div>
+          )}
+
           <div className="flex items-center gap-2 px-4 pt-3 border-b border-border">
             <button
               onClick={() => setDetailTab('ports')}
