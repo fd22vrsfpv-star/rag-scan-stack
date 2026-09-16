@@ -1501,9 +1501,9 @@ services:
       MODIFIED_EXPLOITS_DIR: /app/modified_exploits
       # Automatic exploit/PoC retry budgets (generate -> try -> read output ->
       # fix -> retry). EXPLOIT_MAX_AUTOCORRECT bounds the MSF auto-correct chain;
-      # POC_MAX_ATTEMPTS bounds the web-PoC refine loop (total attempts).
+      # POC_MAX_ATTEMPTS bounds the web-PoC refine loop (total attempts, default 5).
       EXPLOIT_MAX_AUTOCORRECT: ${EXPLOIT_MAX_AUTOCORRECT:-2}
-      POC_MAX_ATTEMPTS: ${POC_MAX_ATTEMPTS:-3}
+      POC_MAX_ATTEMPTS: ${POC_MAX_ATTEMPTS:-5}
     depends_on:
       wait-for-db:
         condition: service_completed_successfully
