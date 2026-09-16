@@ -204,6 +204,24 @@ def _render_tool_options(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_credential_spray_policy(data: Dict[str, Any]) -> List[Doc]:
+    docs: List[Doc] = []
+    for p in (data.get("policies") or []):
+        if not isinstance(p, dict):
+            continue
+        title = f"Spray policy: {p.get('name') or p.get('id')}"
+        body = (f"Password-spray policy '{p.get('id')}' — verdict: "
+                f"{p.get('verdict', 'see below')}. {_s(p.get('rationale'))} "
+                f"When to use: {_s(p.get('when_to_use'))} "
+                f"Acceptable only when ALL hold: {_s(p.get('acceptable_when'))}. "
+                f"Cap: {p.get('max_attempts_per_account')} attempts per account. "
+                f"Tools: {_s(p.get('tools'))}. "
+                f"NOT acceptable: {_s(p.get('not_acceptable'))}. "
+                f"Enforced by: {_s(p.get('enforced_by'))}.")
+        docs.append((title, body.strip()))
+    return docs
+
+
 def _render_web_profiles(data: Dict[str, Any]) -> List[Doc]:
     docs: List[Doc] = []
     for name, spec in (data.get("profiles") or {}).items():
@@ -231,6 +249,7 @@ RENDERERS = {
     "scan_parameters": _render_scan_parameters,
     "tool_options": _render_tool_options,
     "web_profiles": _render_web_profiles,
+    "credential_spray_policy": _render_credential_spray_policy,
 }
 
 
