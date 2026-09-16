@@ -63,7 +63,7 @@ _MSG_CAP = 4000
 _READ_ONLY = {
     "query_assets", "query_open_ports", "query_vulnerabilities",
     "get_web_findings", "search_all_findings", "get_attack_vectors",
-    "query_credential_findings", "query_exploitdb",
+    "query_credential_findings", "query_exploitdb", "search_knowledge_base",
     "get_session_scan_status", "get_all_active_jobs",
 }
 
@@ -77,6 +77,7 @@ SCAN_TOOLS_READONLY = {
     "get_tool_recommendations",
     "get_scan_recommendations", "get_passive_recon_plan", "query_assets",
     "query_open_ports", "get_session_scan_status", "get_all_active_jobs",
+    "search_knowledge_base",
 }
 # Discovery / enumeration dispatchers. Deliberately EXCLUDES the credential
 # brute-force tools (start_brutus, start_credential_check) and everything
@@ -111,7 +112,7 @@ EXPLOIT_PLAN_TOOLS = {
     "query_vulnerabilities", "query_open_ports", "query_assets",
     "match_vuln_to_exploits", "query_exploitdb", "search_msf_modules",
     "customize_exploit", "list_pending_exploits", "get_exploit_approval_status",
-    "queue_exploit_for_approval",
+    "queue_exploit_for_approval", "search_knowledge_base",
 }
 
 _RECON_SYSTEM = (

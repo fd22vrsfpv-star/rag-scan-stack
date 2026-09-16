@@ -278,6 +278,22 @@ TOOL_SPECS: List[ToolSpec] = [
         func=scan_tools.query_exploitdb,
     ),
     ToolSpec(
+        name="search_knowledge_base",
+        description=(
+            "Recall METHODOLOGY and DECISION knowledge from the RAG knowledge "
+            "corpus (rag_documents): agent workflows and actions, operator-authored "
+            "dispatch flows, cracked-credential notes and the findings backfill. "
+            "Ask it 'what should I do now' from a situation in plain language — "
+            "e.g. 'ssh open but no valid passwords', 'captured shadow hashes', "
+            "'reconnect access after a reboot' — and it returns the matching "
+            "workflows/flows (title, text, source, similarity). This is the "
+            "general knowledge recall; use query_exploitdb instead when you want "
+            "ExploitDB/Metasploit exploit writeups. Optional sources filter, e.g. "
+            "'dispatch_flow,agent_capability'."
+        ),
+        func=scan_tools.search_knowledge_base,
+    ),
+    ToolSpec(
         name="search_all_findings",
         description=(
             "Unified search across ALL finding types (vulns, web, recon, credentials). "

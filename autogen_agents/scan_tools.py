@@ -3913,6 +3913,45 @@ def query_exploitdb(query: str, top_k: int = 5) -> str:
     return json.dumps(result, indent=2)
 
 
+def search_knowledge_base(query: str, top_k: int = 6, sources: str = None) -> str:
+    """Recall methodology/decision knowledge from the RAG knowledge corpus.
+
+    Semantic search over rag_documents — the corpus of agent workflows and
+    actions, operator-authored dispatch flows, cracked-credential notes and the
+    findings backfill. Use it to answer "what should I DO now" from what the
+    platform knows: e.g. "ssh open but no valid passwords", "captured shadow
+    hashes", "reconnect after reboot". This is the general knowledge recall,
+    distinct from query_exploitdb (which searches ExploitDB/Metasploit).
+
+    Args:
+        query: natural-language situation or question.
+        top_k: number of documents to return (1-25, default 6).
+        sources: optional comma-separated metadata.source filter, e.g.
+            "dispatch_flow,agent_capability". Omit to search all sources.
+
+    Returns a JSON string: {query, count, results:[{title, text, source,
+    similarity}]}.
+    """
+    api_key = os.environ.get("API_KEY", "changeme")
+    t = get_scan_tools()
+    payload = {"query": query, "top_k": top_k}
+    if sources:
+        payload["sources"] = [s.strip() for s in sources.split(",") if s.strip()]
+    try:
+        r = httpx.post(
+            f"{t.rag_api_url}/rag/knowledge/search",
+            json=payload,
+            headers={"x-api-key": api_key},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            return json.dumps({"error": f"HTTP {r.status_code}: {r.text[:200]}",
+                               "results": []})
+        return json.dumps(r.json(), indent=2)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"error": str(e), "results": []})
+
+
 def get_scan_recommendations(context: str) -> str:
     """
     Get AI-powered scan recommendations.
