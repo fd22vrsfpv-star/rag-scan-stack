@@ -38,6 +38,7 @@ RAG_LOADED = {
     "scan_parameters.yaml": "etl/load_knowledge_documents.py",
     "tool_options.yaml": "etl/load_knowledge_documents.py",
     "web_profiles.yaml": "etl/load_knowledge_documents.py",
+    "credential_spray_policy.yaml": "etl/load_knowledge_documents.py",
 }
 
 # YAMLs deliberately NOT embedded into rag_documents. Each needs a reason. This
