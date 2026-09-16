@@ -18874,7 +18874,9 @@ def queue_poc_for_finding(
             "xss": "xss", "sqli": "sqli", "sql-injection": "sqli",
             "command-injection": "command_injection", "ssrf": "ssrf",
             "lfi": "lfi", "path-traversal": "lfi", "xxe": "xxe",
-            "csrf": "csrf", "open-redirect": "open_redirect",
+            # 'open_redirect' is NOT an allowed exploit_type — map web-app issues
+            # with no dedicated enum to the 'webapp_other' catch-all.
+            "csrf": "csrf", "open-redirect": "webapp_other",
         }
         exploit_type = type_map.get(issue_type, "other")
 
