@@ -297,6 +297,36 @@ export function useExportExtractors() {
   })
 }
 
+export interface ExtractorPreview {
+  ok: boolean
+  tool: string
+  kind: string
+  rule: Record<string, any>
+  has_sample: boolean
+  sample?: {
+    artifact_id: string
+    target?: string | null
+    port?: number | null
+    command?: string | null
+    snippet?: string
+    captured_at?: string | null
+  }
+  would_fire?: boolean
+  finding?: { title: string; detail: string; severity: string; when: string }
+  fields_used?: Record<string, any>
+  captured?: Record<string, any>
+}
+
+/** What a learned extractor would OUTPUT against a real captured sample. Lazy —
+ *  only fetched once a row is expanded for review. */
+export function useExtractorPreview(ruleId?: string) {
+  return useQuery({
+    queryKey: ['extractor-preview', ruleId ?? 'none'],
+    queryFn: () => apiFetch<ExtractorPreview>(`/extractors/learned/${ruleId}/preview`),
+    enabled: !!ruleId,
+  })
+}
+
 // ── Post-execution review (post_review_agent) ─────────────────────────────
 //
 // Classifies executed work and finds results that were captured but never

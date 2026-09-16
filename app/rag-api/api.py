@@ -21673,6 +21673,124 @@ def review_extractor_learned(rule_id: str, action: str,
     return {"ok": True, "actor": x_operator, **dict(row)}
 
 
+@app.get("/extractors/learned/{rule_id}/preview", tags=["Extractors"])
+def preview_extractor_learned(rule_id: str, artifact_id: Optional[str] = None,
+                              _: bool = Depends(auth)):
+    """Show WHAT THIS RULE WOULD OUTPUT against a real captured sample, so a
+    reviewer can see the finding (or the extracted values) before approving it.
+
+    Runs the deterministic profile over a recent raw artifact for the tool, then:
+      - notable/follow_on rule: evaluates its `when` and renders the finding it
+        would emit (title with {fields} filled, detail, severity), plus the field
+        values the predicate used and whether it would fire on this sample.
+      - deterministic rule: applies each field pattern and shows what it captures.
+    Read-only: no LLM, no writes, no dispatch."""
+    import extractor_specs as es
+    import re as _re
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT tool, kind, rule FROM extractor_learned WHERE id = %s::uuid",
+                    (rule_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"learned rule {rule_id} not found")
+        tool, kind, rule = row["tool"], row["kind"], row["rule"] or {}
+        if artifact_id:
+            cur.execute("SELECT id::text, content, target, port, command, created_at "
+                        "FROM raw_artifacts WHERE id = %s::uuid", (artifact_id,))
+            candidates = [r for r in [cur.fetchone()] if r]
+        else:
+            # Scan several recent samples and PREFER one this rule actually fires
+            # on, so the reviewer sees a real positive output rather than an empty
+            # "would not fire" from whichever artifact happened to be newest.
+            cur.execute(
+                """SELECT id::text, content, target, port, command, created_at
+                     FROM raw_artifacts
+                    WHERE tool = %s AND content IS NOT NULL AND length(content) > 0
+                    ORDER BY created_at DESC LIMIT 12""", (tool,))
+            candidates = cur.fetchall()
+
+    _spec = es.spec_for(tool)
+
+    def _fires(text: str) -> bool:
+        ex = es.run_deterministic(_spec, text) if (_spec and text) else {}
+        if kind in ("notable", "follow_on"):
+            try:
+                return bool(es.evaluate_predicate(rule.get("when", "") or "", ex))
+            except Exception:  # noqa: BLE001
+                return False
+        for field, fspec in (rule.items() if isinstance(rule, dict) else []):
+            if isinstance(fspec, dict) and fspec.get("pattern"):
+                try:
+                    if _re.findall(fspec["pattern"], text):
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+        return False
+
+    art = None
+    for c in candidates:
+        if _fires(c["content"] or ""):
+            art = c
+            break
+    if art is None and candidates:
+        art = candidates[0]
+
+    out: Dict[str, Any] = {"ok": True, "tool": tool, "kind": kind, "rule": rule,
+                           "has_sample": bool(art)}
+    content = (art["content"] or "") if art else ""
+    if art:
+        snippet = content if len(content) <= 1500 else content[:1500] + "\n…(truncated)"
+        out["sample"] = {
+            "artifact_id": art["id"], "target": art["target"], "port": art["port"],
+            "command": art["command"], "snippet": snippet,
+            "captured_at": art["created_at"].isoformat() if art["created_at"] else None}
+
+    spec = es.spec_for(tool)
+    extracted = es.run_deterministic(spec, content) if (spec and content) else {}
+
+    if kind in ("notable", "follow_on"):
+        when = rule.get("when", "") or ""
+        try:
+            fires = bool(es.evaluate_predicate(when, extracted)) if content else False
+        except Exception:  # noqa: BLE001
+            fires = False
+        # Context (target/port) comes from the artifact, not the extraction, so a
+        # {target} in the title renders to the real host rather than "unknown".
+        render_ctx = dict(extracted)
+        if art:
+            if art.get("target"):
+                render_ctx.setdefault("target", art["target"])
+            if art.get("port"):
+                render_ctx.setdefault("port", art["port"])
+        title = rule.get("title", "") or ""
+        for field in _re.findall(r"\{(\w+)\}", title):
+            val = render_ctx.get(field)
+            if isinstance(val, list):
+                val = len(val)
+            title = title.replace("{" + field + "}",
+                                  "unknown" if val is None else str(val))
+        used = {f: extracted.get(f) for f in set(_re.findall(r"[A-Za-z_]\w*", when))
+                if f in extracted}
+        out["would_fire"] = fires
+        out["finding"] = {"title": title, "detail": rule.get("detail", ""),
+                          "severity": rule.get("severity", "info"), "when": when}
+        out["fields_used"] = used
+    else:  # deterministic field-capture rule
+        captures: Dict[str, Any] = {}
+        for field, fspec in (rule.items() if isinstance(rule, dict) else []):
+            if not isinstance(fspec, dict) or not fspec.get("pattern"):
+                continue
+            try:
+                ms = _re.findall(fspec["pattern"], content)
+            except Exception:  # noqa: BLE001
+                ms = []
+            captures[field] = (ms[:25] if fspec.get("capture") == "all"
+                               else (ms[0] if ms else None))
+        out["captured"] = captures
+        out["would_fire"] = any(v for v in captures.values())
+    return out
+
+
 @app.post("/extractors/export", tags=["Extractors"])
 def export_extractor_learned(tool: Optional[str] = None, _: bool = Depends(auth)):
     """Render ACTIVE learned rules as YAML per tool, for committing into
