@@ -1510,6 +1510,7 @@ services:
     volumes:
       - ./etl:/app/etl:ro                             # shared scope gate (etl/scope_gate.py)
       - ./knowledge:/knowledge:ro                     # enumeration_rules.yaml for post-exploit output analysis
+      - ${WORDLISTS_DIR:-./wordlists}:/wordlists:ro       # rockyou + generated lists for credential cracking
       # shared scan-slot semaphore (common/tool_job.py) — bounds this
       # service by MAX_CONCURRENT_SCANS instead of a private number
       - ./common:/app/common:ro
