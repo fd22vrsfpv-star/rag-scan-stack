@@ -576,6 +576,17 @@ else
     echo "❌ Missing followup_target_host() — the follow-up trigger and its backfill cannot agree on what 'the host' is"
     MISSING=$((MISSING + 1))
 fi
+
+# Normalizes the Metasploit module id on EVERY insert into pending_exploits — from
+# any writer, including the LangGraph engine's queue_exploit_for_approval — so the
+# same module stored two ways ('java_rmi_server' vs 'exploit/multi/misc/…') carries
+# one id and dedups. Missing => duplicates re-accumulate and dedup misses them.
+if _psql -tAc "SELECT 1 FROM pg_trigger WHERE tgname='trg_normalize_pending_exploit_module' AND NOT tgisinternal;" | grep -q 1; then
+    echo "✓ trg_normalize_pending_exploit_module (module-id normalization on ingest)"
+else
+    echo "❌ Missing trg_normalize_pending_exploit_module — the same exploit stored short vs full path will not dedup"
+    MISSING=$((MISSING + 1))
+fi
 # Report drift rather than fail: new rows arrive constantly and a host that is
 # genuinely in no scope is CORRECTLY unattributed. A rising count is the signal.
 UNATTRIBUTED_ASSETS=$(_psql -tAc "SELECT count(*) FROM assets WHERE engagement_id IS NULL;" | tr -d '[:space:]')
