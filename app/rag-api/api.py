@@ -21759,6 +21759,79 @@ _RECON_MODULE_SQL = (
 # Author a dispatch "flow" (an enumeration rule) and dry-run it against an
 # engagement's REAL facts before committing it. Custom rules live in the DB
 # overlay (the knowledge YAML is read-only in the container).
+FLOW_RAG_SOURCE = "dispatch_flow"
+
+
+def _flow_rag_text(rule: Dict[str, Any]) -> tuple[str, str]:
+    """Render a flow as a retrievable RAG document (title, body).
+
+    A flow is domain knowledge — "when you see X, do Y" — the same kind the
+    agent-capability loader embeds. Putting each authored flow in rag_documents
+    means the planner can retrieve the operator's own dispatch rules, not only
+    the shipped YAML, when it decides what to do next.
+    """
+    fid = str(rule.get("id") or "unnamed")
+    when = rule.get("when") or {}
+    propose = rule.get("propose") or {}
+    fact = when.get("fact") or "?"
+    where = when.get("where") or {}
+    where_txt = ""
+    if isinstance(where, dict) and where:
+        where_txt = " where " + ", ".join(f"{k}={v}" for k, v in where.items())
+    tool = propose.get("tool") or ""
+    command = propose.get("command") or ""
+    why = (rule.get("why") or "").strip()
+    title = f"Dispatch flow: {fid}"
+    body = (f"Dispatch flow `{fid}`. When a `{fact}` fact is observed{where_txt}, "
+            f"propose the {tool or 'tool'} action: `{command}`. "
+            f"This is an operator-authored enumeration/dispatch rule — retrieve it "
+            f"when a {fact} is found to know the follow-up step.")
+    if why:
+        body += f" Rationale: {why}"
+    return title, body
+
+
+def _load_flow_into_rag(rule: Dict[str, Any], engagement_id: Optional[str] = None) -> bool:
+    """Embed one flow and upsert it into rag_documents (idempotent per flow id).
+
+    Best-effort: a failed embed must not fail the flow save, so the caller logs
+    and continues. Returns True on success."""
+    try:
+        title, body = _flow_rag_text(rule)
+        vec = _embed_text(f"{title}\n{body}")
+        vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+        meta = {"source": FLOW_RAG_SOURCE, "kind": "dispatch_flow",
+                "flow_id": str(rule.get("id") or ""),
+                "engagement_id": engagement_id}
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM rag_documents WHERE metadata->>'source' = %s "
+                "AND metadata->>'flow_id' = %s",
+                (FLOW_RAG_SOURCE, str(rule.get("id") or "")))
+            cur.execute(
+                "INSERT INTO rag_documents (title, text_chunk, metadata, embedding) "
+                "VALUES (%s, %s, %s, %s::vector)",
+                (title, body, Json(meta), vec_str))
+            conn.commit()
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.warning("flow->rag load failed for %s: %s", rule.get("id"), e)
+        return False
+
+
+def _remove_flow_from_rag(flow_id: str) -> None:
+    """Drop a flow's RAG document when the flow is deleted."""
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM rag_documents WHERE metadata->>'source' = %s "
+                "AND metadata->>'flow_id' = %s",
+                (FLOW_RAG_SOURCE, str(flow_id)))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("flow->rag delete failed for %s: %s", flow_id, e)
+
+
 class FlowRule(BaseModel):
     id: str
     when: Dict[str, Any]
@@ -21811,7 +21884,11 @@ def add_flow_rule(rule: FlowRule,
                    updated_at = now()""",
             (rule.id, json.dumps(body), rule.enabled, rule.engagement_id, x_operator))
         conn.commit()
-    return {"ok": True, "id": rule.id}
+    # Also load the flow into the RAG corpus so the planner can retrieve it —
+    # an authored dispatch rule is knowledge the LLMs should see, like the
+    # agent-capability documents. Only when enabled; best-effort.
+    rag_loaded = _load_flow_into_rag(body, rule.engagement_id) if rule.enabled else False
+    return {"ok": True, "id": rule.id, "rag_loaded": rag_loaded}
 
 
 @app.delete("/rules/{rule_id}", tags=["Flows"])
@@ -21823,7 +21900,32 @@ def delete_flow_rule(rule_id: str, _: bool = Depends(auth)):
         conn.commit()
     if not n:
         raise HTTPException(404, f"custom rule {rule_id} not found")
+    _remove_flow_from_rag(rule_id)
     return {"ok": True, "deleted": rule_id}
+
+
+@app.post("/rules/sync-rag", tags=["Flows"])
+def sync_flows_to_rag(_: bool = Depends(auth)):
+    """Embed every flow (YAML catalogue + DB overlay) into rag_documents so the
+    planner can retrieve them. Idempotent — re-run any time. Replaces the whole
+    dispatch_flow source set so removed rules do not linger."""
+    from etl.post_enumeration import load_rules
+    rules = load_rules()
+    # Clear the source set first so a rule dropped from the catalogue is not
+    # left behind, then re-load each (per-flow upsert handles the rest).
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM rag_documents WHERE metadata->>'source' = %s",
+                        (FLOW_RAG_SOURCE,))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("flow rag clear failed: %s", e)
+    loaded = 0
+    for r in rules:
+        if isinstance(r, dict) and (r.get("id") and (r.get("propose") or {}).get("command")):
+            if _load_flow_into_rag(r, r.get("engagement_id")):
+                loaded += 1
+    return {"ok": True, "flows": len(rules), "rag_loaded": loaded}
 
 
 @app.get("/foothold/no-callback", tags=["Access"])

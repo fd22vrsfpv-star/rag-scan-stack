@@ -21,6 +21,17 @@ import {
   type RagTrainingExportResult,
   type RagEvalRun,
 } from '@/api/rag'
+import {
+  useFlowRules,
+  useTestFlow,
+  useAddFlow,
+  useDeleteFlow,
+  useSyncFlowsToRag,
+  type FlowRule,
+  type FlowProposal,
+} from '@/api/flows'
+import { useEngagements } from '@/api/engagements'
+import { useUIStore } from '@/stores/ui'
 
 /**
  * "Training data" panel — Layer 3 of the RAG feedback loop.
@@ -851,6 +862,321 @@ function AddServiceForm({ onDone }: { onDone: () => void }) {
   )
 }
 
+/**
+ * Flows panel — author dispatch rules (enumeration "flows") and dry-run them
+ * against an engagement's real facts before committing.
+ *
+ * A flow is "when you see FACT, propose TOOL: COMMAND". Shipped rules live in
+ * read-only YAML; operator-authored flows live in the DB overlay and are what
+ * this panel edits. Saving a flow also embeds it into the RAG corpus so the
+ * planner can retrieve it. The dry-run calls test_rules (etl/post_enumeration)
+ * — it shows what fires and what it would propose, and never dispatches.
+ */
+function FlowRow({ rule, editable }: { rule: FlowRule; editable: boolean }) {
+  const del = useDeleteFlow()
+  const when = rule.when || ({} as FlowRule['when'])
+  const propose = rule.propose || ({} as FlowRule['propose'])
+  const where = when.where || {}
+  return (
+    <div className="border border-border rounded p-2 bg-background/50">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <code className="text-xs font-semibold">{rule.id}</code>
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-secondary text-secondary-foreground">
+              {editable ? 'custom' : 'shipped'}
+            </span>
+            <span className="text-[10px] text-muted-foreground">
+              fact: <code>{when.fact}</code>
+              {Object.keys(where).length > 0 && (
+                <>
+                  {' '}where{' '}
+                  {Object.entries(where)
+                    .map(([k, v]) => `${k}=${String(v)}`)
+                    .join(', ')}
+                </>
+              )}
+            </span>
+          </div>
+          <div className="text-[11px] mt-1">
+            → {propose.tool && <span className="text-muted-foreground">{propose.tool}: </span>}
+            <code className="break-all">{propose.command}</code>
+          </div>
+          {rule.why && (
+            <p className="text-[10px] text-muted-foreground mt-1 line-clamp-2">{rule.why}</p>
+          )}
+        </div>
+        {editable && (
+          <button
+            onClick={() => {
+              if (confirm(`Delete flow "${rule.id}"?`)) del.mutate(rule.id)
+            }}
+            disabled={del.isPending}
+            className="text-[10px] text-red-400 hover:text-red-300 shrink-0 disabled:opacity-50"
+          >
+            Delete
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function AddFlowForm() {
+  const add = useAddFlow()
+  const { data: engagements } = useEngagements()
+  const selected = useUIStore(s => s.selectedEngagementId)
+  const [id, setId] = useState('')
+  const [fact, setFact] = useState('login_service')
+  const [where, setWhere] = useState('')
+  const [tool, setTool] = useState('')
+  const [command, setCommand] = useState('')
+  const [why, setWhy] = useState('')
+  const [scope, setScope] = useState<'global' | 'engagement'>('global')
+
+  const parseWhere = (): Record<string, unknown> => {
+    const out: Record<string, unknown> = {}
+    where
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean)
+      .forEach(pair => {
+        const [k, ...rest] = pair.split('=')
+        if (!k || rest.length === 0) return
+        const raw = rest.join('=').trim()
+        let v: unknown = raw
+        if (raw === 'true') v = true
+        else if (raw === 'false') v = false
+        out[k.trim()] = v
+      })
+    return out
+  }
+
+  const submit = () => {
+    if (!id.trim() || !fact.trim() || !command.trim()) return
+    const rule: FlowRule = {
+      id: id.trim(),
+      when: { fact: fact.trim(), where: parseWhere() },
+      propose: { command: command.trim(), ...(tool.trim() ? { tool: tool.trim() } : {}) },
+      why: why.trim() || undefined,
+      enabled: true,
+      engagement_id: scope === 'engagement' ? selected : null,
+    }
+    add.mutate(rule, {
+      onSuccess: () => {
+        setId('')
+        setWhere('')
+        setTool('')
+        setCommand('')
+        setWhy('')
+      },
+    })
+  }
+
+  const inp = 'w-full px-2 py-1 bg-background border border-border rounded text-xs'
+  const engName = engagements?.engagements?.find(e => e.id === selected)?.name
+
+  return (
+    <div className="border border-border rounded p-3 space-y-2 bg-background/50">
+      <p className="text-xs font-medium">Add a flow</p>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+        <label className="text-[10px] text-muted-foreground">
+          Rule id
+          <input className={inp} value={id} onChange={e => setId(e.target.value)}
+            placeholder="e.g. vnc-default-creds" />
+        </label>
+        <label className="text-[10px] text-muted-foreground">
+          When fact
+          <input className={inp} value={fact} onChange={e => setFact(e.target.value)}
+            placeholder="login_service, share, host_fact…" />
+        </label>
+        <label className="text-[10px] text-muted-foreground sm:col-span-2">
+          Where (field=value, comma-separated — optional)
+          <input className={inp} value={where} onChange={e => setWhere(e.target.value)}
+            placeholder="service=vnc, writable=true" />
+        </label>
+        <label className="text-[10px] text-muted-foreground">
+          Tool (optional)
+          <input className={inp} value={tool} onChange={e => setTool(e.target.value)}
+            placeholder="hydra, smbclient…" />
+        </label>
+        <label className="text-[10px] text-muted-foreground">
+          Scope
+          <select className={inp} value={scope}
+            onChange={e => setScope(e.target.value as 'global' | 'engagement')}>
+            <option value="global">Global (all engagements)</option>
+            <option value="engagement" disabled={!selected}>
+              This engagement{engName ? ` (${engName})` : ''}
+            </option>
+          </select>
+        </label>
+        <label className="text-[10px] text-muted-foreground sm:col-span-2">
+          Command (templated: {'{target}'}, {'{port}'}, fact fields)
+          <input className={inp} value={command} onChange={e => setCommand(e.target.value)}
+            placeholder="hydra -L users.txt -P pass.txt {target} vnc" />
+        </label>
+        <label className="text-[10px] text-muted-foreground sm:col-span-2">
+          Why (optional)
+          <textarea className={inp} rows={2} value={why} onChange={e => setWhy(e.target.value)}
+            placeholder="What this catches and why it is worth doing." />
+        </label>
+      </div>
+      <div className="flex items-center gap-2">
+        <button onClick={submit}
+          disabled={add.isPending || !id.trim() || !fact.trim() || !command.trim()}
+          className="px-3 py-1.5 bg-primary text-primary-foreground rounded text-xs disabled:opacity-50">
+          {add.isPending ? 'Saving…' : 'Save flow'}
+        </button>
+        {add.isSuccess && (
+          <span className="text-[10px] text-green-400">
+            Saved{add.data?.rag_loaded ? ' · loaded into RAG' : ''}
+          </span>
+        )}
+        {add.isError && (
+          <span className="text-[10px] text-red-400 break-words max-w-sm">
+            {String(add.error)}
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function TestFlowPanel() {
+  const test = useTestFlow()
+  const selected = useUIStore(s => s.selectedEngagementId)
+  const [target, setTarget] = useState('')
+  const inp = 'px-2 py-1 bg-background border border-border rounded text-xs'
+  const run = () => {
+    if (!target.trim()) return
+    test.mutate({ target: target.trim(), engagement_id: selected })
+  }
+  const res = test.data
+  const renderRow = (p: FlowProposal, i: number) => (
+    <div key={i} className="border border-border rounded p-2 text-[11px] bg-background/50">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <code className="font-semibold">{p.rule}</code>
+        <span className={p.would_dispatch ? 'text-green-400 text-[10px]' : 'text-yellow-400 text-[10px]'}>
+          {p.would_dispatch ? 'would dispatch' : 'blocked by scope'}
+        </span>
+      </div>
+      <div className="text-muted-foreground mt-0.5">
+        {p.target} · fact {p.matched_fact?.fact}
+        {p.matched_fact?.service ? ` (${p.matched_fact.service})` : ''}
+        {p.matched_fact?.port ? `:${p.matched_fact.port}` : ''}
+      </div>
+      <code className="break-all block mt-0.5">{p.command}</code>
+      {p.refused && <div className="text-yellow-400 text-[10px] mt-0.5">refused: {p.refused}</div>}
+    </div>
+  )
+  return (
+    <div className="border border-border rounded p-3 space-y-2 bg-background/50">
+      <p className="text-xs font-medium">Dry-run against engagement data</p>
+      <p className="text-[10px] text-muted-foreground">
+        Runs the whole catalogue (shipped + custom) against a host's real facts. Shows what
+        would fire and whether the scope gate allows it. Never dispatches.
+      </p>
+      <div className="flex items-center gap-2 flex-wrap">
+        <input className={inp} value={target} onChange={e => setTarget(e.target.value)}
+          placeholder="target ip/host, e.g. 192.168.1.150"
+          onKeyDown={e => e.key === 'Enter' && run()} />
+        <button onClick={run} disabled={test.isPending || !target.trim()}
+          className="px-3 py-1.5 bg-primary text-primary-foreground rounded text-xs disabled:opacity-50">
+          {test.isPending ? 'Testing…' : 'Dry-run'}
+        </button>
+      </div>
+      {test.isError && (
+        <span className="text-[10px] text-red-400 break-words">{String(test.error)}</span>
+      )}
+      {res && (
+        <div className="space-y-2">
+          <div className="text-[10px] text-muted-foreground">
+            {res.facts} facts · {res.rules_tested} rules · {res.matched} matched · scope: {res.scope}
+            {res.error ? ` · error: ${res.error}` : ''}
+          </div>
+          {res.proposals.length === 0 ? (
+            <p className="text-[10px] text-muted-foreground">No flow fired for this host.</p>
+          ) : (
+            <div className="space-y-1.5 max-h-96 overflow-y-auto">
+              {res.proposals.map(renderRow)}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function FlowsPanel() {
+  const { data, isLoading } = useFlowRules()
+  const syncRag = useSyncFlowsToRag()
+  const [showShipped, setShowShipped] = useState(false)
+  const custom = data?.custom_rules || []
+  const yamlRules = data?.yaml_rules || []
+  return (
+    <div className="bg-card border border-border rounded-lg p-3 space-y-3">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div>
+          <h3 className="text-sm font-semibold">Flows (dispatch rules)</h3>
+          <p className="text-[10px] text-muted-foreground">
+            “When you see FACT, propose TOOL: COMMAND.” Author a rule, dry-run it on real
+            engagement data, and it is embedded into RAG so the agents retrieve it.
+          </p>
+        </div>
+        <button
+          onClick={() => syncRag.mutate()}
+          disabled={syncRag.isPending}
+          className="px-3 py-1.5 bg-secondary text-secondary-foreground rounded text-xs disabled:opacity-50"
+        >
+          {syncRag.isPending ? 'Syncing…' : 'Sync all flows → RAG'}
+        </button>
+      </div>
+      {syncRag.isSuccess && (
+        <span className="text-[10px] text-green-400">
+          {syncRag.data.rag_loaded} of {syncRag.data.flows} flows embedded into RAG
+        </span>
+      )}
+      {syncRag.isError && (
+        <span className="text-[10px] text-red-400 break-words">{String(syncRag.error)}</span>
+      )}
+
+      <AddFlowForm />
+      <TestFlowPanel />
+
+      <div className="space-y-1.5">
+        <p className="text-xs font-medium">
+          Custom flows{isLoading ? '' : ` (${custom.length})`}
+        </p>
+        {isLoading ? (
+          <p className="text-[10px] text-muted-foreground">Loading…</p>
+        ) : custom.length === 0 ? (
+          <p className="text-[10px] text-muted-foreground">
+            No custom flows yet. Add one above; shipped rules still apply.
+          </p>
+        ) : (
+          custom.map((r, i) => <FlowRow key={r.id || i} rule={r} editable />)
+        )}
+      </div>
+
+      <div className="space-y-1.5">
+        <button
+          onClick={() => setShowShipped(v => !v)}
+          className="text-xs font-medium text-primary hover:underline"
+        >
+          {showShipped ? '▾' : '▸'} Shipped flows ({yamlRules.length})
+        </button>
+        {showShipped && (
+          <div className="space-y-1.5">
+            {yamlRules.map((r, i) => (
+              <FlowRow key={r.id || i} rule={r} editable={false} />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export default function KnowledgeBase() {
   const { data, isLoading } = useKBServices()
   const [selected, setSelected] = useState<string | null>(null)
@@ -976,6 +1302,7 @@ export default function KnowledgeBase() {
       {selected && <ServiceDetail name={selected} onClose={() => setSelected(null)} />}
 
       <AskKnowledgeBase />
+      <FlowsPanel />
       <TrainingDataPanel />
       <RetrievalQualityPanel />
 
