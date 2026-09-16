@@ -764,9 +764,7 @@ def _sync_access_findings(cur, target: str,
                 cur.execute(
                     """UPDATE public.vulns
                           SET severity = %s, title = %s, output = %s, metadata = %s,
-                              port_id = COALESCE(%s, port_id), last_seen = now(),
-                              workflow_status = CASE WHEN workflow_status = 'resolved'
-                                                     THEN 'new' ELSE workflow_status END
+                              port_id = COALESCE(%s, port_id), last_seen = now()
                         WHERE id = %s""",
                     (sev, title, output, Json(meta), port_id, ex[0]))
             else:
@@ -781,10 +779,11 @@ def _sync_access_findings(cur, target: str,
                     _emit_access_finding_webhook(target, title, sev, engagement_id)
             synced += 1
         elif ex:
-            # Access is gone — resolve the finding so it drops off the open view.
-            cur.execute("UPDATE public.vulns SET workflow_status = 'resolved', "
-                        "last_seen = now() WHERE id = %s AND workflow_status <> 'resolved'",
-                        (ex[0],))
+            # Access is gone — DELETE the finding. It asserts LIVE access; a dead
+            # one is no longer true. (An earlier version set workflow_status =
+            # 'resolved', which is not an allowed value for that column and raised
+            # a CheckViolation wherever the constraint is applied.)
+            cur.execute("DELETE FROM public.vulns WHERE id = %s", (ex[0],))
     return synced
 
 

@@ -1096,7 +1096,7 @@ CREATE TABLE IF NOT EXISTS public.pending_exploits (
     id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     asset_id           uuid REFERENCES public.assets(id) ON DELETE CASCADE,
     port_id            uuid REFERENCES public.ports(id) ON DELETE SET NULL,
-    source             text NOT NULL CHECK (source IN ('exploitdb', 'metasploit', 'webshell', 'command')),
+    source             text NOT NULL CHECK (source IN ('exploitdb', 'metasploit', 'webshell', 'command', 'web_poc')),
     exploit_id         text NOT NULL,
     exploit_title      text NOT NULL,
     exploit_type       text CHECK (exploit_type IN ('rce', 'auth_bypass', 'info_disclosure', 'other')),
@@ -3227,7 +3227,7 @@ BEGIN
   END IF;
   ALTER TABLE public.pending_exploits
     ADD CONSTRAINT pending_exploits_source_check
-    CHECK (source IN ('exploitdb', 'metasploit', 'webshell', 'command'));
+    CHECK (source IN ('exploitdb', 'metasploit', 'webshell', 'command', 'web_poc'));
 EXCEPTION WHEN undefined_table THEN
   NULL;  -- pending_exploits not created yet on this pass
 END $$;
