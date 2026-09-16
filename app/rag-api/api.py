@@ -21988,6 +21988,20 @@ def rag_knowledge_search(body: KnowledgeSearchBody, _: bool = Depends(auth)):
     return {"query": q, "count": len(results), "results": results}
 
 
+@app.post("/rag/knowledge/sync", tags=["RAG/Knowledge"])
+def rag_knowledge_sync(_: bool = Depends(auth)):
+    """Embed the knowledge/*.yaml catalogue into rag_documents (CLAUDE.md
+    "Knowledge is RAG-first"), and re-embed the flow catalogue too. Idempotent —
+    each source's rows are replaced, so re-run any time after editing a knowledge
+    file. Returns per-file document counts."""
+    from etl.load_knowledge_documents import sync_all
+    knowledge = sync_all()
+    flows = sync_flows_to_rag(_=True)   # reuse the flow embed; returns rag_loaded
+    return {"ok": True, "knowledge": knowledge,
+            "flows_rag_loaded": flows.get("rag_loaded"),
+            "total": knowledge.get("total", 0) + (flows.get("rag_loaded") or 0)}
+
+
 @app.get("/foothold/no-callback", tags=["Access"])
 def foothold_no_callback(limit: int = 50, include_recon: bool = False,
                          _: bool = Depends(auth)):

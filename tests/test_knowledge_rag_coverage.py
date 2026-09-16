@@ -27,38 +27,30 @@ RAG_LOADED = {
     # load_rules() merges enumeration_rules.yaml, and sync_flows_to_rag /
     # _load_flow_into_rag embed every merged flow into rag_documents.
     "enumeration_rules.yaml": "app/rag-api/api.py",
+    # etl/load_knowledge_documents.py renders each of these into rag_documents
+    # (source=knowledge_<stem>); POST /rag/knowledge/sync runs it.
+    "service_tools.yaml": "etl/load_knowledge_documents.py",
+    "credential_followups.yaml": "etl/load_knowledge_documents.py",
+    "default_credentials.yaml": "etl/load_knowledge_documents.py",
+    "service_access_methods.yaml": "etl/load_knowledge_documents.py",
+    "cloud_scan_rules.yaml": "etl/load_knowledge_documents.py",
+    "port_profiles.yaml": "etl/load_knowledge_documents.py",
+    "scan_parameters.yaml": "etl/load_knowledge_documents.py",
+    "tool_options.yaml": "etl/load_knowledge_documents.py",
+    "web_profiles.yaml": "etl/load_knowledge_documents.py",
 }
 
-# YAMLs read deterministically but not yet embedded into RAG. Each needs a reason,
-# and the list is meant to SHRINK — the CLAUDE.md direction is to load these too.
+# YAMLs deliberately NOT embedded into rag_documents. Each needs a reason. This
+# list is meant to stay small — a new knowledge file that defines scans/actions
+# belongs in RAG_LOADED, not here.
 RAG_LOAD_DEBT = {
-    "service_tools.yaml":
-        "per-service tool/module/nuclei mapping, read by scan_recommender/tool_kb.py; "
-        "load into rag_documents so the planner can recall per-service tooling.",
-    "credential_followups.yaml":
-        "credential-reuse follow-up commands, read by etl/credential_followups.py; "
-        "embed so 'what to do with a valid credential' is retrievable.",
-    "default_credentials.yaml":
-        "default credential sets for brutus; embed so the planner can recall "
-        "which defaults to try per service.",
-    "service_access_methods.yaml":
-        "how to turn a service into access; embed so access methods are retrievable.",
-    "cloud_scan_rules.yaml":
-        "cloud-resource scan rules; embed so cloud follow-ups are retrievable.",
-    "port_profiles.yaml":
-        "port -> scan profile mapping; embed so profile choice can be recalled.",
-    "scan_parameters.yaml":
-        "per-scan tuning parameters; embed so parameter choices are retrievable.",
-    "tool_options.yaml":
-        "per-tool flag catalogue; embed so option guidance is retrievable.",
-    "web_profiles.yaml":
-        "web-scan profiles; embed so web profile choice can be recalled.",
     "wstg_map.yaml":
-        "WSTG finding->test map; the WSTG guidance is served from exploit_chunks "
-        "today (get_wstg_guidance), a separate corpus — fold into rag_documents "
-        "or leave as the deliberate exception once decided.",
+        "WSTG finding->test guidance is already retrievable from exploit_chunks "
+        "via get_wstg_guidance (a separate embedded corpus), so re-embedding it "
+        "into rag_documents would duplicate the same knowledge under two sources.",
     "wstg_coverage_map.yaml":
-        "WSTG coverage matrix; same exploit_chunks exception as wstg_map.yaml.",
+        "WSTG coverage matrix backing the same exploit_chunks-served guidance as "
+        "wstg_map.yaml; retrievable there, not duplicated into rag_documents.",
     # Example/seed material, not live knowledge — kept out of RAG on purpose but
     # declared so a rename or a real file added here is not silently exempt.
     "seed_prompts.example.yaml":
