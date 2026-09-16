@@ -21755,6 +21755,239 @@ _RECON_MODULE_SQL = (
     " OR pe.exploit_title ILIKE 'msf_exploit post/%%')")
 
 
+# ── Flow / enumeration-rule authoring + testing ─────────────────────────────
+# Author a dispatch "flow" (an enumeration rule) and dry-run it against an
+# engagement's REAL facts before committing it. Custom rules live in the DB
+# overlay (the knowledge YAML is read-only in the container).
+FLOW_RAG_SOURCE = "dispatch_flow"
+
+
+def _flow_rag_text(rule: Dict[str, Any]) -> tuple[str, str]:
+    """Render a flow as a retrievable RAG document (title, body).
+
+    A flow is domain knowledge — "when you see X, do Y" — the same kind the
+    agent-capability loader embeds. Putting each authored flow in rag_documents
+    means the planner can retrieve the operator's own dispatch rules, not only
+    the shipped YAML, when it decides what to do next.
+    """
+    fid = str(rule.get("id") or "unnamed")
+    when = rule.get("when") or {}
+    propose = rule.get("propose") or {}
+    fact = when.get("fact") or "?"
+    where = when.get("where") or {}
+    where_txt = ""
+    if isinstance(where, dict) and where:
+        where_txt = " where " + ", ".join(f"{k}={v}" for k, v in where.items())
+    tool = propose.get("tool") or ""
+    command = propose.get("command") or ""
+    why = (rule.get("why") or "").strip()
+    title = f"Dispatch flow: {fid}"
+    body = (f"Dispatch flow `{fid}`. When a `{fact}` fact is observed{where_txt}, "
+            f"propose the {tool or 'tool'} action: `{command}`. "
+            f"This is an operator-authored enumeration/dispatch rule — retrieve it "
+            f"when a {fact} is found to know the follow-up step.")
+    if why:
+        body += f" Rationale: {why}"
+    return title, body
+
+
+def _load_flow_into_rag(rule: Dict[str, Any], engagement_id: Optional[str] = None) -> bool:
+    """Embed one flow and upsert it into rag_documents (idempotent per flow id).
+
+    Best-effort: a failed embed must not fail the flow save, so the caller logs
+    and continues. Returns True on success."""
+    try:
+        title, body = _flow_rag_text(rule)
+        vec = _embed_text(f"{title}\n{body}")
+        vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+        meta = {"source": FLOW_RAG_SOURCE, "kind": "dispatch_flow",
+                "flow_id": str(rule.get("id") or ""),
+                "engagement_id": engagement_id}
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM rag_documents WHERE metadata->>'source' = %s "
+                "AND metadata->>'flow_id' = %s",
+                (FLOW_RAG_SOURCE, str(rule.get("id") or "")))
+            cur.execute(
+                "INSERT INTO rag_documents (title, text_chunk, metadata, embedding) "
+                "VALUES (%s, %s, %s, %s::vector)",
+                (title, body, Json(meta), vec_str))
+            conn.commit()
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.warning("flow->rag load failed for %s: %s", rule.get("id"), e)
+        return False
+
+
+def _remove_flow_from_rag(flow_id: str) -> None:
+    """Drop a flow's RAG document when the flow is deleted."""
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM rag_documents WHERE metadata->>'source' = %s "
+                "AND metadata->>'flow_id' = %s",
+                (FLOW_RAG_SOURCE, str(flow_id)))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("flow->rag delete failed for %s: %s", flow_id, e)
+
+
+class FlowRule(BaseModel):
+    id: str
+    when: Dict[str, Any]
+    propose: Dict[str, Any]
+    why: Optional[str] = None
+    enabled: bool = True
+    engagement_id: Optional[str] = None
+
+
+class FlowTestBody(BaseModel):
+    rule: Optional[Dict[str, Any]] = None          # a candidate rule, or None => live catalogue
+    target: str
+    engagement_id: Optional[str] = None
+
+
+@app.get("/rules", tags=["Flows"])
+def list_flow_rules(_: bool = Depends(auth)):
+    """Every enumeration rule (flow): the YAML catalogue plus the DB overlay."""
+    from etl.post_enumeration import load_rules, load_custom_rules
+    yaml_rules = [r for r in load_rules() if r not in load_custom_rules()]
+    return {"yaml_rules": yaml_rules, "custom_rules": load_custom_rules(),
+            "total": len(load_rules())}
+
+
+@app.post("/rules/test", tags=["Flows"])
+def test_flow_rule(body: FlowTestBody, _: bool = Depends(auth)):
+    """DRY-RUN a flow against a host's real facts — what fires and what it would
+    propose. Never queues or dispatches."""
+    from etl.post_enumeration import test_rules
+    rules = [body.rule] if body.rule else None
+    return test_rules(rules=rules, target=body.target, engagement_id=body.engagement_id)
+
+
+@app.post("/rules", tags=["Flows"])
+def add_flow_rule(rule: FlowRule,
+                  x_operator: str = Header("operator", alias="X-Operator"),
+                  _: bool = Depends(auth)):
+    """Add or update a custom flow (enumeration rule) in the DB overlay."""
+    from etl.post_enumeration import _CUSTOM_RULES_DDL
+    if not (rule.when.get("fact") and rule.propose.get("command")):
+        raise HTTPException(400, "rule needs when.fact and propose.command")
+    body = {"id": rule.id, "when": rule.when, "propose": rule.propose, "why": rule.why}
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(_CUSTOM_RULES_DDL)
+        cur.execute(
+            """INSERT INTO custom_enumeration_rules (id, rule, enabled, engagement_id, created_by)
+               VALUES (%s, %s, %s, %s::uuid, %s)
+               ON CONFLICT (id) DO UPDATE SET rule = EXCLUDED.rule,
+                   enabled = EXCLUDED.enabled, engagement_id = EXCLUDED.engagement_id,
+                   updated_at = now()""",
+            (rule.id, json.dumps(body), rule.enabled, rule.engagement_id, x_operator))
+        conn.commit()
+    # Also load the flow into the RAG corpus so the planner can retrieve it —
+    # an authored dispatch rule is knowledge the LLMs should see, like the
+    # agent-capability documents. Only when enabled; best-effort.
+    rag_loaded = _load_flow_into_rag(body, rule.engagement_id) if rule.enabled else False
+    return {"ok": True, "id": rule.id, "rag_loaded": rag_loaded}
+
+
+@app.delete("/rules/{rule_id}", tags=["Flows"])
+def delete_flow_rule(rule_id: str, _: bool = Depends(auth)):
+    """Remove a custom flow from the DB overlay (YAML rules are not affected)."""
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM custom_enumeration_rules WHERE id = %s", (rule_id,))
+        n = cur.rowcount
+        conn.commit()
+    if not n:
+        raise HTTPException(404, f"custom rule {rule_id} not found")
+    _remove_flow_from_rag(rule_id)
+    return {"ok": True, "deleted": rule_id}
+
+
+@app.post("/rules/sync-rag", tags=["Flows"])
+def sync_flows_to_rag(_: bool = Depends(auth)):
+    """Embed every flow (YAML catalogue + DB overlay) into rag_documents so the
+    planner can retrieve them. Idempotent — re-run any time. Replaces the whole
+    dispatch_flow source set so removed rules do not linger."""
+    from etl.post_enumeration import load_rules
+    rules = load_rules()
+    # Clear the source set first so a rule dropped from the catalogue is not
+    # left behind, then re-load each (per-flow upsert handles the rest).
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM rag_documents WHERE metadata->>'source' = %s",
+                        (FLOW_RAG_SOURCE,))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("flow rag clear failed: %s", e)
+    loaded = 0
+    for r in rules:
+        if isinstance(r, dict) and (r.get("id") and (r.get("propose") or {}).get("command")):
+            if _load_flow_into_rag(r, r.get("engagement_id")):
+                loaded += 1
+    return {"ok": True, "flows": len(rules), "rag_loaded": loaded}
+
+
+class KnowledgeSearchBody(BaseModel):
+    query: str
+    top_k: int = 6
+    sources: Optional[List[str]] = None    # optional metadata.source filter
+
+
+@app.post("/rag/knowledge/search", tags=["RAG/Knowledge"])
+def rag_knowledge_search(body: KnowledgeSearchBody, _: bool = Depends(auth)):
+    """Source-agnostic semantic search over the rag_documents knowledge corpus.
+
+    This is the retrieval the planner uses to RECALL what to do — agent
+    workflows/capabilities, operator-authored dispatch flows, cracked-credential
+    notes and the findings backfill all live here. It is DISTINCT from
+    /rag/query and /rag/search/enhanced, which search exploit_chunks (ExploitDB /
+    Metasploit) — nothing read the rag_documents corpus before this endpoint.
+
+    Why probes are raised: the ivfflat index is built with lists=100, and at the
+    default probes=1 an approximate search visits a single list and misses the
+    small-minority docs (only ~70 capability/flow rows against thousands of
+    findings). `SET LOCAL ivfflat.probes = 100` makes the search cover every
+    list — exact for this size of corpus — and is transaction-scoped, so it
+    reverts on commit and never leaks onto the pooled connection.
+    """
+    q = (body.query or "").strip()
+    if not q:
+        raise HTTPException(400, "query is required")
+    top_k = max(1, min(int(body.top_k or 6), 25))
+    try:
+        vec = _embed_text(q)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"embedder unavailable: {e}")
+    vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+    where = "embedding IS NOT NULL"
+    params: list = [vec_str]
+    if body.sources:
+        where += " AND metadata->>'source' = ANY(%s)"
+        params.append(list(body.sources))
+    params.append(vec_str)
+    params.append(top_k)
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SET LOCAL ivfflat.probes = 100")
+        cur.execute(
+            f"""SELECT title,
+                       text_chunk,
+                       metadata->>'source'  AS source,
+                       metadata->>'flow_id' AS flow_id,
+                       1 - (embedding <=> %s::vector) AS similarity
+                  FROM rag_documents
+                 WHERE {where}
+                 ORDER BY embedding <=> %s::vector
+                 LIMIT %s""",
+            params)
+        rows = cur.fetchall()
+    results = [{"title": r["title"], "text": r["text_chunk"],
+                "source": r["source"], "flow_id": r["flow_id"],
+                "similarity": round(float(r["similarity"]), 4)}
+               for r in rows]
+    return {"query": q, "count": len(results), "results": results}
+
+
 @app.get("/foothold/no-callback", tags=["Access"])
 def foothold_no_callback(limit: int = 50, include_recon: bool = False,
                          _: bool = Depends(auth)):

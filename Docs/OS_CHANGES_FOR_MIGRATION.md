@@ -295,3 +295,18 @@ Platform notes to check when migrating:
   noticeably slower to start than on native Linux; narrow the range if only one
   or two nodes are ever used.
 - On Windows, a host firewall prompt may appear the first time the range binds.
+
+## 2026-09-15 — exploit-runner /knowledge mount
+- **Files:** docker-compose.yml (exploit-runner volumes)
+- **Platforms:** linux (check docker-compose.mac.yml / azure.yml if they fully
+  override exploit-runner volumes — currently they do not define it, so no change)
+- **Change:** added `- ./knowledge:/knowledge:ro` so post-exploit output analysis
+  (etl.post_enumeration.analyse) can load /knowledge/enumeration_rules.yaml.
+- **Notes:** without it, analyse() runs but finds no rules and queues nothing.
+
+## 2026-09-15 — exploit-runner cracking deps + wordlists mount
+- **Files:** docker-compose.yml (exploit-runner volumes), exploit_runner/Dockerfile
+- **Platforms:** linux (mac/azure compose do not override exploit-runner volumes)
+- **Change:** mounted `${WORDLISTS_DIR:-./wordlists}:/wordlists:ro`; Dockerfile
+  installs hashcat + pocl-opencl-icd (CPU OpenCL, so hashcat runs without a GPU).
+- **Notes:** remote-node cracking uses the node's own hashcat/GPU + REMOTE_CRACK_WORDLIST.
