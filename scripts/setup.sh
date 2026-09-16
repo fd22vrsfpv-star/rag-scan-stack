@@ -1541,6 +1541,7 @@ DIRS=(
     "brutus_reports"
     "osint_reports"
     "pd_reports"
+    "modified_exploits"
 )
 
 CREATED=0
@@ -1550,6 +1551,10 @@ for dir in "${DIRS[@]}"; do
         CREATED=$((CREATED + 1))
     fi
 done
+# modified_exploits is bind-mounted into exploit-runner, whose app runs as a
+# non-root user (uid 1000). It must be writable by that user so downloaded EDB
+# scripts PERSIST there across restarts instead of falling to ephemeral /tmp.
+chmod 777 "$PROJECT_ROOT/modified_exploits" 2>/dev/null || true
 log_ok "Directories verified ($CREATED created, $((${#DIRS[@]} - CREATED)) already existed)"
 
 # Credential-testing wordlists for brutus-runner.
