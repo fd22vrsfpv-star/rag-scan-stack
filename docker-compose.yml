@@ -1505,6 +1505,9 @@ services:
       EXPLOIT_MAX_AUTOCORRECT: ${EXPLOIT_MAX_AUTOCORRECT:-2}
       POC_MAX_ATTEMPTS: ${POC_MAX_ATTEMPTS:-5}
       EXPLOITDB_MAX_ATTEMPTS: ${EXPLOITDB_MAX_ATTEMPTS:-3}
+      # llm_query serves plaintext HTTP on 8002 — an https default makes the LLM
+      # customize/diagnose calls fail with SSL WRONG_VERSION_NUMBER.
+      LLM_URL: ${LLM_URL:-http://llm_query:8002/ollama/chat}
     depends_on:
       wait-for-db:
         condition: service_completed_successfully
