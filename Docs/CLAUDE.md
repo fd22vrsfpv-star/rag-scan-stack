@@ -78,6 +78,47 @@ Per-mode required set: **local** → only `mode`. **remote** (tunnel) → `remot
 `remote_db_password` (no SSH key; server needs 5432 open + SSL). The database name is
 fixed to `scans` (node_manager `remote_db_name` default) and is not set here.
 
+### Knowledge is RAG-first (retrieve to decide; gate deterministically to act)
+The knowledge that says **what to scan and what to do next** — the YAML under
+`knowledge/` (enumeration/dispatch rules, service tooling, credential and
+service-access methods, port/scan/tool profiles, WSTG maps) plus authored
+playbooks — is **data to be retrieved, not only branches in code**. Prefer
+loading it into the RAG corpus (`rag_documents`) and having the planner recall it
+(`search_knowledge_base` / `POST /rag/knowledge/search`) over hard-coding the same
+decision as a deterministic lookup. New knowledge should take effect by being
+**loaded and embedded**, not by editing branching logic — that is what lets an
+operator add a flow or a method and have the agents use it without a code change.
+
+- **Every `knowledge/*.yaml` that defines scans or actions MUST have an idempotent
+  loader that embeds it into `rag_documents`**, run on change (the pattern:
+  `autogen_agents/load_agent_capabilities.py`, and the flow sync in
+  `app/rag-api/api.py::sync_flows_to_rag`). Ship the loader in the **same change**
+  as a new knowledge file, the way an endpoint ships its test. A file that is read
+  deterministically but never embedded is retrievable by nobody.
+- **Retrieve, then gate — never retrieve to authorize.** RAG decides *what is
+  worth doing*; the **deterministic** scope gate and `MAX_CONCURRENT_SCANS` decide
+  *whether it may run*, and they stay **fail-closed** (see Authorization gates and
+  Scan volume). A retrieved recommendation is still scope-gated and bounded before
+  any traffic. RAG proposes; the gate disposes. Authorization and volume are
+  **never** a similarity score.
+- **The deterministic rules engine stays as the execution backstop.**
+  `etl/post_enumeration.load_rules()` (YAML + the DB overlay) still fires proposals
+  through the gate — RAG-first changes *what informs the decision*, it does not
+  remove the gated dispatch path that actually queues work.
+- **A retriever that misses minority docs is not retrieving.** `rag_documents` is
+  mostly findings; the knowledge rows are a small minority, and an approximate
+  ivfflat scan at the default `probes=1` returns none of them. Any reader raises
+  `ivfflat.probes` (transaction-scoped) or exact-scans — see
+  `rag_knowledge_search`.
+- *Enforced by:* `tests/test_knowledge_rag_coverage.py` (every `knowledge/*.yaml`
+  is embedded by a loader or carries a `RAG_LOAD_DEBT` reason; the list ratchets —
+  shrink it, and a new undeclared YAML fails by name).
+- *Why:* the flows and agent capabilities were embedded into `rag_documents`, but
+  no live code read that table — the agents' retrieval hit `exploit_chunks` — so
+  "load it into RAG" put knowledge where nothing queried it, and at `probes=1` a
+  global search returned only web findings. The read path and this rule exist so
+  new knowledge is actually recalled.
+
 ### Dedup + Delta
 Implement:
 - Finding fingerprinting (stable hash) to deduplicate across tools/runs
