@@ -101,6 +101,7 @@ _ROSTER = [
     "unix/misc/distcc_exec",
     "multi/kubernetes/exec",
     "linux/local/some_root_shell_thing",
+    "windows/browser/real_arcade_installerdlg",   # the wrong live correction
 ]
 
 
@@ -111,17 +112,23 @@ class _RosterClient:
 
 def test_closest_maps_near_miss():
     got = _run(er._closest_module_by_tokens(_RosterClient(),
-              "php_cgi_argument_injection", "exploit/php_cgi_argument_injection"))
+              "exploit/php_cgi_argument_injection"))
     assert got == "exploit/multi/http/php_cgi_arg_injection"
 
 
+def test_closest_maps_title_not_fuzzy():
+    # The live regression: a human TITLE (not a path) must map to the module it
+    # names, never to an unrelated high-rank module. 'Samba usermap_script exploit'
+    # -> usermap_script, NOT windows/browser/real_arcade_installerdlg.
+    got = _run(er._closest_module_by_tokens(_RosterClient(), "Samba usermap_script exploit"))
+    assert got == "exploit/multi/samba/usermap_script", got
+
+
 def test_closest_rejects_absent_modules():
-    # First token matches nothing loaded -> no confident wrong guess.
+    # Identity token loaded by nobody -> no confident wrong guess.
     assert _run(er._closest_module_by_tokens(_RosterClient(),
-               "drb_remote_codeexec", "exploit/drb_remote_codeexec")) is None
-    # 'exec' must NOT match inside 'codeexec' (the earlier false positive), and
-    # a synthetic id must not latch onto '..._root_shell_...' via 2 shared tokens
-    # because its first token ('metasploitable') is loaded by nobody.
+               "exploit/drb_remote_codeexec")) is None
+    # A synthetic id must NOT latch onto '..._root_shell_...' via {root,shell}:
+    # its distinctive first token ('metasploitable') is loaded by nobody.
     assert _run(er._closest_module_by_tokens(_RosterClient(),
-               "metasploitable_root_shell_1524",
                "exploit/metasploitable_root_shell_1524")) is None
