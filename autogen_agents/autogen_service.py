@@ -1435,6 +1435,22 @@ async def startup_event():
     print(f"✓ Reconnect watcher task started (default {_rc_default}; operator toggle governs)",
           file=sys.stderr)
 
+    # Load the agent's ACTIONS (tools + workflows) into the RAG corpus so the LLMs
+    # can RETRIEVE them — knowing a capability exists is what makes it get used.
+    # Idempotent (replaces source='agent_capability'); best-effort, off-thread.
+    if os.environ.get("LOAD_AGENT_CAPABILITIES", "true").lower() == "true":
+        import threading
+
+        def _load_caps():
+            try:
+                from load_agent_capabilities import main as _lc
+                _lc()
+                print("✓ Agent capabilities loaded into RAG", file=sys.stderr)
+            except Exception as e:  # noqa: BLE001
+                print(f"⚠ agent capability RAG load failed: {e}", file=sys.stderr)
+
+        threading.Thread(target=_load_caps, daemon=True, name="load-capabilities").start()
+
     # Register webhook with rag-api for scan completion events
     try:
         rag_api_url = os.environ.get("RAG_API_URL", "https://rag-api:8000")

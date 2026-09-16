@@ -74,24 +74,86 @@ def _connect():
         or "postgresql://app:app@rag-postgres:5432/scans", connect_timeout=5)
 
 
-def load_rules() -> List[Dict[str, Any]]:
-    """The rule catalogue, or empty if unreadable.
+def load_rules(engagement_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """The rule catalogue (YAML) plus the operator-authored DB overlay, or empty
+    if the YAML is unreadable.
 
     Empty is the safe direction and it is logged: no rules means nothing is
     proposed, never that everything is.
     """
+    yaml_rules: List[Dict[str, Any]] = []
     for candidate in (RULES_YAML, _REPO_RULES):
         if not candidate or not os.path.exists(candidate):
             continue
         try:
             import yaml
             with open(candidate, encoding="utf-8") as fh:
-                return (yaml.safe_load(fh) or {}).get("rules") or []
+                yaml_rules = (yaml.safe_load(fh) or {}).get("rules") or []
+            break
         except Exception as e:  # noqa: BLE001
             log.warning("enumeration rules %s unreadable: %s", candidate, e)
-            return []
-    log.warning("no enumeration rules found (looked in %s, %s)", RULES_YAML, _REPO_RULES)
-    return []
+            yaml_rules = []
+            break
+    else:
+        log.warning("no enumeration rules found (looked in %s, %s)", RULES_YAML, _REPO_RULES)
+    return yaml_rules + load_custom_rules(engagement_id)
+
+
+def test_rules(*, rules: Optional[List[Dict[str, Any]]] = None, target: str = "",
+               engagement_id: Optional[str] = None, limit: int = 60) -> Dict[str, Any]:
+    """DRY-RUN a rule set against a host's REAL facts: what fires, and what would
+    it propose? Never queues and never dispatches — for authoring and testing a
+    flow against engagement data before committing it.
+
+    rules: the rules to test (a candidate list). None => the live catalogue
+    (YAML + DB overlay). Scope is checked and reported, not enforced."""
+    if rules is None:
+        rules = load_rules(engagement_id)
+    out: Dict[str, Any] = {"target": target, "engagement_id": engagement_id,
+                           "rules_tested": len(rules), "facts": 0, "matched": 0,
+                           "proposals": [], "refusals": [], "scope": "ok"}
+    try:
+        from etl.scope_gate import check_dispatch, load_dispatch_scope
+    except ImportError:  # pragma: no cover
+        from scope_gate import check_dispatch, load_dispatch_scope
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            facts = facts_from_web_findings(cur, target=target, limit=200,
+                                            engagement_id=engagement_id)
+            facts += facts_from_exploits(cur, target=target)
+            facts += facts_from_open_ports(cur, target=target, limit=limit)
+            facts += facts_from_login_services(cur, target=target, limit=limit)
+            out["facts"] = len(facts)
+            scope_rows, scope_src = load_dispatch_scope(cur, engagement_id)
+            if scope_src == "unavailable":
+                out["scope"] = "unavailable"
+            seen = set()
+            for fact in facts:
+                for rule in rules:
+                    if not _matches(rule, fact):
+                        continue
+                    proposal = rule.get("propose") or {}
+                    command = render(proposal.get("command") or "", fact, target=target)
+                    ftgt = fact.get("target") or target or ""
+                    key = (rule.get("id"), command, ftgt)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out["matched"] += 1
+                    refusal = (check_dispatch(str(ftgt), scope_rows, command=command)
+                               if out["scope"] != "unavailable" else "scope unavailable")
+                    entry = {"rule": rule.get("id") or "unnamed",
+                             "tool": proposal.get("tool"), "target": ftgt,
+                             "command": command,
+                             "matched_fact": {k: fact.get(k) for k in ("fact", "service", "port")},
+                             "would_dispatch": not refusal}
+                    if refusal:
+                        entry["refused"] = str(refusal)
+                        out["refusals"].append(entry)
+                    out["proposals"].append(entry)
+    except Exception as e:  # noqa: BLE001
+        out["error"] = str(e)[:200]
+    return out
 
 
 # ── Facts ──────────────────────────────────────────────────────────────────
@@ -145,6 +207,41 @@ def facts_from(parsed: Optional[Dict[str, Any]], *, output: str = "",
                 facts.append({"fact": "host", "target": ip, "source": "known_hosts",
                               "seen_on": target, "line": line[:200]})
     return facts
+
+
+_CUSTOM_RULES_DDL = """
+CREATE TABLE IF NOT EXISTS public.custom_enumeration_rules (
+    id            text PRIMARY KEY,
+    rule          jsonb NOT NULL,
+    enabled       boolean NOT NULL DEFAULT true,
+    engagement_id uuid,
+    created_by    text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+)
+"""
+
+
+def load_custom_rules(engagement_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Operator-authored rules from the DB — the writable overlay on the
+    read-only YAML. Global rules (engagement_id NULL) always apply; an
+    engagement's own rules apply for that engagement."""
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute(_CUSTOM_RULES_DDL)
+            conn.commit()
+            if engagement_id:
+                cur.execute(
+                    "SELECT rule FROM public.custom_enumeration_rules "
+                    " WHERE enabled AND (engagement_id IS NULL OR engagement_id = %s::uuid)",
+                    (engagement_id,))
+            else:
+                cur.execute("SELECT rule FROM public.custom_enumeration_rules "
+                            " WHERE enabled AND engagement_id IS NULL")
+            return [r[0] for r in cur.fetchall() if isinstance(r[0], dict)]
+    except Exception as e:  # noqa: BLE001
+        log.debug("custom rules unavailable: %s", e)
+        return []
 
 
 def _matches(rule: Dict[str, Any], fact: Dict[str, Any]) -> bool:
@@ -503,6 +600,45 @@ def facts_from_open_ports(cur, *, target: str = "", limit: int = 60) -> List[Dic
     return facts
 
 
+# Services that take a login and are worth a default-credential check.
+_LOGIN_SERVICES = {
+    "ssh": 22, "ftp": 21, "telnet": 23, "mysql": 3306, "mariadb": 3306,
+    "postgresql": 5432, "postgres": 5432, "mssql": 1433, "ms-sql-s": 1433,
+    "vnc": 5900, "rdp": 3389, "ms-wbt-server": 3389, "smb": 445,
+    "microsoft-ds": 445, "netbios-ssn": 139, "redis": 6379, "mongodb": 27017,
+    "mongod": 27017, "rlogin": 513, "rexec": 512, "vnc-http": 5800,
+    "imap": 143, "pop3": 110, "smtp": 25, "ldap": 389, "snmp": 161,
+}
+
+
+def facts_from_login_services(cur, *, target: str = "", limit: int = 60) -> List[Dict[str, Any]]:
+    """Open ports running a service that takes a login — each a candidate for a
+    default-credential check. Emitted as `login_service` facts so a rule can
+    propose the guess. The gap this closes: recon identifies ssh/ftp/db and the
+    platform never tries the defaults, so no valid password is ever found."""
+    facts: List[Dict[str, Any]] = []
+    where = ["COALESCE(p.is_open, true)", "LOWER(COALESCE(p.proto,'tcp')) = 'tcp'"]
+    params: List[Any] = []
+    if target:
+        where.append("host(a.ip) = %s")
+        params.append(target)
+    params.append(limit)
+    try:
+        cur.execute(
+            f"""SELECT host(a.ip), p.port, LOWER(COALESCE(p.service,''))
+                  FROM ports p JOIN assets a ON a.id = p.asset_id
+                 WHERE {' AND '.join(where)}
+                 ORDER BY p.port LIMIT %s""", params)
+        for host, port, service in cur.fetchall():
+            svc = (service or "").strip()
+            if svc in _LOGIN_SERVICES:
+                facts.append({"fact": "login_service", "target": host,
+                              "port": port, "service": svc, "login_service": True})
+    except Exception as e:  # noqa: BLE001
+        log.debug("login-service facts unavailable: %s", e)
+    return facts
+
+
 def facts_from_web_findings(cur, *, target: str = "", limit: int = 200,
                             engagement_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Evidence that never came from a command's stdout.
@@ -569,7 +705,7 @@ def analyse(execution: Dict[str, Any], *, queue: bool = True) -> Dict[str, Any]:
     facts = facts_from(parsed, output=execution.get("output") or "",
                        target=target, service=service)
     out["facts"] = len(facts)
-    rules = load_rules()
+    rules = load_rules(execution.get("engagement_id"))
     if not facts or not rules:
         return out
 
@@ -694,7 +830,7 @@ def analyse_findings(*, target: str = "", engagement_id: Optional[str] = None,
     out: Dict[str, Any] = {"facts": 0, "proposals": [], "queued": 0,
                            "refused": 0, "refusals": [], "suppressed": [],
                            "available": False}
-    rules = load_rules()
+    rules = load_rules(engagement_id)
     if not rules:
         return out
     try:
@@ -709,6 +845,10 @@ def analyse_findings(*, target: str = "", engagement_id: Optional[str] = None,
                 # opened it — 6200 on this host reads as `lm-x` and is a root
                 # shell.
                 facts += facts_from_open_ports(cur, target=target)
+                # An open LOGIN service (ssh/ftp/db/vnc/…) is worth a default-
+                # credential check. Without this the agent found ssh on a host and
+                # never guessed msfadmin:msfadmin.
+                facts += facts_from_login_services(cur, target=target)
                 out["facts"] = len(facts)
                 if facts:
                     _propose_from_facts(cur, facts, context, rules, out)
