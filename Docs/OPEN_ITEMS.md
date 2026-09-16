@@ -393,3 +393,19 @@ not by id.
 (or a real `module_path` column is added and populated), so a BFF-approved MSF
 exploit dispatched by id actually runs.
 **Enforced by:** not enforced
+
+### Synthetic module ids queued as source=metasploit
+**Found:** 2026-09-16
+**Evidence:** exploit-runner fired `exploit/metasploitable_root_shell_1524` and
+`exploit/drb_remote_codeexec` as `source='metasploit'` pending_exploits; neither
+exists in this MSF (`module.exploits` roster has no such leaf), so both fail
+`Invalid Module` every scan. `metasploitable_root_shell_1524` is a synthetic id,
+not an MSF module path at all.
+**Where:** whatever queues these pending_exploits (recommender / langgraph exploit
+planning) — it emits made-up exploit_ids under source=metasploit instead of a real
+module path or a non-metasploit source.
+**Done when:** a pending_exploit with source=metasploit either carries a module
+path that resolves against `module.exploits`, or is queued under the correct
+source (e.g. a bind-shell access, not an MSF module). The auto-correct now flags
+`module_missing` on these (2026-09-16), but the root queuing should not create them.
+**Enforced by:** not enforced
