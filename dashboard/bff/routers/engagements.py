@@ -88,11 +88,15 @@ async def update_engagement(eid: str, body: EngagementUpdateBody):
 
 
 @router.delete("/api/engagements/{eid}")
-async def delete_engagement(eid: str):
+async def delete_engagement(eid: str, purge: bool = Query(False),
+                            dry_run: bool = Query(False)):
+    """Archive (default) or hard-purge an engagement. purge=true removes the
+    engagement's assets and all their data; dry_run=true previews the counts."""
     s = get_settings()
-    async with httpx.AsyncClient(timeout=15) as c:
+    async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.delete(
             f"{s.rag_api_url}/engagements/{eid}",
+            params={"purge": str(purge).lower(), "dry_run": str(dry_run).lower()},
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
