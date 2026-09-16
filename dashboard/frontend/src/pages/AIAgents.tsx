@@ -6,13 +6,14 @@ import {
   useAgentsStatus, useGapReport, useTriggerGapAnalysis, useAutoFillGaps,
   useDrainArtifacts, useAgentFlags, useActAgentFlag,
   useLearnedExtractors, useReviewExtractor, useExportExtractors,
+  useExtractorPreview,
   useAgentActivity,
   useToolSelectionRules, useReviewToolSelectionRule, useToolAttempts,
   useBackfillToolSelection,
   useToolSettings, useReviewToolSetting,
   useRunPostReview, useIngestPostReviewFacts,
   type AgentInfo, type GapReport, type GapTargetDetail, type ToolSelectionRule,
-  type ToolSetting,
+  type ToolSetting, type LearnedExtractor,
 } from '@/api/agents'
 import {
   useReconnectWatcherStatus, useExploitWatcherStatus, useFootholdNoCallback,
@@ -601,6 +602,10 @@ function LearnedExtractorsPanel() {
           {Object.values(exp.data.yaml).join('\n---\n')}
         </pre>
       )}
+      <p className="text-[11px] text-muted-foreground">
+        Expand a rule to preview what it would output against a real captured sample — you should
+        see the finding (or extracted values) before approving.
+      </p>
       <div className="overflow-x-auto">
         <table className="w-full min-w-[720px] text-xs">
           <thead className="text-muted-foreground">
@@ -612,33 +617,131 @@ function LearnedExtractorsPanel() {
           </thead>
           <tbody>
             {[...proposed, ...active.slice(0, 20)].map(r => (
-              <tr key={r.id} className="border-b border-border/40">
-                <td className="py-1 px-2 font-mono">{r.tool}</td>
-                <td className="px-2">{r.kind}</td>
-                <td className="px-2 font-mono truncate max-w-[320px]" title={JSON.stringify(r.rule)}>
-                  {r.rule?.id || Object.keys(r.rule || {}).join(', ')}
-                </td>
-                <td className="px-2">
-                  <span className={cn('px-1.5 py-0.5 rounded text-[10px]',
-                    r.status === 'active' ? 'bg-green-500/10 text-green-400' : 'bg-amber-500/10 text-amber-400')}>{r.status}</span>
-                  {r.reviewed_by && <span className="ml-1 text-[10px] text-muted-foreground">by {r.reviewed_by}</span>}
-                </td>
-                <td className="px-2 text-right">
-                  {r.status === 'proposed' && (
-                    <span className="inline-flex gap-1">
-                      <button onClick={() => review.mutate({ id: r.id, action: 'approve' })} disabled={review.isPending}
-                        className="px-2 py-0.5 text-[10px] rounded bg-green-600 hover:bg-green-500 text-white">Approve</button>
-                      <button onClick={() => review.mutate({ id: r.id, action: 'reject' })} disabled={review.isPending}
-                        className="px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">Reject</button>
-                    </span>
-                  )}
-                </td>
-              </tr>
+              <ExtractorRow key={r.id} r={r} review={review} />
             ))}
           </tbody>
         </table>
       </div>
     </div>
+  )
+}
+
+const EXTRACTOR_SEV: Record<string, string> = {
+  critical: 'bg-red-500/15 text-red-300', high: 'bg-red-500/10 text-red-400',
+  medium: 'bg-amber-500/10 text-amber-400', low: 'bg-blue-500/10 text-blue-400',
+  info: 'bg-gray-500/10 text-gray-400',
+}
+
+/** One learned-extractor row, expandable to a live preview of its output. */
+function ExtractorRow({ r, review }: {
+  r: LearnedExtractor
+  review: ReturnType<typeof useReviewExtractor>
+}) {
+  const [open, setOpen] = useState(false)
+  const { data: preview, isLoading } = useExtractorPreview(open ? r.id : undefined)
+  return (
+    <>
+      <tr className="border-b border-border/40">
+        <td className="py-1 px-2 font-mono">
+          <button onClick={() => setOpen(o => !o)} className="inline-flex items-center gap-1 hover:text-foreground">
+            {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+            {r.tool}
+          </button>
+        </td>
+        <td className="px-2">{r.kind}</td>
+        <td className="px-2 font-mono truncate max-w-[320px]" title={JSON.stringify(r.rule)}>
+          {r.rule?.id || Object.keys(r.rule || {}).join(', ')}
+        </td>
+        <td className="px-2">
+          <span className={cn('px-1.5 py-0.5 rounded text-[10px]',
+            r.status === 'active' ? 'bg-green-500/10 text-green-400' : 'bg-amber-500/10 text-amber-400')}>{r.status}</span>
+          {r.reviewed_by && <span className="ml-1 text-[10px] text-muted-foreground">by {r.reviewed_by}</span>}
+        </td>
+        <td className="px-2 text-right">
+          {r.status === 'proposed' && (
+            <span className="inline-flex gap-1">
+              <button onClick={() => review.mutate({ id: r.id, action: 'approve' })} disabled={review.isPending}
+                className="px-2 py-0.5 text-[10px] rounded bg-green-600 hover:bg-green-500 text-white">Approve</button>
+              <button onClick={() => review.mutate({ id: r.id, action: 'reject' })} disabled={review.isPending}
+                className="px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">Reject</button>
+            </span>
+          )}
+        </td>
+      </tr>
+      {open && (
+        <tr className="border-b border-border/40 bg-black/20">
+          <td colSpan={5} className="px-4 py-2 space-y-2">
+            {isLoading && <p className="text-[10px] text-muted-foreground">Running against a real sample…</p>}
+            {preview && (
+              <>
+                {/* What it outputs */}
+                {preview.finding ? (
+                  <div>
+                    <div className="text-[10px] text-muted-foreground uppercase tracking-wide">
+                      Output — the finding it would create
+                      {preview.would_fire
+                        ? <span className="ml-2 text-green-400">fires on the latest sample</span>
+                        : <span className="ml-2 text-amber-400">would not fire on the latest sample</span>}
+                    </div>
+                    <div className="mt-1 border border-border/60 rounded p-2 bg-background/40">
+                      <div className="flex items-center gap-2">
+                        <span className={cn('px-1.5 py-0.5 rounded text-[10px]', EXTRACTOR_SEV[preview.finding.severity] || EXTRACTOR_SEV.info)}>
+                          {preview.finding.severity}
+                        </span>
+                        <span className="font-medium">{preview.finding.title}</span>
+                      </div>
+                      {preview.finding.detail && <p className="text-[11px] text-muted-foreground mt-1">{preview.finding.detail}</p>}
+                      <div className="text-[10px] text-muted-foreground mt-1">fires when <code>{preview.finding.when}</code></div>
+                      {preview.fields_used && Object.keys(preview.fields_used).length > 0 && (
+                        <div className="text-[10px] mt-1">
+                          <span className="text-muted-foreground">extracted values used: </span>
+                          <code className="break-all">{JSON.stringify(preview.fields_used)}</code>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ) : preview.captured ? (
+                  <div>
+                    <div className="text-[10px] text-muted-foreground uppercase tracking-wide">
+                      Output — values this rule captures
+                    </div>
+                    <pre className="mt-1 text-[10px] font-mono whitespace-pre-wrap bg-background/40 border border-border/60 rounded p-2 max-h-40 overflow-auto">
+                      {JSON.stringify(preview.captured, null, 1)}
+                    </pre>
+                  </div>
+                ) : null}
+
+                {/* The sample it ran against */}
+                {preview.has_sample && preview.sample ? (
+                  <div>
+                    <div className="text-[10px] text-muted-foreground uppercase tracking-wide">
+                      Real sample: {r.tool}
+                      {preview.sample.target ? ` @ ${preview.sample.target}` : ''}
+                      {preview.sample.command ? ` · ${preview.sample.command}` : ''}
+                    </div>
+                    <pre className="mt-1 text-[10px] font-mono whitespace-pre-wrap text-muted-foreground bg-black/30 border border-border/60 rounded p-2 max-h-40 overflow-auto">
+                      {preview.sample.snippet}
+                    </pre>
+                  </div>
+                ) : (
+                  <p className="text-[10px] text-amber-400">
+                    No captured {r.tool} output on file yet — showing the rule template only. The
+                    preview fills in once this tool has run against a target.
+                  </p>
+                )}
+
+                <details className="text-[10px]">
+                  <summary className="cursor-pointer text-muted-foreground hover:text-foreground">Raw rule</summary>
+                  <pre className="mt-1 font-mono whitespace-pre-wrap bg-background/40 border border-border/60 rounded p-2 max-h-40 overflow-auto">
+                    {JSON.stringify(preview.rule, null, 1)}
+                  </pre>
+                </details>
+              </>
+            )}
+          </td>
+        </tr>
+      )}
+    </>
   )
 }
 
