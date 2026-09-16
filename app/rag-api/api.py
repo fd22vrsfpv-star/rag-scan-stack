@@ -8531,6 +8531,28 @@ class ExploitApprovalRuleRequest(BaseModel):
     apply_now: bool = True         # sweep the currently-pending rows immediately
 
 
+def _is_dos_pending(p) -> bool:
+    """A pending_exploit that is a denial-of-service exploit (never auto-execute).
+    exploit_type is often munged to 'other' at queue time, so the TITLE is the
+    reliable signal; check both, boundaried so 'dos' as a substring can't trip it.
+
+    Honors the operator allowlist (knowledge/dos_exploit_overrides.yaml)."""
+    try:
+        from etl.dos_overrides import is_dos_override
+        if is_dos_override(edb_id=p.get("edb_id") or p.get("exploit_id"),
+                           module=p.get("exploit_id"), title=p.get("exploit_title")):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    t = str(p.get("exploit_type") or "").lower().strip()
+    if t == "dos":
+        return True
+    text = " ".join(str(p.get(k) or "") for k in
+                    ("exploit_title", "exploit_id", "target_service")).lower()
+    return ("denial of service" in text or "denial-of-service" in text
+            or " dos " in f" {text} " or "(dos)" in text or "/dos/" in text)
+
+
 def _sweep_exploit_approval_rules(engagement_id=None, dry_run=False,
                                   actor="exploit_approval_rule"):
     """Apply every enabled rule to the pending queue.
@@ -8619,27 +8641,39 @@ def _sweep_exploit_approval_rules(engagement_id=None, dry_run=False,
                 report["refused_scope"].append({**label, "reason": refusal})
                 continue
 
+            # A denial-of-service exploit is never approved/executed (defense in
+            # depth — the recommender drops these and the runner refuses them too).
+            if _is_dos_pending(p):
+                report.setdefault("held_dos", []).append(
+                    {**label, "reason": "denial-of-service — never auto-executed"})
+                continue
+
             report["approved"].append(label)
-            approved_ids.append((str(p["id"]), str(rule["id"])))
+            approved_ids.append((str(p["id"]), str(rule["id"]), bool(rule["auto_execute"])))
             if rule["auto_execute"]:
                 report["to_execute"].append(str(p["id"]))
 
         if approved_ids and not dry_run:
-            for pid, rid in approved_ids:
+            for pid, rid, auto_x in approved_ids:
+                # Stamp auto_exec_rule on auto_execute matches so the firing step
+                # (and a later sweep) can pick up an approved-but-unfired straggler
+                # that a concurrency bound shed.
+                patch = {"approval_rule_id": rid}
+                if auto_x:
+                    patch["auto_exec_rule"] = True
                 cur.execute(
                     """UPDATE public.pending_exploits
                           SET status = 'approved',
                               reviewed_by = %s,
                               reviewed_at = now(),
-                              metadata = COALESCE(metadata, '{}'::jsonb)
-                                         || jsonb_build_object('approval_rule_id', %s)
+                              metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
                         WHERE id = %s::uuid AND status = 'pending'""",
-                    (f"rule:{rid}", rid, pid))
+                    (f"rule:{rid}", Json(patch), pid))
             cur.execute(
                 """UPDATE public.exploit_approval_rules
                       SET applied_count = applied_count + %s, last_applied_at = now()
                     WHERE id = ANY(%s::uuid[])""",
-                (1, list({rid for _, rid in approved_ids})))
+                (1, list({rid for _, rid, _ in approved_ids})))
             conn.commit()
 
     if report["approved"] and not dry_run:
@@ -8688,6 +8722,7 @@ def list_exploit_approval_rules(engagement_id: Optional[str] = Query(None),
 
 @app.post("/exploits/approval-rules", tags=["Exploits"])
 def upsert_exploit_approval_rule(body: ExploitApprovalRuleRequest,
+                                 background: BackgroundTasks,
                                  _: bool = Depends(auth)):
     """Create or update a standing approval rule, and (by default) apply it now.
 
@@ -8733,8 +8768,11 @@ def upsert_exploit_approval_rule(body: ExploitApprovalRuleRequest,
     except Exception as e:                                  # noqa: BLE001
         log.warning("exploit_approval_rule_saved webhook failed: %s", e)
 
-    report = (_sweep_exploit_approval_rules(body.engagement_id)
-              if (body.apply_now and body.enabled) else None)
+    report = None
+    if body.apply_now and body.enabled:
+        report = _sweep_exploit_approval_rules(body.engagement_id)
+        fired = _fire_auto_exec_approved(background)
+        report["fired"] = fired["fired"]
     return {"ok": True, "rule": rule, "applied": report}
 
 
@@ -8759,15 +8797,23 @@ def delete_exploit_approval_rule(rule_id: str, _: bool = Depends(auth)):
 
 
 @app.post("/exploits/approval-rules/apply", tags=["Exploits"])
-def apply_exploit_approval_rules(engagement_id: Optional[str] = Query(None),
+def apply_exploit_approval_rules(background: BackgroundTasks,
+                                 engagement_id: Optional[str] = Query(None),
                                  dry_run: bool = Query(False),
                                  _: bool = Depends(auth)):
-    """Sweep the pending queue against every enabled rule.
+    """Sweep the pending queue against every enabled rule, then FIRE the exploits
+    that an auto_execute rule approved (bounded by MAX_CONCURRENT_SCANS).
 
-    `dry_run=true` reports exactly what would happen and writes nothing — the
-    honest way to find out what a wildcard is about to approve.
+    This closes the loop so an `auto_execute` rule actually executes: approval and
+    dispatch used to be separate manual steps, so approved exploits sat unfired.
+    `dry_run=true` reports what would happen and writes/fires nothing.
     """
-    return _sweep_exploit_approval_rules(engagement_id, dry_run=dry_run)
+    report = _sweep_exploit_approval_rules(engagement_id, dry_run=dry_run)
+    if not dry_run:
+        fired = _fire_auto_exec_approved(background)
+        report["fired"] = fired["fired"]
+        report["execute_limit"] = _RELEASE_MAX_CONCURRENT
+    return report
 
 
 class ReleaseImpactfulBody(BaseModel):
@@ -8793,6 +8839,39 @@ def _fire_exploit_by_id(exploit_id: str) -> None:
                       verify=False, timeout=1800)
     except Exception as e:  # noqa: BLE001
         log.warning("release: execute-by-id %s failed: %s", exploit_id, e)
+
+
+def _fire_auto_exec_approved(background, limit=None) -> Dict[str, Any]:
+    """Dispatch approved exploits that an auto_execute rule matched but that have
+    not been fired yet (metadata.auto_exec_rule set, no release_fired).
+
+    This is what makes an `auto_execute` rule actually EXECUTE: the sweep only
+    approves; nothing fired the result, so exploits sat 'approved' forever. Bounded
+    by MAX_CONCURRENT_SCANS — the rest stay approved-unfired and the next sweep
+    picks them up (shed, don't flood). The runner re-checks scope at
+    /execute/by-id, so an approved row that later falls out of scope is refused."""
+    limit = limit or _RELEASE_MAX_CONCURRENT
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT id::text AS id FROM public.pending_exploits
+                WHERE status = 'approved'
+                  AND metadata->>'auto_exec_rule' = 'true'
+                  AND (metadata->>'release_fired') IS NULL
+                ORDER BY updated_at NULLS FIRST
+                LIMIT %s""", (limit,))
+        ids = [r["id"] for r in cur.fetchall()]
+        if not ids:
+            return {"fired": 0, "ids": []}
+        # Mark fired BEFORE dispatching so a concurrent sweep cannot double-fire.
+        cur.execute(
+            "UPDATE public.pending_exploits SET metadata = COALESCE(metadata, '{}'::jsonb) "
+            "|| jsonb_build_object('release_fired', now()::text) WHERE id = ANY(%s::uuid[])",
+            (ids,))
+        conn.commit()
+    for pid in ids:
+        background.add_task(_fire_exploit_by_id, pid)
+    log.info("auto-exec: fired %d approved exploit(s) via approval rules", len(ids))
+    return {"fired": len(ids), "ids": ids}
 
 
 @app.post("/exploits/release", tags=["Exploits"])
