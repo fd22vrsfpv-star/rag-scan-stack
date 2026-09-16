@@ -435,6 +435,19 @@ export function useAccessSummary() {
   })
 }
 
+/** Per-host count of exploits pending approval, so the asset list can highlight
+ *  hosts with impactful tests waiting to be released. Keyed by host IP. */
+export function usePendingExploitCounts(engagementId?: string | null) {
+  const qs = engagementId ? `?engagement_id=${engagementId}` : ''
+  return useQuery({
+    queryKey: ['assets-pending-exploits', engagementId ?? 'all'],
+    queryFn: () => apiFetch<{
+      counts: Record<string, number>; hosts: number; total: number
+    }>(`/assets/pending-exploit-counts${qs}`),
+    staleTime: 30_000,
+  })
+}
+
 /** Re-discover and re-probe. Touches the host, so it is an explicit button
  *  rather than something a page load does. */
 export function useRefreshAccess() {
