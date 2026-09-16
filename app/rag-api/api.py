@@ -8895,6 +8895,79 @@ def release_impactful_tests(body: ReleaseImpactfulBody,
     return report
 
 
+class SprayReleaseBody(BaseModel):
+    target: str
+    engagement_id: Optional[str] = None
+    ports: Optional[List[int]] = None    # default: the host's open login ports
+    dry_run: bool = False
+
+
+@app.post("/credentials/spray-release", tags=["Access"])
+def spray_release(body: SprayReleaseBody, background: BackgroundTasks,
+                  x_operator: str = Header("operator", alias="X-Operator"),
+                  _: bool = Depends(auth)):
+    """Run the SMALL default-credential spray for ONE target in one action.
+
+    Dispatches the platform's default-credential check (username-as-password plus
+    the documented default set per service, lockout-safe) against the host's open
+    login services — the acceptable first credential step per
+    knowledge/credential_spray_policy.yaml. It is NOT credential reuse and NOT a
+    wordlist brute force. Scope-gated and fail-closed here, and again at the
+    scanner; out of scope is refused, never run. dry_run reports the login ports
+    without dispatching."""
+    target = (body.target or "").strip()
+    if not target:
+        raise HTTPException(400, "target is required")
+    from etl.scope_gate import load_dispatch_scope, check_dispatch
+    eid = body.engagement_id
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        scope_rows, scope_src = load_dispatch_scope(cur, eid)
+        if scope_src == "unavailable":
+            raise HTTPException(409, "no dispatch scope configured — cannot spray "
+                                     "(fail closed; configure the engagement scope first)")
+        refusal = check_dispatch(target, scope_rows)
+        if refusal:
+            raise HTTPException(403, f"out of scope — {refusal}")
+        # The host's open login ports, unless the caller named specific ones.
+        ports = list(body.ports or [])
+        if not ports:
+            cur.execute(
+                """SELECT DISTINCT p.port
+                     FROM public.ports p JOIN public.assets a ON a.id = p.asset_id
+                    WHERE host(a.ip) = %s AND p.is_open = true AND p.port = ANY(%s)
+                    ORDER BY p.port""",
+                (target, _LOGIN_SPRAY_PORTS))
+            ports = [int(r["port"]) for r in cur.fetchall()]
+    if not ports:
+        return {"ok": True, "target": target, "dispatched": False,
+                "reason": "no open login services on this host to spray"}
+    if body.dry_run:
+        return {"ok": True, "target": target, "dry_run": True, "ports": ports,
+                "would_spray": len(ports)}
+
+    base = os.environ.get("NMAP_SCANNER_URL", "https://nmap_scanner:8012")
+
+    def _dispatch_spray():
+        try:
+            requests.post(f"{base}/jobs/credential-check",
+                          json={"targets": [target], "ports": ports, "method": "auto"},
+                          headers={"content-type": "application/json"},
+                          verify=False, timeout=60)
+        except Exception as e:  # noqa: BLE001
+            log.warning("spray-release dispatch failed for %s: %s", target, e)
+
+    background.add_task(_dispatch_spray)
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("credential_spray_released", "access", {
+            "target": target, "engagement_id": eid, "actor": x_operator,
+            "ports": ports})
+    except Exception:
+        log.warning("credential_spray_released webhook emit failed", exc_info=True)
+    return {"ok": True, "target": target, "dispatched": True, "ports": ports,
+            "sprayed": len(ports)}
+
+
 @app.put("/exploits/{exploit_id}/status", tags=["Exploits"])
 def update_exploit_status(
     exploit_id: str,
