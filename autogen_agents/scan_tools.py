@@ -4517,6 +4517,31 @@ nc -lvnp {lport}"""
     return json.dumps(result, indent=2)
 
 
+def _resolve_metasploit_or_none(exploit_id: str, exploit_title: str):
+    """(canonical_module_or_None, options, checked).
+
+    Ask exploit-runner /msf/resolve whether this exploit_id/title maps to a REAL,
+    loaded MSF module and, if so, its configurable options. `checked` is False when
+    the check could not run (exploit-runner unreachable) — the caller then queues
+    as-is (fail-open) rather than dropping a possibly-valid exploit."""
+    st = get_scan_tools()
+    base = os.environ.get("EXPLOIT_RUNNER_URL", "https://exploit-runner:8017")
+    try:
+        r = st.client.post(f"{base}/msf/resolve",
+                           json={"exploit_id": exploit_id or "",
+                                 "exploit_title": exploit_title or ""},
+                           headers=st.headers)
+        if r.status_code >= 400:
+            return None, {}, False
+        data = r.json()
+        if data.get("error"):            # runner said it could not check (MSF down)
+            return None, {}, False
+        return data.get("module"), (data.get("options") or {}), True
+    except Exception as e:  # noqa: BLE001
+        logger.debug("msf resolve check failed: %s", e)
+        return None, {}, False
+
+
 def queue_exploit_for_approval(
     exploit_id: str,
     source: str,
@@ -4562,6 +4587,34 @@ def queue_exploit_for_approval(
 
     try:
         session_uuid = uuid_lib.UUID(session_id) if session_id else None
+
+        # Gate: a source=metasploit exploit must resolve to a REAL, loaded MSF
+        # module. This stops doomed synthetic rows (e.g.
+        # 'metasploitable_root_shell_1524', a bind-shell banner, not a module) and
+        # modules not shipped in this MSF from being queued only to fail every scan.
+        # Near-misses are NORMALISED to the canonical path. Fail-open: if the check
+        # cannot run, queue as-is (the runner still flags an unrunnable module).
+        if (source or "").lower() == "metasploit":
+            resolved, msf_options, checked = _resolve_metasploit_or_none(exploit_id, exploit_title)
+            if checked and not resolved:
+                logger.info("queue refused: %r/%r does not resolve to a loaded MSF module",
+                            exploit_id, exploit_title)
+                return json.dumps({
+                    "ok": False,
+                    "skipped": True,
+                    "reason": (f"'{exploit_id}' is not a real Metasploit module in this "
+                               f"install — not queued. If this is a direct shell/service "
+                               f"(e.g. a bind shell), queue it under a non-metasploit "
+                               f"source or let the access layer record it."),
+                }, indent=2)
+            if resolved and resolved != exploit_id:
+                logger.info("queue normalised MSF module %r -> %r", exploit_id, resolved)
+                exploit_id = resolved
+            # Carry the module's configurable options so approval/execution knows
+            # what can be set (RHOSTS/RPORT/required creds) — validated up front.
+            if msf_options:
+                parameters = dict(parameters or {})
+                parameters.setdefault("msf_options", msf_options)
 
         pending_id = create_pending_exploit(
             source=source,
