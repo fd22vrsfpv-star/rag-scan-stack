@@ -8829,8 +8829,12 @@ def release_impactful_tests(body: ReleaseImpactfulBody,
         # Candidates: still-pending impactful exploits, PLUS ones an earlier
         # release approved but the concurrency cap shed (released, never fired) —
         # so re-running release fires the next batch instead of doing nothing.
+        # DISTINCT ON (module, port): the same module is queued many times per
+        # host by successive scans, so release ONE per (exploit_id, port) — never
+        # fire the same exploit several times. Prefer an approved row, then newest.
         cur.execute(
-            f"""SELECT pe.id::text AS id, pe.exploit_title, pe.exploit_id,
+            f"""SELECT DISTINCT ON (pe.exploit_id, COALESCE(pe.target_port, 0))
+                       pe.id::text AS id, pe.exploit_title, pe.exploit_id,
                        pe.target_port, pe.target_service, pe.status
                   FROM pending_exploits pe
                  WHERE host(pe.target_ip) = %s{where_recon}
@@ -8838,7 +8842,9 @@ def release_impactful_tests(body: ReleaseImpactfulBody,
                         OR (pe.status = 'approved'
                             AND pe.metadata->>'released' = 'true'
                             AND pe.metadata->>'release_fired' IS NULL))
-                 ORDER BY pe.target_port""",
+                 ORDER BY pe.exploit_id, COALESCE(pe.target_port, 0),
+                          CASE pe.status WHEN 'approved' THEN 0 ELSE 1 END,
+                          pe.created_at DESC""",
             (target,))
         rows = cur.fetchall()
         report["candidates"] = len(rows)
@@ -8966,6 +8972,64 @@ def spray_release(body: SprayReleaseBody, background: BackgroundTasks,
         log.warning("credential_spray_released webhook emit failed", exc_info=True)
     return {"ok": True, "target": target, "dispatched": True, "ports": ports,
             "sprayed": len(ports)}
+
+
+@app.post("/exploits/dedup", tags=["Exploits"])
+def dedup_pending_exploits(target: Optional[str] = Query(None),
+                           engagement_id: Optional[str] = Query(None),
+                           dry_run: bool = Query(False),
+                           _: bool = Depends(auth)):
+    """Collapse duplicate ACTIVE (pending/approved) exploits — the same module on
+    the same target and port queued many times by successive scans and by more
+    than one generator. Keeps ONE per (target_ip, exploit_id, port), preferring a
+    row that already has a result, then approved, then newest, and deletes only
+    the childless duplicates (a row with an exploit_result is never removed, so no
+    execution history is lost). dry_run reports the count without deleting."""
+    where = ["pe.status IN ('pending','approved')"]
+    params: list = []
+    if target:
+        where.append("host(pe.target_ip) = %s")
+        params.append(target)
+    if engagement_id:
+        where.append("pe.engagement_id = %s::uuid")
+        params.append(engagement_id)
+    clause = " AND ".join(where)
+    ranked = f"""
+        WITH ranked AS (
+          SELECT pe.id,
+            EXISTS(SELECT 1 FROM exploit_results er WHERE er.pending_exploit_id=pe.id) AS has_result,
+            row_number() OVER (
+              PARTITION BY pe.target_ip, pe.exploit_id, COALESCE(pe.target_port,0)
+              ORDER BY EXISTS(SELECT 1 FROM exploit_results er2 WHERE er2.pending_exploit_id=pe.id) DESC,
+                       CASE pe.status WHEN 'approved' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+                       pe.created_at DESC) AS rn
+          FROM pending_exploits pe WHERE {clause}
+        )"""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(ranked + " SELECT id::text FROM ranked WHERE rn > 1 AND NOT has_result",
+                    params)
+        ids = [r["id"] for r in cur.fetchall()]
+        if dry_run:
+            return {"ok": True, "dry_run": True, "would_remove": len(ids)}
+        removed = 0
+        if ids:
+            # A duplicate exploit's impactful security_test would be orphaned to a
+            # NULL pending_exploit_id (SET NULL FK), which its lane CHECK forbids —
+            # so drop those duplicate tests first. exploit_results CASCADE, and the
+            # ranked set excludes result-bearing rows, so no history is lost.
+            cur.execute("DELETE FROM public.security_tests WHERE pending_exploit_id = ANY(%s::uuid[])",
+                        (ids,))
+            cur.execute("DELETE FROM public.pending_exploits WHERE id = ANY(%s::uuid[])", (ids,))
+            removed = cur.rowcount
+        conn.commit()
+    if removed:
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("pending_exploits_deduped", "exploits",
+                         {"removed": removed, "target": target, "engagement_id": engagement_id})
+        except Exception:
+            pass
+    return {"ok": True, "removed": removed}
 
 
 @app.put("/exploits/{exploit_id}/status", tags=["Exploits"])
@@ -22238,7 +22302,8 @@ def assets_pending_exploit_counts(engagement_id: Optional[str] = Query(None),
                      "AND pe.metadata->>'release_fired' IS NULL))")
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            f"""SELECT host(pe.target_ip) AS ip, count(*) AS n
+            f"""SELECT host(pe.target_ip) AS ip,
+                       count(DISTINCT (pe.exploit_id, COALESCE(pe.target_port, 0))) AS n
                   FROM pending_exploits pe
                  WHERE {' AND '.join(where)} AND {status_clause}
                  GROUP BY host(pe.target_ip)""",
