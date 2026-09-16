@@ -239,7 +239,27 @@ def _render_web_profiles(data: Dict[str, Any]) -> List[Doc]:
 
 # filename stem -> renderer. The test_knowledge_rag_coverage RAG_LOADED map must
 # stay in step with this set.
+def _render_msf_learned_options(data: Dict[str, Any]) -> List[Doc]:
+    """Learned best MSF module options -> one retrievable doc per module."""
+    docs: List[Doc] = []
+    for module, spec in (data.get("modules") or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        opts = spec.get("options") or {}
+        svc = _s(spec.get("service"))
+        title = f"Learned Metasploit options: {module}"
+        text = (f"Best-known options for Metasploit module {module}"
+                + (f" (service {svc})" if svc else "") + ": "
+                + (_s(opts) or "module defaults")
+                + f". Learned from {spec.get('learned_from', 1)} successful run(s). "
+                + "Apply as msf_option_overrides when running this module; host, "
+                + "port and callback options are set per target, not learned.")
+        docs.append((title, text))
+    return docs
+
+
 RENDERERS = {
+    "msf_learned_options": _render_msf_learned_options,
     "service_tools": _render_service_tools,
     "credential_followups": _render_credential_followups,
     "default_credentials": _render_default_credentials,
