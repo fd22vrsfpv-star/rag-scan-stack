@@ -90,22 +90,22 @@ def test_live_root_shell_becomes_a_critical_finding(target_with_access):
     assert f[2] != "resolved"
 
 
-def test_dead_access_resolves_the_finding(target_with_access):
+def test_dead_access_removes_the_finding(target_with_access):
     ip = target_with_access["ip"]
     conn = _conn()
     cur = conn.cursor()
     access._sync_access_findings(cur, ip, None)      # create it
     conn.commit()
-    # Access goes dead; re-sync must resolve, not leave a phantom critical.
+    assert _finding(ip) is not None, "finding should exist while access is live"
+    # Access goes dead; re-sync must REMOVE the finding (it asserts live access),
+    # not leave a phantom critical and not write an invalid workflow_status.
     cur.execute("UPDATE public.obtained_access SET status = 'dead' WHERE target = %s", (ip,))
     conn.commit()
     access._sync_access_findings(cur, ip, None)
     conn.commit()
     cur.close(); conn.close()
 
-    f = _finding(ip)
-    assert f is not None
-    assert f[2] == "resolved", f"dead access finding should be resolved, got {f[2]}"
+    assert _finding(ip) is None, "dead access finding should be deleted"
 
 
 def test_severity_mapping():
