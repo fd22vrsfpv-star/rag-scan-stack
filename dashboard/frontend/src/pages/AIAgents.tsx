@@ -9,8 +9,10 @@ import {
   useAgentActivity,
   useToolSelectionRules, useReviewToolSelectionRule, useToolAttempts,
   useBackfillToolSelection,
+  useToolSettings, useReviewToolSetting,
   useRunPostReview, useIngestPostReviewFacts,
   type AgentInfo, type GapReport, type GapTargetDetail, type ToolSelectionRule,
+  type ToolSetting,
 } from '@/api/agents'
 import {
   useReconnectWatcherStatus, useExploitWatcherStatus, useFootholdNoCallback,
@@ -189,7 +191,12 @@ export default function AIAgents() {
       {tab === 'foothold' && <FootholdAgentPanel />}
       {tab === 'feedback' && <AgentFlagsPanel />}
       {tab === 'extractors' && <LearnedExtractorsPanel />}
-      {tab === 'tools' && <ToolSelectionPanel />}
+      {tab === 'tools' && (
+        <>
+          <ToolSelectionPanel />
+          <ToolOptionsSection />
+        </>
+      )}
     </div>
   )
 }
@@ -1174,6 +1181,149 @@ function ToolSelectionPanel() {
           </tbody>
         </table>
       </div>
+    </div>
+  )
+}
+
+/** Run vs proposed OPTIONS per tool.
+ *
+ *  Distinct from the rules above, which choose WHICH tool to run. This shows,
+ *  for the tools that take negotiation flags (ssh/scp/sftp/openssl…), the option
+ *  the platform proposes to RUN with against each target — derived as the
+ *  intersection of what the host advertised (host_offers) and what the running
+ *  client accepts (client_supports), so a legacy host is reachable without
+ *  downgrading every other connection. Read-only; approving grants no traffic. */
+function ToolOptionsSection() {
+  const { data } = useToolSettings()
+  const review = useReviewToolSetting()
+  const [open, setOpen] = useState<string | null>(null)
+  const settings = data?.settings ?? []
+  const catalogue = data?.catalogue ?? {}
+
+  // Group by tool so the operator reads one tool's options together.
+  const byTool = new Map<string, ToolSetting[]>()
+  for (const s of settings) {
+    const arr = byTool.get(s.tool) ?? []
+    arr.push(s)
+    byTool.set(s.tool, arr)
+  }
+
+  return (
+    <div className="bg-card border border-border rounded-lg p-3 space-y-2">
+      <h4 className="text-sm font-semibold flex items-center gap-2">
+        <Settings className="h-4 w-4" /> Tool options — run vs proposed
+      </h4>
+      <p className="text-[11px] text-muted-foreground">
+        For tools that negotiate (ssh, scp, sftp, openssl…), the option to <em>run</em> with against
+        each target, derived from what the host offers intersected with what the client supports.
+        Nothing is typed — an empty intersection is the honest “this client cannot talk to this host”.
+      </p>
+
+      {/* Catalogue: what options each tool CAN express (the run-option syntax). */}
+      {Object.keys(catalogue).length > 0 && (
+        <details className="text-[11px]">
+          <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
+            Run-option catalogue ({Object.keys(catalogue).length} tools)
+          </summary>
+          <div className="mt-1 grid grid-cols-1 sm:grid-cols-2 gap-1">
+            {Object.entries(catalogue).map(([tool, cats]) => (
+              <div key={tool} className="border border-border/50 rounded p-1.5">
+                <div className="font-mono font-semibold">{tool}</div>
+                {Object.entries(cats).map(([cat, tmpl]) => (
+                  <div key={cat} className="text-[10px] text-muted-foreground">
+                    {cat}: <code className="text-foreground">{tmpl}</code>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+
+      {settings.length === 0 ? (
+        <p className="text-[11px] text-muted-foreground">
+          No derived tool options yet. They appear once recon records what a target advertises
+          (ssh-audit / nmap algorithm enumeration) and tool settings are derived from it.
+        </p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[720px] text-xs">
+            <thead className="text-muted-foreground">
+              <tr className="border-b border-border">
+                <th className="text-left py-1 px-2">Tool</th>
+                <th className="text-left px-2">Category</th>
+                <th className="text-left px-2">Proposed option (run with)</th>
+                <th className="text-left px-2">Target</th>
+                <th className="text-left px-2">Status</th>
+                <th className="text-right px-2">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {[...byTool.entries()].map(([tool, rows]) =>
+                rows.map((s, i) => (
+                  <Fragment key={s.id}>
+                    <tr className="border-b border-border/40">
+                      <td className="py-1 px-2 font-mono">
+                        {i === 0 ? tool : <span className="text-muted-foreground/40">↳</span>}
+                      </td>
+                      <td className="px-2 text-muted-foreground">{s.category}</td>
+                      <td className="px-2">
+                        <button onClick={() => setOpen(open === s.id ? null : s.id)}
+                          className="inline-flex items-start gap-1 hover:text-foreground text-left">
+                          {open === s.id ? <ChevronDown className="w-3 h-3 mt-0.5" /> : <ChevronRight className="w-3 h-3 mt-0.5" />}
+                          <code className="text-green-400 break-all">{s.option_text || '(empty — cannot negotiate)'}</code>
+                        </button>
+                      </td>
+                      <td className="px-2 font-mono text-muted-foreground">
+                        {s.target}{s.port ? `:${s.port}` : ''}
+                      </td>
+                      <td className="px-2">
+                        <span className={cn('px-1.5 py-0.5 rounded text-[10px]',
+                          s.status === 'active' ? 'bg-green-500/10 text-green-400'
+                            : s.status === 'rejected' ? 'bg-red-500/10 text-red-400'
+                              : 'bg-amber-500/10 text-amber-400')}>{s.status}</span>
+                      </td>
+                      <td className="px-2 text-right whitespace-nowrap">
+                        <span className="inline-flex gap-1">
+                          {s.status !== 'active' && (
+                            <button onClick={() => review.mutate({ id: s.id, action: 'approve' })} disabled={review.isPending}
+                              className="px-2 py-0.5 text-[10px] rounded bg-green-600 hover:bg-green-500 text-white">Use it</button>
+                          )}
+                          {s.status !== 'rejected' && (
+                            <button onClick={() => review.mutate({ id: s.id, action: 'reject' })} disabled={review.isPending}
+                              className="px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">Reject</button>
+                          )}
+                          {s.status === 'rejected' && (
+                            <button onClick={() => review.mutate({ id: s.id, action: 'reset' })} disabled={review.isPending}
+                              className="px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent">Reset</button>
+                          )}
+                        </span>
+                      </td>
+                    </tr>
+                    {open === s.id && (
+                      <tr className="border-b border-border/40 bg-black/20">
+                        <td colSpan={6} className="px-4 py-2 space-y-1">
+                          <div className="text-[10px]">
+                            <span className="text-muted-foreground uppercase tracking-wide">Host offers (available to run): </span>
+                            <span className="font-mono break-all">{s.host_offers?.join(', ') || '—'}</span>
+                          </div>
+                          <div className="text-[10px]">
+                            <span className="text-muted-foreground uppercase tracking-wide">Client supports: </span>
+                            <span className="font-mono break-all">{s.client_supports?.length ? s.client_supports.join(', ') : '(not measured)'}</span>
+                          </div>
+                          <div className="text-[10px] text-muted-foreground">
+                            source {s.source} · derived {new Date(s.derived_at).toLocaleString()}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                )),
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   )
 }
