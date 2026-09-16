@@ -17709,16 +17709,164 @@ def update_engagement(eid: str, body: EngagementUpdate, _: bool = Depends(auth))
         raise HTTPException(404, "Engagement not found")
     return row
 
-@app.delete("/engagements/{eid}", tags=["Engagements"])
-def delete_engagement(eid: str, _: bool = Depends(auth)):
-    """Archive an engagement (sets status to 'archived')."""
+# Asset-child tables cleared BEFORE deleting the assets. `findings` FIRST: its
+# assets FK is NO ACTION, so it BLOCKS the asset delete until cleared (the other
+# asset-children CASCADE). The SET NULL children (recon_findings, port_observation,
+# scan_targets, rag_documents) would be left orphaned with a null asset_id, so
+# clear them too rather than leave dangling rows.
+_PURGE_ASSET_CHILD_TABLES = [
+    "findings", "recon_findings", "port_observation", "scan_targets", "rag_documents",
+]
+# Data rows attributed to the engagement but possibly not via a live asset
+# (asset_id NULL). Best-effort — a table may lack engagement_id on some installs,
+# so each runs inside its own SAVEPOINT.
+_PURGE_DATA_BY_ENGAGEMENT = [
+    "findings", "vulns", "web_findings", "recon_findings", "credential_findings",
+    "playwright_findings", "pending_exploits",
+]
+# Engagement CONFIG (the scope + schedule that DEFINE the engagement). Removed
+# only on a full delete; KEPT when purging data so the engagement can be re-run.
+_PURGE_CONFIG_BY_ENGAGEMENT = ["scope_targets", "scheduled_scans"]
+
+
+def _sp_delete(cur, sql: str, params) -> int:
+    """DELETE inside a SAVEPOINT so a missing table/column does not abort the
+    whole purge transaction. Returns rows deleted (0 on any failure)."""
+    cur.execute("SAVEPOINT purge_sp")
+    try:
+        cur.execute(sql, params)
+        n = cur.rowcount
+        cur.execute("RELEASE SAVEPOINT purge_sp")
+        return n
+    except Exception as e:  # noqa: BLE001
+        cur.execute("ROLLBACK TO SAVEPOINT purge_sp")
+        log.warning("purge step failed (%s): %s", sql.split()[2] if len(sql.split()) > 2 else sql, e)
+        return 0
+
+
+def _purge_engagement_data(cur, eid: str, keep_engagement: bool = False) -> Dict[str, int]:
+    """Delete an engagement's collected DATA — its assets and every row hanging
+    off them (ports, vulns, findings, web/recon/credential/playwright findings,
+    exploits, recommendations, …), plus engagement-attributed orphan findings.
+
+    An asset carries exactly one engagement_id, so this never touches another
+    engagement's inventory. `keep_engagement=True` KEEPS the engagement row and
+    its scope/schedule (so it can be re-run); False also removes the scope and the
+    engagement itself. Returns per-table deleted counts."""
+    counts: Dict[str, int] = {}
+    cur.execute("SELECT id FROM assets WHERE engagement_id = %s::uuid", (eid,))
+    # Cursor may be a RealDictCursor (dict rows) — read by column name, not index.
+    asset_ids = [(r["id"] if isinstance(r, dict) else r[0]) for r in cur.fetchall()]
+    if asset_ids:
+        for tbl in _PURGE_ASSET_CHILD_TABLES:
+            counts[tbl] = _sp_delete(cur, f"DELETE FROM {tbl} WHERE asset_id = ANY(%s)", (asset_ids,))
+        cur.execute("DELETE FROM assets WHERE engagement_id = %s::uuid", (eid,))
+        counts["assets"] = cur.rowcount
+    else:
+        counts["assets"] = 0
+    for tbl in _PURGE_DATA_BY_ENGAGEMENT:
+        n = _sp_delete(cur, f"DELETE FROM {tbl} WHERE engagement_id = %s::uuid", (eid,))
+        counts[tbl] = counts.get(tbl, 0) + n
+    if keep_engagement:
+        return counts
+    for tbl in _PURGE_CONFIG_BY_ENGAGEMENT:
+        counts[tbl] = _sp_delete(cur, f"DELETE FROM {tbl} WHERE engagement_id = %s::uuid", (eid,))
+    # campaign_events, evidence_store and credential_vault CASCADE on the delete.
+    cur.execute("DELETE FROM engagements WHERE id = %s::uuid", (eid,))
+    counts["engagements"] = cur.rowcount
+    return counts
+
+
+def _purge_dry_run(cur, eid: str) -> Dict[str, Any]:
+    """Counts of what a purge would remove, without deleting anything."""
+    cur.execute("SELECT COUNT(*) AS n FROM assets WHERE engagement_id = %s::uuid", (eid,))
+    asset_n = cur.fetchone()["n"]
+    sub = "asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)"
+    counts: Dict[str, int] = {}
+    for tbl, col in (("ports", sub), ("vulns", sub), ("findings", sub),
+                     ("web_findings", sub), ("credential_findings", sub),
+                     ("scope_targets", "engagement_id = %s::uuid")):
+        cur.execute("SAVEPOINT dr_sp")
+        try:
+            cur.execute(f"SELECT COUNT(*) AS n FROM {tbl} WHERE {col}", (eid,))
+            counts[tbl] = cur.fetchone()["n"]
+            cur.execute("RELEASE SAVEPOINT dr_sp")
+        except Exception:  # noqa: BLE001
+            cur.execute("ROLLBACK TO SAVEPOINT dr_sp")
+    return {"assets": asset_n, "would_delete": counts}
+
+
+@app.post("/engagements/{eid}/purge-data", tags=["Engagements"])
+def purge_engagement_data_endpoint(eid: str, dry_run: bool = Query(False),
+                                   x_operator: str = Header("operator", alias="X-Operator"),
+                                   _: bool = Depends(auth)):
+    """Delete the engagement's collected DATA but KEEP the engagement.
+
+    Removes its assets and everything hanging off them (ports, vulns, findings,
+    recon, credentials, exploits, recommendations), so the engagement is emptied
+    and can be re-run — its scope and schedule are preserved. Irreversible; pass
+    dry_run=true to preview the counts first."""
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("UPDATE engagements SET status = 'archived' WHERE id = %s RETURNING id", (eid,))
-        row = cur.fetchone()
+        cur.execute("SELECT id, name FROM engagements WHERE id = %s::uuid", (eid,))
+        eng = cur.fetchone()
+        if not eng:
+            raise HTTPException(404, "Engagement not found")
+        if dry_run:
+            out = _purge_dry_run(cur, eid)
+            return {"ok": True, "id": eid, "dry_run": True, "action": "purge_data", **out}
+        counts = _purge_engagement_data(cur, eid, keep_engagement=True)
         conn.commit()
-    if not row:
-        raise HTTPException(404, "Engagement not found")
-    return {"ok": True, "id": eid}
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("engagement_data_purged", "engagements", {
+            "engagement_id": eid, "name": eng["name"], "actor": x_operator,
+            "assets_deleted": counts.get("assets", 0)})
+    except Exception:
+        log.warning("engagement data-purge webhook emit failed", exc_info=True)
+    return {"ok": True, "id": eid, "action": "data_purged", "kept_engagement": True,
+            "deleted": counts}
+
+
+@app.delete("/engagements/{eid}", tags=["Engagements"])
+def delete_engagement(eid: str, purge: bool = Query(False), dry_run: bool = Query(False),
+                      x_operator: str = Header("operator", alias="X-Operator"),
+                      _: bool = Depends(auth)):
+    """Remove an engagement.
+
+    Default (purge=false): ARCHIVE — sets status='archived', deletes nothing, so
+    the engagement's assets and findings are preserved (the historical behaviour).
+
+    purge=true: HARD DELETE — removes the engagement AND its assets and every row
+    hanging off them, plus its scope and schedule. Irreversible; pass dry_run=true
+    to preview. To keep the engagement and wipe only its data, use
+    POST /engagements/{eid}/purge-data instead. An asset belongs to one
+    engagement, so this never deletes another engagement's hosts."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT id, name, status FROM engagements WHERE id = %s::uuid", (eid,))
+        eng = cur.fetchone()
+        if not eng:
+            raise HTTPException(404, "Engagement not found")
+
+        if not purge:
+            cur.execute("UPDATE engagements SET status = 'archived' WHERE id = %s::uuid "
+                        "RETURNING id", (eid,))
+            conn.commit()
+            return {"ok": True, "id": eid, "action": "archived"}
+
+        if dry_run:
+            out = _purge_dry_run(cur, eid)
+            return {"ok": True, "id": eid, "dry_run": True, "action": "purge", **out}
+
+        counts = _purge_engagement_data(cur, eid, keep_engagement=False)
+        conn.commit()
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("engagement_purged", "engagements", {
+            "engagement_id": eid, "name": eng["name"], "actor": x_operator,
+            "assets_deleted": counts.get("assets", 0)})
+    except Exception:
+        log.warning("engagement purge webhook emit failed", exc_info=True)
+    return {"ok": True, "id": eid, "action": "purged", "deleted": counts}
 
 
 # ── Engagement-Scoped Scopes ────────────────────────────────────────────
