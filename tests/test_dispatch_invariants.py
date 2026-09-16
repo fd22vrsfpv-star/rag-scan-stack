@@ -136,6 +136,11 @@ LIMIT_NOT_APPLICABLE = {
     "node_manager/ssh_manager.py":
         "SSH transport, not a scan initiator; remote_scan holds the slot around "
         "the whole dispatch, so bounding here too would double-count one scan.",
+    "exploit_runner/cred_cracker.py":
+        "does not initiate a scan — its subprocess.run runs hashcat LOCALLY (or "
+        "on a compute node via node_manager) against already-captured /etc/shadow "
+        "hashes. There is no target traffic and no scan to admit, so consulting "
+        "MAX_CONCURRENT_SCANS would count offline CPU/GPU work as a scan.",
 }
 
 GATE_NOT_APPLICABLE = {
@@ -171,6 +176,12 @@ GATE_NOT_APPLICABLE = {
         "remote node and runs it there with no etl/ and no database, so an "
         "etl-based gate would fail closed and kill email/dns/service enum. "
         "Gated upstream in node_manager.remote_scan instead.",
+    "exploit_runner/cred_cracker.py":
+        "OFFLINE hash cracking, not a target scan. Its subprocess.run invokes "
+        "hashcat on captured hashes held in credential_findings, and its one "
+        "httpx.post targets node_manager /ssh/{id}/exec on a compute NODE, never "
+        "an operator-supplied host. There is no scan target to gate — the local "
+        "hashcat and the node are both our own infrastructure.",
 }
 
 LIMIT_DEBT = {
