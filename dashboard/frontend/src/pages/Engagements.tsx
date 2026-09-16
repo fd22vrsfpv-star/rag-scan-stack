@@ -2,10 +2,11 @@ import { useState, useRef } from 'react'
 import PageHelp from '@/components/PageHelp'
 import {
   useEngagements, useEngagement, useCreateEngagement, useUpdateEngagement, useDeleteEngagement,
+  usePurgeEngagementData,
   useCampaignEvents, useCreateCampaignEvent, useUpdateCampaignEvent, useCampaignSummary,
   useEngagementScopes, useEngagementScopeTargets, useAddScopeTargets, useDeleteScope,
   useRenameScope, useMoveTargets, useMoveEntireScope,
-  type EngagementScope, type ScopeTarget,
+  type EngagementScope, type ScopeTarget, type EngagementDeleteResult,
 } from '@/api/engagements'
 import { useScopeNames } from '@/api/scope'
 import { cn } from '@/lib/utils'
@@ -596,6 +597,102 @@ function ScopeTab({ engagementId }: { engagementId: string }) {
 
 type DetailTab = 'overview' | 'scope' | 'notes' | 'campaign' | 'agents'
 
+/** Manage an engagement's lifecycle: delete just its DATA (keep the engagement
+ *  so it can be re-run), archive it, or permanently delete the whole thing. A
+ *  dry-run shows exactly what would be removed first — deletes cannot be undone. */
+function DeleteEngagementControl({ id, name, onDeleted }: {
+  id: string; name: string; onDeleted: () => void
+}) {
+  const del = useDeleteEngagement()
+  const purgeData = usePurgeEngagementData()
+  const [open, setOpen] = useState(false)
+  const [preview, setPreview] = useState<EngagementDeleteResult | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const busy = del.isPending || purgeData.isPending
+
+  const openDialog = async () => {
+    setOpen(true); setPreview(null); setErr(null)
+    try {
+      // Same counts for either destructive action — one dry run covers both.
+      setPreview(await purgeData.mutateAsync({ id, dryRun: true }))
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Could not load preview')
+    }
+  }
+  const done = () => { setOpen(false); onDeleted() }
+  const purgeDataOnly = () => purgeData.mutate({ id }, { onSuccess: done })
+  const archive = () => del.mutate({ id }, { onSuccess: done })
+  const deleteAll = () => del.mutate({ id, purge: true }, { onSuccess: done })
+
+  const wd = preview?.would_delete || {}
+  const summary = preview ? (
+    <span>
+      {preview.assets ?? 0} asset{(preview.assets ?? 0) === 1 ? '' : 's'}
+      {wd.ports != null ? `, ${wd.ports} ports` : ''}
+      {wd.vulns != null ? `, ${wd.vulns} vulns` : ''}
+      {wd.findings != null ? `, ${wd.findings} findings` : ''}
+      {wd.web_findings != null ? `, ${wd.web_findings} web findings` : ''}
+      {wd.credential_findings != null ? `, ${wd.credential_findings} credentials` : ''}
+    </span>
+  ) : null
+
+  return (
+    <>
+      <button
+        onClick={openDialog}
+        className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-red-500/40 text-red-400 hover:bg-red-500/10"
+      >
+        <Trash2 className="h-3.5 w-3.5" /> Delete…
+      </button>
+      {open && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          onClick={() => !busy && setOpen(false)}>
+          <div className="bg-card border border-border rounded-lg p-4 max-w-md w-full space-y-3"
+            onClick={e => e.stopPropagation()}>
+            <h3 className="text-sm font-semibold">Manage “{name}”</h3>
+            {err && <p className="text-xs text-red-400">{err}</p>}
+            {preview ? (
+              <div className="border border-red-500/30 rounded p-2 bg-red-500/5 text-[11px]">
+                <span className="text-muted-foreground">The data for this engagement is </span>
+                <span className="font-mono">{summary}</span>.
+              </div>
+            ) : (
+              <p className="text-[11px] text-muted-foreground">Loading what this engagement holds…</p>
+            )}
+
+            <div className="space-y-2">
+              <button onClick={purgeDataOnly} disabled={busy || !preview}
+                className="w-full text-left px-3 py-2 rounded border border-red-500/40 bg-red-500/5 hover:bg-red-500/10 disabled:opacity-50">
+                <div className="text-xs font-semibold text-red-300">Delete data, keep engagement</div>
+                <div className="text-[10px] text-muted-foreground">
+                  Wipes the assets and all their findings so it can be re-run. Keeps the engagement and its scope.
+                </div>
+              </button>
+              <button onClick={archive} disabled={busy}
+                className="w-full text-left px-3 py-2 rounded border border-border hover:bg-accent disabled:opacity-50">
+                <div className="text-xs font-semibold">Archive</div>
+                <div className="text-[10px] text-muted-foreground">Hides the engagement, keeps all data. Reversible.</div>
+              </button>
+              <button onClick={deleteAll} disabled={busy || !preview}
+                className="w-full text-left px-3 py-2 rounded border border-border hover:bg-accent disabled:opacity-50">
+                <div className="text-xs font-semibold">Delete engagement entirely</div>
+                <div className="text-[10px] text-muted-foreground">Removes the engagement, its scope and all its data.</div>
+              </button>
+            </div>
+
+            <div className="flex justify-end">
+              <button onClick={() => setOpen(false)} disabled={busy}
+                className="px-3 py-1.5 text-xs rounded border border-border hover:bg-accent">
+                {busy ? 'Working…' : 'Cancel'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  )
+}
+
 function EngagementDetail({ id, onBack }: { id: string; onBack: () => void }) {
   const [detailTab, setDetailTab] = useState<DetailTab>('overview')
   const { data: eng } = useEngagement(id)
@@ -630,6 +727,7 @@ function EngagementDetail({ id, onBack }: { id: string; onBack: () => void }) {
               <option key={s} value={s}>{s}</option>
             ))}
           </select>
+          <DeleteEngagementControl id={id} name={eng.name} onDeleted={onBack} />
         </div>
       </div>
 

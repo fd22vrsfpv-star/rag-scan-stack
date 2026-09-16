@@ -53,14 +53,50 @@ export function useUpdateEngagement() {
   })
 }
 
-export function useDeleteEngagement() {
+export interface EngagementDeleteResult {
+  ok: boolean
+  id: string
+  action: 'archived' | 'purged' | 'purge' | 'data_purged' | 'purge_data'
+  dry_run?: boolean
+  kept_engagement?: boolean
+  assets?: number
+  would_delete?: Record<string, number>
+  deleted?: Record<string, number>
+}
+
+/** Delete an engagement's collected DATA (assets + everything hanging off them)
+ *  but KEEP the engagement and its scope, so it can be re-run. dryRun previews. */
+export function usePurgeEngagementData() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (id: string) =>
-      apiFetch(`/engagements/${id}`, { method: 'DELETE' }),
+    mutationFn: ({ id, dryRun = false }: { id: string; dryRun?: boolean }) =>
+      apiFetch<EngagementDeleteResult>(
+        `/engagements/${id}/purge-data${dryRun ? '?dry_run=true' : ''}`, { method: 'POST' }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['engagements'] })
       qc.invalidateQueries({ queryKey: ['engagement'] })
+      qc.invalidateQueries({ queryKey: ['assets'] })
+    },
+  })
+}
+
+/** Archive (default), or hard-purge the engagement and its assets/data.
+ *  Pass { purge: true } to delete; add { dryRun: true } to preview the counts. */
+export function useDeleteEngagement() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, purge = false, dryRun = false }:
+      { id: string; purge?: boolean; dryRun?: boolean }) => {
+      const qs = new URLSearchParams()
+      if (purge) qs.set('purge', 'true')
+      if (dryRun) qs.set('dry_run', 'true')
+      const suffix = qs.toString() ? `?${qs.toString()}` : ''
+      return apiFetch<EngagementDeleteResult>(`/engagements/${id}${suffix}`, { method: 'DELETE' })
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['engagements'] })
+      qc.invalidateQueries({ queryKey: ['engagement'] })
+      qc.invalidateQueries({ queryKey: ['assets'] })
     },
   })
 }

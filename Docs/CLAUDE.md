@@ -98,6 +98,19 @@ Provide a lightweight web UI:
 - Findings table with filters (severity, tool, host, port, date, status)
 - Finding detail page with evidence + references
 - Run comparison (delta)
+- **Break a busy page into tabs, do not keep stacking panels.** When a page
+  grows past ~3-4 substantial panels stacked vertically, split the distinct
+  concerns into tabs rather than adding another panel to the scroll. A page the
+  operator has to scroll past four unrelated tools to reach the fifth is a page
+  that hides its own features. Use the established tab pattern (a local `tab`
+  state, a `border-b` tab bar of buttons styled with `cn(...)`, conditional
+  render per tab — see `Settings.tsx` and `AIAgents.tsx`); persist the selection
+  in `localStorage` (fail-soft) so a refresh does not bounce back to the first
+  tab. Keep the always-relevant status on the default tab; give each heavy,
+  self-contained tool (foothold, feedback, learned extractors, learned tools,
+  gap analysis) its own tab. This is a judgement call about density, not a
+  test-enforced invariant — it is a suggestion, applied when a page is clearly
+  getting too busy.
 
 ### Security
 - use TLS and secure communications for any network based traffic
