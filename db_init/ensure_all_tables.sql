@@ -1124,6 +1124,35 @@ CREATE INDEX IF NOT EXISTS idx_pending_exploits_asset_id ON public.pending_explo
 CREATE INDEX IF NOT EXISTS idx_pending_exploits_session_id ON public.pending_exploits(session_id);
 CREATE INDEX IF NOT EXISTS idx_pending_exploits_created_at ON public.pending_exploits(created_at DESC);
 
+-- Normalize the Metasploit module id at ingest so the SAME module stored two
+-- ways — 'java_rmi_server' (a vector's short name) vs
+-- 'exploit/multi/misc/java_rmi_server' (the full path) — carries ONE id and
+-- therefore dedups. Only rewrites when exploit_id is not already a module path
+-- AND a full path can be recovered from the title (e.g. "vector … (msf
+-- exploit/multi/misc/java_rmi_server)"). An ExploitDB edb_id (numeric) or a
+-- webshell/command with no module path in the title is left untouched. A
+-- DIFFERENT module on the same port (auxiliary/scanner/… vs exploit/…) keeps its
+-- own full path and stays a distinct enumeration.
+CREATE OR REPLACE FUNCTION public.normalize_pending_exploit_module() RETURNS trigger AS $pemod$
+BEGIN
+    -- Non-capturing (?:…) so substring() returns the WHOLE module path, not just
+    -- the 'exploit'/'auxiliary' word.
+    IF NEW.exploit_id IS NOT NULL
+       AND NEW.exploit_id !~ '^(exploit|auxiliary|post|encoder|nop|payload)/' THEN
+        NEW.exploit_id := COALESCE(
+            substring(coalesce(NEW.exploit_title, '')
+                      from '(?:exploit|auxiliary|post)/[A-Za-z0-9_./-]+'),
+            NEW.exploit_id);
+    END IF;
+    RETURN NEW;
+END;
+$pemod$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_normalize_pending_exploit_module ON public.pending_exploits;
+CREATE TRIGGER trg_normalize_pending_exploit_module
+    BEFORE INSERT ON public.pending_exploits
+    FOR EACH ROW EXECUTE FUNCTION public.normalize_pending_exploit_module();
+
 -- Expand exploit_type CHECK to include web exploit categories
 DO $$ BEGIN
   ALTER TABLE public.pending_exploits DROP CONSTRAINT IF EXISTS pending_exploits_exploit_type_check;
