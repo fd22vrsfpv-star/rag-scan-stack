@@ -113,11 +113,12 @@ function formatCount(n: number): string {
   return String(n)
 }
 
-type MaintTab = 'overview' | 'cleanup'
+type MaintTab = 'overview' | 'cleanup' | 'scan-log'
 
 function MaintenanceTabs({ tab, setTab }: { tab: MaintTab; setTab: (t: MaintTab) => void }) {
   const tabs: Array<{ id: MaintTab; label: string }> = [
     { id: 'overview', label: 'Overview' },
+    { id: 'scan-log', label: 'Scan Log' },
     { id: 'cleanup', label: 'Cleanup' },
   ]
   return (
@@ -131,6 +132,130 @@ function MaintenanceTabs({ tab, setTab }: { tab: MaintTab; setTab: (t: MaintTab)
           {t.label}
         </button>
       ))}
+    </div>
+  )
+}
+
+/**
+ * Scan audit log — timestamped record of every scan executed. Moved to its own
+ * tab so the Overview is not dominated by a long scrolling table. Self-contained
+ * (owns its own limit/rotate state and queries) like CleanupPanel.
+ */
+function ScanLogPanel() {
+  const [auditLimit, setAuditLimit] = useState(100)
+  const { data: auditData, isLoading: auditLoading } = useAuditLog({ limit: auditLimit })
+  const rotateAuditLog = useRotateAuditLog()
+  const [rotateMsg, setRotateMsg] = useState<string>('')
+  return (
+    <div className="bg-card border border-border rounded-lg p-4">
+      <h3 className="text-sm font-semibold mb-3">Scan Audit Log</h3>
+      <p className="text-xs text-muted-foreground mb-3">
+        Timestamped record of all scans executed — useful for post-engagement audit reports.
+        Use <strong>Rotate</strong> to archive the current log to a timestamped file and start a fresh one;
+        archived files stay on disk in <code className="font-mono">/scan_audit/</code> and can be exported.
+      </p>
+      <div className="flex items-center gap-2 mb-3 flex-wrap">
+        <span className="text-xs text-muted-foreground">Show:</span>
+        {[50, 100, 500].map(n => (
+          <button
+            key={n}
+            onClick={() => setAuditLimit(n)}
+            className={`h-6 px-2 text-xs rounded border ${
+              auditLimit === n
+                ? 'border-primary bg-primary/10 text-primary'
+                : 'border-border hover:bg-muted/40'
+            }`}
+          >
+            {n}
+          </button>
+        ))}
+        <div className="ml-auto flex items-center gap-2">
+          {rotateMsg && (
+            <span className="text-xs font-mono text-primary">{rotateMsg}</span>
+          )}
+          <button
+            onClick={async () => {
+              if (!window.confirm(
+                'Archive the active audit log to a timestamped file and start a fresh one?\n\n' +
+                'The archive is preserved on disk in /scan_audit/ (not deleted).'
+              )) return
+              setRotateMsg('Rotating…')
+              try {
+                const res = await rotateAuditLog.mutateAsync()
+                if (res.rotated) {
+                  setRotateMsg(`Archived to ${res.archive_name} (${res.archived_lines} lines)`)
+                } else {
+                  setRotateMsg(res.reason ?? 'No active log to rotate')
+                }
+              } catch (err: unknown) {
+                setRotateMsg(`Error: ${err instanceof Error ? err.message : 'Unknown'}`)
+              }
+            }}
+            disabled={rotateAuditLog.isPending}
+            className="h-6 px-3 text-xs rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-50"
+            title="Archive active audit log and start a fresh one"
+          >
+            {rotateAuditLog.isPending ? 'Rotating…' : 'Rotate'}
+          </button>
+        </div>
+      </div>
+      {auditLoading ? (
+        <p className="text-xs text-muted-foreground">Loading audit log...</p>
+      ) : auditData && auditData.entries.length > 0 ? (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="border-b border-border text-left text-muted-foreground">
+                <th className="py-1.5 px-2">Timestamp</th>
+                <th className="py-1.5 px-2">Event</th>
+                <th className="py-1.5 px-2">Scan Type</th>
+                <th className="py-1.5 px-2">Targets</th>
+                <th className="py-1.5 px-2">External IP</th>
+                <th className="py-1.5 px-2">Proxy</th>
+                <th className="py-1.5 px-2">Duration</th>
+                <th className="py-1.5 px-2">Findings</th>
+              </tr>
+            </thead>
+            <tbody>
+              {auditData.entries.map((entry, i) => (
+                <tr key={i} className="border-b border-border/50 hover:bg-muted/20">
+                  <td className="py-1.5 px-2 font-mono whitespace-nowrap">
+                    {entry.timestamp ? new Date(entry.timestamp).toLocaleString() : '—'}
+                  </td>
+                  <td className="py-1.5 px-2">
+                    <span
+                      className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                        entry.event === 'completed'
+                          ? 'bg-green-500/20 text-green-400'
+                          : entry.event === 'failed'
+                          ? 'bg-red-500/20 text-red-400'
+                          : 'bg-blue-500/20 text-blue-400'
+                      }`}
+                    >
+                      {entry.event}
+                    </span>
+                  </td>
+                  <td className="py-1.5 px-2">{entry.scan_type || '—'}</td>
+                  <td className="py-1.5 px-2 max-w-[200px] truncate">
+                    {Array.isArray(entry.targets) ? entry.targets.join(', ') : String(entry.targets || '—')}
+                  </td>
+                  <td className="py-1.5 px-2 font-mono">{entry.external_ip || '—'}</td>
+                  <td className="py-1.5 px-2 font-mono text-[10px]">{entry.proxy || '—'}</td>
+                  <td className="py-1.5 px-2">
+                    {entry.duration_s != null ? `${entry.duration_s.toFixed(1)}s` : '—'}
+                  </td>
+                  <td className="py-1.5 px-2">{entry.findings_count ?? '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="text-xs text-muted-foreground mt-2">
+            Showing {auditData.entries.length} of {auditData.total} entries
+          </p>
+        </div>
+      ) : (
+        <p className="text-xs text-muted-foreground">No audit log entries found</p>
+      )}
     </div>
   )
 }
@@ -276,7 +401,7 @@ function CleanupPanel() {
 export default function Maintenance() {
   const { data: stats, isLoading: statsLoading } = useMaintenanceStats()
   const cleanup = useCleanup()
-  const [tab, setTab] = useState<'overview' | 'cleanup'>('overview')
+  const [tab, setTab] = useState<MaintTab>('overview')
   const dataExport = useDataExport()
   const dataImport = useDataImport()
   const { data: estimate } = useExportEstimate()
@@ -305,10 +430,6 @@ export default function Maintenance() {
   const [importResult, setImportResult] = useState<ImportResult | null>(null)
   const [importStatus, setImportStatus] = useState<string>('')
 
-  // Audit log state
-  const [auditLimit, setAuditLimit] = useState(100)
-  const { data: auditData, isLoading: auditLoading } = useAuditLog({ limit: auditLimit })
-  const rotateAuditLog = useRotateAuditLog()
   const schemaCheck = useSchemaCheck()
   const schemaApply = useSchemaApply()
   const knowledgeStatus = useKnowledgeStatus()
@@ -316,7 +437,6 @@ export default function Maintenance() {
   const [repairMsg, setRepairMsg] = useState('')
   const [seeding, setSeeding] = useState(false)
   const zapStatus = useZapStatus()
-  const [rotateMsg, setRotateMsg] = useState<string>('')
 
   const setAge = (key: string, val: string) =>
     setAges(prev => ({ ...prev, [key]: val }))
@@ -427,6 +547,16 @@ export default function Maintenance() {
         <h2 className="text-lg font-semibold">Maintenance</h2>
         <MaintenanceTabs tab={tab} setTab={setTab} />
         <CleanupPanel />
+      </div>
+    )
+  }
+
+  if (tab === 'scan-log') {
+    return (
+      <div className="space-y-6">
+        <h2 className="text-lg font-semibold">Maintenance</h2>
+        <MaintenanceTabs tab={tab} setTab={setTab} />
+        <ScanLogPanel />
       </div>
     )
   }
@@ -921,118 +1051,6 @@ export default function Maintenance() {
               </div>
             ) : null}
           </>
-        )}
-      </div>
-
-      {/* Scan Audit Log */}
-      <div className="bg-card border border-border rounded-lg p-4">
-        <h3 className="text-sm font-semibold mb-3">Scan Audit Log</h3>
-        <p className="text-xs text-muted-foreground mb-3">
-          Timestamped record of all scans executed — useful for post-engagement audit reports.
-          Use <strong>Rotate</strong> to archive the current log to a timestamped file and start a fresh one;
-          archived files stay on disk in <code className="font-mono">/scan_audit/</code> and can be exported.
-        </p>
-        <div className="flex items-center gap-2 mb-3 flex-wrap">
-          <span className="text-xs text-muted-foreground">Show:</span>
-          {[50, 100, 500].map(n => (
-            <button
-              key={n}
-              onClick={() => setAuditLimit(n)}
-              className={`h-6 px-2 text-xs rounded border ${
-                auditLimit === n
-                  ? 'border-primary bg-primary/10 text-primary'
-                  : 'border-border hover:bg-muted/40'
-              }`}
-            >
-              {n}
-            </button>
-          ))}
-          <div className="ml-auto flex items-center gap-2">
-            {rotateMsg && (
-              <span className="text-xs font-mono text-primary">{rotateMsg}</span>
-            )}
-            <button
-              onClick={async () => {
-                if (!window.confirm(
-                  'Archive the active audit log to a timestamped file and start a fresh one?\n\n' +
-                  'The archive is preserved on disk in /scan_audit/ (not deleted).'
-                )) return
-                setRotateMsg('Rotating…')
-                try {
-                  const res = await rotateAuditLog.mutateAsync()
-                  if (res.rotated) {
-                    setRotateMsg(`Archived to ${res.archive_name} (${res.archived_lines} lines)`)
-                  } else {
-                    setRotateMsg(res.reason ?? 'No active log to rotate')
-                  }
-                } catch (err: unknown) {
-                  setRotateMsg(`Error: ${err instanceof Error ? err.message : 'Unknown'}`)
-                }
-              }}
-              disabled={rotateAuditLog.isPending}
-              className="h-6 px-3 text-xs rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-50"
-              title="Archive active audit log and start a fresh one"
-            >
-              {rotateAuditLog.isPending ? 'Rotating…' : 'Rotate'}
-            </button>
-          </div>
-        </div>
-        {auditLoading ? (
-          <p className="text-xs text-muted-foreground">Loading audit log...</p>
-        ) : auditData && auditData.entries.length > 0 ? (
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="border-b border-border text-left text-muted-foreground">
-                  <th className="py-1.5 px-2">Timestamp</th>
-                  <th className="py-1.5 px-2">Event</th>
-                  <th className="py-1.5 px-2">Scan Type</th>
-                  <th className="py-1.5 px-2">Targets</th>
-                  <th className="py-1.5 px-2">External IP</th>
-                  <th className="py-1.5 px-2">Proxy</th>
-                  <th className="py-1.5 px-2">Duration</th>
-                  <th className="py-1.5 px-2">Findings</th>
-                </tr>
-              </thead>
-              <tbody>
-                {auditData.entries.map((entry, i) => (
-                  <tr key={i} className="border-b border-border/50 hover:bg-muted/20">
-                    <td className="py-1.5 px-2 font-mono whitespace-nowrap">
-                      {entry.timestamp ? new Date(entry.timestamp).toLocaleString() : '—'}
-                    </td>
-                    <td className="py-1.5 px-2">
-                      <span
-                        className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-medium ${
-                          entry.event === 'completed'
-                            ? 'bg-green-500/20 text-green-400'
-                            : entry.event === 'failed'
-                            ? 'bg-red-500/20 text-red-400'
-                            : 'bg-blue-500/20 text-blue-400'
-                        }`}
-                      >
-                        {entry.event}
-                      </span>
-                    </td>
-                    <td className="py-1.5 px-2">{entry.scan_type || '—'}</td>
-                    <td className="py-1.5 px-2 max-w-[200px] truncate">
-                      {Array.isArray(entry.targets) ? entry.targets.join(', ') : String(entry.targets || '—')}
-                    </td>
-                    <td className="py-1.5 px-2 font-mono">{entry.external_ip || '—'}</td>
-                    <td className="py-1.5 px-2 font-mono text-[10px]">{entry.proxy || '—'}</td>
-                    <td className="py-1.5 px-2">
-                      {entry.duration_s != null ? `${entry.duration_s.toFixed(1)}s` : '—'}
-                    </td>
-                    <td className="py-1.5 px-2">{entry.findings_count ?? '—'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            <p className="text-xs text-muted-foreground mt-2">
-              Showing {auditData.entries.length} of {auditData.total} entries
-            </p>
-          </div>
-        ) : (
-          <p className="text-xs text-muted-foreground">No audit log entries found</p>
         )}
       </div>
 
