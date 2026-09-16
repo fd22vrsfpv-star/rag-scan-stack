@@ -22409,6 +22409,53 @@ def list_target_tool_settings(target: str, tool: str = Query(None),
     return {"count": len(rows), "settings": rows}
 
 
+@app.get("/tool-settings", tags=["Tool Settings"])
+def list_all_tool_settings(tool: str = Query(None), target: str = Query(None),
+                           status: str = Query(None), _: bool = Depends(auth)):
+    """Every derived tool setting across targets — the PROPOSED options each tool
+    should run with — plus the tool_options.yaml catalogue of what options each
+    tool can express (the RUN-option syntax). Powers the Learned Tools tab's
+    run-vs-proposed view. Read-only.
+
+    Each setting carries option_text (the proposed option), host_offers (what the
+    target advertised) and client_supports (what the running client accepts); the
+    proposed option is the intersection, so the operator can see both the raw run
+    material and the value that will be used."""
+    where, params = [], []
+    if tool:
+        where.append("tool = %s"); params.append(tool)
+    if target:
+        where.append("target = %s"); params.append(target)
+    if status:
+        where.append("status = %s"); params.append(status)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""SELECT id::text, target, port, service, tool, category,
+                       option_text, host_offers, client_supports, source,
+                       status, reviewed_by, derived_at
+                  FROM target_tool_settings{clause}
+                 ORDER BY tool, target, category""", params)
+        rows = [dict(r) for r in cur.fetchall()]
+    # The catalogue: what options each tool CAN run with, from tool_options.yaml.
+    catalogue: Dict[str, Any] = {}
+    try:
+        import yaml as _yaml
+        for base in ("/knowledge", os.path.join(os.path.dirname(__file__), "..", "..", "knowledge")):
+            path = os.path.join(base, "tool_options.yaml")
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    doc = _yaml.safe_load(f) or {}
+                for t, cats in (doc.get("tools") or {}).items():
+                    if isinstance(cats, dict):
+                        catalogue[t] = {c: v for c, v in cats.items()
+                                        if isinstance(v, str) and "{values}" in v}
+                break
+    except Exception as e:  # noqa: BLE001
+        log.debug("tool_options catalogue load failed: %s", e)
+    return {"count": len(rows), "settings": rows, "catalogue": catalogue}
+
+
 @app.post("/targets/tool-settings/{setting_id}/{action}", tags=["Tool Settings"])
 def review_target_tool_setting(setting_id: str, action: str,
                                x_operator: str = Header("operator", alias="X-Operator"),

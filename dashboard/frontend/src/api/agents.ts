@@ -449,6 +449,52 @@ export function useBackfillToolSelection() {
   })
 }
 
+// A derived tool setting: the option a tool should RUN with against a target,
+// computed as host_offers ∩ client_supports. option_text is the PROPOSED option.
+export interface ToolSetting {
+  id: string
+  target: string
+  port?: number | null
+  service: string
+  tool: string
+  category: string
+  option_text: string
+  host_offers: string[]
+  client_supports: string[]
+  source: string
+  status: 'active' | 'proposed' | 'rejected'
+  reviewed_by?: string | null
+  derived_at: string
+}
+
+/** Run/proposed tool options across targets, plus the tool_options.yaml
+ *  catalogue of what each tool can express. */
+export function useToolSettings(tool?: string, status?: string) {
+  const qs = new URLSearchParams()
+  if (tool) qs.set('tool', tool)
+  if (status) qs.set('status', status)
+  const suffix = qs.toString() ? `?${qs.toString()}` : ''
+  return useQuery({
+    queryKey: ['tool-settings', tool ?? 'all', status ?? 'all'],
+    queryFn: () => apiFetch<{
+      count: number
+      settings: ToolSetting[]
+      catalogue: Record<string, Record<string, string>>
+    }>(`/tool-settings${suffix}`),
+    refetchInterval: POLL.SLOW,
+  })
+}
+
+export function useReviewToolSetting() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, action }: { id: string; action: 'approve' | 'reject' | 'reset' }) =>
+      apiFetch<{ ok: boolean }>(
+        `/targets/tool-settings/${id}/${action}`, { method: 'POST', headers: ACTOR_HEADER }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['tool-settings'] }),
+  })
+}
+
 // ── Agent activity timeline (webhook event-log) ───────────────────────────
 export interface AgentActivityEvent {
   id: string
