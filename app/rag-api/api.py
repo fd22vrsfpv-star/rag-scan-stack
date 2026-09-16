@@ -8774,11 +8774,30 @@ class ReleaseImpactfulBody(BaseModel):
     target: str
     engagement_id: Optional[str] = None
     include_recon: bool = False          # also release auxiliary/post scanners
+    execute: bool = True                 # fire a bounded slice; false = approve only
     dry_run: bool = False
+
+
+# Approving a pending exploit does NOT execute it — the runner does not poll for
+# 'approved'. The BFF's per-exploit approve fires exploit-runner /execute/by-id;
+# a bulk release must do the same, BOUNDED by MAX_CONCURRENT_SCANS and shedding
+# the rest (they stay 'approved' for a later fire), per the scan-volume invariant.
+_RELEASE_MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_SCANS", "5"))
+
+
+def _fire_exploit_by_id(exploit_id: str) -> None:
+    """Background: kick off one approved exploit on the runner. /execute/by-id
+    blocks until the exploit completes, so this runs in a background task."""
+    try:
+        requests.post(f"{EXPLOIT_RUNNER_URL}/execute/by-id/{exploit_id}",
+                      verify=False, timeout=1800)
+    except Exception as e:  # noqa: BLE001
+        log.warning("release: execute-by-id %s failed: %s", exploit_id, e)
 
 
 @app.post("/exploits/release", tags=["Exploits"])
 def release_impactful_tests(body: ReleaseImpactfulBody,
+                            background: BackgroundTasks,
                             x_operator: str = Header("operator", alias="X-Operator"),
                             _: bool = Depends(auth)):
     """Operator-release the impactful (approval-gated) tests for ONE target.
@@ -8807,11 +8826,18 @@ def release_impactful_tests(body: ReleaseImpactfulBody,
             # Fail closed: no scope means nothing is authorised to run.
             raise HTTPException(409, "no dispatch scope configured — cannot release "
                                      "(fail closed; configure the engagement scope first)")
+        # Candidates: still-pending impactful exploits, PLUS ones an earlier
+        # release approved but the concurrency cap shed (released, never fired) —
+        # so re-running release fires the next batch instead of doing nothing.
         cur.execute(
             f"""SELECT pe.id::text AS id, pe.exploit_title, pe.exploit_id,
-                       pe.target_port, pe.target_service
+                       pe.target_port, pe.target_service, pe.status
                   FROM pending_exploits pe
-                 WHERE host(pe.target_ip) = %s AND pe.status = 'pending'{where_recon}
+                 WHERE host(pe.target_ip) = %s{where_recon}
+                   AND (pe.status = 'pending'
+                        OR (pe.status = 'approved'
+                            AND pe.metadata->>'released' = 'true'
+                            AND pe.metadata->>'release_fired' IS NULL))
                  ORDER BY pe.target_port""",
             (target,))
         rows = cur.fetchall()
@@ -8826,7 +8852,9 @@ def release_impactful_tests(body: ReleaseImpactfulBody,
                 continue
             report["released"].append(label)
             to_release.append(p["id"])
+        fire_slice: list = []
         if to_release and not body.dry_run:
+            # Approve the still-pending ones (already-approved ones keep status).
             cur.execute(
                 """UPDATE public.pending_exploits
                       SET status = 'approved', reviewed_by = %s, reviewed_at = now(),
@@ -8835,9 +8863,26 @@ def release_impactful_tests(body: ReleaseImpactfulBody,
                                                            'released_by', %s)
                     WHERE id = ANY(%s::uuid[]) AND status = 'pending'""",
                 (f"operator:{x_operator}", x_operator, to_release))
+            # Fire a bounded slice and SHED the rest (they stay approved, unfired,
+            # for the next release) — scan-volume invariant: don't launch dozens
+            # of exploits at once. Mark the fired ones so a re-release skips them.
+            if body.execute:
+                fire_slice = to_release[:_RELEASE_MAX_CONCURRENT]
+                if fire_slice:
+                    cur.execute(
+                        "UPDATE public.pending_exploits SET metadata = "
+                        "COALESCE(metadata, '{}'::jsonb) || jsonb_build_object("
+                        "'release_fired', now()::text) WHERE id = ANY(%s::uuid[])",
+                        (fire_slice,))
             conn.commit()
     report["released_count"] = len(report["released"]) if not body.dry_run else 0
     report["would_release"] = len(report["released"]) if body.dry_run else None
+    if fire_slice:
+        for pid in fire_slice:
+            background.add_task(_fire_exploit_by_id, pid)
+        report["fired"] = len(fire_slice)
+        report["deferred"] = len(to_release) - len(fire_slice)
+        report["execute_limit"] = _RELEASE_MAX_CONCURRENT
     if report["released"] and not body.dry_run:
         try:
             from webhooks import emit_webhook
