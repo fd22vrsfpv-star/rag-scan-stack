@@ -40,6 +40,7 @@ RAG_LOADED = {
     "web_profiles.yaml": "etl/load_knowledge_documents.py",
     "credential_spray_policy.yaml": "etl/load_knowledge_documents.py",
     "msf_learned_options.yaml": "etl/load_knowledge_documents.py",
+    "dos_exploit_overrides.yaml": "etl/load_knowledge_documents.py",
 }
 
 # YAMLs deliberately NOT embedded into rag_documents. Each needs a reason. This

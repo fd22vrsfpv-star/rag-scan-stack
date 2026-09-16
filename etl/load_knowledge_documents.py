@@ -258,8 +258,24 @@ def _render_msf_learned_options(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_dos_exploit_overrides(data: Dict[str, Any]) -> List[Doc]:
+    """Operator DoS overrides -> one doc each, so the exemption is discoverable."""
+    docs: List[Doc] = []
+    for o in (data.get("overrides") or []):
+        m = o.get("match") if isinstance(o, dict) else o
+        if not m:
+            continue
+        reason = (o.get("reason") if isinstance(o, dict) else "") or ""
+        docs.append((f"DoS override: {m}",
+                     f"Exploit {m} is an operator-approved DoS override: it may be "
+                     f"recommended, queued and executed despite being tagged "
+                     f"denial-of-service. Reason: {reason or 'operator-approved'}."))
+    return docs
+
+
 RENDERERS = {
     "msf_learned_options": _render_msf_learned_options,
+    "dos_exploit_overrides": _render_dos_exploit_overrides,
     "service_tools": _render_service_tools,
     "credential_followups": _render_credential_followups,
     "default_credentials": _render_default_credentials,

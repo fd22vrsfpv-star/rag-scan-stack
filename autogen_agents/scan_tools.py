@@ -4604,6 +4604,16 @@ def queue_exploit_for_approval(
     try:
         session_uuid = uuid_lib.UUID(session_id) if session_id else None
 
+        # A denial-of-service exploit is never queued — it gains no access, only
+        # disrupts, and must never auto-execute.
+        _dos_text = f"{exploit_type or ''} {exploit_title or ''} {exploit_id or ''}".lower()
+        if (str(exploit_type or '').lower().strip() == 'dos'
+                or 'denial of service' in _dos_text or 'denial-of-service' in _dos_text
+                or ' dos ' in f' {_dos_text} ' or '(dos)' in _dos_text or '/dos/' in _dos_text):
+            return json.dumps({"ok": False, "skipped": True,
+                               "reason": f"'{exploit_title or exploit_id}' is a "
+                               "denial-of-service exploit — DoS is never queued or run."}, indent=2)
+
         # Gate: a source=metasploit exploit must resolve to a REAL, loaded MSF
         # module. This stops doomed synthetic rows (e.g.
         # 'metasploitable_root_shell_1524', a bind-shell banner, not a module) and
