@@ -18054,24 +18054,11 @@ def update_engagement(eid: str, body: EngagementUpdate, _: bool = Depends(auth))
         raise HTTPException(404, "Engagement not found")
     return row
 
-# Asset-child tables cleared BEFORE deleting the assets. `findings` FIRST: its
-# assets FK is NO ACTION, so it BLOCKS the asset delete until cleared (the other
-# asset-children CASCADE). The SET NULL children (recon_findings, port_observation,
-# scan_targets, rag_documents) would be left orphaned with a null asset_id, so
-# clear them too rather than leave dangling rows.
-_PURGE_ASSET_CHILD_TABLES = [
-    "findings", "recon_findings", "port_observation", "scan_targets", "rag_documents",
-]
-# Data rows attributed to the engagement but possibly not via a live asset
-# (asset_id NULL). Best-effort — a table may lack engagement_id on some installs,
-# so each runs inside its own SAVEPOINT.
-_PURGE_DATA_BY_ENGAGEMENT = [
-    "findings", "vulns", "web_findings", "recon_findings", "credential_findings",
-    "playwright_findings", "pending_exploits",
-]
-# Engagement CONFIG (the scope + schedule that DEFINE the engagement). Removed
-# only on a full delete; KEPT when purging data so the engagement can be re-run.
-_PURGE_CONFIG_BY_ENGAGEMENT = ["scope_targets", "scheduled_scans"]
+# _purge_engagement_data now discovers engagement_id / asset_id tables dynamically
+# (so a new table is covered automatically) and adds IP / scan_id / pending_exploit
+# keyed deletes for rows with a NULL engagement_id. Operator config (scope,
+# schedules, rules, prompts) is listed in that function's CONFIG_KEEP set and kept
+# on a data purge, removed only on a full delete.
 
 
 def _sp_delete(cur, sql: str, params) -> int:
@@ -18099,46 +18086,160 @@ def _purge_engagement_data(cur, eid: str, keep_engagement: bool = False) -> Dict
     its scope/schedule (so it can be re-run); False also removes the scope and the
     engagement itself. Returns per-table deleted counts."""
     counts: Dict[str, int] = {}
+
+    def _scalars(sql, params):
+        cur.execute(sql, params)
+        out = []
+        for r in cur.fetchall():
+            v = (list(r.values())[0] if isinstance(r, dict) else r[0])
+            if v:
+                out.append(str(v))
+        return out
+
+    # Gather the engagement's target IPs BEFORE deleting assets. A lot of data —
+    # cracked creds (credential_findings src=hashcat_crack), exploits, held access,
+    # security tests — is keyed ONLY by IP with a NULL engagement_id/asset_id, so an
+    # engagement/asset-scoped delete misses it and it keeps showing after a purge.
+    ips = set(_scalars("SELECT host(ip) FROM assets WHERE engagement_id = %s::uuid", (eid,)))
+    ips |= {x.split('/')[0] for x in _scalars(
+        "SELECT target FROM scope_targets WHERE engagement_id = %s::uuid "
+        "AND target_type = 'ip'", (eid,))}
+    ips = [i for i in ips if i]
+
     cur.execute("SELECT id FROM assets WHERE engagement_id = %s::uuid", (eid,))
-    # Cursor may be a RealDictCursor (dict rows) — read by column name, not index.
-    asset_ids = [(r["id"] if isinstance(r, dict) else r[0]) for r in cur.fetchall()]
+    asset_ids = [str(r["id"] if isinstance(r, dict) else r[0]) for r in cur.fetchall()]
+
+    # The engagement's scan ids (via asset-linked scan_id rows) and pending-exploit
+    # ids — gathered before their parents are deleted so scan_id / pending_exploit_id
+    # children can be cleaned too.
+    scan_ids = pe_ids = []
     if asset_ids:
-        for tbl in _PURGE_ASSET_CHILD_TABLES:
-            counts[tbl] = _sp_delete(cur, f"DELETE FROM {tbl} WHERE asset_id = ANY(%s)", (asset_ids,))
-        cur.execute("DELETE FROM assets WHERE engagement_id = %s::uuid", (eid,))
+        scan_ids = _scalars("SELECT DISTINCT scan_id FROM public.port_observation "
+                            "WHERE asset_id = ANY(%s::uuid[]) AND scan_id IS NOT NULL", (asset_ids,))
+    if ips:
+        pe_ids = _scalars("SELECT id FROM public.pending_exploits WHERE host(target_ip) = ANY(%s)", (ips,))
+
+    # Config the operator OWNS (scope, schedules, rules, prompts) — kept on a
+    # data purge so the engagement can be re-run, removed only on a full delete.
+    CONFIG_KEEP = {"scope_targets", "scheduled_scans", "exploit_approval_rules",
+                   "custom_enumeration_rules", "scope_classification_rules",
+                   "service_prompts", "scan_parameters", "target_tool_settings",
+                   "chat_presets"}
+
+    def _tables_with(col):
+        cur.execute(
+            "SELECT c.table_name FROM information_schema.columns c "
+            "JOIN information_schema.tables t ON t.table_name = c.table_name "
+            "  AND t.table_schema = c.table_schema "
+            "WHERE c.table_schema = 'public' AND c.column_name = %s "
+            "  AND t.table_type = 'BASE TABLE'", (col,))
+        return [(r["table_name"] if isinstance(r, dict) else r[0]) for r in cur.fetchall()]
+
+    def _del(tbl, sql, params):
+        counts[tbl] = counts.get(tbl, 0) + _sp_delete(cur, sql, params)
+
+    # 1) pending-exploit children (no cascade) — before pending_exploits itself.
+    if pe_ids:
+        for tbl in ("exploit_results", "exploit_callbacks", "active_listeners", "vector_coverage"):
+            _del(tbl, f"DELETE FROM public.{tbl} WHERE pending_exploit_id = ANY(%s::uuid[])", (pe_ids,))
+
+    # 2) IP / target-keyed data — the class with a NULL engagement_id/asset_id
+    #    (cracked creds src=hashcat_crack, exploits, held access, tests, recs).
+    if ips:
+        for tbl, col in (("credential_findings", "ip"), ("pending_exploits", "target_ip"),
+                         ("security_tests", "target_ip"), ("credential_spray_attempts", "target_ip"),
+                         ("detected_software", "ip"), ("pending_scan_recommendations", "ip"),
+                         ("scan_recommendations", "ip"), ("port_observation", "ip")):
+            _del(tbl, f"DELETE FROM public.{tbl} WHERE host({col}::inet) = ANY(%s)", (ips,))
+        for tbl, col in (("obtained_access", "target"), ("attack_vectors", "target"),
+                         ("recon_findings", "target"), ("follow_up_items", "target"),
+                         ("tool_attempts", "target"), ("tool_executions", "target"),
+                         ("scan_runs", "target"), ("raw_artifacts", "target"),
+                         ("burp_followup_queue", "target"), ("port_access_advice", "target"),
+                         ("enumeration_observations", "target"), ("vector_coverage", "target"),
+                         ("scope_coverage", "target"), ("scope_decisions", "target"),
+                         ("scope_suggestions", "target"), ("scope_conflicts", "target"),
+                         ("attack_path_edges", "target"),
+                         ("scan_pipeline_jobs", "host")):
+            _del(tbl, f"DELETE FROM public.{tbl} WHERE "
+                      f"split_part(regexp_replace({col}, '^.*@', ''), ':', 1) = ANY(%s)", (ips,))
+
+    # 3) scan_id-keyed children (for scans tied to this engagement's assets).
+    if scan_ids:
+        for tbl in _tables_with("scan_id"):
+            _del(tbl, f"DELETE FROM public.{tbl} WHERE scan_id = ANY(%s::uuid[])", (scan_ids,))
+
+    # 4) asset_id-keyed — EVERY table with asset_id, for this engagement's assets.
+    if asset_ids:
+        for tbl in _tables_with("asset_id"):
+            _del(tbl, f"DELETE FROM public.{tbl} WHERE asset_id = ANY(%s::uuid[])", (asset_ids,))
+
+    # 5) engagement_id-keyed — EVERY table with engagement_id (dynamic, so a new
+    #    table is covered automatically), minus operator config on a data purge.
+    for tbl in _tables_with("engagement_id"):
+        if tbl == "engagements":
+            continue
+        if keep_engagement and tbl in CONFIG_KEEP:
+            continue
+        _del(tbl, f"DELETE FROM public.{tbl} WHERE engagement_id = %s::uuid", (eid,))
+
+    # 6) the assets themselves.
+    if asset_ids:
+        cur.execute("DELETE FROM public.assets WHERE engagement_id = %s::uuid", (eid,))
         counts["assets"] = cur.rowcount
     else:
         counts["assets"] = 0
-    for tbl in _PURGE_DATA_BY_ENGAGEMENT:
-        n = _sp_delete(cur, f"DELETE FROM {tbl} WHERE engagement_id = %s::uuid", (eid,))
-        counts[tbl] = counts.get(tbl, 0) + n
+
     if keep_engagement:
         return counts
-    for tbl in _PURGE_CONFIG_BY_ENGAGEMENT:
-        counts[tbl] = _sp_delete(cur, f"DELETE FROM {tbl} WHERE engagement_id = %s::uuid", (eid,))
-    # campaign_events, evidence_store and credential_vault CASCADE on the delete.
-    cur.execute("DELETE FROM engagements WHERE id = %s::uuid", (eid,))
+    # Full delete: config is gone with the engagement (CONFIG_KEEP tables were
+    # already deleted above since keep_engagement is False), then the row itself.
+    cur.execute("DELETE FROM public.engagements WHERE id = %s::uuid", (eid,))
     counts["engagements"] = cur.rowcount
     return counts
 
 
 def _purge_dry_run(cur, eid: str) -> Dict[str, Any]:
-    """Counts of what a purge would remove, without deleting anything."""
+    """Counts of what a purge would remove, without deleting anything. Counts by
+    engagement AND by target IP, so IP-keyed rows with a NULL engagement_id
+    (cracked creds, exploits, held access) are shown — the real purge deletes them."""
     cur.execute("SELECT COUNT(*) AS n FROM assets WHERE engagement_id = %s::uuid", (eid,))
     asset_n = cur.fetchone()["n"]
-    sub = "asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)"
+
+    def _col(sql, params):
+        cur.execute(sql, params)
+        return [(r[list(r.keys())[0]] if isinstance(r, dict) else r[0]) for r in cur.fetchall()]
+
+    ips = set(x for x in _col("SELECT host(ip) FROM assets WHERE engagement_id = %s::uuid", (eid,)) if x)
+    ips |= {str(x).split('/')[0] for x in _col(
+        "SELECT target FROM scope_targets WHERE engagement_id = %s::uuid AND target_type = 'ip'", (eid,)) if x}
+    ips = [i for i in ips if i]
     counts: Dict[str, int] = {}
-    for tbl, col in (("ports", sub), ("vulns", sub), ("findings", sub),
-                     ("web_findings", sub), ("credential_findings", sub),
-                     ("scope_targets", "engagement_id = %s::uuid")):
+
+    def _count(tbl, where, params):
         cur.execute("SAVEPOINT dr_sp")
         try:
-            cur.execute(f"SELECT COUNT(*) AS n FROM {tbl} WHERE {col}", (eid,))
+            cur.execute(f"SELECT COUNT(*) AS n FROM public.{tbl} WHERE {where}", params)
             counts[tbl] = cur.fetchone()["n"]
             cur.execute("RELEASE SAVEPOINT dr_sp")
         except Exception:  # noqa: BLE001
             cur.execute("ROLLBACK TO SAVEPOINT dr_sp")
-    return {"assets": asset_n, "would_delete": counts}
+
+    sub = "asset_id IN (SELECT id FROM public.assets WHERE engagement_id = %s::uuid)"
+    for tbl in ("ports", "vulns", "findings", "web_findings"):
+        _count(tbl, sub, (eid,))
+    for tbl in ("recon_findings", "pending_exploits", "playwright_findings"):
+        _count(tbl, "engagement_id = %s::uuid", (eid,))
+    if ips:
+        _count("credential_findings", "host(ip::inet) = ANY(%s)", (ips,))
+        _count("pending_exploits", "host(target_ip::inet) = ANY(%s)", (ips,))
+        _count("obtained_access",
+               "split_part(regexp_replace(target,'^.*@',''),':',1) = ANY(%s)", (ips,))
+        _count("security_tests", "host(target_ip::inet) = ANY(%s)", (ips,))
+        _count("exploit_results",
+               "pending_exploit_id IN (SELECT id FROM public.pending_exploits "
+               "WHERE host(target_ip) = ANY(%s))", (ips,))
+    return {"assets": asset_n, "target_ips": ips, "would_delete": counts}
 
 
 @app.post("/engagements/{eid}/purge-data", tags=["Engagements"])

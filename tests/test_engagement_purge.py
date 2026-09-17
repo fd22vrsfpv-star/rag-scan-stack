@@ -138,3 +138,44 @@ def test_default_delete_only_archives(engagement_with_asset):
     assert res.json().get("action") == "archived"
     assert _engagement_exists(eid), "archive must not delete the engagement"
     assert _asset_count(eid) == 1, "archive must not delete assets"
+
+
+def test_purge_deletes_ip_keyed_findings_with_null_engagement():
+    """The reported bug: cracked creds (credential_findings src=hashcat_crack) have a
+    NULL engagement_id/asset_id — keyed only by ip — so an engagement-scoped purge
+    missed them and they kept showing. purge-data must delete them by target IP."""
+    conn = _conn(); conn.autocommit = True; cur = conn.cursor()
+    name = f"pytest-purge-ip-{uuid.uuid4().hex[:8]}"
+    ip = f"198.51.100.{uuid.uuid4().int % 250 + 1}"     # TEST-NET-2
+    eid = aid = None
+    try:
+        cur.execute("INSERT INTO engagements (name, status) VALUES (%s,'active') RETURNING id", (name,))
+        eid = cur.fetchone()[0]
+        cur.execute("INSERT INTO assets (ip, engagement_id) VALUES (%s::inet,%s) RETURNING id", (ip, eid))
+        aid = cur.fetchone()[0]
+        cur.execute("INSERT INTO scope_targets (name, target, target_type, engagement_id) "
+                    "VALUES (%s,%s,'ip',%s)", (name, ip, eid))
+        # NULL engagement_id + NULL asset_id, keyed only by ip — like a real cracked cred.
+        cur.execute("INSERT INTO credential_findings (ip, port, protocol, username, source, auth_type, valid_cred) "
+                    "VALUES (%s::inet,22,'tcp','msfadmin','hashcat_crack','password',true)", (ip,))
+        cur.execute("SELECT count(*) FROM credential_findings WHERE host(ip)=%s", (ip,))
+        assert cur.fetchone()[0] == 1
+
+        r = _req("POST", f"/engagements/{eid}/purge-data", headers={"x-api-key": _key()})
+        if r.status_code in (401, 403):
+            pytest.skip("auth required")
+        assert r.status_code == 200, r.text[:200]
+
+        cur.execute("SELECT count(*) FROM credential_findings WHERE host(ip)=%s", (ip,))
+        assert cur.fetchone()[0] == 0, "cracked creds survived the purge (the bug)"
+        # engagement kept (keep_engagement); scope preserved for re-run.
+        cur.execute("SELECT count(*) FROM engagements WHERE id=%s", (eid,))
+        assert cur.fetchone()[0] == 1
+    finally:
+        cur.execute("DELETE FROM credential_findings WHERE host(ip)=%s", (ip,))
+        if aid:
+            cur.execute("DELETE FROM assets WHERE id=%s", (aid,))
+        if eid:
+            cur.execute("DELETE FROM scope_targets WHERE engagement_id=%s", (eid,))
+            cur.execute("DELETE FROM engagements WHERE id=%s", (eid,))
+        cur.close(); conn.close()
