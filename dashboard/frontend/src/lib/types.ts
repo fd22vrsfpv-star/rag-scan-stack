@@ -38,6 +38,8 @@ export interface Port {
   os?: string
   finding_count?: number
   max_severity?: string | null
+  tools_run?: number
+  has_enum?: boolean
 }
 
 export interface Finding {

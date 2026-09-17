@@ -1935,6 +1935,19 @@ def get_open_ports(
                    p.product, p.version, p.banner,
                    a.os,
                    COALESCE(COUNT(DISTINCT v.id), 0)::int AS finding_count,
+                   -- how many distinct tools have run against this exact port,
+                   -- and whether there is enumeration data (a held shell, an
+                   -- executed exploit, or a finding) worth opening for it.
+                   (SELECT COUNT(DISTINCT te.tool) FROM tool_executions te
+                     WHERE te.target = host(a.ip) AND te.port = p.port)::int AS tools_run,
+                   (COUNT(DISTINCT v.id) > 0
+                    OR EXISTS (SELECT 1 FROM obtained_access oa
+                                WHERE oa.target = host(a.ip) AND oa.port = p.port
+                                  AND oa.status <> 'rejected')
+                    OR EXISTS (SELECT 1 FROM pending_exploits pe
+                                 JOIN exploit_results er ON er.pending_exploit_id = pe.id
+                                WHERE host(pe.target_ip) = host(a.ip)
+                                  AND pe.target_port = p.port)) AS has_enum,
                    -- public.severity_rank() — one scale for the whole stack
                    -- (etl/severity.py). This was a hand-written descending CASE.
                    CASE MAX(
