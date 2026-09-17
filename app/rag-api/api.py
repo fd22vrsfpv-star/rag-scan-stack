@@ -23191,7 +23191,48 @@ def asset_enumeration(ip: str, _: bool = Depends(auth)):
         loot = [loot_by_title[t] for t in loot_order]
         loot_cmd_count = sum(len(g["commands"]) for g in loot)
 
-        # 4) Login attempts (credential revalidation / spray) against this host.
+            # Listening ports the target sees from INSIDE (ss/netstat through a held
+        # shell) — internal/pivot services, often not visible in an external scan.
+        listening_ports = []
+        _seen_lp = set()
+        for _g in loot:
+            for _cmd in _g.get("commands", []):
+                _c = _cmd.get("command") or ""
+                if "ss -tlnp" not in _c and "netstat" not in _c:
+                    continue
+                for _line in (_cmd.get("output") or "").splitlines():
+                    _line = _re.sub(r"^\S+@\S+:[^#]*#\s*", "", _line).strip()
+                    _parts = _line.split()
+                    if (len(_parts) >= 3 and _parts[0].isdigit()
+                            and _parts[1].isdigit() and ":" in _parts[2]):
+                        _addr, _, _ps = _parts[2].rpartition(":")
+                        if not _ps.isdigit():
+                            continue
+                        _pm = _re.search(r'users:\(\("([^"]+)"', _line)
+                        _proc = _pm.group(1) if _pm else None
+                        _port_i = int(_ps)
+                        if _port_i in _seen_lp:
+                            # already have this port — fill in a process name if
+                            # this line has one and the stored row did not.
+                            if _proc:
+                                for _e in listening_ports:
+                                    if _e["port"] == _port_i and not _e.get("process"):
+                                        _e["process"] = _proc
+                            continue
+                        _seen_lp.add(_port_i)
+                        listening_ports.append({"port": _port_i,
+                                                "address": _addr or "*",
+                                                "process": _proc})
+        listening_ports.sort(key=lambda x: x["port"])
+        # flag internal-only ports (listening inside but not an externally-open port)
+        _ext_ports = {a.get("port") for a in access}  # held-access ports (coarse)
+        cur.execute("SELECT p.port FROM ports p JOIN assets a ON p.asset_id=a.id "
+                    "WHERE host(a.ip)=%s AND COALESCE(p.is_open,true)", (ip,))
+        _open_ext = {r["port"] for r in cur.fetchall()}
+        for _lp in listening_ports:
+            _lp["internal_only"] = _lp["port"] not in _open_ext
+
+    # 4) Login attempts (credential revalidation / spray) against this host.
         cur.execute(
             """SELECT username, service, target_port, status, attempted_at
                  FROM credential_spray_attempts
@@ -23239,11 +23280,14 @@ def asset_enumeration(ip: str, _: bool = Depends(auth)):
     attempts_ok = sum(1 for a in login_attempts if a["status"] in ("success", "valid"))
     return {"ip": ip, "highlights": highlights, "access": access,
             "credentials": creds, "loot": loot, "login_attempts": login_attempts,
+            "listening_ports": listening_ports,
             "counts": {"access": len(access), "credentials": len(creds),
                        "cracked": len(cracked), "hashes": len(hashes),
                        "loot_items": loot_cmd_count, "loot_groups": len(loot),
                        "login_attempts": len(login_attempts),
-                       "login_success": attempts_ok}}
+                       "login_success": attempts_ok,
+                       "listening_ports": len(listening_ports),
+                       "listening_internal_only": sum(1 for l in listening_ports if l.get("internal_only"))}}
 
 
 @app.post("/assets/{ip}/access/refresh", tags=["Access"])
