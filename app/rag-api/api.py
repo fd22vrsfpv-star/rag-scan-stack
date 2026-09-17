@@ -1940,6 +1940,9 @@ def get_open_ports(
                    -- executed exploit, or a finding) worth opening for it.
                    (SELECT COUNT(DISTINCT te.tool) FROM tool_executions te
                      WHERE te.target = host(a.ip) AND te.port = p.port)::int AS tools_run,
+                   (SELECT COUNT(DISTINCT pe2.exploit_id) FROM pending_exploits pe2
+                     WHERE host(pe2.target_ip) = host(a.ip)
+                       AND pe2.target_port = p.port)::int AS exploits_attempted,
                    (COUNT(DISTINCT v.id) > 0
                     OR EXISTS (SELECT 1 FROM obtained_access oa
                                 WHERE oa.target = host(a.ip) AND oa.port = p.port
@@ -1948,6 +1951,16 @@ def get_open_ports(
                                  JOIN exploit_results er ON er.pending_exploit_id = pe.id
                                 WHERE host(pe.target_ip) = host(a.ip)
                                   AND pe.target_port = p.port)) AS has_enum,
+                   -- proven COMMAND EXECUTION on this port: an exploit-success
+                   -- finding (record_exploit_success_finding writes script
+                   -- 'exploit:<kind>') OR a held shell/session on the port.
+                   (EXISTS (SELECT 1 FROM vulns vex
+                             WHERE vex.port_id = p.id AND vex.script LIKE 'exploit:%%')
+                    OR EXISTS (SELECT 1 FROM obtained_access oa2
+                                WHERE oa2.target = host(a.ip) AND oa2.port = p.port
+                                  AND oa2.kind IN ('bind_shell','msf_session',
+                                                   'webshell','listener_callback')
+                                  AND oa2.status <> 'rejected')) AS has_command_exec,
                    -- public.severity_rank() — one scale for the whole stack
                    -- (etl/severity.py). This was a hand-written descending CASE.
                    CASE MAX(
