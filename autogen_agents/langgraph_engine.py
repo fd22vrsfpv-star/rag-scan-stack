@@ -4151,6 +4151,24 @@ def _exec_one_impactful(sid, pending_id, test):
             has_shell=bool(success), triggered_by="agent",
             triggered_by_session=sid)
         _update_vector_coverage_from_run(sid, test, success, session_id, out, pending_id, er_id)
+        # A PASSED impactful test PROVED impact (command execution / RCE) against
+        # this service — flag it as a FINDING on the asset even without a
+        # persistent shell, so proven exploitation shows up in the asset's
+        # findings, not only as a security_test pass (java-rmi, proftpd, etc. were
+        # proved but never appeared as findings). Idempotent per (ip, port, label).
+        if rec.get("status") == "pass":
+            try:
+                from etl import access as _ax
+                _ip = (test.get("host") or test.get("ip") or test.get("target") or "")
+                _ax.record_exploit_success_finding(
+                    str(_ip).split("/")[0], test.get("port"),
+                    test.get("service") or test.get("category") or "",
+                    test.get("exploit_ref") or test.get("tool")
+                        or test.get("test_id") or "exploit",
+                    (out or "")[:4000],
+                    session_type if success else "command_exec")
+            except Exception as _fe:  # noqa: BLE001
+                _log.debug("[%s] surface-test finding record failed: %s", sid, _fe)
         if success:
             _postex_enumerate(test.get("host"), session_type, session_id, sid)
         return rec.get("status")

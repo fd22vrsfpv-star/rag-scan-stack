@@ -217,6 +217,23 @@ function makePortColumns(
     const count = getValue() as number | undefined
     return count ? <span className="text-xs font-medium">{count}</span> : <span className="text-xs text-muted-foreground">—</span>
   }},
+  { id: 'tools_enum', header: 'Tools / Enum', size: 115, minSize: 80, cell: ({ row }) => {
+    const t = Number(row.original.tools_run ?? 0)
+    const hasEnum = !!row.original.has_enum
+    return (
+      <div className="flex items-center gap-1.5">
+        <span className="text-xs" title={`${t} distinct tool(s) run against this port`}>
+          {t > 0 ? `${t} tool${t === 1 ? '' : 's'}` : <span className="text-muted-foreground">—</span>}
+        </span>
+        {hasEnum && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded border bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
+                title="Enumeration data available (findings / held access / exploit output) — open the Enumeration tab">
+            enum
+          </span>
+        )}
+      </div>
+    )
+  }},
   { accessorKey: 'max_severity', header: 'Severity', size: 85, minSize: 60, cell: ({ getValue }) => {
     const sev = getValue() as string | null
     if (!sev) return <span className="text-xs text-muted-foreground">—</span>
