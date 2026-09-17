@@ -1,0 +1,346 @@
+"""LLM router for enumeration: per-task model routing + triage + fact review.
+
+Two LLM ROLES exist in the enumeration pipeline, and they want different
+handling:
+
+  * EXTRACTION — read output that the deterministic extractors
+    (knowledge/enumeration_extractors.yaml) missed and propose structured facts.
+  * REVIEW     — validate candidate facts (from BOTH the deterministic extractors
+    AND the LLM fallback) before they become proposals/observations, so a
+    low-confidence generic match or an LLM guess does not fill the queue with
+    false positives.
+
+The ROUTER does two things:
+
+  1. Selects the model / params per role from operator config
+     (app_settings, category 'config', keys ``enum_router.*``; code defaults when
+     unset — same mechanism as the session watchdog). The model defaults to None
+     so llm_query TASK-ROUTES it (a hardcoded model masquerades as a caller
+     choice and 404s on task-routing backends — see memory
+     llm-query-model-default-defeats-routing); an operator may pin one per role.
+  2. TRIAGES each output chunk so the LLM runs only when it adds value:
+     deterministic extractors first, LLM extraction only when they miss and the
+     output is substantive; review only over the facts that are actually
+     uncertain (configurable to all).
+
+Fail direction:
+  * extraction fails CLOSED — an error yields no extra facts, never acts blind.
+  * review fails OPEN — an error keeps the facts as-is, so a reviewer outage does
+    not silently drop real findings.
+
+No hard dependency on post_enumeration: it imports this, not the other way round.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import time
+from typing import Any, Callable, Dict, List, Optional
+
+log = logging.getLogger("enumeration_llm_router")
+
+LLM_URL = os.environ.get("LLM_URL", "https://llm_query:8002/ollama/chat")
+
+# Fact kinds the LLM roles may emit / keep — the vocabulary the extractors and
+# rules already speak. An invented kind nothing consumes is dropped.
+ALLOWED_FACTS = {"secret", "host", "file", "credential", "share", "host_fact"}
+
+# Global kill switch (kept for backward-compat with ENUMERATION_LLM_FALLBACK).
+_GLOBAL_ENABLED = os.environ.get("ENUMERATION_LLM_FALLBACK", "1") not in (
+    "0", "false", "False", "")
+
+# Code defaults; app_settings overrides per key. Namespaced + globally unique so
+# they set the same way as every other tunable (/settings/config/{key}).
+_DEFAULTS: Dict[str, Any] = {
+    "enum_router.extraction.enabled": True,
+    "enum_router.extraction.model": None,      # None => llm_query task-routes it
+    "enum_router.extraction.temperature": 0.0,
+    "enum_router.extraction.max_tokens": 600,
+    "enum_router.extraction.min_chars": 40,
+    "enum_router.extraction.max_chars": 6000,
+    "enum_router.review.enabled": True,
+    "enum_router.review.model": None,
+    "enum_router.review.temperature": 0.0,
+    "enum_router.review.max_tokens": 500,
+    # which facts to review: "uncertain" (llm-sourced / generic / low-confidence)
+    # or "all".
+    "enum_router.review.scope": "uncertain",
+}
+
+_SETTINGS_TTL = int(os.environ.get("ENUM_ROUTER_SETTINGS_TTL", "60"))
+
+
+def _as_bool(v: Any, default: bool) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("true", "1", "yes", "on")
+
+
+class EnumerationLLMRouter:
+    """Routes enumeration LLM calls by role, triages when to call, and reviews
+    facts. One instance is fine to share (settings are cached with a TTL)."""
+
+    def __init__(self, connect: Optional[Callable[[], Any]] = None):
+        self._connect = connect
+        self._cache: Dict[str, Any] = {}
+        self._cache_at: float = 0.0
+
+    # ── config ───────────────────────────────────────────────────────────────
+    def _settings(self) -> Dict[str, Any]:
+        now = time.time()
+        if self._cache and (now - self._cache_at) < _SETTINGS_TTL:
+            return self._cache
+        merged = dict(_DEFAULTS)
+        rows: Dict[str, str] = {}
+        try:
+            conn = self._connect() if self._connect else self._default_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT key, value FROM public.app_settings "
+                                "WHERE category = 'config' AND key = ANY(%s)",
+                                (list(_DEFAULTS.keys()),))
+                    rows = {k: v for k, v in cur.fetchall()}
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            log.debug("enum router: app_settings unavailable; using defaults",
+                      exc_info=True)
+        for key, raw in rows.items():
+            default = _DEFAULTS.get(key)
+            if isinstance(default, bool):
+                merged[key] = _as_bool(raw, default)
+            elif isinstance(default, int) and not isinstance(default, bool):
+                try:
+                    merged[key] = int(raw)
+                except (TypeError, ValueError):
+                    pass
+            elif isinstance(default, float):
+                try:
+                    merged[key] = float(raw)
+                except (TypeError, ValueError):
+                    pass
+            else:  # str / None
+                merged[key] = (raw if raw not in (None, "", "null", "None")
+                               else default)
+        self._cache = merged
+        self._cache_at = now
+        return merged
+
+    @staticmethod
+    def _default_connect():
+        import psycopg2
+        dsn = os.environ.get("DB_DSN",
+                             "postgresql://app:app@rag-postgres:5432/scans")
+        c = psycopg2.connect(dsn, connect_timeout=5)
+        c.autocommit = True
+        return c
+
+    def route(self, task: str) -> Dict[str, Any]:
+        """Params for a role: {'enabled','model','temperature','max_tokens', ...}."""
+        s = self._settings()
+        p = f"enum_router.{task}."
+        return {k[len(p):]: v for k, v in s.items() if k.startswith(p)}
+
+    # ── LLM call ───────────────────────────────────────────────────────────────
+    def _call_llm(self, system: str, user: str, params: Dict[str, Any]) -> str:
+        import requests
+        body: Dict[str, Any] = {
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
+            "max_tokens": int(params.get("max_tokens") or 500),
+            "temperature": float(params.get("temperature") or 0.0),
+        }
+        model = params.get("model")
+        if model:                       # omit => llm_query task-routes it
+            body["model"] = model
+        resp = requests.post(LLM_URL, json=body, timeout=60, verify=False)
+        if resp.status_code >= 400:
+            log.debug("enum router LLM HTTP %s: %s", resp.status_code,
+                      resp.text[:160])
+            return ""
+        data = resp.json()
+        if not isinstance(data, dict):
+            return ""
+        msg = data.get("message")
+        if isinstance(msg, dict) and msg.get("content"):
+            return msg["content"]
+        ch = data.get("choices")
+        if isinstance(ch, list) and ch:
+            content = ((ch[0] or {}).get("message") or {}).get("content")
+            if content:
+                return content
+        return data.get("response") or data.get("content") or ""
+
+    @staticmethod
+    def _first_json(text: str):
+        import json as _json
+        import re as _re
+        m = _re.search(r"\{.*\}", text or "", _re.S)
+        if not m:
+            return None
+        try:
+            return _json.loads(m.group(0))
+        except Exception:  # noqa: BLE001
+            return None
+
+    # ── triage ─────────────────────────────────────────────────────────────────
+    def should_extract(self, output: str, deterministic_facts: List[Dict]) -> bool:
+        """LLM extraction runs only when the deterministic extractors found
+        NOTHING and the output is substantive (within size bounds)."""
+        if not _GLOBAL_ENABLED or deterministic_facts:
+            return False
+        p = self.route("extraction")
+        if not p.get("enabled"):
+            return False
+        n = len((output or "").strip())
+        return int(p.get("min_chars") or 40) <= n
+
+    # ── extraction ───────────────────────────────────────────────────────────
+    def extract(self, output: str, *, tool: str = "", target: str = "",
+                service: str = "") -> List[Dict[str, Any]]:
+        """Classify output that matched no extractor into structured facts.
+        Fails CLOSED (returns [] on any problem)."""
+        p = self.route("extraction")
+        text = (output or "").strip()
+        if not _GLOBAL_ENABLED or not p.get("enabled"):
+            return []
+        if len(text) < int(p.get("min_chars") or 40):
+            return []
+        text = text[:int(p.get("max_chars") or 6000)]
+        try:
+            system = (
+                "You are a penetration-test post-exploitation analyst reading the "
+                "raw output of a command for AUTHORIZED security testing. The "
+                "platform's pattern matchers found NOTHING actionable in it. "
+                "Identify anything a tester would act on and return ONLY JSON, no "
+                'prose: {"facts":[{"fact":"secret|host|file|credential|host_fact",'
+                '"kind":"<short kind, e.g. api_token, config_path>",'
+                '"value":"<the literal string found>",'
+                '"why":"<one short reason it matters>"}]}. Only include something '
+                'actually present in the output. If nothing is actionable, return '
+                '{"facts":[]}. Never invent values.')
+            user = (f"Tool: {tool}\nTarget: {target}\nService: {service}\n"
+                    f"Output:\n{text}")
+            parsed = self._first_json(self._call_llm(system, user, p))
+            raw = parsed.get("facts") if isinstance(parsed, dict) else None
+            if not isinstance(raw, list):
+                return []
+            facts: List[Dict[str, Any]] = []
+            for rf in raw[:25]:
+                if not isinstance(rf, dict):
+                    continue
+                kind_fact = str(rf.get("fact") or "").strip().lower()
+                if kind_fact not in ALLOWED_FACTS:
+                    continue
+                val = rf.get("value")
+                if not val:
+                    continue
+                fact: Dict[str, Any] = {
+                    "fact": kind_fact,
+                    "kind": str(rf.get("kind") or "llm").strip()[:40],
+                    "value": str(val)[:300],
+                    "service": service,
+                    "source": "llm_fallback",
+                    "confidence": "low",
+                    "why": str(rf.get("why") or "")[:200],
+                    "line": str(val)[:200],
+                }
+                fact["target"] = (str(val) if kind_fact == "host" else target)
+                if kind_fact == "host":
+                    fact["seen_on"] = target
+                facts.append(fact)
+            return facts
+        except Exception as e:  # noqa: BLE001
+            log.debug("enum router extraction failed: %s", e)
+            return []
+
+    # ── review ─────────────────────────────────────────────────────────────────
+    def _needs_review(self, fact: Dict[str, Any], scope: str) -> bool:
+        if scope == "all":
+            return True
+        # "uncertain": LLM-sourced, the low-confidence generic catch, or anything
+        # already flagged low confidence.
+        return (fact.get("source") == "llm_fallback"
+                or fact.get("kind") == "generic"
+                or fact.get("confidence") == "low")
+
+    def review(self, facts: List[Dict[str, Any]], *, output: str = "",
+               target: str = "", service: str = "") -> Dict[str, Any]:
+        """Validate candidate facts before they are queued. Returns
+        {"facts": kept_facts, "reviewed": n, "dropped": n}. Fails OPEN — an error
+        keeps every fact, so a reviewer outage never silently drops findings."""
+        result = {"facts": facts, "reviewed": 0, "dropped": 0}
+        if not facts:
+            return result
+        p = self.route("review")
+        if not _GLOBAL_ENABLED or not p.get("enabled"):
+            return result
+        scope = str(p.get("scope") or "uncertain")
+        idx = [i for i, f in enumerate(facts) if self._needs_review(f, scope)]
+        if not idx:
+            return result
+        try:
+            import json as _json
+            lines = []
+            for i in idx:
+                f = facts[i]
+                lines.append(f"{i}. fact={f.get('fact')} kind={f.get('kind')} "
+                             f"value={str(f.get('value') or f.get('path') or f.get('target'))[:160]} "
+                             f"why={str(f.get('why') or '')[:120]}")
+            system = (
+                "You are validating candidate findings extracted from penetration-"
+                "test enumeration output, for AUTHORIZED security testing. For each "
+                "numbered item decide if it is a REAL, actionable finding actually "
+                "supported by the output, or a FALSE POSITIVE (a placeholder, an "
+                "example value, a variable name with no secret, a self/reserved "
+                "host, unrelated text). Return ONLY JSON: "
+                '{"verdicts":[{"i":<index>,"keep":true|false,'
+                '"confidence":"high|medium|low","reason":"<short>"}]}. '
+                "Judge only from the output; when unsure, keep it and mark "
+                "confidence low.")
+            user = (f"Target: {target}\nService: {service}\n"
+                    f"Output (context):\n{(output or '')[:4000]}\n\n"
+                    f"Candidate findings:\n" + "\n".join(lines))
+            parsed = self._first_json(self._call_llm(system, user, p))
+            verdicts = parsed.get("verdicts") if isinstance(parsed, dict) else None
+            if not isinstance(verdicts, list):
+                return result                       # fail open
+            vmap = {}
+            for v in verdicts:
+                if isinstance(v, dict) and isinstance(v.get("i"), int):
+                    vmap[v["i"]] = v
+            kept: List[Dict[str, Any]] = []
+            dropped = 0
+            for i, f in enumerate(facts):
+                v = vmap.get(i)
+                if v is None:
+                    kept.append(f)                  # not judged -> keep
+                    continue
+                result["reviewed"] += 1
+                if v.get("keep") is False:
+                    dropped += 1
+                    continue
+                f = dict(f)
+                f["review"] = {"kept": True,
+                               "confidence": str(v.get("confidence") or "low"),
+                               "reason": str(v.get("reason") or "")[:200]}
+                kept.append(f)
+            result["facts"] = kept
+            result["dropped"] = dropped
+            return result
+        except Exception as e:  # noqa: BLE001
+            log.debug("enum router review failed (keeping all): %s", e)
+            return {"facts": facts, "reviewed": 0, "dropped": 0}
+
+
+_ROUTER: Optional[EnumerationLLMRouter] = None
+
+
+def get_router(connect: Optional[Callable[[], Any]] = None) -> EnumerationLLMRouter:
+    """Shared router instance."""
+    global _ROUTER
+    if _ROUTER is None:
+        _ROUTER = EnumerationLLMRouter(connect=connect)
+    return _ROUTER
