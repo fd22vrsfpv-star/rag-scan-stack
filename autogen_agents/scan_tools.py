@@ -4720,11 +4720,15 @@ def queue_exploit_for_approval(
                     ov.setdefault(k, v)
                 parameters["msf_option_overrides"] = ov
 
-        # DEDUP: do not re-queue an exploit already pending/approved/executed for
-        # this (target, port, module). The exploit agent re-proposing the same
-        # candidate every planning pass otherwise piles up duplicates that all
-        # auto-fire — 49 duplicate executions were observed on a rich target,
-        # keeping the session from ever converging. Best-effort; never blocks.
+        # DEDUP (session-scoped): do not re-queue an exploit already
+        # pending/approved/executed FOR THIS SESSION. The exploit agent
+        # re-proposing the same candidate every planning pass otherwise piles up
+        # duplicates that all auto-fire — 49 duplicate executions were observed in
+        # ONE session on a rich target, keeping it from converging. Scoped to the
+        # session on purpose: a FRESH session must be able to re-run (re-verify)
+        # an exploit a PRIOR session already executed — a cross-session dedup
+        # starved a new run of everything and it stalled. A failed row is not
+        # deduped, so a retry is still allowed. Best-effort; never blocks.
         try:
             from db_utils import get_db as _get_db
             _ip = str(target_ip or "").split("/")[0].strip()
@@ -4734,8 +4738,11 @@ def queue_exploit_for_approval(
                     "WHERE host(target_ip) = %s AND exploit_id = %s "
                     "  AND COALESCE(target_port, 0) = COALESCE(%s, 0) "
                     "  AND status IN ('pending','approved','executed') "
+                    "  AND (%s::uuid IS NULL OR session_id = %s::uuid) "
                     "ORDER BY created_at DESC LIMIT 1",
-                    (_ip, exploit_id, target_port))
+                    (_ip, exploit_id, target_port,
+                     str(session_uuid) if session_uuid else None,
+                     str(session_uuid) if session_uuid else None))
                 _dup = _cur.fetchone()
             if _dup:
                 return json.dumps({
