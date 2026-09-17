@@ -23244,6 +23244,10 @@ def asset_enumeration(ip: str, _: bool = Depends(auth)):
         _open_ext = {r["port"] for r in cur.fetchall()}
         for _lp in listening_ports:
             _lp["internal_only"] = _lp["port"] not in _open_ext
+            # local_only: bound to loopback (127.0.0.0/8 or ::1) — reachable ONLY
+            # from the host itself, so a follow-up pivot target, never externally.
+            _al = str(_lp.get("address") or "").strip().lower().strip("[]")
+            _lp["local_only"] = (_al.startswith("127.") or _al in ("::1", "localhost"))
 
     # 4) Login attempts (credential revalidation / spray) against this host.
         cur.execute(
@@ -23288,6 +23292,14 @@ def asset_enumeration(ip: str, _: bool = Depends(auth)):
         highlights.append({"severity": "high", "kind": "sudo_nopasswd",
                            "label": "Passwordless / full sudo rights available"})
     sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    _local = [l for l in listening_ports if l.get("local_only")]
+    if _local:
+        _names = ", ".join(f"{l['port']}{('/' + l['process']) if l.get('process') else ''}"
+                           for l in _local[:8])
+        highlights.append({"severity": "high", "kind": "local_only_ports",
+                           "label": f"{len(_local)} local-only service(s) (loopback) — "
+                                    f"reachable only by pivoting through this host, "
+                                    f"follow up: {_names}"})
     highlights.sort(key=lambda h: sev_rank.get(h["severity"], 9))
 
     attempts_ok = sum(1 for a in login_attempts if a["status"] in ("success", "valid"))
@@ -23300,7 +23312,8 @@ def asset_enumeration(ip: str, _: bool = Depends(auth)):
                        "login_attempts": len(login_attempts),
                        "login_success": attempts_ok,
                        "listening_ports": len(listening_ports),
-                       "listening_internal_only": sum(1 for l in listening_ports if l.get("internal_only"))}}
+                       "listening_internal_only": sum(1 for l in listening_ports if l.get("internal_only")),
+                       "listening_local_only": sum(1 for l in listening_ports if l.get("local_only"))}}
 
 
 @app.post("/assets/{ip}/access/refresh", tags=["Access"])
