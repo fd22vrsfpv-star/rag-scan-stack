@@ -920,3 +920,82 @@ def best_for(target: str) -> Optional[Dict[str, Any]]:
     keys = ("id", "target", "port", "kind", "handle", "transport", "whoami",
             "is_root", "score", "probes", "probes_ok")
     return dict(zip(keys, row))
+
+
+def record_exploit_success_finding(target: str, port, service: str,
+                                   label: str, output: str,
+                                   session_type: str = None) -> bool:
+    """Tag a successful exploit as a FINDING even when it left no persistent shell.
+
+    A one-shot RCE (distcc, php_cgi, java_rmi, unrealircd, a webshell command) is a
+    real result — command execution was proven — so it is recorded as a vuln
+    finding that drives the asset banner's severity, distinct from a live session
+    (which lives in obtained_access). Idempotent per (ip, port, label) via a stable
+    fingerprint. Best-effort; returns True if a finding was written.
+
+    severity: root in the output -> critical; a command-execution exploit -> high;
+    a pure auxiliary/scanner confirmation -> medium (not command execution)."""
+    import hashlib
+    from psycopg2.extras import Json
+    ip = str(target or "").split("/")[0]
+    lab = (label or "exploit").strip()
+    low = f"{lab} {output or ''}".lower()
+    is_aux = "auxiliary/" in lab.lower() or "scanner/" in lab.lower()
+    is_root = ("uid=0(root)" in low or "whoami\nroot" in low
+               or "\nroot\n" in low or low.strip().endswith(" root")
+               or '"whoami":"root"' in low)
+    if is_root:
+        sev = "critical"
+    elif is_aux:
+        sev = "medium"
+    else:
+        sev = "high"
+    kind = "service_confirmed" if is_aux else "command_exec"
+    verb = "Service issue confirmed" if is_aux else "Command execution confirmed"
+    persistent = bool(session_type and session_type not in ("", "none", "web_poc"))
+    title = (f"{verb} on {ip}" + (f":{port}" if port else "")
+             + f" via {lab}" + (" (persistent session)" if persistent else ""))
+    fp = hashlib.md5(f"exploit_success|{ip}|{port or ''}|{lab}".encode()).hexdigest()
+    conn = None
+    try:
+        conn = _connect(); conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("SELECT id, engagement_id FROM public.assets WHERE host(ip) = %s LIMIT 1", (ip,))
+        a = cur.fetchone()
+        if not a:
+            return False
+        asset_id, engagement_id = a[0], a[1]
+        port_id = None
+        if port:
+            cur.execute("SELECT id FROM public.ports WHERE asset_id = %s AND port = %s LIMIT 1",
+                        (asset_id, int(port)))
+            pr = cur.fetchone(); port_id = pr[0] if pr else None
+        meta = {"source": "exploit_success", "kind": kind, "exploit": lab,
+                "port": port, "service": service, "persistent_shell": persistent}
+        out = (f"{verb} via {lab}"
+               + (f" on {service}" if service else "")
+               + (". A persistent session was opened." if persistent
+                  else ". Command execution was proven; no persistent shell.")
+               + (f"\n--- output ---\n{(output or '')[:1500]}" if output else ""))
+        cur.execute("SELECT id FROM public.vulns WHERE fingerprint = %s", (fp,))
+        ex = cur.fetchone()
+        if ex:
+            cur.execute("""UPDATE public.vulns SET severity=%s, title=%s, output=%s,
+                             metadata=%s, port_id=COALESCE(%s, port_id), last_seen=now()
+                           WHERE id=%s""",
+                        (sev, title, out, Json(meta), port_id, ex[0]))
+        else:
+            cur.execute("""INSERT INTO public.vulns
+                             (asset_id, port_id, script, output, severity, title, metadata,
+                              fingerprint, workflow_status, engagement_id, first_seen, last_seen)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'new',%s,now(),now())""",
+                        (asset_id, port_id, f"exploit:{kind}", out, sev, title,
+                         Json(meta), fp, engagement_id))
+        cur.close()
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("record_exploit_success_finding failed for %s: %s", ip, e)
+        return False
+    finally:
+        if conn:
+            conn.close()
