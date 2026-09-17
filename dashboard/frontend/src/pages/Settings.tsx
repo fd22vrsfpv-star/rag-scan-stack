@@ -4625,6 +4625,73 @@ function ExploitWatcherTab() {
       </div>
 
       <MsfPayloadSettings />
+      <SessionWatchdogCard />
+    </div>
+  )
+}
+
+function SessionWatchdogCard() {
+  const KEYS = {
+    enabled: 'session_watchdog.enabled',
+    interval: 'session_watchdog.interval_minutes',
+    stale: 'session_watchdog.stale_minutes',
+  }
+  const [enabled, setEnabled] = useState(true)
+  const [interval, setInterval] = useState('15')
+  const [stale, setStale] = useState('15')
+  const [saved, setSaved] = useState('')
+
+  useEffect(() => {
+    apiFetch<{ value: string }>(`/settings/config/${KEYS.enabled}`)
+      .then(r => setEnabled(String(r?.value).toLowerCase() !== 'false')).catch(() => {})
+    apiFetch<{ value: string }>(`/settings/config/${KEYS.interval}`)
+      .then(r => { if (r?.value) setInterval(String(r.value)) }).catch(() => {})
+    apiFetch<{ value: string }>(`/settings/config/${KEYS.stale}`)
+      .then(r => { if (r?.value) setStale(String(r.value)) }).catch(() => {})
+  }, [])
+
+  const save = async (key: string, value: string, label: string) => {
+    try {
+      await apiFetch(`/settings/config/${key}`, { method: 'PUT', body: JSON.stringify({ value }) })
+      setSaved(label)
+      setTimeout(() => setSaved(''), 2000)
+    } catch { /* ignore */ }
+  }
+
+  return (
+    <div className="border border-border rounded-lg p-4 space-y-3">
+      <div>
+        <h3 className="text-base font-semibold">Session Health Watchdog</h3>
+        <p className="text-sm text-muted-foreground">
+          Periodic deeper-dive check that detects HUNG pentest sessions (e.g. a session stuck
+          &ldquo;scanning&rdquo; after its scans actually finished), self-heals the stale scan
+          status, and raises a <span className="font-mono text-xs">session_stuck_detected</span> alert.
+        </p>
+      </div>
+      <div className="flex flex-wrap items-end gap-4">
+        <label className="flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={enabled}
+                 onChange={e => { setEnabled(e.target.checked); save(KEYS.enabled, String(e.target.checked), 'enabled') }} />
+          Enabled
+        </label>
+        <div className="space-y-1">
+          <label className="block text-xs text-muted-foreground">Check every (minutes)</label>
+          <div className="flex items-center gap-2">
+            <input type="number" min={1} value={interval}
+                   onChange={e => setInterval(e.target.value)}
+                   onBlur={() => save(KEYS.interval, interval, 'interval')}
+                   className="w-20 h-8 px-2 text-sm rounded border border-border bg-background" />
+          </div>
+        </div>
+        <div className="space-y-1">
+          <label className="block text-xs text-muted-foreground">No-progress threshold (minutes)</label>
+          <input type="number" min={1} value={stale}
+                 onChange={e => setStale(e.target.value)}
+                 onBlur={() => save(KEYS.stale, stale, 'stale')}
+                 className="w-20 h-8 px-2 text-sm rounded border border-border bg-background" />
+        </div>
+        {saved && <span className="text-xs text-green-500">Saved ({saved})</span>}
+      </div>
     </div>
   )
 }

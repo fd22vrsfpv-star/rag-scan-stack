@@ -2,8 +2,8 @@ import { useState, useMemo, useEffect, Fragment } from 'react'
 import { Link } from 'react-router-dom'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
 import PageHelp from '@/components/PageHelp'
-import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice,
-  type ObtainedAccess, type DdgSearchResponse } from '@/api/assets'
+import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice, useAssetEnumeration,
+  type ObtainedAccess, type DdgSearchResponse, type EnumHighlight, type EnumCredential, type EnumLoot } from '@/api/assets'
 import { apiFetch } from '@/api/client'
 import { useTargetedReconLookup, useTargetedReconExecute } from '@/api/targeted-recon'
 import { cn } from '@/lib/utils'
@@ -448,6 +448,129 @@ function SecretValue({ value, secretType }: { value: string; secretType?: string
  *  panel is also the explanation of where those results came from.
  *
  *  `is_root: null` means NOT PROBED. It is shown as "unknown", never as "no". */
+function EnumerationSection({ ip }: { ip: string }) {
+  const { data, isLoading } = useAssetEnumeration(ip)
+  const [reveal, setReveal] = useState<Record<number, boolean>>({})
+  const [openLoot, setOpenLoot] = useState<Record<number, boolean>>({})
+
+  const sevClass: Record<string, string> = {
+    critical: 'bg-red-500/15 text-red-400 border-red-500/40',
+    high: 'bg-orange-500/15 text-orange-400 border-orange-500/40',
+    medium: 'bg-yellow-500/15 text-yellow-400 border-yellow-500/40',
+    low: 'bg-muted text-muted-foreground border-border',
+  }
+
+  if (isLoading) return <div className="text-xs text-muted-foreground">Loading enumeration…</div>
+  const d = data
+  const hl: EnumHighlight[] = d?.highlights ?? []
+  const creds: EnumCredential[] = d?.credentials ?? []
+  const loot: EnumLoot[] = d?.loot ?? []
+  const c = d?.counts
+
+  const nothing = !hl.length && !creds.length && !loot.length && !(d?.access?.length)
+  if (nothing) {
+    return (
+      <div className="text-xs text-muted-foreground">
+        No post-enumeration data collected for this host yet. It appears once an agent runs
+        post-access enumeration through a held shell (loot, credentials, /etc/shadow).
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-5">
+      {/* HIGHLIGHTS — the valuable items, pinned to the top */}
+      {hl.length > 0 && (
+        <div>
+          <h4 className="text-xs font-medium text-muted-foreground mb-2">Highlights</h4>
+          <div className="flex flex-col gap-1.5">
+            {hl.map((h, i) => (
+              <div key={i} className={`px-3 py-1.5 rounded border text-xs font-medium flex items-center gap-2 ${sevClass[h.severity] ?? sevClass.low}`}>
+                <span className="uppercase text-[9px] tracking-wide opacity-80">{h.severity}</span>
+                <span>{h.label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {c && (
+        <div className="text-[11px] text-muted-foreground">
+          {c.access} access · {c.credentials} credential(s) ({c.cracked} cracked, {c.hashes} hash) · {c.loot_items} loot item(s)
+        </div>
+      )}
+
+      {/* CREDENTIALS */}
+      {creds.length > 0 && (
+        <div>
+          <h4 className="text-xs font-medium text-muted-foreground mb-2">Recovered credentials</h4>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead className="text-muted-foreground">
+                <tr className="text-left border-b border-border">
+                  <th className="py-1 pr-3 font-medium">User</th>
+                  <th className="py-1 pr-3 font-medium">Secret</th>
+                  <th className="py-1 pr-3 font-medium">Type</th>
+                  <th className="py-1 pr-3 font-medium">Source</th>
+                  <th className="py-1 pr-3 font-medium">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {creds.map((cr, i) => (
+                  <tr key={i} className="border-b border-border/50">
+                    <td className="py-1 pr-3 font-mono">{cr.username}</td>
+                    <td className="py-1 pr-3 font-mono">
+                      {cr.secret
+                        ? <button className="hover:text-foreground text-left"
+                            title="Click to reveal / hide"
+                            onClick={() => setReveal(r => ({ ...r, [i]: !r[i] }))}>
+                            {reveal[i] ? cr.secret : (cr.secret_masked || '••••••')}
+                          </button>
+                        : <span className="text-muted-foreground">—</span>}
+                    </td>
+                    <td className="py-1 pr-3">
+                      {cr.cracked
+                        ? <span className="px-1.5 py-0.5 rounded bg-red-500/15 text-red-400 text-[10px]">cracked</span>
+                        : cr.is_hash
+                          ? <span className="px-1.5 py-0.5 rounded bg-yellow-500/15 text-yellow-400 text-[10px]">hash</span>
+                          : <span>{cr.secret_type ?? ''}</span>}
+                    </td>
+                    <td className="py-1 pr-3 text-muted-foreground">{cr.source ?? ''}</td>
+                    <td className="py-1 pr-3">{cr.status ?? ''}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* RAW LOOT */}
+      {loot.length > 0 && (
+        <div>
+          <h4 className="text-xs font-medium text-muted-foreground mb-2">Enumeration output ({loot.length})</h4>
+          <div className="space-y-1.5">
+            {loot.map((l, i) => (
+              <div key={i} className="border border-border rounded">
+                <button
+                  onClick={() => setOpenLoot(o => ({ ...o, [i]: !o[i] }))}
+                  className="w-full text-left px-2.5 py-1.5 text-xs font-medium flex items-center justify-between hover:bg-accent/50">
+                  <span>{l.title}</span>
+                  <span className="text-[10px] text-muted-foreground">{openLoot[i] ? '−' : '+'}</span>
+                </button>
+                {openLoot[i] && (
+                  <pre className="px-2.5 py-2 text-[11px] font-mono whitespace-pre-wrap break-all border-t border-border bg-muted/30 max-h-80 overflow-y-auto">{l.output}</pre>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+
 function AccessSection({ ip }: { ip: string }) {
   const [includeDead, setIncludeDead] = useState(false)
   const { data, isLoading } = useAssetAccess(ip, includeDead)
@@ -935,7 +1058,7 @@ export default function AssetBrowser() {
   const [selectedIp, setSelectedIp] = useState<string | null>(null)
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null)
   const [selectedPort, setSelectedPort] = useState<Port | null>(null)
-  const [detailTab, setDetailTab] = useState<'ports' | 'credentials' | 'access' | 'screenshots' | 'recon'>('ports')
+  const [detailTab, setDetailTab] = useState<'ports' | 'credentials' | 'access' | 'enumeration' | 'screenshots' | 'recon'>('ports')
   const [search, setSearch] = useState('')
   const [credStatusFilter, setCredStatusFilter] = useState<string>('')
   // Track which credential rows have their audit panel expanded.  Keyed by
@@ -2159,6 +2282,10 @@ export default function AssetBrowser() {
               className={`px-3 py-1.5 text-xs font-medium rounded-t-md border border-b-0 ${detailTab === 'access' ? 'bg-card text-foreground border-border' : 'bg-muted/50 text-muted-foreground border-transparent hover:text-foreground'}`}
             ><Terminal className="h-3 w-3 inline mr-1" />Current Access</button>
             <button
+              onClick={() => setDetailTab('enumeration')}
+              className={`px-3 py-1.5 text-xs font-medium rounded-t-md border border-b-0 ${detailTab === 'enumeration' ? 'bg-card text-foreground border-border' : 'bg-muted/50 text-muted-foreground border-transparent hover:text-foreground'}`}
+            >Enumeration</button>
+            <button
               onClick={() => setDetailTab('screenshots')}
               className={`px-3 py-1.5 text-xs font-medium rounded-t-md border border-b-0 ${detailTab === 'screenshots' ? 'bg-card text-foreground border-border' : 'bg-muted/50 text-muted-foreground border-transparent hover:text-foreground'}`}
             ><Camera className="h-3 w-3 inline mr-1" />Screenshots</button>
@@ -2166,6 +2293,7 @@ export default function AssetBrowser() {
 
           <div className="p-4 space-y-6">
             {detailTab === 'access' && <AccessSection ip={selectedIp} />}
+            {detailTab === 'enumeration' && <EnumerationSection ip={selectedIp} />}
             {detailTab === 'ports' && (
               <div>
                 {portsData?.items?.length ? (
