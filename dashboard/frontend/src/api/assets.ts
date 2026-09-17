@@ -421,6 +421,38 @@ export function useAssetAccess(ip: string, includeDead = false) {
   })
 }
 
+export interface EnumHighlight { severity: string; kind: string; label: string }
+export interface EnumCredential {
+  username: string; protocol?: string | null; port?: number | null
+  secret_type?: string | null; source?: string | null; status?: string | null
+  valid?: boolean | null; is_hash: boolean; secret: string; secret_masked: string
+  cracked: boolean
+}
+export interface EnumLootCommand { command: string; output: string }
+export interface EnumLoot { title: string; commands: EnumLootCommand[]; at?: string | null; session_id?: string }
+export interface EnumLoginAttempt { username: string; service?: string | null; port?: number | null; status?: string | null; at?: string | null }
+export interface EnumListeningPort { port: number; address?: string | null; process?: string | null; internal_only?: boolean }
+export interface AssetEnumeration {
+  ip: string
+  highlights: EnumHighlight[]
+  access: ObtainedAccess[]
+  credentials: EnumCredential[]
+  loot: EnumLoot[]
+  login_attempts: EnumLoginAttempt[]
+  listening_ports: EnumListeningPort[]
+  counts: { access: number; credentials: number; cracked: number; hashes: number; loot_items: number; loot_groups?: number; login_attempts?: number; login_success?: number }
+}
+
+/** Post-enumeration loot for a host — held access, recovered credentials, raw
+ *  enumeration output, and the ranked highlights the Enumeration tab pins on top. */
+export function useAssetEnumeration(ip: string) {
+  return useQuery({
+    queryKey: ['asset-enumeration', ip],
+    queryFn: () => apiFetch<AssetEnumeration>(`/assets/${encodeURIComponent(ip)}/enumeration`),
+    enabled: !!ip,
+  })
+}
+
 /** Per-host access counts, keyed by target, for the asset-list badge and the
  *  "held access" filter. One grouped query rather than a probe listing per row —
  *  the list has hundreds of hosts and a handful ever hold access. `live` agrees

@@ -113,3 +113,43 @@ def test_debt_does_not_rot():
 def test_exempt_and_debt_are_disjoint():
     both = sorted(set(ENG_ATTR_EXEMPT) & set(ENG_ATTR_DEBT))
     assert not both, f"a table is both exempt and debt — pick one: {both}"
+
+
+# ---------------------------------------------------------------------------
+# scope_targets is a COLLECTED-DATA table (it has both engagement_id and target),
+# so it passes the schema check above. But that check only proves the COLUMN
+# exists — not that it is filled. Scope entries define what an engagement may
+# touch, so a NULL engagement_id makes a scope row unattributable and an
+# engagement purge cannot claim it. The ONLY scope name allowed to be
+# engagement-less is the global cross-engagement deny-list (`not_in_scope`),
+# which the dispatch gate reads and both writers insert with `engagement_id IS
+# NULL` on purpose (app/rag-api/api.py). This is a DATA check on live rows
+# (separate from the schema check) and it RATCHETS: a new NULL-engagement scope
+# name fails by name.
+SCOPE_NULL_ALLOWED = {
+    "not_in_scope": "global cross-engagement deny-list — read by the dispatch "
+                    "gate and inserted with engagement_id IS NULL by design "
+                    "(app/rag-api/api.py: 'the global not_in_scope list')",
+}
+
+
+def test_scope_targets_are_engagement_tied():
+    c = _conn()
+    try:
+        cur = c.cursor()
+        cur.execute("SELECT 1 FROM information_schema.tables WHERE "
+                    "table_schema='public' AND table_name='scope_targets'")
+        if not cur.fetchone():
+            pytest.skip("scope_targets table absent")
+        cur.execute("SELECT name, count(*) FROM scope_targets "
+                    "WHERE engagement_id IS NULL GROUP BY name ORDER BY name")
+        rows = cur.fetchall()
+    finally:
+        c.close()
+    offending = {name: n for (name, n) in rows if name not in SCOPE_NULL_ALLOWED}
+    assert not offending, (
+        "scope_targets rows with NULL engagement_id for non-global scope names "
+        "(per-engagement scope entries MUST carry engagement_id):\n  "
+        + "\n  ".join(f"{k}: {v} rows" for k, v in sorted(offending.items()))
+        + "\nBackfill them to their owning engagement. If a name is a genuine "
+          "global cross-engagement list, add it to SCOPE_NULL_ALLOWED with a reason.")

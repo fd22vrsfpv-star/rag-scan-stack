@@ -2,8 +2,8 @@ import { useState, useMemo, useEffect, Fragment } from 'react'
 import { Link } from 'react-router-dom'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
 import PageHelp from '@/components/PageHelp'
-import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice,
-  type ObtainedAccess, type DdgSearchResponse } from '@/api/assets'
+import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice, useAssetEnumeration,
+  type ObtainedAccess, type DdgSearchResponse, type EnumHighlight, type EnumCredential, type EnumLoot, type EnumLoginAttempt, type EnumListeningPort } from '@/api/assets'
 import { apiFetch } from '@/api/client'
 import { useTargetedReconLookup, useTargetedReconExecute } from '@/api/targeted-recon'
 import { cn } from '@/lib/utils'
@@ -216,6 +216,35 @@ function makePortColumns(
   { accessorKey: 'finding_count', header: 'Findings', size: 75, minSize: 55, cell: ({ getValue }) => {
     const count = getValue() as number | undefined
     return count ? <span className="text-xs font-medium">{count}</span> : <span className="text-xs text-muted-foreground">—</span>
+  }},
+  { id: 'tools_enum', header: 'Tools / Exploits', size: 175, minSize: 120, cell: ({ row }) => {
+    const t = Number(row.original.tools_run ?? 0)
+    const ex = Number(row.original.exploits_attempted ?? 0)
+    const hasEnum = !!row.original.has_enum
+    const cmdExec = !!row.original.has_command_exec
+    const label = [
+      t > 0 ? `${t} tool${t === 1 ? '' : 's'}` : null,
+      ex > 0 ? `${ex} exploit${ex === 1 ? '' : 's'}` : null,
+    ].filter(Boolean).join(' · ')
+    return (
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <span className="text-xs" title={`${t} distinct tool(s) run and ${ex} exploit(s) attempted against this port`}>
+          {label || <span className="text-muted-foreground">—</span>}
+        </span>
+        {cmdExec && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded border bg-green-500/20 text-green-400 border-green-500/40 font-medium"
+                title="Proven command execution on this port (exploit-success finding or a held shell)">
+            command execution
+          </span>
+        )}
+        {!cmdExec && hasEnum && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded border bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
+                title="Enumeration data available (findings / held access / exploit output) — open the Enumeration tab">
+            enum
+          </span>
+        )}
+      </div>
+    )
   }},
   { accessorKey: 'max_severity', header: 'Severity', size: 85, minSize: 60, cell: ({ getValue }) => {
     const sev = getValue() as string | null
@@ -448,6 +477,202 @@ function SecretValue({ value, secretType }: { value: string; secretType?: string
  *  panel is also the explanation of where those results came from.
  *
  *  `is_root: null` means NOT PROBED. It is shown as "unknown", never as "no". */
+function EnumerationSection({ ip }: { ip: string }) {
+  const { data, isLoading } = useAssetEnumeration(ip)
+  const [reveal, setReveal] = useState<Record<number, boolean>>({})
+  const [openLoot, setOpenLoot] = useState<Record<number, boolean>>({})
+
+  const sevClass: Record<string, string> = {
+    critical: 'bg-red-500/15 text-red-400 border-red-500/40',
+    high: 'bg-orange-500/15 text-orange-400 border-orange-500/40',
+    medium: 'bg-yellow-500/15 text-yellow-400 border-yellow-500/40',
+    low: 'bg-muted text-muted-foreground border-border',
+  }
+
+  if (isLoading) return <div className="text-xs text-muted-foreground">Loading enumeration…</div>
+  const d = data
+  const hl: EnumHighlight[] = d?.highlights ?? []
+  const creds: EnumCredential[] = d?.credentials ?? []
+  const loot: EnumLoot[] = d?.loot ?? []
+  const attempts: EnumLoginAttempt[] = d?.login_attempts ?? []
+  const listening: EnumListeningPort[] = d?.listening_ports ?? []
+  const c = d?.counts
+
+  const nothing = !hl.length && !creds.length && !loot.length && !attempts.length && !listening.length && !(d?.access?.length)
+  if (nothing) {
+    return (
+      <div className="text-xs text-muted-foreground">
+        No post-enumeration data collected for this host yet. It appears once an agent runs
+        post-access enumeration through a held shell (loot, credentials, /etc/shadow).
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-5">
+      {/* HIGHLIGHTS — the valuable items, pinned to the top */}
+      {hl.length > 0 && (
+        <div>
+          <h4 className="text-xs font-medium text-muted-foreground mb-2">Highlights</h4>
+          <div className="flex flex-col gap-1.5">
+            {hl.map((h, i) => (
+              <div key={i} className={`px-3 py-1.5 rounded border text-xs font-medium flex items-center gap-2 ${sevClass[h.severity] ?? sevClass.low}`}>
+                <span className="uppercase text-[9px] tracking-wide opacity-80">{h.severity}</span>
+                <span>{h.label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {c && (
+        <div className="text-[11px] text-muted-foreground">
+          {c.access} access · {c.credentials} credential(s) ({c.cracked} cracked, {c.hashes} hash) · {c.loot_items} loot item(s)
+        </div>
+      )}
+
+      {/* CREDENTIALS */}
+      {creds.length > 0 && (
+        <div>
+          <h4 className="text-xs font-medium text-muted-foreground mb-2">Recovered credentials</h4>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead className="text-muted-foreground">
+                <tr className="text-left border-b border-border">
+                  <th className="py-1 pr-3 font-medium">User</th>
+                  <th className="py-1 pr-3 font-medium">Secret</th>
+                  <th className="py-1 pr-3 font-medium">Type</th>
+                  <th className="py-1 pr-3 font-medium">Source</th>
+                  <th className="py-1 pr-3 font-medium">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {creds.map((cr, i) => (
+                  <tr key={i} className="border-b border-border/50">
+                    <td className="py-1 pr-3 font-mono">{cr.username}</td>
+                    <td className="py-1 pr-3 font-mono">
+                      {cr.secret
+                        ? <button className="hover:text-foreground text-left"
+                            title="Click to reveal / hide"
+                            onClick={() => setReveal(r => ({ ...r, [i]: !r[i] }))}>
+                            {reveal[i] ? cr.secret : (cr.secret_masked || '••••••')}
+                          </button>
+                        : <span className="text-muted-foreground">—</span>}
+                    </td>
+                    <td className="py-1 pr-3">
+                      {cr.cracked
+                        ? <span className="px-1.5 py-0.5 rounded bg-red-500/15 text-red-400 text-[10px]">cracked</span>
+                        : cr.is_hash
+                          ? <span className="px-1.5 py-0.5 rounded bg-yellow-500/15 text-yellow-400 text-[10px]">hash</span>
+                          : <span>{cr.secret_type ?? ''}</span>}
+                    </td>
+                    <td className="py-1 pr-3 text-muted-foreground">{cr.source ?? ''}</td>
+                    <td className="py-1 pr-3">{cr.status ?? ''}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* LOGIN ATTEMPTS — credential revalidation / spray results */}
+      {attempts.length > 0 && (
+        <div>
+          <h4 className="text-xs font-medium text-muted-foreground mb-2">
+            Login attempts ({attempts.filter(a => a.status === 'success' || a.status === 'valid').length} succeeded / {attempts.length})
+          </h4>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead className="text-muted-foreground">
+                <tr className="text-left border-b border-border">
+                  <th className="py-1 pr-3 font-medium">User</th>
+                  <th className="py-1 pr-3 font-medium">Service</th>
+                  <th className="py-1 pr-3 font-medium">Result</th>
+                </tr>
+              </thead>
+              <tbody>
+                {attempts.map((a, i) => {
+                  const ok = a.status === 'success' || a.status === 'valid'
+                  return (
+                    <tr key={i} className="border-b border-border/50">
+                      <td className="py-1 pr-3 font-mono">{a.username}</td>
+                      <td className="py-1 pr-3 text-muted-foreground">{a.service ?? ''}{a.port ? `:${a.port}` : ''}</td>
+                      <td className="py-1 pr-3">
+                        <span className={ok
+                          ? 'px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 text-[10px]'
+                          : 'px-1.5 py-0.5 rounded bg-muted text-muted-foreground text-[10px]'}>
+                          {ok ? 'success' : (a.status ?? 'failed')}
+                        </span>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* LISTENING PORTS — what the host sees from inside (pivot targets) */}
+      {listening.length > 0 && (
+        <div>
+          <h4 className="text-xs font-medium text-muted-foreground mb-2">
+            Listening ports ({listening.length}) — seen from inside the host
+          </h4>
+          <div className="flex flex-wrap gap-1.5">
+            {listening.map((l, i) => (
+              <span key={i}
+                className={`px-2 py-0.5 rounded border text-[11px] font-mono ${l.internal_only
+                  ? 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                  : 'bg-muted text-foreground border-border'}`}
+                title={`${l.address ?? '*'}:${l.port}${l.process ? ` (${l.process})` : ''}${l.internal_only ? ' — internal only (pivot target)' : ''}`}>
+                {l.port}{l.process ? `/${l.process}` : ''}{l.internal_only ? ' \u2022 internal' : ''}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* RAW LOOT — one section per checklist step; each command shown with its output */}
+      {loot.length > 0 && (
+        <div>
+          <h4 className="text-xs font-medium text-muted-foreground mb-2">Enumeration output ({loot.length} step{loot.length === 1 ? '' : 's'})</h4>
+          <div className="space-y-1.5">
+            {loot.map((l, i) => (
+              <div key={i} className="border border-border rounded">
+                <button
+                  onClick={() => setOpenLoot(o => ({ ...o, [i]: !o[i] }))}
+                  className="w-full text-left px-2.5 py-1.5 text-xs font-medium flex items-center justify-between hover:bg-accent/50">
+                  <span>{l.title} <span className="text-[10px] text-muted-foreground font-normal">({l.commands.length} command{l.commands.length === 1 ? '' : 's'})</span></span>
+                  <span className="text-[10px] text-muted-foreground">{openLoot[i] ? '−' : '+'}</span>
+                </button>
+                {openLoot[i] && (
+                  <div className="border-t border-border divide-y divide-border/60">
+                    {l.commands.map((cmd, j) => (
+                      <div key={j} className="px-2.5 py-2 space-y-1">
+                        {cmd.command && (
+                          <div className="text-[11px] font-mono text-primary break-all">
+                            <span className="text-muted-foreground select-none">$ </span>{cmd.command}
+                          </div>
+                        )}
+                        {cmd.output
+                          ? <pre className="text-[11px] font-mono whitespace-pre-wrap break-all bg-muted/30 rounded px-2 py-1.5 max-h-72 overflow-y-auto">{cmd.output}</pre>
+                          : <div className="text-[11px] text-muted-foreground italic">(no output)</div>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+
 function AccessSection({ ip }: { ip: string }) {
   const [includeDead, setIncludeDead] = useState(false)
   const { data, isLoading } = useAssetAccess(ip, includeDead)
@@ -935,7 +1160,7 @@ export default function AssetBrowser() {
   const [selectedIp, setSelectedIp] = useState<string | null>(null)
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null)
   const [selectedPort, setSelectedPort] = useState<Port | null>(null)
-  const [detailTab, setDetailTab] = useState<'ports' | 'credentials' | 'access' | 'screenshots' | 'recon'>('ports')
+  const [detailTab, setDetailTab] = useState<'ports' | 'credentials' | 'access' | 'enumeration' | 'screenshots' | 'recon'>('ports')
   const [search, setSearch] = useState('')
   const [credStatusFilter, setCredStatusFilter] = useState<string>('')
   // Track which credential rows have their audit panel expanded.  Keyed by
@@ -2159,6 +2384,10 @@ export default function AssetBrowser() {
               className={`px-3 py-1.5 text-xs font-medium rounded-t-md border border-b-0 ${detailTab === 'access' ? 'bg-card text-foreground border-border' : 'bg-muted/50 text-muted-foreground border-transparent hover:text-foreground'}`}
             ><Terminal className="h-3 w-3 inline mr-1" />Current Access</button>
             <button
+              onClick={() => setDetailTab('enumeration')}
+              className={`px-3 py-1.5 text-xs font-medium rounded-t-md border border-b-0 ${detailTab === 'enumeration' ? 'bg-card text-foreground border-border' : 'bg-muted/50 text-muted-foreground border-transparent hover:text-foreground'}`}
+            >Enumeration</button>
+            <button
               onClick={() => setDetailTab('screenshots')}
               className={`px-3 py-1.5 text-xs font-medium rounded-t-md border border-b-0 ${detailTab === 'screenshots' ? 'bg-card text-foreground border-border' : 'bg-muted/50 text-muted-foreground border-transparent hover:text-foreground'}`}
             ><Camera className="h-3 w-3 inline mr-1" />Screenshots</button>
@@ -2166,6 +2395,7 @@ export default function AssetBrowser() {
 
           <div className="p-4 space-y-6">
             {detailTab === 'access' && <AccessSection ip={selectedIp} />}
+            {detailTab === 'enumeration' && <EnumerationSection ip={selectedIp} />}
             {detailTab === 'ports' && (
               <div>
                 {portsData?.items?.length ? (
@@ -2531,14 +2761,35 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
     </div>
   )
 
+  // OS INFORMATION we hold: the fingerprinted asset OS plus anything a held
+  // shell reported (os_info). Shown at the top of Recon Intel.
+  const { data: reconAccess } = useAssetAccess(ip)
+  const osFromAccess = (reconAccess?.access ?? [])
+    .map(a => a.os_info)
+    .filter((v): v is string => !!v && v.trim().length > 0)
+  const osValues = Array.from(new Set([asset?.os, ...osFromAccess]
+    .filter((v): v is string => !!v && String(v).trim().length > 0)))
+  const osBadge = osValues.length > 0 && (
+    <div className="rounded-md border border-border bg-muted/30 p-3">
+      <h5 className="text-xs font-medium text-muted-foreground mb-1.5">Operating System</h5>
+      <div className="flex flex-wrap gap-1.5">
+        {osValues.map((os, i) => (
+          <span key={i} className="px-2 py-0.5 rounded text-[11px] font-medium border border-emerald-500/30 bg-emerald-500/10 text-emerald-400">{os}</span>
+        ))}
+      </div>
+    </div>
+  )
+
   if (isLoading) return (
     <div className="space-y-4">
+      {osBadge}
       {providerBadge}
       <p className="text-xs text-muted-foreground">Loading recon data for {lookupDomain}...</p>
     </div>
   )
   if (!overview) return (
     <div className="space-y-4">
+      {osBadge}
       {providerBadge}
       <p className="text-xs text-muted-foreground">No recon data found for {lookupDomain}. Run a passive recon or content recon scan.</p>
     </div>
@@ -2554,6 +2805,7 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
 
   return (
     <div className="space-y-4">
+      {osBadge}
       {providerBadge}
       {/* Stats summary */}
       <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
