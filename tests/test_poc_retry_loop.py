@@ -25,7 +25,12 @@ wpe = pytest.importorskip("web_poc_executor")
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # Python 3.12 removed the implicit current-event-loop; make a fresh one.
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 class _FakeExecutor:
