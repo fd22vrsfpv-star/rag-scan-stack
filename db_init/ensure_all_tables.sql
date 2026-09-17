@@ -6424,6 +6424,8 @@ CREATE TABLE IF NOT EXISTS web_auth_configs (
     password text,
     logged_in_regex text,
     logged_out_regex text,
+    auth_type text DEFAULT 'form',
+    csrf_field text,
     enabled boolean DEFAULT true,
     engagement_id uuid,
     created_at timestamptz DEFAULT now(),

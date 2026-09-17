@@ -676,11 +676,15 @@ def _ensure_web_auth_table():
                     password text,
                     logged_in_regex text,
                     logged_out_regex text,
+                    auth_type text DEFAULT 'form',
+                    csrf_field text,
                     enabled boolean DEFAULT true,
                     engagement_id uuid,
                     created_at timestamptz DEFAULT now(),
                     updated_at timestamptz DEFAULT now()
                 )""")
+            cur.execute("ALTER TABLE web_auth_configs ADD COLUMN IF NOT EXISTS auth_type text DEFAULT 'form'")
+            cur.execute("ALTER TABLE web_auth_configs ADD COLUMN IF NOT EXISTS csrf_field text")
             conn.commit()
     except Exception as e:  # noqa: BLE001
         logger.warning(f"web_auth_configs ensure failed: {e}")
@@ -698,7 +702,7 @@ def _resolve_web_auth(url: str):
         with get_db() as conn, conn.cursor() as cur:
             cur.execute(
                 """SELECT login_url, login_data, username, password,
-                          logged_in_regex, logged_out_regex
+                          logged_in_regex, logged_out_regex, auth_type, csrf_field
                      FROM web_auth_configs
                     WHERE enabled AND host IN (%s, %s)
                     ORDER BY (host = %s) DESC LIMIT 1""",
@@ -707,7 +711,8 @@ def _resolve_web_auth(url: str):
         if not r:
             return None
         return {"login_url": r[0], "login_data": r[1], "username": r[2],
-                "password": r[3], "logged_in_regex": r[4], "logged_out_regex": r[5]}
+                "password": r[3], "logged_in_regex": r[4], "logged_out_regex": r[5],
+                "auth_type": r[6], "csrf_field": r[7]}
     except Exception as e:  # noqa: BLE001
         logger.warning(f"web auth resolve failed for {url}: {e}")
         return None
@@ -779,19 +784,23 @@ async def set_web_auth(body: Dict):
             cur.execute(
                 """INSERT INTO web_auth_configs
                       (host, login_url, login_data, username, password,
-                       logged_in_regex, logged_out_regex, enabled, engagement_id)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       logged_in_regex, logged_out_regex, auth_type, csrf_field,
+                       enabled, engagement_id)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (host) DO UPDATE SET
                       login_url=EXCLUDED.login_url, login_data=EXCLUDED.login_data,
                       username=EXCLUDED.username, password=EXCLUDED.password,
                       logged_in_regex=EXCLUDED.logged_in_regex,
                       logged_out_regex=EXCLUDED.logged_out_regex,
+                      auth_type=EXCLUDED.auth_type, csrf_field=EXCLUDED.csrf_field,
                       enabled=EXCLUDED.enabled, updated_at=now()""",
                 (body["host"].strip(), body["login_url"].strip(),
                  body["login_data"].strip(), body["username"].strip(),
                  body.get("password"), body.get("logged_in_regex"),
-                 body.get("logged_out_regex"), bool(body.get("enabled", True)),
-                 body.get("engagement_id")))
+                 body.get("logged_out_regex"),
+                 (body.get("auth_type") or ("csrf" if body.get("csrf_field") else "form")),
+                 body.get("csrf_field"),
+                 bool(body.get("enabled", True)), body.get("engagement_id")))
             conn.commit()
         return {"ok": True, "host": body["host"].strip()}
     except Exception as e:  # noqa: BLE001
