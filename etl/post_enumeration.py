@@ -68,6 +68,53 @@ SOURCE = "post_enumeration"
 # but rare should not be killed by its first two misses.
 SUPPRESS_AFTER = int(os.environ.get("ENUMERATION_SUPPRESS_AFTER", "5"))
 
+# ── LLM fallback ─────────────────────────────────────────────────────────────
+# When substantive output produces NO facts from any known extractor, hand it to
+# the LLM to classify into STRUCTURED facts that re-enter the SAME rules -> scope
+# gate -> pending path. The LLM PROPOSES facts; the deterministic scope gate
+# still DISPOSES (CLAUDE.md: retrieve/ask to decide, gate to act). Off if the LLM
+# is unreachable — the safe direction is "no extra facts", never "act blind".
+LLM_FALLBACK_ENABLED = os.environ.get("ENUMERATION_LLM_FALLBACK", "1") not in (
+    "0", "false", "False", "")
+LLM_URL = os.environ.get("LLM_URL", "https://llm_query:8002/ollama/chat")
+# Omit the model by default so llm_query TASK-ROUTES it. A hardcoded model here
+# masquerades as a caller choice and 404s on backends that route by task
+# (see memory: llm-query-model-default-defeats-routing). Set POSTEX_LLM_MODEL to
+# pin one deliberately.
+LLM_MODEL = os.environ.get("POSTEX_LLM_MODEL") or None
+LLM_FALLBACK_MIN_CHARS = int(os.environ.get("ENUMERATION_LLM_MIN_CHARS", "40"))
+LLM_FALLBACK_MAX_CHARS = int(os.environ.get("ENUMERATION_LLM_MAX_CHARS", "6000"))
+
+# Fact kinds the LLM fallback is allowed to emit — the same vocabulary the
+# extractors and rules already speak. An LLM-invented fact kind nothing consumes
+# is dropped, so a hallucinated shape cannot leak into the queue.
+_LLM_ALLOWED_FACTS = {"secret", "host", "file", "credential", "share", "host_fact"}
+
+API_BASE = os.environ.get("RAG_API_URL", "https://rag-api:8000")
+API_KEY = os.environ.get("API_KEY", "changeme")
+WEBHOOK_ENABLED = os.environ.get("WEBHOOK_ENABLED", "1") not in (
+    "0", "false", "False", "")
+
+
+def _emit_webhook(event_type: str, data: Dict[str, Any],
+                  severity: Optional[str] = None) -> None:
+    """Best-effort webhook emit (CLAUDE.md: features that perform actions emit
+    events). Never raises into the analysis."""
+    if not WEBHOOK_ENABLED:
+        return
+    try:
+        import requests
+        payload: Dict[str, Any] = {"event_type": event_type,
+                                   "source": SOURCE, "data": data}
+        if severity:
+            payload["severity"] = severity
+        requests.post(f"{API_BASE}/webhooks/emit",
+                      headers={"x-api-key": API_KEY,
+                               "Content-Type": "application/json"},
+                      json=payload, timeout=5, verify=False)
+    except Exception as e:  # noqa: BLE001
+        log.debug("webhook emit %s failed: %s", event_type, e)
+
 _IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _PRIVATE_KEY = re.compile(r"-----BEGIN (?:RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----")
 _KEY_PATH = re.compile(r"(/[^\s:]*\.ssh/id_[a-z0-9_]+)")
@@ -778,6 +825,117 @@ def facts_from_web_findings(cur, *, target: str = "", limit: int = 200,
 
 # ── The analysis every command goes through ────────────────────────────────
 
+def _llm_classify_output(output: str, *, tool: str = "", target: str = "",
+                         service: str = "") -> List[Dict[str, Any]]:
+    """Ask the LLM to read output that matched NO known extractor and return
+    STRUCTURED facts in the vocabulary the rules already speak.
+
+    Best-effort and bounded: returns [] on any error, on empty/oversized output,
+    or on a shape it cannot trust. The facts it returns are still scope-gated by
+    _propose_from_facts downstream — this only proposes WHAT was found, never
+    authorises acting on it."""
+    text = (output or "").strip()
+    if not LLM_FALLBACK_ENABLED or len(text) < LLM_FALLBACK_MIN_CHARS:
+        return []
+    text = text[:LLM_FALLBACK_MAX_CHARS]
+    try:
+        import json as _json
+        import re as _re
+        import requests
+        system = (
+            "You are a penetration-test post-exploitation analyst reading the raw "
+            "output of a command for AUTHORIZED security testing. The platform's "
+            "pattern matchers found NOTHING actionable in it. Identify anything a "
+            "tester would act on and return ONLY JSON, no prose: "
+            '{"facts":[{"fact":"secret|host|file|credential|host_fact",'
+            '"kind":"<short kind, e.g. api_token, config_path>",'
+            '"value":"<the literal string found>",'
+            '"why":"<one short reason it matters>"}]}. '
+            "Only include something actually present in the output. If nothing is "
+            'actionable, return {"facts":[]}. Never invent values.')
+        user = (f"Tool: {tool}\nTarget: {target}\nService: {service}\n"
+                f"Output:\n{text}")
+        body: Dict[str, Any] = {
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
+            "max_tokens": 600}
+        if LLM_MODEL:
+            body["model"] = LLM_MODEL
+        resp = requests.post(LLM_URL, json=body, timeout=60, verify=False)
+        if resp.status_code >= 400:
+            log.debug("LLM fallback HTTP %s: %s", resp.status_code, resp.text[:160])
+            return []
+        data = resp.json()
+        # Unwrap the various chat shapes to the text content.
+        content = ""
+        if isinstance(data, dict):
+            msg = data.get("message")
+            if isinstance(msg, dict):
+                content = msg.get("content") or ""
+            if not content:
+                ch = data.get("choices")
+                if isinstance(ch, list) and ch:
+                    content = ((ch[0] or {}).get("message") or {}).get("content") or ""
+            content = content or data.get("response") or data.get("content") or ""
+        m = _re.search(r"\{.*\}", content or "", _re.S)
+        if not m:
+            return []
+        parsed = _json.loads(m.group(0))
+        raw_facts = parsed.get("facts") if isinstance(parsed, dict) else None
+        if not isinstance(raw_facts, list):
+            return []
+        facts: List[Dict[str, Any]] = []
+        for rf in raw_facts[:25]:
+            if not isinstance(rf, dict):
+                continue
+            kind_fact = str(rf.get("fact") or "").strip().lower()
+            if kind_fact not in _LLM_ALLOWED_FACTS:
+                continue
+            val = rf.get("value")
+            if not val:
+                continue
+            fact: Dict[str, Any] = {
+                "fact": kind_fact,
+                "kind": str(rf.get("kind") or "llm").strip()[:40],
+                "value": str(val)[:300],
+                "service": service,
+                "source": "llm_fallback",
+                "confidence": "low",
+                "why": str(rf.get("why") or "")[:200],
+                "line": str(val)[:200],
+            }
+            # A host fact from the LLM is a LEAD like any other — leave the scope
+            # gate to decide. Everything else defaults its target to this host.
+            fact["target"] = (str(val) if kind_fact == "host" else target)
+            if kind_fact == "host":
+                fact["seen_on"] = target
+                fact["source"] = "llm_fallback"
+            facts.append(fact)
+        return facts
+    except Exception as e:  # noqa: BLE001
+        log.debug("LLM fallback classify failed: %s", e)
+        return []
+
+
+def _record_secret_facts(cur, facts: List[Dict[str, Any]],
+                         execution: Dict[str, Any]) -> int:
+    """Record `secret` facts as observations even when NO rule proposes a
+    follow-up command. A JWT or an AWS key is valuable on its own — the tool's
+    purpose is to collect data for a tester's manual workflow — so it must not
+    vanish just because the rules engine had nothing to dispatch for it."""
+    recorded = 0
+    for fact in facts:
+        if fact.get("fact") != "secret":
+            continue
+        kind = fact.get("kind") or "unknown"
+        try:
+            _observe(cur, f"secret:{kind}", execution, fact, None, None)
+            recorded += 1
+        except Exception as e:  # noqa: BLE001
+            log.debug("recording secret fact failed: %s", e)
+    return recorded
+
+
 def analyse(execution: Dict[str, Any], *, queue: bool = True) -> Dict[str, Any]:
     """One finished command: what it found, and what should follow.
 
@@ -806,15 +964,46 @@ def analyse(execution: Dict[str, Any], *, queue: bool = True) -> Dict[str, Any]:
 
     facts = facts_from(parsed, output=execution.get("output") or "",
                        target=target, service=service)
+
+    # LLM FALLBACK: substantive output that matched NO known extractor is handed
+    # to the LLM to classify into structured facts, which re-enter the SAME
+    # rules -> scope gate -> pending path below. The LLM proposes WHAT was found;
+    # the deterministic gate still decides whether anything may run.
+    if not facts:
+        llm_facts = _llm_classify_output(execution.get("output") or "",
+                                         tool=tool, target=target, service=service)
+        if llm_facts:
+            facts = llm_facts
+            out["llm_fallback"] = {"facts": len(llm_facts),
+                                   "kinds": sorted({f.get("kind") for f in llm_facts})}
+            _emit_webhook("post_enum_llm_classified",
+                          {"target": target, "tool": tool, "service": service,
+                           "facts": len(llm_facts),
+                           "engagement_id": execution.get("engagement_id")})
+
     out["facts"] = len(facts)
-    rules = load_rules(execution.get("engagement_id"))
-    if not facts or not rules:
+    if not facts:
         return out
+    rules = load_rules(execution.get("engagement_id"))
 
     try:
         with _connect() as conn:
             with conn.cursor() as cur:
                 out["available"] = True
+                # Secrets are recorded even with no rule to dispatch — a token is
+                # worth keeping for the tester's manual workflow on its own.
+                secrets = _record_secret_facts(cur, facts, execution)
+                if secrets:
+                    out["secrets_recorded"] = secrets
+                    _emit_webhook("post_enum_secret_found",
+                                  {"target": target, "count": secrets,
+                                   "kinds": sorted({f.get("kind") for f in facts
+                                                    if f.get("fact") == "secret"}),
+                                   "engagement_id": execution.get("engagement_id")},
+                                  severity="high")
+                if not rules:
+                    conn.commit()
+                    return out
                 try:
                     from etl.scope_gate import check_dispatch, load_dispatch_scope
                 except ImportError:  # pragma: no cover
@@ -826,6 +1015,7 @@ def analyse(execution: Dict[str, Any], *, queue: bool = True) -> Dict[str, Any]:
                 if scope_source == "unavailable":
                     out["refusals"].append({"reason": "scope could not be loaded"})
                     out["refused"] = len(facts)
+                    conn.commit()
                     return out
 
                 _propose_from_facts(cur, facts, execution, rules, out,
