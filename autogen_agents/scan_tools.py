@@ -1594,7 +1594,28 @@ class ScanTools:
         if ports:
             payload["ports"] = ports
         if services:
-            payload["services"] = services
+            # The runner rejects the WHOLE batch with 400 on the first unknown
+            # service name (e.g. "exec" from port 512/rexec), so a single bad
+            # name silently kills password guessing for every valid service in
+            # the list. Filter to the runner's known set here, dropping (and
+            # logging) unknowns, so the good services still run.
+            valid = {"ssh", "ftp", "telnet", "mysql", "postgres", "vnc",
+                     "tomcat", "smb", "redis", "mongodb", "mssql"}
+            wanted = [str(s).strip().lower() for s in services if str(s).strip()]
+            kept = [s for s in wanted if s in valid]
+            dropped = [s for s in wanted if s not in valid]
+            if dropped:
+                logger.warning(
+                    "start_credential_check: dropping unknown service(s) %s "
+                    "(not credential-testable); running %s",
+                    dropped, kept or "no services")
+            if kept:
+                payload["services"] = kept
+            elif wanted:
+                # Every requested service was unknown — fall back to
+                # port/auto-detection rather than sending an all-invalid list.
+                logger.warning("start_credential_check: no valid services in %s; "
+                               "falling back to auto-detection", wanted)
 
         return self._make_request(
             method="POST",
