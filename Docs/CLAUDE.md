@@ -198,11 +198,18 @@ large change. Add the test in the same commit as the rule.
 - A collected-data table with neither `engagement_id` nor `asset_id` is a gap: add
   attribution or declare it in `ENG_ATTR_DEBT` with a reason (ratchets, shrink it).
   An exempt-by-design table goes in `ENG_ATTR_EXEMPT` with a reason (permanent).
+- **Scope entries are per-engagement collected config** — a `scope_targets` row
+  defines what an engagement may touch and MUST carry `engagement_id`. The one
+  exception is the global `not_in_scope` deny-list, which the dispatch gate reads
+  and the writers insert with `engagement_id IS NULL` by design (a cross-engagement
+  safety list). Every OTHER scope name with a NULL `engagement_id` is an
+  unattributable orphan a purge cannot claim — backfill it to its owning engagement.
 - *Enforced by:* `tests/test_engagement_attribution.py` (every collected-data table
   is engagement-attributable, exempt, or declared debt; debt may not rot),
   `tests/test_engagement_purge.py` (a NULL-engagement IP-keyed credential is deleted
   by the purge), `tests/test_cracked_creds_engagement.py` (cracked creds carry the
-  engagement).
+  engagement), `tests/test_engagement_attribution.py::test_scope_targets_are_engagement_tied`
+  (no NULL-engagement scope rows except the global `not_in_scope` deny-list; ratchets).
 - *Why:* hashcat-cracked credentials were stored keyed only by `ip` with a NULL
   `engagement_id`, so an engagement data-purge missed them and they kept showing
   after the engagement was cleared. Attribution is what makes engagement isolation,

@@ -415,7 +415,46 @@ class SessionScanTracker:
         logger.info(f"[SessionScanTracker] Tracked {scan_type} job {job_id} for session {session_id}")
 
     @classmethod
-    def update_scan_status(cls, job_id: str, status: str, result_summary: Dict = None):
+    @classmethod
+    def persist_scan_status(cls, session_id: str, job_id: str, status: str,
+                            completed_at: str = None, result_summary: Dict = None):
+        """Write a scan's terminal status straight to session_scan_metrics by
+        (session_id, job_id).
+
+        update_scan_status() alone is not enough: it keys off
+        get_current_session(), which is unset in the background post-scan thread
+        and in the API request handlers, so the completion never reached the
+        table — the scan read 'running' forever and the graph's post-scan wait
+        loop blocked until its deadline, leaving the session stuck 'scanning'.
+        This persists regardless of thread/registry state."""
+        if not session_id or not job_id or status not in ("completed", "failed",
+                                                           "cancelled", "stopped"):
+            return
+        try:
+            import psycopg2, json as _json
+            db_dsn = os.environ.get(
+                "DB_DSN",
+                "dbname=scans user=app password=app host=rag-postgres port=5432")
+            with psycopg2.connect(db_dsn) as conn:
+                conn.autocommit = True
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE session_scan_metrics "
+                        "SET status = %s, "
+                        "    completed_at = COALESCE(%s::timestamptz, completed_at, now()), "
+                        "    duration_seconds = COALESCE(duration_seconds, "
+                        "        EXTRACT(EPOCH FROM (COALESCE(%s::timestamptz, now()) - started_at))), "
+                        "    result_summary = COALESCE(%s::jsonb, result_summary) "
+                        "WHERE session_id = %s::uuid AND job_id = %s",
+                        (status, completed_at, completed_at,
+                         _json.dumps(result_summary) if result_summary else None,
+                         str(session_id), job_id))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[SessionScanTracker] persist_scan_status failed "
+                           "(%s/%s): %s", session_id, job_id, e)
+
+    def update_scan_status(cls, job_id: str, status: str, result_summary: Dict = None,
+                           session_id: str = None):
         """
         Update the status of a tracked scan.
 
@@ -423,8 +462,13 @@ class SessionScanTracker:
             job_id: The job/scan ID
             status: New status (running, completed, failed)
             result_summary: Optional summary of results
+            session_id: Session to update. REQUIRED when called off the thread
+                that ran the graph (e.g. the background post-scan poller and the
+                API handlers), where get_current_session() is unset — without it
+                the in-memory registry scan stayed 'running' and the graph's
+                post-scan wait loop never saw the scan finish.
         """
-        session_id = cls.get_current_session()
+        session_id = session_id or cls.get_current_session()
         if not session_id:
             return
 
@@ -445,9 +489,17 @@ class SessionScanTracker:
                         if result_summary:
                             scan["result_summary"] = result_summary
 
-                        # Persist to database when scan completes
+                        # Persist to database when scan completes. Two paths:
+                        # (a) the whole-registry snapshot (best-effort, async),
+                        # (b) a direct by-(session,job) write that does NOT depend
+                        #     on registry contents — the reliable one when this
+                        #     runs off a background thread with an empty registry.
                         if status in ("completed", "failed"):
                             logger.info(f"[SessionScanTracker] Scan {job_id} {status}, persisting session data")
+                            cls.persist_scan_status(
+                                session_id, job_id, status,
+                                completed_at=scan.get("completed_at"),
+                                result_summary=result_summary)
                             # Release lock before calling persist (it may acquire locks)
                             from threading import Thread
                             Thread(target=cls.persist_to_db, args=(session_id,), daemon=True).start()
@@ -904,13 +956,23 @@ class SessionScanTracker:
                 logger.debug(f"[SessionScanTracker] No persisted scans found for session {session_id}")
                 return
 
-            # Initialize session in tracker if not exists
+            # Initialize session in tracker if not exists. current_phase is
+            # REQUIRED by get_session_status(); omitting it (as this path used to)
+            # raised KeyError the moment a session was read from the DB with an
+            # empty registry — e.g. after a restart or from a background thread —
+            # which _running_scans then swallowed, so a restore never surfaced.
+            _earliest = next((r["started_at"] for r in rows if r["started_at"]), None)
+            _all_terminal = all(
+                str(r["status"] or "").lower() in ("completed", "failed",
+                                                   "cancelled", "stopped", "skipped")
+                for r in rows)
             with cls._lock:
                 if session_id not in cls._registry:
                     cls._registry[session_id] = {
                         "session_id": session_id,
                         "scans": [],
-                        "started_at": None
+                        "started_at": _earliest.isoformat() if _earliest else None,
+                        "current_phase": "COMPLETE" if _all_terminal else "SCANNING",
                     }
 
                 # Restore scans from database
@@ -922,7 +984,13 @@ class SessionScanTracker:
                         "status": row["status"],
                         "started_at": row["started_at"].isoformat() if row["started_at"] else None,
                         "completed_at": row["completed_at"].isoformat() if row["completed_at"] else None,
-                        "duration_seconds": row["duration_seconds"],
+                        # float(), not the raw psycopg2 Decimal: a Decimal in the
+                        # scan snapshot breaks json.dumps when the finished session
+                        # is written back (update_agent_session), which left the
+                        # session stuck 'scanning' even after analysis re-ran.
+                        "duration_seconds": (float(row["duration_seconds"])
+                                             if row["duration_seconds"] is not None
+                                             else None),
                         "params": row["params"] or {},
                         "result_summary": row["result_summary"] or {}
                     }
@@ -4652,6 +4720,39 @@ def queue_exploit_for_approval(
                     ov.setdefault(k, v)
                 parameters["msf_option_overrides"] = ov
 
+        # DEDUP (session-scoped): do not re-queue an exploit already
+        # pending/approved/executed FOR THIS SESSION. The exploit agent
+        # re-proposing the same candidate every planning pass otherwise piles up
+        # duplicates that all auto-fire — 49 duplicate executions were observed in
+        # ONE session on a rich target, keeping it from converging. Scoped to the
+        # session on purpose: a FRESH session must be able to re-run (re-verify)
+        # an exploit a PRIOR session already executed — a cross-session dedup
+        # starved a new run of everything and it stalled. A failed row is not
+        # deduped, so a retry is still allowed. Best-effort; never blocks.
+        try:
+            from db_utils import get_db as _get_db
+            _ip = str(target_ip or "").split("/")[0].strip()
+            with _get_db() as _c, _c.cursor() as _cur:
+                _cur.execute(
+                    "SELECT id::text FROM pending_exploits "
+                    "WHERE host(target_ip) = %s AND exploit_id = %s "
+                    "  AND COALESCE(target_port, 0) = COALESCE(%s, 0) "
+                    "  AND status IN ('pending','approved','executed') "
+                    "  AND (%s::uuid IS NULL OR session_id = %s::uuid) "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (_ip, exploit_id, target_port,
+                     str(session_uuid) if session_uuid else None,
+                     str(session_uuid) if session_uuid else None))
+                _dup = _cur.fetchone()
+            if _dup:
+                return json.dumps({
+                    "ok": True, "skipped": True, "deduped": True,
+                    "pending_exploit_id": _dup[0], "status": "pending",
+                    "message": ("Already queued/executed for this target/port/module "
+                                "— not re-queued (dedup).")}, indent=2)
+        except Exception:  # noqa: BLE001
+            pass
+
         pending_id = create_pending_exploit(
             source=source,
             exploit_id=exploit_id,
@@ -5524,6 +5625,9 @@ def get_session_scan_status(session_id: str = None) -> str:
     """
     # Get status from the tracker
     status = scan_tracker.get_session_status(session_id)
+    # The real session id for a reliable by-(session,job) persist below —
+    # get_current_session() is unset on the background post-scan thread.
+    _sid = session_id or status.get("session_id")
 
     # If we have tracked scans, enrich with live status from scanners
     if status.get("scans"):
@@ -5540,7 +5644,10 @@ def get_session_scan_status(session_id: str = None) -> str:
                         "masscan": tools.nmap_url,
                         "nmap": tools.nmap_url,
                         "udp": tools.nmap_url,
+                        "udp_scan": tools.nmap_url,
+                        "nmap-udp": tools.nmap_url,
                         "full_scan": tools.nmap_url,
+                        "deep_port_scan": tools.nmap_url,
                         "smb_vuln": tools.nmap_url,
                         "credential_check": tools.nmap_url,
                         "web_scan": tools.web_scanner_url,
@@ -5553,6 +5660,9 @@ def get_session_scan_status(session_id: str = None) -> str:
                         "dnsx": tools.osint_runner_url,
                         "passive-recon": tools.osint_runner_url,
                         "recon-pipeline": tools.osint_runner_url,
+                        "asnmap": tools.osint_runner_url,
+                        "uncover": tools.osint_runner_url,
+                        "cloudlist": tools.osint_runner_url,
                         "brutus": tools.brutus_runner_url,
                     }
                     service_url = type_to_url.get(scan_type)
@@ -5589,7 +5699,24 @@ def get_session_scan_status(session_id: str = None) -> str:
                                     result_summary["valid_credentials"] = creds
                                 if _res.get("reconciliation") is not None:
                                     result_summary["reconciliation"] = _res.get("reconciliation")
-                            scan_tracker.update_scan_status(job_id, live_status, result_summary)
+                            scan_tracker.update_scan_status(job_id, live_status, result_summary,
+                                                            session_id=_sid)
+                            # Reliable persist even when this runs on a background
+                            # thread with no current-session context (the cause of
+                            # the session getting stuck 'scanning' for hours).
+                            scan_tracker.persist_scan_status(
+                                _sid, job_id, live_status,
+                                completed_at=live_data.get("completed_at"),
+                                result_summary=result_summary)
+                    elif resp.status_code == 404:
+                        # Job aged out of the scanner's memory — it finished; the
+                        # completion callback just never landed. Treat as done so a
+                        # stale 'running' cannot linger forever and keep the
+                        # session 'scanning' waiting on a job that is gone.
+                        scan["status"] = "completed"
+                        scan_tracker.update_scan_status(job_id, "completed", None,
+                                                        session_id=_sid)
+                        scan_tracker.persist_scan_status(_sid, job_id, "completed")
 
                 except Exception as e:
                     scan["status_error"] = str(e)

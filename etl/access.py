@@ -787,6 +787,60 @@ def _sync_access_findings(cur, target: str,
     return synced
 
 
+def _reconcile_credential(cur, cand: Dict[str, Any], result: Dict[str, Any],
+                          engagement_id: Optional[str]) -> None:
+    """The missing REVALIDATE step of dump->crack->store->revalidate.
+
+    A login candidate is built from a credential_findings row (ssh_credential or
+    a service credential). When probe() proves it answers, mark that credential
+    VALID and log the login as a credential_spray_attempt so recovered passwords
+    stop reading as unknown/invalid and their attempts are visible. A refused
+    probe is logged as a failed attempt but never downgrades a credential — a
+    transient failure is not proof of invalidity. Best-effort; never breaks the
+    refresh."""
+    kind = cand.get("kind")
+    if kind not in ("ssh_credential", "credential"):
+        return
+    handle = cand.get("handle") or ""
+    target = cand.get("target") or ""
+    if kind == "ssh_credential":
+        proto = "ssh"
+        username, _, secret = handle.partition(":")
+    else:  # "proto:username:secret"
+        proto, _, rest = handle.partition(":")
+        username, _, secret = rest.partition(":")
+    if not username or not secret:
+        return
+    port = cand.get("port") or _DEFAULT_PORTS.get(proto) or 0
+    live = result.get("status") == "live"
+    try:
+        import hashlib
+        fp = hashlib.sha256(secret.encode()).hexdigest()[:16]
+        if live:
+            # Flip the source credential to valid (idempotent — only when it is
+            # not already valid). Never mark invalid here.
+            cur.execute(
+                """UPDATE credential_findings
+                      SET valid_cred = true, status = 'valid', last_verified_at = now()
+                    WHERE host(ip) = %s AND username = %s AND secret_value = %s
+                      AND (valid_cred IS DISTINCT FROM true OR status <> 'valid')""",
+                (target, username, secret))
+        # Log the login attempt (idempotent per uq_spray_identity), regardless of
+        # outcome, so "we tried this password here" is visible.
+        cur.execute(
+            """INSERT INTO public.credential_spray_attempts
+                 (engagement_id, username, secret_fingerprint, target_host,
+                  target_port, service, status)
+               VALUES (%s::uuid, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (username, COALESCE(secret_fingerprint, ''::text),
+                            target_host, target_port)
+                 DO UPDATE SET status = EXCLUDED.status, attempted_at = now()""",
+            (engagement_id, username, fp, target, int(port), proto,
+             "success" if live else "failed"))
+    except Exception as e:  # noqa: BLE001
+        log.debug("credential reconcile failed for %s@%s: %s", username, target, e)
+
+
 def refresh(target: str, *, rounds: int = None,
             engagement_id: Optional[str] = None) -> Dict[str, Any]:
     """Discover, probe and record every access on this target.
@@ -835,6 +889,9 @@ def refresh(target: str, *, rounds: int = None,
                          result["os_info"], result["probes"], result["probes_ok"],
                          result["last_error"], result["score"], result["status"],
                          engagement_id))
+                    # REVALIDATE: feed a probed credential back into the
+                    # credential model (mark valid + log the attempt).
+                    _reconcile_credential(cur, cand, result, engagement_id)
                     if result["status"] == "live":
                         out["live"] += 1
                     else:

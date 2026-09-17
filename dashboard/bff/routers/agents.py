@@ -182,6 +182,17 @@ async def asset_access(ip: str, include_dead: bool = False):
         return safe_json(resp)
 
 
+@router.get("/api/assets/{ip}/enumeration")
+async def asset_enumeration(ip: str):
+    """Post-enumeration loot for a host: held access, recovered credentials, raw
+    enumeration output, and the ranked highlights the Enumeration tab pins up top."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/assets/{ip}/enumeration",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
 @router.get("/api/assets/{ip}/port-advice")
 async def asset_port_advice(ip: str):
     """Non-default methods for dead ports the probe could not reach."""

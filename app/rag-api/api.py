@@ -1935,6 +1935,32 @@ def get_open_ports(
                    p.product, p.version, p.banner,
                    a.os,
                    COALESCE(COUNT(DISTINCT v.id), 0)::int AS finding_count,
+                   -- how many distinct tools have run against this exact port,
+                   -- and whether there is enumeration data (a held shell, an
+                   -- executed exploit, or a finding) worth opening for it.
+                   (SELECT COUNT(DISTINCT te.tool) FROM tool_executions te
+                     WHERE te.target = host(a.ip) AND te.port = p.port)::int AS tools_run,
+                   (SELECT COUNT(DISTINCT pe2.exploit_id) FROM pending_exploits pe2
+                     WHERE host(pe2.target_ip) = host(a.ip)
+                       AND pe2.target_port = p.port)::int AS exploits_attempted,
+                   (COUNT(DISTINCT v.id) > 0
+                    OR EXISTS (SELECT 1 FROM obtained_access oa
+                                WHERE oa.target = host(a.ip) AND oa.port = p.port
+                                  AND oa.status <> 'rejected')
+                    OR EXISTS (SELECT 1 FROM pending_exploits pe
+                                 JOIN exploit_results er ON er.pending_exploit_id = pe.id
+                                WHERE host(pe.target_ip) = host(a.ip)
+                                  AND pe.target_port = p.port)) AS has_enum,
+                   -- proven COMMAND EXECUTION on this port: an exploit-success
+                   -- finding (record_exploit_success_finding writes script
+                   -- 'exploit:<kind>') OR a held shell/session on the port.
+                   (EXISTS (SELECT 1 FROM vulns vex
+                             WHERE vex.port_id = p.id AND vex.script LIKE 'exploit:%%')
+                    OR EXISTS (SELECT 1 FROM obtained_access oa2
+                                WHERE oa2.target = host(a.ip) AND oa2.port = p.port
+                                  AND oa2.kind IN ('bind_shell','msf_session',
+                                                   'webshell','listener_callback')
+                                  AND oa2.status <> 'rejected')) AS has_command_exec,
                    -- public.severity_rank() — one scale for the whole stack
                    -- (etl/severity.py). This was a hand-written descending CASE.
                    CASE MAX(
@@ -23079,6 +23105,202 @@ def asset_access(ip: str, include_dead: bool = Query(False),
         "best": live[0] if live else None,
         "access": rows,
     }
+
+
+@app.get("/assets/{ip}/enumeration", tags=["Access"])
+def asset_enumeration(ip: str, _: bool = Depends(auth)):
+    """Everything post-enumeration collected on this host, with the valuable
+    items surfaced first.
+
+    Aggregates the three places post-ex loot lands — held access
+    (obtained_access), recovered credentials (credential_findings, incl. cracked
+    /etc/shadow plaintext), and the raw enumeration output the agent ran through
+    a held shell (PostEnumeration messages) — into one view. `highlights` is the
+    ranked "what matters here" list the UI pins to the top."""
+    import re as _re
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # 1) Held access
+        cur.execute(
+            """SELECT id::text, port, kind, handle, transport, whoami, uid,
+                      is_root, os_info, score, status, last_probe_at, updated_at
+                 FROM obtained_access
+                WHERE target = %s
+                ORDER BY (status='live') DESC, score DESC, updated_at DESC""",
+            (ip,))
+        access = [dict(r) for r in cur.fetchall()]
+        for r in access:
+            if r.get("kind") == "ssh_credential" and ":" in (r.get("handle") or ""):
+                u, _, sec = r["handle"].partition(":")
+                r["handle"] = f"{u}:{'*' * min(len(sec), 8)}"
+
+        # 2) Credentials (cracked plaintext + hashes)
+        cur.execute(
+            """SELECT username, protocol, port, secret_type, secret_value,
+                      source, status, valid_cred, created_at
+                 FROM credential_findings
+                WHERE host(ip) = %s
+                ORDER BY (status='valid') DESC, created_at DESC""",
+            (ip,))
+        creds = []
+        for r in cur.fetchall():
+            sv = r.get("secret_value") or ""
+            is_hash = sv.startswith("$") or (r.get("secret_type") in ("hash", "ntlm_hash"))
+            creds.append({
+                "username": r["username"], "protocol": r.get("protocol"),
+                "port": r.get("port"), "secret_type": r.get("secret_type"),
+                "source": r.get("source"), "status": r.get("status"),
+                "valid": r.get("valid_cred"),
+                "is_hash": bool(is_hash),
+                # plaintext is the whole value of the tab; the UI reveals it on click
+                "secret": sv,
+                "secret_masked": ("*" * min(len(sv), 10)) if sv else "",
+                "cracked": bool(sv and not is_hash),
+            })
+
+        # 3) Raw post-enum loot: PostEnumeration messages from sessions on this IP
+        cur.execute(
+            """SELECT am.content, am.created_at, am.session_id::text
+                 FROM agent_messages am
+                 JOIN agent_sessions se ON se.id = am.session_id
+                WHERE am.agent_name = 'PostEnumeration'
+                  AND (se.target_description = %s OR am.content LIKE %s)
+                ORDER BY am.created_at DESC
+                LIMIT 200""",
+            (ip, f"%{ip}%"))
+        # Group by title: a checklist step (e.g. "Check SSH keys") runs SEVERAL
+        # commands, each stored as its own message with the same title. Collapse
+        # them into ONE group and keep the individual command+output pairs so the
+        # UI shows one section per step with each command separated inside.
+        loot_by_title: dict = {}
+        loot_order: list = []
+        seen_pairs: dict = {}
+        for r in cur.fetchall():
+            content = r["content"] or ""
+            m = _re.match(r"^\[([^\]]+)\]\s*(.*)$", content, _re.S)
+            title = m.group(1) if m else "post-enum"
+            body = (m.group(2) if m else content).strip()
+            # skip the summary/status lines — keep the actual command output blocks
+            if title.lower().startswith(("post_enumeration", "access", "loot")):
+                continue
+            # the message is "[title] <command>\n<output>": first line is the
+            # command the step ran, the rest is its output.
+            if "\n" in body:
+                cmd, _, outp = body.partition("\n")
+            else:
+                cmd, outp = "", body
+            cmd = cmd.strip()[:400]
+            outp = outp.strip()[:4000]
+            pair_key = (title, cmd, outp)
+            if pair_key in seen_pairs:      # drop exact repeats across sessions
+                continue
+            seen_pairs[pair_key] = True
+            if title not in loot_by_title:
+                loot_by_title[title] = {
+                    "title": title, "commands": [],
+                    "at": r["created_at"].isoformat() if r["created_at"] else None,
+                    "session_id": r["session_id"]}
+                loot_order.append(title)
+            loot_by_title[title]["commands"].append({"command": cmd, "output": outp})
+        loot = [loot_by_title[t] for t in loot_order]
+        loot_cmd_count = sum(len(g["commands"]) for g in loot)
+
+            # Listening ports the target sees from INSIDE (ss/netstat through a held
+        # shell) — internal/pivot services, often not visible in an external scan.
+        listening_ports = []
+        _seen_lp = set()
+        for _g in loot:
+            for _cmd in _g.get("commands", []):
+                _c = _cmd.get("command") or ""
+                if "ss -tlnp" not in _c and "netstat" not in _c:
+                    continue
+                for _line in (_cmd.get("output") or "").splitlines():
+                    _line = _re.sub(r"^\S+@\S+:[^#]*#\s*", "", _line).strip()
+                    _parts = _line.split()
+                    if (len(_parts) >= 3 and _parts[0].isdigit()
+                            and _parts[1].isdigit() and ":" in _parts[2]):
+                        _addr, _, _ps = _parts[2].rpartition(":")
+                        if not _ps.isdigit():
+                            continue
+                        _pm = _re.search(r'users:\(\("([^"]+)"', _line)
+                        _proc = _pm.group(1) if _pm else None
+                        _port_i = int(_ps)
+                        if _port_i in _seen_lp:
+                            # already have this port — fill in a process name if
+                            # this line has one and the stored row did not.
+                            if _proc:
+                                for _e in listening_ports:
+                                    if _e["port"] == _port_i and not _e.get("process"):
+                                        _e["process"] = _proc
+                            continue
+                        _seen_lp.add(_port_i)
+                        listening_ports.append({"port": _port_i,
+                                                "address": _addr or "*",
+                                                "process": _proc})
+        listening_ports.sort(key=lambda x: x["port"])
+        # flag internal-only ports (listening inside but not an externally-open port)
+        _ext_ports = {a.get("port") for a in access}  # held-access ports (coarse)
+        cur.execute("SELECT p.port FROM ports p JOIN assets a ON p.asset_id=a.id "
+                    "WHERE host(a.ip)=%s AND COALESCE(p.is_open,true)", (ip,))
+        _open_ext = {r["port"] for r in cur.fetchall()}
+        for _lp in listening_ports:
+            _lp["internal_only"] = _lp["port"] not in _open_ext
+
+    # 4) Login attempts (credential revalidation / spray) against this host.
+        cur.execute(
+            """SELECT username, service, target_port, status, attempted_at
+                 FROM credential_spray_attempts
+                WHERE target_host = %s
+                ORDER BY (status IN ('success','valid')) DESC, attempted_at DESC
+                LIMIT 200""",
+            (ip,))
+        login_attempts = [{
+            "username": r["username"], "service": r.get("service"),
+            "port": r.get("target_port"), "status": r.get("status"),
+            "at": r["attempted_at"].isoformat() if r.get("attempted_at") else None,
+        } for r in cur.fetchall()]
+
+    # 4) Highlights — the ranked "what matters" list pinned to the top.
+    highlights = []
+    for a in access:
+        if a["status"] == "live" and a.get("is_root"):
+            highlights.append({"severity": "critical", "kind": "root_access",
+                               "label": f"ROOT {a['kind']} on port {a.get('port') or '?'} "
+                                        f"(whoami={a.get('whoami') or 'root'})"})
+        elif a["status"] == "live":
+            highlights.append({"severity": "high", "kind": "shell_access",
+                               "label": f"{a['kind']} shell on port {a.get('port') or '?'} "
+                                        f"(whoami={a.get('whoami') or '?'})"})
+    cracked = [c for c in creds if c["cracked"]]
+    if cracked:
+        names = ", ".join(sorted({c["username"] for c in cracked})[:8])
+        highlights.append({"severity": "critical", "kind": "cracked_credentials",
+                           "label": f"{len(cracked)} credential(s) recovered in plaintext: {names}"})
+    hashes = [c for c in creds if c["is_hash"]]
+    if hashes:
+        highlights.append({"severity": "medium", "kind": "password_hashes",
+                           "label": f"{len(hashes)} password hash(es) captured (crack candidates)"})
+    # loot-derived highlights (private keys, passwordless sudo)
+    blob = "\n".join(c["output"] for l in loot for c in l["commands"])
+    if _re.search(r"BEGIN (?:OPENSSH|RSA|EC|DSA) PRIVATE KEY", blob):
+        highlights.append({"severity": "high", "kind": "ssh_private_key",
+                           "label": "SSH private key(s) found on host"})
+    if _re.search(r"NOPASSWD|\(ALL\s*:\s*ALL\)\s*ALL", blob):
+        highlights.append({"severity": "high", "kind": "sudo_nopasswd",
+                           "label": "Passwordless / full sudo rights available"})
+    sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    highlights.sort(key=lambda h: sev_rank.get(h["severity"], 9))
+
+    attempts_ok = sum(1 for a in login_attempts if a["status"] in ("success", "valid"))
+    return {"ip": ip, "highlights": highlights, "access": access,
+            "credentials": creds, "loot": loot, "login_attempts": login_attempts,
+            "listening_ports": listening_ports,
+            "counts": {"access": len(access), "credentials": len(creds),
+                       "cracked": len(cracked), "hashes": len(hashes),
+                       "loot_items": loot_cmd_count, "loot_groups": len(loot),
+                       "login_attempts": len(login_attempts),
+                       "login_success": attempts_ok,
+                       "listening_ports": len(listening_ports),
+                       "listening_internal_only": sum(1 for l in listening_ports if l.get("internal_only"))}}
 
 
 @app.post("/assets/{ip}/access/refresh", tags=["Access"])

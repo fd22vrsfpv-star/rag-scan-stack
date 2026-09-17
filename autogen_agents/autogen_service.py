@@ -2941,6 +2941,107 @@ async def get_pentest_status(session_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ---------------------------------------------------------------------------
+# Stale scan-status reconciliation (shared by /scans and /flow-summary).
+#
+# A scanner job can finish without its completion ever reaching
+# session_scan_metrics — the scan then reads "running" forever in both the scan
+# list and the flow summary, and the session looks stuck at "scanning". These
+# helpers poll the owning scanner for any job still marked running and persist a
+# terminal result to session_scan_metrics (the source of truth that
+# restore_from_db / load_scans_from_db read), so a monitor hitting either
+# endpoint self-heals the stale row. update_scan_status() cannot be used here:
+# it keys off get_current_session(), which is unset in an API request handler.
+# ---------------------------------------------------------------------------
+def _scan_type_service_url(scan_type):
+    """Base URL of the scanner that owns a given scan type, or None.
+
+    Every tracked scan type must appear here or a stale row of that type can
+    never be reconciled (deep_port_scan was the gap: a first-class type absent
+    from the map, so every poll logged 'no service URL' and gave up)."""
+    nmap = os.environ.get("NMAP_URL", "https://nmap_scanner:8012")
+    pd = os.environ.get("PD_RUNNER_URL", "https://pd-runner:8023")
+    osint = os.environ.get("OSINT_RUNNER_URL", "https://osint-runner:8024")
+    return {
+        "masscan": nmap, "nmap": nmap, "udp": nmap, "udp_scan": nmap,
+        "nmap-udp": nmap, "full_scan": nmap, "deep_port_scan": nmap,
+        "smb_vuln": nmap, "credential_check": nmap,
+        "web_scan": os.environ.get("WEB_SCANNER_URL", "https://web-scanner:8010"),
+        "nuclei": os.environ.get("NUCLEI_URL", "https://nuclei-runner:8011"),
+        "httpx": pd, "naabu": pd, "katana": pd, "tlsx": pd,
+        "subfinder": osint, "dnsx": osint, "passive-recon": osint,
+        "recon-pipeline": osint, "asnmap": osint, "uncover": osint,
+        "cloudlist": osint,
+        "brutus": os.environ.get("BRUTUS_RUNNER_URL", "https://brutus-runner:8025"),
+        "playwright": os.environ.get("PLAYWRIGHT_URL", "https://playwright-scanner:8014"),
+    }.get(scan_type)
+
+
+def _reconcile_stale_scans(session_id, scans):
+    """Poll scanners for scans still 'running' and persist terminal results to
+    session_scan_metrics. Mutates `scans` in place. Returns the count reconciled
+    to a terminal state."""
+    import sys as _sys
+    stale = [s for s in scans if s.get("status") == "running"]
+    if not stale:
+        return 0
+    try:
+        import httpx as _httpx
+    except Exception:
+        return 0
+    finished = []
+    for scan in stale:
+        stype = scan.get("type")
+        svc = _scan_type_service_url(stype)
+        if not svc:
+            print(f"[{session_id}] reconcile: no service URL for scan type {stype}",
+                  file=_sys.stderr)
+            continue
+        job_id = scan.get("job_id")
+        if not job_id:
+            continue
+        try:
+            url = (f"{svc}/scan/{job_id}" if stype == "playwright"
+                   else f"{svc}/jobs/{job_id}")
+            r = _httpx.get(url, timeout=5.0, verify=False)
+            new_status, completed_at, err = None, None, None
+            if r.status_code == 200:
+                live = r.json()
+                new_status = live.get("status")
+                completed_at = live.get("completed_at")
+                err = live.get("error")
+            elif r.status_code == 404:
+                # Job aged out of scanner memory — it must have finished.
+                new_status = "completed"
+            if new_status and new_status != scan.get("status"):
+                scan["status"] = new_status
+                if completed_at:
+                    scan["completed_at"] = completed_at
+                if err:
+                    scan["error"] = err
+                if new_status in ("completed", "failed"):
+                    finished.append((job_id, new_status, completed_at))
+        except Exception as e:
+            print(f"[{session_id}] reconcile poll failed {stype} {job_id}: {e}",
+                  file=_sys.stderr)
+    for job_id, status, completed_at in finished:
+        try:
+            from db_utils import get_db
+            with get_db() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE session_scan_metrics "
+                    "SET status = %s, "
+                    "    completed_at = COALESCE(%s::timestamptz, completed_at, now()), "
+                    "    duration_seconds = COALESCE(duration_seconds, "
+                    "        EXTRACT(EPOCH FROM (COALESCE(%s::timestamptz, now()) - started_at))) "
+                    "WHERE session_id = %s::uuid AND job_id = %s",
+                    (status, completed_at, completed_at, str(session_id), job_id))
+        except Exception as e:
+            print(f"[{session_id}] reconcile persist failed {job_id}: {e}",
+                  file=_sys.stderr)
+    return len(finished)
+
+
 @app.get("/pentest/{session_id}/flow-summary")
 def get_session_flow_summary(session_id: uuid.UUID):
     """Per-scan-type summary of everything the session ran.
@@ -2948,6 +3049,16 @@ def get_session_flow_summary(session_id: uuid.UUID):
     Served from the live tracker while the session is active, and from the
     persisted copy on agent_sessions.metadata once it has ended.
     """
+    # Self-heal stale scan rows before summarising: poll the scanner for any
+    # scan still marked running and persist a terminal result to
+    # session_scan_metrics, so build_flow_summary (which restores from that
+    # table) reflects completion instead of reporting "running" forever.
+    try:
+        _db_scans = scan_tracker.load_scans_from_db(str(session_id))
+        if _db_scans:
+            _reconcile_stale_scans(str(session_id), _db_scans)
+    except Exception:
+        pass
     live = {}
     try:
         live = scan_tracker.build_flow_summary(str(session_id)) or {}
@@ -3100,55 +3211,10 @@ async def get_pentest_scans(session_id: str):
                 except Exception as e:
                     session_logger.warning(f"[{session_id}] Failed to query scan metrics fallback: {e}")
 
-            # Reconcile stale "running" statuses by polling scanner services
-            stale = [s for s in scans if s.get('status') == 'running']
-            if stale:
-                import httpx as httpx_client
-                import sys
-                type_to_url = {
-                    "masscan": os.environ.get("NMAP_URL", "https://nmap_scanner:8012"),
-                    "nmap": os.environ.get("NMAP_URL", "https://nmap_scanner:8012"),
-                    "udp": os.environ.get("NMAP_URL", "https://nmap_scanner:8012"),
-                    "full_scan": os.environ.get("NMAP_URL", "https://nmap_scanner:8012"),
-                    "smb_vuln": os.environ.get("NMAP_URL", "https://nmap_scanner:8012"),
-                    "credential_check": os.environ.get("NMAP_URL", "https://nmap_scanner:8012"),
-                    "web_scan": os.environ.get("WEB_SCANNER_URL", "https://web-scanner:8010"),
-                    "nuclei": os.environ.get("NUCLEI_URL", "https://nuclei-runner:8011"),
-                    "httpx": os.environ.get("PD_RUNNER_URL", "https://pd-runner:8023"),
-                    "naabu": os.environ.get("PD_RUNNER_URL", "https://pd-runner:8023"),
-                    "katana": os.environ.get("PD_RUNNER_URL", "https://pd-runner:8023"),
-                    "tlsx": os.environ.get("PD_RUNNER_URL", "https://pd-runner:8023"),
-                    "subfinder": os.environ.get("OSINT_RUNNER_URL", "https://osint-runner:8024"),
-                    "dnsx": os.environ.get("OSINT_RUNNER_URL", "https://osint-runner:8024"),
-                    "passive-recon": os.environ.get("OSINT_RUNNER_URL", "https://osint-runner:8024"),
-                    "recon-pipeline": os.environ.get("OSINT_RUNNER_URL", "https://osint-runner:8024"),
-                    "brutus": os.environ.get("BRUTUS_RUNNER_URL", "https://brutus-runner:8025"),
-                    "playwright": os.environ.get("PLAYWRIGHT_URL", "https://playwright-scanner:8014"),
-                }
-                for scan in stale:
-                    svc = type_to_url.get(scan.get('type'))
-                    if not svc:
-                        print(f"[{session_id}] No service URL for scan type: {scan.get('type')}", file=sys.stderr)
-                        continue
-                    try:
-                        if scan.get('type') == 'playwright':
-                            url = f"{svc}/scan/{scan['job_id']}"
-                        else:
-                            url = f"{svc}/jobs/{scan['job_id']}"
-                        r = httpx_client.get(url, timeout=5.0, verify=False)
-                        if r.status_code == 200:
-                            live = r.json()
-                            scan['status'] = live.get('status', scan['status'])
-                            if live.get('completed_at'):
-                                scan['completed_at'] = live['completed_at']
-                            if live.get('error'):
-                                scan['error'] = live['error']
-                        elif r.status_code == 404:
-                            # Job expired from scanner memory — session is done,
-                            # so the scan must have finished (completed or failed)
-                            scan['status'] = 'completed'
-                    except Exception as e:
-                        print(f"[{session_id}] Failed to poll {scan.get('type')} {scan['job_id']}: {e}", file=sys.stderr)
+            # Reconcile stale "running" statuses and persist terminal
+            # results so the flow summary and a re-read agree (see
+            # _reconcile_stale_scans).
+            _reconcile_stale_scans(str(session_uuid), scans)
 
             scan_summary = {
                 "total_scans": len(scans),
