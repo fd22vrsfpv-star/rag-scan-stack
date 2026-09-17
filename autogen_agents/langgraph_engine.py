@@ -2255,6 +2255,16 @@ def _harvest_shell_loot(sid, target: str, steps: list) -> dict:
             out["cracked"] = d.get("cracked", 0)
         except Exception as e:  # noqa: BLE001
             out["crack_error"] = str(e)[:160]
+        # REVALIDATE now: probe the freshly-cracked creds so any that work flip to
+        # valid and their login attempts are recorded immediately (dump -> crack ->
+        # store -> revalidate in one flow), not only on the next access sweep.
+        if out.get("cracked"):
+            try:
+                from etl import access as _ax
+                rv = _ax.refresh(target)
+                out["revalidated_live"] = rv.get("live", 0)
+            except Exception as e:  # noqa: BLE001
+                out["revalidate_error"] = str(e)[:160]
     except Exception as e:  # noqa: BLE001
         out["error"] = str(e)[:160]
     return out

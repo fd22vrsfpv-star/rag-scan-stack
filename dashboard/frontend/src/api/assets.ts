@@ -430,13 +430,15 @@ export interface EnumCredential {
 }
 export interface EnumLootCommand { command: string; output: string }
 export interface EnumLoot { title: string; commands: EnumLootCommand[]; at?: string | null; session_id?: string }
+export interface EnumLoginAttempt { username: string; service?: string | null; port?: number | null; status?: string | null; at?: string | null }
 export interface AssetEnumeration {
   ip: string
   highlights: EnumHighlight[]
   access: ObtainedAccess[]
   credentials: EnumCredential[]
   loot: EnumLoot[]
-  counts: { access: number; credentials: number; cracked: number; hashes: number; loot_items: number; loot_groups?: number }
+  login_attempts: EnumLoginAttempt[]
+  counts: { access: number; credentials: number; cracked: number; hashes: number; loot_items: number; loot_groups?: number; login_attempts?: number; login_success?: number }
 }
 
 /** Post-enumeration loot for a host — held access, recovered credentials, raw

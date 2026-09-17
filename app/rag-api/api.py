@@ -23178,6 +23178,20 @@ def asset_enumeration(ip: str, _: bool = Depends(auth)):
         loot = [loot_by_title[t] for t in loot_order]
         loot_cmd_count = sum(len(g["commands"]) for g in loot)
 
+        # 4) Login attempts (credential revalidation / spray) against this host.
+        cur.execute(
+            """SELECT username, service, target_port, status, attempted_at
+                 FROM credential_spray_attempts
+                WHERE target_host = %s
+                ORDER BY (status IN ('success','valid')) DESC, attempted_at DESC
+                LIMIT 200""",
+            (ip,))
+        login_attempts = [{
+            "username": r["username"], "service": r.get("service"),
+            "port": r.get("target_port"), "status": r.get("status"),
+            "at": r["attempted_at"].isoformat() if r.get("attempted_at") else None,
+        } for r in cur.fetchall()]
+
     # 4) Highlights — the ranked "what matters" list pinned to the top.
     highlights = []
     for a in access:
@@ -23209,11 +23223,14 @@ def asset_enumeration(ip: str, _: bool = Depends(auth)):
     sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     highlights.sort(key=lambda h: sev_rank.get(h["severity"], 9))
 
+    attempts_ok = sum(1 for a in login_attempts if a["status"] in ("success", "valid"))
     return {"ip": ip, "highlights": highlights, "access": access,
-            "credentials": creds, "loot": loot,
+            "credentials": creds, "loot": loot, "login_attempts": login_attempts,
             "counts": {"access": len(access), "credentials": len(creds),
                        "cracked": len(cracked), "hashes": len(hashes),
-                       "loot_items": loot_cmd_count, "loot_groups": len(loot)}}
+                       "loot_items": loot_cmd_count, "loot_groups": len(loot),
+                       "login_attempts": len(login_attempts),
+                       "login_success": attempts_ok}}
 
 
 @app.post("/assets/{ip}/access/refresh", tags=["Access"])
