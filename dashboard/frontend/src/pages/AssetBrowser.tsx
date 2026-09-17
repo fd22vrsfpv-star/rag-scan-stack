@@ -2420,7 +2420,7 @@ export default function AssetBrowser() {
                     data={portsData.items}
                     columns={portCols}
                     onRowClick={(row) => setSelectedPort(row)}
-                    rowClassName={(p) => accessByPort.has(p.port) ? 'bg-green-500/10 hover:bg-green-500/20' : undefined}
+                    rowClassName={(p) => (p.has_command_exec || accessByPort.has(p.port)) ? 'bg-green-500/10 hover:bg-green-500/20' : undefined}
                     resizable
                   />
                 ) : (
