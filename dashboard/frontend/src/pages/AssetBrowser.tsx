@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
 import PageHelp from '@/components/PageHelp'
 import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice, useAssetEnumeration,
-  type ObtainedAccess, type DdgSearchResponse, type EnumHighlight, type EnumCredential, type EnumLoot } from '@/api/assets'
+  type ObtainedAccess, type DdgSearchResponse, type EnumHighlight, type EnumCredential, type EnumLoot, type EnumLoginAttempt } from '@/api/assets'
 import { apiFetch } from '@/api/client'
 import { useTargetedReconLookup, useTargetedReconExecute } from '@/api/targeted-recon'
 import { cn } from '@/lib/utils'
@@ -465,9 +465,10 @@ function EnumerationSection({ ip }: { ip: string }) {
   const hl: EnumHighlight[] = d?.highlights ?? []
   const creds: EnumCredential[] = d?.credentials ?? []
   const loot: EnumLoot[] = d?.loot ?? []
+  const attempts: EnumLoginAttempt[] = d?.login_attempts ?? []
   const c = d?.counts
 
-  const nothing = !hl.length && !creds.length && !loot.length && !(d?.access?.length)
+  const nothing = !hl.length && !creds.length && !loot.length && !attempts.length && !(d?.access?.length)
   if (nothing) {
     return (
       <div className="text-xs text-muted-foreground">
@@ -539,6 +540,44 @@ function EnumerationSection({ ip }: { ip: string }) {
                     <td className="py-1 pr-3">{cr.status ?? ''}</td>
                   </tr>
                 ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* LOGIN ATTEMPTS — credential revalidation / spray results */}
+      {attempts.length > 0 && (
+        <div>
+          <h4 className="text-xs font-medium text-muted-foreground mb-2">
+            Login attempts ({attempts.filter(a => a.status === 'success' || a.status === 'valid').length} succeeded / {attempts.length})
+          </h4>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead className="text-muted-foreground">
+                <tr className="text-left border-b border-border">
+                  <th className="py-1 pr-3 font-medium">User</th>
+                  <th className="py-1 pr-3 font-medium">Service</th>
+                  <th className="py-1 pr-3 font-medium">Result</th>
+                </tr>
+              </thead>
+              <tbody>
+                {attempts.map((a, i) => {
+                  const ok = a.status === 'success' || a.status === 'valid'
+                  return (
+                    <tr key={i} className="border-b border-border/50">
+                      <td className="py-1 pr-3 font-mono">{a.username}</td>
+                      <td className="py-1 pr-3 text-muted-foreground">{a.service ?? ''}{a.port ? `:${a.port}` : ''}</td>
+                      <td className="py-1 pr-3">
+                        <span className={ok
+                          ? 'px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 text-[10px]'
+                          : 'px-1.5 py-0.5 rounded bg-muted text-muted-foreground text-[10px]'}>
+                          {ok ? 'success' : (a.status ?? 'failed')}
+                        </span>
+                      </td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
