@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
 import PageHelp from '@/components/PageHelp'
 import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice, useAssetEnumeration,
-  type ObtainedAccess, type DdgSearchResponse, type EnumHighlight, type EnumCredential, type EnumLoot, type EnumLoginAttempt } from '@/api/assets'
+  type ObtainedAccess, type DdgSearchResponse, type EnumHighlight, type EnumCredential, type EnumLoot, type EnumLoginAttempt, type EnumListeningPort } from '@/api/assets'
 import { apiFetch } from '@/api/client'
 import { useTargetedReconLookup, useTargetedReconExecute } from '@/api/targeted-recon'
 import { cn } from '@/lib/utils'
@@ -483,9 +483,10 @@ function EnumerationSection({ ip }: { ip: string }) {
   const creds: EnumCredential[] = d?.credentials ?? []
   const loot: EnumLoot[] = d?.loot ?? []
   const attempts: EnumLoginAttempt[] = d?.login_attempts ?? []
+  const listening: EnumListeningPort[] = d?.listening_ports ?? []
   const c = d?.counts
 
-  const nothing = !hl.length && !creds.length && !loot.length && !attempts.length && !(d?.access?.length)
+  const nothing = !hl.length && !creds.length && !loot.length && !attempts.length && !listening.length && !(d?.access?.length)
   if (nothing) {
     return (
       <div className="text-xs text-muted-foreground">
@@ -597,6 +598,26 @@ function EnumerationSection({ ip }: { ip: string }) {
                 })}
               </tbody>
             </table>
+          </div>
+        </div>
+      )}
+
+      {/* LISTENING PORTS — what the host sees from inside (pivot targets) */}
+      {listening.length > 0 && (
+        <div>
+          <h4 className="text-xs font-medium text-muted-foreground mb-2">
+            Listening ports ({listening.length}) — seen from inside the host
+          </h4>
+          <div className="flex flex-wrap gap-1.5">
+            {listening.map((l, i) => (
+              <span key={i}
+                className={`px-2 py-0.5 rounded border text-[11px] font-mono ${l.internal_only
+                  ? 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                  : 'bg-muted text-foreground border-border'}`}
+                title={`${l.address ?? '*'}:${l.port}${l.process ? ` (${l.process})` : ''}${l.internal_only ? ' — internal only (pivot target)' : ''}`}>
+                {l.port}{l.process ? `/${l.process}` : ''}{l.internal_only ? ' \u2022 internal' : ''}
+              </span>
+            ))}
           </div>
         </div>
       )}
