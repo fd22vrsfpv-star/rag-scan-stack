@@ -23141,7 +23141,13 @@ def asset_enumeration(ip: str, _: bool = Depends(auth)):
                 ORDER BY am.created_at DESC
                 LIMIT 200""",
             (ip, f"%{ip}%"))
-        loot = []
+        # Group by title: a checklist step (e.g. "Check SSH keys") runs SEVERAL
+        # commands, each stored as its own message with the same title. Collapse
+        # them into ONE group and keep the individual command+output pairs so the
+        # UI shows one section per step with each command separated inside.
+        loot_by_title: dict = {}
+        loot_order: list = []
+        seen_pairs: dict = {}
         for r in cur.fetchall():
             content = r["content"] or ""
             m = _re.match(r"^\[([^\]]+)\]\s*(.*)$", content, _re.S)
@@ -23150,9 +23156,27 @@ def asset_enumeration(ip: str, _: bool = Depends(auth)):
             # skip the summary/status lines — keep the actual command output blocks
             if title.lower().startswith(("post_enumeration", "access", "loot")):
                 continue
-            loot.append({"title": title, "output": body[:4000],
-                         "at": r["created_at"].isoformat() if r["created_at"] else None,
-                         "session_id": r["session_id"]})
+            # the message is "[title] <command>\n<output>": first line is the
+            # command the step ran, the rest is its output.
+            if "\n" in body:
+                cmd, _, outp = body.partition("\n")
+            else:
+                cmd, outp = "", body
+            cmd = cmd.strip()[:400]
+            outp = outp.strip()[:4000]
+            pair_key = (title, cmd, outp)
+            if pair_key in seen_pairs:      # drop exact repeats across sessions
+                continue
+            seen_pairs[pair_key] = True
+            if title not in loot_by_title:
+                loot_by_title[title] = {
+                    "title": title, "commands": [],
+                    "at": r["created_at"].isoformat() if r["created_at"] else None,
+                    "session_id": r["session_id"]}
+                loot_order.append(title)
+            loot_by_title[title]["commands"].append({"command": cmd, "output": outp})
+        loot = [loot_by_title[t] for t in loot_order]
+        loot_cmd_count = sum(len(g["commands"]) for g in loot)
 
     # 4) Highlights — the ranked "what matters" list pinned to the top.
     highlights = []
@@ -23175,7 +23199,7 @@ def asset_enumeration(ip: str, _: bool = Depends(auth)):
         highlights.append({"severity": "medium", "kind": "password_hashes",
                            "label": f"{len(hashes)} password hash(es) captured (crack candidates)"})
     # loot-derived highlights (private keys, passwordless sudo)
-    blob = "\n".join(l["output"] for l in loot)
+    blob = "\n".join(c["output"] for l in loot for c in l["commands"])
     if _re.search(r"BEGIN (?:OPENSSH|RSA|EC|DSA) PRIVATE KEY", blob):
         highlights.append({"severity": "high", "kind": "ssh_private_key",
                            "label": "SSH private key(s) found on host"})
@@ -23189,7 +23213,7 @@ def asset_enumeration(ip: str, _: bool = Depends(auth)):
             "credentials": creds, "loot": loot,
             "counts": {"access": len(access), "credentials": len(creds),
                        "cracked": len(cracked), "hashes": len(hashes),
-                       "loot_items": len(loot)}}
+                       "loot_items": loot_cmd_count, "loot_groups": len(loot)}}
 
 
 @app.post("/assets/{ip}/access/refresh", tags=["Access"])

@@ -428,14 +428,15 @@ export interface EnumCredential {
   valid?: boolean | null; is_hash: boolean; secret: string; secret_masked: string
   cracked: boolean
 }
-export interface EnumLoot { title: string; output: string; at?: string | null; session_id?: string }
+export interface EnumLootCommand { command: string; output: string }
+export interface EnumLoot { title: string; commands: EnumLootCommand[]; at?: string | null; session_id?: string }
 export interface AssetEnumeration {
   ip: string
   highlights: EnumHighlight[]
   access: ObtainedAccess[]
   credentials: EnumCredential[]
   loot: EnumLoot[]
-  counts: { access: number; credentials: number; cracked: number; hashes: number; loot_items: number }
+  counts: { access: number; credentials: number; cracked: number; hashes: number; loot_items: number; loot_groups?: number }
 }
 
 /** Post-enumeration loot for a host — held access, recovered credentials, raw

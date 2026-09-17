@@ -545,21 +545,34 @@ function EnumerationSection({ ip }: { ip: string }) {
         </div>
       )}
 
-      {/* RAW LOOT */}
+      {/* RAW LOOT — one section per checklist step; each command shown with its output */}
       {loot.length > 0 && (
         <div>
-          <h4 className="text-xs font-medium text-muted-foreground mb-2">Enumeration output ({loot.length})</h4>
+          <h4 className="text-xs font-medium text-muted-foreground mb-2">Enumeration output ({loot.length} step{loot.length === 1 ? '' : 's'})</h4>
           <div className="space-y-1.5">
             {loot.map((l, i) => (
               <div key={i} className="border border-border rounded">
                 <button
                   onClick={() => setOpenLoot(o => ({ ...o, [i]: !o[i] }))}
                   className="w-full text-left px-2.5 py-1.5 text-xs font-medium flex items-center justify-between hover:bg-accent/50">
-                  <span>{l.title}</span>
+                  <span>{l.title} <span className="text-[10px] text-muted-foreground font-normal">({l.commands.length} command{l.commands.length === 1 ? '' : 's'})</span></span>
                   <span className="text-[10px] text-muted-foreground">{openLoot[i] ? '−' : '+'}</span>
                 </button>
                 {openLoot[i] && (
-                  <pre className="px-2.5 py-2 text-[11px] font-mono whitespace-pre-wrap break-all border-t border-border bg-muted/30 max-h-80 overflow-y-auto">{l.output}</pre>
+                  <div className="border-t border-border divide-y divide-border/60">
+                    {l.commands.map((cmd, j) => (
+                      <div key={j} className="px-2.5 py-2 space-y-1">
+                        {cmd.command && (
+                          <div className="text-[11px] font-mono text-primary break-all">
+                            <span className="text-muted-foreground select-none">$ </span>{cmd.command}
+                          </div>
+                        )}
+                        {cmd.output
+                          ? <pre className="text-[11px] font-mono whitespace-pre-wrap break-all bg-muted/30 rounded px-2 py-1.5 max-h-72 overflow-y-auto">{cmd.output}</pre>
+                          : <div className="text-[11px] text-muted-foreground italic">(no output)</div>}
+                      </div>
+                    ))}
+                  </div>
                 )}
               </div>
             ))}
@@ -2659,14 +2672,35 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
     </div>
   )
 
+  // OS INFORMATION we hold: the fingerprinted asset OS plus anything a held
+  // shell reported (os_info). Shown at the top of Recon Intel.
+  const { data: reconAccess } = useAssetAccess(ip)
+  const osFromAccess = (reconAccess?.access ?? [])
+    .map(a => a.os_info)
+    .filter((v): v is string => !!v && v.trim().length > 0)
+  const osValues = Array.from(new Set([asset?.os, ...osFromAccess]
+    .filter((v): v is string => !!v && String(v).trim().length > 0)))
+  const osBadge = osValues.length > 0 && (
+    <div className="rounded-md border border-border bg-muted/30 p-3">
+      <h5 className="text-xs font-medium text-muted-foreground mb-1.5">Operating System</h5>
+      <div className="flex flex-wrap gap-1.5">
+        {osValues.map((os, i) => (
+          <span key={i} className="px-2 py-0.5 rounded text-[11px] font-medium border border-emerald-500/30 bg-emerald-500/10 text-emerald-400">{os}</span>
+        ))}
+      </div>
+    </div>
+  )
+
   if (isLoading) return (
     <div className="space-y-4">
+      {osBadge}
       {providerBadge}
       <p className="text-xs text-muted-foreground">Loading recon data for {lookupDomain}...</p>
     </div>
   )
   if (!overview) return (
     <div className="space-y-4">
+      {osBadge}
       {providerBadge}
       <p className="text-xs text-muted-foreground">No recon data found for {lookupDomain}. Run a passive recon or content recon scan.</p>
     </div>
@@ -2682,6 +2716,7 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
 
   return (
     <div className="space-y-4">
+      {osBadge}
       {providerBadge}
       {/* Stats summary */}
       <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
