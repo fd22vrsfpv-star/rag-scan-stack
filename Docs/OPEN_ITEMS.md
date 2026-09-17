@@ -420,3 +420,51 @@ follow-up commands (alongside webshell handle and MSF module re-invocation).
 **Done when:** /command-exec/run can run follow-up commands via a bash /dev/tcp
 channel when the target has bash and outbound to the node is reachable.
 **Enforced by:** not enforced
+
+### no_session auto-correct flips to reverse behind NAT/proxy
+**Found:** 2026-09-16
+**Evidence:** usermap_script no_session auto-correct flipped bind->reverse with
+PAYLOAD=cmd/unix/pingback_reverse LHOST=172.18.0.15 (a container IP the target
+cannot reach through the SOCKS proxy) — doomed. A proxied target reaches nothing
+by reverse unless a node relay/callback host is set.
+**Where:** exploit_runner._next_correction no_session branch (flips connect_style).
+**Done when:** on no_session with no reachable callback host, the correction tries
+an alternate BIND payload instead of a reverse payload to an unreachable LHOST.
+**Enforced by:** not enforced
+
+### Scope writers create NULL-engagement scope_targets rows
+**Found:** 2026-09-16
+**Evidence:** 2108 `scope_targets` rows had `engagement_id IS NULL`: 1256 `customer`
+(1256 = 851 unique + 405 internal duplicates) and 851 `not_in_scope`. The `customer`
+orphans were backfilled to their owning engagement (redteam3,
+652c257d-7d54-4c66-bd4c-38bd2c3e1bc3) after collapsing internal duplicates;
+`not_in_scope` is the intended global deny-list. The SOURCE is still live: several
+scope writers INSERT with no `engagement_id` — scope-move (`app/rag-api/api.py:15065`,
+source='moved'), auto-classify (`api.py:15173`, source='auto-classified'),
+unknown_scope auto-discovery (`api.py:14859`), swagger-import (`api.py:25100`/`25115`).
+Any of these can recreate orphans under a non-global scope name.
+**Where:** the scope_targets INSERT sites in `app/rag-api/api.py` listed above — each
+takes a scope `name` param but omits `engagement_id`.
+**Done when:** those writers resolve and set `engagement_id` (from the scope's owning
+engagement) for every non-`not_in_scope` insert, so no new NULL-engagement scope
+orphan can be created.
+**Enforced by:** `tests/test_engagement_attribution.py::test_scope_targets_are_engagement_tied`
+(fails when a non-global scope name has NULL-engagement rows; ratchets).
+
+### Credential brute-force (hydra) recommended but never auto-dispatched in a session
+**Found:** 2026-09-17
+**Evidence:** Session msf_sept16-2307 (192.168.1.150, auto_execute) flow-summary
+kb_coverage showed `recommended_but_never_run: [{scanner: hydra, recommended: 2,
+top_priority: 25, acted_on: false}]` — the credential brute-force was recommended
+(priority 25) and never ran, while the langgraph exploit phase ran 12 exploits.
+**Where:** hydra maps to credential-check/brutus (`autogen_agents/scan_tools.py:712`),
+but the auto-dispatch of pending credential `scan_recommendations` lives in the BFF
+`dashboard/bff/services/recon_agent.py` loop (`SELECT ... WHERE sr.status='pending'`),
+which is separate from the langgraph session flow. A langgraph auto_execute session
+plans/fires exploits but does not dispatch KB credential brute-force recommendations,
+so they sit pending until the BFF loop runs or an operator presses Run.
+**Done when:** an auto_execute langgraph session dispatches high-priority pending
+credential-brute recommendations (scanner hydra/credential-check/brutus) for open auth
+services with no held credential, through the SAME scope-gated + MAX_CONCURRENT_SCANS
+bounded path as every other dispatcher (fail-closed; no private concurrency number).
+**Enforced by:** not enforced

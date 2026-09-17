@@ -23081,6 +23081,117 @@ def asset_access(ip: str, include_dead: bool = Query(False),
     }
 
 
+@app.get("/assets/{ip}/enumeration", tags=["Access"])
+def asset_enumeration(ip: str, _: bool = Depends(auth)):
+    """Everything post-enumeration collected on this host, with the valuable
+    items surfaced first.
+
+    Aggregates the three places post-ex loot lands — held access
+    (obtained_access), recovered credentials (credential_findings, incl. cracked
+    /etc/shadow plaintext), and the raw enumeration output the agent ran through
+    a held shell (PostEnumeration messages) — into one view. `highlights` is the
+    ranked "what matters here" list the UI pins to the top."""
+    import re as _re
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # 1) Held access
+        cur.execute(
+            """SELECT id::text, port, kind, handle, transport, whoami, uid,
+                      is_root, os_info, score, status, last_probe_at, updated_at
+                 FROM obtained_access
+                WHERE target = %s
+                ORDER BY (status='live') DESC, score DESC, updated_at DESC""",
+            (ip,))
+        access = [dict(r) for r in cur.fetchall()]
+        for r in access:
+            if r.get("kind") == "ssh_credential" and ":" in (r.get("handle") or ""):
+                u, _, sec = r["handle"].partition(":")
+                r["handle"] = f"{u}:{'*' * min(len(sec), 8)}"
+
+        # 2) Credentials (cracked plaintext + hashes)
+        cur.execute(
+            """SELECT username, protocol, port, secret_type, secret_value,
+                      source, status, valid_cred, created_at
+                 FROM credential_findings
+                WHERE host(ip) = %s
+                ORDER BY (status='valid') DESC, created_at DESC""",
+            (ip,))
+        creds = []
+        for r in cur.fetchall():
+            sv = r.get("secret_value") or ""
+            is_hash = sv.startswith("$") or (r.get("secret_type") in ("hash", "ntlm_hash"))
+            creds.append({
+                "username": r["username"], "protocol": r.get("protocol"),
+                "port": r.get("port"), "secret_type": r.get("secret_type"),
+                "source": r.get("source"), "status": r.get("status"),
+                "valid": r.get("valid_cred"),
+                "is_hash": bool(is_hash),
+                # plaintext is the whole value of the tab; the UI reveals it on click
+                "secret": sv,
+                "secret_masked": ("*" * min(len(sv), 10)) if sv else "",
+                "cracked": bool(sv and not is_hash),
+            })
+
+        # 3) Raw post-enum loot: PostEnumeration messages from sessions on this IP
+        cur.execute(
+            """SELECT am.content, am.created_at, am.session_id::text
+                 FROM agent_messages am
+                 JOIN agent_sessions se ON se.id = am.session_id
+                WHERE am.agent_name = 'PostEnumeration'
+                  AND (se.target_description = %s OR am.content LIKE %s)
+                ORDER BY am.created_at DESC
+                LIMIT 200""",
+            (ip, f"%{ip}%"))
+        loot = []
+        for r in cur.fetchall():
+            content = r["content"] or ""
+            m = _re.match(r"^\[([^\]]+)\]\s*(.*)$", content, _re.S)
+            title = m.group(1) if m else "post-enum"
+            body = (m.group(2) if m else content).strip()
+            # skip the summary/status lines — keep the actual command output blocks
+            if title.lower().startswith(("post_enumeration", "access", "loot")):
+                continue
+            loot.append({"title": title, "output": body[:4000],
+                         "at": r["created_at"].isoformat() if r["created_at"] else None,
+                         "session_id": r["session_id"]})
+
+    # 4) Highlights — the ranked "what matters" list pinned to the top.
+    highlights = []
+    for a in access:
+        if a["status"] == "live" and a.get("is_root"):
+            highlights.append({"severity": "critical", "kind": "root_access",
+                               "label": f"ROOT {a['kind']} on port {a.get('port') or '?'} "
+                                        f"(whoami={a.get('whoami') or 'root'})"})
+        elif a["status"] == "live":
+            highlights.append({"severity": "high", "kind": "shell_access",
+                               "label": f"{a['kind']} shell on port {a.get('port') or '?'} "
+                                        f"(whoami={a.get('whoami') or '?'})"})
+    cracked = [c for c in creds if c["cracked"]]
+    if cracked:
+        names = ", ".join(sorted({c["username"] for c in cracked})[:8])
+        highlights.append({"severity": "critical", "kind": "cracked_credentials",
+                           "label": f"{len(cracked)} credential(s) recovered in plaintext: {names}"})
+    hashes = [c for c in creds if c["is_hash"]]
+    if hashes:
+        highlights.append({"severity": "medium", "kind": "password_hashes",
+                           "label": f"{len(hashes)} password hash(es) captured (crack candidates)"})
+    # loot-derived highlights (private keys, passwordless sudo)
+    blob = "\n".join(l["output"] for l in loot)
+    if _re.search(r"BEGIN (?:OPENSSH|RSA|EC|DSA) PRIVATE KEY", blob):
+        highlights.append({"severity": "high", "kind": "ssh_private_key",
+                           "label": "SSH private key(s) found on host"})
+    if _re.search(r"NOPASSWD|\(ALL\s*:\s*ALL\)\s*ALL", blob):
+        highlights.append({"severity": "high", "kind": "sudo_nopasswd",
+                           "label": "Passwordless / full sudo rights available"})
+    sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    highlights.sort(key=lambda h: sev_rank.get(h["severity"], 9))
+
+    return {"ip": ip, "highlights": highlights, "access": access,
+            "credentials": creds, "loot": loot,
+            "counts": {"access": len(access), "credentials": len(creds),
+                       "cracked": len(cracked), "hashes": len(hashes),
+                       "loot_items": len(loot)}}
+
+
 @app.post("/assets/{ip}/access/refresh", tags=["Access"])
 def asset_access_refresh(ip: str, rounds: int = Query(None, ge=1, le=10),
                          x_operator: str = Header("operator", alias="X-Operator"),
