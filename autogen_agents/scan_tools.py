@@ -5627,6 +5627,9 @@ def get_session_scan_status(session_id: str = None) -> str:
                         "dnsx": tools.osint_runner_url,
                         "passive-recon": tools.osint_runner_url,
                         "recon-pipeline": tools.osint_runner_url,
+                        "asnmap": tools.osint_runner_url,
+                        "uncover": tools.osint_runner_url,
+                        "cloudlist": tools.osint_runner_url,
                         "brutus": tools.brutus_runner_url,
                     }
                     service_url = type_to_url.get(scan_type)
@@ -5672,6 +5675,15 @@ def get_session_scan_status(session_id: str = None) -> str:
                                 _sid, job_id, live_status,
                                 completed_at=live_data.get("completed_at"),
                                 result_summary=result_summary)
+                    elif resp.status_code == 404:
+                        # Job aged out of the scanner's memory — it finished; the
+                        # completion callback just never landed. Treat as done so a
+                        # stale 'running' cannot linger forever and keep the
+                        # session 'scanning' waiting on a job that is gone.
+                        scan["status"] = "completed"
+                        scan_tracker.update_scan_status(job_id, "completed", None,
+                                                        session_id=_sid)
+                        scan_tracker.persist_scan_status(_sid, job_id, "completed")
 
                 except Exception as e:
                     scan["status_error"] = str(e)
