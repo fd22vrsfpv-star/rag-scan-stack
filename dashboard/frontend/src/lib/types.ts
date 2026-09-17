@@ -40,6 +40,8 @@ export interface Port {
   max_severity?: string | null
   tools_run?: number
   has_enum?: boolean
+  exploits_attempted?: number
+  has_command_exec?: boolean
 }
 
 export interface Finding {

@@ -217,15 +217,27 @@ function makePortColumns(
     const count = getValue() as number | undefined
     return count ? <span className="text-xs font-medium">{count}</span> : <span className="text-xs text-muted-foreground">—</span>
   }},
-  { id: 'tools_enum', header: 'Tools / Enum', size: 115, minSize: 80, cell: ({ row }) => {
+  { id: 'tools_enum', header: 'Tools / Exploits', size: 175, minSize: 120, cell: ({ row }) => {
     const t = Number(row.original.tools_run ?? 0)
+    const ex = Number(row.original.exploits_attempted ?? 0)
     const hasEnum = !!row.original.has_enum
+    const cmdExec = !!row.original.has_command_exec
+    const label = [
+      t > 0 ? `${t} tool${t === 1 ? '' : 's'}` : null,
+      ex > 0 ? `${ex} exploit${ex === 1 ? '' : 's'}` : null,
+    ].filter(Boolean).join(' · ')
     return (
-      <div className="flex items-center gap-1.5">
-        <span className="text-xs" title={`${t} distinct tool(s) run against this port`}>
-          {t > 0 ? `${t} tool${t === 1 ? '' : 's'}` : <span className="text-muted-foreground">—</span>}
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <span className="text-xs" title={`${t} distinct tool(s) run and ${ex} exploit(s) attempted against this port`}>
+          {label || <span className="text-muted-foreground">—</span>}
         </span>
-        {hasEnum && (
+        {cmdExec && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded border bg-green-500/20 text-green-400 border-green-500/40 font-medium"
+                title="Proven command execution on this port (exploit-success finding or a held shell)">
+            command execution
+          </span>
+        )}
+        {!cmdExec && hasEnum && (
           <span className="text-[10px] px-1.5 py-0.5 rounded border bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
                 title="Enumeration data available (findings / held access / exploit output) — open the Enumeration tab">
             enum
