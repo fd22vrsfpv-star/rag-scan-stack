@@ -869,8 +869,15 @@ def _record_secret_facts(cur, facts: List[Dict[str, Any]],
     return recorded
 
 
-def analyse(execution: Dict[str, Any], *, queue: bool = True) -> Dict[str, Any]:
+def analyse(execution: Dict[str, Any], *, queue: bool = True,
+            allow_llm: bool = True) -> Dict[str, Any]:
     """One finished command: what it found, and what should follow.
+
+    ``allow_llm`` gates the LLM roles (extraction + review). It MUST be False for
+    BATCH callers — the post-enumeration sweep re-analyses up to 100 historical
+    executions in a loop, and an LLM call per row turned a fast sweep into a
+    30-minute one. The LLM fallback is for FRESH single-command output (the
+    per-command hook), where it is also bounded by the router's rolling budget.
 
     ``{"facts", "proposals", "queued", "refused", "refusals", "suppressed",
     "available"}``. Never raises — an analysis failure must not fail a command
@@ -905,7 +912,9 @@ def analyse(execution: Dict[str, Any], *, queue: bool = True) -> Dict[str, Any]:
     # structured facts, which re-enter the SAME rules -> scope gate -> pending
     # path below. The router decides IF the LLM runs (deterministic first) and
     # WHICH model. The LLM proposes WHAT was found; the gate still disposes.
-    if router.should_extract(output_text, facts):
+    # Skipped entirely for batch callers (allow_llm=False) so a 100-row sweep
+    # never fires 100 serial LLM calls.
+    if allow_llm and router.should_extract(output_text, facts):
         llm_facts = router.extract(output_text, tool=tool, target=target,
                                    service=service)
         if llm_facts:
@@ -920,8 +929,8 @@ def analyse(execution: Dict[str, Any], *, queue: bool = True) -> Dict[str, Any]:
     # REVIEW (routed): validate candidate facts (from BOTH deterministic
     # extractors and the LLM fallback) before they are queued, dropping false
     # positives. Fails OPEN — a reviewer outage keeps the facts, never silently
-    # drops findings.
-    if facts:
+    # drops findings. Skipped for batch callers (allow_llm=False).
+    if facts and allow_llm:
         rev = router.review(facts, output=output_text, target=target,
                             service=service)
         if rev.get("reviewed"):
