@@ -18150,7 +18150,12 @@ def _purge_engagement_data(cur, eid: str, keep_engagement: bool = False) -> Dict
                          ("security_tests", "target_ip"), ("credential_spray_attempts", "target_ip"),
                          ("detected_software", "ip"), ("pending_scan_recommendations", "ip"),
                          ("scan_recommendations", "ip"), ("port_observation", "ip")):
-            _del(tbl, f"DELETE FROM public.{tbl} WHERE host({col}::inet) = ANY(%s)", (ips,))
+            # Per-row CASE guard: some of these columns are TEXT and hold non-IP
+            # values (e.g. detected_software.ip), so a table-wide `col::inet` cast
+            # would error and skip the whole delete. Cast only rows that look like IPs.
+            _del(tbl, f"DELETE FROM public.{tbl} WHERE CASE WHEN {col}::text ~ "
+                      f"'^[0-9]{{1,3}}(\\.[0-9]{{1,3}}){{3}}' "
+                      f"THEN host({col}::inet) = ANY(%s) ELSE false END", (ips,))
         for tbl, col in (("obtained_access", "target"), ("attack_vectors", "target"),
                          ("recon_findings", "target"), ("follow_up_items", "target"),
                          ("tool_attempts", "target"), ("tool_executions", "target"),
@@ -18163,6 +18168,10 @@ def _purge_engagement_data(cur, eid: str, keep_engagement: bool = False) -> Dict
                          ("scan_pipeline_jobs", "host")):
             _del(tbl, f"DELETE FROM public.{tbl} WHERE "
                       f"split_part(regexp_replace({col}, '^.*@', ''), ':', 1) = ANY(%s)", (ips,))
+        # web_findings are keyed by URL — extract the host (strip scheme, path, port).
+        _del("web_findings", "DELETE FROM public.web_findings WHERE "
+             "split_part(split_part(regexp_replace(url, '^[a-z]+://', ''), '/', 1), ':', 1) "
+             "= ANY(%s)", (ips,))
 
     # 3) scan_id-keyed children (for scans tied to this engagement's assets).
     if scan_ids:
@@ -18239,6 +18248,8 @@ def _purge_dry_run(cur, eid: str) -> Dict[str, Any]:
         _count("exploit_results",
                "pending_exploit_id IN (SELECT id FROM public.pending_exploits "
                "WHERE host(target_ip) = ANY(%s))", (ips,))
+        _count("web_findings",
+               "split_part(split_part(regexp_replace(url,'^[a-z]+://',''),'/',1),':',1) = ANY(%s)", (ips,))
     return {"assets": asset_n, "target_ips": ips, "would_delete": counts}
 
 

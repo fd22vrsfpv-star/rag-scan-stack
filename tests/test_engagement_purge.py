@@ -160,6 +160,10 @@ def test_purge_deletes_ip_keyed_findings_with_null_engagement():
                     "VALUES (%s::inet,22,'tcp','msfadmin','hashcat_crack','password',true)", (ip,))
         cur.execute("SELECT count(*) FROM credential_findings WHERE host(ip)=%s", (ip,))
         assert cur.fetchone()[0] == 1
+        # A web finding keyed only by URL (contains the IP), NULL engagement_id — the
+        # class that survived a purge and kept showing after an engagement delete.
+        cur.execute("INSERT INTO web_findings (url, issue_type, name, severity, source) "
+                    "VALUES (%s,'info','pytest web','low','nuclei')", (f"http://{ip}:80/x",))
 
         r = _req("POST", f"/engagements/{eid}/purge-data", headers={"x-api-key": _key()})
         if r.status_code in (401, 403):
@@ -168,11 +172,14 @@ def test_purge_deletes_ip_keyed_findings_with_null_engagement():
 
         cur.execute("SELECT count(*) FROM credential_findings WHERE host(ip)=%s", (ip,))
         assert cur.fetchone()[0] == 0, "cracked creds survived the purge (the bug)"
+        cur.execute("SELECT count(*) FROM web_findings WHERE url LIKE %s", (f"%{ip}%",))
+        assert cur.fetchone()[0] == 0, "web_findings survived the purge (url-keyed bug)"
         # engagement kept (keep_engagement); scope preserved for re-run.
         cur.execute("SELECT count(*) FROM engagements WHERE id=%s", (eid,))
         assert cur.fetchone()[0] == 1
     finally:
         cur.execute("DELETE FROM credential_findings WHERE host(ip)=%s", (ip,))
+        cur.execute("DELETE FROM web_findings WHERE url LIKE %s", (f"%{ip}%",))
         if aid:
             cur.execute("DELETE FROM assets WHERE id=%s", (aid,))
         if eid:
