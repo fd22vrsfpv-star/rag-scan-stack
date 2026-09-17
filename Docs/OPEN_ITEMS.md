@@ -468,3 +468,22 @@ credential-brute recommendations (scanner hydra/credential-check/brutus) for ope
 services with no held credential, through the SAME scope-gated + MAX_CONCURRENT_SCANS
 bounded path as every other dispatcher (fail-closed; no private concurrency number).
 **Enforced by:** not enforced
+
+### agent_sessions status CHECK constraint drifted on the live DB
+**Found:** 2026-09-17
+**Evidence:** A completed run (msf-sep17-953) was marked 'failed' by a
+CheckViolation: `_finish` (langgraph_engine.py) writes status 'scanning' while a
+scan is still running, but the LIVE constraint was
+`status IN ('active','completed','failed','stopped','stalled','awaiting_approval')`
+— missing 'scanning'. db_init IS correct (create_agent_tables.sql:12 and
+setup_alldb.sql:1501 both include 'scanning'), so this is drift: the live
+constraint predates 'scanning' being added and scripts/ensure_db_schema.sh did
+not repair it (it adds tables/columns but does not reconcile CHECK constraints).
+Fixed the live DB by hand (DROP + ADD with 'scanning').
+**Where:** scripts/ensure_db_schema.sh drift repair — it does not detect/repair a
+CHECK constraint that differs from db_init.
+**Done when:** ensure_db_schema reconciles CHECK constraints (at least
+agent_sessions_status_check) with db_init, so a drifted enum constraint is
+repaired the way a missing column is.
+**Enforced by:** tests/test_scan_status_reconcile.py::test_agent_sessions_status_check_allows_scanning
+(pins the db_init DDL; the live-DB repair itself is not test-enforced).

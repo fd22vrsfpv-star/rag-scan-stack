@@ -2970,7 +2970,8 @@ def _scan_type_service_url(scan_type):
         "nuclei": os.environ.get("NUCLEI_URL", "https://nuclei-runner:8011"),
         "httpx": pd, "naabu": pd, "katana": pd, "tlsx": pd,
         "subfinder": osint, "dnsx": osint, "passive-recon": osint,
-        "recon-pipeline": osint,
+        "recon-pipeline": osint, "asnmap": osint, "uncover": osint,
+        "cloudlist": osint,
         "brutus": os.environ.get("BRUTUS_RUNNER_URL", "https://brutus-runner:8025"),
         "playwright": os.environ.get("PLAYWRIGHT_URL", "https://playwright-scanner:8014"),
     }.get(scan_type)
