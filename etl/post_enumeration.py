@@ -55,6 +55,12 @@ _REPO_RULES = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "knowledge", "enumeration_rules.yaml")
 
+EXTRACTORS_YAML = os.environ.get("ENUMERATION_EXTRACTORS_YAML",
+                                 "/knowledge/enumeration_extractors.yaml")
+_REPO_EXTRACTORS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "knowledge", "enumeration_extractors.yaml")
+
 SOURCE = "post_enumeration"
 
 # A rule that has been acted on this many times with nothing to show for it
@@ -65,6 +71,109 @@ SUPPRESS_AFTER = int(os.environ.get("ENUMERATION_SUPPRESS_AFTER", "5"))
 _IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _PRIVATE_KEY = re.compile(r"-----BEGIN (?:RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----")
 _KEY_PATH = re.compile(r"(/[^\s:]*\.ssh/id_[a-z0-9_]+)")
+
+# The hardcoded regexes above are the FALLBACK for _extract_from_lines when the
+# extractor YAML is unreadable — the safe direction is "still read private keys
+# and host leads", never "read nothing".
+_FALLBACK_EXTRACTORS: List[Dict[str, Any]] = [
+    {"id": "private-key-block", "_rx": _PRIVATE_KEY,
+     "emit": {"fact": "file", "kind": "private_key"}},
+    {"id": "ssh-key-path", "_rx": _KEY_PATH, "fields": {"path": 1},
+     "emit": {"fact": "file", "kind": "private_key"}},
+    {"id": "known-host-ip", "_rx": _IPV4, "fields": {"target": 0}, "lead": True,
+     "emit": {"fact": "host", "source": "known_hosts"}},
+]
+
+_EXTRACTORS_CACHE: Optional[List[Dict[str, Any]]] = None
+
+
+def load_extractors() -> List[Dict[str, Any]]:
+    """Output→fact extractors from YAML (regex compiled and cached), or the
+    hardcoded fallback if the file is unreadable.
+
+    An unreadable file logs and falls back — the safe direction is that private
+    keys and host leads are still read, never that a config typo silently turns
+    off all free-text fact extraction."""
+    global _EXTRACTORS_CACHE
+    if _EXTRACTORS_CACHE is not None:
+        return _EXTRACTORS_CACHE
+    compiled: List[Dict[str, Any]] = []
+    for candidate in (EXTRACTORS_YAML, _REPO_EXTRACTORS):
+        if not candidate or not os.path.exists(candidate):
+            continue
+        try:
+            import yaml
+            with open(candidate, encoding="utf-8") as fh:
+                raw = (yaml.safe_load(fh) or {}).get("extractors") or []
+            for ex in raw:
+                pat = ex.get("match")
+                if not pat:
+                    continue
+                try:
+                    ex = dict(ex)
+                    ex["_rx"] = re.compile(pat)
+                    compiled.append(ex)
+                except re.error as re_err:
+                    log.warning("extractor %s has a bad regex, skipped: %s",
+                                ex.get("id"), re_err)
+            break
+        except Exception as e:  # noqa: BLE001
+            log.warning("enumeration extractors %s unreadable: %s", candidate, e)
+            compiled = []
+            break
+    if not compiled:
+        log.warning("no enumeration extractors loaded (looked in %s, %s) — "
+                    "using hardcoded fallback", EXTRACTORS_YAML, _REPO_EXTRACTORS)
+        compiled = _FALLBACK_EXTRACTORS
+    _EXTRACTORS_CACHE = compiled
+    return compiled
+
+
+def _extract_from_lines(lines: List[str], *, target: str = "",
+                        service: str = "") -> List[Dict[str, Any]]:
+    """Scan raw output lines against every extractor, emitting normalised facts.
+
+    A rule is written against a FACT, so an extractor added here (a new token
+    shape, say) is picked up by any rule that matches its fact — no code change
+    on either side."""
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for line in lines:
+        for ex in load_extractors():
+            rx = ex.get("_rx")
+            if rx is None:
+                continue
+            for m in rx.finditer(line):
+                emit = ex.get("emit") or {}
+                if not emit.get("fact"):
+                    continue
+                fact: Dict[str, Any] = dict(emit)
+                fact["service"] = fact.get("service") or service
+                fact["line"] = line[:200]
+                for field, grp in (ex.get("fields") or {}).items():
+                    try:
+                        gi = int(grp)
+                        val = m.group(gi) if gi else m.group(0)
+                    except (IndexError, ValueError):
+                        val = None
+                    if val is not None:
+                        fact[field] = val
+                if ex.get("lead"):
+                    lead = fact.get("target")
+                    if (not lead or lead == target
+                            or lead.startswith(("0.", "127.", "255."))):
+                        continue
+                    fact["seen_on"] = target
+                else:
+                    fact.setdefault("target", target)
+                key = (ex.get("id"),
+                       fact.get("value") or fact.get("path") or fact.get("target"),
+                       fact.get("fact"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(fact)
+    return out
 
 
 def _connect():
@@ -190,22 +299,15 @@ def facts_from(parsed: Optional[Dict[str, Any]], *, output: str = "",
 
     # Command output is where post-access steps put everything they found, and
     # it is the least structured thing here — so it gets the widest reading.
+    # The reading itself is DATA (knowledge/enumeration_extractors.yaml): a new
+    # token/secret shape is added there, not here. A host named in known_hosts
+    # is a LEAD, not a licence — the scope gate decides whether it may be
+    # touched, and it usually will not.
     lines = list(parsed.get("command_output") or [])
     if output and not lines:
         lines = output.splitlines()
-    for line in lines:
-        if _PRIVATE_KEY.search(line) or _KEY_PATH.search(line):
-            m = _KEY_PATH.search(line)
-            facts.append({"fact": "file", "kind": "private_key",
-                          "target": target, "service": service,
-                          "path": m.group(1) if m else None, "line": line[:200]})
-        for ip in _IPV4.findall(line):
-            # A host named in known_hosts is somewhere this account already
-            # reaches. Recording it as a LEAD; the scope gate decides whether it
-            # may be touched, and it usually will not.
-            if ip != target and not ip.startswith(("0.", "127.", "255.")):
-                facts.append({"fact": "host", "target": ip, "source": "known_hosts",
-                              "seen_on": target, "line": line[:200]})
+    if lines:
+        facts.extend(_extract_from_lines(lines, target=target, service=service))
     return facts
 
 
