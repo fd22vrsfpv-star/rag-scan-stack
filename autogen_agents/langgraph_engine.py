@@ -827,19 +827,33 @@ def scan(state: PentestState) -> dict:
     # Without it they stay out, exactly as before. Both tools remain scope-gated
     # and MAX_CONCURRENT_SCANS-bounded in their own bodies.
     creds_enabled = False
+    _creds_auth = ""
     if auto:
         preapproved, _eid = _engagement_preapproval(sid)
-        if preapproved:
+        _rule_name = None
+        if not preapproved:
+            # A standing approval rule for this target ("approve everything for
+            # this IP", e.g. msf_home) is the operator's advance authorization
+            # too — the same reasoning that lets it skip the exploit interrupt.
+            # Without this, exploits auto-ran via the rule but password guessing
+            # never became available, so credential testing silently never ran.
+            try:
+                _rule_name, _ = _target_rule_preapproval(sid)
+            except Exception:  # noqa: BLE001
+                _rule_name = None
+        if preapproved or _rule_name:
             names = names | SCAN_TOOLS_CREDENTIAL
             creds_enabled = True
+            _creds_auth = ("operator pre-approval" if preapproved
+                           else f"standing rule '{_rule_name}'")
 
     system = _SCAN_SYSTEM_DISPATCH if auto else _SCAN_SYSTEM_PLAN
     try:
         # Say the credential tools exist when they do. A tool the agent is never
         # told about tends not to get chosen: the previous run had ftp, ssh,
         # telnet and vnc open and still ran no credential check.
-        cred_note = ("\nCredential testing IS authorised for this engagement "
-                     "(operator pre-approval). If you find authentication "
+        cred_note = (f"\nCredential testing IS authorised for this target "
+                     f"({_creds_auth}). If you find authentication "
                      "services — ftp, ssh, telnet, smb, vnc, rdp, mysql, "
                      "postgres — run start_credential_check on them, and "
                      "start_brutus where a wordlist attack is warranted. Both "
