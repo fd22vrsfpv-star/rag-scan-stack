@@ -102,9 +102,80 @@ class ZAPBridge:
             print(f"Error creating ZAP context: {e}")
             return ""
 
+    def _ensure_csrf_auth_script(self):
+        """Load the bundled generic CSRF-login auth script into ZAP once. Returns
+        the script name, or None if no JS engine / load failed."""
+        name = "csrf_form_auth"
+        try:
+            existing = self.zap.script.list_scripts or []
+            if any((sc.get("name") == name) for sc in existing):
+                return name
+            engines = self.zap.script.list_engines or []
+            js = next((e for e in engines if any(t in e.lower()
+                       for t in ("graal", "ecmascript", "nashorn", "javascript"))), None)
+            if not js:
+                print("ZAP has no JS script engine — CSRF script auth unavailable")
+                return None
+            r = self.zap.script.load(
+                scriptname=name, scripttype="authentication",
+                scriptengine=js, filename="/home/zap/csrf_auth.js")
+            if str(r).upper() != "OK":
+                print(f"ZAP CSRF auth script load returned {r}")
+            return name
+        except Exception as e:  # noqa: BLE001
+            print(f"Error loading CSRF auth script: {e}")
+            return None
+
+    def configure_script_authentication(self, context_name, context_id, auth):
+        """Script-based auth for login forms that carry an anti-CSRF token
+        (DVWA user_token, Django csrfmiddlewaretoken, ...). The bundled script
+        GETs the login page, scrapes the token, and POSTs the login with it.
+        auth needs: login_url, csrf_field, login_data (with {%username%}/
+        {%password%}/{%csrf%}), username, password. Returns the ZAP user id."""
+        try:
+            import urllib.parse as _up
+            name = self._ensure_csrf_auth_script()
+            if not name:
+                return None
+            login_url = (auth.get("login_url") or "").strip()
+            login_data = (auth.get("login_data") or "").strip()
+            csrf_field = (auth.get("csrf_field") or "user_token").strip()
+            username = auth.get("username") or ""
+            password = auth.get("password") or ""
+            if not (login_url and login_data and username):
+                return None
+            self.zap.sessionManagement.set_session_management_method(
+                context_id, "cookieBasedSessionManagement", "")
+            params = ("scriptName=" + _up.quote(name, safe="")
+                      + "&loginUrl=" + _up.quote(login_url, safe="")
+                      + "&csrfField=" + _up.quote(csrf_field, safe="")
+                      + "&loginData=" + _up.quote(login_data, safe=""))
+            self.zap.authentication.set_authentication_method(
+                context_id, "scriptBasedAuthentication", params)
+            if auth.get("logged_in_regex"):
+                self.zap.authentication.set_logged_in_indicator(context_id, auth["logged_in_regex"])
+            if auth.get("logged_out_regex"):
+                self.zap.authentication.set_logged_out_indicator(context_id, auth["logged_out_regex"])
+            user_id = self.zap.users.new_user(context_id, username)
+            self.zap.users.set_authentication_credentials(
+                context_id, user_id,
+                "username=" + _up.quote(username, safe="")
+                + "&password=" + _up.quote(password, safe=""))
+            self.zap.users.set_user_enabled(context_id, user_id, "true")
+            self.zap.forcedUser.set_forced_user(context_id, user_id)
+            self.zap.forcedUser.set_forced_user_mode_enabled("true")
+            print(f"ZAP CSRF script-auth configured for {context_name} (field {csrf_field})")
+            return user_id
+        except Exception as e:  # noqa: BLE001
+            print(f"Error configuring ZAP script authentication: {e}")
+            return None
+
     def configure_authentication(self, context_name, context_id, auth):
         """FORM-BASED authentication for ANY app with a login form, so the spider
         and active scan run as a logged-in user (not hardcoded to one app).
+
+        If the login carries an anti-CSRF token (auth_type == "csrf", or a
+        csrf_field is given), this delegates to script-based auth instead.
 
         auth keys:
           login_url        the form action URL that receives the POST
@@ -114,6 +185,9 @@ class ZAPBridge:
           logged_in_regex  (optional) a regex present ONLY when logged in
           logged_out_regex (optional) a regex present ONLY when logged out
         Returns the ZAP user id, or None if there is not enough config."""
+        # CSRF logins need the multi-step script auth (GET token -> POST).
+        if str(auth.get("auth_type") or "").lower() == "csrf" or auth.get("csrf_field"):
+            return self.configure_script_authentication(context_name, context_id, auth)
         try:
             import urllib.parse as _up
             login_url = (auth.get("login_url") or "").strip()
