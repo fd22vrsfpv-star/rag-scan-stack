@@ -866,6 +866,30 @@ def scan(state: PentestState) -> dict:
                                  recursion_limit=(24 if auto
                                                   else PHASE_STEP_BUDGET["Scanner"]))
         dispatched = sorted({t for t in used if t.startswith("start_")})
+
+        # DETERMINISTIC credential testing. Same reasoning as the concrete-test
+        # plan below: the model must not be the reason password guessing never
+        # happens. At dispatch time the port scan has not finished, so "if you
+        # find auth services, test them" has nothing to act on and the model
+        # skips it — so when credential testing is authorised, dispatch it here
+        # on the auth services ALREADY known open (scope-gated + rate-bounded in
+        # the tool body). Skip if the model already ran it.
+        if creds_enabled and "start_credential_check" not in used:
+            try:
+                _auth_svcs = _discovered_auth_services(target)
+                if _auth_svcs:
+                    scan_tools.start_credential_check(
+                        targets=target, services=",".join(_auth_svcs))
+                    dispatched = sorted(set(dispatched) | {"start_credential_check"})
+                    _msg(sid, "Scanner",
+                         f"[credential testing] Authorised ({_creds_auth}); "
+                         f"dispatched start_credential_check on discovered auth "
+                         f"service(s): {', '.join(_auth_svcs)} — default/weak "
+                         f"password check (scope-gated, rate-bounded).",
+                         role="system")
+            except Exception as _ce:  # noqa: BLE001
+                _log.warning("[%s] deterministic credential check failed: %s", sid, _ce)
+
         # Append the deterministic plan regardless of what the model produced.
         # Observed twice on one afternoon: the scan agent was rate-limited (429)
         # and fell back, then on the retry it ran fine, never called
@@ -931,6 +955,39 @@ def _tls_state(service: str, product: str = "", banner: str = "") -> str:
 # How many distinct (service, port) pairs the deterministic planner will build
 # tests for. Bounded because each one is an HTTP call to the recommender.
 _DETERMINISTIC_PLAN_LIMIT = 8
+
+
+_AUTH_SVC_MAP = {
+    "ssh": "ssh", "ftp": "ftp", "telnet": "telnet", "mysql": "mysql",
+    "postgresql": "postgres", "postgres": "postgres", "vnc": "vnc",
+    "smb": "smb", "microsoft-ds": "smb", "netbios-ssn": "smb",
+    "ms-wbt-server": "rdp", "rdp": "rdp", "http-proxy": "", "tomcat": "tomcat",
+    "mongodb": "mongodb", "redis": "redis",
+}
+
+
+def _discovered_auth_services(target: str):
+    """Credential-check service names for the auth services already discovered
+    open on this target (from the ports table). Deterministic input to credential
+    testing — no dependency on the model 'seeing' the services."""
+    try:
+        from db_utils import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT lower(p.service) FROM ports p "
+                "JOIN assets a ON p.asset_id = a.id "
+                "WHERE host(a.ip) = %s AND COALESCE(p.is_open, true) "
+                "  AND p.service IS NOT NULL", (str(target).split('/')[0],))
+            svcs = {r[0] for r in cur.fetchall()}
+        out = set()
+        for sv in svcs:
+            mapped = _AUTH_SVC_MAP.get((sv or "").strip())
+            if mapped:
+                out.add(mapped)
+        return sorted(out)
+    except Exception as e:  # noqa: BLE001
+        _log.debug("auth-service discovery failed for %s: %s", target, e)
+        return []
 
 
 def _build_test_plan(_unused_target: str = "") -> "tuple[str, int]":
