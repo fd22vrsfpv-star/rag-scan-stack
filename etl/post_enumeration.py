@@ -825,96 +825,29 @@ def facts_from_web_findings(cur, *, target: str = "", limit: int = 200,
 
 # ── The analysis every command goes through ────────────────────────────────
 
+def _enum_router():
+    """The shared enumeration LLM router (model routing + triage + review),
+    wired to this module's DB connection for reading operator config."""
+    try:
+        from etl.enumeration_llm_router import get_router
+    except ImportError:  # pragma: no cover
+        from enumeration_llm_router import get_router
+    return get_router(connect=_connect)
+
+
 def _llm_classify_output(output: str, *, tool: str = "", target: str = "",
                          service: str = "") -> List[Dict[str, Any]]:
-    """Ask the LLM to read output that matched NO known extractor and return
-    STRUCTURED facts in the vocabulary the rules already speak.
+    """LLM EXTRACTION of facts from output that matched NO known extractor.
 
-    Best-effort and bounded: returns [] on any error, on empty/oversized output,
-    or on a shape it cannot trust. The facts it returns are still scope-gated by
-    _propose_from_facts downstream — this only proposes WHAT was found, never
+    Thin wrapper over the router's extract role (kept for backward compat and the
+    global LLM_FALLBACK_ENABLED kill switch). The router selects the model/params
+    for the extraction role and does the bounded, validated call; the facts it
+    returns are still scope-gated downstream — this proposes WHAT was found, never
     authorises acting on it."""
-    text = (output or "").strip()
-    if not LLM_FALLBACK_ENABLED or len(text) < LLM_FALLBACK_MIN_CHARS:
+    if not LLM_FALLBACK_ENABLED:
         return []
-    text = text[:LLM_FALLBACK_MAX_CHARS]
-    try:
-        import json as _json
-        import re as _re
-        import requests
-        system = (
-            "You are a penetration-test post-exploitation analyst reading the raw "
-            "output of a command for AUTHORIZED security testing. The platform's "
-            "pattern matchers found NOTHING actionable in it. Identify anything a "
-            "tester would act on and return ONLY JSON, no prose: "
-            '{"facts":[{"fact":"secret|host|file|credential|host_fact",'
-            '"kind":"<short kind, e.g. api_token, config_path>",'
-            '"value":"<the literal string found>",'
-            '"why":"<one short reason it matters>"}]}. '
-            "Only include something actually present in the output. If nothing is "
-            'actionable, return {"facts":[]}. Never invent values.')
-        user = (f"Tool: {tool}\nTarget: {target}\nService: {service}\n"
-                f"Output:\n{text}")
-        body: Dict[str, Any] = {
-            "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": user}],
-            "max_tokens": 600}
-        if LLM_MODEL:
-            body["model"] = LLM_MODEL
-        resp = requests.post(LLM_URL, json=body, timeout=60, verify=False)
-        if resp.status_code >= 400:
-            log.debug("LLM fallback HTTP %s: %s", resp.status_code, resp.text[:160])
-            return []
-        data = resp.json()
-        # Unwrap the various chat shapes to the text content.
-        content = ""
-        if isinstance(data, dict):
-            msg = data.get("message")
-            if isinstance(msg, dict):
-                content = msg.get("content") or ""
-            if not content:
-                ch = data.get("choices")
-                if isinstance(ch, list) and ch:
-                    content = ((ch[0] or {}).get("message") or {}).get("content") or ""
-            content = content or data.get("response") or data.get("content") or ""
-        m = _re.search(r"\{.*\}", content or "", _re.S)
-        if not m:
-            return []
-        parsed = _json.loads(m.group(0))
-        raw_facts = parsed.get("facts") if isinstance(parsed, dict) else None
-        if not isinstance(raw_facts, list):
-            return []
-        facts: List[Dict[str, Any]] = []
-        for rf in raw_facts[:25]:
-            if not isinstance(rf, dict):
-                continue
-            kind_fact = str(rf.get("fact") or "").strip().lower()
-            if kind_fact not in _LLM_ALLOWED_FACTS:
-                continue
-            val = rf.get("value")
-            if not val:
-                continue
-            fact: Dict[str, Any] = {
-                "fact": kind_fact,
-                "kind": str(rf.get("kind") or "llm").strip()[:40],
-                "value": str(val)[:300],
-                "service": service,
-                "source": "llm_fallback",
-                "confidence": "low",
-                "why": str(rf.get("why") or "")[:200],
-                "line": str(val)[:200],
-            }
-            # A host fact from the LLM is a LEAD like any other — leave the scope
-            # gate to decide. Everything else defaults its target to this host.
-            fact["target"] = (str(val) if kind_fact == "host" else target)
-            if kind_fact == "host":
-                fact["seen_on"] = target
-                fact["source"] = "llm_fallback"
-            facts.append(fact)
-        return facts
-    except Exception as e:  # noqa: BLE001
-        log.debug("LLM fallback classify failed: %s", e)
-        return []
+    return _enum_router().extract(output, tool=tool, target=target,
+                                  service=service)
 
 
 def _record_secret_facts(cur, facts: List[Dict[str, Any]],
@@ -964,14 +897,17 @@ def analyse(execution: Dict[str, Any], *, queue: bool = True) -> Dict[str, Any]:
 
     facts = facts_from(parsed, output=execution.get("output") or "",
                        target=target, service=service)
+    output_text = execution.get("output") or ""
+    router = _enum_router()
 
-    # LLM FALLBACK: substantive output that matched NO known extractor is handed
-    # to the LLM to classify into structured facts, which re-enter the SAME
-    # rules -> scope gate -> pending path below. The LLM proposes WHAT was found;
-    # the deterministic gate still decides whether anything may run.
-    if not facts:
-        llm_facts = _llm_classify_output(execution.get("output") or "",
-                                         tool=tool, target=target, service=service)
+    # LLM EXTRACTION (routed + triaged): substantive output that matched NO known
+    # extractor is handed to the router's extraction role to classify into
+    # structured facts, which re-enter the SAME rules -> scope gate -> pending
+    # path below. The router decides IF the LLM runs (deterministic first) and
+    # WHICH model. The LLM proposes WHAT was found; the gate still disposes.
+    if router.should_extract(output_text, facts):
+        llm_facts = router.extract(output_text, tool=tool, target=target,
+                                   service=service)
         if llm_facts:
             facts = llm_facts
             out["llm_fallback"] = {"facts": len(llm_facts),
@@ -980,6 +916,22 @@ def analyse(execution: Dict[str, Any], *, queue: bool = True) -> Dict[str, Any]:
                           {"target": target, "tool": tool, "service": service,
                            "facts": len(llm_facts),
                            "engagement_id": execution.get("engagement_id")})
+
+    # REVIEW (routed): validate candidate facts (from BOTH deterministic
+    # extractors and the LLM fallback) before they are queued, dropping false
+    # positives. Fails OPEN — a reviewer outage keeps the facts, never silently
+    # drops findings.
+    if facts:
+        rev = router.review(facts, output=output_text, target=target,
+                            service=service)
+        if rev.get("reviewed"):
+            out["review"] = {"reviewed": rev["reviewed"], "dropped": rev["dropped"]}
+            _emit_webhook("post_enum_facts_reviewed",
+                          {"target": target, "tool": tool,
+                           "reviewed": rev["reviewed"], "dropped": rev["dropped"],
+                           "kept": len(rev["facts"]),
+                           "engagement_id": execution.get("engagement_id")})
+        facts = rev["facts"]
 
     out["facts"] = len(facts)
     if not facts:
