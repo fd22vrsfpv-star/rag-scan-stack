@@ -58,6 +58,13 @@ _DEFAULTS: Dict[str, Any] = {
     "enum_router.extraction.max_tokens": 600,
     "enum_router.extraction.min_chars": 40,
     "enum_router.extraction.max_chars": 6000,
+    # HARD budget: at most this many LLM extraction calls per rolling window,
+    # process-wide. The post-enumeration sweep re-analyses up to 100 historical
+    # executions in a loop; without a budget an LLM-per-row turns a fast sweep
+    # into a 30-minute one (observed). This caps the blast radius even if a
+    # caller forgets to disable the LLM for batch work.
+    "enum_router.extraction.max_per_window": 8,
+    "enum_router.extraction.window_sec": 300,
     "enum_router.review.enabled": True,
     "enum_router.review.model": None,
     "enum_router.review.temperature": 0.0,
@@ -86,6 +93,7 @@ class EnumerationLLMRouter:
         self._connect = connect
         self._cache: Dict[str, Any] = {}
         self._cache_at: float = 0.0
+        self._extract_calls: List[float] = []   # timestamps, for the budget
 
     # ── config ───────────────────────────────────────────────────────────────
     def _settings(self) -> Dict[str, Any]:
@@ -185,17 +193,33 @@ class EnumerationLLMRouter:
         except Exception:  # noqa: BLE001
             return None
 
-    # ── triage ─────────────────────────────────────────────────────────────────
+    # ── triage / budget ─────────────────────────────────────────────────────
+    def _within_budget(self, p: Dict[str, Any], *, consume: bool = False) -> bool:
+        """Token-bucket over a rolling window, process-wide. Read-only unless
+        `consume` (extract() consumes when it actually makes a call)."""
+        window = float(p.get("window_sec") or 300)
+        cap = int(p.get("max_per_window") or 8)
+        now = time.time()
+        self._extract_calls = [t for t in self._extract_calls if now - t < window]
+        if len(self._extract_calls) >= cap:
+            return False
+        if consume:
+            self._extract_calls.append(now)
+        return True
+
     def should_extract(self, output: str, deterministic_facts: List[Dict]) -> bool:
         """LLM extraction runs only when the deterministic extractors found
-        NOTHING and the output is substantive (within size bounds)."""
+        NOTHING, the output is substantive (within size bounds), AND the rolling
+        budget is not exhausted."""
         if not _GLOBAL_ENABLED or deterministic_facts:
             return False
         p = self.route("extraction")
         if not p.get("enabled"):
             return False
         n = len((output or "").strip())
-        return int(p.get("min_chars") or 40) <= n
+        if n < int(p.get("min_chars") or 40):
+            return False
+        return self._within_budget(p)
 
     # ── extraction ───────────────────────────────────────────────────────────
     def extract(self, output: str, *, tool: str = "", target: str = "",
@@ -207,6 +231,11 @@ class EnumerationLLMRouter:
         if not _GLOBAL_ENABLED or not p.get("enabled"):
             return []
         if len(text) < int(p.get("min_chars") or 40):
+            return []
+        # Consume the rolling budget; refuse once exhausted so a batch caller
+        # cannot fire an unbounded number of LLM calls.
+        if not self._within_budget(p, consume=True):
+            log.debug("enum router extraction budget exhausted; skipping")
             return []
         text = text[:int(p.get("max_chars") or 6000)]
         try:

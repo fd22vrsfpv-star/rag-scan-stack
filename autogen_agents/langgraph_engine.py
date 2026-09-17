@@ -2194,7 +2194,12 @@ def _sweep_enumeration(target: str) -> dict:
         out["available"] = True
         for r in rows:
             out["examined"] += 1
-            res = analyse(dict(r))
+            # BATCH path: deterministic extraction + rules only. The LLM roles
+            # (extraction/review) would fire per row over up to 100 executions
+            # and serialise ~20s calls into a 30-minute sweep. The LLM fallback
+            # runs on FRESH single-command output (the per-command hook), bounded
+            # by the router budget — not here.
+            res = analyse(dict(r), allow_llm=False)
             out["facts"] += res.get("facts", 0)
             out["queued"] += res.get("queued", 0)
             out["refused"] += res.get("refused", 0)

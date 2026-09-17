@@ -166,6 +166,19 @@ def test_review_uncertain_scope_skips_high_confidence(monkeypatch):
     assert calls["n"] == 0, "no LLM call for a high-confidence deterministic fact"
 
 
+def test_extraction_budget_caps_calls(monkeypatch):
+    # The rolling budget must stop a batch caller from firing unbounded LLM
+    # calls (the sweep regression: 100 rows -> 100 serial LLM calls).
+    calls = _fake_requests(monkeypatch, '{"facts":[]}')
+    r = _router(rows=[("enum_router.extraction.max_per_window", "3"),
+                      ("enum_router.extraction.window_sec", "300")])
+    for _ in range(10):
+        r.extract("x" * 100, target="10.0.0.7")
+    assert calls["n"] == 3, f"budget of 3 not enforced (made {calls['n']} calls)"
+    # and should_extract reports the budget is spent
+    assert r.should_extract("x" * 100, []) is False
+
+
 def test_review_all_scope_reviews_everything(monkeypatch):
     _fake_requests(monkeypatch, '{"verdicts":[{"i":0,"keep":true,"confidence":"high"}]}')
     r = _router(rows=[("enum_router.review.scope", "all")])
