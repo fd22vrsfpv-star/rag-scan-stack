@@ -1,16 +1,23 @@
-"""ENFORCED: every table that holds target data must be attributable to an
-engagement — either directly (an `engagement_id` column) or via its asset
+"""ENFORCED: every table that holds COLLECTED TARGET DATA must be attributable to
+an engagement — either directly (an `engagement_id` column) or via its asset
 (`asset_id` -> assets.engagement_id).
 
-Why: data written with no engagement link (e.g. hashcat-cracked credentials keyed
-only by `ip`) is not attributed to the engagement and an engagement purge/delete
-misses it, so it keeps showing after the engagement is cleared. Requiring every
-target-scoped table to be engagement-attributable keeps "delete an engagement's
-data" complete and keeps a re-scan clean.
+Collected target data = scans, assets, ports, findings, vulns, web/recon findings,
+credentials, exploits, sessions/held access, observations — anything gathered
+*about a specific target during an engagement*.
 
-This RATCHETS: a target-scoped table with neither `engagement_id` nor `asset_id`
-must be listed in ENG_ATTR_DEBT with a reason. A NEW one fails by name; a resolved
-one must be removed from the list (a table that gains attribution should drop out).
+NOT required (exempt by design): techniques / methodology, follow-up queues, and
+anything inherently shared ACROSS engagements or operator config. Those legitimately
+have no single engagement and are listed in ENG_ATTR_EXEMPT.
+
+Why: collected data written with no engagement link (e.g. hashcat-cracked credentials
+keyed only by `ip`) is not attributed and an engagement purge/delete misses it, so it
+keeps showing after the engagement is cleared. Requiring collected-data tables to be
+engagement-attributable keeps "delete an engagement's data" complete and a re-scan clean.
+
+This RATCHETS: a collected-data table with neither `engagement_id` nor `asset_id`
+must be listed in ENG_ATTR_DEBT with a reason. A NEW one fails by name; a resolved one
+must be removed. Exempt-by-design tables go in ENG_ATTR_EXEMPT (permanent, with a reason).
 
 Skips cleanly without a DB (reads information_schema).
 
@@ -24,18 +31,22 @@ psycopg2 = pytest.importorskip("psycopg2")
 
 DB_DSN = os.environ.get("DB_DSN", "postgresql://app:app@rag-postgres:5432/scans")
 
-# Target-scoped base tables that today carry NEITHER engagement_id NOR asset_id, so
-# they can only be tied to an engagement by IP/target. Each needs a reason; shrink
-# this list by adding engagement_id (or asset_id) to the table. Do NOT grow it
-# without a stated reason.
+# EXEMPT BY DESIGN — techniques, follow-ups, cross-engagement, or operator config.
+# These are NOT collected-per-engagement data, so they need no engagement_id and are
+# intentionally kept across a data purge.
+ENG_ATTR_EXEMPT = {
+    "burp_followup_queue": "follow-up export queue — an action item, not collected data",
+    "port_access_advice": "technique/advice ('what to try on this service') — reusable across engagements",
+    "scope_conflicts": "scope-overlap rows that SPAN engagements by design",
+    "target_tool_settings": "operator per-target tool config — reused, kept across purges",
+}
+
+# DEBT — COLLECTED DATA that SHOULD be engagement-attributed but is not yet. Each
+# needs a reason; shrink by adding engagement_id (or asset_id). Do NOT grow without one.
 ENG_ATTR_DEBT = {
-    "scan_runs": "delta run rows keyed by target; engagement inferred at query time",
-    "tool_executions": "kali-dispatched tool log keyed by target/scan_id",
-    "scan_pipeline_jobs": "transient pipeline job rows keyed by host",
-    "burp_followup_queue": "export queue keyed by target",
-    "port_access_advice": "advisory rows keyed by target",
-    "scope_conflicts": "scope-overlap rows spanning engagements by design",
-    "target_tool_settings": "operator per-target tool config (kept across purges)",
+    "scan_runs": "delta scan-run rows keyed by target; should carry engagement_id",
+    "tool_executions": "kali-dispatched tool-run log keyed by target/scan_id; should carry engagement_id",
+    "scan_pipeline_jobs": "pipeline job rows keyed by host; should carry engagement_id",
 }
 
 _TARGET_COLS = ("ip", "target", "target_ip", "host")
@@ -72,18 +83,21 @@ def test_every_target_table_is_engagement_attributable():
         c.close()
     if not tables:
         pytest.skip("no target-scoped tables found")
-    # A table is attributable if it has engagement_id OR asset_id.
+    # A table is OK if it has engagement_id OR asset_id, or is exempt-by-design,
+    # or is declared debt.
+    known = set(ENG_ATTR_EXEMPT) | set(ENG_ATTR_DEBT)
     unattributable = {t for t, (eng, asset) in tables.items() if not (eng or asset)}
-    undeclared = sorted(unattributable - set(ENG_ATTR_DEBT))
+    undeclared = sorted(unattributable - known)
     assert not undeclared, (
-        "target-scoped tables with NO engagement attribution (no engagement_id, no "
-        "asset_id) and not in ENG_ATTR_DEBT:\n  " + "\n  ".join(undeclared) +
-        "\nAdd engagement_id (or asset_id) to the table, or declare it in "
-        "ENG_ATTR_DEBT with a reason.")
+        "collected-data tables with NO engagement attribution (no engagement_id, no "
+        "asset_id) and not classified:\n  " + "\n  ".join(undeclared) +
+        "\nIf this is collected target data, add engagement_id (or asset_id) or put "
+        "it in ENG_ATTR_DEBT with a reason. If it is a technique / follow-up / "
+        "cross-engagement / config table, put it in ENG_ATTR_EXEMPT with a reason.")
 
 
-def test_debt_list_does_not_rot():
-    """A table listed as debt that has GAINED attribution must be removed."""
+def test_debt_does_not_rot():
+    """A DEBT table that has GAINED attribution must be moved out of the list."""
     c = _conn()
     try:
         tables = _target_scoped_tables(c.cursor())
@@ -91,7 +105,11 @@ def test_debt_list_does_not_rot():
         c.close()
     if not tables:
         pytest.skip("no target-scoped tables found")
-    resolved = sorted(t for t in ENG_ATTR_DEBT
-                      if t in tables and any(tables[t]))   # now has eng or asset
+    resolved = sorted(t for t in ENG_ATTR_DEBT if t in tables and any(tables[t]))
     assert not resolved, ("these are in ENG_ATTR_DEBT but are now attributable — "
                           "remove them from the list:\n  " + "\n  ".join(resolved))
+
+
+def test_exempt_and_debt_are_disjoint():
+    both = sorted(set(ENG_ATTR_EXEMPT) & set(ENG_ATTR_DEBT))
+    assert not both, f"a table is both exempt and debt — pick one: {both}"
