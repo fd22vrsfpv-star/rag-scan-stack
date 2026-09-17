@@ -4720,6 +4720,32 @@ def queue_exploit_for_approval(
                     ov.setdefault(k, v)
                 parameters["msf_option_overrides"] = ov
 
+        # DEDUP: do not re-queue an exploit already pending/approved/executed for
+        # this (target, port, module). The exploit agent re-proposing the same
+        # candidate every planning pass otherwise piles up duplicates that all
+        # auto-fire — 49 duplicate executions were observed on a rich target,
+        # keeping the session from ever converging. Best-effort; never blocks.
+        try:
+            from db_utils import get_db as _get_db
+            _ip = str(target_ip or "").split("/")[0].strip()
+            with _get_db() as _c, _c.cursor() as _cur:
+                _cur.execute(
+                    "SELECT id::text FROM pending_exploits "
+                    "WHERE host(target_ip) = %s AND exploit_id = %s "
+                    "  AND COALESCE(target_port, 0) = COALESCE(%s, 0) "
+                    "  AND status IN ('pending','approved','executed') "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (_ip, exploit_id, target_port))
+                _dup = _cur.fetchone()
+            if _dup:
+                return json.dumps({
+                    "ok": True, "skipped": True, "deduped": True,
+                    "pending_exploit_id": _dup[0], "status": "pending",
+                    "message": ("Already queued/executed for this target/port/module "
+                                "— not re-queued (dedup).")}, indent=2)
+        except Exception:  # noqa: BLE001
+            pass
+
         pending_id = create_pending_exploit(
             source=source,
             exploit_id=exploit_id,
