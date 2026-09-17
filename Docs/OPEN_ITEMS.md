@@ -468,3 +468,22 @@ credential-brute recommendations (scanner hydra/credential-check/brutus) for ope
 services with no held credential, through the SAME scope-gated + MAX_CONCURRENT_SCANS
 bounded path as every other dispatcher (fail-closed; no private concurrency number).
 **Enforced by:** not enforced
+
+### Recovered/cracked credentials never revalidated → no password attempts recorded
+**Found:** 2026-09-17
+**Evidence:** On 192.168.1.150 the 6 hashcat-cracked passwords are stored as
+credential_findings with valid_cred=false, status='unknown' (source hashcat_crack),
+yet obtained_access holds LIVE ssh_credential shells that used those same passwords
+(postgres/sys/user/msfadmin). credential_spray_attempts has 0 rows for the target
+(none anywhere). So the platform proved the creds work (via etl/access.py probing)
+but never marked them valid, and never logged a password/login attempt — "password
+attempts didn't show up" because none are recorded and the creds still read invalid.
+**Where:** etl/access.py only READS credential_findings (to pick ssh_credentials to
+probe); it never writes valid_cred/status back when a probe opens a shell, and no
+path inserts credential_spray_attempts for the dump→crack→store→REVALIDATE loop
+(the revalidate step is the missing one; the crack step was added 2026-09-17).
+**Done when:** a credential proven working by access.py (or a spray) flips its
+credential_finding to valid_cred=true/status='valid' AND records a
+credential_spray_attempt row, so recovered passwords show as valid and their login
+attempts are visible.
+**Enforced by:** not enforced
