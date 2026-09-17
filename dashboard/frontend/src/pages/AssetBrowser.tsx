@@ -619,15 +619,22 @@ function EnumerationSection({ ip }: { ip: string }) {
         <div>
           <h4 className="text-xs font-medium text-muted-foreground mb-2">
             Listening ports ({listening.length}) — seen from inside the host
+            {listening.some(l => l.local_only) && (
+              <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded border bg-red-500/15 text-red-400 border-red-500/40">
+                {listening.filter(l => l.local_only).length} local-only — follow up
+              </span>
+            )}
           </h4>
           <div className="flex flex-wrap gap-1.5">
             {listening.map((l, i) => (
               <span key={i}
-                className={`px-2 py-0.5 rounded border text-[11px] font-mono ${l.internal_only
-                  ? 'bg-amber-500/15 text-amber-400 border-amber-500/30'
-                  : 'bg-muted text-foreground border-border'}`}
-                title={`${l.address ?? '*'}:${l.port}${l.process ? ` (${l.process})` : ''}${l.internal_only ? ' — internal only (pivot target)' : ''}`}>
-                {l.port}{l.process ? `/${l.process}` : ''}{l.internal_only ? ' \u2022 internal' : ''}
+                className={`px-2 py-0.5 rounded border text-[11px] font-mono ${l.local_only
+                  ? 'bg-red-500/20 text-red-400 border-red-500/50 font-medium'
+                  : l.internal_only
+                    ? 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                    : 'bg-muted text-foreground border-border'}`}
+                title={`${l.address ?? '*'}:${l.port}${l.process ? ` (${l.process})` : ''}${l.local_only ? ' — LOCAL ONLY (loopback): reachable only by pivoting through this host — follow up' : l.internal_only ? ' — internal only (pivot target)' : ''}`}>
+                {l.port}{l.process ? `/${l.process}` : ''}{l.local_only ? ' \u2022 local-only' : l.internal_only ? ' \u2022 internal' : ''}
               </span>
             ))}
           </div>

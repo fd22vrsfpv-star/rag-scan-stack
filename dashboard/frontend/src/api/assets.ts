@@ -431,7 +431,7 @@ export interface EnumCredential {
 export interface EnumLootCommand { command: string; output: string }
 export interface EnumLoot { title: string; commands: EnumLootCommand[]; at?: string | null; session_id?: string }
 export interface EnumLoginAttempt { username: string; service?: string | null; port?: number | null; status?: string | null; at?: string | null }
-export interface EnumListeningPort { port: number; address?: string | null; process?: string | null; internal_only?: boolean }
+export interface EnumListeningPort { port: number; address?: string | null; process?: string | null; internal_only?: boolean; local_only?: boolean }
 export interface AssetEnumeration {
   ip: string
   highlights: EnumHighlight[]
