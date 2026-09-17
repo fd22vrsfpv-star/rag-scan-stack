@@ -2029,6 +2029,15 @@ def post_enumeration(state: PentestState) -> dict:
                  f"[loot] /etc/shadow: {loot['hashes']} hash(es) harvested, "
                  f"{loot.get('cracked', 0)} cracked to plaintext via offline hashcat "
                  f"— stored as credentials for reuse/lateral movement.")
+        # DETECTION-TRIGGERED STEP: a DB listening only on loopback is reachable
+        # only through this host — enumerate it locally via the shell when found.
+        dbenum = _enumerate_local_databases(sid, target, through.get("steps"))
+        if dbenum.get("dbs"):
+            findings.append(
+                f"post_enumeration: detected {len(dbenum['dbs'])} local-only "
+                f"database(s) ({', '.join(dbenum['dbs'])}) — ran {dbenum.get('ran', 0)} "
+                f"local DB enumeration command(s) through the held shell"
+                + (f" [{dbenum['reason']}]" if dbenum.get('reason') else ""))
     elif through.get("reason"):
         findings.append(f"post_enumeration: {through['reason']}")
 
@@ -2409,16 +2418,37 @@ def _loopback_db_services(listen_out):
     return found
 
 
-def _enumerate_local_databases(out, run_step, listen_out):
-    """Run read-only local enumeration for any DB bound to loopback, through the
-    held shell. Appends to out['steps']; records which DBs were probed."""
-    dbs = _loopback_db_services(listen_out)
-    if not dbs:
-        return
-    out["local_databases"] = sorted(dbs.keys())
-    for svc in dbs:
-        for step_id, title, cmd in _LOCAL_DB_PROBES[svc]["cmds"]:
-            run_step(step_id, f"[local db] {title}", cmd)
+def _enumerate_local_databases(sid, target, steps):
+    """Detection-triggered post-ex STEP: a database bound to loopback (127.x/::1)
+    is unreachable from an external scan, but we hold a shell. Detect such DB
+    ports in the listening-services output and, ONLY when one is present, run
+    READ-ONLY local enumeration for it through the shell. Mirrors
+    _harvest_shell_loot (a follow-up gated on what enumeration found). Returns
+    {"dbs": [...], "ran": N}."""
+    out = {"dbs": [], "ran": 0}
+    try:
+        listen = next((stp.get("output", "") for stp in (steps or [])
+                       if stp.get("step") == "listen"), "")
+        dbs = _loopback_db_services(listen)
+        if not dbs:
+            return out                       # detection: nothing local-only, no trigger
+        out["dbs"] = sorted(dbs.keys())
+        from etl import access as ax
+        best = ax.best_for(target)
+        if not best:
+            out["reason"] = "local-only DB(s) detected but no live shell to reach them"
+            return out
+        for svc in dbs:
+            for _sid_step, title, cmd in _LOCAL_DB_PROBES[svc]["cmds"]:
+                res = ax.run(best, cmd)
+                if res.get("ok"):
+                    out["ran"] += 1
+                _msg(sid, "PostEnumeration",
+                     f"[local db · {title}] {cmd}\n{(res.get('output') or '')[:1200]}")
+    except Exception as e:  # noqa: BLE001
+        out["error"] = str(e)[:160]
+        _log.debug("[%s] local-db enumeration failed: %s", sid, e)
+    return out
 
 
 def _enumerate_through_best_access(sid, target: str) -> dict:
@@ -2505,15 +2535,6 @@ def _enumerate_through_best_access(sid, target: str) -> dict:
             if not cmd or "{" in cmd:
                 continue
             _run_step(st["id"], st["title"], cmd)
-
-    # A database bound to loopback is unreachable externally — but we hold a
-    # shell, so enumerate it locally (read-only). Uses the "listen" output above.
-    try:
-        _listen = next((stp["output"] for stp in out["steps"]
-                        if stp.get("step") == "listen"), "")
-        _enumerate_local_databases(out, _run_step, _listen)
-    except Exception as e:  # noqa: BLE001
-        _log.debug("[%s] local-db enumeration skipped: %s", sid, e)
     return out
 
 
