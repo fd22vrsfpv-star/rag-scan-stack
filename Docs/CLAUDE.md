@@ -174,31 +174,39 @@ Each rule below names the test that FAILS when it is violated. A rule with no
 enforcing test is a suggestion, and suggestions do not survive contact with a
 large change. Add the test in the same commit as the rule.
 
-### Engagement attribution is mandatory
-- Every row of collected data MUST be tied to an engagement — directly via an
-  `engagement_id`, or via its `asset_id` (→ `assets.engagement_id`). "Which
-  engagement is this?" must have an answer for every finding, credential, exploit,
-  session, and observation.
-- A writer that creates target data MUST set `engagement_id`, resolving it from the
-  target's asset or scope (see `exploit_runner/cred_cracker.py::_resolve_engagement`)
-  — do NOT leave it NULL and rely on a later backfill trigger.
-- **Deleting an engagement's data MUST remove ALL of it.** The purge
+### Engagement attribution is mandatory (for collected data)
+- **Collected target data MUST be tied to an engagement** — directly via an
+  `engagement_id`, or via its `asset_id` (→ `assets.engagement_id`). This is the
+  data gathered *about a specific target during an engagement*: scans, assets,
+  ports, findings, vulns, web/recon findings, credentials, exploits, sessions/held
+  access, observations. "Which engagement is this?" must have an answer for each.
+- **Exempt by design** (need NO engagement_id): **techniques / methodology**,
+  **follow-up queues** (action items, not collected data), and anything **inherently
+  shared across engagements** or **operator config** (knowledge YAML, MITRE map,
+  playbooks, port/service advice, per-target tool settings, scope-conflict rows).
+  These legitimately have no single engagement — do not force one on them.
+- A writer that creates *collected* target data MUST set `engagement_id`, resolving
+  it from the target's asset or scope (see
+  `exploit_runner/cred_cracker.py::_resolve_engagement`) — do NOT leave it NULL and
+  rely on a later backfill trigger.
+- **Deleting an engagement's data MUST remove ALL of its collected data.** The purge
   (`_purge_engagement_data`) discovers every `engagement_id`/`asset_id` table
   dynamically AND deletes IP/target-keyed rows for the engagement's target IPs, so a
   row with a NULL `engagement_id` keyed only by IP is still removed and a re-scan
-  starts clean. Operator config (scope, schedules, approval rules, prompts) is the
-  only thing kept on a data purge.
-- A target-scoped table with neither `engagement_id` nor `asset_id` is a gap: add
-  attribution or declare it in `ENG_ATTR_DEBT` with a reason. The list ratchets.
-- *Enforced by:* `tests/test_engagement_attribution.py` (every target-scoped table
-  is engagement-attributable or declared debt; the debt list may not rot),
+  starts clean. Operator config (scope, schedules, approval rules, prompts, tool
+  settings) is kept on a data purge.
+- A collected-data table with neither `engagement_id` nor `asset_id` is a gap: add
+  attribution or declare it in `ENG_ATTR_DEBT` with a reason (ratchets, shrink it).
+  An exempt-by-design table goes in `ENG_ATTR_EXEMPT` with a reason (permanent).
+- *Enforced by:* `tests/test_engagement_attribution.py` (every collected-data table
+  is engagement-attributable, exempt, or declared debt; debt may not rot),
   `tests/test_engagement_purge.py` (a NULL-engagement IP-keyed credential is deleted
   by the purge), `tests/test_cracked_creds_engagement.py` (cracked creds carry the
   engagement).
 - *Why:* hashcat-cracked credentials were stored keyed only by `ip` with a NULL
   `engagement_id`, so an engagement data-purge missed them and they kept showing
   after the engagement was cleared. Attribution is what makes engagement isolation,
-  reporting, and cleanup actually work.
+  reporting, and cleanup work — for the data that belongs to one engagement.
 
 ### Authorization gates
 - Every code path that sends traffic to a host MUST pass the scope gate before
