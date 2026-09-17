@@ -102,12 +102,61 @@ class ZAPBridge:
             print(f"Error creating ZAP context: {e}")
             return ""
 
+    def configure_authentication(self, context_name, context_id, auth):
+        """FORM-BASED authentication for ANY app with a login form, so the spider
+        and active scan run as a logged-in user (not hardcoded to one app).
+
+        auth keys:
+          login_url        the form action URL that receives the POST
+          login_data       POST body with {%username%}/{%password%} placeholders,
+                           e.g. "username={%username%}&password={%password%}&Login=Login"
+          username / password  the credentials to substitute
+          logged_in_regex  (optional) a regex present ONLY when logged in
+          logged_out_regex (optional) a regex present ONLY when logged out
+        Returns the ZAP user id, or None if there is not enough config."""
+        try:
+            import urllib.parse as _up
+            login_url = (auth.get("login_url") or "").strip()
+            login_data = (auth.get("login_data") or "").strip()
+            username = auth.get("username") or ""
+            password = auth.get("password") or ""
+            if not (login_url and login_data and username):
+                return None
+            # cookie session so the auth cookie carries across the scan
+            self.zap.sessionManagement.set_session_management_method(
+                context_id, "cookieBasedSessionManagement", "")
+            cfg = ("loginUrl=" + _up.quote(login_url, safe="")
+                   + "&loginRequestData=" + _up.quote(login_data, safe=""))
+            self.zap.authentication.set_authentication_method(
+                context_id, "formBasedAuthentication", cfg)
+            if auth.get("logged_in_regex"):
+                self.zap.authentication.set_logged_in_indicator(
+                    context_id, auth["logged_in_regex"])
+            if auth.get("logged_out_regex"):
+                self.zap.authentication.set_logged_out_indicator(
+                    context_id, auth["logged_out_regex"])
+            user_id = self.zap.users.new_user(context_id, username)
+            self.zap.users.set_authentication_credentials(
+                context_id, user_id,
+                "username=" + _up.quote(username, safe="")
+                + "&password=" + _up.quote(password, safe=""))
+            self.zap.users.set_user_enabled(context_id, user_id, "true")
+            self.zap.forcedUser.set_forced_user(context_id, user_id)
+            self.zap.forcedUser.set_forced_user_mode_enabled("true")
+            print(f"ZAP form-auth configured for context {context_name} as user {username} (id {user_id})")
+            return user_id
+        except Exception as e:  # noqa: BLE001
+            print(f"Error configuring ZAP authentication: {e}")
+            return None
+
     def spider_url(
         self,
         url: str,
         context_name: Optional[str] = None,
         max_depth: int = 5,
-        max_duration: int = 300
+        max_duration: int = 300,
+        user_id: Optional[str] = None,
+        context_id: Optional[str] = None
     ) -> str:
         """
         Run ZAP spider on URL
@@ -122,7 +171,11 @@ class ZAPBridge:
             Spider scan ID
         """
         try:
-            if context_name:
+            if user_id is not None and context_id is not None:
+                # authenticated crawl — spider as the logged-in user
+                scan_id = self.zap.spider.scan_as_user(
+                    context_id, user_id, url, maxchildren=max_depth)
+            elif context_name:
                 scan_id = self.zap.spider.scan(
                     url=url,
                     maxchildren=max_depth,
@@ -170,7 +223,9 @@ class ZAPBridge:
         self,
         url: str,
         context_name: Optional[str] = None,
-        scan_policy: Optional[str] = None
+        scan_policy: Optional[str] = None,
+        user_id: Optional[str] = None,
+        context_id: Optional[str] = None
     ) -> str:
         """
         Run ZAP active scan
@@ -184,7 +239,13 @@ class ZAPBridge:
             Active scan ID
         """
         try:
-            if context_name:
+            if user_id is not None and context_id is not None:
+                # authenticated active scan — attack as the logged-in user so the
+                # app's post-login endpoints (forms, params) are actually exercised
+                scan_id = self.zap.ascan.scan_as_user(
+                    url, context_id, user_id, recurse=True,
+                    scanpolicyname=scan_policy)
+            elif context_name:
                 scan_id = self.zap.ascan.scan(
                     url=url,
                     contextid=context_name,
@@ -377,7 +438,8 @@ class ZAPBridge:
         url: str,
         do_spider: bool = True,
         do_active_scan: bool = True,
-        context_name: Optional[str] = None
+        context_name: Optional[str] = None,
+        auth: Optional[Dict] = None
     ) -> Dict:
         """
         Full ZAP scan after Playwright has explored the site
@@ -404,13 +466,28 @@ class ZAPBridge:
             results['error'] = 'ZAP not ready'
             return results
 
+        # AUTHENTICATED scan: when auth config is supplied, build a context and a
+        # forced logged-in user so the spider + active scan run authenticated —
+        # this is what pulls vulns out of login-gated apps (any app, not just one).
+        user_id = None
+        context_id = None
+        if auth and auth.get("login_url"):
+            context_name = context_name or f"authctx_{int(time.time())}"
+            context_id = self.create_context(context_name, url)
+            user_id = self.configure_authentication(context_name, context_id, auth)
+            results['authenticated'] = bool(user_id)
+            if not user_id:
+                results['auth_error'] = 'authentication config incomplete or ZAP rejected it'
+
         if do_spider:
-            results['spider_id'] = self.spider_url(url, context_name=context_name)
+            results['spider_id'] = self.spider_url(
+                url, context_name=context_name, user_id=user_id, context_id=context_id)
             if results['spider_id']:
                 results['spider_completed'] = self.wait_for_spider(results['spider_id'])
 
         if do_active_scan:
-            results['active_scan_id'] = self.active_scan(url, context_name=context_name)
+            results['active_scan_id'] = self.active_scan(
+                url, context_name=context_name, user_id=user_id, context_id=context_id)
             if results['active_scan_id']:
                 results['active_scan_completed'] = self.wait_for_active_scan(
                     results['active_scan_id'],

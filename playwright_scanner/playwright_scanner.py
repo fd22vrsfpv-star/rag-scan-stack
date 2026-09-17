@@ -176,6 +176,7 @@ class ScanRequest(BaseModel):
     run_security_checks: Optional[bool] = Field(True, description="Run security checks")
     zap_spider: Optional[bool] = Field(False, description="Run ZAP spider after scan")
     zap_active_scan: Optional[bool] = Field(False, description="Run ZAP active scan")
+    auth: Optional[Dict] = Field(None, description="ZAP form-auth for an authenticated scan: {login_url, login_data (with {%username%}/{%password%}), username, password, logged_in_regex?, logged_out_regex?}. If omitted, a stored per-host config is used.")
     timeout: Optional[int] = Field(30, description="Page load timeout in seconds")
 
 
@@ -514,12 +515,19 @@ async def _perform_scan_slotted(scan_request: ScanRequest, scan_id: uuid.UUID):
                     sites=[url_str]
                 )
 
+                # Auth: explicit request auth wins; otherwise a stored per-host
+                # config (set via /web-auth) so the auto-driven pipeline scans
+                # login-gated apps authenticated without the caller passing creds.
+                _auth = scan_request.auth or _resolve_web_auth(url_str)
                 zap_results = await zap_bridge.scan_with_playwright_session(
                     url=url_str,
                     do_spider=scan_request.zap_spider,
                     do_active_scan=scan_request.zap_active_scan,
-                    context_name=context_name
+                    context_name=context_name,
+                    auth=_auth
                 )
+                if _auth:
+                    logger.info(f"ZAP authenticated scan for {url_str} (login {_auth.get('login_url')})")
 
                 # Save ZAP findings to web_findings table
                 from db_utils import get_db
@@ -651,6 +659,60 @@ async def health():
     }
 
 
+def _ensure_web_auth_table():
+    """web_auth_configs: per-host ZAP form-auth so the auto-driven pipeline can
+    scan login-gated apps authenticated. Runtime CREATE for existing DBs (also in
+    db_init for clean builds)."""
+    try:
+        from db_utils import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS web_auth_configs (
+                    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                    host text NOT NULL UNIQUE,
+                    login_url text NOT NULL,
+                    login_data text NOT NULL,
+                    username text NOT NULL,
+                    password text,
+                    logged_in_regex text,
+                    logged_out_regex text,
+                    enabled boolean DEFAULT true,
+                    engagement_id uuid,
+                    created_at timestamptz DEFAULT now(),
+                    updated_at timestamptz DEFAULT now()
+                )""")
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"web_auth_configs ensure failed: {e}")
+
+
+def _resolve_web_auth(url: str):
+    """Stored ZAP form-auth for this URL's host (set via POST /web-auth), or None."""
+    try:
+        from urllib.parse import urlparse
+        from db_utils import get_db
+        pu = urlparse(url if "://" in url else f"http://{url}")
+        netloc, host = pu.netloc, pu.hostname
+        if not netloc:
+            return None
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT login_url, login_data, username, password,
+                          logged_in_regex, logged_out_regex
+                     FROM web_auth_configs
+                    WHERE enabled AND host IN (%s, %s)
+                    ORDER BY (host = %s) DESC LIMIT 1""",
+                (netloc, host, netloc))
+            r = cur.fetchone()
+        if not r:
+            return None
+        return {"login_url": r[0], "login_data": r[1], "username": r[2],
+                "password": r[3], "logged_in_regex": r[4], "logged_out_regex": r[5]}
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"web auth resolve failed for {url}: {e}")
+        return None
+
+
 @app.post("/scan", response_model=ScanResponse)
 async def create_scan(
     scan_request: ScanRequest,
@@ -699,6 +761,56 @@ async def create_scan(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start scan: {str(e)}")
+
+
+@app.post("/web-auth")
+async def set_web_auth(body: Dict):
+    """Store per-host ZAP form-auth so authenticated scans work for ANY app.
+    Body: {host, login_url, login_data, username, password, logged_in_regex?,
+    logged_out_regex?, enabled?, engagement_id?}. Upserts by host."""
+    _ensure_web_auth_table()
+    required = ("host", "login_url", "login_data", "username")
+    missing = [k for k in required if not (body.get(k) or "").strip()]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"missing required: {missing}")
+    from db_utils import get_db
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO web_auth_configs
+                      (host, login_url, login_data, username, password,
+                       logged_in_regex, logged_out_regex, enabled, engagement_id)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (host) DO UPDATE SET
+                      login_url=EXCLUDED.login_url, login_data=EXCLUDED.login_data,
+                      username=EXCLUDED.username, password=EXCLUDED.password,
+                      logged_in_regex=EXCLUDED.logged_in_regex,
+                      logged_out_regex=EXCLUDED.logged_out_regex,
+                      enabled=EXCLUDED.enabled, updated_at=now()""",
+                (body["host"].strip(), body["login_url"].strip(),
+                 body["login_data"].strip(), body["username"].strip(),
+                 body.get("password"), body.get("logged_in_regex"),
+                 body.get("logged_out_regex"), bool(body.get("enabled", True)),
+                 body.get("engagement_id")))
+            conn.commit()
+        return {"ok": True, "host": body["host"].strip()}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/web-auth")
+async def list_web_auth():
+    """List configured hosts (passwords masked)."""
+    _ensure_web_auth_table()
+    from db_utils import get_db
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT host, login_url, username, (password IS NOT NULL), "
+                    "enabled, updated_at FROM web_auth_configs ORDER BY host")
+        rows = cur.fetchall()
+    return {"configs": [
+        {"host": r[0], "login_url": r[1], "username": r[2],
+         "has_password": r[3], "enabled": r[4],
+         "updated_at": r[5].isoformat() if r[5] else None} for r in rows]}
 
 
 @app.get("/jobs/{scan_id}")
