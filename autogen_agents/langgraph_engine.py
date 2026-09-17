@@ -1502,6 +1502,46 @@ def _pending_exploits_for_session(sid: str):
         return None
 
 
+def _target_rule_preapproval(sid: str):
+    """(rule_name, engagement_id) if a STANDING exploit_approval_rule pre-authorises
+    auto-execution for THIS session's target — the operator's advance
+    authorization, per target, exactly like engagement pre-approval (e.g. an
+    "approve everything for 192.168.1.150" rule). Matches an enabled + approved +
+    auto_execute rule whose target pattern matches the session target and whose
+    engagement is this session's or NULL (any). Uses the SAME matcher as the
+    server-side sweep (etl.approval_match) so the graph and the sweep never
+    disagree. Scope is still enforced at execution."""
+    try:
+        row = get_agent_session(_sid(sid)) or {}
+        cfg = row.get("configuration") or {}
+        target = (row.get("target_description") or cfg.get("target_description") or "").strip()
+        eid = cfg.get("engagement_id")
+        if not target:
+            return None, None
+        try:
+            from etl.approval_match import matches as _rule_matches
+        except Exception:  # noqa: BLE001
+            def _rule_matches(pat, val):
+                return str(pat).strip() == str(val).strip()
+        from db_utils import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT name, target, engagement_id::text FROM exploit_approval_rules "
+                "WHERE enabled = true AND approved = true AND auto_execute = true "
+                "  AND (engagement_id IS NULL OR engagement_id = %s::uuid)",
+                (str(eid) if eid else None,))
+            rules = cur.fetchall()
+        for name, rtarget, reng in rules:
+            if rtarget and _rule_matches(rtarget, target):
+                return name, reng
+        return None, None
+    except Exception as e:  # noqa: BLE001
+        # Fail CLOSED: an unreadable rule set is not authorization — park as usual.
+        _log.warning("[%s] standing-rule pre-approval lookup failed (%s) — parking",
+                     sid, e)
+        return None, None
+
+
 def exploit_approval(state: PentestState) -> dict:
     """The human-in-the-loop gate: `interrupt()` parks the graph in Postgres until
     the operator answers via POST /pentest/{id}/approve.
@@ -1546,6 +1586,41 @@ def exploit_approval(state: PentestState) -> dict:
                 "findings": [f"exploit_approval: pre-approved ({who}), "
                              f"{len(pending_ids)} exploit(s)"],
                 "log": [f"exploit_approval: pre-approved ({who}) x{len(pending_ids)}"]}
+
+    # Standing-rule pre-approval: a target-scoped "approve everything for this
+    # IP" rule (exploit_approval_rules) is the operator's advance authorization
+    # too — the same short-circuit as engagement pre-approval, keyed on a matching
+    # standing rule instead of engagement metadata. Without this the graph parked
+    # at awaiting_approval even when such a rule existed.
+    rule_name, rule_eng = _target_rule_preapproval(sid)
+    if rule_name:
+        pending_ids = _pending_exploits_for_session(sid)
+        who = f"approval_rule:{rule_name}"
+        for pid in pending_ids:
+            try:
+                _mark_approved(pid, who, note=f"matched standing rule '{rule_name}'")
+            except Exception as e:  # noqa: BLE001
+                _log.warning("[%s] rule-approval mark failed for %s: %s", sid, pid, e)
+        _msg(sid, "Exploit",
+             f"[auto-approved] A standing approval rule ('{rule_name}') authorises "
+             f"exploit execution for this target, so the run is not pausing for a "
+             f"decision. "
+             + (f"Approving {len(pending_ids)} queued exploit(s). "
+                if pending_ids else "No queued exploit was found to approve. ")
+             + "Scope is still enforced at execution — an out-of-scope target is "
+               "refused regardless of the rule.",
+             role="system")
+        _emit("langgraph_exploit_rule_approved", sid,
+              {"rule": rule_name, "pending_exploit_ids": pending_ids,
+               "approved_by": who})
+        return {"phase": "exploit_exec" if pending_ids else "report",
+                "exploit_decision": {"approved": True,
+                                     "note": f"standing rule ({who})",
+                                     "pending_exploit_ids": pending_ids},
+                "findings": [f"exploit_approval: standing rule '{rule_name}' "
+                             f"({len(pending_ids)} exploit(s))"],
+                "log": [f"exploit_approval: standing rule '{rule_name}' "
+                        f"x{len(pending_ids)}"]}
 
     from langgraph.types import interrupt
     # Every queued candidate is named, not just the one the planner liked most.
