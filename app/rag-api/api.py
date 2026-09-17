@@ -22290,12 +22290,19 @@ def review_extractor_learned(rule_id: str, action: str,
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("UPDATE extractor_learned SET status = %s, reviewed_by = %s, "
                     "approved_at = CASE WHEN %s = 'active' THEN now() ELSE approved_at END "
-                    "WHERE id = %s::uuid RETURNING id::text, tool, kind, status",
+                    "WHERE id = %s::uuid RETURNING id::text, tool, kind, status, rule",
                     (new_status, x_operator, new_status, rule_id))
         row = cur.fetchone()
         if not row:
             raise HTTPException(404, f"learned rule {rule_id} not found")
         conn.commit()
+    # Approved learned patterns become RAG data the planner LLMs can retrieve
+    # ("we know how to recognize X"); a rejection drops it back out.
+    if new_status == "active":
+        _load_learned_extractor_into_rag(row["id"], row["tool"], row["kind"],
+                                         row.get("rule") or {})
+    else:
+        _remove_learned_extractor_from_rag(row["id"])
     try:
         from webhooks import emit_webhook
         emit_webhook("extractor_rule_reviewed", "extractors", {
@@ -22303,7 +22310,27 @@ def review_extractor_learned(rule_id: str, action: str,
             "tool": row["tool"], "kind": row["kind"], "status": row["status"]})
     except Exception:
         pass
-    return {"ok": True, "actor": x_operator, **dict(row)}
+    return {"ok": True, "actor": x_operator,
+            **{k: v for k, v in dict(row).items() if k != "rule"}}
+
+
+@app.post("/extractors/learned/sync-rag", tags=["Extractors"])
+def sync_learned_extractors_to_rag(_: bool = Depends(auth)):
+    """(Re)embed every ACTIVE learned extractor into rag_documents so the planner
+    LLMs can retrieve the shapes the platform now recognizes. Idempotent — safe to
+    re-run; used to backfill patterns approved before RAG embedding existed."""
+    embedded, failed = 0, 0
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT id::text, tool, kind, rule FROM extractor_learned "
+                    "WHERE status = 'active'")
+        rows = cur.fetchall()
+    for r in rows:
+        if _load_learned_extractor_into_rag(r["id"], r["tool"], r["kind"],
+                                            r.get("rule") or {}):
+            embedded += 1
+        else:
+            failed += 1
+    return {"ok": True, "active": len(rows), "embedded": embedded, "failed": failed}
 
 
 @app.get("/extractors/learned/{rule_id}/preview", tags=["Extractors"])
@@ -22648,6 +22675,70 @@ def _remove_flow_from_rag(flow_id: str) -> None:
             conn.commit()
     except Exception as e:  # noqa: BLE001
         logging.warning("flow->rag delete failed for %s: %s", flow_id, e)
+
+
+LEARNED_EXTRACTOR_RAG_SOURCE = "knowledge_learned_extractors"
+
+
+def _learned_extractor_rag_text(tool: str, kind: str, rule: Dict[str, Any]) -> tuple:
+    """(title, body) for an approved learned extractor, so the planner can
+    RETRIEVE what shapes the platform now recognizes. Handles the tool-independent
+    enumeration extractor shape ({match, emit}) and the per-tool deterministic
+    shape ({field: {pattern}})."""
+    if isinstance(rule, dict) and rule.get("match") and isinstance(rule.get("emit"), dict):
+        emit = rule["emit"]
+        fk = emit.get("kind") or "value"
+        fact = emit.get("fact") or "fact"
+        why = (rule.get("why") or "").strip()
+        return (f"Learned extractor: {fk} ({fact})",
+                f"The platform recognizes a `{fact}` of kind `{fk}` in command or "
+                f"scan output by the learned pattern `{rule['match']}`. {why} "
+                f"(promoted from LLM discovery, operator-approved).".strip())
+    # per-tool deterministic shape {field: {pattern, ...}}
+    fields = [k for k in (rule or {}).keys()] if isinstance(rule, dict) else []
+    label = ", ".join(fields) or kind
+    return (f"Learned extractor: {tool} / {label}",
+            f"The platform now extracts {label} from {tool} output via a learned, "
+            f"operator-approved deterministic rule.")
+
+
+def _load_learned_extractor_into_rag(rule_id: str, tool: str, kind: str,
+                                     rule: Dict[str, Any]) -> bool:
+    """Embed an APPROVED learned extractor into rag_documents (idempotent per
+    rule id). Best-effort — a failed embed must not fail the approval."""
+    try:
+        title, body = _learned_extractor_rag_text(tool, kind, rule)
+        vec = _embed_text(f"{title}\n{body}")
+        vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+        meta = {"source": LEARNED_EXTRACTOR_RAG_SOURCE, "kind": "learned_extractor",
+                "rule_id": str(rule_id), "tool": tool}
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM rag_documents WHERE metadata->>'source' = %s "
+                "AND metadata->>'rule_id' = %s",
+                (LEARNED_EXTRACTOR_RAG_SOURCE, str(rule_id)))
+            cur.execute(
+                "INSERT INTO rag_documents (title, text_chunk, metadata, embedding) "
+                "VALUES (%s, %s, %s, %s::vector)",
+                (title, body, Json(meta), vec_str))
+            conn.commit()
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.warning("learned-extractor->rag load failed for %s: %s", rule_id, e)
+        return False
+
+
+def _remove_learned_extractor_from_rag(rule_id: str) -> None:
+    """Drop a learned extractor's RAG doc (on reject/delete)."""
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM rag_documents WHERE metadata->>'source' = %s "
+                "AND metadata->>'rule_id' = %s",
+                (LEARNED_EXTRACTOR_RAG_SOURCE, str(rule_id)))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("learned-extractor->rag delete failed for %s: %s", rule_id, e)
 
 
 MSF_LEARNED_SOURCE = "knowledge_msf_learned_options"

@@ -133,14 +133,21 @@ _FALLBACK_EXTRACTORS: List[Dict[str, Any]] = [
 
 _EXTRACTORS_CACHE: Optional[List[Dict[str, Any]]] = None
 
+# Promoted (operator-approved) enumeration extractors live in the SHARED
+# extractor_learned table — the same store the /extractors learning loop uses —
+# under this synthetic tool, so there is ONE learned-pattern store and ONE review
+# surface (/extractors/learned), not a parallel one. See propose_learned_extractor.
+_ENUM_TOOL = "_enumeration"
+_PROMOTED_CACHE: Optional[List[Dict[str, Any]]] = None
+_PROMOTED_CACHE_AT: float = 0.0
+_PROMOTED_TTL = int(os.environ.get("ENUM_PROMOTED_TTL", "300"))
 
-def load_extractors() -> List[Dict[str, Any]]:
-    """Output→fact extractors from YAML (regex compiled and cached), or the
-    hardcoded fallback if the file is unreadable.
 
-    An unreadable file logs and falls back — the safe direction is that private
-    keys and host leads are still read, never that a config typo silently turns
-    off all free-text fact extraction."""
+def _load_yaml_extractors() -> List[Dict[str, Any]]:
+    """The YAML extractor catalogue (regex compiled and cached forever), or the
+    hardcoded fallback if the file is unreadable. The safe direction on any error
+    is that private keys and host leads are still read, never that a config typo
+    silently turns off all free-text fact extraction."""
     global _EXTRACTORS_CACHE
     if _EXTRACTORS_CACHE is not None:
         return _EXTRACTORS_CACHE
@@ -174,6 +181,54 @@ def load_extractors() -> List[Dict[str, Any]]:
         compiled = _FALLBACK_EXTRACTORS
     _EXTRACTORS_CACHE = compiled
     return compiled
+
+
+def _load_promoted_extractors() -> List[Dict[str, Any]]:
+    """APPROVED learned enumeration extractors from the shared extractor_learned
+    table (tool=_enumeration, status=active). These are the patterns the LLM
+    discovered that an operator promoted — permanent and deterministic from then
+    on, no more LLM cost. TTL-cached; best-effort ([] if the DB is unreachable)."""
+    global _PROMOTED_CACHE, _PROMOTED_CACHE_AT
+    import time as _t
+    now = _t.time()
+    if _PROMOTED_CACHE is not None and (now - _PROMOTED_CACHE_AT) < _PROMOTED_TTL:
+        return _PROMOTED_CACHE
+    compiled: List[Dict[str, Any]] = []
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT rule FROM public.extractor_learned "
+                "WHERE tool = %s AND status = 'active'", (_ENUM_TOOL,))
+            for (rule,) in cur.fetchall():
+                if not isinstance(rule, dict):
+                    continue
+                pat = rule.get("match")
+                if not pat:
+                    continue
+                try:
+                    ex = dict(rule)
+                    ex["_rx"] = re.compile(pat)
+                    ex["_promoted"] = True
+                    compiled.append(ex)
+                except re.error as re_err:
+                    log.warning("promoted extractor %s bad regex, skipped: %s",
+                                rule.get("id"), re_err)
+    except Exception as e:  # noqa: BLE001
+        log.debug("promoted extractors unavailable: %s", e)
+        # keep any previous cache rather than dropping to none on a transient error
+        if _PROMOTED_CACHE is not None:
+            return _PROMOTED_CACHE
+        compiled = []
+    _PROMOTED_CACHE = compiled
+    _PROMOTED_CACHE_AT = now
+    return compiled
+
+
+def load_extractors() -> List[Dict[str, Any]]:
+    """The full extractor set: the YAML catalogue PLUS operator-approved promoted
+    extractors from extractor_learned. A shape the LLM kept finding, once
+    approved, is caught here for free — the same as a hand-written YAML rule."""
+    return _load_yaml_extractors() + _load_promoted_extractors()
 
 
 def _extract_from_lines(lines: List[str], *, target: str = "",
@@ -869,6 +924,113 @@ def _record_secret_facts(cur, facts: List[Dict[str, Any]],
     return recorded
 
 
+# Kinds too vague to generalize into a reusable pattern — never promote these.
+_UNPROMOTABLE_KINDS = {"generic", "llm", "unknown", ""}
+
+
+def _synthesize_regex(value: str) -> Optional[str]:
+    """Conservative regex generalized from ONE sample value: runs of the same
+    character class become that class with the run's exact length; other
+    characters are matched literally (escaped). Precise by design — an operator
+    broadens it if needed, and false positives are worse than a narrow pattern.
+
+    "AKIAIOSFODNN7EXAMPLE" -> r"[A-Z]{12}[0-9]{1}[A-Z]{7}"
+    """
+    s = str(value or "")
+    if len(s) < 6 or len(s) > 200:
+        return None
+
+    def _cls(ch: str) -> Optional[str]:
+        if ch.isascii() and ch.isupper():
+            return "[A-Z]"
+        if ch.isascii() and ch.islower():
+            return "[a-z]"
+        if ch.isdigit():
+            return "[0-9]"
+        return None
+
+    out, i, n = [], 0, len(s)
+    while i < n:
+        cls = _cls(s[i])
+        if cls is None:
+            out.append(re.escape(s[i]))
+            i += 1
+            continue
+        j = i
+        while j < n and _cls(s[j]) == cls:
+            j += 1
+        out.append(f"{cls}{{{j - i}}}")
+        i = j
+    pattern = "".join(out)
+    try:
+        rx = re.compile(pattern)
+    except re.error:
+        return None
+    # Must still match its own sample, and not be trivially broad.
+    if not rx.search(s) or pattern.count("{") < 1:
+        return None
+    return pattern
+
+
+def propose_learned_extractor(kind: str, value: str, *, fact: str = "secret",
+                              why: str = "", engagement_id: Optional[str] = None,
+                              source: str = "enum_promotion") -> Optional[str]:
+    """Propose a promoted enumeration extractor into the SHARED extractor_learned
+    table (tool=_enumeration, kind=deterministic, status='proposed') for operator
+    review. Approving it (status='active' via /extractors/learned) makes the shape
+    a permanent, free, deterministic extractor that load_extractors() picks up.
+
+    De-duped by the table's unique (tool, kind, md5(rule)) index, so proposing the
+    same shape twice is a no-op. Returns the row id, or None if nothing was
+    proposed (unpromotable kind, no regex, or DB unavailable). Best-effort — never
+    raises into the analysis."""
+    k = (kind or "").strip().lower()
+    if k in _UNPROMOTABLE_KINDS:
+        return None
+    pattern = _synthesize_regex(value)
+    if not pattern:
+        return None
+    try:
+        from psycopg2.extras import Json
+    except ImportError:  # pragma: no cover - psycopg2 always present in prod
+        def Json(x):  # type: ignore
+            return x
+    rule = {
+        "id": f"learned-{k}",
+        "match": pattern,
+        "emit": {"fact": fact, "kind": k},
+        "fields": {"value": 0},
+        "why": (why or f"Promoted from a shape the LLM repeatedly classified as "
+                       f"{k}.")[:300],
+        "sample": str(value)[:80],
+    }
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            # extractor_learned holds cross-engagement technique knowledge (a
+            # reusable pattern), so it has no engagement_id by design — like
+            # port_access_advice. The engagement is recorded in the rule only for
+            # provenance.
+            if engagement_id:
+                rule["proposed_for_engagement"] = str(engagement_id)
+            cur.execute(
+                """INSERT INTO public.extractor_learned
+                     (tool, kind, rule, status, source, confidence)
+                   VALUES (%s, 'deterministic', %s::jsonb, 'proposed', %s, 0.6)
+                   ON CONFLICT (tool, kind, md5(rule::text)) DO NOTHING
+                   RETURNING id::text""",
+                (_ENUM_TOOL, Json(rule), source))
+            row = cur.fetchone()
+            conn.commit()
+            if row:
+                _emit_webhook("enum_extractor_proposed",
+                              {"kind": k, "pattern": pattern,
+                               "engagement_id": engagement_id})
+                return row[0]
+    except Exception as e:  # noqa: BLE001
+        log.debug("propose_learned_extractor failed: %s", e)
+    return None
+
+
 def analyse(execution: Dict[str, Any], *, queue: bool = True,
             allow_llm: bool = True) -> Dict[str, Any]:
     """One finished command: what it found, and what should follow.
@@ -941,6 +1103,24 @@ def analyse(execution: Dict[str, Any], *, queue: bool = True,
                            "kept": len(rev["facts"]),
                            "engagement_id": execution.get("engagement_id")})
         facts = rev["facts"]
+
+        # PROMOTION: a secret the LLM discovered (not a known extractor) and the
+        # review CONFIRMED is worth turning into a permanent, free, deterministic
+        # extractor. Propose it (operator-approved via /extractors/learned) so the
+        # next run catches the shape without an LLM call. Only specific kinds, only
+        # review-confirmed — a one-off or a vague "generic" is never promoted.
+        proposed = []
+        for f in facts:
+            if (f.get("fact") == "secret" and f.get("source") == "llm_fallback"
+                    and (f.get("review") or {}).get("confidence") in ("high", "medium")):
+                rid = propose_learned_extractor(
+                    f.get("kind"), f.get("value") or f.get("line") or "",
+                    why=f.get("why") or "",
+                    engagement_id=execution.get("engagement_id"))
+                if rid:
+                    proposed.append(f.get("kind"))
+        if proposed:
+            out["promotions_proposed"] = sorted(set(proposed))
 
     out["facts"] = len(facts)
     if not facts:
