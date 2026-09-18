@@ -4952,8 +4952,27 @@ def execute_approved_exploit(pending_exploit_id: str) -> str:
 
     exploit_runner_url = os.environ.get("EXPLOIT_RUNNER_URL", "https://exploit-runner:8017")
 
+    # Validate the id up front and return actionable guidance instead of letting
+    # uuid.UUID() raise a bare "badly formed hexadecimal UUID string". The planner
+    # sometimes calls this with a placeholder / wildcard ('*', 'all', '') meaning
+    # "run everything approved" — but there is no bulk-execute: the approval gate
+    # is per-exploit and fail-closed, so point it back at the right flow rather
+    # than executing anything.
+    _pid = (pending_exploit_id or "").strip()
     try:
-        exploit_uuid = uuid_lib.UUID(pending_exploit_id)
+        exploit_uuid = uuid_lib.UUID(_pid)
+    except (ValueError, AttributeError, TypeError):
+        return json.dumps({
+            "ok": False,
+            "error": f"'{pending_exploit_id}' is not a valid pending_exploit_id (UUID).",
+            "hint": "Pass the UUID of ONE specific exploit that a human has already "
+                    "APPROVED. There is no bulk/wildcard execute — each exploit must "
+                    "be approved individually. Call list_pending_exploits_tool to see "
+                    "ids and statuses; impactful tests sit at status='pending' until a "
+                    "human approves them via POST /pentest/{session_id}/approve.",
+        }, indent=2)
+
+    try:
         exploit = get_pending_exploit(exploit_uuid)
 
         if not exploit:
