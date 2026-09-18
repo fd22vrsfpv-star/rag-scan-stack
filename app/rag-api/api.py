@@ -10455,10 +10455,14 @@ def proxy_replay(
         # Phase 3: Auth tokens
         auth_headers = {}
         if include_auth:
+            # credential_vault.status lifecycle is ('active','cracking','cracked',
+            # 'expired','revoked') — there is no 'valid', so the old filter matched
+            # nothing on TWO counts (bad status AND the web-session types were not
+            # in the CHECK). 'active' is the honest "held and not retired" state.
             cur.execute("""
                 SELECT credential_type, credential_value, domain, username
                 FROM credential_vault
-                WHERE status = 'valid' AND credential_type IN ('cookie', 'token', 'api_key', 'bearer')
+                WHERE status = 'active' AND credential_type IN ('cookie', 'token', 'api_key', 'bearer')
                 ORDER BY updated_at DESC
                 LIMIT 50
             """)
