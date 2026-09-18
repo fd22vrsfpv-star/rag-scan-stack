@@ -112,10 +112,10 @@ def create_webhook(webhook: WebhookCreate, authorized: bool = Depends(auth)):
     """Create a new webhook configuration."""
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
-            INSERT INTO webhooks (name, url, secret, enabled, event_types, sources, severities, max_retries, timeout_ms)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO webhooks (name, url, secret, enabled, event_types, sources, severities, max_retries, timeout_ms, engagement_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id, name, url, enabled, event_types, sources, severities, max_retries, timeout_ms,
-                      created_at, updated_at, last_success, failure_count
+                      engagement_id, created_at, updated_at, last_success, failure_count
         """, (
             webhook.name,
             webhook.url,
@@ -125,7 +125,8 @@ def create_webhook(webhook: WebhookCreate, authorized: bool = Depends(auth)):
             webhook.sources,
             webhook.severities,
             webhook.max_retries,
-            webhook.timeout_ms
+            webhook.timeout_ms,
+            webhook.engagement_id,
         ))
         row = cur.fetchone()
         conn.commit()
@@ -140,6 +141,7 @@ def create_webhook(webhook: WebhookCreate, authorized: bool = Depends(auth)):
         severities=row["severities"],
         max_retries=row["max_retries"],
         timeout_ms=row["timeout_ms"],
+        engagement_id=str(row["engagement_id"]) if row.get("engagement_id") else None,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         last_success=row["last_success"],
@@ -169,7 +171,7 @@ def list_webhooks(
         cur.execute(
             """
             SELECT id, name, url, enabled, event_types, sources, severities, max_retries, timeout_ms,
-                   created_at, updated_at, last_success, failure_count
+                   engagement_id, created_at, updated_at, last_success, failure_count
             FROM webhooks
             WHERE (%s::boolean IS NULL OR enabled = %s::boolean)
             ORDER BY created_at DESC
@@ -190,6 +192,7 @@ def list_webhooks(
             severities=row["severities"],
             max_retries=row["max_retries"],
             timeout_ms=row["timeout_ms"],
+            engagement_id=str(row["engagement_id"]) if row.get("engagement_id") else None,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             last_success=row["last_success"],
@@ -344,7 +347,8 @@ def emit_webhook_event(req: WebhookEmitRequest, authorized: bool = Depends(auth)
         event_type=req.event_type,
         source=req.source,
         data=req.data,
-        severity=req.severity
+        severity=req.severity,
+        engagement_id=req.engagement_id,
     )
 
     return {"ok": True, "webhooks_notified": count}
@@ -356,7 +360,7 @@ def get_webhook(webhook_id: str, authorized: bool = Depends(auth)):
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
             SELECT id, name, url, enabled, event_types, sources, severities, max_retries, timeout_ms,
-                   created_at, updated_at, last_success, failure_count
+                   engagement_id, created_at, updated_at, last_success, failure_count
             FROM webhooks
             WHERE id = %s
         """, (webhook_id,))
@@ -375,6 +379,7 @@ def get_webhook(webhook_id: str, authorized: bool = Depends(auth)):
         severities=row["severities"],
         max_retries=row["max_retries"],
         timeout_ms=row["timeout_ms"],
+        engagement_id=str(row["engagement_id"]) if row.get("engagement_id") else None,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         last_success=row["last_success"],
@@ -392,7 +397,7 @@ def update_webhook(webhook_id: str, webhook: WebhookUpdate, authorized: bool = D
     if all(v is None for v in (
         webhook.name, webhook.url, webhook.secret, webhook.enabled,
         webhook.event_types, webhook.sources, webhook.severities,
-        webhook.max_retries, webhook.timeout_ms,
+        webhook.max_retries, webhook.timeout_ms, webhook.engagement_id,
     )):
         raise HTTPException(status_code=400, detail="No fields to update")
 
@@ -409,15 +414,16 @@ def update_webhook(webhook_id: str, webhook: WebhookUpdate, authorized: bool = D
                 severities   = COALESCE(%s, severities),
                 max_retries  = COALESCE(%s, max_retries),
                 timeout_ms   = COALESCE(%s, timeout_ms),
+                engagement_id = COALESCE(%s, engagement_id),
                 updated_at   = now()
             WHERE id = %s
             RETURNING id, name, url, enabled, event_types, sources, severities, max_retries, timeout_ms,
-                      created_at, updated_at, last_success, failure_count
+                      engagement_id, created_at, updated_at, last_success, failure_count
             """,
             [
                 webhook.name, webhook.url, webhook.secret, webhook.enabled,
                 webhook.event_types, webhook.sources, webhook.severities,
-                webhook.max_retries, webhook.timeout_ms,
+                webhook.max_retries, webhook.timeout_ms, webhook.engagement_id,
                 webhook_id,
             ],
         )
@@ -437,6 +443,7 @@ def update_webhook(webhook_id: str, webhook: WebhookUpdate, authorized: bool = D
         severities=row["severities"],
         max_retries=row["max_retries"],
         timeout_ms=row["timeout_ms"],
+        engagement_id=str(row["engagement_id"]) if row.get("engagement_id") else None,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         last_success=row["last_success"],
