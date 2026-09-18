@@ -368,6 +368,15 @@ def add_agent_message(
             (_sid(session_id), agent_name, role, content, Json(metadata or {}))
         )
         message_id = cur.fetchone()[0]
+        # Keep the session's updated_at fresh so a long RUNNING run does not read
+        # as stalled. Without this, updated_at is only written on a status change,
+        # so it freezes at the run's start and a healthy 30-minute run looks dead
+        # to the UI and to anything keying on it. Gated on running statuses so a
+        # late message never rewrites a finished session's completion time.
+        cur.execute(
+            "UPDATE agent_sessions SET updated_at = now() "
+            "WHERE id = %s AND status IN ('active', 'scanning', 'awaiting_approval')",
+            (_sid(session_id),))
         conn.commit()
         return message_id
 

@@ -2194,7 +2194,12 @@ def _sweep_enumeration(target: str) -> dict:
         out["available"] = True
         for r in rows:
             out["examined"] += 1
-            res = analyse(dict(r))
+            # BATCH path: deterministic extraction + rules only. The LLM roles
+            # (extraction/review) would fire per row over up to 100 executions
+            # and serialise ~20s calls into a 30-minute sweep. The LLM fallback
+            # runs on FRESH single-command output (the per-command hook), bounded
+            # by the router budget — not here.
+            res = analyse(dict(r), allow_llm=False)
             out["facts"] += res.get("facts", 0)
             out["queued"] += res.get("queued", 0)
             out["refused"] += res.get("refused", 0)
@@ -2331,7 +2336,7 @@ def _wrap_remote(protocol: str, ip: str, port, command: str) -> Optional[str]:
 # bind/command/meterpreter/ssh access), and NONE mutate the target — this is
 # enumeration, not persistence. A root-only read (e.g. /etc/shadow) simply
 # returns nothing on a user shell rather than erroring the sequence.
-_POSTEX_INFO_COMMANDS = [
+_POSTEX_INFO_COMMANDS_FALLBACK = [
     ("id", "Current identity & groups", "id"),
     ("uname", "Kernel / OS (privesc surface)", "uname -a"),
     ("os_release", "Distro release", "cat /etc/issue /etc/os-release 2>/dev/null"),
@@ -2428,7 +2433,7 @@ def _harvest_shell_loot(sid, target: str, steps: list) -> dict:
 # Local (loopback-bound) DB services worth enumerating THROUGH a held shell —
 # they are unreachable externally, so an external scan never sees them, but a
 # shell can query them locally (often as root with no password). Read-only.
-_LOCAL_DB_PROBES = {
+_LOCAL_DB_PROBES_FALLBACK = {
     "mysql": {"ports": {3306}, "procs": ("mysql", "mariadb"), "cmds": [
         ("db_mysql", "Local MySQL/MariaDB databases + users",
          "mysql -u root -N -e 'SELECT version(); SHOW DATABASES; "
@@ -2449,6 +2454,61 @@ _LOCAL_DB_PROBES = {
         ("db_memcached", "Local memcached stats",
          "printf 'stats\\r\\nquit\\r\\n' | nc -w1 127.0.0.1 11211 2>&1 | head -40")]},
 }
+
+
+def _load_postex_commands():
+    """Load post-ex command knowledge from knowledge/postex_commands.yaml, or the
+    hardcoded fallbacks if it is unreadable.
+
+    Returns (info_commands, local_db_probes) in the SAME shape the consumers
+    already expect: info_commands is a list of (id, title, command) tuples;
+    local_db_probes is {svc: {"ports": set[int], "procs": tuple[str],
+    "cmds": [(id, title, command)]}}. The safe direction on any error is the
+    fallback — post-ex enumeration keeps running its known checklist, never
+    silently runs nothing."""
+    import os as _os
+    candidates = [
+        _os.environ.get("POSTEX_COMMANDS_YAML", "/knowledge/postex_commands.yaml"),
+        _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                      "knowledge", "postex_commands.yaml"),
+    ]
+    for path in candidates:
+        if not path or not _os.path.exists(path):
+            continue
+        try:
+            import yaml as _yaml
+            with open(path, encoding="utf-8") as fh:
+                data = _yaml.safe_load(fh) or {}
+            info = [(c["id"], c.get("title", c["id"]), c["command"])
+                    for c in (data.get("info_commands") or [])
+                    if isinstance(c, dict) and c.get("id") and c.get("command")]
+            probes = {}
+            for svc, spec in (data.get("local_database_probes") or {}).items():
+                if not isinstance(spec, dict):
+                    continue
+                probes[svc] = {
+                    "ports": {int(p) for p in (spec.get("ports") or [])},
+                    "procs": tuple(spec.get("procs") or []),
+                    "cmds": [(c["id"], c.get("title", c["id"]), c["command"])
+                             for c in (spec.get("commands") or [])
+                             if isinstance(c, dict) and c.get("id") and c.get("command")],
+                }
+            if info and probes:
+                return info, probes
+            _log.warning("postex_commands.yaml %s parsed empty (info=%d probes=%d) "
+                         "— using fallback", path, len(info), len(probes))
+            break
+        except Exception as e:  # noqa: BLE001
+            _log.warning("postex_commands.yaml %s unreadable: %s — using fallback",
+                         path, e)
+            break
+    else:
+        _log.warning("postex_commands.yaml not found (looked in %s) — using fallback",
+                     ", ".join(c for c in candidates if c))
+    return _POSTEX_INFO_COMMANDS_FALLBACK, _LOCAL_DB_PROBES_FALLBACK
+
+
+_POSTEX_INFO_COMMANDS, _LOCAL_DB_PROBES = _load_postex_commands()
 
 
 def _loopback_db_services(listen_out):

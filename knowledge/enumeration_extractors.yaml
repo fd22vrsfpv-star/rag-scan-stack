@@ -1,0 +1,140 @@
+# What a line of RAW command/scan OUTPUT contains — as data, not regex in code.
+#
+# WHY THIS IS DATA
+#   knowledge/enumeration_rules.yaml already answers "given a FACT, what do we do
+#   next" without a code change. But a rule only fires if a fact of the right
+#   shape was produced first, and fact extraction from free-text output lived in
+#   etl/post_enumeration.facts_from() as three hardcoded regexes (private key,
+#   ssh key path, IPv4). A web token, an AWS key, a database URL in a config dump
+#   produced NO fact, so no rule could ever match it — the output was stored and
+#   nothing followed, the same gap the rules file was written to close, one layer
+#   down. These extractors are that layer, and they are data so an operator who
+#   recognises a secret shape can add it without touching Python.
+#
+# HOW IT IS USED
+#   facts_from() scans each output line against every extractor's `match` regex.
+#   On a match it emits a fact = {**emit, target, service, line} with captured
+#   groups filled into the named `fields`. Structured facts (credential, share,
+#   host_fact) still come from the tool PARSERS, not from here — this file only
+#   covers the free-text reading that a parser did not already structure.
+#
+# SCHEMA
+#   id      : stable identifier (also the RAG doc key)
+#   match   : Python `re` pattern (case-sensitivity is in the pattern; use (?i))
+#   fields  : {fact_field: capture_group_index}  (0 = whole match)
+#   emit    : constant fields merged into every fact this extractor produces
+#             (must include `fact`; a secret uses fact=secret + kind=...)
+#   lead    : true => the captured target field is a HOST LEAD (a host this
+#             account already reaches). The match becomes fact["target"];
+#             self / loopback / broadcast / reserved values are skipped. The
+#             scope gate — never this file — decides whether the lead may be
+#             touched.
+#   why     : one line, for the operator and for RAG retrieval.
+#
+# SECRETS ARE RECORDED EVEN WITH NO RULE
+#   A `secret` fact is valuable on its own (a JWT or AWS key is something a
+#   tester uses manually), so post_enumeration records every secret fact as an
+#   observation/finding regardless of whether a rule proposes a follow-up
+#   command. Where a secret HAS a natural next command (an AWS key ->
+#   `aws sts get-caller-identity`), add that in enumeration_rules.yaml.
+#
+# NEVER PUT A REAL SECRET HERE. These are shapes, not values.
+
+version: 1
+
+extractors:
+
+  # ── carried over from the hardcoded facts_from() regexes ──────────────────
+  - id: private-key-block
+    match: '-----BEGIN (?:RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----'
+    emit: {fact: file, kind: private_key}
+    why: >-
+      A private key in command output is reusable credential material — the
+      difference between "read a file" and "authenticate as its owner".
+
+  - id: ssh-key-path
+    match: '(/[^\s:]*\.ssh/id_[a-z0-9_]+)'
+    fields: {path: 1}
+    emit: {fact: file, kind: private_key}
+    why: >-
+      A path to an id_* key names where reusable key material lives even when the
+      key body itself was not printed.
+
+  - id: known-host-ip
+    match: '\b(?:\d{1,3}\.){3}\d{1,3}\b'
+    fields: {target: 0}
+    lead: true
+    emit: {fact: host, source: known_hosts}
+    why: >-
+      A host named in known_hosts / output is somewhere this account already
+      reaches — a LEAD. The scope gate decides whether it may be touched.
+
+  # ── web tokens & cloud secrets (new; the operator asked for these) ─────────
+  - id: jwt
+    match: '\beyJ[A-Za-z0-9_-]{6,}\.eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{4,}'
+    fields: {value: 0}
+    emit: {fact: secret, kind: jwt}
+    why: >-
+      A JSON Web Token in output is a live session/authorisation artefact a
+      tester can decode and replay against the app it came from.
+
+  - id: aws-access-key-id
+    match: '\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|ASCA)[0-9A-Z]{16}\b'
+    fields: {value: 0}
+    emit: {fact: secret, kind: aws_access_key}
+    why: >-
+      An AWS access-key id is a cloud credential; paired with its secret it is
+      programmatic access to the account.
+
+  - id: aws-secret-access-key
+    match: '(?i)aws_secret_access_key\s*[=:]\s*["'']?([A-Za-z0-9/+]{40})'
+    fields: {value: 1}
+    emit: {fact: secret, kind: aws_secret_key}
+    why: >-
+      The 40-char AWS secret key, the other half of programmatic cloud access.
+
+  - id: bearer-token
+    match: '(?i)\bbearer\s+([A-Za-z0-9._~+/-]{20,}={0,2})'
+    fields: {value: 1}
+    emit: {fact: secret, kind: bearer_token}
+    why: >-
+      A Bearer token in a header/config dump authorises API calls as its holder.
+
+  - id: github-token
+    match: '\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}\b'
+    fields: {value: 0}
+    emit: {fact: secret, kind: github_token}
+    why: >-
+      A GitHub token grants repo/API access — often source, CI secrets, and
+      deploy keys behind it.
+
+  - id: slack-token
+    match: '\bxox[baprs]-[A-Za-z0-9-]{10,}\b'
+    fields: {value: 0}
+    emit: {fact: secret, kind: slack_token}
+    why: >-
+      A Slack token reads and posts as the workspace/bot it belongs to.
+
+  - id: db-connection-url
+    match: '(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s"''<>]+:[^\s"''<>@]+@[^\s"''<>]+'
+    fields: {value: 0}
+    emit: {fact: secret, kind: db_url}
+    why: >-
+      A connection string with an embedded password is a ready-to-use credential
+      for a backend service, often reachable from the foothold host.
+
+  - id: private-key-pem-header-generic
+    match: '-----BEGIN (?:PGP )?PRIVATE KEY BLOCK-----'
+    emit: {fact: secret, kind: pgp_private_key}
+    why: >-
+      A PGP private key block is reusable identity/decryption material.
+
+  - id: generic-secret-assignment
+    match: '(?i)\b(?:api[_-]?key|apikey|secret[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|passwd|password)\s*[=:]\s*["'']?([A-Za-z0-9._\-/+=]{12,})["'']?'
+    fields: {value: 1}
+    emit: {fact: secret, kind: generic}
+    why: >-
+      A key=value secret in a config/env dump is a candidate credential; the kind
+      is unknown but the shape (named secret with a long value) is worth flagging
+      for manual triage. Low-confidence by design — the LLM fallback and the
+      operator refine what a `generic` secret actually is.
