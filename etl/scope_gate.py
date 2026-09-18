@@ -432,9 +432,9 @@ def enforce_target_scope(target, command="", dsn=None, cache_ttl=None,
 
     ttl = ENFORCE_CACHE_TTL if cache_ttl is None else cache_ttl
     now = time.time()
+    conn_str = dsn or os.environ.get("DB_DSN")
     rows = _ENFORCE_CACHE["rows"]
     if rows is None or now - _ENFORCE_CACHE["at"] >= ttl:
-        conn_str = dsn or os.environ.get("DB_DSN")
         if not conn_str:
             return ("scope cannot be verified: DB_DSN is unset — refusing to "
                     "send traffic")
@@ -453,7 +453,33 @@ def enforce_target_scope(target, command="", dsn=None, cache_ttl=None,
             return f"scope cannot be verified: {type(exc).__name__}: {exc}"
         _ENFORCE_CACHE.update({"rows": rows, "at": now})
 
+    # Resolve the target's OTHER observed identities from the assets table, so a
+    # target referenced one way is authorised when the scope names it another —
+    # the exploit runner dispatches by RESOLVED IP (e.g. 65.61.137.117) while the
+    # scope is defined by hostname/URL (demo.testfire.net). Without this, every
+    # web-app exploit against a hostname target fail-closed with "IP not in
+    # scope". OBSERVED asset pairings only, never live DNS (a resolver answer is
+    # attacker-influencable — see load_host_aliases). Not cached with the scope
+    # rows because aliases are per-target. A lookup failure NARROWS (checks with
+    # no aliases → stricter), it never widens; aliases can only ADD matches for a
+    # host that is genuinely in scope under a different identity.
+    aliases = None
+    if target and conn_str:
+        try:
+            import psycopg2
+            conn = psycopg2.connect(conn_str)
+            try:
+                with conn.cursor() as cur:
+                    aliases = load_host_aliases(cur, str(target))
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning(
+                "scope alias lookup failed for %r (%s) — checking without aliases",
+                target, exc)
+            aliases = None
+
     # check_dispatch already returns "refusal string or None" — the same
     # contract this function has, so pass it straight through rather than
     # inventing a second convention.
-    return check_dispatch(target, rows, command)
+    return check_dispatch(target, rows, command, aliases)
