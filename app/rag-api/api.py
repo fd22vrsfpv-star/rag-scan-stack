@@ -1330,6 +1330,7 @@ def get_assets(
     search: Optional[str] = Query(None, description="Substring match on hostname or IP (case-insensitive)"),
     provider: Optional[str] = Query(None, description="Filter by cloud-hosting provider tag(s). Comma-separated for OR-match: 'aws', 'aws,azure'. Backed by the GIN index on assets.provider."),
     asset_kind: Optional[str] = Query(None, description="Filter by asset type: 'hosts-only' (exclude cloud imports), 'cloud-only' (cloud imports only), or null for all"),
+    engagement_id: Optional[str] = Query(None, description="Scope to one engagement (UUID). Falls back to the X-Engagement-Id header; null/absent returns all engagements (legacy/unscoped)."),
     limit: int = Query(100, ge=1, le=5000),
     offset: int = Query(0, ge=0, description="Pagination offset for retrieving > limit rows"),
     authorized: bool = Depends(auth),
@@ -1355,6 +1356,16 @@ def get_assets(
             where_clauses.append(cloud_import_condition)
         elif asset_kind == 'hosts-only':
             where_clauses.append(f"NOT {cloud_import_condition}")
+
+    # Scope to the active engagement (explicit param or X-Engagement-Id header).
+    # Without this the page returns EVERY engagement's assets ordered by IP, so a
+    # large engagement's hosts (1827 of 1830 here) bury a small one's (2), and
+    # "assets under this scope" looks empty when the data is really just on a
+    # later page. None = unscoped/legacy → all assets, as before.
+    eid = _validate_engagement_uuid(_resolve_engagement_id(engagement_id))
+    if eid:
+        where_clauses.append("a.engagement_id = %s::uuid")
+        where_params.append(eid)
 
     where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
@@ -10981,6 +10992,7 @@ def export_zap_report(
 @app.get("/recon/subdomains", tags=["Recon"])
 def get_recon_subdomains(
     domain: Optional[str] = Query(None, description="Filter by parent domain"),
+    engagement_id: Optional[str] = Query(None, description="Scope to one engagement (UUID). Falls back to the X-Engagement-Id header; null/absent returns all."),
     limit: int = Query(500, ge=1, le=5000, description="Max results"),
     authorized: bool = Depends(auth),
 ):
@@ -10996,6 +11008,15 @@ def get_recon_subdomains(
         WHERE rf.source = 'subfinder'
     """
     params: list = []
+    # Scope to the active engagement (param or X-Engagement-Id header) so a large
+    # engagement's subdomains don't bury the one the operator is viewing. Scope by
+    # the linked asset's engagement (reliable) OR rf.engagement_id (mostly NULL on
+    # recon rows) — see /recon/search for why.
+    eid = _validate_engagement_uuid(_resolve_engagement_id(engagement_id))
+    if eid:
+        sql += " AND (a.engagement_id = %s::uuid OR rf.engagement_id = %s::uuid)"
+        params.append(eid)
+        params.append(eid)
     if domain:
         sql += " AND rf.data->>'input' = %s"
         params.append(domain)
@@ -11083,9 +11104,21 @@ def search_recon(
     if asset_id:
         where_clauses.append("rf.asset_id = %s::uuid")
         params.append(asset_id)
-    if engagement_id:
-        where_clauses.append("rf.engagement_id = %s::uuid")
-        params.append(engagement_id)
+    # Fall back to the X-Engagement-Id header when no explicit param is given —
+    # the recon page relies on the active-engagement header like every other
+    # view, so without this it returns EVERY engagement's recon findings and a
+    # large engagement buries the one the operator is looking at.
+    #
+    # Scope by the LINKED ASSET's engagement (a.engagement_id), not only
+    # rf.engagement_id: recon_findings.engagement_id is badly under-populated
+    # (20,987 NULL vs 86 attributed for a real engagement here), while the asset
+    # it points at is reliably attributed. Keep rf.engagement_id as an OR so a
+    # directly-attributed finding with no/other asset still matches.
+    eid = _validate_engagement_uuid(_resolve_engagement_id(engagement_id))
+    if eid:
+        where_clauses.append("(a.engagement_id = %s::uuid OR rf.engagement_id = %s::uuid)")
+        params.append(eid)
+        params.append(eid)
     if date_from:
         where_clauses.append("rf.created_at >= %s")
         params.append(date_from)
@@ -11219,17 +11252,31 @@ def recon_customer_hosts(_: bool = Depends(auth)):
 @app.get("/recon/domains", tags=["Recon"])
 def list_recon_domains(
     search: Optional[str] = Query(None, description="Filter domains (ILIKE)"),
+    engagement_id: Optional[str] = Query(None, description="Scope to one engagement (UUID). Falls back to the X-Engagement-Id header; null/absent returns all."),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     include_excluded: bool = Query(False, description="Include out-of-scope domains"),
     authorized: bool = Depends(auth),
 ):
     """List distinct parent domains with per-source counts."""
-    where_sql = ""
+    where_clauses: list = []
     params: list = []
+    # Scope to the active engagement (param or X-Engagement-Id header) so a large
+    # engagement's domains don't crowd out the one the operator is viewing. This
+    # query does not join assets, so reach the linked asset's engagement via a
+    # subquery (recon_findings.engagement_id itself is mostly NULL — see
+    # /recon/search); OR the direct attribution for asset-less rows.
+    eid = _validate_engagement_uuid(_resolve_engagement_id(engagement_id))
+    if eid:
+        where_clauses.append(
+            "(rf.asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)"
+            " OR rf.engagement_id = %s::uuid)")
+        params.append(eid)
+        params.append(eid)
     if search:
-        where_sql = "WHERE rf.target ILIKE %s"
+        where_clauses.append("rf.target ILIKE %s")
         params.append(f"%{search}%")
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
     sql = f"""
         SELECT rf.target, rf.source, rf.finding_type, rf.created_at
