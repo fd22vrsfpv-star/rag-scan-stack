@@ -15,16 +15,18 @@ BRUTUS_URL = os.environ.get("BRUTUS_URL", "https://brutus-runner:8025")
 RAG_API_URL = os.environ.get("RAG_API_URL", "https://rag-api:8000")
 API_KEY = os.environ.get("API_KEY", "changeme")
 
-# Engagement isolation: when ENGAGEMENT_ID (or MCP_ENGAGEMENT_ID) is set, every
-# rag-api call carries X-Engagement-Id so this MCP server only sees that
-# engagement's data. Unset = platform-wide (unchanged behaviour).
-ENGAGEMENT_ID = os.environ.get("ENGAGEMENT_ID") or os.environ.get("MCP_ENGAGEMENT_ID")
+# Engagement isolation: each rag-api call carries X-Engagement-Id for the
+# request's engagement — captured PER REQUEST from the caller's X-Engagement-Id
+# header / ?engagement_id (via _engagement_mw), else the ENGAGEMENT_ID env pin,
+# else unset = platform-wide. So the mcpo gateway can scope a single tool call.
+from _engagement_mw import current_engagement, run_streamable, set_request_engagement
 
 
 def _api_headers(extra=None):
     h = {"x-api-key": API_KEY}
-    if ENGAGEMENT_ID:
-        h["X-Engagement-Id"] = ENGAGEMENT_ID
+    eid = current_engagement()
+    if eid:
+        h["X-Engagement-Id"] = eid
     if extra:
         h.update(extra)
     return h
@@ -109,6 +111,7 @@ async def list_users(
     is_admin: Annotated[Optional[bool], Field(description="True to return only admins")] = None,
     is_guest: Annotated[Optional[bool], Field(description="True to return only guest accounts")] = None,
     has_credential: Annotated[Optional[bool], Field(description="True to return only identities with a matching credential_vault row")] = None,
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
     max_total: Annotated[int, Field(description="Hard cap on rows returned across all pages (default 20000)")] = _DEFAULT_MAX_TOTAL,
 ) -> str:
     """List identities (users / guests / service principals) ingested from
@@ -119,6 +122,7 @@ async def list_users(
     flat list. The response carries `{total, returned, truncated, results}`
     so the caller can tell when more matched than were returned.
     """
+    set_request_engagement(engagement_id)
     base: dict = {}
     for k, v in (("provider", provider), ("principal_type", principal_type),
                  ("member_of", member_of), ("search", search),
@@ -134,10 +138,12 @@ async def list_users(
 @mcp.tool()
 async def get_user(
     identity_id: Annotated[str, Field(description="Identity UUID returned by list_users")],
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Full identity detail: every member_of:* group tag, linked credentials,
     recon findings that surfaced this identifier, and provider/tenant context.
     """
+    set_request_engagement(engagement_id)
     async with httpx.AsyncClient(verify=False, timeout=30) as client:
         resp = await client.get(f"{RAG_API_URL}/identities/{identity_id}", headers=_api_headers())
         return json.dumps(resp.json() if resp.status_code == 200 else {"error": resp.text}, indent=2)
@@ -149,6 +155,7 @@ async def list_groups(
     min_members: Annotated[int, Field(description="Drop groups smaller than this. Useful for hiding 1-member trash groups.")] = 1,
     limit: Annotated[int, Field(description="Max rows to return per call (1-20000). Default 500 keeps responses well under chat/LLM context caps.")] = 500,
     offset: Annotated[int, Field(description="Pagination offset for retrieving > limit groups")] = 0,
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Groups discovered via MicroBurst <GroupName>_Users.csv ingestion + group
     tags from other Azure AD/Entra ingestors, with member counts.
@@ -160,6 +167,7 @@ async def list_groups(
     when more matched than were returned. Pass a group name to
     get_group_members to expand its membership.
     """
+    set_request_engagement(engagement_id)
     params: dict = {"limit": limit, "offset": offset, "min_members": min_members}
     if search:
         params["search"] = search
@@ -174,6 +182,7 @@ async def get_group_members(
     group_name: Annotated[str, Field(description="Group name as returned by list_groups (e.g. 'Domain Admins')")],
     active_only: Annotated[bool, Field(description="Drop disabled accounts (recommended for spray lists)")] = True,
     search: Annotated[Optional[str], Field(description="OPTIONAL — server-side substring filter on UPN / display name (case-insensitive). Use this when looking for a specific person inside a large group instead of returning the whole membership.")] = None,
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
     max_total: Annotated[int, Field(description="Hard cap on members returned across all pages (default 20000)")] = _DEFAULT_MAX_TOTAL,
 ) -> str:
     """Every member of one group. Auto-paginates internally — returns the
@@ -186,6 +195,7 @@ async def get_group_members(
     the filter runs server-side and the response stays small — much faster
     and cheaper than pulling all 7000+ members into context to grep.
     """
+    set_request_engagement(engagement_id)
     base = {"member_of": group_name}
     if search:
         base["search"] = search
@@ -203,4 +213,4 @@ async def get_group_members(
 
 if __name__ == "__main__":
     logger.info("Starting MCP Credentials Server on 0.0.0.0:9020")
-    mcp.run(transport="streamable-http")
+    run_streamable(mcp)
