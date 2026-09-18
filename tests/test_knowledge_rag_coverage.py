@@ -43,6 +43,7 @@ RAG_LOADED = {
     "dos_exploit_overrides.yaml": "etl/load_knowledge_documents.py",
     "enumeration_extractors.yaml": "etl/load_knowledge_documents.py",
     "postex_commands.yaml": "etl/load_knowledge_documents.py",
+    "msf_readonly_scanners.yaml": "etl/load_knowledge_documents.py",
 }
 
 # YAMLs deliberately NOT embedded into rag_documents. Each needs a reason. This

@@ -32,6 +32,7 @@ sequential: a parallel fan-out would run in worker threads and lose it.
 """
 from __future__ import annotations
 
+import functools
 import json
 import operator
 import os
@@ -2996,6 +2997,64 @@ def _rank_msf(mods, limit=None, platform=None):
             return 2
         return 1
     return sorted(kept, key=_rank)[:(limit or _MSF_MODULE_LIMIT)]
+
+
+@functools.lru_cache(maxsize=1)
+def _load_readonly_msf_scanners() -> dict:
+    """{module -> (category, safe_command_template)} from
+    knowledge/msf_readonly_scanners.yaml — the DATA that says which MSF auxiliary
+    scanners are purely read-only and how to run each without Metasploit.
+
+    Knowledge is RAG-first (CLAUDE.md): this classification is a knowledge file
+    (embedded into rag_documents by etl/load_knowledge_documents.py), not a
+    hardcoded branch, so reclassifying a module is a YAML edit, not a code change.
+    The file is bind-mounted, so edits take effect on the next process start.
+    Fail-safe: any error returns {} → every module stays IMPACTFUL through MSF."""
+    import os as _os
+    candidates = [
+        _os.environ.get("MSF_READONLY_SCANNERS_YAML", "/knowledge/msf_readonly_scanners.yaml"),
+        _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                      "knowledge", "msf_readonly_scanners.yaml"),
+    ]
+    for path in candidates:
+        if not path or not _os.path.exists(path):
+            continue
+        try:
+            import yaml as _yaml
+            with open(path, encoding="utf-8") as fh:
+                data = _yaml.safe_load(fh) or {}
+            out = {}
+            for row in (data.get("read_only_scanners") or []):
+                if not isinstance(row, dict):
+                    continue
+                mod = str(row.get("module") or "").lower().strip()
+                cat = row.get("category")
+                cmd = row.get("safe_command")
+                if mod and cat and cmd:
+                    out[mod] = (cat, cmd)
+            return out
+        except Exception:  # noqa: BLE001 — fail-safe to no reclassification
+            return {}
+    return {}
+
+
+def _safe_alt_for_msf(module, ip, port, scheme):
+    """(category, command) if this MSF module is a PURELY READ-ONLY info scanner
+    with a safe non-MSF equivalent, else None.
+
+    A robots.txt fetch, a header/version grab, a cert read, a directory listing
+    change nothing and run no code — so queuing them as IMPACTFUL metasploit
+    tests (human approval + an MSF session) is wrong; the operator rightly
+    expects a robots.txt fetch to just run with curl. These take the SAFE
+    autonomous lane via their curl/sslscan/gobuster equivalent instead. The
+    classification lives in knowledge/msf_readonly_scanners.yaml (data, not code);
+    anything not listed there stays IMPACTFUL through MSF — fail-safe by omission."""
+    entry = _load_readonly_msf_scanners().get(str(module or "").lower().strip())
+    if not entry:
+        return None
+    category, template = entry
+    command = template.format(scheme=scheme, ip=ip, port=port)
+    return (category, command)
 # How long surface_safe_exec polls one safe test for its terminal result. Must
 # exceed run_custom_test's tool timeout (300s) so slow scanners (nuclei/gobuster)
 # are captured instead of recorded as empty errors. Env-tunable.
@@ -3831,9 +3890,33 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
             })
 
         # IMPACTFUL candidates: metasploit modules the recommender named.
+        scheme = "https" if tls == "yes" else "http"
+        existing_cmds = {t.get("command") for t in tests if t.get("command")}
         for m in _rank_msf(rec.get("metasploit"), platform=_plat):
             module = m.get("module") or m.get("name")
             if not module:
+                continue
+            # Read-only info scanners (robots.txt/version/header/cert/dir listing)
+            # run in the SAFE autonomous lane via curl/sslscan/gobuster instead of
+            # as an approval-gated MSF session — the operator should not have to
+            # approve a robots.txt fetch. Skip if that safe command is already
+            # queued for this host (the read-only probe set often covers it).
+            alt = _safe_alt_for_msf(module, ip, port, scheme)
+            if alt:
+                alt_cat, alt_cmd = alt
+                alt_cmd = _bound_safe_command(alt_cmd, ip, port)
+                if alt_cmd in existing_cmds:
+                    continue
+                existing_cmds.add(alt_cmd)
+                tests.append({
+                    "name": f"{alt_cat} {svc}/{port} @ {ip}",
+                    "host": ip, "service": svc, "port": port, "tool": _tool_head(alt_cmd),
+                    "command": alt_cmd,
+                    "category": alt_cat,
+                    "tier": _classify(alt_cat, alt_cmd, has_exploit_ref=False),
+                    "assertion": _assertion_for(alt_cat, tls),
+                    "exploit_ref": None,
+                })
                 continue
             tests.append({
                 "name": f"msf_exploit {module} @ {ip}",
