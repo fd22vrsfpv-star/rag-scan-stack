@@ -5,6 +5,8 @@ Performs browser-based security testing with ZAP integration
 
 import os
 import uuid
+import time
+import asyncio
 import logging
 import requests
 from typing import Dict, List, Optional
@@ -1013,13 +1015,23 @@ class AuthCaptureRequest(BaseModel):
     extra_params: Optional[dict] = None
     persist_host: Optional[str] = Field(None, description="If set, persist the captured token into a session-only Auth Profile for this host (reusable by ZAP/Burp).")
     engagement_id: Optional[str] = None
+    # authorization_code mode (scripted OAuth2 where the IdP allows programmatic login)
+    authorize_url: Optional[str] = None
+    token_url: Optional[str] = None
+    redirect_uri: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    code_verifier: Optional[str] = None
+    totp_secret: Optional[str] = None
 
 
-def _persist_session_headers(host: str, headers: dict, engagement_id=None):
-    """Upsert the captured session headers into a session-only Auth Profile for
-    `host`, so a token grabbed via OAuth2 client-credentials / interception is
-    reusable by later ZAP scans and the Burp bundle. Best-effort."""
-    if not host or not headers:
+def _persist_session(host: str, session: dict, engagement_id=None,
+                     auth_type: str = "token"):
+    """Upsert a captured SESSION (cookies + headers + storage) into a session-only
+    Auth Profile for `host`, so a session obtained interactively (SSO/OAuth/SAML/
+    MFA) or imported by the operator is reusable by later ZAP scans and the Burp
+    bundle. Best-effort."""
+    if not host or not session:
         return False
     import json as _json
     _ensure_web_auth_table()
@@ -1028,17 +1040,202 @@ def _persist_session_headers(host: str, headers: dict, engagement_id=None):
         with get_db() as conn, conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO web_auth_configs (host, auth_type, session, enabled, engagement_id)
-                   VALUES (%s,'token',%s::jsonb,true,%s)
+                   VALUES (%s,%s,%s::jsonb,true,%s)
                    ON CONFLICT (COALESCE(engagement_id,
                        '00000000-0000-0000-0000-000000000000'::uuid), host)
-                   DO UPDATE SET session=EXCLUDED.session, auth_type='token', updated_at=now()""",
-                (host, _json.dumps({"headers": headers, "captured_from": "auth_capture"}),
-                 engagement_id))
+                   DO UPDATE SET session=EXCLUDED.session, auth_type=EXCLUDED.auth_type,
+                     updated_at=now()""",
+                (host, auth_type, _json.dumps(session), engagement_id))
             conn.commit()
         return True
     except Exception as e:  # noqa: BLE001
-        logger.warning(f"persist session headers failed for {host}: {e}")
+        logger.warning(f"persist session failed for {host}: {e}")
         return False
+
+
+def _persist_session_headers(host: str, headers: dict, engagement_id=None):
+    """Back-compat: persist header-only session material (OAuth2 client-creds)."""
+    if not headers:
+        return False
+    return _persist_session(host, {"headers": headers, "captured_from": "auth_capture"},
+                            engagement_id)
+
+
+@app.post("/auth/import-session")
+async def import_session(body: Dict):
+    """Manual import: tie an interactively-obtained session (the operator logged
+    in via SSO/OAuth/MFA in their OWN browser) into an Auth Profile. Body:
+    {host, engagement_id?, cookies?:[{name,value}], storage_state?, har?,
+    headers?}. Builds a replayable session and upserts a session-only profile."""
+    import session_capture as sc
+    host = (body.get("host") or "").strip()
+    if not host:
+        raise HTTPException(status_code=400, detail="host is required")
+    session = None
+    if body.get("storage_state"):
+        session = sc.session_from_storage_state(body["storage_state"], captured_from="import:storage_state")
+    elif body.get("har"):
+        session = sc.session_from_har(body["har"], captured_from="import:har")
+    else:
+        session = sc.build_session(cookies=body.get("cookies"),
+                                   headers=body.get("headers"),
+                                   captured_from="import:manual")
+    if not (session.get("cookies") or session.get("headers")):
+        raise HTTPException(status_code=400, detail="no session material found (provide cookies, headers, storage_state, or har)")
+    ok = _persist_session(host, session, body.get("engagement_id"),
+                          auth_type="session")
+    if not ok:
+        raise HTTPException(status_code=500, detail="failed to persist session")
+    return {"ok": True, "host": host,
+            "cookies": len(session.get("cookies") or []),
+            "headers": sorted((session.get("headers") or {}).keys())}
+
+
+# Held browser contexts for out-of-band-OTP interactive logins (id -> objects).
+_login_sessions: Dict[str, dict] = {}
+_LOGIN_TTL = 300
+
+_OTP_SELECTOR = ("input[autocomplete='one-time-code'], input[name*='otp' i], "
+                 "input[name*='code' i], input[name*='token' i], input[id*='otp' i]")
+
+
+async def _drive_login(page, url, username, password, user_sel, pass_sel, submit_sel):
+    """Fill + submit a login form, following whatever OAuth/OIDC/SAML redirects
+    the browser performs. Selectors override the heuristics."""
+    await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+    try:
+        u = user_sel or "input[type='email'], input[name*='user' i], input[name*='email' i], input[type='text']"
+        if username:
+            await page.fill(u, username, timeout=8000)
+        if password:
+            await page.fill(pass_sel or "input[type='password']", password, timeout=8000)
+        await (page.click(submit_sel) if submit_sel else
+               page.click("button[type='submit'], input[type='submit'], button"))
+    except Exception as e:  # noqa: BLE001
+        logger.info(f"[interactive-login] fill/submit note: {e}")
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _otp_present(page, otp_sel):
+    try:
+        return (await page.query_selector(otp_sel or _OTP_SELECTOR)) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _capture_login(context, page, host, engagement_id):
+    import session_capture as sc
+    state = await context.storage_state()
+    session = sc.session_from_storage_state(state, captured_from="interactive")
+    _persist_session(host, session, engagement_id, auth_type="session")
+    return {"cookies": len(session.get("cookies") or []),
+            "has_bearer": "Authorization" in (session.get("headers") or {}),
+            "final_url": page.url}
+
+
+async def _teardown_login(rec):
+    for k in ("context", "browser"):
+        try:
+            await rec[k].close()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        await rec["pw"].stop()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _sweep_login_sessions():
+    now = time.time()
+    for sid in [s for s, r in _login_sessions.items() if now - r["created"] > _LOGIN_TTL]:
+        rec = _login_sessions.pop(sid, None)
+        if rec:
+            asyncio.ensure_future(_teardown_login(rec))
+
+
+@app.post("/auth/interactive-login")
+async def interactive_login(body: Dict):
+    """Assisted interactive login for SSO/OAuth/OIDC/SAML (and MFA): drive a real
+    browser through the login, following the IdP redirect chain, then CAPTURE the
+    resulting session (cookies + localStorage token) into an Auth Profile that
+    ZAP/Burp replay. MFA: pass `totp_secret` (computed here) or `otp`; if MFA is
+    required and neither is given, the browser is held and {mfa_required,
+    login_session_id} is returned for POST /auth/interactive-login/{id}/otp.
+    Body: {login_url, host?, engagement_id?, username?, password?, user_selector?,
+    pass_selector?, submit_selector?, otp_selector?, totp_secret?, otp?,
+    success_url_contains?}."""
+    import session_capture as sc
+    from urllib.parse import urlparse
+    login_url = (body.get("login_url") or "").strip()
+    if not login_url:
+        raise HTTPException(status_code=400, detail="login_url is required")
+    refusal = _scope_refusal_for_url(login_url, "interactive login")
+    if refusal:
+        raise HTTPException(status_code=403, detail=refusal)
+    host = (body.get("host") or urlparse(login_url).hostname or "").strip()
+    eid = body.get("engagement_id")
+    _sweep_login_sessions()
+
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(headless=True)
+    context = await browser.new_context(ignore_https_errors=True, user_agent=USER_AGENT)
+    page = await context.new_page()
+    rec = {"pw": pw, "browser": browser, "context": context, "page": page,
+           "host": host, "engagement_id": eid, "created": time.time()}
+    try:
+        await _drive_login(page, login_url, body.get("username"), body.get("password"),
+                           body.get("user_selector"), body.get("pass_selector"),
+                           body.get("submit_selector"))
+        if await _otp_present(page, body.get("otp_selector")):
+            otp = body.get("otp") or (sc.totp_now(body["totp_secret"]) if body.get("totp_secret") else None)
+            if not otp:
+                # Out-of-band OTP (SMS/email): hold the browser for a resume call.
+                sid = str(uuid.uuid4())
+                _login_sessions[sid] = rec
+                return {"ok": True, "mfa_required": True, "login_session_id": sid,
+                        "host": host, "message": "OTP required — resume via "
+                        "POST /auth/interactive-login/{id}/otp"}
+            try:
+                await page.fill(body.get("otp_selector") or _OTP_SELECTOR, str(otp), timeout=8000)
+                await page.click(body.get("submit_selector")
+                                 or "button[type='submit'], input[type='submit'], button")
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception as e:  # noqa: BLE001
+                logger.info(f"[interactive-login] otp fill note: {e}")
+        cap = await _capture_login(context, page, host, eid)
+        suc = body.get("success_url_contains")
+        authenticated = (suc in page.url) if suc else bool(cap["cookies"] or cap["has_bearer"])
+        return {"ok": True, "authenticated": authenticated, "host": host, **cap}
+    finally:
+        # Not held for OTP resume -> tear down now.
+        if not any(r is rec for r in _login_sessions.values()):
+            await _teardown_login(rec)
+
+
+@app.post("/auth/interactive-login/{login_session_id}/otp")
+async def interactive_login_otp(login_session_id: str, body: Dict):
+    """Resume a held interactive login by supplying the out-of-band OTP."""
+    rec = _login_sessions.pop(login_session_id, None)
+    if not rec:
+        raise HTTPException(status_code=404, detail="login session not found or expired")
+    otp = str(body.get("otp") or "").strip()
+    if not otp:
+        await _teardown_login(rec)
+        raise HTTPException(status_code=400, detail="otp is required")
+    page, context = rec["page"], rec["context"]
+    try:
+        await page.fill(body.get("otp_selector") or _OTP_SELECTOR, otp, timeout=8000)
+        await page.click(body.get("submit_selector")
+                         or "button[type='submit'], input[type='submit'], button")
+        await page.wait_for_load_state("networkidle", timeout=15000)
+        cap = await _capture_login(context, page, rec["host"], rec["engagement_id"])
+        return {"ok": True, "authenticated": bool(cap["cookies"] or cap["has_bearer"]),
+                "host": rec["host"], **cap}
+    finally:
+        await _teardown_login(rec)
 
 
 @app.post("/auth/capture")
@@ -1058,8 +1255,89 @@ async def capture_auth_token(req: AuthCaptureRequest):
         return await _capture_client_credentials(req)
     elif req.mode == "intercept":
         return await _capture_intercept(req)
+    elif req.mode == "authorization_code":
+        return await _capture_authorization_code(req)
     else:
-        raise HTTPException(400, f"Unknown mode: {req.mode}. Use 'client_credentials' or 'intercept'")
+        raise HTTPException(400, f"Unknown mode: {req.mode}. Use "
+                            "'client_credentials', 'authorization_code', or 'intercept'")
+
+
+async def _capture_authorization_code(req: AuthCaptureRequest):
+    """Scripted OAuth2 authorization-code (+PKCE): drive the browser through the
+    authorize redirect (filling IdP creds, TOTP if given), grab the `code` from
+    the redirect back to redirect_uri, and exchange it at token_url for an
+    access_token. Works when the IdP allows programmatic login (no interactive
+    consent / no unscriptable MFA); for those, use /auth/interactive-login."""
+    import httpx
+    import session_capture as sc
+    from urllib.parse import urlparse, parse_qs
+    if not (req.authorize_url and req.token_url and req.redirect_uri and req.client_id):
+        raise HTTPException(400, "authorization_code needs authorize_url, token_url, "
+                            "redirect_uri and client_id")
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(headless=True)
+    context = await browser.new_context(ignore_https_errors=True, user_agent=USER_AGENT)
+    page = await context.new_page()
+    try:
+        await _drive_login(page, req.authorize_url, req.username, req.password,
+                           None, None, None)
+        if req.totp_secret and await _otp_present(page, None):
+            code = sc.totp_now(req.totp_secret)
+            if code:
+                try:
+                    await page.fill(_OTP_SELECTOR, code, timeout=8000)
+                    await page.click("button[type='submit'], input[type='submit'], button")
+                    await page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:  # noqa: BLE001
+                    pass
+        auth_code = None
+        base_redirect = req.redirect_uri.split("?")[0]
+        for _ in range(20):
+            if page.url.startswith(base_redirect):
+                q = parse_qs(urlparse(page.url).query)
+                auth_code = (q.get("code") or [None])[0]
+                if auth_code:
+                    break
+            await page.wait_for_timeout(500)
+        if not auth_code:
+            return {"ok": False, "error": "no authorization code captured "
+                    f"(final url {page.url[:200]})"}
+    finally:
+        for k in (context, browser):
+            try:
+                await k.close()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            await pw.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+    data = {"grant_type": "authorization_code", "code": auth_code,
+            "redirect_uri": req.redirect_uri, "client_id": req.client_id}
+    if req.client_secret:
+        data["client_secret"] = req.client_secret
+    if req.code_verifier:
+        data["code_verifier"] = req.code_verifier
+    try:
+        async with httpx.AsyncClient(timeout=15, verify=False) as client:
+            resp = await client.post(req.token_url, data=data,
+                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+            if resp.status_code >= 400:
+                return {"ok": False, "error": f"token endpoint {resp.status_code}",
+                        "body": resp.text[:2000]}
+            body = resp.json()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+    token = body.get("access_token", "")
+    token_type = body.get("token_type", "Bearer")
+    persisted = False
+    if token and req.persist_host:
+        persisted = _persist_session_headers(
+            req.persist_host, {"Authorization": f"{token_type} {token}"}, req.engagement_id)
+    return {"ok": True, "mode": "authorization_code", "access_token": token,
+            "token_type": token_type, "persisted_profile": persisted,
+            "full_response": body}
 
 
 async def _capture_client_credentials(req: AuthCaptureRequest):
