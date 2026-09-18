@@ -10,7 +10,7 @@ import { useScopeNames, useAddToScope, useScope } from '@/api/scope'
 import { ScopeFilter } from '@/components/common/ScopeFilter'
 import { useScopeFilter } from '@/hooks/useScopeFilter'
 import { useScreenshots } from '@/api/recon'
-import { apiUrl } from '@/api/client'
+import { apiUrl, apiFetch } from '@/api/client'
 import { ScreenshotThumbnail, MicroScreenshot } from '@/components/common/ScreenshotThumbnail'
 import { useUIStore } from '@/stores/ui'
 import { useCreateFeedback } from '@/api/feedback'
@@ -904,6 +904,17 @@ function FindingDetailPanel({
   const [pocPayloads, setPocPayloads] = useState<WebPayload[]>([])
   const [selectedPayloads, setSelectedPayloads] = useState<Set<number>>(new Set())
   const [pocQueued, setPocQueued] = useState(false)
+  const [deepen, setDeepen] = useState<{ loading?: boolean; msg?: string; err?: boolean }>({})
+  const handleDeepen = async () => {
+    setDeepen({ loading: true })
+    try {
+      const r = await apiFetch<{ command?: string; why?: string }>(
+        `/findings/${fSource}/${f.id}/deepen`, { method: 'POST', body: JSON.stringify({}) })
+      setDeepen({ msg: r?.command ? `Queued read-only probe: ${r.command}` : 'Deepen queued' })
+    } catch (e: any) {
+      setDeepen({ msg: String(e?.message || e).slice(0, 160), err: true })
+    }
+  }
 
   const WEB_POC_TYPES = new Set([
     'xss', 'cross-site scripting', 'sqli', 'sql-injection', 'sql injection',
@@ -1205,6 +1216,30 @@ function FindingDetailPanel({
             )}
             {generatePocs.isError && (
               <p className="text-[10px] text-red-400">Failed to generate payloads</p>
+            )}
+          </div>
+        )}
+
+        {/* ── Deepen this finding (AI read-only probe) ── */}
+        {canGeneratePoc && (
+          <div className="border border-border rounded-md p-2.5 space-y-2">
+            <h5 className="text-xs font-medium text-muted-foreground flex items-center gap-1">
+              <Zap className="h-3 w-3" /> Deepen
+            </h5>
+            <p className="text-[10px] text-muted-foreground">
+              Synthesize ONE read-only probe that turns this finding into evidence and queue it
+              (scope-gated, pending approval). Useful for informational findings.
+            </p>
+            <button
+              onClick={handleDeepen}
+              disabled={deepen.loading}
+              className="px-3 py-1.5 text-xs rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 flex items-center gap-1"
+            >
+              {deepen.loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />}
+              {deepen.loading ? 'Deepening…' : 'Deepen this finding'}
+            </button>
+            {deepen.msg && (
+              <p className={`text-[10px] ${deepen.err ? 'text-red-400' : 'text-green-400'} break-all`}>{deepen.msg}</p>
             )}
           </div>
         )}
