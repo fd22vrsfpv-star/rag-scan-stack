@@ -757,6 +757,9 @@ def _resolve_web_auth(url: str, engagement_id: Optional[str] = None):
                 session = _json.loads(session)
             except Exception:  # noqa: BLE001
                 session = {}
+        # Auto-refresh a near-expiry access token so a long authenticated scan
+        # doesn't silently drop mid-run (durability for every token flow).
+        session = _maybe_refresh_session(host or netloc, r[10], session or {})
         return {"login_url": r[0], "login_data": r[1], "username": r[2],
                 "password": password, "logged_in_regex": r[4],
                 "logged_out_regex": r[5], "auth_type": r[6], "csrf_field": r[7],
@@ -1023,6 +1026,10 @@ class AuthCaptureRequest(BaseModel):
     password: Optional[str] = None
     code_verifier: Optional[str] = None
     totp_secret: Optional[str] = None
+    # headless OIDC: discover endpoints from an issuer; ROPC / device-code
+    issuer: Optional[str] = None
+    scope: Optional[str] = None
+    device_code: Optional[str] = None
 
 
 def _persist_session(host: str, session: dict, engagement_id=None,
@@ -1051,6 +1058,33 @@ def _persist_session(host: str, session: dict, engagement_id=None,
     except Exception as e:  # noqa: BLE001
         logger.warning(f"persist session failed for {host}: {e}")
         return False
+
+
+def _maybe_refresh_session(host, engagement_id, session: dict) -> dict:
+    """If the session's access token is near expiry and carries a refresh_token,
+    mint a fresh one (grant_type=refresh_token) and persist it — so a long
+    authenticated scan stays logged in. Sync + best-effort; returns the (possibly
+    refreshed) session unchanged on any problem."""
+    try:
+        import oidc_flows as of
+        if not of.needs_refresh(session):
+            return session
+        form = of.refresh_form(session)
+        if not form:
+            return session
+        r = requests.post(form["url"], data=form["data"],
+                          headers={"Content-Type": "application/x-www-form-urlencoded"},
+                          timeout=15, verify=False)
+        if r.status_code >= 400:
+            logger.warning(f"token refresh for {host} failed: {r.status_code}")
+            return session
+        updated = of.apply_refresh(session, r.json())
+        _persist_session(host, updated, engagement_id, "token")
+        logger.info(f"[auth] refreshed access token for {host}")
+        return updated
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"token refresh error for {host}: {e}")
+        return session
 
 
 def _persist_session_headers(host: str, headers: dict, engagement_id=None):
@@ -1099,24 +1133,54 @@ _OTP_SELECTOR = ("input[autocomplete='one-time-code'], input[name*='otp' i], "
                  "input[name*='code' i], input[name*='token' i], input[id*='otp' i]")
 
 
-async def _drive_login(page, url, username, password, user_sel, pass_sel, submit_sel):
-    """Fill + submit a login form, following whatever OAuth/OIDC/SAML redirects
-    the browser performs. Selectors override the heuristics."""
-    await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+# Selectors that cover the common IdPs without per-provider hardcoding: email-first
+# flows (Azure AD, Google) split username/password across pages; Keycloak/Okta are
+# single-page. The multi-step loop fills whatever visible field is present each step.
+_USER_SEL = ("input[type='email'], input[name*='user' i], input[name*='email' i], "
+             "input#identifierId, input#okta-signin-username, input#username, "
+             "input[type='text']:not([type='hidden'])")
+_PASS_SEL = "input[type='password']:not([aria-hidden='true'])"
+_SUBMIT_SEL = ("button[type='submit'], input[type='submit'], #idSIButton9, "
+               "#kc-login, #okta-signin-submit, button")
+
+
+async def _fill_if_present(page, selector, value):
+    """Fill a visible, empty field; return True if we filled it."""
     try:
-        u = user_sel or "input[type='email'], input[name*='user' i], input[name*='email' i], input[type='text']"
-        if username:
-            await page.fill(u, username, timeout=8000)
-        if password:
-            await page.fill(pass_sel or "input[type='password']", password, timeout=8000)
-        await (page.click(submit_sel) if submit_sel else
-               page.click("button[type='submit'], input[type='submit'], button"))
-    except Exception as e:  # noqa: BLE001
-        logger.info(f"[interactive-login] fill/submit note: {e}")
-    try:
-        await page.wait_for_load_state("networkidle", timeout=15000)
+        el = await page.query_selector(selector)
+        if el and await el.is_visible() and not (await el.input_value()):
+            await el.fill(value, timeout=8000)
+            return True
     except Exception:  # noqa: BLE001
         pass
+    return False
+
+
+async def _drive_login(page, url, username, password, user_sel, pass_sel, submit_sel):
+    """MULTI-STEP login that follows OAuth/OIDC/SAML redirects and handles
+    provider email-first flows (Azure/Google: email → Next → password → Sign in →
+    'Stay signed in?') as well as single-page forms (Keycloak/Okta). Fills
+    whatever visible field each page presents, up to a few steps."""
+    await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+    for step in range(4):
+        filled = False
+        if username:
+            filled |= await _fill_if_present(page, user_sel or _USER_SEL, username)
+        if password:
+            filled |= await _fill_if_present(page, pass_sel or _PASS_SEL, password)
+        try:
+            btn = await page.query_selector(submit_sel or _SUBMIT_SEL)
+            if btn:
+                await btn.click()
+        except Exception as e:  # noqa: BLE001
+            logger.info(f"[interactive-login] submit note (step {step}): {e}")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=12000)
+        except Exception:  # noqa: BLE001
+            pass
+        # Done once there is nothing left to fill (and we advanced at least once).
+        if step > 0 and not filled:
+            break
 
 
 async def _otp_present(page, otp_sel):
@@ -1257,9 +1321,129 @@ async def capture_auth_token(req: AuthCaptureRequest):
         return await _capture_intercept(req)
     elif req.mode == "authorization_code":
         return await _capture_authorization_code(req)
+    elif req.mode == "password":
+        return await _capture_password(req)
+    elif req.mode == "device_code":
+        return await _capture_device_start(req)
     else:
-        raise HTTPException(400, f"Unknown mode: {req.mode}. Use "
-                            "'client_credentials', 'authorization_code', or 'intercept'")
+        raise HTTPException(400, f"Unknown mode: {req.mode}. Use 'client_credentials', "
+                            "'password', 'device_code', 'authorization_code', or 'intercept'")
+
+
+async def _oidc_discover(issuer: str) -> dict:
+    """Fetch the OIDC discovery document for an issuer. Best-effort ({} on error)."""
+    import oidc_flows as of
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10, verify=False) as c:
+            r = await c.get(of.discovery_url(issuer))
+            return r.json() if r.status_code < 400 else {}
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"OIDC discovery failed for {issuer}: {e}")
+        return {}
+
+
+async def _capture_password(req: AuthCaptureRequest):
+    """ROPC / direct-grant (grant_type=password) — fully headless, no browser, for
+    IdPs that permit it (Azure AD ROPC, Keycloak direct access grant)."""
+    import httpx
+    import oidc_flows as of
+    token_url = req.token_url
+    if not token_url and req.issuer:
+        token_url = (await _oidc_discover(req.issuer)).get("token_endpoint")
+    if not (token_url and req.client_id and req.username and req.password):
+        raise HTTPException(400, "password grant needs token_url (or issuer), client_id, username, password")
+    data = {"grant_type": "password", "client_id": req.client_id,
+            "username": req.username, "password": req.password}
+    if req.client_secret:
+        data["client_secret"] = req.client_secret
+    if req.scope:
+        data["scope"] = req.scope
+    try:
+        async with httpx.AsyncClient(timeout=15, verify=False) as c:
+            resp = await c.post(token_url, data=data,
+                                headers={"Content-Type": "application/x-www-form-urlencoded"})
+            if resp.status_code >= 400:
+                return {"ok": False, "error": f"token endpoint {resp.status_code}", "body": resp.text[:1500]}
+            body = resp.json()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+    session = of.session_from_token_response(
+        body, token_url=token_url, client_id=req.client_id,
+        client_secret=req.client_secret, scope=req.scope, captured_from="ropc")
+    if not session:
+        return {"ok": False, "error": "no access_token in response"}
+    persisted = _persist_session(req.persist_host, session, req.engagement_id, "token") if req.persist_host else False
+    return {"ok": True, "mode": "password", "access_token": body.get("access_token"),
+            "has_refresh": bool(session.get("refresh", {}).get("refresh_token")),
+            "persisted_profile": persisted}
+
+
+async def _capture_device_start(req: AuthCaptureRequest):
+    """OAuth2 device-authorization grant — start: request device+user codes. The
+    human approves at verification_uri on another device, then poll /auth/device-poll."""
+    import httpx
+    disco = await _oidc_discover(req.issuer) if req.issuer else {}
+    device_ep = disco.get("device_authorization_endpoint") or req.authorize_url
+    if not (device_ep and req.client_id):
+        raise HTTPException(400, "device_code needs issuer (or authorize_url as device endpoint) and client_id")
+    data = {"client_id": req.client_id}
+    if req.scope:
+        data["scope"] = req.scope
+    try:
+        async with httpx.AsyncClient(timeout=15, verify=False) as c:
+            resp = await c.post(device_ep, data=data,
+                                headers={"Content-Type": "application/x-www-form-urlencoded"})
+            if resp.status_code >= 400:
+                return {"ok": False, "error": f"device endpoint {resp.status_code}", "body": resp.text[:1000]}
+            body = resp.json()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "mode": "device_code",
+            "device_code": body.get("device_code"), "user_code": body.get("user_code"),
+            "verification_uri": body.get("verification_uri") or body.get("verification_url"),
+            "verification_uri_complete": body.get("verification_uri_complete"),
+            "interval": body.get("interval", 5), "expires_in": body.get("expires_in"),
+            "token_url": disco.get("token_endpoint") or req.token_url,
+            "message": "Approve at verification_uri, then POST /auth/device-poll with device_code + token_url."}
+
+
+@app.post("/auth/device-poll")
+async def device_poll(body: Dict):
+    """Poll the token endpoint ONCE for a device_code grant. Returns
+    {ok:true, pending:true} while the user has not yet approved; on success
+    persists the session and returns the token. Body: {device_code, token_url,
+    client_id, client_secret?, scope?, persist_host?, engagement_id?}."""
+    import httpx
+    import oidc_flows as of
+    dc, token_url, client_id = body.get("device_code"), body.get("token_url"), body.get("client_id")
+    if not (dc and token_url and client_id):
+        raise HTTPException(400, "device_code, token_url and client_id are required")
+    data = {"grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": dc, "client_id": client_id}
+    if body.get("client_secret"):
+        data["client_secret"] = body["client_secret"]
+    try:
+        async with httpx.AsyncClient(timeout=15, verify=False) as c:
+            resp = await c.post(token_url, data=data,
+                                headers={"Content-Type": "application/x-www-form-urlencoded"})
+            j = resp.json()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+    if resp.status_code >= 400:
+        err = (j or {}).get("error", "")
+        if err in ("authorization_pending", "slow_down"):
+            return {"ok": True, "pending": True, "error": err}
+        return {"ok": False, "error": err or f"token endpoint {resp.status_code}", "body": resp.text[:800]}
+    session = of.session_from_token_response(
+        j, token_url=token_url, client_id=client_id,
+        client_secret=body.get("client_secret"), scope=body.get("scope"), captured_from="device_code")
+    if not session:
+        return {"ok": False, "error": "no access_token"}
+    persisted = _persist_session(body["persist_host"], session, body.get("engagement_id"), "token") if body.get("persist_host") else False
+    return {"ok": True, "pending": False, "access_token": j.get("access_token"),
+            "has_refresh": bool(session.get("refresh", {}).get("refresh_token")),
+            "persisted_profile": persisted}
 
 
 async def _capture_authorization_code(req: AuthCaptureRequest):
