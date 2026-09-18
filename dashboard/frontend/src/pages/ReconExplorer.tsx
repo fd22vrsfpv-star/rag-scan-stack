@@ -15,7 +15,6 @@ import { DataTable } from '@/components/common/DataTable'
 import { SeverityBadge } from '@/components/common/SeverityBadge'
 import { CustomerBadge } from '@/components/common/CustomerBadge'
 import { SourceBadge } from '@/components/common/SourceBadge'
-import { ScopeFilter } from '@/components/common/ScopeFilter'
 import { useScopeFilter } from '@/hooks/useScopeFilter'
 import type { ColumnDef } from '@tanstack/react-table'
 import type { ReconFinding } from '@/lib/types'
@@ -127,8 +126,15 @@ function ParametersTab() {
   const [viewMode, setViewMode] = useState<'grouped' | 'flat'>('grouped')
   const [expandedParams, setExpandedParams] = useState<Set<string>>(new Set())
 
-  const params = data?.params ?? []
-  const total = data?.total ?? 0
+  // Scope filter driven by the global (TopBar) scope selector — a discovered
+  // parameter is in scope when its URL is.
+  const scopeName = useUIStore(s => s.selectedScopeName) || ''
+  const { matchesScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeName)
+  const params = useMemo(() => {
+    const all = data?.params ?? []
+    return isScopeFiltering ? all.filter(p => matchesScope(p.url_pattern || '')) : all
+  }, [data, isScopeFiltering, matchesScope])
+  const total = isScopeFiltering ? params.length : (data?.total ?? 0)
 
   // Group by param_name
   type ParamGroup = { name: string; type: string; totalHits: number; urls: typeof params; locations: Set<string>; methods: Set<string> }
@@ -547,7 +553,11 @@ function FindingsTab() {
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
-        <ScopeFilter value={scopeFilterVal} onChange={setScopeFilterVal} />
+        <span className="text-xs text-muted-foreground">
+          {isScopeFiltering
+            ? <>Scope: <span className="text-foreground font-medium">{scopeFilterVal}</span></>
+            : 'All scopes'}
+        </span>
         <span className="text-xs text-muted-foreground">{total} findings{isScopeFiltering ? ` in ${scopeFilterVal}` : ''}</span>
       </div>
 
@@ -925,11 +935,29 @@ function FindingsTab() {
 
 // ─── Screenshots Tab ──────────────────────────────────────
 
+// Screenshots carry no target field — gowitness/playwright encode the host in
+// the filename/dir (e.g. "https__demo.testfire.net.png", "http-1.2.3.4-8080.png").
+// Pull the first hostname- or IPv4-looking token so the scope filter can match.
+function _screenshotHost(sc: { filename?: string; directory?: string; path?: string }): string {
+  const raw = `${sc.directory || ''} ${sc.filename || sc.path || ''}`
+    .toLowerCase()
+    .replace(/\.(png|jpe?g|webp|gif|bmp)\b/gi, '')
+  const m = raw.match(/(?:\d{1,3}\.){3}\d{1,3}|(?:[a-z0-9-]+\.)+[a-z]{2,}/)
+  return m ? m[0] : raw.trim()
+}
+
 function ScreenshotsTab() {
   const [search, setSearch] = useState('')
   const { data, isLoading } = useScreenshots(search || undefined)
   const { data: allMetaData } = useAllScreenshotMetadata()
-  const screenshots = data?.screenshots ?? []
+  // Scope filter driven by the global (TopBar) scope selector — a screenshot is
+  // in scope when its captured target/host is.
+  const scopeName = useUIStore(s => s.selectedScopeName) || ''
+  const { matchesScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeName)
+  const screenshots = useMemo(() => {
+    const all = data?.screenshots ?? []
+    return isScopeFiltering ? all.filter(sc => matchesScope(_screenshotHost(sc))) : all
+  }, [data, isScopeFiltering, matchesScope])
   const [lightbox, setLightbox] = useState<string | null>(null)
 
   // Build a path->tags lookup from bulk metadata
@@ -944,7 +972,11 @@ function ScreenshotsTab() {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <span className="text-xs text-muted-foreground">{data?.total ?? 0} screenshots captured</span>
+        <span className="text-xs text-muted-foreground">
+          {isScopeFiltering
+            ? `${screenshots.length} screenshots in ${scopeName}`
+            : `${data?.total ?? 0} screenshots captured`}
+        </span>
       </div>
 
       {/* Search */}
@@ -2077,6 +2109,11 @@ function MetadataTab() {
 
   const extractions = data?.extractions ?? []
 
+  // Scope filter driven by the global (TopBar) scope selector — an extraction is
+  // in scope when the URL it came from is.
+  const scopeName = useUIStore(s => s.selectedScopeName) || ''
+  const { matchesScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeName)
+
   // Build metadata items from extractions
   const metadataItems = useMemo(() => {
     const items: Array<{
@@ -2134,6 +2171,7 @@ function MetadataTab() {
   // Filter
   const q = search.toLowerCase()
   const filtered = metadataItems.filter(item => {
+    if (isScopeFiltering && !matchesScope(item.url || '')) return false
     if (typeFilter && item.type !== typeFilter) return false
     if (q) {
       const dataStr = JSON.stringify(item.data).toLowerCase()
