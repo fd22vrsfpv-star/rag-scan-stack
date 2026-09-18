@@ -72,6 +72,13 @@ _DEFAULTS: Dict[str, Any] = {
     # which facts to review: "uncertain" (llm-sourced / generic / low-confidence)
     # or "all".
     "enum_router.review.scope": "uncertain",
+    # PROMOTION: turn a shape the LLM keeps discovering into a permanent extractor.
+    "enum_router.promotion.enabled": True,
+    # Auto-approve a proposed extractor once its kind has this many PRIOR confirmed
+    # sightings. 0 = never auto-approve (operator approves every one manually) —
+    # the safe default: a one-off LLM guess never becomes a permanent rule on its
+    # own. Set to e.g. 3 to let a shape seen 3+ times activate automatically.
+    "enum_router.promotion.auto_approve_after": 0,
 }
 
 _SETTINGS_TTL = int(os.environ.get("ENUM_ROUTER_SETTINGS_TTL", "60"))
