@@ -38,6 +38,9 @@ REQUIRED = {
     "search_recon": ["_resolve_engagement_id", "a.engagement_id = %s::uuid"],
     "get_recon_subdomains": ["_resolve_engagement_id", "a.engagement_id = %s::uuid"],
     "list_recon_domains": ["_resolve_engagement_id", "engagement_id = %s::uuid"],
+    # OSINT Explorer Parameters tab — scope via the linked asset's engagement.
+    "search_params": ["_resolve_engagement_id", "dp.asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)"],
+    "params_summary": ["_resolve_engagement_id", "dp.asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)"],
 }
 
 
