@@ -1293,22 +1293,27 @@ class ScanTools:
             params=params
         )
 
-    def query_assets(self, limit: int = 100) -> Dict:
+    def query_assets(self, limit: int = 100, search: str = None) -> Dict:
         """
         Query assets from database
 
         Args:
             limit: Maximum number of results
+            search: Optional substring filter on hostname/IP (pushed server-side
+                so a target's asset is on the returned page, not truncated out).
 
         Returns:
             Dictionary with assets data
         """
+        params = {"limit": limit}
+        if search:
+            params["search"] = search
         return self._make_request(
             method="GET",
             url=f"{self.rag_api_url}/assets",
             operation=f"Query assets (limit={limit})",
             headers=self.headers,
-            params={"limit": limit}
+            params=params
         )
 
     def query_vulnerabilities(
@@ -1893,7 +1898,7 @@ class ScanTools:
     WEB_FINDING_SOURCES = ["nuclei", "nikto", "zap", "burp", "playwright",
                            "gobuster", "wafw00f", "whatweb", "httpx"]
 
-    def get_web_findings(self, limit: int = 100) -> Dict:
+    def get_web_findings(self, limit: int = 100, ip: str = None) -> Dict:
         """
         Get web findings from database.
 
@@ -1913,7 +1918,8 @@ class ScanTools:
             url=f"{self.rag_api_url}/findings/search",
             operation=f"Query web findings (limit={limit})",
             headers=self.headers,
-            params={"source": self.WEB_FINDING_SOURCES, "limit": limit},
+            params=({"source": self.WEB_FINDING_SOURCES, "limit": limit, "ip": ip}
+                    if ip else {"source": self.WEB_FINDING_SOURCES, "limit": limit}),
         )
         # The unified endpoint returns `results`; alias it to `findings` so the
         # get_web_findings() wrapper's target/source post-filtering still applies.
@@ -2893,6 +2899,32 @@ def _operator_guidance_for(ports: List[Dict], max_services: int = _GUIDANCE_MAX_
     return out
 
 
+def _resolve_target_ip(target: str) -> Optional[str]:
+    """Turn a target (IP, hostname, or URL) into the asset's IP so the ip-keyed
+    queries match. Data is keyed by IP but a scan target is often a hostname
+    ('demo.testfire.net') — resolve it via rag-api /assets/resolve. Returns the
+    resolved IP, or the bare host string if nothing resolved."""
+    import re as _re
+    if not target:
+        return None
+    t = _re.sub(r"/[0-9]+$", "", str(target)).strip()
+    host = _re.sub(r"^[a-z][a-z0-9+.-]*://", "", t, flags=_re.I).split("/")[0]
+    if host.count(":") == 1:
+        host = host.split(":")[0]
+    if _re.match(r"^[0-9]{1,3}(\.[0-9]{1,3}){3}$", host):
+        return host
+    try:
+        st = get_scan_tools()
+        r = st._make_request(method="GET", url=f"{st.rag_api_url}/assets/resolve",
+                             operation=f"resolve target {host}", headers=st.headers,
+                             params={"target": host})
+        if isinstance(r, dict) and r.get("ip"):
+            return r["ip"]
+    except Exception:  # noqa: BLE001
+        pass
+    return host
+
+
 def query_open_ports(target: str = None, limit: int = 100) -> str:
     """
     Query open ports from the database.
@@ -2906,25 +2938,25 @@ def query_open_ports(target: str = None, limit: int = 100) -> str:
     found. Use that guidance when choosing which tools to run next; it reflects
     technique proven against these services and overrides generic defaults.
     """
-    # Push the host filter to the server (host(a.ip)=, CIDR-safe). Without this
-    # the endpoint returns a flat LIMIT-capped page across every host, so an
-    # internal lab IP falls outside the page and the client filter below sees 0.
-    result = get_scan_tools().query_open_ports(limit, ip=target or None)
+    # Resolve a hostname/URL target to the asset IP the ports are keyed by, then
+    # push that to the server (host(a.ip)= or hostname match, CIDR-safe). Without
+    # this a hostname target ('demo.testfire.net') matched no IP-keyed port and
+    # the agent saw zero services for a host it just scanned.
+    _rip = _resolve_target_ip(target) if target else None
+    result = get_scan_tools().query_open_ports(limit, ip=(_rip or target or None))
 
     # rag-api returns the rows under "items"; older callers looked for "ports",
     # which silently matched nothing — the target filter below never ran, so
     # asking for one host returned every host. Accept both keys.
     rows_key = "items" if isinstance(result, dict) and "items" in result else "ports"
 
-    # Filter by target if specified. Stored IPs may carry a /32 CIDR suffix
-    # (assets.ip is inet), so strip it before comparing or a host filter never
-    # matches and the agent sees zero services for a host it just scanned.
+    # Client filter by the RESOLVED ip (strip a /32 CIDR suffix — assets.ip is inet).
     if target and isinstance(result, dict) and rows_key in result:
         import re as _re
-        tgt = _re.sub(r"/[0-9]+$", "", str(target))
+        tgt = _re.sub(r"/[0-9]+$", "", str(_rip or target))
         def _m(p):
             pip = _re.sub(r"/[0-9]+$", "", str(p.get("ip") or ""))
-            return pip == tgt or str(p.get("host") or "") == tgt
+            return pip == tgt or str(p.get("host") or "") == tgt or str(p.get("hostname") or "") == tgt
         result[rows_key] = [p for p in result[rows_key] if _m(p)]
         result["filtered_by"] = target
         result["count"] = len(result[rows_key])
@@ -2955,15 +2987,20 @@ def query_assets(target: str = None, limit: int = 100) -> str:
 
     Returns JSON string with assets data.
     """
-    result = get_scan_tools().query_assets(limit)
+    # Push a substring host filter to the server so the target's asset is on the
+    # returned page (with ~1800 assets a LIMIT-capped page would truncate it out),
+    # then client-filter by the resolved IP.
+    import re as _re
+    _host = _re.sub(r"^[a-z][a-z0-9+.-]*://", "", str(target or ""), flags=_re.I).split("/")[0].split(":")[0] or None
+    _rip = _resolve_target_ip(target) if target else None
+    result = get_scan_tools().query_assets(limit, search=_host)
 
-    # Filter by target if specified (strip a /32 CIDR suffix — see query_open_ports).
     if target and isinstance(result, dict) and "assets" in result:
-        import re as _re
-        tgt = _re.sub(r"/[0-9]+$", "", str(target))
+        tgt = _re.sub(r"/[0-9]+$", "", str(_rip or target))
         result["assets"] = [a for a in result["assets"]
                             if _re.sub(r"/[0-9]+$", "", str(a.get("ip") or "")) == tgt
-                            or str(a.get("host") or "") == tgt]
+                            or str(a.get("host") or "") == tgt
+                            or str(a.get("hostname") or "").lower() == (_host or "").lower()]
         result["filtered_by"] = target
 
     return json.dumps(result, indent=2)
@@ -2994,16 +3031,21 @@ def get_web_findings(target: str = None, source: str = None, limit: int = 100) -
 
     Returns JSON string with web findings data.
     """
-    result = get_scan_tools().get_web_findings(limit)
+    # Resolve a hostname/URL target to the asset IP and scope the query
+    # server-side, so a web target's findings aren't truncated out of a
+    # severity-sorted page before the client filter runs.
+    _rip = _resolve_target_ip(target) if target else None
+    result = get_scan_tools().get_web_findings(limit, ip=_rip)
 
     # Filter by target IP if specified
     if target and isinstance(result, dict):
         for key in ("findings", "web_findings"):
             if key in result:
+                _htarget = target.split("://")[-1].split("/")[0].split(":")[0]
                 result[key] = [
                     f for f in result[key]
-                    if f.get("ip") == target or f.get("host") == target
-                    or (f.get("url") and target in f.get("url", ""))
+                    if f.get("ip") in (target, _rip) or f.get("host") in (target, _htarget)
+                    or (f.get("url") and (_htarget in f.get("url", "") or target in f.get("url", "")))
                 ]
                 result["filtered_by_target"] = target
 

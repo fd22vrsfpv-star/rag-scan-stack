@@ -1288,6 +1288,43 @@ def nmap_from_masscan(authorized: bool = Depends(auth), job_id: Optional[str] = 
                 conn.commit()
         raise HTTPException(status_code=502, detail=f"nmap_scanner unavailable: {e}")
 
+
+def _target_host(s: str) -> str:
+    """Normalize a target string to its bare host: strip scheme, path and port.
+    'http://demo.testfire.net:80/login' -> 'demo.testfire.net'."""
+    import re as _re
+    s = (s or "").strip()
+    s = _re.sub(r'^[a-z][a-z0-9+.-]*://', '', s, flags=_re.I)   # scheme
+    s = s.split('/')[0]                                          # path
+    if s.count(':') == 1:                                        # host:port (not IPv6)
+        s = s.split(':')[0]
+    return s.lower()
+
+
+@app.get("/assets/resolve", tags=["Assets"])
+def resolve_asset_target(target: str, authorized: bool = Depends(auth)):
+    """Resolve a target string (IP, hostname, or URL) to its asset, so callers can
+    turn a hostname/URL the operator/agent typed into the IP the data is keyed by.
+    A scan planner that asks for 'http://demo.testfire.net' gets back the asset
+    (ip 65.61.137.117) and can then query ports/findings by that ip."""
+    host = _target_host(target)
+    if not host:
+        raise HTTPException(400, "target is required")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT host(ip)::text AS ip, hostname, engagement_id::text, id::text
+                 FROM assets
+                WHERE host(ip) = %s OR lower(hostname) = %s
+                ORDER BY (host(ip) = %s) DESC, last_seen DESC NULLS LAST
+                LIMIT 1""", (host, host, host))
+        row = cur.fetchone()
+    if not row:
+        return {"ok": False, "target": target, "host": host, "resolved": None}
+    return {"ok": True, "target": target, "host": host,
+            "ip": row["ip"], "hostname": row["hostname"],
+            "asset_id": row["id"], "engagement_id": row["engagement_id"]}
+
+
 @app.get("/assets")
 def get_assets(
     search: Optional[str] = Query(None, description="Substring match on hostname or IP (case-insensitive)"),
@@ -1913,8 +1950,12 @@ def get_open_ports(
         where = ["COALESCE(p.is_open, true)"]
         params: list = []
         if ip:
-            where.append("host(a.ip)=%s")
-            params.append(ip)
+            # Accept an IP, hostname, or URL — a scan target is often a hostname
+            # ('demo.testfire.net') while ports are keyed by the resolved IP, so
+            # match either the address or the asset hostname (scheme/port stripped).
+            _h = _target_host(ip)
+            where.append("(host(a.ip)=%s OR lower(a.hostname)=%s)")
+            params.extend([_h, _h])
         if service:
             where.append("p.service ILIKE %s")
             params.append(service)
