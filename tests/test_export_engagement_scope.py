@@ -28,7 +28,7 @@ API = os.path.join(REPO, "app", "rag-api", "api.py")
 
 REQUIRED = {
     "export_burp_sitemap":   ["_resolve_engagement_id",
-                              "asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)"],
+                              "asset_id IN (SELECT id::text FROM assets WHERE engagement_id = %s::uuid)"],
     "export_har":            ["_resolve_engagement_id", "wf.engagement_id = %s::uuid",
                               "v.engagement_id = %s::uuid"],
     "export_zap_report":     ["_resolve_engagement_id", "wf.engagement_id = %s::uuid"],
