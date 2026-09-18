@@ -983,6 +983,11 @@ class ScanAuth(BaseModel):
     login_request_data: str = "username={%username%}&password={%password%}&Login=Login"
     method: str = "formBasedAuthentication"
     session_management: str = "cookieBasedSessionManagement"
+    #: Anti-CSRF token field name. When set, the pipeline uses SCRIPT-based auth
+    #: (the bundled csrf_auth.js: GET login page, scrape the token, POST with it)
+    #: instead of plain form auth — so the pipeline path handles CSRF logins too,
+    #: not only the Playwright path. login_request_data should carry {%csrf%}.
+    csrf_field: Optional[str] = None
     #: How ZAP decides it is authenticated. At least one is required — without
     #: either, ZAP cannot detect a session drop and will happily scan the login
     #: page over and over, reporting a clean authenticated pass that never was.
@@ -1029,6 +1034,31 @@ def _credential_from_vault(vault_id: str) -> tuple:
     return row["username"], secret, f"vault:{vault_id}"
 
 
+def _ensure_csrf_auth_script(zap):
+    """Load the bundled CSRF-login auth script into ZAP once (same script the
+    Playwright path uses; the file lives on the shared ZAP container). Returns the
+    script name or None if no JS engine / load failed."""
+    name = "csrf_form_auth"
+    try:
+        existing = zap.script.list_scripts or []
+        if any((sc.get("name") == name) for sc in existing):
+            return name
+        engines = zap.script.list_engines or []
+        js = next((e for e in engines if any(t in e.lower()
+                   for t in ("graal", "ecmascript", "nashorn", "javascript"))), None)
+        if not js:
+            logger.warning("[auth] ZAP has no JS script engine — CSRF script auth unavailable")
+            return None
+        r = zap.script.load(scriptname=name, scripttype="authentication",
+                            scriptengine=js, filename="/home/zap/csrf_auth.js")
+        if str(r).upper() != "OK":
+            logger.warning(f"[auth] CSRF auth script load returned {r}")
+        return name
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[auth] CSRF auth script load failed: {e}")
+        return None
+
+
 def configure_zap_auth(zap, context_name: str, auth: "ScanAuth", scope_regex: str):
     """Set up ZAP authentication, session management and a forced user.
 
@@ -1048,11 +1078,30 @@ def configure_zap_auth(zap, context_name: str, auth: "ScanAuth", scope_regex: st
     cid = zap.context.new_context(context_name)
     zap.context.include_in_context(context_name, scope_regex)
 
-    cfg = urllib.parse.urlencode({
-        "loginUrl": auth.login_url,
-        "loginRequestData": auth.login_request_data,
-    })
-    zap.authentication.set_authentication_method(cid, auth.method, cfg)
+    # CSRF/anti-forgery-token logins need SCRIPT-based auth (the bundled
+    # csrf_auth.js GETs the login page, scrapes the token, and POSTs it) — the
+    # same script the Playwright path uses. Plain form auth cannot carry a token.
+    if auth.csrf_field:
+        script_name = _ensure_csrf_auth_script(zap)
+        if script_name:
+            params = urllib.parse.urlencode({
+                "scriptName": script_name, "loginUrl": auth.login_url,
+                "csrfField": auth.csrf_field, "loginData": auth.login_request_data})
+            zap.authentication.set_authentication_method(
+                cid, "scriptBasedAuthentication", params)
+            logger.info(f"[auth] pipeline using CSRF script-auth (field {auth.csrf_field})")
+        else:
+            logger.warning("[auth] CSRF requested but ZAP script engine unavailable; "
+                           "falling back to form auth")
+            cfg = urllib.parse.urlencode({"loginUrl": auth.login_url,
+                                          "loginRequestData": auth.login_request_data})
+            zap.authentication.set_authentication_method(cid, auth.method, cfg)
+    else:
+        cfg = urllib.parse.urlencode({
+            "loginUrl": auth.login_url,
+            "loginRequestData": auth.login_request_data,
+        })
+        zap.authentication.set_authentication_method(cid, auth.method, cfg)
     zap.sessionManagement.set_session_management_method(cid, auth.session_management)
     if auth.logged_in_regex:
         zap.authentication.set_logged_in_indicator(cid, auth.logged_in_regex)

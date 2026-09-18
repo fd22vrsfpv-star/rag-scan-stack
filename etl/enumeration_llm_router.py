@@ -39,7 +39,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 log = logging.getLogger("enumeration_llm_router")
 
-LLM_URL = os.environ.get("LLM_URL", "https://llm_query:8002/ollama/chat")
+# llm_query listens on HTTP, not HTTPS — an https:// URL fails with an SSL
+# "record layer failure" and every router LLM call then fails closed silently.
+LLM_URL = os.environ.get("LLM_URL", "http://llm_query:8002/ollama/chat")
 
 # Fact kinds the LLM roles may emit / keep — the vocabulary the extractors and
 # rules already speak. An invented kind nothing consumes is dropped.
@@ -385,15 +387,19 @@ class EnumerationLLMRouter:
     # ── deepen ─────────────────────────────────────────────────────────────────
     _DEEPEN_TOOLS = {"curl", "wget", "http", "httpx", "nuclei", "whatweb"}
 
-    def deepen_finding(self, finding: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Investigate an INFORMATIONAL finding the deterministic rules did not
-        name: ask the LLM whether it is worth a deeper look and, if so, for ONE
-        READ-ONLY probe (curl/http/nuclei/whatweb) that turns the note into
-        evidence. Returns {command, why, assertion} or None. Budget-capped
-        (separate bucket) and fail-CLOSED — never proposes on error, and rejects
-        anything but a read-only allowlisted tool so a queued item is safe."""
+    def deepen_finding(self, finding: Dict[str, Any],
+                       force: bool = False) -> Optional[Dict[str, Any]]:
+        """Investigate a finding: ask the LLM for ONE READ-ONLY probe
+        (curl/http/nuclei/whatweb) that turns it into evidence. Returns
+        {command, why, assertion} or None. Budget-capped (separate bucket) and
+        fail-CLOSED — never proposes on error, and rejects anything but a
+        read-only allowlisted tool so a queued item is safe.
+
+        force=True is the OPERATOR-INITIATED path ("Deepen this finding" button):
+        propose the best probe regardless of the auto-triage `worth` verdict, and
+        bypass the enabled-flag (the operator asked for it explicitly)."""
         p = self.route("deepen")
-        if not _GLOBAL_ENABLED or not p.get("enabled"):
+        if not _GLOBAL_ENABLED or (not force and not p.get("enabled")):
             return None
         url = finding.get("url") or finding.get("target") or ""
         name = finding.get("name") or finding.get("issue_type") or ""
@@ -402,19 +408,23 @@ class EnumerationLLMRouter:
         if not self._within_budget(p, consume=True, bucket=self._deepen_calls):
             return None
         try:
+            worth_clause = (
+                "The operator has explicitly asked to investigate this finding, so "
+                "ALWAYS propose the best probe (set worth=true)."
+                if force else
+                "Decide whether it is worth a deeper look.")
             system = (
-                "You are triaging an INFORMATIONAL web finding for AUTHORIZED "
-                "security testing. Decide whether it is worth a deeper look, and if "
-                "so give ONE READ-ONLY probe that turns the note into evidence. The "
-                "command MUST be read-only and start with one of: curl, wget, http, "
-                "httpx, nuclei, whatweb. Return ONLY JSON: "
+                "You are triaging a web finding for AUTHORIZED security testing. "
+                f"{worth_clause} Give ONE READ-ONLY probe that turns the finding "
+                "into evidence. The command MUST be read-only and start with one "
+                "of: curl, wget, http, httpx, nuclei, whatweb. Return ONLY JSON: "
                 '{"worth": true|false, "command": "<one read-only command using the '
                 'URL>", "assertion": {"contains": "<expected string>"}, '
                 '"why": "<one short sentence>"}. If not worth deepening, '
                 '{"worth": false}.')
             user = f"Finding: {name}\nURL: {url}\nType: {finding.get('issue_type') or ''}"
             parsed = self._first_json(self._call_llm(system, user, p))
-            if not isinstance(parsed, dict) or not parsed.get("worth"):
+            if not isinstance(parsed, dict) or (not force and not parsed.get("worth")):
                 return None
             cmd = str(parsed.get("command") or "").strip()
             head = (cmd.split() or [""])[0].split("/")[-1].lower()

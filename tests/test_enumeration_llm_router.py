@@ -213,3 +213,10 @@ def test_review_all_scope_reviews_everything(monkeypatch):
               "source": "extractor"}]
     res = r.review(facts, output="ctx", target="10.0.0.7")
     assert res["reviewed"] == 1
+
+
+def test_deepen_force_proposes_even_when_not_worth(monkeypatch):
+    # worth=false, but the operator forced it -> still return the probe
+    _fake_requests(monkeypatch, '{"worth":false,"command":"curl -sk http://app/x"}')
+    got = _router().deepen_finding({"name": "X", "url": "http://app/x"}, force=True)
+    assert got and got["command"].startswith("curl")
