@@ -428,6 +428,20 @@ async def add_comment(source: str, fid: str, body: CommentBody):
         return safe_json(resp)
 
 
+@router.post("/api/findings/{source}/{fid}/deepen")
+async def deepen_finding(source: str, fid: str, body: dict = None):
+    """Operator "Deepen this finding": run the read-only probe synthesis and queue
+    it. Longer timeout — this calls the LLM."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=90) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/findings/{source}/{fid}/deepen",
+            json=body or {},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
 @router.get("/api/findings/{source}/{fid}/activity")
 async def get_activity(source: str, fid: str):
     s = get_settings()

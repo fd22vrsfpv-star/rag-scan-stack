@@ -1433,6 +1433,79 @@ def _deepen_info_findings(cur, facts, context, rules, out) -> None:
                        "engagement_id": context.get("engagement_id")})
 
 
+def deepen_web_finding(finding_id: str,
+                       engagement_id: Optional[str] = None) -> Dict[str, Any]:
+    """OPERATOR-INITIATED deepen ("Deepen this finding" button): load one
+    web_finding, ask the router (force=True) for a read-only probe, scope-gate it,
+    and queue it pending. Returns {ok, queued, command?, why?, reason?}. One
+    implementation shared with the automatic _deepen_info_findings tier."""
+    from psycopg2.extras import Json
+    try:
+        from etl.scope_gate import check_dispatch, load_dispatch_scope
+    except ImportError:  # pragma: no cover
+        from scope_gate import check_dispatch, load_dispatch_scope
+    out: Dict[str, Any] = {"ok": False, "queued": 0}
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT wf.url, COALESCE(wf.name,''), COALESCE(wf.issue_type,''),
+                          COALESCE(wf.severity,''), host(a.ip)
+                     FROM web_findings wf JOIN assets a ON a.id = wf.asset_id
+                    WHERE wf.id = %s::uuid""", (finding_id,))
+            r = cur.fetchone()
+            if not r:
+                out["reason"] = "finding not found"
+                return out
+            url, name, issue_type, severity, host = r
+            fact = {"fact": "web_finding", "target": host, "service": "http",
+                    "web_finding_id": finding_id, "url": url, "name": name,
+                    "issue_type": issue_type, "severity": (severity or "").lower()}
+            proposal = _enum_router().deepen_finding(fact, force=True)
+            if not proposal:
+                out["reason"] = "no probe proposed (LLM unavailable or declined)"
+                return out
+            command = proposal["command"]
+            scope_rows, scope_source = load_dispatch_scope(cur, engagement_id)
+            if scope_source == "unavailable":
+                out["reason"] = "scope could not be loaded"
+                return out
+            refusal = check_dispatch(str(host), scope_rows, command=command)
+            if refusal:
+                _observe(cur, "deepen:manual",
+                         {"tool": "deepen", "target": host, "engagement_id": engagement_id},
+                         fact, command, None, refused=str(refusal))
+                conn.commit()
+                out["reason"] = f"out of scope: {refusal}"
+                return out
+            cur.execute(
+                """INSERT INTO scan_recommendations
+                     (ip, service, scanner, action, script, source, priority,
+                      status, engagement_id, extra)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s)
+                   ON CONFLICT (fingerprint) DO NOTHING RETURNING id::text""",
+                (host, "http", "deepen", command, command, SOURCE, 35,
+                 engagement_id,
+                 Json({"deepened_finding": finding_id, "why": proposal.get("why"),
+                       "assertion": proposal.get("assertion"),
+                       "finding_name": name, "queued_by": "deepen:manual"})))
+            row = cur.fetchone()
+            rec_id = row[0] if row else None
+            _observe(cur, "deepen:manual",
+                     {"tool": "deepen", "target": host, "engagement_id": engagement_id},
+                     fact, command, rec_id)
+            conn.commit()
+            out.update({"ok": True, "queued": 1 if rec_id else 0,
+                        "recommendation_id": rec_id, "command": command,
+                        "why": proposal.get("why"), "target": host})
+            _emit_webhook("web_finding_deepened",
+                          {"target": host, "finding_id": finding_id,
+                           "engagement_id": engagement_id})
+    except Exception as e:  # noqa: BLE001
+        log.warning("deepen_web_finding failed: %s", e)
+        out["reason"] = str(e)[:200]
+    return out
+
+
 def _observe(cur, rule_id, execution, fact, command, rec_id, refused=None):
     """Record that a rule fired, with what it proposed and on what evidence."""
     from psycopg2.extras import Json
