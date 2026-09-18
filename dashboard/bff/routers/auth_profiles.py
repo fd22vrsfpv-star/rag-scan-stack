@@ -74,6 +74,64 @@ async def auto_populate(request: Request):
         raise HTTPException(502, f"auto-populate failed: {e}")
 
 
+@router.post("/api/auth-profiles/import-session")
+async def import_session(request: Request):
+    """Manual import of an interactively-obtained session (SSO/OAuth/MFA done in
+    the operator's own browser) → session-only Auth Profile."""
+    body = await request.json()
+    try:
+        async with httpx.AsyncClient(timeout=20, verify=False) as c:
+            r = await c.post(f"{_ps()}/auth/import-session", json=body, headers=_hdrs())
+            if r.status_code >= 400:
+                raise HTTPException(r.status_code, r.text[:300])
+            return r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"import-session failed: {e}")
+
+
+@router.post("/api/auth-profiles/interactive-login")
+async def interactive_login(request: Request):
+    """Assisted browser login (SSO/OAuth/OIDC/SAML, +TOTP) that captures the
+    session into an Auth Profile. Long timeout — drives a real browser."""
+    body = await request.json()
+    try:
+        async with httpx.AsyncClient(timeout=120, verify=False) as c:
+            r = await c.post(f"{_ps()}/auth/interactive-login", json=body, headers=_hdrs())
+            if r.status_code >= 400:
+                raise HTTPException(r.status_code, r.text[:300])
+            return r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"interactive-login failed: {e}")
+
+
+@router.post("/api/auth-profiles/interactive-login/{sid}/otp")
+async def interactive_login_otp(sid: str, request: Request):
+    body = await request.json()
+    try:
+        async with httpx.AsyncClient(timeout=60, verify=False) as c:
+            r = await c.post(f"{_ps()}/auth/interactive-login/{sid}/otp", json=body, headers=_hdrs())
+            return r.json() if r.status_code < 400 else {"ok": False, "error": r.text[:200]}
+    except Exception as e:
+        raise HTTPException(502, f"interactive-login otp failed: {e}")
+
+
+@router.post("/api/auth-profiles/oauth-capture")
+async def oauth_capture(request: Request):
+    """OAuth2 token capture (client_credentials / authorization_code / intercept)
+    → persist into an Auth Profile."""
+    body = await request.json()
+    try:
+        async with httpx.AsyncClient(timeout=120, verify=False) as c:
+            r = await c.post(f"{_ps()}/auth/capture", json=body, headers=_hdrs())
+            return r.json() if r.status_code < 400 else {"ok": False, "error": r.text[:300]}
+    except Exception as e:
+        raise HTTPException(502, f"oauth-capture failed: {e}")
+
+
 @router.get("/api/auth-profiles/burp-bundle")
 async def burp_bundle(host: str, engagement_id: str = None):
     params = {"host": host}
