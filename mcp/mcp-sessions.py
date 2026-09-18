@@ -19,7 +19,7 @@ API_KEY = os.environ.get("API_KEY", "changeme")
 # request's engagement — captured PER REQUEST from the caller's X-Engagement-Id
 # header / ?engagement_id (via _engagement_mw), else the ENGAGEMENT_ID env pin,
 # else unset = platform-wide. So the mcpo gateway can scope a single tool call.
-from _engagement_mw import current_engagement, run_streamable
+from _engagement_mw import current_engagement, run_streamable, set_request_engagement
 
 
 def _api_headers(extra=None):
@@ -263,7 +263,7 @@ async def get_session_messages(session_id: Annotated[str, Field(description="Ses
 
 
 @mcp.tool()
-async def cleanup_findings(sources: Annotated[Optional[list[str]], Field(description="Filter by source, e.g. ['nuclei', 'nmap', 'zap']. Deletes all if omitted")] = None, older_than_hours: Annotated[Optional[int], Field(description="Only delete findings older than N hours")] = None, dry_run: Annotated[bool, Field(description="If true, only show what would be deleted")] = True) -> str:
+async def cleanup_findings(sources: Annotated[Optional[list[str]], Field(description="Filter by source, e.g. ['nuclei', 'nmap', 'zap']. Deletes all if omitted")] = None, older_than_hours: Annotated[Optional[int], Field(description="Only delete findings older than N hours")] = None, dry_run: Annotated[bool, Field(description="If true, only show what would be deleted")] = True, engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID); omit for the server default.")] = None) -> str:
     """Delete vulnerability findings from the database.
 
     Args:
@@ -271,6 +271,7 @@ async def cleanup_findings(sources: Annotated[Optional[list[str]], Field(descrip
         older_than_hours: Only delete findings older than N hours
         dry_run: If true, only show what would be deleted without deleting (default: true)
     """
+    set_request_engagement(engagement_id)
     payload = {"dry_run": dry_run}
     if sources:
         payload["sources"] = sources

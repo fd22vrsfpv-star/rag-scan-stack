@@ -18,7 +18,7 @@ API_KEY = os.environ.get("API_KEY", "changeme")
 # request's engagement — captured PER REQUEST from the caller's X-Engagement-Id
 # header / ?engagement_id (via _engagement_mw), else the ENGAGEMENT_ID env pin,
 # else unset = platform-wide. So the mcpo gateway can scope a single tool call.
-from _engagement_mw import current_engagement, run_streamable
+from _engagement_mw import current_engagement, run_streamable, set_request_engagement
 
 
 def _api_headers(extra=None):
@@ -149,7 +149,8 @@ async def ingest_zap_alerts(
 
 @mcp.tool()
 async def import_zap_xml_report(
-    xml_content: Annotated[str, Field(description="Raw ZAP XML report content")]
+    xml_content: Annotated[str, Field(description="Raw ZAP XML report content")],
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Import a ZAP XML report file into the platform.
 
@@ -159,6 +160,7 @@ async def import_zap_xml_report(
 
     Findings are deduplicated so re-importing the same report is safe.
     """
+    set_request_engagement(engagement_id)
     # ZAP XML reports can be ingested through the same web_findings pipeline
     # We synthesize it as a file upload to the ingest endpoint
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as client:
@@ -187,7 +189,8 @@ async def export_findings_for_zap(
     severity: Annotated[Optional[str], Field(description="Filter by severity: high, medium, low, info")] = None,
     source: Annotated[Optional[str], Field(description="Filter by source: zap, nuclei, burp, etc.")] = None,
     search: Annotated[Optional[str], Field(description="Search term for finding names/URLs")] = None,
-    limit: Annotated[int, Field(description="Maximum findings to export")] = 100
+    limit: Annotated[int, Field(description="Maximum findings to export")] = 100,
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Export platform findings as a URL list for ZAP import.
 
@@ -195,6 +198,7 @@ async def export_findings_for_zap(
     into ZAP via the 'Import URLs' add-on or seeding the spider. Includes URLs
     from all sources (Gobuster, Katana, Playwright, Burp, etc.).
     """
+    set_request_engagement(engagement_id)
     params = {"limit": limit}
     if severity:
         params["severity"] = severity
@@ -235,13 +239,15 @@ async def search_zap_findings(
     severity: Annotated[Optional[str], Field(description="Filter by severity: high, medium, low, info")] = None,
     url_pattern: Annotated[Optional[str], Field(description="Search URL pattern (partial match)")] = None,
     cwe: Annotated[Optional[str], Field(description="Filter by CWE ID, e.g. 'CWE-79'")] = None,
-    limit: Annotated[int, Field(description="Maximum results to return")] = 50
+    limit: Annotated[int, Field(description="Maximum results to return")] = 50,
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Search ZAP findings in the platform database.
 
     Queries web_findings filtered to source='zap'. Returns JSON array of matching
     findings with severity, URL, name, evidence, CWE, method, and confidence.
     """
+    set_request_engagement(engagement_id)
     params = {"limit": limit, "source": "zap"}
     if severity:
         params["severity"] = severity

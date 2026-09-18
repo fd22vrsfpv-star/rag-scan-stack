@@ -18,7 +18,7 @@ API_KEY = os.environ.get("API_KEY", "changeme")
 # request's engagement — captured PER REQUEST from the caller's X-Engagement-Id
 # header / ?engagement_id (via _engagement_mw), else the ENGAGEMENT_ID env pin,
 # else unset = platform-wide. So the mcpo gateway can scope a single tool call.
-from _engagement_mw import current_engagement, run_streamable
+from _engagement_mw import current_engagement, run_streamable, set_request_engagement
 
 
 def _api_headers(extra=None):
@@ -201,8 +201,9 @@ async def get_osint_job_status(job_id: Annotated[str, Field(description="Job UUI
 
 
 @mcp.tool()
-async def list_scopes() -> str:
+async def list_scopes(engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID); omit for the server default.")] = None) -> str:
     """List all scope names with target counts. Shows how targets are organized into scopes like 'unknown_scope', 'customer_or_third_party', etc."""
+    set_request_engagement(engagement_id)
     async with httpx.AsyncClient(verify=False, timeout=15) as client:
         resp = await client.get(f"{RAG_API_URL}/scope/names", headers=_api_headers())
         return json.dumps(resp.json() if resp.status_code == 200 else {"error": resp.text}, indent=2)
@@ -211,12 +212,14 @@ async def list_scopes() -> str:
 @mcp.tool()
 async def list_scope_targets(
     scope_name: Annotated[str, Field(description="Scope name, e.g. 'unknown_scope' or 'customer_apps'")],
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """List all targets in a specific scope.
 
     Args:
         scope_name: Name of the scope to list targets from
     """
+    set_request_engagement(engagement_id)
     async with httpx.AsyncClient(verify=False, timeout=15) as client:
         resp = await client.get(f"{RAG_API_URL}/scope", params={"name": scope_name}, headers=_api_headers())
         return json.dumps(resp.json() if resp.status_code == 200 else {"error": resp.text}, indent=2)
@@ -227,6 +230,7 @@ async def move_to_scope(
     targets: Annotated[list[str], Field(description="List of hostnames, domains, or IPs to move")],
     from_scope: Annotated[str, Field(description="Source scope name to remove from, e.g. 'unknown_scope'")],
     to_scope: Annotated[str, Field(description="Destination scope name to add to, e.g. 'customer_apps'. Creates if new.")],
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Move targets from one scope to another. Removes from source, adds to destination.
     Use this to triage assets from 'unknown_scope' into proper scopes.
@@ -236,6 +240,7 @@ async def move_to_scope(
         from_scope: Source scope name to remove targets from
         to_scope: Destination scope name to move targets to (created if doesn't exist)
     """
+    set_request_engagement(engagement_id)
     async with httpx.AsyncClient(verify=False, timeout=30) as client:
         resp = await client.post(
             f"{RAG_API_URL}/scope/move",
@@ -249,6 +254,7 @@ async def move_to_scope(
 async def add_to_scope(
     targets: Annotated[list[str], Field(description="List of hostnames, domains, or IPs to add")],
     scope_name: Annotated[str, Field(description="Scope name to add targets to, e.g. 'customer_apps'")] = "default",
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Add targets to a scope without removing from any other scope.
 
@@ -256,6 +262,7 @@ async def add_to_scope(
         targets: List of hostnames/domains/IPs to add
         scope_name: Scope name to add to (created if doesn't exist)
     """
+    set_request_engagement(engagement_id)
     target_items = []
     for t in targets:
         t = t.strip()
@@ -273,9 +280,10 @@ async def add_to_scope(
 
 
 @mcp.tool()
-async def auto_assign_unknown_scope() -> str:
+async def auto_assign_unknown_scope(engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID); omit for the server default.")] = None) -> str:
     """Scan all assets and recon findings, assign any that aren't in a scope to 'unknown_scope'.
     Run this after new scans to triage unscoped discoveries."""
+    set_request_engagement(engagement_id)
     async with httpx.AsyncClient(verify=False, timeout=120) as client:
         resp = await client.post(f"{RAG_API_URL}/scope/auto-assign-unknown", headers=_api_headers())
         return json.dumps(resp.json() if resp.status_code == 200 else {"error": resp.text}, indent=2)
@@ -284,12 +292,14 @@ async def auto_assign_unknown_scope() -> str:
 @mcp.tool()
 async def get_domain_overview(
     domain: Annotated[str, Field(description="Domain or subdomain to get overview for, e.g. 'blog.example.com'")],
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Get full recon overview for a domain or subdomain: subdomains, DNS, HTTP services, TLS, web findings, parameters.
 
     Args:
         domain: Domain or subdomain name
     """
+    set_request_engagement(engagement_id)
     async with httpx.AsyncClient(verify=False, timeout=30) as client:
         resp = await client.get(
             f"{RAG_API_URL}/recon/domains/{domain}/overview",
