@@ -2,6 +2,7 @@ import { useLocation } from 'react-router-dom'
 import { useHealth } from '@/api/reports'
 import { useScanCount } from '@/api/scans'
 import { useEngagements } from '@/api/engagements'
+import { useScopeNames } from '@/api/scope'
 import { useUIStore } from '@/stores/ui'
 import { useAutoSelectEngagementScope } from '@/hooks/useAutoSelectEngagementScope'
 import { BUILD_VERSION } from '@/lib/constants'
@@ -67,7 +68,13 @@ export function TopBar() {
   const { data: health } = useHealth()
   const { data: activeScans = 0 } = useScanCount()
   const { data: engData } = useEngagements()
-  const { chatOpen, setChatOpen, selectedEngagementId, setSelectedEngagement } = useUIStore()
+  const { chatOpen, setChatOpen, selectedEngagementId, setSelectedEngagement,
+          selectedScopeName, setSelectedScope } = useUIStore()
+  // Scope names for the active engagement — this global selector drives the
+  // scope filter across the recon views (findings, parameters, screenshots,
+  // metadata), so scope lives next to the engagement selector rather than being
+  // re-picked per tab.
+  const scopeNames = useScopeNames().data?.names ?? []
   // When engagement changes, auto-select the largest scope (one-time per change).
   useAutoSelectEngagementScope()
 
@@ -102,6 +109,21 @@ export function TopBar() {
           <option value="">All Engagements</option>
           {engagements.map(e => (
             <option key={e.id} value={e.id}>{e.name}</option>
+          ))}
+        </select>
+
+        {/* Scope selector — filters the recon views (findings, parameters,
+            screenshots, metadata) to one scope within the engagement. */}
+        <select
+          value={selectedScopeName ?? ''}
+          onChange={e => setSelectedScope(e.target.value || null)}
+          className="h-7 text-xs rounded border border-border bg-background px-2 text-foreground max-w-[160px]"
+          title="Scope filter — applies across the recon views"
+          disabled={scopeNames.length === 0}
+        >
+          <option value="">All scopes</option>
+          {scopeNames.map(s => (
+            <option key={s.name} value={s.name}>{s.name} ({s.target_count})</option>
           ))}
         </select>
 
