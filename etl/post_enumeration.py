@@ -76,7 +76,7 @@ SUPPRESS_AFTER = int(os.environ.get("ENUMERATION_SUPPRESS_AFTER", "5"))
 # is unreachable — the safe direction is "no extra facts", never "act blind".
 LLM_FALLBACK_ENABLED = os.environ.get("ENUMERATION_LLM_FALLBACK", "1") not in (
     "0", "false", "False", "")
-LLM_URL = os.environ.get("LLM_URL", "https://llm_query:8002/ollama/chat")
+LLM_URL = os.environ.get("LLM_URL", "http://llm_query:8002/ollama/chat")
 # Omit the model by default so llm_query TASK-ROUTES it. A hardcoded model here
 # masquerades as a caller choice and 404s on backends that route by task
 # (see memory: llm-query-model-default-defeats-routing). Set POSTEX_LLM_MODEL to
