@@ -102,9 +102,19 @@ def parse_httpx(path: str, profile: str = "upload", job_id: str = None):
                         svc = 'https' if url.startswith('https') else 'http'
                         try:
                             cur.execute("SAVEPOINT port_sp")
+                            # A successful httpx fingerprint (we got an HTTP
+                            # response + Server banner) is PROOF the port is open,
+                            # so assert is_open=true even if a prior port scan
+                            # recorded it closed/filtered — that commonly happens
+                            # when the network scan is routed through a proxy that
+                            # can't reach the host while the web scan went direct.
                             cur.execute("""INSERT INTO ports (id, asset_id, proto, port, service, product, is_open)
                                           VALUES (%s, %s, 'tcp', %s, %s, %s, true)
-                                          ON CONFLICT DO NOTHING""",
+                                          ON CONFLICT (asset_id, proto, port) DO UPDATE SET
+                                            is_open = true,
+                                            service = EXCLUDED.service,
+                                            product = COALESCE(EXCLUDED.product, ports.product),
+                                            last_seen = now()""",
                                         (str(uuid.uuid4()), asset_id, port, svc, webserver or None))
                             cur.execute("RELEASE SAVEPOINT port_sp")
                         except Exception:
