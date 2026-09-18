@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { apiUrl } from '@/api/client'
+import { apiFetch } from '@/api/client'
+import { useUIStore } from '@/stores/ui'
 import PageHelp from '@/components/PageHelp'
 import PopoutButton from '@/components/PopoutButton'
 import {
@@ -85,6 +86,11 @@ export default function Users() {
   // (The detail popout writes ?member_of=<group>; without this, opening
   // such a link landed on /users with no filter and showed every row.)
   const [searchParams] = useSearchParams()
+  // The identity views are scoped to the active engagement (identities carry
+  // engagement_id). apiFetch sends the X-Engagement-Id header; this id is also
+  // in every query key so switching engagements refetches instead of showing
+  // the previous engagement's (or all engagements') accounts.
+  const engagementId = useUIStore(s => s.selectedEngagementId) ?? ''
   const _initial = (key: string) => searchParams.get(key) || ''
   const [provider, setProvider] = useState<string>(_initial('provider'))
   const [principalType, setPrincipalType] = useState<string>(_initial('principal_type'))
@@ -181,8 +187,8 @@ export default function Users() {
   }
 
   const summaryQ = useQuery({
-    queryKey: ['identities', 'summary'],
-    queryFn: async () => (await fetch(apiUrl('/identities/summary'))).json(),
+    queryKey: ['identities', 'summary', engagementId],
+    queryFn: () => apiFetch<Record<string, number>>('/identities/summary'),
     refetchInterval: 30_000,
   })
 
@@ -190,12 +196,8 @@ export default function Users() {
   // the group-filter dropdown so an operator can pick e.g. "Domain Admins"
   // and export only that group's members.
   const groupsQ = useQuery({
-    queryKey: ['identities', 'groups'],
-    queryFn: async () => {
-      const r = await fetch(apiUrl('/identities/groups'))
-      if (!r.ok) throw new Error(await r.text())
-      return r.json() as Promise<{ results: Array<{ name: string; members: number }> }>
-    },
+    queryKey: ['identities', 'groups', engagementId],
+    queryFn: () => apiFetch<{ results: Array<{ name: string; members: number }> }>('/identities/groups'),
     refetchInterval: 60_000,
   })
   const groups = groupsQ.data?.results ?? []
@@ -219,12 +221,8 @@ export default function Users() {
   params.set('offset', String(page * pageSize))
 
   const listQ = useQuery({
-    queryKey: ['identities', 'list', params.toString()],
-    queryFn: async () => {
-      const r = await fetch(apiUrl(`/identities?${params.toString()}`))
-      if (!r.ok) throw new Error(await r.text())
-      return r.json()
-    },
+    queryKey: ['identities', 'list', engagementId, params.toString()],
+    queryFn: () => apiFetch<{ results: Identity[]; total: number }>(`/identities?${params.toString()}`),
   })
 
   // Fetch every row matching the current filters, paging in batches up to
@@ -241,9 +239,7 @@ export default function Users() {
     const HARD_CAP = 100_000
     while (all.length < HARD_CAP) {
       filterParams.set('offset', String(off))
-      const r = await fetch(apiUrl(`/identities?${filterParams.toString()}`))
-      if (!r.ok) throw new Error(await r.text())
-      const j = await r.json()
+      const j = await apiFetch<{ results?: Identity[] }>(`/identities?${filterParams.toString()}`)
       const got: Identity[] = j.results ?? []
       all.push(...got)
       if (got.length < PAGE_BATCH) break
@@ -290,12 +286,7 @@ export default function Users() {
 
   const detailQ = useQuery({
     queryKey: ['identities', 'detail', selectedId],
-    queryFn: async () => {
-      if (!selectedId) return null
-      const r = await fetch(apiUrl(`/identities/${selectedId}`))
-      if (!r.ok) throw new Error(await r.text())
-      return r.json() as Promise<IdentityDetail>
-    },
+    queryFn: () => selectedId ? apiFetch<IdentityDetail>(`/identities/${selectedId}`) : Promise.resolve(null),
     enabled: !!selectedId,
   })
 
