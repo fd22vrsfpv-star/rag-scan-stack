@@ -516,8 +516,7 @@ function EnumerationSection({ ip }: { ip: string }) {
           <h4 className="text-xs font-medium text-muted-foreground mb-2">Highlights</h4>
           <div className="flex flex-col gap-1.5">
             {hl.map((h, i) => (
-              <div key={i} className={`px-3 py-1.5 rounded border text-xs font-medium flex items-center gap-2 ${sevClass[h.severity] ?? sevClass.low}`}>
-                <span className="uppercase text-[9px] tracking-wide opacity-80">{h.severity}</span>
+              <div key={i} className={`px-3 py-1.5 rounded border text-xs font-medium ${sevClass[h.severity] ?? sevClass.low}`}>
                 <span>{h.label}</span>
               </div>
             ))}
@@ -619,17 +618,35 @@ function EnumerationSection({ ip }: { ip: string }) {
         <div>
           <h4 className="text-xs font-medium text-muted-foreground mb-2">
             Listening ports ({listening.length}) — seen from inside the host
+            {listening.some(l => l.local_only) && (
+              <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded border bg-red-500/15 text-red-400 border-red-500/40">
+                {listening.filter(l => l.local_only).length} local-only — follow up
+              </span>
+            )}
           </h4>
           <div className="flex flex-wrap gap-1.5">
-            {listening.map((l, i) => (
-              <span key={i}
-                className={`px-2 py-0.5 rounded border text-[11px] font-mono ${l.internal_only
-                  ? 'bg-amber-500/15 text-amber-400 border-amber-500/30'
-                  : 'bg-muted text-foreground border-border'}`}
-                title={`${l.address ?? '*'}:${l.port}${l.process ? ` (${l.process})` : ''}${l.internal_only ? ' — internal only (pivot target)' : ''}`}>
-                {l.port}{l.process ? `/${l.process}` : ''}{l.internal_only ? ' \u2022 internal' : ''}
-              </span>
-            ))}
+            {listening.map((l, i) => {
+              const raw = (l.address ?? '*').trim()
+              // normalise the bind address for display: * -> all interfaces,
+              // wrap bare IPv6 in [] so :port is unambiguous.
+              const addr = raw === '*' || raw === '0.0.0.0' ? '0.0.0.0'
+                : (raw.includes(':') && !raw.startsWith('[')) ? `[${raw}]`
+                : raw
+              const bindLabel = l.local_only ? 'loopback (local only)'
+                : (raw === '*' || raw === '0.0.0.0' || raw === '::') ? 'all interfaces'
+                : `bound to ${raw}`
+              return (
+                <span key={i}
+                  className={`px-2 py-0.5 rounded border text-[11px] font-mono ${l.local_only
+                    ? 'bg-red-500/20 text-red-400 border-red-500/50 font-medium'
+                    : l.internal_only
+                      ? 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                      : 'bg-muted text-foreground border-border'}`}
+                  title={`${addr}:${l.port}${l.process ? ` (${l.process})` : ''} — ${bindLabel}${l.local_only ? ' — reachable only by pivoting through this host, follow up' : l.internal_only ? ' — internal only (pivot target)' : ''}`}>
+                  {addr}:{l.port}{l.process ? ` ${l.process}` : ''}{l.local_only ? ' \u2022 local-only' : l.internal_only ? ' \u2022 internal' : ''}
+                </span>
+              )
+            })}
           </div>
         </div>
       )}
