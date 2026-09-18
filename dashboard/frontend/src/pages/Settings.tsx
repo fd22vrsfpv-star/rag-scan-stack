@@ -4642,6 +4642,7 @@ function AuthProfilesCard() {
   const [profiles, setProfiles] = useState<AuthProfile[]>([])
   const [form, setForm] = useState({ ...empty })
   const [ap, setAp] = useState({ host: '', login_url: '' })
+  const [imp, setImp] = useState({ host: '', json: '' })
   const [msg, setMsg] = useState('')
 
   const load = async () => {
@@ -4672,6 +4673,22 @@ function AuthProfilesCard() {
     try {
       await apiFetch('/auth-profiles/auto-populate', { method: 'POST', body: JSON.stringify(ap) })
       flash('auto-populated from discovered credential'); setAp({ host: '', login_url: '' }); load()
+    } catch (e: any) { flash(String(e?.message || e)) }
+  }
+  const importSession = async () => {
+    if (!imp.host || !imp.json) { flash('host + session JSON required'); return }
+    let payload: any = { host: imp.host }
+    try {
+      const parsed = JSON.parse(imp.json)
+      // storage_state (Playwright), a HAR, or a plain cookies array
+      if (parsed?.origins || parsed?.cookies) payload.storage_state = parsed
+      else if (parsed?.log?.entries) payload.har = parsed
+      else if (Array.isArray(parsed)) payload.cookies = parsed
+      else payload.headers = parsed
+    } catch { flash('session JSON is not valid JSON'); return }
+    try {
+      await apiFetch('/auth-profiles/import-session', { method: 'POST', body: JSON.stringify(payload) })
+      flash('session imported'); setImp({ host: '', json: '' }); load()
     } catch (e: any) { flash(String(e?.message || e)) }
   }
 
@@ -4740,6 +4757,23 @@ function AuthProfilesCard() {
         <button onClick={autoPopulate} className="h-8 px-3 text-sm rounded border border-border">
           Auto-populate from credential
         </button>
+      </div>
+
+      {/* import an interactively-obtained session (SSO/OAuth/MFA done elsewhere) */}
+      <div className="space-y-1 pt-2 border-t border-border/50">
+        <label className="block text-xs text-muted-foreground">
+          Import session (SSO/OAuth/MFA): paste a Playwright storage_state, a HAR, or a cookies array
+        </label>
+        <div className="flex flex-wrap items-start gap-2">
+          <input className={inputCls} placeholder="host" value={imp.host}
+                 onChange={e => setImp({ ...imp, host: e.target.value })} />
+          <textarea className="flex-1 min-w-[240px] h-16 px-2 py-1 text-xs rounded border border-border bg-background font-mono"
+                    placeholder='{"cookies":[...],"origins":[...]}  or  [{"name":"sid","value":"..."}]'
+                    value={imp.json} onChange={e => setImp({ ...imp, json: e.target.value })} />
+          <button onClick={importSession} className="h-8 px-3 text-sm rounded border border-border">
+            Import session
+          </button>
+        </div>
       </div>
       {msg && <span className="text-xs text-green-500">{msg}</span>}
     </div>
