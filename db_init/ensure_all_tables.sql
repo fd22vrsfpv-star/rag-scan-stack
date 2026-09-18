@@ -3734,6 +3734,32 @@ CREATE TABLE IF NOT EXISTS scope_targets (
 );
 CREATE INDEX IF NOT EXISTS idx_scope_targets_name ON scope_targets(name);
 
+-- A scope carries the empty '' placeholder sentinel (source='__placeholder__')
+-- ONLY while it has zero real targets, so an empty scope stays visible in the
+-- UI. The moment a REAL target is added, the placeholder must go — otherwise the
+-- scope holds a blank-target row, and blank targets are an ILIKE '%%' wildcard
+-- trap in scope-intelligence (it matched every engagement's recon findings).
+-- This trigger enforces the invariant at EVERY insert path (present and future),
+-- not just the one endpoint that creates the placeholder.
+CREATE OR REPLACE FUNCTION public.scope_targets_drop_placeholder()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF COALESCE(btrim(NEW.target), '') <> ''
+       AND NEW.source IS DISTINCT FROM '__placeholder__' THEN
+        DELETE FROM public.scope_targets
+         WHERE name = NEW.name
+           AND engagement_id IS NOT DISTINCT FROM NEW.engagement_id
+           AND id <> NEW.id
+           AND (source = '__placeholder__' OR COALESCE(btrim(target), '') = '');
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_scope_targets_drop_placeholder ON public.scope_targets;
+CREATE TRIGGER trg_scope_targets_drop_placeholder
+    AFTER INSERT ON public.scope_targets
+    FOR EACH ROW EXECUTE FUNCTION public.scope_targets_drop_placeholder();
+
 -- ============================================================================
 -- TIER 17: Scope Auto-Classification (learn from user scope decisions)
 -- ============================================================================
