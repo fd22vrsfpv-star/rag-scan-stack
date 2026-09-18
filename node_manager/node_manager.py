@@ -999,7 +999,7 @@ def _ensure_db_constraints():
             cur.execute("""
                 ALTER TABLE remote_nodes DROP CONSTRAINT IF EXISTS remote_nodes_status_check;
                 ALTER TABLE remote_nodes ADD CONSTRAINT remote_nodes_status_check
-                    CHECK (status IN ('online','offline','degraded','provisioning','connecting','error','rotating'))
+                    CHECK (status IN ('online','offline','degraded','provisioning','connecting','error','rotating','disabled'))
             """)
         except Exception:
             pass
