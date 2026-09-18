@@ -4627,6 +4627,121 @@ function ExploitWatcherTab() {
       <MsfPayloadSettings />
       <SessionWatchdogCard />
       <ExtractorPromotionCard />
+      <AuthProfilesCard />
+    </div>
+  )
+}
+
+interface AuthProfile {
+  host: string; login_url?: string; username?: string; auth_type?: string
+  has_password?: boolean; has_credential?: boolean; has_session?: boolean; enabled?: boolean
+}
+
+function AuthProfilesCard() {
+  const empty = { host: '', login_url: '', login_data: '', username: '', password: '', csrf_field: '' }
+  const [profiles, setProfiles] = useState<AuthProfile[]>([])
+  const [form, setForm] = useState({ ...empty })
+  const [ap, setAp] = useState({ host: '', login_url: '' })
+  const [msg, setMsg] = useState('')
+
+  const load = async () => {
+    try {
+      const r = await apiFetch<{ configs: AuthProfile[] }>('/auth-profiles')
+      setProfiles(r?.configs || [])
+    } catch { /* ignore */ }
+  }
+  useEffect(() => { load() }, [])
+
+  const flash = (m: string) => { setMsg(m); setTimeout(() => setMsg(''), 2500) }
+
+  const save = async () => {
+    if (!form.host || !form.login_url || !form.login_data) {
+      flash('host, login_url and login_data are required'); return
+    }
+    try {
+      await apiFetch('/auth-profiles', { method: 'POST', body: JSON.stringify(form) })
+      setForm({ ...empty }); flash('saved'); load()
+    } catch (e: any) { flash(String(e?.message || e)) }
+  }
+  const del = async (host: string) => {
+    try { await apiFetch(`/auth-profiles/${encodeURIComponent(host)}`, { method: 'DELETE' }); load() }
+    catch (e: any) { flash(String(e?.message || e)) }
+  }
+  const autoPopulate = async () => {
+    if (!ap.host) { flash('host required for auto-populate'); return }
+    try {
+      await apiFetch('/auth-profiles/auto-populate', { method: 'POST', body: JSON.stringify(ap) })
+      flash('auto-populated from discovered credential'); setAp({ host: '', login_url: '' }); load()
+    } catch (e: any) { flash(String(e?.message || e)) }
+  }
+
+  const inputCls = 'h-8 px-2 text-sm rounded border border-border bg-background'
+  return (
+    <div className="border border-border rounded-lg p-4 space-y-3">
+      <div>
+        <h3 className="text-base font-semibold">Auth Profiles (authenticated scanning + Burp)</h3>
+        <p className="text-sm text-muted-foreground">
+          One portable web-auth model: it drives the platform's ZAP pipeline (authenticated
+          crawl + scan) and feeds Burp (<span className="font-mono text-xs">application_logins</span> +
+          session HAR). Reference a discovered credential by id (the secret is resolved at scan
+          time, never stored here), or auto-populate a profile from a discovered credential + the
+          login page.
+        </p>
+      </div>
+
+      {/* existing profiles */}
+      <div className="space-y-1">
+        {profiles.length === 0 && <div className="text-xs text-muted-foreground">No profiles yet.</div>}
+        {profiles.map(p => (
+          <div key={p.host} className="flex items-center gap-2 text-sm border-b border-border/50 py-1">
+            <span className="font-mono">{p.host}</span>
+            <span className="text-xs text-muted-foreground">{p.auth_type || 'form'}</span>
+            {p.has_credential && <span className="text-xs text-green-500">cred</span>}
+            {p.has_session && <span className="text-xs text-blue-400">session</span>}
+            {p.has_password && <span className="text-xs text-amber-500">inline-pw</span>}
+            <span className="flex-1" />
+            <button onClick={() => del(p.host)} className="text-xs text-red-400 hover:underline">delete</button>
+          </div>
+        ))}
+      </div>
+
+      {/* create / upsert */}
+      <div className="grid grid-cols-2 gap-2">
+        <input className={inputCls} placeholder="host (app.example)" value={form.host}
+               onChange={e => setForm({ ...form, host: e.target.value })} />
+        <input className={inputCls} placeholder="login_url" value={form.login_url}
+               onChange={e => setForm({ ...form, login_url: e.target.value })} />
+        <input className={inputCls + ' col-span-2'} placeholder="login_data (user={%username%}&pass={%password%})"
+               value={form.login_data} onChange={e => setForm({ ...form, login_data: e.target.value })} />
+        <input className={inputCls} placeholder="username" value={form.username}
+               onChange={e => setForm({ ...form, username: e.target.value })} />
+        <input className={inputCls} placeholder="csrf_field (optional)" value={form.csrf_field}
+               onChange={e => setForm({ ...form, csrf_field: e.target.value })} />
+        <input className={inputCls + ' col-span-2'} type="password"
+               placeholder="password (leave blank to reference a discovered credential)"
+               value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} />
+      </div>
+      <button onClick={save} className="h-8 px-3 text-sm rounded bg-primary text-primary-foreground">
+        Save profile
+      </button>
+
+      {/* auto-populate */}
+      <div className="flex flex-wrap items-end gap-2 pt-2 border-t border-border/50">
+        <div className="space-y-1">
+          <label className="block text-xs text-muted-foreground">Auto-populate: host</label>
+          <input className={inputCls} placeholder="host" value={ap.host}
+                 onChange={e => setAp({ ...ap, host: e.target.value })} />
+        </div>
+        <div className="space-y-1">
+          <label className="block text-xs text-muted-foreground">login_url (optional)</label>
+          <input className={inputCls} placeholder="http://host/login" value={ap.login_url}
+                 onChange={e => setAp({ ...ap, login_url: e.target.value })} />
+        </div>
+        <button onClick={autoPopulate} className="h-8 px-3 text-sm rounded border border-border">
+          Auto-populate from credential
+        </button>
+      </div>
+      {msg && <span className="text-xs text-green-500">{msg}</span>}
     </div>
   )
 }

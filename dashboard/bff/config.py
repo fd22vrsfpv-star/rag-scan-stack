@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     exploit_runner_url: str = "https://exploit-runner:8017"
     scan_recommender_url: str = "https://scan-recommender:8013"
     autogen_url: str = "https://autogen-agents:8015"
+    playwright_scanner_url: str = "https://playwright-scanner:8014"
     ollama_url: str = "http://ollama:11434"
     brutus_runner_url: str = "https://brutus-runner:8025"
     kali_listener_url: str = "https://kali-listener:8019"

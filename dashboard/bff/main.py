@@ -17,6 +17,7 @@ from routers.security_tests import router as security_tests_router
 from routers.control import router as control_router
 from routers.reports import router as reports_router
 from routers.chat import router as chat_router
+from routers.auth_profiles import router as auth_profiles_router
 from routers.feedback import router as feedback_router
 from routers.maintenance import router as maintenance_router
 from routers.agent_sessions import router as agent_sessions_router
@@ -107,6 +108,7 @@ app.include_router(security_tests_router)
 app.include_router(control_router)
 app.include_router(reports_router)
 app.include_router(chat_router)
+app.include_router(auth_profiles_router)
 app.include_router(feedback_router)
 app.include_router(webhook_router)
 app.include_router(maintenance_router)
