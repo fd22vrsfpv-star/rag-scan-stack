@@ -77,3 +77,41 @@ def test_every_written_status_is_in_the_check():
         f"langgraph_engine writes agent-session statuses the CHECK rejects: "
         f"{sorted(bad)} (allowed: {sorted(allowed)}). A live run will raise "
         f'violates check constraint "agent_sessions_status_check".')
+
+
+def test_all_agent_session_status_checks_include_scanning():
+    """Every definition of the agent_sessions status CHECK — in ANY .py or .sql
+    file, CREATE TABLE or migration ALTER alike — must include 'scanning'.
+
+    WHY: the constraint kept drifting back to a set WITHOUT 'scanning' even
+    though ensure_all_tables.sql had it. The culprit was a runtime migration in
+    autogen_agents/db_utils.py that DROP+ADDs agent_sessions_status_check on
+    every startup with the narrow list, silently undoing the schema file. The
+    original guard only read ensure_all_tables.sql, so it never saw the
+    re-narrowing. This scans the whole repo so no second definition can drift.
+
+    SABOTAGE PROOF: drop 'scanning' from the CHECK in db_utils.py and this fails.
+    """
+    offenders = []
+    for root, dirs, files in os.walk(REPO):
+        dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "__pycache__")]
+        for fn in files:
+            if not (fn.endswith(".py") or fn.endswith(".sql")):
+                continue
+            path = os.path.join(root, fn)
+            try:
+                text = open(path, encoding="utf-8", errors="ignore").read()
+            except OSError:
+                continue
+            # SQL CHECK constraints only — CHECK ( status IN ( ... ) ).
+            # (Excludes Python `if x in (...)` membership tests, which have no CHECK.)
+            for grp in re.findall(r"CHECK\s*\(\s*status\s+IN\s*\(([^)]*)\)", text, re.I):
+                vals = {v.strip().strip("'\"") for v in grp.split(",") if v.strip()}
+                # Only the agent_sessions CHECK carries 'awaiting_approval'.
+                if "awaiting_approval" in vals and "scanning" not in vals:
+                    offenders.append(os.path.relpath(path, REPO))
+    assert not offenders, (
+        "agent_sessions status CHECK missing 'scanning' in: "
+        f"{sorted(set(offenders))}. The engine writes status='scanning'; any "
+        "definition (CREATE or migration ALTER) that omits it will re-narrow "
+        "the live constraint and break LangGraph runs.")
