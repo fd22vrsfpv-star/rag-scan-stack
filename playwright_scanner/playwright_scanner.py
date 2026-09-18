@@ -1011,6 +1011,34 @@ class AuthCaptureRequest(BaseModel):
     token_patterns: list = Field(default=["authorization", "bearer", "token", "jwt", "access_token"])
     wait_seconds: int = Field(30, description="Max wait for intercept mode")
     extra_params: Optional[dict] = None
+    persist_host: Optional[str] = Field(None, description="If set, persist the captured token into a session-only Auth Profile for this host (reusable by ZAP/Burp).")
+    engagement_id: Optional[str] = None
+
+
+def _persist_session_headers(host: str, headers: dict, engagement_id=None):
+    """Upsert the captured session headers into a session-only Auth Profile for
+    `host`, so a token grabbed via OAuth2 client-credentials / interception is
+    reusable by later ZAP scans and the Burp bundle. Best-effort."""
+    if not host or not headers:
+        return False
+    import json as _json
+    _ensure_web_auth_table()
+    try:
+        from db_utils import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO web_auth_configs (host, auth_type, session, enabled, engagement_id)
+                   VALUES (%s,'token',%s::jsonb,true,%s)
+                   ON CONFLICT (COALESCE(engagement_id,
+                       '00000000-0000-0000-0000-000000000000'::uuid), host)
+                   DO UPDATE SET session=EXCLUDED.session, auth_type='token', updated_at=now()""",
+                (host, _json.dumps({"headers": headers, "captured_from": "auth_capture"}),
+                 engagement_id))
+            conn.commit()
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"persist session headers failed for {host}: {e}")
+        return False
 
 
 @app.post("/auth/capture")
@@ -1063,12 +1091,20 @@ async def _capture_client_credentials(req: AuthCaptureRequest):
                     "body": resp.text[:2000],
                 }
             body = resp.json()
+            token = body.get("access_token", "")
+            token_type = body.get("token_type", "Bearer")
+            persisted = False
+            if token and req.persist_host:
+                persisted = _persist_session_headers(
+                    req.persist_host,
+                    {"Authorization": f"{token_type} {token}"}, req.engagement_id)
             return {
                 "ok": True,
                 "mode": "client_credentials",
-                "access_token": body.get("access_token", ""),
-                "token_type": body.get("token_type", "Bearer"),
+                "access_token": token,
+                "token_type": token_type,
                 "expires_in": body.get("expires_in"),
+                "persisted_profile": persisted,
                 "full_response": body,
             }
     except Exception as e:
