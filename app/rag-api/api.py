@@ -1671,6 +1671,12 @@ def list_all_credentials(
 ):
     """List all credential findings across all assets."""
     clauses, params = [], []
+    # Scope to the active engagement (X-Engagement-Id header); credential_findings
+    # carries engagement_id, so a selected engagement must not list every
+    # engagement's discovered credentials.
+    _eid = _validate_engagement_uuid(_resolve_engagement_id())
+    if _eid:
+        clauses.append("engagement_id = %s::uuid"); params.append(_eid)
     if status:
         clauses.append("status = %s"); params.append(status)
     if protocol:
@@ -1960,6 +1966,12 @@ def get_open_ports(
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         where = ["COALESCE(p.is_open, true)"]
         params: list = []
+        # Scope to the active engagement (via the joined asset — ports has no
+        # engagement_id) so the global port list isn't cross-engagement.
+        _eid = _validate_engagement_uuid(_resolve_engagement_id())
+        if _eid:
+            where.append("a.engagement_id = %s::uuid")
+            params.append(_eid)
         if ip:
             # Accept an IP, hostname, or URL — a scan target is often a hostname
             # ('demo.testfire.net') while ports are keyed by the resolved IP, so
@@ -5011,6 +5023,12 @@ def identities_credential_state(
     `state=username_only` is the spray list: enumerated, no password yet.
     """
     where, params = ["1=1"], []
+    # Scope to the active engagement. The view has no engagement_id, but exposes
+    # identity_id → identities.engagement_id, so scope through that.
+    _eid = _validate_engagement_uuid(_resolve_engagement_id())
+    if _eid:
+        where.append("identity_id IN (SELECT id FROM identities WHERE engagement_id = %s::uuid)")
+        params.append(_eid)
     if state:
         where.append("credential_state = %s")
         params.append(state)
@@ -5775,6 +5793,14 @@ def get_vulnerabilities(
     where = []
     params = []
 
+    # Scope to the active engagement (X-Engagement-Id header); vulns carries
+    # engagement_id, so a selected engagement must not list every engagement's
+    # vulnerabilities.
+    _eid = _validate_engagement_uuid(_resolve_engagement_id())
+    if _eid:
+        where.append("v.engagement_id = %s::uuid")
+        params.append(_eid)
+
     if ip:
         where.append("host(a.ip)=%s")
         params.append(ip)
@@ -6248,6 +6274,15 @@ def search_findings(
     # Build WHERE clause with psycopg2 %s placeholders
     where_clauses_pg = []
     params_pg: List[Any] = []
+
+    # Scope to the active engagement (explicit param or X-Engagement-Id header).
+    # Every UNION arm selects engagement_id, so filtering the combined result
+    # scopes findings across all source tables at once — without this the
+    # Findings Explorer showed every engagement's findings.
+    _eid = _validate_engagement_uuid(_resolve_engagement_id(engagement_id))
+    if _eid:
+        where_clauses_pg.append("engagement_id = %s::uuid")
+        params_pg.append(_eid)
 
     if severity:
         where_clauses_pg.append("severity = ANY(%s::text[])")
@@ -11690,6 +11725,12 @@ def get_detected_software(
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         where = []
         params: list = []
+        # Scope to the active engagement via the linked asset (detected_software
+        # has no engagement_id) so the inventory isn't cross-engagement.
+        _eid = _validate_engagement_uuid(_resolve_engagement_id())
+        if _eid:
+            where.append("asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)")
+            params.append(_eid)
         if search:
             where.append("(ip ILIKE %s OR hostname ILIKE %s OR LOWER(product) LIKE LOWER(%s) OR LOWER(version) LIKE LOWER(%s))")
             params.extend([f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%"])
@@ -14392,6 +14433,10 @@ def get_vulnx_findings(
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         where_conditions = ["v.script = 'vulnx'"]
         params = []
+        _eid = _validate_engagement_uuid(_resolve_engagement_id())
+        if _eid:
+            where_conditions.append("v.engagement_id = %s::uuid")
+            params.append(_eid)
 
         # Filter by High+ severity only (CVSS >= 7.0)
         where_conditions.append("v.cvss >= 7.0")
@@ -16206,6 +16251,12 @@ def list_content_extractions(
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         conditions = []
         params = []
+        # Scope to the active engagement via the linked asset (content_extractions
+        # has no engagement_id) so the list isn't cross-engagement.
+        _eid = _validate_engagement_uuid(_resolve_engagement_id())
+        if _eid:
+            conditions.append("ce.asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)")
+            params.append(_eid)
         if asset_id:
             conditions.append("ce.asset_id = %s")
             params.append(asset_id)
@@ -20728,9 +20779,13 @@ def list_credentials_vault(
 ):
     """List credentials, filterable by engagement, type, status, domain."""
     clauses, params = [], []
-    if engagement_id:
-        clauses.append("engagement_id = %s")
-        params.append(engagement_id)
+    # Fall back to the X-Engagement-Id header when no explicit param — the
+    # Credentials page relies on the active engagement like every other view, so
+    # without this the vault lists every engagement's credentials.
+    eid = _validate_engagement_uuid(_resolve_engagement_id(engagement_id))
+    if eid:
+        clauses.append("engagement_id = %s::uuid")
+        params.append(eid)
     if credential_type:
         clauses.append("credential_type = %s")
         params.append(credential_type)
@@ -20792,14 +20847,18 @@ def credentials_expiring(
     _: bool = Depends(auth),
 ):
     """List credentials expiring within N minutes."""
+    _eid = _validate_engagement_uuid(_resolve_engagement_id())
+    eng_clause = " AND engagement_id = %s::uuid" if _eid else ""
+    args = [minutes] + ([_eid] if _eid else [])
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            """SELECT * FROM credential_vault
+            f"""SELECT * FROM credential_vault
                WHERE expires_at IS NOT NULL
                  AND expires_at <= now() + interval '1 minute' * %s
                  AND status NOT IN ('revoked','expired')
+                 {eng_clause}
                ORDER BY expires_at ASC""",
-            (minutes,))
+            args)
         rows = cur.fetchall()
     return {"credentials": rows, "threshold_minutes": minutes}
 
@@ -20822,8 +20881,11 @@ def refresh_credential_expiry(cid: str, body: dict, _: bool = Depends(auth)):
 @app.get("/credential-vault/cloud-summary", tags=["Credentials"])
 def credential_cloud_summary(_: bool = Depends(auth)):
     """Grouped credential summary by cloud account/tenant."""
+    _eid = _validate_engagement_uuid(_resolve_engagement_id())
+    eng_clause = " AND engagement_id = %s::uuid" if _eid else ""
+    args = [_eid] if _eid else []
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT
                 credential_type,
                 cloud_metadata->>'account_id' as account_id,
@@ -20833,9 +20895,10 @@ def credential_cloud_summary(_: bool = Depends(auth)):
                 count(*) FILTER (WHERE expires_at IS NOT NULL AND expires_at < now()) as expired_count
             FROM credential_vault
             WHERE credential_type IN ('aws_access_key','aws_sts','azure_oauth','azure_sp','gcp_sa_key')
+              {eng_clause}
             GROUP BY credential_type, cloud_metadata->>'account_id', cloud_metadata->>'tenant_id'
             ORDER BY count DESC
-        """)
+        """, args)
         rows = cur.fetchall()
     return {"summary": rows}
 
@@ -22869,9 +22932,11 @@ def assets_pending_exploit_counts(engagement_id: Optional[str] = Query(None),
     params: list = []
     if not include_recon:
         where.append(f"NOT {_RECON_MODULE_SQL}")
-    if engagement_id:
+    # Fall back to the X-Engagement-Id header when no explicit param.
+    _eid = _validate_engagement_uuid(_resolve_engagement_id(engagement_id))
+    if _eid:
         where.append("pe.engagement_id = %s::uuid")
-        params.append(engagement_id)
+        params.append(_eid)
     # Count what still NEEDS an operator action: pending (needs approval) plus
     # released-but-unfired (approved, waiting for the next release to fire) —
     # matching the release endpoint's candidate set, so the badge tracks the real
