@@ -1,6 +1,7 @@
 FROM ghcr.io/zaproxy/zaproxy:stable
 
 COPY addons.txt /zap/addons.txt
+COPY scripts/csrf_auth.js /home/zap/csrf_auth.js
 
 # Refresh marketplace index, then install each add-on from the list
 RUN zap.sh -cmd -addonupdate && \

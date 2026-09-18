@@ -6413,3 +6413,21 @@ WHERE script LIKE 'ssh-audit:%' AND port_id IS NULL AND (metadata->>'port') IS N
 
 UPDATE public.vulns SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{port}', '443'::jsonb)
 WHERE script LIKE ANY(ARRAY['sslscan:%','testssl:%','sslyze:%']) AND port_id IS NULL AND (metadata->>'port') IS NULL;
+
+-- Per-host ZAP form-auth so authenticated web scans work for any login-gated app
+CREATE TABLE IF NOT EXISTS web_auth_configs (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    host text NOT NULL UNIQUE,
+    login_url text NOT NULL,
+    login_data text NOT NULL,
+    username text NOT NULL,
+    password text,
+    logged_in_regex text,
+    logged_out_regex text,
+    auth_type text DEFAULT 'form',
+    csrf_field text,
+    enabled boolean DEFAULT true,
+    engagement_id uuid,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+);
