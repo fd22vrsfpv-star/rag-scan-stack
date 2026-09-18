@@ -13,6 +13,21 @@ logger = logging.getLogger(__name__)
 RAG_API_URL = os.environ.get("RAG_API_URL", "https://rag-api:8000")
 WEB_SCANNER_URL = os.environ.get("WEB_SCANNER_URL", "https://web-scanner:8010")
 API_KEY = os.environ.get("API_KEY", "changeme")
+
+# Engagement isolation: when ENGAGEMENT_ID (or MCP_ENGAGEMENT_ID) is set, every
+# rag-api call carries X-Engagement-Id so this MCP server only sees that
+# engagement's data. Unset = platform-wide (unchanged behaviour).
+ENGAGEMENT_ID = os.environ.get("ENGAGEMENT_ID") or os.environ.get("MCP_ENGAGEMENT_ID")
+
+
+def _api_headers(extra=None):
+    h = {"x-api-key": API_KEY}
+    if ENGAGEMENT_ID:
+        h["X-Engagement-Id"] = ENGAGEMENT_ID
+    if extra:
+        h.update(extra)
+    return h
+
 TIMEOUT = float(os.environ.get("MCP_TIMEOUT_ZAP", "300"))
 
 mcp = FastMCP("zap-integration", host="0.0.0.0", port=9023,
@@ -20,7 +35,7 @@ mcp = FastMCP("zap-integration", host="0.0.0.0", port=9023,
 
 
 def _headers():
-    return {"x-api-key": API_KEY}
+    return _api_headers()
 
 
 # ── Scan tools (launch ZAP scans) ───────────────────────────────────────────
