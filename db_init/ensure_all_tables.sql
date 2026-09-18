@@ -3893,31 +3893,44 @@ CREATE TRIGGER trg_findings_engagement
 -- decides which engagement's reports and views the host appears in.
 CREATE OR REPLACE FUNCTION propagate_engagement_to_assets()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
+-- Scope targets are stored verbatim, often as a URL ('http://demo.testfire.net')
+-- or host:port. Below we compare against the HOST only (scheme/port/path
+-- stripped) — otherwise a bare-hostname asset never matches a url-typed scope
+-- entry and is left unattributed (the reason demo.testfire.net's assets/ports/
+-- web_findings were orphaned while its scope row existed and was engagement-tied).
 BEGIN
     IF NEW.engagement_id IS NULL THEN
-        -- 1. Hostname against the scope list (exact, or dot-boundary suffix).
+        -- 1. Hostname against the scope list (exact, or dot-boundary suffix),
+        --    matching the scope target's HOST part (scheme/port/path stripped).
         IF NEW.hostname IS NOT NULL AND btrim(NEW.hostname) <> '' THEN
             SELECT st.engagement_id INTO NEW.engagement_id
-            FROM scope_targets st
+            FROM scope_targets st,
+                 LATERAL (SELECT split_part(split_part(
+                            regexp_replace(lower(btrim(st.target)), '^[a-z][a-z0-9+.-]*://', ''),
+                            '/', 1), ':', 1) AS h) n
             WHERE st.engagement_id IS NOT NULL
-              -- A blank scope target is NOT a wildcard. Four such rows exist
-              -- live (blackbaud, customer, customer_scope, msf); without this
-              -- every host matches them all and is attributed at random.
-              AND st.target IS NOT NULL AND btrim(st.target) <> ''
-              AND (lower(NEW.hostname) = lower(st.target)
+              -- A blank scope target is NOT a wildcard.
+              AND st.target IS NOT NULL AND btrim(st.target) <> '' AND n.h <> ''
+              AND (lower(NEW.hostname) = n.h
                    -- Suffix matching is for domains only, never IP octets.
                    OR (lower(NEW.hostname) !~ '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
-                       AND lower(NEW.hostname) LIKE '%.' || lower(st.target)))
-            ORDER BY length(st.target) DESC   -- most specific scope rule wins
+                       AND lower(NEW.hostname) LIKE '%.' || n.h))
+            ORDER BY length(n.h) DESC   -- most specific scope rule wins
             LIMIT 1;
         END IF;
-        -- 2. The address itself, for assets that have no hostname yet.
+        -- 2. The address itself — either the asset's IP appears in scope, or a
+        --    url/host scope entry resolves to this IP (the scope host equals the
+        --    asset's hostname). Covers a url-typed scope + an ip-only asset row.
         IF NEW.engagement_id IS NULL AND NEW.ip IS NOT NULL THEN
             SELECT st.engagement_id INTO NEW.engagement_id
-            FROM scope_targets st
+            FROM scope_targets st,
+                 LATERAL (SELECT split_part(split_part(
+                            regexp_replace(lower(btrim(st.target)), '^[a-z][a-z0-9+.-]*://', ''),
+                            '/', 1), ':', 1) AS h) n
             WHERE st.engagement_id IS NOT NULL
-              AND st.target IS NOT NULL AND btrim(st.target) <> ''
-              AND lower(st.target) = host(NEW.ip)
+              AND st.target IS NOT NULL AND btrim(st.target) <> '' AND n.h <> ''
+              AND (n.h = host(NEW.ip)
+                   OR (NEW.hostname IS NOT NULL AND lower(NEW.hostname) = n.h))
             LIMIT 1;
         END IF;
     END IF;
