@@ -10065,6 +10065,14 @@ def export_burp_sitemap(
     where_clauses: List[str] = []
     params_pg: List[Any] = []
 
+    # Scope the export to the active engagement (X-Engagement-Id header). Every
+    # arm of the `unified` CTE selects asset_id, so one predicate scopes them all
+    # — an export must never bundle another engagement's findings.
+    _eid = _validate_engagement_uuid(_resolve_engagement_id())
+    if _eid:
+        where_clauses.append("asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)")
+        params_pg.append(_eid)
+
     if severity:
         placeholders = ", ".join(["%s"] * len(severity))
         where_clauses.append(f"severity IN ({placeholders})")
@@ -10185,9 +10193,15 @@ def export_har(
     from urllib.parse import urlparse as _urlparse
 
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # Scope the export to the active engagement (X-Engagement-Id header) so a
+        # HAR bundle never carries another engagement's findings.
+        _eid = _validate_engagement_uuid(_resolve_engagement_id())
         where = []
         params: list = []
 
+        if _eid:
+            where.append("wf.engagement_id = %s::uuid")
+            params.append(_eid)
         if severity:
             ph = ", ".join(["%s"] * len(severity))
             where.append(f"severity IN ({ph})")
@@ -10228,6 +10242,9 @@ def export_har(
         # Also pull vulns with HTTP services
         vuln_where = []
         vuln_params: list = []
+        if _eid:
+            vuln_where.append("v.engagement_id = %s::uuid")
+            vuln_params.append(_eid)
         if severity:
             ph = ", ".join(["%s"] * len(severity))
             vuln_where.append(f"v.severity IN ({ph})")
@@ -10916,6 +10933,11 @@ def export_zap_report(
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         where = []
         params: list = []
+        # Scope the export to the active engagement (X-Engagement-Id header).
+        _eid = _validate_engagement_uuid(_resolve_engagement_id())
+        if _eid:
+            where.append("wf.engagement_id = %s::uuid")
+            params.append(_eid)
         if severity:
             placeholders = ", ".join(["%s"] * len(severity))
             where.append(f"severity IN ({placeholders})")
@@ -16802,7 +16824,8 @@ def _export_order_column(cur, table: str) -> Optional[str]:
 
 
 def _export_web_findings(cur, include_inventory: bool,
-                         collapse_problems: bool, limit: int = 50000) -> list:
+                         collapse_problems: bool, limit: int = 50000,
+                         engagement_id: str = None) -> list:
     """web_findings for /export/data, honouring the same two switches the
     findings search and the SARIF export honour.
 
@@ -16812,6 +16835,10 @@ def _export_web_findings(cur, include_inventory: bool,
     silently drop hundreds of unrelated findings from the export.
     """
     where = "WHERE 1=1"
+    eng_params: list = []
+    if engagement_id:  # scope the export to the active engagement
+        where += " AND engagement_id = %s::uuid"
+        eng_params.append(engagement_id)
     if not include_inventory:
         where += " AND COALESCE(record_kind, 'finding') = 'finding'"
     if collapse_problems:
@@ -16833,16 +16860,36 @@ def _export_web_findings(cur, include_inventory: bool,
             ORDER BY last_seen DESC
             LIMIT %s
         """
-    cur.execute(sql, [limit])
+    cur.execute(sql, eng_params + [limit])
     cols = [d[0] for d in cur.description]
     return [{c: _serialize_value(r[c]) for c in cols} for r in cur.fetchall()]
 
 
-def _export_table_rows(cur, table: str, limit: int = 50000) -> list:
-    """Generic SELECT * from a table or view, with safe serialization."""
+def _export_table_rows(cur, table: str, limit: int = 50000,
+                       engagement_id: str = None) -> list:
+    """Generic SELECT * from a table or view, with safe serialization.
+
+    When engagement_id is given, scope collected-data tables to it: filter by the
+    table's own engagement_id, or (for tables that only carry asset_id) via the
+    linked asset. A table with neither column is cross-engagement config/technique
+    data and is exported unscoped."""
+    where_sql, eng_params = "", []
+    if engagement_id:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+            (table,))
+        cols_present = {(r["column_name"] if isinstance(r, dict) else r[0])
+                        for r in cur.fetchall()}
+        if "engagement_id" in cols_present:
+            where_sql = "WHERE engagement_id = %s::uuid"
+            eng_params.append(engagement_id)
+        elif "asset_id" in cols_present:
+            where_sql = "WHERE asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)"
+            eng_params.append(engagement_id)
     order_col = _export_order_column(cur, table)
     order_sql = f"ORDER BY {order_col} DESC" if order_col else ""
-    cur.execute(f"SELECT * FROM {table} {order_sql} LIMIT %s", [limit])
+    cur.execute(f"SELECT * FROM {table} {where_sql} {order_sql} LIMIT %s",
+                eng_params + [limit])
     cols = [desc[0] for desc in cur.description]
     rows = []
     for row in cur.fetchall():
@@ -16963,6 +17010,11 @@ def export_sarif(
             WHERE 1=1
         """
         params = []
+        # Scope the export to the active engagement (X-Engagement-Id header).
+        _eid = _validate_engagement_uuid(_resolve_engagement_id())
+        if _eid:
+            vuln_sql += " AND v.engagement_id = %s::uuid"
+            params.append(_eid)
         if severity:
             vuln_sql += " AND v.severity = ANY(%s)"
             params.append(severity)
@@ -16983,6 +17035,9 @@ def export_sarif(
             FROM web_findings WHERE 1=1
         """
         web_params = []
+        if _eid:
+            web_sql += " AND engagement_id = %s::uuid"
+            web_params.append(_eid)
         if not include_inventory:
             # 746 of 787 SARIF results were katana crawl rows — the inventory the
             # record_kind column exists to separate. /findings/search filters them
@@ -17247,7 +17302,10 @@ def export_data(
     for cat in selected:
         tables_to_query.extend(EXPORT_CATEGORIES[cat])
 
-    # Query all data
+    # Query all data — scoped to the active engagement (X-Engagement-Id header)
+    # so a bulk export never bundles another engagement's data. Config/technique
+    # tables with no engagement attribution are exported unscoped by the helpers.
+    _eid = _validate_engagement_uuid(_resolve_engagement_id())
     data: Dict[str, list] = {}
     counts: Dict[str, int] = {}
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -17259,9 +17317,9 @@ def export_data(
                 # /findings/search — three export paths, three different answers.
                 if tbl == "web_findings":
                     rows = _export_web_findings(cur, include_inventory,
-                                                collapse_problems)
+                                                collapse_problems, engagement_id=_eid)
                 else:
-                    rows = _export_table_rows(cur, tbl)
+                    rows = _export_table_rows(cur, tbl, engagement_id=_eid)
                 data[tbl] = rows
                 counts[tbl] = len(rows)
             except Exception:
@@ -26472,8 +26530,14 @@ def export_findings_exchange(
         include_sources = [s.strip().lower() for s in source.split(",")] if source else None
         exclude_list = [s.strip().lower() for s in exclude_sources.split(",")] if exclude_sources else []
 
+        # Scope the export to the active engagement (X-Engagement-Id header).
+        _eid = _validate_engagement_uuid(_resolve_engagement_id())
+
         # Web findings (ZAP, Nikto, Nuclei, etc.)
         clauses, params = [], []
+        if _eid:
+            clauses.append("wf.engagement_id = %s::uuid")
+            params.append(_eid)
         if target:
             clauses.append("wf.url LIKE %s")
             params.append(f"%{target}%")
@@ -26562,6 +26626,9 @@ def export_findings_exchange(
         # Vulns (nmap/nuclei/ssh-audit/sslscan/etc) -- skip if web_only
         if not web_only:
             v_clauses, v_params = [], []
+            if _eid:
+                v_clauses.append("v.engagement_id = %s::uuid")
+                v_params.append(_eid)
             if target:
                 v_clauses.append("host(a.ip)::text LIKE %s")
                 v_params.append(f"%{target}%")
