@@ -10070,7 +10070,9 @@ def export_burp_sitemap(
     # — an export must never bundle another engagement's findings.
     _eid = _validate_engagement_uuid(_resolve_engagement_id())
     if _eid:
-        where_clauses.append("asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)")
+        # unified.asset_id is ::text (see the CTE), so compare against id::text —
+        # a bare uuid comparison raises "operator does not exist: text = uuid".
+        where_clauses.append("asset_id IN (SELECT id::text FROM assets WHERE engagement_id = %s::uuid)")
         params_pg.append(_eid)
 
     if severity:
