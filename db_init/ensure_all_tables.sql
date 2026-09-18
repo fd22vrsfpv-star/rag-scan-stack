@@ -3469,11 +3469,16 @@ CREATE INDEX IF NOT EXISTS idx_scan_run_findings_fingerprint ON public.scan_run_
 -- TIER 14: Cloud Credential & Token Management
 -- ============================================================================
 
--- Expand credential_vault: add cloud credential types
+-- Expand credential_vault: add cloud credential types + web-session types.
+-- The web-session types (cookie/bearer/token/api_key) are what a portable web
+-- Auth Profile stores as reusable session material and what /export/proxy-replay
+-- Phase 3 reads to inject Cookie/Authorization/X-API-Key headers — that query
+-- filtered on exactly these types, so without them here it matched zero rows.
 ALTER TABLE public.credential_vault DROP CONSTRAINT IF EXISTS credential_vault_credential_type_check;
 ALTER TABLE public.credential_vault ADD CONSTRAINT credential_vault_credential_type_check
   CHECK (credential_type IN ('password','ntlm_hash','krb_tgs','krb_tgt','ssh_key',
-    'api_token','certificate','aws_access_key','aws_sts','azure_oauth','azure_sp','gcp_sa_key','other'));
+    'api_token','certificate','aws_access_key','aws_sts','azure_oauth','azure_sp','gcp_sa_key',
+    'cookie','bearer','token','api_key','other'));
 
 -- Add cloud-specific columns
 ALTER TABLE public.credential_vault ADD COLUMN IF NOT EXISTS expires_at timestamptz;
@@ -6431,3 +6436,23 @@ CREATE TABLE IF NOT EXISTS web_auth_configs (
     created_at timestamptz DEFAULT now(),
     updated_at timestamptz DEFAULT now()
 );
+
+-- Auth Profile: web_auth_configs generalized into ONE portable, tool-agnostic
+-- auth model that drives the platform's ZAP pipeline AND feeds Burp.
+--   credential_id -> credential_findings, so the secret is resolved at scan time
+--     and never stored here in plaintext (mirrors knowledge/credential_followups).
+--   session jsonb {cookies:[...], headers:{Cookie|Authorization|X-API-Key}} — a
+--     reusable authenticated session captured from a login, emittable as a HAR
+--     for Burp Proxy>Import and consumable by ZAP.
+ALTER TABLE web_auth_configs ADD COLUMN IF NOT EXISTS credential_id uuid;
+ALTER TABLE web_auth_configs ADD COLUMN IF NOT EXISTS session jsonb DEFAULT '{}'::jsonb;
+-- A session-only or credential-only profile need not carry a full login macro.
+ALTER TABLE web_auth_configs ALTER COLUMN login_url DROP NOT NULL;
+ALTER TABLE web_auth_configs ALTER COLUMN login_data DROP NOT NULL;
+ALTER TABLE web_auth_configs ALTER COLUMN username DROP NOT NULL;
+-- Per-(engagement,host) uniqueness so different engagements hold different
+-- profiles for the same host. COALESCE the nullable engagement_id — a NULL makes
+-- rows non-equal, so a bare partial index would not constrain NULL-engagement rows.
+ALTER TABLE web_auth_configs DROP CONSTRAINT IF EXISTS web_auth_configs_host_key;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_web_auth_configs_eng_host
+  ON web_auth_configs (COALESCE(engagement_id, '00000000-0000-0000-0000-000000000000'::uuid), host);

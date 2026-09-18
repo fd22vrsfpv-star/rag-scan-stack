@@ -148,6 +148,67 @@ rules:
       from a scanner's summary line. The headers are the cheapest thing that
       proves the endpoint is still live and still responding that way.
 
+  # ── Deepen INFORMATIONAL findings (deterministic tier) ─────────────────────
+  #
+  # info/low web findings were stored and never acted on: the exploit watcher
+  # excludes them by severity, and until now no rule matched them. These rules
+  # key off WHAT the finding is (issue_type/name), not only severity, and propose
+  # a cheap READ-ONLY capture so an interesting "informational" lead is actually
+  # investigated. Scope-gated + queued pending like every other proposal; the LLM
+  # fallback (surface-test synthesis) handles the long tail these do not name.
+
+  - id: web-info-disclosure-capture
+    when:
+      fact: web_finding
+      where: {severity: [info, low], name: {contains: "information disclosure"}}
+    propose:
+      tool: curl
+      command: "curl -sk -D - {url} -o /dev/null"
+      priority: 22
+    why: >-
+      An "information disclosure" flagged as informational is often a real leak
+      (version, path, internal host, token) worth capturing at the source. The
+      response is the evidence that turns a scanner note into a reportable item.
+
+  - id: web-directory-listing-enumerate
+    when:
+      fact: web_finding
+      where: {severity: [info, low], name: {contains: "directory"}}
+    propose:
+      tool: curl
+      command: "curl -sk {url}"
+      priority: 22
+    why: >-
+      A directory listing is informational until you read it — it can expose
+      backups, configs, or source. Fetching it is how you learn whether it
+      matters.
+
+  - id: web-verbose-error-capture
+    when:
+      fact: web_finding
+      where: {severity: [info, low], name: {contains: "stack trace"}}
+    propose:
+      tool: curl
+      command: "curl -sk {url}"
+      priority: 20
+    why: >-
+      A stack trace / verbose error leaks framework, versions and file paths that
+      shape the next test. Capturing the body preserves that surface before it is
+      lost.
+
+  - id: web-exposed-vcs-capture
+    when:
+      fact: web_finding
+      where: {name: {contains: ".git"}}
+    propose:
+      tool: curl
+      command: "curl -sk {url}/.git/HEAD"
+      priority: 26
+    why: >-
+      An exposed .git often means the whole repository (and its secrets/history)
+      is retrievable. Confirming /.git/HEAD responds is the cheap first step
+      before dumping it.
+
   # ── After an exploit succeeds ─────────────────────────────────────────────
   #
   # The vsftpd 2.3.4 backdoor was executed against 192.168.1.150, opened a root

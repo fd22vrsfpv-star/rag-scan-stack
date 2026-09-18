@@ -518,7 +518,11 @@ async def _perform_scan_slotted(scan_request: ScanRequest, scan_id: uuid.UUID):
                 # Auth: explicit request auth wins; otherwise a stored per-host
                 # config (set via /web-auth) so the auto-driven pipeline scans
                 # login-gated apps authenticated without the caller passing creds.
-                _auth = scan_request.auth or _resolve_web_auth(url_str)
+                try:
+                    _eid = current_engagement_id.get()
+                except Exception:  # noqa: BLE001
+                    _eid = None
+                _auth = scan_request.auth or _resolve_web_auth(url_str, _eid)
                 zap_results = await zap_bridge.scan_with_playwright_session(
                     url=url_str,
                     do_spider=scan_request.zap_spider,
@@ -685,14 +689,33 @@ def _ensure_web_auth_table():
                 )""")
             cur.execute("ALTER TABLE web_auth_configs ADD COLUMN IF NOT EXISTS auth_type text DEFAULT 'form'")
             cur.execute("ALTER TABLE web_auth_configs ADD COLUMN IF NOT EXISTS csrf_field text")
+            # Auth Profile columns: credential_id (resolve secret at scan time, no
+            # plaintext) + session (reusable cookies/headers, feeds ZAP + Burp).
+            cur.execute("ALTER TABLE web_auth_configs ADD COLUMN IF NOT EXISTS credential_id uuid")
+            cur.execute("ALTER TABLE web_auth_configs ADD COLUMN IF NOT EXISTS session jsonb DEFAULT '{}'::jsonb")
+            for col in ("login_url", "login_data", "username"):
+                cur.execute(f"ALTER TABLE web_auth_configs ALTER COLUMN {col} DROP NOT NULL")
+            # per-(engagement,host) uniqueness (COALESCE nullable engagement_id)
+            cur.execute("ALTER TABLE web_auth_configs DROP CONSTRAINT IF EXISTS web_auth_configs_host_key")
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_web_auth_configs_eng_host "
+                        "ON web_auth_configs (COALESCE(engagement_id, "
+                        "'00000000-0000-0000-0000-000000000000'::uuid), host)")
             conn.commit()
     except Exception as e:  # noqa: BLE001
         logger.warning(f"web_auth_configs ensure failed: {e}")
 
 
-def _resolve_web_auth(url: str):
-    """Stored ZAP form-auth for this URL's host (set via POST /web-auth), or None."""
+def _resolve_web_auth(url: str, engagement_id: Optional[str] = None):
+    """Resolve the Auth Profile for this URL's host into a ready-to-use auth dict.
+
+    Engagement-scoped: prefers a row for `engagement_id`, else a global
+    (NULL-engagement) row; NEVER applies another engagement's profile to this one
+    (the previous host-only lookup leaked a stored credential across engagements).
+    The secret is resolved at THIS point: from `credential_id` -> credential_findings
+    (never stored plaintext in the profile), falling back to an inline `password`
+    for back-compat. Also returns the reusable `session` (cookies/headers)."""
     try:
+        import json as _json
         from urllib.parse import urlparse
         from db_utils import get_db
         pu = urlparse(url if "://" in url else f"http://{url}")
@@ -702,17 +725,41 @@ def _resolve_web_auth(url: str):
         with get_db() as conn, conn.cursor() as cur:
             cur.execute(
                 """SELECT login_url, login_data, username, password,
-                          logged_in_regex, logged_out_regex, auth_type, csrf_field
+                          logged_in_regex, logged_out_regex, auth_type, csrf_field,
+                          credential_id, session, engagement_id
                      FROM web_auth_configs
                     WHERE enabled AND host IN (%s, %s)
-                    ORDER BY (host = %s) DESC LIMIT 1""",
-                (netloc, host, netloc))
+                      AND (engagement_id IS NULL
+                           OR (%s::uuid IS NOT NULL AND engagement_id = %s::uuid))
+                    ORDER BY (engagement_id IS NOT NULL) DESC, (host = %s) DESC
+                    LIMIT 1""",
+                (netloc, host, engagement_id, engagement_id, netloc))
             r = cur.fetchone()
-        if not r:
-            return None
+            if not r:
+                return None
+            password = r[3]
+            cred_id = r[8]
+            # Resolve the secret from credential_findings at scan time.
+            if cred_id:
+                try:
+                    cur.execute("SELECT secret_value FROM credential_findings "
+                                "WHERE id = %s::uuid", (str(cred_id),))
+                    cr = cur.fetchone()
+                    if cr and cr[0]:
+                        password = cr[0]
+                except Exception as ce:  # noqa: BLE001
+                    logger.warning(f"credential_id resolve failed: {ce}")
+        session = r[9]
+        if isinstance(session, str):
+            try:
+                session = _json.loads(session)
+            except Exception:  # noqa: BLE001
+                session = {}
         return {"login_url": r[0], "login_data": r[1], "username": r[2],
-                "password": r[3], "logged_in_regex": r[4], "logged_out_regex": r[5],
-                "auth_type": r[6], "csrf_field": r[7]}
+                "password": password, "logged_in_regex": r[4],
+                "logged_out_regex": r[5], "auth_type": r[6], "csrf_field": r[7],
+                "credential_id": str(cred_id) if cred_id else None,
+                "session": session or {}}
     except Exception as e:  # noqa: BLE001
         logger.warning(f"web auth resolve failed for {url}: {e}")
         return None
@@ -770,14 +817,30 @@ async def create_scan(
 
 @app.post("/web-auth")
 async def set_web_auth(body: Dict):
-    """Store per-host ZAP form-auth so authenticated scans work for ANY app.
-    Body: {host, login_url, login_data, username, password, logged_in_regex?,
-    logged_out_regex?, enabled?, engagement_id?}. Upserts by host."""
+    """Store/UPSERT an Auth Profile — one portable, tool-agnostic auth model.
+    Body: {host, engagement_id?, enabled?,
+           login_url?, login_data?, username?, csrf_field?, auth_type?,
+           logged_in_regex?, logged_out_regex?,
+           credential_id?,        # resolve the secret at scan time (preferred)
+           password?,             # inline secret (back-compat; discouraged)
+           session?}              # {cookies:[...], headers:{...}} reusable session
+    Requires `host` plus at least ONE of: a login macro (login_url+login_data),
+    a credential_id, or a session. Upserts per (engagement_id, host)."""
+    import json as _json
     _ensure_web_auth_table()
-    required = ("host", "login_url", "login_data", "username")
-    missing = [k for k in required if not (body.get(k) or "").strip()]
-    if missing:
-        raise HTTPException(status_code=400, detail=f"missing required: {missing}")
+    host = (body.get("host") or "").strip()
+    if not host:
+        raise HTTPException(status_code=400, detail="missing required: host")
+    has_macro = (body.get("login_url") or "").strip() and (body.get("login_data") or "").strip()
+    has_cred = bool(body.get("credential_id"))
+    has_session = bool(body.get("session"))
+    if not (has_macro or has_cred or has_session):
+        raise HTTPException(status_code=400, detail=(
+            "provide at least one of: a login macro (login_url+login_data), "
+            "credential_id, or session"))
+    session = body.get("session") or {}
+    if not isinstance(session, dict):
+        raise HTTPException(status_code=400, detail="session must be an object")
     from db_utils import get_db
     try:
         with get_db() as conn, conn.cursor() as cur:
@@ -785,41 +848,73 @@ async def set_web_auth(body: Dict):
                 """INSERT INTO web_auth_configs
                       (host, login_url, login_data, username, password,
                        logged_in_regex, logged_out_regex, auth_type, csrf_field,
-                       enabled, engagement_id)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (host) DO UPDATE SET
+                       enabled, engagement_id, credential_id, session)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                    ON CONFLICT (COALESCE(engagement_id,
+                        '00000000-0000-0000-0000-000000000000'::uuid), host)
+                    DO UPDATE SET
                       login_url=EXCLUDED.login_url, login_data=EXCLUDED.login_data,
                       username=EXCLUDED.username, password=EXCLUDED.password,
                       logged_in_regex=EXCLUDED.logged_in_regex,
                       logged_out_regex=EXCLUDED.logged_out_regex,
                       auth_type=EXCLUDED.auth_type, csrf_field=EXCLUDED.csrf_field,
-                      enabled=EXCLUDED.enabled, updated_at=now()""",
-                (body["host"].strip(), body["login_url"].strip(),
-                 body["login_data"].strip(), body["username"].strip(),
-                 body.get("password"), body.get("logged_in_regex"),
-                 body.get("logged_out_regex"),
+                      enabled=EXCLUDED.enabled, credential_id=EXCLUDED.credential_id,
+                      session=EXCLUDED.session, updated_at=now()""",
+                (host,
+                 (body.get("login_url") or "").strip() or None,
+                 (body.get("login_data") or "").strip() or None,
+                 (body.get("username") or "").strip() or None,
+                 # Do not persist a plaintext password when a credential_id is given.
+                 (None if has_cred else body.get("password")),
+                 body.get("logged_in_regex"), body.get("logged_out_regex"),
                  (body.get("auth_type") or ("csrf" if body.get("csrf_field") else "form")),
                  body.get("csrf_field"),
-                 bool(body.get("enabled", True)), body.get("engagement_id")))
+                 bool(body.get("enabled", True)), body.get("engagement_id"),
+                 body.get("credential_id"), _json.dumps(session)))
             conn.commit()
-        return {"ok": True, "host": body["host"].strip()}
+        return {"ok": True, "host": host}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/web-auth")
 async def list_web_auth():
-    """List configured hosts (passwords masked)."""
+    """List Auth Profiles (secrets never returned)."""
     _ensure_web_auth_table()
     from db_utils import get_db
     with get_db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT host, login_url, username, (password IS NOT NULL), "
-                    "enabled, updated_at FROM web_auth_configs ORDER BY host")
+        cur.execute(
+            "SELECT host, login_url, username, (password IS NOT NULL), enabled, "
+            "updated_at, auth_type, (credential_id IS NOT NULL), "
+            "(COALESCE(session,'{}'::jsonb) <> '{}'::jsonb), engagement_id "
+            "FROM web_auth_configs ORDER BY host")
         rows = cur.fetchall()
     return {"configs": [
         {"host": r[0], "login_url": r[1], "username": r[2],
          "has_password": r[3], "enabled": r[4],
-         "updated_at": r[5].isoformat() if r[5] else None} for r in rows]}
+         "updated_at": r[5].isoformat() if r[5] else None,
+         "auth_type": r[6], "has_credential": r[7], "has_session": r[8],
+         "engagement_id": str(r[9]) if r[9] else None} for r in rows]}
+
+
+@app.delete("/web-auth/{host}")
+async def delete_web_auth(host: str, engagement_id: Optional[str] = None):
+    """Delete the Auth Profile for a host (optionally engagement-scoped)."""
+    _ensure_web_auth_table()
+    from db_utils import get_db
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            if engagement_id:
+                cur.execute("DELETE FROM web_auth_configs WHERE host=%s AND engagement_id=%s::uuid",
+                            (host, engagement_id))
+            else:
+                cur.execute("DELETE FROM web_auth_configs WHERE host=%s AND engagement_id IS NULL",
+                            (host,))
+            n = cur.rowcount
+            conn.commit()
+        return {"ok": True, "host": host, "deleted": n}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/jobs/{scan_id}")
@@ -1392,6 +1487,7 @@ class CrawlRequest(BaseModel):
     timeout_per_page: int = Field(15, description="Page load timeout in seconds")
     same_origin_only: bool = Field(True, description="Only follow same-origin links")
     capture_screenshots: bool = Field(False, description="Screenshot each page")
+    auth: Optional[Dict] = Field(None, description="Auth Profile for an AUTHENTICATED crawl: {login_url, login_data (with {%username%}/{%password%}), username, password}. If omitted, a stored Auth Profile for the host is used. The browser logs in before crawling so the tree seeded into ZAP is authenticated.")
 
 
 class CrawlResponse(BaseModel):
@@ -1404,11 +1500,72 @@ class CrawlResponse(BaseModel):
 _crawl_jobs: Dict[str, dict] = {}
 
 
+def _login_fields(login_data: str):
+    """(user_field, pass_field) input names from a login_data template such as
+    'user={%username%}&pass={%password%}&csrf={%csrf%}'. Pure/testable."""
+    from urllib.parse import parse_qsl
+    user_field = pass_field = None
+    for k, v in parse_qsl(login_data or "", keep_blank_values=True):
+        if "{%username%}" in v:
+            user_field = k
+        elif "{%password%}" in v:
+            pass_field = k
+    return user_field, pass_field
+
+
+async def _browser_login(page, auth: Dict) -> bool:
+    """Best-effort form login in the browser so the crawl (and the ZAP site tree
+    it seeds) is authenticated. Parses the login_data template to find the
+    username/password fields, fills and submits them, and — when a
+    logged_in_regex is given — verifies the result rather than assuming success.
+    Never raises into the crawl."""
+    try:
+        login_url = auth.get("login_url")
+        login_data = auth.get("login_data") or ""
+        if not login_url or not login_data:
+            return False
+        user_field, pass_field = _login_fields(login_data)
+        await page.goto(login_url, wait_until="domcontentloaded", timeout=20000)
+        if user_field and auth.get("username"):
+            try:
+                await page.fill(f"input[name='{user_field}']", str(auth["username"]))
+            except Exception:  # noqa: BLE001
+                pass
+        if pass_field and auth.get("password"):
+            try:
+                await page.fill(f"input[name='{pass_field}']", str(auth["password"]))
+            except Exception:  # noqa: BLE001
+                pass
+        # Submit: a submit button if present, else Enter in the password field.
+        try:
+            btn = await page.query_selector("button[type=submit], input[type=submit]")
+            if btn:
+                await btn.click()
+            else:
+                await page.keyboard.press("Enter")
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:  # noqa: BLE001
+            pass
+        rx = auth.get("logged_in_regex")
+        if rx:
+            import re as _re
+            body = await page.content()
+            ok = bool(_re.search(rx, body))
+            logger.info(f"[crawl] browser login verified={ok} (logged_in_regex)")
+            return ok
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[crawl] browser login failed: {e}")
+        return False
+
+
 async def _perform_crawl(job_id: str, req: CrawlRequest):
     """
     Browser-based crawl that discovers URLs by following links.
     All traffic goes through ZAP proxy so ZAP builds its site tree.
     Returns discovered URLs for downstream pipeline stages.
+    When an Auth Profile is present, the browser logs in FIRST so the seeded
+    tree — and thus ZAP's authenticated active scan — covers post-login pages.
     """
     # Every seed, not just req.url: a single unchecked seed_urls entry is a
     # complete bypass of the gate on req.url.
@@ -1462,6 +1619,17 @@ async def _perform_crawl(job_id: str, req: CrawlRequest):
 
             ctx = await browser.new_context(**context_options)
             page = await ctx.new_page()
+
+            # AUTHENTICATED crawl: log the browser in BEFORE crawling so every
+            # discovered page (and the ZAP tree seeded from this traffic) is
+            # post-login. Explicit req.auth wins; else a stored Auth Profile.
+            try:
+                _eid = current_engagement_id.get()
+            except Exception:  # noqa: BLE001
+                _eid = None
+            _crawl_auth = req.auth or _resolve_web_auth(req.url, _eid)
+            if _crawl_auth and _crawl_auth.get("login_url"):
+                job["authenticated"] = await _browser_login(page, _crawl_auth)
 
             # Capture network requests as additional discovered URLs
             def _on_request(request):

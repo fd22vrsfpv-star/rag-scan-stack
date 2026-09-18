@@ -179,6 +179,33 @@ def test_extraction_budget_caps_calls(monkeypatch):
     assert r.should_extract("x" * 100, []) is False
 
 
+def test_deepen_returns_readonly_probe(monkeypatch):
+    _fake_requests(monkeypatch,
+                   '{"worth":true,"command":"curl -sk http://app/x","assertion":{"contains":"root:"},"why":"leak"}')
+    got = _router().deepen_finding({"name": "Information Disclosure", "url": "http://app/x"})
+    assert got and got["command"].startswith("curl") and got["assertion"]["contains"] == "root:"
+
+
+def test_deepen_skips_when_not_worth(monkeypatch):
+    _fake_requests(monkeypatch, '{"worth":false}')
+    assert _router().deepen_finding({"name": "X", "url": "http://app/x"}) is None
+
+
+def test_deepen_rejects_non_readonly_tool(monkeypatch):
+    # an LLM that proposes a non-allowlisted (write/exec) tool must be rejected
+    _fake_requests(monkeypatch, '{"worth":true,"command":"python -c pwn()","why":"x"}')
+    assert _router().deepen_finding({"name": "X", "url": "http://app/x"}) is None
+
+
+def test_deepen_budget_caps(monkeypatch):
+    calls = _fake_requests(monkeypatch, '{"worth":true,"command":"curl http://app"}')
+    r = _router(rows=[("enum_router.deepen.max_per_window", "2"),
+                      ("enum_router.deepen.window_sec", "300")])
+    for _ in range(6):
+        r.deepen_finding({"name": "X", "url": "http://app/x"})
+    assert calls["n"] == 2, f"deepen budget of 2 not enforced (made {calls['n']})"
+
+
 def test_review_all_scope_reviews_everything(monkeypatch):
     _fake_requests(monkeypatch, '{"verdicts":[{"i":0,"keep":true,"confidence":"high"}]}')
     r = _router(rows=[("enum_router.review.scope", "all")])
