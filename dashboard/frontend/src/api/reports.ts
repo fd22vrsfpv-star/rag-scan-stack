@@ -396,10 +396,13 @@ export function useContentExtractions(search?: string, scanId?: string) {
   })
 }
 
-export function useContentSummary(search?: string) {
-  const params = search ? `?search=${encodeURIComponent(search)}` : ''
+export function useContentSummary(search?: string, scope?: string) {
+  const qs = new URLSearchParams()
+  if (search) qs.set('search', search)
+  if (scope) qs.set('scope', scope)
+  const params = qs.toString() ? `?${qs.toString()}` : ''
   return useQuery({
-    queryKey: ['content-summary', search],
+    queryKey: ['content-summary', search, scope],
     queryFn: () => apiFetch<{ ok: boolean; summary: ContentSummary }>(
       `/content-extractions/summary${params}`
     ),

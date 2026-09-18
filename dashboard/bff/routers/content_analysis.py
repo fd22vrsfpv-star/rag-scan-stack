@@ -35,13 +35,15 @@ async def list_content_extractions(asset_id: str = None, scan_id: str = None, se
 
 
 @router.get("/api/content-extractions/summary")
-async def content_extraction_summary(asset_id: str = None, search: str = None):
+async def content_extraction_summary(asset_id: str = None, search: str = None, scope: str = None):
     s = get_settings()
     params = {}
     if asset_id:
         params["asset_id"] = asset_id
     if search:
         params["search"] = search
+    if scope:
+        params["scope"] = scope
     async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/content-extractions/summary",
