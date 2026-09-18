@@ -319,8 +319,31 @@ def _render_postex_commands(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_msf_readonly_scanners(data: Dict[str, Any]) -> List[Doc]:
+    """Read-only MSF auxiliary scanners -> one doc each, so the planner can
+    retrieve WHICH Metasploit scanner modules are purely informational (and the
+    safe non-MSF command that runs them) as knowledge — the classification that
+    keeps a robots.txt fetch out of the human-approval lane."""
+    docs: List[Doc] = []
+    for row in (data.get("read_only_scanners") or []):
+        if not isinstance(row, dict):
+            continue
+        module = row.get("module")
+        if not module:
+            continue
+        docs.append((
+            f"Read-only MSF scanner: {module}",
+            f"The Metasploit module {module} ({row.get('purpose', 'info scan')}) "
+            f"is purely read-only — it retrieves information and changes nothing. "
+            f"The platform runs it in the SAFE autonomous lane via "
+            f"`{row.get('safe_command')}` (category {row.get('category')}) instead "
+            f"of an approval-gated Metasploit session."))
+    return docs
+
+
 RENDERERS = {
     "msf_learned_options": _render_msf_learned_options,
+    "msf_readonly_scanners": _render_msf_readonly_scanners,
     "dos_exploit_overrides": _render_dos_exploit_overrides,
     "enumeration_extractors": _render_enumeration_extractors,
     "postex_commands": _render_postex_commands,
