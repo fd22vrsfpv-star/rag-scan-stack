@@ -1,0 +1,66 @@
+# Read-only MSF auxiliary scanners -> safe non-MSF equivalents.
+#
+# These Metasploit auxiliary/scanner modules are PURELY READ-ONLY information
+# retrievals: a robots.txt fetch, a header/version grab, a TLS-cert read, a
+# directory listing. They change no data and run no code. Queuing them as
+# IMPACTFUL, approval-gated Metasploit sessions is wrong — an operator should not
+# have to approve a robots.txt fetch. The surface-test planner runs each in the
+# SAFE autonomous lane via the `safe_command` below (curl/sslscan/gobuster)
+# instead of Metasploit.
+#
+# This is data, not code (CLAUDE.md "Knowledge is RAG-first"): edit this file to
+# reclassify a module — no code change — and it is embedded into rag_documents by
+# etl/load_knowledge_documents.py so the recommender/planner can also retrieve it.
+#
+# Templating: {scheme} (http|https), {ip}, {port} are substituted at plan time.
+#   - `category`     MUST be one of the planner's SAFE categories
+#                    (langgraph_engine._SAFE_CATEGORIES), else it fails safe and
+#                    is (correctly) treated as impactful.
+#   - `safe_command` its first token MUST be on the safe-lane allowlist
+#                    (langgraph_engine._SAFE_TOOL_HINTS) for the same reason.
+#
+# ONLY list modules that neither authenticate, brute-force, write, nor execute.
+# Anything omitted stays IMPACTFUL through MSF (fail-safe by omission) — e.g.
+# auxiliary/scanner/http/http_login (credential brute), .../tomcat_mgr_login,
+# .../jenkins_enum, and every exploit/... module.
+
+read_only_scanners:
+  - module: auxiliary/scanner/http/robots_txt
+    category: http_probe
+    safe_command: "curl -s -m 20 -k {scheme}://{ip}:{port}/robots.txt"
+    purpose: fetch & parse robots.txt
+
+  - module: auxiliary/scanner/http/http_version
+    category: version_probe
+    safe_command: "curl -sI -m 20 -k {scheme}://{ip}:{port}/"
+    purpose: HTTP server version / banner
+
+  - module: auxiliary/scanner/http/http_header
+    category: header_check
+    safe_command: "curl -sI -m 20 -k {scheme}://{ip}:{port}/"
+    purpose: HTTP response headers
+
+  - module: auxiliary/scanner/http/dir_scanner
+    category: dir_enum
+    safe_command: "gobuster dir -u {scheme}://{ip}:{port} -w /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt -q -k"
+    purpose: directory listing
+
+  - module: auxiliary/scanner/http/files_dir
+    category: dir_enum
+    safe_command: "gobuster dir -u {scheme}://{ip}:{port} -w /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt -q -k"
+    purpose: interesting-file listing
+
+  - module: auxiliary/scanner/http/cert
+    category: cert_check
+    safe_command: "sslscan {ip}:{port}"
+    purpose: TLS certificate info
+
+  - module: auxiliary/scanner/http/ssl_version
+    category: tls_check
+    safe_command: "sslscan {ip}:{port}"
+    purpose: TLS version / cipher info
+
+  - module: auxiliary/scanner/http/ssl
+    category: tls_check
+    safe_command: "sslscan {ip}:{port}"
+    purpose: TLS configuration info
