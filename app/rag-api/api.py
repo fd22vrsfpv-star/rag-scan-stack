@@ -14691,6 +14691,13 @@ def search_params(
     where_clauses: list[str] = []
     params: list = []
 
+    # Scope to the active engagement (X-Engagement-Id header). discovered_params
+    # has no engagement_id column, so filter via the linked asset — otherwise the
+    # OSINT Explorer Parameters tab shows every engagement's parameters.
+    _eid = _validate_engagement_uuid(_resolve_engagement_id())
+    if _eid:
+        where_clauses.append("dp.asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)")
+        params.append(_eid)
     if url_pattern:
         where_clauses.append("dp.url_pattern ILIKE %s")
         params.append(f"%{url_pattern}%")
@@ -14751,11 +14758,20 @@ def params_summary(
     authorized: bool = Depends(auth),
 ):
     """Summarize discovered params grouped by name with total occurrences across all URLs."""
-    where_sql = ""
-    sql_params: list = []
+    # Scope to the active engagement via the linked asset (no engagement_id
+    # column on discovered_params) so the counts match the engagement, not all.
+    where_clauses: list = []
+    where_params: list = []
+    _eid = _validate_engagement_uuid(_resolve_engagement_id())
+    if _eid:
+        where_clauses.append("dp.asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)")
+        where_params.append(_eid)
+    where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    having_sql = ""
+    having_params: list = []
     if min_occurrences > 1:
-        where_sql = "HAVING SUM(dp.occurrence_count) >= %s"
-        sql_params.append(min_occurrences)
+        having_sql = "HAVING SUM(dp.occurrence_count) >= %s"
+        having_params.append(min_occurrences)
 
     sql = f"""
         SELECT dp.param_name,
@@ -14764,14 +14780,15 @@ def params_summary(
                SUM(dp.occurrence_count)::int AS total_occurrences,
                COUNT(DISTINCT dp.url_pattern)::int AS url_count
         FROM discovered_params dp
-        GROUP BY dp.param_name
         {where_sql}
+        GROUP BY dp.param_name
+        {having_sql}
         ORDER BY total_occurrences DESC
         LIMIT %s
     """
 
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, sql_params + [limit])
+        cur.execute(sql, where_params + having_params + [limit])
         rows = cur.fetchall()
 
     return {
