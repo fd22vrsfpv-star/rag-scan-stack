@@ -14,6 +14,21 @@ logger = logging.getLogger(__name__)
 BRUTUS_URL = os.environ.get("BRUTUS_URL", "https://brutus-runner:8025")
 RAG_API_URL = os.environ.get("RAG_API_URL", "https://rag-api:8000")
 API_KEY = os.environ.get("API_KEY", "changeme")
+
+# Engagement isolation: when ENGAGEMENT_ID (or MCP_ENGAGEMENT_ID) is set, every
+# rag-api call carries X-Engagement-Id so this MCP server only sees that
+# engagement's data. Unset = platform-wide (unchanged behaviour).
+ENGAGEMENT_ID = os.environ.get("ENGAGEMENT_ID") or os.environ.get("MCP_ENGAGEMENT_ID")
+
+
+def _api_headers(extra=None):
+    h = {"x-api-key": API_KEY}
+    if ENGAGEMENT_ID:
+        h["X-Engagement-Id"] = ENGAGEMENT_ID
+    if extra:
+        h.update(extra)
+    return h
+
 TIMEOUT = float(os.environ.get("MCP_TIMEOUT_SCAN", "300"))
 
 mcp = FastMCP("pentest-credentials", host="0.0.0.0", port=9020, stateless_http=True, streamable_http_path="/mcp")
@@ -68,7 +83,7 @@ async def _paginate_identities(client: httpx.AsyncClient, base_params: dict,
         params["limit"] = _API_PAGE_SIZE
         params["offset"] = offset
         resp = await client.get(f"{RAG_API_URL}/identities", params=params,
-                                headers={"x-api-key": API_KEY})
+                                headers=_api_headers())
         if resp.status_code != 200:
             return {"error": resp.text}
         data = resp.json()
@@ -124,7 +139,7 @@ async def get_user(
     recon findings that surfaced this identifier, and provider/tenant context.
     """
     async with httpx.AsyncClient(verify=False, timeout=30) as client:
-        resp = await client.get(f"{RAG_API_URL}/identities/{identity_id}", headers={"x-api-key": API_KEY})
+        resp = await client.get(f"{RAG_API_URL}/identities/{identity_id}", headers=_api_headers())
         return json.dumps(resp.json() if resp.status_code == 200 else {"error": resp.text}, indent=2)
 
 
@@ -150,7 +165,7 @@ async def list_groups(
         params["search"] = search
     async with httpx.AsyncClient(verify=False, timeout=30) as client:
         resp = await client.get(f"{RAG_API_URL}/identities/groups", params=params,
-                                headers={"x-api-key": API_KEY})
+                                headers=_api_headers())
         return json.dumps(resp.json() if resp.status_code == 200 else {"error": resp.text}, indent=2)
 
 
