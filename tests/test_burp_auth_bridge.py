@@ -84,6 +84,17 @@ def test_capture_inserts_session():
     assert "app.example" in captured
 
 
+def test_bff_start_scan_autosources_from_auth_profile():
+    src = open(os.path.join(REPO, "dashboard", "bff", "routers", "burp.py"),
+               encoding="utf-8").read()
+    m = re.search(r"async def start_burp_scan\([\s\S]*?(?=\n@router\.|\Z)", src)
+    assert m, "start_burp_scan not found"
+    body = m.group(0)
+    # when no explicit credentials, fetch the Auth Profile's application_logins
+    assert "/auth-profiles/burp-bundle" in body
+    assert "application_logins" in body
+
+
 def test_capture_skips_when_no_auth_headers_or_already_seen():
     fn = _capture_fn()
     cur = _FakeCur()
