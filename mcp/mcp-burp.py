@@ -17,7 +17,7 @@ API_KEY = os.environ.get("API_KEY", "changeme")
 # request's engagement — captured PER REQUEST from the caller's X-Engagement-Id
 # header / ?engagement_id (via _engagement_mw), else the ENGAGEMENT_ID env pin,
 # else unset = platform-wide. So the mcpo gateway can scope a single tool call.
-from _engagement_mw import current_engagement, run_streamable
+from _engagement_mw import current_engagement, run_streamable, set_request_engagement
 
 
 def _api_headers(extra=None):
@@ -43,7 +43,8 @@ def _headers():
 
 @mcp.tool()
 async def import_burp_xml(
-    xml_content: Annotated[str, Field(description="Raw Burp XML export content (scanner issues or sitemap)")]
+    xml_content: Annotated[str, Field(description="Raw Burp XML export content (scanner issues or sitemap)")],
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Import a Burp Suite XML export (scanner issues or sitemap) into the platform.
 
@@ -53,6 +54,7 @@ async def import_burp_xml(
 
     Findings are deduplicated by fingerprint so re-importing the same file is safe.
     """
+    set_request_engagement(engagement_id)
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as client:
         files = {"file": ("burp_export.xml", xml_content.encode("utf-8"), "application/xml")}
         resp = await client.post(
@@ -65,13 +67,15 @@ async def import_burp_xml(
 
 @mcp.tool()
 async def import_burp_sitemap(
-    xml_content: Annotated[str, Field(description="Burp sitemap XML export (<items> root)")]
+    xml_content: Annotated[str, Field(description="Burp sitemap XML export (<items> root)")],
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Import a Burp sitemap export and extract URLs for content intelligence.
 
     Parses the sitemap XML into web_findings and also triggers URL extraction
     for the content intelligence module (discovered parameters, login forms, etc.).
     """
+    set_request_engagement(engagement_id)
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as client:
         # First, ingest the XML
         files = {"file": ("burp_sitemap.xml", xml_content.encode("utf-8"), "application/xml")}
@@ -100,7 +104,8 @@ async def import_burp_sitemap(
 
 @mcp.tool()
 async def import_burp_requests(
-    requests_json: Annotated[str, Field(description="JSON array of objects with fields: url, method, request, response, status_code, comment")]
+    requests_json: Annotated[str, Field(description="JSON array of objects with fields: url, method, request, response, status_code, comment")],
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Import request/response pairs from Burp into the platform as findings.
 
@@ -115,6 +120,7 @@ async def import_burp_requests(
 
     Synthesizes a Burp sitemap XML and imports it through the standard pipeline.
     """
+    set_request_engagement(engagement_id)
     try:
         items = json.loads(requests_json)
     except json.JSONDecodeError as e:
@@ -183,13 +189,15 @@ async def export_findings_burp_xml(
     source: Annotated[Optional[str], Field(description="Filter by source tool: burp, zap, nuclei, etc.")] = None,
     ip: Annotated[Optional[str], Field(description="Filter by IP address")] = None,
     search: Annotated[Optional[str], Field(description="Search term for finding names/URLs")] = None,
-    limit: Annotated[int, Field(description="Maximum findings to export")] = 100
+    limit: Annotated[int, Field(description="Maximum findings to export")] = 100,
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Export platform findings as Burp-compatible XML for import into Burp Suite.
 
     Returns XML in Burp Scanner issue format that can be imported into Burp
     via Extensions or the "Import scanner results" feature.
     """
+    set_request_engagement(engagement_id)
     params = {"limit": limit}
     if severity:
         params["severity"] = severity
@@ -214,12 +222,14 @@ async def export_findings_burp_xml(
 @mcp.tool()
 async def export_sitemap_burp_xml(
     domain: Annotated[Optional[str], Field(description="Filter by domain name")] = None,
-    asset_id: Annotated[Optional[str], Field(description="Filter by asset UUID")] = None
+    asset_id: Annotated[Optional[str], Field(description="Filter by asset UUID")] = None,
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Export the platform's discovered sitemap as Burp-compatible XML.
 
     Returns sitemap data in Burp's items XML format for import into Burp's site map.
     """
+    set_request_engagement(engagement_id)
     params = {}
     if domain:
         params["domain"] = domain
@@ -240,12 +250,14 @@ async def export_sitemap_burp_xml(
 @mcp.tool()
 async def export_urls_txt(
     domain: Annotated[Optional[str], Field(description="Filter by domain name")] = None,
-    asset_id: Annotated[Optional[str], Field(description="Filter by asset UUID")] = None
+    asset_id: Annotated[Optional[str], Field(description="Filter by asset UUID")] = None,
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Export discovered URLs as plain text (one per line) for Burp's URL import or other tools.
 
     Useful for feeding into Burp's "Paste URL" feature, Intruder, or external tools.
     """
+    set_request_engagement(engagement_id)
     params = {}
     if domain:
         params["domain"] = domain
@@ -271,12 +283,14 @@ async def search_findings(
     source: Annotated[Optional[str], Field(description="Filter by source tool: burp, zap, nuclei, etc.")] = None,
     cve: Annotated[Optional[str], Field(description="Filter by CVE ID, e.g. 'CVE-2021-44228'")] = None,
     url_pattern: Annotated[Optional[str], Field(description="Search URL pattern (partial match)")] = None,
-    limit: Annotated[int, Field(description="Maximum results to return")] = 50
+    limit: Annotated[int, Field(description="Maximum results to return")] = 50,
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Search findings in the platform database with filters.
 
     Returns JSON array of matching findings with severity, URL, name, evidence, and source.
     """
+    set_request_engagement(engagement_id)
     params = {"limit": limit}
     if severity:
         params["severity"] = severity
@@ -298,13 +312,15 @@ async def search_findings(
 
 @mcp.tool()
 async def get_sitemap(
-    domain: Annotated[str, Field(description="Domain name to query sitemap for, e.g. 'example.com'")]
+    domain: Annotated[str, Field(description="Domain name to query sitemap for, e.g. 'example.com'")],
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Get the discovered sitemap for a domain including URLs, parameters, and metadata.
 
     Returns the content intelligence sitemap data showing all discovered pages,
     forms, parameters, and technologies for the specified domain.
     """
+    set_request_engagement(engagement_id)
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as client:
         resp = await client.get(
             f"{RAG_API_URL}/content-intel/sitemap",
@@ -320,12 +336,14 @@ async def get_discovered_params(
     url_pattern: Annotated[Optional[str], Field(description="Filter by URL pattern substring (case-insensitive)")] = None,
     param_name: Annotated[Optional[str], Field(description="Filter by parameter name substring (case-insensitive)")] = None,
     limit: Annotated[int, Field(description="Max rows to return (1-2000)")] = 200,
+    engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID). Omit to use the server default. mcpo forwards this as a tool argument.")] = None,
 ) -> str:
     """Get discovered parameters from crawled web applications.
 
     Returns parameters found in URLs, forms, and JavaScript files — useful for
     building Burp Intruder payloads or identifying injection points.
     """
+    set_request_engagement(engagement_id)
     # The rag-api endpoint is /params (not /content-intel/params).
     # `domain` maps onto `url_pattern` server-side since the API filters URLs
     # via ILIKE substring matching.
@@ -347,12 +365,13 @@ async def get_discovered_params(
 
 
 @mcp.tool()
-async def get_scope() -> str:
+async def get_scope(engagement_id: Annotated[Optional[str], Field(description="Scope this call to one engagement (UUID); omit for the server default.")] = None) -> str:
     """Get the current engagement scope (target IPs, domains, and networks).
 
     Returns the authorized scope targets — useful for configuring Burp's
     target scope to match the engagement boundaries.
     """
+    set_request_engagement(engagement_id)
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as client:
         resp = await client.get(
             f"{RAG_API_URL}/scope/targets",
