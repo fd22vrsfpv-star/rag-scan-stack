@@ -13,6 +13,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy all MCP server scripts
+COPY _engagement_mw.py .
 COPY autogen-streamable-http-mcp-server.py .
 COPY mcp-sessions.py .
 COPY mcp-scanning.py .
