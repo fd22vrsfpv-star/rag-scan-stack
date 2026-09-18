@@ -1462,6 +1462,7 @@ class CrawlRequest(BaseModel):
     timeout_per_page: int = Field(15, description="Page load timeout in seconds")
     same_origin_only: bool = Field(True, description="Only follow same-origin links")
     capture_screenshots: bool = Field(False, description="Screenshot each page")
+    auth: Optional[Dict] = Field(None, description="Auth Profile for an AUTHENTICATED crawl: {login_url, login_data (with {%username%}/{%password%}), username, password}. If omitted, a stored Auth Profile for the host is used. The browser logs in before crawling so the tree seeded into ZAP is authenticated.")
 
 
 class CrawlResponse(BaseModel):
@@ -1474,11 +1475,72 @@ class CrawlResponse(BaseModel):
 _crawl_jobs: Dict[str, dict] = {}
 
 
+def _login_fields(login_data: str):
+    """(user_field, pass_field) input names from a login_data template such as
+    'user={%username%}&pass={%password%}&csrf={%csrf%}'. Pure/testable."""
+    from urllib.parse import parse_qsl
+    user_field = pass_field = None
+    for k, v in parse_qsl(login_data or "", keep_blank_values=True):
+        if "{%username%}" in v:
+            user_field = k
+        elif "{%password%}" in v:
+            pass_field = k
+    return user_field, pass_field
+
+
+async def _browser_login(page, auth: Dict) -> bool:
+    """Best-effort form login in the browser so the crawl (and the ZAP site tree
+    it seeds) is authenticated. Parses the login_data template to find the
+    username/password fields, fills and submits them, and — when a
+    logged_in_regex is given — verifies the result rather than assuming success.
+    Never raises into the crawl."""
+    try:
+        login_url = auth.get("login_url")
+        login_data = auth.get("login_data") or ""
+        if not login_url or not login_data:
+            return False
+        user_field, pass_field = _login_fields(login_data)
+        await page.goto(login_url, wait_until="domcontentloaded", timeout=20000)
+        if user_field and auth.get("username"):
+            try:
+                await page.fill(f"input[name='{user_field}']", str(auth["username"]))
+            except Exception:  # noqa: BLE001
+                pass
+        if pass_field and auth.get("password"):
+            try:
+                await page.fill(f"input[name='{pass_field}']", str(auth["password"]))
+            except Exception:  # noqa: BLE001
+                pass
+        # Submit: a submit button if present, else Enter in the password field.
+        try:
+            btn = await page.query_selector("button[type=submit], input[type=submit]")
+            if btn:
+                await btn.click()
+            else:
+                await page.keyboard.press("Enter")
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:  # noqa: BLE001
+            pass
+        rx = auth.get("logged_in_regex")
+        if rx:
+            import re as _re
+            body = await page.content()
+            ok = bool(_re.search(rx, body))
+            logger.info(f"[crawl] browser login verified={ok} (logged_in_regex)")
+            return ok
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[crawl] browser login failed: {e}")
+        return False
+
+
 async def _perform_crawl(job_id: str, req: CrawlRequest):
     """
     Browser-based crawl that discovers URLs by following links.
     All traffic goes through ZAP proxy so ZAP builds its site tree.
     Returns discovered URLs for downstream pipeline stages.
+    When an Auth Profile is present, the browser logs in FIRST so the seeded
+    tree — and thus ZAP's authenticated active scan — covers post-login pages.
     """
     # Every seed, not just req.url: a single unchecked seed_urls entry is a
     # complete bypass of the gate on req.url.
@@ -1532,6 +1594,17 @@ async def _perform_crawl(job_id: str, req: CrawlRequest):
 
             ctx = await browser.new_context(**context_options)
             page = await ctx.new_page()
+
+            # AUTHENTICATED crawl: log the browser in BEFORE crawling so every
+            # discovered page (and the ZAP tree seeded from this traffic) is
+            # post-login. Explicit req.auth wins; else a stored Auth Profile.
+            try:
+                _eid = current_engagement_id.get()
+            except Exception:  # noqa: BLE001
+                _eid = None
+            _crawl_auth = req.auth or _resolve_web_auth(req.url, _eid)
+            if _crawl_auth and _crawl_auth.get("login_url"):
+                job["authenticated"] = await _browser_login(page, _crawl_auth)
 
             # Capture network requests as additional discovered URLs
             def _on_request(request):
