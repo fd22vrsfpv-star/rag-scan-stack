@@ -39,7 +39,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 log = logging.getLogger("enumeration_llm_router")
 
-LLM_URL = os.environ.get("LLM_URL", "https://llm_query:8002/ollama/chat")
+# llm_query listens on HTTP, not HTTPS — an https:// URL fails with an SSL
+# "record layer failure" and every router LLM call then fails closed silently.
+LLM_URL = os.environ.get("LLM_URL", "http://llm_query:8002/ollama/chat")
 
 # Fact kinds the LLM roles may emit / keep — the vocabulary the extractors and
 # rules already speak. An invented kind nothing consumes is dropped.
