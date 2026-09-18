@@ -433,6 +433,17 @@ else
   warn "trg_recon_findings_engagement check skipped (no DB connection helper available)"
 fi
 
+# scope_targets placeholder-drop trigger (keeps a scope with real targets from
+# also holding a blank '' placeholder — a scope-intelligence wildcard trap)
+HAS_ST_TRG=$(_run_sql "SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_scope_targets_drop_placeholder')")
+if [[ "$HAS_ST_TRG" == "t" ]]; then
+  pass "scope_targets: trg_scope_targets_drop_placeholder present"
+elif [[ "$HAS_ST_TRG" == "f" ]]; then
+  fail "scope_targets: trg_scope_targets_drop_placeholder missing — run ./scripts/ensure_db_schema.sh"
+else
+  warn "trg_scope_targets_drop_placeholder check skipped (no DB connection helper available)"
+fi
+
 # Tool registry (node_manager) reachable + Kali allowlist reconciled
 echo ""
 echo "  -- tool registry / Kali allowlist --"
