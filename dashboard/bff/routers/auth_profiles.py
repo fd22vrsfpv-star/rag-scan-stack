@@ -132,6 +132,18 @@ async def oauth_capture(request: Request):
         raise HTTPException(502, f"oauth-capture failed: {e}")
 
 
+@router.post("/api/auth-profiles/device-poll")
+async def device_poll(request: Request):
+    """Poll the token endpoint once for an in-progress device-code grant."""
+    body = await request.json()
+    try:
+        async with httpx.AsyncClient(timeout=20, verify=False) as c:
+            r = await c.post(f"{_ps()}/auth/device-poll", json=body, headers=_hdrs())
+            return r.json() if r.status_code < 400 else {"ok": False, "error": r.text[:200]}
+    except Exception as e:
+        raise HTTPException(502, f"device-poll failed: {e}")
+
+
 @router.get("/api/auth-profiles/burp-bundle")
 async def burp_bundle(host: str, engagement_id: str = None):
     params = {"host": host}
