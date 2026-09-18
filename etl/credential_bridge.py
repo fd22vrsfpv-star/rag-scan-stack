@@ -106,6 +106,13 @@ _SECRET_TYPE_TO_VAULT = {
     "kerberos_ticket": "krb_tgt",
     "aws_key": "aws_access_key",
     "azure_key": "other",
+    # Web-session material (portable Auth Profile). These reach the vault as
+    # reusable session credentials and are read back by /export/proxy-replay
+    # Phase 3 and the Burp/ZAP auth bridge as Cookie/Authorization/X-API-Key.
+    "cookie": "cookie",
+    "bearer": "bearer",
+    "token": "token",
+    "api_key": "api_key",
     "other": "other",
 }
 _VAULT_FALLBACK_TYPE = "other"

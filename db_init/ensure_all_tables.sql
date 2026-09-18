@@ -3469,11 +3469,16 @@ CREATE INDEX IF NOT EXISTS idx_scan_run_findings_fingerprint ON public.scan_run_
 -- TIER 14: Cloud Credential & Token Management
 -- ============================================================================
 
--- Expand credential_vault: add cloud credential types
+-- Expand credential_vault: add cloud credential types + web-session types.
+-- The web-session types (cookie/bearer/token/api_key) are what a portable web
+-- Auth Profile stores as reusable session material and what /export/proxy-replay
+-- Phase 3 reads to inject Cookie/Authorization/X-API-Key headers — that query
+-- filtered on exactly these types, so without them here it matched zero rows.
 ALTER TABLE public.credential_vault DROP CONSTRAINT IF EXISTS credential_vault_credential_type_check;
 ALTER TABLE public.credential_vault ADD CONSTRAINT credential_vault_credential_type_check
   CHECK (credential_type IN ('password','ntlm_hash','krb_tgs','krb_tgt','ssh_key',
-    'api_token','certificate','aws_access_key','aws_sts','azure_oauth','azure_sp','gcp_sa_key','other'));
+    'api_token','certificate','aws_access_key','aws_sts','azure_oauth','azure_sp','gcp_sa_key',
+    'cookie','bearer','token','api_key','other'));
 
 -- Add cloud-specific columns
 ALTER TABLE public.credential_vault ADD COLUMN IF NOT EXISTS expires_at timestamptz;
