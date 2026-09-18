@@ -70,17 +70,25 @@ def test_no_raw_api_key_header_at_call_sites(name):
         f"{name} has a raw x-api-key header dict outside the helper.")
 
 
-def test_credentials_tools_accept_per_request_engagement():
-    """The data-query tools expose an engagement_id parameter and bind it per
-    call — the only channel mcpo forwards (it passes declared tool args, not
-    headers/query). Verified live: list_users returns fewer rows with it set."""
-    s = _src("mcp-credentials")
-    assert "set_request_engagement" in s, "must import/use set_request_engagement"
-    # Each data-query tool takes engagement_id and binds it.
-    assert s.count("engagement_id: Annotated") >= 4, (
-        "the identity/group query tools must accept an engagement_id argument")
-    assert s.count("set_request_engagement(engagement_id)") >= 4, (
-        "each such tool must bind its engagement_id for the request")
+# Servers whose rag-api tools take a per-request engagement_id argument, and the
+# minimum number of such tools each must expose (the reliable mcpo channel).
+_PER_REQUEST = {"mcp-credentials": 4, "mcp-recon": 6, "mcp-sessions": 1,
+                "mcp-burp": 10, "mcp-zap": 3}
+
+
+@pytest.mark.parametrize("name", sorted(_PER_REQUEST))
+def test_rag_api_tools_accept_per_request_engagement(name):
+    """Every tool that touches rag-api exposes an engagement_id argument and
+    binds it per call — the only channel mcpo forwards (declared tool args, not
+    headers/query). Verified live on credentials: list_users 7 vs 5 scoped."""
+    s = _src(name)
+    assert "set_request_engagement" in s, f"{name} must import/use set_request_engagement"
+    need = _PER_REQUEST[name]
+    assert s.count("engagement_id: Annotated") >= need, (
+        f"{name}: expected >= {need} tools with an engagement_id argument")
+    # every engagement_id param must be bound for the request
+    assert s.count("set_request_engagement(engagement_id)") == s.count("engagement_id: Annotated"), (
+        f"{name}: every engagement_id argument must call set_request_engagement(engagement_id)")
 
 
 def test_mcpo_config_uses_http_for_streamable():
