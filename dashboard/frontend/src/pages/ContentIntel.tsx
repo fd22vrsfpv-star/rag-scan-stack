@@ -233,7 +233,7 @@ export default function ContentIntel() {
         ))}
       </div>
 
-      {tab === 'extractions' && <ExtractionsTab assetFilter={assetFilter} scopeDomains={scopeDomains} />}
+      {tab === 'extractions' && <ExtractionsTab assetFilter={assetFilter} scopeDomains={scopeDomains} selectedScope={selectedScope} />}
       {tab === 'sitemap' && <SitemapTab assetFilter={assetFilter} scopeDomains={scopeDomains} selectedScope={selectedScope} />}
       {tab === 'wordlists' && <WordlistsTab assetFilter={assetFilter} />}
       {tab === 'settings' && <SettingsTab />}
@@ -259,9 +259,12 @@ const CATEGORY_META: Record<string, { icon: typeof Mail; label: string; color: s
   file_metadata:       { icon: ScanSearch,    label: 'File Metadata',       color: 'text-emerald-400', summaryKey: 'total_file_metadata' },
 }
 
-function ExtractionsTab({ assetFilter, scopeDomains }: { assetFilter: string; scopeDomains?: string[] }) {
+function ExtractionsTab({ assetFilter, scopeDomains, selectedScope }: { assetFilter: string; scopeDomains?: string[]; selectedScope?: string }) {
   const { data: extractionsData, isLoading } = useContentExtractions(assetFilter || undefined)
-  const { data: summaryData, isLoading: loadingSummary } = useContentSummary(assetFilter || undefined)
+  // Counts are calculated for the active engagement (via the X-Engagement-Id
+  // header apiFetch always sends) and the selected scope, so the summary cards
+  // match the scope-filtered list instead of showing global totals.
+  const { data: summaryData, isLoading: loadingSummary } = useContentSummary(assetFilter || undefined, selectedScope || undefined)
   const updateExtraction = useUpdateExtraction()
   const deleteExtraction = useDeleteExtraction()
   const [activeCategory, setActiveCategory] = useState<CategoryFilter>(null)
