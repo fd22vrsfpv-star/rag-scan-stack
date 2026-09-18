@@ -879,17 +879,42 @@ async def set_web_auth(body: Dict):
 
 @app.get("/web-auth")
 async def list_web_auth():
-    """List configured hosts (passwords masked)."""
+    """List Auth Profiles (secrets never returned)."""
     _ensure_web_auth_table()
     from db_utils import get_db
     with get_db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT host, login_url, username, (password IS NOT NULL), "
-                    "enabled, updated_at FROM web_auth_configs ORDER BY host")
+        cur.execute(
+            "SELECT host, login_url, username, (password IS NOT NULL), enabled, "
+            "updated_at, auth_type, (credential_id IS NOT NULL), "
+            "(COALESCE(session,'{}'::jsonb) <> '{}'::jsonb), engagement_id "
+            "FROM web_auth_configs ORDER BY host")
         rows = cur.fetchall()
     return {"configs": [
         {"host": r[0], "login_url": r[1], "username": r[2],
          "has_password": r[3], "enabled": r[4],
-         "updated_at": r[5].isoformat() if r[5] else None} for r in rows]}
+         "updated_at": r[5].isoformat() if r[5] else None,
+         "auth_type": r[6], "has_credential": r[7], "has_session": r[8],
+         "engagement_id": str(r[9]) if r[9] else None} for r in rows]}
+
+
+@app.delete("/web-auth/{host}")
+async def delete_web_auth(host: str, engagement_id: Optional[str] = None):
+    """Delete the Auth Profile for a host (optionally engagement-scoped)."""
+    _ensure_web_auth_table()
+    from db_utils import get_db
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            if engagement_id:
+                cur.execute("DELETE FROM web_auth_configs WHERE host=%s AND engagement_id=%s::uuid",
+                            (host, engagement_id))
+            else:
+                cur.execute("DELETE FROM web_auth_configs WHERE host=%s AND engagement_id IS NULL",
+                            (host,))
+            n = cur.rowcount
+            conn.commit()
+        return {"ok": True, "host": host, "deleted": n}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/jobs/{scan_id}")

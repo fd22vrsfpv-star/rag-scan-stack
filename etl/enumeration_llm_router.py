@@ -428,6 +428,42 @@ class EnumerationLLMRouter:
             return None
 
 
+    def synth_login_macro(self, html: str, page_url: str) -> Optional[Dict[str, Any]]:
+        """LLM fallback for auto-populate: read a login page the deterministic
+        parser could not and return the Auth Profile macro fields. Budget-gated
+        (deepen bucket), fail-CLOSED. Returns
+        {login_url, login_data, csrf_field, auth_type} or None."""
+        p = self.route("deepen")
+        if not _GLOBAL_ENABLED or not (html or "").strip():
+            return None
+        if not self._within_budget(p, consume=True, bucket=self._deepen_calls):
+            return None
+        try:
+            system = (
+                "You are reading an HTML login page for AUTHORIZED security "
+                "testing. Return ONLY JSON describing how to submit the login "
+                "form: {\"login_url\":\"<absolute form action>\","
+                "\"login_data\":\"field1={%username%}&field2={%password%}"
+                "[&csrf={%csrf%}]\",\"csrf_field\":\"<hidden token field name or "
+                "null>\"}. Use the placeholders {%username%}/{%password%}/{%csrf%} "
+                "for those fields; carry other hidden fields with their literal "
+                "values. If there is no login form, return {}.")
+            user = f"Page URL: {page_url}\nHTML (truncated):\n{html[:6000]}"
+            parsed = self._first_json(self._call_llm(system, user, p))
+            if not isinstance(parsed, dict):
+                return None
+            ld = str(parsed.get("login_data") or "")
+            if "{%username%}" not in ld or "{%password%}" not in ld:
+                return None
+            return {"login_url": str(parsed.get("login_url") or page_url),
+                    "login_data": ld,
+                    "csrf_field": parsed.get("csrf_field") or None,
+                    "auth_type": "csrf" if parsed.get("csrf_field") else "form"}
+        except Exception as e:  # noqa: BLE001
+            log.debug("synth_login_macro failed: %s", e)
+            return None
+
+
 _ROUTER: Optional[EnumerationLLMRouter] = None
 
 
