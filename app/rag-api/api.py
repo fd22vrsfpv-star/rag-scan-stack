@@ -19587,7 +19587,13 @@ def scope_intelligence(scope_name: str, _: bool = Depends(auth)):
         from urllib.parse import urlparse as _urlparse
         like_set: set = set()
         for r in scope_targets:
-            target = r["target"]
+            target = (r["target"] or "").strip()
+            # A blank scope target is a WILDCARD TRAP: "%" || "" || "%" is '%%',
+            # which ILIKE-matches EVERY recon finding — so a scope with an empty
+            # target row (e.g. the 'testfire' scope's blank domain row) pulled in
+            # every other engagement's blackbaud/convio data. Skip empties.
+            if not target:
+                continue
             like_set.add(f"%{target}%")
             if target.startswith(("http://", "https://")):
                 try:
@@ -19597,6 +19603,10 @@ def scope_intelligence(scope_name: str, _: bool = Depends(auth)):
                 except Exception:
                     pass
         like_patterns = list(like_set)
+        # No concrete targets → nothing to match (and an empty IN-list would make
+        # the WHERE clause invalid). Return the empty view rather than everything.
+        if not like_patterns:
+            return empty
         like_sql = " OR ".join(["rf.target ILIKE %s"] * len(like_patterns))
 
         # 1. Subdomains
@@ -19954,7 +19964,11 @@ def scope_analysis(scope_name: str, _: bool = Depends(auth)):
         scope_ips: set = set()
         scope_domains: set = set()
         for r in scope_targets:
-            target = r["target"]
+            target = (r["target"] or "").strip()
+            # Skip blank targets — "%" || "" || "%" is '%%', which ILIKE-matches
+            # every recon finding and dragged in other engagements' data.
+            if not target:
+                continue
             like_set.add(f"%{target}%")
             if r["target_type"] == "ip":
                 scope_ips.add(target)
