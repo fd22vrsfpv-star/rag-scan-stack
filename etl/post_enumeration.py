@@ -457,6 +457,15 @@ def _matches(rule: Dict[str, Any], fact: Dict[str, Any]) -> bool:
         if isinstance(expected, bool):
             if bool(got) is not expected:
                 return False
+        elif isinstance(expected, list):
+            # any-of: fact value must equal one of the listed values (ci).
+            if str(got).lower() not in [str(e).lower() for e in expected]:
+                return False
+        elif isinstance(expected, dict) and "contains" in expected:
+            # substring match (ci) — for varied free-text fields like a web
+            # finding's issue_type/name where exact match is too brittle.
+            if str(expected["contains"]).lower() not in str(got or "").lower():
+                return False
         elif str(got).lower() != str(expected).lower():
             return False
     return True
@@ -860,7 +869,7 @@ def facts_from_web_findings(cur, *, target: str = "", limit: int = 200,
     try:
         cur.execute(
             f"""SELECT wf.id::text, host(a.ip), wf.url, wf.severity,
-                       COALESCE(wf.name,'')
+                       COALESCE(wf.name,''), COALESCE(wf.issue_type,'')
                   FROM web_findings wf
                   JOIN assets a ON a.id = wf.asset_id
                  WHERE {' AND '.join(where)}
@@ -868,11 +877,14 @@ def facts_from_web_findings(cur, *, target: str = "", limit: int = 200,
                                     WHERE eo.fact->>'web_finding_id' = wf.id::text)
                  ORDER BY wf.created_at DESC
                  LIMIT %s""", params)
-        for wid, host, url, severity, name in cur.fetchall():
+        for wid, host, url, severity, name, issue_type in cur.fetchall():
+            # issue_type/name carried so rules can key off WHAT the finding is
+            # (e.g. information disclosure, directory listing), not only severity —
+            # the deterministic tier of "deepen informational findings".
             facts.append({"fact": "web_finding", "target": host, "service": "http",
                           "web_finding_id": wid, "url": url,
                           "severity": (severity or "").lower(),
-                          "name": name})
+                          "name": name, "issue_type": issue_type})
     except Exception as e:  # noqa: BLE001
         log.debug("web finding facts unavailable: %s", e)
     return facts
