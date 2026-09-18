@@ -273,8 +273,50 @@ def _parse_scanner_issues(filepath: str, cur, stats: dict, dedupe: bool,
         elem.clear()
 
 
+def _capture_burp_session(cur, host, request_text, captured):
+    """Tie a Burp session back into the platform: pull the authenticated session
+    headers (Cookie / Authorization / X-API-Key) out of a sitemap request and
+    upsert them as a session-only Auth Profile for the host, so a subsequent
+    platform (ZAP) scan can reuse Burp's logged-in session. Once per host, and
+    best-effort (a savepoint isolates it — a missing column pre-migration or any
+    error must not fail the import)."""
+    if not host or host in captured or not request_text:
+        return
+    hdrs = {}
+    for line in request_text.splitlines():
+        low = line.lower()
+        if low.startswith("cookie:"):
+            hdrs["Cookie"] = line.split(":", 1)[1].strip()
+        elif low.startswith("authorization:"):
+            hdrs["Authorization"] = line.split(":", 1)[1].strip()
+        elif low.startswith("x-api-key:"):
+            hdrs["X-API-Key"] = line.split(":", 1)[1].strip()
+    if not hdrs:
+        return
+    captured.add(host)
+    session = json.dumps({"headers": hdrs, "captured_from": "burp"})
+    try:
+        cur.execute("SAVEPOINT sess_sp")
+        cur.execute(
+            """INSERT INTO web_auth_configs (host, auth_type, session, enabled)
+               VALUES (%s, 'session', %s::jsonb, true)
+               ON CONFLICT (COALESCE(engagement_id,
+                   '00000000-0000-0000-0000-000000000000'::uuid), host)
+               DO UPDATE SET session = EXCLUDED.session, updated_at = now()""",
+            (host, session))
+        cur.execute("RELEASE SAVEPOINT sess_sp")
+        stats["sessions_captured"] = stats.get("sessions_captured", 0) + 1
+    except Exception as e:  # noqa: BLE001
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT sess_sp")
+        except Exception:  # noqa: BLE001
+            pass
+        logger.debug("burp session capture skipped for %s: %s", host, e)
+
+
 def _parse_sitemap_items(filepath: str, cur, stats: dict, dedupe: bool):
     """Parse Burp Sitemap XML (<items> root)."""
+    _captured_hosts: set = set()
     for event, elem in iterparse(filepath, events=("end",)):
         if elem.tag != "item":
             continue
@@ -296,6 +338,10 @@ def _parse_sitemap_items(filepath: str, cur, stats: dict, dedupe: bool):
         response_b64 = elem.findtext("response")
         request_text = _decode_base64_safe(request_b64)
         response_text = _decode_base64_safe(response_b64)
+
+        # Tie a Burp session back in: capture the authenticated headers once per host.
+        if host and request_text:
+            _capture_burp_session(cur, host, request_text, _captured_hosts)
 
         evidence_parts = []
         if request_text:
