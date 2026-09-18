@@ -126,7 +126,8 @@ def emit_webhook(
     source: str,
     data: Dict[str, Any],
     severity: Optional[str] = None,
-    db_conn=None
+    db_conn=None,
+    engagement_id: Optional[str] = None,
 ) -> int:
     """
     Emit a webhook event to all matching webhooks.
@@ -155,18 +156,33 @@ def emit_webhook(
             logger.error(f"Failed to connect to database for webhook emission: {e}")
             return 0
 
+    # The engagement this event belongs to: an explicit arg, else the emit
+    # payload's engagement_id (callers include it per CLAUDE.md). Used to route
+    # engagement-scoped webhooks and to stamp the event log.
+    event_eid = engagement_id or (data.get("engagement_id") if isinstance(data, dict) else None)
+    event_eid = str(event_eid) if event_eid else None
+
     notified = 0
     try:
         with db_conn.cursor(cursor_factory=RealDictCursor) as cur:
             # Find matching webhooks
             cur.execute("""
-                SELECT id, url, secret, event_types, sources, severities, max_retries, timeout_ms
+                SELECT id, url, secret, event_types, sources, severities, max_retries, timeout_ms,
+                       engagement_id
                 FROM webhooks
                 WHERE enabled = true
             """)
             webhooks = cur.fetchall()
 
             for webhook in webhooks:
+                # Engagement filter: a webhook scoped to one engagement fires ONLY
+                # for that engagement's events (and never for an unattributed
+                # event — fail closed, so a per-client webhook can't leak another
+                # engagement's data). A NULL-engagement webhook is platform-wide.
+                if webhook.get("engagement_id"):
+                    if not event_eid or str(webhook["engagement_id"]) != event_eid:
+                        continue
+
                 # Check event type filter
                 if webhook["event_types"] and event_type not in webhook["event_types"]:
                     continue
@@ -185,10 +201,10 @@ def emit_webhook(
                 # Create event record with source-prefixed event type for clear identification
                 source_event_type = f"{source}_{event_type}"
                 cur.execute("""
-                    INSERT INTO webhook_events (webhook_id, event_type, payload, status)
-                    VALUES (%s, %s, %s, 'pending')
+                    INSERT INTO webhook_events (webhook_id, event_type, payload, status, engagement_id)
+                    VALUES (%s, %s, %s, 'pending', %s)
                     RETURNING id
-                """, (str(webhook["id"]), source_event_type, json.dumps(payload)))
+                """, (str(webhook["id"]), source_event_type, json.dumps(payload), event_eid))
                 event_id = str(cur.fetchone()["id"])
                 db_conn.commit()
 

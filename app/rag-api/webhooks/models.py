@@ -40,6 +40,7 @@ class WebhookCreate(BaseModel):
     )
     max_retries: int = Field(3, ge=0, le=10, description="Maximum delivery retry attempts")
     timeout_ms: int = Field(5000, ge=1000, le=30000, description="Request timeout in milliseconds")
+    engagement_id: Optional[str] = Field(None, description="Scope this webhook to ONE engagement (UUID); None = fires for all engagements")
 
 
 class WebhookUpdate(BaseModel):
@@ -53,6 +54,7 @@ class WebhookUpdate(BaseModel):
     severities: Optional[List[str]] = None
     max_retries: Optional[int] = Field(None, ge=0, le=10)
     timeout_ms: Optional[int] = Field(None, ge=1000, le=30000)
+    engagement_id: Optional[str] = None
 
 
 class WebhookResponse(BaseModel):
@@ -66,6 +68,7 @@ class WebhookResponse(BaseModel):
     severities: Optional[List[str]]
     max_retries: int
     timeout_ms: int
+    engagement_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     last_success: Optional[datetime]
@@ -125,3 +128,4 @@ class WebhookEmitRequest(BaseModel):
     source: str = Field(..., description="Source scanner (nmap, nuclei, zap, etc.)")
     data: Dict[str, Any] = Field(..., description="Event payload data")
     severity: Optional[str] = Field(None, description="Severity level (for finding events)")
+    engagement_id: Optional[str] = Field(None, description="Engagement this event belongs to; routes engagement-scoped webhooks. Defaults to data.engagement_id.")
