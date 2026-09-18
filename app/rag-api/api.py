@@ -4875,6 +4875,12 @@ def list_identities(
     derived from credential_vault.username match."""
     conds = []
     params: list = []
+    # Scope to the active engagement (X-Engagement-Id header). Identities carry
+    # engagement_id, so selecting an engagement must not still list every
+    # engagement's accounts.
+    _eid = _validate_engagement_uuid(_resolve_engagement_id())
+    if _eid:
+        conds.append("i.engagement_id = %s::uuid"); params.append(_eid)
     if provider:
         conds.append("i.provider = %s"); params.append(provider)
     if principal_type:
@@ -5049,6 +5055,10 @@ def identities_groups(
     # to interpret the bare `%` as a placeholder when other params are present.
     where = ["t LIKE %s"]
     params: list = ["member_of:%"]
+    # Scope groups to the active engagement (identities carry engagement_id).
+    _eid = _validate_engagement_uuid(_resolve_engagement_id())
+    if _eid:
+        where.append("engagement_id = %s::uuid"); params.append(_eid)
     if search:
         where.append("substring(t FROM 11) ILIKE %s")
         params.append(f"%{search}%")
@@ -5171,8 +5181,13 @@ def get_identity(identity_id: str, authorized: bool = Depends(auth)):
 @app.get("/identities/stats/summary", tags=["Identities"])
 def identities_summary(authorized: bool = Depends(auth)):
     """Aggregated counts for the Users page header tiles."""
+    # Scope the tiles to the active engagement so they match the (now
+    # engagement-filtered) identity list rather than showing global totals.
+    _eid = _validate_engagement_uuid(_resolve_engagement_id())
+    where = "WHERE engagement_id = %s::uuid" if _eid else ""
+    params = [_eid] if _eid else []
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT
                 count(*)                                      AS total,
                 count(*) FILTER (WHERE is_admin)              AS admins,
@@ -5181,7 +5196,8 @@ def identities_summary(authorized: bool = Depends(auth)):
                 count(*) FILTER (WHERE principal_type='service_principal') AS service_principals,
                 count(DISTINCT provider)                      AS providers
             FROM identities
-        """)
+            {where}
+        """, params)
         row = cur.fetchone() or {}
     return dict(row)
 
@@ -16210,15 +16226,47 @@ def list_content_extractions(
 def content_extraction_summary(
     asset_id: str = None,
     search: str = None,
+    scope: str = None,
+    engagement_id: str = None,
     authorized: bool = Depends(auth),
 ):
-    """Aggregated counts of extracted content intelligence."""
+    """Aggregated counts of extracted content intelligence.
+
+    Counts are calculated for the active ENGAGEMENT and (optional) SCOPE, so the
+    summary matches the scope-filtered list rather than showing global totals.
+    content_extractions has no engagement_id column, so engagement is applied via
+    the linked asset; scope is a URL substring match on the scope's targets, the
+    same rule the Content Intel list uses client-side.
+    """
+    eid = _validate_engagement_uuid(_resolve_engagement_id(engagement_id))
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         conditions = []
         params = []
         if asset_id:
             conditions.append("asset_id = %s")
             params.append(asset_id)
+        if eid:
+            conditions.append(
+                "asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)")
+            params.append(eid)
+        if scope:
+            cur.execute(
+                "SELECT target FROM scope_targets WHERE lower(name) = lower(%s)", (scope,))
+            pats = []
+            for (t,) in cur.fetchall():
+                tv = (t or "").strip()
+                if not tv:  # blank target = %% wildcard trap — skip
+                    continue
+                pats.append(f"%{tv}%")
+                if "://" in tv:  # url target → also match its bare host
+                    host = tv.split("://", 1)[1].split("/", 1)[0].split(":")[0]
+                    if host:
+                        pats.append(f"%{host}%")
+            # A selected scope with no concrete target matches nothing (not
+            # everything) — otherwise the counts would silently show all rows.
+            conditions.append("url ILIKE ANY(%s)" if pats else "false")
+            if pats:
+                params.append(pats)
         if search:
             like = f"%{search}%"
             conditions.append(
