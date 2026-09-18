@@ -19182,6 +19182,27 @@ class QueuePocRequest(BaseModel):
     payloads: List[Dict[str, Any]] = Field(..., description="Selected payloads to queue")
 
 
+@app.post("/findings/{source}/{fid}/deepen", tags=["Findings"])
+def deepen_finding_endpoint(source: str, fid: str, request: dict = None,
+                            authorized: bool = Depends(auth)):
+    """Operator-initiated "Deepen this finding": synthesize ONE read-only probe
+    for the finding (router deepen role, force=True), scope-gate it, and queue it
+    pending. Web findings only. Body/query: {engagement_id?}."""
+    if source not in ("web", "web_findings"):
+        raise HTTPException(400, "deepen currently supports web findings only")
+    try:
+        from etl.post_enumeration import deepen_web_finding
+    except ImportError:  # pragma: no cover
+        from post_enumeration import deepen_web_finding
+    eid = (request or {}).get("engagement_id")
+    res = deepen_web_finding(fid, engagement_id=eid)
+    if not res.get("ok"):
+        # 422 for "nothing proposed / out of scope", 404 for missing finding
+        code = 404 if res.get("reason") == "finding not found" else 422
+        raise HTTPException(code, res.get("reason") or "could not deepen finding")
+    return res
+
+
 @app.post("/findings/{source}/{fid}/queue-poc", tags=["Findings"])
 def queue_poc_for_finding(
     source: str, fid: str, body: QueuePocRequest,

@@ -223,6 +223,42 @@ class ZAPBridge:
             print(f"Error configuring ZAP authentication: {e}")
             return None
 
+    def apply_session_headers(self, headers: dict) -> int:
+        """Inject static session headers (bearer/JWT Authorization, X-API-Key,
+        Cookie) into EVERY ZAP request via the Replacer add-on — this is how
+        token/header-authenticated apps and APIs are scanned authenticated (no
+        login form). Returns how many rules were added. Best-effort."""
+        n = 0
+        for name, value in (headers or {}).items():
+            if not name or value in (None, ""):
+                continue
+            try:
+                self.zap.replacer.add_rule(
+                    description=f"authhdr_{name}", enabled=True,
+                    matchtype="REQ_HEADER", matchregex=False, matchstring=name,
+                    replacement=str(value), initiators="", url="")
+                n += 1
+            except Exception as e:  # noqa: BLE001
+                print(f"ZAP replacer add_rule failed for {name}: {e}")
+        if n:
+            print(f"ZAP: injected {n} session header(s) into all requests")
+        return n
+
+    def verify_authentication(self, context_id, user_id):
+        """Confirm ZAP actually logged in — mirrors the pipeline path
+        (web_scan.configure_zap_auth): trigger a login and read the auth state,
+        where 0/empty means it never authenticated. Returns True/False, or None
+        if ZAP could not tell us. This replaces the old
+        `authenticated = bool(user_id)` (a user object is not a live session)."""
+        try:
+            self.zap.users.authenticate_as_user(context_id, user_id)
+            time.sleep(3)
+            state = str(self.zap.users.get_authentication_state(context_id, user_id) or "0")
+            return state not in ("0", "", "None")
+        except Exception as e:  # noqa: BLE001
+            print(f"ZAP auth verification could not run: {e}")
+            return None
+
     def spider_url(
         self,
         url: str,
@@ -549,9 +585,26 @@ class ZAPBridge:
             context_name = context_name or f"authctx_{int(time.time())}"
             context_id = self.create_context(context_name, url)
             user_id = self.configure_authentication(context_name, context_id, auth)
-            results['authenticated'] = bool(user_id)
             if not user_id:
+                results['authenticated'] = False
                 results['auth_error'] = 'authentication config incomplete or ZAP rejected it'
+            else:
+                # VERIFY the login actually worked rather than assuming
+                # authenticated == user-created (a user object is not a session).
+                verified = self.verify_authentication(context_id, user_id)
+                results['auth_verified'] = verified
+                results['authenticated'] = bool(verified) if verified is not None else bool(user_id)
+                if verified is False:
+                    results['auth_error'] = ('ZAP did not confirm a login — check '
+                                             'login_url/login_data and the indicators')
+
+        # TOKEN/HEADER auth (bearer/JWT/API-key): inject the Auth Profile's session
+        # headers into every request. Independent of a login form, so a token-only
+        # profile (no login_url) still scans authenticated.
+        _sess_headers = (auth or {}).get("session", {}).get("headers") if auth else None
+        if _sess_headers:
+            results['session_headers_injected'] = self.apply_session_headers(_sess_headers)
+            results['authenticated'] = True
 
         if do_spider:
             results['spider_id'] = self.spider_url(
