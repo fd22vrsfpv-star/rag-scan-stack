@@ -135,6 +135,50 @@ def build_har(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
                     "entries": entries}}
 
 
+# ── Auth Profile → Burp (the portable auth bridge) ──────────────────────────
+
+def auth_profile_to_burp_logins(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Map an Auth Profile to Burp's `application_logins` (simple form-login
+    credentials). The secret must already be RESOLVED into `password` by the
+    caller (from credential_id) — this never reads a store. Returns [] when there
+    is no usable username/password (e.g. a session-only profile)."""
+    u = (profile or {}).get("username")
+    p = (profile or {}).get("password")
+    if not u or not p:
+        return []
+    return [{"label": profile.get("host") or profile.get("login_url") or "app",
+             "username": str(u), "password": str(p)}]
+
+
+def session_har_headers(session: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """HAR request-header entries carrying a captured authenticated session
+    ({cookies:[{name,value}], headers:{Cookie|Authorization|X-API-Key}}). This is
+    what lets an exported HAR replay the session in Burp/ZAP."""
+    out: List[Dict[str, Any]] = []
+    hdrs = (session or {}).get("headers") or {}
+    if isinstance(hdrs, dict):
+        for k, v in hdrs.items():
+            if v:
+                out.append({"name": str(k), "value": str(v)})
+    cookies = (session or {}).get("cookies") or []
+    if cookies and not any(h["name"].lower() == "cookie" for h in out):
+        cval = "; ".join(f"{c.get('name')}={c.get('value')}"
+                         for c in cookies if isinstance(c, dict) and c.get("name"))
+        if cval:
+            out.append({"name": "Cookie", "value": cval})
+    return out
+
+
+def build_session_har(url: str, session: Dict[str, Any],
+                      method: str = "GET") -> Dict[str, Any]:
+    """A one-entry HAR for `url` carrying the session headers/cookies — import it
+    into Burp (Proxy > Import) or ZAP to replay an authenticated session captured
+    elsewhere (e.g. by the browser or by Burp itself)."""
+    hdrs = {h["name"]: h["value"] for h in session_har_headers(session)}
+    return build_har([to_har_entry({"method": method, "url": url, "headers": hdrs},
+                                   comment="Auth Profile session")])
+
+
 def _req_for_test(t: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
     """Return (http_request, comment) for one security_test row."""
     cmd = t.get("command") or ""

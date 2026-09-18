@@ -7685,6 +7685,54 @@ def security_test_export_burp(test_id: str, request: dict = None,
             "content_type": content_type, "format": fmt}
 
 
+@app.get("/auth-profiles/burp-bundle", tags=["Auth Profiles"])
+def auth_profile_burp_bundle(host: str, engagement_id: Optional[str] = None,
+                             authorized: bool = Depends(auth)):
+    """Render the Auth Profile for `host` into a Burp-consumable bundle: Burp
+    `application_logins` (for POST /api/burp/scan, an authenticated Burp scan) and
+    a one-entry session HAR (for Burp Proxy > Import / ZAP). The secret is
+    resolved HERE from credential_id -> credential_findings and returned only in
+    the ephemeral response, never stored in the profile. Engagement-scoped like
+    _resolve_web_auth (this engagement's row, else a global one)."""
+    import burp_export
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT login_url, login_data, username, password, auth_type,
+                      csrf_field, credential_id, session, host, engagement_id
+                 FROM web_auth_configs
+                WHERE enabled AND host = %s
+                  AND (engagement_id IS NULL
+                       OR (%s::uuid IS NOT NULL AND engagement_id = %s::uuid))
+                ORDER BY (engagement_id IS NOT NULL) DESC
+                LIMIT 1""",
+            (host, engagement_id, engagement_id))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"no Auth Profile for host {host}")
+        profile = dict(row)
+        password = profile.get("password")
+        if profile.get("credential_id"):
+            cur.execute("SELECT secret_value FROM credential_findings WHERE id = %s::uuid",
+                        (str(profile["credential_id"]),))
+            cr = cur.fetchone()
+            if cr and cr.get("secret_value"):
+                password = cr["secret_value"]
+        profile["password"] = password
+    session = profile.get("session")
+    if isinstance(session, str):
+        try:
+            session = json.loads(session)
+        except Exception:  # noqa: BLE001
+            session = {}
+    logins = burp_export.auth_profile_to_burp_logins(profile)
+    session_har = (burp_export.build_session_har(f"http://{host}/", session or {})
+                   if session else None)
+    return {"ok": True, "host": host,
+            "application_logins": logins,
+            "has_session": bool(session_har),
+            "session_har": session_har}
+
+
 @app.post("/agent-sessions/{session_id}/security-tests/export-burp", tags=["Security Tests"])
 def session_security_tests_export_burp(session_id: str, request: dict = None,
                                        authorized: bool = Depends(auth)):
