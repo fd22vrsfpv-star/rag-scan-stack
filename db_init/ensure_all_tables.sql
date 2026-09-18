@@ -6436,3 +6436,23 @@ CREATE TABLE IF NOT EXISTS web_auth_configs (
     created_at timestamptz DEFAULT now(),
     updated_at timestamptz DEFAULT now()
 );
+
+-- Auth Profile: web_auth_configs generalized into ONE portable, tool-agnostic
+-- auth model that drives the platform's ZAP pipeline AND feeds Burp.
+--   credential_id -> credential_findings, so the secret is resolved at scan time
+--     and never stored here in plaintext (mirrors knowledge/credential_followups).
+--   session jsonb {cookies:[...], headers:{Cookie|Authorization|X-API-Key}} — a
+--     reusable authenticated session captured from a login, emittable as a HAR
+--     for Burp Proxy>Import and consumable by ZAP.
+ALTER TABLE web_auth_configs ADD COLUMN IF NOT EXISTS credential_id uuid;
+ALTER TABLE web_auth_configs ADD COLUMN IF NOT EXISTS session jsonb DEFAULT '{}'::jsonb;
+-- A session-only or credential-only profile need not carry a full login macro.
+ALTER TABLE web_auth_configs ALTER COLUMN login_url DROP NOT NULL;
+ALTER TABLE web_auth_configs ALTER COLUMN login_data DROP NOT NULL;
+ALTER TABLE web_auth_configs ALTER COLUMN username DROP NOT NULL;
+-- Per-(engagement,host) uniqueness so different engagements hold different
+-- profiles for the same host. COALESCE the nullable engagement_id — a NULL makes
+-- rows non-equal, so a bare partial index would not constrain NULL-engagement rows.
+ALTER TABLE web_auth_configs DROP CONSTRAINT IF EXISTS web_auth_configs_host_key;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_web_auth_configs_eng_host
+  ON web_auth_configs (COALESCE(engagement_id, '00000000-0000-0000-0000-000000000000'::uuid), host);
