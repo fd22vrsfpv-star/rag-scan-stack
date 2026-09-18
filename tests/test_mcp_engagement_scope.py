@@ -1,4 +1,4 @@
-"""Data-query MCP servers must forward the active engagement to rag-api.
+"""Data-query MCP servers scope to the active engagement — per request via mcpo.
 
 Run on demand:
 
@@ -6,19 +6,24 @@ Run on demand:
 
 WHY THIS EXISTS
 ---------------
-The MCP servers reach collected data by calling rag-api, but sent only
-`x-api-key` — never X-Engagement-Id — so their tools returned every engagement's
-data regardless of which engagement the client was working. Each data-query MCP
-server now derives ENGAGEMENT_ID (or MCP_ENGAGEMENT_ID) from the environment and
-adds X-Engagement-Id via a shared `_api_headers()` helper; unset = platform-wide
-(unchanged). No raw `{"x-api-key": API_KEY}` header dict may remain — it would
-bypass the engagement header.
+The MCP servers reached collected data via rag-api but sent only `x-api-key`, so
+their tools returned every engagement's data. Now each data-query server carries
+X-Engagement-Id via a shared `_api_headers()` that resolves the engagement from
+`_engagement_mw.current_engagement()` — the PER-REQUEST value the streamable
+server captures from the caller's `X-Engagement-Id` header / `?engagement_id`
+(so the mcpo gateway can scope one tool call), else the ENGAGEMENT_ID env pin,
+else unset = platform-wide. Servers run via `run_streamable(mcp)` which installs
+the capture middleware.
+
+Also pins the mcpo gateway config to http:// for the plain-HTTP streamable
+servers — a https:// URL there made mcpo expose ZERO tools.
 
 SABOTAGE PROOF
 --------------
-Reintroduce a raw `{"x-api-key": API_KEY}` header on a request in any listed
-server (instead of `_api_headers()`) and its case fails.
+Put back a raw `headers={"x-api-key": API_KEY}` on a request, drop the middleware
+run, or set an mcp-streamable URL back to https:// — the matching case fails.
 """
+import json
 import os
 
 import pytest
@@ -34,22 +39,58 @@ def _src(name):
     return open(path, encoding="utf-8").read()
 
 
+def test_shared_middleware_module_present():
+    path = os.path.join(REPO, "mcp", "_engagement_mw.py")
+    assert os.path.exists(path), "mcp/_engagement_mw.py is missing"
+    s = open(path, encoding="utf-8").read()
+    for needle in ("class EngagementMiddleware", "def current_engagement",
+                   "def run_streamable", "x-engagement-id", "ENGAGEMENT_ID"):
+        assert needle in s, f"_engagement_mw.py missing {needle!r}"
+    # Dockerfile must ship it into the streamable image.
+    df = open(os.path.join(REPO, "mcp", "Dockerfile.streamable"), encoding="utf-8").read()
+    assert "COPY _engagement_mw.py" in df, "Dockerfile.streamable must COPY _engagement_mw.py"
+
+
 @pytest.mark.parametrize("name", SERVERS)
-def test_defines_engagement_aware_header_helper(name):
+def test_uses_per_request_engagement(name):
     s = _src(name)
-    assert "def _api_headers" in s, f"{name} must define the _api_headers() helper"
-    assert "ENGAGEMENT_ID" in s and "X-Engagement-Id" in s, (
-        f"{name} must derive the engagement from env and set X-Engagement-Id")
+    assert "from _engagement_mw import current_engagement, run_streamable" in s, (
+        f"{name} must import the shared per-request engagement helpers")
+    assert "current_engagement()" in s, f"{name}'s _api_headers must use current_engagement()"
+    assert "run_streamable(mcp)" in s and 'mcp.run(transport="streamable-http")' not in s, (
+        f"{name} must run via run_streamable(mcp) so the capture middleware is installed")
 
 
 @pytest.mark.parametrize("name", SERVERS)
 def test_no_raw_api_key_header_at_call_sites(name):
     s = _src(name)
-    # The helper body legitimately builds {"x-api-key": API_KEY}; what must be
-    # gone is the CALL-SITE form that bypasses the engagement header.
     assert 'headers={"x-api-key": API_KEY}' not in s, (
-        f"{name} still passes headers={{'x-api-key': API_KEY}} on a request — that "
-        f"bypasses the engagement header; use headers=_api_headers().")
-    # And the raw dict must appear at most once (inside the helper).
+        f"{name} still passes a raw x-api-key header — use headers=_api_headers().")
     assert s.count('{"x-api-key": API_KEY}') <= 1, (
         f"{name} has a raw x-api-key header dict outside the helper.")
+
+
+def test_credentials_tools_accept_per_request_engagement():
+    """The data-query tools expose an engagement_id parameter and bind it per
+    call — the only channel mcpo forwards (it passes declared tool args, not
+    headers/query). Verified live: list_users returns fewer rows with it set."""
+    s = _src("mcp-credentials")
+    assert "set_request_engagement" in s, "must import/use set_request_engagement"
+    # Each data-query tool takes engagement_id and binds it.
+    assert s.count("engagement_id: Annotated") >= 4, (
+        "the identity/group query tools must accept an engagement_id argument")
+    assert s.count("set_request_engagement(engagement_id)") >= 4, (
+        "each such tool must bind its engagement_id for the request")
+
+
+def test_mcpo_config_uses_http_for_streamable():
+    path = os.path.join(REPO, "mcpo", "config.json")
+    if not os.path.exists(path):
+        pytest.skip("mcpo/config.json not present")
+    cfg = json.load(open(path, encoding="utf-8"))
+    for name, spec in (cfg.get("mcpServers") or {}).items():
+        url = spec.get("url", "")
+        if "mcp-streamable" in url:
+            assert url.startswith("http://"), (
+                f"mcpo server {name!r} points at {url} — the streamable servers "
+                f"serve plain HTTP, so a https:// URL makes mcpo expose zero tools.")
