@@ -7685,6 +7685,143 @@ def security_test_export_burp(test_id: str, request: dict = None,
             "content_type": content_type, "format": fmt}
 
 
+@app.get("/auth-profiles/burp-bundle", tags=["Auth Profiles"])
+def auth_profile_burp_bundle(host: str, engagement_id: Optional[str] = None,
+                             authorized: bool = Depends(auth)):
+    """Render the Auth Profile for `host` into a Burp-consumable bundle: Burp
+    `application_logins` (for POST /api/burp/scan, an authenticated Burp scan) and
+    a one-entry session HAR (for Burp Proxy > Import / ZAP). The secret is
+    resolved HERE from credential_id -> credential_findings and returned only in
+    the ephemeral response, never stored in the profile. Engagement-scoped like
+    _resolve_web_auth (this engagement's row, else a global one)."""
+    import burp_export
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """SELECT login_url, login_data, username, password, auth_type,
+                      csrf_field, credential_id, session, host, engagement_id
+                 FROM web_auth_configs
+                WHERE enabled AND host = %s
+                  AND (engagement_id IS NULL
+                       OR (%s::uuid IS NOT NULL AND engagement_id = %s::uuid))
+                ORDER BY (engagement_id IS NOT NULL) DESC
+                LIMIT 1""",
+            (host, engagement_id, engagement_id))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"no Auth Profile for host {host}")
+        profile = dict(row)
+        password = profile.get("password")
+        if profile.get("credential_id"):
+            cur.execute("SELECT secret_value FROM credential_findings WHERE id = %s::uuid",
+                        (str(profile["credential_id"]),))
+            cr = cur.fetchone()
+            if cr and cr.get("secret_value"):
+                password = cr["secret_value"]
+        profile["password"] = password
+    session = profile.get("session")
+    if isinstance(session, str):
+        try:
+            session = json.loads(session)
+        except Exception:  # noqa: BLE001
+            session = {}
+    logins = burp_export.auth_profile_to_burp_logins(profile)
+    session_har = (burp_export.build_session_har(f"http://{host}/", session or {})
+                   if session else None)
+    return {"ok": True, "host": host,
+            "application_logins": logins,
+            "has_session": bool(session_har),
+            "session_har": session_har}
+
+
+@app.post("/auth-profiles/auto-populate", tags=["Auth Profiles"])
+def auth_profile_auto_populate(request: dict, authorized: bool = Depends(auth)):
+    """Assemble an Auth Profile from a DISCOVERED web credential + a login page.
+
+    Body: {host, engagement_id?, login_url?, html?}. Finds an HTTP(S) credential
+    in credential_findings for the host (its id + username), determines the login
+    form from supplied `html` (preferred) or by fetching `login_url`, and
+    synthesizes the login macro (login_url/login_data/csrf_field) — deterministic
+    parse first, LLM fallback via the router. Upserts an Auth Profile that
+    REFERENCES the credential by id (secret resolved at scan time, never stored).
+    """
+    import auth_autopopulate as ap
+    host = (request.get("host") or "").strip()
+    if not host:
+        raise HTTPException(400, "host is required")
+    engagement_id = request.get("engagement_id")
+    login_url = (request.get("login_url") or "").strip()
+    html = request.get("html") or ""
+
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # a discovered web credential for this host (http family, has a secret)
+        cur.execute(
+            """SELECT id::text, username FROM credential_findings
+                WHERE host(ip) = %s AND secret_value IS NOT NULL
+                  AND lower(COALESCE(protocol,'')) IN
+                      ('http','https','http-proxy','web','tomcat','www')
+                ORDER BY valid_cred DESC NULLS LAST, created_at DESC LIMIT 1""",
+            (host,))
+        cred = cur.fetchone()
+    if not cred:
+        raise HTTPException(404, f"no discovered HTTP credential for {host} to build a profile from")
+
+    # Obtain the login page HTML: supplied, or best-effort fetch of login_url.
+    page_url = login_url
+    if not html and login_url:
+        try:
+            import requests as _rq
+            proxies = None
+            _sx = os.environ.get("SCAN_PROXY") or os.environ.get("HTTPS_PROXY")
+            if _sx:
+                proxies = {"http": _sx, "https": _sx}
+            resp = _rq.get(login_url, timeout=15, verify=False, proxies=proxies)
+            if resp.status_code < 400:
+                html = resp.text
+        except Exception as e:  # noqa: BLE001
+            log.warning("auto-populate login fetch failed: %s", e)
+    if not html:
+        raise HTTPException(400, "provide `html` (login page) or a reachable `login_url`")
+
+    macro = ap.synthesize_profile(html, page_url or f"http://{host}/", login_url)
+    if not macro:
+        # LLM fallback: let the router read a form it could not parse deterministically
+        try:
+            from etl.enumeration_llm_router import get_router
+            macro = get_router().synth_login_macro(html, page_url or f"http://{host}/")
+        except Exception as e:  # noqa: BLE001
+            log.warning("auto-populate LLM fallback failed: %s", e)
+            macro = None
+    if not macro:
+        raise HTTPException(422, "could not find/synthesize a login form on the page")
+
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO web_auth_configs
+                  (host, login_url, login_data, username, auth_type, csrf_field,
+                   enabled, engagement_id, credential_id)
+                VALUES (%s,%s,%s,%s,%s,%s,true,%s,%s)
+                ON CONFLICT (COALESCE(engagement_id,
+                    '00000000-0000-0000-0000-000000000000'::uuid), host)
+                DO UPDATE SET login_url=EXCLUDED.login_url,
+                  login_data=EXCLUDED.login_data, username=EXCLUDED.username,
+                  auth_type=EXCLUDED.auth_type, csrf_field=EXCLUDED.csrf_field,
+                  credential_id=EXCLUDED.credential_id, updated_at=now()""",
+            (host, macro["login_url"], macro["login_data"], cred["username"],
+             macro.get("auth_type") or "form", macro.get("csrf_field"),
+             engagement_id, cred["id"]))
+        conn.commit()
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("auth_profile_autopopulated", "auth_profiles",
+                     {"host": host, "credential_id": cred["id"],
+                      "auth_type": macro.get("auth_type"),
+                      "engagement_id": engagement_id})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "host": host, "credential_id": cred["id"],
+            "username": cred["username"], **macro}
+
+
 @app.post("/agent-sessions/{session_id}/security-tests/export-burp", tags=["Security Tests"])
 def session_security_tests_export_burp(session_id: str, request: dict = None,
                                        authorized: bool = Depends(auth)):
@@ -10455,10 +10592,14 @@ def proxy_replay(
         # Phase 3: Auth tokens
         auth_headers = {}
         if include_auth:
+            # credential_vault.status lifecycle is ('active','cracking','cracked',
+            # 'expired','revoked') — there is no 'valid', so the old filter matched
+            # nothing on TWO counts (bad status AND the web-session types were not
+            # in the CHECK). 'active' is the honest "held and not retired" state.
             cur.execute("""
                 SELECT credential_type, credential_value, domain, username
                 FROM credential_vault
-                WHERE status = 'valid' AND credential_type IN ('cookie', 'token', 'api_key', 'bearer')
+                WHERE status = 'active' AND credential_type IN ('cookie', 'token', 'api_key', 'bearer')
                 ORDER BY updated_at DESC
                 LIMIT 50
             """)

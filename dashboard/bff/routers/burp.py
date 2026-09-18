@@ -62,8 +62,28 @@ async def start_burp_scan(request: Request):
         "default": [{"type": "NamedConfiguration", "name": "Crawl and audit - lightweight"}],
     }
     scan_body["scan_configurations"] = config_map.get(scan_config, config_map["default"])
-    if body.get("credentials"):
-        scan_body["application_logins"] = body["credentials"]
+    # Authenticated Burp scan: explicit credentials win; otherwise auto-source the
+    # Auth Profile's application_logins from rag-api's burp-bundle for the target
+    # host, so "launch an authenticated Burp scan from the platform's auth" is one
+    # call. The secret is resolved server-side from credential_id (never here).
+    app_logins = body.get("credentials")
+    if not app_logins:
+        from urllib.parse import urlparse
+        host = body.get("auth_profile_host") or (urlparse(urls[0]).hostname if urls else None)
+        if host:
+            try:
+                s = get_settings()
+                async with httpx.AsyncClient(timeout=15, verify=False) as c:
+                    r = await c.get(
+                        f"{s.rag_api_url.rstrip('/')}/auth-profiles/burp-bundle",
+                        params={"host": host},
+                        headers={"x-api-key": s.api_key, **engagement_headers()})
+                    if r.status_code == 200:
+                        app_logins = (r.json() or {}).get("application_logins") or None
+            except Exception:
+                app_logins = None
+    if app_logins:
+        scan_body["application_logins"] = app_logins
 
     try:
         async with httpx.AsyncClient(timeout=30) as c:

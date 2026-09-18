@@ -72,6 +72,14 @@ _DEFAULTS: Dict[str, Any] = {
     # which facts to review: "uncertain" (llm-sourced / generic / low-confidence)
     # or "all".
     "enum_router.review.scope": "uncertain",
+    # DEEPEN: investigate an informational finding the deterministic rules did
+    # not name — propose ONE read-only probe to turn a "note" into evidence.
+    "enum_router.deepen.enabled": True,
+    "enum_router.deepen.model": None,
+    "enum_router.deepen.temperature": 0.0,
+    "enum_router.deepen.max_tokens": 400,
+    "enum_router.deepen.max_per_window": 6,
+    "enum_router.deepen.window_sec": 300,
     # PROMOTION: turn a shape the LLM keeps discovering into a permanent extractor.
     "enum_router.promotion.enabled": True,
     # Auto-approve a proposed extractor once its kind has this many PRIOR confirmed
@@ -101,6 +109,7 @@ class EnumerationLLMRouter:
         self._cache: Dict[str, Any] = {}
         self._cache_at: float = 0.0
         self._extract_calls: List[float] = []   # timestamps, for the budget
+        self._deepen_calls: List[float] = []     # separate budget for deepen()
 
     # ── config ───────────────────────────────────────────────────────────────
     def _settings(self) -> Dict[str, Any]:
@@ -201,17 +210,20 @@ class EnumerationLLMRouter:
             return None
 
     # ── triage / budget ─────────────────────────────────────────────────────
-    def _within_budget(self, p: Dict[str, Any], *, consume: bool = False) -> bool:
+    def _within_budget(self, p: Dict[str, Any], *, consume: bool = False,
+                       bucket: Optional[List[float]] = None) -> bool:
         """Token-bucket over a rolling window, process-wide. Read-only unless
-        `consume` (extract() consumes when it actually makes a call)."""
+        `consume`. `bucket` selects which call log (extraction vs deepen)."""
+        if bucket is None:
+            bucket = self._extract_calls
         window = float(p.get("window_sec") or 300)
         cap = int(p.get("max_per_window") or 8)
         now = time.time()
-        self._extract_calls = [t for t in self._extract_calls if now - t < window]
-        if len(self._extract_calls) >= cap:
+        bucket[:] = [t for t in bucket if now - t < window]
+        if len(bucket) >= cap:
             return False
         if consume:
-            self._extract_calls.append(now)
+            bucket.append(now)
         return True
 
     def should_extract(self, output: str, deterministic_facts: List[Dict]) -> bool:
@@ -369,6 +381,87 @@ class EnumerationLLMRouter:
         except Exception as e:  # noqa: BLE001
             log.debug("enum router review failed (keeping all): %s", e)
             return {"facts": facts, "reviewed": 0, "dropped": 0}
+
+    # ── deepen ─────────────────────────────────────────────────────────────────
+    _DEEPEN_TOOLS = {"curl", "wget", "http", "httpx", "nuclei", "whatweb"}
+
+    def deepen_finding(self, finding: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Investigate an INFORMATIONAL finding the deterministic rules did not
+        name: ask the LLM whether it is worth a deeper look and, if so, for ONE
+        READ-ONLY probe (curl/http/nuclei/whatweb) that turns the note into
+        evidence. Returns {command, why, assertion} or None. Budget-capped
+        (separate bucket) and fail-CLOSED — never proposes on error, and rejects
+        anything but a read-only allowlisted tool so a queued item is safe."""
+        p = self.route("deepen")
+        if not _GLOBAL_ENABLED or not p.get("enabled"):
+            return None
+        url = finding.get("url") or finding.get("target") or ""
+        name = finding.get("name") or finding.get("issue_type") or ""
+        if not url or not name:
+            return None
+        if not self._within_budget(p, consume=True, bucket=self._deepen_calls):
+            return None
+        try:
+            system = (
+                "You are triaging an INFORMATIONAL web finding for AUTHORIZED "
+                "security testing. Decide whether it is worth a deeper look, and if "
+                "so give ONE READ-ONLY probe that turns the note into evidence. The "
+                "command MUST be read-only and start with one of: curl, wget, http, "
+                "httpx, nuclei, whatweb. Return ONLY JSON: "
+                '{"worth": true|false, "command": "<one read-only command using the '
+                'URL>", "assertion": {"contains": "<expected string>"}, '
+                '"why": "<one short sentence>"}. If not worth deepening, '
+                '{"worth": false}.')
+            user = f"Finding: {name}\nURL: {url}\nType: {finding.get('issue_type') or ''}"
+            parsed = self._first_json(self._call_llm(system, user, p))
+            if not isinstance(parsed, dict) or not parsed.get("worth"):
+                return None
+            cmd = str(parsed.get("command") or "").strip()
+            head = (cmd.split() or [""])[0].split("/")[-1].lower()
+            if not cmd or head not in self._DEEPEN_TOOLS:
+                return None
+            assertion = parsed.get("assertion") if isinstance(parsed.get("assertion"), dict) else {}
+            return {"command": cmd, "why": str(parsed.get("why") or "")[:200],
+                    "assertion": assertion}
+        except Exception as e:  # noqa: BLE001
+            log.debug("enum router deepen failed: %s", e)
+            return None
+
+
+    def synth_login_macro(self, html: str, page_url: str) -> Optional[Dict[str, Any]]:
+        """LLM fallback for auto-populate: read a login page the deterministic
+        parser could not and return the Auth Profile macro fields. Budget-gated
+        (deepen bucket), fail-CLOSED. Returns
+        {login_url, login_data, csrf_field, auth_type} or None."""
+        p = self.route("deepen")
+        if not _GLOBAL_ENABLED or not (html or "").strip():
+            return None
+        if not self._within_budget(p, consume=True, bucket=self._deepen_calls):
+            return None
+        try:
+            system = (
+                "You are reading an HTML login page for AUTHORIZED security "
+                "testing. Return ONLY JSON describing how to submit the login "
+                "form: {\"login_url\":\"<absolute form action>\","
+                "\"login_data\":\"field1={%username%}&field2={%password%}"
+                "[&csrf={%csrf%}]\",\"csrf_field\":\"<hidden token field name or "
+                "null>\"}. Use the placeholders {%username%}/{%password%}/{%csrf%} "
+                "for those fields; carry other hidden fields with their literal "
+                "values. If there is no login form, return {}.")
+            user = f"Page URL: {page_url}\nHTML (truncated):\n{html[:6000]}"
+            parsed = self._first_json(self._call_llm(system, user, p))
+            if not isinstance(parsed, dict):
+                return None
+            ld = str(parsed.get("login_data") or "")
+            if "{%username%}" not in ld or "{%password%}" not in ld:
+                return None
+            return {"login_url": str(parsed.get("login_url") or page_url),
+                    "login_data": ld,
+                    "csrf_field": parsed.get("csrf_field") or None,
+                    "auth_type": "csrf" if parsed.get("csrf_field") else "form"}
+        except Exception as e:  # noqa: BLE001
+            log.debug("synth_login_macro failed: %s", e)
+            return None
 
 
 _ROUTER: Optional[EnumerationLLMRouter] = None

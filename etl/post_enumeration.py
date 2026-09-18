@@ -457,6 +457,15 @@ def _matches(rule: Dict[str, Any], fact: Dict[str, Any]) -> bool:
         if isinstance(expected, bool):
             if bool(got) is not expected:
                 return False
+        elif isinstance(expected, list):
+            # any-of: fact value must equal one of the listed values (ci).
+            if str(got).lower() not in [str(e).lower() for e in expected]:
+                return False
+        elif isinstance(expected, dict) and "contains" in expected:
+            # substring match (ci) — for varied free-text fields like a web
+            # finding's issue_type/name where exact match is too brittle.
+            if str(expected["contains"]).lower() not in str(got or "").lower():
+                return False
         elif str(got).lower() != str(expected).lower():
             return False
     return True
@@ -860,7 +869,7 @@ def facts_from_web_findings(cur, *, target: str = "", limit: int = 200,
     try:
         cur.execute(
             f"""SELECT wf.id::text, host(a.ip), wf.url, wf.severity,
-                       COALESCE(wf.name,'')
+                       COALESCE(wf.name,''), COALESCE(wf.issue_type,'')
                   FROM web_findings wf
                   JOIN assets a ON a.id = wf.asset_id
                  WHERE {' AND '.join(where)}
@@ -868,11 +877,14 @@ def facts_from_web_findings(cur, *, target: str = "", limit: int = 200,
                                     WHERE eo.fact->>'web_finding_id' = wf.id::text)
                  ORDER BY wf.created_at DESC
                  LIMIT %s""", params)
-        for wid, host, url, severity, name in cur.fetchall():
+        for wid, host, url, severity, name, issue_type in cur.fetchall():
+            # issue_type/name carried so rules can key off WHAT the finding is
+            # (e.g. information disclosure, directory listing), not only severity —
+            # the deterministic tier of "deepen informational findings".
             facts.append({"fact": "web_finding", "target": host, "service": "http",
                           "web_finding_id": wid, "url": url,
                           "severity": (severity or "").lower(),
-                          "name": name})
+                          "name": name, "issue_type": issue_type})
     except Exception as e:  # noqa: BLE001
         log.debug("web finding facts unavailable: %s", e)
     return facts
@@ -1354,11 +1366,71 @@ def analyse_findings(*, target: str = "", engagement_id: Optional[str] = None,
                 out["facts"] = len(facts)
                 if facts:
                     _propose_from_facts(cur, facts, context, rules, out)
+                    # B2: deepen INFORMATIONAL web findings the deterministic
+                    # rules did not name (the long tail) — budget-bounded LLM.
+                    _deepen_info_findings(cur, facts, context, rules, out)
                 out["available"] = True
             conn.commit()
     except Exception as e:  # noqa: BLE001
         log.warning("finding analysis failed: %s", e)
     return out
+
+
+def _deepen_info_findings(cur, facts, context, rules, out) -> None:
+    """For info/low web findings that matched NO deterministic rule, ask the
+    router (budget-bounded, fail-closed) for ONE read-only probe that turns the
+    note into evidence, scope-gate it, and queue it pending — the AI tier of
+    "deepen informational findings". Symmetric with the command-output LLM
+    fallback; the router budget caps how many findings we spend the LLM on."""
+    from psycopg2.extras import Json
+    try:
+        from etl.scope_gate import check_dispatch, load_dispatch_scope
+    except ImportError:  # pragma: no cover
+        from scope_gate import check_dispatch, load_dispatch_scope
+    candidates = [f for f in facts
+                  if f.get("fact") == "web_finding"
+                  and f.get("severity") in ("info", "low")
+                  and not any(_matches(r, f) for r in rules)]
+    if not candidates:
+        return
+    router = _enum_router()
+    scope_rows, scope_source = load_dispatch_scope(cur, context.get("engagement_id"))
+    if scope_source == "unavailable":
+        return
+    deepened = 0
+    for fact in candidates:
+        proposal = router.deepen_finding(fact)   # None once the budget is spent
+        if not proposal:
+            continue
+        command = proposal["command"]
+        fact_target = fact.get("target") or context.get("target") or ""
+        refusal = check_dispatch(str(fact_target), scope_rows, command=command)
+        if refusal:
+            _observe(cur, "deepen:info", context, fact, command, None, refused=str(refusal))
+            out["refused"] += 1
+            continue
+        cur.execute(
+            """INSERT INTO scan_recommendations
+                 (ip, service, scanner, action, script, source, priority,
+                  status, engagement_id, extra)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s)
+               ON CONFLICT (fingerprint) DO NOTHING RETURNING id::text""",
+            (fact_target, "http", "deepen", command, command, SOURCE, 30,
+             context.get("engagement_id"),
+             Json({"deepened_finding": fact.get("web_finding_id"),
+                   "why": proposal.get("why"), "assertion": proposal.get("assertion"),
+                   "finding_name": fact.get("name"), "queued_by": "deepen:info"})))
+        row = cur.fetchone()
+        rec_id = row[0] if row else None
+        if rec_id:
+            out["queued"] += 1
+            deepened += 1
+        _observe(cur, "deepen:info", context, fact, command, rec_id)
+    if deepened:
+        out["info_deepened"] = deepened
+        _emit_webhook("post_enum_info_deepened",
+                      {"target": context.get("target"), "count": deepened,
+                       "engagement_id": context.get("engagement_id")})
 
 
 def _observe(cur, rule_id, execution, fact, command, rec_id, refused=None):
