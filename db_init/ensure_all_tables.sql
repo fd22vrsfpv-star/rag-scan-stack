@@ -1585,6 +1585,13 @@ CREATE TABLE IF NOT EXISTS public.webhooks (
 );
 CREATE INDEX IF NOT EXISTS idx_webhooks_enabled ON public.webhooks(enabled);
 CREATE INDEX IF NOT EXISTS idx_webhooks_created_at ON public.webhooks(created_at DESC);
+-- A webhook may be scoped to ONE engagement (fires only for that engagement's
+-- events) or left NULL for a platform-wide integration (fires for all). Without
+-- this, a per-client Slack/n8n webhook received every engagement's findings.
+DO $$ BEGIN
+  ALTER TABLE public.webhooks ADD COLUMN IF NOT EXISTS engagement_id uuid;
+EXCEPTION WHEN duplicate_column THEN NULL; END $$;
+CREATE INDEX IF NOT EXISTS idx_webhooks_engagement ON public.webhooks(engagement_id);
 
 -- webhook_events (delivery tracking)
 CREATE TABLE IF NOT EXISTS public.webhook_events (
@@ -1600,6 +1607,11 @@ CREATE TABLE IF NOT EXISTS public.webhook_events (
     delivered_at  timestamptz,
     next_retry    timestamptz
 );
+-- The engagement the event belonged to (from the emit payload), so the event
+-- log can be filtered per engagement.
+DO $$ BEGIN
+  ALTER TABLE public.webhook_events ADD COLUMN IF NOT EXISTS engagement_id uuid;
+EXCEPTION WHEN duplicate_column THEN NULL; END $$;
 CREATE INDEX IF NOT EXISTS idx_webhook_events_webhook_id ON public.webhook_events(webhook_id);
 CREATE INDEX IF NOT EXISTS idx_webhook_events_status ON public.webhook_events(status);
 CREATE INDEX IF NOT EXISTS idx_webhook_events_next_retry ON public.webhook_events(next_retry) WHERE status = 'retrying';
