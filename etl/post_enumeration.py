@@ -972,18 +972,50 @@ def _synthesize_regex(value: str) -> Optional[str]:
     return pattern
 
 
+def _count_kind_sightings(cur, kind: str) -> int:
+    """How many times a secret of this kind has already been recorded (prior
+    confirmed sightings), from enumeration_observations. The recurrence signal
+    for auto-approval — a shape seen many times is worth making permanent."""
+    try:
+        cur.execute("SELECT count(*) FROM public.enumeration_observations "
+                    "WHERE rule_id = %s", (f"secret:{kind}",))
+        r = cur.fetchone()
+        return int(r[0]) if r else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _embed_learned_to_rag() -> None:
+    """Best-effort: ask rag-api to (re)embed active learned extractors into RAG.
+    Called after an AUTO-approval so the pattern reaches RAG without an operator
+    click. The per-request approve endpoint embeds directly; this covers the
+    auto path from inside etl (which cannot import the rag-api embed helper)."""
+    try:
+        import requests
+        requests.post(f"{API_BASE}/extractors/learned/sync-rag",
+                      headers={"x-api-key": API_KEY}, timeout=10, verify=False)
+    except Exception as e:  # noqa: BLE001
+        log.debug("auto-promote RAG embed failed: %s", e)
+
+
 def propose_learned_extractor(kind: str, value: str, *, fact: str = "secret",
                               why: str = "", engagement_id: Optional[str] = None,
-                              source: str = "enum_promotion") -> Optional[str]:
+                              source: str = "enum_promotion",
+                              auto_approve_after: int = 0) -> Optional[str]:
     """Propose a promoted enumeration extractor into the SHARED extractor_learned
-    table (tool=_enumeration, kind=deterministic, status='proposed') for operator
-    review. Approving it (status='active' via /extractors/learned) makes the shape
-    a permanent, free, deterministic extractor that load_extractors() picks up.
+    table (tool=_enumeration, kind=deterministic) for review. Approving it
+    (status='active' via /extractors/learned) makes the shape a permanent, free,
+    deterministic extractor that load_extractors() picks up.
 
-    De-duped by the table's unique (tool, kind, md5(rule)) index, so proposing the
-    same shape twice is a no-op. Returns the row id, or None if nothing was
-    proposed (unpromotable kind, no regex, or DB unavailable). Best-effort — never
-    raises into the analysis."""
+    ``auto_approve_after`` (operator setting enum_router.promotion.auto_approve_after):
+    0 (default) => always land 'proposed' for manual review — a one-off LLM guess
+    never becomes a rule on its own. N>0 => land 'active' immediately when this
+    kind already has >= N prior confirmed sightings (a shape seen that many times
+    is trusted), and upgrade an existing 'proposed' row for it to 'active' too. A
+    'rejected' row is never revived.
+
+    De-duped by the unique (tool, kind, md5(rule)) index. Returns the row id, or
+    None (unpromotable kind, no regex, DB down). Best-effort — never raises."""
     k = (kind or "").strip().lower()
     if k in _UNPROMOTABLE_KINDS:
         return None
@@ -1004,6 +1036,7 @@ def propose_learned_extractor(kind: str, value: str, *, fact: str = "secret",
                        f"{k}.")[:300],
         "sample": str(value)[:80],
     }
+    activated = False
     try:
         with _connect() as conn, conn.cursor() as cur:
             # extractor_learned holds cross-engagement technique knowledge (a
@@ -1012,23 +1045,53 @@ def propose_learned_extractor(kind: str, value: str, *, fact: str = "secret",
             # provenance.
             if engagement_id:
                 rule["proposed_for_engagement"] = str(engagement_id)
+            threshold = int(auto_approve_after or 0)
+            auto = bool(threshold > 0
+                        and _count_kind_sightings(cur, k) >= threshold)
+            new_status = "active" if auto else "proposed"
+            # On conflict: upgrade an existing 'proposed' row to 'active' when the
+            # threshold is now met, but NEVER revive a 'rejected' one.
             cur.execute(
                 """INSERT INTO public.extractor_learned
-                     (tool, kind, rule, status, source, confidence)
-                   VALUES (%s, 'deterministic', %s::jsonb, 'proposed', %s, 0.6)
-                   ON CONFLICT (tool, kind, md5(rule::text)) DO NOTHING
-                   RETURNING id::text""",
-                (_ENUM_TOOL, Json(rule), source))
+                     (tool, kind, rule, status, source, confidence, approved_at,
+                      reviewed_by)
+                   VALUES (%s, 'deterministic', %s::jsonb, %s, %s, 0.6,
+                      CASE WHEN %s = 'active' THEN now() ELSE NULL END,
+                      CASE WHEN %s = 'active' THEN 'auto:promotion' ELSE NULL END)
+                   ON CONFLICT (tool, kind, md5(rule::text)) DO UPDATE
+                     SET status = CASE
+                            WHEN %s = 'active' AND extractor_learned.status = 'proposed'
+                              THEN 'active' ELSE extractor_learned.status END,
+                         approved_at = CASE
+                            WHEN %s = 'active' AND extractor_learned.status = 'proposed'
+                              THEN now() ELSE extractor_learned.approved_at END,
+                         reviewed_by = CASE
+                            WHEN %s = 'active' AND extractor_learned.status = 'proposed'
+                              THEN 'auto:promotion' ELSE extractor_learned.reviewed_by END,
+                         updated_at = now()
+                   RETURNING id::text, status""",
+                (_ENUM_TOOL, Json(rule), new_status, source,
+                 new_status, new_status, new_status, new_status, new_status))
             row = cur.fetchone()
             conn.commit()
-            if row:
-                _emit_webhook("enum_extractor_proposed",
-                              {"kind": k, "pattern": pattern,
-                               "engagement_id": engagement_id})
-                return row[0]
+            if not row:
+                return None
+            rid, final_status = row[0], row[1]
+            activated = (final_status == "active")
+            _emit_webhook(
+                "enum_extractor_auto_approved" if activated and auto
+                else "enum_extractor_proposed",
+                {"kind": k, "pattern": pattern, "status": final_status,
+                 "auto": auto, "engagement_id": engagement_id})
     except Exception as e:  # noqa: BLE001
         log.debug("propose_learned_extractor failed: %s", e)
-    return None
+        return None
+    if activated:
+        # picked up by this process immediately, and embedded into RAG.
+        global _PROMOTED_CACHE
+        _PROMOTED_CACHE = None
+        _embed_learned_to_rag()
+    return rid
 
 
 def analyse(execution: Dict[str, Any], *, queue: bool = True,
@@ -1106,21 +1169,27 @@ def analyse(execution: Dict[str, Any], *, queue: bool = True,
 
         # PROMOTION: a secret the LLM discovered (not a known extractor) and the
         # review CONFIRMED is worth turning into a permanent, free, deterministic
-        # extractor. Propose it (operator-approved via /extractors/learned) so the
-        # next run catches the shape without an LLM call. Only specific kinds, only
-        # review-confirmed — a one-off or a vague "generic" is never promoted.
-        proposed = []
-        for f in facts:
-            if (f.get("fact") == "secret" and f.get("source") == "llm_fallback"
-                    and (f.get("review") or {}).get("confidence") in ("high", "medium")):
-                rid = propose_learned_extractor(
-                    f.get("kind"), f.get("value") or f.get("line") or "",
-                    why=f.get("why") or "",
-                    engagement_id=execution.get("engagement_id"))
-                if rid:
-                    proposed.append(f.get("kind"))
-        if proposed:
-            out["promotions_proposed"] = sorted(set(proposed))
+        # extractor. Land it 'proposed' for operator review, or auto-approve once
+        # the kind has enough prior sightings (operator setting
+        # enum_router.promotion.auto_approve_after; 0 = manual only). Only specific
+        # kinds, only review-confirmed — a one-off / vague "generic" is never
+        # promoted.
+        promo = router.route("promotion")
+        if promo.get("enabled"):
+            auto_after = int(promo.get("auto_approve_after") or 0)
+            proposed = []
+            for f in facts:
+                if (f.get("fact") == "secret" and f.get("source") == "llm_fallback"
+                        and (f.get("review") or {}).get("confidence") in ("high", "medium")):
+                    rid = propose_learned_extractor(
+                        f.get("kind"), f.get("value") or f.get("line") or "",
+                        why=f.get("why") or "",
+                        engagement_id=execution.get("engagement_id"),
+                        auto_approve_after=auto_after)
+                    if rid:
+                        proposed.append(f.get("kind"))
+            if proposed:
+                out["promotions_proposed"] = sorted(set(proposed))
 
     out["facts"] = len(facts)
     if not facts:

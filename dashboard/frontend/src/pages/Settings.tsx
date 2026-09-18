@@ -4626,6 +4626,63 @@ function ExploitWatcherTab() {
 
       <MsfPayloadSettings />
       <SessionWatchdogCard />
+      <ExtractorPromotionCard />
+    </div>
+  )
+}
+
+function ExtractorPromotionCard() {
+  const KEYS = {
+    enabled: 'enum_router.promotion.enabled',
+    autoAfter: 'enum_router.promotion.auto_approve_after',
+  }
+  const [enabled, setEnabled] = useState(true)
+  const [autoAfter, setAutoAfter] = useState('0')
+  const [saved, setSaved] = useState('')
+
+  useEffect(() => {
+    apiFetch<{ value: string }>(`/settings/config/${KEYS.enabled}`)
+      .then(r => setEnabled(String(r?.value).toLowerCase() !== 'false')).catch(() => {})
+    apiFetch<{ value: string }>(`/settings/config/${KEYS.autoAfter}`)
+      .then(r => { if (r?.value != null) setAutoAfter(String(r.value)) }).catch(() => {})
+  }, [])
+
+  const save = async (key: string, value: string, label: string) => {
+    try {
+      await apiFetch(`/settings/config/${key}`, { method: 'PUT', body: JSON.stringify({ value }) })
+      setSaved(label)
+      setTimeout(() => setSaved(''), 2000)
+    } catch { /* ignore */ }
+  }
+
+  return (
+    <div className="border border-border rounded-lg p-4 space-y-3">
+      <div>
+        <h3 className="text-base font-semibold">Learned Extractor Promotion</h3>
+        <p className="text-sm text-muted-foreground">
+          When the LLM keeps finding a shape the deterministic extractors miss, the platform can
+          turn it into a permanent, free extractor. Approve them under{' '}
+          <span className="font-mono text-xs">/extractors/learned</span>, or auto-approve a shape
+          once it has been seen enough times. <span className="font-semibold">0 = manual only</span>{' '}
+          (every promotion waits for review — the safe default; a one-off LLM guess never becomes a
+          rule on its own).
+        </p>
+      </div>
+      <div className="flex flex-wrap items-end gap-4">
+        <label className="flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={enabled}
+                 onChange={e => { setEnabled(e.target.checked); save(KEYS.enabled, String(e.target.checked), 'enabled') }} />
+          Promotion enabled
+        </label>
+        <div className="space-y-1">
+          <label className="block text-xs text-muted-foreground">Auto-approve after N prior sightings (0 = manual)</label>
+          <input type="number" min={0} value={autoAfter}
+                 onChange={e => setAutoAfter(e.target.value)}
+                 onBlur={() => save(KEYS.autoAfter, autoAfter, 'auto-approve')}
+                 className="w-24 h-8 px-2 text-sm rounded border border-border bg-background" />
+        </div>
+        {saved && <span className="text-xs text-green-500">Saved ({saved})</span>}
+      </div>
     </div>
   )
 }

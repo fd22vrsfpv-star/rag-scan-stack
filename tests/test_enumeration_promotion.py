@@ -59,15 +59,24 @@ def test_synthesize_refuses_unusable():
 
 # ── proposal writer (fake DB) ────────────────────────────────────────────────
 class _FakeCur:
-    def __init__(self, store):
+    # sightings: what _count_kind_sightings sees; insert_status: status the
+    # INSERT ... RETURNING reports back.
+    def __init__(self, store, sightings=0, insert_status="proposed"):
         self.store = store
+        self._sightings = sightings
+        self._insert_status = insert_status
 
     def execute(self, sql, params=None):
         self.store.append((sql, params))
         self._last = sql
 
     def fetchone(self):
-        return ("fake-row-id",) if "INSERT" in getattr(self, "_last", "") else None
+        last = getattr(self, "_last", "")
+        if "count(*)" in last and "enumeration_observations" in last:
+            return (self._sightings,)
+        if "INSERT INTO public.extractor_learned" in last:
+            return ("fake-row-id", self._insert_status)
+        return None
 
     def fetchall(self):
         return []
@@ -80,11 +89,13 @@ class _FakeCur:
 
 
 class _FakeConn:
-    def __init__(self, store):
+    def __init__(self, store, sightings=0, insert_status="proposed"):
         self.store = store
+        self._sightings = sightings
+        self._insert_status = insert_status
 
     def cursor(self):
-        return _FakeCur(self.store)
+        return _FakeCur(self.store, self._sightings, self._insert_status)
 
     def commit(self):
         pass
@@ -129,6 +140,52 @@ def test_specific_kind_proposes_with_pattern(monkeypatch):
     assert isinstance(rule, dict)
     assert rule["emit"] == {"fact": "secret", "kind": "aws_access_key"}
     assert re.compile(rule["match"]).search("AKIAIOSFODNN7EXAMPLE")
+
+
+def test_auto_approve_after_threshold(monkeypatch):
+    # threshold met (sightings 3 >= 3) -> INSERT lands 'active', embed is called.
+    calls = []
+    embedded = {"n": 0}
+    monkeypatch.setattr(pe, "_connect",
+                        lambda: _FakeConn(calls, sightings=3, insert_status="active"))
+    monkeypatch.setattr(pe, "_emit_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(pe, "_embed_learned_to_rag",
+                        lambda: embedded.__setitem__("n", embedded["n"] + 1))
+    rid = pe.propose_learned_extractor("aws_access_key", "AKIAIOSFODNN7EXAMPLE",
+                                       auto_approve_after=3)
+    assert rid == "fake-row-id"
+    ins = [p for (s, p) in calls if "INSERT INTO public.extractor_learned" in s][0]
+    # 3rd INSERT param is the status the row is created with
+    assert ins[2] == "active", f"expected active status, got {ins[2]}"
+    assert embedded["n"] == 1, "auto-approve must embed into RAG"
+
+
+def test_auto_approve_below_threshold_stays_proposed(monkeypatch):
+    calls = []
+    embedded = {"n": 0}
+    monkeypatch.setattr(pe, "_connect",
+                        lambda: _FakeConn(calls, sightings=1, insert_status="proposed"))
+    monkeypatch.setattr(pe, "_emit_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(pe, "_embed_learned_to_rag",
+                        lambda: embedded.__setitem__("n", embedded["n"] + 1))
+    pe.propose_learned_extractor("aws_access_key", "AKIAIOSFODNN7EXAMPLE",
+                                 auto_approve_after=3)  # only 1 sighting < 3
+    ins = [p for (s, p) in calls if "INSERT INTO public.extractor_learned" in s][0]
+    assert ins[2] == "proposed"
+    assert embedded["n"] == 0, "no RAG embed when it stays proposed"
+
+
+def test_default_is_manual_no_auto(monkeypatch):
+    # auto_approve_after=0 (default) -> never auto, regardless of sightings.
+    calls = []
+    monkeypatch.setattr(pe, "_connect",
+                        lambda: _FakeConn(calls, sightings=99, insert_status="proposed"))
+    monkeypatch.setattr(pe, "_emit_webhook", lambda *a, **k: None)
+    pe.propose_learned_extractor("aws_access_key", "AKIAIOSFODNN7EXAMPLE")
+    ins = [p for (s, p) in calls if "INSERT INTO public.extractor_learned" in s][0]
+    assert ins[2] == "proposed", "default must stay manual even with many sightings"
+    # and the count query is never even needed to force active
+    assert calls, "an INSERT should still happen"
 
 
 def test_load_promoted_compiles_active_rows(monkeypatch):
