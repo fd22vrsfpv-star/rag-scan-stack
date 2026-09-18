@@ -13,6 +13,21 @@ logger = logging.getLogger(__name__)
 OSINT_URL = os.environ.get("OSINT_URL", "https://osint-runner:8024")
 RAG_API_URL = os.environ.get("RAG_API_URL", "https://rag-api:8000")
 API_KEY = os.environ.get("API_KEY", "changeme")
+
+# Engagement isolation: when ENGAGEMENT_ID (or MCP_ENGAGEMENT_ID) is set, every
+# rag-api call carries X-Engagement-Id so this MCP server only sees that
+# engagement's data. Unset = platform-wide (unchanged behaviour).
+ENGAGEMENT_ID = os.environ.get("ENGAGEMENT_ID") or os.environ.get("MCP_ENGAGEMENT_ID")
+
+
+def _api_headers(extra=None):
+    h = {"x-api-key": API_KEY}
+    if ENGAGEMENT_ID:
+        h["X-Engagement-Id"] = ENGAGEMENT_ID
+    if extra:
+        h.update(extra)
+    return h
+
 SCAN_RECOMMENDER_URL = os.environ.get("SCAN_RECOMMENDER_URL", "https://scan-recommender:8013")
 TIMEOUT = float(os.environ.get("MCP_TIMEOUT_SCAN", "300"))
 
@@ -187,7 +202,7 @@ async def get_osint_job_status(job_id: Annotated[str, Field(description="Job UUI
 async def list_scopes() -> str:
     """List all scope names with target counts. Shows how targets are organized into scopes like 'unknown_scope', 'customer_or_third_party', etc."""
     async with httpx.AsyncClient(verify=False, timeout=15) as client:
-        resp = await client.get(f"{RAG_API_URL}/scope/names", headers={"x-api-key": API_KEY})
+        resp = await client.get(f"{RAG_API_URL}/scope/names", headers=_api_headers())
         return json.dumps(resp.json() if resp.status_code == 200 else {"error": resp.text}, indent=2)
 
 
@@ -201,7 +216,7 @@ async def list_scope_targets(
         scope_name: Name of the scope to list targets from
     """
     async with httpx.AsyncClient(verify=False, timeout=15) as client:
-        resp = await client.get(f"{RAG_API_URL}/scope", params={"name": scope_name}, headers={"x-api-key": API_KEY})
+        resp = await client.get(f"{RAG_API_URL}/scope", params={"name": scope_name}, headers=_api_headers())
         return json.dumps(resp.json() if resp.status_code == 200 else {"error": resp.text}, indent=2)
 
 
@@ -223,7 +238,7 @@ async def move_to_scope(
         resp = await client.post(
             f"{RAG_API_URL}/scope/move",
             json={"from_scope": from_scope, "to_scope": to_scope, "targets": targets},
-            headers={"x-api-key": API_KEY},
+            headers=_api_headers(),
         )
         return json.dumps(resp.json() if resp.status_code == 200 else {"error": resp.text}, indent=2)
 
@@ -250,7 +265,7 @@ async def add_to_scope(
         resp = await client.post(
             f"{RAG_API_URL}/scope/add",
             json={"name": scope_name, "targets": target_items},
-            headers={"x-api-key": API_KEY},
+            headers=_api_headers(),
         )
         return json.dumps(resp.json() if resp.status_code == 200 else {"error": resp.text}, indent=2)
 
@@ -260,7 +275,7 @@ async def auto_assign_unknown_scope() -> str:
     """Scan all assets and recon findings, assign any that aren't in a scope to 'unknown_scope'.
     Run this after new scans to triage unscoped discoveries."""
     async with httpx.AsyncClient(verify=False, timeout=120) as client:
-        resp = await client.post(f"{RAG_API_URL}/scope/auto-assign-unknown", headers={"x-api-key": API_KEY})
+        resp = await client.post(f"{RAG_API_URL}/scope/auto-assign-unknown", headers=_api_headers())
         return json.dumps(resp.json() if resp.status_code == 200 else {"error": resp.text}, indent=2)
 
 
@@ -276,7 +291,7 @@ async def get_domain_overview(
     async with httpx.AsyncClient(verify=False, timeout=30) as client:
         resp = await client.get(
             f"{RAG_API_URL}/recon/domains/{domain}/overview",
-            headers={"x-api-key": API_KEY},
+            headers=_api_headers(),
         )
         if resp.status_code == 200:
             data = resp.json()
