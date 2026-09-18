@@ -273,9 +273,57 @@ def _render_dos_exploit_overrides(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_enumeration_extractors(data: Dict[str, Any]) -> List[Doc]:
+    """Output->fact extractors -> one doc each, so the planner can retrieve what
+    shapes the platform reads out of raw command/scan output (which token and
+    secret kinds it recognises) without parsing the regexes."""
+    docs: List[Doc] = []
+    for ex in (data.get("extractors") or []):
+        if not isinstance(ex, dict):
+            continue
+        xid = ex.get("id") or ""
+        emit = ex.get("emit") or {}
+        fact = emit.get("fact") or "fact"
+        kind = emit.get("kind")
+        why = (ex.get("why") or "").strip()
+        label = f"{fact}/{kind}" if kind else fact
+        docs.append((
+            f"Enumeration extractor: {xid} ({label})",
+            f"When raw command or scan output matches the {xid} pattern, the "
+            f"platform emits a `{label}` fact that the enumeration rules can act "
+            f"on. {why}".strip()))
+    return docs
+
+
+def _render_postex_commands(data: Dict[str, Any]) -> List[Doc]:
+    """Post-exploitation command sets -> one doc per command, so the planner can
+    retrieve what the platform runs through a held shell (baseline info-gathering
+    and per-service local-database probes) as knowledge, not only as code."""
+    docs: List[Doc] = []
+    for step in (data.get("info_commands") or []):
+        if not isinstance(step, dict):
+            continue
+        docs.append((
+            f"Post-ex info command: {step.get('id') or step.get('title')}",
+            f"Through a held shell the platform runs `{step.get('command')}` "
+            f"({step.get('title')}) as baseline post-exploitation enumeration."))
+    for svc, spec in (data.get("local_database_probes") or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        for c in (spec.get("commands") or []):
+            docs.append((
+                f"Local DB probe ({svc}): {c.get('title')}",
+                f"When {svc} is found listening only on loopback, the platform "
+                f"runs `{c.get('command')}` ({c.get('title')}) through the local "
+                f"shell to enumerate it — {spec.get('why', '')}".strip()))
+    return docs
+
+
 RENDERERS = {
     "msf_learned_options": _render_msf_learned_options,
     "dos_exploit_overrides": _render_dos_exploit_overrides,
+    "enumeration_extractors": _render_enumeration_extractors,
+    "postex_commands": _render_postex_commands,
     "service_tools": _render_service_tools,
     "credential_followups": _render_credential_followups,
     "default_credentials": _render_default_credentials,

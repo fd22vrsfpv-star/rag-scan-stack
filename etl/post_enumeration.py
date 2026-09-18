@@ -55,6 +55,12 @@ _REPO_RULES = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "knowledge", "enumeration_rules.yaml")
 
+EXTRACTORS_YAML = os.environ.get("ENUMERATION_EXTRACTORS_YAML",
+                                 "/knowledge/enumeration_extractors.yaml")
+_REPO_EXTRACTORS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "knowledge", "enumeration_extractors.yaml")
+
 SOURCE = "post_enumeration"
 
 # A rule that has been acted on this many times with nothing to show for it
@@ -62,9 +68,214 @@ SOURCE = "post_enumeration"
 # but rare should not be killed by its first two misses.
 SUPPRESS_AFTER = int(os.environ.get("ENUMERATION_SUPPRESS_AFTER", "5"))
 
+# ── LLM fallback ─────────────────────────────────────────────────────────────
+# When substantive output produces NO facts from any known extractor, hand it to
+# the LLM to classify into STRUCTURED facts that re-enter the SAME rules -> scope
+# gate -> pending path. The LLM PROPOSES facts; the deterministic scope gate
+# still DISPOSES (CLAUDE.md: retrieve/ask to decide, gate to act). Off if the LLM
+# is unreachable — the safe direction is "no extra facts", never "act blind".
+LLM_FALLBACK_ENABLED = os.environ.get("ENUMERATION_LLM_FALLBACK", "1") not in (
+    "0", "false", "False", "")
+LLM_URL = os.environ.get("LLM_URL", "https://llm_query:8002/ollama/chat")
+# Omit the model by default so llm_query TASK-ROUTES it. A hardcoded model here
+# masquerades as a caller choice and 404s on backends that route by task
+# (see memory: llm-query-model-default-defeats-routing). Set POSTEX_LLM_MODEL to
+# pin one deliberately.
+LLM_MODEL = os.environ.get("POSTEX_LLM_MODEL") or None
+LLM_FALLBACK_MIN_CHARS = int(os.environ.get("ENUMERATION_LLM_MIN_CHARS", "40"))
+LLM_FALLBACK_MAX_CHARS = int(os.environ.get("ENUMERATION_LLM_MAX_CHARS", "6000"))
+
+# Fact kinds the LLM fallback is allowed to emit — the same vocabulary the
+# extractors and rules already speak. An LLM-invented fact kind nothing consumes
+# is dropped, so a hallucinated shape cannot leak into the queue.
+_LLM_ALLOWED_FACTS = {"secret", "host", "file", "credential", "share", "host_fact"}
+
+API_BASE = os.environ.get("RAG_API_URL", "https://rag-api:8000")
+API_KEY = os.environ.get("API_KEY", "changeme")
+WEBHOOK_ENABLED = os.environ.get("WEBHOOK_ENABLED", "1") not in (
+    "0", "false", "False", "")
+
+
+def _emit_webhook(event_type: str, data: Dict[str, Any],
+                  severity: Optional[str] = None) -> None:
+    """Best-effort webhook emit (CLAUDE.md: features that perform actions emit
+    events). Never raises into the analysis."""
+    if not WEBHOOK_ENABLED:
+        return
+    try:
+        import requests
+        payload: Dict[str, Any] = {"event_type": event_type,
+                                   "source": SOURCE, "data": data}
+        if severity:
+            payload["severity"] = severity
+        requests.post(f"{API_BASE}/webhooks/emit",
+                      headers={"x-api-key": API_KEY,
+                               "Content-Type": "application/json"},
+                      json=payload, timeout=5, verify=False)
+    except Exception as e:  # noqa: BLE001
+        log.debug("webhook emit %s failed: %s", event_type, e)
+
 _IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _PRIVATE_KEY = re.compile(r"-----BEGIN (?:RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----")
 _KEY_PATH = re.compile(r"(/[^\s:]*\.ssh/id_[a-z0-9_]+)")
+
+# The hardcoded regexes above are the FALLBACK for _extract_from_lines when the
+# extractor YAML is unreadable — the safe direction is "still read private keys
+# and host leads", never "read nothing".
+_FALLBACK_EXTRACTORS: List[Dict[str, Any]] = [
+    {"id": "private-key-block", "_rx": _PRIVATE_KEY,
+     "emit": {"fact": "file", "kind": "private_key"}},
+    {"id": "ssh-key-path", "_rx": _KEY_PATH, "fields": {"path": 1},
+     "emit": {"fact": "file", "kind": "private_key"}},
+    {"id": "known-host-ip", "_rx": _IPV4, "fields": {"target": 0}, "lead": True,
+     "emit": {"fact": "host", "source": "known_hosts"}},
+]
+
+_EXTRACTORS_CACHE: Optional[List[Dict[str, Any]]] = None
+
+# Promoted (operator-approved) enumeration extractors live in the SHARED
+# extractor_learned table — the same store the /extractors learning loop uses —
+# under this synthetic tool, so there is ONE learned-pattern store and ONE review
+# surface (/extractors/learned), not a parallel one. See propose_learned_extractor.
+_ENUM_TOOL = "_enumeration"
+_PROMOTED_CACHE: Optional[List[Dict[str, Any]]] = None
+_PROMOTED_CACHE_AT: float = 0.0
+_PROMOTED_TTL = int(os.environ.get("ENUM_PROMOTED_TTL", "300"))
+
+
+def _load_yaml_extractors() -> List[Dict[str, Any]]:
+    """The YAML extractor catalogue (regex compiled and cached forever), or the
+    hardcoded fallback if the file is unreadable. The safe direction on any error
+    is that private keys and host leads are still read, never that a config typo
+    silently turns off all free-text fact extraction."""
+    global _EXTRACTORS_CACHE
+    if _EXTRACTORS_CACHE is not None:
+        return _EXTRACTORS_CACHE
+    compiled: List[Dict[str, Any]] = []
+    for candidate in (EXTRACTORS_YAML, _REPO_EXTRACTORS):
+        if not candidate or not os.path.exists(candidate):
+            continue
+        try:
+            import yaml
+            with open(candidate, encoding="utf-8") as fh:
+                raw = (yaml.safe_load(fh) or {}).get("extractors") or []
+            for ex in raw:
+                pat = ex.get("match")
+                if not pat:
+                    continue
+                try:
+                    ex = dict(ex)
+                    ex["_rx"] = re.compile(pat)
+                    compiled.append(ex)
+                except re.error as re_err:
+                    log.warning("extractor %s has a bad regex, skipped: %s",
+                                ex.get("id"), re_err)
+            break
+        except Exception as e:  # noqa: BLE001
+            log.warning("enumeration extractors %s unreadable: %s", candidate, e)
+            compiled = []
+            break
+    if not compiled:
+        log.warning("no enumeration extractors loaded (looked in %s, %s) — "
+                    "using hardcoded fallback", EXTRACTORS_YAML, _REPO_EXTRACTORS)
+        compiled = _FALLBACK_EXTRACTORS
+    _EXTRACTORS_CACHE = compiled
+    return compiled
+
+
+def _load_promoted_extractors() -> List[Dict[str, Any]]:
+    """APPROVED learned enumeration extractors from the shared extractor_learned
+    table (tool=_enumeration, status=active). These are the patterns the LLM
+    discovered that an operator promoted — permanent and deterministic from then
+    on, no more LLM cost. TTL-cached; best-effort ([] if the DB is unreachable)."""
+    global _PROMOTED_CACHE, _PROMOTED_CACHE_AT
+    import time as _t
+    now = _t.time()
+    if _PROMOTED_CACHE is not None and (now - _PROMOTED_CACHE_AT) < _PROMOTED_TTL:
+        return _PROMOTED_CACHE
+    compiled: List[Dict[str, Any]] = []
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT rule FROM public.extractor_learned "
+                "WHERE tool = %s AND status = 'active'", (_ENUM_TOOL,))
+            for (rule,) in cur.fetchall():
+                if not isinstance(rule, dict):
+                    continue
+                pat = rule.get("match")
+                if not pat:
+                    continue
+                try:
+                    ex = dict(rule)
+                    ex["_rx"] = re.compile(pat)
+                    ex["_promoted"] = True
+                    compiled.append(ex)
+                except re.error as re_err:
+                    log.warning("promoted extractor %s bad regex, skipped: %s",
+                                rule.get("id"), re_err)
+    except Exception as e:  # noqa: BLE001
+        log.debug("promoted extractors unavailable: %s", e)
+        # keep any previous cache rather than dropping to none on a transient error
+        if _PROMOTED_CACHE is not None:
+            return _PROMOTED_CACHE
+        compiled = []
+    _PROMOTED_CACHE = compiled
+    _PROMOTED_CACHE_AT = now
+    return compiled
+
+
+def load_extractors() -> List[Dict[str, Any]]:
+    """The full extractor set: the YAML catalogue PLUS operator-approved promoted
+    extractors from extractor_learned. A shape the LLM kept finding, once
+    approved, is caught here for free — the same as a hand-written YAML rule."""
+    return _load_yaml_extractors() + _load_promoted_extractors()
+
+
+def _extract_from_lines(lines: List[str], *, target: str = "",
+                        service: str = "") -> List[Dict[str, Any]]:
+    """Scan raw output lines against every extractor, emitting normalised facts.
+
+    A rule is written against a FACT, so an extractor added here (a new token
+    shape, say) is picked up by any rule that matches its fact — no code change
+    on either side."""
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for line in lines:
+        for ex in load_extractors():
+            rx = ex.get("_rx")
+            if rx is None:
+                continue
+            for m in rx.finditer(line):
+                emit = ex.get("emit") or {}
+                if not emit.get("fact"):
+                    continue
+                fact: Dict[str, Any] = dict(emit)
+                fact["service"] = fact.get("service") or service
+                fact["line"] = line[:200]
+                for field, grp in (ex.get("fields") or {}).items():
+                    try:
+                        gi = int(grp)
+                        val = m.group(gi) if gi else m.group(0)
+                    except (IndexError, ValueError):
+                        val = None
+                    if val is not None:
+                        fact[field] = val
+                if ex.get("lead"):
+                    lead = fact.get("target")
+                    if (not lead or lead == target
+                            or lead.startswith(("0.", "127.", "255."))):
+                        continue
+                    fact["seen_on"] = target
+                else:
+                    fact.setdefault("target", target)
+                key = (ex.get("id"),
+                       fact.get("value") or fact.get("path") or fact.get("target"),
+                       fact.get("fact"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(fact)
+    return out
 
 
 def _connect():
@@ -190,22 +401,15 @@ def facts_from(parsed: Optional[Dict[str, Any]], *, output: str = "",
 
     # Command output is where post-access steps put everything they found, and
     # it is the least structured thing here — so it gets the widest reading.
+    # The reading itself is DATA (knowledge/enumeration_extractors.yaml): a new
+    # token/secret shape is added there, not here. A host named in known_hosts
+    # is a LEAD, not a licence — the scope gate decides whether it may be
+    # touched, and it usually will not.
     lines = list(parsed.get("command_output") or [])
     if output and not lines:
         lines = output.splitlines()
-    for line in lines:
-        if _PRIVATE_KEY.search(line) or _KEY_PATH.search(line):
-            m = _KEY_PATH.search(line)
-            facts.append({"fact": "file", "kind": "private_key",
-                          "target": target, "service": service,
-                          "path": m.group(1) if m else None, "line": line[:200]})
-        for ip in _IPV4.findall(line):
-            # A host named in known_hosts is somewhere this account already
-            # reaches. Recording it as a LEAD; the scope gate decides whether it
-            # may be touched, and it usually will not.
-            if ip != target and not ip.startswith(("0.", "127.", "255.")):
-                facts.append({"fact": "host", "target": ip, "source": "known_hosts",
-                              "seen_on": target, "line": line[:200]})
+    if lines:
+        facts.extend(_extract_from_lines(lines, target=target, service=service))
     return facts
 
 
@@ -676,8 +880,229 @@ def facts_from_web_findings(cur, *, target: str = "", limit: int = 200,
 
 # ── The analysis every command goes through ────────────────────────────────
 
-def analyse(execution: Dict[str, Any], *, queue: bool = True) -> Dict[str, Any]:
+def _enum_router():
+    """The shared enumeration LLM router (model routing + triage + review),
+    wired to this module's DB connection for reading operator config."""
+    try:
+        from etl.enumeration_llm_router import get_router
+    except ImportError:  # pragma: no cover
+        from enumeration_llm_router import get_router
+    return get_router(connect=_connect)
+
+
+def _llm_classify_output(output: str, *, tool: str = "", target: str = "",
+                         service: str = "") -> List[Dict[str, Any]]:
+    """LLM EXTRACTION of facts from output that matched NO known extractor.
+
+    Thin wrapper over the router's extract role (kept for backward compat and the
+    global LLM_FALLBACK_ENABLED kill switch). The router selects the model/params
+    for the extraction role and does the bounded, validated call; the facts it
+    returns are still scope-gated downstream — this proposes WHAT was found, never
+    authorises acting on it."""
+    if not LLM_FALLBACK_ENABLED:
+        return []
+    return _enum_router().extract(output, tool=tool, target=target,
+                                  service=service)
+
+
+def _record_secret_facts(cur, facts: List[Dict[str, Any]],
+                         execution: Dict[str, Any]) -> int:
+    """Record `secret` facts as observations even when NO rule proposes a
+    follow-up command. A JWT or an AWS key is valuable on its own — the tool's
+    purpose is to collect data for a tester's manual workflow — so it must not
+    vanish just because the rules engine had nothing to dispatch for it."""
+    recorded = 0
+    for fact in facts:
+        if fact.get("fact") != "secret":
+            continue
+        kind = fact.get("kind") or "unknown"
+        try:
+            _observe(cur, f"secret:{kind}", execution, fact, None, None)
+            recorded += 1
+        except Exception as e:  # noqa: BLE001
+            log.debug("recording secret fact failed: %s", e)
+    return recorded
+
+
+# Kinds too vague to generalize into a reusable pattern — never promote these.
+_UNPROMOTABLE_KINDS = {"generic", "llm", "unknown", ""}
+
+
+def _synthesize_regex(value: str) -> Optional[str]:
+    """Conservative regex generalized from ONE sample value: runs of the same
+    character class become that class with the run's exact length; other
+    characters are matched literally (escaped). Precise by design — an operator
+    broadens it if needed, and false positives are worse than a narrow pattern.
+
+    "AKIAIOSFODNN7EXAMPLE" -> r"[A-Z]{12}[0-9]{1}[A-Z]{7}"
+    """
+    s = str(value or "")
+    if len(s) < 6 or len(s) > 200:
+        return None
+
+    def _cls(ch: str) -> Optional[str]:
+        if ch.isascii() and ch.isupper():
+            return "[A-Z]"
+        if ch.isascii() and ch.islower():
+            return "[a-z]"
+        if ch.isdigit():
+            return "[0-9]"
+        return None
+
+    out, i, n = [], 0, len(s)
+    while i < n:
+        cls = _cls(s[i])
+        if cls is None:
+            out.append(re.escape(s[i]))
+            i += 1
+            continue
+        j = i
+        while j < n and _cls(s[j]) == cls:
+            j += 1
+        out.append(f"{cls}{{{j - i}}}")
+        i = j
+    pattern = "".join(out)
+    try:
+        rx = re.compile(pattern)
+    except re.error:
+        return None
+    # Must still match its own sample, and not be trivially broad.
+    if not rx.search(s) or pattern.count("{") < 1:
+        return None
+    return pattern
+
+
+def _count_kind_sightings(cur, kind: str) -> int:
+    """How many times a secret of this kind has already been recorded (prior
+    confirmed sightings), from enumeration_observations. The recurrence signal
+    for auto-approval — a shape seen many times is worth making permanent."""
+    try:
+        cur.execute("SELECT count(*) FROM public.enumeration_observations "
+                    "WHERE rule_id = %s", (f"secret:{kind}",))
+        r = cur.fetchone()
+        return int(r[0]) if r else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _embed_learned_to_rag() -> None:
+    """Best-effort: ask rag-api to (re)embed active learned extractors into RAG.
+    Called after an AUTO-approval so the pattern reaches RAG without an operator
+    click. The per-request approve endpoint embeds directly; this covers the
+    auto path from inside etl (which cannot import the rag-api embed helper)."""
+    try:
+        import requests
+        requests.post(f"{API_BASE}/extractors/learned/sync-rag",
+                      headers={"x-api-key": API_KEY}, timeout=10, verify=False)
+    except Exception as e:  # noqa: BLE001
+        log.debug("auto-promote RAG embed failed: %s", e)
+
+
+def propose_learned_extractor(kind: str, value: str, *, fact: str = "secret",
+                              why: str = "", engagement_id: Optional[str] = None,
+                              source: str = "enum_promotion",
+                              auto_approve_after: int = 0) -> Optional[str]:
+    """Propose a promoted enumeration extractor into the SHARED extractor_learned
+    table (tool=_enumeration, kind=deterministic) for review. Approving it
+    (status='active' via /extractors/learned) makes the shape a permanent, free,
+    deterministic extractor that load_extractors() picks up.
+
+    ``auto_approve_after`` (operator setting enum_router.promotion.auto_approve_after):
+    0 (default) => always land 'proposed' for manual review — a one-off LLM guess
+    never becomes a rule on its own. N>0 => land 'active' immediately when this
+    kind already has >= N prior confirmed sightings (a shape seen that many times
+    is trusted), and upgrade an existing 'proposed' row for it to 'active' too. A
+    'rejected' row is never revived.
+
+    De-duped by the unique (tool, kind, md5(rule)) index. Returns the row id, or
+    None (unpromotable kind, no regex, DB down). Best-effort — never raises."""
+    k = (kind or "").strip().lower()
+    if k in _UNPROMOTABLE_KINDS:
+        return None
+    pattern = _synthesize_regex(value)
+    if not pattern:
+        return None
+    try:
+        from psycopg2.extras import Json
+    except ImportError:  # pragma: no cover - psycopg2 always present in prod
+        def Json(x):  # type: ignore
+            return x
+    rule = {
+        "id": f"learned-{k}",
+        "match": pattern,
+        "emit": {"fact": fact, "kind": k},
+        "fields": {"value": 0},
+        "why": (why or f"Promoted from a shape the LLM repeatedly classified as "
+                       f"{k}.")[:300],
+        "sample": str(value)[:80],
+    }
+    activated = False
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            # extractor_learned holds cross-engagement technique knowledge (a
+            # reusable pattern), so it has no engagement_id by design — like
+            # port_access_advice. The engagement is recorded in the rule only for
+            # provenance.
+            if engagement_id:
+                rule["proposed_for_engagement"] = str(engagement_id)
+            threshold = int(auto_approve_after or 0)
+            auto = bool(threshold > 0
+                        and _count_kind_sightings(cur, k) >= threshold)
+            new_status = "active" if auto else "proposed"
+            # On conflict: upgrade an existing 'proposed' row to 'active' when the
+            # threshold is now met, but NEVER revive a 'rejected' one.
+            cur.execute(
+                """INSERT INTO public.extractor_learned
+                     (tool, kind, rule, status, source, confidence, approved_at,
+                      reviewed_by)
+                   VALUES (%s, 'deterministic', %s::jsonb, %s, %s, 0.6,
+                      CASE WHEN %s = 'active' THEN now() ELSE NULL END,
+                      CASE WHEN %s = 'active' THEN 'auto:promotion' ELSE NULL END)
+                   ON CONFLICT (tool, kind, md5(rule::text)) DO UPDATE
+                     SET status = CASE
+                            WHEN %s = 'active' AND extractor_learned.status = 'proposed'
+                              THEN 'active' ELSE extractor_learned.status END,
+                         approved_at = CASE
+                            WHEN %s = 'active' AND extractor_learned.status = 'proposed'
+                              THEN now() ELSE extractor_learned.approved_at END,
+                         reviewed_by = CASE
+                            WHEN %s = 'active' AND extractor_learned.status = 'proposed'
+                              THEN 'auto:promotion' ELSE extractor_learned.reviewed_by END,
+                         updated_at = now()
+                   RETURNING id::text, status""",
+                (_ENUM_TOOL, Json(rule), new_status, source,
+                 new_status, new_status, new_status, new_status, new_status))
+            row = cur.fetchone()
+            conn.commit()
+            if not row:
+                return None
+            rid, final_status = row[0], row[1]
+            activated = (final_status == "active")
+            _emit_webhook(
+                "enum_extractor_auto_approved" if activated and auto
+                else "enum_extractor_proposed",
+                {"kind": k, "pattern": pattern, "status": final_status,
+                 "auto": auto, "engagement_id": engagement_id})
+    except Exception as e:  # noqa: BLE001
+        log.debug("propose_learned_extractor failed: %s", e)
+        return None
+    if activated:
+        # picked up by this process immediately, and embedded into RAG.
+        global _PROMOTED_CACHE
+        _PROMOTED_CACHE = None
+        _embed_learned_to_rag()
+    return rid
+
+
+def analyse(execution: Dict[str, Any], *, queue: bool = True,
+            allow_llm: bool = True) -> Dict[str, Any]:
     """One finished command: what it found, and what should follow.
+
+    ``allow_llm`` gates the LLM roles (extraction + review). It MUST be False for
+    BATCH callers — the post-enumeration sweep re-analyses up to 100 historical
+    executions in a loop, and an LLM call per row turned a fast sweep into a
+    30-minute one. The LLM fallback is for FRESH single-command output (the
+    per-command hook), where it is also bounded by the router's rolling budget.
 
     ``{"facts", "proposals", "queued", "refused", "refusals", "suppressed",
     "available"}``. Never raises — an analysis failure must not fail a command
@@ -704,15 +1129,91 @@ def analyse(execution: Dict[str, Any], *, queue: bool = True) -> Dict[str, Any]:
 
     facts = facts_from(parsed, output=execution.get("output") or "",
                        target=target, service=service)
+    output_text = execution.get("output") or ""
+    router = _enum_router()
+
+    # LLM EXTRACTION (routed + triaged): substantive output that matched NO known
+    # extractor is handed to the router's extraction role to classify into
+    # structured facts, which re-enter the SAME rules -> scope gate -> pending
+    # path below. The router decides IF the LLM runs (deterministic first) and
+    # WHICH model. The LLM proposes WHAT was found; the gate still disposes.
+    # Skipped entirely for batch callers (allow_llm=False) so a 100-row sweep
+    # never fires 100 serial LLM calls.
+    if allow_llm and router.should_extract(output_text, facts):
+        llm_facts = router.extract(output_text, tool=tool, target=target,
+                                   service=service)
+        if llm_facts:
+            facts = llm_facts
+            out["llm_fallback"] = {"facts": len(llm_facts),
+                                   "kinds": sorted({f.get("kind") for f in llm_facts})}
+            _emit_webhook("post_enum_llm_classified",
+                          {"target": target, "tool": tool, "service": service,
+                           "facts": len(llm_facts),
+                           "engagement_id": execution.get("engagement_id")})
+
+    # REVIEW (routed): validate candidate facts (from BOTH deterministic
+    # extractors and the LLM fallback) before they are queued, dropping false
+    # positives. Fails OPEN — a reviewer outage keeps the facts, never silently
+    # drops findings. Skipped for batch callers (allow_llm=False).
+    if facts and allow_llm:
+        rev = router.review(facts, output=output_text, target=target,
+                            service=service)
+        if rev.get("reviewed"):
+            out["review"] = {"reviewed": rev["reviewed"], "dropped": rev["dropped"]}
+            _emit_webhook("post_enum_facts_reviewed",
+                          {"target": target, "tool": tool,
+                           "reviewed": rev["reviewed"], "dropped": rev["dropped"],
+                           "kept": len(rev["facts"]),
+                           "engagement_id": execution.get("engagement_id")})
+        facts = rev["facts"]
+
+        # PROMOTION: a secret the LLM discovered (not a known extractor) and the
+        # review CONFIRMED is worth turning into a permanent, free, deterministic
+        # extractor. Land it 'proposed' for operator review, or auto-approve once
+        # the kind has enough prior sightings (operator setting
+        # enum_router.promotion.auto_approve_after; 0 = manual only). Only specific
+        # kinds, only review-confirmed — a one-off / vague "generic" is never
+        # promoted.
+        promo = router.route("promotion")
+        if promo.get("enabled"):
+            auto_after = int(promo.get("auto_approve_after") or 0)
+            proposed = []
+            for f in facts:
+                if (f.get("fact") == "secret" and f.get("source") == "llm_fallback"
+                        and (f.get("review") or {}).get("confidence") in ("high", "medium")):
+                    rid = propose_learned_extractor(
+                        f.get("kind"), f.get("value") or f.get("line") or "",
+                        why=f.get("why") or "",
+                        engagement_id=execution.get("engagement_id"),
+                        auto_approve_after=auto_after)
+                    if rid:
+                        proposed.append(f.get("kind"))
+            if proposed:
+                out["promotions_proposed"] = sorted(set(proposed))
+
     out["facts"] = len(facts)
-    rules = load_rules(execution.get("engagement_id"))
-    if not facts or not rules:
+    if not facts:
         return out
+    rules = load_rules(execution.get("engagement_id"))
 
     try:
         with _connect() as conn:
             with conn.cursor() as cur:
                 out["available"] = True
+                # Secrets are recorded even with no rule to dispatch — a token is
+                # worth keeping for the tester's manual workflow on its own.
+                secrets = _record_secret_facts(cur, facts, execution)
+                if secrets:
+                    out["secrets_recorded"] = secrets
+                    _emit_webhook("post_enum_secret_found",
+                                  {"target": target, "count": secrets,
+                                   "kinds": sorted({f.get("kind") for f in facts
+                                                    if f.get("fact") == "secret"}),
+                                   "engagement_id": execution.get("engagement_id")},
+                                  severity="high")
+                if not rules:
+                    conn.commit()
+                    return out
                 try:
                     from etl.scope_gate import check_dispatch, load_dispatch_scope
                 except ImportError:  # pragma: no cover
@@ -724,6 +1225,7 @@ def analyse(execution: Dict[str, Any], *, queue: bool = True) -> Dict[str, Any]:
                 if scope_source == "unavailable":
                     out["refusals"].append({"reason": "scope could not be loaded"})
                     out["refused"] = len(facts)
+                    conn.commit()
                     return out
 
                 _propose_from_facts(cur, facts, execution, rules, out,

@@ -335,6 +335,14 @@ async def add_agent_message(
             """,
             session_id, agent_name, role, content, _serialize_dict(metadata or {})
         )
+        # Keep updated_at fresh for a long RUNNING run (see the sync
+        # add_agent_message in db_utils.py) — otherwise a healthy run reads as
+        # stalled because updated_at is only written on a status change. Gated on
+        # running statuses so a late message never rewrites a finished session.
+        await conn.execute(
+            "UPDATE agent_sessions SET updated_at = now() "
+            "WHERE id = $1 AND status IN ('active', 'scanning', 'awaiting_approval')",
+            session_id)
         return row['id']
 
 
