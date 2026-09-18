@@ -3373,6 +3373,11 @@ _KNOWN_APPS_WORDLIST = os.environ.get(
 
 
 _WEB_PIPELINE_MAX_PORTS = int(os.environ.get("WEB_PIPELINE_MAX_PORTS", "3"))
+# How long the surface phase will BLOCK waiting for the just-dispatched web
+# pipeline (Gobuster→ZAP→Nuclei) to finish before building surface tests, so its
+# app-layer findings (SQLi/XSS/IDOR) are actually available to test. Bounded, and
+# opt-out via session config wait_for_web_pipeline=false.
+_WEB_PIPELINE_WAIT_SECONDS = int(os.environ.get("WEB_PIPELINE_WAIT_SECONDS", "600"))
 
 
 def _ensure_web_pipeline(host: str, sid, engagement_id=None) -> dict:
@@ -3429,6 +3434,43 @@ def _ensure_web_pipeline(host: str, sid, engagement_id=None) -> dict:
               {"host": host, "dispatched": len(dispatched),
                "urls": [d["url"] for d in dispatched]})
     return {"dispatched": dispatched}
+
+
+def _wait_for_web_pipeline(dispatched, sid, timeout=None) -> None:
+    """Block (bounded) until the dispatched web pipeline job(s) finish, so the
+    ZAP/gobuster/nuclei app-layer findings (SQLi/XSS/IDOR surface) EXIST before
+    surface tests are built. Without this the pipeline is fire-and-forget and its
+    findings land minutes AFTER surface testing — so a single-pass run never
+    tests the web app layer, which is why testfire's web tests 'didn't kick off'.
+    Bounded by WEB_PIPELINE_WAIT_SECONDS; returns (does not fail) on timeout."""
+    import time as _t
+    jobs = [d.get("job_id") for d in (dispatched or []) if d.get("job_id")]
+    if not jobs:
+        return
+    cap = timeout or _WEB_PIPELINE_WAIT_SECONDS
+    deadline = _t.time() + cap
+    _TERMINAL = {"completed", "complete", "done", "finished", "failed",
+                 "error", "cancelled", "canceled", "stopped", "timeout"}
+    pending = set(jobs)
+    _msg(sid, "SurfaceTester",
+         f"[web pipeline] waiting up to {cap}s for {len(jobs)} web scan(s) to "
+         f"finish so their app-layer findings can be surface-tested…")
+    while pending and _t.time() < deadline:
+        for jid in list(pending):
+            try:
+                st = json.loads(_tool(scan_tools.get_web_scan_job_status, job_id=jid))
+                status = str(st.get("status") or st.get("state") or "").lower()
+            except Exception:  # noqa: BLE001
+                status = ""
+            if status in _TERMINAL:
+                pending.discard(jid)
+        if pending:
+            _t.sleep(10)
+    done = len(jobs) - len(pending)
+    _msg(sid, "SurfaceTester",
+         f"[web pipeline] {done}/{len(jobs)} web scan(s) finished; building surface "
+         f"tests from their findings"
+         + (f" ({len(pending)} still running at the {cap}s cap)" if pending else ""))
 
 
 def _known_app_discovery_tests(items: list) -> list:
@@ -4109,7 +4151,15 @@ def surface_plan(state: PentestState) -> dict:
     # fire-and-forget (its findings drive the next cycle).
     if bool(state.get("auto_execute")):
         try:
-            _ensure_web_pipeline(host, sid, engagement_id)
+            pipe = _ensure_web_pipeline(host, sid, engagement_id)
+            # Wait (bounded) for the pipeline so its app-layer findings (ZAP
+            # SQLi/XSS, gobuster, nuclei) are present BEFORE surface tests are
+            # built — otherwise a single-pass run tests only the pre-pipeline
+            # findings and the web app tests never fire. Default on; opt out with
+            # session config wait_for_web_pipeline=false.
+            wait_web = eng.get("wait_for_web_pipeline", True) if isinstance(eng, dict) else True
+            if wait_web and isinstance(pipe, dict) and pipe.get("dispatched"):
+                _wait_for_web_pipeline(pipe["dispatched"], sid)
         except Exception as e:  # noqa: BLE001
             _msg(sid, "SurfaceTester", f"[web pipeline autotrigger skipped: {e}]")
 
