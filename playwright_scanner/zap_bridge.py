@@ -223,6 +223,27 @@ class ZAPBridge:
             print(f"Error configuring ZAP authentication: {e}")
             return None
 
+    def apply_session_headers(self, headers: dict) -> int:
+        """Inject static session headers (bearer/JWT Authorization, X-API-Key,
+        Cookie) into EVERY ZAP request via the Replacer add-on — this is how
+        token/header-authenticated apps and APIs are scanned authenticated (no
+        login form). Returns how many rules were added. Best-effort."""
+        n = 0
+        for name, value in (headers or {}).items():
+            if not name or value in (None, ""):
+                continue
+            try:
+                self.zap.replacer.add_rule(
+                    description=f"authhdr_{name}", enabled=True,
+                    matchtype="REQ_HEADER", matchregex=False, matchstring=name,
+                    replacement=str(value), initiators="", url="")
+                n += 1
+            except Exception as e:  # noqa: BLE001
+                print(f"ZAP replacer add_rule failed for {name}: {e}")
+        if n:
+            print(f"ZAP: injected {n} session header(s) into all requests")
+        return n
+
     def verify_authentication(self, context_id, user_id):
         """Confirm ZAP actually logged in — mirrors the pipeline path
         (web_scan.configure_zap_auth): trigger a login and read the auth state,
@@ -576,6 +597,14 @@ class ZAPBridge:
                 if verified is False:
                     results['auth_error'] = ('ZAP did not confirm a login — check '
                                              'login_url/login_data and the indicators')
+
+        # TOKEN/HEADER auth (bearer/JWT/API-key): inject the Auth Profile's session
+        # headers into every request. Independent of a login form, so a token-only
+        # profile (no login_url) still scans authenticated.
+        _sess_headers = (auth or {}).get("session", {}).get("headers") if auth else None
+        if _sess_headers:
+            results['session_headers_injected'] = self.apply_session_headers(_sess_headers)
+            results['authenticated'] = True
 
         if do_spider:
             results['spider_id'] = self.spider_url(
