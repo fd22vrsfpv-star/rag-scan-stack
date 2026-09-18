@@ -8,6 +8,7 @@ import time
 import traceback
 import uuid
 import threading
+import socket
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from pathlib import Path
@@ -1463,21 +1464,49 @@ def _run_nmap_proxied_async(job_id: str, targets: List[str], ports: str, proxy: 
             if job_id in jobs:
                 jobs[job_id]["nmap_log_base"] = outbase
 
-        # nmap only supports socks4://, not socks5:// — downgrade automatically
-        nmap_proxy = proxy.replace("socks5://", "socks4://")
-
-        # Build nmap command: TCP connect scan through SOCKS proxy
-        # NOTE: -oA writes .nmap + .gnmap + .xml; required for `nmap --resume`
+        # Route the connect scan through the SELECTED node's SOCKS proxy.
+        #
+        # nmap's own --proxies only speaks socks4 (the old code downgraded
+        # socks5://->socks4://), but the nodes are SOCKS5 — a socks4 handshake
+        # against a socks5 server fails, so EVERY connect failed and every port
+        # came back closed (an internet target scanned "through the selected
+        # node" looked entirely dead). Run nmap under proxychains4 instead, which
+        # speaks socks5 and does proxy-side DNS, and add -Pn: host-discovery pings
+        # cannot traverse a SOCKS proxy, so without it nmap marks the host down
+        # and scans nothing.
+        from urllib.parse import urlparse as _urlparse
+        _pu = _urlparse(proxy)
+        _pscheme = (_pu.scheme or "socks5").lower()
+        _pscheme = "socks5" if _pscheme not in ("socks4", "socks5") else _pscheme
+        _phost, _pport = _pu.hostname or "node-manager", _pu.port or 1080
+        # proxychains needs a NUMERIC proxy address — it will not resolve the
+        # proxy host itself ("... has invalid value or is not numeric"), so
+        # resolve node-manager -> IP here.
+        try:
+            _pip = socket.gethostbyname(_phost)
+        except Exception:  # noqa: BLE001
+            _pip = _phost
         opts = _nmap_scan_opts
         timing = opts.get("timing", "T4")
-        cmd = [
-            "nmap", "-sT", "--proxies", nmap_proxy,
-            "-p", ports,
-            "-oA", outbase,
-            "--open",
-            "--stats-every", "30s",
-            f"-{timing}",
-        ]
+
+        use_proxychains = shutil.which("proxychains4") is not None
+        pchains_cfg = None
+        if use_proxychains:
+            pchains_cfg = outbase + ".proxychains.conf"
+            with open(pchains_cfg, "w") as _cf:
+                _cf.write("strict_chain\nproxy_dns\nremote_dns_subnet 224\n"
+                          "tcp_read_time_out 15000\ntcp_connect_time_out 8000\n"
+                          f"[ProxyList]\n{_pscheme} {_pip} {_pport}\n")
+            cmd = ["proxychains4", "-q", "-f", pchains_cfg,
+                   "nmap", "-sT", "-Pn",
+                   "-p", ports, "-oA", outbase, "--open",
+                   "--stats-every", "30s", f"-{timing}"]
+        else:
+            # Fallback: nmap's built-in (socks4-only) proxy support.
+            nmap_proxy = proxy.replace("socks5://", "socks4://")
+            cmd = ["nmap", "-sT", "-Pn", "--proxies", nmap_proxy,
+                   "-p", ports, "-oA", outbase, "--open",
+                   "--stats-every", "30s", f"-{timing}"]
 
         # Service detection: per-scan param overrides env var
         svc_detect_param = opts.get("service_detection")
