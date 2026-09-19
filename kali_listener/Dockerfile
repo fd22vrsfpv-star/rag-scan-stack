@@ -82,6 +82,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     enum4linux-ng \
     ftp \
     gobuster \
+    cewl \
     irssi \
     lftp \
     ntpsec \
