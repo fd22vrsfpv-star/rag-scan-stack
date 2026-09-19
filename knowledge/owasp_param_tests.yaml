@@ -79,3 +79,32 @@ param_tests:
     wstg: WSTG-ATHZ-04
     command: 'curl -sk "{raw}"'
     assertion: {expect_status: 200}
+
+# Per-WEB-SERVICE WSTG probes (not per-param): HSTS, cross-domain policy, cloud
+# exposures, cache-control. Same schema; {base} = scheme://ip:port. tls_only
+# entries emit only when the service negotiates TLS.
+service_tests:
+  - category: hsts_check
+    tool: curl
+    wstg: WSTG-CONF-07
+    tls_only: true
+    command: 'curl -sk -I {base}/'
+    assertion: {expect_not_substring: ['Strict-Transport-Security', 'strict-transport-security']}
+
+  - category: crossdomain_check
+    tool: curl
+    wstg: WSTG-CONF-08
+    command: 'curl -sk {base}/crossdomain.xml'
+    assertion: {expect_regex: '(?i)cross-domain-policy|allow-access-from'}
+
+  - category: cloud_storage
+    tool: nuclei
+    wstg: WSTG-CONF-11
+    command: 'nuclei -u {base} -tags exposure,aws,s3,gcp,azure,bucket -silent'
+    assertion: {expect_regex: '\[[a-z0-9-]+\]'}
+
+  - category: cache_check
+    tool: curl
+    wstg: WSTG-ATHN-06
+    command: 'curl -sk -I {base}/'
+    assertion: {expect_not_substring: ['no-store', 'No-Store', 'no-cache']}
