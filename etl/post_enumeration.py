@@ -869,7 +869,8 @@ def facts_from_web_findings(cur, *, target: str = "", limit: int = 200,
     try:
         cur.execute(
             f"""SELECT wf.id::text, host(a.ip), wf.url, wf.severity,
-                       COALESCE(wf.name,''), COALESCE(wf.issue_type,'')
+                       COALESCE(wf.name,''), COALESCE(wf.issue_type,''),
+                       COALESCE(wf.method,'GET'), COALESCE(wf.payload,'')
                   FROM web_findings wf
                   JOIN assets a ON a.id = wf.asset_id
                  WHERE {' AND '.join(where)}
@@ -877,14 +878,17 @@ def facts_from_web_findings(cur, *, target: str = "", limit: int = 200,
                                     WHERE eo.fact->>'web_finding_id' = wf.id::text)
                  ORDER BY wf.created_at DESC
                  LIMIT %s""", params)
-        for wid, host, url, severity, name, issue_type in cur.fetchall():
+        for wid, host, url, severity, name, issue_type, method, payload in cur.fetchall():
             # issue_type/name carried so rules can key off WHAT the finding is
             # (e.g. information disclosure, directory listing), not only severity —
             # the deterministic tier of "deepen informational findings".
+            # method/payload let the deepen tier author a probe of the right SHAPE
+            # (a POST-body SQLi needs a POST/sqlmap confirmation, not a GET).
             facts.append({"fact": "web_finding", "target": host, "service": "http",
                           "web_finding_id": wid, "url": url,
                           "severity": (severity or "").lower(),
-                          "name": name, "issue_type": issue_type})
+                          "name": name, "issue_type": issue_type,
+                          "method": method, "payload": payload})
     except Exception as e:  # noqa: BLE001
         log.debug("web finding facts unavailable: %s", e)
     return facts
@@ -1376,6 +1380,46 @@ def analyse_findings(*, target: str = "", engagement_id: Optional[str] = None,
     return out
 
 
+def _queue_impactful_deepen(cur, host, url, command, proposal,
+                            finding_id, finding_name, issue_type, queued_by):
+    """Queue an IMPACTFUL deepen confirmation (POST/sqlmap) to the APPROVAL lane
+    (pending_exploits, status='pending'), NOT the safe lane. A state-changing
+    confirmation must never auto-run; execution happens only through the operator
+    approval -> execute_approved_exploit path. Mirrors the queue-poc insert shape.
+    Returns the pending_exploit id (or None)."""
+    import uuid as _uuid
+    from urllib.parse import urlparse
+    from psycopg2.extras import Json
+    pu = urlparse(url or "")
+    port = pu.port or (443 if pu.scheme == "https" else 80)
+    itype = (issue_type or "").lower()
+    # SQLi/auth-affecting confirmations are auth_bypass; else the 'other' catch-all
+    # (exploit_type CHECK is rce|auth_bypass|info_disclosure|other).
+    etype = "auth_bypass" if any(k in itype for k in ("sql", "auth", "login", "bypass")) else "other"
+    why = (proposal.get("why") or "")
+    assertion = proposal.get("assertion") or {}
+    pid = str(_uuid.uuid4())
+    cur.execute(
+        """INSERT INTO pending_exploits
+             (id, source, exploit_id, exploit_title, exploit_type, exploit_category,
+              target_ip, target_port, target_service,
+              customized_command, parameters, match_confidence,
+              match_reasoning, status, requested_by, metadata)
+           VALUES (%s,'web_poc',%s,%s,%s,'webapp',%s::inet,%s,'http',
+                   %s,%s,%s,%s,'pending',%s,%s)
+           RETURNING id::text""",
+        (pid, f"deepen-{str(finding_id)[:8]}", (finding_name or "Deepen finding")[:200],
+         etype, host, port, command,
+         Json({"target_url": url, "finding_id": str(finding_id),
+               "assertion": assertion, "queued_by": queued_by}),
+         0.5, (why or "")[:500], queued_by,
+         Json({"deepened_finding": finding_id, "why": why, "assertion": assertion,
+               "finding_name": finding_name, "queued_by": queued_by,
+               "tier": "impactful"})))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
 def _deepen_info_findings(cur, facts, context, rules, out) -> None:
     """For info/low web findings that matched NO deterministic rule, ask the
     router (budget-bounded, fail-closed) for ONE read-only probe that turns the
@@ -1409,19 +1453,26 @@ def _deepen_info_findings(cur, facts, context, rules, out) -> None:
             _observe(cur, "deepen:info", context, fact, command, None, refused=str(refusal))
             out["refused"] += 1
             continue
-        cur.execute(
-            """INSERT INTO scan_recommendations
-                 (ip, service, scanner, action, script, source, priority,
-                  status, engagement_id, extra)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s)
-               ON CONFLICT (fingerprint) DO NOTHING RETURNING id::text""",
-            (fact_target, "http", "deepen", command, command, SOURCE, 30,
-             context.get("engagement_id"),
-             Json({"deepened_finding": fact.get("web_finding_id"),
-                   "why": proposal.get("why"), "assertion": proposal.get("assertion"),
-                   "finding_name": fact.get("name"), "queued_by": "deepen:info"})))
-        row = cur.fetchone()
-        rec_id = row[0] if row else None
+        if proposal.get("tier") == "impactful":
+            # State-changing confirmation -> APPROVAL lane, never auto-run.
+            rec_id = _queue_impactful_deepen(
+                cur, fact_target, fact.get("url"), command, proposal,
+                fact.get("web_finding_id"), fact.get("name"),
+                fact.get("issue_type"), "deepen:info")
+        else:
+            cur.execute(
+                """INSERT INTO scan_recommendations
+                     (ip, service, scanner, action, script, source, priority,
+                      status, engagement_id, extra)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s)
+                   ON CONFLICT (fingerprint) DO NOTHING RETURNING id::text""",
+                (fact_target, "http", "deepen", command, command, SOURCE, 30,
+                 context.get("engagement_id"),
+                 Json({"deepened_finding": fact.get("web_finding_id"),
+                       "why": proposal.get("why"), "assertion": proposal.get("assertion"),
+                       "finding_name": fact.get("name"), "queued_by": "deepen:info"})))
+            row = cur.fetchone()
+            rec_id = row[0] if row else None
         if rec_id:
             out["queued"] += 1
             deepened += 1
@@ -1449,17 +1500,19 @@ def deepen_web_finding(finding_id: str,
         with _connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """SELECT wf.url, COALESCE(wf.name,''), COALESCE(wf.issue_type,''),
-                          COALESCE(wf.severity,''), host(a.ip)
+                          COALESCE(wf.severity,''), host(a.ip),
+                          COALESCE(wf.method,'GET'), COALESCE(wf.payload,'')
                      FROM web_findings wf JOIN assets a ON a.id = wf.asset_id
                     WHERE wf.id = %s::uuid""", (finding_id,))
             r = cur.fetchone()
             if not r:
                 out["reason"] = "finding not found"
                 return out
-            url, name, issue_type, severity, host = r
+            url, name, issue_type, severity, host, method, payload = r
             fact = {"fact": "web_finding", "target": host, "service": "http",
                     "web_finding_id": finding_id, "url": url, "name": name,
-                    "issue_type": issue_type, "severity": (severity or "").lower()}
+                    "issue_type": issue_type, "severity": (severity or "").lower(),
+                    "method": method, "payload": payload}
             proposal = _enum_router().deepen_finding(fact, force=True)
             if not proposal:
                 out["reason"] = "no probe proposed (LLM unavailable or declined)"
@@ -1476,6 +1529,26 @@ def deepen_web_finding(finding_id: str,
                          fact, command, None, refused=str(refusal))
                 conn.commit()
                 out["reason"] = f"out of scope: {refusal}"
+                return out
+            if proposal.get("tier") == "impactful":
+                # State-changing confirmation (e.g. a POST-body SQLi) -> APPROVAL
+                # lane. It never auto-runs; the operator approves it, and execution
+                # goes through execute_approved_exploit (POST-capable, proxied).
+                pid = _queue_impactful_deepen(
+                    cur, host, url, command, proposal, finding_id, name,
+                    issue_type, "deepen:manual")
+                _observe(cur, "deepen:manual",
+                         {"tool": "deepen", "target": host, "engagement_id": engagement_id},
+                         fact, command, pid)
+                conn.commit()
+                out.update({"ok": True, "queued": 1 if pid else 0,
+                            "pending_exploit_id": pid, "tier": "impactful",
+                            "requires_approval": True, "command": command,
+                            "why": proposal.get("why"), "target": host})
+                _emit_webhook("web_finding_deepened",
+                              {"target": host, "finding_id": finding_id,
+                               "engagement_id": engagement_id, "tier": "impactful",
+                               "requires_approval": True})
                 return out
             cur.execute(
                 """INSERT INTO scan_recommendations
@@ -1494,12 +1567,12 @@ def deepen_web_finding(finding_id: str,
                      {"tool": "deepen", "target": host, "engagement_id": engagement_id},
                      fact, command, rec_id)
             conn.commit()
-            out.update({"ok": True, "queued": 1 if rec_id else 0,
+            out.update({"ok": True, "queued": 1 if rec_id else 0, "tier": "safe",
                         "recommendation_id": rec_id, "command": command,
                         "why": proposal.get("why"), "target": host})
             _emit_webhook("web_finding_deepened",
                           {"target": host, "finding_id": finding_id,
-                           "engagement_id": engagement_id})
+                           "engagement_id": engagement_id, "tier": "safe"})
     except Exception as e:  # noqa: BLE001
         log.warning("deepen_web_finding failed: %s", e)
         out["reason"] = str(e)[:200]

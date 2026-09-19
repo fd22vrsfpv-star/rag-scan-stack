@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -386,14 +387,42 @@ class EnumerationLLMRouter:
 
     # ── deepen ─────────────────────────────────────────────────────────────────
     _DEEPEN_TOOLS = {"curl", "wget", "http", "httpx", "nuclei", "whatweb"}
+    # Tools allowed for an IMPACTFUL confirmation of a STATE-CHANGING finding (a
+    # POST-body SQLi cannot be reproduced by a read-only GET). These route to the
+    # human approval lane, never the safe lane — so a mutating tool is admissible.
+    _DEEPEN_IMPACTFUL_TOOLS = {"curl", "wget", "http", "httpx", "sqlmap"}
+
+    @staticmethod
+    def _probe_is_impactful(cmd: str) -> bool:
+        """A confirmation probe is IMPACTFUL (state-changing → approval lane) if it
+        runs sqlmap or sends a request body / non-GET method. `curl -G/--get`
+        appends --data as a GET QUERY STRING, so with -G a --data probe is
+        read-only again (only sqlmap stays impactful)."""
+        head = (cmd.split() or [""])[0].split("/")[-1].lower()
+        if head == "sqlmap":
+            return True
+        get_mode = bool(re.search(r"(?:^|\s)(?:-G|--get)(?:\s|$)", cmd))
+        if get_mode:
+            return False
+        return bool(re.search(
+            r"(?:^|\s)(?:-X\s*(?:POST|PUT|PATCH|DELETE)\b|--data\b|--data-raw\b"
+            r"|--data-binary\b|--data-urlencode\b|-d\b|-F\b|--form\b)", cmd))
 
     def deepen_finding(self, finding: Dict[str, Any],
                        force: bool = False) -> Optional[Dict[str, Any]]:
-        """Investigate a finding: ask the LLM for ONE READ-ONLY probe
-        (curl/http/nuclei/whatweb) that turns it into evidence. Returns
-        {command, why, assertion} or None. Budget-capped (separate bucket) and
-        fail-CLOSED — never proposes on error, and rejects anything but a
-        read-only allowlisted tool so a queued item is safe.
+        """Investigate a finding: ask the LLM for ONE confirmation probe that turns
+        it into evidence. Returns {command, why, assertion, tier} or None.
+        Budget-capped (separate bucket) and fail-CLOSED.
+
+        METHOD-AWARE. A finding on a POST/PUT/PATCH/DELETE request (or a body
+        parameter) CANNOT be reproduced by a read-only GET — the classic case is a
+        POST-body SQL injection at a login form, where a `curl -G` probe just hits
+        the app and returns the same redirect for any input. For a state-changing
+        finding this asks for an IMPACTFUL confirmation (curl -X POST/--data, or
+        sqlmap --data) and returns tier='impactful', which the caller routes to the
+        human APPROVAL lane (never the safe lane); a read-only GET returned for a
+        state-changing finding is the dead-probe bug this fixes, so it is REJECTED
+        (fail-closed). A GET finding keeps the read-only probe, tier='safe'.
 
         force=True is the OPERATOR-INITIATED path ("Deepen this finding" button):
         propose the best probe regardless of the auto-triage `worth` verdict, and
@@ -405,6 +434,10 @@ class EnumerationLLMRouter:
         name = finding.get("name") or finding.get("issue_type") or ""
         if not url or not name:
             return None
+        method = str(finding.get("method") or finding.get("http_method") or "GET").upper()
+        param = (finding.get("param") or finding.get("parameter")
+                 or finding.get("param_name") or "")
+        state_changing = method in ("POST", "PUT", "PATCH", "DELETE")
         if not self._within_budget(p, consume=True, bucket=self._deepen_calls):
             return None
         try:
@@ -413,26 +446,51 @@ class EnumerationLLMRouter:
                 "ALWAYS propose the best probe (set worth=true)."
                 if force else
                 "Decide whether it is worth a deeper look.")
+            if state_changing:
+                shape = (
+                    f"This finding is on an HTTP {method} request, so a read-only GET "
+                    f"CANNOT reproduce it. Give ONE IMPACTFUL confirmation probe that "
+                    f"uses {method}: either `curl -s -i -X {method} --data '<body>' "
+                    f"'<url>'` or `sqlmap -u '<url>' --data '<body>' -p <param> "
+                    f"--batch --smart --level 1 --risk 1`. It WILL be routed to the "
+                    f"human approval lane before it runs. MUST start with one of: "
+                    f"curl, wget, http, httpx, sqlmap.")
+            else:
+                shape = (
+                    "Give ONE READ-ONLY probe (GET, no side effects) that turns the "
+                    "finding into evidence. MUST start with one of: curl, wget, http, "
+                    "httpx, nuclei, whatweb.")
             system = (
                 "You are triaging a web finding for AUTHORIZED security testing. "
-                f"{worth_clause} Give ONE READ-ONLY probe that turns the finding "
-                "into evidence. The command MUST be read-only and start with one "
-                "of: curl, wget, http, httpx, nuclei, whatweb. Return ONLY JSON: "
-                '{"worth": true|false, "command": "<one read-only command using the '
-                'URL>", "assertion": {"contains": "<expected string>"}, '
+                f"{worth_clause} {shape} Return ONLY JSON: "
+                '{"worth": true|false, "command": "<one command using the URL>", '
+                '"assertion": {"contains": "<expected string>"}, '
                 '"why": "<one short sentence>"}. If not worth deepening, '
                 '{"worth": false}.')
-            user = f"Finding: {name}\nURL: {url}\nType: {finding.get('issue_type') or ''}"
+            user = (f"Finding: {name}\nURL: {url}\nHTTP method: {method}\n"
+                    f"Parameter: {param}\nType: {finding.get('issue_type') or ''}\n"
+                    f"Known payload: {str(finding.get('payload') or '')[:200]}")
             parsed = self._first_json(self._call_llm(system, user, p))
             if not isinstance(parsed, dict) or (not force and not parsed.get("worth")):
                 return None
             cmd = str(parsed.get("command") or "").strip()
             head = (cmd.split() or [""])[0].split("/")[-1].lower()
-            if not cmd or head not in self._DEEPEN_TOOLS:
+            if not cmd:
+                return None
+            impactful = self._probe_is_impactful(cmd)
+            if state_changing and not impactful:
+                # A read-only GET cannot confirm a state-changing finding: never
+                # queue the dead probe.
+                log.debug("deepen: refusing read-only probe for %s finding on %s",
+                          method, url)
+                return None
+            tier = "impactful" if impactful else "safe"
+            allow = self._DEEPEN_IMPACTFUL_TOOLS if impactful else self._DEEPEN_TOOLS
+            if head not in allow:
                 return None
             assertion = parsed.get("assertion") if isinstance(parsed.get("assertion"), dict) else {}
             return {"command": cmd, "why": str(parsed.get("why") or "")[:200],
-                    "assertion": assertion}
+                    "assertion": assertion, "tier": tier}
         except Exception as e:  # noqa: BLE001
             log.debug("enum router deepen failed: %s", e)
             return None
