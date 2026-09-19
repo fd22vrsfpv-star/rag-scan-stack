@@ -1384,8 +1384,17 @@ def _queue_impactful_deepen(cur, host, url, command, proposal,
                             finding_id, finding_name, issue_type, queued_by):
     """Queue an IMPACTFUL deepen confirmation (POST/sqlmap) to the APPROVAL lane
     (pending_exploits, status='pending'), NOT the safe lane. A state-changing
-    confirmation must never auto-run; execution happens only through the operator
-    approval -> execute_approved_exploit path. Mirrors the queue-poc insert shape.
+    confirmation must never auto-run; execution happens only after operator
+    approval, via exploit-runner /execute/by-id -> the listener's /vectors/run
+    (POST-capable, scope-gated, proxy-enforced), which runs the raw command.
+
+    dispatch: source='command' — the runner runs `customized_command` as a raw
+    offensive command. The exploit_title MUST be neutral (no SQLi/XSS/LFI/etc.
+    keyword): _infer_exploit_category routes any injection-keyword title to the
+    Playwright web_poc path, which expects structured metadata.payload, not a
+    command — so a keyword title would silently drop our command. The finding name
+    is carried in metadata/match_reasoning instead. The assertion is passed as
+    parameters.success so the runner's _eval_vector_success can judge the result.
     Returns the pending_exploit id (or None)."""
     import uuid as _uuid
     from urllib.parse import urlparse
@@ -1394,10 +1403,12 @@ def _queue_impactful_deepen(cur, host, url, command, proposal,
     port = pu.port or (443 if pu.scheme == "https" else 80)
     itype = (issue_type or "").lower()
     # SQLi/auth-affecting confirmations are auth_bypass; else the 'other' catch-all
-    # (exploit_type CHECK is rce|auth_bypass|info_disclosure|other).
+    # (exploit_type CHECK is rce|auth_bypass|info_disclosure|other). A non-webapp
+    # title + source='command' routes to the command lane regardless.
     etype = "auth_bypass" if any(k in itype for k in ("sql", "auth", "login", "bypass")) else "other"
     why = (proposal.get("why") or "")
     assertion = proposal.get("assertion") or {}
+    reasoning = (f"deepen confirmation for finding {finding_name!r}: {why}")[:500]
     pid = str(_uuid.uuid4())
     cur.execute(
         """INSERT INTO pending_exploits
@@ -1405,14 +1416,14 @@ def _queue_impactful_deepen(cur, host, url, command, proposal,
               target_ip, target_port, target_service,
               customized_command, parameters, match_confidence,
               match_reasoning, status, requested_by, metadata)
-           VALUES (%s,'web_poc',%s,%s,%s,'webapp',%s::inet,%s,'http',
+           VALUES (%s,'command',%s,%s,%s,'command',%s::inet,%s,'http',
                    %s,%s,%s,%s,'pending',%s,%s)
            RETURNING id::text""",
-        (pid, f"deepen-{str(finding_id)[:8]}", (finding_name or "Deepen finding")[:200],
+        (pid, f"deepen-{str(finding_id)[:8]}", "deepen confirmation probe",
          etype, host, port, command,
-         Json({"target_url": url, "finding_id": str(finding_id),
-               "assertion": assertion, "queued_by": queued_by}),
-         0.5, (why or "")[:500], queued_by,
+         Json({"success": assertion, "target_url": url,
+               "finding_id": str(finding_id), "queued_by": queued_by}),
+         0.5, reasoning, queued_by,
          Json({"deepened_finding": finding_id, "why": why, "assertion": assertion,
                "finding_name": finding_name, "queued_by": queued_by,
                "tier": "impactful"})))
