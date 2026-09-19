@@ -3161,28 +3161,96 @@ def _assertion_for(category: str, tls: str) -> dict:
     return {"expect_exit_code": 0}
 
 
+@functools.lru_cache(maxsize=1)
+def _load_safe_service_probes() -> tuple:
+    """Safe read-only surface-probe specs from knowledge/safe_service_probes.yaml
+    — the service-family -> [(category, tool)] mapping AND the per-tool default
+    command, as DATA not hardcode (CLAUDE.md 'Knowledge is RAG-first'). Each
+    family is a dict {family, services, probes:[{category, tool, command,
+    tls_only?}]}; the [_web_family] sentinel means _SERVICE_FAMILIES_WEB.
+    Bind-mounted (edit -> new probes without a code change); embedded into
+    rag_documents by etl/load_knowledge_documents.py. Fail-safe: any error -> ()
+    and the callers fall back to their in-code defaults."""
+    import os as _os
+    candidates = [
+        _os.environ.get("SAFE_SERVICE_PROBES_YAML", "/knowledge/safe_service_probes.yaml"),
+        _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                      "knowledge", "safe_service_probes.yaml"),
+    ]
+    for path in candidates:
+        if not path or not _os.path.exists(path):
+            continue
+        try:
+            import yaml as _yaml
+            with open(path, encoding="utf-8") as fh:
+                data = _yaml.safe_load(fh) or {}
+            fams = []
+            for fam in (data.get("safe_service_probes") or []):
+                if isinstance(fam, dict) and fam.get("family") and isinstance(fam.get("probes"), list):
+                    fams.append(fam)
+            return tuple(fams)
+        except Exception:  # noqa: BLE001 — fail-safe to in-code defaults
+            return ()
+    return ()
+
+
+def _safe_probe_family_matches(fam: dict, svc: str) -> bool:
+    """Does this probe family apply to service `svc`? The [_web_family] sentinel
+    defers to the code's _SERVICE_FAMILIES_WEB set (single source of truth for
+    'what is a web service'); otherwise match the family's `services` list."""
+    services = fam.get("services") or []
+    if "_web_family" in services:
+        return svc in _SERVICE_FAMILIES_WEB
+    return svc in {str(s).strip().lower() for s in services}
+
+
+def _safe_probe_default_commands() -> dict:
+    """tool -> default command template ({scheme}/{ip}/{port}) from YAML, for the
+    fallback used when the tool recommender supplies no command. Falls back to the
+    in-code map if the YAML is absent (fail-safe)."""
+    out = {}
+    for fam in _load_safe_service_probes():
+        for p in (fam.get("probes") or []):
+            tool, cmd = p.get("tool"), p.get("command")
+            if tool and cmd and tool not in out:
+                out[tool] = cmd
+    if out:
+        return out
+    return {  # in-code fallback (YAML absent) — mirrors safe_service_probes.yaml
+        "whatweb": "whatweb -a 3 --color=never {scheme}://{ip}:{port}",
+        "nuclei": "nuclei -u {scheme}://{ip}:{port} -silent",
+        "gobuster": "gobuster dir -u {scheme}://{ip}:{port} -w /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt -q",
+        "sslscan": "sslscan {ip}:{port}",
+        "enum4linux-ng": "enum4linux-ng -A {ip}",
+        "ssh-audit": "ssh-audit {ip}:{port}",
+        "snmpwalk": "snmpwalk -v2c -c public {ip}",
+        "nmap": "nmap -sV -Pn --host-timeout 120s -p {port} {ip}",
+    }
+
+
 def _surface_categories_for(svc: str, tls: str) -> "list[tuple[str,str]]":
-    """(category, tool) safe probes appropriate to a service. Deterministic; the
-    concrete command comes from get_tool_recommendations where possible, else a
-    sensible default here."""
-    web = svc in _SERVICE_FAMILIES_WEB
+    """(category, tool) safe probes appropriate to a service, from
+    knowledge/safe_service_probes.yaml (DATA not hardcode). Deterministic; the
+    concrete command comes from get_tool_recommendations where possible, else the
+    YAML default (see _safe_probe_default_commands). A tls_only probe is emitted
+    only for a TLS service. Fail-safe: empty YAML -> the `default` family, then
+    the banner probe."""
+    fams = _load_safe_service_probes()
     out = []
-    if web:
-        # whatweb, not ProjectDiscovery httpx: the kali image ships Python's
-        # httpx at /usr/bin/httpx (different CLI, and not on the allowlist), so
-        # an `httpx -title -tech-detect …` probe both 400s at the gate and would
-        # not parse. whatweb is present, allowlisted, and gives title / server /
-        # tech — exactly what http_probe asserts on.
-        out += [("http_probe", "whatweb"), ("nuclei_detect", "nuclei"),
-                ("dir_enum", "gobuster")]
-        if tls == "yes":
-            out += [("tls_check", "sslscan")]
-    if svc in ("smb", "microsoft-ds", "netbios-ssn", "cifs"):
-        out += [("version_probe", "enum4linux-ng")]
-    if svc in ("ssh",):
-        out += [("version_probe", "ssh-audit")]
-    if svc in ("snmp",):
-        out += [("version_probe", "snmpwalk")]
+    for fam in fams:
+        if fam.get("family") == "default" or not _safe_probe_family_matches(fam, svc):
+            continue
+        for p in (fam.get("probes") or []):
+            if p.get("tls_only") and tls != "yes":
+                continue
+            if p.get("category") and p.get("tool"):
+                out.append((p["category"], p["tool"]))
+    if not out:
+        for fam in fams:
+            if fam.get("family") == "default":
+                out = [(p["category"], p["tool"]) for p in (fam.get("probes") or [])
+                       if p.get("category") and p.get("tool")]
+                break
     if not out:
         out = [("banner", "nmap")]
     return out
@@ -3960,18 +4028,12 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
                 cmd = _bound_safe_command(cmd, ip, port)
             else:
                 scheme = "https" if tls == "yes" else "http"
-                cmd = {
-                    # Present + allowlisted in the kali image (see _surface_categories_for).
-                    "whatweb": f"whatweb -a 3 --color=never {scheme}://{ip}:{port}",
-                    "nuclei": f"nuclei -u {scheme}://{ip}:{port} -silent",
-                    # seclists is installed; /usr/share/wordlists/dirb/ is not.
-                    "gobuster": f"gobuster dir -u {scheme}://{ip}:{port} -w /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt -q",
-                    "sslscan": f"sslscan {ip}:{port}",
-                    "enum4linux-ng": f"enum4linux-ng -A {ip}",
-                    "ssh-audit": f"ssh-audit {ip}:{port}",
-                    "snmpwalk": f"snmpwalk -v2c -c public {ip}",
-                    "nmap": f"nmap -sV -Pn --host-timeout 120s -p {port} {ip}",
-                }.get(default_tool, f"nmap -sV -Pn --host-timeout 120s -p {port} {ip}")
+                # Default command templates from knowledge/safe_service_probes.yaml
+                # ({scheme}/{ip}/{port} placeholders); DATA not hardcode.
+                defaults = _safe_probe_default_commands()
+                tmpl = defaults.get(default_tool) or defaults.get("nmap") \
+                    or "nmap -sV -Pn --host-timeout 120s -p {port} {ip}"
+                cmd = tmpl.format(scheme=scheme, ip=ip, port=port)
             tier = _classify(category, cmd, has_exploit_ref=False)
             tests.append({
                 "name": f"{category} {svc}/{port} @ {ip}",
