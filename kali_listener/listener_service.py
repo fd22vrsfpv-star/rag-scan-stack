@@ -1238,11 +1238,18 @@ def _readonly_arg_violation(tool: str, command: str) -> str:
     def has(*flags):
         return next((f for f in flags if f" {f} " in c or f" {f}=" in c), "")
     if tool in ("curl", "wget"):
-        # GET/HEAD only: no request body, no upload, no non-idempotent method.
-        bad = has("-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
-                  "-f", "--form", "-t", "--upload-file", "--upload")
-        if bad:
-            return f"{tool} {bad} sends a body/upload — not read-only"
+        # GET/HEAD only: no upload, no non-idempotent method.
+        upload = has("-f", "--form", "-t", "--upload-file", "--upload")
+        if upload:
+            return f"{tool} {upload} sends a body/upload — not read-only"
+        # `curl -G`/`--get` appends --data* to the URL as a GET QUERY STRING, so
+        # those flags are read-only in that mode (case-sensitive: -G is --get,
+        # while lowercase -g is --globoff — do NOT match on the lowercased copy).
+        get_mode = tool == "curl" and bool(
+            re.search(r"(?:^|\s)(?:-G|--get)(?:\s|$)", command))
+        data = has("-d", "--data", "--data-raw", "--data-binary", "--data-urlencode")
+        if data and not get_mode:
+            return f"{tool} {data} sends a body — not read-only (use -G to send it as a query)"
         m = re.search(r"(?:-x|--request)[= ]+([a-z]+)", c)
         if m and m.group(1).upper() not in ("GET", "HEAD"):
             return f"{tool} -X {m.group(1).upper()} is not an idempotent read"
