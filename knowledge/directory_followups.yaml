@@ -42,6 +42,10 @@ directory_followup:
     timeout_seconds: 600
     status_codes_blacklist: "404"
   priority: 24
+  # Before brute-forcing, verify the directory actually responds (a HEAD via the
+  # safe lane): skip a phantom path that 404s for everything (e.g. a
+  # relative-path-confusion crawl artifact). Fail-open — only a definite 404 skips.
+  verify_exists: true
   # Auto-fire on the safe lane; the dispatch is tagged as a follow-up.
   lane: safe
   followup_tag: dir_followup
