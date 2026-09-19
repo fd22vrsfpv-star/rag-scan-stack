@@ -233,39 +233,24 @@ def run_default_cred_check(cur, host: str, login_page_url: str, *,
         return out
     login_url = urljoin(login_page_url, form.get("action") or "") or login_page_url
 
-    # 2) candidate set + the threshold decision
+    # 2) candidate set. The SETTING caps how many are submitted UNATTENDED: the
+    # auto run tries the top `max_auto_attempts` (highest-value first, so admin:admin
+    # is always tried); if none work and the full set is larger, the fuller spray is
+    # queued for operator APPROVAL. force=True (the approval path) runs the full set.
     pairs = candidate_pairs(port, cfg)
     out["candidates"] = len(pairs)
     threshold = int(cfg.get("max_auto_attempts", 24))
-    if len(pairs) > threshold and not force:
-        # ABOVE the setting -> queue for operator approval, do NOT submit.
-        cur.execute(
-            """INSERT INTO scan_recommendations
-                 (ip, service, scanner, action, script, source, priority,
-                  status, engagement_id, extra)
-               VALUES (%s,'http',%s,%s,%s,'default_cred_check',%s,'pending',%s,%s)
-               ON CONFLICT (fingerprint) DO NOTHING RETURNING id::text""",
-            (host, cfg.get("followup_tag", "default_cred_check"),
-             f"default-cred check ({len(pairs)} pairs) @ {login_url}",
-             f"default-cred check @ {login_url}", int(cfg.get("priority", 26)),
-             engagement_id,
-             Json({"followup": True, "followup_type": "default_cred_check",
-                   "login_url": login_url, "candidate_count": len(pairs),
-                   "requires_approval": True, "reason": f"{len(pairs)} > max_auto_attempts {threshold}",
-                   "queued_by": "enum:default_cred_check"})))
-        row = cur.fetchone()
-        out.update({"ok": True, "queued": 1 if row else 0, "requires_approval": True,
-                    "recommendation_id": row[0] if row else None, "login_url": login_url,
-                    "reason": f"{len(pairs)} candidates exceed max_auto_attempts ({threshold}); queued for approval"})
-        return out
+    run_set = pairs if force else pairs[:threshold]
 
-    # 3) run the bounded spray (auto lane, or the approved force path)
+    # 3) run the bounded spray
     markers = (cfg.get("success") or {}).get("login_path_markers") or []
     base_cmd = _login_command(login_url, form, "zz_baseline_no_such_user", "zz_bad_pw_123")
     baseline = _parse_response(_run_tool("curl", base_cmd, host, port, lane="vectors"))
     found = None
     anomalies = 0
-    for i, (user, pw) in enumerate(pairs):
+    attempted = 0
+    for user, pw in run_set:
+        attempted += 1
         resp_raw = _run_tool("curl", _login_command(login_url, form, user, pw), host, port, lane="vectors")
         if resp_raw.startswith("__REFUSED__"):
             out["reason"] = f"login POST refused: {resp_raw[:120]}"
@@ -279,9 +264,33 @@ def run_default_cred_check(cur, host: str, login_page_url: str, *,
         if _is_success(_parse_response(resp_raw), baseline, markers):
             found = {"username": user, "password": pw}
             break
-    out["attempted"] = i + 1 if pairs else 0
+    out["attempted"] = attempted
 
     if not found:
+        # none of the auto set worked; if more candidates exist, queue the fuller
+        # spray for approval (never auto-submit more than the setting).
+        if not force and len(pairs) > threshold:
+            cur.execute(
+                """INSERT INTO scan_recommendations
+                     (ip, service, scanner, action, script, source, priority,
+                      status, engagement_id, extra)
+                   VALUES (%s,'http',%s,%s,%s,'default_cred_check',%s,'pending',%s,%s)
+                   ON CONFLICT (fingerprint) DO NOTHING RETURNING id::text""",
+                (host, cfg.get("followup_tag", "default_cred_check"),
+                 f"full default-cred spray ({len(pairs)} pairs) @ {login_url}",
+                 f"default-cred check @ {login_url}", int(cfg.get("priority", 26)),
+                 engagement_id,
+                 Json({"followup": True, "followup_type": "default_cred_check",
+                       "login_url": login_url, "candidate_count": len(pairs),
+                       "auto_tried": threshold, "requires_approval": True,
+                       "reason": f"top {threshold} defaults tried (none worked); full spray ({len(pairs)}) needs approval",
+                       "queued_by": "enum:default_cred_check"})))
+            row = cur.fetchone()
+            out.update({"ok": True, "valid": False, "login_url": login_url,
+                        "requires_approval": True, "queued": 1 if row else 0,
+                        "recommendation_id": row[0] if row else None,
+                        "reason": f"top {threshold} defaults tried; full spray ({len(pairs)}) queued for approval"})
+            return out
         out.update({"ok": True, "valid": False, "login_url": login_url})
         return out
 
