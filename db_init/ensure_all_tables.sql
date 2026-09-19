@@ -311,6 +311,7 @@ CREATE TABLE IF NOT EXISTS public.web_findings (
     evidence    text,
     status_code integer,
     method      text,
+    param       text,
     payload     text,
     description text,
     solution    text,
@@ -327,6 +328,12 @@ CREATE TABLE IF NOT EXISTS public.web_findings (
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE public.web_findings ADD COLUMN IF NOT EXISTS port integer;
+-- The injected/affected parameter name (ZAP alert.param, nuclei matched param).
+-- Kept as its OWN column: it was previously merged into `evidence`
+-- (evidence OR param) and lost whenever ZAP also returned evidence text, so a
+-- finding's vulnerable parameter could not be recovered for a targeted deepen
+-- probe or a bulk parameter evaluation.
+ALTER TABLE public.web_findings ADD COLUMN IF NOT EXISTS param text;
 CREATE INDEX IF NOT EXISTS idx_web_findings_asset_id ON public.web_findings(asset_id);
 CREATE INDEX IF NOT EXISTS idx_web_findings_url ON public.web_findings(url);
 CREATE INDEX IF NOT EXISTS idx_web_findings_source ON public.web_findings(source);

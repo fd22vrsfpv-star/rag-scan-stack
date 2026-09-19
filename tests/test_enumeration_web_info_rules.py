@@ -57,9 +57,9 @@ class _Cur:
 
     def fetchall(self):
         # Mirrors facts_from_web_findings SELECT: id, ip, url, severity, name,
-        # issue_type, method, payload.
+        # issue_type, method, payload, param.
         return [("wid1", "10.0.0.9", "http://10.0.0.9/x", "info",
-                 "Directory Browsing", "dir-listing", "GET", "")]
+                 "Directory Browsing", "dir-listing", "GET", "", "")]
 
 
 def test_facts_carry_issue_type():
