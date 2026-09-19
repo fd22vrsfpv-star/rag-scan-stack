@@ -95,6 +95,19 @@ def _zap_crawl_settings(cur, cfg: Dict[str, Any]) -> Dict[str, int]:
     out["max_pages"] = max(1, min(out["max_pages"], 1000))
     out["max_depth"] = max(1, min(out["max_depth"], 5))
     out["wait_seconds"] = max(30, min(out["wait_seconds"], 1800))
+    # Ajax spider OFF by default (memory-heavy; redundant after the authenticated
+    # crawl). Optional via ZAP setting zap.ajax_spider.
+    out["ajax_spider"] = 0
+    try:
+        cur.execute("SELECT value FROM app_settings WHERE key='zap.ajax_spider' AND category='config'")
+        r = cur.fetchone()
+        if r and str(r[0]).strip().lower() in ("1", "true", "yes", "on"):
+            out["ajax_spider"] = 1
+    except Exception:  # noqa: BLE001
+        try:
+            cur.connection.rollback()
+        except Exception:  # noqa: BLE001
+            pass
     return out
 
 
@@ -516,7 +529,8 @@ def run_default_cred_check(cur, host: str, login_page_url: str, *,
                 sr = cli.post(f"{pw_url.rstrip('/')}/scan",
                               json={"url": base, "engagement_id": engagement_id,
                                     "zap_spider": bool(rc.get("zap_spider", True)),
-                                    "zap_active_scan": bool(rc.get("zap_active_scan", True))},
+                                    "zap_active_scan": bool(rc.get("zap_active_scan", True)),
+                                    "zap_ajax_spider": bool(zc.get("ajax_spider", 0))},
                               headers=hdr)
                 body = sr.json() if sr.status_code < 400 else {}
                 out["authenticated_scan"] = {

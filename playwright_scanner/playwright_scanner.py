@@ -178,6 +178,10 @@ class ScanRequest(BaseModel):
     run_security_checks: Optional[bool] = Field(True, description="Run security checks")
     zap_spider: Optional[bool] = Field(False, description="Run ZAP spider after scan")
     zap_active_scan: Optional[bool] = Field(False, description="Run ZAP active scan")
+    #: OFF by default — the ajax spider drives real browsers (memory-heavy, slow)
+    #: and is redundant once the authenticated Playwright crawl has seeded the tree.
+    #: Opt-in for a JS-heavy SPA the traditional spider can't map.
+    zap_ajax_spider: Optional[bool] = Field(False, description="Run the ZAP ajax (browser) spider — off by default")
     auth: Optional[Dict] = Field(None, description="ZAP form-auth for an authenticated scan: {login_url, login_data (with {%username%}/{%password%}), username, password, logged_in_regex?, logged_out_regex?}. If omitted, a stored per-host config is used.")
     #: Engagement for resolving the stored Auth Profile. The X-Engagement-Id header
     #: contextvar is RESET when the request returns, but the ZAP scan runs after
@@ -539,7 +543,8 @@ async def _perform_scan_slotted(scan_request: ScanRequest, scan_id: uuid.UUID):
                     do_spider=scan_request.zap_spider,
                     do_active_scan=scan_request.zap_active_scan,
                     context_name=context_name,
-                    auth=_auth
+                    auth=_auth,
+                    do_ajax_spider=bool(getattr(scan_request, "zap_ajax_spider", False)),
                 )
                 if _auth:
                     logger.info(f"ZAP authenticated scan for {url_str} (login {_auth.get('login_url')})")
