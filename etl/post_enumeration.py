@@ -324,9 +324,9 @@ def test_rules(*, rules: Optional[List[Dict[str, Any]]] = None, target: str = ""
                            "rules_tested": len(rules), "facts": 0, "matched": 0,
                            "proposals": [], "refusals": [], "scope": "ok"}
     try:
-        from etl.scope_gate import check_dispatch, load_dispatch_scope
+        from etl.scope_gate import check_dispatch, load_dispatch_scope, load_host_aliases
     except ImportError:  # pragma: no cover
-        from scope_gate import check_dispatch, load_dispatch_scope
+        from scope_gate import check_dispatch, load_dispatch_scope, load_host_aliases
     try:
         with _connect() as conn, conn.cursor() as cur:
             facts = facts_from_web_findings(cur, target=target, limit=200,
@@ -351,7 +351,7 @@ def test_rules(*, rules: Optional[List[Dict[str, Any]]] = None, target: str = ""
                         continue
                     seen.add(key)
                     out["matched"] += 1
-                    refusal = (check_dispatch(str(ftgt), scope_rows, command=command)
+                    refusal = (check_dispatch(str(ftgt), scope_rows, command=command, aliases=load_host_aliases(cur, str(ftgt)))
                                if out["scope"] != "unavailable" else "scope unavailable")
                     entry = {"rule": rule.get("id") or "unnamed",
                              "tool": proposal.get("tool"), "target": ftgt,
@@ -1227,9 +1227,9 @@ def analyse(execution: Dict[str, Any], *, queue: bool = True,
                     conn.commit()
                     return out
                 try:
-                    from etl.scope_gate import check_dispatch, load_dispatch_scope
+                    from etl.scope_gate import check_dispatch, load_dispatch_scope, load_host_aliases
                 except ImportError:  # pragma: no cover
-                    from scope_gate import check_dispatch, load_dispatch_scope
+                    from scope_gate import check_dispatch, load_dispatch_scope, load_host_aliases
                 scope_rows, scope_source = load_dispatch_scope(
                     cur, execution.get("engagement_id"))
                 # Fail closed. No resolvable scope proposes nothing, because the
@@ -1257,9 +1257,9 @@ def _propose_from_facts(cur, facts, context, rules, out, scope_rows=None):
     """
     from psycopg2.extras import Json
     try:
-        from etl.scope_gate import check_dispatch, load_dispatch_scope
+        from etl.scope_gate import check_dispatch, load_dispatch_scope, load_host_aliases
     except ImportError:  # pragma: no cover
-        from scope_gate import check_dispatch, load_dispatch_scope
+        from scope_gate import check_dispatch, load_dispatch_scope, load_host_aliases
     if scope_rows is None:
         scope_rows, scope_source = load_dispatch_scope(
             cur, context.get("engagement_id"))
@@ -1291,7 +1291,7 @@ def _propose_from_facts(cur, facts, context, rules, out, scope_rows=None):
                 continue
             seen.add(key)
 
-            refusal = check_dispatch(str(fact_target), scope_rows, command=command)
+            refusal = check_dispatch(str(fact_target), scope_rows, command=command, aliases=load_host_aliases(cur, str(fact_target)))
             if refusal:
                 out["refused"] += 1
                 out["refusals"].append({"target": fact_target, "rule": rule_id,
@@ -1384,9 +1384,9 @@ def _deepen_info_findings(cur, facts, context, rules, out) -> None:
     fallback; the router budget caps how many findings we spend the LLM on."""
     from psycopg2.extras import Json
     try:
-        from etl.scope_gate import check_dispatch, load_dispatch_scope
+        from etl.scope_gate import check_dispatch, load_dispatch_scope, load_host_aliases
     except ImportError:  # pragma: no cover
-        from scope_gate import check_dispatch, load_dispatch_scope
+        from scope_gate import check_dispatch, load_dispatch_scope, load_host_aliases
     candidates = [f for f in facts
                   if f.get("fact") == "web_finding"
                   and f.get("severity") in ("info", "low")
@@ -1404,7 +1404,7 @@ def _deepen_info_findings(cur, facts, context, rules, out) -> None:
             continue
         command = proposal["command"]
         fact_target = fact.get("target") or context.get("target") or ""
-        refusal = check_dispatch(str(fact_target), scope_rows, command=command)
+        refusal = check_dispatch(str(fact_target), scope_rows, command=command, aliases=load_host_aliases(cur, str(fact_target)))
         if refusal:
             _observe(cur, "deepen:info", context, fact, command, None, refused=str(refusal))
             out["refused"] += 1
@@ -1441,9 +1441,9 @@ def deepen_web_finding(finding_id: str,
     implementation shared with the automatic _deepen_info_findings tier."""
     from psycopg2.extras import Json
     try:
-        from etl.scope_gate import check_dispatch, load_dispatch_scope
+        from etl.scope_gate import check_dispatch, load_dispatch_scope, load_host_aliases
     except ImportError:  # pragma: no cover
-        from scope_gate import check_dispatch, load_dispatch_scope
+        from scope_gate import check_dispatch, load_dispatch_scope, load_host_aliases
     out: Dict[str, Any] = {"ok": False, "queued": 0}
     try:
         with _connect() as conn, conn.cursor() as cur:
@@ -1469,7 +1469,7 @@ def deepen_web_finding(finding_id: str,
             if scope_source == "unavailable":
                 out["reason"] = "scope could not be loaded"
                 return out
-            refusal = check_dispatch(str(host), scope_rows, command=command)
+            refusal = check_dispatch(str(host), scope_rows, command=command, aliases=load_host_aliases(cur, str(host)))
             if refusal:
                 _observe(cur, "deepen:manual",
                          {"tool": "deepen", "target": host, "engagement_id": engagement_id},
