@@ -225,6 +225,7 @@ const ZAP_AUTH_CRAWL_KEYS = [
   { key: 'zap.auth_crawl.max_pages', label: 'Max pages', def: '200', hint: 'pages the authenticated crawl walks' },
   { key: 'zap.auth_crawl.max_depth', label: 'Max depth', def: '5', hint: 'link depth from the post-login landing (1–5)' },
   { key: 'zap.auth_crawl.wait_seconds', label: 'Wait (s)', def: '300', hint: 'how long the rescan waits for the crawl before ZAP fires' },
+  { key: 'zap.active_scan_chunk_size', label: 'Active-scan batch', def: '10', hint: 'URLs per active-scan batch; ZAP flushes to disk between batches to bound memory (0 = whole tree)' },
 ] as const
 
 function ZapAuthCrawlPanel() {

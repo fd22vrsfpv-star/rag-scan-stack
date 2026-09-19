@@ -125,3 +125,20 @@ def test_ajax_spider_off_by_default_optional():
     chk = _src(CHECK)
     assert "zap.ajax_spider" in chk and '"zap_ajax_spider"' in chk, \
         "the check must read the optional zap.ajax_spider setting and pass it"
+
+
+def test_active_scan_chunking_bounds_memory():
+    """Chunked active scan: scan in batches and delete_site_node between them so
+    ZAP flushes its message store to disk and peak memory stays bounded."""
+    zb = os.path.join(REPO, "playwright_scanner", "zap_bridge.py")
+    if not os.path.exists(zb):
+        pytest.skip("zap_bridge missing")
+    s = open(zb, encoding="utf-8").read()
+    assert "def _active_scan_chunked" in s, "chunked active-scan helper missing"
+    assert "delete_site_node" in s, "must delete scanned nodes to free ZAP memory"
+    assert "active_scan_chunk_size" in s, "scan must accept a chunk size"
+    pw = open(os.path.join(REPO, "playwright_scanner", "playwright_scanner.py"), encoding="utf-8").read()
+    assert "zap_active_scan_chunk_size" in pw, "ScanRequest must expose the chunk size"
+    chk = _src(CHECK)
+    assert "zap.active_scan_chunk_size" in chk and '"zap_active_scan_chunk_size"' in chk, \
+        "the check must read + pass the chunk size (default on)"
