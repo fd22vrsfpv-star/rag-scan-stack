@@ -6281,7 +6281,9 @@ def search_findings(
     # Findings Explorer showed every engagement's findings.
     _eid = _validate_engagement_uuid(_resolve_engagement_id(engagement_id))
     if _eid:
-        where_clauses_pg.append("engagement_id = %s::uuid")
+        # The UNION selects engagement_id::text on every arm, so compare as text
+        # (a bare `= %s::uuid` raises "operator does not exist: text = uuid").
+        where_clauses_pg.append("engagement_id = %s")
         params_pg.append(_eid)
 
     if severity:
