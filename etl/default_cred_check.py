@@ -121,11 +121,12 @@ def candidate_pairs(port: Optional[int], cfg: Dict[str, Any]) -> List[Tuple[str,
 
 
 def _run_tool(tool: str, command: str, host: str, port: int, *, lane: str,
-              timeout: int = 25) -> str:
+              timeout: int = 30) -> str:
     """Dispatch via the listener and return stdout. lane='safe' -> /tools/execute
     (read-only GET); lane='vectors' -> /vectors/run (POST-capable, needs key)."""
     import time
     import httpx
+    timeout = max(30, int(timeout))  # /tools/execute requires timeout >= 30
     try:
         with httpx.Client(verify=False, timeout=timeout + 10) as cli:
             if lane == "vectors":
@@ -324,7 +325,13 @@ def run_default_cred_check(cur, host: str, login_page_url: str, *,
     except Exception as e:  # noqa: BLE001
         log.debug("record web_finding failed: %s", e)
 
-    # auto-populate the Auth Profile (on-ramp to authenticated scanning)
+    # auto-populate the Auth Profile (on-ramp to authenticated scanning).
+    # Commit first: /auth-profiles/auto-populate runs in a SEPARATE rag-api
+    # transaction and must see the credential + finding we just wrote.
+    try:
+        cur.connection.commit()
+    except Exception as e:  # noqa: BLE001
+        log.debug("pre-auto-populate commit failed: %s", e)
     try:
         import httpx
         with httpx.Client(verify=False, timeout=30) as cli:
