@@ -1,0 +1,330 @@
+"""Default-credential check on discovered login forms.
+
+When a login form is discovered (content_extractions.login_pages, or a login
+web_finding), this STANDARD followup tries a small set of DOCUMENTED default
+credentials against it and reports any that work — closing the "default admin
+password on the app login" class a link-only crawl never tests. On success it
+records the working credential and auto-populates an Auth Profile (the on-ramp to
+authenticated scanning).
+
+THE SETTING (knowledge/default_cred_check.yaml::max_auto_attempts, env override
+DEFAULT_CRED_MAX_AUTO_ATTEMPTS): if the candidate-pair count is AT OR BELOW it,
+the check auto-fires on the safe lane; ABOVE it, the check is queued for operator
+APPROVAL instead (a large spray never fires unattended). A hard max_total_attempts
+caps the set even when approved — never a full brute force.
+
+Login POSTs run via the listener's /vectors/run (POST-capable, scope-gated,
+proxy-enforced) — the same lane the impactful deepen uses; the GET page-fetch runs
+on the read-only /tools/execute lane. Lockout-aware: stops early on repeated
+anomalies.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import re
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse, quote
+
+log = logging.getLogger("default_cred_check")
+
+KALI_LISTENER_URL = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+RAG_API_URL = os.environ.get("RAG_API_URL", "https://localhost:8000")
+API_KEY = os.environ.get("API_KEY", "")
+
+_DEFAULTS = {
+    "max_auto_attempts": 24,
+    "max_total_attempts": 120,
+    "app_login": [{"username": "admin", "password": "admin"}],
+    "success": {"login_path_markers": ["login", "signin", "logon", "error", "denied", "invalid"]},
+    "skip_csrf": True,
+    "priority": 26,
+    "followup_tag": "default_cred_check",
+}
+
+
+def _kn_path(name: str) -> Optional[str]:
+    for p in (f"/knowledge/{name}",
+              os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "knowledge", name)):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def load_cfg() -> Dict[str, Any]:
+    p = _kn_path("default_cred_check.yaml")
+    cfg = dict(_DEFAULTS)
+    if p:
+        try:
+            import yaml
+            d = (yaml.safe_load(open(p, encoding="utf-8")) or {}).get("default_cred_check") or {}
+            cfg.update({k: v for k, v in d.items() if v is not None})
+        except Exception as e:  # noqa: BLE001
+            log.debug("default_cred_check.yaml load failed: %s", e)
+    env = os.environ.get("DEFAULT_CRED_MAX_AUTO_ATTEMPTS")
+    if env and env.isdigit():
+        cfg["max_auto_attempts"] = int(env)
+    return cfg
+
+
+def _load_default_credentials() -> Dict[str, Any]:
+    p = _kn_path("default_credentials.yaml")
+    if not p:
+        return {}
+    try:
+        import yaml
+        return yaml.safe_load(open(p, encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def candidate_pairs(port: Optional[int], cfg: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Documented default (user, pass) pairs: the service-for-the-port + the
+    global `common` set + the app_login extras + username_as_password. Deduped and
+    hard-capped by max_total_attempts. Small and documented — NOT a brute force."""
+    dc = _load_default_credentials()
+    users: List[str] = []
+    passwords: List[str] = []
+    common = dc.get("common") or {}
+    users += list(common.get("usernames") or [])
+    passwords += list(common.get("passwords") or [])
+    # service whose default port list contains this port
+    for svc in (dc.get("services") or {}).values():
+        if isinstance(svc, dict) and port and port in (svc.get("ports") or []):
+            users += list(svc.get("usernames") or [])
+            passwords += list(svc.get("passwords") or [])
+    users = list(dict.fromkeys(u for u in users if u))
+    passwords = list(dict.fromkeys(p for p in passwords))
+
+    pairs: List[Tuple[str, str]] = []
+    # explicit app_login pairs first (highest-value, e.g. admin:admin)
+    for e in (cfg.get("app_login") or []):
+        if isinstance(e, dict) and e.get("username") is not None and e.get("password") is not None:
+            pairs.append((str(e["username"]), str(e["password"])))
+    if dc.get("username_as_password"):
+        pairs += [(u, u) for u in users]
+    # then the cross of common/service users x passwords
+    for u in users:
+        for pw in passwords:
+            pairs.append((u, pw))
+    # dedupe, drop pairs with shell-hostile chars (defaults never have them), cap
+    seen, out = set(), []
+    for u, pw in pairs:
+        if "'" in u or "'" in pw or "\n" in u or "\n" in pw:
+            continue
+        k = (u, pw)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(k)
+    return out[: int(cfg.get("max_total_attempts", 120))]
+
+
+def _run_tool(tool: str, command: str, host: str, port: int, *, lane: str,
+              timeout: int = 25) -> str:
+    """Dispatch via the listener and return stdout. lane='safe' -> /tools/execute
+    (read-only GET); lane='vectors' -> /vectors/run (POST-capable, needs key)."""
+    import time
+    import httpx
+    try:
+        with httpx.Client(verify=False, timeout=timeout + 10) as cli:
+            if lane == "vectors":
+                r = cli.post(f"{KALI_LISTENER_URL.rstrip('/')}/vectors/run",
+                             json={"command": command, "target": host, "port": port,
+                                   "timeout": timeout},
+                             headers={"x-api-key": API_KEY})
+                if r.status_code >= 400:
+                    return f"__REFUSED__ {r.status_code} {r.text[:120]}"
+                return r.json().get("output", "") or ""
+            r = cli.post(f"{KALI_LISTENER_URL.rstrip('/')}/tools/execute",
+                         json={"tool": tool, "command": command, "target": host,
+                               "service": "default_cred_check", "port": port,
+                               "timeout": timeout})
+            if r.status_code >= 400:
+                return f"__REFUSED__ {r.status_code} {r.text[:120]}"
+            eid = r.json().get("id")
+            for _ in range(12):
+                time.sleep(2)
+                d = cli.get(f"{KALI_LISTENER_URL.rstrip('/')}/tools/executions/{eid}").json()
+                if d.get("status") in ("completed", "failed"):
+                    return d.get("output") or ""
+            return ""
+    except Exception as e:  # noqa: BLE001
+        return f"__ERROR__ {e}"
+
+
+def _parse_response(out: str) -> Dict[str, Any]:
+    """From a `curl -s -i` dump: status code, Location header, Set-Cookie names."""
+    codes = re.findall(r"HTTP/\d(?:\.\d)?\s+(\d{3})", out)
+    loc = re.search(r"(?im)^location:\s*(.+?)\s*$", out)
+    cookies = re.findall(r"(?im)^set-cookie:\s*([^=]+)=", out)
+    return {"status": int(codes[-1]) if codes else None,
+            "location": (loc.group(1).strip() if loc else ""),
+            "cookies": {c.strip().lower() for c in cookies}}
+
+
+def _login_command(login_url: str, form: Dict[str, Any], user: str, pw: str) -> str:
+    parts = [f"--data-urlencode '{form['user_field']}={user}'",
+             f"--data-urlencode '{form['pass_field']}={pw}'"]
+    for k, v in (form.get("extras") or {}).items():
+        parts.append(f"--data-urlencode '{k}={v}'")
+    return f"curl -s -i -m 15 -X POST {' '.join(parts)} '{login_url}'"
+
+
+def _is_success(resp: Dict[str, Any], baseline: Dict[str, Any], markers: List[str]) -> bool:
+    """A working login differs from the known-bad baseline: it redirects somewhere
+    that is NOT a login/error page, or sets an auth cookie the baseline did not."""
+    loc = (resp.get("location") or "").lower()
+    if loc and not any(m in loc for m in markers):
+        if loc != (baseline.get("location") or "").lower():
+            return True
+    new_cookies = resp.get("cookies", set()) - baseline.get("cookies", set())
+    if new_cookies:
+        return True
+    return False
+
+
+def run_default_cred_check(cur, host: str, login_page_url: str, *,
+                           asset_id: Optional[str] = None,
+                           engagement_id: Optional[str] = None,
+                           scope_rows=None, aliases=None,
+                           force: bool = False) -> Dict[str, Any]:
+    """Try documented default creds against a discovered login form. Honors the
+    max_auto_attempts SETTING: at/below it auto-fires; above it queues for approval
+    (unless force=True, the approval path). On success records the credential + a
+    High web_finding and auto-populates an Auth Profile. Returns a result dict."""
+    from psycopg2.extras import Json
+    out: Dict[str, Any] = {"ok": False, "host": host, "login_page": login_page_url}
+    cfg = load_cfg()
+    pu = urlparse(login_page_url)
+    port = pu.port or (443 if pu.scheme == "https" else 80)
+
+    # scope gate (fail-closed)
+    if scope_rows is not None:
+        try:
+            from etl.scope_gate import check_dispatch
+        except ImportError:  # pragma: no cover
+            from scope_gate import check_dispatch
+        refusal = check_dispatch(str(host), scope_rows, command=f"curl {login_page_url}", aliases=aliases)
+        if refusal:
+            out["reason"] = f"out of scope: {refusal}"
+            return out
+
+    # 1) fetch the login page (read-only lane) and parse the form
+    html = _run_tool("curl", f"curl -s -m 15 '{login_page_url}'", host, port, lane="safe")
+    if html.startswith(("__REFUSED__", "__ERROR__")):
+        out["reason"] = f"could not fetch login page: {html[:120]}"
+        return out
+    try:
+        import auth_autopopulate as ap
+    except ImportError:  # pragma: no cover
+        try:
+            from app.rag_api import auth_autopopulate as ap  # type: ignore
+        except Exception:
+            out["reason"] = "auth_autopopulate unavailable"
+            return out
+    form = ap.parse_login_form(html)
+    if not form:
+        out["reason"] = "no login form found on page"
+        return out
+    if form.get("csrf_field") and cfg.get("skip_csrf", True):
+        out.update({"ok": True, "skipped": "csrf",
+                    "reason": "login form is CSRF-protected — left for manual review"})
+        return out
+    login_url = urljoin(login_page_url, form.get("action") or "") or login_page_url
+
+    # 2) candidate set + the threshold decision
+    pairs = candidate_pairs(port, cfg)
+    out["candidates"] = len(pairs)
+    threshold = int(cfg.get("max_auto_attempts", 24))
+    if len(pairs) > threshold and not force:
+        # ABOVE the setting -> queue for operator approval, do NOT submit.
+        cur.execute(
+            """INSERT INTO scan_recommendations
+                 (ip, service, scanner, action, script, source, priority,
+                  status, engagement_id, extra)
+               VALUES (%s,'http',%s,%s,%s,'default_cred_check',%s,'pending',%s,%s)
+               ON CONFLICT (fingerprint) DO NOTHING RETURNING id::text""",
+            (host, cfg.get("followup_tag", "default_cred_check"),
+             f"default-cred check ({len(pairs)} pairs) @ {login_url}",
+             f"default-cred check @ {login_url}", int(cfg.get("priority", 26)),
+             engagement_id,
+             Json({"followup": True, "followup_type": "default_cred_check",
+                   "login_url": login_url, "candidate_count": len(pairs),
+                   "requires_approval": True, "reason": f"{len(pairs)} > max_auto_attempts {threshold}",
+                   "queued_by": "enum:default_cred_check"})))
+        row = cur.fetchone()
+        out.update({"ok": True, "queued": 1 if row else 0, "requires_approval": True,
+                    "recommendation_id": row[0] if row else None, "login_url": login_url,
+                    "reason": f"{len(pairs)} candidates exceed max_auto_attempts ({threshold}); queued for approval"})
+        return out
+
+    # 3) run the bounded spray (auto lane, or the approved force path)
+    markers = (cfg.get("success") or {}).get("login_path_markers") or []
+    base_cmd = _login_command(login_url, form, "zz_baseline_no_such_user", "zz_bad_pw_123")
+    baseline = _parse_response(_run_tool("curl", base_cmd, host, port, lane="vectors"))
+    found = None
+    anomalies = 0
+    for i, (user, pw) in enumerate(pairs):
+        resp_raw = _run_tool("curl", _login_command(login_url, form, user, pw), host, port, lane="vectors")
+        if resp_raw.startswith("__REFUSED__"):
+            out["reason"] = f"login POST refused: {resp_raw[:120]}"
+            return out
+        if resp_raw.startswith("__ERROR__"):
+            anomalies += 1
+            if anomalies >= 3:  # lockout / connectivity guard: stop early
+                out["reason"] = "stopped after repeated errors (possible lockout/connectivity)"
+                break
+            continue
+        if _is_success(_parse_response(resp_raw), baseline, markers):
+            found = {"username": user, "password": pw}
+            break
+    out["attempted"] = i + 1 if pairs else 0
+
+    if not found:
+        out.update({"ok": True, "valid": False, "login_url": login_url})
+        return out
+
+    # 4) record the working credential + a High finding, then auto-populate a profile
+    out.update({"ok": True, "valid": True, "username": found["username"],
+                "login_url": login_url})
+    try:
+        cur.execute(
+            """INSERT INTO credential_findings
+                 (asset_id, ip, port, protocol, username, secret_value, secret_type,
+                  valid_cred, auth_type, severity, source, status, engagement_id, metadata)
+               VALUES (%s,%s,%s,'http',%s,%s,'password',true,'form','high',
+                       'default_cred_check','valid',%s,%s)
+               RETURNING id::text""",
+            (asset_id, host, port, found["username"], found["password"],
+             engagement_id, Json({"login_url": login_url, "via": "default_cred_check"})))
+        r = cur.fetchone()
+        out["credential_id"] = r[0] if r else None
+    except Exception as e:  # noqa: BLE001
+        log.warning("record credential failed: %s", e)
+    try:
+        cur.execute(
+            """INSERT INTO web_findings
+                 (asset_id, url, source, issue_type, name, severity, param, evidence,
+                  method, engagement_id)
+               VALUES (%s,%s,'default_cred_check','default-credentials',
+                       'Default Credentials Accepted','high',%s,%s,'POST',%s)
+               ON CONFLICT DO NOTHING""",
+            (asset_id, login_url, form.get("user_field"),
+             f"login accepted default credentials ({found['username']}:****)", engagement_id))
+    except Exception as e:  # noqa: BLE001
+        log.debug("record web_finding failed: %s", e)
+
+    # auto-populate the Auth Profile (on-ramp to authenticated scanning)
+    try:
+        import httpx
+        with httpx.Client(verify=False, timeout=30) as cli:
+            pr = cli.post(f"{RAG_API_URL.rstrip('/')}/auth-profiles/auto-populate",
+                          json={"host": host, "engagement_id": engagement_id,
+                                "login_url": login_url, "html": html},
+                          headers={"x-api-key": API_KEY})
+            out["auth_profile"] = (pr.json() if pr.status_code < 400 else
+                                   {"error": pr.status_code, "detail": pr.text[:160]})
+    except Exception as e:  # noqa: BLE001
+        out["auth_profile"] = {"error": str(e)[:160]}
+    return out

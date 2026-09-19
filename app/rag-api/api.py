@@ -19473,6 +19473,39 @@ def deepen_finding_endpoint(source: str, fid: str, request: dict = None,
     return res
 
 
+@app.post("/followups/default-cred-check/{rec_id}/approve", tags=["Findings"])
+def approve_default_cred_check(rec_id: str, authorized: bool = Depends(auth)):
+    """Approve a default-credential check that exceeded max_auto_attempts and was
+    queued for a human. Runs the bounded check with force=True (the approval path)
+    against the queued login form, then marks the recommendation done."""
+    try:
+        from etl.default_cred_check import run_default_cred_check
+        from etl.scope_gate import load_dispatch_scope, load_host_aliases
+    except ImportError:  # pragma: no cover
+        from default_cred_check import run_default_cred_check
+        from scope_gate import load_dispatch_scope, load_host_aliases
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""SELECT host(ip)::text AS host, engagement_id::text AS eid,
+                              extra->>'login_url' AS login_url, status
+                         FROM scan_recommendations
+                        WHERE id = %s::uuid AND scanner = 'default_cred_check'""", (rec_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "default-cred-check recommendation not found")
+        if not row.get("login_url"):
+            raise HTTPException(409, "recommendation has no login_url")
+        host, eid, login_url = row["host"], row["eid"], row["login_url"]
+        scope_rows, src = load_dispatch_scope(cur, eid)
+        if src == "unavailable":
+            raise HTTPException(409, "no dispatch scope configured — cannot run (fail closed)")
+        aliases = load_host_aliases(cur, host)
+        res = run_default_cred_check(cur, host, login_url, engagement_id=eid,
+                                     scope_rows=scope_rows, aliases=aliases, force=True)
+        cur.execute("UPDATE scan_recommendations SET status='done' WHERE id=%s::uuid", (rec_id,))
+        conn.commit()
+    return res
+
+
 @app.post("/findings/{source}/{fid}/queue-poc", tags=["Findings"])
 def queue_poc_for_finding(
     source: str, fid: str, body: QueuePocRequest,
