@@ -98,11 +98,20 @@ def _zap_crawl_settings(cur, cfg: Dict[str, Any]) -> Dict[str, int]:
     # Ajax spider OFF by default (memory-heavy; redundant after the authenticated
     # crawl). Optional via ZAP setting zap.ajax_spider.
     out["ajax_spider"] = 0
+    # Active-scan chunking ON by default (batch size 10) so ZAP flushes its message
+    # store to disk between batches and peak memory stays bounded regardless of site
+    # size. Set zap.active_scan_chunk_size=0 for the whole-tree scan.
+    out["active_scan_chunk_size"] = 10
     try:
-        cur.execute("SELECT value FROM app_settings WHERE key='zap.ajax_spider' AND category='config'")
-        r = cur.fetchone()
-        if r and str(r[0]).strip().lower() in ("1", "true", "yes", "on"):
+        cur.execute("""SELECT key, value FROM app_settings
+                        WHERE key IN ('zap.ajax_spider','zap.active_scan_chunk_size')
+                          AND category='config'""")
+        got = {k: v for k, v in cur.fetchall()}
+        if str(got.get("zap.ajax_spider", "")).strip().lower() in ("1", "true", "yes", "on"):
             out["ajax_spider"] = 1
+        cs = got.get("zap.active_scan_chunk_size")
+        if cs is not None and str(cs).strip().lstrip("-").isdigit():
+            out["active_scan_chunk_size"] = max(0, min(int(cs), 500))
     except Exception:  # noqa: BLE001
         try:
             cur.connection.rollback()
@@ -530,7 +539,8 @@ def run_default_cred_check(cur, host: str, login_page_url: str, *,
                               json={"url": base, "engagement_id": engagement_id,
                                     "zap_spider": bool(rc.get("zap_spider", True)),
                                     "zap_active_scan": bool(rc.get("zap_active_scan", True)),
-                                    "zap_ajax_spider": bool(zc.get("ajax_spider", 0))},
+                                    "zap_ajax_spider": bool(zc.get("ajax_spider", 0)),
+                                    "zap_active_scan_chunk_size": int(zc.get("active_scan_chunk_size", 10))},
                               headers=hdr)
                 body = sr.json() if sr.status_code < 400 else {}
                 out["authenticated_scan"] = {
