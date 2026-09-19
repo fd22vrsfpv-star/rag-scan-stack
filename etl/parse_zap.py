@@ -473,17 +473,18 @@ def parse_zap_alerts(
                         cur.execute("""
                             INSERT INTO web_findings
                               (id, asset_id, url, source, issue_type, name, severity, evidence,
-                               method, payload, cwe, refs, description, solution, reference,
+                               method, param, payload, cwe, refs, description, solution, reference,
                                confidence, tags, request_data, response_data,
                                first_seen, last_seen, fingerprint)
-                            VALUES (%s, %s, %s, 'zap', 'zap-alert', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now(), %s)
+                            VALUES (%s, %s, %s, 'zap', 'zap-alert', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now(), %s)
                             -- Re-seeing a finding advances last_seen instead of
                             -- inserting it again. Requires uq_web_findings_fingerprint;
                             -- without that index this raises rather than deduping.
                             ON CONFLICT (fingerprint) DO UPDATE SET
                                 last_seen = now(),
                                 severity  = EXCLUDED.severity,
-                                evidence  = COALESCE(EXCLUDED.evidence, web_findings.evidence)
+                                evidence  = COALESCE(EXCLUDED.evidence, web_findings.evidence),
+                                param     = COALESCE(EXCLUDED.param, web_findings.param)
                         """, (
                             finding_id,
                             asset_id,
@@ -492,6 +493,7 @@ def parse_zap_alerts(
                             severity,
                             alert.get("evidence") or alert.get("param"),
                             alert.get("method"),
+                            alert.get("param"),
                             alert.get("attack"),
                             cwe_list if cwe_list else None,
                             json.dumps(refs) if refs else None,
