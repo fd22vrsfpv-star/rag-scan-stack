@@ -370,8 +370,34 @@ def _render_owasp_param_tests(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_safe_service_probes(data: Dict[str, Any]) -> List[Doc]:
+    """Safe read-only surface-probe specs -> one doc per (family, probe), so the
+    planner can retrieve which safe probe (http_probe/nuclei_detect/dir_enum/
+    tls_check/version_probe/banner) the surface phase runs per open service and
+    the default command, as knowledge not code."""
+    docs: List[Doc] = []
+    for fam in (data.get("safe_service_probes") or []):
+        if not isinstance(fam, dict) or not fam.get("family"):
+            continue
+        family = fam["family"]
+        services = fam.get("services") or []
+        who = "any web service" if "_web_family" in services else (
+            ", ".join(str(s) for s in services) if services
+            else "any service with no more specific probe")
+        for p in (fam.get("probes") or []):
+            if not isinstance(p, dict) or not p.get("category"):
+                continue
+            docs.append((
+                f"Safe surface probe: {p['category']} ({p.get('tool','nmap')}) for {family} services",
+                f"For an open {who} the surface phase runs the safe read-only probe "
+                f"`{p.get('command')}` ({p.get('wstg','WSTG')}) to test {p['category']}"
+                + (" (TLS only)" if p.get('tls_only') else "") + "."))
+    return docs
+
+
 RENDERERS = {
     "msf_learned_options": _render_msf_learned_options,
+    "safe_service_probes": _render_safe_service_probes,
     "msf_readonly_scanners": _render_msf_readonly_scanners,
     "owasp_param_tests": _render_owasp_param_tests,
     "dos_exploit_overrides": _render_dos_exploit_overrides,

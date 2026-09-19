@@ -1,0 +1,48 @@
+# Safe (read-only) surface probes per service family.
+#
+# DATA, NOT HARDCODE (CLAUDE.md "Knowledge is RAG-first"). The langgraph surface
+# planner (autogen_agents/langgraph_engine.py) loads these to decide WHICH safe
+# read-only probes to run for an open service (the service-family -> [(category,
+# tool)] mapping) AND the DEFAULT command to run for each tool when the tool
+# recommender supplies none. Previously these were the hardcoded
+# `_surface_categories_for` mapping and the per-tool default-command dict.
+#
+# Bind-mounted into the containers at /knowledge, so editing this file changes
+# which safe probes run WITHOUT a code change, and it is embedded into
+# rag_documents by etl/load_knowledge_documents.py so the planner can retrieve
+# it. Loader: autogen_agents/langgraph_engine.py::_load_safe_service_probes.
+#
+# Command templates use {scheme} (http|https, from TLS state), {ip}, {port}.
+# A probe with `tls_only: true` is emitted only when the service is TLS.
+# `services`: the service names (nmap labels) this family matches. The special
+# sentinel [_web_family] means "match against the code's _SERVICE_FAMILIES_WEB
+# set" — the single source of truth for what counts as a web service.
+# The `default` family is the fallback banner probe when nothing else matches.
+safe_service_probes:
+  - family: web
+    services: [_web_family]
+    probes:
+      # whatweb, not ProjectDiscovery httpx: the kali image ships Python's httpx
+      # at /usr/bin/httpx (different CLI, not allowlisted). whatweb is present,
+      # allowlisted, and gives title / server / tech — what http_probe asserts on.
+      - {category: http_probe,    tool: whatweb, command: "whatweb -a 3 --color=never {scheme}://{ip}:{port}", wstg: WSTG-INFO-08}
+      - {category: nuclei_detect, tool: nuclei,  command: "nuclei -u {scheme}://{ip}:{port} -silent",          wstg: WSTG-INFO-02}
+      # seclists is installed; /usr/share/wordlists/dirb/ is not.
+      - {category: dir_enum,      tool: gobuster, command: "gobuster dir -u {scheme}://{ip}:{port} -w /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt -q", wstg: WSTG-CONF-04}
+      - {category: tls_check,     tool: sslscan, command: "sslscan {ip}:{port}", tls_only: true, wstg: WSTG-CRYP-01}
+  - family: smb
+    services: [smb, microsoft-ds, netbios-ssn, cifs]
+    probes:
+      - {category: version_probe, tool: enum4linux-ng, command: "enum4linux-ng -A {ip}", wstg: WSTG-INFO-02}
+  - family: ssh
+    services: [ssh]
+    probes:
+      - {category: version_probe, tool: ssh-audit, command: "ssh-audit {ip}:{port}", wstg: WSTG-CRYP-01}
+  - family: snmp
+    services: [snmp]
+    probes:
+      - {category: version_probe, tool: snmpwalk, command: "snmpwalk -v2c -c public {ip}", wstg: WSTG-INFO-02}
+  - family: default
+    services: []
+    probes:
+      - {category: banner, tool: nmap, command: "nmap -sV -Pn --host-timeout 120s -p {port} {ip}", wstg: WSTG-INFO-02}
