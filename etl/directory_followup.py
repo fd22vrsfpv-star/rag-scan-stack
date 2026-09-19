@@ -151,6 +151,41 @@ def _live_cewl_words(host: str, base_url: str, cfg: Dict[str, Any]) -> List[str]
         return []
 
 
+def _probe_directory_status(host: str, dir_url: str, timeout: int = 30) -> Optional[int]:
+    """Best-effort HTTP status of a candidate directory via the SAFE lane (a HEAD
+    request; scope-gated at the listener). Returns the status code, or None if it
+    could not be determined. Used to SKIP phantom directories — a path that 404s
+    for everything, e.g. a relative-path-confusion crawl artifact like testfire's
+    `/my documents/JohnSmith/Bank Site Documents/` — before spending cewl+gobuster
+    on it. `curl -sI` (no %{...}) avoids the listener's unresolved-placeholder
+    guard."""
+    try:
+        import re
+        import time
+        import httpx
+        cmd = f"curl -s -I -m 15 {dir_url}"
+        port = urlparse(dir_url).port or (443 if dir_url.startswith("https") else 80)
+        with httpx.Client(verify=False, timeout=timeout) as cli:
+            r = cli.post(f"{KALI_LISTENER_URL.rstrip('/')}/tools/execute",
+                         json={"tool": "curl", "command": cmd, "target": host,
+                               "service": "dir_followup_probe", "port": port,
+                               "timeout": 30})
+            if r.status_code >= 400:
+                return None
+            eid = r.json().get("id")
+            for _ in range(10):  # up to ~30s
+                time.sleep(3)
+                d = cli.get(f"{KALI_LISTENER_URL.rstrip('/')}/tools/executions/{eid}").json()
+                if d.get("status") in ("completed", "failed"):
+                    out = d.get("output") or ""
+                    codes = re.findall(r"HTTP/\d(?:\.\d)?\s+(\d{3})", out)
+                    return int(codes[-1]) if codes else None
+        return None
+    except Exception as e:  # noqa: BLE001
+        log.debug("dir existence probe failed for %s: %s", dir_url, e)
+        return None
+
+
 def build_merged_wordlist(host: str, asset_id: Optional[str], base_url: str,
                           cfg: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Merge docs/backup + site corpus + (best-effort) live cewl into ONE deduped
@@ -199,16 +234,23 @@ def queue_directory_followup(cur, host: str, dir_url: str, *,
     gated there; it ingests the results). Scope-gated here first (fail-closed).
     Returns {ok, queued, dispatched, command, wordlist, recommendation_id, reason?}.
     """
-    from psycopg2.extras import Json
-    try:
-        from etl.scope_gate import check_dispatch
-    except ImportError:  # pragma: no cover
-        from scope_gate import check_dispatch
     out: Dict[str, Any] = {"ok": False, "queued": 0, "dispatched": False}
     cfg = load_cfg()
     if not base_url:
         pu = urlparse(dir_url)
         base_url = f"{pu.scheme or 'http'}://{pu.netloc}" if pu.netloc else f"http://{host}"
+
+    # Existence check: skip a phantom directory (404 for everything — a
+    # relative-path-confusion crawl artifact) before spending cewl+gobuster on it.
+    # Fail-OPEN: only a definitive 404 skips; an undeterminable status proceeds so
+    # a transient probe error never suppresses a real followup.
+    if cfg.get("verify_exists", True):
+        status = _probe_directory_status(host, dir_url)
+        out["dir_status"] = status
+        if status == 404:
+            out.update({"ok": True, "queued": 0, "skipped": True,
+                        "reason": "directory does not exist (HTTP 404)"})
+            return out
 
     wordlist = build_merged_wordlist(host, asset_id, base_url, cfg)
     if not wordlist:
@@ -218,11 +260,16 @@ def queue_directory_followup(cur, host: str, dir_url: str, *,
 
     # Scope gate (fail-closed) before anything leaves.
     if scope_rows is not None:
+        try:
+            from etl.scope_gate import check_dispatch
+        except ImportError:  # pragma: no cover
+            from scope_gate import check_dispatch
         refusal = check_dispatch(str(host), scope_rows, command=command, aliases=aliases)
         if refusal:
             out["reason"] = f"out of scope: {refusal}"
             return out
 
+    from psycopg2.extras import Json
     tag = cfg.get("followup_tag", "dir_followup")
     cur.execute(
         """INSERT INTO scan_recommendations
