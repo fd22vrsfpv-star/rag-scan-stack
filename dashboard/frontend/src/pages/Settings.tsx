@@ -218,6 +218,74 @@ const GOBUSTER_WORDLISTS = [
 
 const ZAP_STRENGTH_OPTIONS = ['LOW', 'MEDIUM', 'HIGH', 'INSANE'] as const
 
+// Authenticated-crawl tuning (app_settings zap.auth_crawl.*). After a
+// default-credential login succeeds, Playwright walks the logged-in app (seeding
+// ZAP's site tree) before the ZAP scan; these widen that crawl.
+const ZAP_AUTH_CRAWL_KEYS = [
+  { key: 'zap.auth_crawl.max_pages', label: 'Max pages', def: '200', hint: 'pages the authenticated crawl walks' },
+  { key: 'zap.auth_crawl.max_depth', label: 'Max depth', def: '5', hint: 'link depth from the post-login landing (1–5)' },
+  { key: 'zap.auth_crawl.wait_seconds', label: 'Wait (s)', def: '300', hint: 'how long the rescan waits for the crawl before ZAP fires' },
+] as const
+
+function ZapAuthCrawlPanel() {
+  const [vals, setVals] = useState<Record<string, string>>({})
+  const [msg, setMsg] = useState('')
+  useEffect(() => {
+    ZAP_AUTH_CRAWL_KEYS.forEach(({ key, def }) => {
+      fetch(`/api/settings/config/${key}`)
+        .then(r => (r.ok ? r.json() : { value: def }))
+        .then(d => setVals(v => ({ ...v, [key]: String(d?.value ?? def) })))
+        .catch(() => setVals(v => ({ ...v, [key]: def })))
+    })
+  }, [])
+  const save = async () => {
+    try {
+      for (const { key, def } of ZAP_AUTH_CRAWL_KEYS) {
+        await fetch(`/api/settings/config/${key}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: String(vals[key] ?? def) }),
+        })
+      }
+      setMsg('Saved — applies to the next authenticated crawl.')
+      setTimeout(() => setMsg(''), 4000)
+    } catch {
+      setMsg('Save failed')
+    }
+  }
+  return (
+    <div className="mt-4 pt-3 border-t border-border">
+      <h4 className="text-xs font-semibold mb-1">Authenticated Crawl</h4>
+      <p className="text-[10px] text-muted-foreground mb-2">
+        After a default-credential login succeeds, Playwright walks the logged-in app
+        (seeding ZAP's site tree with the /bank-style authenticated pages) before ZAP
+        scans. Widen these to cover the whole authenticated area.
+      </p>
+      <div className="space-y-2 max-w-md">
+        {ZAP_AUTH_CRAWL_KEYS.map(({ key, label, hint, def }) => (
+          <div key={key}>
+            <label className="block text-xs text-muted-foreground mb-1">
+              {label} <span className="text-[10px]">— {hint}</span>
+            </label>
+            <input
+              type="number"
+              value={vals[key] ?? ''}
+              placeholder={def}
+              onChange={e => setVals(v => ({ ...v, [key]: e.target.value }))}
+              className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border outline-none focus:border-primary"
+            />
+          </div>
+        ))}
+        <div className="flex items-center gap-2">
+          <button type="button" onClick={save}
+            className="px-3 py-1.5 text-sm rounded-md bg-primary text-primary-foreground">Save</button>
+          {msg && <span className="text-xs text-muted-foreground">{msg}</span>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ─── General Tab ─────────────────────────────────────
 function GeneralTab() {
   const store = useScanDefaultsStore()
@@ -409,6 +477,7 @@ function GeneralTab() {
             </button>
             <label className="text-sm">Spider Enabled</label>
           </div>
+          <ZapAuthCrawlPanel />
         </div>
       </div>
 
