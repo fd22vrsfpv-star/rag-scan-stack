@@ -3560,6 +3560,36 @@ def _owasp_service_tests(items: list) -> list:
     return out
 
 
+@functools.lru_cache(maxsize=1)
+def _load_owasp_param_tests() -> tuple:
+    """OWASP parameter-test specs from knowledge/owasp_param_tests.yaml — the
+    SQLi/XSS/LFI/SSI/HPP/IDOR payloads+commands+assertions, as DATA not hardcode
+    (CLAUDE.md 'Knowledge is RAG-first'). Bind-mounted, so editing the YAML
+    reclassifies without a code change; embedded into rag_documents by
+    etl/load_knowledge_documents.py. Fail-safe: any error -> () (no param tests)."""
+    import os as _os
+    candidates = [
+        _os.environ.get("OWASP_PARAM_TESTS_YAML", "/knowledge/owasp_param_tests.yaml"),
+        _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                      "knowledge", "owasp_param_tests.yaml"),
+    ]
+    for path in candidates:
+        if not path or not _os.path.exists(path):
+            continue
+        try:
+            import yaml as _yaml
+            with open(path, encoding="utf-8") as fh:
+                data = _yaml.safe_load(fh) or {}
+            specs = []
+            for row in (data.get("param_tests") or []):
+                if isinstance(row, dict) and row.get("category") and row.get("command"):
+                    specs.append(row)
+            return tuple(specs)
+        except Exception:  # noqa: BLE001 — fail-safe to no param tests
+            return ()
+    return ()
+
+
 def _owasp_param_tests(host: str, limit: int = 16) -> list:
     """Turn CRAWLED parameterized endpoints into OWASP WSTG app-layer tests —
     the IDOR / SQLi / XSS / LFI coverage a service+port-keyed recommender never
@@ -3606,45 +3636,34 @@ def _owasp_param_tests(host: str, limit: int = 16) -> list:
                 q = _up.parse_qs(u.query); q[pname] = [val]
                 return f"{base}?{_up.urlencode(q, doseq=True)}"
 
-            # SQLi — safe detection via sqlmap (allow-listed), scoped to this param.
-            out.append(_param_test("sqli_detect", "sqlmap", base, pname, port,
-                f"sqlmap -u \"{raw}\" -p {pname} --batch --smart --level 1 --risk 1 --flush-session",
-                {"expect_regex": "(?i)(is vulnerable|injectable|parameter .* is|payload)"}))
-            # XSS — safe reflection probe: does a marker payload come back verbatim?
-            xurl = _with("pxXSS<svg/onload=1>")
-            out.append(_param_test("xss_detect", "curl", base, pname, port,
-                f"curl -sk \"{xurl}\"",
-                {"expect_substring": ["pxXSS<svg/onload=1>"]}))
-            # LFI — path-like params only.
-            if low in _PATH_PARAM_NAMES:
-                lurl = _with("../../../../../../etc/passwd")
-                out.append(_param_test("lfi_read", "curl", base, pname, port,
-                    f"curl -sk \"{lurl}\"", {"expect_substring": ["root:x:0:0"]}))
-            # SSI injection (INPV-08) — an echo directive that executes returns a
-            # server value instead of the literal.
-            surl = _with('<!--#echo var="DATE_LOCAL"-->')
-            out.append(_param_test("ssi_detect", "curl", base, pname, port,
-                f"curl -sk \"{surl}\"",
-                {"expect_not_substring": ["<!--#echo", "&lt;!--#echo"]}, wid="WSTG-INPV-08"))
-            # Format string (INPV-13) — %n/%s/%x tends to surface an error or artifact.
-            furl2 = _with("%25n%25s%25x%25x%25x")
-            out.append(_param_test("format_string", "curl", base, pname, port,
-                f"curl -sk \"{furl2}\"",
-                {"expect_regex": r"(?i)(warning|fatal|segmentation|0x[0-9a-f]{6}|va_arg)"},
-                wid="WSTG-INPV-13"))
-            # HTTP Parameter Pollution (INPV-04) — duplicate the param; both
-            # markers surviving (or a concat) signals HPP-relevant handling.
-            hurl = f"{base}?{_up.urlencode({pname:['pxHPP1','pxHPP2']}, doseq=True)}"
-            out.append(_param_test("hpp_detect", "curl", base, pname, port,
-                f"curl -sk \"{hurl}\"",
-                {"expect_regex": "(?i)pxHPP1.*pxHPP2|pxHPP2.*pxHPP1|pxHPP1pxHPP2"},
-                wid="WSTG-INPV-04"))
-            # IDOR — object-ref params. Impactful + gated: confirming needs a
-            # second identity, so this ENUMERATES the reference for the operator.
-            if low in _IDOR_PARAM_NAMES:
-                out.append(_param_test("idor", "curl", base, pname, port,
-                    f"curl -sk \"{raw}\"", {"expect_status": 200},
-                    impactful=True, wid="WSTG-ATHZ-04"))
+            # Payloads + commands + assertions come from knowledge/owasp_param_tests.yaml
+            # (data, not hardcode). Each spec builds one test for this parameter.
+            for spec in _load_owasp_param_tests():
+                ps = spec.get("param_set")
+                if ps == "path" and low not in _PATH_PARAM_NAMES:
+                    continue
+                if ps == "idor" and low not in _IDOR_PARAM_NAMES:
+                    continue
+                inj = spec.get("inject", "payload")
+                pay = spec.get("payload")
+                if inj == "raw":
+                    url = raw
+                elif inj == "duplicate":
+                    vals = pay if isinstance(pay, list) else [pay, pay]
+                    url = f"{base}?{_up.urlencode({pname: vals}, doseq=True)}"
+                else:  # inject the payload value into this param
+                    url = _with(pay if isinstance(pay, str) else "")
+                try:
+                    cmd = str(spec["command"]).format(raw=raw, url=url, pname=pname)
+                except Exception:  # noqa: BLE001 — bad template, skip this spec
+                    continue
+                out.append(_param_test(
+                    spec["category"], spec.get("tool", "curl"), base, pname, port,
+                    cmd, spec.get("assertion") or {},
+                    impactful=bool(spec.get("impactful")),
+                    wid=spec.get("wstg")))
+                if len(out) >= limit:
+                    break
             if len(out) >= limit:
                 break
     return out
