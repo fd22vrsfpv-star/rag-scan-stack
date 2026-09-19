@@ -136,12 +136,17 @@ def _research_host_default_creds(cur, host: str, html: str) -> List[Tuple[str, s
         if 2 <= len(t) <= 60:
             terms.append(t)
     try:
+        # detected_software is a VIEW whose `ip` is already text (host(a.ip)::text),
+        # so match on ip directly — host(ip) would error and abort the transaction.
         cur.execute("""SELECT DISTINCT product FROM detected_software
-                        WHERE host(ip)=%s AND product IS NOT NULL AND product <> '' LIMIT 5""",
+                        WHERE ip = %s AND product IS NOT NULL AND product <> '' LIMIT 5""",
                     (host,))
         terms += [r[0] for r in cur.fetchall() if r[0]]
     except Exception:  # noqa: BLE001
-        pass
+        try:
+            cur.connection.rollback()
+        except Exception:  # noqa: BLE001
+            pass
     seen_terms, pairs = set(), []
     import httpx
     for term in terms[:4]:
@@ -162,12 +167,20 @@ def _research_host_default_creds(cur, host: str, html: str) -> List[Tuple[str, s
             log.debug("default-cred research for %r failed: %s", term, e)
     # previously-stored researched candidates for this host
     try:
-        cur.execute("""SELECT DISTINCT username, secret_value FROM credential_findings
-                        WHERE host(ip)=%s AND source='default_cred_research'
-                          AND username IS NOT NULL AND secret_value IS NOT NULL""", (host,))
-        pairs += [(u, pw) for u, pw in cur.fetchall() if u]
+        # Reuse creds already discovered for this host: web-researched candidates
+        # (unvalidated) AND ones a prior check already validated — both are the
+        # best things to try on this login. Validated first.
+        cur.execute("""SELECT DISTINCT username, secret_value, valid_cred FROM credential_findings
+                        WHERE host(ip)=%s
+                          AND source IN ('default_cred_research','default_cred_check')
+                          AND username IS NOT NULL AND secret_value IS NOT NULL
+                        ORDER BY valid_cred DESC NULLS LAST""", (host,))
+        pairs += [(u, pw) for u, pw, _v in cur.fetchall() if u]
     except Exception:  # noqa: BLE001
-        pass
+        try:
+            cur.connection.rollback()
+        except Exception:  # noqa: BLE001
+            pass
     return list(dict.fromkeys(pairs))
 
 
@@ -415,6 +428,9 @@ def run_default_cred_check(cur, host: str, login_page_url: str, *,
                     "username": found["username"],
                     "credential_id": cred_id, "csrf_field": form.get("csrf_field"),
                     "auth_type": "form", "logged_in_regex": logged_in_regex,
+                    # login_url is the form ACTION; the browser login needs the form
+                    # PAGE (may differ, e.g. /login.jsp -> POST /doLogin).
+                    "session": {"login_page": login_page_url},
                     "enabled": True}
     import httpx
     pw_url = os.environ.get("PLAYWRIGHT_URL") or os.environ.get("PLAYWRIGHT_SCANNER_URL") \
