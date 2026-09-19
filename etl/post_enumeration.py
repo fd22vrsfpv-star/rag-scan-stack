@@ -1382,6 +1382,11 @@ def analyse_findings(*, target: str = "", engagement_id: Optional[str] = None,
                 # discovered URL), so it runs whether or not there were new facts.
                 _directory_enumeration_followups(cur, context, out,
                                                  target=target, engagement_id=engagement_id)
+                # STANDARD followup: try documented default credentials against
+                # discovered login forms (auto below the setting; queued for
+                # approval above it).
+                _default_cred_check_followups(cur, context, out,
+                                              target=target, engagement_id=engagement_id)
                 out["available"] = True
             conn.commit()
     except Exception as e:  # noqa: BLE001
@@ -1536,6 +1541,101 @@ def _directory_enumeration_followups(cur, context, out, *, target: str = "",
                                "engagement_id": engagement_id})
     if done:
         out["dir_followups"] = done
+
+
+_DEFAULT_CRED_MAX_PAGES = int(os.environ.get("DEFAULT_CRED_MAX_LOGIN_PAGES", "3"))
+
+
+def _default_cred_check_followups(cur, context, out, *, target: str = "",
+                                  engagement_id=None) -> None:
+    """STANDARD followup: try documented default credentials against discovered
+    login forms (content_extractions.login_pages). Honors the max_auto_attempts
+    setting inside run_default_cred_check (auto below it, queued for approval
+    above). Scope-gated, deduped (skips a login form already checked or where a
+    default cred was already found), bounded (DEFAULT_CRED_MAX_LOGIN_PAGES)."""
+    from urllib.parse import urljoin, urlparse
+    try:
+        from etl.scope_gate import load_dispatch_scope, load_host_aliases
+        from etl.default_cred_check import run_default_cred_check
+    except ImportError:  # pragma: no cover
+        from scope_gate import load_dispatch_scope, load_host_aliases
+        from default_cred_check import run_default_cred_check
+
+    where, params = ["ce.login_pages IS NOT NULL"], []
+    if target:
+        where.append("host(a.ip) = %s")
+        params.append(target)
+    try:
+        cur.execute(
+            f"""SELECT DISTINCT host(a.ip), a.id::text, ce.url, ce.login_pages
+                  FROM content_extractions ce JOIN assets a ON a.id = ce.asset_id
+                 WHERE {' AND '.join(where)}""", params)
+        rows = cur.fetchall()
+    except Exception as e:  # noqa: BLE001
+        log.debug("default-cred followup: login_pages query failed: %s", e)
+        return
+    if not rows:
+        return
+
+    # host -> asset_id + set of full login-page URLs (vhost name from ce.url)
+    cand: Dict[str, Dict[str, Any]] = {}
+    for host, asset_id, page_url, login_pages in rows:
+        if not host:
+            continue
+        try:
+            lps = login_pages if isinstance(login_pages, list) else json.loads(login_pages or "[]")
+        except Exception:  # noqa: BLE001
+            lps = []
+        for lp in lps:
+            path = (lp.get("url") if isinstance(lp, dict) else str(lp)) or ""
+            if not path:
+                continue
+            full = urljoin(page_url or f"http://{host}/", path)
+            cand.setdefault(host, {"asset_id": asset_id, "urls": set()})["urls"].add(full)
+
+    scope_rows, scope_src = load_dispatch_scope(cur, engagement_id)
+    if scope_src == "unavailable":
+        return
+
+    done = 0
+    for host, entry in cand.items():
+        if done >= _DEFAULT_CRED_MAX_PAGES:
+            break
+        # skip a host where a default cred was already found
+        cur.execute("""SELECT 1 FROM credential_findings
+                        WHERE host(ip)=%s AND source='default_cred_check'
+                          AND valid_cred IS TRUE LIMIT 1""", (host,))
+        if cur.fetchone():
+            continue
+        aliases = load_host_aliases(cur, str(host))
+        for login_url in sorted(entry["urls"]):
+            if done >= _DEFAULT_CRED_MAX_PAGES:
+                break
+            # dedupe: skip a login form already checked
+            cur.execute("""SELECT 1 FROM scan_recommendations
+                            WHERE scanner='default_cred_check'
+                              AND extra->>'login_url' = %s LIMIT 1""", (login_url,))
+            if cur.fetchone():
+                continue
+            try:
+                res = run_default_cred_check(
+                    cur, host, login_url, asset_id=entry["asset_id"],
+                    engagement_id=engagement_id, scope_rows=scope_rows, aliases=aliases)
+            except Exception as e:  # noqa: BLE001
+                log.warning("default-cred check for %s failed: %s", login_url, e)
+                continue
+            if res.get("ok"):
+                done += 1
+                if res.get("valid"):
+                    out["default_creds_found"] = out.get("default_creds_found", 0) + 1
+                _emit_webhook("default_cred_check_ran",
+                              {"target": host, "login_url": login_url,
+                               "valid": res.get("valid"),
+                               "requires_approval": res.get("requires_approval"),
+                               "username": res.get("username"),
+                               "engagement_id": engagement_id})
+    if done:
+        out["default_cred_checks"] = done
 
 
 def _deepen_info_findings(cur, facts, context, rules, out) -> None:
