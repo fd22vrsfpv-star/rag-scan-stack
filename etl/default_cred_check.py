@@ -298,6 +298,7 @@ def run_default_cred_check(cur, host: str, login_page_url: str, *,
     # 4) record the working credential + a High finding, then auto-populate a profile
     out.update({"ok": True, "valid": True, "username": found["username"],
                 "login_url": login_url})
+    cred_id = None
     try:
         cur.execute(
             """INSERT INTO credential_findings
@@ -309,7 +310,15 @@ def run_default_cred_check(cur, host: str, login_page_url: str, *,
             (asset_id, host, port, found["username"], found["password"],
              engagement_id, Json({"login_url": login_url, "via": "default_cred_check"})))
         r = cur.fetchone()
-        out["credential_id"] = r[0] if r else None
+        cred_id = r[0] if r else None
+        # on dedup conflict the insert returns nothing — fetch the existing id
+        if not cred_id:
+            cur.execute("""SELECT id::text FROM credential_findings
+                            WHERE host(ip)=%s AND username=%s AND source='default_cred_check'
+                            ORDER BY created_at DESC LIMIT 1""", (host, found["username"]))
+            rr = cur.fetchone()
+            cred_id = rr[0] if rr else None
+        out["credential_id"] = cred_id
     except Exception as e:  # noqa: BLE001
         log.warning("record credential failed: %s", e)
     try:
@@ -325,22 +334,61 @@ def run_default_cred_check(cur, host: str, login_page_url: str, *,
     except Exception as e:  # noqa: BLE001
         log.debug("record web_finding failed: %s", e)
 
-    # auto-populate the Auth Profile (on-ramp to authenticated scanning).
-    # Commit first: /auth-profiles/auto-populate runs in a SEPARATE rag-api
-    # transaction and must see the credential + finding we just wrote.
+    # Commit first: the profile upsert + authenticated scan run in SEPARATE
+    # service transactions and must see the credential we just wrote.
     try:
         cur.connection.commit()
     except Exception as e:  # noqa: BLE001
-        log.debug("pre-auto-populate commit failed: %s", e)
+        log.debug("pre-profile commit failed: %s", e)
+
+    # Build the Auth Profile keyed by the HOSTNAME the scan targets (the resolver
+    # matches on the scan URL's host, not the credential's IP), referencing the
+    # credential by id. Set an auth indicator so ZAP can verify the session.
     try:
-        import httpx
+        import auth_autopopulate as _ap
+    except Exception:  # noqa: BLE001
+        _ap = ap
+    login_data = _ap.build_login_data(form)
+    scan_host = urlparse(login_url).hostname or host
+    scheme = urlparse(login_url).scheme or "http"
+    logged_in_regex = ((cfg.get("success") or {}).get("logged_in_regex")
+                       or r"(?i)(sign ?off|log ?off|log ?out|sign ?out|logout|my account)")
+    profile_body = {"host": scan_host, "engagement_id": engagement_id,
+                    "login_url": login_url, "login_data": login_data,
+                    # username is not secret and ZAP form-auth needs it; the SECRET
+                    # stays referenced by credential_id (resolved at scan time).
+                    "username": found["username"],
+                    "credential_id": cred_id, "csrf_field": form.get("csrf_field"),
+                    "auth_type": "form", "logged_in_regex": logged_in_regex,
+                    "enabled": True}
+    import httpx
+    pw_url = os.environ.get("PLAYWRIGHT_URL") or os.environ.get("PLAYWRIGHT_SCANNER_URL") \
+        or "https://playwright-scanner:8014"
+    try:
         with httpx.Client(verify=False, timeout=30) as cli:
-            pr = cli.post(f"{RAG_API_URL.rstrip('/')}/auth-profiles/auto-populate",
-                          json={"host": host, "engagement_id": engagement_id,
-                                "login_url": login_url, "html": html},
-                          headers={"x-api-key": API_KEY})
-            out["auth_profile"] = (pr.json() if pr.status_code < 400 else
+            pr = cli.post(f"{pw_url.rstrip('/')}/web-auth", json=profile_body)
+            out["auth_profile"] = ({"ok": True, "host": scan_host, "login_url": login_url,
+                                    "login_data": login_data, "credential_id": cred_id}
+                                   if pr.status_code < 400 else
                                    {"error": pr.status_code, "detail": pr.text[:160]})
     except Exception as e:  # noqa: BLE001
         out["auth_profile"] = {"error": str(e)[:160]}
+
+    # Gap 2 — trigger an AUTHENTICATED scan: the Playwright /scan path auto-resolves
+    # the stored profile for this host (ZAP spider + active scan run authenticated).
+    if isinstance(out.get("auth_profile"), dict) and out["auth_profile"].get("ok"):
+        try:
+            with httpx.Client(verify=False, timeout=30) as cli:
+                sr = cli.post(f"{pw_url.rstrip('/')}/scan",
+                              json={"url": f"{scheme}://{scan_host}/",
+                                    "engagement_id": engagement_id})
+                body = sr.json() if sr.status_code < 400 else {}
+                out["authenticated_scan"] = {
+                    "dispatched": sr.status_code < 400,
+                    "status": sr.status_code,
+                    "job_id": body.get("job_id") or body.get("scan_id") or body.get("id"),
+                    "authenticated": body.get("authenticated"),
+                    "detail": (None if sr.status_code < 400 else sr.text[:160])}
+        except Exception as e:  # noqa: BLE001
+            out["authenticated_scan"] = {"dispatched": False, "error": str(e)[:160]}
     return out
