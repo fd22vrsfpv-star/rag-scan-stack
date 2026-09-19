@@ -374,14 +374,20 @@ def run_default_cred_check(cur, host: str, login_page_url: str, *,
     except Exception as e:  # noqa: BLE001
         out["auth_profile"] = {"error": str(e)[:160]}
 
-    # Gap 2 — trigger an AUTHENTICATED scan: the Playwright /scan path auto-resolves
-    # the stored profile for this host (ZAP spider + active scan run authenticated).
+    # Gap 2 — trigger an AUTHENTICATED scan. /scan runs the authenticated ZAP block
+    # ONLY when zap_spider/zap_active_scan are set, and it reads the engagement from
+    # the X-Engagement-Id HEADER (not the body) to resolve the stored profile — so
+    # both are required for the profile to actually drive an authenticated scan.
     if isinstance(out.get("auth_profile"), dict) and out["auth_profile"].get("ok"):
+        rc = cfg.get("authenticated_rescan") or {}
         try:
             with httpx.Client(verify=False, timeout=30) as cli:
                 sr = cli.post(f"{pw_url.rstrip('/')}/scan",
                               json={"url": f"{scheme}://{scan_host}/",
-                                    "engagement_id": engagement_id})
+                                    "engagement_id": engagement_id,
+                                    "zap_spider": bool(rc.get("zap_spider", True)),
+                                    "zap_active_scan": bool(rc.get("zap_active_scan", True))},
+                              headers={"X-Engagement-Id": str(engagement_id or "")})
                 body = sr.json() if sr.status_code < 400 else {}
                 out["authenticated_scan"] = {
                     "dispatched": sr.status_code < 400,
