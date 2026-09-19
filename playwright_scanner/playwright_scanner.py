@@ -2060,13 +2060,27 @@ async def _browser_login(page, auth: Dict) -> bool:
                 await page.fill(f"input[name='{pass_field}']", str(auth["password"]))
             except Exception:  # noqa: BLE001
                 pass
-        # Submit: a submit button if present, else Enter in the password field.
+        # Submit the LOGIN form specifically. A page often has other forms before
+        # it (e.g. a search box with its own submit button) — a bare
+        # `input[type=submit]` selector grabs that first button and submits the
+        # wrong form, so scope the submit to the form that OWNS the password field.
         try:
-            btn = await page.query_selector("button[type=submit], input[type=submit]")
+            btn = await page.query_selector(
+                "form:has(input[type=password]) button[type=submit], "
+                "form:has(input[type=password]) input[type=submit]")
             if btn:
                 await btn.click()
             else:
-                await page.keyboard.press("Enter")
+                # submit the password field's own form (bypasses sibling forms)
+                submitted = False
+                try:
+                    submitted = await page.eval_on_selector(
+                        "input[type=password]",
+                        "el => { if (el.form) { el.form.submit(); return true; } return false; }")
+                except Exception:  # noqa: BLE001
+                    submitted = False
+                if not submitted:
+                    await page.keyboard.press("Enter")
             await page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:  # noqa: BLE001
             pass
