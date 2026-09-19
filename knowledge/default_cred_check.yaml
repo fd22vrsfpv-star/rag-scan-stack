@@ -42,6 +42,12 @@ default_cred_check:
   # active scan run logged-in, reaching the authenticated area a link-only crawl
   # can't). Toggle the stages here.
   authenticated_rescan:
+    # Playwright WALKS the logged-in app first (real browser login, crawling
+    # through the ZAP proxy so ZAP's site tree is seeded with the authenticated
+    # /bank/* pages), THEN ZAP scans that seeded tree.
+    crawl_first: true
+    max_pages: 60
+    crawl_wait_seconds: 180
     zap_spider: true
     zap_active_scan: true
   priority: 26

@@ -374,26 +374,51 @@ def run_default_cred_check(cur, host: str, login_page_url: str, *,
     except Exception as e:  # noqa: BLE001
         out["auth_profile"] = {"error": str(e)[:160]}
 
-    # Gap 2 — trigger an AUTHENTICATED scan. /scan runs the authenticated ZAP block
-    # ONLY when zap_spider/zap_active_scan are set, and it reads the engagement from
-    # the X-Engagement-Id HEADER (not the body) to resolve the stored profile — so
-    # both are required for the profile to actually drive an authenticated scan.
+    # Gap 2 — trigger an AUTHENTICATED scan. Playwright WALKS the logged-in app
+    # first (a real browser login, crawling through the ZAP proxy so ZAP's site
+    # tree is seeded with the authenticated /bank/* pages), THEN ZAP scans that
+    # seeded tree. Both calls carry engagement_id in the BODY (the X-Engagement-Id
+    # header contextvar is reset before the async scan/crawl runs).
     if isinstance(out.get("auth_profile"), dict) and out["auth_profile"].get("ok"):
+        import time
         rc = cfg.get("authenticated_rescan") or {}
+        base = f"{scheme}://{scan_host}/"
+        hdr = {"X-Engagement-Id": str(engagement_id or "")}
         try:
-            with httpx.Client(verify=False, timeout=30) as cli:
+            with httpx.Client(verify=False, timeout=40) as cli:
+                # 1) authenticated Playwright crawl — walk the logged-in app, seed ZAP.
+                if rc.get("crawl_first", True):
+                    cr = cli.post(f"{pw_url.rstrip('/')}/crawl",
+                                  json={"url": base, "engagement_id": engagement_id,
+                                        "max_pages": int(rc.get("max_pages", 60)),
+                                        "use_zap_proxy": True},
+                                  headers=hdr)
+                    cj = cr.json().get("job_id") if cr.status_code < 400 else None
+                    out["authenticated_crawl"] = {"dispatched": cr.status_code < 400, "job_id": cj}
+                    deadline = time.time() + int(rc.get("crawl_wait_seconds", 180))
+                    while cj and time.time() < deadline:
+                        time.sleep(6)
+                        try:
+                            j = cli.get(f"{pw_url.rstrip('/')}/crawl/{cj}").json()
+                            if str(j.get("status", "")).lower() in ("completed", "failed", "blocked", "done"):
+                                out["authenticated_crawl"].update(
+                                    {"status": j.get("status"),
+                                     "pages_visited": j.get("pages_visited"),
+                                     "authenticated": j.get("authenticated")})
+                                break
+                        except Exception:  # noqa: BLE001
+                            pass
+                # 2) THEN ZAP the authenticated-seeded tree.
                 sr = cli.post(f"{pw_url.rstrip('/')}/scan",
-                              json={"url": f"{scheme}://{scan_host}/",
-                                    "engagement_id": engagement_id,
+                              json={"url": base, "engagement_id": engagement_id,
                                     "zap_spider": bool(rc.get("zap_spider", True)),
                                     "zap_active_scan": bool(rc.get("zap_active_scan", True))},
-                              headers={"X-Engagement-Id": str(engagement_id or "")})
+                              headers=hdr)
                 body = sr.json() if sr.status_code < 400 else {}
                 out["authenticated_scan"] = {
                     "dispatched": sr.status_code < 400,
                     "status": sr.status_code,
-                    "job_id": body.get("job_id") or body.get("scan_id") or body.get("id"),
-                    "authenticated": body.get("authenticated"),
+                    "job_id": body.get("scan_id") or body.get("job_id") or body.get("id"),
                     "detail": (None if sr.status_code < 400 else sr.text[:160])}
         except Exception as e:  # noqa: BLE001
             out["authenticated_scan"] = {"dispatched": False, "error": str(e)[:160]}

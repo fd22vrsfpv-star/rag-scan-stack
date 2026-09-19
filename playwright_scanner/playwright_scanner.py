@@ -1995,6 +1995,9 @@ class CrawlRequest(BaseModel):
     same_origin_only: bool = Field(True, description="Only follow same-origin links")
     capture_screenshots: bool = Field(False, description="Screenshot each page")
     auth: Optional[Dict] = Field(None, description="Auth Profile for an AUTHENTICATED crawl: {login_url, login_data (with {%username%}/{%password%}), username, password}. If omitted, a stored Auth Profile for the host is used. The browser logs in before crawling so the tree seeded into ZAP is authenticated.")
+    #: Engagement for resolving the stored Auth Profile (the X-Engagement-Id header
+    #: contextvar is reset before the async crawl runs — see ScanRequest.engagement_id).
+    engagement_id: Optional[str] = Field(None, description="Engagement id for resolving the stored Auth Profile")
 
 
 class CrawlResponse(BaseModel):
@@ -2134,6 +2137,10 @@ async def _perform_crawl(job_id: str, req: CrawlRequest):
                 _eid = current_engagement_id.get()
             except Exception:  # noqa: BLE001
                 _eid = None
+            # The header contextvar is reset when the request returns, but this
+            # crawl runs after that — fall back to the body's engagement_id so the
+            # engagement-scoped Auth Profile resolves (else the crawl is anonymous).
+            _eid = _eid or getattr(req, "engagement_id", None)
             _crawl_auth = req.auth or _resolve_web_auth(req.url, _eid)
             if _crawl_auth and _crawl_auth.get("login_url"):
                 job["authenticated"] = await _browser_login(page, _crawl_auth)
