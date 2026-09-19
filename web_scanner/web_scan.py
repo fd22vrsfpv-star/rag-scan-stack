@@ -1962,6 +1962,12 @@ class PipelineReq(BaseModel):
     #: host's own address. If a proxy is given and cannot be established, the
     #: job FAILS rather than scanning unproxied.
     proxy: Optional[str] = None
+    #: Engagement for this scan. When set (and no explicit `auth` is supplied), the
+    #: pipeline resolves the stored Auth Profile (web_auth_configs) for the target
+    #: host and runs the ZAP stage authenticated — the same profile the Playwright
+    #: path auto-resolves. Without it, only a NULL-engagement / host-only profile
+    #: is used.
+    engagement_id: Optional[str] = None
 
 
 class NiktoReq(BaseModel):
@@ -3716,6 +3722,60 @@ def run_nikto_scan_sync(req: NiktoReq):
         raise HTTPException(status_code=500, detail=f"Nikto scan failed: {str(e)}")
 
 
+def _resolve_scan_auth(target_url: str, engagement_id: Optional[str] = None) -> Optional["ScanAuth"]:
+    """Resolve a stored Auth Profile (web_auth_configs) for the target host into a
+    ScanAuth so the pipeline runs authenticated even when the caller passed none —
+    the web_scanner counterpart of playwright's _resolve_web_auth. Secret resolved
+    from credential_id -> credential_findings at run time (no plaintext at rest).
+    Engagement-scoped when engagement_id is given; otherwise falls back to any
+    enabled profile for the host. Returns None if nothing usable matches."""
+    try:
+        from urllib.parse import urlparse
+        pu = urlparse(target_url if "://" in target_url else f"http://{target_url}")
+        netloc, host = pu.netloc, pu.hostname
+        if not netloc:
+            return None
+        with conn() as c, c.cursor() as cur:
+            if engagement_id:
+                cur.execute(
+                    """SELECT login_url, login_data, username, password, logged_in_regex,
+                              logged_out_regex, csrf_field, credential_id
+                         FROM web_auth_configs
+                        WHERE enabled AND host IN (%s,%s)
+                          AND (engagement_id IS NULL OR engagement_id = %s::uuid)
+                        ORDER BY (engagement_id IS NOT NULL) DESC, (host=%s) DESC LIMIT 1""",
+                    (netloc, host, engagement_id, netloc))
+            else:
+                # host-only fallback (no engagement supplied): any enabled profile.
+                cur.execute(
+                    """SELECT login_url, login_data, username, password, logged_in_regex,
+                              logged_out_regex, csrf_field, credential_id
+                         FROM web_auth_configs
+                        WHERE enabled AND host IN (%s,%s)
+                        ORDER BY (host=%s) DESC LIMIT 1""",
+                    (netloc, host, netloc))
+            r = cur.fetchone()
+            if not r:
+                return None
+            login_url, login_data, username, password, lin, lout, csrf, cred_id = r
+            if cred_id:
+                cur.execute("SELECT username, secret_value FROM credential_findings WHERE id=%s::uuid",
+                            (str(cred_id),))
+                cr = cur.fetchone()
+                if cr:
+                    username = cr[0] or username
+                    password = cr[1] or password
+        if not login_url or not (username and password):
+            return None
+        return ScanAuth(
+            login_url=login_url, username=username, password=password,
+            login_request_data=(login_data or "username={%username%}&password={%password%}&Login=Login"),
+            csrf_field=csrf, logged_in_regex=lin, logged_out_regex=lout)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"scan auth resolve failed for {target_url}: {e}")
+        return None
+
+
 # ===============================
 # Pipeline Scan (Sequential: Katana → Playwright → Gobuster → Nikto → Nuclei → ZAP)
 # ===============================
@@ -3735,8 +3795,19 @@ def _run_pipeline_scan_job(
     auth: Optional["ScanAuth"] = None,
     zap_tuning: Optional["ZapTuning"] = None,
     proxy: Optional[str] = None,
+    engagement_id: Optional[str] = None,
 ):
     """Background task to run sequential scan pipeline with progress tracking"""
+    # Gap #1: run authenticated when a stored Auth Profile exists and the caller
+    # passed no explicit auth — the ZAP stage would otherwise be anonymous.
+    if auth is None:
+        try:
+            resolved = _resolve_scan_auth(target_url, engagement_id)
+            if resolved is not None:
+                auth = resolved
+                logger.info(f"[{job_id[:8]}] using stored Auth Profile for {target_url}")
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(f"[{job_id[:8]}] auth-profile resolve failed: {_e}")
     _proxy_stack = contextlib.ExitStack()
     try:
         # Route every stage through the operator's proxy BEFORE any stage runs.
@@ -3982,6 +4053,7 @@ def run_pipeline_scan(req: PipelineReq, background_tasks: BackgroundTasks):
         req.auth,
         req.zap_tuning,
         req.proxy,
+        req.engagement_id,
     )
 
     return {
