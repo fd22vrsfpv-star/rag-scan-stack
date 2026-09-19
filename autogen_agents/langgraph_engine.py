@@ -3377,7 +3377,19 @@ _WEB_PIPELINE_MAX_PORTS = int(os.environ.get("WEB_PIPELINE_MAX_PORTS", "3"))
 # pipeline (Gobuster→ZAP→Nuclei) to finish before building surface tests, so its
 # app-layer findings (SQLi/XSS/IDOR) are actually available to test. Bounded, and
 # opt-out via session config wait_for_web_pipeline=false.
-_WEB_PIPELINE_WAIT_SECONDS = int(os.environ.get("WEB_PIPELINE_WAIT_SECONDS", "600"))
+_WEB_PIPELINE_WAIT_SECONDS = int(os.environ.get("WEB_PIPELINE_WAIT_SECONDS", "900"))
+# A DEEP web scan (ZAP active scan over every crawled param) routinely runs
+# 30-60 min — the 600s cap timed out mid-scan on demo.testfire.net, so surface
+# tests were built from partial ZAP findings. This is the ceiling for a deep
+# web_profile; the wait still RETURNS the moment the pipeline finishes, so a
+# faster site never pays the full cap.
+_WEB_PIPELINE_WAIT_SECONDS_DEEP = int(os.environ.get("WEB_PIPELINE_WAIT_SECONDS_DEEP", "3600"))
+
+
+def _web_wait_cap(eng: dict) -> int:
+    """Wait ceiling for the web pipeline, longer for a deep web_profile."""
+    prof = (eng.get("web_profile") or "").strip().lower() if isinstance(eng, dict) else ""
+    return _WEB_PIPELINE_WAIT_SECONDS_DEEP if prof == "deep" else _WEB_PIPELINE_WAIT_SECONDS
 
 
 def _ensure_web_pipeline(host: str, sid, engagement_id=None) -> dict:
@@ -4159,7 +4171,7 @@ def surface_plan(state: PentestState) -> dict:
             # session config wait_for_web_pipeline=false.
             wait_web = eng.get("wait_for_web_pipeline", True) if isinstance(eng, dict) else True
             if wait_web and isinstance(pipe, dict) and pipe.get("dispatched"):
-                _wait_for_web_pipeline(pipe["dispatched"], sid)
+                _wait_for_web_pipeline(pipe["dispatched"], sid, timeout=_web_wait_cap(eng))
         except Exception as e:  # noqa: BLE001
             _msg(sid, "SurfaceTester", f"[web pipeline autotrigger skipped: {e}]")
 
