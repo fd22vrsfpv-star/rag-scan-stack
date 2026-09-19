@@ -395,9 +395,35 @@ def _render_safe_service_probes(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_directory_followup(data: Dict[str, Any]) -> List[Doc]:
+    """Directory-discovery followup -> docs so the planner can retrieve the method:
+    on discovering a directory, run gobuster with a docs/backup wordlist enriched
+    by site-harvested (cewl) words, to surface leaked documents/backups a
+    link-only crawl walks past."""
+    d = data.get("directory_followup")
+    if not isinstance(d, dict):
+        return []
+    exts = ", ".join(str(e) for e in (d.get("extensions") or []))
+    srcs = []
+    for s in (d.get("wordlist_sources") or []):
+        if isinstance(s, dict):
+            if s.get("repo_list"): srcs.append("a docs/backup wordlist")
+            if s.get("site_corpus"): srcs.append("site-harvested corpus words")
+            if s.get("cewl_live") is not None: srcs.append("live cewl words (when installed)")
+    return [(
+        "Enumeration followup: discovered directory -> docs/backup gobuster (cewl-enriched)",
+        "When a directory is discovered (a listing, or a crawled folder URL), a "
+        "standard SAFE-lane followup runs gobuster over it with a wordlist built "
+        f"from {', '.join(srcs) or 'a docs/backup list'} and the extensions "
+        f"[{exts}], to surface leaked documents and backups a link-only crawl "
+        "misses. Scope-gated, bounded, tagged as a follow-up "
+        f"(scanner='{d.get('followup_tag','dir_followup')}').")]
+
+
 RENDERERS = {
     "msf_learned_options": _render_msf_learned_options,
     "safe_service_probes": _render_safe_service_probes,
+    "directory_followups": _render_directory_followup,
     "msf_readonly_scanners": _render_msf_readonly_scanners,
     "owasp_param_tests": _render_owasp_param_tests,
     "dos_exploit_overrides": _render_dos_exploit_overrides,

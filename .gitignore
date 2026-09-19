@@ -213,6 +213,7 @@ logs/
 # Wordlist payloads — populated by scripts/install-wordlists.sh (rockyou ~134MB, SecLists ~30MB)
 wordlists/*
 !wordlists/.gitkeep
+!wordlists/docs-backup.txt
 certs/ca-bundle.crt
 
 # Generated report/export artifacts (PDF/CSV/URL lists from the export endpoints

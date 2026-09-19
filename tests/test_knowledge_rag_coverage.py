@@ -46,6 +46,7 @@ RAG_LOADED = {
     "msf_readonly_scanners.yaml": "etl/load_knowledge_documents.py",
     "owasp_param_tests.yaml": "etl/load_knowledge_documents.py",
     "safe_service_probes.yaml": "etl/load_knowledge_documents.py",
+    "directory_followups.yaml": "etl/load_knowledge_documents.py",
 }
 
 # YAMLs deliberately NOT embedded into rag_documents. Each needs a reason. This
