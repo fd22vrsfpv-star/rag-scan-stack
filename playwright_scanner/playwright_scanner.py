@@ -2035,7 +2035,21 @@ async def _browser_login(page, auth: Dict) -> bool:
         if not login_url or not login_data:
             return False
         user_field, pass_field = _login_fields(login_data)
-        await page.goto(login_url, wait_until="domcontentloaded", timeout=20000)
+        # Navigate to the login FORM PAGE, which may differ from login_url (the form
+        # ACTION). e.g. AltoroMutual's form is on /login.jsp but posts to /doLogin —
+        # GETting /doLogin shows no form, so the fill/login/verify all fail. The
+        # profile carries the page in session.login_page (set by the default-cred
+        # check). Fall back to login_url when unknown.
+        nav_url = ((auth.get("session") or {}).get("login_page")) or login_url
+        await page.goto(nav_url, wait_until="domcontentloaded", timeout=20000)
+        # If the page has no password field (nav_url was the action, not the form),
+        # try login_url as a fallback page.
+        if nav_url != login_url:
+            try:
+                if not await page.query_selector("input[type=password]"):
+                    await page.goto(login_url, wait_until="domcontentloaded", timeout=20000)
+            except Exception:  # noqa: BLE001
+                pass
         if user_field and auth.get("username"):
             try:
                 await page.fill(f"input[name='{user_field}']", str(auth["username"]))
