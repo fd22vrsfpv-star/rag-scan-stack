@@ -4379,19 +4379,27 @@ def surface_approval(state: PentestState) -> dict:
     if isinstance(decision, dict):
         approved = bool(decision.get("approved"))
         note = str(decision.get("note") or "")
-        pending_id = decision.get("pending_exploit_id")
+        # The approve endpoint sends pending_exploit_ids (a LIST); accept the
+        # singular too for older callers. Executing only one meant an operator
+        # who approved all 4 impactful surface tests got just one run (or, when
+        # only the list was sent, "no pending_exploit_id — nothing executed").
+        pending_ids = decision.get("pending_exploit_ids")
+        if pending_ids is None:
+            one = decision.get("pending_exploit_id")
+            pending_ids = [one] if one else []
     else:
-        approved, note, pending_id = bool(decision), "", None
+        approved, note, pending_ids = bool(decision), "", []
+    pending_ids = [str(p) for p in (pending_ids or []) if p]
     sid = state["session_id"]
     _msg(sid, "SurfaceTester",
          f"[operator decision] approved={approved}"
-         f"{' pending_exploit_id=' + str(pending_id) if pending_id else ''}",
+         f"{' (' + str(len(pending_ids)) + ' test(s))' if pending_ids else ''}",
          role="user")
     _emit("langgraph_surface_decision", sid,
-          {"approved": approved, "pending_exploit_id": str(pending_id or "")})
+          {"approved": approved, "pending_exploit_ids": pending_ids})
     return {"phase": "surface_exec" if approved else "surface_onward",
             "surface_decision": {"approved": approved, "note": note[:500],
-                                 "pending_exploit_id": str(pending_id or "") or None},
+                                 "pending_exploit_ids": pending_ids},
             "findings": [f"surface_approval: approved={approved}"],
             "log": [f"surface_approval: approved={approved}"]}
 
@@ -4402,20 +4410,26 @@ def surface_exec(state: PentestState) -> dict:
     sid = state["session_id"]
     import db_utils
     decision = state.get("surface_decision") or {}
-    pending_id = decision.get("pending_exploit_id")
-    if not pending_id:
+    pending_ids = decision.get("pending_exploit_ids")
+    if pending_ids is None:  # checkpoint written before this took a list
+        one = decision.get("pending_exploit_id")
+        pending_ids = [one] if one else []
+    pending_ids = [str(p) for p in pending_ids if p]
+    if not pending_ids:
         _msg(sid, "SurfaceTester",
              "[approved but no pending_exploit_id] Nothing executed.")
         return {"phase": "surface_onward",
                 "findings": ["surface_exec: skipped (no id)"],
                 "log": ["surface_exec skipped: no id"]}
-    _mark_approved(pending_id, "operator (surface approval)",
-                   (state.get("surface_decision") or {}).get("note"))
-    result = _tool(scan_tools.execute_approved_exploit, pending_id)
-    # Find the security_test that referenced this pending exploit.
-    test = next((t for t in (state.get("pending_surface_tests") or [])
+    executed = []
+    for pending_id in pending_ids:
+      _mark_approved(pending_id, "operator (surface approval)",
+                   decision.get("note"))
+      result = _tool(scan_tools.execute_approved_exploit, pending_id)
+      # Find the security_test that referenced this pending exploit.
+      test = next((t for t in (state.get("pending_surface_tests") or [])
                  if str(t.get("pending_exploit_id")) == str(pending_id)), None)
-    if test:
+      if test:
         # Read the exploit_results row id + success for the run record.
         try:
             import psycopg2
@@ -4439,12 +4453,13 @@ def surface_exec(state: PentestState) -> dict:
                 _postex_enumerate(test.get("host"), session_type, session_id, sid)
         except Exception as e:  # noqa: BLE001
             _msg(sid, "SurfaceTester", f"[record impactful failed: {e}]")
-    _msg(sid, "SurfaceTester", f"[execute_approved_exploit {pending_id}]\n{result[:1500]}")
+      _msg(sid, "SurfaceTester", f"[execute_approved_exploit {pending_id}]\n{result[:1500]}")
+      executed.append(pending_id)
     _emit("langgraph_surface_test_completed", sid,
-          {"executed": True, "pending_exploit_id": str(pending_id)})
+          {"executed": len(executed), "pending_exploit_ids": executed})
     return {"phase": "surface_onward",
-            "findings": [f"surface_exec: executed {pending_id}"],
-            "log": [f"surface_exec: {pending_id}"]}
+            "findings": [f"surface_exec: executed {len(executed)} impactful test(s)"],
+            "log": [f"surface_exec: executed={executed}"]}
 
 
 def _postex_enumerate(host, session_type, session_id, sid):
