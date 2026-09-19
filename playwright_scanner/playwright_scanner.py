@@ -179,6 +179,11 @@ class ScanRequest(BaseModel):
     zap_spider: Optional[bool] = Field(False, description="Run ZAP spider after scan")
     zap_active_scan: Optional[bool] = Field(False, description="Run ZAP active scan")
     auth: Optional[Dict] = Field(None, description="ZAP form-auth for an authenticated scan: {login_url, login_data (with {%username%}/{%password%}), username, password, logged_in_regex?, logged_out_regex?}. If omitted, a stored per-host config is used.")
+    #: Engagement for resolving the stored Auth Profile. The X-Engagement-Id header
+    #: contextvar is RESET when the request returns, but the ZAP scan runs after
+    #: that — so the header alone resolves to None. Carrying it in the body lets the
+    #: scan resolve the (engagement-scoped) profile regardless.
+    engagement_id: Optional[str] = Field(None, description="Engagement id for resolving the stored Auth Profile")
     timeout: Optional[int] = Field(30, description="Page load timeout in seconds")
 
 
@@ -524,6 +529,10 @@ async def _perform_scan_slotted(scan_request: ScanRequest, scan_id: uuid.UUID):
                     _eid = current_engagement_id.get()
                 except Exception:  # noqa: BLE001
                     _eid = None
+                # The header contextvar is reset when the request returns, but this
+                # ZAP work runs after that — fall back to the body's engagement_id so
+                # the engagement-scoped Auth Profile still resolves.
+                _eid = _eid or getattr(scan_request, "engagement_id", None)
                 _auth = scan_request.auth or _resolve_web_auth(url_str, _eid)
                 zap_results = await zap_bridge.scan_with_playwright_session(
                     url=url_str,
