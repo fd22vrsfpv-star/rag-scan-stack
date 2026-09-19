@@ -1160,7 +1160,7 @@ _FALLBACK_ALLOWED_TOOLS = {
     # Baked into this image (see kali_listener/Dockerfile). Present in the
     # node-manager registry too; listed here so a registry fetch failure does not
     # reject a tool the image demonstrably has.
-    "rmg", "dnsenum", "dnsrecon", "enum4linux-ng", "sqlmap", "gobuster",
+    "rmg", "dnsenum", "dnsrecon", "enum4linux-ng", "sqlmap", "gobuster", "cewl",
     "nuclei", "smtp-user-enum", "snmpcheck", "swaks", "avahi-browse",
     "tftp", "telnet", "ftp", "lftp", "vncviewer", "ntpq", "ntpdate",
     # Read-only HTTP/TLS clients the WSTG safe lane needs (lfi_read, header_check,
@@ -1205,6 +1205,8 @@ _SAFE_READONLY_TOOLS = {
     "sslscan", "testssl.sh", "testssl", "sslyze",
     # Content / path discovery (reads).
     "gobuster", "feroxbuster", "ffuf", "dirb", "dirsearch",
+    # Site word harvesting for the directory-enumeration followup (read-only spider).
+    "cewl",
     # Port / service enumeration.
     "nmap",
     # DNS.

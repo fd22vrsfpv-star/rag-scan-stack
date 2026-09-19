@@ -1376,6 +1376,12 @@ def analyse_findings(*, target: str = "", engagement_id: Optional[str] = None,
                     # B2: deepen INFORMATIONAL web findings the deterministic
                     # rules did not name (the long tail) — budget-bounded LLM.
                     _deepen_info_findings(cur, facts, context, rules, out)
+                # STANDARD followup: brute-force discovered directories (esp.
+                # deep/hidden ones) for leaked docs/backups with a cewl-enriched
+                # docs/backup wordlist. Independent of `facts` (works off every
+                # discovered URL), so it runs whether or not there were new facts.
+                _directory_enumeration_followups(cur, context, out,
+                                                 target=target, engagement_id=engagement_id)
                 out["available"] = True
             conn.commit()
     except Exception as e:  # noqa: BLE001
@@ -1432,6 +1438,104 @@ def _queue_impactful_deepen(cur, host, url, command, proposal,
                "tier": "impactful"})))
     row = cur.fetchone()
     return row[0] if row else None
+
+
+_DIR_FOLLOWUP_MAX = int(os.environ.get("DIR_FOLLOWUP_MAX_PER_PASS", "6"))
+
+
+def _directory_enumeration_followups(cur, context, out, *, target: str = "",
+                                     engagement_id=None) -> None:
+    """STANDARD enumeration followup: for each discovered directory (a listing, or
+    the parent folder of a crawled file — e.g. `/my documents/JohnSmith/Bank Site
+    Documents/`), run a SAFE-lane gobuster with a docs/backup wordlist enriched by
+    site-harvested (cewl) words, to surface leaked documents/backups a link-only
+    crawl walked past. Scope-gated, bounded (DIR_FOLLOWUP_MAX_PER_PASS), deduped
+    (skips a directory already followed up), tagged scanner='dir_followup'."""
+    from urllib.parse import urlparse
+    try:
+        from etl.scope_gate import load_dispatch_scope, load_host_aliases
+        from etl.directory_followup import queue_directory_followup
+    except ImportError:  # pragma: no cover
+        from scope_gate import load_dispatch_scope, load_host_aliases
+        from directory_followup import queue_directory_followup
+
+    # Collect candidate directories from discovered web findings.
+    where, params = ["wf.created_at > now() - interval '30 days'"], []
+    if target:
+        where.append("host(a.ip) = %s")
+        params.append(target)
+    try:
+        cur.execute(
+            f"""SELECT DISTINCT host(a.ip), a.id::text, wf.url,
+                       COALESCE(wf.name,'')
+                  FROM web_findings wf JOIN assets a ON a.id = wf.asset_id
+                 WHERE {' AND '.join(where)}""", params)
+        rows = cur.fetchall()
+    except Exception as e:  # noqa: BLE001
+        log.debug("directory followup: web_findings query failed: %s", e)
+        return
+    if not rows:
+        return
+
+    # host -> (asset_id, {dir_url}). A directory is a listing finding's URL, a URL
+    # that ends in '/', or the PARENT folder of any crawled file URL.
+    per_host: Dict[str, Dict[str, Any]] = {}
+    for host, asset_id, url, name in rows:
+        if not host or not url:
+            continue
+        pu = urlparse(url)
+        if not pu.scheme or not pu.netloc:
+            continue
+        path = pu.path or "/"
+        is_dir = url.endswith("/") or "directory" in (name or "").lower()
+        # parent folder (of a file, or the dir itself)
+        parent = path if path.endswith("/") else path.rsplit("/", 1)[0] + "/"
+        entry = per_host.setdefault(host, {"asset_id": asset_id, "dirs": set(),
+                                           "base": f"{pu.scheme}://{pu.netloc}"})
+        if is_dir and path.endswith("/"):
+            entry["dirs"].add(f"{pu.scheme}://{pu.netloc}{path}")
+        # only follow up NON-root parent dirs (root is covered by the normal
+        # gobuster surface probe); deep/hidden dirs are the point.
+        if parent not in ("/", ""):
+            entry["dirs"].add(f"{pu.scheme}://{pu.netloc}{parent}")
+
+    scope_rows, scope_src = load_dispatch_scope(cur, engagement_id)
+    if scope_src == "unavailable":
+        return
+
+    done = 0
+    for host, entry in per_host.items():
+        if done >= _DIR_FOLLOWUP_MAX:
+            break
+        aliases = load_host_aliases(cur, str(host))
+        for dir_url in sorted(entry["dirs"]):
+            if done >= _DIR_FOLLOWUP_MAX:
+                break
+            # dedupe: skip a directory already followed up.
+            cur.execute(
+                """SELECT 1 FROM scan_recommendations
+                    WHERE scanner = 'dir_followup'
+                      AND extra->>'directory' = %s LIMIT 1""", (dir_url,))
+            if cur.fetchone():
+                continue
+            try:
+                res = queue_directory_followup(
+                    cur, host, dir_url, asset_id=entry["asset_id"],
+                    engagement_id=engagement_id, base_url=entry["base"],
+                    scope_rows=scope_rows, aliases=aliases)
+            except Exception as e:  # noqa: BLE001
+                log.warning("directory followup for %s failed: %s", dir_url, e)
+                continue
+            if res.get("ok"):
+                out["queued"] = out.get("queued", 0) + res.get("queued", 0)
+                done += 1
+                _emit_webhook("directory_followup_dispatched",
+                              {"target": host, "directory": dir_url,
+                               "dispatched": res.get("dispatched"),
+                               "wordlist": res.get("wordlist"),
+                               "engagement_id": engagement_id})
+    if done:
+        out["dir_followups"] = done
 
 
 def _deepen_info_findings(cur, facts, context, rules, out) -> None:
