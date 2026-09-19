@@ -1,0 +1,41 @@
+# Default-credential check on discovered login forms (RAG-first).
+#
+# WHAT: when a login form is discovered (content_extractions.login_pages, or a
+# login web_finding), a STANDARD followup tries a small set of DOCUMENTED default
+# credentials against it and reports any that work. This closes the "Apache
+# Tomcat default admin password" / "default creds on the app login" class of
+# finding that a link-only crawl never tests. On success it records the working
+# credential and auto-populates an Auth Profile (POST /auth-profiles/auto-populate)
+# — the on-ramp to AUTHENTICATED scanning.
+#
+# THE SETTING (operator-configurable, bind-mounted — edit takes effect live):
+#   max_auto_attempts — the threshold. If the number of candidate credential
+#   pairs is AT OR BELOW this, the check auto-fires (bounded, lockout-aware,
+#   scope-gated). ABOVE it, the check is NOT auto-run — it is queued for operator
+#   APPROVAL first (so a large spray never fires unattended). Env override:
+#   DEFAULT_CRED_MAX_AUTO_ATTEMPTS.
+#
+# Candidates come from knowledge/default_credentials.yaml (common + the service
+# for the port + username_as_password) plus the app_login extras below. A hard
+# `max_total_attempts` caps the set even when approved (never a full brute force).
+default_cred_check:
+  max_auto_attempts: 24          # <= this -> safe lane (auto). above -> approval.
+  max_total_attempts: 120        # hard ceiling regardless of approval (not a brute force)
+  # Extra web-app login defaults (the app's own accounts), beyond the service
+  # defaults in default_credentials.yaml. user:pass pairs.
+  app_login:
+    - {username: admin,  password: admin}
+    - {username: admin,  password: password}
+    - {username: jsmith, password: demo1234}
+    - {username: guest,  password: guest}
+    - {username: tomcat, password: tomcat}
+  # Success detection: a working login differs from a known-bad baseline — it
+  # redirects somewhere OTHER than a login/error page, or sets a new auth cookie.
+  success:
+    # a Location that does NOT match these = left the login page = success
+    login_path_markers: ["login", "signin", "logon", "error", "denied", "invalid"]
+  # Forms protected by a CSRF token are NOT auto-tested (a token must be fetched
+  # per request); they are reported for manual review instead.
+  skip_csrf: true
+  priority: 26
+  followup_tag: default_cred_check

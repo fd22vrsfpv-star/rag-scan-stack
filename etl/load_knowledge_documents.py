@@ -420,10 +420,31 @@ def _render_directory_followup(data: Dict[str, Any]) -> List[Doc]:
         f"(scanner='{d.get('followup_tag','dir_followup')}').")]
 
 
+def _render_default_cred_check(data: Dict[str, Any]) -> List[Doc]:
+    """Default-credential check -> a doc so the planner can retrieve the method:
+    on a discovered login form, try documented default credentials; auto-fire when
+    the candidate count is at/below the setting, else queue for approval; on
+    success record the credential and auto-populate an Auth Profile."""
+    d = data.get("default_cred_check")
+    if not isinstance(d, dict):
+        return []
+    return [(
+        "Enumeration followup: discovered login form -> default-credential check",
+        "When a login form is discovered, a standard followup tries documented "
+        "default credentials (from default_credentials.yaml + app_login extras). "
+        f"It auto-fires on the safe lane when the candidate count is <= "
+        f"max_auto_attempts ({d.get('max_auto_attempts')}), and is queued for "
+        "operator approval above that; bounded, lockout-aware, scope-gated, tagged "
+        f"'{d.get('followup_tag','default_cred_check')}'. On success it records the "
+        "working credential and auto-populates an Auth Profile (the on-ramp to "
+        "authenticated scanning). CSRF-protected forms are left for manual review.")]
+
+
 RENDERERS = {
     "msf_learned_options": _render_msf_learned_options,
     "safe_service_probes": _render_safe_service_probes,
     "directory_followups": _render_directory_followup,
+    "default_cred_check": _render_default_cred_check,
     "msf_readonly_scanners": _render_msf_readonly_scanners,
     "owasp_param_tests": _render_owasp_param_tests,
     "dos_exploit_overrides": _render_dos_exploit_overrides,
