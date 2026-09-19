@@ -101,8 +101,12 @@ def test_over_threshold_requires_approval_gate_present():
     fn = next(n for n in ast.walk(ast.parse(src))
               if isinstance(n, ast.FunctionDef) and n.name == "run_default_cred_check")
     body = ast.get_source_segment(src, fn)
-    assert "len(pairs) > threshold and not force" in body, \
-        "must queue for approval when candidates exceed the setting (unless forced)"
+    # auto-submit at most `threshold`; force runs the full set
+    assert "run_set = pairs if force else pairs[:threshold]" in body, \
+        "the setting must cap how many creds are submitted unattended"
+    # a larger set queues the fuller spray for approval
+    assert "not force and len(pairs) > threshold" in body, \
+        "must queue the fuller spray for approval when candidates exceed the setting"
     assert '"requires_approval": True' in body
     assert "auto-populate" in body or "auto-populate" in src, "success must auto-populate an Auth Profile"
     assert "credential_findings" in body, "a working default cred must be recorded"
