@@ -67,6 +67,37 @@ def load_cfg() -> Dict[str, Any]:
     return cfg
 
 
+def _zap_crawl_settings(cur, cfg: Dict[str, Any]) -> Dict[str, int]:
+    """Authenticated-crawl tuning, resolved as: ZAP settings (app_settings
+    zap.auth_crawl.*) > YAML authenticated_rescan > tuned defaults. These are the
+    knobs surfaced in the dashboard's ZAP settings so an operator can widen the
+    authenticated crawl (more pages / deeper) to seed ZAP's whole logged-in tree."""
+    rc = cfg.get("authenticated_rescan") or {}
+    out = {"max_pages": int(rc.get("max_pages", 200)),
+           "max_depth": int(rc.get("max_depth", 5)),
+           "wait_seconds": int(rc.get("crawl_wait_seconds", 300))}
+    keymap = {"max_pages": "zap.auth_crawl.max_pages",
+              "max_depth": "zap.auth_crawl.max_depth",
+              "wait_seconds": "zap.auth_crawl.wait_seconds"}
+    try:
+        cur.execute("SELECT key, value FROM app_settings WHERE key = ANY(%s) AND category='config'",
+                    (list(keymap.values()),))
+        got = {k: v for k, v in cur.fetchall()}
+        for k, dbk in keymap.items():
+            v = got.get(dbk)
+            if v is not None and str(v).strip().isdigit():
+                out[k] = int(v)
+    except Exception:  # noqa: BLE001
+        try:
+            cur.connection.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+    out["max_pages"] = max(1, min(out["max_pages"], 1000))
+    out["max_depth"] = max(1, min(out["max_depth"], 5))
+    out["wait_seconds"] = max(30, min(out["wait_seconds"], 1800))
+    return out
+
+
 def _load_default_credentials() -> Dict[str, Any]:
     p = _kn_path("default_credentials.yaml")
     if not p:
@@ -453,6 +484,8 @@ def run_default_cred_check(cur, host: str, login_page_url: str, *,
     if isinstance(out.get("auth_profile"), dict) and out["auth_profile"].get("ok"):
         import time
         rc = cfg.get("authenticated_rescan") or {}
+        zc = _zap_crawl_settings(cur, cfg)   # ZAP settings (app_settings) > YAML > defaults
+        out["auth_crawl_settings"] = zc
         base = f"{scheme}://{scan_host}/"
         hdr = {"X-Engagement-Id": str(engagement_id or "")}
         try:
@@ -461,12 +494,12 @@ def run_default_cred_check(cur, host: str, login_page_url: str, *,
                 if rc.get("crawl_first", True):
                     cr = cli.post(f"{pw_url.rstrip('/')}/crawl",
                                   json={"url": base, "engagement_id": engagement_id,
-                                        "max_pages": int(rc.get("max_pages", 60)),
+                                        "max_pages": zc["max_pages"], "max_depth": zc["max_depth"],
                                         "use_zap_proxy": True},
                                   headers=hdr)
                     cj = cr.json().get("job_id") if cr.status_code < 400 else None
                     out["authenticated_crawl"] = {"dispatched": cr.status_code < 400, "job_id": cj}
-                    deadline = time.time() + int(rc.get("crawl_wait_seconds", 180))
+                    deadline = time.time() + zc["wait_seconds"]
                     while cj and time.time() < deadline:
                         time.sleep(6)
                         try:
