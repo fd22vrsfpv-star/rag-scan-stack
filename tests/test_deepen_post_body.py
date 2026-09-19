@@ -68,6 +68,14 @@ def test_impactful_deepen_routes_to_pending_exploits():
     hbody = ast.get_source_segment(src, helper)
     assert "INSERT INTO pending_exploits" in hbody, "impactful deepen must queue a pending_exploit"
     assert "'pending'" in hbody, "queued pending_exploit must be status pending (needs approval)"
+    # Must dispatch as source='command' so the runner runs the raw curl/sqlmap via
+    # /vectors/run (POST-capable). source='web_poc'/category='webapp' would route to
+    # the Playwright path, which needs metadata.payload and drops the command.
+    assert "'command'" in hbody, "impactful deepen must queue source='command' (raw command lane)"
+    assert "'web_poc'" not in hbody and "'webapp'" not in hbody, \
+        "must NOT use the web_poc/webapp path (it ignores customized_command)"
+    # A neutral title — an injection keyword would re-route to the webapp lane.
+    assert "deepen confirmation probe" in hbody, "title must be neutral (no injection keyword)"
     # both deepen paths branch on the impactful tier
     for fname in ("deepen_web_finding", "_deepen_info_findings"):
         fn = next((n for n in ast.walk(ast.parse(src))
