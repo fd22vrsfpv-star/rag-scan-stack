@@ -2033,6 +2033,96 @@ def _login_fields(login_data: str):
     return user_field, pass_field
 
 
+_IDOR_NAME_RE = __import__("re").compile(
+    r"(?i)(^id$|_id$|acct|account|user$|uid|customer|profile|order|invoice|doc|file|record|msg|ticket|num$|no$|number)")
+
+
+async def _idor_mutate_probe(ctx, base_url: str, host: str, engagement_id, job_id: str,
+                             max_candidates: int = 8) -> int:
+    """Single-credential IDOR / object-reference probe.
+
+    As the ALREADY-LOGGED-IN user, take URLs whose parameters look like object
+    references (id-like name, or a numeric value) and re-request them with mutated
+    numeric ids in the SAME authenticated browser context. Flag a potential IDOR
+    when a mutated id returns a distinct, substantive 200 that is NOT a login/error
+    page — i.e. the account reached a DIFFERENT object it may not own. This covers
+    the case where we DON'T have a second credential (the two-user path uses ZAP's
+    accessControl add-on). Heuristic + bounded; findings are 'medium'.
+
+    NB: only GET numeric object-refs are mutated (safe + meaningful). POST-body
+    object-refs (e.g. testfire's showAccount account number) need POST-param
+    discovery and are not covered here yet."""
+    import re
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+    from db_utils import get_db
+
+    # Candidate (url, param) from discovered_params + crawled URLs with numeric query values.
+    cands = []
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""SELECT DISTINCT url_pattern, param_name, sample_values
+                             FROM discovered_params dp JOIN assets a ON a.id = dp.asset_id
+                            WHERE ip = %s AND http_method = 'GET'""", (host,))
+            for up, pn, samples in cur.fetchall():
+                sample = (samples[0] if samples else "")
+                if _IDOR_NAME_RE.search(pn or "") or str(sample).isdigit():
+                    cands.append((up, pn, sample))
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[idor:{job_id[:8]}] param load failed: {e}")
+    cands = cands[:max_candidates]
+    if not cands:
+        return 0
+
+    def _build(pu, q, param, value):
+        q2 = {k: (v[0] if isinstance(v, list) else v) for k, v in q.items()}
+        q2[param] = str(value)
+        return urlunparse(pu._replace(query=urlencode(q2)))
+
+    found = 0
+    page = await ctx.new_page()
+    try:
+        for up, pn, sample in cands:
+            pu = urlparse(up)
+            q = parse_qs(pu.query)
+            base_val = (q.get(pn, [sample])[0] if q.get(pn) else sample)
+            if not str(base_val).isdigit():
+                continue  # only mutate numeric object refs (safe, low-FP)
+            try:
+                await page.goto(_build(pu, q, pn, base_val), wait_until="domcontentloaded", timeout=15000)
+                orig = await page.content()
+                n = int(base_val)
+                hits = []
+                for mv in (n + 1, n - 1, n + 2):
+                    if mv < 0:
+                        continue
+                    await page.goto(_build(pu, q, pn, mv), wait_until="domcontentloaded", timeout=15000)
+                    body = await page.content()
+                    if (len(body) > 500 and body != orig
+                            and not re.search(r"(?i)sign ?in|log ?in|not authori[sz]ed|access denied|forbidden|error", body[:2500])):
+                        hits.append(mv)
+                if hits:
+                    found += 1
+                    with get_db() as conn, conn.cursor() as cur:
+                        cur.execute("SELECT id FROM assets WHERE host(ip)=%s LIMIT 1", (host,))
+                        r = cur.fetchone()
+                        cur.execute(
+                            """INSERT INTO web_findings
+                                 (asset_id, url, source, issue_type, name, severity, param,
+                                  evidence, method, engagement_id)
+                               VALUES (%s,%s,'idor_probe','idor',
+                                       'Potential IDOR (object reference)','medium',%s,%s,'GET',%s)
+                               ON CONFLICT DO NOTHING""",
+                            (r[0] if r else None, _build(pu, q, pn, hits[0]), pn,
+                             f"authenticated request with {pn}={n} mutated to {hits} returned distinct "
+                             f"content (possible access to another object)"[:300], engagement_id))
+                        conn.commit()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"[idor:{job_id[:8]}] probe {up} err: {e}")
+    finally:
+        await page.close()
+    return found
+
+
 async def _browser_login(page, auth: Dict) -> bool:
     """Best-effort form login in the browser so the crawl (and the ZAP site tree
     it seeds) is authenticated. Parses the login_data template to find the
@@ -2275,6 +2365,18 @@ async def _perform_crawl(job_id: str, req: CrawlRequest):
                 except Exception as e:
                     logger.debug(f"[crawl:{job_id[:8]}] Failed to load {url}: {e}")
                     continue
+
+            # IDOR: single-credential object-reference probe, reusing this
+            # authenticated context — only meaningful once logged in.
+            if job.get("authenticated"):
+                try:
+                    _eng = _eid
+                    n = await _idor_mutate_probe(ctx, req.url, urlparse(req.url).hostname or "", _eng, job_id)
+                    job["idor_findings"] = n
+                    if n:
+                        logger.info(f"[crawl:{job_id[:8]}] IDOR probe flagged {n} potential object-reference issue(s)")
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"[crawl:{job_id[:8]}] IDOR probe failed: {e}")
 
             await ctx.close()
             await browser.close()
