@@ -2846,6 +2846,15 @@ async def wordlist_inventory(max_files: int = 2000, min_lines: int = 2,
             "wordlists": out}
 
 
+# Timeout policy for the offensive command lanes (/vectors/run, /access/run).
+# These run ONE approved, scope-gated command (e.g. a sqlmap confirmation at a
+# higher --level/--risk, an nfs mount, a backdoor kick) that can legitimately run
+# for minutes — the old 180s hard cap truncated sqlmap mid-run. Configurable so an
+# operator can lengthen it without a code change; still bounded (fail-safe).
+VECTOR_RUN_DEFAULT_TIMEOUT = int(os.environ.get("VECTOR_RUN_TIMEOUT", "600"))
+VECTOR_RUN_MAX_TIMEOUT = int(os.environ.get("VECTOR_RUN_MAX_TIMEOUT", "1800"))
+
+
 class AccessRunRequest(BaseModel):
     """Run one command through access the platform already holds."""
     kind: str = Field(..., description="msf_session | bind_shell | ssh_credential | listener_callback")
@@ -2898,7 +2907,7 @@ class VectorRunRequest(BaseModel):
     command: str
     target: str = ""
     port: Optional[int] = None
-    timeout: int = 60
+    timeout: int = VECTOR_RUN_DEFAULT_TIMEOUT
 
 
 @app.post("/vectors/run")
@@ -2920,7 +2929,8 @@ def vectors_run(request: VectorRunRequest):
     if refusal:
         logger.warning("REFUSED vector run on %s: %s", request.target, refusal)
         raise HTTPException(403, f"out of scope: {refusal}")
-    to = max(5, min(int(request.timeout or 60), 180))
+    to = max(5, min(int(request.timeout or VECTOR_RUN_DEFAULT_TIMEOUT),
+                    VECTOR_RUN_MAX_TIMEOUT))
     try:
         proc = subprocess.run(cmd, shell=True, capture_output=True,
                               text=True, timeout=to)
