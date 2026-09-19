@@ -40,7 +40,9 @@ REQUIRED = {
                                    "asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)"],
     "list_content_extractions":   ["_resolve_engagement_id",
                                    "ce.asset_id IN (SELECT id FROM assets WHERE engagement_id = %s::uuid)"],
-    "search_findings":            ["_resolve_engagement_id", "engagement_id = %s::uuid"],
+    # search_findings filters over a UNION that selects engagement_id::text, so
+    # it compares as text (a `= %s::uuid` here raises text = uuid).
+    "search_findings":            ["_resolve_engagement_id", 'engagement_id = %s")'],
     "assets_pending_exploit_counts": ["_resolve_engagement_id", "pe.engagement_id = %s::uuid"],
     "identities_credential_state": ["_resolve_engagement_id",
                                     "identity_id IN (SELECT id FROM identities WHERE engagement_id = %s::uuid)"],
