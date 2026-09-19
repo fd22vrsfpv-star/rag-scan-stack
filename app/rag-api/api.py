@@ -19451,9 +19451,13 @@ class QueuePocRequest(BaseModel):
 @app.post("/findings/{source}/{fid}/deepen", tags=["Findings"])
 def deepen_finding_endpoint(source: str, fid: str, request: dict = None,
                             authorized: bool = Depends(auth)):
-    """Operator-initiated "Deepen this finding": synthesize ONE read-only probe
-    for the finding (router deepen role, force=True), scope-gate it, and queue it
-    pending. Web findings only. Body/query: {engagement_id?}."""
+    """Operator-initiated "Deepen this finding": synthesize ONE confirmation probe
+    for the finding (router deepen role, force=True), scope-gate it, and queue it.
+    METHOD-AWARE: a GET finding gets a read-only probe queued to the safe lane
+    (tier='safe'); a state-changing (POST/PUT/PATCH/DELETE) finding — e.g. a
+    POST-body SQLi — gets an impactful POST/sqlmap confirmation queued to the
+    APPROVAL lane (tier='impactful', requires_approval=true, pending_exploit_id).
+    Web findings only. Body/query: {engagement_id?}."""
     if source not in ("web", "web_findings"):
         raise HTTPException(400, "deepen currently supports web findings only")
     try:
