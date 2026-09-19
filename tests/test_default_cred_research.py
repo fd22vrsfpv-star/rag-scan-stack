@@ -107,3 +107,21 @@ def test_zap_auth_crawl_settings_configurable():
     if os.path.exists(pw):
         s = open(pw, encoding="utf-8").read()
         assert "seeded post-login landing" in s, "the crawl must seed the post-login landing page"
+
+
+def test_ajax_spider_off_by_default_optional():
+    """The ZAP ajax spider (browser-based, memory-heavy) is OFF by default and an
+    optional toggle — not run unless explicitly enabled."""
+    zb = os.path.join(REPO, "playwright_scanner", "zap_bridge.py")
+    pw = os.path.join(REPO, "playwright_scanner", "playwright_scanner.py")
+    for p in (zb, pw):
+        if not os.path.exists(p):
+            pytest.skip(f"{p} missing")
+    zbs = open(zb, encoding="utf-8").read()
+    assert "do_ajax_spider: bool = False" in zbs, "ajax spider must default OFF in the scan"
+    assert "if do_ajax_spider:" in zbs and "ajaxSpider" in zbs
+    pws = open(pw, encoding="utf-8").read()
+    assert "zap_ajax_spider: Optional[bool] = Field(False" in pws, "ScanRequest ajax spider must default False"
+    chk = _src(CHECK)
+    assert "zap.ajax_spider" in chk and '"zap_ajax_spider"' in chk, \
+        "the check must read the optional zap.ajax_spider setting and pass it"
