@@ -12157,10 +12157,13 @@ def research_default_credentials(product: str, version: str = "", proxy: str = N
             return (cached[0].get("results") or {}).get("pairs", []) or []
     # Gather web evidence.
     snippets = []
-    for q in (f"{product} {version} default credentials".strip(),
-              f"{product} default username and password",
-              f"{product} default login admin password"):
-        for r in ddg_search(q, max_results=8, proxy=proxy):
+    # Few, broad queries — DuckDuckGo rate-limits rapid scraping (each extra query
+    # brings the block closer), so cast wide per query rather than many queries.
+    # Reliability comes from the configurable web_research.proxy (rotate egress)
+    # and the task='web_search' LLM backup, not from query count.
+    for q in (f"{product} {version} default credentials demo account".strip(),
+              f"{product} default username and password login"):
+        for r in ddg_search(q, max_results=12, proxy=proxy):
             blob = f"{r.get('title','')} — {r.get('snippet','')}".strip(" —")
             if blob:
                 snippets.append(f"- {blob} ({r.get('url','')})")
@@ -12172,11 +12175,13 @@ def research_default_credentials(product: str, version: str = "", proxy: str = N
             "You are extracting DOCUMENTED DEFAULT credentials for a product from web "
             "search snippets, for AUTHORIZED security testing.\n"
             f"Product: {product} {version}\n\nSearch results:\n" + "\n".join(snippets[:24]) +
-            "\n\nReturn ONLY a JSON array of the default credential pairs explicitly "
-            'mentioned, most-relevant first: [{"username":"...","password":"...",'
-            '"note":"<where/what>"}]. Use empty string for a blank password. Include a '
-            "pair only if the text states it as a default/demo/built-in credential FOR "
-            "THIS product. If none are stated, return []. No prose, JSON only.")
+            "\n\nExtract EVERY credential pair the text states as a default/demo/"
+            "test/built-in account FOR THIS product — there are often several "
+            "(e.g. multiple demo users sharing one password). Return ONLY a JSON "
+            'array, most-relevant first: [{"username":"...","password":"...",'
+            '"note":"<where/what>"}]. Watch for "user/pass", "user : pass" and '
+            '"User, pass" formats. Use empty string for a blank password. If none '
+            "are stated, return []. No prose, JSON only.")
         _task, _caller = "analyze", "default_cred_research"
     else:
         # BACKUP: LLM-as-web-search. When DDG returns nothing (blocked/rate-limited),
