@@ -21,12 +21,17 @@
 default_cred_check:
   max_auto_attempts: 24          # <= this -> safe lane (auto). above -> approval.
   max_total_attempts: 120        # hard ceiling regardless of approval (not a brute force)
-  # Extra web-app login defaults (the app's own accounts), beyond the service
-  # defaults in default_credentials.yaml. user:pass pairs.
+  # Web+LLM research of the app's OWN default creds (DuckDuckGo + LLM, keyed on the
+  # login page <title> and the host's detected products) — so app-specific defaults
+  # like jsmith:demo1234 for "Altoro Mutual" are DISCOVERED, not hardcoded, and
+  # stored as unvalidated accounts. See app/rag-api /software/default-credentials.
+  research_defaults: true
+  # Generic web-app login fallbacks (kept product-agnostic; app-specific accounts
+  # come from research_defaults above, not from this list).
   app_login:
     - {username: admin,  password: admin}
     - {username: admin,  password: password}
-    - {username: jsmith, password: demo1234}
+    - {username: administrator, password: administrator}
     - {username: guest,  password: guest}
     - {username: tomcat, password: tomcat}
   # Success detection: a working login differs from a known-bad baseline — it
