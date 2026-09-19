@@ -52,6 +52,10 @@ def test_surface_phase_waits_before_building_tests():
     assert "_wait_for_web_pipeline(" in src, "surface phase must call _wait_for_web_pipeline"
     assert 'wait_for_web_pipeline"' in src or "wait_for_web_pipeline'" in src, (
         "the wait must be gated by the wait_for_web_pipeline session-config flag")
+    assert "_WEB_PIPELINE_WAIT_SECONDS_DEEP" in src and "_web_wait_cap" in src, (
+        "a deep web_profile must get a longer wait cap via _web_wait_cap")
+    assert "_web_wait_cap(eng)" in src, (
+        "the surface phase must use the profile-aware cap (_web_wait_cap)")
     assert "_WEB_PIPELINE_WAIT_SECONDS = int(os.environ.get(" in src, (
         "WEB_PIPELINE_WAIT_SECONDS must be a configurable bound")
 
