@@ -303,7 +303,7 @@ async def search_findings(
 
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as client:
         resp = await client.get(
-            f"{RAG_API_URL}/findings",
+            f"{RAG_API_URL}/findings/search",
             headers=_headers(),
             params=params
         )

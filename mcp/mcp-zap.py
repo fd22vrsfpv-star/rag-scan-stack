@@ -167,7 +167,7 @@ async def import_zap_xml_report(
         files = {"file": ("zap_report.xml", xml_content.encode("utf-8"), "application/xml")}
         # Try the generic findings ingest which handles ZAP XML
         resp = await client.post(
-            f"{RAG_API_URL}/ingest/generic",
+            f"{RAG_API_URL}/ingest/zap",
             headers=_headers(),
             files=files,
             data={"source": "zap"}
@@ -258,7 +258,7 @@ async def search_zap_findings(
 
     async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as client:
         resp = await client.get(
-            f"{RAG_API_URL}/findings",
+            f"{RAG_API_URL}/findings/search",
             headers=_headers(),
             params=params
         )
