@@ -341,9 +341,31 @@ def _render_msf_readonly_scanners(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_owasp_param_tests(data: Dict[str, Any]) -> List[Doc]:
+    """OWASP parameter-test specs -> one doc each, so the planner can retrieve
+    which app-layer probe (SQLi/XSS/LFI/SSI/HPP/IDOR) the surface phase runs per
+    crawled parameter, and with what payload/assertion, as knowledge not code."""
+    docs: List[Doc] = []
+    for row in (data.get("param_tests") or []):
+        if not isinstance(row, dict):
+            continue
+        cat = row.get("category")
+        if not cat:
+            continue
+        docs.append((
+            f"OWASP param test: {cat} ({row.get('tool','curl')})",
+            f"For a crawled parameter the surface phase runs `{row.get('command')}` "
+            f"({row.get('wstg','WSTG')}, {'impactful' if row.get('impactful') else 'safe'}) "
+            f"to test {cat}"
+            + (f", restricted to {row.get('param_set')} parameters" if row.get('param_set') else "")
+            + "."))
+    return docs
+
+
 RENDERERS = {
     "msf_learned_options": _render_msf_learned_options,
     "msf_readonly_scanners": _render_msf_readonly_scanners,
+    "owasp_param_tests": _render_owasp_param_tests,
     "dos_exploit_overrides": _render_dos_exploit_overrides,
     "enumeration_extractors": _render_enumeration_extractors,
     "postex_commands": _render_postex_commands,
