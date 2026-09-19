@@ -159,29 +159,72 @@ def _get_setting(key: str, default: str = "") -> str:
     return default
 
 
+_DDG_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+
+def _ddg_parse_html(text: str, max_results: int) -> list:
+    """Parse the html.duckduckgo.com/html/ result page -> [{title,url,snippet}]."""
+    out, seen = [], set()
+    # Each result: <a class="result__a" href="URL">TITLE</a> ... <a class="result__snippet">SNIPPET</a>
+    anchors = _re_module.findall(
+        r'result__a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', text, _re_module.DOTALL)
+    snippets = [_re_module.sub(r'<[^>]+>', '', s).strip()
+                for s in _re_module.findall(r'result__snippet[^>]*>(.*?)</a>', text, _re_module.DOTALL)]
+    for i, (href, title_html) in enumerate(anchors[:max_results]):
+        # DDG wraps external URLs as //duckduckgo.com/l/?uddg=ENCODED
+        url = href
+        if "uddg=" in href:
+            u = href if "://" in href else "https:" + href
+            url = _unquote(_parse_qs(_urlparse_fn(u).query).get("uddg", [href])[0])
+        if url in seen:
+            continue
+        seen.add(url)
+        title = _re_module.sub(r'<[^>]+>', '', title_html).strip()
+        snippet = (snippets[i][:300] if i < len(snippets) else "")
+        out.append({"title": title, "url": url, "snippet": snippet})
+    return out
+
+
 def ddg_search(query: str, max_results: int = 15, timeout: float = 10.0, proxy: str = None) -> list:
-    """Search DuckDuckGo via lite endpoint. Returns list of {title, url, snippet}."""
-    results = []
-    proxy_url = proxy or DDG_PROXY
+    """Search DuckDuckGo. Returns list of {title, url, snippet}.
+
+    Uses the html.duckduckgo.com/html/ POST endpoint (returns 200 with parseable
+    result__a/result__snippet blocks). The old lite endpoint now answers 202 with
+    an anti-bot interstitial and no parseable links, so it silently returned
+    nothing — every web-search consumer (CVE research, default-cred lookup) got an
+    empty list. The lite GET is kept as a fallback."""
+    # Proxy is a configurable OPSEC option: an explicit arg wins, else the
+    # operator setting `web_research.proxy` (Settings), else the DDG_PROXY env,
+    # else direct. Empty = search egresses from this host's own IP, which reveals
+    # what products/targets are being researched — set a SOCKS proxy to avoid that.
+    proxy_url = proxy or _get_setting("web_research.proxy", DDG_PROXY)
     proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
+    headers = {"User-Agent": _DDG_UA}
+    # Primary: HTML POST endpoint.
+    try:
+        resp = requests.post("https://html.duckduckgo.com/html/",
+                             data={"q": query}, headers=headers,
+                             timeout=timeout, verify=False, proxies=proxies)
+        if resp.status_code == 200:
+            parsed = _ddg_parse_html(resp.text, max_results)
+            if parsed:
+                return parsed
+    except Exception:  # noqa: BLE001
+        pass
+    # Fallback: lite endpoint (older format), accept 200/202.
     try:
         resp = requests.get("https://lite.duckduckgo.com/lite/",
-            params={"q": query},
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            params={"q": query}, headers=headers,
             timeout=timeout, verify=False, proxies=proxies)
-        if resp.status_code != 200:
-            return results
-
-        # Extract result links (DDG lite format: //duckduckgo.com/l/?uddg=ENCODED_URL)
+        if resp.status_code not in (200, 202):
+            return []
         raw_links = _re_module.findall(r'href="(//duckduckgo\.com/l/\?uddg=[^"]+)"', resp.text)
-        # Extract titles: text between <a> tags with result-link class or nofollow
         title_matches = _re_module.findall(
             r'<a[^>]*rel="nofollow"[^>]*>(.*?)</a>', resp.text, _re_module.DOTALL)
-        # Extract snippets: <td> with class="result-snippet"
         snippet_matches = _re_module.findall(
             r'class="result-snippet"[^>]*>(.*?)</td>', resp.text, _re_module.DOTALL)
-
-        seen = set()
+        results, seen = [], set()
         for i, raw_url in enumerate(raw_links[:max_results]):
             url = "https:" + raw_url
             actual_url = _unquote(_parse_qs(_urlparse_fn(url).query).get("uddg", [url])[0])
@@ -191,9 +234,9 @@ def ddg_search(query: str, max_results: int = 15, timeout: float = 10.0, proxy: 
             title = _re_module.sub(r'<[^>]+>', '', title_matches[i]).strip() if i < len(title_matches) else ""
             snippet = _re_module.sub(r'<[^>]+>', '', snippet_matches[i]).strip()[:300] if i < len(snippet_matches) else ""
             results.append({"title": title, "url": actual_url, "snippet": snippet})
-    except Exception:
-        pass
-    return results
+        return results
+    except Exception:  # noqa: BLE001
+        return []
 
 
 # ── LLM call helper with automatic metrics logging ──
@@ -12095,6 +12138,142 @@ def _load_research_cache(product: str, version: str, source: str = None) -> list
         return []
 
 
+def research_default_credentials(product: str, version: str = "", proxy: str = None,
+                                 max_pairs: int = 20, refresh: bool = False) -> list:
+    """Web-research the DEFAULT credentials for a product/app (tomcat, wordpress,
+    a router, or an app fingerprint like 'Altoro Mutual'). DuckDuckGo + LLM: search
+    for documented defaults, let the LLM extract username/password pairs from the
+    result snippets, cache the result. Returns [{username, password, source_url}].
+
+    Cached in software_research_cache (source='default_credentials') so a product
+    is researched once. These are CANDIDATES — the default-cred check validates
+    them against the live login before anything is marked valid."""
+    product = (product or "").strip()
+    if not product:
+        return []
+    if not refresh:
+        cached = _load_research_cache(product, version or "", source="default_credentials")
+        if cached:
+            return (cached[0].get("results") or {}).get("pairs", []) or []
+    # Gather web evidence.
+    snippets = []
+    for q in (f"{product} {version} default credentials".strip(),
+              f"{product} default username and password",
+              f"{product} default login admin password"):
+        for r in ddg_search(q, max_results=8, proxy=proxy):
+            blob = f"{r.get('title','')} — {r.get('snippet','')}".strip(" —")
+            if blob:
+                snippets.append(f"- {blob} ({r.get('url','')})")
+        if len(snippets) >= 24:
+            break
+    if snippets:
+        # Primary: extract from DuckDuckGo result snippets (task='analyze').
+        prompt = (
+            "You are extracting DOCUMENTED DEFAULT credentials for a product from web "
+            "search snippets, for AUTHORIZED security testing.\n"
+            f"Product: {product} {version}\n\nSearch results:\n" + "\n".join(snippets[:24]) +
+            "\n\nReturn ONLY a JSON array of the default credential pairs explicitly "
+            'mentioned, most-relevant first: [{"username":"...","password":"...",'
+            '"note":"<where/what>"}]. Use empty string for a blank password. Include a '
+            "pair only if the text states it as a default/demo/built-in credential FOR "
+            "THIS product. If none are stated, return []. No prose, JSON only.")
+        _task, _caller = "analyze", "default_cred_research"
+    else:
+        # BACKUP: LLM-as-web-search. When DDG returns nothing (blocked/rate-limited),
+        # a search/browsing-capable model configured by the operator answers
+        # directly. Routable via task='web_search' so the operator maps it to the
+        # right backend in the LLM task-routing config.
+        prompt = (
+            "Using your web knowledge, for AUTHORIZED security testing, list the "
+            f"DOCUMENTED DEFAULT credentials for the product/app: {product} {version}. "
+            'Return ONLY a JSON array [{"username":"...","password":"...","note":"..."}] '
+            "of documented default/demo/built-in credentials, most-relevant first; "
+            "empty string for a blank password; [] if there are none. JSON only.")
+        _task, _caller = "web_search", "default_cred_research_websearch"
+    try:
+        res = llm_generate(prompt, caller=_caller, task=_task, num_predict=1024)
+    except TypeError:
+        res = llm_generate(prompt, caller=_caller)
+    pairs = []
+    if res.get("ok"):
+        txt = _re_module.sub(r'```(?:json)?\s*', '', res.get("response", ""))
+        m = _re_module.search(r'\[.*\]', txt, _re_module.DOTALL)
+        if m:
+            try:
+                for p in json.loads(m.group()):
+                    if isinstance(p, dict) and p.get("username") is not None and p.get("password") is not None:
+                        u, pw = str(p["username"]).strip(), str(p["password"]).strip()
+                        if u and len(u) <= 128 and len(pw) <= 128 and "\n" not in u and "\n" not in pw:
+                            pairs.append({"username": u, "password": pw, "note": str(p.get("note", ""))[:160]})
+            except json.JSONDecodeError:
+                pass
+    pairs = pairs[:max_pairs]
+    _save_research_cache(product, version or "", "default_credentials",
+                         {"pairs": pairs, "sources": len(snippets)}, [])
+    return pairs
+
+
+def _store_researched_cred_candidates(product: str, version: str, pairs: list) -> int:
+    """Store researched default-cred pairs as UNVALIDATED candidate accounts for
+    every asset running this product (from detected_software): credential_findings
+    with valid_cred=false, status='unvalidated', source='default_cred_research'. The
+    default-credential check promotes one to valid if it logs in. Returns count."""
+    if not pairs:
+        return 0
+    from psycopg2.extras import Json as _Json
+    n = 0
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""SELECT DISTINCT asset_id, ip, port FROM detected_software
+                            WHERE LOWER(product) = LOWER(%s) AND asset_id IS NOT NULL""",
+                        (product,))
+            for asset_id, ip, port in cur.fetchall():
+                if not ip:
+                    continue
+                cur.execute("SELECT engagement_id FROM assets WHERE id=%s", (asset_id,))
+                er = cur.fetchone()
+                eng = er[0] if er else None
+                for p in pairs:
+                    try:
+                        cur.execute("""
+                            INSERT INTO credential_findings
+                              (asset_id, ip, port, protocol, username, secret_value,
+                               secret_type, valid_cred, auth_type, severity, source,
+                               status, engagement_id, metadata)
+                            VALUES (%s,%s,%s,'http',%s,%s,'password',false,'form','info',
+                                    'default_cred_research','unvalidated',%s,%s)
+                            ON CONFLICT DO NOTHING""",
+                            (asset_id, ip, port, p["username"], p["password"], eng,
+                             _Json({"product": product, "version": version,
+                                    "note": p.get("note", ""), "via": "default_cred_research"})))
+                        n += 1
+                    except Exception:  # noqa: BLE001
+                        conn.rollback()
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("store researched cred candidates failed: %s", e)
+    return n
+
+
+class DefaultCredResearchReq(BaseModel):
+    product: str
+    version: str = ""
+    refresh: bool = False
+
+
+@app.post("/software/default-credentials", tags=["Assets"])
+def software_default_credentials(body: DefaultCredResearchReq, authorized: bool = Depends(auth)):
+    """Web-research (DuckDuckGo + LLM) the documented default credentials for a
+    product or app fingerprint (e.g. 'Apache Tomcat', 'WordPress', 'Altoro
+    Mutual'). Returns {product, pairs:[{username,password,note}]} — CANDIDATES, not
+    validated. Cached; also stored as unvalidated accounts for assets running the
+    product. The web search routes through the configurable web_research.proxy."""
+    pairs = research_default_credentials(body.product, body.version, refresh=body.refresh)
+    stored = _store_researched_cred_candidates(body.product, body.version, pairs)
+    return {"ok": True, "product": body.product, "version": body.version,
+            "pairs": pairs, "count": len(pairs), "stored_candidates": stored}
+
+
 @app.get("/software/research-cache", tags=["Assets"])
 def get_research_cache(
     product: str = Query(...),
@@ -13361,6 +13540,19 @@ def _do_ddg_search(product: str, version: str, _ddg_start, _ddg_time, _job_id: s
         except Exception:
             pass
         _save_research_cache(product, version, "ddg_search", response, all_found_cves)
+
+    # Also pull DEFAULT CREDENTIALS for this app (tomcat/wordpress/app fingerprint,
+    # etc.) — same web+LLM research, cached separately. Candidates are stored as
+    # UNVALIDATED accounts against every asset running this product; the
+    # default-credential check validates them against the live login later.
+    try:
+        _cred_pairs = research_default_credentials(product, version)
+        if _cred_pairs:
+            _store_researched_cred_candidates(product, version, _cred_pairs)
+            logger.info("[ddg-search] %d default-credential candidate(s) for %s %s",
+                        len(_cred_pairs), product, version)
+    except Exception as _e:  # noqa: BLE001
+        logger.warning("[ddg-search] default-cred research failed for %s: %s", product, _e)
 
     elapsed = round(_ddg_time.time() - _ddg_start, 1)
     logger.info("[ddg-search] Complete for %s %s: %d NVD, %d web, %d analysis, %d flagged in %.1fs",
