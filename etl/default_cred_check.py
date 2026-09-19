@@ -120,6 +120,57 @@ def candidate_pairs(port: Optional[int], cfg: Dict[str, Any]) -> List[Tuple[str,
     return out[: int(cfg.get("max_total_attempts", 120))]
 
 
+def _research_host_default_creds(cur, host: str, html: str) -> List[Tuple[str, str]]:
+    """Web+LLM research of default creds for THIS host's apps, so candidates are
+    DISCOVERED, not hardcoded. Research terms: the login page <title> (the app
+    fingerprint, e.g. 'Altoro Mutual') + the host's detected_software products
+    (tomcat, apache, wordpress...). Calls rag-api /software/default-credentials
+    (DuckDuckGo + LLM, proxy-configurable), which also stores the pairs as
+    UNVALIDATED accounts. Also folds in any previously-stored researched
+    candidates for the host. Best-effort -> [] on any failure."""
+    import re as _re
+    terms: List[str] = []
+    m = _re.search(r"<title[^>]*>(.*?)</title>", html or "", _re.I | _re.S)
+    if m:
+        t = _re.sub(r"\s+", " ", _re.sub(r"<[^>]+>", "", m.group(1))).strip()
+        if 2 <= len(t) <= 60:
+            terms.append(t)
+    try:
+        cur.execute("""SELECT DISTINCT product FROM detected_software
+                        WHERE host(ip)=%s AND product IS NOT NULL AND product <> '' LIMIT 5""",
+                    (host,))
+        terms += [r[0] for r in cur.fetchall() if r[0]]
+    except Exception:  # noqa: BLE001
+        pass
+    seen_terms, pairs = set(), []
+    import httpx
+    for term in terms[:4]:
+        tl = term.strip().lower()
+        if not tl or tl in seen_terms:
+            continue
+        seen_terms.add(tl)
+        try:
+            with httpx.Client(verify=False, timeout=45) as cli:
+                r = cli.post(f"{RAG_API_URL.rstrip('/')}/software/default-credentials",
+                             json={"product": term}, headers={"x-api-key": API_KEY})
+                if r.status_code < 400:
+                    for p in (r.json().get("pairs") or []):
+                        u, pw = str(p.get("username", "")), str(p.get("password", ""))
+                        if u:
+                            pairs.append((u, pw))
+        except Exception as e:  # noqa: BLE001
+            log.debug("default-cred research for %r failed: %s", term, e)
+    # previously-stored researched candidates for this host
+    try:
+        cur.execute("""SELECT DISTINCT username, secret_value FROM credential_findings
+                        WHERE host(ip)=%s AND source='default_cred_research'
+                          AND username IS NOT NULL AND secret_value IS NOT NULL""", (host,))
+        pairs += [(u, pw) for u, pw in cur.fetchall() if u]
+    except Exception:  # noqa: BLE001
+        pass
+    return list(dict.fromkeys(pairs))
+
+
 def _run_tool(tool: str, command: str, host: str, port: int, *, lane: str,
               timeout: int = 30) -> str:
     """Dispatch via the listener and return stdout. lane='safe' -> /tools/execute
@@ -238,7 +289,11 @@ def run_default_cred_check(cur, host: str, login_page_url: str, *,
     # auto run tries the top `max_auto_attempts` (highest-value first, so admin:admin
     # is always tried); if none work and the full set is larger, the fuller spray is
     # queued for operator APPROVAL. force=True (the approval path) runs the full set.
-    pairs = candidate_pairs(port, cfg)
+    # DISCOVERED candidates first (web+LLM research of this app's default creds —
+    # e.g. jsmith:demo1234 for 'Altoro Mutual'), then the static documented set.
+    researched = _research_host_default_creds(cur, host, html) if cfg.get("research_defaults", True) else []
+    out["researched_candidates"] = len(researched)
+    pairs = list(dict.fromkeys(researched + candidate_pairs(port, cfg)))
     out["candidates"] = len(pairs)
     threshold = int(cfg.get("max_auto_attempts", 24))
     run_set = pairs if force else pairs[:threshold]
