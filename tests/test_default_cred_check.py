@@ -108,8 +108,23 @@ def test_over_threshold_requires_approval_gate_present():
     assert "not force and len(pairs) > threshold" in body, \
         "must queue the fuller spray for approval when candidates exceed the setting"
     assert '"requires_approval": True' in body
-    assert "auto-populate" in body or "auto-populate" in src, "success must auto-populate an Auth Profile"
+    assert "/web-auth" in src, "success must upsert an Auth Profile via /web-auth (keyed by hostname)"
+    assert "authenticated_scan" in src, "success must trigger an authenticated scan (Gap 2)"
     assert "credential_findings" in body, "a working default cred must be recorded"
+
+
+def test_pipeline_resolves_stored_auth_profile():
+    """Gap #1: the web_scanner pipeline resolves a stored Auth Profile when the
+    caller passed no explicit auth, so the ZAP stage runs authenticated."""
+    ws = os.path.join(REPO, "web_scanner", "web_scan.py")
+    if not os.path.exists(ws):
+        pytest.skip("web_scan.py missing")
+    src = open(ws, encoding="utf-8").read()
+    assert "def _resolve_scan_auth" in src, "pipeline auth resolver missing"
+    assert "if auth is None:" in src and "_resolve_scan_auth(target_url" in src, \
+        "pipeline job must resolve a stored profile when no explicit auth is given"
+    assert "engagement_id: Optional[str] = None" in src, "pipeline must accept engagement_id"
+    assert "credential_findings" in src, "resolver must resolve the secret from credential_findings"
 
 
 def test_wired_into_post_enum_and_api():
