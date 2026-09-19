@@ -37,5 +37,12 @@ default_cred_check:
   # Forms protected by a CSRF token are NOT auto-tested (a token must be fetched
   # per request); they are reported for manual review instead.
   skip_csrf: true
+  # On a working credential, auto-populate an Auth Profile and trigger an
+  # AUTHENTICATED re-scan (Playwright /scan resolves the profile -> ZAP spider +
+  # active scan run logged-in, reaching the authenticated area a link-only crawl
+  # can't). Toggle the stages here.
+  authenticated_rescan:
+    zap_spider: true
+    zap_active_scan: true
   priority: 26
   followup_tag: default_cred_check
