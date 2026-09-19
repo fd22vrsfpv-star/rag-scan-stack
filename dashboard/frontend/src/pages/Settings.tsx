@@ -229,6 +229,7 @@ const ZAP_AUTH_CRAWL_KEYS = [
 
 function ZapAuthCrawlPanel() {
   const [vals, setVals] = useState<Record<string, string>>({})
+  const [ajax, setAjax] = useState(false)
   const [msg, setMsg] = useState('')
   useEffect(() => {
     ZAP_AUTH_CRAWL_KEYS.forEach(({ key, def }) => {
@@ -237,6 +238,10 @@ function ZapAuthCrawlPanel() {
         .then(d => setVals(v => ({ ...v, [key]: String(d?.value ?? def) })))
         .catch(() => setVals(v => ({ ...v, [key]: def })))
     })
+    fetch('/api/settings/config/zap.ajax_spider')
+      .then(r => (r.ok ? r.json() : { value: 'false' }))
+      .then(d => setAjax(['1', 'true', 'yes', 'on'].includes(String(d?.value ?? '').toLowerCase())))
+      .catch(() => setAjax(false))
   }, [])
   const save = async () => {
     try {
@@ -247,6 +252,11 @@ function ZapAuthCrawlPanel() {
           body: JSON.stringify({ value: String(vals[key] ?? def) }),
         })
       }
+      await fetch('/api/settings/config/zap.ajax_spider', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: ajax ? 'true' : 'false' }),
+      })
       setMsg('Saved — applies to the next authenticated crawl.')
       setTimeout(() => setMsg(''), 4000)
     } catch {
@@ -276,6 +286,22 @@ function ZapAuthCrawlPanel() {
             />
           </div>
         ))}
+        <div className="flex items-center gap-2 pt-1">
+          <button
+            type="button"
+            onClick={() => setAjax(!ajax)}
+            className={cn(
+              'relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors',
+              ajax ? 'bg-primary' : 'bg-muted-foreground/30',
+            )}
+          >
+            <span className={cn(
+              'pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow transform transition-transform',
+              ajax ? 'translate-x-4' : 'translate-x-0',
+            )} />
+          </button>
+          <label className="text-sm">Ajax spider <span className="text-[10px] text-muted-foreground">— browser-based; off by default (memory-heavy, redundant after the auth crawl). Enable for JS-heavy SPAs.</span></label>
+        </div>
         <div className="flex items-center gap-2">
           <button type="button" onClick={save}
             className="px-3 py-1.5 text-sm rounded-md bg-primary text-primary-foreground">Save</button>

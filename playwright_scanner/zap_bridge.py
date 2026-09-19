@@ -549,7 +549,8 @@ class ZAPBridge:
         do_spider: bool = True,
         do_active_scan: bool = True,
         context_name: Optional[str] = None,
-        auth: Optional[Dict] = None
+        auth: Optional[Dict] = None,
+        do_ajax_spider: bool = False,
     ) -> Dict:
         """
         Full ZAP scan after Playwright has explored the site
@@ -610,6 +611,24 @@ class ZAPBridge:
         # Passing a context_name that was never created makes spider.scan/ascan
         # return "does_not_exist" instead of a scan id.
         _ctx_name = context_name if context_id else None
+
+        # OPTIONAL ajax spider — OFF by default. It drives real browsers (memory-
+        # heavy and slow) and is redundant when an authenticated Playwright crawl
+        # has already seeded the tree; enable it only for a JS-heavy SPA that the
+        # traditional spider can't map. Best-effort, bounded.
+        if do_ajax_spider:
+            try:
+                if user_id and context_id:
+                    self.zap.ajaxSpider.scan_as_user(_ctx_name, user_id, url, subtreeonly=None)
+                else:
+                    self.zap.ajaxSpider.scan(url, inscope=None, contextname=_ctx_name, subtreeonly=None)
+                waited = 0
+                while str(self.zap.ajaxSpider.status).lower() == "running" and waited < 300:
+                    time.sleep(3)
+                    waited += 3
+                results['ajax_spider'] = {"ran": True, "status": str(self.zap.ajaxSpider.status)}
+            except Exception as e:  # noqa: BLE001
+                results['ajax_spider'] = {"ran": False, "error": str(e)[:160]}
 
         if do_spider:
             results['spider_id'] = self.spider_url(
