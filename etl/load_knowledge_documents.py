@@ -359,6 +359,14 @@ def _render_owasp_param_tests(data: Dict[str, Any]) -> List[Doc]:
             f"to test {cat}"
             + (f", restricted to {row.get('param_set')} parameters" if row.get('param_set') else "")
             + "."))
+    for row in (data.get("service_tests") or []):
+        if not isinstance(row, dict) or not row.get("category"):
+            continue
+        docs.append((
+            f"OWASP service test: {row['category']} ({row.get('tool','curl')})",
+            f"Per web service the surface phase runs `{row.get('command')}` "
+            f"({row.get('wstg','WSTG')}, safe) to test {row['category']}"
+            + (" (TLS only)" if row.get('tls_only') else "") + "."))
     return docs
 
 

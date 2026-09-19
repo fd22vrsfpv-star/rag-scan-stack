@@ -3521,6 +3521,31 @@ def _svc_test(category, tool, wid, ip, port, command, assertion) -> dict:
             "source_finding_id": None, "source_finding_source": "wstg-service"}
 
 
+@functools.lru_cache(maxsize=1)
+def _load_owasp_service_tests() -> tuple:
+    """Per-service WSTG probe specs from the `service_tests:` section of
+    knowledge/owasp_param_tests.yaml — data, not hardcode (see
+    _load_owasp_param_tests). Fail-safe: any error -> ()."""
+    import os as _os
+    candidates = [
+        _os.environ.get("OWASP_PARAM_TESTS_YAML", "/knowledge/owasp_param_tests.yaml"),
+        _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                      "knowledge", "owasp_param_tests.yaml"),
+    ]
+    for path in candidates:
+        if not path or not _os.path.exists(path):
+            continue
+        try:
+            import yaml as _yaml
+            with open(path, encoding="utf-8") as fh:
+                data = _yaml.safe_load(fh) or {}
+            return tuple(r for r in (data.get("service_tests") or [])
+                         if isinstance(r, dict) and r.get("category") and r.get("command"))
+        except Exception:  # noqa: BLE001
+            return ()
+    return ()
+
+
 def _owasp_service_tests(items: list) -> list:
     """Tier-2 WSTG probes generated per WEB SERVICE (not per finding/param):
     HSTS (CONF-07), cross-domain policy (CONF-08), cloud storage / exposures
@@ -3539,24 +3564,18 @@ def _owasp_service_tests(items: list) -> list:
         tls = _tls_state(svc, row.get("product"), row.get("banner"))
         scheme = "https" if tls == "yes" else "http"
         base = f"{scheme}://{ip}:{port}"
-        # HSTS (CONF-07) — only meaningful over TLS; the ISSUE is the header's
-        # absence, so a "pass" = missing header (expect_not_substring).
-        if tls == "yes":
-            out.append(_svc_test("hsts_check", "curl", "WSTG-CONF-07", ip, port,
-                f"curl -sk -I {base}/",
-                {"expect_not_substring": ["Strict-Transport-Security", "strict-transport-security"]}))
-        # Cross-domain policy (CONF-08) — a permissive allow-access-from is the issue.
-        out.append(_svc_test("crossdomain_check", "curl", "WSTG-CONF-08", ip, port,
-            f"curl -sk {base}/crossdomain.xml",
-            {"expect_regex": "(?i)cross-domain-policy|allow-access-from"}))
-        # Cloud storage / exposures (CONF-11) — nuclei tag sweep.
-        out.append(_svc_test("cloud_storage", "nuclei", "WSTG-CONF-11", ip, port,
-            f"nuclei -u {base} -tags exposure,aws,s3,gcp,azure,bucket -silent",
-            {"expect_regex": r"\[[a-z0-9-]+\]"}))
-        # Cache-control on the root (ATHN-06) — no-store absent is the flag.
-        out.append(_svc_test("cache_check", "curl", "WSTG-ATHN-06", ip, port,
-            f"curl -sk -I {base}/",
-            {"expect_not_substring": ["no-store", "No-Store", "no-cache"]}))
+        # Probes (command + assertion + WSTG id) come from the service_tests
+        # section of knowledge/owasp_param_tests.yaml — data, not hardcode. A
+        # tls_only probe (e.g. HSTS) is emitted only when the service has TLS.
+        for spec in _load_owasp_service_tests():
+            if spec.get("tls_only") and tls != "yes":
+                continue
+            try:
+                cmd = str(spec["command"]).format(base=base)
+            except Exception:  # noqa: BLE001 — bad template, skip
+                continue
+            out.append(_svc_test(spec["category"], spec.get("tool", "curl"),
+                spec.get("wstg", "WSTG"), ip, port, cmd, spec.get("assertion") or {}))
     return out
 
 
