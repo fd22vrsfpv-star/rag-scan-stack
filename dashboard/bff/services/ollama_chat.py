@@ -469,7 +469,12 @@ async def _stream_openai_compatible(
                     continue
 
                 choice = (data.get("choices") or [{}])[0]
-                delta = choice.get("delta", {})
+                # `.get(k, {})` returns None when the key is PRESENT but null (which
+                # OpenAI-compatible backends do emit on the final/content chunks) —
+                # so coalesce, or iterating tool_calls raises
+                # "'NoneType' object is not iterable" and the whole stream dies,
+                # which made every tool-using chat return only blank text.
+                delta = choice.get("delta") or {}
                 finish = choice.get("finish_reason")
 
                 # Text content
@@ -477,7 +482,7 @@ async def _stream_openai_compatible(
                     yield {"message": {"content": delta["content"]}, "done": False}
 
                 # Tool call deltas (streamed incrementally by index)
-                for tc_delta in delta.get("tool_calls", []):
+                for tc_delta in (delta.get("tool_calls") or []):
                     idx = tc_delta.get("index", 0)
                     if idx not in pending_tool_calls:
                         pending_tool_calls[idx] = {
