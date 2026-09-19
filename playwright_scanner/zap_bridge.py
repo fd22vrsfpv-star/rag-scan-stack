@@ -543,6 +543,59 @@ class ZAPBridge:
         except Exception as e:
             print(f"Error setting scan policy: {e}")
 
+    def _active_scan_chunked(self, url: str, context_id=None, user_id=None,
+                             chunk_size: int = 10) -> List[Dict]:
+        """Active-scan the in-scope URLs in batches, flushing to disk between them.
+
+        For each batch: active-scan the URLs (as the logged-in user when a
+        context/user exists), collect their alerts into Python, then
+        delete_site_node() the scanned URLs so ZAP's in-memory message store — the
+        part that grows to fill the JVM heap during a whole-tree active scan — is
+        freed/flushed to the on-disk session DB. Peak ZAP memory stays ~one batch,
+        independent of site size. Returns the accumulated alerts (deduped)."""
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc
+        try:
+            all_urls = [u for u in (self.zap.core.urls() or [])
+                        if urlparse(u).netloc == host]
+        except Exception:  # noqa: BLE001
+            all_urls = []
+        all_urls = list(dict.fromkeys(all_urls)) or [url]
+        collected: Dict[tuple, Dict] = {}
+        scanned_batch: List[str] = []
+
+        def _flush(batch):
+            # collect alerts for the batch, then delete the nodes to free memory
+            for bu in batch:
+                try:
+                    for f in self.export_alerts_to_db_format(bu):
+                        collected[(f.get('url'), f.get('name'), f.get('param') or '')] = f
+                except Exception:  # noqa: BLE001
+                    pass
+            for bu in batch:
+                try:
+                    self.zap.core.delete_site_node(bu)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        for u in all_urls:
+            try:
+                if user_id and context_id:
+                    sid = self.zap.ascan.scan_as_user(u, context_id, user_id, recurse=False)
+                else:
+                    sid = self.zap.ascan.scan(url=u, recurse=False)
+                if sid and str(sid).isdigit():
+                    self.wait_for_active_scan(sid, max_wait=300)
+            except Exception as e:  # noqa: BLE001
+                print(f"[chunk-ascan] {u}: {e}")
+            scanned_batch.append(u)
+            if len(scanned_batch) >= max(1, chunk_size):
+                _flush(scanned_batch)
+                scanned_batch = []
+        if scanned_batch:
+            _flush(scanned_batch)
+        return list(collected.values())
+
     async def scan_with_playwright_session(
         self,
         url: str,
@@ -551,6 +604,7 @@ class ZAPBridge:
         context_name: Optional[str] = None,
         auth: Optional[Dict] = None,
         do_ajax_spider: bool = False,
+        active_scan_chunk_size: int = 0,
     ) -> Dict:
         """
         Full ZAP scan after Playwright has explored the site
@@ -636,16 +690,30 @@ class ZAPBridge:
             if results['spider_id']:
                 results['spider_completed'] = self.wait_for_spider(results['spider_id'])
 
+        _chunk_alerts = None
         if do_active_scan:
-            results['active_scan_id'] = self.active_scan(
-                url, context_name=_ctx_name, user_id=user_id, context_id=context_id)
-            if results['active_scan_id']:
-                results['active_scan_completed'] = self.wait_for_active_scan(
-                    results['active_scan_id'],
-                    max_wait=900  # 15 minutes max for active scan
-                )
+            if active_scan_chunk_size and active_scan_chunk_size > 0:
+                # CHUNKED active scan: scan the in-scope URLs in batches, collect
+                # each batch's alerts into Python, then delete the scanned nodes
+                # from ZAP so its in-memory message store (the thing that grows to
+                # fill the heap) is flushed to disk/freed between batches. Keeps
+                # ZAP's peak memory ~one batch, independent of site size.
+                results['active_scan_chunked'] = True
+                _chunk_alerts = self._active_scan_chunked(
+                    url, context_id=context_id, user_id=user_id,
+                    chunk_size=active_scan_chunk_size)
+                results['active_scan_completed'] = True
+            else:
+                results['active_scan_id'] = self.active_scan(
+                    url, context_name=_ctx_name, user_id=user_id, context_id=context_id)
+                if results['active_scan_id']:
+                    results['active_scan_completed'] = self.wait_for_active_scan(
+                        results['active_scan_id'],
+                        max_wait=900  # 15 minutes max for active scan
+                    )
 
-        results['alerts'] = self.export_alerts_to_db_format(url)
+        results['alerts'] = (_chunk_alerts if _chunk_alerts is not None
+                             else self.export_alerts_to_db_format(url))
         results['alerts_summary'] = self.get_alerts_summary(url)
 
         return results
