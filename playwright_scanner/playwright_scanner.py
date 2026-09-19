@@ -2172,6 +2172,22 @@ async def _perform_crawl(job_id: str, req: CrawlRequest):
             _crawl_auth = req.auth or _resolve_web_auth(req.url, _eid)
             if _crawl_auth and _crawl_auth.get("login_url"):
                 job["authenticated"] = await _browser_login(page, _crawl_auth)
+                # Seed the POST-LOGIN landing page (e.g. /bank/main.jsp) at the FRONT
+                # of the queue: the logged-out homepage (req.url) usually does not
+                # link into the authenticated area, so without this the crawl walks
+                # only public pages even when logged in. Same-origin, scope-gated.
+                if job.get("authenticated"):
+                    try:
+                        from urllib.parse import urlparse as _upl
+                        landed = page.url or ""
+                        same = (not req.same_origin_only
+                                or _upl(landed).netloc == _upl(req.url).netloc)
+                        if (landed and landed not in visited and same
+                                and not _scope_refusal_for_url(landed, "post-login seed")):
+                            queue.appendleft((landed, 0))
+                            logger.info(f"[crawl:{job_id[:8]}] seeded post-login landing {landed}")
+                    except Exception:  # noqa: BLE001
+                        pass
 
             # Capture network requests as additional discovered URLs
             def _on_request(request):

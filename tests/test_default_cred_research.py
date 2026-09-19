@@ -91,3 +91,19 @@ def test_check_uses_research():
     assert "/software/default-credentials" in s, "the check calls the research endpoint"
     # researched candidates come before the static set
     assert "researched + candidate_pairs" in s
+
+
+def test_zap_auth_crawl_settings_configurable():
+    """Auth-crawl tuning is operator-configurable via app_settings (ZAP settings)
+    and used by the check + seeded post-login in the crawl."""
+    api = _src(API)
+    assert '"/settings/zap-auth-crawl"' in api, "ZAP auth-crawl settings endpoints missing"
+    assert "zap.auth_crawl.max_pages" in api and "zap.auth_crawl.max_depth" in api
+    chk = _src(CHECK)
+    assert "def _zap_crawl_settings" in chk and "zap.auth_crawl.max_pages" in chk, \
+        "the check must read the ZAP auth-crawl settings from app_settings"
+    assert 'zc["max_depth"]' in chk, "the crawl must use the configured max_depth"
+    pw = os.path.join(REPO, "playwright_scanner", "playwright_scanner.py")
+    if os.path.exists(pw):
+        s = open(pw, encoding="utf-8").read()
+        assert "seeded post-login landing" in s, "the crawl must seed the post-login landing page"

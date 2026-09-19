@@ -12279,6 +12279,51 @@ def software_default_credentials(body: DefaultCredResearchReq, authorized: bool 
             "pairs": pairs, "count": len(pairs), "stored_candidates": stored}
 
 
+class ZapAuthCrawlSettings(BaseModel):
+    max_pages: Optional[int] = None
+    max_depth: Optional[int] = None
+    wait_seconds: Optional[int] = None
+
+
+@app.get("/settings/zap-auth-crawl", tags=["Assets"])
+def get_zap_auth_crawl_settings(authorized: bool = Depends(auth)):
+    """Authenticated-crawl tuning shown in the dashboard ZAP settings. When a
+    default-cred check finds a working login it runs an authenticated Playwright
+    crawl (browser login) whose walked pages seed ZAP's site tree before the ZAP
+    scan — these knobs widen that crawl so the whole logged-in area is covered.
+    Backed by app_settings; defaults mirror knowledge/default_cred_check.yaml."""
+    def _i(k, d):
+        try:
+            return int(_get_setting(k, str(d)) or d)
+        except (TypeError, ValueError):
+            return d
+    return {"max_pages": _i("zap.auth_crawl.max_pages", 200),
+            "max_depth": _i("zap.auth_crawl.max_depth", 5),
+            "wait_seconds": _i("zap.auth_crawl.wait_seconds", 300)}
+
+
+@app.put("/settings/zap-auth-crawl", tags=["Assets"])
+def set_zap_auth_crawl_settings(body: ZapAuthCrawlSettings, authorized: bool = Depends(auth)):
+    """Persist the authenticated-crawl tuning (bounded)."""
+    updates = {}
+    if body.max_pages is not None:
+        updates["zap.auth_crawl.max_pages"] = str(max(1, min(int(body.max_pages), 1000)))
+    if body.max_depth is not None:
+        updates["zap.auth_crawl.max_depth"] = str(max(1, min(int(body.max_depth), 5)))
+    if body.wait_seconds is not None:
+        updates["zap.auth_crawl.wait_seconds"] = str(max(30, min(int(body.wait_seconds), 1800)))
+    if updates:
+        with get_db() as conn, conn.cursor() as cur:
+            for k, v in updates.items():
+                cur.execute(
+                    "INSERT INTO app_settings (key, value, category) VALUES (%s,%s,'config') "
+                    "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()", (k, v))
+            conn.commit()
+        for k in updates:
+            _SETTING_CACHE.pop(k, None)
+    return {"ok": True, "updated": updates}
+
+
 @app.get("/software/research-cache", tags=["Assets"])
 def get_research_cache(
     product: str = Query(...),
