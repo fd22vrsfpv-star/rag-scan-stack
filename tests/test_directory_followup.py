@@ -105,6 +105,35 @@ def test_merges_three_sources():
         "build_merged_wordlist must merge all three sources"
 
 
+def test_existence_check_wired():
+    import yaml
+    src = _src(MOD)
+    assert "def _probe_directory_status" in src, "existence probe missing"
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "queue_directory_followup")
+    body = ast.get_source_segment(src, fn)
+    assert "_probe_directory_status" in body and "== 404" in body, \
+        "queue_directory_followup must skip a directory that 404s"
+    assert yaml.safe_load(_src(YAML))["directory_followup"].get("verify_exists") is True
+
+
+def test_existence_check_skips_404(monkeypatch):
+    m = _import_mod()
+    monkeypatch.setattr(m, "_probe_directory_status", lambda *a, **k: 404)
+    res = m.queue_directory_followup(None, "1.2.3.4", "http://x/phantom/", dispatch=False)
+    assert res.get("skipped") is True and res.get("queued") == 0, res
+
+
+def test_existing_directory_proceeds_past_check(monkeypatch):
+    m = _import_mod()
+    monkeypatch.setattr(m, "_probe_directory_status", lambda *a, **k: 200)
+    # short-circuit right after the existence check so no DB/network is needed
+    monkeypatch.setattr(m, "build_merged_wordlist", lambda *a, **k: None)
+    res = m.queue_directory_followup(None, "1.2.3.4", "http://x/real/", dispatch=False)
+    assert res.get("skipped") is not True, res
+    assert res.get("reason") == "no wordlist words available", res  # got past the 404 check
+
+
 def test_post_enum_invokes_followup():
     src = _src(POSTENUM)
     assert "_directory_enumeration_followups(" in src, "post_enumeration must run the followup"
