@@ -51,8 +51,13 @@ default_cred_check:
     # through the ZAP proxy so ZAP's site tree is seeded with the authenticated
     # /bank/* pages), THEN ZAP scans that seeded tree.
     crawl_first: true
-    max_pages: 60
-    crawl_wait_seconds: 180
+    # Auth-crawl coverage. These are the DEFAULTS; the dashboard ZAP settings
+    # (app_settings zap.auth_crawl.max_pages / .max_depth / .wait_seconds) override
+    # them so an operator can widen the authenticated crawl to seed ZAP's whole
+    # logged-in tree. Tuned up from 60/180 so /bank/* is fully walked.
+    max_pages: 200
+    max_depth: 5
+    crawl_wait_seconds: 300
     zap_spider: true
     zap_active_scan: true
   priority: 26
