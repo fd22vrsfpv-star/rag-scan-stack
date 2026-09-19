@@ -1,0 +1,47 @@
+# Directory-discovery enumeration followup (RAG-first).
+#
+# WHAT: when the crawl/scan discovers a directory (a listing, or a crawled path
+# that is a folder such as `/my documents/JohnSmith/Bank Site Documents/`), a
+# STANDARD followup runs a gobuster content scan of that directory using a
+# docs/backup wordlist ENRICHED with site-harvested words ("cewl data") — the
+# words a target actually uses (employee names, doc titles, product names) are
+# the ones that name its leaked backups and documents, and a generic list misses
+# them. This is how a VAPT finds the exposed "passwords" document a link-only
+# crawl walks past.
+#
+# The followup is embedded into rag_documents by etl/load_knowledge_documents.py
+# so the planner can retrieve the method; the deterministic engine
+# (etl/directory_followup.py, called from post_enumeration) is the execution
+# backstop. Scope-gated + bounded like every dispatch; auto-fires on the SAFE
+# lane (gobuster dir is read-only recon). The queued item is TAGGED as a
+# follow-up (scanner='dir_followup', extra.followup=true).
+directory_followup:
+  # Fires when a directory is discovered. A web_finding whose name says
+  # "directory" (a listing), or a crawled URL that ends in '/'.
+  triggers:
+    finding_name_contains: ["directory", "directory browsing", "directory listing"]
+    url_is_directory: true          # path ends in '/'
+  # Word sources merged into the followup wordlist, in priority order.
+  wordlist_sources:
+    # 1. docs/backup names shipped in the repo (dirs + filenames worth trying).
+    - repo_list: "/wordlists/docs-backup.txt"
+    # 2. site-harvested corpus (the platform's own generator, from
+    #    content_extractions: word_corpus, internal_paths, comments, names).
+    - site_corpus: true
+    # 3. real cewl spidered live from the site, WHEN cewl is installed (optional
+    #    enrichment; the followup runs fine without it).
+    - cewl_live:
+        depth: 2
+        min_word_length: 4
+  # File extensions gobuster appends — the documents/backups that get left in a
+  # web-reachable folder.
+  extensions: [txt, pdf, doc, docx, xls, xlsx, csv, bak, old, zip, tar, gz, 7z, rar, sql, conf, config, log, json, xml, ini, backup, "~"]
+  # gobuster tuning (bounded).
+  gobuster:
+    threads: 10
+    timeout_seconds: 600
+    status_codes_blacklist: "404"
+  priority: 24
+  # Auto-fire on the safe lane; the dispatch is tagged as a follow-up.
+  lane: safe
+  followup_tag: dir_followup
