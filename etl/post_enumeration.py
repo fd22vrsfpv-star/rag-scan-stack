@@ -870,7 +870,8 @@ def facts_from_web_findings(cur, *, target: str = "", limit: int = 200,
         cur.execute(
             f"""SELECT wf.id::text, host(a.ip), wf.url, wf.severity,
                        COALESCE(wf.name,''), COALESCE(wf.issue_type,''),
-                       COALESCE(wf.method,'GET'), COALESCE(wf.payload,'')
+                       COALESCE(wf.method,'GET'), COALESCE(wf.payload,''),
+                       COALESCE(wf.param, wf.evidence, '')
                   FROM web_findings wf
                   JOIN assets a ON a.id = wf.asset_id
                  WHERE {' AND '.join(where)}
@@ -878,17 +879,19 @@ def facts_from_web_findings(cur, *, target: str = "", limit: int = 200,
                                     WHERE eo.fact->>'web_finding_id' = wf.id::text)
                  ORDER BY wf.created_at DESC
                  LIMIT %s""", params)
-        for wid, host, url, severity, name, issue_type, method, payload in cur.fetchall():
+        for wid, host, url, severity, name, issue_type, method, payload, param in cur.fetchall():
             # issue_type/name carried so rules can key off WHAT the finding is
             # (e.g. information disclosure, directory listing), not only severity —
             # the deterministic tier of "deepen informational findings".
-            # method/payload let the deepen tier author a probe of the right SHAPE
-            # (a POST-body SQLi needs a POST/sqlmap confirmation, not a GET).
+            # method/payload/param let the deepen tier author a probe of the right
+            # SHAPE and target (a POST-body SQLi needs a POST/sqlmap confirmation
+            # against the vulnerable parameter, not a GET). param falls back to
+            # evidence for rows stored before the dedicated column existed.
             facts.append({"fact": "web_finding", "target": host, "service": "http",
                           "web_finding_id": wid, "url": url,
                           "severity": (severity or "").lower(),
                           "name": name, "issue_type": issue_type,
-                          "method": method, "payload": payload})
+                          "method": method, "payload": payload, "param": param})
     except Exception as e:  # noqa: BLE001
         log.debug("web finding facts unavailable: %s", e)
     return facts
@@ -1512,18 +1515,19 @@ def deepen_web_finding(finding_id: str,
             cur.execute(
                 """SELECT wf.url, COALESCE(wf.name,''), COALESCE(wf.issue_type,''),
                           COALESCE(wf.severity,''), host(a.ip),
-                          COALESCE(wf.method,'GET'), COALESCE(wf.payload,'')
+                          COALESCE(wf.method,'GET'), COALESCE(wf.payload,''),
+                          COALESCE(wf.param, wf.evidence, '')
                      FROM web_findings wf JOIN assets a ON a.id = wf.asset_id
                     WHERE wf.id = %s::uuid""", (finding_id,))
             r = cur.fetchone()
             if not r:
                 out["reason"] = "finding not found"
                 return out
-            url, name, issue_type, severity, host, method, payload = r
+            url, name, issue_type, severity, host, method, payload, param = r
             fact = {"fact": "web_finding", "target": host, "service": "http",
                     "web_finding_id": finding_id, "url": url, "name": name,
                     "issue_type": issue_type, "severity": (severity or "").lower(),
-                    "method": method, "payload": payload}
+                    "method": method, "payload": payload, "param": param}
             proposal = _enum_router().deepen_finding(fact, force=True)
             if not proposal:
                 out["reason"] = "no probe proposed (LLM unavailable or declined)"
