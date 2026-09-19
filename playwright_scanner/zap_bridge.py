@@ -606,15 +606,20 @@ class ZAPBridge:
             results['session_headers_injected'] = self.apply_session_headers(_sess_headers)
             results['authenticated'] = True
 
+        # Only reference the ZAP context if one was actually created (auth path).
+        # Passing a context_name that was never created makes spider.scan/ascan
+        # return "does_not_exist" instead of a scan id.
+        _ctx_name = context_name if context_id else None
+
         if do_spider:
             results['spider_id'] = self.spider_url(
-                url, context_name=context_name, user_id=user_id, context_id=context_id)
+                url, context_name=_ctx_name, user_id=user_id, context_id=context_id)
             if results['spider_id']:
                 results['spider_completed'] = self.wait_for_spider(results['spider_id'])
 
         if do_active_scan:
             results['active_scan_id'] = self.active_scan(
-                url, context_name=context_name, user_id=user_id, context_id=context_id)
+                url, context_name=_ctx_name, user_id=user_id, context_id=context_id)
             if results['active_scan_id']:
                 results['active_scan_completed'] = self.wait_for_active_scan(
                     results['active_scan_id'],
