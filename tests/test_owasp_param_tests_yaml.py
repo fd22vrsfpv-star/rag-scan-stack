@@ -32,5 +32,8 @@ def test_engine_reads_yaml_not_hardcoded():
     assert fn, "_owasp_param_tests not found"
     body = ast.get_source_segment(src, fn)
     assert "_load_owasp_param_tests()" in body, "must read the YAML specs"
+    svc = next((n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and n.name=="_owasp_service_tests"), None)
+    assert svc and "_load_owasp_service_tests()" in ast.get_source_segment(src, svc), "service tests must read the YAML too"
+    assert "curl -sk -I" not in ast.get_source_segment(src, svc), "service probe commands must NOT be hardcoded"
     assert "sqlmap -u" not in body, "sqlmap command must NOT be hardcoded in the engine"
     assert 'curl -sk' not in body, "curl probe commands must NOT be hardcoded in the engine"
