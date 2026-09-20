@@ -1430,6 +1430,18 @@ def analyse_findings(*, target: str = "", engagement_id: Optional[str] = None,
                 # approval above it).
                 _default_cred_check_followups(cur, context, out,
                                               target=target, engagement_id=engagement_id)
+                # STANDARD followup: tag discovered AD credentials and queue SAFE
+                # credentialed AD enumeration (BloodHound/Kerberoast/LDAP dump)
+                # against the domain when a domain credential is found.
+                try:
+                    try:
+                        from etl.ad_enum_followup import queue_ad_enum_followups
+                    except ImportError:  # pragma: no cover
+                        from ad_enum_followup import queue_ad_enum_followups
+                    queue_ad_enum_followups(cur, context, out,
+                                            target=target, engagement_id=engagement_id)
+                except Exception as _ae:  # noqa: BLE001
+                    log.debug("ad enum followup failed: %s", _ae)
                 out["available"] = True
             conn.commit()
     except Exception as e:  # noqa: BLE001

