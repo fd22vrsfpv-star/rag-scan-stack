@@ -106,6 +106,21 @@ def test_probes_are_data_driven_by_yaml():
     assert "def _bl_config(" in s
 
 
+def test_forced_browsing_wired():
+    d = _cfg()
+    fb = d["forced_browsing"]
+    assert fb["privileged_paths"] and any("admin" in p.lower() for p in fb["privileged_paths"])
+    assert any("/bank" in p.lower() for p in fb["authenticated_path_patterns"])
+    s = _src("playwright_scanner/playwright_scanner.py")
+    assert "async def _forced_browsing_probe(" in s
+    assert "_forced_browsing_probe(" in s and "discovered_urls=list(visited)" in s
+    assert "'forced_browsing','access_control'" in s
+    # anonymous check: no cookies, don't follow redirects (a redirect = enforced)
+    assert "follow_redirects=False" in s
+    # every anonymous request is scope-gated
+    assert '_scope_refusal_for_url(url, f"forced-browsing' in s
+
+
 def test_rag_renderer_present():
     s = _src("etl/load_knowledge_documents.py")
     assert "_render_business_logic_tests" in s
