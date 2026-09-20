@@ -1065,6 +1065,9 @@ services:
       # shared scan-slot semaphore (common/tool_job.py) — bounds this
       # service by MAX_CONCURRENT_SCANS instead of a private number
       - ./common:/app/common:ro
+      # business-logic probe data (IDOR/value-tamper patterns + oracle); read at
+      # runtime by _bl_config(), bind-mounted so edits take effect live.
+      - ./knowledge:/knowledge:ro
       - ./playwright_screenshots:/screenshots
       - ./playwright_reports:/reports
     # SHM size needed for Chromium to avoid crashes

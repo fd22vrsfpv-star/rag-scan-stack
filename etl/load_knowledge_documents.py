@@ -462,9 +462,31 @@ def _render_ajax_spider_signals(data: Dict[str, Any]) -> List[Doc]:
         "(1-4 browsers, capped crawl states).")]
 
 
+def _render_business_logic_tests(data: Dict[str, Any]) -> List[Doc]:
+    """Business-logic web tests -> a doc so the planner can retrieve the method:
+    authenticated probes for object-reference access (IDOR/BOLA incl. POST bodies)
+    and business-VALUE tampering (negative amounts / price / qty), driven by
+    param-name patterns + tamper value-sets + a response oracle."""
+    d = data.get("business_logic_tests")
+    if not isinstance(d, dict):
+        return []
+    vt = ", ".join((d.get("value_tamper") or {}).get("values") or [])
+    return [(
+        "Business-logic web testing: object-reference access + value tampering",
+        "Authenticated probes (single credential, run in the crawl) cover classes "
+        "a scanner misses: IDOR/BOLA on GET and POST-body object-reference params "
+        "(mutate the id, compare to the owned-value baseline), and WSTG-BUSL-01/03 "
+        f"business-value tampering — resubmit monetary/quantity params with values "
+        f"[{vt}] and flag a successful (non-validation-error) response to a "
+        "negative/zero/oversized value. Object-ref vs value params and the "
+        "success/error/blocked oracle are data in business_logic_tests.yaml. "
+        "Findings are potential flags for manual triage.")]
+
+
 RENDERERS = {
     "msf_learned_options": _render_msf_learned_options,
     "ajax_spider_signals": _render_ajax_spider_signals,
+    "business_logic_tests": _render_business_logic_tests,
     "safe_service_probes": _render_safe_service_probes,
     "directory_followups": _render_directory_followup,
     "default_cred_check": _render_default_cred_check,

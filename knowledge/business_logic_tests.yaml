@@ -1,0 +1,55 @@
+# Business-logic web tests — RAG-first, data-driven.
+#
+# Authenticated probes that run in the crawl (playwright_scanner) reuse this data
+# to test the classes a scanner never covers: object-reference access (IDOR/BOLA,
+# incl. POST bodies) and business-VALUE tampering (WSTG-BUSL-01/03 — negative
+# amounts, price/qty manipulation). Edit this file (not code) to tune which
+# params are treated as object-refs vs business values, the tamper value-sets,
+# and the response oracle. Embedded into rag_documents by
+# etl/load_knowledge_documents.py so the planner can retrieve the method.
+#
+# All probes run as the ALREADY-logged-in user (single credential); findings are
+# "potential" flags for manual triage (the platform collects for manual tools).
+business_logic_tests:
+  # OBJECT-REFERENCE params (IDOR / BOLA). Extends the GET-numeric probe to POST
+  # bodies. A param is a candidate if its name matches a pattern OR its sample
+  # value is numeric. The numeric value is mutated by the offsets below and the
+  # response compared to the owned-value baseline.
+  idor:
+    name_patterns: [acct, account, listaccounts, "id", uid, custid, customer, user, userid,
+                    order, orderid, invoice, doc, docid, file, fileid, record, msg, ticket,
+                    profile, num, "no", number, ref]
+    mutations: [1, -1, 2]        # numeric offsets from the base object id
+    max_candidates: 8
+
+  # BUSINESS-VALUE params to tamper (WSTG-BUSL-01 data validation / BUSL-03
+  # integrity). A numeric param whose name looks like a monetary/quantity value
+  # is resubmitted with each tamper value; a response that looks SUCCESSFUL (and
+  # not a validation error) for a negative/zero/oversized value is a potential
+  # business-logic flaw.
+  value_tamper:
+    name_patterns: [amount, amt, transferamount, qty, quantity, price, cost, total,
+                    sum, balance, value, credit, debit, fee, discount, rate, points, count]
+    values: ["-1", "-1000", "0", "999999999", "-0.01"]
+    max_candidates: 6
+
+  # Params NEVER mutated/tampered — auth/session/CSRF/submit controls; changing
+  # them just breaks the request and yields false negatives.
+  skip_params: [csrf, token, _token, _csrf, authenticity_token, jsessionid, sessionid,
+                viewstate, __viewstate, eventvalidation, submit, btnsubmit, login, passw,
+                password, pwd]
+
+  # Response oracle.
+  oracle:
+    # Present ONLY on a login/denied/blocked page (not on an object-data page) —
+    # a password field or an explicit denial. Same signal the GET IDOR probe uses.
+    blocked_markers: ['type="password"', 'name="passw"', 'name="uid"', "not authori",
+                      "access denied", "forbidden", "must be logged", "please log in"]
+    # A value-tamper request "succeeded" if the response carries one of these …
+    success_markers: ["success", "complete", "completed", "confirmed", "transferred",
+                      "has been", "thank you", "approved", "accepted", "processed"]
+    # … and NONE of these (a validation/business rejection).
+    error_markers: ["invalid", "insufficient", "not allowed", "must be", "cannot",
+                    "failed", "denied", "greater than", "too large", "exceeds",
+                    "negative", "not valid", "is required", "out of range"]
+    min_response_bytes: 500
