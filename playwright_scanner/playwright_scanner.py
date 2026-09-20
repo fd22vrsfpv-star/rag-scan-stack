@@ -2515,6 +2515,88 @@ async def _value_tamper_probe(ctx, base_url: str, host: str, engagement_id, job_
     return found
 
 
+async def _forced_browsing_probe(base_url: str, host: str, engagement_id, job_id: str,
+                                 discovered_urls=None) -> int:
+    """Forced browsing / function-level access control (WSTG-ATHZ-02).
+
+    (1) Re-request each AUTHENTICATED-area page the crawl discovered with NO
+    session (anonymous httpx, no cookies): a page that serves content to an
+    anonymous user instead of redirecting to login / 401 / 403 is missing
+    authentication enforcement (high). (2) Request a small wordlist of
+    sensitive/privileged paths anonymously (medium if exposed). Each URL is
+    scope-gated. Data-driven by business_logic_tests.yaml::forced_browsing."""
+    import httpx
+    from urllib.parse import urlparse, urljoin
+    from db_utils import get_db
+    fb = _bl_config().get("forced_browsing") or {}
+    if not fb:
+        return 0
+    auth_pats = [str(p).lower() for p in (fb.get("authenticated_path_patterns") or [])]
+    priv_paths = fb.get("privileged_paths") or []
+    maxc = int(fb.get("max_candidates", 25))
+    minb = int((_bl_config().get("oracle") or {}).get("min_response_bytes", 500))
+
+    pu0 = urlparse(base_url if "://" in base_url else f"http://{base_url}")
+    root = f"{pu0.scheme}://{pu0.netloc}"
+
+    cands, seen = [], set()   # (url, kind) kind in ('authed','privileged')
+    for u in (discovered_urls or []):
+        try:
+            up = urlparse(u)
+            if (up.hostname or "") != host:
+                continue
+            if any(p in (up.path or "").lower() for p in auth_pats) and u not in seen:
+                cands.append((u, "authed")); seen.add(u)
+        except Exception:  # noqa: BLE001
+            continue
+    for p in priv_paths:
+        u = urljoin(root + "/", str(p).lstrip("/"))
+        if u not in seen:
+            cands.append((u, "privileged")); seen.add(u)
+    cands = cands[:maxc]
+    if not cands:
+        return 0
+
+    found = 0
+    async with httpx.AsyncClient(verify=False, timeout=12, follow_redirects=False) as c:
+        for url, kind in cands:
+            # scope-gate every anonymous request
+            if _scope_refusal_for_url(url, f"forced-browsing {url}"):
+                continue
+            try:
+                r = await c.get(url)   # NO cookies -> anonymous
+            except Exception:  # noqa: BLE001
+                continue
+            # redirect (usually to login) / 401 / 403 / non-200 = correctly enforced
+            if r.status_code != 200:
+                continue
+            body = r.text or ""
+            if len(body) < minb or _bl_is_blocked(body):
+                continue
+            found += 1
+            sev = "high" if kind == "authed" else "medium"
+            name = ("Broken access control — authenticated page reachable without a session"
+                    if kind == "authed"
+                    else "Forced browsing — sensitive path exposed anonymously")
+            try:
+                with get_db() as conn, conn.cursor() as cur:
+                    aid = _bl_asset_id(cur, host)
+                    cur.execute(
+                        """INSERT INTO web_findings
+                             (asset_id, url, source, issue_type, name, severity,
+                              evidence, method, engagement_id)
+                           VALUES (%s,%s,'forced_browsing','access_control',%s,%s,%s,'GET',%s)
+                           ON CONFLICT DO NOTHING""",
+                        (aid, url, name, sev,
+                         f"anonymous GET returned 200 with a substantive non-login page "
+                         f"({len(body)} bytes) — {kind} resource reachable without "
+                         f"authentication (WSTG-ATHZ-02)"[:300], engagement_id))
+                    conn.commit()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"[forcedbrowse:{job_id[:8]}] store failed for {url}: {e}")
+    return found
+
+
 async def _browser_login(page, auth: Dict) -> bool:
     """Best-effort form login in the browser so the crawl (and the ZAP site tree
     it seeds) is authenticated. Parses the login_data template to find the
@@ -2797,6 +2879,19 @@ async def _perform_crawl(job_id: str, req: CrawlRequest):
                         logger.info(f"[crawl:{job_id[:8]}] value-tamper probe flagged {vt} potential business-logic issue(s)")
                 except Exception as e:  # noqa: BLE001
                     logger.debug(f"[crawl:{job_id[:8]}] value-tamper probe failed: {e}")
+                # Forced browsing / function-level access control (ATHZ-02): re-request
+                # the authenticated pages we discovered with NO session + a sensitive-
+                # path wordlist. Uses anonymous httpx (not the authed ctx), so it needs
+                # the discovered URLs, not the browser context.
+                try:
+                    fb = await _forced_browsing_probe(
+                        req.url, urlparse(req.url).hostname or "", _eng, job_id,
+                        discovered_urls=list(visited) + list(discovered))
+                    job["forced_browsing_findings"] = fb
+                    if fb:
+                        logger.info(f"[crawl:{job_id[:8]}] forced-browsing probe flagged {fb} access-control issue(s)")
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"[crawl:{job_id[:8]}] forced-browsing probe failed: {e}")
 
             await ctx.close()
             await browser.close()

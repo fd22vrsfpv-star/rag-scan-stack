@@ -39,6 +39,43 @@ business_logic_tests:
                 viewstate, __viewstate, eventvalidation, submit, btnsubmit, login, passw,
                 password, pwd]
 
+  # FORCED BROWSING / function-level access control (WSTG-ATHZ-02).
+  #
+  # ZAP plugin coverage (why this probe exists alongside them):
+  #  - ZAP "Forced Browse" (bruteforce add-on) = dirbuster content discovery, and
+  #    is DESKTOP-ONLY (its REST API returns no_implementor) — not scriptable.
+  #    That content discovery is already covered by the pipeline's gobuster +
+  #    directory_followup, so this probe does NOT duplicate it.
+  #  - ZAP "Access Control Testing" (accessControl add-on) is API-drivable but
+  #    needs TWO users and classifies at node level.
+  #  This probe covers the gap: the SINGLE-credential anonymous-reachability test
+  #  (is an authenticated page served with no session?) that neither ZAP plugin
+  #  does via the API. Two checks, both run from the crawl:
+  #  1. re-request each AUTHENTICATED page the crawl discovered with NO session —
+  #     a page that serves content to an anonymous user (instead of redirecting to
+  #     login) is missing authentication/authorization enforcement.
+  #  2. request a small wordlist of sensitive/privileged paths anonymously — one
+  #     that returns a substantive non-login page is exposed.
+  forced_browsing:
+    # Paths joined to the site root and requested with no session.
+    privileged_paths:
+      - /admin
+      - /admin/
+      - /admin/admin.jsp
+      - /manager/html
+      - /console
+      - /config
+      - /server-status
+      - /actuator
+      - /actuator/env
+      - /.git/config
+      - /backup
+      - /phpinfo.php
+    # A discovered URL is treated as "authenticated-area" (worth the anon re-check)
+    # when its path matches one of these.
+    authenticated_path_patterns: [/bank/, /account, /admin, /user, /profile, /manage, /dashboard]
+    max_candidates: 25
+
   # Response oracle.
   oracle:
     # Present ONLY on a login/denied/blocked page (not on an object-data page) —
