@@ -1,0 +1,88 @@
+# Content-discovery (directory/file brute) tool selection — RAG-first.
+#
+# gobuster, ffuf and feroxbuster all do directory/file discovery; running more
+# than one is redundant. Pick ONE via the operator setting content_discovery.tool
+# (default gobuster). The directory followup (etl/directory_followup.py) reads the
+# selection and builds that tool's command, injecting the authenticated session
+# cookie the crawl persisted (see web_auth_configs.session).
+#
+# Measured on demo.testfire.net (common.txt 4749 words, 40 threads):
+#   gobuster 5s/17  ~  ffuf 4s/16   (interchangeable, pure wordlist brute)
+#   feroxbuster 20s/64 (brute + link-extraction + recursion; deeper, 4x slower;
+#     needs --filter-size 0 to drop Windows reserved-name 0-byte false-200 noise)
+content_discovery:
+  default_tool: gobuster
+  setting_key: content_discovery.tool     # app_settings override; one of the tools below
+  tools:
+    gobuster:
+      recursive: false
+      # placeholders: {url} {wordlist} {exts} {threads} {blacklist} {cookie_flag}
+      template: "gobuster dir -u {url} -w {wordlist} -x {exts} -t {threads} -q -k -b {blacklist} --no-error{cookie_flag}"
+      cookie_flag: ' -c "{cookie}"'
+    ffuf:
+      recursive: false
+      template: "ffuf -u {url}FUZZ -w {wordlist} -e {exts} -t {threads} -fc {blacklist} -ac -s{cookie_flag}"
+      cookie_flag: ' -H "Cookie: {cookie}"'
+    feroxbuster:
+      recursive: true
+      # --filter-size 0 removes the reserved-name 0-byte false-200 noise; ferox
+      # also extracts links + recurses, so it finds linked pages a pure brute
+      # misses (e.g. /swagger, /survey_questions.jsp) — the "deep" option.
+      template: "feroxbuster -u {url} -w {wordlist} -x {exts} -t {threads} -k -q --filter-size 0{cookie_flag}"
+      cookie_flag: ' -H "Cookie: {cookie}"'
+
+# CUSTOM ATTACKS / EXPLOITS with the same fuzzers — RAG-retrievable recipes the
+# agent / test synthesis can construct beyond plain directory discovery. Each
+# takes the authenticated session cookie the same way (cookie_flag above).
+# Placeholders in {curly} are filled at run time. `impactful: true` recipes are
+# state-changing and MUST go through the approval lane (never auto-fire).
+custom_attacks:
+  - name: parameter-name discovery
+    tool: ffuf
+    wstg: WSTG-INPV-01
+    fuzz: query-param-name
+    template: 'ffuf -u "{url}?FUZZ=1" -w {param_wordlist} -ac -mc all -fc 404 -s{cookie_flag}'
+    purpose: "find hidden GET parameters an endpoint accepts, then fuzz their values"
+  - name: parameter-value injection fuzz
+    tool: ffuf
+    wstg: WSTG-INPV-05
+    fuzz: query-param-value
+    template: 'ffuf -u "{url}?{param}=FUZZ" -w {payload_wordlist} -mr "{match_regex}" -s{cookie_flag}'
+    purpose: "drive an attack payload list (SQLi/XSS/LFI markers) at one parameter and match evidence"
+  - name: POST-body value injection fuzz
+    tool: ffuf
+    wstg: WSTG-INPV-05
+    fuzz: body-param-value
+    template: 'ffuf -u {url} -X POST -d "{body_with_FUZZ}" -w {payload_wordlist} -mr "{match_regex}" -s{cookie_flag}'
+    purpose: "fuzz a POST body field with attack payloads (authenticated when a cookie is set)"
+  - name: virtual-host discovery
+    tool: ffuf
+    wstg: WSTG-CONF-10
+    fuzz: host-header
+    template: 'ffuf -u {url} -H "Host: FUZZ.{domain}" -w {vhost_wordlist} -ac -fs {baseline_size} -s'
+    purpose: "find virtual hosts / internal apps sharing the target IP"
+  - name: login / credential brute
+    tool: ffuf
+    wstg: WSTG-ATHN-03
+    fuzz: login-body
+    impactful: true
+    template: 'ffuf -u {login_url} -X POST -d "{login_body_with_FUZZ}" -w {wordlist} -fr "{fail_regex}" -s'
+    purpose: "brute a login field (state-changing; approval-gated, lockout-aware)"
+  - name: 403 / forbidden access-control bypass
+    tool: ffuf
+    wstg: WSTG-ATHZ-02
+    fuzz: bypass-header-or-path
+    template: 'ffuf -u {url} -w {bypass_wordlist} -H "FUZZ" -mc all -fc 403 -s{cookie_flag}'
+    purpose: "test header/path tricks that bypass a 403 on a protected resource"
+  - name: subdomain / DNS brute
+    tool: gobuster
+    wstg: WSTG-INFO-04
+    fuzz: dns
+    template: 'gobuster dns -d {domain} -w {dns_wordlist} -q'
+    purpose: "enumerate subdomains of the target domain"
+  - name: recursive deep content + link extraction
+    tool: feroxbuster
+    wstg: WSTG-CONF-04
+    fuzz: recursive-dir
+    template: 'feroxbuster -u {url} -w {wordlist} -x {exts} --filter-size 0 -k -q{cookie_flag}'
+    purpose: "deep recursive discovery incl. linked pages a pure brute misses (swagger, hidden endpoints)"
