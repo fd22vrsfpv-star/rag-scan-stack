@@ -2689,7 +2689,61 @@ TOOL_INSTALL_MAP = {
     "irssi": "apt-get install -y irssi",
     "psql": "apt-get install -y postgresql-client",
     "mysql": "apt-get install -y default-mysql-client",
+    # ── Active Directory tools (see knowledge/ad_attacks.yaml) ──
+    "responder": "apt-get install -y responder",
+    "mitm6": "pipx install mitm6 || pip3 install mitm6",
+    "impacket": "pipx install impacket || pip3 install impacket",  # secretsdump/GetUserSPNs/ticketer/getST/...
+    "netexec": "pipx install netexec || pip3 install netexec",
+    "crackmapexec": "pipx install crackmapexec || apt-get install -y crackmapexec",
+    "bloodhound-python": "pipx install bloodhound || pip3 install bloodhound",
+    "bloodyAD": "pipx install bloodyAD || pip3 install bloodyAD",
+    "certipy": "pipx install certipy-ad || pip3 install certipy-ad",
+    "certsync": "pipx install certsync || pip3 install certsync",
+    "ldeep": "pipx install ldeep || pip3 install ldeep",
+    "kerbrute": "apt-get install -y kerbrute || go install github.com/ropnop/kerbrute@latest",
+    "lsassy": "pipx install lsassy || pip3 install lsassy",
+    "targetedKerberoast": "pipx install targetedKerberoast || pip3 install targetedKerberoast",
+    "coercer": "pipx install coercer || pip3 install coercer",
+    "hashcat": "apt-get install -y hashcat",
+    "evil-winrm": "apt-get install -y evil-winrm || gem install evil-winrm",
+    "smbmap": "apt-get install -y smbmap",
+    "enum4linux-ng": "apt-get install -y enum4linux-ng || pipx install enum4linux-ng",
+    "sccmhunter": "pipx install sccmhunter || pip3 install git+https://github.com/garrettfoster13/sccmhunter",
+    "pcredz": "pipx install pcredz || pip3 install pcredz",
 }
+
+# ── Tool install GROUPS — "install <group> tools" one-click sets ──────────────
+# AD tools are the Linux-installable set from knowledge/ad_attacks.yaml. Windows
+# payloads used in the mindmap (mimikatz, Rubeus, SharpHound/SharpSCCM, Certify,
+# GodPotato, PrintSpoofer, winPEAS) are NOT apt-installable on Kali — they are
+# operator-supplied binaries, so they are listed as notes, not install commands.
+TOOL_GROUPS = {
+    "ad": {
+        "label": "AD tools",
+        "tools": [
+            "responder", "mitm6", "impacket", "netexec", "crackmapexec",
+            "bloodhound-python", "bloodyAD", "certipy", "certsync", "ldeep",
+            "kerbrute", "lsassy", "targetedKerberoast", "coercer", "hashcat",
+            "evil-winrm", "smbmap", "enum4linux-ng", "ldapsearch", "sccmhunter",
+            "pcredz",
+        ],
+        "windows_payloads": [
+            "mimikatz", "rubeus", "sharphound", "sharpsccm", "certify",
+            "godpotato", "printspoofer", "winpeas",
+        ],
+    },
+}
+
+
+@router.get("/api/tools/groups")
+async def list_tool_groups():
+    """Named tool-install groups for one-click 'install <group> tools' (e.g. 'ad').
+    Each returns the Linux-installable tool ids (POST them to /api/tools/install)
+    plus any Windows payloads that must be operator-supplied (not apt)."""
+    return {"ok": True, "groups": {
+        k: {"label": v.get("label", k), "tools": v.get("tools", []),
+            "windows_payloads": v.get("windows_payloads", [])}
+        for k, v in TOOL_GROUPS.items()}}
 
 
 @router.get("/api/tools/executions")

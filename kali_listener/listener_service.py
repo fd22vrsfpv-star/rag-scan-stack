@@ -1173,6 +1173,15 @@ _FALLBACK_ALLOWED_TOOLS = {
     # brute-force guards (check_candidate_space / check_account_lockout), which
     # already treat it as a credential tool.
     "ncrack", "ffuf", "feroxbuster",
+    # Active Directory tools (knowledge/ad_attacks.yaml). Install manifest only —
+    # the SAFE-lane gate below still decides which may run without approval; the
+    # offensive ones (secretsdump, ticketer, responder, ntlmrelayx, mitm6) stay
+    # on the impactful/approval lane.
+    "responder", "mitm6", "ntlmrelayx", "certipy", "certsync", "ldeep",
+    "kerbrute", "lsassy", "bloodhound-python", "bloodyAD", "targetedKerberoast",
+    "coercer", "hashcat", "evil-winrm", "smbmap", "sccmhunter", "pcredz",
+    "secretsdump", "GetUserSPNs", "GetNPUsers", "getST", "getTGT", "ticketer",
+    "findDelegation", "rbcd", "dacledit", "psexec", "wmiexec",
 }
 # Metasploit is never auto-dispatchable here.
 _MSF_DENY = {"metasploit", "msfconsole", "msfvenom", "msf"}
@@ -1220,6 +1229,12 @@ _SAFE_READONLY_TOOLS = {
     "ssh-audit",
     # NFS export list + java-rmi enumeration.
     "showmount", "rmg",
+    # Active Directory READ-ONLY enumeration (knowledge/ad_attacks.yaml, tier=safe):
+    # LDAP/domain enum, user enum, BloodHound collection, and roasting (requests
+    # tickets any domain user may request — no AD modification). Offensive AD
+    # tools (secretsdump, ticketer, responder, ntlmrelayx, certipy req, netexec
+    # -x) are NOT here — they stay on the impactful/approval lane.
+    "ldeep", "kerbrute", "bloodhound-python", "GetUserSPNs", "GetNPUsers",
 }
 
 
