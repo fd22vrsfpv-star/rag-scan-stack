@@ -265,6 +265,10 @@ interface StartSessionParams {
   /** Named web scan depth from knowledge/web_profiles.yaml. Omit to keep each
    *  web tool's own defaults. */
   web_profile?: string
+  /** Target is PRIMARILY A WEBSITE: cap the port scan at top-1000 (skip the
+   *  1-65535 deep sweep) and start the web pipeline at the beginning of the scan
+   *  phase, in parallel with the port scan. */
+  primarily_website?: boolean
   /** Pin this session to an engine: 'langgraph' (default) or 'autogen' (legacy
    *  GroupChat, kept one release). Omit for the service default. */
   engine?: string
