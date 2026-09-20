@@ -67,7 +67,8 @@ def load_cfg() -> Dict[str, Any]:
     return cfg
 
 
-def _zap_crawl_settings(cur, cfg: Dict[str, Any]) -> Dict[str, int]:
+def _zap_crawl_settings(cur, cfg: Dict[str, Any], host: str = "",
+                        engagement_id: Optional[str] = None) -> Dict[str, int]:
     """Authenticated-crawl tuning, resolved as: ZAP settings (app_settings
     zap.auth_crawl.*) > YAML authenticated_rescan > tuned defaults. These are the
     knobs surfaced in the dashboard's ZAP settings so an operator can widen the
@@ -114,8 +115,27 @@ def _zap_crawl_settings(cur, cfg: Dict[str, Any]) -> Dict[str, int]:
                                       'zap.access_control')
                           AND category='config'""")
         got = {k: v for k, v in cur.fetchall()}
-        if str(got.get("zap.ajax_spider", "")).strip().lower() in ("1", "true", "yes", "on"):
+        # Ajax spider is tri-state: on/off force it; "auto" (the default when the
+        # setting is unset) uses the RAG-driven JS-heavy signals — run the (costly)
+        # browser spider only when the target looks like an SPA (XHR endpoints /
+        # framework / websockets). See knowledge/ajax_spider_signals.yaml.
+        _ajax = str(got.get("zap.ajax_spider", "auto")).strip().lower()
+        if _ajax in ("1", "true", "yes", "on"):
             out["ajax_spider"] = 1
+        elif _ajax in ("0", "false", "no", "off"):
+            out["ajax_spider"] = 0
+        else:  # auto -> signal-based
+            try:
+                from etl.ajax_spider_signals import evaluate_ajax_signals
+            except ImportError:  # pragma: no cover
+                from ajax_spider_signals import evaluate_ajax_signals
+            try:
+                sig = evaluate_ajax_signals(cur, host, engagement_id)
+                out["ajax_spider"] = 1 if sig.get("js_heavy") else 0
+                out["ajax_decision"] = {"mode": "auto", "js_heavy": bool(sig.get("js_heavy")),
+                                        "reasons": sig.get("reasons", [])}
+            except Exception:  # noqa: BLE001
+                out["ajax_spider"] = 0
         if str(got.get("zap.access_control", "")).strip().lower() in ("1", "true", "yes", "on"):
             out["access_control"] = 1
         cs = got.get("zap.active_scan_chunk_size")
@@ -515,7 +535,7 @@ def run_default_cred_check(cur, host: str, login_page_url: str, *,
     if isinstance(out.get("auth_profile"), dict) and out["auth_profile"].get("ok"):
         import time
         rc = cfg.get("authenticated_rescan") or {}
-        zc = _zap_crawl_settings(cur, cfg)   # ZAP settings (app_settings) > YAML > defaults
+        zc = _zap_crawl_settings(cur, cfg, host=scan_host, engagement_id=engagement_id)   # ZAP settings (app_settings) > YAML > defaults
         out["auth_crawl_settings"] = zc
         base = f"{scheme}://{scan_host}/"
         hdr = {"X-Engagement-Id": str(engagement_id or "")}
