@@ -596,6 +596,120 @@ class ZAPBridge:
             _flush(scanned_batch)
         return list(collected.values())
 
+    def configure_ajax_spider_bounds(self, num_browsers=None, max_crawl_states=None,
+                                     max_duration_min=None, max_crawl_depth=None) -> Dict:
+        """Bound the ajax (browser) spider so it is container-safe. ZAP's default
+        here is NumberOfBrowsers=32 with MaxCrawlStates=0 (unlimited) — 32 Firefox
+        instances crawling without a state cap balloon memory from ~1GiB to >14GiB
+        in seconds and OOM.
+
+        Measured on demo.testfire.net (24GiB container, 300-state cap): 1 browser
+        ~+0.4-1GiB, 4 browsers plateaus ~+2.4GiB and stays flat (state cap stops
+        runaway), 32 browsers OOMs. Default 4 (fast + safe); env-overridable with
+        ZAP_AJAX_BROWSERS / ZAP_AJAX_MAX_STATES / ZAP_AJAX_MAX_DURATION_MIN /
+        ZAP_AJAX_MAX_DEPTH so it tunes without a rebuild. Best-effort; returns
+        what was set."""
+        def _env(name, default):
+            try:
+                return int(os.environ.get(name, default))
+            except Exception:  # noqa: BLE001
+                return default
+        num_browsers = _env("ZAP_AJAX_BROWSERS", 4) if num_browsers is None else num_browsers
+        max_crawl_states = _env("ZAP_AJAX_MAX_STATES", 300) if max_crawl_states is None else max_crawl_states
+        max_duration_min = _env("ZAP_AJAX_MAX_DURATION_MIN", 5) if max_duration_min is None else max_duration_min
+        max_crawl_depth = _env("ZAP_AJAX_MAX_DEPTH", 5) if max_crawl_depth is None else max_crawl_depth
+        out = {}
+        opts = {
+            "set_option_number_of_browsers": int(num_browsers),
+            "set_option_max_crawl_states": int(max_crawl_states),
+            "set_option_max_duration": int(max_duration_min),
+            "set_option_max_crawl_depth": int(max_crawl_depth),
+        }
+        for method, val in opts.items():
+            try:
+                fn = getattr(self.zap.ajaxSpider, method, None)
+                if fn:
+                    fn(str(val))
+                    out[method] = val
+            except Exception as e:  # noqa: BLE001
+                out[method] = f"err:{str(e)[:60]}"
+        return out
+
+    def add_context_user(self, context_id, username, password) -> Optional[str]:
+        """Add a SECOND (or Nth) user to an EXISTING context whose authentication
+        method is already configured (form or script). Used by the access-control
+        (IDOR) scan, which needs two logged-in users to compare who-can-reach-what.
+        Returns the new ZAP user id, or None."""
+        try:
+            import urllib.parse as _up
+            if not (username and context_id):
+                return None
+            uid = self.zap.users.new_user(context_id, username)
+            self.zap.users.set_authentication_credentials(
+                context_id, uid,
+                "username=" + _up.quote(username, safe="")
+                + "&password=" + _up.quote(password or "", safe=""))
+            self.zap.users.set_user_enabled(context_id, uid, "true")
+            print(f"ZAP added access-control user {username} (id {uid}) to context {context_id}")
+            return uid
+        except Exception as e:  # noqa: BLE001
+            print(f"Error adding ZAP context user {username}: {e}")
+            return None
+
+    def access_control_scan(self, context_id, user_ids, unauth=True,
+                            alert_risk_level="High", max_wait=600) -> Dict:
+        """Run the ZAP Access Control Testing add-on (broken access control / IDOR).
+        For each URL explored during the (authenticated) crawl+spider, ZAP re-issues
+        the request as EACH user (and, when unauth=True, as an unauthenticated user)
+        and — using the context's logged-in/out indicators — classifies whether the
+        response was authorized. It raises an alert where a user reached a resource
+        the access rules say they should not. Needs a context with an auth method and
+        at least one enabled user (two users → horizontal-IDOR comparison).
+
+        NOTE on scope: the add-on classifies at the URL/node level. It reliably
+        catches FUNCTIONAL/vertical access control (a low-priv user reaching an
+        admin URL) and horizontal IDOR where the object reference is in the URL
+        PATH or a distinct node. Same-URL, param-VALUE IDOR (e.g.
+        showAccount?listAccounts=<other-acct>) is only flagged when the two users'
+        crawls recorded DIFFERENT param values as distinct messages — which is why
+        the AJAX spider (which exercises dropdowns) must run first. Returns status."""
+        out = {"ran": False}
+        try:
+            uids = [u for u in (user_ids or []) if u]
+            if not (context_id and uids):
+                out["error"] = "no context/users for access control scan"
+                return out
+            self.zap.accessControl.scan(
+                contextid=str(context_id),
+                userid=",".join(str(u) for u in uids),
+                scanasunauthuser="true" if unauth else "false",
+                raisealert="true",
+                alertrisklevel=alert_risk_level,
+            )
+            out["ran"] = True
+            # getScanStatus returns a numeric percentage WHILE running and the
+            # literal "NOT RUNNING" when idle/finished (NOT "100"). Give it a moment
+            # to spin up, then treat "NOT RUNNING"/100 as done — otherwise the poll
+            # spins the full max_wait after the scan has already completed.
+            time.sleep(3)
+            waited = 3
+            while waited < max_wait:
+                try:
+                    st = self.zap.accessControl.get_scan_status(contextid=str(context_id))
+                except Exception:
+                    st = None
+                out["status"] = str(st)
+                s = str(st).strip().upper()
+                if s in ("NOT RUNNING", "100", "COMPLETED", "FINISHED"):
+                    out["completed"] = True
+                    break
+                time.sleep(5)
+                waited += 5
+            out.setdefault("completed", False)
+        except Exception as e:  # noqa: BLE001
+            out["error"] = str(e)[:200]
+        return out
+
     async def scan_with_playwright_session(
         self,
         url: str,
@@ -605,6 +719,8 @@ class ZAPBridge:
         auth: Optional[Dict] = None,
         do_ajax_spider: bool = False,
         active_scan_chunk_size: int = 0,
+        second_auth: Optional[Dict] = None,
+        do_access_control: bool = False,
     ) -> Dict:
         """
         Full ZAP scan after Playwright has explored the site
@@ -636,10 +752,22 @@ class ZAPBridge:
         # this is what pulls vulns out of login-gated apps (any app, not just one).
         user_id = None
         context_id = None
+        access_user_ids = []
         if auth and auth.get("login_url"):
             context_name = context_name or f"authctx_{int(time.time())}"
             context_id = self.create_context(context_name, url)
             user_id = self.configure_authentication(context_name, context_id, auth)
+            if user_id:
+                access_user_ids.append(user_id)
+                # Second user for the horizontal-IDOR (access-control) comparison.
+                # The context's auth method is already set; just add creds+enable.
+                if second_auth and second_auth.get("username"):
+                    uid2 = self.add_context_user(
+                        context_id, second_auth.get("username"), second_auth.get("password"))
+                    if uid2:
+                        self.zap.users.set_user_enabled(context_id, uid2, "true")
+                        access_user_ids.append(uid2)
+                        results['access_control_users'] = len(access_user_ids)
             if not user_id:
                 results['authenticated'] = False
                 results['auth_error'] = 'authentication config incomplete or ZAP rejected it'
@@ -672,8 +800,17 @@ class ZAPBridge:
         # traditional spider can't map. Best-effort, bounded.
         if do_ajax_spider:
             try:
-                if user_id and context_id:
-                    self.zap.ajaxSpider.scan_as_user(_ctx_name, user_id, url, subtreeonly=None)
+                # BOUND the ajax spider first — the default 32 browsers /
+                # unlimited crawl states OOMs the container (measured: 1GiB->14GiB
+                # in seconds). 1 browser + a state cap keeps memory flat.
+                results['ajax_spider_bounds'] = self.configure_ajax_spider_bounds()
+                # NOTE: ajaxSpider.scan_as_user takes (contextname, USERNAME, ...) —
+                # the username STRING, not the numeric user id (unlike spider.scan_as_user
+                # which takes contextid+userid). Passing the id makes ZAP fail to find
+                # the user and the ajax crawl silently returns 0 results.
+                _ajax_user = (auth or {}).get("username") if auth else None
+                if _ajax_user and context_id:
+                    self.zap.ajaxSpider.scan_as_user(_ctx_name, _ajax_user, url, subtreeonly=None)
                 else:
                     self.zap.ajaxSpider.scan(url, inscope=None, contextname=_ctx_name, subtreeonly=None)
                 waited = 0
@@ -689,6 +826,16 @@ class ZAPBridge:
                 url, context_name=_ctx_name, user_id=user_id, context_id=context_id)
             if results['spider_id']:
                 results['spider_completed'] = self.wait_for_spider(results['spider_id'])
+
+        # ACCESS CONTROL (broken access control / IDOR) — run AFTER the crawl+spider
+        # have populated the context's message tree, but BEFORE the active scan
+        # (the CHUNKED active scan deletes site-tree nodes to flush memory, which
+        # would leave access control nothing to re-request). Its alerts land in the
+        # same store and are picked up by the export below. Needs a context with an
+        # auth method + >=1 user; a second user enables the horizontal-IDOR compare.
+        if do_access_control and context_id and access_user_ids:
+            results['access_control'] = self.access_control_scan(
+                context_id, access_user_ids, unauth=True)
 
         _chunk_alerts = None
         if do_active_scan:

@@ -503,3 +503,16 @@ repaired the way a missing column is.
 - **Done when:** a deep authenticated active scan of testfire completes without ZAP recycling and ingests /bank findings (showAccount IDOR, transfer/transaction business-logic, queryxpath injection).
 - **Likely fix:** reduce the active-scan footprint — scope the active scan to the authenticated area (/bank) rather than the whole tree, lower thread_per_host, cap max_scan_duration, and/or disable the ajax spider during the authenticated active scan; or give ZAP exclusive memory headroom. The authenticated crawl/seeding (the capability built this session) is unaffected and verified.
 - **Enforced by:** not enforced (live-scan/infra behavior).
+
+## Version-shape test disagrees with update-version.sh format
+- **Found:** 2026-09-19, during a routine version bump.
+- **Evidence:** `tests/test_build_version_sync.py::test_version_has_the_documented_shape`
+  uses `VERSION_RE = ^\d{4}\.\d{2}\.\d{2}-\d+$` (YYYY.MM.DD-N, dash), but the mandated
+  `scripts/update-version.sh <YYYY.MM.DD.HHMM>` writes dot-form (e.g. `2026.09.19.1947`).
+  The pre-existing committed version `2026.09.19.1947` already fails this regex, so the
+  test is red at baseline independent of any change.
+- **Where:** `tests/test_build_version_sync.py:34,73` vs `scripts/update-version.sh`.
+- **Done when:** the regex and the update script agree on ONE format (and
+  `dashboard/frontend/.../constants.test.ts` matches), suite green on a fresh bump.
+- **Enforced by:** `tests/test_build_version_sync.py::test_version_has_the_documented_shape`
+  (currently failing at baseline).
