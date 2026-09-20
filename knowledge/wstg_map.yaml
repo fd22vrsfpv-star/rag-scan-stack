@@ -512,6 +512,43 @@ entries:
       expect_status: 200
     wstg_note: "WSTG-ATHZ-04: an object reference (id/user/doc) reachable without authorization — enumerate the endpoint, then confirm cross-account access."
 
+  # Business-logic value tampering (what the value_tamper probe emits). A numeric
+  # business value (amount/qty/price) accepted with a negative/zero/oversized
+  # input. Impactful + gated: confirming a real money/quantity effect needs the
+  # operator to judge the app's intent.
+  - id: business_logic_value
+    wstg_id: [WSTG-BUSL-01, WSTG-BUSL-03]
+    match:
+      issue_type: [business_logic, business logic, value tampering, data validation]
+      cwe: [CWE-840, CWE-20, CWE-841]
+      nuclei_tags: [business-logic]
+      name_contains: [value tampering, business-logic, business logic, negative amount, price manipulation]
+    tier: impactful
+    category: business_logic
+    tool: curl
+    command: "curl -sk \"{url}\""
+    assertion:
+      expect_status: 200
+    wstg_note: "WSTG-BUSL-01/03: resubmit the business value (amount/qty/price) with a negative/zero/oversized input and confirm it is processed rather than rejected — the app trusts client-supplied values."
+
+  # Forced browsing / function-level access control (what the forced_browsing
+  # probe emits). An authenticated resource reachable without a session, or a
+  # sensitive path exposed anonymously.
+  - id: access_control_forced_browsing
+    wstg_id: [WSTG-ATHZ-02]
+    match:
+      issue_type: [access_control, broken access control, forced browsing, authorization]
+      cwe: [CWE-425, CWE-284, CWE-862]
+      nuclei_tags: [exposure, forced-browsing]
+      name_contains: [reachable without a session, forced browsing, sensitive path exposed, broken access control]
+    tier: impactful
+    category: access_control
+    tool: curl
+    command: "curl -sk -o /dev/null -w '%{http_code}' \"{url}\""
+    assertion:
+      expect_substring: "200"
+    wstg_note: "WSTG-ATHZ-02: request the resource with NO session (and as a low-privilege user); a 200 with real content instead of a login redirect is missing function-level access control."
+
   # ── Tier 2 additions (proactively generated too; here for finding-driven match) ──
   - id: hpp
     wstg_id: [WSTG-INPV-04]
