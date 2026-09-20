@@ -16,6 +16,13 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# playwright_scanner's package import pulls in `playwright`, which is a heavy
+# browser dependency not present in the plain test image. Without this guard its
+# absence is a COLLECTION ERROR that aborts the whole run ("Interrupted: 1 error
+# during collection") rather than skipping this one file — the difference
+# between "cannot run here" and "the suite is broken".
+pytest.importorskip("playwright", reason="playwright_scanner imports playwright")
+
 from playwright_scanner import db_utils  # noqa: E402
 
 

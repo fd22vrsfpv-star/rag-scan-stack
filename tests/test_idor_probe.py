@@ -36,5 +36,14 @@ def test_idor_probe_mutates_and_records():
     assert "discovered_params" in fn, "candidates come from discovered object-ref params"
     assert "(n + 1, n - 1, n + 2)" in fn, "must mutate the numeric id to neighbours"
     assert "isdigit()" in fn, "only numeric object refs are mutated (safe)"
-    assert "sign ?in|log ?in|not authori" in fn, "must exclude login/error pages (false-positive guard)"
+    # The probe must exclude login/denied pages (false-positive guard). This used
+    # to pin the literal regex "sign ?in|log ?in|not authori", which FAILED the
+    # moment that check was improved: word-matching "login" also matched static
+    # labels on authenticated pages (alt="Secure Login", id="LoginLink") and
+    # suppressed every real finding. Assert the BEHAVIOUR — a blocked response is
+    # recognised by the login FORM — not one spelling of it.
+    assert "_blocked" in fn, "must classify blocked/login responses before flagging"
+    assert "password" in fn, (
+        "blocked detection must key on the login form (a password field), which is "
+        "absent from an object-data page — not on the word 'login'")
     assert "issue_type, name, severity" in fn and "'idor'" in fn, "must record an IDOR web_finding"
