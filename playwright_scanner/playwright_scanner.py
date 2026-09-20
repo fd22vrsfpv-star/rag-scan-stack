@@ -2101,6 +2101,72 @@ _IDOR_NAME_RE = __import__("re").compile(
 _LOGOUT_RE = __import__("re").compile(
     r"(?i)(logout|log-?off|log_?off|sign-?off|sign-?out|signout|/exit\b|loggedout|session.?end)")
 
+# ── Business-logic testing (IDOR/BOLA + value tampering) — RAG-driven ─────────
+_BL_CFG = None
+
+
+def _bl_config() -> dict:
+    """Load knowledge/business_logic_tests.yaml once (name patterns, tamper
+    value-sets, response oracle). Data-driven: edit the YAML, not this file."""
+    global _BL_CFG
+    if _BL_CFG is not None:
+        return _BL_CFG
+    cfg = {}
+    for p in ("/knowledge/business_logic_tests.yaml",
+              os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "knowledge", "business_logic_tests.yaml")):
+        try:
+            if os.path.exists(p):
+                import yaml
+                cfg = (yaml.safe_load(open(p, encoding="utf-8")) or {}).get("business_logic_tests") or {}
+                break
+        except Exception:  # noqa: BLE001
+            cfg = {}
+    _BL_CFG = cfg
+    return cfg
+
+
+def _bl_asset_id(cur, host: str):
+    """Resolve the asset id for a host by hostname OR ip (assets.ip is inet)."""
+    cur.execute("SELECT id FROM assets WHERE hostname=%s OR host(ip)=%s LIMIT 1", (host, host))
+    r = cur.fetchone()
+    return r[0] if r else None
+
+
+def _bl_body_params(cur, host: str, url_pattern: str) -> dict:
+    """Reconstruct a POST body for url_pattern from discovered_params: {name: value}
+    for every body param, using the first sample value (or '1' when none)."""
+    cur.execute(
+        """SELECT param_name, sample_values FROM discovered_params dp
+             JOIN assets a ON a.id = dp.asset_id
+            WHERE (a.hostname=%s OR host(a.ip)=%s) AND url_pattern=%s
+              AND param_location='body'""", (host, host, url_pattern))
+    body = {}
+    for name, samples in cur.fetchall():
+        body[name] = (samples[0] if samples else "1")
+    return body
+
+
+def _bl_is_blocked(body: str) -> bool:
+    """True if the response is a login/denied/blocked page (a password field or an
+    explicit denial), per the YAML oracle — NOT a word-match on 'login'."""
+    markers = (_bl_config().get("oracle") or {}).get("blocked_markers") or []
+    low = (body or "").lower()
+    return any(m.lower() in low for m in markers)
+
+
+async def _bl_fetch(ctx, method: str, url: str, body: dict = None) -> str:
+    """Replay a request in the authenticated context (shares cookies). Returns the
+    response text, or '' on error. POST sends form-encoded body."""
+    try:
+        if (method or "GET").upper() == "POST":
+            resp = await ctx.request.post(url, form=(body or {}), timeout=15000)
+        else:
+            resp = await ctx.request.get(url, timeout=15000)
+        return await resp.text()
+    except Exception:  # noqa: BLE001
+        return ""
+
 
 async def _run_authenticated_katana(ctx, base_url: str, engagement_id, job_id: str,
                                     landing_url: str = None) -> Dict:
@@ -2172,9 +2238,11 @@ async def _idor_mutate_probe(ctx, base_url: str, host: str, engagement_id, job_i
     the case where we DON'T have a second credential (the two-user path uses ZAP's
     accessControl add-on). Heuristic + bounded; findings are 'medium'.
 
-    NB: only GET numeric object-refs are mutated (safe + meaningful). POST-body
-    object-refs (e.g. testfire's showAccount account number) need POST-param
-    discovery and are not covered here yet."""
+    Covers GET query object-refs (via page navigation) AND POST-body object-refs
+    (replayed in the authenticated context via ctx.request, reconstructing the
+    full body from discovered_params) — the latter catches form/dropdown object
+    references katana's -aff seeds. Object-ref param names come from
+    knowledge/business_logic_tests.yaml."""
     import re
     from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
     from db_utils import get_db
@@ -2258,8 +2326,192 @@ async def _idor_mutate_probe(ctx, base_url: str, host: str, engagement_id, job_i
                         conn.commit()
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"[idor:{job_id[:8]}] probe {up} err: {e}")
+
+        # POST-BODY object refs: replay the form in the authenticated context with
+        # the object-ref param mutated, reconstructing the full body so the request
+        # is valid. Catches form/dropdown object references (e.g. account numbers)
+        # the GET pass can't see.
+        try:
+            found += await _idor_post_body_pass(ctx, host, engagement_id, job_id)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[idor:{job_id[:8]}] post-body pass err: {e}")
     finally:
         await page.close()
+    return found
+
+
+async def _idor_post_body_pass(ctx, host: str, engagement_id, job_id: str) -> int:
+    """POST-body IDOR: for each POST url_pattern with an object-reference body
+    param, replay the reconstructed body with the id mutated and flag a distinct,
+    non-blocked response (the account reached another object). Bounded by
+    business_logic_tests.yaml (idor.name_patterns / mutations / max_candidates)."""
+    import re as _re
+    from db_utils import get_db
+    cfg = _bl_config().get("idor") or {}
+    offsets = [int(x) for x in (cfg.get("mutations") or [1, -1, 2])]
+    name_pats = [str(n).lower() for n in (cfg.get("name_patterns") or [])]
+    maxc = int(cfg.get("max_candidates", 8))
+    skip = {str(s).lower() for s in (_bl_config().get("skip_params") or [])}
+
+    cands = []  # (url_pattern, param_name, base_value)
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT DISTINCT url_pattern, param_name, sample_values
+                     FROM discovered_params dp JOIN assets a ON a.id = dp.asset_id
+                    WHERE (a.hostname=%s OR host(a.ip)=%s)
+                      AND http_method='POST' AND param_location='body'""", (host, host))
+            for up, pn, samples in cur.fetchall():
+                pl = (pn or "").lower()
+                if pl in skip:
+                    continue
+                sample = (samples[0] if samples else "")
+                is_ref = any(p in pl for p in name_pats) or _IDOR_NAME_RE.search(pn or "")
+                if (is_ref or str(sample).isdigit()) and str(sample).isdigit():
+                    cands.append((up, pn, sample))
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[idor:{job_id[:8]}] post-body candidate load failed: {e}")
+        return 0
+    cands = cands[:maxc]
+    if not cands:
+        return 0
+
+    found = 0
+    for up, pn, base_val in cands:
+        try:
+            with get_db() as conn, conn.cursor() as cur:
+                body = _bl_body_params(cur, host, up)
+            if pn not in body:
+                body[pn] = base_val
+            base_body = dict(body, **{pn: base_val})
+            orig = await _bl_fetch(ctx, "POST", up, base_body)
+            if not orig or _bl_is_blocked(orig):
+                continue
+            n = int(base_val)
+            hits = []
+            for off in offsets:
+                mv = n + off
+                if mv < 0:
+                    continue
+                resp = await _bl_fetch(ctx, "POST", up, dict(body, **{pn: str(mv)}))
+                if len(resp) > 500 and resp != orig and not _bl_is_blocked(resp):
+                    hits.append(mv)
+            if hits:
+                found += 1
+                with get_db() as conn, conn.cursor() as cur:
+                    aid = _bl_asset_id(cur, host)
+                    cur.execute(
+                        """INSERT INTO web_findings
+                             (asset_id, url, source, issue_type, name, severity, param,
+                              evidence, method, engagement_id)
+                           VALUES (%s,%s,'idor_probe','idor',
+                                   'Potential IDOR (object reference, POST body)','medium',%s,%s,'POST',%s)
+                           ON CONFLICT DO NOTHING""",
+                        (aid, up, pn,
+                         f"authenticated POST with {pn}={n} mutated to {hits} returned distinct "
+                         f"content (possible access to another object)"[:300], engagement_id))
+                    conn.commit()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[idor:{job_id[:8]}] post-body {up} err: {e}")
+    return found
+
+
+async def _value_tamper_probe(ctx, base_url: str, host: str, engagement_id, job_id: str) -> int:
+    """Business-VALUE tampering (WSTG-BUSL-01/03). For numeric params whose name
+    looks like a monetary/quantity value, resubmit the request (GET or POST, in
+    the authenticated context) with negative/zero/oversized values from
+    business_logic_tests.yaml. Flag when a tampered value yields a SUCCESSFUL,
+    non-validation-error response that differs from the baseline — a potential
+    business-logic flaw (e.g. a negative-amount transfer accepted). Heuristic;
+    findings are 'medium' potential flags for manual triage."""
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+    from db_utils import get_db
+    cfg = _bl_config().get("value_tamper") or {}
+    oracle = _bl_config().get("oracle") or {}
+    name_pats = [str(n).lower() for n in (cfg.get("name_patterns") or [])]
+    values = [str(v) for v in (cfg.get("values") or ["-1", "0", "999999999"])]
+    maxc = int(cfg.get("max_candidates", 6))
+    succ = [m.lower() for m in (oracle.get("success_markers") or [])]
+    errm = [m.lower() for m in (oracle.get("error_markers") or [])]
+    minb = int(oracle.get("min_response_bytes", 500))
+    skip = {str(s).lower() for s in (_bl_config().get("skip_params") or [])}
+    if not name_pats:
+        return 0
+
+    cands = []  # (url_pattern, param_name, method, base_value)
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT DISTINCT url_pattern, param_name, http_method, param_location, sample_values
+                     FROM discovered_params dp JOIN assets a ON a.id = dp.asset_id
+                    WHERE (a.hostname=%s OR host(a.ip)=%s)""", (host, host))
+            for up, pn, method, loc, samples in cur.fetchall():
+                pl = (pn or "").lower()
+                if pl in skip or not any(p in pl for p in name_pats):
+                    continue
+                sample = (samples[0] if samples else "")
+                # only tamper numeric business values
+                try:
+                    float(str(sample))
+                except (TypeError, ValueError):
+                    sample = "1"
+                cands.append((up, pn, (method or "GET").upper(), loc, sample))
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[valtamper:{job_id[:8]}] candidate load failed: {e}")
+        return 0
+    cands = cands[:maxc]
+    if not cands:
+        return 0
+
+    def _has(markers, text):
+        low = text.lower()
+        return any(m in low for m in markers)
+
+    found = 0
+    for up, pn, method, loc, base_val in cands:
+        try:
+            if method == "POST" or loc == "body":
+                with get_db() as conn, conn.cursor() as cur:
+                    body = _bl_body_params(cur, host, up)
+                body[pn] = base_val
+                baseline = await _bl_fetch(ctx, "POST", up, dict(body, **{pn: base_val}))
+                def _send(val):  # noqa: E306
+                    return _bl_fetch(ctx, "POST", up, dict(body, **{pn: val}))
+            else:
+                pu = urlparse(up)
+                q = {k: (v[0] if isinstance(v, list) else v) for k, v in parse_qs(pu.query).items()}
+                q[pn] = base_val
+                base_url_full = urlunparse(pu._replace(query=urlencode(q)))
+                baseline = await _bl_fetch(ctx, "GET", base_url_full)
+                def _send(val):  # noqa: E306
+                    q2 = dict(q, **{pn: val})
+                    return _bl_fetch(ctx, "GET", urlunparse(pu._replace(query=urlencode(q2))))
+            if not baseline or _bl_is_blocked(baseline):
+                continue
+            for val in values:
+                resp = await _send(val)
+                if (len(resp) > minb and not _bl_is_blocked(resp)
+                        and _has(succ, resp) and not _has(errm, resp)
+                        and resp != baseline):
+                    found += 1
+                    with get_db() as conn, conn.cursor() as cur:
+                        aid = _bl_asset_id(cur, host)
+                        cur.execute(
+                            """INSERT INTO web_findings
+                                 (asset_id, url, source, issue_type, name, severity, param,
+                                  payload, evidence, method, engagement_id)
+                               VALUES (%s,%s,'value_tamper','business_logic',
+                                       'Potential business-logic flaw (value tampering)','medium',
+                                       %s,%s,%s,%s,%s)
+                               ON CONFLICT DO NOTHING""",
+                            (aid, up, pn, val,
+                             f"tampered {pn}={val} (from {base_val}) returned a success-shaped "
+                             f"response with no validation error — possible unchecked business "
+                             f"value (WSTG-BUSL-01/03)"[:300], method, engagement_id))
+                        conn.commit()
+                    break  # one finding per param is enough
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[valtamper:{job_id[:8]}] {up} err: {e}")
     return found
 
 
@@ -2528,12 +2780,23 @@ async def _perform_crawl(job_id: str, req: CrawlRequest):
                             ctx, req.url, _eng, job_id, landing_url=(page.url or None))
                     except Exception as _ke:  # noqa: BLE001
                         logger.debug(f"[crawl:{job_id[:8]}] auth katana failed: {_ke}")
-                    n = await _idor_mutate_probe(ctx, req.url, urlparse(req.url).hostname or "", _eng, job_id)
+                    _bl_host = urlparse(req.url).hostname or ""
+                    n = await _idor_mutate_probe(ctx, req.url, _bl_host, _eng, job_id)
                     job["idor_findings"] = n
                     if n:
                         logger.info(f"[crawl:{job_id[:8]}] IDOR probe flagged {n} potential object-reference issue(s)")
                 except Exception as e:  # noqa: BLE001
                     logger.debug(f"[crawl:{job_id[:8]}] IDOR probe failed: {e}")
+                # Business-VALUE tampering (negative amounts / price / qty) — same
+                # authenticated context. Separate try so an IDOR failure doesn't
+                # skip it and vice versa.
+                try:
+                    vt = await _value_tamper_probe(ctx, req.url, urlparse(req.url).hostname or "", _eng, job_id)
+                    job["value_tamper_findings"] = vt
+                    if vt:
+                        logger.info(f"[crawl:{job_id[:8]}] value-tamper probe flagged {vt} potential business-logic issue(s)")
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"[crawl:{job_id[:8]}] value-tamper probe failed: {e}")
 
             await ctx.close()
             await browser.close()
