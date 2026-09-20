@@ -334,6 +334,7 @@ def test_rules(*, rules: Optional[List[Dict[str, Any]]] = None, target: str = ""
             facts += facts_from_exploits(cur, target=target)
             facts += facts_from_open_ports(cur, target=target, limit=limit)
             facts += facts_from_login_services(cur, target=target, limit=limit)
+            facts += facts_from_web_tech(cur, target=target, engagement_id=engagement_id)
             out["facts"] = len(facts)
             scope_rows, scope_src = load_dispatch_scope(cur, engagement_id)
             if scope_src == "unavailable":
@@ -849,6 +850,48 @@ def facts_from_login_services(cur, *, target: str = "", limit: int = 60) -> List
                               "port": port, "service": svc, "login_service": True})
     except Exception as e:  # noqa: BLE001
         log.debug("login-service facts unavailable: %s", e)
+    return facts
+
+
+def facts_from_web_tech(cur, *, target: str = "",
+                        engagement_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Web-technology signals -> a `web_tech` fact per host, carrying whether the
+    target is JS-heavy (SPA framework / XHR endpoints / websockets) and therefore
+    whether the (expensive) ZAP ajax spider is worth running. Data-driven by
+    knowledge/ajax_spider_signals.yaml (evaluate_ajax_signals). This is the
+    post-enumeration observation the ajax decision reads when zap.ajax_spider='auto'."""
+    try:
+        from etl.ajax_spider_signals import evaluate_ajax_signals
+    except ImportError:  # pragma: no cover
+        from ajax_spider_signals import evaluate_ajax_signals
+    facts: List[Dict[str, Any]] = []
+    # Which hosts to evaluate: the target if given, else hosts with web recon data.
+    hosts: List[str] = []
+    try:
+        if target:
+            hosts = [target]
+        else:
+            cur.execute(
+                """SELECT DISTINCT host(a.ip) FROM assets a
+                    WHERE EXISTS (SELECT 1 FROM dom_analysis d WHERE d.asset_id=a.id)
+                       OR EXISTS (SELECT 1 FROM content_extractions c WHERE c.asset_id=a.id)
+                    LIMIT 50""")
+            hosts = [r[0] for r in cur.fetchall() if r[0]]
+    except Exception:  # noqa: BLE001
+        try:
+            cur.connection.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return facts
+    for host in hosts:
+        sig = evaluate_ajax_signals(cur, host, engagement_id)
+        facts.append({"fact": "web_tech", "target": host, "service": "http",
+                      "js_heavy": bool(sig.get("js_heavy")),
+                      "xhr_count": sig.get("xhr_count", 0),
+                      "js_frameworks": sig.get("js_frameworks", []),
+                      "websockets": bool(sig.get("websockets")),
+                      "ajax_spider_recommended": bool(sig.get("js_heavy")),
+                      "reasons": sig.get("reasons", [])})
     return facts
 
 

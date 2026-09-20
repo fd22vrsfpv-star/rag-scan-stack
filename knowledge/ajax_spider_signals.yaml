@@ -1,0 +1,51 @@
+# When to try the ZAP ajax (browser) spider — RAG-first, data-driven.
+#
+# The ajax spider drives real browsers (memory-heavy even when bounded) and is
+# OFF by default. It only pays off on JS-heavy / SPA apps where the traditional
+# spider AND authenticated katana miss runtime-rendered content. These signals,
+# observed during enumeration, decide whether a target is JS-heavy enough to
+# warrant it. Evaluated by etl/ajax_spider_signals.evaluate_ajax_signals() and
+# surfaced as a post-enumeration `web_tech` fact (facts_from_web_tech).
+#
+# Gate: the ZAP setting `zap.ajax_spider` is tri-state — "on"/"off" force it,
+# "auto" (the default) uses THESE signals. Even when a signal fires, the spider
+# stays bounded (1-4 browsers + a crawl-state cap, see
+# zap_bridge.configure_ajax_spider_bounds); signals decide WHETHER, never how heavy.
+ajax_spider_signals:
+  # Any ONE signal at/above threshold marks the target JS-heavy -> ajax spider ON.
+  signals:
+    xhr_endpoints:
+      # katana-discovered XHR/fetch/API endpoints (content_extractions.api_endpoints).
+      # A static/link crawl cannot reach data behind these; a browser spider can.
+      min_count: 3
+      why: "XHR/fetch endpoints indicate an AJAX/JS-driven app the link crawl can't map"
+    js_frameworks:
+      # SPA/client-render frameworks (dom_analysis.javascript_libs / external_scripts).
+      # Their presence means content is assembled in the browser, not the HTML.
+      min_count: 1
+      names:
+        - react
+        - angular
+        - angularjs
+        - vue
+        - svelte
+        - ember
+        - backbone
+        - knockout
+        - next
+        - nuxt
+        - preact
+        - alpine
+        - stimulus
+        - marionette
+      why: "an SPA framework renders content client-side; the DOM spider is needed"
+    websockets:
+      # any websocket usage (dom_analysis.websockets) is inherently JS-driven and
+      # completely invisible to a static crawl.
+      min_count: 1
+      why: "websocket usage is JS-driven and invisible to a static crawl"
+  # Decision when NONE of the signals fire: leave the ajax spider off (katana +
+  # the link crawl + the IDOR probe already cover a server-rendered app cheaply).
+  default_when_no_signal: false
+  # The operator setting that this rule feeds. "auto" -> use these signals.
+  setting_key: zap.ajax_spider
