@@ -395,6 +395,17 @@ class KatanaReq(BaseModel):
     filter_similar: Optional[bool] = True       # collapse /users/123 and /users/456
     proxy: Optional[str] = None
     no_ingest: Optional[bool] = False
+    # AUTHENTICATED crawl: custom headers (incl. "Cookie: JSESSIONID=..." or
+    # "Authorization: Bearer ...") sent on every request, so katana reaches the
+    # logged-in area (e.g. /bank/*). The caller resolves the session from the
+    # Auth Profile and passes it here — pd-runner just forwards it to -H.
+    headers: Optional[List[str]] = None         # each "Name: value"
+    # Automatic form fill (-aff): fills and SUBMITS discovered forms, so a GET
+    # form like the account-summary dropdown produces the concrete object-ref URL
+    # (showAccount?listAccounts=<value>) that parse_katana turns into a
+    # discovered_param the IDOR mutation probe can then mutate. Off by default
+    # (experimental in katana); enabled for authenticated web crawls.
+    auto_form_fill: Optional[bool] = False
     # Crawl scope. katana's default is "rdn" (root domain), which is far too
     # loose for an engagement: crawling a Metasploitable TWiki instance followed
     # links off-host and issued requests to twiki.org, twitter.com, youtube.com,
@@ -570,6 +581,21 @@ def run_katana(req: KatanaReq, background_tasks: BackgroundTasks):
         cmd.extend(["-known-files", req.known_files])
     if req.headless:
         cmd.append("-headless")
+    # Authenticated crawl: forward each header/cookie to katana's -H.
+    for h in (req.headers or []):
+        if h and ":" in h:
+            cmd.extend(["-H", h])
+    # Automatic form fill: submit forms so object-ref URLs (e.g.
+    # showAccount?listAccounts=<value>) are produced and ingested as params.
+    if req.auto_form_fill:
+        cmd.append("-aff")
+    # NEVER crawl logout/sign-off during an AUTHENTICATED crawl (headers set):
+    # katana shares the caller's session cookie, so requesting /logout.jsp
+    # invalidates it server-side and logs out everything else using that session
+    # (the browser crawl + the IDOR probe). Exclude it from the crawl scope.
+    if req.headers:
+        cmd.extend(["-crawl-out-scope",
+                    r"(?i)(logout|log-?off|log_?off|sign-?off|sign-?out|signout)"])
     # -filter-similar not available in katana v1.4.0
     # if req.filter_similar:
     #     cmd.append("-filter-similar")
