@@ -21,6 +21,50 @@ sys.path.insert(0, str(project_root))
 # by explicit file path with importlib (see tests/test_artifact_actions.py).
 
 
+# ---- Shared lab / fixture constants ----
+#
+# The lab target was written as a LITERAL in ~200 places across the suite, so
+# moving the lab — or running the same tests against a different host — meant a
+# 200-site edit. New tests import LAB_TARGET instead, and the env override lets
+# the suite point somewhere else without touching code.
+LAB_TARGET = os.environ.get("TEST_LAB_TARGET", "192.168.1.150")
+
+# RFC 5737 documentation ranges. Fixtures use these for "other hosts" so a
+# fixture can never name something routable by accident.
+DOC_PEERS = ("192.0.2.41", "198.51.100.23", "203.0.113.9")
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def _render_loot(template: str) -> str:
+    """Fill the fixture's {{PLACEHOLDERS}} with secret-SHAPED synthetic values.
+
+    These are assembled here rather than committed because a literal 88-char
+    Azure storage key in the repo trips GitHub's push protection — correctly.
+    The resolution for a fixture is to stop storing secret-shaped strings, not to
+    click "allow the secret": that is how a real leak gets waved through later.
+    The values are still the right SHAPE, so the extractors are exercised exactly
+    as they would be on real loot.
+    """
+    azure_key = ("QAbCdEf0123456789" * 6)[:86] + "=="          # 88 chars, b64-ish
+    sas_sig = ("ZmljdGlvbmFsc2lnbmF0dXJl" * 2)[:44] + "%3D%3D"  # url-encoded tail
+    gh_token = "ghp_" + ("FICTIONALtoken0123456789abcdefghij" * 2)[:36]
+    return (template
+            .replace("{{AZURE_ACCOUNT_KEY}}", azure_key)
+            .replace("{{AZURE_SAS_SIG}}", sas_sig)
+            .replace("{{GITHUB_TOKEN}}", gh_token))
+
+
+@pytest.fixture
+def loot_output() -> str:
+    """Captured post-access enumeration output carrying SYNTHETIC loot: an AWS
+    example key pair, Azure storage/SP/SAS values, an SSH private key + known_hosts,
+    DB connection strings and sensitive documents. Drives the extractor -> fact ->
+    rule controls. Nothing in it is a working credential."""
+    raw = (FIXTURES_DIR / "pentest_loot_enumeration.txt").read_text(encoding="utf-8")
+    return _render_loot(raw)
+
+
 # ---- Database Fixtures ----
 
 

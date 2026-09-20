@@ -13,6 +13,7 @@ YAML the way an endpoint ships its test.
 
     pytest tests/test_knowledge_rag_coverage.py
 """
+import ast
 import os
 import glob
 
@@ -21,37 +22,43 @@ import pytest
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 KNOWLEDGE = os.path.join(REPO, "knowledge")
 
-# YAMLs that ARE embedded into rag_documents, mapped to the loader that does it.
-# Add here (and remove the RAG_LOAD_DEBT entry) when you wire a file into RAG.
-RAG_LOADED = {
+RENDERER_LOADER = "etl/load_knowledge_documents.py"
+
+
+def _renderer_covered_yamls():
+    """YAML stems the RENDERERS registry actually renders, DERIVED from the
+    loader source via ast.
+
+    This used to be a hand-copied list of 23 filenames that mirrored RENDERERS
+    exactly. Mirroring a registry by hand is drift waiting to happen: the list
+    and the registry can disagree, and every new knowledge file needed an edit
+    here that is pure toil (four were added in one session). Deriving it keeps
+    the guard's teeth — a YAML with no renderer is still undeclared and still
+    fails — while removing the bookkeeping.
+    """
+    src = open(os.path.join(REPO, RENDERER_LOADER), encoding="utf-8").read()
+    for node in ast.walk(ast.parse(src)):
+        if (isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "RENDERERS" for t in node.targets)
+                and isinstance(node.value, ast.Dict)):
+            return {k.value + ".yaml" for k in node.value.keys
+                    if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+    raise AssertionError(f"RENDERERS registry not found in {RENDERER_LOADER}")
+
+
+# Loaders that are NOT the renderer registry — one entry each, named explicitly
+# because nothing else can derive them.
+RAG_LOADED_OTHER = {
     # load_rules() merges enumeration_rules.yaml, and sync_flows_to_rag /
     # _load_flow_into_rag embed every merged flow into rag_documents.
     "enumeration_rules.yaml": "app/rag-api/api.py",
-    # etl/load_knowledge_documents.py renders each of these into rag_documents
-    # (source=knowledge_<stem>); POST /rag/knowledge/sync runs it.
-    "service_tools.yaml": "etl/load_knowledge_documents.py",
-    "credential_followups.yaml": "etl/load_knowledge_documents.py",
-    "default_credentials.yaml": "etl/load_knowledge_documents.py",
-    "service_access_methods.yaml": "etl/load_knowledge_documents.py",
-    "cloud_scan_rules.yaml": "etl/load_knowledge_documents.py",
-    "port_profiles.yaml": "etl/load_knowledge_documents.py",
-    "scan_parameters.yaml": "etl/load_knowledge_documents.py",
-    "tool_options.yaml": "etl/load_knowledge_documents.py",
-    "web_profiles.yaml": "etl/load_knowledge_documents.py",
-    "credential_spray_policy.yaml": "etl/load_knowledge_documents.py",
-    "msf_learned_options.yaml": "etl/load_knowledge_documents.py",
-    "dos_exploit_overrides.yaml": "etl/load_knowledge_documents.py",
-    "enumeration_extractors.yaml": "etl/load_knowledge_documents.py",
-    "postex_commands.yaml": "etl/load_knowledge_documents.py",
-    "msf_readonly_scanners.yaml": "etl/load_knowledge_documents.py",
-    "owasp_param_tests.yaml": "etl/load_knowledge_documents.py",
-    "safe_service_probes.yaml": "etl/load_knowledge_documents.py",
-    "directory_followups.yaml": "etl/load_knowledge_documents.py",
-    "default_cred_check.yaml": "etl/load_knowledge_documents.py",
-    "ajax_spider_signals.yaml": "etl/load_knowledge_documents.py",
-    "business_logic_tests.yaml": "etl/load_knowledge_documents.py",
-    "content_discovery.yaml": "etl/load_knowledge_documents.py",
-    "ad_attacks.yaml": "etl/load_knowledge_documents.py",
+}
+
+# YAMLs that ARE embedded into rag_documents, mapped to the loader that does it.
+# Wiring a new file into RAG via a renderer needs NO edit here.
+RAG_LOADED = {
+    **{y: RENDERER_LOADER for y in _renderer_covered_yamls()},
+    **RAG_LOADED_OTHER,
 }
 
 # YAMLs deliberately NOT embedded into rag_documents. Each needs a reason. This

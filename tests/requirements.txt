@@ -1,27 +1,35 @@
-# Dependencies the test suite needs.
+# Dependencies required to COLLECT and run the test suite.
 #
-# Without this the suite's result depended on whatever happened to be installed:
-# a missing pytest-asyncio silently turned an async test into a FAILURE rather
-# than a skip, and absent bs4/psycopg2 produced failures that looked like code
-# defects. Every one of those cost time to diagnose as "not actually a bug".
+# Why this file exists: the documented command was
+#   pip install -q pytest pyyaml; pytest tests/
+# which collected 2528 tests, of which 107 ERRORED on import — 103 on `fastapi`
+# and 87 on `psycopg2`. Those looked like failures but were missing packages, and
+# they hid 402 further tests that never collected at all (2930 collect with this
+# file installed). A suite whose true state depends on an undocumented, ad-hoc
+# pip line cannot honour the "keep the suite green" rule, because nobody can see
+# what green is.
 #
-#   pip install -r tests/requirements.txt && pytest tests/
+#   docker run --rm -v "$PWD":/repo -w /repo python:3.12-slim sh -c \
+#     "pip install -q -r tests/requirements.txt && python -m pytest tests/ -q"
 #
-# Service-specific packages (playwright, msgpack, pydantic-settings) are
-# deliberately NOT here: those tests importorskip and are exercised inside their
-# own images, so requiring them would make a laptop run impossible.
-pytest>=7.4
-pytest-asyncio>=0.21     # async tests fail, not skip, without this
-psycopg2-binary>=2.9     # DB integration tests (they skip without a database)
-pyyaml>=6.0              # rule/profile loading
-requests>=2.31
-httpx>=0.24
-fastapi>=0.100           # routers imported by BFF tests
-pydantic>=2.0
-jinja2>=3.1
-beautifulsoup4>=4.12     # HTML extraction path in url_fetch
+# Anything heavier than this (playwright browsers, a live database, a running
+# stack) must be an importorskip / skipif inside the test, never a hard import —
+# a missing optional dep should SKIP one file, not abort collection for all.
 
-# Undefined-name detection for service entrypoints (tests/test_undefined_names.py).
-# A NameError at import crash-loops a container; ast.parse and the CI flake8 step
-# (which runs with `|| true`) both miss it.
-pyflakes
+pytest>=8.0
+
+# Parsers and knowledge YAML (extractors, rules, profiles).
+PyYAML>=6.0
+
+# Service modules under test declare FastAPI apps and Pydantic models at import
+# time, so collection needs them even for pure-logic tests.
+fastapi>=0.110
+pydantic>=2.0
+
+# db_utils and the ETL writers import psycopg2 at module scope. The binary wheel
+# avoids needing libpq headers in the test image.
+psycopg2-binary>=2.9
+
+# HTTP clients used by dispatchers and by the live endpoint sweeps.
+httpx>=0.27
+requests>=2.31
