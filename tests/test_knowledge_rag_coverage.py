@@ -51,6 +51,7 @@ RAG_LOADED = {
     "ajax_spider_signals.yaml": "etl/load_knowledge_documents.py",
     "business_logic_tests.yaml": "etl/load_knowledge_documents.py",
     "content_discovery.yaml": "etl/load_knowledge_documents.py",
+    "ad_attacks.yaml": "etl/load_knowledge_documents.py",
 }
 
 # YAMLs deliberately NOT embedded into rag_documents. Each needs a reason. This
