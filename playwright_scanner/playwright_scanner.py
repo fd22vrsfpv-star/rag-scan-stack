@@ -2155,6 +2155,50 @@ def _bl_is_blocked(body: str) -> bool:
     return any(m.lower() in low for m in markers)
 
 
+def _bl_discovered_paths(cur, host: str, root: str, limit: int = 60) -> list:
+    """Paths that gobuster/ffuf/feroxbuster already discovered for this host,
+    normalized to absolute URLs — the forced-browsing probe tests ANONYMOUS access
+    to them (content discovery is those tools' job; access control is the probe's).
+    ffuf stores data->>'url'; gobuster stores a raw_output text block whose lines
+    look like 'admin  (Status: 302) [Size: 0] [--> /login.jsp]'."""
+    import re as _re
+    urls, seen = [], set()
+
+    def _add(u):
+        if u and u not in seen:
+            seen.add(u); urls.append(u)
+
+    try:
+        cur.execute(
+            """SELECT source, finding_type, data FROM recon_findings rf
+                 JOIN assets a ON a.id = rf.asset_id
+                WHERE (a.hostname=%s OR host(a.ip)=%s)
+                  AND source IN ('ffuf','gobuster','feroxbuster')""", (host, host))
+        rows = cur.fetchall()
+    except Exception:  # noqa: BLE001
+        try:
+            cur.connection.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return []
+    for source, ftype, data in rows:
+        if not isinstance(data, dict):
+            continue
+        u = data.get("url")
+        if u:
+            _add(u if "://" in str(u) else root.rstrip("/") + "/" + str(u).lstrip("/"))
+        raw = data.get("raw_output") or ""
+        for line in str(raw).splitlines():
+            m = _re.match(r"\s*(/?[^\s(]+)\s+\(Status:", line)
+            if m:
+                p = m.group(1).strip()
+                if p and not p.lower().startswith(("http", "status")):
+                    _add(root.rstrip("/") + "/" + p.lstrip("/"))
+        if len(urls) >= limit:
+            break
+    return urls[:limit]
+
+
 async def _bl_fetch(ctx, method: str, url: str, body: dict = None) -> str:
     """Replay a request in the authenticated context (shares cookies). Returns the
     response text, or '' on error. POST sends form-encoded body."""
@@ -2553,6 +2597,15 @@ async def _forced_browsing_probe(base_url: str, host: str, engagement_id, job_id
         u = urljoin(root + "/", str(p).lstrip("/"))
         if u not in seen:
             cands.append((u, "privileged")); seen.add(u)
+    # Paths gobuster/ffuf/feroxbuster already discovered — test anon access to what
+    # the content-discovery tools found, not just a static wordlist.
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            for u in _bl_discovered_paths(cur, host, root):
+                if u not in seen:
+                    cands.append((u, "discovered")); seen.add(u)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[forcedbrowse:{job_id[:8]}] discovered-path load failed: {e}")
     cands = cands[:maxc]
     if not cands:
         return 0
