@@ -512,11 +512,39 @@ def _render_content_discovery(data: Dict[str, Any]) -> List[Doc]:
     return out
 
 
+def _render_ad_attacks(data: Dict[str, Any]) -> List[Doc]:
+    """Active Directory attack methodology (OCD mindmap) -> one RAG doc per
+    technique so the planner / test-synth can retrieve the right AD attack +
+    command for the current foothold (no-creds -> user -> DA), with its tool,
+    MITRE id, and safe/impactful tier."""
+    d = data.get("ad_attacks")
+    if not isinstance(d, dict):
+        return []
+    out: List[Doc] = []
+    src = d.get("source", "AD mindmap")
+    for ph in (d.get("phases") or []):
+        if not isinstance(ph, dict):
+            continue
+        pname = ph.get("name", ph.get("id", ""))
+        for t in (ph.get("techniques") or []):
+            if not isinstance(t, dict) or not t.get("name"):
+                continue
+            tier = t.get("tier", "safe")
+            gate = " (IMPACTFUL — approval-gated)" if tier == "impactful" else " (safe/read-only)"
+            out.append((
+                f"AD attack [{pname}]: {t['name']} ({t.get('tool','')})",
+                f"{t.get('note','') or t['name']}. Phase: {pname}. Tool: {t.get('tool','')}, "
+                f"MITRE {t.get('mitre','')}, tier={tier}{gate}. Command: {t.get('command','')}. "
+                f"Source: {src}. Authorized engagements only."))
+    return out
+
+
 RENDERERS = {
     "msf_learned_options": _render_msf_learned_options,
     "ajax_spider_signals": _render_ajax_spider_signals,
     "business_logic_tests": _render_business_logic_tests,
     "content_discovery": _render_content_discovery,
+    "ad_attacks": _render_ad_attacks,
     "safe_service_probes": _render_safe_service_probes,
     "directory_followups": _render_directory_followup,
     "default_cred_check": _render_default_cred_check,
