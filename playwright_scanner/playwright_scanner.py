@@ -849,6 +849,39 @@ def _resolve_second_web_auth(url: str, engagement_id: Optional[str], primary_aut
     return None
 
 
+def _persist_session_cookies(host: str, engagement_id, cookies) -> int:
+    """Persist the browser's authenticated session cookies into the Auth Profile
+    (web_auth_configs.session.cookies) so downstream tools that don't drive a
+    browser — gobuster, ffuf, Burp, a re-run ZAP — can reuse the logged-in session
+    without re-authenticating. Merges into the session blob (keeps login_page etc.)."""
+    try:
+        import json as _json
+        pairs = []
+        for c in (cookies or []):
+            dom = (c.get("domain") or "").lstrip(".")
+            if c.get("name") and (not host or not dom or dom in host or host in dom):
+                pairs.append({"name": c.get("name"), "value": c.get("value"),
+                              "domain": c.get("domain"), "path": c.get("path")})
+        if not pairs:
+            return 0
+        from db_utils import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE web_auth_configs
+                      SET session = COALESCE(session,'{}'::jsonb)
+                                    || jsonb_build_object('cookies', %s::jsonb),
+                          updated_at = now()
+                    WHERE host = %s
+                      AND (engagement_id IS NULL
+                           OR (%s::uuid IS NOT NULL AND engagement_id = %s::uuid))""",
+                (_json.dumps(pairs), host, engagement_id, engagement_id))
+            conn.commit()
+            return cur.rowcount
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"persist session cookies failed for {host}: {e}")
+        return 0
+
+
 @app.post("/scan", response_model=ScanResponse)
 async def create_scan(
     scan_request: ScanRequest,
@@ -2844,6 +2877,16 @@ async def _perform_crawl(job_id: str, req: CrawlRequest):
             _crawl_auth = req.auth or _resolve_web_auth(req.url, _eid)
             if _crawl_auth and _crawl_auth.get("login_url"):
                 job["authenticated"] = await _browser_login(page, _crawl_auth)
+                # Persist the live session cookies into the Auth Profile so tools
+                # that don't drive a browser (gobuster, ffuf, Burp) can reuse the
+                # logged-in session without re-authenticating.
+                if job.get("authenticated"):
+                    try:
+                        _ph = urlparse(req.url).hostname or ""
+                        job["session_persisted"] = _persist_session_cookies(
+                            _ph, _eid, await ctx.cookies())
+                    except Exception as _pe:  # noqa: BLE001
+                        logger.debug(f"[crawl:{job_id[:8]}] persist session failed: {_pe}")
                 # Seed the POST-LOGIN landing page (e.g. /bank/main.jsp) at the FRONT
                 # of the queue: the logged-out homepage (req.url) usually does not
                 # link into the authenticated area, so without this the crawl walks
