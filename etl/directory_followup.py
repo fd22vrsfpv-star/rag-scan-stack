@@ -261,6 +261,73 @@ def _gobuster_command(dir_url: str, wordlist_path: str, cfg: Dict[str, Any],
             f"-q -k -b {blk} --no-error{auth}")
 
 
+_CD_CFG = None
+
+
+def _content_discovery_cfg() -> Dict[str, Any]:
+    """Load knowledge/content_discovery.yaml once (tool templates + default +
+    custom-attack recipes). Data-driven: edit the YAML to add tools/recipes."""
+    global _CD_CFG
+    if _CD_CFG is not None:
+        return _CD_CFG
+    cfg = {}
+    for path in ("/knowledge/content_discovery.yaml",
+                 os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "knowledge", "content_discovery.yaml")):
+        if os.path.exists(path):
+            try:
+                import yaml
+                cfg = yaml.safe_load(open(path, encoding="utf-8")) or {}
+            except Exception:  # noqa: BLE001
+                cfg = {}
+            break
+    _CD_CFG = cfg
+    return cfg
+
+
+def _select_content_tool(cur) -> str:
+    """Which content-discovery tool to run: the operator setting
+    (content_discovery.tool) if it names a known tool, else the YAML default
+    (gobuster). One of the 3 — never all three."""
+    cd = _content_discovery_cfg().get("content_discovery") or {}
+    tools = cd.get("tools") or {}
+    default = cd.get("default_tool", "gobuster")
+    try:
+        cur.execute("SELECT value FROM app_settings WHERE key=%s AND category='config'",
+                    (cd.get("setting_key", "content_discovery.tool"),))
+        r = cur.fetchone()
+        sel = (r[0].strip().lower() if r and r[0] else "")
+        if sel in tools:
+            return sel
+    except Exception:  # noqa: BLE001
+        try:
+            cur.connection.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+    return default if default in tools else "gobuster"
+
+
+def _build_content_command(tool: str, dir_url: str, wordlist: str,
+                           cfg: Dict[str, Any], cookie: Optional[str] = None) -> str:
+    """Build the selected tool's command from its YAML template, injecting the
+    authenticated session cookie. Falls back to the gobuster builder."""
+    cd = _content_discovery_cfg().get("content_discovery") or {}
+    spec = (cd.get("tools") or {}).get(tool)
+    if not spec or not spec.get("template"):
+        return _gobuster_command(dir_url, wordlist, cfg, cookie=cookie)
+    exts = ",".join(str(e) for e in (cfg.get("extensions") or []))
+    g = cfg.get("gobuster", {})
+    threads = int(g.get("threads", 10))
+    blk = g.get("status_codes_blacklist", "404")
+    u = dir_url if dir_url.endswith("/") else dir_url + "/"
+    cookie_flag = ""
+    if cookie and spec.get("cookie_flag"):
+        cookie_flag = str(spec["cookie_flag"]).format(cookie=cookie)
+    return str(spec["template"]).format(
+        url=u, wordlist=wordlist, exts=exts, threads=threads,
+        blacklist=blk, cookie_flag=cookie_flag)
+
+
 def queue_directory_followup(cur, host: str, dir_url: str, *,
                              asset_id: Optional[str] = None,
                              engagement_id: Optional[str] = None,
@@ -299,7 +366,8 @@ def queue_directory_followup(cur, host: str, dir_url: str, *,
     # Authenticated brute-force when the crawl has persisted a session cookie for
     # this host into the Auth Profile (mirrors ffuf's -H). Falls back to anonymous.
     _cookie = _resolve_session_cookie(cur, host, engagement_id)
-    command = _gobuster_command(dir_url, wordlist, cfg, cookie=_cookie)
+    _tool = _select_content_tool(cur)
+    command = _build_content_command(_tool, dir_url, wordlist, cfg, cookie=_cookie)
 
     # Scope gate (fail-closed) before anything leaves.
     if scope_rows is not None:
@@ -337,7 +405,7 @@ def queue_directory_followup(cur, host: str, dir_url: str, *,
             import httpx
             with httpx.Client(verify=False, timeout=20) as cli:
                 r = cli.post(f"{KALI_LISTENER_URL.rstrip('/')}/tools/execute",
-                             json={"tool": "gobuster", "command": command,
+                             json={"tool": _tool, "command": command,
                                    "target": host, "service": tag,
                                    "port": urlparse(base_url).port or (443 if base_url.startswith("https") else 80),
                                    "timeout": int(cfg.get("gobuster", {}).get("timeout_seconds", 600))})

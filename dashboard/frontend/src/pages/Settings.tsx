@@ -339,6 +339,56 @@ function ZapAuthCrawlPanel() {
   )
 }
 
+const CONTENT_DISCOVERY_TOOLS = [
+  { id: 'gobuster', label: 'gobuster — fast flat brute (default)' },
+  { id: 'ffuf', label: 'ffuf — fast flat brute (+ param/POST fuzzing)' },
+  { id: 'feroxbuster', label: 'feroxbuster — recursive + link extraction (deep, slower)' },
+] as const
+
+function ContentDiscoveryPanel() {
+  const [tool, setTool] = useState('gobuster')
+  const [msg, setMsg] = useState('')
+  useEffect(() => {
+    fetch('/api/settings/config/content_discovery.tool')
+      .then(r => (r.ok ? r.json() : { value: 'gobuster' }))
+      .then(d => setTool(String(d?.value ?? 'gobuster')))
+      .catch(() => setTool('gobuster'))
+  }, [])
+  const save = async (v: string) => {
+    setTool(v)
+    try {
+      await fetch('/api/settings/config/content_discovery.tool', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: v }),
+      })
+      setMsg('Saved — applies to the next directory followup.')
+      setTimeout(() => setMsg(''), 4000)
+    } catch { setMsg('Save failed') }
+  }
+  return (
+    <div className="mt-4 pt-3 border-t border-border">
+      <h4 className="text-xs font-semibold mb-1">Content Discovery Tool</h4>
+      <p className="text-[10px] text-muted-foreground mb-2">
+        One directory/file brute tool runs per followup (not all three — they're redundant).
+        Authenticated automatically when the crawl has a session. gobuster ≈ ffuf; feroxbuster
+        recurses + extracts links (deeper, ~4× slower).
+      </p>
+      <div className="flex items-center gap-2 max-w-md">
+        <select
+          value={tool}
+          onChange={e => save(e.target.value)}
+          className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border outline-none focus:border-primary"
+        >
+          {CONTENT_DISCOVERY_TOOLS.map(t => (
+            <option key={t.id} value={t.id}>{t.label}</option>
+          ))}
+        </select>
+        {msg && <span className="text-xs text-muted-foreground whitespace-nowrap">{msg}</span>}
+      </div>
+    </div>
+  )
+}
+
 // ─── General Tab ─────────────────────────────────────
 function GeneralTab() {
   const store = useScanDefaultsStore()
@@ -531,6 +581,7 @@ function GeneralTab() {
             <label className="text-sm">Spider Enabled</label>
           </div>
           <ZapAuthCrawlPanel />
+          <ContentDiscoveryPanel />
         </div>
       </div>
 
