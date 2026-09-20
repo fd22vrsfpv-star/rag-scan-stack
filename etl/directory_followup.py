@@ -21,6 +21,7 @@ Scope-gated before dispatch (defence in depth) and fail-closed.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -211,14 +212,53 @@ def build_merged_wordlist(host: str, asset_id: Optional[str], base_url: str,
     return path
 
 
-def _gobuster_command(dir_url: str, wordlist_path: str, cfg: Dict[str, Any]) -> str:
+def _resolve_session_cookie(cur, host: str, engagement_id: Optional[str] = None) -> Optional[str]:
+    """The authenticated session cookie for `host`, from the Auth Profile
+    (web_auth_configs.session.cookies) that the crawl persisted — so gobuster can
+    brute-force the LOGGED-IN surface. Returns "name=value; ..." or None. Prefers
+    the engagement's profile, else a global one. Never raises."""
+    try:
+        cur.execute(
+            """SELECT session FROM web_auth_configs
+                WHERE enabled AND host = %s
+                  AND (engagement_id IS NULL
+                       OR (%s::uuid IS NOT NULL AND engagement_id = %s::uuid))
+                ORDER BY (engagement_id IS NOT NULL) DESC LIMIT 1""",
+            (host, engagement_id, engagement_id))
+        r = cur.fetchone()
+    except Exception:  # noqa: BLE001
+        try:
+            cur.connection.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+    if not r or not r[0]:
+        return None
+    session = r[0]
+    if isinstance(session, str):
+        try:
+            session = json.loads(session or "{}")
+        except Exception:  # noqa: BLE001
+            return None
+    cookies = (session or {}).get("cookies") or []
+    pairs = [f"{c.get('name')}={c.get('value')}" for c in cookies
+             if isinstance(c, dict) and c.get("name")]
+    return "; ".join(pairs) if pairs else None
+
+
+def _gobuster_command(dir_url: str, wordlist_path: str, cfg: Dict[str, Any],
+                      cookie: Optional[str] = None) -> str:
     exts = ",".join(str(e) for e in (cfg.get("extensions") or []))
     g = cfg.get("gobuster", {})
     threads = int(g.get("threads", 10))
     blk = g.get("status_codes_blacklist", "404")
     u = dir_url if dir_url.endswith("/") else dir_url + "/"
+    # Authenticated brute-force: gobuster dir -c sends the session cookie, so the
+    # scan runs as the logged-in user (mirrors ffuf's -H). Static snapshot — fine
+    # for a bounded followup; no re-auth on expiry (that is ZAP's job).
+    auth = f' -c "{cookie}"' if cookie else ""
     return (f"gobuster dir -u {u} -w {wordlist_path} -x {exts} -t {threads} "
-            f"-q -k -b {blk} --no-error")
+            f"-q -k -b {blk} --no-error{auth}")
 
 
 def queue_directory_followup(cur, host: str, dir_url: str, *,
@@ -256,7 +296,10 @@ def queue_directory_followup(cur, host: str, dir_url: str, *,
     if not wordlist:
         out["reason"] = "no wordlist words available"
         return out
-    command = _gobuster_command(dir_url, wordlist, cfg)
+    # Authenticated brute-force when the crawl has persisted a session cookie for
+    # this host into the Auth Profile (mirrors ffuf's -H). Falls back to anonymous.
+    _cookie = _resolve_session_cookie(cur, host, engagement_id)
+    command = _gobuster_command(dir_url, wordlist, cfg, cookie=_cookie)
 
     # Scope gate (fail-closed) before anything leaves.
     if scope_rows is not None:
