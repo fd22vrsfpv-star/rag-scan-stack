@@ -483,10 +483,40 @@ def _render_business_logic_tests(data: Dict[str, Any]) -> List[Doc]:
         "Findings are potential flags for manual triage.")]
 
 
+def _render_content_discovery(data: Dict[str, Any]) -> List[Doc]:
+    """Content-discovery tool selection + custom-attack recipes -> RAG docs so the
+    planner/test-synth can (a) know which brute tool is selected and (b) retrieve
+    fuzzer-based CUSTOM ATTACK recipes (param discovery/injection, vhost, login
+    brute, 403 bypass, subdomain, recursive deep) to construct beyond dir discovery."""
+    d = data.get("content_discovery")
+    out: List[Doc] = []
+    if isinstance(d, dict):
+        tools = ", ".join((d.get("tools") or {}).keys())
+        out.append((
+            "Content discovery: which directory-brute tool runs",
+            f"Directory/file discovery uses ONE tool ({tools}); default "
+            f"{d.get('default_tool','gobuster')}, overridden by the operator setting "
+            f"{d.get('setting_key','content_discovery.tool')}. gobuster~ffuf for a flat "
+            "brute; feroxbuster recurses + extracts links (deeper, slower, needs "
+            "--filter-size 0). All reuse the persisted authenticated session cookie."))
+    # one doc per custom-attack recipe (data.get at TOP level, sibling of content_discovery)
+    for r in (data.get("custom_attacks") or []):
+        if not isinstance(r, dict) or not r.get("name"):
+            continue
+        imp = " (IMPACTFUL — approval-gated)" if r.get("impactful") else ""
+        out.append((
+            f"Custom attack recipe: {r['name']} ({r.get('tool','ffuf')})",
+            f"{r.get('purpose','')}. WSTG {r.get('wstg','')}, fuzz={r.get('fuzz','')}{imp}. "
+            f"Command template: {r.get('template','')}. Fill the {{placeholders}} at run "
+            "time; a cookie_flag injects the authenticated session."))
+    return out
+
+
 RENDERERS = {
     "msf_learned_options": _render_msf_learned_options,
     "ajax_spider_signals": _render_ajax_spider_signals,
     "business_logic_tests": _render_business_logic_tests,
+    "content_discovery": _render_content_discovery,
     "safe_service_probes": _render_safe_service_probes,
     "directory_followups": _render_directory_followup,
     "default_cred_check": _render_default_cred_check,
