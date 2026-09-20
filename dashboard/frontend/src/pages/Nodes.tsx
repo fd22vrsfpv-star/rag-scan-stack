@@ -241,6 +241,12 @@ function ToolSelectionModal({
     web: ['httpx', 'nuclei', 'katana', 'ffuf', 'whatweb', 'wafw00f'],
     recon: ['nmap', 'subfinder', 'amass', 'dnsx', 'httpx', 'nuclei'],
     network: ['nmap', 'masscan', 'naabu', 'tlsx'],
+    // Active Directory attack toolkit (knowledge/ad_attacks.yaml). Windows
+    // payloads (mimikatz, Rubeus, SharpHound) are operator-supplied, not apt.
+    'ad tools': ['responder', 'mitm6', 'impacket', 'netexec', 'crackmapexec',
+      'bloodhound-python', 'bloodyAD', 'certipy', 'certsync', 'ldeep', 'kerbrute',
+      'lsassy', 'targetedKerberoast', 'coercer', 'hashcat', 'evil-winrm', 'smbmap',
+      'enum4linux-ng', 'ldapsearch', 'sccmhunter', 'pcredz'],
     wireguard: ['wireguard']
   }
 
