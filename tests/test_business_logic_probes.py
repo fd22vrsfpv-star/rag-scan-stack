@@ -119,6 +119,10 @@ def test_forced_browsing_wired():
     assert "follow_redirects=False" in s
     # every anonymous request is scope-gated
     assert '_scope_refusal_for_url(url, f"forced-browsing' in s
+    # consumes gobuster/ffuf-discovered paths (content discovery) for the anon check
+    assert "def _bl_discovered_paths(" in s
+    assert "'ffuf','gobuster','feroxbuster'" in s
+    assert "_bl_discovered_paths(cur, host, root)" in s
 
 
 def test_wstg_map_covers_probe_findings():
