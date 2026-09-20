@@ -60,5 +60,12 @@ default_cred_check:
     crawl_wait_seconds: 300
     zap_spider: true
     zap_active_scan: true
+    # Broken access control / IDOR: after the authenticated crawl+spider seed the
+    # tree, run ZAP's accessControl add-on. It compares who-can-reach-what across
+    # the logged-in user (plus a SECOND registered user for the horizontal-IDOR
+    # comparison, when one exists) and an unauthenticated baseline. Best paired
+    # with the ajax spider ON (zap.ajax_spider) so dropdown/form object-ref params
+    # are in the tree. Operator toggle: app_settings zap.access_control.
+    zap_access_control: true
   priority: 26
   followup_tag: default_cred_check

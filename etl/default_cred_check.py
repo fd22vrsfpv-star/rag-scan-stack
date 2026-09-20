@@ -102,13 +102,22 @@ def _zap_crawl_settings(cur, cfg: Dict[str, Any]) -> Dict[str, int]:
     # store to disk between batches and peak memory stays bounded regardless of site
     # size. Set zap.active_scan_chunk_size=0 for the whole-tree scan.
     out["active_scan_chunk_size"] = 10
+    # Access-control (broken access control / IDOR) scan OFF by default. When on,
+    # ZAP's accessControl add-on runs after the authenticated crawl+spider,
+    # comparing who-can-reach-what across the logged-in user (and a second user
+    # when one is registered) plus an unauthenticated baseline. Optional via ZAP
+    # setting zap.access_control.
+    out["access_control"] = 0
     try:
         cur.execute("""SELECT key, value FROM app_settings
-                        WHERE key IN ('zap.ajax_spider','zap.active_scan_chunk_size')
+                        WHERE key IN ('zap.ajax_spider','zap.active_scan_chunk_size',
+                                      'zap.access_control')
                           AND category='config'""")
         got = {k: v for k, v in cur.fetchall()}
         if str(got.get("zap.ajax_spider", "")).strip().lower() in ("1", "true", "yes", "on"):
             out["ajax_spider"] = 1
+        if str(got.get("zap.access_control", "")).strip().lower() in ("1", "true", "yes", "on"):
+            out["access_control"] = 1
         cs = got.get("zap.active_scan_chunk_size")
         if cs is not None and str(cs).strip().lstrip("-").isdigit():
             out["active_scan_chunk_size"] = max(0, min(int(cs), 500))
@@ -540,7 +549,8 @@ def run_default_cred_check(cur, host: str, login_page_url: str, *,
                                     "zap_spider": bool(rc.get("zap_spider", True)),
                                     "zap_active_scan": bool(rc.get("zap_active_scan", True)),
                                     "zap_ajax_spider": bool(zc.get("ajax_spider", 0)),
-                                    "zap_active_scan_chunk_size": int(zc.get("active_scan_chunk_size", 10))},
+                                    "zap_active_scan_chunk_size": int(zc.get("active_scan_chunk_size", 10)),
+                                    "zap_access_control": bool(zc.get("access_control", 0))},
                               headers=hdr)
                 body = sr.json() if sr.status_code < 400 else {}
                 out["authenticated_scan"] = {
