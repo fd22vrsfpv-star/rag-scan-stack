@@ -2837,6 +2837,11 @@ _SAFE_CATEGORIES = {
 _IMPACTFUL_CATEGORIES = {
     "rce", "shell", "msf_exploit", "file_write", "upload", "cred_bruteforce",
     "dos", "sqli_dump", "deserialization", "webshell_upload", "edb_exploit", "idor",
+    # Business-logic / authorization confirmations (wstg_map business_logic_value,
+    # access_control_forced_browsing). Impactful because confirming them means
+    # re-submitting a business value or reaching a resource as another principal —
+    # the operator judges intent, so they never auto-run.
+    "business_logic", "access_control",
 }
 # ExploitDB scripts to try per (product, version). Non-MSF exploit coverage.
 _EDB_PER_SERVICE = int(os.environ.get("SURFACE_EDB_LIMIT", "3"))
@@ -2859,6 +2864,12 @@ _SAFE_TOOL_HINTS = {
     "avahi-browse", "smtp-user-enum",
     "ssh-audit",
     "showmount", "rmg",
+    # Site word harvesting for the directory-enumeration followup (read-only spider).
+    "cewl",
+    # Active Directory READ-ONLY enumeration — must mirror the listener's
+    # _SAFE_READONLY_TOOLS exactly (tests/test_safe_lane_tools.py pins the two
+    # sets to each other; they drifted when the listener side was extended alone).
+    "ldeep", "kerbrute", "bloodhound-python", "GetUserSPNs", "GetNPUsers",
 }
 # Cap per host — this is a single-host exhaustive sweep, not the cross-host
 # _DETERMINISTIC_PLAN_LIMIT that bounds recommender calls across many hosts.
