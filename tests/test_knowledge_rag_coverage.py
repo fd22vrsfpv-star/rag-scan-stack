@@ -48,6 +48,7 @@ RAG_LOADED = {
     "safe_service_probes.yaml": "etl/load_knowledge_documents.py",
     "directory_followups.yaml": "etl/load_knowledge_documents.py",
     "default_cred_check.yaml": "etl/load_knowledge_documents.py",
+    "ajax_spider_signals.yaml": "etl/load_knowledge_documents.py",
 }
 
 # YAMLs deliberately NOT embedded into rag_documents. Each needs a reason. This

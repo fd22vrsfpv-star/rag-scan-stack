@@ -440,8 +440,31 @@ def _render_default_cred_check(data: Dict[str, Any]) -> List[Doc]:
         "authenticated scanning). CSRF-protected forms are left for manual review.")]
 
 
+def _render_ajax_spider_signals(data: Dict[str, Any]) -> List[Doc]:
+    """Ajax-spider gating -> a doc so the planner can retrieve WHEN to run the
+    (expensive) browser spider: only on JS-heavy targets, decided by observed
+    signals (XHR endpoint count, SPA framework, websockets), when the operator
+    setting zap.ajax_spider is 'auto'."""
+    d = data.get("ajax_spider_signals")
+    if not isinstance(d, dict):
+        return []
+    sig = d.get("signals") or {}
+    xhr = (sig.get("xhr_endpoints") or {}).get("min_count")
+    fw = ", ".join((sig.get("js_frameworks") or {}).get("names") or [])
+    return [(
+        "Web scan tuning: when to run the ZAP ajax (browser) spider",
+        "The ajax spider is expensive and OFF by default; it is enabled only for "
+        "JS-heavy / SPA targets, decided by enumeration signals when zap.ajax_spider "
+        f"= 'auto': >= {xhr} katana XHR/fetch endpoints, OR an SPA framework "
+        f"({fw}), OR any websocket usage. Surfaced as a post-enumeration web_tech "
+        "fact (js_heavy). Server-rendered apps stay on the cheaper katana + link "
+        "crawl + IDOR probe path. Even when enabled the spider stays bounded "
+        "(1-4 browsers, capped crawl states).")]
+
+
 RENDERERS = {
     "msf_learned_options": _render_msf_learned_options,
+    "ajax_spider_signals": _render_ajax_spider_signals,
     "safe_service_probes": _render_safe_service_probes,
     "directory_followups": _render_directory_followup,
     "default_cred_check": _render_default_cred_check,
