@@ -231,6 +231,7 @@ const ZAP_AUTH_CRAWL_KEYS = [
 function ZapAuthCrawlPanel() {
   const [vals, setVals] = useState<Record<string, string>>({})
   const [ajax, setAjax] = useState(false)
+  const [accessControl, setAccessControl] = useState(false)
   const [msg, setMsg] = useState('')
   useEffect(() => {
     ZAP_AUTH_CRAWL_KEYS.forEach(({ key, def }) => {
@@ -243,6 +244,10 @@ function ZapAuthCrawlPanel() {
       .then(r => (r.ok ? r.json() : { value: 'false' }))
       .then(d => setAjax(['1', 'true', 'yes', 'on'].includes(String(d?.value ?? '').toLowerCase())))
       .catch(() => setAjax(false))
+    fetch('/api/settings/config/zap.access_control')
+      .then(r => (r.ok ? r.json() : { value: 'false' }))
+      .then(d => setAccessControl(['1', 'true', 'yes', 'on'].includes(String(d?.value ?? '').toLowerCase())))
+      .catch(() => setAccessControl(false))
   }, [])
   const save = async () => {
     try {
@@ -257,6 +262,11 @@ function ZapAuthCrawlPanel() {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ value: ajax ? 'true' : 'false' }),
+      })
+      await fetch('/api/settings/config/zap.access_control', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: accessControl ? 'true' : 'false' }),
       })
       setMsg('Saved — applies to the next authenticated crawl.')
       setTimeout(() => setMsg(''), 4000)
@@ -302,6 +312,22 @@ function ZapAuthCrawlPanel() {
             )} />
           </button>
           <label className="text-sm">Ajax spider <span className="text-[10px] text-muted-foreground">— browser-based; off by default (memory-heavy, redundant after the auth crawl). Enable for JS-heavy SPAs.</span></label>
+        </div>
+        <div className="flex items-center gap-2 pt-1">
+          <button
+            type="button"
+            onClick={() => setAccessControl(!accessControl)}
+            className={cn(
+              'relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors',
+              accessControl ? 'bg-primary' : 'bg-muted-foreground/30',
+            )}
+          >
+            <span className={cn(
+              'pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow transform transition-transform',
+              accessControl ? 'translate-x-4' : 'translate-x-0',
+            )} />
+          </button>
+          <label className="text-sm">Access control (IDOR) <span className="text-[10px] text-muted-foreground">— ZAP accessControl add-on; compares who-can-reach-what across the logged-in user, a second registered user, and an unauthenticated baseline. Pair with the ajax spider on.</span></label>
         </div>
         <div className="flex items-center gap-2">
           <button type="button" onClick={save}

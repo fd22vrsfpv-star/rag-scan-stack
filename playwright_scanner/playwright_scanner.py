@@ -187,6 +187,14 @@ class ScanRequest(BaseModel):
     #: whole-tree active scan (grows to fill the heap on large sites).
     zap_active_scan_chunk_size: Optional[int] = Field(0, description="Active-scan batch size (0 = whole tree)")
     auth: Optional[Dict] = Field(None, description="ZAP form-auth for an authenticated scan: {login_url, login_data (with {%username%}/{%password%}), username, password, logged_in_regex?, logged_out_regex?}. If omitted, a stored per-host config is used.")
+    #: Run the ZAP Access Control Testing add-on (broken access control / IDOR)
+    #: after the authenticated crawl+spider. Off by default. Best with a second
+    #: user (below) for the horizontal-IDOR comparison; the ajax spider should be
+    #: on so dropdown/form object-ref params are in the tree to compare.
+    zap_access_control: Optional[bool] = Field(False, description="Run the ZAP access-control (IDOR) scan — off by default")
+    #: A SECOND user for the access-control comparison: {username, password}. If
+    #: omitted, one is auto-resolved from a second credential for the same host.
+    second_auth: Optional[Dict] = Field(None, description="Second user {username, password} for the access-control (IDOR) comparison")
     #: Engagement for resolving the stored Auth Profile. The X-Engagement-Id header
     #: contextvar is RESET when the request returns, but the ZAP scan runs after
     #: that — so the header alone resolves to None. Carrying it in the body lets the
@@ -542,6 +550,12 @@ async def _perform_scan_slotted(scan_request: ScanRequest, scan_id: uuid.UUID):
                 # the engagement-scoped Auth Profile still resolves.
                 _eid = _eid or getattr(scan_request, "engagement_id", None)
                 _auth = scan_request.auth or _resolve_web_auth(url_str, _eid)
+                _do_ac = bool(getattr(scan_request, "zap_access_control", False))
+                # Second user for the access-control (IDOR) comparison: explicit, or
+                # auto-resolved from a second credential registered for the host.
+                _second = getattr(scan_request, "second_auth", None)
+                if _do_ac and not _second and _auth:
+                    _second = _resolve_second_web_auth(url_str, _eid, _auth)
                 zap_results = await zap_bridge.scan_with_playwright_session(
                     url=url_str,
                     do_spider=scan_request.zap_spider,
@@ -550,6 +564,8 @@ async def _perform_scan_slotted(scan_request: ScanRequest, scan_id: uuid.UUID):
                     auth=_auth,
                     do_ajax_spider=bool(getattr(scan_request, "zap_ajax_spider", False)),
                     active_scan_chunk_size=int(getattr(scan_request, "zap_active_scan_chunk_size", 0) or 0),
+                    second_auth=_second,
+                    do_access_control=_do_ac,
                 )
                 if _auth:
                     logger.info(f"ZAP authenticated scan for {url_str} (login {_auth.get('login_url')})")
@@ -787,6 +803,50 @@ def _resolve_web_auth(url: str, engagement_id: Optional[str] = None):
     except Exception as e:  # noqa: BLE001
         logger.warning(f"web auth resolve failed for {url}: {e}")
         return None
+
+
+def _resolve_second_web_auth(url: str, engagement_id: Optional[str], primary_auth: Optional[Dict]):
+    """Resolve a SECOND distinct web credential for the access-control (IDOR)
+    comparison: a different username at the same target with a resolvable secret.
+    credential_findings is IP-keyed, so we anchor on the primary credential's IP
+    when known (else fall back to any distinct web credential). Returns
+    {username, password} or None (single-cred → the scan still runs one-user)."""
+    try:
+        from db_utils import get_db
+        primary_user = (primary_auth or {}).get("username") or ""
+        cred_id = (primary_auth or {}).get("credential_id")
+        with get_db() as conn, conn.cursor() as cur:
+            target_ip = None
+            if cred_id:
+                cur.execute("SELECT ip::text FROM credential_findings WHERE id=%s::uuid",
+                            (str(cred_id),))
+                row = cur.fetchone()
+                if row:
+                    target_ip = row[0]
+            web_types = "('password','web','http','form','login','')"
+            if target_ip:
+                cur.execute(
+                    f"""SELECT username, secret_value FROM credential_findings
+                         WHERE ip = %s::inet AND username <> %s
+                           AND secret_value IS NOT NULL
+                           AND COALESCE(auth_type,'') IN {web_types}
+                         ORDER BY (valid_cred IS TRUE) DESC, created_at DESC
+                         LIMIT 1""",
+                    (target_ip, primary_user))
+            else:
+                cur.execute(
+                    f"""SELECT username, secret_value FROM credential_findings
+                         WHERE username <> %s AND secret_value IS NOT NULL
+                           AND COALESCE(auth_type,'') IN {web_types}
+                         ORDER BY (valid_cred IS TRUE) DESC, created_at DESC
+                         LIMIT 1""",
+                    (primary_user,))
+            r = cur.fetchone()
+            if r and r[0]:
+                return {"username": r[0], "password": r[1] or ""}
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"second web auth resolve failed for {url}: {e}")
+    return None
 
 
 @app.post("/scan", response_model=ScanResponse)
