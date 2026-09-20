@@ -17,6 +17,33 @@ An open-source **workflow collector for authorized penetration testing and red t
 > Configured in *Settings → LLM Tuning*; see
 > [`Docs/LLM-ROUTING.md`](Docs/LLM-ROUTING.md).
 
+> **New — authenticated web-app & business-logic testing.**
+> A **portable Auth Profile** logs the crawler in once and the live session is
+> reused by every tool (ZAP, katana, ffuf, gobuster, Burp) — no re-authenticating.
+> On the logged-in surface the platform now tests the classes a scanner misses:
+> **IDOR / broken object access** (GET *and* POST-body object references),
+> **business-value tampering** (WSTG-BUSL — negative amounts, price/qty), and
+> **forced browsing / function-level access control** (WSTG-ATHZ-02), fed by the
+> paths gobuster/ffuf discover. All data-driven by `knowledge/business_logic_tests.yaml`
+> and gated safe-vs-approval.
+
+> **New — smarter, non-redundant content discovery.**
+> Pick **one** directory-brute tool — gobuster (default), ffuf, or feroxbuster —
+> in *Settings*; the AJAX spider now **auto-enables only on JS-heavy/SPA targets**
+> (XHR/framework/websocket signals), and ZAP's ajax spider is **memory-bounded**
+> (was 32 browsers → OOM; now capped). Fuzzer-based **custom-attack recipes**
+> (param/vhost/login-brute/403-bypass) live in RAG for the agent to construct.
+
+> **New — Active Directory attack methodology, tooling & automation.**
+> The full **Orange Cyberdefense AD mindmap** is ingested into
+> `knowledge/ad_attacks.yaml` (9 phases, ~45 techniques with commands, MITRE IDs,
+> and safe/impactful tiers) and embedded in RAG. The AD toolkit
+> (impacket, netexec, BloodHound, certipy, kerbrute, responder, ldeep, lsassy, …)
+> is **baked into the local Kali image** and one-click installable as an *AD tools*
+> group. A **Domain Controller auto-fires safe AD enumeration**; a discovered
+> **domain credential is tagged `ad_credential`** and drives safe credentialed
+> enum (BloodHound/Kerberoast/LDAP), with offensive techniques approval-gated.
+
 ![RAG Scan Stack dashboard](presentation-materials/dashboard.png)
 
 *The main dashboard — engagement-scoped totals, findings-by-severity, live scans, and the most recent findings across every tool.*

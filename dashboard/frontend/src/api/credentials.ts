@@ -69,6 +69,9 @@ export interface DiscoveredCredential {
   source?: string
   status?: string
   discovered_at?: string
+  /** credential_findings.metadata — carries the AD tag set by etl/ad_credentials:
+   *  { ad_credential: true, domain: '<domain>' } for Active Directory creds. */
+  metadata?: { ad_credential?: boolean; domain?: string; [k: string]: unknown }
 }
 
 export function useDiscoveredCredentials(limit = 500) {
