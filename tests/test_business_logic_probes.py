@@ -121,6 +121,23 @@ def test_forced_browsing_wired():
     assert '_scope_refusal_for_url(url, f"forced-browsing' in s
 
 
+def test_wstg_map_covers_probe_findings():
+    """The surface-test tier maps a finding to WSTG guidance by issue_type; the new
+    BUSL/ATHZ entries must match exactly what the probes emit, or the LLM tier
+    never authors a business-logic confirmation test for them."""
+    m = yaml.safe_load((ROOT / "knowledge/wstg_map.yaml").read_text())
+    entries = m if isinstance(m, list) else next((v for v in m.values() if isinstance(v, list)), [])
+    by_id = {e["id"]: e for e in entries if isinstance(e, dict) and "id" in e}
+    # value_tamper probe emits issue_type='business_logic'
+    assert "business_logic" in by_id["business_logic_value"]["match"]["issue_type"]
+    assert "WSTG-BUSL-01" in by_id["business_logic_value"]["wstg_id"]
+    # forced_browsing probe emits issue_type='access_control'
+    assert "access_control" in by_id["access_control_forced_browsing"]["match"]["issue_type"]
+    assert "WSTG-ATHZ-02" in by_id["access_control_forced_browsing"]["wstg_id"]
+    # POST-body IDOR emits issue_type='idor' — already covered by the idor entry
+    assert "idor" in by_id["idor"]["match"]["issue_type"]
+
+
 def test_rag_renderer_present():
     s = _src("etl/load_knowledge_documents.py")
     assert "_render_business_logic_tests" in s
