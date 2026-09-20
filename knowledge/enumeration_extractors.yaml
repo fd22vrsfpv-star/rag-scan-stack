@@ -93,6 +93,58 @@ extractors:
     why: >-
       The 40-char AWS secret key, the other half of programmatic cloud access.
 
+  # ── Azure ── AWS was covered and Azure was not, so an Azure storage key or
+  # service-principal secret sitting in a looted web.config / azure.json / CI
+  # variable produced NO fact at all. These are the four Azure forms that
+  # actually appear on disk during an engagement.
+  - id: azure-storage-account-key
+    match: 'AccountKey=([A-Za-z0-9+/]{86}==)'
+    fields: {value: 1}
+    emit: {fact: secret, kind: azure_storage_key}
+    why: >-
+      An Azure storage AccountKey is full read/write control of the storage
+      account — every container and blob in it, with no further authorization.
+
+  - id: azure-storage-connection-string
+    match: '(?i)DefaultEndpointsProtocol=https?;AccountName=[A-Za-z0-9]+;AccountKey=[A-Za-z0-9+/=]{20,}'
+    fields: {value: 0}
+    emit: {fact: secret, kind: azure_connection_string}
+    why: >-
+      The full connection string names the account AND carries its key, so it is
+      directly usable by az/azcopy without any other discovery.
+
+  - id: azure-client-secret
+    match: '(?i)["'']?(?:client_secret|clientsecret|azure_client_secret)["'']?\s*[=:]\s*["'']?([A-Za-z0-9._~\-]{32,})'
+    fields: {value: 1}
+    emit: {fact: secret, kind: azure_client_secret}
+    why: >-
+      A service-principal client secret is non-interactive Entra ID / Azure AD
+      access as that principal, with whatever RBAC roles it holds.
+
+  # The separator class includes ';' so an XML-escaped '&amp;sig=' (how a SAS is
+  # actually stored in a web.config / appsettings file) still matches — the raw
+  # '[?&]' form silently missed every config-embedded SAS.
+  - id: azure-sas-token
+    match: '(?i)[?&;]sig=([A-Za-z0-9%/+=]{20,})'
+    fields: {value: 1}
+    emit: {fact: secret, kind: azure_sas_token}
+    why: >-
+      A SAS signature grants delegated access to storage for its validity window
+      — usable as-is, and it does not show up as a sign-in.
+
+  # Loot that is a DOCUMENT rather than a credential: the spreadsheet of
+  # passwords, the DR runbook, the network diagram, the database dump. Recorded
+  # as an observation (like a secret fact) so it is tracked and reportable
+  # instead of scrolling past in command output.
+  - id: sensitive-document-filename
+    match: '(?i)\b[\w.-]*(?:password|passwd|credential|secret|runbook|diagram|backup|dump|confidential)[\w.-]*\.(?:xlsx?|docx?|pptx?|pdf|csv|kdbx|sql|bak|vsdx|ovpn|pfx|p12|zip)\b'
+    fields: {path: 0}
+    emit: {fact: file, kind: sensitive_document}
+    why: >-
+      A file named for what it holds — passwords.xlsx, a DR runbook, a network
+      diagram, a database dump — is engagement-relevant loot on its name alone,
+      and naming it is what makes it reviewable rather than lost in scrollback.
+
   - id: bearer-token
     match: '(?i)\bbearer\s+([A-Za-z0-9._~+/-]{20,}={0,2})'
     fields: {value: 1}
