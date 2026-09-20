@@ -1503,6 +1503,10 @@ function SessionList() {
     initial_task: SESSION_PROFILES[DEFAULT_PROFILE].task,
     max_rounds: 200,
     auto_execute_scans: true,
+    // Target is primarily a website: cap the port scan at top-1000 (skip the
+    // 1-65535 deep sweep) and start the web pipeline early, in parallel with the
+    // port scan. Off by default (a general host gets the full quick-then-deep policy).
+    primarily_website: false,
     // '' = use the service default (AGENT_ENGINE), which is the only engine
     // there is now. Kept as a field because the API still accepts it and saved
     // launch presets may carry one.
@@ -1603,6 +1607,7 @@ function SessionList() {
           initial_task: SESSION_PROFILES[DEFAULT_PROFILE].task,
           max_rounds: 200,
           auto_execute_scans: true,
+          primarily_website: false,
           engine: '',
           enable_exploit_phase: false,
           enable_surface_test_phase: false,
@@ -1768,6 +1773,22 @@ function SessionList() {
                 ))}
               </select>
             </div>
+            {/* Primarily a website: cap the port scan at top-1000 (skip the
+                1-65535 deep sweep) and start the web pipeline early, in parallel
+                with the port scan. When on and no explicit Port Scope is chosen,
+                the session uses top-1000. */}
+            <label
+              className="flex items-center gap-2 text-sm pb-1"
+              title="Target is primarily a website: limit the port scan to the top 1000 ports (no full 1-65535 sweep) and kick the web scans off at the start of the scan phase instead of after."
+            >
+              <input
+                type="checkbox"
+                checked={form.primarily_website}
+                onChange={e => setForm(f => ({ ...f, primarily_website: e.target.checked }))}
+                className="rounded border-border"
+              />
+              Primarily a website (top-1000 ports, web scans first)
+            </label>
             {/* The engine selector is gone: AutoGen was retired, so LangGraph is
                 the only engine. Offering a second option that the service
                 warns about and then silently overrides would be a control that

@@ -32,6 +32,10 @@ class StartSessionRequest(BaseModel):
     port_profile: Optional[str] = None
     # Named web scan depth from knowledge/web_profiles.yaml.
     web_profile: Optional[str] = None
+    # Target is PRIMARILY A WEBSITE: cap the port scan at top-1000 (skip the
+    # 1-65535 deep sweep) and start the web pipeline at the beginning of the scan
+    # phase, in parallel with the port scan.
+    primarily_website: bool = False
     # Launch options. model_dump() is what gets forwarded, so a field missing
     # here is silently dropped no matter what the autogen service accepts.
     #

@@ -506,6 +506,7 @@ class PentestRequest(BaseModel):
     proxy: Optional[str] = Field(None, description="SOCKS proxy URL for routing scans through a remote node (e.g., 'socks5://node-manager:10001')")
     port_profile: Optional[str] = Field(None, description="Named port scope from knowledge/port_profiles.yaml (top-100, top-1000, web, redteam-targeted, all). Omit to use the scanner agent's built-in quick-then-deep policy.")
     web_profile: Optional[str] = Field(None, description="Named web scan depth from knowledge/web_profiles.yaml (quick, standard, deep, api, passive-web). Omit to use each web tool's own defaults.")
+    primarily_website: bool = Field(False, description="Target is PRIMARILY A WEBSITE: cap the port scan at top-1000 (skip the 1-65535 deep sweep) and kick the web pipeline off at the START of the scan phase, in parallel with the port scan, instead of after it.")
     engine: Optional[str] = Field(
         None,
         description=(
@@ -2132,6 +2133,7 @@ def run_pentest_session_sync(
     surface_target: Optional[str] = None,
     synthesize_tests: Optional[bool] = None,
     auto_exploit: Optional[bool] = None,
+    primarily_website: bool = False,
 ):
     """Run a pentest session. Delegates to the LangGraph engine.
 
@@ -2175,7 +2177,8 @@ def run_pentest_session_sync(
         surface_test_phase=surface_test_phase,
         surface_target=surface_target,
         synthesize_tests=synthesize_tests,
-        auto_exploit=auto_exploit)
+        auto_exploit=auto_exploit,
+        primarily_website=primarily_website)
 
 
 @app.get("/health")
@@ -2366,6 +2369,7 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
                 "proxy": request.proxy,
                 "port_profile": request.port_profile,
                 "web_profile": request.web_profile,
+                "primarily_website": bool(request.primarily_website),
                 "engine": engine,
                 "engagement_id": _eid,
                 "enable_exploit_phase": bool(request.enable_exploit_phase),
@@ -2410,6 +2414,7 @@ async def start_pentest(request: PentestRequest, http_request: Request = None):
                 request.surface_target_host,
                 request.enable_test_synthesis,
                 request.enable_auto_exploit,
+                bool(request.primarily_website),
             )
         )
 
