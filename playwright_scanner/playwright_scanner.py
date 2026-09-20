@@ -2095,6 +2095,69 @@ def _login_fields(login_data: str):
 
 _IDOR_NAME_RE = __import__("re").compile(
     r"(?i)(^id$|_id$|acct|account|user$|uid|customer|profile|order|invoice|doc|file|record|msg|ticket|num$|no$|number)")
+# URLs that DESTROY the authenticated session — an authenticated crawl must NOT
+# navigate to them, or every step after (further crawl, katana, the IDOR probe,
+# the ZAP tree it seeds) runs logged-out. Matched case-insensitively on the URL.
+_LOGOUT_RE = __import__("re").compile(
+    r"(?i)(logout|log-?off|log_?off|sign-?off|sign-?out|signout|/exit\b|loggedout|session.?end)")
+
+
+async def _run_authenticated_katana(ctx, base_url: str, engagement_id, job_id: str,
+                                    landing_url: str = None) -> Dict:
+    """Run pd-runner katana AUTHENTICATED with the browser's live session cookies
+    and form-fill on. This is the discovery half of the IDOR path: katana's
+    -aff SUBMITS forms (the account dropdown), producing object-reference URLs
+    like showAccount?listAccounts=<value> that parse_katana ingests into
+    discovered_params — which the mutation probe below then mutates. The link-only
+    crawl and even the ajax spider miss these (they stay in ZAP); katana emits
+    them as structured params. Polls to completion so ingestion finishes BEFORE
+    the probe runs. Best-effort, bounded."""
+    import httpx
+    import os as _os
+    import asyncio as _aio
+    from urllib.parse import urlparse as _up
+    out = {"dispatched": False}
+    try:
+        host = _up(base_url).hostname or ""
+        cookies = await ctx.cookies()
+        pairs = []
+        for c in cookies or []:
+            dom = (c.get("domain") or "").lstrip(".")
+            if c.get("name") and (not host or not dom or dom in host or host in dom):
+                pairs.append(f"{c['name']}={c['value']}")
+        if not pairs:
+            out["error"] = "no session cookies to authenticate katana"
+            return out
+        cookie_hdr = "Cookie: " + "; ".join(pairs)
+        pd = _os.environ.get("PD_RUNNER_URL", "https://pd-runner:8023").rstrip("/")
+        targets = [t for t in (landing_url, base_url) if t]
+        targets = list(dict.fromkeys(targets))  # dedupe, keep order
+        payload = {"targets": targets, "depth": 2, "field_scope": "fqdn",
+                   "js_crawl": True, "form_extraction": True,
+                   "auto_form_fill": True, "headers": [cookie_hdr]}
+        hdr = {"X-Engagement-Id": engagement_id} if engagement_id else {}
+        async with httpx.AsyncClient(timeout=30, verify=False) as c:
+            r = await c.post(f"{pd}/jobs/katana", json=payload, headers=hdr)
+            if r.status_code >= 400:
+                out["error"] = f"katana dispatch HTTP {r.status_code}"
+                return out
+            kid = (r.json() or {}).get("job_id")
+            out.update({"dispatched": True, "job_id": kid})
+            waited = 0
+            while kid and waited < 180:
+                await _aio.sleep(6)
+                waited += 6
+                try:
+                    jr = await c.get(f"{pd}/jobs/{kid}")
+                    st = (jr.json() or {}).get("status") if jr.status_code < 400 else None
+                except Exception:  # noqa: BLE001
+                    st = None
+                out["status"] = st
+                if st in ("completed", "failed"):
+                    break
+    except Exception as e:  # noqa: BLE001
+        out["error"] = str(e)[:160]
+    return out
 
 
 async def _idor_mutate_probe(ctx, base_url: str, host: str, engagement_id, job_id: str,
@@ -2120,9 +2183,14 @@ async def _idor_mutate_probe(ctx, base_url: str, host: str, engagement_id, job_i
     cands = []
     try:
         with get_db() as conn, conn.cursor() as cur:
+            # Match the asset by hostname OR IP — the probe is called with the URL
+            # host (a hostname like demo.testfire.net), but assets.ip is inet, so a
+            # bare `ip = <hostname>` errors and returns nothing. assets carries both
+            # ip and hostname; match either.
             cur.execute("""SELECT DISTINCT url_pattern, param_name, sample_values
                              FROM discovered_params dp JOIN assets a ON a.id = dp.asset_id
-                            WHERE ip = %s AND http_method = 'GET'""", (host,))
+                            WHERE (a.hostname = %s OR host(a.ip) = %s)
+                              AND dp.http_method = 'GET'""", (host, host))
             for up, pn, samples in cur.fetchall():
                 sample = (samples[0] if samples else "")
                 if _IDOR_NAME_RE.search(pn or "") or str(sample).isdigit():
@@ -2157,13 +2225,25 @@ async def _idor_mutate_probe(ctx, base_url: str, host: str, engagement_id, job_i
                         continue
                     await page.goto(_build(pu, q, pn, mv), wait_until="domcontentloaded", timeout=15000)
                     body = await page.content()
-                    if (len(body) > 500 and body != orig
-                            and not re.search(r"(?i)sign ?in|log ?in|not authori[sz]ed|access denied|forbidden|error", body[:2500])):
+                    # Detect a "blocked" response by the LOGIN FORM / denial text,
+                    # NOT by the word "login": authenticated pages carry static
+                    # labels like alt="Secure Login" and id="LoginLink" that a
+                    # word match trips on, so every valid object response was
+                    # wrongly discarded. A password field (type=password / name=
+                    # passw|uid|...) appears on the login/blocked page and NOT on an
+                    # object-data page — a robust, app-agnostic negative signal.
+                    _blocked = re.search(
+                        r"(?i)type=[\"']?password|name=[\"']?(?:passw|pwd|uid|"
+                        r"username|user|j_username|j_password)\b|not authori[sz]ed|"
+                        r"access denied|\bforbidden\b|must be logged|please log ?in",
+                        body)
+                    if len(body) > 500 and body != orig and not _blocked:
                         hits.append(mv)
                 if hits:
                     found += 1
                     with get_db() as conn, conn.cursor() as cur:
-                        cur.execute("SELECT id FROM assets WHERE host(ip)=%s LIMIT 1", (host,))
+                        cur.execute("SELECT id FROM assets WHERE hostname=%s OR host(ip)=%s LIMIT 1",
+                                    (host, host))
                         r = cur.fetchone()
                         cur.execute(
                             """INSERT INTO web_findings
@@ -2382,6 +2462,14 @@ async def _perform_crawl(job_id: str, req: CrawlRequest):
                     discovered.add(url)
                     continue
 
+                # Never NAVIGATE to a logout link during an authenticated crawl — it
+                # would end the session and log out everything that runs after
+                # (remaining crawl, authenticated katana, the IDOR probe, and the
+                # ZAP tree seeded from this browser). Still record it as discovered.
+                if job.get("authenticated") and _LOGOUT_RE.search(url):
+                    discovered.add(url)
+                    continue
+
                 try:
                     response = await page.goto(
                         url,
@@ -2431,6 +2519,15 @@ async def _perform_crawl(job_id: str, req: CrawlRequest):
             if job.get("authenticated"):
                 try:
                     _eng = _eid
+                    # DISCOVERY: authenticated katana (form-fill) seeds
+                    # discovered_params with object-ref params (e.g.
+                    # listAccounts=<value>) the link-crawl misses, so the probe
+                    # below has candidates to mutate. Waits for ingestion first.
+                    try:
+                        job["katana_auth"] = await _run_authenticated_katana(
+                            ctx, req.url, _eng, job_id, landing_url=(page.url or None))
+                    except Exception as _ke:  # noqa: BLE001
+                        logger.debug(f"[crawl:{job_id[:8]}] auth katana failed: {_ke}")
                     n = await _idor_mutate_probe(ctx, req.url, urlparse(req.url).hostname or "", _eng, job_id)
                     job["idor_findings"] = n
                     if n:
