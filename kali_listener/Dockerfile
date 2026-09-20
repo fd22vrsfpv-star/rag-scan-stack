@@ -76,6 +76,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #   vncviewer    -> tigervnc-viewer   xspy / xwd     -> x11-apps, x11-utils
 RUN apt-get update && apt-get install -y --no-install-recommends \
     avahi-utils \
+    git \
+    pipx \
     crackmapexec \
     dnsenum \
     dnsrecon \
@@ -99,6 +101,40 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     x11-utils \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Active Directory attack toolkit (knowledge/ad_attacks.yaml) — baked so AD
+# enumeration/attacks are part of LOCAL enumeration, not a manual install step.
+# netexec, impacket-scripts, crackmapexec, enum4linux-ng, smbmap, ldap-utils,
+# hashcat are already installed above. Installed per-package so an unavailable
+# name in a given kali-rolling snapshot warns instead of breaking the build.
+RUN apt-get update && for pkg in \
+      responder mitm6 certipy certsync kerbrute evil-winrm ldeep lsassy \
+      coercer pcredz bloodhound.py bloodyad ; do \
+      apt-get install -y --no-install-recommends "$pkg" || echo "WARN: AD tool '$pkg' not in this kali snapshot"; \
+    done; \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+# AD tools not in apt (this snapshot) — install from PyPI/GitHub, non-fatal per
+# tool so a naming/availability drift warns instead of breaking the build. git is
+# installed above so the git+ sources resolve.
+RUN pip3 install --break-system-packages --no-cache-dir certipy-ad || echo "WARN: certipy-ad failed"; \
+    # Kali ships the binary as 'certipy-ad'; ad_attacks.yaml uses 'certipy' — link both.
+    { command -v certipy-ad >/dev/null && ln -sf "$(command -v certipy-ad)" /usr/local/bin/certipy; } || true; \
+    for url in \
+        "git+https://github.com/ShutdownRepo/targetedKerberoast" \
+        "git+https://github.com/zblurx/certsync" \
+        "git+https://github.com/garrettfoster13/sccmhunter" ; do \
+      pip3 install --break-system-packages --no-cache-dir "$url" || echo "WARN: $url failed"; \
+    done
+# Pcredz is a standalone script (not on PyPI) — clone + wrapper on PATH.
+RUN git clone --depth 1 https://github.com/lgandx/PCredz /opt/PCredz 2>/dev/null \
+      && pip3 install --break-system-packages --no-cache-dir Cython python-libpcap 2>/dev/null; \
+    printf '#!/bin/sh\nexec python3 /opt/PCredz/Pcredz "$@"\n' > /usr/local/bin/pcredz \
+      && chmod +x /usr/local/bin/pcredz || echo "WARN: pcredz not installed"
+# kerbrute — Go binary release
+RUN curl -fsSL -o /usr/local/bin/kerbrute \
+      "https://github.com/ropnop/kerbrute/releases/latest/download/kerbrute_linux_amd64" \
+      && chmod +x /usr/local/bin/kerbrute \
+      || echo "WARN: kerbrute binary download failed"
 
 # remote-method-guesser (rmg) — java-rmi enumeration, the tool the KB recommends
 # for port 1099. Not in the Kali repos, so it comes from its GitHub release as a
