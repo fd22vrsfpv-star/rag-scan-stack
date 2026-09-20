@@ -410,6 +410,10 @@ class PentestState(TypedDict):
     task: str
     auto_execute: bool
     exploit_phase: bool
+    #: Operator marked the target as PRIMARILY A WEBSITE: cap port scans at
+    #: top-1000 (no 1-65535 deep sweep) and kick the web pipeline off at the
+    #: START of the scan phase (in parallel with the port scan) instead of after.
+    primarily_website: bool
     phase: str
     findings: Annotated[List[str], operator.add]
     log: Annotated[List[str], operator.add]
@@ -850,6 +854,25 @@ def scan(state: PentestState) -> dict:
 
     system = _SCAN_SYSTEM_DISPATCH if auto else _SCAN_SYSTEM_PLAN
     try:
+        # PRIMARILY A WEBSITE: kick the comprehensive web pipeline off NOW — at the
+        # start of the scan phase, in parallel with the port scan the LLM runs
+        # below — rather than waiting for the port scan to finish and the surface
+        # phase to trigger it. The web pipeline is the long pole, so starting it
+        # early is the whole point of the website flag. Scope-gated in-tool.
+        if auto and state.get("primarily_website"):
+            try:
+                _we = _early_website_web_pipeline(sid, state.get("target", ""))
+                _n = len(_we.get("dispatched", []) or [])
+                if _n:
+                    _msg(sid, "Scanner",
+                         f"[website] target marked primarily-a-website: dispatched "
+                         f"{_n} web pipeline scan(s) early (Gobuster→…→ZAP→Nuclei), "
+                         f"in parallel with a top-1000 port scan.", role="system")
+                    _emit("langgraph_website_web_early", sid,
+                          {"phase": "scan", "dispatched": _n})
+            except Exception as _we_e:  # noqa: BLE001
+                _log.warning("[%s] early website web pipeline failed: %s", sid, _we_e)
+
         # Say the credential tools exist when they do. A tool the agent is never
         # told about tends not to get chosen: the previous run had ftp, ssh,
         # telnet and vnc open and still ran no credential check.
@@ -3516,6 +3539,49 @@ def _ensure_web_pipeline(host: str, sid, engagement_id=None) -> dict:
     return {"dispatched": dispatched}
 
 
+def _website_host(target: str) -> str:
+    """Extract a clean host from a session target that may be a URL, a bare host,
+    host:port, or a short description that starts with one."""
+    t = (target or "").strip()
+    if not t:
+        return ""
+    try:
+        from urllib.parse import urlparse
+        if "://" in t:
+            return urlparse(t).hostname or ""
+    except Exception:  # noqa: BLE001
+        pass
+    # bare host / host:port / host/path / "host ..." — take the first token.
+    return t.split()[0].split("/")[0].split(":")[0]
+
+
+def _early_website_web_pipeline(sid, target: str) -> dict:
+    """PRIMARILY-A-WEBSITE fast path: dispatch the comprehensive web pipeline at
+    the START of the scan phase. Prefer already-discovered web ports
+    (_ensure_web_pipeline); if none are known yet (fresh target, port scan still
+    running), fall back to the website assumption and scan http/https on the host
+    directly so the long-pole web pipeline runs in parallel with the port scan
+    rather than after it. Each start_pipeline_scan body re-checks scope."""
+    host = _website_host(target)
+    if not host:
+        return {"skipped": "no host"}
+    res = _ensure_web_pipeline(host, sid) or {}
+    if res.get("dispatched"):
+        return res
+    # No web ports discovered yet — a website serves HTTP/HTTPS by definition.
+    if not _host_in_scope(host):
+        return {"skipped": "out-of-scope"}
+    dispatched = []
+    for url in (f"https://{host}", f"http://{host}"):
+        try:
+            r = json.loads(_tool(scan_tools.start_pipeline_scan, target_url=url))
+            if r.get("job_id"):
+                dispatched.append({"url": url, "job_id": r.get("job_id")})
+        except Exception as e:  # noqa: BLE001
+            _msg(sid, "Scanner", f"[website web pipeline dispatch failed for {url}: {e}]")
+    return {"dispatched": dispatched, "assumed_web_ports": True}
+
+
 def _wait_for_web_pipeline(dispatched, sid, timeout=None) -> None:
     """Block (bounded) until the dispatched web pipeline job(s) finish, so the
     ZAP/gobuster/nuclei app-layer findings (SQLi/XSS/IDOR surface) EXIST before
@@ -5097,6 +5163,7 @@ def run_langgraph_session_sync(
     surface_target: Optional[str] = None,
     synthesize_tests: Optional[bool] = None,
     auto_exploit: Optional[bool] = None,
+    primarily_website: bool = False,
 ):
     """Drop-in LangGraph replacement for the AutoGen session runner."""
     from llm_metrics import LLMMetricsContext
@@ -5114,6 +5181,13 @@ def run_langgraph_session_sync(
     task = initial_task
     if resume_context:
         task = f"{initial_task}\n\n[resumed context]\n{resume_context[:1000]}"
+
+    # PRIMARILY A WEBSITE: cap the port scan at top-1000 (which also suppresses
+    # the 1-65535 deep sweep — see scan_tools.start_full_scan) unless the operator
+    # picked an explicit port_profile. Web depth (web_profile) is left to the
+    # operator's choice / tool defaults.
+    if primarily_website and not port_profile:
+        port_profile = "top-1000"
 
     # Same thread-local context AutoGen sets: without it /scans is empty for the
     # session, port_profile/web_profile are silently ignored, and no
@@ -5149,6 +5223,7 @@ def run_langgraph_session_sync(
                 "session_id": sid, "target": target_description, "task": task,
                 "auto_execute": bool(auto_execute_scans),
                 "exploit_phase": bool(exploit_phase),
+                "primarily_website": bool(primarily_website),
                 "surface_test_phase": bool(surface_test_phase),
                 "surface_synthesize": synthesize_tests,
                 "surface_auto_exploit": auto_exploit,
