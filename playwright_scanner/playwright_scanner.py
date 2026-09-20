@@ -2270,6 +2270,51 @@ async def _run_authenticated_katana(ctx, base_url: str, engagement_id, job_id: s
     return out
 
 
+async def _run_authenticated_ffuf(ctx, base_url: str, engagement_id, job_id: str) -> Dict:
+    """Run pd-runner ffuf AUTHENTICATED with the browser's live session cookies —
+    directory/content fuzzing of the LOGGED-IN surface, which finds authenticated-
+    only paths a link crawl misses. Fire-and-forget: results land in recon_findings
+    (parse_ffuf) and feed the directory followup + the forced-browsing probe's
+    anonymous re-check. Off unless FFUF_AUTHENTICATED is set (heavy/noisy on some
+    apps), so the operator opts in. Best-effort."""
+    import httpx
+    import os as _os
+    from urllib.parse import urlparse as _up
+    out = {"dispatched": False}
+    if _os.environ.get("FFUF_AUTHENTICATED", "").strip().lower() not in ("1", "true", "yes", "on"):
+        out["skipped"] = "FFUF_AUTHENTICATED not set"
+        return out
+    try:
+        pu = _up(base_url if "://" in base_url else f"http://{base_url}")
+        host = pu.hostname or ""
+        cookies = await ctx.cookies()
+        pairs = []
+        for c in cookies or []:
+            dom = (c.get("domain") or "").lstrip(".")
+            if c.get("name") and (not host or not dom or dom in host or host in dom):
+                pairs.append(f"{c['name']}={c['value']}")
+        if not pairs:
+            out["error"] = "no session cookies to authenticate ffuf"
+            return out
+        cookie_hdr = "Cookie: " + "; ".join(pairs)
+        scheme = pu.scheme or "http"
+        pd = _os.environ.get("PD_RUNNER_URL", "https://pd-runner:8023").rstrip("/")
+        # FUZZ the path; match codes that indicate a real authenticated resource
+        # (exclude 302 — usually a redirect back to login, i.e. session not applied).
+        payload = {"target_url": f"{scheme}://{host}/FUZZ", "headers": [cookie_hdr],
+                   "match_code": "200,204,301,307,401,403", "rate": 60}
+        hdr = {"X-Engagement-Id": engagement_id} if engagement_id else {}
+        async with httpx.AsyncClient(timeout=30, verify=False) as c:
+            r = await c.post(f"{pd}/jobs/ffuf", json=payload, headers=hdr)
+            out["dispatched"] = r.status_code < 400
+            out["status"] = r.status_code
+            if r.status_code < 400:
+                out["job_id"] = (r.json() or {}).get("job_id")
+    except Exception as e:  # noqa: BLE001
+        out["error"] = str(e)[:160]
+    return out
+
+
 async def _idor_mutate_probe(ctx, base_url: str, host: str, engagement_id, job_id: str,
                              max_candidates: int = 8) -> int:
     """Single-credential IDOR / object-reference probe.
@@ -2915,6 +2960,13 @@ async def _perform_crawl(job_id: str, req: CrawlRequest):
                             ctx, req.url, _eng, job_id, landing_url=(page.url or None))
                     except Exception as _ke:  # noqa: BLE001
                         logger.debug(f"[crawl:{job_id[:8]}] auth katana failed: {_ke}")
+                    # Authenticated ffuf (opt-in, FFUF_AUTHENTICATED) — directory/
+                    # content fuzzing of the logged-in surface with the browser's
+                    # session cookie; fire-and-forget into recon_findings.
+                    try:
+                        job["ffuf_auth"] = await _run_authenticated_ffuf(ctx, req.url, _eng, job_id)
+                    except Exception as _fe:  # noqa: BLE001
+                        logger.debug(f"[crawl:{job_id[:8]}] auth ffuf failed: {_fe}")
                     _bl_host = urlparse(req.url).hostname or ""
                     n = await _idor_mutate_probe(ctx, req.url, _bl_host, _eng, job_id)
                     job["idor_findings"] = n

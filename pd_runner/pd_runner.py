@@ -435,6 +435,10 @@ class FfufReq(BaseModel):
     rate: Optional[int] = 100
     proxy: Optional[str] = None
     no_ingest: Optional[bool] = False
+    # AUTHENTICATED fuzzing: custom headers (e.g. "Cookie: JSESSIONID=..." or
+    # "Authorization: Bearer ...") sent on every request, so ffuf fuzzes the
+    # logged-in surface. The caller resolves the session from the Auth Profile.
+    headers: Optional[List[str]] = None       # each "Name: value"
 
 # --- Health ---
 
@@ -704,6 +708,10 @@ def run_ffuf(req: FfufReq, background_tasks: BackgroundTasks):
         cmd.extend(["-mc", req.match_code])
     if req.proxy:
         cmd.extend(["-x", req.proxy])
+    # Authenticated fuzzing: forward each header/cookie to ffuf's -H.
+    for h in (req.headers or []):
+        if h and ":" in h:
+            cmd.extend(["-H", h])
 
     _job_tracker.update_progress(job_id, targets_count=1)
     background_tasks.add_task(_run_tool_job, job_id, "ffuf", cmd, None, output_file, no_ingest=req.no_ingest)
