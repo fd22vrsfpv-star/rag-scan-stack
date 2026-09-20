@@ -100,6 +100,48 @@ rules:
       hosts accept it is the question that follows, and it is the one that
       changes the scope of an engagement.
 
+  # ── Active Directory enumeration (see knowledge/ad_attacks.yaml + RAG) ──
+  # A Domain Controller exposes Kerberos (88) and LDAP (389/636). These fire the
+  # SAFE, no-credential AD enumeration that a service scan doesn't; the deeper
+  # credentialed techniques (BloodHound, kerberoasting, ADCS, delegation, ticket
+  # attacks) are in ad_attacks.yaml — retrieved by the planner and gated by tier.
+  - id: ad-dc-kerberos-detected
+    when:
+      fact: open_port
+      where: {port: 88}
+    propose:
+      tool: enum4linux-ng
+      command: "enum4linux-ng -A {target}"
+      priority: 22
+    why: >-
+      Kerberos on 88 means this host is a Domain Controller. enum4linux-ng is the
+      no-credential first look (users, groups, shares, password policy) that turns
+      "a DC is here" into a username list and the domain name the AD attack
+      techniques (ad_attacks.yaml) need. Safe/read-only; scope-gated.
+  - id: ad-ldap-anonymous-enum
+    when:
+      fact: open_port
+      where: {port: 389}
+    propose:
+      tool: ldapsearch
+      command: "ldapsearch -x -H ldap://{target} -s base namingContexts defaultNamingContext"
+      priority: 23
+    why: >-
+      Anonymous rootDSE on 389 leaks the domain naming context (the domain FQDN),
+      which every downstream AD technique keys off. Read-only, no credential; if
+      anonymous bind is fuller than base it enumerates users/groups too.
+  - id: ad-ldaps-anonymous-enum
+    when:
+      fact: open_port
+      where: {port: 636}
+    propose:
+      tool: ldapsearch
+      command: "ldapsearch -x -H ldaps://{target} -s base namingContexts"
+      priority: 23
+    why: >-
+      Same rootDSE leak over LDAPS (636) for domains that expose only the TLS
+      port. Read-only; scope-gated.
+
   - id: known-host-discovered
     when:
       fact: host
