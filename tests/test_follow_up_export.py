@@ -36,6 +36,8 @@ def _curl(path):
     script = (
         "import os,urllib3,requests;urllib3.disable_warnings();"
         "k=os.environ.get('API_KEY','changeme');"
+        # container-internal: runs via `docker exec rag-api`, so localhost is
+        # rag-api itself, not whatever TEST_RAG_API points at.
         f"r=requests.get('https://localhost:8000{path}',headers={{'x-api-key':k}},verify=False,timeout=60);"
         "print(r.status_code);print(r.text)"
     )

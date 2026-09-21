@@ -3,7 +3,7 @@
 Run on demand:
 
     pytest tests/test_maintenance_repair_endpoints.py -v
-    BFF_URL=https://localhost:3002 pytest tests/test_maintenance_repair_endpoints.py
+    TEST_BFF=https://localhost:3002 pytest tests/test_maintenance_repair_endpoints.py
 
 WHY THIS EXISTS
 ---------------
@@ -35,11 +35,12 @@ import os
 import time
 
 import pytest
+from conftest import BFF  # shared service endpoints (see tests/conftest.py)
 
 requests = pytest.importorskip("requests")
 requests.packages.urllib3.disable_warnings()  # self-signed stack certs
 
-BFF = os.environ.get("BFF_URL", "https://localhost:3002")
+BFF = os.environ.get("BFF_URL") or BFF
 TIMEOUT = int(os.environ.get("MAINT_TIMEOUT", "900"))
 
 

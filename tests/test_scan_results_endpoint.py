@@ -2,7 +2,7 @@
 
 Run on demand:
 
-    SCANS_URL=https://localhost:8000 pytest tests/test_scan_results_endpoint.py
+    TEST_RAG_API=https://localhost:8000 pytest tests/test_scan_results_endpoint.py
 
 WHY THIS EXISTS
 ---------------
@@ -24,10 +24,11 @@ import re
 import pathlib
 
 import pytest
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 
 requests = pytest.importorskip("requests")
 
-BASE = os.environ.get("SCANS_URL", "https://localhost:8000")
+BASE = os.environ.get("SCANS_URL") or RAG_API
 # A well-formed id that will not match anything -> empty results, not an error.
 UNKNOWN_JOB = "smoke-nonexistent-job-0000"
 

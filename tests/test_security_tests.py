@@ -4,7 +4,7 @@ impactful re-run cannot bypass approval).
 
 Run on demand:
     pytest tests/test_security_tests.py -v
-    ST_URL=https://localhost:3002 pytest tests/test_security_tests.py
+    TEST_BFF=https://localhost:3002 pytest tests/test_security_tests.py
 
 WHY THIS EXISTS
 ---------------
@@ -32,6 +32,7 @@ import os
 import pathlib
 
 import pytest
+from conftest import BFF  # shared service endpoints (see tests/conftest.py)
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 API_MOD = REPO / "app" / "rag-api" / "security_tests.py"
@@ -137,7 +138,7 @@ def test_record_test_run_refuses_lane_evidence_mismatch():
 
 
 # ── live endpoints (skip cleanly without a stack) ───────────────────────────
-BASE = os.environ.get("ST_URL", "https://localhost:3002")
+BASE = os.environ.get("ST_URL") or BFF
 
 
 def _api():

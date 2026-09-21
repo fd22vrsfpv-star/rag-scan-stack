@@ -208,6 +208,25 @@ used as the fallback judge.
 
 ## Data and deployment
 
+### The BFF's `/api/health` hangs while every other `/api` route answers
+**Found:** 2026-09-21
+**Evidence:** Against the running stack, `curl -sk --max-time 4
+https://localhost:3002/api/health` returns `000` (client timeout, no response),
+while `/api/engagements` → 200 in 0.38s, `/api/assets` → 200 in 0.70s and
+`/api/scans` → 200 in 0.80s. `https://localhost:3002/health` (no `/api`) → 200.
+So the service is healthy and only this one proxied path hangs.
+**Where:** `dashboard/bff` — the `/api/health` route, or whatever upstream it
+proxies to. Not investigated further; found while checking service reachability
+for the test-endpoint migration.
+**Why it matters:** a health path that hangs rather than failing fast is the
+worst shape for one — a caller with no timeout waits forever, and any monitor
+pointed at it reports "no answer" rather than a status. It also makes `/api/health`
+useless as the reachability probe a test would naturally reach for.
+**Done when:** `/api/health` returns a status promptly (200 or an honest error),
+or the route is removed so callers use `/health`.
+**Enforced by:** not enforced
+
+
 ### One asset carries no engagement
 **Found:** 2026-09-11
 **Evidence:** After the attribution backfill, 136 of 137 assets resolved.

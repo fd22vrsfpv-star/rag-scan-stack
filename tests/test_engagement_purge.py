@@ -10,7 +10,7 @@ This test creates a throwaway engagement + asset + port, then proves the asset i
 gone after purge-data while the engagement survives, and that the full purge
 removes the engagement. Skips cleanly without a live rag-api + DB.
 
-    RAG_API_URL=https://localhost:8000 DB_DSN=... pytest tests/test_engagement_purge.py
+    TEST_RAG_API=https://localhost:8000 DB_DSN=... pytest tests/test_engagement_purge.py
 """
 import os
 import re
@@ -18,11 +18,12 @@ import uuid
 import pathlib
 
 import pytest
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 
 requests = pytest.importorskip("requests")
 psycopg2 = pytest.importorskip("psycopg2")
 
-BASE = os.environ.get("RAG_API_URL", "https://localhost:8000")
+BASE = os.environ.get("RAG_API_URL") or RAG_API
 DB_DSN = os.environ.get("DB_DSN", "postgresql://app:app@rag-postgres:5432/scans")
 
 
