@@ -24126,14 +24126,62 @@ def asset_enumeration(ip: str, _: bool = Depends(auth)):
                            "label": f"{len(_local)} local-only service(s) (loopback) — "
                                     f"reachable only by pivoting through this host, "
                                     f"follow up: {_names}"})
+    # 4) EXTRACTED loot: what the enumeration extractors pulled out of the raw
+    # output — cloud keys, tokens, DB URLs, and the documents worth reporting.
+    # These were recorded as observations and then surfaced NOWHERE: this view
+    # aggregated held access, credentials and the raw command text, so an AWS key
+    # or a passwords.xlsx the extractors found was invisible unless you queried
+    # enumeration_observations by hand. They belong next to the credentials.
+    # NOTE: opens its OWN connection — the aggregation above runs inside a
+    # `with get_db()` that has already exited by this point, so reusing `cur`
+    # here raises "cursor already closed" and (behind a broad except) would
+    # silently return empty sections.
+    extracted_secrets, documents = [], []
+    try:
+        with get_db() as _lc, _lc.cursor(cursor_factory=RealDictCursor) as _lcur:
+            _lcur.execute(
+                """SELECT fact, created_at FROM enumeration_observations
+                    WHERE (fact->>'target' = %s OR target = %s)
+                      AND (fact->>'fact' = 'secret'
+                           OR fact->>'kind' = 'sensitive_document')
+                    ORDER BY created_at DESC LIMIT 200""", (ip, ip))
+            _loot_rows = _lcur.fetchall()
+        for r in _loot_rows:
+            f = r["fact"] or {}
+            at = r["created_at"].isoformat() if r.get("created_at") else None
+            if f.get("kind") == "sensitive_document":
+                documents.append({"path": f.get("path") or f.get("value"),
+                                  "kind": "sensitive_document", "at": at})
+            else:
+                val = f.get("value") or ""
+                extracted_secrets.append({
+                    "kind": f.get("kind") or "unknown", "at": at,
+                    "value_masked": (val[:6] + "*" * min(max(len(val) - 6, 0), 14)) if val else "",
+                    "value": val})
+    except Exception as _le:  # noqa: BLE001
+        logger.warning("extracted loot lookup failed for %s: %s", ip, _le)
+
+    _cloud = sorted({s["kind"] for s in extracted_secrets
+                     if s["kind"].startswith(("aws_", "azure_", "gcp_"))})
+    if _cloud:
+        highlights.append({"severity": "critical", "kind": "cloud_credentials",
+                           "label": f"Cloud credential material on host: {', '.join(_cloud)} "
+                                    f"— programmatic access beyond this network"})
+    if documents:
+        _dnames = ", ".join(str(d["path"]).split("/")[-1] for d in documents[:4])
+        highlights.append({"severity": "high", "kind": "sensitive_documents",
+                           "label": f"{len(documents)} sensitive document(s) on host: {_dnames}"})
     highlights.sort(key=lambda h: sev_rank.get(h["severity"], 9))
 
     attempts_ok = sum(1 for a in login_attempts if a["status"] in ("success", "valid"))
     return {"ip": ip, "highlights": highlights, "access": access,
             "credentials": creds, "loot": loot, "login_attempts": login_attempts,
             "listening_ports": listening_ports,
+            "extracted_secrets": extracted_secrets, "documents": documents,
             "counts": {"access": len(access), "credentials": len(creds),
                        "cracked": len(cracked), "hashes": len(hashes),
+                       "extracted_secrets": len(extracted_secrets),
+                       "documents": len(documents),
                        "loot_items": loot_cmd_count, "loot_groups": len(loot),
                        "login_attempts": len(login_attempts),
                        "login_success": attempts_ok,
