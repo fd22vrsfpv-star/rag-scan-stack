@@ -56,6 +56,7 @@ import re
 import pytest
 
 from _container import container_exec
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 COMPOSE = os.path.join(REPO, "docker-compose.yml")
@@ -194,7 +195,7 @@ _LIVE = r"""
 import json, os, urllib3, requests
 urllib3.disable_warnings()
 H = {"x-api-key": os.environ.get("API_KEY", "changeme")}
-B = "https://localhost:8000"
+B = RAG_API
 out = {}
 # An out-of-scope host must be refused BEFORE any socket opens.
 r = requests.post("https://playwright-scanner:8014/preview",

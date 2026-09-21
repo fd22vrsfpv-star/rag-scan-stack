@@ -24,11 +24,12 @@ import uuid
 from pathlib import Path
 
 import pytest
+from conftest import BFF, RAG_API  # shared service endpoints (see tests/conftest.py)
 
 httpx = pytest.importorskip("httpx")
 
-DASH = os.environ.get("E2E_DASHBOARD_URL", "https://localhost:3002")
-RAG = os.environ.get("E2E_RAG_API_URL", "https://localhost:8000")
+DASH = os.environ.get("E2E_DASHBOARD_URL", f"{BFF}")
+RAG = os.environ.get("E2E_RAG_API_URL", f"{RAG_API}")
 MARK = f"e2e-{uuid.uuid4().hex[:8]}"          # unique per run, for cleanup
 
 
@@ -182,6 +183,29 @@ def test_reingesting_the_same_finding_does_not_duplicate(client, rag):
 
 # ══════════════════════════════════════════════ 4. no out-of-scope data
 
+def _scope_host(target: str) -> str:
+    """Normalize a scope target to the host the findings side compares against.
+
+    A scope row may be stored with `target_type: "url"` — the testfire scope
+    holds `http://demo.testfire.net` — while a finding's host is extracted from
+    its URL as the bare hostname. Comparing the two raw made an AUTHORISED host
+    with 685 findings read as a scope violation.
+
+    That is the third false positive this one assertion has produced (see the
+    truncation and not_in_scope notes below), and a false positive is the
+    dangerous direction for a scope guard: one that cries wolf gets ignored,
+    which is how a real violation walks past it.
+
+    Only a target carrying a scheme is reduced — a bare CIDR (192.168.1.0/24)
+    must keep its suffix or the allow-list silently widens to a single host.
+    """
+    t = (target or "").strip()
+    if "://" in t:
+        from urllib.parse import urlsplit
+        return (urlsplit(t).hostname or t).lower()
+    return t.lower()
+
+
 @pytest.mark.e2e
 def test_no_out_of_scope_hosts_are_present_in_findings(client):
     """Regression guard for the katana incident: crawlers followed links to
@@ -213,7 +237,8 @@ def test_no_out_of_scope_hosts_are_present_in_findings(client):
         r = client.get(f"{DASH}/api/scope", params={"name": nm, "limit": 5000})
         if r.status_code != 200:
             pytest.skip(f"scope {nm!r} unreadable (HTTP {r.status_code})")
-        targets = [t.get("target") for t in r.json().get("targets", []) if t.get("target")]
+        targets = [_scope_host(t.get("target")) for t in r.json().get("targets", [])
+                   if t.get("target")]
         if isinstance(declared, int) and declared > len(targets):
             pytest.skip(
                 f"scope {nm!r} reports {declared} targets but the endpoint returned "

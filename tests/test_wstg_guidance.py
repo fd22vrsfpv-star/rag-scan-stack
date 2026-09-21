@@ -3,7 +3,7 @@
 Run on demand:
 
     pytest tests/test_wstg_guidance.py -v
-    RAG_API=https://localhost:3002/api pytest tests/test_wstg_guidance.py
+    TEST_BFF=https://localhost:3002 pytest tests/test_wstg_guidance.py
 
 WHY THIS EXISTS
 ---------------
@@ -32,11 +32,15 @@ import os
 import re
 
 import pytest
+from conftest import BFF_API  # shared service endpoints (see tests/conftest.py)
 
 requests = pytest.importorskip("requests")
 requests.packages.urllib3.disable_warnings()
 
-BASE = os.environ.get("RAG_API", "https://localhost:3002/api")
+# NOTE the legacy name is misleading: this env var is spelled RAG_API but
+# points at the BFF (:3002/api), not rag-api (:8000). It is still honoured so
+# existing invocations keep working -- use TEST_BFF.
+BASE = os.environ.get("RAG_API") or BFF_API
 
 #: Matches two distinct ingested documents. The whole point of the fix.
 AMBIGUOUS_ID = "WSTG-INPV-13"

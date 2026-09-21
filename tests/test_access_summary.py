@@ -3,7 +3,7 @@
 Run on demand:
 
     pytest tests/test_access_summary.py -v
-    ACCESS_SUMMARY_URL=https://localhost:3002/api/assets/access/summary \
+    TEST_BFF=https://localhost:3002 ACCESS_SUMMARY_URL=https://localhost:3002/api/assets/access/summary \
         pytest tests/test_access_summary.py
 
 WHY THIS EXISTS
@@ -33,10 +33,11 @@ access. Drop the HAVING clause and hosts with only dead access appear, failing
 import os
 
 import pytest
+from conftest import BFF_API  # shared service endpoints (see tests/conftest.py)
 
 requests = pytest.importorskip("requests")
 
-BASE = os.environ.get("BFF_BASE", "https://localhost:3002/api")
+BASE = os.environ.get("BFF_BASE") or BFF_API
 SUMMARY_URL = os.environ.get("ACCESS_SUMMARY_URL", f"{BASE}/assets/access/summary")
 
 

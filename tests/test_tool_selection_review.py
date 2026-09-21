@@ -33,6 +33,7 @@ import sys
 import uuid
 
 import pytest
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
@@ -40,7 +41,7 @@ sys.path.insert(0, REPO)
 requests = pytest.importorskip("requests", reason="requests not installed")
 tl = pytest.importorskip("etl.tool_learning", reason="etl/tool_learning.py not importable")
 
-RAG_API = os.environ.get("RAG_API_URL", "https://localhost:8000")
+RAG_API = os.environ.get("RAG_API_URL") or RAG_API
 API_KEY = os.environ.get("API_KEY", "changeme")
 HEADERS = {"x-api-key": API_KEY, "X-Operator": "pytest"}
 

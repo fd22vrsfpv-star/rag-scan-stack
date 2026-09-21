@@ -1,7 +1,7 @@
 """Live endpoint smoke sweep, as a test.
 
     pytest tests/test_endpoint_smoke.py -v
-    SMOKE_BASE=https://localhost:3002 pytest tests/test_endpoint_smoke.py
+    TEST_BFF=https://localhost:3002 pytest tests/test_endpoint_smoke.py
 
 Skips when no stack is reachable, so a laptop unit run stays green. The sweep
 itself lives in scripts/smoke_endpoints.py — the same code post-install-check.sh
@@ -15,10 +15,11 @@ import importlib.util
 import os
 
 import pytest
+from conftest import BFF  # shared service endpoints (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 _SCRIPT = os.path.join(REPO, "scripts", "smoke_endpoints.py")
-BASE = os.environ.get("SMOKE_BASE", "https://localhost:3002")
+BASE = os.environ.get("SMOKE_BASE") or BFF
 
 
 @pytest.fixture(scope="module")

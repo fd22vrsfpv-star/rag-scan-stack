@@ -25,7 +25,7 @@ import os
 import sys
 
 import pytest
-from conftest import LAB_TARGET  # shared lab constant (see tests/conftest.py)
+from conftest import BFF_API, LAB_TARGET# shared lab constant (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
@@ -88,7 +88,7 @@ def test_the_endpoint_returns_advice_for_a_host():
     """Live endpoint check — skips cleanly without the stack. On the lab host it
     returns advice for the dead ports (vsftpd 21, http 80, rsh 514, rpc 33737)."""
     requests = pytest.importorskip("requests")
-    base = os.environ.get("BFF_BASE", "https://localhost:3002/api")
+    base = os.environ.get("BFF_BASE") or BFF_API
     ip = os.environ.get("ADVISOR_TEST_IP", LAB_TARGET)
     try:
         r = requests.get(f"{base}/assets/{ip}/port-advice", timeout=30, verify=False)

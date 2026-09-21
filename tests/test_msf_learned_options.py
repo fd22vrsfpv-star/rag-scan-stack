@@ -7,7 +7,7 @@ Per-target/run keys (RHOSTS/RPORT/LHOST/...) are never learned.
 
 Hits live rag-api; skips cleanly without it (or its DB / embedder).
 
-    RAG_API_URL=https://localhost:8000 pytest tests/test_msf_learned_options.py
+    TEST_RAG_API=https://localhost:8000 pytest tests/test_msf_learned_options.py
 """
 import os
 import re
@@ -15,11 +15,12 @@ import uuid
 import pathlib
 
 import pytest
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 
 requests = pytest.importorskip("requests")
 psycopg2 = pytest.importorskip("psycopg2")
 
-BASE = os.environ.get("RAG_API_URL", "https://localhost:8000")
+BASE = os.environ.get("RAG_API_URL") or RAG_API
 DB_DSN = os.environ.get("DB_DSN", "postgresql://app:app@rag-postgres:5432/scans")
 
 

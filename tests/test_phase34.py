@@ -12,9 +12,10 @@ import re
 import pathlib
 
 import pytest
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
-BASE = os.environ.get("P34_URL", "https://localhost:8000")
+BASE = os.environ.get("P34_URL", f"{RAG_API}")
 
 
 def _key():

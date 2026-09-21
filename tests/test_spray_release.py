@@ -5,7 +5,7 @@ username-as-password + documented defaults against a host's open login services,
 lockout-safe. This proves it previews the host's login services, and fails closed
 without scope. Skips cleanly without a live rag-api + DB.
 
-    RAG_API_URL=https://localhost:8000 DB_DSN=... pytest tests/test_spray_release.py
+    TEST_RAG_API=https://localhost:8000 DB_DSN=... pytest tests/test_spray_release.py
 """
 import os
 import re
@@ -13,11 +13,12 @@ import uuid
 import pathlib
 
 import pytest
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 
 requests = pytest.importorskip("requests")
 psycopg2 = pytest.importorskip("psycopg2")
 
-BASE = os.environ.get("RAG_API_URL", "https://localhost:8000")
+BASE = os.environ.get("RAG_API_URL") or RAG_API
 DB_DSN = os.environ.get("DB_DSN", "postgresql://app:app@rag-postgres:5432/scans")
 
 
