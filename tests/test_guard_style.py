@@ -91,6 +91,49 @@ def test_baseline_is_not_stale():
         "lower BASELINE to lock the improvement in")
 
 
+# `X = src[src.index("def NAME("):]` with no end bound. It reads to END OF FILE,
+# so a guard that says it checks one function actually checks everything after
+# it. Two real holes came from this in one day: test_proposals_pass_the_scope_gate
+# claimed to check analyse() (lines 1170-1309) but swept to 1881 and passed while
+# a check_dispatch call site lost its command= argument; and an exec-ordering
+# guard matched a call in an unrelated later function. Use
+# _ast_assert.function_source(src, name).
+_UNBOUNDED_SLICE = re.compile(
+    r'(\w+)\s*=\s*(\w+)\[\2\.index\(f?["\']def ')
+
+
+def _unbounded_slices():
+    found = []
+    for path in sorted(glob.glob(os.path.join(TESTS, "*.py"))):
+        name = os.path.basename(path)
+        if name == os.path.basename(__file__):
+            continue
+        lines = open(path, encoding="utf-8", errors="ignore").read().splitlines()
+        for i, line in enumerate(lines):
+            if line.lstrip().startswith("#"):
+                continue                      # a comment ABOUT the idiom is not the idiom
+            m = _UNBOUNDED_SLICE.search(line)
+            if not m:
+                continue
+            var = m.group(1)
+            # the bound may be `var = var[:...]` or `return var[:...]`, on either
+            # of the next two lines
+            window = " ".join(lines[i + 1:i + 3])
+            if f"{var}[:" in window:
+                continue
+            found.append(f"{name}:{i + 1}")
+    return found
+
+
+def test_no_unbounded_function_slices():
+    """A guard must not claim a function and read the rest of the file."""
+    offenders = _unbounded_slices()
+    assert not offenders, (
+        "these slices run to end of file, so the guard checks far more than the "
+        f"function it names: {offenders}\n"
+        "Use function_source(src, 'name') from tests/_ast_assert.")
+
+
 def test_ast_helper_offers_the_alternatives():
     """The ratchet is only fair if the replacement exists and works."""
     import sys
