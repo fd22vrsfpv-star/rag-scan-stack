@@ -19,8 +19,9 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from etl.scope_gate import host_in_scope, is_in_scope  # noqa: E402
+from conftest import FIXTURE_HOST  # shared lab constant (see tests/conftest.py)
 
-SCOPE = [("192.168.1.150", "ip")]
+SCOPE = [(FIXTURE_HOST, "ip")]
 
 
 # ------------------------------------------------------------ the predicate
@@ -29,7 +30,7 @@ SCOPE = [("192.168.1.150", "ip")]
 @pytest.mark.parametrize("value", [
     "http://192.168.1.150/twiki/bin/view/Main/WebHome",
     "http://192.168.1.150:8180/manager/html",   # port must not change identity
-    "192.168.1.150",                            # bare host form
+    FIXTURE_HOST,                            # bare host form
 ])
 def test_in_scope_values_are_kept(value):
     assert host_in_scope(value, True, SCOPE) is True
@@ -61,7 +62,7 @@ def test_malformed_and_empty_hosts_fail_closed(value):
 @pytest.mark.unit
 def test_empty_scope_is_not_a_free_pass_for_the_predicate():
     """is_in_scope itself stays fail-closed even with no scope rows."""
-    assert is_in_scope("192.168.1.150", []) is False
+    assert is_in_scope(FIXTURE_HOST, []) is False
 
 
 @pytest.mark.unit

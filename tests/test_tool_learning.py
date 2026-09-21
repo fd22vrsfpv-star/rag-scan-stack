@@ -47,6 +47,7 @@ import sys
 import uuid
 
 import pytest
+from conftest import FIXTURE_HOST  # shared lab constant (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
@@ -105,7 +106,7 @@ def test_the_same_failure_signs_the_same_on_any_host():
     a host, not a failure."""
     a, _ = tl.error_signature(HYDRA_KEX)
     b, _ = tl.error_signature(
-        HYDRA_KEX.replace("192.168.1.150", "10.9.8.7").replace(":22", ":2222"))
+        HYDRA_KEX.replace(FIXTURE_HOST, "10.9.8.7").replace(":22", ":2222"))
     assert a and a == b, "signature moved with the address; every host would re-learn"
 
 

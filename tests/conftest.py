@@ -29,6 +29,14 @@ sys.path.insert(0, str(project_root))
 # the suite point somewhere else without touching code.
 LAB_TARGET = os.environ.get("TEST_LAB_TARGET", "192.168.1.150")
 
+# The host that appears INSIDE captured tool output under tests/ (crackmapexec
+# banners, netexec ACCOUNT FOUND lines, whatweb output, ...). It is deliberately
+# NOT env-overridable: those fixtures are recorded bytes, so an expected value
+# compared against them must move only when the recording does. Using
+# LAB_TARGET for these would mean setting TEST_LAB_TARGET silently breaks every
+# test that parses a fixture — a trap that is worse than the literal it removes.
+FIXTURE_HOST = "192.168.1.150"
+
 # RFC 5737 documentation ranges. Fixtures use these for "other hosts" so a
 # fixture can never name something routable by accident.
 DOC_PEERS = ("192.0.2.41", "198.51.100.23", "203.0.113.9")

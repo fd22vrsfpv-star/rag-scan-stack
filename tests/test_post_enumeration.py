@@ -41,6 +41,7 @@ import re
 import sys
 
 import pytest
+from conftest import FIXTURE_HOST  # shared lab constant (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
@@ -375,7 +376,7 @@ def test_the_real_output_fires_the_rules_it_should():
     pe = pytest.importorskip("etl.post_enumeration")
     pn = pytest.importorskip("etl.parse_netexec")
     parsed = pn.parse_netexec_output(_fixture("netexec_smb_shares.txt"))
-    facts = pe.facts_from(parsed, target="192.168.1.150", service="smb")
+    facts = pe.facts_from(parsed, target=FIXTURE_HOST, service="smb")
     assert len(facts) >= 10, facts
 
     rules = pe.load_rules()

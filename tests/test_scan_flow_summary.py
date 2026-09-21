@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import FIXTURE_HOST  # shared lab constant (see tests/conftest.py)
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "autogen_agents"))
 os.environ.setdefault("PORT_PROFILES_PATH",
@@ -58,8 +59,8 @@ def _scan(stype, status="completed", result=None, dur=1.0, params=None, job="j")
 @pytest.mark.unit
 def test_groups_by_scan_type_and_preserves_flow_order():
     s = _session([
-        _scan("masscan", params={"targets": ["192.168.1.150"]}),
-        _scan("nmap", params={"targets": ["192.168.1.150"]}),
+        _scan("masscan", params={"targets": [FIXTURE_HOST]}),
+        _scan("nmap", params={"targets": [FIXTURE_HOST]}),
         _scan("masscan", params={"targets": ["192.168.1.151"]}),
         _scan("nuclei", params={"target_url": "http://192.168.1.150"}),
     ])
@@ -69,7 +70,7 @@ def test_groups_by_scan_type_and_preserves_flow_order():
     assert s["flow_order"] == ["masscan", "nmap", "nuclei"]
     masscan = next(t for t in s["by_scan_type"] if t["scan_type"] == "masscan")
     assert masscan["runs"] == 2
-    assert masscan["targets"] == ["192.168.1.150", "192.168.1.151"]
+    assert masscan["targets"] == [FIXTURE_HOST, "192.168.1.151"]
 
 
 @pytest.mark.unit
@@ -184,7 +185,7 @@ def test_list_valued_results_are_counted_not_ignored():
 
 @pytest.mark.unit
 def test_summary_includes_kb_coverage_section():
-    s = _session([_scan("nmap", params={"targets": ["192.168.1.150"]})])
+    s = _session([_scan("nmap", params={"targets": [FIXTURE_HOST]})])
     assert "kb_coverage" in s
     assert "available" in s["kb_coverage"]
 
@@ -193,7 +194,7 @@ def test_summary_includes_kb_coverage_section():
 def test_kb_coverage_degrades_when_the_db_is_unreachable(monkeypatch):
     """Reporting must never be the reason a session teardown fails."""
     monkeypatch.setenv("DB_DSN", "dbname=nope user=nope host=127.0.0.1 port=1 connect_timeout=1")
-    s = _session([_scan("nmap", params={"targets": ["192.168.1.150"]})])
+    s = _session([_scan("nmap", params={"targets": [FIXTURE_HOST]})])
     kb = s["kb_coverage"]
     assert kb["available"] is False
     assert "reason" in kb          # says WHY, rather than silently reporting zero

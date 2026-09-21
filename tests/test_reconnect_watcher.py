@@ -34,6 +34,7 @@ import sys
 import types
 
 import pytest
+from conftest import FIXTURE_HOST  # shared lab constant (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
@@ -78,7 +79,7 @@ def test_scope_refusal_blocks_refresh(monkeypatch):
                         lambda t: {"dead": {("ssh_credential", "root:x")},
                                    "live": {("ssh_credential", "root:x")}})
 
-    result = asyncio.run(w._reconnect_target("192.168.1.150", "eng-1"))
+    result = asyncio.run(w._reconnect_target(FIXTURE_HOST, "eng-1"))
 
     assert called["refresh"] == 0, "refresh ran despite an out-of-scope refusal"
     assert "blocked" in result
@@ -103,7 +104,7 @@ def test_recovered_access_emits_reconnected(monkeypatch):
     ])
     monkeypatch.setattr(w, "_access_state", lambda t: next(states))
 
-    result = asyncio.run(w._reconnect_target("192.168.1.150", "eng-1"))
+    result = asyncio.run(w._reconnect_target(FIXTURE_HOST, "eng-1"))
 
     assert result["recovered"] == 1
     assert result["kinds"] == ["ssh_credential"]
@@ -127,7 +128,7 @@ def test_no_recovery_emits_failed(monkeypatch):
                         lambda t: {"dead": {("msf_session", "3")},
                                    "live": {("bind_shell", "1524")}})
 
-    result = asyncio.run(w._reconnect_target("192.168.1.150", "eng-1"))
+    result = asyncio.run(w._reconnect_target(FIXTURE_HOST, "eng-1"))
 
     assert result["recovered"] == 0
     kinds = [et for et, _ in events]
@@ -150,7 +151,7 @@ def test_live_shell_that_died_is_detected_as_dropped(monkeypatch):
     ])
     monkeypatch.setattr(w, "_access_state", lambda t: next(states))
 
-    result = asyncio.run(w._reconnect_target("192.168.1.150", "eng-1"))
+    result = asyncio.run(w._reconnect_target(FIXTURE_HOST, "eng-1"))
 
     assert result["dropped"] == 1
     kinds = [et for et, _ in events]
@@ -171,7 +172,7 @@ def test_healthy_live_target_is_quiet(monkeypatch):
     monkeypatch.setattr(w, "_access_state",
                         lambda t: {"dead": set(), "live": {("ssh_credential", "root:x")}})
 
-    result = asyncio.run(w._reconnect_target("192.168.1.150", "eng-1"))
+    result = asyncio.run(w._reconnect_target(FIXTURE_HOST, "eng-1"))
 
     assert result["recovered"] == 0 and result["dropped"] == 0
     assert events == []   # completely silent for a healthy target
@@ -191,9 +192,9 @@ def test_throttle_skips_recent_target(monkeypatch):
     monkeypatch.setattr(w, "_access_state", lambda t: {"dead": set(), "live": set()})
 
     from datetime import datetime, timezone
-    w._last_attempt["192.168.1.150"] = datetime.now(timezone.utc).timestamp()
+    w._last_attempt[FIXTURE_HOST] = datetime.now(timezone.utc).timestamp()
 
-    result = asyncio.run(w._reconnect_target("192.168.1.150", "eng-1"))
+    result = asyncio.run(w._reconnect_target(FIXTURE_HOST, "eng-1"))
 
     assert result.get("skipped") == "throttled"
     assert called["refresh"] == 0
