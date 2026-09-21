@@ -40,6 +40,57 @@ def _netexec(output: str, error: str = "") -> Dict[str, Any]:
     return parse_netexec_output(f"{output}\n{error}" if error else output)
 
 
+def _nuclei(output: str, error: str = "") -> Dict[str, Any]:
+    """nuclei -json / -jsonl output: one JSON object per finding.
+
+    nuclei already had `etl/parse_nuclei.py`, but that one takes a FILE PATH and
+    writes findings to the database — it is the ingest path. This registry needs
+    a pure text->dict function, so a tool run recorded in `tool_executions` was
+    left unparsed: every nuclei run had `parsed_results IS NULL`, ~7.8 MB of real
+    output that nothing read. "It has a parser" was true and beside the point.
+
+    Tolerant by design: nuclei interleaves banner/progress lines on stderr and
+    occasionally a non-JSON line on stdout, so unparseable lines are skipped
+    rather than failing the run.
+    """
+    import json as _json
+
+    findings = []
+    for line in (output or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            d = _json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or not d.get("template-id"):
+            continue
+        info = d.get("info") if isinstance(d.get("info"), dict) else {}
+        findings.append({
+            "template_id": d.get("template-id"),
+            "name": info.get("name"),
+            "severity": (info.get("severity") or "unknown").lower(),
+            "host": d.get("host"),
+            "matched_at": d.get("matched-at"),
+            "tags": info.get("tags"),
+        })
+
+    by_sev: Dict[str, int] = {}
+    for f in findings:
+        by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
+
+    return {
+        "tool": "nuclei",
+        "findings": findings,
+        "counts": {"findings": len(findings), "by_severity": by_sev},
+        # An `info`-only run found nothing actionable, but it DID run and read
+        # the target — unlike netexec's banner lines, these are real matches, so
+        # any finding counts as productive.
+        "productive": bool(findings),
+    }
+
+
 # tool name -> pure text->dict parser. Aliases are listed explicitly rather than
 # normalised, because `nxc` and `netexec` are genuinely both used and a silent
 # prefix match would claim tools this does not handle.
@@ -47,6 +98,7 @@ PARSERS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "netexec": _netexec,
     "nxc": _netexec,
     "crackmapexec": _netexec,   # same line format; netexec is its successor
+    "nuclei": _nuclei,
 }
 
 
