@@ -4026,7 +4026,10 @@ def _service_vector_tests(items: list) -> list:
                         "category": "vector_attempt", "tier": "impactful",
                         "assertion": vec.get("success") or {"expect_shell": True},
                         "exploit_ref": {"source": "metasploit", "dispatch_source": "metasploit",
-                                        "exploit_type": "rce", "module": vec["msf"]},
+                                        "exploit_type": scan_tools.infer_msf_exploit_type(
+                                            vec["msf"], vec.get("name") or vid or "",
+                                            default="rce"),
+                                        "module": vec["msf"]},
                         "vector": {"vector_id": vid, "source_path": "msf",
                                    "mutates": mutates},
                     })
@@ -4155,6 +4158,11 @@ def _build_surface_tests(host: str, synthesize: bool = None) -> list:
                 "command": None, "category": "msf_exploit", "tier": "impactful",
                 "assertion": {"expect_shell": True},
                 "exploit_ref": {"source": "metasploit", "module": module,
+                                # Type from the module CLASS: the recommender
+                                # returns auxiliary/ scanners alongside exploit/
+                                # modules, and they are not RCE.
+                                "exploit_type": scan_tools.infer_msf_exploit_type(
+                                    module, m.get("purpose") or "", default="rce"),
                                 "purpose": m.get("purpose")},
             })
 
@@ -4375,7 +4383,14 @@ def surface_plan(state: PentestState) -> dict:
             # path/scheme) the exploit-runner needs. Fall back to the old
             # metasploit/rce defaults so nothing else changes.
             dispatch_source = ref.get("dispatch_source") or ref.get("source") or "metasploit"
-            exploit_type = ref.get("exploit_type") or "rce"
+            # "rce" is the fallback only for a ref that names no type; a metasploit
+            # module path then decides its own type from its CLASS, so an
+            # auxiliary/ scanner is not queued as remote code execution.
+            # (queue_exploit_for_approval re-applies this — belt and braces, since
+            # this is also the value the operator sees in the plan.)
+            exploit_type = scan_tools.infer_msf_exploit_type(
+                ref.get("module") or "", c.get("name") or "",
+                default=ref.get("exploit_type") or "rce")
             try:
                 res = json.loads(_tool(
                     scan_tools.queue_exploit_for_approval,

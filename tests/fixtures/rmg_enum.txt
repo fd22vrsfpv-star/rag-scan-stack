@@ -1,0 +1,34 @@
+[+] [34mRMI registry bound names:[0m
+[+]
+[+] 	- No objects are bound to the registry.
+[+]
+[+] 	[34mRMI server codebase enumeration:[0m
+[+]
+[+] 		- The remote server [33mdoes not[0m expose any codebases.
+[+]
+[+] 	[34mRMI server String unmarshalling enumeration:[0m
+[+]
+[+]
+[+] 	[34mRMI server useCodebaseOnly enumeration:[0m
+[+]
+[+] 		- RMI registry uses [33mreadString()[0m for unmarshalling java.lang.String.
+[+] 		  This prevents [34museCodebaseOnly[0m enumeration from remote.
+[+]
+[+] 	[34mRMI registry localhost bypass enumeration (CVE-2019-2684):[0m
+[+]
+[+]
+[+] 	[34mRMI Security Manager enumeration:[0m
+[+]
+[+]
+[+] 	[34mRMI server JEP290 enumeration:[0m
+[+]
+[+]
+[+] 	[34mRMI registry JEP290 bypass enumeration:[0m
+[+]
+[+] 		- RMI registry uses [33mreadString()[0m for unmarshalling java.lang.String.
+[+] 		  This prevents [34mJEP 290 bypass[0m enumeration from remote.
+[+]
+[+] 	[34mRMI ActivationSystem enumeration:[0m
+[+]
+[+] 		- Caught [33mNoSuchObjectException[0m during activate call [33m(activator not present).[0m
+[+] 		  Configuration Status: [32mCurrent Default[0m

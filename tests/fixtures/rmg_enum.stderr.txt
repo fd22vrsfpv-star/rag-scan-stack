@@ -1,0 +1,79 @@
+[-] 		Caught unexpected [33mjava.lang.ClassNotFoundException[0m during [34mlookup[0m call.
+[-] 		Please report this to improve rmg :)
+[-] 		StackTrace:
+java.lang.ClassNotFoundException: eu.tneitzel.rmg.utils.DefinitelyNonExistingClass not found in gnu.gcj.runtime.SystemClassLoader{urls=[file:./], parent=gnu.gcj.runtime.ExtensionClassLoader{urls=[], parent=null}}
+	at java.rmi/sun.rmi.transport.StreamRemoteCall.exceptionReceivedFromServer(StreamRemoteCall.java:298)
+	at java.rmi/sun.rmi.transport.StreamRemoteCall.executeCall(StreamRemoteCall.java:274)
+	at java.rmi/sun.rmi.server.UnicastRef.invoke(UnicastRef.java:378)
+	at eu.tneitzel.rmg.networking.RMIEndpoint.unmanagedCall(RMIEndpoint.java:279)
+	at eu.tneitzel.rmg.networking.RMIEndpoint.genericCall(RMIEndpoint.java:152)
+	at eu.tneitzel.rmg.networking.RMIEndpoint.genericCall(RMIEndpoint.java:106)
+	at eu.tneitzel.rmg.operations.RegistryClient.registryCall(RegistryClient.java:611)
+	at eu.tneitzel.rmg.operations.RegistryClient.enumerateStringMarshalling(RegistryClient.java:347)
+	at eu.tneitzel.rmg.operations.Dispatcher.dispatchEnum(Dispatcher.java:614)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:104)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+	at eu.tneitzel.rmg.operations.Operation.invoke(Operation.java:385)
+	at eu.tneitzel.rmg.Starter.main(Starter.java:41)
+[-] 		Caught unexpected [33mjava.rmi.UnmarshalException[0m during [34munbind[0m call.
+[-] 		Please report this to improve rmg :)
+[-] 		StackTrace:
+java.rmi.UnmarshalException: Error unmarshaling return header; nested exception is: 
+	java.io.EOFException
+	at java.rmi/sun.rmi.transport.StreamRemoteCall.executeCall(StreamRemoteCall.java:249)
+	at java.rmi/sun.rmi.server.UnicastRef.invoke(UnicastRef.java:378)
+	at eu.tneitzel.rmg.networking.RMIEndpoint.unmanagedCall(RMIEndpoint.java:279)
+	at eu.tneitzel.rmg.networking.RMIEndpoint.genericCall(RMIEndpoint.java:152)
+	at eu.tneitzel.rmg.networking.RMIEndpoint.genericCall(RMIEndpoint.java:106)
+	at eu.tneitzel.rmg.operations.RegistryClient.registryCall(RegistryClient.java:609)
+	at eu.tneitzel.rmg.operations.RegistryClient.enumLocalhostBypass(RegistryClient.java:434)
+	at eu.tneitzel.rmg.operations.Dispatcher.dispatchEnum(Dispatcher.java:626)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:104)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+	at eu.tneitzel.rmg.operations.Operation.invoke(Operation.java:385)
+	at eu.tneitzel.rmg.Starter.main(Starter.java:41)
+Caused by: java.io.EOFException
+	at java.base/java.io.DataInputStream.readUnsignedByte(DataInputStream.java:302)
+	at java.base/java.io.DataInputStream.readByte(DataInputStream.java:280)
+	at java.rmi/sun.rmi.transport.StreamRemoteCall.executeCall(StreamRemoteCall.java:235)
+	... 11 more
+[-] 		Caught unexpected [33mjava.lang.ClassNotFoundException[0m during [34mSecurity Manager[0m enumeration.
+[-] 		Please report this to improve rmg :)
+[-] 		StackTrace:
+java.lang.ClassNotFoundException: [Ljava.rmi.server.ObjID;
+	at java.rmi/sun.rmi.transport.StreamRemoteCall.exceptionReceivedFromServer(StreamRemoteCall.java:298)
+	at java.rmi/sun.rmi.transport.StreamRemoteCall.executeCall(StreamRemoteCall.java:274)
+	at java.rmi/sun.rmi.server.UnicastRef.invoke(UnicastRef.java:378)
+	at eu.tneitzel.rmg.networking.RMIEndpoint.unmanagedCall(RMIEndpoint.java:279)
+	at eu.tneitzel.rmg.networking.RMIEndpoint.genericCall(RMIEndpoint.java:152)
+	at eu.tneitzel.rmg.networking.RMIEndpoint.genericCall(RMIEndpoint.java:106)
+	at eu.tneitzel.rmg.operations.DGCClient.dgcCall(DGCClient.java:253)
+	at eu.tneitzel.rmg.operations.DGCClient.enumSecurityManager(DGCClient.java:81)
+	at eu.tneitzel.rmg.operations.Dispatcher.dispatchEnum(Dispatcher.java:642)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:104)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+	at eu.tneitzel.rmg.operations.Operation.invoke(Operation.java:385)
+	at eu.tneitzel.rmg.Starter.main(Starter.java:41)
+Caused by: java.net.MalformedURLException: Absolute URL required with null context: InvalidURL
+[-] 		Caught unexpected [33mjava.rmi.UnmarshalException[0m during [34mJEP290[0m enumeration.
+[-] 		Please report this to improve rmg :)
+[-] 		StackTrace:
+java.rmi.UnmarshalException: Error unmarshaling return header; nested exception is: 
+	java.io.EOFException
+	at java.rmi/sun.rmi.transport.StreamRemoteCall.executeCall(StreamRemoteCall.java:249)
+	at java.rmi/sun.rmi.server.UnicastRef.invoke(UnicastRef.java:378)
+	at eu.tneitzel.rmg.networking.RMIEndpoint.unmanagedCall(RMIEndpoint.java:279)
+	at eu.tneitzel.rmg.networking.RMIEndpoint.genericCall(RMIEndpoint.java:152)
+	at eu.tneitzel.rmg.networking.RMIEndpoint.genericCall(RMIEndpoint.java:106)
+	at eu.tneitzel.rmg.operations.DGCClient.dgcCall(DGCClient.java:253)
+	at eu.tneitzel.rmg.operations.DGCClient.enumJEP290(DGCClient.java:154)
+	at eu.tneitzel.rmg.operations.Dispatcher.dispatchEnum(Dispatcher.java:648)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:104)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+	at eu.tneitzel.rmg.operations.Operation.invoke(Operation.java:385)
+	at eu.tneitzel.rmg.Starter.main(Starter.java:41)
+Caused by: java.io.EOFException
+	at java.base/java.io.DataInputStream.readUnsignedByte(DataInputStream.java:302)
+	at java.base/java.io.DataInputStream.readByte(DataInputStream.java:280)
+	at java.rmi/sun.rmi.transport.StreamRemoteCall.executeCall(StreamRemoteCall.java:235)
+	... 11 more

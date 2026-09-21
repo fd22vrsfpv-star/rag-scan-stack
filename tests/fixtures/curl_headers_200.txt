@@ -1,0 +1,6 @@
+HTTP/1.1 200 OK
+Date: Tue, 01 Sep 2026 16:42:02 GMT
+Server: Apache/2.2.8 (Ubuntu) DAV/2
+X-Powered-By: PHP/5.2.4-2ubuntu5.10
+Content-Type: text/html
+

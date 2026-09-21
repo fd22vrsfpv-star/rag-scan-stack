@@ -370,6 +370,198 @@ def test_the_registry_parses_nuclei():
     assert reg.parse_for("nuclei", "") is None
 
 
+# ── The four tools that had 180 unread runs ────────────────────────────────
+#
+# curl (172 runs, 482 KB), cewl (2), rmg (5) and showmount (1) all had
+# `parsed_results IS NULL` for every row in `tool_executions`. Every fixture
+# below is one of those rows, copied out of the column byte for byte — the
+# command that produced each is named in its test.
+
+
+def _raw_fixture(name):
+    """A fixture with its line endings intact.
+
+    `_fixture` opens in text mode, so Python's universal-newline translation
+    turns a real `HTTP/1.1 200 OK\r\n` header block into LF — which is exactly
+    the shape the parser must NOT be tuned to. curl's header fixtures are read
+    through here so the test sees the CRLF the server actually sent.
+    """
+    path = os.path.join(FIXTURES, name)
+    if not os.path.exists(path):
+        pytest.skip(f"fixture {name} not present")
+    with open(path, encoding="utf-8", newline="") as fh:
+        return fh.read()
+
+
+def test_the_registry_parses_curl_headers():
+    """`curl -sk -I http://192.168.1.150:80/` and the SQLi login probe.
+
+    Header-only responses, CRLF included. 155 and 126 bytes, real rows.
+    """
+    reg = pytest.importorskip("etl.tool_output_parsers")
+    parsed = reg.parse_for("curl", _raw_fixture("curl_headers_200.txt"))
+    assert parsed, "curl output is unparsed again"
+    r = parsed["responses"][0]
+    assert (r["status"], r["status_source"]) == (200, "header")
+    assert r["server"] == "Apache/2.2.8 (Ubuntu) DAV/2"
+    assert parsed["productive"] is True and reg.result_count(parsed) == 1
+
+    # `curl -s -i -G .../doLogin --data-urlencode "uid=' OR '1'='1" ...`
+    redirect = reg.parse_for("curl", _raw_fixture("curl_login_302.txt"))
+    rr = redirect["responses"][0]
+    assert (rr["status"], rr["location"]) == (302, "index.jsp"), rr
+    assert reg.result_count(redirect) == 1
+
+
+def test_a_404_body_with_no_status_line_is_not_a_result():
+    """THE defect this module exists to avoid, in curl's own shape.
+
+    `curl -sk "http://192.168.1.150/bin/oops/Sandbox/TestTopic2?template=..."`
+    exits 0 and prints 309 bytes with NO status line — just Apache's
+    `<title>404 Not Found</title>` page. Most of the 172 unread curl runs are
+    probes exactly like this one. Counting the body as a hit is how a probe
+    that found nothing reports as productive, so the body's error-page title
+    has to supply the status the headers never carried.
+    """
+    reg = pytest.importorskip("etl.tool_output_parsers")
+    parsed = reg.parse_for("curl", _fixture("curl_404_page.txt"))
+    r = parsed["responses"][0]
+    assert (r["status"], r["status_source"]) == (404, "body_title"), r
+    assert parsed["productive"] is False
+    assert reg.result_count(parsed) == 0, "a 404 probe counted as a finding"
+
+    # ...while a real body with no status line IS content: same flags, same
+    # host, 891 bytes of the Metasploitable2 index page.
+    body = reg.parse_for("curl", _fixture("curl_body_index.txt"))
+    br = body["responses"][0]
+    assert br["status"] is None, "an unseen status must not be asserted as 200"
+    assert br["title"] == "Metasploitable2 - Linux"
+    assert body["productive"] is True and reg.result_count(body) == 1
+
+
+def test_a_curl_run_that_never_reached_the_network_is_measured_zero():
+    """`curl -sk http://192.168.1.150:80/phpinfo.php'` — a stray quote. Exit 2,
+    empty output, `/bin/sh: 1: Syntax error: Unterminated quoted string` on
+    stderr. Eight rows look like this.
+
+    Zero, not unknown: the run was read, and reading it is what tells the
+    learner the command itself is broken rather than the target being quiet.
+    """
+    reg = pytest.importorskip("etl.tool_output_parsers")
+    parsed = reg.parse_for("curl", "", _fixture("curl_shell_error.txt"))
+    assert parsed is not None, "a failed run with stderr is still measurable"
+    assert parsed["counts"]["responses"] == 0
+    assert parsed["productive"] is False
+    assert reg.result_count(parsed) == 0
+    assert "Unterminated quoted string" in parsed["errors"][0]
+
+    # No output AND no error is the one genuinely unmeasured case.
+    assert reg.parse_for("curl", "", "") is None
+
+
+def test_curl_headers_and_body_in_one_stream():
+    """`curl -i` prints both. No captured row has both (every `-i` row in the
+    column had `Content-Length: 0`), so this input is the two real fixtures
+    concatenated — the exact bytes curl would have printed for that request,
+    assembled rather than invented."""
+    reg = pytest.importorskip("etl.tool_output_parsers")
+    combined = _raw_fixture("curl_headers_200.txt") + _fixture("curl_body_index.txt")
+    parsed = reg.parse_for("curl", combined)
+    assert parsed["counts"]["responses"] == 1, parsed["responses"]
+    r = parsed["responses"][0]
+    assert (r["status"], r["status_source"]) == (200, "header")
+    assert r["title"] == "Metasploitable2 - Linux", r
+    assert r["body_bytes"] > 800, r["body_bytes"]
+
+
+def test_the_registry_parses_cewl():
+    """`cewl -d 2 -m 4 http://demo.testfire.net` — 11,534 bytes, one banner
+    line and 1,445 words. The banner is not a word."""
+    reg = pytest.importorskip("etl.tool_output_parsers")
+    parsed = reg.parse_for("cewl", _fixture("cewl_wordlist.txt"))
+    assert parsed, "cewl output is unparsed again"
+    assert parsed["counts"]["words"] == 1445, parsed["counts"]
+    assert parsed["version"].startswith("CeWL 6.2.1")
+    assert "CeWL" not in parsed["words"], "the banner was counted as a word"
+    assert parsed["counts"]["other_lines"] == 0, parsed["other_lines"]
+    assert parsed["words"][:2] == ["Altoro", "Mutual"], parsed["words"][:5]
+    assert parsed["productive"] is True
+    assert reg.result_count(parsed) == 1445
+
+    # A run that produced only the banner read the output and found nothing.
+    banner_only = reg.parse_for("cewl", parsed["version"])
+    assert banner_only["productive"] is False
+    assert reg.result_count(banner_only) == 0
+
+
+def test_the_registry_parses_showmount():
+    """`showmount -e 192.168.1.150` — 35 bytes, and the whole filesystem
+    exported to `*`. That star is the finding."""
+    reg = pytest.importorskip("etl.tool_output_parsers")
+    parsed = reg.parse_for("showmount", _fixture("showmount_exports.txt"))
+    assert parsed, "showmount output is unparsed again"
+    assert parsed["host"] == FIXTURE_HOST
+    assert parsed["exports"] == [
+        {"path": "/", "clients": ["*"], "world_readable": True}], parsed["exports"]
+    assert parsed["counts"]["world_readable"] == 1
+    assert reg.result_count(parsed) == 1
+
+    # An export list with nothing under it is zero, not unknown.
+    empty = reg.parse_for("showmount", "Export list for 192.168.1.150:\n")
+    assert empty["productive"] is False and reg.result_count(empty) == 0
+
+
+def test_the_registry_parses_rmg():
+    """`rmg enum 192.168.1.150 1099` — 1,113 bytes of ANSI-coloured `[+]`
+    output on stdout and 5.6 KB of Java stack traces on stderr, exit 0.
+
+    Nine checks ran, NOTHING is bound to the registry, and no check reported a
+    vulnerability. A tool that emits 6.7 KB and exits 0 looks productive from
+    outside; it found nothing, and zero is the answer.
+    """
+    reg = pytest.importorskip("etl.tool_output_parsers")
+    parsed = reg.parse_for("rmg", _fixture("rmg_enum.txt"),
+                           _fixture("rmg_enum.stderr.txt"))
+    assert parsed, "rmg output is unparsed again"
+    assert parsed["bound_names"] == [], parsed["bound_names"]
+    assert "No objects are bound to the registry." not in parsed["bound_names"]
+    assert parsed["counts"]["checks"] == 9, parsed["checks"]
+    assert parsed["statuses"] == [{"kind": "Configuration",
+                                   "value": "Current Default"}], parsed["statuses"]
+    assert parsed["vulnerable"] == []
+    assert {e["call"] for e in parsed["exceptions"]} == {"lookup", "unbind"}
+    assert parsed["productive"] is False
+    assert reg.result_count(parsed) == 0, "an empty RMI registry counted as a result"
+
+    # "Non Vulnerable" must not read as vulnerable; only a bound name or a real
+    # vulnerable status is a result.
+    non_vuln = reg.parse_for(
+        "rmg", "[+] \tRMI server JEP290 enumeration:\n"
+               "[+] \t\t- Vulnerability Status: Non Vulnerable\n")
+    assert non_vuln["vulnerable"] == [] and non_vuln["productive"] is False
+
+
+def test_each_new_parser_reports_exactly_one_counted_key():
+    """`result_count` SUMS every key of its `meaningful` tuple that it finds, so
+    a parser emitting two of them double-counts its own run. Fixtures above
+    would still pass; this is the guard that keeps a THIRD count from being
+    added silently."""
+    reg = pytest.importorskip("etl.tool_output_parsers")
+    samples = {
+        "curl": (_raw_fixture("curl_headers_200.txt"), ""),
+        "cewl": (_fixture("cewl_wordlist.txt"), ""),
+        "showmount": (_fixture("showmount_exports.txt"), ""),
+        "rmg": (_fixture("rmg_enum.txt"), _fixture("rmg_enum.stderr.txt")),
+    }
+    meaningful = ("credentials", "shares", "findings", "command_output_lines",
+                  "hosts", "results", "items", "vulnerabilities", "ports")
+    for tool, (out, err) in samples.items():
+        assert reg.parse_status(tool)["has_parser"] is True, tool
+        counts = reg.parse_for(tool, out, err)["counts"]
+        hit = [k for k in meaningful if k in counts]
+        assert hit == ["results"], f"{tool} counts {hit}"
+
+
 def test_an_unproductive_parse_counts_zero_not_unknown():
     """A parsed run that achieved nothing IS measured, and zero is the answer —
     that is what lets the learner reach for another tool."""
