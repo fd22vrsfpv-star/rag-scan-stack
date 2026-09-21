@@ -8,7 +8,7 @@ container and only 500'd on execution):
     api.py uses -> NameError after the row was already inserted.
 
 Skips cleanly without a stack.
-    ST_URL=https://localhost:8000 pytest tests/test_security_tests_burp.py
+    TEST_RAG_API=https://localhost:8000 pytest tests/test_security_tests_burp.py
 """
 import json
 import os
@@ -16,9 +16,10 @@ import re
 import pathlib
 
 import pytest
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 
 requests = pytest.importorskip("requests")
-BASE = os.environ.get("ST_URL", "https://localhost:8000")
+BASE = os.environ.get("ST_URL") or RAG_API
 
 
 def _key():

@@ -32,6 +32,7 @@ API = os.path.join(REPO, "app", "rag-api", "api.py")
 
 _SCRIPT = r"""
 import os, json, urllib3, requests, psycopg2
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 urllib3.disable_warnings()
 c = psycopg2.connect(os.environ["DB_DSN"]); c.autocommit = True
 cur = c.cursor()
@@ -47,7 +48,7 @@ try:
                 "VALUES (gen_random_uuid(),'recon',%s,%s,'info','customer_hosted_site','open',%s)",
                 ("Customer-hosted site — " + HOST, HOST, eid))
 
-    r = requests.post(f"https://localhost:8000/engagements/{eid}/scope/mark-customer-sites",
+    r = requests.post(f"{RAG_API}/engagements/{eid}/scope/mark-customer-sites",
                       headers={"x-api-key": KEY}, json={"targets": [HOST]},
                       verify=False, timeout=60)
     status = r.status_code

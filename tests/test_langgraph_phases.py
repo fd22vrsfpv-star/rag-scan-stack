@@ -3,7 +3,7 @@
 Run on demand:
 
     pytest tests/test_langgraph_phases.py -v
-    AGENT_API=https://localhost:3002 pytest tests/test_langgraph_phases.py -v
+    TEST_BFF=https://localhost:3002 pytest tests/test_langgraph_phases.py -v
 
 WHY THIS EXISTS
 ---------------
@@ -41,6 +41,7 @@ import re
 import sys
 
 import pytest
+from conftest import BFF  # shared service endpoints (see tests/conftest.py)
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -433,7 +434,7 @@ def test_no_candidate_skips_the_gate(graph_mod, monkeypatch):
 
 
 # ── 6. the endpoints execute (live; skips when the stack is down) ───────────
-BASE = os.environ.get("AGENT_API", "https://localhost:3002")
+BASE = os.environ.get("AGENT_API") or BFF
 
 
 def _client():

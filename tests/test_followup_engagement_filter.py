@@ -62,6 +62,7 @@ import re
 import pytest
 
 from _container import container_exec
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 SCHEMA = os.path.join(REPO, "db_init", "ensure_all_tables.sql")
@@ -230,7 +231,7 @@ try:
     res["orphan_row_id"], res["orphan_engagement"] = insert(
         "pytest orphan follow-up", "https://" + ORPHAN + "/x")
 
-    r = requests.get("https://localhost:8000/follow-ups",
+    r = requests.get(f"{RAG_API}/follow-ups",
                      params={"engagement_id": str(eid), "rule_id": "pytest_fu_filter",
                              "limit": 10000},
                      headers={"x-api-key": KEY}, verify=False, timeout=60)

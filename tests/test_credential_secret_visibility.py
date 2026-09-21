@@ -54,6 +54,7 @@ import re
 import pytest
 
 from _container import container_exec
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 API = os.path.join(REPO, "app", "rag-api", "api.py")
@@ -175,7 +176,7 @@ IP = "192.0.2.61"           # RFC 5737 TEST-NET-1, never a live host
 SECRET = "pytest-secret-value-do-not-use"
 try:
     # Round-trip through the real endpoint, not a hand-written INSERT.
-    r = requests.post("https://localhost:8000/credentials",
+    r = requests.post(f"{RAG_API}/credentials",
                       params={"ip": IP, "port": 22, "protocol": "ssh",
                               "username": "pytest-cred", "secret_value": SECRET,
                               "secret_type": "password", "source": "pytest"},
@@ -188,7 +189,7 @@ try:
     res["column_matches"] = bool(row) and row[0] == SECRET
     res["also_in_metadata"] = bool(row) and row[1]
 
-    g = requests.get(f"https://localhost:8000/assets/{IP}/credentials",
+    g = requests.get(f"{RAG_API}/assets/{IP}/credentials",
                      headers=H, verify=False, timeout=30)
     res["get_status"] = g.status_code
     creds = g.json().get("credentials", []) if g.ok else []

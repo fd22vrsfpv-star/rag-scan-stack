@@ -3,7 +3,7 @@
 Run on demand:
 
     pytest tests/test_vector_coverage.py -v
-    BFF_BASE=https://localhost:3002/api pytest tests/test_vector_coverage.py
+    TEST_BFF=https://localhost:3002 pytest tests/test_vector_coverage.py
 
 WHY THIS EXISTS
 ---------------
@@ -16,10 +16,11 @@ the stack.
 import os
 
 import pytest
+from conftest import BFF_API  # shared service endpoints (see tests/conftest.py)
 
 requests = pytest.importorskip("requests")
 
-BASE = os.environ.get("BFF_BASE", "https://localhost:3002/api")
+BASE = os.environ.get("BFF_BASE") or BFF_API
 URL = f"{BASE}/vector-coverage"
 
 
