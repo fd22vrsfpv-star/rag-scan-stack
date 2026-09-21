@@ -138,6 +138,52 @@ def loot_output() -> str:
     return _render_loot(raw)
 
 
+# ---- Skip budget ----
+#
+# A skip says "cannot run HERE". That is legitimate and most of this suite's
+# skips are exactly that — no database, no running stack. But it makes a skip
+# the perfect hiding place: a change that silently stops 75 tests from running
+# looks identical to a machine without Postgres.
+#
+# That is not hypothetical. Two service directories each ship a `log_manager`,
+# and once any test put autogen_agents/ on sys.path first, 75 scan_recommender
+# tests began reporting "not importable in this env" — an environment-shaped
+# message for a test-ordering bug. They pass 106/106 in isolation. The suite
+# stayed green the whole time and the skip count simply grew.
+#
+# So: opt-in ceiling. Set PYTEST_SKIP_BUDGET=<n> (CI does) and the session FAILS
+# if more tests skipped than that. Opt-in because the right number depends on
+# what infrastructure is reachable, and because running a subset would otherwise
+# trip it. Raise it only with a reason, the way the other ratchets here work.
+_SKIP_BUDGET_ENV = "PYTEST_SKIP_BUDGET"
+
+
+def pytest_sessionfinish(session, exitstatus):
+    budget = os.environ.get(_SKIP_BUDGET_ENV)
+    if not budget:
+        return
+    try:
+        limit = int(budget)
+    except ValueError:
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:
+        return
+    skipped = len(reporter.stats.get("skipped", []))
+    if skipped <= limit:
+        return
+    reporter.write_line("")
+    reporter.write_line(
+        f"SKIP BUDGET EXCEEDED: {skipped} tests skipped, ceiling is {limit} "
+        f"({_SKIP_BUDGET_ENV}).", red=True)
+    reporter.write_line(
+        "A skip means 'cannot run here'. If a change made tests stop running, "
+        "fix that; if more infrastructure is genuinely absent, raise the ceiling "
+        "with a reason. Run with -rs to see every reason.", red=True)
+    # 1 is pytest's own "tests failed" status, so CI treats this like a failure.
+    session.exitstatus = 1
+
+
 # ---- Database Fixtures ----
 
 
