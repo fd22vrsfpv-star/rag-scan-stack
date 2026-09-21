@@ -27,6 +27,7 @@ import subprocess
 import sys
 
 import pytest
+from conftest import FIXTURE_HOST  # shared lab constant (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 for path in (REPO, os.path.join(REPO, "app", "rag-api")):
@@ -34,7 +35,7 @@ for path in (REPO, os.path.join(REPO, "app", "rag-api")):
         sys.path.insert(0, path)
 
 VOCAB = os.path.join(REPO, "knowledge", "scan_parameters.yaml")
-HOST = "192.168.1.150"
+HOST = FIXTURE_HOST
 
 
 def _psql(sql):

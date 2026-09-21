@@ -3,6 +3,7 @@ IP-keyed port/asset/web-finding queries match (they returned zero for
 'demo.testfire.net' because ports/findings are keyed by the resolved IP)."""
 import os, re, textwrap
 import pytest
+from conftest import LAB_TARGET  # shared lab constant (see tests/conftest.py)
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 def _r(rel):
     p=os.path.join(REPO,rel)
@@ -17,7 +18,7 @@ def test_target_host_normalizer():
     assert f("http://demo.testfire.net:80/login") == "demo.testfire.net"
     assert f("https://demo.testfire.net/") == "demo.testfire.net"
     assert f("demo.testfire.net") == "demo.testfire.net"
-    assert f("192.168.1.150") == "192.168.1.150"
+    assert f(LAB_TARGET) == LAB_TARGET
 
 def test_resolve_endpoint_and_ports_hostname_match():
     src=_r("app/rag-api/api.py")

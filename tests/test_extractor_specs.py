@@ -34,6 +34,7 @@ import os
 import sys
 
 import pytest
+from conftest import FIXTURE_HOST  # shared lab constant (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 for path in (REPO, os.path.join(REPO, "app", "rag-api")):
@@ -319,7 +320,7 @@ def test_signature_is_content_based_not_mtime():
 def test_deterministic_fields_are_marked_settled_in_the_prompt():
     """The model must not be invited to contradict a regex that read the text."""
     spec = es.spec_for("enum4linux-ng", SPEC_DIR)
-    prompt = es.build_prompt(spec, "enum4linux-ng", "192.168.1.150", 445,
+    prompt = es.build_prompt(spec, "enum4linux-ng", FIXTURE_HOST, 445,
                              "enum4linux-ng -A h", "output here",
                              already={"users": ["root"]})
     assert "settled" in prompt.lower()

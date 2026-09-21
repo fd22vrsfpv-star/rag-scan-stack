@@ -24,6 +24,7 @@ import ast
 import pathlib
 
 import pytest
+from conftest import LAB_TARGET  # shared lab constant (see tests/conftest.py)
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 API = REPO / "app" / "rag-api" / "api.py"
@@ -46,7 +47,7 @@ def _infer():
 
 def test_bare_ip_is_typed_ip():
     f = _infer()
-    assert f("192.168.1.150") == "ip"
+    assert f(LAB_TARGET) == "ip"
     assert f("8.8.8.8") == "ip"
     assert f("2001:db8::1") == "ip"
 
@@ -93,6 +94,6 @@ def test_typed_row_is_enforceable_end_to_end():
     except Exception as e:  # noqa: BLE001
         pytest.skip(f"etl.scope_gate not importable: {e}")
     # a NULL-typed row must NOT match; an ip-typed one must
-    assert is_in_scope("192.168.1.150", [("192.168.1.150", "ip")]) is True
-    assert is_in_scope("192.168.1.150", [("192.168.1.150", None)]) is False
-    assert is_in_scope("8.8.8.8", [("192.168.1.150", "ip")]) is False
+    assert is_in_scope(LAB_TARGET, [(LAB_TARGET, "ip")]) is True
+    assert is_in_scope(LAB_TARGET, [(LAB_TARGET, None)]) is False
+    assert is_in_scope("8.8.8.8", [(LAB_TARGET, "ip")]) is False

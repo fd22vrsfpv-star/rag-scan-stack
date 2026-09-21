@@ -21,6 +21,7 @@ import importlib.util
 import os
 
 import pytest
+from conftest import FIXTURE_HOST  # shared lab constant (see tests/conftest.py)
 
 _PATH = os.path.join(os.path.dirname(__file__), "..", "app", "rag-api", "artifact_actions.py")
 
@@ -71,7 +72,7 @@ NMAP = (
 
 
 def test_smb_evidence_produces_smb_actions(aa):
-    got = ids(aa.suggest_actions(CRACKMAPEXEC, tool="crackmapexec", target="192.168.1.150"))
+    got = ids(aa.suggest_actions(CRACKMAPEXEC, tool="crackmapexec", target=FIXTURE_HOST))
     assert "smbv1_enabled" in got
     assert "smb_signing_disabled" in got
 
@@ -80,7 +81,7 @@ def test_tool_setup_chatter_does_not_trigger_rules(aa):
     """The regression this filter exists for: crackmapexec generating its OWN
     certificate must not propose a TLS audit of the target."""
     assert "tls_present" not in ids(aa.suggest_actions(CRACKMAPEXEC, tool="crackmapexec",
-                                                       target="192.168.1.150"))
+                                                       target=FIXTURE_HOST))
 
 
 def test_genuine_tls_evidence_still_fires(aa):
@@ -91,34 +92,34 @@ def test_genuine_tls_evidence_still_fires(aa):
 
 def test_nmap_banner_url_is_not_treated_as_web_surface(aa):
     """`Starting Nmap ( https://nmap.org )` is the tool's banner, not the target."""
-    actions = aa.suggest_actions(NMAP, tool="nmap", target="192.168.1.150")
+    actions = aa.suggest_actions(NMAP, tool="nmap", target=FIXTURE_HOST)
     for a in actions:
         assert "nmap.org" not in a["evidence"]
 
 
 def test_anonymous_ftp_detected(aa):
-    assert "anonymous_ftp" in ids(aa.suggest_actions(NMAP, tool="nmap", target="192.168.1.150"))
+    assert "anonymous_ftp" in ids(aa.suggest_actions(NMAP, tool="nmap", target=FIXTURE_HOST))
 
 
 def test_software_version_detected_from_native_json(aa):
     """The whole point of preferring native JSON: Apache 2.2.8 as a real field."""
     assert "software_version" in ids(aa.suggest_actions(WHATWEB_JSON, tool="whatweb",
-                                                        target="192.168.1.150"))
+                                                        target=FIXTURE_HOST))
 
 
 def test_every_action_cites_evidence(aa):
     """A suggestion with no evidence cannot be justified by the operator."""
     for content, tool in ((CRACKMAPEXEC, "crackmapexec"), (NMAP, "nmap"), (WHATWEB_JSON, "whatweb")):
-        for a in aa.suggest_actions(content, tool=tool, target="192.168.1.150"):
+        for a in aa.suggest_actions(content, tool=tool, target=FIXTURE_HOST):
             if a["source"] == "rules":
                 assert a["evidence"].strip(), f"{a['id']} produced no evidence"
 
 
 def test_target_is_substituted_into_commands(aa):
-    for a in aa.suggest_actions(CRACKMAPEXEC, tool="crackmapexec", target="192.168.1.150"):
+    for a in aa.suggest_actions(CRACKMAPEXEC, tool="crackmapexec", target=FIXTURE_HOST):
         if not a["needs_input"]:
             assert "{target}" not in a["script"]
-            assert "192.168.1.150" in a["script"]
+            assert FIXTURE_HOST in a["script"]
 
 
 def test_unfilled_placeholder_is_flagged_not_hidden(aa):
@@ -144,7 +145,7 @@ def test_mentioned_hosts_never_become_targets(aa):
     own target."""
     out = ("Redirect to https://twitter.com/example\n"
            "Powered by TWiki - see https://twiki.org\n200 OK")
-    for a in aa.suggest_actions(out, tool="whatweb", target="192.168.1.150"):
+    for a in aa.suggest_actions(out, tool="whatweb", target=FIXTURE_HOST):
         assert "twitter.com" not in a["script"]
         assert "twiki.org" not in a["script"]
 
@@ -152,12 +153,12 @@ def test_mentioned_hosts_never_become_targets(aa):
 def test_ansi_escapes_stripped_from_evidence(aa):
     """whatweb colours stdout; raw escapes make evidence unreadable in the UI."""
     coloured = "\x1b[1m\x1b[34mhttp://192.168.1.150\x1b[0m [200 OK] \x1b[1mApache\x1b[0m[2.2.8]"
-    for a in aa.suggest_actions(coloured, tool="whatweb", target="192.168.1.150"):
+    for a in aa.suggest_actions(coloured, tool="whatweb", target=FIXTURE_HOST):
         assert "\x1b[" not in a["evidence"]
 
 
 def test_results_sorted_by_priority(aa):
-    got = aa.suggest_actions(NMAP + CRACKMAPEXEC, tool="nmap", target="192.168.1.150")
+    got = aa.suggest_actions(NMAP + CRACKMAPEXEC, tool="nmap", target=FIXTURE_HOST)
     assert [a["priority"] for a in got] == sorted((a["priority"] for a in got), reverse=True)
 
 
@@ -167,7 +168,7 @@ def test_empty_content_yields_nothing(aa):
 
 def test_no_duplicate_rule_ids(aa):
     got = ids(aa.suggest_actions(NMAP + CRACKMAPEXEC + WHATWEB_JSON, tool="nmap",
-                                 target="192.168.1.150"))
+                                 target=FIXTURE_HOST))
     assert len(got) == len(set(got))
 
 
