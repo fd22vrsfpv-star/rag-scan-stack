@@ -969,20 +969,31 @@ def _llm_classify_output(output: str, *, tool: str = "", target: str = "",
 
 def _record_secret_facts(cur, facts: List[Dict[str, Any]],
                          execution: Dict[str, Any]) -> int:
-    """Record `secret` facts as observations even when NO rule proposes a
-    follow-up command. A JWT or an AWS key is valuable on its own — the tool's
-    purpose is to collect data for a tester's manual workflow — so it must not
-    vanish just because the rules engine had nothing to dispatch for it."""
+    """Record LOOT facts as observations even when NO rule proposes a follow-up
+    command. A JWT or an AWS key is valuable on its own — the tool's purpose is
+    to collect data for a tester's manual workflow — so it must not vanish just
+    because the rules engine had nothing to dispatch for it.
+
+    `file:sensitive_document` is recorded for the same reason and was the proof
+    of it: a live sweep extracted Q4-infrastructure-passwords.xlsx, a DR runbook,
+    a network diagram and a database dump, and all four were dropped on the floor
+    because no rule matches a document. Loot the operator would report is exactly
+    what must survive the rules engine having nothing to say about it.
+    """
     recorded = 0
     for fact in facts:
-        if fact.get("fact") != "secret":
-            continue
         kind = fact.get("kind") or "unknown"
+        if fact.get("fact") == "secret":
+            label = f"secret:{kind}"
+        elif fact.get("fact") == "file" and kind == "sensitive_document":
+            label = f"loot:{kind}"
+        else:
+            continue
         try:
-            _observe(cur, f"secret:{kind}", execution, fact, None, None)
+            _observe(cur, label, execution, fact, None, None)
             recorded += 1
         except Exception as e:  # noqa: BLE001
-            log.debug("recording secret fact failed: %s", e)
+            log.debug("recording loot fact failed: %s", e)
     return recorded
 
 
