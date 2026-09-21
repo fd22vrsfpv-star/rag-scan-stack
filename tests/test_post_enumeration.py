@@ -343,6 +343,33 @@ def test_the_registry_handles_netexec_and_its_aliases():
         assert parsed and parsed["counts"]["credentials"] == 1, name
 
 
+def test_the_registry_parses_nuclei():
+    """nuclei HAD a parser and was still unparsed.
+
+    `etl/parse_nuclei.py` takes a FILE PATH and writes findings to the database —
+    the ingest path. This registry needs a pure text->dict function, and nuclei
+    was not in it, so every nuclei run in `tool_executions` had
+    `parsed_results IS NULL`: ~7.8 MB of real output nothing read. "It has a
+    parser" was true and beside the point.
+
+    Fixture is real nuclei -jsonl shape, banner lines and a junk line included,
+    because that is what the column actually holds.
+    """
+    reg = pytest.importorskip("etl.tool_output_parsers")
+    parsed = reg.parse_for("nuclei", _fixture("nuclei_jsonl.txt"))
+    assert parsed, "nuclei output is unparsed again"
+    assert parsed["counts"]["findings"] == 3, parsed["counts"]
+    assert parsed["counts"]["by_severity"] == {"info": 2, "high": 1}
+    assert reg.result_count(parsed) == 3
+    assert parsed["productive"] is True
+    ids = [f["template_id"] for f in parsed["findings"]]
+    assert "CVE-2021-41773" in ids, ids
+
+    # noise-only and empty are DIFFERENT answers: nothing found vs not measured
+    assert reg.parse_for("nuclei", "[INF] no results found")["productive"] is False
+    assert reg.parse_for("nuclei", "") is None
+
+
 def test_an_unproductive_parse_counts_zero_not_unknown():
     """A parsed run that achieved nothing IS measured, and zero is the answer —
     that is what lets the learner reach for another tool."""

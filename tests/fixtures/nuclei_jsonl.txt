@@ -1,0 +1,6 @@
+[INF] Current nuclei version: v3.2.0 (latest)
+[INF] Templates loaded for current scan: 7412
+{"template":"http/exposures/apis/swagger-api.yaml","template-url":"https://cloud.projectdiscovery.io/public/swagger-api","template-id":"swagger-api","template-path":"/root/nuclei-templates/http/exposures/apis/swagger-api.yaml","info":{"name":"Public Swagger API - Detect","author":["pdteam"],"tags":["exposure","api","swagger"],"description":"Public Swagger API was detected.","severity":"info","metadata":{"max-request":2}},"type":"http","host":"192.0.2.10","port":"80","scheme":"http","matched-at":"http://192.0.2.10:80/swagger/index.html","matcher-status":true,"ip":"192.0.2.10"}
+{"template":"http/cves/2021/CVE-2021-41773.yaml","template-id":"CVE-2021-41773","info":{"name":"Apache 2.4.49 - Path Traversal","author":["pdteam"],"tags":["cve","apache","lfi"],"severity":"high","classification":{"cve-id":["cve-2021-41773"]}},"type":"http","host":"192.0.2.10","port":"80","scheme":"http","matched-at":"http://192.0.2.10:80/cgi-bin/.%2e/etc/passwd","matcher-status":true,"ip":"192.0.2.10"}
+this line is not json and must be skipped
+{"template-id":"tech-detect","info":{"name":"Technology Detection","severity":"info","tags":["tech"]},"host":"192.0.2.10","matched-at":"http://192.0.2.10:80/"}
