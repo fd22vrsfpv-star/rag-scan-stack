@@ -16,11 +16,15 @@ Sabotage-proven: revert any one wire and the matching assertion fails.
 Runs standalone; the regex test is self-contained.
 """
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).parent))
+from _ast_assert import call_order  # noqa: E402
+PW = ROOT / "playwright_scanner/playwright_scanner.py"
 
 
 def _src(rel):
@@ -77,9 +81,9 @@ def test_playwright_runs_authenticated_katana_before_probe():
     assert "def _run_authenticated_katana(" in s
     assert "auto_form_fill" in s
     # the katana step is invoked inside the crawl, before the probe
-    i_katana = s.index("_run_authenticated_katana(ctx")
-    i_probe = s.index("_idor_mutate_probe(ctx, req.url")
-    assert i_katana < i_probe, "authenticated katana must run before the IDOR probe"
+    assert call_order(PW, "_run_authenticated_katana", "_idor_mutate_probe",
+                      within="_perform_crawl"), (
+        "authenticated katana must run before the IDOR probe")
 
 
 def test_crawl_excludes_logout_navigation():
