@@ -141,9 +141,13 @@ extractor specs in as a second parser tier already covered `enum4linux-ng`,
 **Update 2026-09-21:** re-counted from `tool_executions` where
 `parsed_results IS NULL` — now 5 tools and ~8.3 MB unread, not 6 and 632 KB:
 nuclei (30 runs, 7.8 MB), curl (160, 482 KB), cewl (2, 23 KB), rmg (5, 5.6 KB),
-showmount (1, 35 B). NOTE nuclei is a different defect: `etl/parse_nuclei.py`
-EXISTS, so those 30 runs are a parser that is not being invoked or is failing,
-not a missing parser — worth splitting out before writing anything new.
+showmount (1, 35 B). nuclei was a different defect and is now FIXED:
+`etl/parse_nuclei.py` exists but takes a FILE PATH and writes to the database
+(the ingest path), while this column is filled from
+`etl/tool_output_parsers.parse_for()`, whose registry did not list nuclei at all.
+Every nuclei run was unparsed — 0 with `parsed_results`, ~7.8 MB unread. A pure
+text->dict `_nuclei` parser is now registered (tests/test_post_enumeration.py
+::test_the_registry_parses_nuclei). Remaining: curl (482 KB), cewl, rmg, showmount.
 **Done when:** each tool has a registry parser or an extractor spec.
 `POST /parsers/draft?tool=<tool>` drafts one from a stored sample; the gap is
 now visible and has a fix rather than being silent.
@@ -199,14 +203,21 @@ bounded re-rank learns from has never received a row, so the loop has not run
 once in production. GRPO never runs either, and no metric anywhere records
 whether retrieval improved.
 **Where:** the RAG feedback path.
-**Update 2026-09-21:** the MACHINERY now exists — `POST /api/rag/eval/run`
-replays rated queries and computes NDCG@K / MRR / recall@K / precision@K into
-`rag_eval_runs`, and `GET /api/rag/eval/history` reads them back. But it has never
-been run: `SELECT count(*) FROM rag_eval_runs` = 0 and the history endpoint returns
-`{"runs":[]}`. A measurement that exists and is never taken measures nothing, so
-the item stands — with a much smaller remaining step.
-**Done when:** at least one evaluation run is recorded, and something re-runs it so
-a change in retrieval shows up as a change in the numbers.
+**Update 2026-09-21:** the MACHINERY exists and WORKS — `POST /api/rag/eval/run`
+replays rated queries into NDCG@K / MRR / recall@K / precision@K in
+`rag_eval_runs`. It was run to find out why nothing had been recorded, and it
+answered honestly:
+
+    {"ok":true,"ran":false,"reason":"no feedback-rated queries in the window",
+     "eval_set_size":0}
+
+The blocker is DATA, not code: `rag_query_log` has 346 rows and `rag_feedback`
+has **0**, so there are no operator-labeled helpful chunks to score against. The
+endpoint correctly refuses to emit a number rather than reporting a meaningless
+0.0 — do not "fix" that into fabricated ground truth.
+**Done when:** operators have rated enough queries for an eval set to exist, one
+run is recorded, and something re-runs it so a change in retrieval shows as a
+change in the numbers. The rating surface, not the evaluator, is the gap.
 **Enforced by:** not enforced
 
 ## Vector coverage
@@ -380,25 +391,6 @@ requires manual approval, which an already operator-approved exploit satisfies.)
 **Done when:** the correction tries a DIFFERENT bind payload than the one that
 failed — e.g. by excluding the last-tried payload from the candidate list.
 **Enforced by:** not enforced
-
-### Scope writers create NULL-engagement scope_targets rows
-**Found:** 2026-09-16
-**Evidence:** 2108 `scope_targets` rows had `engagement_id IS NULL`: 1256 `customer`
-(1256 = 851 unique + 405 internal duplicates) and 851 `not_in_scope`. The `customer`
-orphans were backfilled to their owning engagement (redteam3,
-652c257d-7d54-4c66-bd4c-38bd2c3e1bc3) after collapsing internal duplicates;
-`not_in_scope` is the intended global deny-list. The SOURCE is still live: several
-scope writers INSERT with no `engagement_id` — scope-move (`app/rag-api/api.py:15065`,
-source='moved'), auto-classify (`api.py:15173`, source='auto-classified'),
-unknown_scope auto-discovery (`api.py:14859`), swagger-import (`api.py:25100`/`25115`).
-Any of these can recreate orphans under a non-global scope name.
-**Where:** the scope_targets INSERT sites in `app/rag-api/api.py` listed above — each
-takes a scope `name` param but omits `engagement_id`.
-**Done when:** those writers resolve and set `engagement_id` (from the scope's owning
-engagement) for every non-`not_in_scope` insert, so no new NULL-engagement scope
-orphan can be created.
-**Enforced by:** `tests/test_engagement_attribution.py::test_scope_targets_are_engagement_tied`
-(fails when a non-global scope name has NULL-engagement rows; ratchets).
 
 ### Credential brute-force (hydra) recommended but never auto-dispatched in a session
 **Found:** 2026-09-17
