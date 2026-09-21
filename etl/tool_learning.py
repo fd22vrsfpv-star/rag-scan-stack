@@ -801,6 +801,12 @@ def learn_from_tool_executions(
     than from zero, so the first run after this ships already knows what the
     last few hundred runs demonstrated.
 
+    `support` counts OBSERVATIONS, not pairings: one failed run of A followed by
+    the next run of B is one observation of "A failed this way, B ran next",
+    however many times B (or anything else) ran afterwards, and it stops at the
+    point A fails that way again — from there on, later runs are evidence about
+    that second failure instead.
+
     Idempotent in effect, not in counters: re-running it re-counts the same
     pairs, so it is a backfill to run once per window, not a cron job.
     """
@@ -852,12 +858,39 @@ def learn_from_tool_executions(
                     for i, failed_row in enumerate(seq):
                         if failed_row["success"] or not failed_row["signature"]:
                             continue
+                        # ONE observation per (this failure -> the next run of
+                        # that other tool). Pairing a failure against EVERY
+                        # later run in the window counted the same occasion once
+                        # per run: 77 executions produced 284 upserts and a
+                        # support of 68 for a pair seen a handful of times,
+                        # because the pairing is quadratic in the number of runs
+                        # on a busy target. `support` is documented — in the DDL
+                        # and in the note the operator reads in `preferred_order`
+                        # — as "times this pair was observed", so it has to count
+                        # occasions, not cross products.
+                        paired: set = set()
                         for later in seq[i + 1:]:
                             if later["tool"] == failed_row["tool"]:
+                                # The same tool failing the same way again is a
+                                # NEW occasion, and everything after it followed
+                                # THAT failure, not this one. Stopping here is
+                                # the other half of the de-duplication: without
+                                # it, ten failures of A before one run of B would
+                                # read as ten observations of "B follows A".
+                                if (not later["success"]
+                                        and later["signature"] == failed_row["signature"]):
+                                    break
                                 continue
                             gap = (later["ts"] - failed_row["ts"]).total_seconds() / 60
                             if gap > CORRELATION_WINDOW_MINUTES:
                                 break
+                            if later["tool"] in paired:
+                                # Already counted: what this failure teaches is
+                                # what happened the NEXT time that tool ran, and
+                                # re-running it does not make the failure more
+                                # observed.
+                                continue
+                            paired.add(later["tool"])
                             _upsert_rule(cur, phase, service, failed_row["tool"],
                                          failed_row["signature"], later["tool"],
                                          failed_row["phrase"], later["success"])
