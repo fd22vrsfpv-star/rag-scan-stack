@@ -7,6 +7,7 @@ import importlib.util
 import os
 
 import pytest
+from conftest import FIXTURE_HOST  # shared lab constant (see tests/conftest.py)
 
 _SPEC = importlib.util.spec_from_file_location(
     "agent_claims",
@@ -33,7 +34,7 @@ class TestExtraction:
 
     def test_ipv4(self):
         c = ac.extract_claims("scanned 192.168.1.150 and 10.0.0.5")
-        assert set(kinds(c, "host")) == {"192.168.1.150", "10.0.0.5"}
+        assert set(kinds(c, "host")) == {FIXTURE_HOST, "10.0.0.5"}
 
     def test_rejects_impossible_octets(self):
         """999.1.1.1 is not an address; claiming it would be a spurious alert."""

@@ -22,6 +22,7 @@ import os
 import re
 
 import pytest
+from conftest import FIXTURE_HOST  # shared lab constant (see tests/conftest.py)
 
 # realpath, NOT a bare join: the unresolved form is ".../tests/..", whose
 # own "/tests" segment matched the skip list below and caused the walk to
@@ -55,7 +56,7 @@ def in_scope(gate):
     return gate.is_in_scope
 
 
-SCOPE = [("192.168.1.150", "ip"), ("10.10.0.0/16", "cidr"), ("example.com", "domain")]
+SCOPE = [(FIXTURE_HOST, "ip"), ("10.10.0.0/16", "cidr"), ("example.com", "domain")]
 
 
 # ── URL targets ─────────────────────────────────────────────────────────────
@@ -111,7 +112,7 @@ def test_url_normalisation_still_fails_closed_on_empty_scope(gate):
 
 
 def test_exact_ip_is_in_scope(in_scope):
-    assert in_scope("192.168.1.150", SCOPE) is True
+    assert in_scope(FIXTURE_HOST, SCOPE) is True
 
 
 @pytest.mark.parametrize("host", ["104.20.44.163", "172.66.0.227"])
@@ -134,8 +135,8 @@ def test_domain_and_subdomain(in_scope):
 def test_empty_scope_refuses_everything(in_scope):
     """Fail closed. An unconfigured scope must not mean 'scan anything' — that
     turns a setup mistake into unauthorised traffic."""
-    assert in_scope("192.168.1.150", []) is False
-    assert in_scope("192.168.1.150", None) is False
+    assert in_scope(FIXTURE_HOST, []) is False
+    assert in_scope(FIXTURE_HOST, None) is False
 
 
 def test_blank_host_is_refused(in_scope):
@@ -152,7 +153,7 @@ def test_near_miss_addresses_are_refused(in_scope):
 def test_malformed_scope_rows_do_not_crash(in_scope):
     """A bad row must not take out the gate — and must not authorise anything."""
     bad = [("", "ip"), (None, "cidr"), ("not-a-cidr", "cidr"), ("x", None)]
-    assert in_scope("192.168.1.150", bad) is False
+    assert in_scope(FIXTURE_HOST, bad) is False
 
 
 def test_trailing_dot_and_case_are_normalised(in_scope):
@@ -162,7 +163,7 @@ def test_trailing_dot_and_case_are_normalised(in_scope):
 # ── Drift guard ───────────────────────────────────────────────────────────
 
 CASES = [
-    ("192.168.1.150", True), ("104.20.44.163", False), ("172.66.0.227", False),
+    (FIXTURE_HOST, True), ("104.20.44.163", False), ("172.66.0.227", False),
     ("10.10.5.9", True), ("10.11.5.9", False),
     ("example.com", True), ("api.example.com", True), ("notexample.com", False),
     ("", False), ("192.168.1.15", False),
@@ -243,12 +244,12 @@ def test_dispatch_check_rejects_command_hidden_targets(gate):
 
 def test_dispatch_check_ignores_self_addresses(gate):
     """Loopback and 0.0.0.0 are the tool talking to itself, not a target."""
-    assert gate.check_dispatch("192.168.1.150", SCOPE, "nc 127.0.0.1 4444") is None
-    assert gate.check_dispatch("192.168.1.150", SCOPE, "bind 0.0.0.0:9001") is None
+    assert gate.check_dispatch(FIXTURE_HOST, SCOPE, "nc 127.0.0.1 4444") is None
+    assert gate.check_dispatch(FIXTURE_HOST, SCOPE, "bind 0.0.0.0:9001") is None
 
 
 def test_dispatch_check_fails_closed_on_empty_scope(gate):
-    assert gate.check_dispatch("192.168.1.150", [])
+    assert gate.check_dispatch(FIXTURE_HOST, [])
 
 
 
@@ -263,10 +264,10 @@ def test_alias_lets_a_host_match_under_its_other_identity(gate):
     from a recommendation — verified live before the fix, where 'metasploitable'
     got 200 from kali-listener and 403 from the scans router.
     """
-    rows = [("192.168.1.150", "ip")]
+    rows = [(FIXTURE_HOST, "ip")]
     assert gate.is_in_scope("metasploitable", rows) is False
     assert gate.is_in_scope_with_aliases(
-        "metasploitable", rows, {"192.168.1.150"}) is True
+        "metasploitable", rows, {FIXTURE_HOST}) is True
 
 
 def test_aliases_cannot_widen_scope_to_an_unrelated_host(gate):
@@ -276,17 +277,17 @@ def test_aliases_cannot_widen_scope_to_an_unrelated_host(gate):
     unchanged, so a host merely present in the assets table — www.owasp.org and
     twitter.com both are — is still refused.
     """
-    rows = [("192.168.1.150", "ip")]
+    rows = [(FIXTURE_HOST, "ip")]
     assert gate.is_in_scope_with_aliases(
         "www.owasp.org", rows, {"104.20.44.163"}) is False
     assert gate.is_in_scope_with_aliases("twitter.com", rows, set()) is False
 
 
 def test_check_dispatch_accepts_aliases(gate):
-    rows = [("192.168.1.150", "ip")]
+    rows = [(FIXTURE_HOST, "ip")]
     assert gate.check_dispatch("metasploitable", rows) is not None
     assert gate.check_dispatch("metasploitable", rows,
-                               aliases={"192.168.1.150"}) is None
+                               aliases={FIXTURE_HOST}) is None
 
 
 def test_alias_lookup_is_not_dns(gate):

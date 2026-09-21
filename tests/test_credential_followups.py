@@ -45,6 +45,7 @@ import re
 import sys
 
 import pytest
+from conftest import FIXTURE_HOST  # shared lab constant (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
@@ -434,7 +435,7 @@ def cur():
 
 
 def test_in_scope_queues_pending_rows(cur):
-    r = cf.queue_followups(cur, ip="192.168.1.150", port=22, protocol="ssh",
+    r = cf.queue_followups(cur, ip=FIXTURE_HOST, port=22, protocol="ssh",
                            username="msfadmin", credential_id="00000000-0000-0000-0000-000000000001")
     if r["scope_source"] == "unavailable":
         pytest.skip("no scope configured in this database")
@@ -446,7 +447,7 @@ def test_in_scope_queues_pending_rows(cur):
     assert r["queued"] >= 1 or r["entries"], r
     cur.execute("SELECT status FROM scan_recommendations "
                 "WHERE source = %s AND host(ip) = %s ORDER BY created_at DESC LIMIT 1",
-                (cf.SOURCE, "192.168.1.150"))
+                (cf.SOURCE, FIXTURE_HOST))
     row = cur.fetchone()
     assert row and row[0] == "pending", (
         f"the follow-up is not queued as pending: {row!r} — it either never "

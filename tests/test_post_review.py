@@ -24,6 +24,7 @@ import subprocess
 import sys
 
 import pytest
+from conftest import FIXTURE_HOST  # shared lab constant (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 for path in (REPO, os.path.join(REPO, "app", "rag-api")):
@@ -38,7 +39,7 @@ CATALOGUE = os.path.join(REPO, "knowledge", "service_tools.yaml")
 
 def _row(**kw):
     base = {"tool": "nmap", "command": "nmap -sV 192.168.1.150",
-            "target": "192.168.1.150", "port": None, "service": None,
+            "target": FIXTURE_HOST, "port": None, "service": None,
             "status": "completed", "exit_code": 0, "output": "", "error": ""}
     base.update(kw)
     return base
@@ -97,9 +98,9 @@ def test_sigkill_without_a_timeout_status_is_a_crash():
 
 @pytest.mark.unit
 @pytest.mark.parametrize("tool,command,target", [
-    ("dig", "dig @192.168.1.150 -p 53 ANY example.com", "192.168.1.150"),
-    ("dnsenum", "dnsenum --dnsserver 192.168.1.150 example.com", "192.168.1.150"),
-    ("dnsrecon", "dnsrecon -d {domain} -n 192.168.1.150", "192.168.1.150"),
+    ("dig", "dig @192.168.1.150 -p 53 ANY example.com", FIXTURE_HOST),
+    ("dnsenum", "dnsenum --dnsserver 192.168.1.150 example.com", FIXTURE_HOST),
+    ("dnsrecon", "dnsrecon -d {domain} -n 192.168.1.150", FIXTURE_HOST),
 ])
 def test_stand_in_domain_is_its_own_category(tool, command, target):
     """57 rows queried someone else's domain through the target's resolver.
@@ -135,7 +136,7 @@ def test_interactive_client_with_no_commands_is_a_silent_no_op():
     Exit 0 and no output is the most dangerous possible signature: it is
     indistinguishable from success against an empty directory.
     """
-    v = pr.classify_execution(_row(tool="lftp", target="192.168.1.150",
+    v = pr.classify_execution(_row(tool="lftp", target=FIXTURE_HOST,
                                    command="lftp -u anonymous, ftp://192.168.1.150:21",
                                    status="completed", exit_code=0, output=""))
     assert v["category"] == "silent_no_op"
@@ -317,7 +318,7 @@ def test_unfillable_template_is_withheld_not_shipped():
     recreate the very defect being reported.
     """
     cmd, missing = pr._fill_command("dig @{target} -p {port} ANY {domain}",
-                                    {"target": "192.168.1.150", "port": 53})
+                                    {"target": FIXTURE_HOST, "port": 53})
     assert missing == ["domain"]
     assert "{domain}" in cmd, "an unfilled placeholder must stay visible"
 
@@ -326,7 +327,7 @@ def test_unfillable_template_is_withheld_not_shipped():
 def test_fillable_template_is_fully_substituted():
     cmd, missing = pr._fill_command(
         "gobuster dir -u {url} -w /usr/share/wordlists/seclists/x.txt",
-        {"target": "192.168.1.150", "port": 80})
+        {"target": FIXTURE_HOST, "port": 80})
     assert missing == []
     assert not re.search(r"\{[a-z_]+\}", cmd), f"placeholders survived: {cmd}"
     assert "192.168.1.150:80" in cmd

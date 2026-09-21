@@ -23,8 +23,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "app" / "rag-api"))
 
 from etl.scope_gate import is_in_scope  # noqa: E402
+from conftest import FIXTURE_HOST  # shared lab constant (see tests/conftest.py)
 
-SCANNED_HOSTS = [("192.168.1.150", "ip"), ("127.0.0.1", "ip")]
+SCANNED_HOSTS = [(FIXTURE_HOST, "ip"), ("127.0.0.1", "ip")]
 
 # Every external host observed in the operator's follow-up queue.
 LEAKED_HOSTS = [
@@ -63,7 +64,7 @@ def test_unknown_host_denied_by_default():
 
 @pytest.mark.unit
 def test_scanned_host_is_in_scope():
-    assert is_in_scope("192.168.1.150", SCANNED_HOSTS) is True
+    assert is_in_scope(FIXTURE_HOST, SCANNED_HOSTS) is True
 
 
 @pytest.mark.unit
@@ -76,7 +77,7 @@ def test_open_redirect_on_an_in_scope_host_stays_in_scope():
     target = ("http://192.168.1.150/mutillidae/index.php"
               "?forwardurl=https%3A%2F%2F8875853757105814929.owasp.org"
               "&page=redirectandlog.php")
-    assert _host_of(target) == "192.168.1.150"
+    assert _host_of(target) == FIXTURE_HOST
     assert is_in_scope(_host_of(target), SCANNED_HOSTS) is True
 
 
@@ -103,7 +104,7 @@ def test_internal_looking_substrings_do_not_grant_scope(host):
 @pytest.mark.unit
 def test_empty_scope_authorizes_nothing():
     """Fail closed: no scope means nothing is in scope, never everything."""
-    assert is_in_scope("192.168.1.150", []) is False
+    assert is_in_scope(FIXTURE_HOST, []) is False
     assert is_in_scope("www.owasp.org", []) is False
 
 
@@ -126,8 +127,8 @@ def test_cidr_and_domain_scope_still_match():
 ALIAS_PAIRS = {                      # what `assets` observed
     "localhost": {"127.0.0.1"},
     "127.0.0.1": {"localhost"},
-    "target.local": {"192.168.1.150"},
-    "192.168.1.150": {"target.local"},
+    "target.local": {FIXTURE_HOST},
+    FIXTURE_HOST: {"target.local"},
 }
 
 
@@ -148,8 +149,8 @@ def test_ip_in_scope_authorizes_its_hostname():
 def test_hostname_in_scope_authorizes_its_resolved_ip():
     """Scope lists a hostname; the scan resolved it to an IP, findings use the IP."""
     scope = [("target.local", "domain")]
-    assert is_in_scope("192.168.1.150", scope) is False     # literal match fails
-    assert _in_scope_with_aliases("192.168.1.150", scope) is True
+    assert is_in_scope(FIXTURE_HOST, scope) is False     # literal match fails
+    assert _in_scope_with_aliases(FIXTURE_HOST, scope) is True
 
 
 @pytest.mark.unit
@@ -157,7 +158,7 @@ def test_aliasing_does_not_grant_scope_to_unrelated_hosts():
     """Aliases widen scope only along OBSERVED pairings — never arbitrarily."""
     scope = [("127.0.0.1", "ip")]
     assert _in_scope_with_aliases("www.owasp.org", scope) is False
-    assert _in_scope_with_aliases("192.168.1.150", scope) is False
+    assert _in_scope_with_aliases(FIXTURE_HOST, scope) is False
 
 
 # ------------------------------------------------------- placeholder rows
@@ -181,9 +182,9 @@ def _strip_placeholders(rows):
 def test_placeholder_row_is_not_a_scope_target():
     rows = [
         {"target": "", "target_type": "domain", "source": "__placeholder__"},
-        {"target": "192.168.1.150", "target_type": "ip", "source": "manual"},
+        {"target": FIXTURE_HOST, "target_type": "ip", "source": "manual"},
     ]
-    assert _strip_placeholders(rows) == [("192.168.1.150", "ip")]
+    assert _strip_placeholders(rows) == [(FIXTURE_HOST, "ip")]
 
 
 @pytest.mark.unit
@@ -202,4 +203,4 @@ def test_placeholder_never_grants_scope():
     """An empty target must not match anything, even if it slips through."""
     scope = [("", "domain")]
     assert is_in_scope("www.owasp.org", scope) is False
-    assert is_in_scope("192.168.1.150", scope) is False
+    assert is_in_scope(FIXTURE_HOST, scope) is False
