@@ -8864,6 +8864,43 @@ def _is_dos_pending(p) -> bool:
             or " dos " in f" {text} " or "(dos)" in text or "/dos/" in text)
 
 
+def _bind_payload_likely() -> bool:
+    """Would an MSF exploit approved right now resolve to a BIND payload?
+
+    Reads the same operator setting the runner does (msf.payload_config) and
+    applies the same rule as _build_exploit_options: explicit bind is bind; auto
+    is bind only when no callback host is configured, because a reverse payload
+    with nowhere to call back is downgraded to bind at execution time.
+
+    Fail closed: if the setting cannot be read, assume bind and hold for a human.
+    """
+    from etl import bind_payload_policy as _bp
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            # No category filter: exploit-runner writes this one under category
+            # 'msf' (_set_app_setting default), not 'config', so the cached
+            # _get_setting() helper would never see it.
+            cur.execute("SELECT value FROM app_settings WHERE key = %s",
+                        ("msf.payload_config",))
+            row = cur.fetchone()
+    except Exception:  # noqa: BLE001 — unreadable setting: hold for a human
+        return True
+    if not row or not row[0]:
+        # No configured callback host anywhere => auto resolves to bind.
+        return True
+    raw = row[0]
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return True
+    if not isinstance(raw, dict):
+        return True
+    return _bp.bind_is_likely(raw)
+
+
 def _sweep_exploit_approval_rules(engagement_id=None, dry_run=False,
                                   actor="exploit_approval_rule"):
     """Apply every enabled rule to the pending queue.
@@ -8883,6 +8920,7 @@ def _sweep_exploit_approval_rules(engagement_id=None, dry_run=False,
     """
     from etl.approval_match import best_match
     from etl.scope_gate import load_dispatch_scope, check_dispatch
+    from etl import bind_payload_policy as bind_policy
 
     eid = _validate_engagement_uuid(engagement_id) if engagement_id else None
     report = {"approved": [], "held": [], "refused_scope": [],
@@ -8957,6 +8995,18 @@ def _sweep_exploit_approval_rules(engagement_id=None, dry_run=False,
             if _is_dos_pending(p):
                 report.setdefault("held_dos", []).append(
                     {**label, "reason": "denial-of-service — never auto-executed"})
+                continue
+
+            # A BIND payload leaves an unauthenticated shell listening on the
+            # target for anyone who can reach the port, so a rule may not approve
+            # it unattended. Held for an operator, not rejected — the exploit is
+            # fine, the connect direction is the risk, and configuring a callback
+            # host turns the same exploit into a reverse payload that rules may
+            # approve. The runner re-checks this on the payload it actually
+            # resolves; this only saves the operator a surprise refusal later.
+            if _bind_payload_likely():
+                report.setdefault("held_bind", []).append(
+                    {**label, "reason": bind_policy.REFUSAL})
                 continue
 
             report["approved"].append(label)

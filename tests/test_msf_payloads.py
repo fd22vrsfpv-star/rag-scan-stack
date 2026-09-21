@@ -109,35 +109,34 @@ def test_default_connect_style_is_auto():
     assert er.MsfPayloadConfig().payload == ""
 
 
-def test_pick_payload_prefers_bind_then_reliable_interpreter():
-    """bind over reverse, then INTERPRETER RELIABILITY — not meterpreter rank.
+def test_pick_payload_prefers_a_callback_and_netcat_is_last():
+    """auto prefers a CALLBACK; among binds, netcat is the last resort.
 
-    This test used to assert the chosen payload contained "meterpreter". That
-    stopped being true when bind payloads were reranked by interpreter
-    reliability (commit "Prefer reliable bind payloads (bind_perl before
-    bind_awk)"), because a reachable shell beats a more capable payload that
-    never lands: bind_awk failed on metasploitable while bind_perl opened a
-    shell, verified live on usermap + distcc.
+    This test has now been wrong twice, in opposite directions, because the file
+    was SKIPPING for want of msgpack and nobody saw it:
+      1. it asserted the pick must contain "meterpreter", which stopped being
+         true when binds were reranked by interpreter reliability (bind_awk
+         failed on metasploitable, bind_perl opened a shell);
+      2. it then asserted bind_netcat, which stopped being true when `auto` was
+         changed to prefer a callback and netcat was made the last resort.
 
-    The expectation was never updated because this whole file was SKIPPING for
-    want of msgpack. When the skip was fixed, this stale assertion argued for
-    changing working, live-verified attack behaviour — and the change was made
-    and reverted before it shipped. tests/test_exploit_execution_fixes.py
-    ::test_pick_payload_prefers_bind is the authority on the ordering; this one
-    must agree with it, not contradict it.
+    tests/test_exploit_execution_fixes.py and tests/test_bind_payload_policy.py
+    are the authorities; this must agree with them rather than contradict them.
     """
     p, style = er._pick_payload(
         ["cmd/unix/reverse", "cmd/unix/bind_netcat", "java/meterpreter/bind_tcp"],
         "auto", "")
-    assert style == "bind", (p, style)
-    assert "bind" in p, p
-    # netcat is on the reliable-interpreter list; the java meterpreter is not
-    assert p == "cmd/unix/bind_netcat", (
-        f"expected the reliable-interpreter bind, got {p}")
+    assert style == "reverse", (p, style)
 
-    # and among equally-ranked cmd payloads, reliability still decides
-    p2, _ = er._pick_payload(["cmd/unix/bind_awk", "cmd/unix/bind_perl"], "auto", "")
-    assert "perl" in p2, p2
+    # Forced bind: netcat loses to a meterpreter (`nc -e` is usually absent, and
+    # a plain netcat bind is the most exposed shell of the set).
+    p2, style2 = er._pick_payload(
+        ["cmd/unix/bind_netcat", "java/meterpreter/bind_tcp"], "bind", "")
+    assert style2 == "bind" and "meterpreter" in p2, p2
+
+    # and among cmd payloads, interpreter reliability still decides
+    p3, _ = er._pick_payload(["cmd/unix/bind_awk", "cmd/unix/bind_perl"], "bind", "")
+    assert "perl" in p3, p3
 
 
 def test_pick_payload_reverse_when_no_bind():

@@ -4,6 +4,18 @@ An open-source **workflow collector for authorized penetration testing and red t
 
 > **Authorized testing only.** This tool is built for engagements you have written permission to perform. Read [Authorized use](#authorized-use) before running it.
 
+> **New — bind payloads prefer a callback and always need a human.**
+> A reverse payload dials out to an address you control; a **bind payload opens
+> an unauthenticated listening shell on the target** that anyone who can reach
+> the port may use — exposure taken on the client's behalf. So `auto` now
+> **prefers a callback**, falling back to bind only when no callback host is
+> reachable, and **a bind payload is never auto-approved**: an approval rule
+> holds it for an operator, and the runner refuses to execute one that no human
+> approved. Among binds, `cmd/unix/bind_netcat` is the **last resort** (`nc -e`
+> is absent from most modern builds, and a plain netcat bind is the most exposed
+> shell of the set). Shared policy in `etl/bind_payload_policy.py`, enforced in
+> both the approval sweep and the execution gate.
+
 > **New — multiple LLM backends, per-task routing, and rate-limit fallback.**
 > Configure **several named LLM providers at once** (two different Azure
 > resources, a local Ollama, OpenAI, Anthropic, vLLM — each with its own
