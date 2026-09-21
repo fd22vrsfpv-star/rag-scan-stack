@@ -11,8 +11,11 @@ describe('constants', () => {
       expect(BUILD_VERSION.length).toBeGreaterThan(0)
     })
 
-    it('matches date-based format (YYYY.MM.DD-N)', () => {
-      expect(BUILD_VERSION).toMatch(/^\d{4}\.\d{2}\.\d{2}-\d+$/)
+    // YYYY.MM.DD.HHMM is what scripts/update-version.sh produces today;
+    // YYYY.MM.DD-N is the historical shape. Kept in sync with
+    // tests/test_build_version_sync.py and update-version.sh.
+    it('matches date-based format (YYYY.MM.DD.HHMM or YYYY.MM.DD-N)', () => {
+      expect(BUILD_VERSION).toMatch(/^\d{4}\.\d{2}\.\d{2}(?:-\d+|\.\d{4})$/)
     })
   })
 
