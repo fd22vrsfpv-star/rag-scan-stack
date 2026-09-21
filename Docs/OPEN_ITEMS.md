@@ -189,24 +189,6 @@ used as the fallback judge.
 
 ## Data and deployment
 
-### Three test files target a `utils` package that does not exist in this repo
-**Found:** 2026-09-21
-**Evidence:** `tests/test_nmap_scheduler_unit.py` (119 lines),
-`tests/test_plugin_loader.py` (99) and `tests/test_followup_integration_adaptive.py`
-(156) import `utils.nmap_scheduler`, `utils.plugin_loader`, `utils.followup_engine`
-and `utils.task_worker`. `find . -name "nmap_scheduler*"` returns nothing, and
-their own header comments say "module was never published to this repo". They
-skip on every run, everywhere — 5 of the suite's 442 skips — and cannot pass in
-any environment.
-**Where:** the three files above.
-**Why it matters:** they are indistinguishable from a skip that WOULD run given
-infrastructure, so they inflate the "we have coverage here" impression and the
-skip count that is supposed to mean "cannot run *here*".
-**Done when:** the `utils` package is published to this repo and the tests run,
-or the three files are deleted. Either is fine; the current state is neither.
-**Enforced by:** not enforced
-
-
 ### One asset carries no engagement
 **Found:** 2026-09-11
 **Evidence:** After the attribution backfill, 136 of 137 assets resolved.
