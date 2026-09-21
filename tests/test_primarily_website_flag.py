@@ -11,9 +11,13 @@ container — heavy deps), plus a focused check of the port-profile default rule
 Sabotage-proven: drop any wire and the matching assertion fails.
 """
 import re
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).parent))
+from _ast_assert import call_order  # noqa: E402
+ENGINE = ROOT / "autogen_agents/langgraph_engine.py"
 
 
 def _src(rel):
@@ -63,9 +67,8 @@ def test_web_pipeline_kicked_off_early_when_website():
     assert "def _early_website_web_pipeline(" in s
     # called inside scan(), gated on the flag, before the LLM scanner task is built
     assert 'state.get("primarily_website")' in s
-    i_call = s.index("_early_website_web_pipeline(sid")
-    i_llm = s.index("_llm_phase(sid, agent_name=\"Scanner\"")
-    assert i_call < i_llm, "early web dispatch must run before the LLM scan step"
+    assert call_order(ENGINE, "_early_website_web_pipeline", "_llm_phase", within="scan"), (
+        "early web dispatch must run before the LLM scan step")
     # fresh-target fallback: scan http/https directly when no web ports are known yet
     assert 'f"https://{host}"' in s and 'f"http://{host}"' in s
 

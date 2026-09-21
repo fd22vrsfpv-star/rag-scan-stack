@@ -28,6 +28,11 @@ get_safe_execution_tools call from the endpoint and test_execute_gate_uses_safe_
 fails.
 """
 import ast
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from _ast_assert import const_elements  # noqa: E402
 import os
 import re
 
@@ -57,17 +62,13 @@ def _read(path):
 
 
 def _set_literal(path, name):
-    """The value of a module-level `name = {...}` set literal, via ast (no import
-    — these modules pull in fastapi/langgraph that a bare checkout lacks)."""
-    tree = ast.parse(_read(path))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for tgt in node.targets:
-                if isinstance(tgt, ast.Name) and tgt.id == name:
-                    return {el.value for el in node.value.elts
-                            if isinstance(el, ast.Constant)}
-    pytest.fail(f"{name} not found as a set literal in {os.path.basename(path)}")
+    """The value of a module-level `name = {...}` set literal.
 
+    Delegates to tests/_ast_assert.const_elements — this file had its own ast
+    walker and so did the knowledge-coverage guard; one shared helper means the
+    next guard that needs to read a registry does not grow a third copy.
+    """
+    return const_elements(Path(path), name)
 
 def _func_src(path, name):
     tree = ast.parse(_read(path))

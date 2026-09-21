@@ -31,7 +31,13 @@ PKG = os.path.join(REPO, "dashboard", "frontend", "package.json")
 LOCK = os.path.join(REPO, "dashboard", "frontend", "package-lock.json")
 CONST = os.path.join(REPO, "dashboard", "frontend", "src", "lib", "constants.ts")
 
-VERSION_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}-\d+$")
+# CLAUDE.md: "a date + timestamp". Both spellings are in the history — the
+# original YYYY.MM.DD-N and the YYYY.MM.DD.HHMM that scripts/update-version.sh
+# has produced for every release since. This guard pinned ONLY the first, so it
+# went red the day the convention changed and stayed red, asserting against the
+# repo rather than about it. Keep both shapes accepted here, in the vitest twin
+# (src/lib/constants.test.ts) and in update-version.sh's own input check.
+VERSION_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}(?:-\d+|\.\d{4})$")
 
 
 def _json(path):
@@ -68,9 +74,12 @@ def test_all_declared_versions_agree():
 
 
 def test_version_has_the_documented_shape():
-    """YYYY.MM.DD-N, matching the frontend's own constants.test.ts assertion."""
+    """YYYY.MM.DD.HHMM (current) or YYYY.MM.DD-N (historical), matching the
+    frontend's own constants.test.ts assertion and update-version.sh."""
     v = _constants_version()
-    assert VERSION_RE.match(v), f"{v!r} is not the documented YYYY.MM.DD-N shape"
+    assert VERSION_RE.match(v), (
+        f"{v!r} is not a documented version shape (YYYY.MM.DD.HHMM or YYYY.MM.DD-N) "
+        "— run scripts/update-version.sh rather than hand-editing")
 
 
 def test_the_lockfile_is_committed():
