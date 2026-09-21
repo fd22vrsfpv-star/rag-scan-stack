@@ -162,6 +162,68 @@ rather than a shared one.
 
 ## Data and deployment
 
+### Generated curl commands carry a stray trailing quote and die in the shell
+**Found:** 2026-09-21 (by the parser agent, while reading real curl output)
+**Evidence:** 11 `tool_executions` rows with `tool='curl'` have empty output and
+`error` = `/bin/sh: 1: Syntax error: Unterminated quoted string`. The stored
+command shows the defect directly:
+`curl -sk http://192.168.1.150:80/doc/'` — a trailing apostrophe with no opener.
+These probes never reached the network; they died in `/bin/sh`.
+**Where:** whatever builds curl probe commands (not yet located — the rows carry
+no single distinguishing source, so start from the writers of `tool_executions`
+with `tool='curl'`).
+**Why it matters:** the runs are recorded as executed-and-fruitless. The new curl
+parser correctly reads them as a measured ZERO, which is honest but wrong about
+the target — nothing was ever asked of it.
+**Done when:** the generator quotes URLs correctly and no stored curl command has
+unbalanced quotes.
+**Enforced by:** not enforced
+
+### 180 historical rows can never be parsed by the running backfill
+**Found:** 2026-09-21
+**Evidence:** The backfill in `autogen_agents/langgraph_engine.py` (~line 2279)
+filters `started_at > now() - interval '12 hours'` AND
+`COALESCE(output,'') <> ''`. The 180 rows with `parsed_results IS NULL` are all
+older than that window (newest 2026-09-19), so 0 are eligible; and the
+non-empty-output filter excludes the 11 stderr-only curl rows the new parser was
+specifically written to read. Parsers now exist for every one of those tools —
+the output stays unread for want of a one-off pass, not a parser.
+**Where:** `autogen_agents/langgraph_engine.py` backfill query.
+**Done when:** a one-off backfill reads the historical rows (an operator decision:
+it is a bulk UPDATE over recorded evidence), and the `COALESCE(output,'') <> ''`
+filter either admits stderr-only rows or is documented as deliberately excluding
+them.
+**Enforced by:** not enforced
+
+### `_learn_against_recent` over-counts support the same way the backfill did
+**Found:** 2026-09-21
+**Evidence:** `learn_from_tool_executions` was fixed to count distinct
+observations, but the LIVE path `etl/tool_learning.py::_learn_against_recent`
+(~line 681) still upserts once per distinct recent failure every time another
+tool runs, so one failure followed by three runs of tool B stores support=3 for
+one observed pairing. `tool_selection_learned` currently holds 65 rows with
+max(support)=79.
+**Where:** `etl/tool_learning.py::_learn_against_recent`.
+**Done when:** the live path counts the same way the backfill now does, so
+`support` means one thing in the column regardless of which writer filled it.
+**Enforced by:** `tests/test_tool_learning_support.py` (covers the backfill path
+only — extend it to the live path when fixing)
+
+### A pytest run wrote into the production learning table
+**Found:** 2026-09-21
+**Evidence:** 16 of the 65 rows in `tool_selection_learned` carry
+`phase = '__pytest_phase'`. A test run persisted learned tool-selection state into
+the live table, and the phase-scoped reset endpoint
+(`POST /tool-selection/backfill {"reset": true, "phase": ...}`) will not clear
+them unless that phase is named explicitly.
+**Where:** whichever test writes `tool_selection_learned` without a rollback —
+`tests/conftest.py` cleans a fixed `_CLEANUP_TABLES` list that does not include it.
+**Done when:** tests cannot write to the live learning table (add it to the
+cleanup list, or point the test at a scratch phase that the cleanup removes), and
+the 16 existing rows are cleared.
+**Enforced by:** not enforced
+
+
 ### One asset carries no engagement
 **Found:** 2026-09-11
 **Evidence:** After the attribution backfill, 136 of 137 assets resolved.
