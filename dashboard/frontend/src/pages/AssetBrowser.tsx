@@ -496,9 +496,11 @@ function EnumerationSection({ ip }: { ip: string }) {
   const loot: EnumLoot[] = d?.loot ?? []
   const attempts: EnumLoginAttempt[] = d?.login_attempts ?? []
   const listening: EnumListeningPort[] = d?.listening_ports ?? []
+  const secrets = d?.extracted_secrets ?? []
+  const docs = d?.documents ?? []
   const c = d?.counts
 
-  const nothing = !hl.length && !creds.length && !loot.length && !attempts.length && !listening.length && !(d?.access?.length)
+  const nothing = !hl.length && !creds.length && !loot.length && !attempts.length && !listening.length && !(d?.access?.length) && !secrets.length && !docs.length
   if (nothing) {
     return (
       <div className="text-xs text-muted-foreground">
@@ -526,14 +528,16 @@ function EnumerationSection({ ip }: { ip: string }) {
 
       {c && (
         <div className="text-[11px] text-muted-foreground">
-          {c.access} access · {c.credentials} credential(s) ({c.cracked} cracked, {c.hashes} hash) · {c.loot_items} loot item(s)
+          {c.access} access · {c.credentials} credential(s) ({c.cracked} cracked, {c.hashes} hash) · {c.loot_items} loot item(s){(c.extracted_secrets ?? 0) > 0 ? ` · ${c.extracted_secrets} extracted secret(s)` : ''}{(c.documents ?? 0) > 0 ? ` · ${c.documents} document(s)` : ''}
         </div>
       )}
 
-      {/* CREDENTIALS */}
-      {creds.length > 0 && (
+      {/* CREDENTIALS + KEY MATERIAL — logins and the key material the extractors
+          pulled off disk (AWS/Azure keys, API tokens, DB URLs) live in ONE list;
+          the Type column is what distinguishes them. Documents sit beside this. */}
+      {(creds.length > 0 || secrets.length > 0) && (
         <div>
-          <h4 className="text-xs font-medium text-muted-foreground mb-2">Recovered credentials</h4>
+          <h4 className="text-xs font-medium text-muted-foreground mb-2">Recovered credentials &amp; key material</h4>
           <div className="overflow-x-auto">
             <table className="w-full text-xs">
               <thead className="text-muted-foreground">
@@ -569,8 +573,45 @@ function EnumerationSection({ ip }: { ip: string }) {
                     <td className="py-1 pr-3">{cr.status ?? ''}</td>
                   </tr>
                 ))}
+                {secrets.map((s, i) => (
+                  <tr key={`sec-${i}`} className="border-b border-border/50">
+                    <td className="py-1 pr-3 text-muted-foreground">—</td>
+                    <td className="py-1 pr-3 font-mono">
+                      {s.value
+                        ? <button className="hover:text-foreground text-left"
+                            title="Click to reveal / hide"
+                            onClick={() => setReveal(r => ({ ...r, [10000 + i]: !r[10000 + i] }))}>
+                            {reveal[10000 + i] ? s.value : (s.value_masked || '••••••')}
+                          </button>
+                        : <span className="text-muted-foreground">—</span>}
+                    </td>
+                    <td className="py-1 pr-3">
+                      <span className={`px-1.5 py-0.5 rounded text-[10px] ${/^(aws|azure|gcp)_/.test(s.kind) ? 'bg-red-500/15 text-red-400' : 'bg-muted'}`}>
+                        {s.kind}
+                      </span>
+                    </td>
+                    <td className="py-1 pr-3 text-muted-foreground">extractor</td>
+                    <td className="py-1 pr-3 text-muted-foreground">{s.at ? new Date(s.at).toLocaleDateString() : ''}</td>
+                  </tr>
+                ))}
               </tbody>
             </table>
+          </div>
+        </div>
+      )}
+
+      {/* DOCUMENTS — loot that is a file rather than a credential: password
+          spreadsheets, runbooks, network diagrams, database dumps. */}
+      {docs.length > 0 && (
+        <div>
+          <h4 className="text-xs font-medium text-muted-foreground mb-2">Sensitive documents</h4>
+          <div className="flex flex-col gap-1">
+            {docs.map((doc, i) => (
+              <div key={i} className="px-3 py-1.5 rounded border border-border bg-muted/30 text-xs flex items-center justify-between">
+                <span className="font-mono truncate max-w-[420px]" title={doc.path}>{doc.path}</span>
+                <span className="text-[10px] text-muted-foreground">{doc.at ? new Date(doc.at).toLocaleString() : ''}</span>
+              </div>
+            ))}
           </div>
         </div>
       )}
