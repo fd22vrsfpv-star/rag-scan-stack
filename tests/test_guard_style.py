@@ -38,8 +38,9 @@ _READS_SOURCE = re.compile(r'read_text\(|_src\(|open\([^)]*\.py')
 
 # Known brittle assertions still to convert. LOWER this as they are converted;
 # it may not rise. 255 at the time the ratchet was introduced; 234 after that
-# conversion pass, 233 after the stale-guard fixes, 230 after the skip audit.
-BASELINE = 230
+# conversion pass, 233 after the stale-guard fixes, 230 after the skip audit,
+# 218 after converting the post-enumeration graph and dispatch guards.
+BASELINE = 218
 
 
 def _is_code_fragment(literal: str) -> bool:

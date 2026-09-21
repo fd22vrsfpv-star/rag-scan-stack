@@ -42,6 +42,8 @@ import sys
 
 import pytest
 from conftest import FIXTURE_HOST  # shared lab constant (see tests/conftest.py)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _ast_assert import calls, call_kwarg, defines, function_source  # noqa: E402
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
@@ -65,6 +67,52 @@ def _fixture(name):
         return fh.read()
 
 
+def _graph_calls(src, method):
+    """Every `g.<method>(...)` call in the module, as ast nodes."""
+    for n in ast.walk(ast.parse(src)):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == method):
+            yield n
+
+
+def _const(node):
+    return node.value if isinstance(node, ast.Constant) else None
+
+
+def graph_nodes(src):
+    """Names passed to g.add_node(...)."""
+    return {_const(c.args[0]) for c in _graph_calls(src, "add_node") if c.args}
+
+
+def graph_edges(src):
+    """(from, to) pairs passed to g.add_edge(...)."""
+    out = set()
+    for c in _graph_calls(src, "add_edge"):
+        if len(c.args) >= 2:
+            out.add((_const(c.args[0]), _const(c.args[1])))
+    return out
+
+
+def conditional_routes(src):
+    """{source_node: {branch_key: destination}} from g.add_conditional_edges.
+
+    Parsed, not sliced. The previous version cut post_enumeration's own exit out
+    of the source TEXT by index arithmetic to exempt its legitimate
+    "report" -> "report" self-loop; that works until someone reformats the call.
+    """
+    out = {}
+    for c in _graph_calls(src, "add_conditional_edges"):
+        if not c.args:
+            continue
+        name = _const(c.args[0])
+        mapping = {}
+        for a in c.args[1:]:
+            if isinstance(a, ast.Dict):
+                mapping = {_const(k): _const(v) for k, v in zip(a.keys, a.values)}
+        out[name] = mapping
+    return out
+
+
 def _graph_block():
     src = _read(ENGINE)
     start = src.index('g.add_edge(START, "recon")')
@@ -75,28 +123,28 @@ def _graph_block():
 
 def test_the_phase_is_a_node():
     src = _read(ENGINE)
-    assert "def post_enumeration(state: PentestState)" in src, "the phase is gone"
-    assert 'g.add_node("post_enumeration", post_enumeration)' in src
+    assert defines(src, "post_enumeration"), "the phase is gone"
+    assert "post_enumeration" in graph_nodes(src), "the phase is not wired as a node"
 
 
 def test_every_route_passes_through_post_enumeration():
     """A route that goes straight to report is a run that finishes without
     enumerating the access it holds — which is the whole defect."""
-    block = _graph_block()
+    src = _read(ENGINE)
+    routes = conditional_routes(src)
 
-    # post_enumeration's OWN exit legitimately maps "report" -> "report": that
-    # is the loop settling, not a bypass. Every other route must land on the
-    # phase first, so that one edge is excluded rather than the check weakened.
-    own_exit = block[block.index('g.add_conditional_edges("post_enumeration"'):]
-    own_exit = own_exit[:own_exit.index(")\n", own_exit.index("{")) + 1]
-    others = block.replace(own_exit, "")
-    assert '"report": "report"' not in others, (
-        "a conditional edge still routes straight to report, so that path "
-        "finishes without post-enumeration")
-    assert others.count('"report": "post_enumeration"') >= 7, \
-        others.count('"report": "post_enumeration"')
-    assert 'g.add_edge("exploit_exec", "post_enumeration")' in block
-    assert '"report": "report"' in own_exit, (
+    # post_enumeration's OWN exit legitimately maps "report" -> "report": that is
+    # the loop settling, not a bypass. It is exempted by NAME here; the previous
+    # version cut it out of the source text by index arithmetic.
+    others = {n: m for n, m in routes.items() if n != "post_enumeration"}
+    bypass = sorted(n for n, m in others.items() if m.get("report") == "report")
+    assert not bypass, (
+        f"these conditional edges still route straight to report, so those paths "
+        f"finish without post-enumeration: {bypass}")
+    through = [n for n, m in others.items() if m.get("report") == "post_enumeration"]
+    assert len(through) >= 7, through
+    assert ("exploit_exec", "post_enumeration") in graph_edges(src)
+    assert routes.get("post_enumeration", {}).get("report") == "report", (
         "post_enumeration has no way out — the loop cannot terminate")
 
 
@@ -146,7 +194,7 @@ def test_playbook_steps_are_wrapped_for_remote_execution():
     assert "{password}" in fn, (
         "the secret is substituted into the stored command instead of being "
         "resolved at dispatch")
-    assert "settings_for(" in fn, (
+    assert calls(fn, "settings_for"), (
         "the derived algorithm options are not applied, so ssh will not "
         "negotiate with a legacy host and every step fails before it runs")
 
@@ -309,7 +357,7 @@ def test_an_unproductive_parse_counts_zero_not_unknown():
 def test_the_listener_parses_when_the_caller_did_not():
     listener = os.path.join(REPO, "kali_listener", "listener_service.py")
     src = _read(listener)
-    assert "_parse_output_for(exec_id, output, error)" in src, (
+    assert calls(src, "_parse_output_for"), (
         "tool output is no longer parsed at the chokepoint, so parsed_results "
         "goes back to NULL for every run")
     assert "if parsed_results is None:" in src
@@ -328,7 +376,7 @@ def test_the_proposer_and_the_review_agree():
     assert "left(COALESCE(output, ''), 400)" not in fn, (
         "the proposer classifies a truncated prefix, so it classifies something "
         "different from what the review classified")
-    assert "classify_execution(row, catalogue)" in fn
+    assert calls(fn, "classify_execution")
 
 
 # ── Every command goes through it, and the loop closes ─────────────────────
@@ -340,7 +388,7 @@ def test_every_command_goes_through_post_enumeration():
     src = _read(listener)
     fn = src[src.index("def db_update_tool_execution("):]
     fn = fn[:fn.index("\ndef ", 10)]
-    assert "_post_enumerate(exec_id" in fn, (
+    assert calls(fn, "_post_enumerate"), (
         "commands no longer feed post-enumeration, so only a pipeline phase "
         "would analyse anything and every other dispatch path is blind")
 
@@ -411,8 +459,25 @@ def test_proposals_pass_the_scope_gate():
     """A known_hosts entry is a lead, not a licence."""
     pe = pytest.importorskip("etl.post_enumeration")
     src = _read(os.path.join(REPO, "etl", "post_enumeration.py"))
-    fn = src[src.index("def analyse("):]
-    assert "check_dispatch(" in fn and "command=command" in fn
+
+    # EVERY gated call site, not one function. `fn = src[src.index("def analyse("):]`
+    # claimed to scope this to analyse() but actually ran to the end of the file
+    # (analyse is 1170-1309 of 1881), so it covered three other dispatch paths by
+    # accident and passed as long as ANY of the four still looked right — dropping
+    # command= from one of them did not fail it.
+    sites = [n for n in ast.walk(ast.parse(src))
+             if isinstance(n, ast.Call)
+             and (getattr(n.func, "id", None) or getattr(n.func, "attr", None)) == "check_dispatch"]
+    assert len(sites) >= 4, f"expected every proposal path to gate; found {len(sites)}"
+    ungated = [n.lineno for n in sites
+               if not any(k.arg == "command" for k in n.keywords)]
+    assert not ungated, (
+        "check_dispatch called without command= at lines "
+        f"{ungated} — the gate cannot apply command-specific scope rules")
+
+    # fail-closed, in the phase entry point itself
+    fn = function_source(src, "analyse")
+    assert fn, "analyse() not found"
     assert 'scope_source == "unavailable"' in fn, (
         "an unloadable scope no longer stops proposals — fail closed")
     assert 'out["refusals"].append' in fn, "refusals are dropped"
@@ -424,7 +489,7 @@ def test_the_loop_carries_forward():
     pe = pytest.importorskip("etl.post_enumeration")
     assert hasattr(pe, "record_outcome_for_command")
     listener = _read(os.path.join(REPO, "kali_listener", "listener_service.py"))
-    assert "record_outcome_for_command(" in listener
+    assert calls(listener, "record_outcome_for_command")
 
 
 def test_an_unmeasured_outcome_is_not_recorded_as_zero():
@@ -577,10 +642,10 @@ def test_the_loop_is_a_graph_cycle_with_history():
     assert "enumeration_cycles: int" in src, "the cycle counter is not in the state"
     assert "enumeration_history: Annotated[List[dict], operator.add]" in src, (
         "the per-cycle history is not accumulated in checkpointed state")
-    assert 'g.add_conditional_edges("post_enumeration", _after_post_enumeration' in src, (
+    routes = conditional_routes(src)
+    assert "post_enumeration" in routes, (
         "post_enumeration no longer loops — it is a single pass again")
-    block = _graph_block()
-    assert '"post_enumeration": "post_enumeration"' in block, (
+    assert routes["post_enumeration"].get("post_enumeration") == "post_enumeration", (
         "the cycle cannot go round; the edge back to itself is gone")
 
 
@@ -611,7 +676,7 @@ def test_evidence_is_reviewed_before_deciding_again():
     src = _read(ENGINE)
     fn = src[src.index("def post_enumeration(state: PentestState)"):]
     fn = fn[:fn.index("\ndef _resolve_outcomes")]
-    assert "_resolve_outcomes()" in fn
+    assert calls(fn, "_resolve_outcomes")
     assert fn.index("_resolve_outcomes()") < fn.index("_analyse_session_output"), (
         "evidence is reviewed after the next decision is made, which makes the "
         "review pointless for that decision")
@@ -626,7 +691,7 @@ def test_outcomes_resolve_whatever_dispatched_them():
     src = _read(os.path.join(REPO, "etl", "post_enumeration.py"))
     fn = src[src.index("def resolve_pending_observations("):]
     fn = fn[:fn.index("\ndef ", 10)]
-    assert "evidence_since(" in fn, (
+    assert calls(fn, "evidence_since"), (
         "resolution still reads one command's output instead of asking whether "
         "evidence appeared, so the native path stays unresolvable")
     assert 'status in ("queued", "running", "pending")' in fn, (
