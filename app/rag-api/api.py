@@ -8864,6 +8864,26 @@ def _is_dos_pending(p) -> bool:
             or " dos " in f" {text} " or "(dos)" in text or "/dos/" in text)
 
 
+def _relay_candidates(cur):
+    """Online nodes and whether each has a callback relay running (for the hold
+    message). Best-effort — this only decorates a reason string."""
+    try:
+        cur.execute("SELECT name, proxy_port, metadata FROM remote_nodes "
+                    "WHERE status = 'online' ORDER BY updated_at DESC NULLS LAST LIMIT 5")
+        rows = cur.fetchall() or []
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for r in rows:
+        meta = r.get("metadata") if isinstance(r, dict) else None
+        meta = meta if isinstance(meta, dict) else {}
+        relay = meta.get("callback_relay") or {}
+        out.append({"name": (r.get("name") if isinstance(r, dict) else None),
+                    "proxy_port": (r.get("proxy_port") if isinstance(r, dict) else None),
+                    "relay_active": bool(relay.get("active"))})
+    return out
+
+
 def _bind_payload_likely() -> bool:
     """Would an MSF exploit approved right now resolve to a BIND payload?
 
@@ -9006,7 +9026,9 @@ def _sweep_exploit_approval_rules(engagement_id=None, dry_run=False,
             # resolves; this only saves the operator a surprise refusal later.
             if _bind_payload_likely():
                 report.setdefault("held_bind", []).append(
-                    {**label, "reason": bind_policy.REFUSAL})
+                    {**label,
+                     "reason": f"{bind_policy.REFUSAL} "
+                               f"{bind_policy.recommend_callback(_relay_candidates(cur))}"})
                 continue
 
             report["approved"].append(label)

@@ -159,6 +159,44 @@ def test_the_sweep_holds_a_bind_instead_of_auto_approving():
     assert "return True" in pred, "the prediction must fail closed"
 
 
+def test_the_recommendation_names_a_node_not_a_settings_field():
+    """A refusal must tell the operator what to DO.
+
+    The recommended callback is a node/proxy relay: the node listens on an
+    address the target can reach and relays the shell to MSF, so nothing opens a
+    port on the target and our own address is not the callback. Generic advice
+    ("configure a callback host") pointed at a settings field instead of the node
+    that already exists.
+    """
+    from etl.bind_payload_policy import recommend_callback, RECOMMENDATION
+    assert "relay" in RECOMMENDATION.lower()
+
+    none_live = recommend_callback([{"name": "rt3_scan1", "relay_active": False}])
+    assert "rt3_scan1" in none_live, "the candidate node is not named"
+
+    live = recommend_callback([{"name": "rt3_scan1", "relay_active": True}])
+    assert "rt3_scan1" in live and "already up" in live, (
+        "when a relay IS running the operator must be told the dispatch missed it, "
+        "not told to start one")
+
+    assert recommend_callback([]) == RECOMMENDATION       # no nodes: generic
+    assert recommend_callback(None) == RECOMMENDATION
+
+
+def test_both_refusals_carry_the_recommendation():
+    runner = _read(RUNNER)
+    fn = function_source(runner, "execute_msf_module")
+    assert calls(fn, "recommend_callback"), (
+        "the runner refuses a bind payload without saying how to get a callback")
+    assert defines(runner, "_relay_candidates"), "the runner cannot name a node"
+
+    api = _read(API)
+    sweep = function_source(api, "_sweep_exploit_approval_rules")
+    assert calls(sweep, "recommend_callback"), (
+        "the sweep holds a bind exploit without saying how to get a callback")
+    assert defines(api, "_relay_candidates"), "the sweep cannot name a node"
+
+
 def test_the_policy_is_shared_not_reimplemented():
     """Two enforcement points, one module — the dos_overrides pattern. A second
     copy of "what counts as bind" is how the two ends stop agreeing."""
