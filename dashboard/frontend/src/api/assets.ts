@@ -440,7 +440,25 @@ export interface AssetEnumeration {
   loot: EnumLoot[]
   login_attempts: EnumLoginAttempt[]
   listening_ports: EnumListeningPort[]
-  counts: { access: number; credentials: number; cracked: number; hashes: number; loot_items: number; loot_groups?: number; login_attempts?: number; login_success?: number }
+  /** Loot the enumeration EXTRACTORS pulled out of the raw output — cloud keys,
+   *  tokens, DB URLs — recorded as observations and previously surfaced nowhere. */
+  extracted_secrets?: EnumExtractedSecret[]
+  /** Documents worth reporting (password spreadsheets, runbooks, DB dumps). */
+  documents?: EnumDocument[]
+  counts: { access: number; credentials: number; cracked: number; hashes: number; loot_items: number; loot_groups?: number; login_attempts?: number; login_success?: number; extracted_secrets?: number; documents?: number }
+}
+
+export interface EnumExtractedSecret {
+  kind: string
+  value?: string
+  value_masked?: string
+  at?: string | null
+}
+
+export interface EnumDocument {
+  path: string
+  kind: string
+  at?: string | null
 }
 
 /** Post-enumeration loot for a host — held access, recovered credentials, raw
