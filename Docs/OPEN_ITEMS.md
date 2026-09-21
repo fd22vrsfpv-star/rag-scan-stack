@@ -27,17 +27,6 @@ named tests exist).
 
 ## Pipeline coverage
 
-### Post-exploitation enumeration never runs
-**Found:** 2026-09-11
-**Evidence:** With pre-approval on for `lab` and a reachable exploit target, the
-pipeline reached `exploit_exec` and stopped. No post-ex enumeration ran and no
-session artefacts were collected.
-**Where:** `autogen_agents/langgraph_engine.py` — there is no phase after
-`exploit_exec` other than `report`.
-**Done when:** a successful exploit is followed by an enumeration step whose
-output is ingested like any other tool output.
-**Enforced by:** not enforced
-
 ### Only one HTTP port was discovered on a host serving several
 **Found:** 2026-09-11
 **Evidence:** `192.168.1.150` has 26 ports recorded and exactly one is
