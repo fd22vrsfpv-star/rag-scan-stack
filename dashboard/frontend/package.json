@@ -1,7 +1,7 @@
 {
   "name": "pentest-dashboard",
   "private": true,
-  "version": "2026.09.20.2219",
+  "version": "2026.09.21.0838",
   "type": "module",
   "scripts": {
     "dev": "vite",

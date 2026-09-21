@@ -33,6 +33,10 @@ REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 COVERAGE = os.path.join(REPO, "app", "rag-api", "wstg_coverage.py")
 ENGINE = os.path.join(REPO, "autogen_agents", "langgraph_engine.py")
 MAP = os.path.join(REPO, "knowledge", "wstg_map.yaml")
+# The surface generators' probes are DATA now (CLAUDE.md "Knowledge is RAG-first"):
+# _load_owasp_param_tests / _load_owasp_service_tests read them from this file, so
+# an id can be generated without ever appearing in the engine source.
+PARAM_TESTS = os.path.join(REPO, "knowledge", "owasp_param_tests.yaml")
 
 _ID_RE = re.compile(r"WSTG-[A-Z]+-\d+")
 
@@ -49,8 +53,29 @@ def _declared_proactive():
     raise AssertionError("PROACTIVE_WSTG_IDS not found — this guard would pass vacuously")
 
 
+def _yaml_probe_ids():
+    """WSTG ids carried by the probe specs the engine LOADS.
+
+    `_owasp_param_tests`/`_owasp_service_tests` used to spell every category and
+    id inline; both now iterate specs from knowledge/owasp_param_tests.yaml. The
+    probe is just as real, so the id must still count as generated — scraping only
+    the Python made ATHN-06 look dropped the day it moved, which is the same
+    "already done, still listed as a gap" error this module was written to stop.
+    """
+    if not os.path.exists(PARAM_TESTS):
+        return set()
+    with open(PARAM_TESTS, encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    ids = set()
+    for section in ("param_tests", "service_tests"):
+        for spec in (data.get(section) or []):
+            if isinstance(spec, dict):
+                ids.update(_ID_RE.findall(str(spec.get("wstg") or "")))
+    return ids
+
+
 def _engine_ids():
-    """Every WSTG id the surface generators name."""
+    """Every WSTG id the surface generators name — in code or in their spec data."""
     if not os.path.exists(ENGINE):
         pytest.skip("langgraph_engine.py not present")
     src = open(ENGINE, encoding="utf-8").read()
@@ -59,6 +84,7 @@ def _engine_ids():
     for node in ast.walk(ast.parse(src)):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             ids.update(_ID_RE.findall(node.value))
+    ids |= _yaml_probe_ids()
     assert ids, "no WSTG ids found in langgraph_engine.py — guard would pass vacuously"
     return ids
 

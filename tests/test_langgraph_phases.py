@@ -938,16 +938,53 @@ def test_auto_exec_executes_only_via_the_scope_gated_runner():
 
 
 def test_owasp_param_generator_covers_the_owasp_classes():
-    """The parameter-driven OWASP generator must produce IDOR / SQLi / XSS / LFI
-    tests, with IDOR impactful (gated) and the detections safe. Guards the param
-    heuristics + tiering. Sabotage: drop the idor branch, or make IDOR safe -> fails."""
+    """The parameter-driven generator must produce IDOR / SQLi / XSS / LFI tests,
+    with IDOR impactful (gated) and the detections safe.
+
+    The specs are DATA now (knowledge/owasp_param_tests.yaml, CLAUDE.md
+    "Knowledge is RAG-first") — the engine iterates them instead of spelling each
+    category inline. So the contract has two halves and this guard checks both:
+    the YAML still declares the four classes with the right tiering, and the
+    engine still HONOURS the tiering rather than hardcoding it. Checking only the
+    Python made this test red the day the categories moved, while the generator
+    was working.
+
+    Sabotage: drop the idor spec from the YAML, mark it `impactful: false`, or
+    make the engine pass a literal `impactful=True` -> fails.
+    """
+    yaml = pytest.importorskip("yaml")
+    spec_path = REPO / "knowledge" / "owasp_param_tests.yaml"
+    if not spec_path.exists():
+        pytest.skip("owasp_param_tests.yaml not present")
+    specs = (yaml.safe_load(spec_path.read_text(encoding="utf-8")) or {}).get("param_tests") or []
+    by_cat = {s.get("category"): s for s in specs if isinstance(s, dict)}
+
+    for cat in ("sqli_detect", "xss_detect", "lfi_read", "idor"):
+        assert cat in by_cat, f"OWASP generator must emit {cat}"
+        assert by_cat[cat].get("command"), f"{cat} spec carries no command — it emits nothing"
+
+    # IDOR is impactful/gated (it needs a second identity to confirm); the
+    # detections stay safe, or the whole surface tier lands in the approval queue.
+    assert by_cat["idor"].get("impactful") is True, \
+        "IDOR must be impactful (needs a second identity to confirm)"
+    for cat in ("sqli_detect", "xss_detect", "lfi_read"):
+        assert not by_cat[cat].get("impactful"), f"{cat} is a detection and must stay safe"
+
     src = _engine_src()
     fn = src[src.index("def _owasp_param_tests("):]
     fn = fn[:fn.index("\n\ndef _param_test(")]
-    for cat in ('"sqli_detect"', '"xss_detect"', '"lfi_read"', '"idor"'):
-        assert cat in fn, f"OWASP generator must emit {cat}"
-    # IDOR is impactful/gated; the detections are safe
-    assert "impactful=True" in fn, "IDOR must be impactful (needs a second identity to confirm)"
+    # Tiering comes FROM the spec, not from a literal in the branch. Asked
+    # structurally: every _param_test call passes impactful= as a computed value,
+    # never a constant -- a hardcoded impactful=False would silently push IDOR
+    # into the safe lane no matter what the YAML says.
+    calls_ = [n for n in ast.walk(ast.parse(fn.lstrip()))
+              if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_param_test"]
+    assert calls_, "the generator no longer builds tests via _param_test"
+    for c in calls_:
+        kw = next((k for k in c.keywords if k.arg == "impactful"), None)
+        assert kw is not None, "_param_test must be told the tier explicitly"
+        assert not isinstance(kw.value, ast.Constant), \
+            "the generator must take impactful from the spec, not hardcode it"
     # object-ref params drive IDOR; path params drive LFI
     assert "_IDOR_PARAM_NAMES" in fn and "_PATH_PARAM_NAMES" in fn
     # idor is a recognised impactful category
