@@ -59,8 +59,18 @@ jobs:
       - name: Run test suite
         run: |
           pip install -r tests/requirements.txt
-          # DB-backed and service-backed tests skip cleanly without them.
-          pytest tests/ -q
+          # DB-backed and service-backed tests skip cleanly without them — CI has
+          # neither, so a few hundred skips here are expected and correct.
+          #
+          # The ceiling exists because a skip is the perfect hiding place: a
+          # change that silently stopped 75 tests from running (two service dirs
+          # both ship a `log_manager`; whichever landed on sys.path first won)
+          # looked exactly like a machine without Postgres, and the suite stayed
+          # green while the skip count grew. 442 skip here today.
+          #
+          # Raise this only with a reason. If it rose because tests STOPPED
+          # running, fix that instead — `pytest tests/ -q -rs` prints every reason.
+          PYTEST_SKIP_BUDGET=450 pytest tests/ -q
       - name: Check shell script syntax
         run: |
           # scripts/cleanup-old-files.sh sat unparseable at HEAD — a stray
