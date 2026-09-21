@@ -4689,6 +4689,86 @@ def _resolve_metasploit_or_none(exploit_id: str, exploit_title: str):
         return None, {}, False
 
 
+# ── MSF module class → exploit_type ──────────────────────────────────────────
+# `pending_exploits.exploit_type` was hardcoded "rce" by every metasploit writer,
+# so 213 rows whose exploit_id starts "auxiliary/" (of 393 'rce' rows) claimed to
+# be remote code execution when they are version/login/enum SCANNERS. The type is
+# what the UI filters on and what an operator triages by, so a uniform value makes
+# the column useless.
+#
+# This is deliberately the ONE dimension exploit_runner's `_infer_exploit_category`
+# (exploit_runner/exploit_runner.py) cannot see: that helper refines a type from
+# the TITLE text and passes `current_type` straight through for network exploits —
+# so feeding it "rce" for an auxiliary scanner returns "rce". It classifies by
+# title; this classifies by MODULE CLASS, and the two compose: the value produced
+# here is exactly the `current_type` that helper expects. The pair is pinned to a
+# shared case table in tests/test_exploit_type_classification.py (they live in
+# different containers and cannot import each other).
+#
+# Values must satisfy the pending_exploits CHECK constraint — see
+# db_init/ensure_all_tables.sql: 'rce', 'auth_bypass', 'info_disclosure', 'other',
+# plus the webapp set ('sqli', 'xss', 'lfi', 'rfi', 'ssrf', 'command_injection',
+# 'file_upload', 'deserialization', 'xxe', 'csrf', 'webapp_other'). Note there is
+# NO 'dos' and NO 'recon' value: a fuzzer/DoS auxiliary module types as 'other'.
+EXPLOIT_TYPE_VALUES = frozenset({
+    "rce", "auth_bypass", "info_disclosure", "other",
+    "sqli", "xss", "lfi", "rfi", "ssrf", "command_injection",
+    "file_upload", "deserialization", "xxe", "csrf", "webapp_other",
+})
+
+# Module-path prefixes that identify a real Metasploit module. Anything else
+# (an EDB id, a vector id, a webshell name) is NOT an MSF module and keeps the
+# caller's own type — this function only claims to know about MSF classes.
+_MSF_PREFIXES = ("exploit/", "auxiliary/", "post/", "evasion/",
+                 "payload/", "encoder/", "nop/")
+
+
+def infer_msf_exploit_type(module, title: str = "", default: str = "rce") -> str:
+    """exploit_type for a Metasploit module path, from its module CLASS.
+
+    - `exploit/…`  → the caller's type if it is a specific webapp type, else 'rce'
+      (an exploit module is the one class that really does aim at code execution).
+    - `auxiliary/…` → 'auth_bypass' for login/brute modules, 'info_disclosure' for
+      scanner/gather/enum ones, 'other' for dos/fuzzers/admin and the rest.
+      NEVER 'rce' — an auxiliary module does not execute code on the target.
+    - `post/…` → 'info_disclosure' for gather/enum modules, 'other' otherwise.
+      Also never 'rce': a post module runs inside a session we already have.
+    - anything that is not an MSF module path → `default` unchanged.
+
+    Fails safe: an unrecognised `default` is replaced by 'other' rather than
+    letting a value through that the CHECK constraint would reject.
+    """
+    safe_default = default if default in EXPLOIT_TYPE_VALUES else "other"
+    mod = str(module or "").strip().lower()
+    if not mod.startswith(_MSF_PREFIXES):
+        return safe_default
+
+    if mod.startswith("exploit/") or mod.startswith("evasion/"):
+        # A caller that already knows this is e.g. an sqli or file_upload exploit
+        # knows more than the path does; only the generic values are overridden.
+        if safe_default in ("rce", "other"):
+            return "rce"
+        return safe_default
+
+    text = f"{mod} {str(title or '').lower()}"
+    if mod.startswith("auxiliary/"):
+        if any(k in text for k in ("login", "brute", "bruteforce", "_creds",
+                                   "default_pass", "credential")):
+            return "auth_bypass"
+        if any(k in mod for k in ("/scanner/", "/gather/", "/sniffer/",
+                                  "/analyze/", "/crawler/")) or "enum" in mod:
+            return "info_disclosure"
+        return "other"
+
+    if mod.startswith("post/"):
+        if "/gather/" in mod or "enum" in mod or "/recon/" in mod:
+            return "info_disclosure"
+        return "other"
+
+    # payload/ encoder/ nop/ — not exploits at all.
+    return "other"
+
+
 def queue_exploit_for_approval(
     exploit_id: str,
     source: str,
@@ -4721,7 +4801,11 @@ def queue_exploit_for_approval(
         target_port: Target port number
         target_service: Service name (e.g., 'smb', 'ssh')
         target_version: Service version
-        exploit_type: 'rce', 'auth_bypass', 'info_disclosure', 'other'
+        exploit_type: 'rce', 'auth_bypass', 'info_disclosure', 'other' (or a
+            webapp type: sqli/xss/lfi/rfi/ssrf/command_injection/file_upload/
+            deserialization/xxe/csrf/webapp_other). For a Metasploit module this
+            is CORRECTED from the module class — an `auxiliary/...` or `post/...`
+            module is never stored as 'rce'.
         parameters: Dict of exploit parameters
         match_confidence: 0.0-1.0 confidence score
         session_id: Agent session UUID (optional)
@@ -4744,6 +4828,15 @@ def queue_exploit_for_approval(
             return json.dumps({"ok": False, "skipped": True,
                                "reason": f"'{exploit_title or exploit_id}' is a "
                                "denial-of-service exploit — DoS is never queued or run."}, indent=2)
+
+        # Correct the exploit_type against the MSF module CLASS. Callers (and the
+        # LLM, which reaches this tool through tool_registry) pass "rce" by habit,
+        # which is how 213 `auxiliary/...` scanner rows came to be typed as remote
+        # code execution. Runs AFTER the DoS guard above, which keys on the raw
+        # caller-supplied 'dos' value. A non-MSF exploit_id (an EDB id, a vector
+        # id, a webshell name) keeps the caller's type untouched.
+        exploit_type = infer_msf_exploit_type(
+            exploit_id, exploit_title, default=exploit_type or "rce")
 
         # Gate: a source=metasploit exploit must resolve to a REAL, loaded MSF
         # module. This stops doomed synthetic rows (e.g.
