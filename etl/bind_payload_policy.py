@@ -37,9 +37,45 @@ _RULE_PREFIX = "rule:"
 REFUSAL = (
     "bind payload requires manual approval: it opens an unauthenticated "
     "listening shell on the target that anyone who can reach the port may use. "
-    "Approve this exploit as an operator, or configure a callback host "
-    "(msf.payload_config.callback_host) so a reverse payload can be used."
+    "Approve this exploit as an operator, or start a node callback relay so a "
+    "reverse payload can be used instead."
 )
+
+# The RECOMMENDED way to get a callback: point it at a node/proxy, not at a bare
+# host. The node listens on an address the target can actually reach and relays
+# the shell to the central MSF handler, so nothing has to open a port on the
+# target AND the callback never exposes our own address directly. That is what
+# _node_callback_config() already builds; it just needs a relay running.
+#
+# A bare callback_host is the fallback, not the goal: it means the target dials
+# an address we own directly, which is both attributable and often unroutable
+# from the target's network.
+RECOMMENDATION = (
+    "Recommended: start a callback relay on the node that proxies this target "
+    "(Nodes -> the node -> Callback relay). The shell then comes back to the "
+    "node and is relayed to MSF, so no port is opened on the target and "
+    "approval rules can fire unattended again."
+)
+
+
+def recommend_callback(nodes=None) -> str:
+    """One actionable line for an operator facing a bind refusal/hold.
+
+    `nodes` is an iterable of dicts with `name`, `proxy_port` and `relay_active`
+    (whatever the caller's query produced). Naming the specific node matters: the
+    generic advice "configure a callback host" sent people to a settings field,
+    when the right action is starting a relay on a node that already exists.
+    """
+    rows = list(nodes or [])
+    if not rows:
+        return RECOMMENDATION
+    live = [n for n in rows if n.get("relay_active")]
+    if live:
+        names = ", ".join(str(n.get("name") or n.get("proxy_port")) for n in live[:3])
+        return (f"A callback relay is already up on {names}. This dispatch did not "
+                "use it — check that the exploit is routed through that node's proxy.")
+    names = ", ".join(str(n.get("name") or n.get("proxy_port")) for n in rows[:3])
+    return (f"{RECOMMENDATION} Candidate node(s) with no relay running: {names}.")
 
 
 def is_bind_payload(payload: Optional[str] = None, style: Optional[str] = None) -> bool:
