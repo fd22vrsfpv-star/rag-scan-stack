@@ -28,6 +28,10 @@ import sys
 
 import pytest
 
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _ast_assert import calls  # noqa: E402
+
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 SSH_MGR = os.path.join(REPO, "node_manager", "ssh_manager.py")
 NODE_MGR = os.path.join(REPO, "node_manager", "node_manager.py")
@@ -82,14 +86,57 @@ def test_node_manager_exposes_relay_endpoints():
     assert "callback_relay" in stored
 
 
+def _passes_name(src, callee, keyword, value):
+    """True if some call to `callee` passes `keyword=<value>` as a bare name."""
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = getattr(fn, "id", None) or getattr(fn, "attr", None)
+        if name != callee:
+            continue
+        for kw in node.keywords:
+            if kw.arg == keyword and isinstance(kw.value, ast.Name) and kw.value.id == value:
+                return True
+    return False
+
+
+def _first_arg_is(src, callee, value):
+    """True if some call to `callee` takes `value` as its first positional arg."""
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = getattr(fn, "id", None) or getattr(fn, "attr", None)
+        if name == callee and node.args and isinstance(node.args[0], ast.Name):
+            if node.args[0].id == value:
+                return True
+    return False
+
+
 def test_exploit_runner_prefers_node_relay():
-    """Both MSF dispatch paths consult the node relay config."""
+    """Both MSF dispatch paths consult the node relay config.
+
+    by-id reaches it by DELEGATION now: it enforces the proxy itself, then hands
+    that effective proxy to execute_msf_module, which resolves the relay. What
+    matters is that by-id's *enforced* proxy is the one the relay is computed
+    from — passing the raw query parameter instead would resolve the relay
+    against a proxy the fail-closed gate had already overridden.
+    """
     byid = _func(ERUNNER, "execute_by_id")
-    assert "_node_callback_config(proxy_url)" in byid, (
-        "by-id dispatch ignores the node relay")
+    assert calls(byid, "execute_msf_module"), (
+        "by-id no longer routes MSF through the shared executor")
+    assert calls(byid, "_enforce_proxy"), "by-id no longer enforces the proxy policy"
+    assert _passes_name(byid, "MsfExecuteRequest", "proxy_url", "eff_proxy"), (
+        "by-id passes something other than its ENFORCED proxy to the executor, so "
+        "the node relay would be resolved against the wrong proxy")
     msf = _func(ERUNNER, "execute_msf_module")
-    assert "_node_callback_config(request.proxy_url)" in msf, (
-        "/execute/msf ignores the node relay")
+    assert calls(msf, "_node_callback_config"), "/execute/msf ignores the node relay"
+    # it resolves the relay from the ENFORCED proxy, not the raw request field --
+    # the guard used to pin `_node_callback_config(request.proxy_url)`, which was
+    # the weaker of the two behaviours.
+    assert _first_arg_is(msf, "_node_callback_config", "eff_proxy"), (
+        "/execute/msf resolves the node relay from the unenforced request proxy")
 
 
 # ── Unit test the resolver (skips cleanly without the runner's deps) ─────────

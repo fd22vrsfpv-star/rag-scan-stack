@@ -52,15 +52,29 @@ def _func(path, name):
 # ── Source guards (no import needed) ─────────────────────────────────────────
 
 def test_exploit_success_requires_a_session():
-    """The by-id MSF branch must judge an EXPLOIT by whether a session held, not
-    by whether a handler job started, and must record the session id."""
+    """The by-id MSF path must judge an EXPLOIT by whether a session held, not by
+    whether a handler job started, and must record the session id.
+
+    by-id no longer INLINES that logic — it delegates to execute_msf_module,
+    which is where the payload build, the session wait and the success rule now
+    live (one implementation instead of two). So the contract is checked in two
+    parts: by-id really delegates and passes the session back, and the shared
+    function really carries the rules. Pinning the old inlined spelling made this
+    guard fail on a consolidation that IMPROVED the code — and it had been
+    skipping for want of msgpack, so nobody saw it either way.
+    """
     fn = _func(ERUNNER, "execute_by_id")
-    assert "_build_exploit_options" in fn, "by-id no longer builds a payload (bind default)"
-    assert "_await_new_session" in fn, "by-id no longer waits for the session to establish"
-    assert "session_id=session_id" in fn, "by-id no longer records the session handle"
-    assert "success = bool(session_id)" in fn, (
-        "exploit success no longer requires an actual session")
+    assert "execute_msf_module" in fn, (
+        "by-id no longer routes metasploit through the shared executor")
     assert "auxiliary" in fn, "auxiliary modules are no longer typed apart from exploits"
+    assert "result.session_id" in fn, "by-id no longer returns the session handle"
+
+    shared = _func(ERUNNER, "execute_msf_module")
+    assert "_build_exploit_options" in shared, "the shared executor no longer builds a payload (bind default)"
+    assert "_await_new_session" in shared, "the shared executor no longer waits for the session"
+    assert "session_id=session_id" in shared, "the shared executor no longer records the session handle"
+    assert "success = bool(session_id)" in shared, (
+        "exploit success no longer requires an actual session")
 
 
 def test_execute_msf_endpoint_records_and_waits():
@@ -95,12 +109,35 @@ def test_default_connect_style_is_auto():
     assert er.MsfPayloadConfig().payload == ""
 
 
-def test_pick_payload_prefers_bind_then_meterpreter():
+def test_pick_payload_prefers_bind_then_reliable_interpreter():
+    """bind over reverse, then INTERPRETER RELIABILITY — not meterpreter rank.
+
+    This test used to assert the chosen payload contained "meterpreter". That
+    stopped being true when bind payloads were reranked by interpreter
+    reliability (commit "Prefer reliable bind payloads (bind_perl before
+    bind_awk)"), because a reachable shell beats a more capable payload that
+    never lands: bind_awk failed on metasploitable while bind_perl opened a
+    shell, verified live on usermap + distcc.
+
+    The expectation was never updated because this whole file was SKIPPING for
+    want of msgpack. When the skip was fixed, this stale assertion argued for
+    changing working, live-verified attack behaviour — and the change was made
+    and reverted before it shipped. tests/test_exploit_execution_fixes.py
+    ::test_pick_payload_prefers_bind is the authority on the ordering; this one
+    must agree with it, not contradict it.
+    """
     p, style = er._pick_payload(
         ["cmd/unix/reverse", "cmd/unix/bind_netcat", "java/meterpreter/bind_tcp"],
         "auto", "")
     assert style == "bind", (p, style)
-    assert "bind" in p and "meterpreter" in p, p
+    assert "bind" in p, p
+    # netcat is on the reliable-interpreter list; the java meterpreter is not
+    assert p == "cmd/unix/bind_netcat", (
+        f"expected the reliable-interpreter bind, got {p}")
+
+    # and among equally-ranked cmd payloads, reliability still decides
+    p2, _ = er._pick_payload(["cmd/unix/bind_awk", "cmd/unix/bind_perl"], "auto", "")
+    assert "perl" in p2, p2
 
 
 def test_pick_payload_reverse_when_no_bind():
