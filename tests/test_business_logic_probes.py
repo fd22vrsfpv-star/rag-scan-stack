@@ -10,11 +10,16 @@ Sabotage-proven: weaken an oracle marker set or drop a wire and a case flips.
 Self-contained; needs only pyyaml.
 """
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).parent))
+from _ast_assert import (defines, calls, call_kwarg, call_order,  # noqa: E402
+                         string_constants)
+PW = ROOT / "playwright_scanner/playwright_scanner.py"
 yaml = pytest.importorskip("yaml")
 
 
@@ -80,30 +85,37 @@ def test_value_tamper_flags_success_not_validation_error():
     assert _tamper_flags(base, LOGIN + "q" * 600) is False
 
 
-# ── source wiring ────────────────────────────────────────────────────────────
+# ── source wiring (structural — see tests/_ast_assert) ───────────────────────
+#
+# These previously pinned source substrings like "'value_tamper','business_logic'"
+# and "_bl_discovered_paths(cur, host, root)" — exact argument spellings that a
+# reformat breaks and a comment satisfies. They now assert the structure.
 
 def test_post_body_idor_wired():
-    s = _src("playwright_scanner/playwright_scanner.py")
-    assert "async def _idor_post_body_pass(" in s
-    assert "_idor_post_body_pass(ctx, host" in s, "POST-body pass must be called from the IDOR probe"
-    assert "'Potential IDOR (object reference, POST body)'" in s
-    # reconstructs the full body from discovered_params
-    assert "def _bl_body_params(" in s and "param_location='body'" in s
+    assert defines(PW, "_idor_post_body_pass"), "POST-body object refs need their own pass"
+    assert calls(PW, "_idor_post_body_pass"), "the IDOR probe must actually call it"
+    assert defines(PW, "_bl_body_params"), "the POST body is reconstructed from discovered_params"
+    assert any("param_location" in c and "body" in c for c in string_constants(PW)), \
+        "body params are selected by param_location"
+    assert any("POST body" in c for c in string_constants(PW)), \
+        "the finding must name itself as a POST-body IDOR"
 
 
 def test_value_tamper_probe_wired_into_crawl():
-    s = _src("playwright_scanner/playwright_scanner.py")
-    assert "async def _value_tamper_probe(" in s
-    assert "_value_tamper_probe(ctx, req.url" in s, "value-tamper probe must run in the crawl"
-    assert "'value_tamper','business_logic'" in s
-    # runs authenticated via the context request (shares cookies)
-    assert "ctx.request.post(" in s and "ctx.request.get(" in s
+    assert defines(PW, "_value_tamper_probe")
+    assert call_order(PW, "_idor_mutate_probe", "_value_tamper_probe", within="_perform_crawl"), \
+        "the value-tamper probe runs in the authenticated crawl, after the IDOR probe"
+    consts = string_constants(PW)
+    assert any("value_tamper" in c for c in consts) and any("business_logic" in c for c in consts), \
+        "findings are recorded with source=value_tamper / issue_type=business_logic"
+    # replayed in the authenticated context so the session is reused
+    assert calls(PW, "request.post") or calls(PW, "post"), "must replay POSTs"
 
 
 def test_probes_are_data_driven_by_yaml():
-    s = _src("playwright_scanner/playwright_scanner.py")
-    assert "business_logic_tests.yaml" in s
-    assert "def _bl_config(" in s
+    assert defines(PW, "_bl_config"), "probe data comes from YAML, not literals in code"
+    assert any(c.endswith("business_logic_tests.yaml") for c in string_constants(PW)), \
+        "the YAML that drives the probes must be named"
 
 
 def test_forced_browsing_wired():
@@ -111,18 +123,23 @@ def test_forced_browsing_wired():
     fb = d["forced_browsing"]
     assert fb["privileged_paths"] and any("admin" in p.lower() for p in fb["privileged_paths"])
     assert any("/bank" in p.lower() for p in fb["authenticated_path_patterns"])
-    s = _src("playwright_scanner/playwright_scanner.py")
-    assert "async def _forced_browsing_probe(" in s
-    assert "_forced_browsing_probe(" in s and "discovered_urls=list(visited)" in s
-    assert "'forced_browsing','access_control'" in s
-    # anonymous check: no cookies, don't follow redirects (a redirect = enforced)
-    assert "follow_redirects=False" in s
+
+    assert defines(PW, "_forced_browsing_probe")
+    assert calls(PW, "_forced_browsing_probe"), "must run in the crawl"
+    consts = string_constants(PW)
+    assert any("forced_browsing" in c for c in consts) and any("access_control" in c for c in consts), \
+        "findings recorded as source=forced_browsing / issue_type=access_control"
+    # anonymous: a redirect means the resource IS enforced, so following one
+    # would turn a protected page into a false positive.
+    assert call_kwarg(PW, "AsyncClient", "follow_redirects"), \
+        "the anonymous client must not follow redirects"
     # every anonymous request is scope-gated
-    assert '_scope_refusal_for_url(url, f"forced-browsing' in s
-    # consumes gobuster/ffuf-discovered paths (content discovery) for the anon check
-    assert "def _bl_discovered_paths(" in s
-    assert "'ffuf','gobuster','feroxbuster'" in s
-    assert "_bl_discovered_paths(cur, host, root)" in s
+    assert calls(PW, "_scope_refusal_for_url"), "anon requests must be scope-gated"
+    # and it consumes what the content-discovery tools already found
+    assert defines(PW, "_bl_discovered_paths")
+    assert calls(PW, "_bl_discovered_paths"), "gobuster/ffuf discoveries feed the anon check"
+    for tool in ("ffuf", "gobuster", "feroxbuster"):
+        assert any(tool in c for c in consts), f"{tool} discoveries must be a source of candidates"
 
 
 def test_wstg_map_covers_probe_findings():

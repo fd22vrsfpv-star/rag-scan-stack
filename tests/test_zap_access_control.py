@@ -24,6 +24,9 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).parent))
+from _ast_assert import call_order  # noqa: E402
+ZAPB = ROOT / "playwright_scanner/zap_bridge.py"
 PW = ROOT / "playwright_scanner"
 
 
@@ -119,9 +122,9 @@ def test_scan_bounds_ajax_before_running_it():
     s = _src("playwright_scanner/zap_bridge.py")
     assert "configure_ajax_spider_bounds(" in s
     # bounds set before the scan_as_user/scan call
-    i_bounds = s.index("configure_ajax_spider_bounds(")
-    i_scan = s.index("ajaxSpider.scan_as_user(")
-    assert i_bounds < i_scan, "must bound the ajax spider before starting it"
+    assert call_order(ZAPB, "configure_ajax_spider_bounds", "scan_as_user",
+                      within="scan_with_playwright_session"), (
+        "must bound the ajax spider before starting it")
     # scan_as_user must be passed the username, not the numeric id
     assert "_ajax_user" in s
 

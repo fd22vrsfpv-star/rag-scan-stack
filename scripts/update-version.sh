@@ -1,16 +1,29 @@
 #!/bin/bash
 # Update version across all required files
-# Usage: ./scripts/update-version.sh 2026.05.13-05
+# Usage: ./scripts/update-version.sh 2026.09.20.2158
 
 set -e
 
 if [ $# -ne 1 ]; then
     echo "Usage: $0 <version>"
-    echo "Example: $0 2026.05.13-05"
+    echo "Example: $0 $(date +%Y.%m.%d.%H%M)"
     exit 1
 fi
 
 NEW_VERSION=$1
+
+# CLAUDE.md asks for "a date + timestamp". Validate here so a malformed version
+# is rejected BEFORE it is written to four files and a rebuild — previously the
+# only shape check lived in the test suite, and it pinned the older YYYY.MM.DD-N
+# spelling, so it simply went red once releases moved to YYYY.MM.DD.HHMM.
+# Both shapes are accepted, in all three places that know about the format:
+# here, tests/test_build_version_sync.py, and the vitest twin
+# dashboard/frontend/src/__tests__/lib/constants.test.ts.
+if ! echo "$NEW_VERSION" | grep -Eq '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}(-[0-9]+|\.[0-9]{4})$'; then
+    echo "✗ '$NEW_VERSION' is not YYYY.MM.DD.HHMM (or the historical YYYY.MM.DD-N)"
+    echo "  Example: $0 $(date +%Y.%m.%d.%H%M)"
+    exit 1
+fi
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "Updating version to: $NEW_VERSION"

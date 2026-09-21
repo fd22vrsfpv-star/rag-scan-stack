@@ -1,7 +1,12 @@
 """Guard: AD tools in the kali install list ('install ad tools') + AD enum rules."""
 import re
+import sys
 from pathlib import Path
 import pytest
+
+sys.path.insert(0, str(Path(__file__).parent))
+from _ast_assert import const_elements  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 yaml = pytest.importorskip("yaml")
 
@@ -26,21 +31,29 @@ def test_ad_tools_in_install_map():
 
 
 def test_ad_tools_in_kali_manifest():
-    s = _src("kali_listener/listener_service.py")
+    """The manifest is a SET constant — read it, don't grep the file. A quoted
+    tool name also appears in comments and in the safe-lane set, so a substring
+    search proves nothing about which set the tool is actually in."""
+    manifest = const_elements(ROOT / "kali_listener/listener_service.py",
+                              "_FALLBACK_ALLOWED_TOOLS")
+    assert manifest, "_FALLBACK_ALLOWED_TOOLS not found"
     for t in ("responder", "mitm6", "certipy", "ldeep", "kerbrute", "secretsdump", "ticketer"):
-        assert f'"{t}"' in s, f"{t} missing from kali manifest"
+        assert t in manifest, f"{t} missing from the kali install manifest"
 
 
 def test_safe_ad_enum_tools_on_readonly_lane():
-    s = _src("kali_listener/listener_service.py")
-    # read-only AD enum allowed on the no-approval lane
+    """Read-only AD enum may run without approval; offensive AD tooling may not.
+
+    This used to slice the file between two marker strings and grep the slice —
+    which silently passes if either marker is edited. The set is right there.
+    """
+    safe = const_elements(ROOT / "kali_listener/listener_service.py",
+                          "_SAFE_READONLY_TOOLS")
+    assert safe, "_SAFE_READONLY_TOOLS not found"
     for t in ("ldeep", "kerbrute", "bloodhound-python", "GetUserSPNs", "GetNPUsers"):
-        assert f'"{t}"' in s
-    # offensive AD tools must NOT be on the safe lane (checked by absence in the
-    # _SAFE_READONLY_TOOLS block specifically)
-    safe_block = s[s.index("_SAFE_READONLY_TOOLS = {"):s.index("def get_safe_execution_tools")]
+        assert t in safe, f"{t} should be runnable on the no-approval lane"
     for t in ("secretsdump", "ticketer", "responder", "ntlmrelayx", "mitm6"):
-        assert f'"{t}"' not in safe_block, f"{t} must NOT be on the safe lane"
+        assert t not in safe, f"{t} must NOT be on the safe lane"
 
 
 def test_ad_enum_rules_present_and_safe():
