@@ -15482,6 +15482,25 @@ def remove_from_scope(
 
 
 @app.post("/scope/auto-assign-unknown", tags=["Scope"])
+def _scope_engagement(cur, scope_name, default=None):
+    """The engagement that owns a scope NAME, from the rows already in it.
+
+    A scope belongs to one engagement in practice, so a row joining that scope
+    should land in the same engagement. Returns `default` for a scope with no
+    attributed rows yet — and None is correct for the global `not_in_scope`
+    deny-list, which is cross-engagement by design (CLAUDE.md).
+    """
+    try:
+        cur.execute("""SELECT engagement_id::text AS eid FROM scope_targets
+                        WHERE name = %s AND engagement_id IS NOT NULL
+                        GROUP BY engagement_id
+                        ORDER BY count(*) DESC LIMIT 1""", (scope_name,))
+        row = cur.fetchone()
+    except Exception:  # noqa: BLE001
+        return default
+    return (row or {}).get("eid") or default
+
+
 def auto_assign_unknown_scope(authorized: bool = Depends(auth)):
     """Find all assets/hostnames not in any scope and assign them to 'unknown_scope'.
 
@@ -15515,6 +15534,25 @@ def auto_assign_unknown_scope(authorized: bool = Depends(auth)):
         if not unscoped:
             return {"ok": True, "added": 0, "message": "All items already in a scope"}
 
+        # Which engagement owns each discovered target? A scope row with a NULL
+        # engagement_id is an orphan a data-purge cannot claim, so resolve it from
+        # the asset/recon row the target came from, falling back to whatever
+        # engagement already owns unknown_scope.
+        owner = {}
+        cur.execute("""
+            SELECT hostname AS t, engagement_id::text AS eid FROM assets
+             WHERE hostname IS NOT NULL AND engagement_id IS NOT NULL
+            UNION ALL
+            SELECT host(ip)::text, engagement_id::text FROM assets
+             WHERE ip IS NOT NULL AND engagement_id IS NOT NULL
+            UNION ALL
+            SELECT target, engagement_id::text FROM recon_findings
+             WHERE target IS NOT NULL AND engagement_id IS NOT NULL
+        """)
+        for r in cur.fetchall():
+            owner.setdefault(r["t"], r["eid"])
+        scope_eid = _scope_engagement(cur, "unknown_scope")
+
         # Add to unknown_scope
         added = 0
         for target in unscoped:
@@ -15528,11 +15566,16 @@ def auto_assign_unknown_scope(authorized: bool = Depends(auth)):
             elif "/" in t and any(c.isdigit() for c in t.split("/")[-1]):
                 target_type = "cidr"
 
+            # ON CONFLICT must repeat the unique index EXACTLY, and the only one
+            # is ux_scope_targets_eng_name_target (engagement_id, name, target).
+            # Naming (name, target) matched no index, so every insert here raised
+            # "no unique or exclusion constraint matching the ON CONFLICT
+            # specification" and this endpoint could never add a row.
             cur.execute("""
-                INSERT INTO scope_targets (id, name, target, target_type, source)
-                VALUES (gen_random_uuid(), 'unknown_scope', %s, %s, 'auto-discovery')
-                ON CONFLICT (name, target) DO NOTHING
-            """, [t, target_type])
+                INSERT INTO scope_targets (id, engagement_id, name, target, target_type, source)
+                VALUES (gen_random_uuid(), %s::uuid, 'unknown_scope', %s, %s, 'auto-discovery')
+                ON CONFLICT (engagement_id, name, target) DO NOTHING
+            """, [owner.get(t) or scope_eid, t, target_type])
             added += cur.rowcount
         conn.commit()
 
@@ -15724,6 +15767,12 @@ def move_scope_targets(body: dict, authorized: bool = Depends(auth)):
 
         # Remove all matched targets from source scope
         move_list = list(to_move)
+        # Capture each row's engagement BEFORE deleting it: a move must not drop
+        # attribution, and re-deriving it afterwards is guesswork.
+        cur.execute("""SELECT target, engagement_id::text AS eid FROM scope_targets
+                        WHERE name = %s AND target = ANY(%s)""", [from_scope, move_list])
+        moved_eid = {r["target"]: r["eid"] for r in cur.fetchall()}
+        dest_eid = _scope_engagement(cur, to_scope)
         cur.execute("DELETE FROM scope_targets WHERE name = %s AND target = ANY(%s)", [from_scope, move_list])
         removed = cur.rowcount
         # Add to destination scope
@@ -15734,11 +15783,14 @@ def move_scope_targets(body: dict, authorized: bool = Depends(auth)):
             target_type = "domain"
             if t.replace(".", "").isdigit() or ":" in t:
                 target_type = "ip"
+            # ON CONFLICT must name the real unique index
+            # (engagement_id, name, target); (name, target) matched none, so this
+            # insert raised and the move deleted the rows without re-adding them.
             cur.execute("""
-                INSERT INTO scope_targets (id, name, target, target_type, source)
-                VALUES (gen_random_uuid(), %s, %s, %s, 'moved')
-                ON CONFLICT (name, target) DO NOTHING
-            """, [to_scope, t, target_type])
+                INSERT INTO scope_targets (id, engagement_id, name, target, target_type, source)
+                VALUES (gen_random_uuid(), %s::uuid, %s, %s, %s, 'moved')
+                ON CONFLICT (engagement_id, name, target) DO NOTHING
+            """, [moved_eid.get(t) or dest_eid, to_scope, t, target_type])
             added += cur.rowcount
 
         # Capture decisions for auto-classification learning
@@ -15840,13 +15892,22 @@ def classify_unknown_scope(
                     cur.execute("SELECT auto_apply FROM scope_classification_rules WHERE id = %s", (result.rule_id,))
                     row = cur.fetchone()
                     if row and row["auto_apply"]:
-                        # Auto-move
+                        # Auto-move. Mirrors _apply_scope_classification above:
+                        # keep the row's engagement across the move, and name the
+                        # real unique index in ON CONFLICT — (name, target)
+                        # matched no index, so this raised every time.
+                        cur.execute("""SELECT engagement_id::text AS eid FROM scope_targets
+                                        WHERE name = 'unknown_scope' AND target = %s""",
+                                    (target,))
+                        _row = cur.fetchone()
+                        _eid = ((_row or {}).get("eid")
+                                or _scope_engagement(cur, result.scope))
                         cur.execute("DELETE FROM scope_targets WHERE name = 'unknown_scope' AND target = %s", (target,))
                         cur.execute("""
-                            INSERT INTO scope_targets (id, name, target, target_type, source)
-                            VALUES (gen_random_uuid(), %s, %s, 'domain', 'auto-classified')
-                            ON CONFLICT (name, target) DO NOTHING
-                        """, (result.scope, target))
+                            INSERT INTO scope_targets (id, engagement_id, name, target, target_type, source)
+                            VALUES (gen_random_uuid(), %s::uuid, %s, %s, 'domain', 'auto-classified')
+                            ON CONFLICT (engagement_id, name, target) DO NOTHING
+                        """, (_eid, result.scope, target))
                         _capture_scope_decisions([target], "unknown_scope", result.scope, cur)
                         auto_assigned += 1
                         continue
@@ -26274,14 +26335,18 @@ def collection_to_scope(collection_id: str, body: dict, _: bool = Depends(auth))
         if not eps:
             return {"ok": True, "added": 0, "total": 0, "scope_name": scope_name}
 
-        # Also add the base host itself as a url target
+        # Also add the base host itself as a url target.
+        # ON CONFLICT must name the real unique index (engagement_id, name,
+        # target) — (name, target) matched none, so every swagger import raised
+        # instead of adding a single row.
+        swagger_eid = _scope_engagement(cur, scope_name)
         added = 0
         if base_url:
             cur.execute(
-                """INSERT INTO scope_targets (name, target, target_type, source)
-                   VALUES (%s, %s, 'url', 'swagger-import')
-                   ON CONFLICT (name, target) DO NOTHING""",
-                [scope_name, base_url],
+                """INSERT INTO scope_targets (engagement_id, name, target, target_type, source)
+                   VALUES (%s::uuid, %s, %s, 'url', 'swagger-import')
+                   ON CONFLICT (engagement_id, name, target) DO NOTHING""",
+                [swagger_eid, scope_name, base_url],
             )
             added += cur.rowcount
 
@@ -26293,10 +26358,10 @@ def collection_to_scope(collection_id: str, body: dict, _: bool = Depends(auth))
             else:
                 url = path
             cur.execute(
-                """INSERT INTO scope_targets (name, target, target_type, source)
-                   VALUES (%s, %s, 'url', 'swagger-import')
-                   ON CONFLICT (name, target) DO NOTHING""",
-                [scope_name, url],
+                """INSERT INTO scope_targets (engagement_id, name, target, target_type, source)
+                   VALUES (%s::uuid, %s, %s, 'url', 'swagger-import')
+                   ON CONFLICT (engagement_id, name, target) DO NOTHING""",
+                [swagger_eid, scope_name, url],
             )
             added += cur.rowcount
 
