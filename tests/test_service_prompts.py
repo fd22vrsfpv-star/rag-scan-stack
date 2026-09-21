@@ -17,6 +17,8 @@ from unittest.mock import patch
 
 import pytest
 
+from conftest import load_service_module  # see tests/conftest.py
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scan_recommender"))
 
 
@@ -52,11 +54,11 @@ def sr():
     if SR_DIR not in sys.path:
         sys.path.insert(0, SR_DIR)
 
-    import importlib.util
+    # load_service_module evicts colliding sibling names (both this service and
+    # autogen_agents ship a `log_manager`) so the module's bare imports resolve
+    # to ITS directory even when an earlier test cached the other copy.
     try:
-        spec = importlib.util.spec_from_file_location("scan_recommender_under_test", SR_FILE)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = load_service_module(SR_FILE, "scan_recommender_under_test", SR_DIR)
     except Exception as e:                                    # pragma: no cover
         pytest.skip(f"scan_recommender not importable in this env: {e}")
     return module
