@@ -37,8 +37,9 @@ _ASSERT = re.compile(
 _READS_SOURCE = re.compile(r'read_text\(|_src\(|open\([^)]*\.py')
 
 # Known brittle assertions still to convert. LOWER this as they are converted;
-# it may not rise. 255 at the time the ratchet was introduced.
-BASELINE = 234
+# it may not rise. 255 at the time the ratchet was introduced; 234 after that
+# conversion pass, 233 once the stale-guard fixes landed.
+BASELINE = 233
 
 
 def _is_code_fragment(literal: str) -> bool:
