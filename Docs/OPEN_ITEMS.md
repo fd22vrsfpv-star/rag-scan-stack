@@ -73,18 +73,6 @@ observed far fewer times.
 column is renamed to say what it counts.
 **Enforced by:** not enforced
 
-### A tool with no parser is recorded as having produced nothing measurable
-**Found:** 2026-09-12
-**Evidence:** the netexec run above wrote 6,816 bytes and `parsed_results` was
-NULL, because no parser handles netexec output. It is now recorded
-`success = false, failure_signature = NULL` — honest, but it means the learner
-gets no signal at all from any tool without a parser.
-**Where:** `etl/parse_tool_output.py` (no netexec branch);
-`kali_listener/listener_service.py::_learn_from_execution`.
-**Done when:** netexec output is parsed, or the generic parser extracts enough
-that a run can be judged productive or fruitless.
-**Enforced by:** not enforced
-
 ## Post-execution review
 
 ### The re-run proposer sees a narrower set than the classifier
@@ -150,6 +138,12 @@ extractor specs in as a second parser tier already covered `enum4linux-ng`,
 `smbclient`, `hydra`, `sslscan`, `medusa` and `gobuster`.
 **Where:** `etl/tool_output_parsers.py::PARSERS` and
 `knowledge/extractors/*.yaml`.
+**Update 2026-09-21:** re-counted from `tool_executions` where
+`parsed_results IS NULL` — now 5 tools and ~8.3 MB unread, not 6 and 632 KB:
+nuclei (30 runs, 7.8 MB), curl (160, 482 KB), cewl (2, 23 KB), rmg (5, 5.6 KB),
+showmount (1, 35 B). NOTE nuclei is a different defect: `etl/parse_nuclei.py`
+EXISTS, so those 30 runs are a parser that is not being invoked or is failing,
+not a missing parser — worth splitting out before writing anything new.
 **Done when:** each tool has a registry parser or an extractor spec.
 `POST /parsers/draft?tool=<tool>` drafts one from a stored sample; the gap is
 now visible and has a fix rather than being silent.
@@ -173,26 +167,14 @@ observation. The native path finishes in `scans`, so it needs its own hook
 rather than a shared one.
 **Enforced by:** not enforced
 
-### Most tools have no parser, so their outcomes stay unresolved
-**Found:** 2026-09-12
-**Evidence:** `enum4linux-ng` returned **9,525 bytes** of real findings and
-`result_count()` returned None because only netexec has a parser. That is now
-recorded as *unresolved* rather than `produced=false` — correct, but it means
-`smbclient`, `enum4linux-ng` and `nmap` proposals can never resolve, so rules
-proposing them can never be judged.
-**Where:** `etl/tool_output_parsers.py::PARSERS` has three entries, all netexec.
-**Done when:** the tools the enumeration rules propose (`smbclient`,
-`enum4linux-ng`, `nmap`) have parsers, or `output_analysis.analyse_output()` is
-used as the fallback judge.
-**Enforced by:** `tests/test_post_enumeration.py::test_an_unmeasured_outcome_is_not_recorded_as_zero`
-(pins that the absence is not recorded as a zero)
-
 ## Data and deployment
 
 ### One asset carries no engagement
 **Found:** 2026-09-11
 **Evidence:** After the attribution backfill, 136 of 137 assets resolved.
-`74.123.154.158` remains unattributed — its host is in no scope.
+`74.123.154.158` remains unattributed — its host is in no scope. Re-checked
+2026-09-21: still exactly one (`SELECT count(*) FROM assets WHERE engagement_id
+IS NULL` = 1, the same host).
 **Where:** `scope_targets`; `db_init/ensure_all_tables.sql::propagate_engagement_to_assets`.
 **Done when:** the host is either in a scope or removed. It is reported by
 `scripts/ensure_db_schema.sh` as "not an error", which is correct.
@@ -217,26 +199,14 @@ bounded re-rank learns from has never received a row, so the loop has not run
 once in production. GRPO never runs either, and no metric anywhere records
 whether retrieval improved.
 **Where:** the RAG feedback path.
-**Done when:** a measurement exists, even a crude one.
-**Enforced by:** not enforced
-
-### Manual exploit approval records no reviewer
-**Found:** before 2026-09-11
-**Evidence:** The wildcard/rule approval path records `reviewed_by`; the manual
-approve path does not, so an audit cannot say who approved an exploit.
-**Where:** the manual approval handler in `app/rag-api/api.py`.
-**Done when:** the manual path records the operator the same way
-`update_exploit_status` does.
-**Enforced by:** not enforced
-
-### There is no per-task LLM routing table
-**Found:** before 2026-09-11
-**Evidence:** No routing table exists — a lookup for `llm_routing`,
-`model_routing` and `llm_task_routes` in `information_schema.tables` returns
-**0**. A caller's requested model is honoured, but which model *should* serve
-which task lives only in each caller's hardcoded choice.
-**Where:** the LLM selection path.
-**Done when:** routing is data rather than each caller's guess.
+**Update 2026-09-21:** the MACHINERY now exists — `POST /api/rag/eval/run`
+replays rated queries and computes NDCG@K / MRR / recall@K / precision@K into
+`rag_eval_runs`, and `GET /api/rag/eval/history` reads them back. But it has never
+been run: `SELECT count(*) FROM rag_eval_runs` = 0 and the history endpoint returns
+`{"runs":[]}`. A measurement that exists and is never taken measures nothing, so
+the item stands — with a much smaller remaining step.
+**Done when:** at least one evaluation run is recorded, and something re-runs it so
+a change in retrieval shows up as a change in the numbers.
 **Enforced by:** not enforced
 
 ## Vector coverage
@@ -307,9 +277,15 @@ the per-task LLM router entirely (unlike the analysis callers converted in the
 `route-analysis-callers-by-task` change).
 **Where:** `exploit_runner/script_executor.py` (the `OLLAMA_URL` generate call
 and the two `LLM_URL` `/ollama/chat` calls at ~:857 and ~:1086).
-**Done when:** script_executor routes through llm_query (`OLLAMA_BASE_URL`) with
-`task="exploit_gen"` and no forced env model, the way web_payload_generator now
-does, OR is confirmed dead and removed.
+**Update 2026-09-21:** mostly done. Two generation paths now POST to `LLM_URL`
+(llm_query) with `"task": "exploit_gen"` — script_executor.py:1015 and :1256. ONE
+call site remains on raw ollama: `txt_to_exploit()` (lines 336-426) posts to
+`{OLLAMA_URL}/api/generate` at line 403, and it is exploit-code generation too
+("Generate an executable exploit from a .txt description using LLM"), so on this
+deployment it still 404s.
+**Done when:** `txt_to_exploit` routes through llm_query with `task="exploit_gen"`
+and no forced env model, the way the other two paths already do, OR is confirmed
+dead and removed.
 **Enforced by:** not enforced
 
 ## Access reconnection
@@ -394,8 +370,15 @@ PAYLOAD=cmd/unix/pingback_reverse LHOST=172.18.0.15 (a container IP the target
 cannot reach through the SOCKS proxy) — doomed. A proxied target reaches nothing
 by reverse unless a node relay/callback host is set.
 **Where:** exploit_runner._next_correction no_session branch (flips connect_style).
-**Done when:** on no_session with no reachable callback host, the correction tries
-an alternate BIND payload instead of a reverse payload to an unreachable LHOST.
+**Update 2026-09-21:** the dangerous half is fixed — `_next_correction` now forces
+`connect_style="bind"` when the dispatch is proxied and no callback_host is set,
+instead of flipping to a reverse payload aimed at an unroutable container LHOST.
+What remains is the word ALTERNATE: `_pick_payload` is deterministic, so forcing
+bind re-picks the SAME payload that just failed, making the correction a no-op
+retry. (Note it now interacts with the bind-payload policy: a forced bind still
+requires manual approval, which an already operator-approved exploit satisfies.)
+**Done when:** the correction tries a DIFFERENT bind payload than the one that
+failed — e.g. by excluding the last-tried payload from the candidate list.
 **Enforced by:** not enforced
 
 ### Scope writers create NULL-engagement scope_targets rows
@@ -434,25 +417,6 @@ credential-brute recommendations (scanner hydra/credential-check/brutus) for ope
 services with no held credential, through the SAME scope-gated + MAX_CONCURRENT_SCANS
 bounded path as every other dispatcher (fail-closed; no private concurrency number).
 **Enforced by:** not enforced
-
-### agent_sessions status CHECK constraint drifted on the live DB
-**Found:** 2026-09-17
-**Evidence:** A completed run (msf-sep17-953) was marked 'failed' by a
-CheckViolation: `_finish` (langgraph_engine.py) writes status 'scanning' while a
-scan is still running, but the LIVE constraint was
-`status IN ('active','completed','failed','stopped','stalled','awaiting_approval')`
-— missing 'scanning'. db_init IS correct (create_agent_tables.sql:12 and
-setup_alldb.sql:1501 both include 'scanning'), so this is drift: the live
-constraint predates 'scanning' being added and scripts/ensure_db_schema.sh did
-not repair it (it adds tables/columns but does not reconcile CHECK constraints).
-Fixed the live DB by hand (DROP + ADD with 'scanning').
-**Where:** scripts/ensure_db_schema.sh drift repair — it does not detect/repair a
-CHECK constraint that differs from db_init.
-**Done when:** ensure_db_schema reconciles CHECK constraints (at least
-agent_sessions_status_check) with db_init, so a drifted enum constraint is
-repaired the way a missing column is.
-**Enforced by:** tests/test_scan_status_reconcile.py::test_agent_sessions_status_check_allows_scanning
-(pins the db_init DDL; the live-DB repair itself is not test-enforced).
 
 ## ZAP authenticated spider does not traverse the logged-in area
 - **Found:** 2026-09-19, proving the default-cred -> Auth Profile -> authenticated scan chain on demo.testfire.net.
