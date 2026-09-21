@@ -43,7 +43,8 @@ import sys
 import pytest
 from conftest import FIXTURE_HOST  # shared lab constant (see tests/conftest.py)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _ast_assert import calls, call_kwarg, defines, function_source  # noqa: E402
+from _ast_assert import (calls, call_kwarg, calls_with, decorated_routes,  # noqa: E402
+                         defines, function_source)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
@@ -566,8 +567,9 @@ def test_the_listener_flags_a_missing_parser_loudly():
 
 def test_there_is_a_way_to_see_the_gaps_and_close_them():
     api = _read(os.path.join(REPO, "app", "rag-api", "api.py"))
-    assert '@app.get("/parsers/missing"' in api, "the gaps are not listable"
-    assert '@app.post("/parsers/draft"' in api, "there is no way to create one"
+    routes = decorated_routes(api)
+    assert ("get", "/parsers/missing") in routes, "the gaps are not listable"
+    assert ("post", "/parsers/draft") in routes, "there is no way to create one"
     fn = api[api.index('@app.get("/parsers/missing"'):]
     fn = fn[:fn.index("@app.post")]
     assert "sample_execution" in fn, (
@@ -918,7 +920,8 @@ def test_every_approved_exploit_runs():
 def test_a_single_id_still_works():
     """A checkpoint written before this took a list must still resume."""
     fn = _func_src(ENGINE, "exploit_exec")
-    assert "decision.get('pending_exploit_id')" in fn
+    assert calls_with(fn, "get", args=["pending_exploit_id"]), \
+        "the decision's pending_exploit_id is not read"
 
 
 def test_omitting_the_ids_approves_everything_queued():
