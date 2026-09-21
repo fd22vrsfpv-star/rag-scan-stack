@@ -27,6 +27,11 @@ import os
 
 import pytest
 
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _ast_assert import (arg_default, call_kwarg, calls, calls_with,  # noqa: E402
+                         field_default, string_constants)
+
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 API = os.path.join(REPO, "app", "rag-api", "api.py")
 CHECK = os.path.join(REPO, "etl", "default_cred_check.py")
@@ -41,7 +46,8 @@ def _src(p):
 def test_ddg_uses_html_endpoint_and_tolerates_202():
     s = _src(API)
     assert "html.duckduckgo.com/html/" in s, "ddg_search must use the html POST endpoint"
-    assert "requests.post(\"https://html.duckduckgo.com/html/\"" in s
+    assert calls_with(s, "post", args=["https://html.duckduckgo.com/html/"]), \
+        "ddg_search must POST to the html endpoint"
     assert "result__a" in s and "result__snippet" in s, "must parse the html result blocks"
     # lite fallback accepts 202 (the anti-bot interstitial) rather than returning nothing
     assert "(200, 202)" in s, "lite fallback must accept 200/202"
@@ -52,7 +58,8 @@ def test_proxy_configurable():
     assert 'web_research.proxy' in s, "the DDG egress proxy must be an operator setting"
     fn = next(n for n in ast.walk(ast.parse(s)) if isinstance(n, ast.FunctionDef) and n.name == "ddg_search")
     body = ast.get_source_segment(s, fn)
-    assert '_get_setting("web_research.proxy"' in body, "ddg_search must read the proxy setting"
+    assert calls_with(body, "_get_setting", args=["web_research.proxy"]), \
+        "ddg_search must read the proxy setting"
 
 
 def test_research_and_websearch_backup():
@@ -61,8 +68,15 @@ def test_research_and_websearch_backup():
     fn = next(n for n in ast.walk(ast.parse(s)) if isinstance(n, ast.FunctionDef) and n.name == "research_default_credentials")
     body = ast.get_source_segment(s, fn)
     assert "ddg_search(" in body, "primary path is DuckDuckGo"
-    assert 'task="web_search"' in body or "task='web_search'" in body, \
+    # The routable backup: "web_search" must be a string CONSTANT in the function
+    # (comments are not in the AST, so prose describing the backup cannot satisfy
+    # this) and it must reach an LLM call as `task=`. The previous substring form
+    # -- `'task="web_search"' in body` -- was satisfied by the COMMENT above the
+    # branch, and would have kept passing if the backup were deleted.
+    assert "web_search" in string_constants(body), \
         "must have the routable LLM-as-web-search backup (task='web_search')"
+    assert call_kwarg(body, "llm_generate", "task"), \
+        "the backup is not routed — llm_generate is called without task="
 
 
 def test_stores_unvalidated_candidates():
@@ -78,8 +92,8 @@ def test_stores_unvalidated_candidates():
 def test_software_research_pulls_default_creds():
     s = _src(API)
     # the software research (_do_ddg_search) also pulls default creds
-    assert "research_default_credentials(product, version)" in s
-    assert "_store_researched_cred_candidates(product, version" in s
+    assert calls(s, "research_default_credentials")
+    assert calls(s, "_store_researched_cred_candidates")
     # on-demand endpoint
     assert '"/software/default-credentials"' in s
 
@@ -87,7 +101,7 @@ def test_software_research_pulls_default_creds():
 def test_check_uses_research():
     s = _src(CHECK)
     assert "def _research_host_default_creds" in s
-    assert "_research_host_default_creds(cur, host, html)" in s, "the check must research this host's app defaults"
+    assert calls(s, "_research_host_default_creds"), "the check must research this host's app defaults"
     assert "/software/default-credentials" in s, "the check calls the research endpoint"
     # researched candidates come before the static set
     assert "researched + candidate_pairs" in s
@@ -118,10 +132,12 @@ def test_ajax_spider_off_by_default_optional():
         if not os.path.exists(p):
             pytest.skip(f"{p} missing")
     zbs = open(zb, encoding="utf-8").read()
-    assert "do_ajax_spider: bool = False" in zbs, "ajax spider must default OFF in the scan"
+    assert arg_default(zbs, "scan_with_playwright_session", "do_ajax_spider") is False, \
+        "ajax spider must default OFF in the scan"
     assert "if do_ajax_spider:" in zbs and "ajaxSpider" in zbs
     pws = open(pw, encoding="utf-8").read()
-    assert "zap_ajax_spider: Optional[bool] = Field(False" in pws, "ScanRequest ajax spider must default False"
+    assert field_default(pws, "ScanRequest", "zap_ajax_spider") is False, \
+        "ScanRequest ajax spider must default False"
     chk = _src(CHECK)
     assert "zap.ajax_spider" in chk and '"zap_ajax_spider"' in chk, \
         "the check must read the optional zap.ajax_spider setting and pass it"
