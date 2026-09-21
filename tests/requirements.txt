@@ -33,3 +33,15 @@ psycopg2-binary>=2.9
 # HTTP clients used by dispatchers and by the live endpoint sweeps.
 httpx>=0.27
 requests>=2.31
+
+# HTML parsing. The scan-recommender image ships it, so tests exercising the
+# URL-fetch/extraction path importorskip on it — without it here, 17 tests
+# report "beautifulsoup4 required" and silently do not run.
+beautifulsoup4>=4.12
+
+# Same class as beautifulsoup4 above: each is a light, pure-Python dep that a
+# service image ships, so its tests importorskip and silently do not run here.
+msgpack>=1.0        # msf_client / exploit_runner RPC
+feedparser>=6.0     # news ingestion parser
+pyflakes>=3.0       # the lint-gate test shells out to it
+pytest-asyncio>=0.23  # async tests ERROR->skip without the plugin

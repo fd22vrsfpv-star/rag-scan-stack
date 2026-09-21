@@ -17,6 +17,8 @@ import types
 
 import pytest
 
+from conftest import load_service_module  # see tests/conftest.py
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scan_recommender"))
 
 yaml = pytest.importorskip("yaml", reason="PyYAML required")
@@ -52,11 +54,11 @@ def sr():
         "TOOL_KB_PATH",
         os.path.join(os.path.dirname(__file__), "..", "knowledge", "service_tools.yaml"),
     )
-    import importlib.util
+    # load_service_module evicts colliding sibling names (both this service and
+    # autogen_agents ship a `log_manager`) so the module's bare imports resolve
+    # to ITS directory even when an earlier test cached the other copy.
     try:
-        spec = importlib.util.spec_from_file_location("scan_recommender_wt", SR_FILE)
-        m = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(m)
+        m = load_service_module(SR_FILE, "scan_recommender_wt", SR_DIR)
     except Exception as e:                                    # pragma: no cover
         pytest.skip(f"scan_recommender not importable: {e}")
     return m
