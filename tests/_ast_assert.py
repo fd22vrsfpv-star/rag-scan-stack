@@ -170,6 +170,146 @@ def const_elements(src: Source, name: str) -> Optional[set]:
     return None
 
 
+def calls_with(src: Source, callee: str, *, args=(), kwargs=None) -> bool:
+    """True if some call to `callee` passes these constant arguments.
+
+    `args` is matched against the leading positional arguments; `kwargs` against
+    keyword arguments by name and value. Both are subsets — extra arguments are
+    fine, because a guard should describe what must be passed, not freeze the
+    whole signature.
+
+        calls_with(src, "_get_setting", args=["web_research.proxy"])
+        calls_with(src, "llm_query", kwargs={"task": "web_search"})
+
+    Replaces `'_get_setting("web_research.proxy"' in src`, which breaks the
+    moment someone wraps the line or swaps the quote style.
+    """
+    kwargs = kwargs or {}
+    want_args = list(args)
+    for name, node in _calls(_tree(src)):
+        if not (name == callee or name.endswith("." + callee)):
+            continue
+        got = [a.value if isinstance(a, ast.Constant) else _MISSING for a in node.args]
+        if len(got) < len(want_args) or any(g != w for g, w in zip(got, want_args)):
+            continue
+        ok = True
+        for k, v in kwargs.items():
+            kw = next((x for x in node.keywords if x.arg == k), None)
+            if kw is None or not isinstance(kw.value, ast.Constant) or kw.value.value != v:
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+
+def arg_default(src: Source, func: str, arg: str):
+    """Default value of a FUNCTION parameter, or `_MISSING`.
+
+    `field_default` covers annotated attributes; this covers
+    `def scan(..., do_ajax_spider: bool = False)`. Same reason: a guard about a
+    DEFAULT should not also pin the parameter's type annotation.
+    """
+    for n in ast.walk(_tree(src)):
+        if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) or n.name != func:
+            continue
+        a = n.args
+        positional = list(a.posonlyargs) + list(a.args)
+        defaults = list(a.defaults)
+        # defaults align to the TAIL of the positional list
+        offset = len(positional) - len(defaults)
+        for i, prm in enumerate(positional):
+            if prm.arg == arg and i >= offset:
+                d = defaults[i - offset]
+                return d.value if isinstance(d, ast.Constant) else _MISSING
+        for prm, d in zip(a.kwonlyargs, a.kw_defaults):
+            if prm.arg == arg and d is not None:
+                return d.value if isinstance(d, ast.Constant) else _MISSING
+    return _MISSING
+
+
+def decorated_routes(src: Source) -> set:
+    """Every ``(method, path)`` declared by an @app.<verb>("/path") decorator.
+
+    Replaces `assert '@app.get("/parsers/missing"' in src`, which is satisfied by
+    the string appearing in a comment and breaks on a reformat or a change of
+    decorator object (`@app` vs `@router`). The decorator OBJECT is ignored on
+    purpose — what matters is that the route exists, not what it is registered on.
+    """
+    out = set()
+    for n in ast.walk(_tree(src)):
+        if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for d in n.decorator_list:
+            if not isinstance(d, ast.Call) or not isinstance(d.func, ast.Attribute):
+                continue
+            verb = d.func.attr.lower()
+            if verb not in ("get", "post", "put", "patch", "delete", "head", "options"):
+                continue
+            for a in d.args:
+                if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                    out.add((verb, a.value))
+                    break
+    return out
+
+
+def field_default(src: Source, container: str, field: str):
+    """The literal default of an annotated attribute, or `_MISSING`.
+
+    Handles both plain `x: bool = False` and pydantic `x: Optional[bool] =
+    Field(False, ...)`. `container` is the class (or function) the attribute
+    lives in; pass None for module level.
+
+    Use it for "this must default OFF" style guards. The substring form
+    (`"do_ajax_spider: bool = False" in src`) pins the annotation's exact
+    spelling, so widening the type to Optional[bool] breaks a test that was only
+    ever about the default.
+    """
+    tree = _tree(src)
+    scope = None
+    if container:
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    and n.name == container:
+                scope = n
+                break
+        if scope is None:
+            return _MISSING
+    else:
+        scope = tree
+    for n in ast.walk(scope):
+        if not isinstance(n, ast.AnnAssign) or n.value is None:
+            continue
+        if not (isinstance(n.target, ast.Name) and n.target.id == field):
+            continue
+        v = n.value
+        # pydantic Field(default, ...) — the default is the first positional arg,
+        # or the `default=` keyword
+        if isinstance(v, ast.Call):
+            fname = _callee_name(v.func) or ""
+            if fname.endswith("Field"):
+                if v.args and isinstance(v.args[0], ast.Constant):
+                    return v.args[0].value
+                for kw in v.keywords:
+                    if kw.arg == "default" and isinstance(kw.value, ast.Constant):
+                        return kw.value.value
+                return _MISSING
+        if isinstance(v, ast.Constant):
+            return v.value
+    return _MISSING
+
+
+class _Missing:
+    """Distinct from None, which is a legitimate default."""
+    def __repr__(self):
+        return "<no default found>"
+    def __bool__(self):
+        return False
+
+
+_MISSING = _Missing()
+
+
 def string_constants(src: Source) -> set:
     """Every string literal in the module — docstrings and comments excluded for
     comments (comments are not in the AST at all). Use when a test must prove a

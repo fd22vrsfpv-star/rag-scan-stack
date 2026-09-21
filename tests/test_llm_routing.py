@@ -24,6 +24,11 @@ import sys
 
 import pytest
 
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _ast_assert import (_MISSING, calls_with, decorated_routes,  # noqa: E402
+                         defines, field_default)
+
 REPO = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, REPO)
 
@@ -238,7 +243,8 @@ def test_llm_query_declares_task_and_failover():
     src = io.open(os.path.join(REPO, "llm_query", "llm_query.py"),
                   encoding="utf-8").read()
     ast.parse(src)
-    assert "task: Optional[str]" in src, "GenerateRequest has no task field"
+    assert field_default(src, "GenerateRequest", "task") is not _MISSING, \
+        "GenerateRequest has no task field"
     assert "_generate_routed" in src, "no 429 failover path"
     assert "_route_for" in src, "no route resolution"
     # The failover must trigger on 429 specifically, not on any error: retrying
@@ -684,7 +690,9 @@ def test_provider_test_endpoint_reports_each_stage():
     src = io.open(os.path.join(REPO, "dashboard", "bff", "routers", "settings.py"),
                   encoding="utf-8").read()
     ast.parse(src)
-    assert '/api/settings/llm/providers/{provider_id}/test' in src
+    assert any(pth == "/api/settings/llm/providers/{provider_id}/test"
+               for _m, pth in decorated_routes(src)), \
+        "the per-provider test route is gone"
     for stage in ('"endpoint"', '"auth"', '"deployments"', '"generate"'):
         assert stage in src, f"the check does not report {stage}"
     # The end-to-end leg is the only one that proves usability, and it must
@@ -704,7 +712,8 @@ def test_provider_test_never_takes_a_key_from_the_browser():
                   encoding="utf-8").read()
     start = src.index('async def test_llm_provider(')
     body = src[start:src.index("@router.get", start)]
-    assert "def test_llm_provider(provider_id: str)" in body, (
+    assert defines(body, "test_llm_provider"), (
         "the test endpoint takes a body — it must take only the provider id"
     )
-    assert 'prov.get("api_key")' in body
+    assert calls_with(body, "get", args=["api_key"]), \
+        "the provider test never reads the configured api_key"
