@@ -44,6 +44,8 @@ import pytest
 from conftest import BFF  # shared service endpoints (see tests/conftest.py)
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _ast_assert import call_order, calls, ref_order  # noqa: E402
 
 
 # ── source-only readers (no imports, so this runs anywhere) ──────────────────
@@ -726,8 +728,10 @@ def test_wstg_conf06_probe_is_scope_gated_before_traffic():
     src = _engine_src()
     fn = src[src.index("def _wstg_conf06_webshell_tests("):]
     fn = fn[:fn.index("\ndef ", 1)]
-    assert "_host_in_scope(" in fn, "WSTG-CONF-06 probe must scope-check the host"
-    assert fn.index("_host_in_scope(") < fn.index("_detect_webdav("), (
+    assert calls(fn, "_host_in_scope"), "WSTG-CONF-06 probe must scope-check the host"
+    # asked of the CALLS: an index() comparison is also satisfied by the two names
+    # appearing in a docstring in that order.
+    assert call_order(fn, "_host_in_scope", "_detect_webdav"), (
         "scope check must precede the OPTIONS probe (authorisation before traffic)")
     # and the scope helper fails closed
     hs = src[src.index("def _host_in_scope("):]
@@ -749,16 +753,52 @@ def test_webshell_ref_dispatches_as_webshell_with_valid_type():
         "exploit_type must satisfy the pending_exploits CHECK constraint")
 
 
+def _webshell_branch(src):
+    """The `source == "webshell"` branch body, as ast statements."""
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.If):
+            continue
+        t = node.test
+        if (isinstance(t, ast.Compare) and isinstance(t.left, ast.Name)
+                and t.left.id == "source"
+                and any(isinstance(c, ast.Constant) and c.value == "webshell"
+                        for c in t.comparators)):
+            return node.body
+    return None
+
+
+def _branch_calls(body, name):
+    return any(
+        isinstance(n, ast.Call)
+        and (getattr(n.func, "id", None) or getattr(n.func, "attr", None)) == name
+        for stmt in body for n in ast.walk(stmt))
+
+
+def _branch_call_order(body, first, second):
+    pos = {}
+    for stmt in body:
+        for n in ast.walk(stmt):
+            if not isinstance(n, ast.Call):
+                continue
+            nm = getattr(n.func, "id", None) or getattr(n.func, "attr", None)
+            if nm in (first, second) and nm not in pos:
+                pos[nm] = (n.lineno, n.col_offset)
+    return first in pos and second in pos and pos[first] < pos[second]
+
+
 def test_exploit_runner_webshell_branch_scope_gated():
     """exploit-runner's source=webshell branch sends a PUT, so it MUST refuse an
     out-of-scope target BEFORE deploying. Sabotage: drop the scope refusal, or
     call _deploy_webshell before it → fails."""
     er = (REPO / "exploit_runner" / "exploit_runner.py").read_text(encoding="utf-8")
-    assert 'elif source == "webshell":' in er, "webshell dispatch branch missing"
-    branch = er[er.index('elif source == "webshell":'):]
-    branch = branch[:branch.index("\n        else:")]
-    assert "_exploit_scope_refusal(" in branch, "webshell branch must scope-check"
-    assert branch.index("_exploit_scope_refusal(") < branch.index("_deploy_webshell("), (
+    branch = _webshell_branch(er)
+    assert branch is not None, "webshell dispatch branch missing"
+    assert _branch_calls(branch, "_exploit_scope_refusal"), "webshell branch must scope-check"
+    # Ordering asked of the CALLS inside that branch. The previous version sliced
+    # the `elif` body out of the file by text and compared substring offsets --
+    # which a docstring naming both would satisfy, and which would silently
+    # measure the wrong region if the "\n        else:" spelling ever changed.
+    assert _branch_call_order(branch, "_exploit_scope_refusal", "_deploy_webshell"), (
         "scope refusal must precede the webshell PUT")
     # and it proves EXECUTION, not just upload
     dep = er[er.index("def _deploy_webshell_one("):]
@@ -784,7 +824,10 @@ def test_exec_nodes_approve_before_execute():
         assert "_mark_approved(" in fn, (
             f"{fn_name} calls execute_approved_exploit without _mark_approved — "
             "the pending_exploit stays 'pending' and execution is refused")
-        assert fn.index("_mark_approved(") < fn.index(call), (
+        # ref_order, not call_order: the exploit runner is handed to a wrapper
+        # (`_tool(scan_tools.execute_approved_exploit, pid)`) rather than called
+        # in place, so there is no Call node for it to find.
+        assert ref_order(fn, "_mark_approved", "execute_approved_exploit"), (
             f"{fn_name} must mark approved BEFORE executing")
 
 
