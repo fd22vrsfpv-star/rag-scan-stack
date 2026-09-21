@@ -226,25 +226,6 @@ or the three files are deleted. Either is fine; the current state is neither.
 **Enforced by:** not enforced
 
 
-### The BFF's `/api/health` hangs while every other `/api` route answers
-**Found:** 2026-09-21
-**Evidence:** Against the running stack, `curl -sk --max-time 4
-https://localhost:3002/api/health` returns `000` (client timeout, no response),
-while `/api/engagements` → 200 in 0.38s, `/api/assets` → 200 in 0.70s and
-`/api/scans` → 200 in 0.80s. `https://localhost:3002/health` (no `/api`) → 200.
-So the service is healthy and only this one proxied path hangs.
-**Where:** `dashboard/bff` — the `/api/health` route, or whatever upstream it
-proxies to. Not investigated further; found while checking service reachability
-for the test-endpoint migration.
-**Why it matters:** a health path that hangs rather than failing fast is the
-worst shape for one — a caller with no timeout waits forever, and any monitor
-pointed at it reports "no answer" rather than a status. It also makes `/api/health`
-useless as the reachability probe a test would naturally reach for.
-**Done when:** `/api/health` returns a status promptly (200 or an honest error),
-or the route is removed so callers use `/health`.
-**Enforced by:** not enforced
-
-
 ### One asset carries no engagement
 **Found:** 2026-09-11
 **Evidence:** After the attribution backfill, 136 of 137 assets resolved.
@@ -541,15 +522,3 @@ repaired the way a missing column is.
 - **Likely fix:** reduce the active-scan footprint — scope the active scan to the authenticated area (/bank) rather than the whole tree, lower thread_per_host, cap max_scan_duration, and/or disable the ajax spider during the authenticated active scan; or give ZAP exclusive memory headroom. The authenticated crawl/seeding (the capability built this session) is unaffected and verified.
 - **Enforced by:** not enforced (live-scan/infra behavior).
 
-## Version-shape test disagrees with update-version.sh format
-- **Found:** 2026-09-19, during a routine version bump.
-- **Evidence:** `tests/test_build_version_sync.py::test_version_has_the_documented_shape`
-  uses `VERSION_RE = ^\d{4}\.\d{2}\.\d{2}-\d+$` (YYYY.MM.DD-N, dash), but the mandated
-  `scripts/update-version.sh <YYYY.MM.DD.HHMM>` writes dot-form (e.g. `2026.09.19.1947`).
-  The pre-existing committed version `2026.09.19.1947` already fails this regex, so the
-  test is red at baseline independent of any change.
-- **Where:** `tests/test_build_version_sync.py:34,73` vs `scripts/update-version.sh`.
-- **Done when:** the regex and the update script agree on ONE format (and
-  `dashboard/frontend/.../constants.test.ts` matches), suite green on a fresh bump.
-- **Enforced by:** `tests/test_build_version_sync.py::test_version_has_the_documented_shape`
-  (currently failing at baseline).
