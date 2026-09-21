@@ -115,6 +115,39 @@ def call_order(src: Source, first: str, second: str, *, within: Optional[str] = 
     return pos[first] < pos[second]
 
 
+def ref_order(src: Source, first: str, second: str, *, within: Optional[str] = None) -> bool:
+    """Like call_order, but counts a function PASSED BY REFERENCE as a use.
+
+    `_tool(scan_tools.execute_approved_exploit, pid)` never creates a Call node
+    for execute_approved_exploit — it hands the function object to a wrapper. A
+    call_order() check for it therefore answers False no matter where it sits,
+    which reads as "the ordering is violated" when the code is correct.
+
+    Use this for dispatch tables, `_tool(...)`-style wrappers and callbacks; use
+    call_order when the thing really is invoked in place.
+    """
+    scope = _scope(_tree(src), within)
+    pos = {}
+    for n in ast.walk(scope):
+        name = None
+        if isinstance(n, ast.Call):
+            name = _callee_name(n.func)
+        elif isinstance(n, ast.Attribute):
+            name = n.attr
+        elif isinstance(n, ast.Name):
+            name = n.id
+        if not name:
+            continue
+        for want in (first, second):
+            if name == want or name.endswith("." + want):
+                at = (n.lineno, n.col_offset)
+                if want not in pos or at < pos[want]:
+                    pos[want] = at
+    if first not in pos or second not in pos:
+        return False
+    return pos[first] < pos[second]
+
+
 def const_elements(src: Source, name: str) -> Optional[set]:
     """Elements of a module-level set/list/tuple constant, or the KEYS of a dict
     constant. None when the name is not assigned at module level.
