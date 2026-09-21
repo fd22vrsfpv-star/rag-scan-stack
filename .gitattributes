@@ -4,3 +4,9 @@
 *.yaml text eol=lf
 *.sql text eol=lf
 *.md text eol=lf
+
+# Captured tool output used as test fixtures is byte-exact evidence, not source.
+# HTTP headers really are CRLF-delimited, and etl/tool_output_parsers.py handles
+# that explicitly (raw.rstrip("\r")). Normalising these to LF would make the
+# fixture stop being the real captured bytes AND stop exercising that path.
+tests/fixtures/*.txt -text
