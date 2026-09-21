@@ -20,12 +20,16 @@ direction. Every group in this deployment happened to be single-severity, which
 is why nothing had ever shown it. It now ranks by public.severity_rank(), the
 one scale the stack shares.
 """
+import ast
 import os
+import sys
 import subprocess
 
 import pytest
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _ast_assert import calls, function_source  # noqa: E402
 DDL = ("db_init/ensure_all_tables.sql", "db_init/setup_alldb.sql")
 
 
@@ -93,10 +97,28 @@ def test_the_export_reader_tolerates_a_view():
     export category was a 500 waiting to happen.
     """
     src = open(os.path.join(REPO, "app", "rag-api", "api.py"), encoding="utf-8").read()
-    assert "_export_order_column" in src, \
+    fn = function_source(src, "_export_table_rows")
+    assert fn, "_export_table_rows not found — this guard would pass vacuously"
+    assert calls(fn, "_export_order_column"), \
         "the export reader no longer resolves its ORDER BY column"
-    assert 'f"SELECT * FROM {table} {order_sql} LIMIT %s"' in src, \
-        "the export reader hard-codes an ORDER BY again"
+    # The ORDER BY must come from the resolved column, so a view (no created_at)
+    # yields an empty clause instead of a 500. Asked structurally: the executed
+    # query interpolates order_sql, and no literal ORDER BY is baked in. Pinning
+    # the exact f-string meant adding the engagement WHERE clause -- an unrelated,
+    # correct change -- read as "hard-codes an ORDER BY again".
+    tree = ast.parse(fn.lstrip())
+    interpolated = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.JoinedStr):
+            for v in node.values:
+                if isinstance(v, ast.FormattedValue) and isinstance(v.value, ast.Name):
+                    interpolated.add(v.value.id)
+    assert "order_sql" in interpolated, \
+        "the export query must interpolate the resolved ORDER BY, not omit it"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            assert "ORDER BY created_at" not in node.value, \
+                "the export reader hard-codes an ORDER BY again — a view has no created_at"
 
 
 # ── executed ────────────────────────────────────────────────────────────────
