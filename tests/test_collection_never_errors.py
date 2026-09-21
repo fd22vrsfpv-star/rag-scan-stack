@@ -38,7 +38,7 @@ treating an import error as a missing dependency.
 
 SABOTAGE PROOF
 --------------
-Add a bare `import msgpack` at the top of any test module and this fails by
+Add a bare `import <undeclared package>` at the top of any test module and this fails by
 name. Remove the `importorskip` from `tests/test_msf_token_refresh.py` and it
 fails the same way.
 """
@@ -173,20 +173,25 @@ def test_the_guard_would_notice_a_bare_import(tmp_path):
     allowed = set(sys.stdlib_module_names) | _declared() | _repo_modules()
 
     bare = tmp_path / "test_bare.py"
-    bare.write_text("import msgpack\n\n\ndef test_x():\n    assert msgpack\n")
-    assert _unguarded(str(bare), allowed) == {"msgpack"}
+    # A sentinel name, never a real package: this example must stay undeclared.
+    # It used to be `msgpack`, which quietly stopped being a valid example the
+    # day msgpack was added to tests/requirements.txt -- the sabotage proof then
+    # asserted nothing.
+    bare.write_text("import definitely_not_a_real_module_xyz\n\n\n"
+                    "def test_x():\n    assert definitely_not_a_real_module_xyz\n")
+    assert _unguarded(str(bare), allowed) == {"definitely_not_a_real_module_xyz"}
 
     guarded = tmp_path / "test_guarded.py"
     guarded.write_text('import pytest\n'
-                       'pytest.importorskip("msgpack")\n'
-                       'import msgpack\n\n\ndef test_x():\n    assert msgpack\n')
+                       'pytest.importorskip("definitely_not_a_real_module_xyz")\n'
+                       'import definitely_not_a_real_module_xyz\n\n\ndef test_x():\n    assert definitely_not_a_real_module_xyz\n')
     assert _unguarded(str(guarded), allowed) == set()
 
     # The shape that fooled the first version of this analyser: the guard is
     # still there in the TEXT, commented out, and does nothing.
     commented = tmp_path / "test_commented.py"
     commented.write_text('import pytest\n'
-                         '# pytest.importorskip("msgpack")\n'
-                         'import msgpack\n\n\ndef test_x():\n    assert msgpack\n')
-    assert _unguarded(str(commented), allowed) == {"msgpack"}, (
+                         '# pytest.importorskip("definitely_not_a_real_module_xyz")\n'
+                         'import definitely_not_a_real_module_xyz\n\n\ndef test_x():\n    assert definitely_not_a_real_module_xyz\n')
+    assert _unguarded(str(commented), allowed) == {"definitely_not_a_real_module_xyz"}, (
         "a commented-out importorskip is being counted as a guard")

@@ -65,6 +65,50 @@ BFF = os.environ.get("TEST_BFF", "https://localhost:3002").rstrip("/")
 BFF_API = f"{BFF}/api"
 
 
+def load_service_module(file_path, module_name, service_dir):
+    """Load a service module by path, with its SIBLING imports resolving correctly.
+
+    The note at the top of this file explains why service directories are not on
+    a shared sys.path. Loading by explicit file path avoids that — but only for
+    the target module. `scan_recommender.py` does a BARE `from log_manager import
+    ... LOGS_UI_HTML`, and both scan_recommender/ and autogen_agents/ ship a
+    `log_manager`. If an earlier test in the session already imported the
+    autogen_agents one, it sits in sys.modules and the bare import gets THAT
+    copy — which has no LOGS_UI_HTML. The sys.path insert is powerless, because
+    a cached module is never re-resolved.
+
+    The symptom is a skip, not a failure: the loader reports "scan_recommender
+    not importable in this env" and 75 real tests quietly do not run, while the
+    same files pass 106/106 in isolation. An environment-shaped message for a
+    test-ordering bug is the worst kind, because it looks like nothing is wrong.
+
+    So: evict the colliding names, load, then put sys.modules back exactly as it
+    was — this fixture must not become the thing that breaks somebody else.
+    """
+    import importlib.util
+
+    siblings = {f[:-3] for f in os.listdir(service_dir) if f.endswith(".py")}
+    saved = {n: sys.modules.pop(n) for n in list(siblings) if n in sys.modules}
+    # PRESENCE on sys.path is not enough — POSITION decides. These test files
+    # already insert their service dir at import time, but any test that later
+    # does sys.path.insert(0, ".../autogen_agents") now sits in front of it, and
+    # the bare `from log_manager import ...` resolves to the wrong copy. So put
+    # this service dir at the front for the duration, and restore the path
+    # exactly afterwards.
+    saved_path = sys.path[:]
+    sys.path.insert(0, service_dir)
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, file_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.path[:] = saved_path
+        for n in list(siblings):
+            sys.modules.pop(n, None)
+        sys.modules.update(saved)
+
+
 def _render_loot(template: str) -> str:
     """Fill the fixture's {{PLACEHOLDERS}} with secret-SHAPED synthetic values.
 
