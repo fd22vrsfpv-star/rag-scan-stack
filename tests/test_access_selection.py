@@ -43,6 +43,8 @@ import pytest
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _ast_assert import call_order, calls, defines  # noqa: E402
 
 ax = pytest.importorskip("etl.access", reason="etl/access.py not importable")
 ENGINE = os.path.join(REPO, "autogen_agents", "langgraph_engine.py")
@@ -300,12 +302,13 @@ def test_the_checklist_runs_through_one_shell():
     """Running it through every shell would be slow, noisy on the target, and
     would produce several partial answers to one question."""
     fn = _func_src(ENGINE, "_enumerate_through_best_access")
-    assert "ax.best_for(target)" in fn, "it no longer selects a single access"
-    assert "ax.refresh(target)" in fn, (
+    assert calls(fn, "best_for"), "it no longer selects a single access"
+    assert calls(fn, "refresh"), (
         "it selects without measuring first, so the ranking is whatever was "
         "recorded last time — possibly a shell that has since died")
-    assert fn.index("refresh") < fn.index("best_for"), (
-        "it selects before measuring")
+    # asked of the CALLS, not of substring positions: `fn.index("refresh")` also
+    # matches the word in a comment or docstring, so prose could satisfy it.
+    assert call_order(fn, "refresh", "best_for"), "it selects before measuring"
 
 
 def test_it_does_not_run_mutating_steps():
@@ -343,10 +346,10 @@ def test_commands_prefer_the_kali_container():
     access.
     """
     src = _read(os.path.join(REPO, "etl", "access.py"))
-    assert "def _run_via_listener" in src
+    assert defines(src, "_run_via_listener")
     fn = _func_src(os.path.join(REPO, "etl", "access.py"), "run")
-    assert "_run_via_listener(access, command)" in fn
-    assert fn.index("_run_via_listener") < fn.index("_have_local_tool"), (
+    assert calls(fn, "_run_via_listener")
+    assert call_order(fn, "_run_via_listener", "_have_local_tool"), (
         "it runs locally first and only asks the listener as a fallback, which "
         "is backwards")
 
@@ -356,7 +359,7 @@ def test_a_missing_local_tool_is_not_a_dead_shell():
     recording the first as the second is the same mistake as an unparsed run
     counted as fruitless."""
     fn = _func_src(os.path.join(REPO, "etl", "access.py"), "run")
-    assert "_have_local_tool(kind)" in fn
+    assert calls(fn, "_have_local_tool")
     assert "not probed" in fn, (
         "the error does not distinguish 'no tool here' from 'no answer'")
 
