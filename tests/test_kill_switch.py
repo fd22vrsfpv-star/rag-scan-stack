@@ -16,6 +16,7 @@ import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 import sys
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 sys.path.insert(0, str(REPO))
 
 try:
@@ -86,7 +87,7 @@ def test_over_budget_empties_the_dispatch_scope():
 
 
 # ── live control endpoints (skip without a stack) ────────────────────────────
-BASE = os.environ.get("CTRL_URL", "https://localhost:8000")
+BASE = os.environ.get("CTRL_URL") or RAG_API
 
 
 def _key():

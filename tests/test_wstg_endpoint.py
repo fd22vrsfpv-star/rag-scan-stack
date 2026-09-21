@@ -4,17 +4,18 @@ The endpoint is the single source of truth the agent tool and the surface-test
 phase both call. If its query against exploit_chunks (doc_kind='wstg') or the
 map load breaks, both silently lose WSTG guidance. Skips without a stack.
 
-    WSTG_URL=https://localhost:8000 pytest tests/test_wstg_endpoint.py
+    TEST_RAG_API=https://localhost:8000 pytest tests/test_wstg_endpoint.py
 """
 import os
 import re
 import pathlib
 
 import pytest
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 
 requests = pytest.importorskip("requests")
 
-BASE = os.environ.get("WSTG_URL", "https://localhost:8000")
+BASE = os.environ.get("WSTG_URL") or RAG_API
 
 
 def _key():

@@ -35,6 +35,7 @@ import urllib.request
 import ssl
 
 import pytest
+from conftest import BFF_API  # shared service endpoints (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -69,7 +70,7 @@ def _get(query):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    url = f"https://localhost:3002/api/findings?ip={TEST_IP}&{query}"
+    url = f"{BFF_API}/findings?ip={TEST_IP}&{query}"
     req = urllib.request.Request(url)
     key = _api_key()
     if key:
@@ -189,7 +190,7 @@ def test_collapse_keeps_ungroupable_rows_distinct(seeded):
     ctx.verify_mode = ssl.CERT_NONE
 
     def fetch(query):
-        req = urllib.request.Request(f"https://localhost:3002/api/findings?{query}")
+        req = urllib.request.Request(f"{BFF_API}/findings?{query}")
         key = _api_key()
         if key:
             req.add_header("x-api-key", key)
@@ -225,6 +226,9 @@ def _sarif(extra=""):
         "ctx = ssl.create_default_context()\n"
         "ctx.check_hostname = False\n"
         "ctx.verify_mode = ssl.CERT_NONE\n"
+        # container-internal: this script runs via `docker exec rag-api`, where
+        # localhost is rag-api itself. NOT the host-side RAG_API constant — an
+        # override pointing at another stack must not be injected here.
         f"req = urllib.request.Request('https://localhost:8000/export/sarif?source=zap&limit=5000&{extra}')\n"
         "req.add_header('x-api-key', os.environ.get('API_KEY',''))\n"
         "print(urllib.request.urlopen(req, timeout=90, context=ctx).read().decode())\n"
@@ -323,7 +327,7 @@ def _get_global(query):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    req = urllib.request.Request(f"https://localhost:3002/api/findings?{query}")
+    req = urllib.request.Request(f"{BFF_API}/findings?{query}")
     key = _api_key()
     if key:
         req.add_header("x-api-key", key)
@@ -447,6 +451,7 @@ def test_exports_still_see_the_crawl_surface(seeded):
         "ctx = ssl.create_default_context()\n"
         "ctx.check_hostname = False\n"
         "ctx.verify_mode = ssl.CERT_NONE\n"
+        # container-internal (see _sarif above)
         "r = urllib.request.Request('https://localhost:8000/export/har?limit=5000')\n"
         "r.add_header('x-api-key', os.environ.get('API_KEY',''))\n"
         "d = json.load(urllib.request.urlopen(r, timeout=120, context=ctx))\n"

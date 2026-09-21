@@ -8,17 +8,18 @@ endpoint end-to-end (embed -> ivfflat kNN with probes raised) and proves a
 relevant capability/flow document actually comes back ranked. Skips without a
 stack when the rag-api / embedder / DB is not reachable.
 
-    RAG_API_URL=https://localhost:8000 pytest tests/test_rag_knowledge_search.py
+    TEST_RAG_API=https://localhost:8000 pytest tests/test_rag_knowledge_search.py
 """
 import os
 import re
 import pathlib
 
 import pytest
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 
 requests = pytest.importorskip("requests")
 
-BASE = os.environ.get("RAG_API_URL", "https://localhost:8000")
+BASE = os.environ.get("RAG_API_URL") or RAG_API
 
 
 def _key():

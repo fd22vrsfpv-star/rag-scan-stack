@@ -3,7 +3,7 @@
 Run on demand:
 
     pytest tests/test_scope_purge.py -v
-    BFF_BASE=https://localhost:3002/api pytest tests/test_scope_purge.py
+    TEST_BFF=https://localhost:3002 pytest tests/test_scope_purge.py
 
 WHY THIS EXISTS
 ---------------
@@ -16,10 +16,11 @@ Skips cleanly without the stack.
 import os
 
 import pytest
+from conftest import BFF_API  # shared service endpoints (see tests/conftest.py)
 
 requests = pytest.importorskip("requests")
 
-BASE = os.environ.get("BFF_BASE", "https://localhost:3002/api")
+BASE = os.environ.get("BFF_BASE") or BFF_API
 
 
 def _post(path, params=None):

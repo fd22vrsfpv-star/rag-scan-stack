@@ -6,16 +6,17 @@ That join is exactly the kind that passes ast/import checks and 500s only when a
 column is wrong, so this EXECUTES it against the live stack and pins the response
 shape. Skips cleanly without a stack.
 
-    COV_URL=https://localhost:8000 pytest tests/test_coverage.py
+    TEST_RAG_API=https://localhost:8000 pytest tests/test_coverage.py
 """
 import os
 import re
 import pathlib
 
 import pytest
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 
 requests = pytest.importorskip("requests")
-BASE = os.environ.get("COV_URL", "https://localhost:8000")
+BASE = os.environ.get("COV_URL") or RAG_API
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
 

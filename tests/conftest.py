@@ -44,6 +44,27 @@ DOC_PEERS = ("192.0.2.41", "198.51.100.23", "203.0.113.9")
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
+# ---- Shared service endpoints ----
+#
+# Nearly every live-stack test talks to one of two services: rag-api (TLS,
+# :8000) and the dashboard BFF (:3002, its API under /api). They were reached
+# through THIRTEEN different environment variables — RAG_API_URL, RAG_API,
+# WSTG_URL, ST_URL, SCANS_URL, LAT_URL, CTRL_URL, CRED_URL, COV_URL, AGENT_API,
+# BFF_BASE, BFF_URL, SMOKE_BASE, RECS_URL — and sixteen further files hardcoded
+# the URL with no override at all. So "run the suite against another stack"
+# required knowing every one of those names, and still missed a third of the
+# files. The literal was never the real problem; the sprawl of names was.
+#
+# ONE variable per service. A file that already documents its own legacy name
+# keeps honouring it FIRST (`os.environ.get("ST_URL") or RAG_API`), so no
+# existing invocation breaks — but the DEFAULT now lives in exactly one place.
+# Note ST_URL meant :8000 in one file and :3002 in another, which is precisely
+# why the legacy names are resolved per-file and not folded in here.
+RAG_API = os.environ.get("TEST_RAG_API", "https://localhost:8000").rstrip("/")
+BFF = os.environ.get("TEST_BFF", "https://localhost:3002").rstrip("/")
+BFF_API = f"{BFF}/api"
+
+
 def _render_loot(template: str) -> str:
     """Fill the fixture's {{PLACEHOLDERS}} with secret-SHAPED synthetic values.
 

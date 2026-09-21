@@ -14,6 +14,7 @@ import re
 import pathlib
 
 import pytest
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 API = REPO / "app" / "rag-api" / "api.py"
@@ -62,7 +63,7 @@ def test_reuse_dedups_attempts():
 
 
 # ── live dry-run (skip without a stack) ──────────────────────────────────────
-BASE = os.environ.get("CRED_URL", "https://localhost:8000")
+BASE = os.environ.get("CRED_URL") or RAG_API
 
 
 def _key():

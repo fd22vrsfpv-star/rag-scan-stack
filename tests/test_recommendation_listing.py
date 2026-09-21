@@ -3,7 +3,7 @@
 Run on demand:
 
     pytest tests/test_recommendation_listing.py -v
-    RECS_URL=https://localhost:3002/api/scan-recommendations pytest tests/test_recommendation_listing.py
+    TEST_BFF=https://localhost:3002 RECS_URL=https://localhost:3002/api/scan-recommendations pytest tests/test_recommendation_listing.py
 
 WHY THIS EXISTS
 ---------------
@@ -23,10 +23,11 @@ import os
 import re
 
 import pytest
+from conftest import BFF_API  # shared service endpoints (see tests/conftest.py)
 
 requests = pytest.importorskip("requests")
 
-URL = os.environ.get("RECS_URL", "https://localhost:3002/api/scan-recommendations")
+URL = os.environ.get("RECS_URL", f"{BFF_API}/scan-recommendations")
 
 # Fields the UI depends on. A completed recommendation that renders a status and
 # nothing else is the exact complaint this endpoint has to answer, so the

@@ -31,6 +31,7 @@ import sys
 import uuid
 
 import pytest
+from conftest import BFF_API  # shared service endpoints (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
@@ -148,7 +149,7 @@ def test_the_endpoint_lists_and_resolves_a_conflict(two_scopes):
         matches = ax.engagements_for_ip(cur, TEST_IP)
     ax.record_scope_conflict(TEST_IP, matches, detected_by="pytest")
 
-    base = os.environ.get("BFF_BASE", "https://localhost:3002/api")
+    base = os.environ.get("BFF_BASE") or BFF_API
     try:
         r = requests.get(f"{base}/scope/conflicts", timeout=15, verify=False)
     except Exception as e:                       # pragma: no cover

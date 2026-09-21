@@ -12,6 +12,7 @@ import re
 import pathlib
 
 import pytest
+from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 API = REPO / "app" / "rag-api" / "api.py"
@@ -52,7 +53,7 @@ def test_lateral_only_chains_when_creds_were_harvested():
 
 
 # ── live: the attack-path ledger endpoint ────────────────────────────────────
-BASE = os.environ.get("LAT_URL", "https://localhost:8000")
+BASE = os.environ.get("LAT_URL") or RAG_API
 
 
 def _key():
