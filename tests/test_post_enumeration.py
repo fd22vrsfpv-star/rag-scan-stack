@@ -153,8 +153,7 @@ def test_the_phase_never_proposes_a_mutating_step():
     `>> authorized_keys`. Persistence is an operator's deliberate act, not a
     pipeline default."""
     src = _read(ENGINE)
-    fn = src[src.index("def _enumerate_post_access"):]
-    fn = fn[:fn.index("\ndef ", 10)] if "\ndef " in fn[10:] else fn
+    fn = function_source(src, "_enumerate_post_access")
     assert "include_mutating" not in fn, (
         "the phase asks for mutating steps — it must take the default, which "
         "excludes them")
@@ -165,8 +164,8 @@ def test_the_phase_says_why_it_did_nothing():
     """"Nothing to enumerate" and "we hold no credential" are different states
     and only one of them is a gap."""
     src = _read(ENGINE)
-    fn = src[src.index("def post_enumeration(state: PentestState)"):]
-    fn = fn[:fn.index("\ndef _analyse_session_output")]
+    fn = function_source(src, "post_enumeration")
+    assert fn, "post_enumeration not found"
     assert 'enumerated["reason"]' in fn or "enumerated.get(\"reason\")" in fn
 
 
@@ -174,7 +173,7 @@ def test_it_only_enumerates_where_a_credential_is_held():
     """A post-access step against a service nobody can reach is noise, and a
     queue that fills with noise stops being read."""
     src = _read(ENGINE)
-    fn = src[src.index("def _enumerate_post_access"):]
+    fn = function_source(src, "_enumerate_post_access")
     assert "credential_findings" in fn
     assert "valid_cred = true" in fn
 
@@ -188,8 +187,7 @@ def test_playbook_steps_are_wrapped_for_remote_execution():
     """
     src = _read(ENGINE)
     assert "def _wrap_remote" in src, "steps are queued unwrapped again"
-    fn = src[src.index("def _wrap_remote"):]
-    fn = fn[:fn.index("\ndef ", 10)]
+    fn = function_source(src, "_wrap_remote")
     assert "sshpass" in fn and "ssh " in fn
     assert "{password}" in fn, (
         "the secret is substituted into the stored command instead of being "
@@ -203,10 +201,9 @@ def test_an_unreachable_protocol_queues_nothing():
     """"We cannot reach this service" is a real answer. Queueing something
     unrunnable is not."""
     src = _read(ENGINE)
-    fn = src[src.index("def _wrap_remote"):]
-    fn = fn[:fn.index("\ndef ", 10)]
+    fn = function_source(src, "_wrap_remote")
     assert 'if proto != "ssh":' in fn and "return None" in fn
-    enum = src[src.index("def _enumerate_post_access"):]
+    enum = function_source(src, "_enumerate_post_access")
     assert "unwrappable" in enum, (
         "a step that could not be wrapped vanishes silently, which looks "
         "identical to a step that was never proposed")
@@ -214,7 +211,7 @@ def test_an_unreachable_protocol_queues_nothing():
 
 def test_the_credential_is_carried_by_reference():
     src = _read(ENGINE)
-    enum = src[src.index("def _enumerate_post_access"):]
+    enum = function_source(src, "_enumerate_post_access")
     assert '"credential_id": cred_id' in enum, (
         "the recommendation does not say which credential it needs, so the "
         "dispatcher cannot resolve {password}")
@@ -222,7 +219,7 @@ def test_the_credential_is_carried_by_reference():
 
 def test_the_analysis_backfills_what_nobody_parsed():
     src = _read(ENGINE)
-    fn = src[src.index("def _analyse_session_output"):]
+    fn = function_source(src, "_analyse_session_output")
     assert "parse_for(" in fn, "the analysis no longer parses unparsed output"
     assert "UPDATE tool_executions SET parsed_results" in fn, (
         "the analysis reads output but does not record what it found, so the "
@@ -233,7 +230,7 @@ def test_unparsed_tools_are_named_not_counted():
     """"17 unparsed" is not actionable. The tool names are — each one is a
     parser somebody can write."""
     src = _read(ENGINE)
-    fn = src[src.index("def post_enumeration(state: PentestState)"):]
+    fn = function_source(src, "post_enumeration")
     assert "unparsed_tools" in fn
 
 
@@ -368,8 +365,7 @@ def test_the_listener_parses_when_the_caller_did_not():
 def test_the_proposer_and_the_review_agree():
     pr_path = os.path.join(REPO, "app", "rag-api", "post_review_agent.py")
     src = _read(pr_path)
-    fn = src[src.index("def propose_reruns("):]
-    fn = fn[:fn.index("\ndef ", 10)]
+    fn = function_source(src, "propose_reruns")
     assert "status IN ('failed', 'timeout')" not in fn, (
         "the proposer has its own narrower candidate set again — the review can "
         "report remedy:rerun about an execution nothing will queue")
@@ -386,8 +382,7 @@ def test_every_command_goes_through_post_enumeration():
     every tool the platform runs passes through."""
     listener = os.path.join(REPO, "kali_listener", "listener_service.py")
     src = _read(listener)
-    fn = src[src.index("def db_update_tool_execution("):]
-    fn = fn[:fn.index("\ndef ", 10)]
+    fn = function_source(src, "db_update_tool_execution")
     assert calls(fn, "_post_enumerate"), (
         "commands no longer feed post-enumeration, so only a pipeline phase "
         "would analyse anything and every other dispatch path is blind")
@@ -500,8 +495,7 @@ def test_an_unmeasured_outcome_is_not_recorded_as_zero():
     suppressed a working rule after five runs.
     """
     listener = _read(os.path.join(REPO, "kali_listener", "listener_service.py"))
-    fn = listener[listener.index("def _post_enumerate("):]
-    fn = fn[:fn.index("\ndef ", 10)]
+    fn = function_source(listener, "_post_enumerate")
     assert "if n is not None:" in fn, (
         "an unmeasured run is written back as 'produced nothing', which "
         "suppresses rules whose tools simply have no parser")
@@ -511,8 +505,7 @@ def test_a_rule_is_only_suppressed_after_it_was_actually_tried():
     """A rule nobody ran has not been disproved — it has been ignored."""
     pe = pytest.importorskip("etl.post_enumeration")
     src = _read(os.path.join(REPO, "etl", "post_enumeration.py"))
-    fn = src[src.index("def rule_status("):]
-    fn = fn[:fn.index("\ndef ", 10)]
+    fn = function_source(src, "rule_status")
     assert "executed >= SUPPRESS_AFTER" in fn, (
         "suppression counts firings rather than outcomes, so a rule nobody "
         "acted on gets killed")
@@ -564,8 +557,7 @@ def test_a_spec_that_matched_nothing_is_still_a_measurement():
 def test_the_listener_flags_a_missing_parser_loudly():
     """Logged at WARNING, not debug: it is a gap somebody can close."""
     src = _read(os.path.join(REPO, "kali_listener", "listener_service.py"))
-    fn = src[src.index("def _post_enumerate("):]
-    fn = fn[:fn.index("\ndef ", 10)]
+    fn = function_source(src, "_post_enumerate")
     assert "PARSER MISSING" in fn, "the gap is no longer flagged distinctly"
     assert "logger.warning" in fn
     assert "/parsers/draft" in fn, (
@@ -674,8 +666,7 @@ def test_evidence_is_reviewed_before_deciding_again():
     """Without this the loop proposes the same things forever and never learns
     that they did not help."""
     src = _read(ENGINE)
-    fn = src[src.index("def post_enumeration(state: PentestState)"):]
-    fn = fn[:fn.index("\ndef _resolve_outcomes")]
+    fn = function_source(src, "post_enumeration")
     assert calls(fn, "_resolve_outcomes")
     assert fn.index("_resolve_outcomes()") < fn.index("_analyse_session_output"), (
         "evidence is reviewed after the next decision is made, which makes the "
@@ -689,8 +680,7 @@ def test_outcomes_resolve_whatever_dispatched_them():
     pe = pytest.importorskip("etl.post_enumeration")
     assert hasattr(pe, "resolve_pending_observations")
     src = _read(os.path.join(REPO, "etl", "post_enumeration.py"))
-    fn = src[src.index("def resolve_pending_observations("):]
-    fn = fn[:fn.index("\ndef ", 10)]
+    fn = function_source(src, "resolve_pending_observations")
     assert calls(fn, "evidence_since"), (
         "resolution still reads one command's output instead of asking whether "
         "evidence appeared, so the native path stays unresolvable")
@@ -702,8 +692,7 @@ def test_outcomes_resolve_whatever_dispatched_them():
 def test_an_unaskable_question_is_not_a_zero():
     pe = pytest.importorskip("etl.post_enumeration")
     src = _read(os.path.join(REPO, "etl", "post_enumeration.py"))
-    fn = src[src.index("def resolve_pending_observations("):]
-    fn = fn[:fn.index("\ndef ", 10)]
+    fn = function_source(src, "resolve_pending_observations")
     assert 'ev.get("available")' in fn, (
         "an unreachable evidence store is recorded as 'produced nothing'")
 
@@ -754,13 +743,11 @@ def test_the_loop_counts_new_work_not_re_reads():
     condition could never be met. What the pass actually DID is the backfill.
     """
     src = _read(ENGINE)
-    fn = src[src.index("def _analyse_session_output"):]
-    fn = fn[:fn.index("\ndef ", 10)]
+    fn = function_source(src, "_analyse_session_output")
     assert 'out["backfilled"] += 1' in fn, (
         "nothing counts new parses, so the loop cannot tell work from re-reading")
 
-    node = src[src.index("def post_enumeration(state: PentestState)"):]
-    node = node[:node.index("\ndef _resolve_outcomes")]
+    node = function_source(src, "post_enumeration")
     assert '"analysed": analysed.get("backfilled", 0)' in node, (
         "the history entry still records re-reads as work, so the loop burns "
         "its whole budget repeating itself")
@@ -769,8 +756,7 @@ def test_the_loop_counts_new_work_not_re_reads():
 def test_a_pass_that_did_nothing_says_so():
     """Five identical lines in a transcript read as work happening."""
     src = _read(ENGINE)
-    node = src[src.index("def post_enumeration(state: PentestState)"):]
-    node = node[:node.index("\ndef _resolve_outcomes")]
+    node = function_source(src, "post_enumeration")
     assert "nothing new to parse" in node
 
 
@@ -821,8 +807,7 @@ def test_a_session_resolves_its_engagement_without_the_header():
     assert "def _engagement_from_target" in src, (
         "a session with no X-Engagement-Id still gets engagement_id NULL, so "
         "pre-approval can never resolve")
-    fn = src[src.index("def _engagement_from_target"):]
-    fn = fn[:fn.index("\ndef ", 10)]
+    fn = function_source(src, "_engagement_from_target")
     # Scope is the authority. Either scope resolver counts — engagements_for_ip
     # (the multi-match view) or resolve_engagement_for_ip — both query
     # scope_targets; anything else would resolve by some other means.
@@ -942,8 +927,8 @@ def test_omitting_the_ids_approves_everything_queued():
     svc = _read(os.path.join(REPO, "autogen_agents", "autogen_service.py"))
     assert "def _queued_exploit_ids" in svc
     assert "pending_exploit_ids" in svc
-    fn = svc[svc.index("def _queued_exploit_ids"):]
-    fn = fn[:fn.index("\n@app.post")]
+    fn = function_source(svc, "_queued_exploit_ids")
+    assert fn, "_queued_exploit_ids not found"
     assert "status = 'pending'" in fn and "session_id = %s::uuid" in fn, (
         "it approves exploits from other sessions, or ones already decided")
 
@@ -951,8 +936,7 @@ def test_omitting_the_ids_approves_everything_queued():
 def test_a_named_subset_is_not_widened():
     """Naming a subset is a deliberate operator choice."""
     src = _read(ENGINE)
-    node = src[src.index("def exploit_approval"):]
-    node = node[:node.index("\ndef _mark_approved")]
+    node = function_source(src, "exploit_approval")
     assert "ids = [one] if one else list(queued)" in node, (
         "the subset/all distinction is gone — either everything widens or "
         "nothing does")
@@ -961,8 +945,7 @@ def test_a_named_subset_is_not_widened():
 def test_the_operator_is_shown_every_candidate():
     """An operator shown a single id cannot tell what else was found."""
     src = _read(ENGINE)
-    node = src[src.index("def exploit_approval"):]
-    node = node[:node.index("\ndef _mark_approved")]
+    node = function_source(src, "exploit_approval")
     assert '"queued_exploit_ids": queued' in node, (
         "the approval prompt names one candidate, so the others sit pending "
         "with nothing pointing at them")
