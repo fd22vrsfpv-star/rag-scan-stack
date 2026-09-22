@@ -158,10 +158,17 @@ max(support)=79.
 **Enforced by:** `tests/test_tool_learning_support.py` (covers the backfill path
 only — extend it to the live path when fixing)
 
-### A pytest run wrote into the production learning table
+### pytest runs write into production tables
 **Update 2026-09-21:** the 16 polluted rows were DELETED along with the inflated
 counters. The SOURCE is untouched — a test can still write here — so the item
 stands on that alone.
+**Second table, found 2026-09-21 while re-typing exploit rows:**
+`pending_exploits` holds `exploit/unix/misc/pytest_release` ("vector pytest dup"),
+**status = 'approved'**, target `198.51.100.152/32`, engagement_id NULL, created
+2026-09-16. The module does not exist in Metasploit. Low risk in practice — the
+target is an RFC 5737 documentation address in no scope, so the fail-closed
+dispatch gate refuses it — but a test left an APPROVED row in the live exploit
+queue, which is the same defect with a sharper edge than a learning counter.
 **Found:** 2026-09-21
 **Evidence:** 16 of the 65 rows in `tool_selection_learned` carry
 `phase = '__pytest_phase'`. A test run persisted learned tool-selection state into
@@ -170,9 +177,9 @@ the live table, and the phase-scoped reset endpoint
 them unless that phase is named explicitly.
 **Where:** whichever test writes `tool_selection_learned` without a rollback —
 `tests/conftest.py` cleans a fixed `_CLEANUP_TABLES` list that does not include it.
-**Done when:** tests cannot write to the live learning table (add it to the
-cleanup list, or point the test at a scratch phase that the cleanup removes), and
-the 16 existing rows are cleared.
+**Done when:** tests cannot write to live tables — `tests/conftest.py` cleans a
+fixed `_CLEANUP_TABLES` list that includes neither `tool_selection_learned` nor
+`pending_exploits` — and the stray `pytest_release` row is removed.
 **Enforced by:** not enforced
 
 
