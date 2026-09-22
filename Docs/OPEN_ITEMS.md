@@ -99,6 +99,27 @@ allowed.
 
 ## Data and deployment
 
+### An unconfigured ssh-tunnel reports `unhealthy`, not "not configured"
+**Found:** 2026-09-22 (noticed while checking container health after a deploy)
+**Evidence:** `ssh-tunnel` has been `Up 7 days (unhealthy)` with every probe
+exiting 1 and printing nothing. It is not broken — it is unused:
+`SSH_REMOTE_HOST=` is empty in `.env:166` and the container confirms
+`SSH_REMOTE_HOST=[]`. The healthcheck is
+`[ -n "$SSH_REMOTE_HOST" ] && nc -z 127.0.0.1 ${SSH_SOCKS_PORT:-1080} || exit 1`,
+so an unset remote host takes the `|| exit 1` branch. The current DB mode is
+`remote_direct` (`db-config.json`), which uses SSL directly and does not need the
+tunnel at all.
+**Where:** the `ssh-tunnel` healthcheck in `docker-compose.yml`.
+**Why it matters:** it is the repo's recurring bug in a new place — "cannot run"
+reported as "failed". A permanently-red container trains operators to ignore
+container health, which is exactly when a real failure gets missed. It also makes
+`docker ps --filter health=unhealthy` useless as a check.
+**Done when:** an unconfigured tunnel reports healthy (or is not started at all —
+it has `profiles: ["ssh-tunnel"]` but the comment says it starts by default), and
+`unhealthy` is reserved for a tunnel that is configured and not working.
+**Enforced by:** not enforced
+
+
 ### Post-access steps cannot run on the Kali route — `sshpass` is not a safe tool
 **Found:** 2026-09-21
 **Evidence:** `_wrap_remote` builds `sshpass -p '{password}' ssh ...`
