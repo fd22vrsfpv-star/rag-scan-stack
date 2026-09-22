@@ -80,3 +80,19 @@ def test_the_gate_is_the_shared_one():
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_only_host_port_handles_have_a_host_recovered():
+    """An ssh_credential handle is `user:secret` and an msf_session handle is a
+    session id. Splitting those would check a USERNAME as a hostname — observed
+    live: handle "u:p" was gated as target "u", which would wrongly PASS if a
+    username ever matched an in-scope host."""
+    body, _ = _handler()
+    assert "bind_shell" in body and "listener_callback" in body, (
+        "the host-recovery fallback is not restricted to the kinds whose handle "
+        "is host:port — a username would be treated as a hostname")
+    # and the restriction must guard the split, not merely appear somewhere
+    idx = body.find("rsplit")
+    assert idx != -1, "no host recovery at all"
+    assert "request.kind in" in body[:idx], (
+        "the handle is split before the kind is checked")
