@@ -115,3 +115,39 @@ def test_the_vector_sweep_resolves_before_queueing():
         "the vector sweep skips on an unresolved module without requiring that "
         "the check actually RAN — an unreachable resolver would then silently "
         "stop all vector queueing")
+
+
+def test_the_bff_writer_resolves_before_queueing():
+    """`dispatch_rec` inserts source=metasploit from the recommender.
+
+    Lower risk than the vector sweep — an operator initiated it, so a bad row is
+    seen — but the same class: a module this Metasploit does not load can only
+    queue a row that fails. It resolves in the ASYNC caller because the insert
+    helper (`_queue_pending`) is sync, mirroring how the watcher does it.
+
+    Fail-open is the property that matters: an unreachable exploit-runner must
+    not stop an operator queueing work, so only a check that actually RAN and
+    came back negative may skip.
+    """
+    import ast as _ast
+    repo = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+    path = os.path.join(repo, "dashboard", "bff", "routers", "assets.py")
+    if not os.path.exists(path):
+        pytest.skip("assets.py not present")
+    src = open(path, encoding="utf-8").read()
+    fn = next((n for n in _ast.walk(_ast.parse(src))
+               if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+               and n.name == "dispatch_rec"), None)
+    assert fn, "dispatch_rec not found"
+    body = _ast.get_source_segment(src, fn)
+
+    assert "/msf/resolve" in body, (
+        "the BFF queues a metasploit exploit without checking the module is "
+        "loaded in this install")
+    assert "not a loaded Metasploit module" in body, (
+        "there is no skip path for an unresolvable module")
+    # fail-open: a None/failed response must NOT skip
+    assert "_rdata is not None" in body, (
+        "the BFF skips on an unresolved module without requiring that the check "
+        "actually ran — an unreachable exploit-runner would then block all "
+        "operator queueing")

@@ -350,21 +350,6 @@ approval path, gated behind an explicit policy flag (Tier 3).
 
 ## Exploit classification
 
-### A BFF writer queues source=metasploit without resolving the module
-**Found:** 2026-09-16 (as "synthetic module ids"), narrowed 2026-09-22
-**Evidence:** `dashboard/bff/routers/assets.py:1856` inserts
-`source='metasploit'` from the recommender without calling `/msf/resolve`. The
-auto-firing twin (`exploit_watcher.process_service_vectors`) was gated on
-2026-09-21 and the DRb declarations that motivated the item were removed on
-2026-09-22, so this is the remaining ungated writer. Lower risk than the sweep —
-it is operator-initiated rather than auto-fired, so a bad row is seen — but it is
-the same class.
-**Where:** `dashboard/bff/routers/assets.py:1856`.
-**Done when:** the writer resolves through `/msf/resolve` before inserting, and
-fails OPEN (skip only when the check actually ran), matching
-`exploit_watcher.py:741-744`.
-**Enforced by:** not enforced (`tests/test_msf_resolve.py` holds the sweep's
-equivalent guard and is the natural home)
 ### A langgraph session never drains pending credential recommendations
 **Found:** 2026-09-17, rewritten 2026-09-21 after audit — the original headline
 ("hydra recommended but never auto-dispatched") is no longer true.
