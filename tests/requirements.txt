@@ -45,3 +45,10 @@ msgpack>=1.0        # msf_client / exploit_runner RPC
 feedparser>=6.0     # news ingestion parser
 pyflakes>=3.0       # the lint-gate test shells out to it
 pytest-asyncio>=0.23  # async tests ERROR->skip without the plugin
+
+# FastAPI needs this to BUILD a route that declares Form(...)/UploadFile — the
+# check runs when the app is constructed, not when the route is called, so its
+# absence raises RuntimeError("Form data requires python-multipart") out of
+# fixture setup and reports as an ERROR, not a skip. Three tests errored this
+# way once a database made them get far enough to construct the app.
+python-multipart>=0.0.9
