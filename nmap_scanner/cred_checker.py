@@ -331,11 +331,49 @@ def _classify_hydra_failure(output: str) -> Tuple[str, Optional[str]]:
             if any(kw in line.lower() for kw in
                    ("could not connect", "no route", "refused", "timed out")):
                 return "connection_error", line.strip()[:180]
-        return "connection_error", None
+        return "connection_error", _failure_excerpt(output)
     if "0 valid passwords" in low or "0 valid pairs" in low or \
        "login fail" in low:
-        return "auth_failed", None
-    return "unknown", output.strip()[:180] if output.strip() else None
+        # even an "expected" auth failure carries WHICH service refused, and the
+        # learner needs that to tell telnet from mysql
+        return "auth_failed", _failure_excerpt(output)
+    return "unknown", _failure_excerpt(output)
+
+
+def _failure_excerpt(output: str, fallback_line: str = "") -> str:
+    """The most DIAGNOSTIC slice of a failed run, not the first 180 characters.
+
+    `output.strip()[:180]` takes hydra's constant banner
+    ("Hydra v9.x (c) ... van Hauser/THC ..."), which is ~205 chars — so every
+    `unknown` failure produced the SAME excerpt and therefore the same
+    `failure_signature`, and the learner could not tell a telnet failure from a
+    mysql one. That is the real cause behind "most services never produce a
+    usable failure signature": the output was kept, just the wrong part of it.
+
+    Reuses etl.tool_learning.salient_lines, which already picks diagnostic lines
+    and normalises IPs/numbers so the same failure hashes stably. Falls back to
+    the old slice when etl/ is not mounted — cred_checker must keep working
+    without it (see _tool_learning).
+
+    salient_lines also REDACTS: verified against a real hydra success line, it
+    returns `login:<redacted> password:<redacted>`, and it normalises IPs/ports so
+    the same failure hashes stably across hosts. The fallback slice below is the
+    pre-existing behaviour and carries the pre-existing (unchanged) exposure —
+    _redact_secret cannot be used here because it needs the username/password,
+    which _classify_hydra_failure is not given.
+    """
+    text = (output or "").strip()
+    if not text:
+        return fallback_line.strip()[:180] if fallback_line else ""
+    tl = _tool_learning()
+    if tl is not None:
+        try:
+            picked = tl.salient_lines(text, limit=3)
+            if picked:
+                return " | ".join(picked)[:180]
+        except Exception as e:  # noqa: BLE001 — never fail a completed run
+            logger.debug(f"[cred_checker] salient_lines failed: {e}")
+    return text[:180]
 
 
 # Tuple type alias for the rich return shape -- (results, audit_dict).
