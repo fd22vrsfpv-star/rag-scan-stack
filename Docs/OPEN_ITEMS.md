@@ -52,16 +52,6 @@ back to the last output lines and the learner has little to distinguish.
 signature is computed from what the tool actually said.
 **Enforced by:** not enforced
 
-### The backfill over-counts pairs
-**Found:** 2026-09-12
-**Evidence:** 77 `tool_executions` rows produced 284 rule upserts; one failure
-pairs against every later run in the window, so `support` reads as 68 for a pair
-observed far fewer times.
-**Where:** `etl/tool_learning.py::learn_from_tool_executions`.
-**Done when:** support counts distinct observations rather than pairings, or the
-column is renamed to say what it counts.
-**Enforced by:** not enforced
-
 ## Post-execution review
 
 ### The re-run proposer sees a narrower set than the classifier
@@ -117,31 +107,6 @@ allow-listed — `netexec smb -x`, `mysql -e`, `psql -c` all exist and are
 allowed.
 **Enforced by:** `tests/test_post_enumeration.py::test_an_unreachable_protocol_queues_nothing`
 (pins that an unwrappable protocol queues nothing rather than something broken)
-
-### Six tools still have no parser, 632 KB of output unread
-**Found:** 2026-09-12
-**Evidence:** `GET /parsers/missing` reports **3 covered, 6 missing** —
-`nuclei` (4 runs, 515,491 bytes), `curl` (16 runs, 79,383), `ssh-audit` (2 runs,
-18,218), `nmap` (38 runs, 14,259), `sqlmap` (3), `whatweb` (2). Wiring the
-extractor specs in as a second parser tier already covered `enum4linux-ng`,
-`smbclient`, `hydra`, `sslscan`, `medusa` and `gobuster`.
-**Where:** `etl/tool_output_parsers.py::PARSERS` and
-`knowledge/extractors/*.yaml`.
-**Update 2026-09-21:** re-counted from `tool_executions` where
-`parsed_results IS NULL` — now 5 tools and ~8.3 MB unread, not 6 and 632 KB:
-nuclei (30 runs, 7.8 MB), curl (160, 482 KB), cewl (2, 23 KB), rmg (5, 5.6 KB),
-showmount (1, 35 B). nuclei was a different defect and is now FIXED:
-`etl/parse_nuclei.py` exists but takes a FILE PATH and writes to the database
-(the ingest path), while this column is filled from
-`etl/tool_output_parsers.parse_for()`, whose registry did not list nuclei at all.
-Every nuclei run was unparsed — 0 with `parsed_results`, ~7.8 MB unread. A pure
-text->dict `_nuclei` parser is now registered (tests/test_post_enumeration.py
-::test_the_registry_parses_nuclei). Remaining: curl (482 KB), cewl, rmg, showmount.
-**Done when:** each tool has a registry parser or an extractor spec.
-`POST /parsers/draft?tool=<tool>` drafts one from a stored sample; the gap is
-now visible and has a fix rather than being silent.
-**Enforced by:** `tests/test_post_enumeration.py::test_a_missing_parser_is_a_distinct_state`
-(pins that the absence is a distinct, reportable state and not a zero)
 
 ### Post-enumeration outcomes only carry forward for Kali-dispatched commands
 **Found:** 2026-09-12
@@ -346,22 +311,26 @@ approval path, gated behind an explicit policy flag (Tier 3).
 
 ## Exploit classification
 
-### exploit_type is uniformly 'rce', even for auxiliary/post scanners
-**Found:** 2026-09-15
-**Evidence:** Every `pending_exploits` row carries `exploit_type='rce'`, including
-pure scanners and info-gathering modules that never open a shell — e.g.
-`auxiliary/scanner/ssh/ssh_login_pubkey`, `auxiliary/gather/dns_info`,
-`auxiliary/scanner/http/robots_txt`. A live query counted 27 executed/failed
-auxiliary/* rows, all tagged `rce`. The Foothold Agent no-callback queue therefore
-has to re-derive the real class from `exploit_id`/`exploit_title` (the module path)
-rather than trusting `exploit_type`.
-**Where:** wherever `pending_exploits` rows are created (the exploit
-recommender / ingest that sets `exploit_type`).
-**Done when:** `exploit_type` reflects the real MSF module class — an
-`auxiliary/*` or `post/*` module is not `rce` — so downstream consumers can trust
-the column instead of pattern-matching the module path.
-**Enforced by:** not enforced
-
+### exploit_type: writers fixed, 213 existing rows still mistyped
+**Found:** 2026-09-15 (writers fixed 2026-09-21; the stored rows were not)
+**Evidence:** `SELECT count(*) FROM pending_exploits WHERE exploit_id LIKE
+'auxiliary/%' AND exploit_type = 'rce'` returns **213** (re-measured 2026-09-21,
+after the writer fix). Those are version, login and enum SCANNERS filed as remote
+code execution. New rows are now typed correctly: one canonical classifier,
+`scan_tools.infer_msf_exploit_type`, is wired into every metasploit writer —
+including a fourth one that hardcoded 'rce' as a SQL literal inside an INSERT and
+was invisible to the first guard.
+**Where:** the stored rows in `pending_exploits`. The writers
+(`autogen_agents/{exploit_watcher,langgraph_engine,scan_tools}.py`) are done.
+**Why it matters:** until the old rows are corrected, a consumer reading the
+column still cannot trust it and has to re-derive the class from the module path
+— which is what the original item was about.
+**Done when:** the 213 rows are re-typed from their module path, OR they are
+accepted as historical and consumers are told the column is trustworthy only from
+a stated date. Re-typing is a bulk UPDATE over recorded engagement data, so it is
+an operator decision rather than a fix.
+**Enforced by:** `tests/test_exploit_type_classification.py` (guards the
+classifier and every writer; says nothing about rows already stored)
 ### Synthetic module ids queued as source=metasploit
 **Found:** 2026-09-16
 **Evidence:** exploit-runner fired `exploit/metasploitable_root_shell_1524` and
@@ -387,24 +356,6 @@ follow-up commands (alongside webshell handle and MSF module re-invocation).
 `/dev/tcp` transport that opens a bash TCP shell to a listener.
 **Done when:** /command-exec/run can run follow-up commands via a bash /dev/tcp
 channel when the target has bash and outbound to the node is reachable.
-**Enforced by:** not enforced
-
-### no_session auto-correct flips to reverse behind NAT/proxy
-**Found:** 2026-09-16
-**Evidence:** usermap_script no_session auto-correct flipped bind->reverse with
-PAYLOAD=cmd/unix/pingback_reverse LHOST=172.18.0.15 (a container IP the target
-cannot reach through the SOCKS proxy) — doomed. A proxied target reaches nothing
-by reverse unless a node relay/callback host is set.
-**Where:** exploit_runner._next_correction no_session branch (flips connect_style).
-**Update 2026-09-21:** the dangerous half is fixed — `_next_correction` now forces
-`connect_style="bind"` when the dispatch is proxied and no callback_host is set,
-instead of flipping to a reverse payload aimed at an unroutable container LHOST.
-What remains is the word ALTERNATE: `_pick_payload` is deterministic, so forcing
-bind re-picks the SAME payload that just failed, making the correction a no-op
-retry. (Note it now interacts with the bind-payload policy: a forced bind still
-requires manual approval, which an already operator-approved exploit satisfies.)
-**Done when:** the correction tries a DIFFERENT bind payload than the one that
-failed — e.g. by excluding the last-tried payload from the candidate list.
 **Enforced by:** not enforced
 
 ### Credential brute-force (hydra) recommended but never auto-dispatched in a session
