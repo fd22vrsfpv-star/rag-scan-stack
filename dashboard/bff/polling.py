@@ -432,7 +432,11 @@ async def _poll_once(client: httpx.AsyncClient):
                         log.warning(f"Scan {job_id} marked as partial due to service detection failure")
 
                     # Check for error arrays or failure indicators
+                    # nmap puts its per-batch failure count at result.stats.errors,
+                    # one level deeper than this check looked — so a run with failed
+                    # batches never matched here and landed as a clean `completed`.
                     elif (result_data.get("errors") or
+                          (result_data.get("stats") or {}).get("errors") or
                           result_data.get("failed_targets") or
                           "some targets failed" in str(result_data).lower()):
                         new_status = "partial"

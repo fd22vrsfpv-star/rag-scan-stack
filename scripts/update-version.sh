@@ -85,4 +85,9 @@ echo "Version updated to $NEW_VERSION in all locations."
 echo "Next steps:"
 echo "1. cd $PROJECT_ROOT/dashboard/frontend && npm run build"
 echo "2. docker compose build --no-cache pentest-dashboard"
-echo "3. docker compose restart pentest-dashboard"
+# `restart` keeps the existing container, and BUILD_VERSION is injected as a
+# runtime env var at CREATE time (docker-compose.yml, `environment:` — it is not
+# baked into any image). So a restarted container keeps reporting the OLD version
+# from /health while running new code. `up -d --force-recreate` recreates it with
+# the new env, which is the whole point of having just bumped the version.
+echo "3. docker compose up -d --force-recreate pentest-dashboard"

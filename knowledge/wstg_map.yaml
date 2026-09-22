@@ -229,7 +229,7 @@ entries:
     tier: safe
     category: error_check
     tool: curl
-    command: "curl -sk {url}'"
+    command: "curl -sk \"{url}\""
     assertion:
       expect_regex: "(?i)(stack trace|exception|sqlstate|traceback|at [a-z0-9_.]+\\()"
     wstg_note: "WSTG-ERRH-01/02: a leaked stack trace or DB error reveals internals."

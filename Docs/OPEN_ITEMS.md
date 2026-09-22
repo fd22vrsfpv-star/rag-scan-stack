@@ -54,17 +54,6 @@ signature is computed from what the tool actually said.
 
 ## Post-execution review
 
-### The re-run proposer sees a narrower set than the classifier
-**Found:** 2026-09-12
-**Evidence:** `propose_reruns` selects only rows that are `failed`/`timeout` or
-completed-with-empty-output, while the review classifies from a wider query. An
-execution the review calls `remedy: rerun` can therefore be invisible to the
-proposer.
-**Where:** `app/rag-api/post_review_agent.py::propose_reruns`.
-**Done when:** both read the same candidate set, or the divergence is stated in
-the report so a remedy that cannot be acted on is visible as such.
-**Enforced by:** not enforced
-
 ### Queued re-runs are auto-dispatched with no hold flag
 **Found:** 2026-09-11 (documented in `propose_reruns`' own docstring)
 **Evidence:** `dashboard/bff/services/recon_agent.py:117` selects
@@ -107,23 +96,6 @@ allow-listed — `netexec smb -x`, `mysql -e`, `psql -c` all exist and are
 allowed.
 **Enforced by:** `tests/test_post_enumeration.py::test_an_unreachable_protocol_queues_nothing`
 (pins that an unwrappable protocol queues nothing rather than something broken)
-
-### Post-enumeration outcomes only carry forward for Kali-dispatched commands
-**Found:** 2026-09-12
-**Evidence:** Acting on the `smbv1-only` proposal dispatched it to the **native
-nmap runner** (`Scan started: 0ea66fb6`), which writes to `scans` and never
-calls `kali_listener.db_update_tool_execution` — where the write-back hook
-lives. The rule stayed `fired=1 executed=0`. Calling
-`record_outcome_for_command()` directly resolves it correctly
-(`fired=1 executed=1 produced=1 conf=1.0`), so the mechanism works and only the
-native path is unhooked.
-**Where:** `kali_listener/listener_service.py::_post_enumerate` is the only
-caller; the native runners (`nmap_scanner`, `nuclei-runner`, ...) have no
-equivalent.
-**Done when:** a command completed by any runner resolves its enumeration
-observation. The native path finishes in `scans`, so it needs its own hook
-rather than a shared one.
-**Enforced by:** not enforced
 
 ## Data and deployment
 
@@ -182,17 +154,6 @@ fixed `_CLEANUP_TABLES` list that includes neither `tool_selection_learned` nor
 `pending_exploits` — and the stray `pytest_release` row is removed.
 **Enforced by:** not enforced
 
-
-### One asset carries no engagement
-**Found:** 2026-09-11
-**Evidence:** After the attribution backfill, 136 of 137 assets resolved.
-`74.123.154.158` remains unattributed — its host is in no scope. Re-checked
-2026-09-21: still exactly one (`SELECT count(*) FROM assets WHERE engagement_id
-IS NULL` = 1, the same host).
-**Where:** `scope_targets`; `db_init/ensure_all_tables.sql::propagate_engagement_to_assets`.
-**Done when:** the host is either in a scope or removed. It is reported by
-`scripts/ensure_db_schema.sh` as "not an error", which is correct.
-**Enforced by:** not enforced
 
 ### BUILD_VERSION labels go stale on containers that were not recreated
 **Found:** 2026-09-11
@@ -284,6 +245,25 @@ but no lab node has been confirmed either way).
 the relay and is recorded as a held `msf_session` on the central msfrpcd.
 **Enforced by:** not enforced
 
+**Blocker identified 2026-09-21 (attempted, refused):** starting a relay on
+`rt3_scan1` returns, correctly, a refusal rather than a broken relay:
+
+    relay bound localhost-only on the node (saw: LISTEN 0 128 127.0.0.1:4444 ...).
+    The node's sshd has GatewayPorts off, so a target cannot reach node:4444 and
+    every callback would be dropped. Set `GatewayPorts clientspecified` (or yes)
+    in the node's sshd_config and reload sshd, then start the relay again.
+
+So this is gated on a NODE CONFIG change, not on platform code: the reverse SSH
+forward binds loopback-only until `GatewayPorts` is enabled on the node's sshd.
+No partial state is left behind (`/callback-relay` reports `active:false` and
+`remote_nodes.metadata.callback_relay` stays NULL), which is the right failure
+mode — a relay that accepted and silently dropped callbacks would be worse.
+
+Note the knock-on: with no relay anywhere, `_node_callback_config()` returns None
+for every dispatch, so MSF exploits resolve to BIND payloads and every one needs
+manual approval (etl/bind_payload_policy). Enabling GatewayPorts on one node
+lifts that too.
+
 ## LLM routing
 
 ## Access reconnection
@@ -318,26 +298,6 @@ approval path, gated behind an explicit policy flag (Tier 3).
 
 ## Exploit classification
 
-### exploit_type: writers fixed, 213 existing rows still mistyped
-**Found:** 2026-09-15 (writers fixed 2026-09-21; the stored rows were not)
-**Evidence:** `SELECT count(*) FROM pending_exploits WHERE exploit_id LIKE
-'auxiliary/%' AND exploit_type = 'rce'` returns **213** (re-measured 2026-09-21,
-after the writer fix). Those are version, login and enum SCANNERS filed as remote
-code execution. New rows are now typed correctly: one canonical classifier,
-`scan_tools.infer_msf_exploit_type`, is wired into every metasploit writer —
-including a fourth one that hardcoded 'rce' as a SQL literal inside an INSERT and
-was invisible to the first guard.
-**Where:** the stored rows in `pending_exploits`. The writers
-(`autogen_agents/{exploit_watcher,langgraph_engine,scan_tools}.py`) are done.
-**Why it matters:** until the old rows are corrected, a consumer reading the
-column still cannot trust it and has to re-derive the class from the module path
-— which is what the original item was about.
-**Done when:** the 213 rows are re-typed from their module path, OR they are
-accepted as historical and consumers are told the column is trustworthy only from
-a stated date. Re-typing is a bulk UPDATE over recorded engagement data, so it is
-an operator decision rather than a fix.
-**Enforced by:** `tests/test_exploit_type_classification.py` (guards the
-classifier and every writer; says nothing about rows already stored)
 ### Synthetic module ids queued as source=metasploit
 **Found:** 2026-09-16
 **Evidence:** exploit-runner fired `exploit/metasploitable_root_shell_1524` and
@@ -352,17 +312,6 @@ module path or a non-metasploit source.
 path that resolves against `module.exploits`, or is queued under the correct
 source (e.g. a bind-shell access, not an MSF module). The auto-correct now flags
 `module_missing` on these (2026-09-16), but the root queuing should not create them.
-**Enforced by:** not enforced
-
-### command-exec transport: bash /dev/tcp reverse shell
-**Found:** 2026-09-16
-**Evidence:** Operator noted a future command-exec option: trigger a bash
-`/dev/tcp/<lhost>/<lport>` shell through a proven RCE, as another way to run
-follow-up commands (alongside webshell handle and MSF module re-invocation).
-**Where:** exploit-runner command-exec capability (POST /command-exec/run) — add a
-`/dev/tcp` transport that opens a bash TCP shell to a listener.
-**Done when:** /command-exec/run can run follow-up commands via a bash /dev/tcp
-channel when the target has bash and outbound to the node is reachable.
 **Enforced by:** not enforced
 
 ### Credential brute-force (hydra) recommended but never auto-dispatched in a session
