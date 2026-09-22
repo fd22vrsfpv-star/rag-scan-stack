@@ -40,12 +40,21 @@ def _conn():
         pytest.skip(f"DB unreachable: {type(e).__name__}")
 
 
-def _post(body):
+def _post_to(path, body):
+    """POST that SKIPS on an unreachable stack instead of raising.
+
+    Fixture setup must never raise ConnectionError: an error means "broken",
+    a skip means "cannot run here", and collapsing the two hides real breakage.
+    """
     try:
-        return requests.post(f"{BASE}/credentials/spray-release", json=body,
+        return requests.post(f"{BASE}{path}", json=body,
                              headers={"x-api-key": _key()}, timeout=30, verify=False)
     except Exception as e:  # noqa: BLE001
         pytest.skip(f"{BASE} unreachable: {type(e).__name__}")
+
+
+def _post(body):
+    return _post_to("/credentials/spray-release", body)
 
 
 @pytest.fixture
@@ -56,10 +65,9 @@ def scoped_login_host():
     name = f"pytest-spray-{uuid.uuid4().hex[:8]}"
     eid, aid = None, None
     try:
-        r = requests.post(f"{BASE}/engagements",
-                          json={"name": name, "engagement_type": "internal_pentest",
-                                "methodology": "OWASP"},
-                          headers={"x-api-key": _key()}, timeout=30, verify=False)
+        r = _post_to("/engagements",
+                     {"name": name, "engagement_type": "internal_pentest",
+                      "methodology": "OWASP"})
         if r.status_code in (401, 403):
             pytest.skip("auth required")
         assert r.status_code in (200, 201), f"create engagement: {r.status_code} {r.text[:200]}"

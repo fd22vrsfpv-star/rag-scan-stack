@@ -37,26 +37,26 @@ HELPER = TESTS / "_container.py"
 #: modules, none of them these — so they already distinguish "unreachable" from
 #: "broken" by their own means. They are debt because the logic is duplicated
 #: ~20 times, not because they are known-wrong.
+#: Five entries left this list on 2026-09-22 when the modules moved to
+#: `conftest.psql_argv` (DSN first, `docker exec rag-postgres` as fallback):
+#: test_asset_merge, test_asset_port_normalization, test_fingerprint,
+#: test_severity_scale, test_tool_docs_fetch. The rest still exec into a
+#: SERVICE container (rag-api, autogen-agents), which a DSN cannot replace.
 DIRECT_EXEC_DEBT = {
     "test_artifact_consumer.py",
-    "test_asset_merge.py",
-    "test_asset_port_normalization.py",
     "test_candidate_space.py",
     "test_credential_bridge.py",
     "test_credential_secret_storage.py",
     "test_dead_parsers.py",
     "test_export_completeness.py",
     "test_findings_rollup.py",
-    "test_fingerprint.py",
     "test_follow_up_export.py",
     "test_identity_credential_state.py",
     "test_infrastructure_rollup_export.py",
     "test_llm_settings_agreement.py",
     "test_post_review.py",
     "test_scan_parameters.py",
-    "test_severity_scale.py",
     "test_tool_command_check.py",
-    "test_tool_docs_fetch.py",
     "test_tool_invocations.py",
 }
 

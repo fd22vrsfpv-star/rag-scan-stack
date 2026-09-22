@@ -30,6 +30,8 @@ from _container import ERR, container_exec
 
 import pytest
 
+from conftest import psql_argv  # DSN-or-container resolver
+
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 API = os.path.join(REPO, "app", "rag-api", "api.py")
 
@@ -250,8 +252,7 @@ ROLLBACK;
 """
     try:
         out = subprocess.run(
-            ["docker", "exec", "-i", "rag-postgres", "psql", "-U", "app", "-d",
-             "scans", "-v", "ON_ERROR_STOP=1", "-tA"],
+            psql_argv(flags=("-v", "ON_ERROR_STOP=1", "-tA")),
             input=sql, capture_output=True, text=True, timeout=180)
     except (OSError, subprocess.SubprocessError):
         pytest.skip("rag-postgres not reachable")
