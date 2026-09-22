@@ -1255,11 +1255,25 @@ def _run_masscan_then_nmap_async(job_id: str, targets: List[str], ports: str, ra
         _ensure_outdir()
         stats = mass2nmap(progress_callback=_nmap_progress)
 
-        # Success!
         duration_s = round(time.time() - start_time, 2)
         result = {"ok": True, "masscan_out": path, "ingest": ingest_payload, "stats": stats,
                   "command": masscan_cmd_str, "duration_s": duration_s}
-        update_job_status(job_id, "completed", "done", "Scan completed successfully", result=result)
+        # A run whose nmap batches partly FAILED is not "completed". run_nmap_batch
+        # raises on a non-zero exit and mass2nmap counts those into stats["errors"]
+        # with samples in stats["error_examples"], but reporting `completed`
+        # regardless meant a host whose ports were never enumerated read as fully
+        # scanned — the port list silently shrank and nothing said so.
+        # "partial" is already a recognised terminal status downstream
+        # (dashboard/bff/polling.py), so nothing else needs teaching.
+        _errs = int((stats or {}).get("errors") or 0)
+        if _errs:
+            _ex = "; ".join((stats or {}).get("error_examples") or [])[:300]
+            update_job_status(job_id, "partial", "done",
+                              f"Scan completed with {_errs} failed nmap batch(es): {_ex}",
+                              result=result)
+        else:
+            update_job_status(job_id, "completed", "done", "Scan completed successfully",
+                              result=result)
 
         # Save session results
         session_files = []

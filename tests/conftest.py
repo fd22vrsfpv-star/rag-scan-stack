@@ -378,6 +378,21 @@ _CLEANUP_TABLES = (
 )
 
 
+# Rows a test can leave in a PRODUCTION table that the timestamp sweep above must
+# NOT be widened to cover. `tool_selection_learned` and `pending_exploits` are
+# live operational state — a concurrent real scan queuing an exploit during a
+# pytest run would be inside the session window and would be deleted by a
+# created_at-scoped DELETE. So these are cleaned by MARKER instead: only rows a
+# test could have written, identified by a value no real row carries.
+#
+# Found 2026-09-21: 16 `__pytest_phase` rows in the learning table and an
+# APPROVED `exploit/unix/misc/pytest_release` row in the live exploit queue.
+_MARKER_CLEANUP = (
+    ("tool_selection_learned", "phase = '__pytest_phase'"),
+    ("pending_exploits", "exploit_id LIKE '%%pytest%%'"),
+)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def cleanup_test_db_rows():
     """Delete rows inserted into the test DB during this pytest session.
@@ -412,6 +427,15 @@ def cleanup_test_db_rows():
 
     try:
         with psycopg2.connect(dsn, connect_timeout=3) as conn:
+            # marker-scoped first: these are live tables, so only rows carrying a
+            # test marker are removed, never "everything since the session began"
+            for table, where in _MARKER_CLEANUP:
+                with conn.cursor() as cur:
+                    try:
+                        cur.execute(f"DELETE FROM {table} WHERE {where}")
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
             for table in _CLEANUP_TABLES:
                 with conn.cursor() as cur:
                     try:
