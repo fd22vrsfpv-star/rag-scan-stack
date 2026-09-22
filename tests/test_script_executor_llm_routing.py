@@ -136,9 +136,14 @@ def test_txt_to_exploit_routes_with_task():
             "txt_to_exploit's routed POST should target the `llm_url` resolved "
             "from os.environ['LLM_URL'], matching customize_script/fix_script."
         )
-    assert "os.environ.get('LLM_URL'" in ast.unparse(fn), (
-        "txt_to_exploit must read LLM_URL from the environment"
-    )
+    # asked of the CALL, not its unparsed spelling: os.environ.get("LLM_URL", ...)
+    reads_env = any(
+        isinstance(n, ast.Call)
+        and (getattr(n.func, "attr", None) == "get")
+        and n.args and isinstance(n.args[0], ast.Constant)
+        and n.args[0].value == "LLM_URL"
+        for n in ast.walk(fn))
+    assert reads_env, "txt_to_exploit must read LLM_URL from the environment"
 
 
 @pytest.mark.parametrize("name", GENERATION_FUNCS)
@@ -175,3 +180,95 @@ def test_generation_calls_do_not_force_a_model(name):
             f"{name}() (line {call.lineno}) must fall back to None, not "
             f"{ast.dump(last)}"
         )
+
+
+# ── the llm_generate lane is wired, and stays gated ──────────────────────────
+
+def _fn_src(name):
+    import ast as _ast
+    src = _source()
+    for n in _ast.walk(_ast.parse(src)):
+        if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef)) and n.name == name:
+            return _ast.get_source_segment(src, n)
+    return None
+
+
+def _calls_and_consts(fn_src):
+    """(called names, string constants) of a function — structure, not spelling."""
+    import ast as _ast
+    tree = _ast.parse(fn_src.lstrip())
+    calls, consts = set(), set()
+    for n in _ast.walk(tree):
+        if isinstance(n, _ast.Call):
+            calls.add(getattr(n.func, "id", None) or getattr(n.func, "attr", None))
+        elif isinstance(n, _ast.Constant) and isinstance(n.value, str):
+            consts.add(n.value)
+    return calls, consts
+
+
+def test_the_llm_generate_lane_reaches_the_generator():
+    """A .txt/.md write-up must actually be turned into a runnable exploit.
+
+    Before: analyze_exploit set strategy "llm_generate", prepare_script produced
+    {"type": "llm_generate", "requires_llm": True} with no "command", and
+    _execute_gated answered "Cannot auto-execute this exploit type". txt_to_exploit
+    existed and had ZERO callers — the lane dead-ended one step before it.
+    """
+    fn = _fn_src("_execute_gated")
+    assert fn, "_execute_gated not found"
+    calls, consts = _calls_and_consts(fn)
+    assert "txt_to_exploit" in calls, (
+        "the llm_generate branch does not call the generator — the lane still "
+        "dead-ends before it")
+    assert "llm_generate" in consts, "no llm_generate branch in _execute_gated"
+
+
+def test_generated_code_runs_through_the_already_gated_inner_path():
+    """It must reuse _execute_fixed_gated, NOT execute_fixed_script.
+
+    _execute_gated already runs inside the scope gate AND a scan slot that
+    execute() took. Calling the OUTER execute_fixed_script() here would re-check
+    scope and take a SECOND slot while holding one — a self-deadlock against
+    MAX_CONCURRENT_SCANS, and a second dispatcher to keep gated.
+    """
+    import ast as _ast
+    fn = _fn_src("_execute_gated")
+    called = set()
+    for n in _ast.walk(_ast.parse(fn.lstrip())):
+        if isinstance(n, _ast.Call):
+            called.add(getattr(n.func, "id", None) or getattr(n.func, "attr", None))
+    assert "_execute_fixed_gated" in called, (
+        "generated code does not run through the inner gated path")
+    # Asked of the CALLS: a `not in` substring check is defeated by the comment
+    # above this branch, which names execute_fixed_script to explain why it is
+    # the wrong one to call.
+    assert "execute_fixed_script" not in called, (
+        "the llm_generate branch calls the OUTER execute_fixed_script, which "
+        "re-gates and takes a second scan slot while already holding one")
+
+
+def test_a_failed_generation_is_never_executed():
+    """txt_to_exploit's fallback returns strategy 'manual' with code=None and a
+    PROSE summary. Handing that to an interpreter would run the write-up."""
+    fn = _fn_src("_execute_gated")
+    import ast as _ast
+    _calls, consts = _calls_and_consts(fn)
+    assert "manual" in consts, (
+        "the llm_generate branch does not reject txt_to_exploit's 'manual' "
+        "fallback, whose summary is prose, not code")
+    # some conditional must actually test the generated `code`
+    guards_code = any(
+        isinstance(n, _ast.If) and any(
+            isinstance(x, _ast.Name) and x.id == "code" for x in _ast.walk(n.test))
+        for n in _ast.walk(_ast.parse(fn.lstrip())))
+    assert guards_code, "the branch does not check that code was produced"
+
+
+def test_the_lane_is_still_scope_gated_and_slot_bounded():
+    """The properties the new lane inherits must still be there to inherit."""
+    outer = _fn_src("execute")
+    assert outer, "execute() not found"
+    calls, _consts = _calls_and_consts(outer)
+    assert "_scope_refusal" in calls, "execute() no longer scope-gates"
+    assert "async_scan_slot" in calls, "execute() no longer bounds by scan slot"
+    assert "_execute_gated" in calls, "execute() no longer delegates to the gated body"
