@@ -2909,6 +2909,32 @@ def access_run(request: AccessRunRequest):
         # Refused, never guessed. A fallback would run the command through a
         # different transport than the caller chose.
         raise HTTPException(400, f"unsupported transport: {request.kind!r}")
+
+    # SCOPE GATE. Holding access is not the same as being authorised to use it
+    # now: an engagement can be purged or a scope narrowed AFTER the shell was
+    # obtained, and this endpoint would still have executed against the host.
+    # CLAUDE.md admits no exception — every path that sends traffic passes the
+    # gate, fail closed — and this is the lane the post-access work routes
+    # through, so anything added there inherits whatever is decided here.
+    scope_target = (request.target or "").strip()
+    if not scope_target:
+        # A bind_shell/listener handle is "host:port"; recover the host rather
+        # than refusing a caller that simply did not repeat it.
+        handle = (request.handle or "").strip()
+        if handle.count(":") == 1 and not handle.startswith("["):
+            scope_target = handle.rsplit(":", 1)[0].strip()
+    if not scope_target:
+        # check_dispatch("") returns None — i.e. ALLOWED — so an unknown target
+        # must be refused HERE. Falling through would be a silent bypass.
+        raise HTTPException(
+            403, "refusing to run through access with no resolvable target: the "
+                 "scope gate cannot verify an empty target")
+    refusal = enforce_scope(scope_target, request.command)
+    if refusal:
+        logger.warning("REFUSED /access/run %s -> %s: %s",
+                       request.kind, scope_target, refusal)
+        raise HTTPException(403, refusal)
+
     try:
         out = fn(request.handle, request.command,
                  target=request.target, port=request.port)

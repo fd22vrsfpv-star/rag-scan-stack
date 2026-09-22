@@ -194,3 +194,51 @@ def test_relay_config_merges_into_payload_config(monkeypatch):
     cfg = er.MsfPayloadConfig.merged(override)
     assert cfg.connect_style == "reverse" and cfg.callback_host == "10.10.0.9"
     assert cfg.listener_bind_address == "0.0.0.0" and cfg.callback_port == 5555
+
+
+# ── provisioning must enable GatewayPorts, or every relay silently drops ────
+
+def test_provisioning_enables_gateway_ports():
+    """A node provisioned without `GatewayPorts` cannot host a callback relay.
+
+    sshd defaults to `GatewayPorts no`, which binds the forwarded port on
+    127.0.0.1 SILENTLY — the forward itself succeeds, so ExitOnForwardFailure
+    does not catch it, and the relay reports up while a target cannot reach it
+    and every callback is dropped. Observed on rt3_scan1: starting the relay
+    returned exactly that diagnosis and refused.
+
+    `clientspecified` rather than `yes`: it lets the client choose the bind
+    address (which is what the relay asks for) instead of forcing EVERY forward
+    on the node to bind globally.
+    """
+    import os
+    repo = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+    checked = 0
+    for name in ("provision-standard-node.sh", "provision-standard-node-safe.sh"):
+        path = os.path.join(repo, "scripts", name)
+        if not os.path.exists(path):
+            continue
+        checked += 1
+        body = open(path, encoding="utf-8").read()
+        assert "GatewayPorts clientspecified" in body, (
+            f"{name} does not set GatewayPorts, so a node it provisions cannot "
+            "host a callback relay — the forward binds loopback-only and every "
+            "reverse shell is dropped with no error")
+        assert "sshd_config" in body, f"{name} no longer edits sshd_config"
+    assert checked, "no provisioning script found — guard would pass vacuously"
+
+
+def test_the_sshd_rollback_points_at_the_backup_it_made():
+    """The safe script took a timestamped backup and restored a DIFFERENT
+    timestamp, so the rollback could never find the file it wrote."""
+    import os
+    repo = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+    path = os.path.join(repo, "scripts", "provision-standard-node-safe.sh")
+    if not os.path.exists(path):
+        import pytest as _p
+        _p.skip("safe provisioning script not present")
+    body = open(path, encoding="utf-8").read()
+    assert 'cp "$SSHD_BACKUP" /etc/ssh/sshd_config' in body, (
+        "the sshd rollback does not restore the backup it captured — recomputing "
+        "$(date +%s) at restore time names a file that was never written, so a "
+        "failed config test leaves the broken config in place")
