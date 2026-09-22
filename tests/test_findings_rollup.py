@@ -35,6 +35,8 @@ import urllib.request
 import ssl
 
 import pytest
+
+from conftest import psql_argv  # DSN-or-container resolver
 from conftest import BFF_API  # shared service endpoints (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
@@ -58,8 +60,7 @@ def _api_key():
 def _psql(sql):
     try:
         out = subprocess.run(
-            ["docker", "exec", "rag-postgres", "psql", "-U", "app", "-d", "scans",
-             "-v", "ON_ERROR_STOP=1", "-tAc", sql],
+            psql_argv(sql, flags=("-v", "ON_ERROR_STOP=1", "-tAc")),
             capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return None

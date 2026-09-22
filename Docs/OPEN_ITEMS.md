@@ -25,6 +25,37 @@ named tests exist).
 
 ---
 
+## Test coverage tiers
+
+### The service-tier tests cannot complete against the live stack
+**Found:** 2026-09-22
+**Evidence:** with services reachable by compose-network name
+(`TEST_RAG_API=https://rag-api:8000 TEST_BFF=https://pentest-dashboard`), a full
+run reached 43% and then advanced 4 tests in 10 minutes; it was killed rather
+than finished. `rag-api`'s own `/health` answers in 4.2s consistently
+(`curl -w %{time_total}`, three consecutive runs: 4.23s, 4.19s, 4.18s) because it
+probes its dependencies serially; the dashboard's aggregated `/api/health` takes
+8.6s and reports `rag_api: ConnectTimeout (timeout=8s)` under that load. ~107
+service-tier tests skip offline as a result.
+**Where:** `app/rag-api/api.py::health` and the per-dependency probes it makes.
+**Done when:** the service tier can run to completion in a bounded time — either
+the dependency probes are made concurrent/cached, or the suite gets a way to run
+service tests against a stub.
+**Enforced by:** not enforced
+
+### ~35 tests need a docker socket the runner does not mount
+**Found:** 2026-09-22
+**Evidence:** 25 test files shell out to `docker exec <service> python3 -c ...`
+to run code with the container's own imports and DSN. The test container has no
+docker socket, so they skip with "rag-api container not reachable" (22 sites),
+"rag-api container unreachable" (13 sites). `scripts/run_scratch_db_tests.sh`
+deliberately does not mount `/var/run/docker.sock`.
+**Where:** `tests/test_agent_flags.py`, `tests/test_customer_site_detection.py`,
+`tests/test_mark_customer_scope.py` and 22 further files.
+**Done when:** either the runner mounts the socket behind an explicit opt-in flag,
+or these tests obtain the container's behaviour without `docker exec`.
+**Enforced by:** not enforced
+
 ## Pipeline coverage
 
 ### Only one HTTP port was discovered on a host serving several

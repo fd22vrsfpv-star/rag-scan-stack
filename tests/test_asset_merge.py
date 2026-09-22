@@ -33,6 +33,8 @@ import subprocess
 
 import pytest
 
+from conftest import psql_argv  # DSN-or-container resolver
+
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 
 INSTALL_SCRIPTS = ("db_init/ensure_all_tables.sql", "db_init/setup_alldb.sql")
@@ -42,8 +44,7 @@ def _psql(sql):
     """One-shot query; returns the scalar text or None when unreachable."""
     try:
         out = subprocess.run(
-            ["docker", "exec", "rag-postgres", "psql", "-U", "app", "-d", "scans",
-             "-v", "ON_ERROR_STOP=1", "-tAc", sql],
+            psql_argv(sql, flags=("-v", "ON_ERROR_STOP=1", "-tAc")),
             capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -54,8 +55,7 @@ def _psql_script(sql):
     """Run a multi-statement script on stdin. `docker exec` needs -i for that."""
     try:
         out = subprocess.run(
-            ["docker", "exec", "-i", "rag-postgres", "psql", "-U", "app", "-d", "scans",
-             "-v", "ON_ERROR_STOP=1", "-tA"],
+            psql_argv(flags=("-v", "ON_ERROR_STOP=1", "-tA")),
             input=sql, capture_output=True, text=True, timeout=300)
     except (OSError, subprocess.SubprocessError):
         return None

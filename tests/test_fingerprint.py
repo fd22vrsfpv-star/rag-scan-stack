@@ -38,6 +38,8 @@ import uuid
 
 import pytest
 
+from conftest import psql_argv as _psql_argv  # DSN-or-container resolver
+
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
@@ -235,7 +237,6 @@ def test_recon_normalizes_case_and_padding():
 
 _LAST_PSQL_ERROR = {"msg": ""}
 
-
 def _psql(sql):
     """Run SQL, returning stdout or None.
 
@@ -245,9 +246,7 @@ def _psql(sql):
     """
     try:
         out = subprocess.run(
-            ["docker", "exec", "rag-postgres", "psql", "-U", "app", "-d", "scans",
-             "-v", "ON_ERROR_STOP=1", "-tAc", sql],
-            capture_output=True, text=True, timeout=60,
+            _psql_argv(sql), capture_output=True, text=True, timeout=60,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         _LAST_PSQL_ERROR["msg"] = f"{type(exc).__name__}: {exc}"
@@ -455,15 +454,16 @@ def test_null_auth_type_no_longer_duplicates(db):
     got the same dedup treatment as the other three.
     """
     out = subprocess.run(
-        ["docker", "exec", "rag-postgres", "psql", "-U", "app", "-d", "scans", "-c",
-         "BEGIN;"
-         "INSERT INTO credential_findings (ip, port, protocol, username, auth_type,"
-         " valid_cred, source, status) VALUES"
-         " ('203.0.113.95'::inet, 22, 'ssh', 'probe', NULL, true, 'test', 'valid');"
-         "INSERT INTO credential_findings (ip, port, protocol, username, auth_type,"
-         " valid_cred, source, status) VALUES"
-         " ('203.0.113.95'::inet, 22, 'ssh', 'probe', NULL, true, 'test', 'valid');"
-         "ROLLBACK;"],
+        _psql_argv(
+            "BEGIN;"
+            "INSERT INTO credential_findings (ip, port, protocol, username, auth_type,"
+            " valid_cred, source, status) VALUES"
+            " ('203.0.113.95'::inet, 22, 'ssh', 'probe', NULL, true, 'test', 'valid');"
+            "INSERT INTO credential_findings (ip, port, protocol, username, auth_type,"
+            " valid_cred, source, status) VALUES"
+            " ('203.0.113.95'::inet, 22, 'ssh', 'probe', NULL, true, 'test', 'valid');"
+            "ROLLBACK;",
+            flags=("-c",)),
         capture_output=True, text=True, timeout=30)
     combined = out.stdout + out.stderr
     rows = _psql(
@@ -491,10 +491,10 @@ def test_brutus_on_conflict_matches_the_index(db):
         " ON CONFLICT (ip, port, username, COALESCE(auth_type, ''))"
         " DO UPDATE SET last_verified_at = now();")
     out = subprocess.run(
-        ["docker", "exec", "rag-postgres", "psql", "-U", "app", "-d", "scans", "-c",
-         "BEGIN;" + upsert + upsert +
-         "SELECT count(*) FROM credential_findings WHERE ip='203.0.113.96'::inet;"
-         "ROLLBACK;"],
+        _psql_argv("BEGIN;" + upsert + upsert +
+                   "SELECT count(*) FROM credential_findings WHERE ip='203.0.113.96'::inet;"
+                   "ROLLBACK;",
+                   flags=("-c",)),
         capture_output=True, text=True, timeout=30)
     combined = out.stdout + out.stderr
     assert "no unique or exclusion constraint" not in combined, (
