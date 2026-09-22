@@ -76,3 +76,42 @@ def test_near_miss_is_normalised():
     if not data["module"]:
         pytest.skip("php_cgi_arg_injection not loaded in this MSF build")
     assert data["module"] == "exploit/multi/http/php_cgi_arg_injection", data["module"]
+
+
+# ── the vector-sweep writer must gate too ───────────────────────────────────
+
+def test_the_vector_sweep_resolves_before_queueing():
+    """`process_service_vectors` auto-approves and auto-fires what it queues.
+
+    Its module comes straight from knowledge/service_access_methods.yaml, which
+    is hand-written and can name a module this Metasploit does not ship — it
+    declares `exploit/linux/misc/drb_remote_codeexec`, and `/msf/resolve` reports
+    exists=False for it on this install. Without the gate that becomes an
+    auto-fired row that can only fail, and it is the likely origin of the
+    "synthetic module ids queued as source=metasploit" rows.
+
+    queue_exploit_for_approval already gates this way; this pins that the vector
+    path does too, and that it FAILS OPEN (an unreachable resolver must not stop
+    all queueing — `checked` is False in that case).
+    """
+    import ast as _ast
+    repo = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+    src = open(os.path.join(repo, "autogen_agents", "exploit_watcher.py"),
+               encoding="utf-8").read()
+    fn = next((n for n in _ast.walk(_ast.parse(src))
+               if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+               and n.name == "process_service_vectors"), None)
+    assert fn, "process_service_vectors not found"
+    body = _ast.get_source_segment(src, fn)
+
+    calls = {getattr(c.func, "id", None) or getattr(c.func, "attr", None)
+             for c in _ast.walk(fn) if isinstance(c, _ast.Call)}
+    assert "_resolve_msf_module" in calls, (
+        "the vector sweep queues a metasploit exploit without checking the module "
+        "is loaded — and this path is auto-approved and auto-fired")
+
+    # fail-open: the skip must require `checked`, not merely "did not resolve"
+    assert "checked and not resolved" in body, (
+        "the vector sweep skips on an unresolved module without requiring that "
+        "the check actually RAN — an unreachable resolver would then silently "
+        "stop all vector queueing")
