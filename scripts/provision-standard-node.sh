@@ -434,6 +434,18 @@ if [[ -f /etc/ssh/sshd_config ]]; then
 
     # Protocol 2 only
     echo "Protocol 2" >> /etc/ssh/sshd_config
+
+    # Callback relays need the node to bind a forwarded port on a NON-loopback
+    # address, or a target cannot reach it and every reverse shell is dropped.
+    # sshd defaults to `GatewayPorts no`, which binds 127.0.0.1 SILENTLY — the
+    # forward succeeds, so ExitOnForwardFailure does not catch it, and the relay
+    # looks up while swallowing callbacks. `clientspecified` (not `yes`) lets the
+    # client choose the bind address rather than forcing every forward global.
+    if grep -qE '^[[:space:]]*GatewayPorts' /etc/ssh/sshd_config; then
+        sed -i 's/^[[:space:]]*#*[[:space:]]*GatewayPorts.*/GatewayPorts clientspecified/' /etc/ssh/sshd_config
+    else
+        echo 'GatewayPorts clientspecified' >> /etc/ssh/sshd_config
+    fi
 fi
 
 # Configure firewall (allow SSH and WireGuard)

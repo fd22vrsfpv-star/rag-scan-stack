@@ -431,19 +431,36 @@ sysctl -p /etc/sysctl.d/99-rag-scan-stack.conf
 # Apply SSH hardening CAREFULLY
 log "Applying SSH security hardening..."
 if [[ -f /etc/ssh/sshd_config ]]; then
-    cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup.$(date +%s)
+    # Capture the backup path ONCE. This used to be `cp ... .backup.$(date +%s)`
+    # in both places, so the restore below computed a NEW timestamp and pointed
+    # at a file that never existed — the rollback silently failed and a bad
+    # config stayed in place.
+    SSHD_BACKUP="/etc/ssh/sshd_config.backup.$(date +%s)"
+    cp /etc/ssh/sshd_config "$SSHD_BACKUP"
 
     # Safe SSH modifications (don't break existing connections)
     sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config || true
     sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config || true
     sed -i 's/#PermitEmptyPasswords no/PermitEmptyPasswords no/' /etc/ssh/sshd_config || true
 
+    # Callback relays need the node to bind a forwarded port on a NON-loopback
+    # address, or a target cannot reach it and every reverse shell is dropped.
+    # sshd defaults to `GatewayPorts no`, which binds 127.0.0.1 SILENTLY — the
+    # forward succeeds, so ExitOnForwardFailure does not catch it, and the relay
+    # looks up while swallowing callbacks. `clientspecified` (not `yes`) lets the
+    # client choose the bind address rather than forcing every forward global.
+    if grep -qE '^[[:space:]]*GatewayPorts' /etc/ssh/sshd_config; then
+        sed -i 's/^[[:space:]]*#*[[:space:]]*GatewayPorts.*/GatewayPorts clientspecified/' /etc/ssh/sshd_config || true
+    else
+        echo 'GatewayPorts clientspecified' >> /etc/ssh/sshd_config
+    fi
+
     # Test SSH config before restarting
     if sshd -t; then
         log "SSH config valid, will restart after firewall setup"
     else
         warn "SSH config test failed, keeping original"
-        cp /etc/ssh/sshd_config.backup.$(date +%s) /etc/ssh/sshd_config
+        cp "$SSHD_BACKUP" /etc/ssh/sshd_config
     fi
 fi
 
