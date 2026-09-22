@@ -53,6 +53,36 @@ def _map():
     return yaml.safe_load(open(MAP, encoding="utf-8"))
 
 
+def test_every_command_template_is_shell_parseable():
+    """A rendered command must survive the shell it is handed to.
+
+    `verbose_errors` carried `curl -sk {url}'` — one stray apostrophe. render_command
+    (app/rag-api/wstg.py) is a literal .replace() with no quoting, so it reached the
+    shell verbatim and 11 stored runs died with
+    `/bin/sh: 1: Syntax error: Unterminated quoted string` BEFORE touching the
+    network. They recorded as executed-and-fruitless, which is the worst outcome:
+    a probe that never ran, filed as a probe that found nothing.
+
+    Guards the CLASS. A test pinning that one row would not have caught the next
+    template to lose a quote.
+    """
+    import shlex
+    bad = []
+    for e in _map().get("entries") or []:
+        cmd = e.get("command")
+        if not cmd:
+            continue
+        rendered = (cmd.replace("{url}", "http://192.0.2.10:80/probe/")
+                       .replace("{target}", "192.0.2.10"))
+        try:
+            shlex.split(rendered)
+        except ValueError as exc:
+            bad.append(f"{e.get('id')}: {rendered!r} ({exc})")
+    assert not bad, (
+        "these command templates do not parse as a shell command, so they die in "
+        f"/bin/sh before reaching the target: {bad}")
+
+
 def test_map_loads_and_is_shaped():
     d = _map()
     entries = d.get("entries")
