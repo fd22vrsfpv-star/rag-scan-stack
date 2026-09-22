@@ -34,6 +34,8 @@ import subprocess
 
 import pytest
 
+from conftest import psql_argv  # DSN-or-container resolver
+
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 SCRIPT = os.path.join(REPO, "scripts", "check_tool_commands.py")
 LISTENER = os.path.join(REPO, "kali_listener", "listener_service.py")
@@ -43,8 +45,7 @@ MARKDOWN = os.path.join(REPO, "knowledge", "commands", "tool_invocations.md")
 def _psql(sql):
     try:
         out = subprocess.run(
-            ["docker", "exec", "rag-postgres", "psql", "-U", "app", "-d", "scans",
-             "-v", "ON_ERROR_STOP=1", "-tAc", sql],
+            psql_argv(sql, flags=("-v", "ON_ERROR_STOP=1", "-tAc")),
             capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -215,6 +216,9 @@ def test_the_markdown_is_present_and_was_ingested():
               "WHERE chunk ILIKE '%probed as:%'")
     if n is None:
         pytest.skip("no reachable rag-postgres")
+    # See test_tool_docs_fetch: an empty corpus means ingestion never ran here.
+    if _psql("SELECT count(*) FROM exploit_chunks") == "0":
+        pytest.skip("exploit_chunks is empty in this database — nothing has been ingested")
     assert int(n) > 0, (
         "the markdown exists but no chunk of it is in the vector store — run "
         "POST /rag/playbooks/ingest {\"playbook_dir\": \"/knowledge/commands\"}")

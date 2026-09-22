@@ -2,6 +2,7 @@
 Pytest configuration and shared fixtures for all tests.
 """
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Generator
@@ -63,6 +64,45 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 RAG_API = os.environ.get("TEST_RAG_API", "https://localhost:8000").rstrip("/")
 BFF = os.environ.get("TEST_BFF", "https://localhost:3002").rstrip("/")
 BFF_API = f"{BFF}/api"
+
+
+# ── reaching Postgres from a test container ──────────────────────────────────
+#
+# Thirteen test modules ran SQL via `docker exec rag-postgres psql`. In
+# `db_mode=remote_direct` there IS no rag-postgres container — the name is only a
+# network alias the DB tunnel publishes — so every one of those modules skipped
+# permanently, and the Python/SQL dedup agreement CLAUDE.md calls load-bearing
+# was verified nowhere. The test container has no docker socket either, so the
+# call raised FileNotFoundError rather than reporting anything useful.
+#
+# Resolution order is DSN first, container second: set TEST_DB_DSN and the SQL
+# runs against whatever it names; leave it unset and behaviour is exactly as
+# before, so an offline checkout still skips cleanly rather than failing.
+#
+# The psql CLI is deliberately kept on BOTH paths. Same binary, same flags, so
+# stdout is byte-identical and each module's existing output parsing keeps its
+# contract. A psycopg2 port would return only the LAST statement's rows, and
+# these probes are multi-statement blocks ending in ROLLBACK — it would silently
+# return nothing and every assertion would quietly compare against empty.
+DB_TEST_DSN = os.environ.get("TEST_DB_DSN") or os.environ.get("DB_DSN") or ""
+
+
+def psql_argv(sql=None, flags=("-v", "ON_ERROR_STOP=1", "-tAc")):
+    """argv running `sql` against TEST_DB_DSN when usable, else rag-postgres.
+
+    `flags` is a parameter because some probes deliberately run WITHOUT
+    ON_ERROR_STOP and with plain `-c`: they assert on psql's own status tags
+    ("INSERT 0 1") and on ERROR text, both of which -tAc suppresses.
+
+    `sql=None` means the statement arrives on stdin (the caller passes
+    `input=...` to subprocess). The container path needs `docker exec -i` for
+    that; the DSN path needs nothing extra.
+    """
+    if DB_TEST_DSN and shutil.which("psql"):
+        return ["psql", DB_TEST_DSN, *flags] + ([] if sql is None else [sql])
+    exec_flags = ["exec"] if sql is not None else ["exec", "-i"]
+    return ["docker", *exec_flags, "rag-postgres", "psql", "-U", "app",
+            "-d", "scans", *flags] + ([] if sql is None else [sql])
 
 
 def load_service_module(file_path, module_name, service_dir):

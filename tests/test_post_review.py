@@ -24,6 +24,8 @@ import subprocess
 import sys
 
 import pytest
+
+from conftest import psql_argv  # DSN-or-container resolver
 from conftest import FIXTURE_HOST  # shared lab constant (see tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
@@ -484,10 +486,9 @@ def test_queue_reruns_inserts_pending_rows_and_dispatches_nothing(live):
     assert again["summary"]["reruns_proposed"] > 0, "nothing was proposed at all"
 
     out = subprocess.run(
-        ["docker", "exec", "rag-postgres", "psql", "-U", "app", "-d", "scans", "-tAc",
-         "SELECT count(*), count(*) FILTER (WHERE status <> 'pending'), "
+        psql_argv("SELECT count(*), count(*) FILTER (WHERE status <> 'pending'), "
          "count(*) FILTER (WHERE executed_at IS NOT NULL) "
-         "FROM scan_recommendations WHERE source = 'post_review'"],
+         "FROM scan_recommendations WHERE source = 'post_review'", flags=("-tAc",)),
         capture_output=True, text=True, timeout=60)
     if out.returncode != 0:
         pytest.skip("rag-postgres not reachable")
@@ -507,10 +508,9 @@ def test_queue_reruns_inserts_pending_rows_and_dispatches_nothing(live):
 def test_queued_proposals_carry_their_evidence(live):
     """A proposal with no reason is indistinguishable from a guess."""
     out = subprocess.run(
-        ["docker", "exec", "rag-postgres", "psql", "-U", "app", "-d", "scans", "-tAc",
-         "SELECT count(*) FROM scan_recommendations WHERE source='post_review' "
+        psql_argv("SELECT count(*) FROM scan_recommendations WHERE source='post_review' "
          "AND (extra->>'post_review_category' IS NULL OR extra->>'evidence' IS NULL "
-         "     OR extra->>'prior_execution_id' IS NULL)"],
+         "     OR extra->>'prior_execution_id' IS NULL)", flags=("-tAc",)),
         capture_output=True, text=True, timeout=60)
     if out.returncode != 0:
         pytest.skip("rag-postgres not reachable")
@@ -523,8 +523,7 @@ def test_queued_proposals_carry_their_evidence(live):
 def _psql(sql):
     try:
         out = subprocess.run(
-            ["docker", "exec", "rag-postgres", "psql", "-U", "app", "-d", "scans",
-             "-tAc", sql], capture_output=True, text=True, timeout=60)
+            psql_argv(sql, flags=("-tAc",)), capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return None
     return out.stdout.strip() if out.returncode == 0 else None

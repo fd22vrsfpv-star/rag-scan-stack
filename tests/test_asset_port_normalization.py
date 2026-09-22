@@ -35,6 +35,8 @@ import subprocess
 
 import pytest
 
+from conftest import psql_argv  # DSN-or-container resolver
+
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 
 
@@ -42,8 +44,7 @@ def _psql(sql):
     """One scalar out of the live DB, or None when no DB is reachable."""
     try:
         out = subprocess.run(
-            ["docker", "exec", "rag-postgres", "psql", "-U", "app", "-d", "scans",
-             "-tAc", sql],
+            psql_argv(sql, flags=("-tAc",)),
             capture_output=True, text=True, timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
@@ -154,9 +155,8 @@ def test_ports_have_no_ip_level_duplicates(db):
 def test_check_constraint_actually_rejects(db):
     """Sabotage the invariant against the live schema, inside a rollback."""
     out = subprocess.run(
-        ["docker", "exec", "rag-postgres", "psql", "-U", "app", "-d", "scans", "-c",
-         "BEGIN; INSERT INTO assets (ip, hostname) "
-         "VALUES ('10.99.99.99'::inet, '10.99.99.99'); ROLLBACK;"],
+        psql_argv("BEGIN; INSERT INTO assets (ip, hostname) "
+         "VALUES ('10.99.99.99'::inet, '10.99.99.99'); ROLLBACK;", flags=("-c",)),
         capture_output=True, text=True, timeout=30,
     )
     combined = out.stdout + out.stderr

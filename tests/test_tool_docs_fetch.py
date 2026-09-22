@@ -34,6 +34,8 @@ import sys
 
 import pytest
 
+from conftest import psql_argv  # DSN-or-container resolver
+
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 SCRIPT = os.path.join(REPO, "scripts", "fetch_tool_docs.py")
 DOCS = os.path.join(REPO, "knowledge", "commands", "kali_tool_docs.md")
@@ -43,8 +45,7 @@ sys.path.insert(0, os.path.join(REPO, "scripts"))
 def _psql(sql):
     try:
         out = subprocess.run(
-            ["docker", "exec", "rag-postgres", "psql", "-U", "app", "-d", "scans",
-             "-v", "ON_ERROR_STOP=1", "-tAc", sql],
+            psql_argv(sql, flags=("-v", "ON_ERROR_STOP=1", "-tAc")),
             capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -163,6 +164,11 @@ def test_the_record_was_ingested():
               "WHERE chunk ILIKE '%subcommand-first%'")
     if n is None:
         pytest.skip("no reachable rag-postgres")
+    # An EMPTY corpus is a database where ingestion has never run (a fresh or
+    # scratch DB) — "cannot run here", not "the ingest is broken". Only a
+    # populated corpus that lacks this chunk is evidence of a real defect.
+    if _psql("SELECT count(*) FROM exploit_chunks") == "0":
+        pytest.skip("exploit_chunks is empty in this database — nothing has been ingested")
     assert int(n) > 0, (
         "no chunk carries the subcommand flag — run POST /rag/playbooks/ingest "
         "with {\"playbook_dir\": \"/knowledge/commands\"}")
