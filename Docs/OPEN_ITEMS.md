@@ -99,26 +99,6 @@ allowed.
 
 ## Data and deployment
 
-### `/access/run` dispatches with no scope check
-**Found:** 2026-09-21 (audit of the post-access transport items)
-**Evidence:** The `access_run` handler in `kali_listener/listener_service.py`
-calls `check_dispatch` **zero** times and makes no scope call of any kind —
-verified by walking its AST for calls. It executes an operator- or
-agent-supplied command through a held shell against a target host.
-Its docstring argues the access "was already obtained by an approved exploit or
-a discovered credential", which is a real argument — but CLAUDE.md's rule admits
-no exception: *"Every code path that sends traffic to a host MUST pass the scope
-gate before dispatch. Fail closed."* An engagement can also be purged or a scope
-narrowed AFTER access was obtained, at which point the prior approval no longer
-describes the current authorisation.
-**Where:** `kali_listener/listener_service.py::access_run`.
-**Why it matters:** it is the lane the post-access work (sudo elevation, non-ssh
-transports) would be routed through, so anything added there inherits the gap.
-**Done when:** `/access/run` calls `etl/scope_gate.py::check_dispatch` and
-refuses out-of-scope targets, OR the exemption is stated explicitly in CLAUDE.md
-as a considered exception with its reasoning, rather than being implicit.
-**Enforced by:** not enforced (`tests/test_dispatch_invariants.py::test_no_new_ungated_dispatchers` is the natural home)
-
 ### Post-access steps cannot run on the Kali route — `sshpass` is not a safe tool
 **Found:** 2026-09-21
 **Evidence:** `_wrap_remote` builds `sshpass -p '{password}' ssh ...`
@@ -308,6 +288,12 @@ Note the knock-on: with no relay anywhere, `_node_callback_config()` returns Non
 for every dispatch, so MSF exploits resolve to BIND payloads and every one needs
 manual approval (etl/bind_payload_policy). Enabling GatewayPorts on one node
 lifts that too.
+
+**Update 2026-09-22:** node provisioning now sets `GatewayPorts clientspecified`
+by default (`scripts/provision-standard-node.sh` and `-safe.sh`), so newly
+provisioned nodes can host a relay. EXISTING nodes are unchanged — rt3_scan1 et al
+were provisioned before this and still need the sshd edit applied by hand before
+a relay will start. The refusal remains the correct behaviour until then.
 
 ## LLM routing
 
