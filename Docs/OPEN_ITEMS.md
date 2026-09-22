@@ -343,22 +343,31 @@ approval path, gated behind an explicit policy flag (Tier 3).
 
 ## Exploit classification
 
-### Synthetic module ids queued as source=metasploit
-**Found:** 2026-09-16
-**Evidence:** exploit-runner fired `exploit/metasploitable_root_shell_1524` and
-`exploit/drb_remote_codeexec` as `source='metasploit'` pending_exploits; neither
-exists in this MSF (`module.exploits` roster has no such leaf), so both fail
-`Invalid Module` every scan. `metasploitable_root_shell_1524` is a synthetic id,
-not an MSF module path at all.
-**Where:** whatever queues these pending_exploits (recommender / langgraph exploit
-planning) — it emits made-up exploit_ids under source=metasploit instead of a real
-module path or a non-metasploit source.
-**Done when:** a pending_exploit with source=metasploit either carries a module
-path that resolves against `module.exploits`, or is queued under the correct
-source (e.g. a bind-shell access, not an MSF module). The auto-correct now flags
-`module_missing` on these (2026-09-16), but the root queuing should not create them.
-**Enforced by:** not enforced
-
+### A vector whose MSF module is not installed is silently dropped
+**Found:** 2026-09-16 as "synthetic module ids queued as source=metasploit";
+rewritten 2026-09-21 — half of it is stale and half is now fixed.
+**Evidence:** measured against the live Metasploit via `/msf/resolve` on
+2026-09-21 — `exploit/unix/ftp/vsftpd_234_backdoor` returns exists=True,
+`exploit/linux/misc/drb_remote_codeexec` exists=False,
+`metasploitable_root_shell_1524` exists=False. The last has no generator left in
+the codebase. The DRb module IS declared in two places
+(`knowledge/service_access_methods.yaml:170`, `scan_recommender/tool_kb.py:92`)
+but is not shipped in this install.
+`process_service_vectors` now resolves before queueing and fails OPEN (`checked`
+is False when the check could not run), so that vector is SKIPPED rather than
+queued-and-failing — a log line and nothing else.
+**Where:** `knowledge/service_access_methods.yaml:168-170`,
+`scan_recommender/tool_kb.py:92`, and the still-ungated writer at
+`dashboard/bff/routers/assets.py:1856`.
+**Why it matters:** silently skipping may not be the intent. The DRb vector
+simply stops being offered; an operator looking for it will not see why. And the
+BFF writer is the same class of gap, lower risk only because it is
+operator-initiated rather than auto-fired.
+**Done when:** the operator decides one of — install the DRb module in this
+Metasploit, or remove it from both declarations so it is not offered at all; AND
+the BFF writer gets the same resolve gate.
+**Enforced by:** `tests/test_msf_resolve.py::test_the_vector_sweep_resolves_before_queueing`
+(pins the gate and that it fails open)
 ### A langgraph session never drains pending credential recommendations
 **Found:** 2026-09-17, rewritten 2026-09-21 after audit — the original headline
 ("hydra recommended but never auto-dispatched") is no longer true.
