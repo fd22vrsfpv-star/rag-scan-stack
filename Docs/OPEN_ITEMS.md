@@ -99,6 +99,65 @@ allowed.
 
 ## Data and deployment
 
+### `/access/run` dispatches with no scope check
+**Found:** 2026-09-21 (audit of the post-access transport items)
+**Evidence:** The `access_run` handler in `kali_listener/listener_service.py`
+calls `check_dispatch` **zero** times and makes no scope call of any kind —
+verified by walking its AST for calls. It executes an operator- or
+agent-supplied command through a held shell against a target host.
+Its docstring argues the access "was already obtained by an approved exploit or
+a discovered credential", which is a real argument — but CLAUDE.md's rule admits
+no exception: *"Every code path that sends traffic to a host MUST pass the scope
+gate before dispatch. Fail closed."* An engagement can also be purged or a scope
+narrowed AFTER access was obtained, at which point the prior approval no longer
+describes the current authorisation.
+**Where:** `kali_listener/listener_service.py::access_run`.
+**Why it matters:** it is the lane the post-access work (sudo elevation, non-ssh
+transports) would be routed through, so anything added there inherits the gap.
+**Done when:** `/access/run` calls `etl/scope_gate.py::check_dispatch` and
+refuses out-of-scope targets, OR the exemption is stated explicitly in CLAUDE.md
+as a considered exception with its reasoning, rather than being implicit.
+**Enforced by:** not enforced (`tests/test_dispatch_invariants.py::test_no_new_ungated_dispatchers` is the natural home)
+
+### Post-access steps cannot run on the Kali route — `sshpass` is not a safe tool
+**Found:** 2026-09-21
+**Evidence:** `_wrap_remote` builds `sshpass -p '{password}' ssh ...`
+(`autogen_agents/langgraph_engine.py:2353`) and the queued recommendation takes
+`scanner = command.split()[0]` = `sshpass` (`:2761`). The Kali dispatch route
+posts to `/tools/execute`, which gates on `get_safe_execution_tools()`.
+`_SAFE_READONLY_TOOLS` holds 44 tools and contains **neither `ssh` nor
+`sshpass`** (checked directly). So post-access steps 400 on that route and only
+run via the node path (`_dispatch_via_node`).
+**Where:** `kali_listener/listener_service.py::_SAFE_READONLY_TOOLS` vs
+`autogen_agents/langgraph_engine.py:2353,2761`.
+**Why it matters:** it is the mechanical reason the "sudo cannot elevate" and
+"only ssh steps reachable" items look like wrapper bugs — the wrapper is not the
+blocker, the lane is. Any fix to those items that does not address this will
+still 400.
+**Done when:** the post-access lane and the tool allow-list agree — either the
+steps dispatch by a route that does not gate on the tool name, or `ssh`/`sshpass`
+are deliberately placed on the correct lane (they are general-purpose remote
+execution, so "safe read-only" is arguably wrong for them — that is the decision).
+**Enforced by:** not enforced
+
+### `drb_remote_codeexec` is declared in knowledge but not installed
+**Found:** 2026-09-21
+**Evidence:** `knowledge/service_access_methods.yaml:170` declares
+`msf: "exploit/linux/misc/drb_remote_codeexec"` and
+`scan_recommender/tool_kb.py:92` repeats it, but the module is not in this
+Metasploit install — it is one of the two ids named in
+`tests/test_msf_resolve.py` as the case the resolve gate exists to reject.
+This is the likely true origin of the "synthetic module ids queued as
+source=metasploit" rows: `exploit_watcher._queue_vector_exploit` reads the module
+straight from that catalogue and queues it without resolving.
+**Where:** `knowledge/service_access_methods.yaml:168-170`, `scan_recommender/tool_kb.py:92`.
+**Done when:** the module is installed in this Metasploit, or removed from both
+declarations so the DRb vector is not offered as available. Gating the writer
+alone silently drops the vector, which may not be the intent — that is why this
+is its own item.
+**Enforced by:** not enforced (`tests/test_declared_tools_are_installed.py` is the existing pattern for "declared thing must exist")
+
+
 ### Generated curl commands carry a stray trailing quote and die in the shell
 **Found:** 2026-09-21 (by the parser agent, while reading real curl output)
 **Evidence:** 11 `tool_executions` rows with `tool='curl'` have empty output and
@@ -115,20 +174,6 @@ the target — nothing was ever asked of it.
 **Done when:** the generator quotes URLs correctly and no stored curl command has
 unbalanced quotes.
 **Enforced by:** not enforced
-
-### `_learn_against_recent` over-counts support the same way the backfill did
-**Found:** 2026-09-21
-**Evidence:** `learn_from_tool_executions` was fixed to count distinct
-observations, but the LIVE path `etl/tool_learning.py::_learn_against_recent`
-(~line 681) still upserts once per distinct recent failure every time another
-tool runs, so one failure followed by three runs of tool B stores support=3 for
-one observed pairing. `tool_selection_learned` currently holds 65 rows with
-max(support)=79.
-**Where:** `etl/tool_learning.py::_learn_against_recent`.
-**Done when:** the live path counts the same way the backfill now does, so
-`support` means one thing in the column regardless of which writer filled it.
-**Enforced by:** `tests/test_tool_learning_support.py` (covers the backfill path
-only — extend it to the live path when fixing)
 
 ### pytest runs write into production tables
 **Update 2026-09-21:** the 16 polluted rows were DELETED along with the inflated
@@ -314,24 +359,34 @@ source (e.g. a bind-shell access, not an MSF module). The auto-correct now flags
 `module_missing` on these (2026-09-16), but the root queuing should not create them.
 **Enforced by:** not enforced
 
-### Credential brute-force (hydra) recommended but never auto-dispatched in a session
-**Found:** 2026-09-17
-**Evidence:** Session msf_sept16-2307 (192.168.1.150, auto_execute) flow-summary
-kb_coverage showed `recommended_but_never_run: [{scanner: hydra, recommended: 2,
-top_priority: 25, acted_on: false}]` — the credential brute-force was recommended
-(priority 25) and never ran, while the langgraph exploit phase ran 12 exploits.
-**Where:** hydra maps to credential-check/brutus (`autogen_agents/scan_tools.py:712`),
-but the auto-dispatch of pending credential `scan_recommendations` lives in the BFF
-`dashboard/bff/services/recon_agent.py` loop (`SELECT ... WHERE sr.status='pending'`),
-which is separate from the langgraph session flow. A langgraph auto_execute session
-plans/fires exploits but does not dispatch KB credential brute-force recommendations,
-so they sit pending until the BFF loop runs or an operator presses Run.
-**Done when:** an auto_execute langgraph session dispatches high-priority pending
-credential-brute recommendations (scanner hydra/credential-check/brutus) for open auth
-services with no held credential, through the SAME scope-gated + MAX_CONCURRENT_SCANS
-bounded path as every other dispatcher (fail-closed; no private concurrency number).
-**Enforced by:** not enforced
-
+### A langgraph session never drains pending credential recommendations
+**Found:** 2026-09-17, rewritten 2026-09-21 after audit — the original headline
+("hydra recommended but never auto-dispatched") is no longer true.
+**What changed:** credential testing IS dispatched deterministically now.
+`autogen_agents/langgraph_engine.py:901` fires
+`scan_tools.start_credential_check(...)` for the auth services found by
+`_discovered_auth_services()` (:996), which reads open `ports` directly rather
+than depending on the model noticing. `kb_coverage` counts hydra satisfied by a
+credential-check run (`scan_tools.py:701`), so the reported symptom —
+`recommended_but_never_run: [{scanner: hydra}]` — should not recur for a
+pre-approved auto_execute session.
+**Evidence of the RESIDUAL:** `grep scan_recommendations
+autogen_agents/langgraph_engine.py` shows only an INSERT (:2755) — there is no
+POST to `/api/scan-recommendations/run`. Pending rows therefore wait for the BFF
+loop (`dashboard/bff/services/recon_agent.py:1070`) or an operator; the session
+itself never drains them. Separately, `start_brutus` (wordlist attack) is still
+model-choice only — the deterministic block fires `start_credential_check` alone.
+**Where:** `autogen_agents/langgraph_engine.py` (the block at :901).
+**Done when:** either the session drains pending credential recommendations
+through the existing `dashboard/bff/routers/assets.py:1211 run_scan_recommendations`
+(which already routes hydra/medusa/ncrack to the brutus-runner, enforces priority
+order, the idempotency guard and `_scope_rows_for()`), or the divergence is
+documented so "recommended but not run" is visibly the BFF loop's job.
+**NOT in scope without a decision:** firing `start_brutus` unattended. A wordlist
+attack risks account lockout, so whether pre-approval alone may trigger it is an
+operator policy call, not a code default.
+**Enforced by:** `tests/test_credential_phase_reachable.py` (pins that the
+pre-approval check precedes SCAN_TOOLS_CREDENTIAL — keep that ordering)
 ## ZAP authenticated spider does not traverse the logged-in area
 - **Found:** 2026-09-19, proving the default-cred -> Auth Profile -> authenticated scan chain on demo.testfire.net.
 - **Evidence:** logs show `ZAP form-auth configured ... as user jsmith (id 10)` + `ZAP authenticated scan for http://demo.testfire.net/`, no errors. But `z.core.urls()` after the scan returns 14 URLs, ALL public (/, /doLogin, /images/*) — zero /bank/ authenticated pages. Credentials are valid (default_cred_check confirmed the login redirect).

@@ -665,7 +665,8 @@ def observe_execution(
                 # read.
                 out["learned"] = [] if unmeasured else _learn_against_recent(
                     cur, phase=phase, service=service or "", target=target,
-                    port=port, tool=tool, succeeded=not (failed or fruitless))
+                    port=port, tool=tool, succeeded=not (failed or fruitless),
+                    attempt_id=out["attempt_id"])
             conn.commit()
     except Exception as e:  # noqa: BLE001
         log.debug("observe_execution failed: %s", e)
@@ -678,12 +679,27 @@ def observe_execution(
     return out
 
 
-def _learn_against_recent(cur, *, phase, service, target, port, tool, succeeded):
+def _learn_against_recent(cur, *, phase, service, target, port, tool, succeeded,
+                          attempt_id=None):
     """Pair this run against the recent failures it followed on the same target.
 
     This is the incremental form of `observe_sequence`: a general runner reports
     one command at a time, so the sequence has to be reconstructed from what is
     already recorded rather than handed over whole.
+
+    ONE OCCASION, ONE OBSERVATION. `support` is documented as "times this
+    (failure -> preferred_tool) pair was observed" and gates promotion
+    (PROMOTE_AFTER_SUPPORT), so it has to count occasions, not pairings. The
+    DISTINCT ON below de-dups only WITHIN one call: run B three times inside the
+    correlation window and A's single old failure was re-selected all three
+    times, each adding +1 — the same over-count that made the backfill read
+    support=68 for a pair seen a handful of times.
+
+    The backfill fixed this by walking a materialised list; this path sees one
+    row at a time and has no list. The equivalent here is temporal: only pair
+    against failures NEWER than this tool's previous attempt on the same key. A
+    re-run of B then finds nothing new, while a fresh failure of A (newer than
+    B's last run) still counts as a new occasion.
     """
     if not target:
         return []
@@ -698,10 +714,20 @@ def _learn_against_recent(cur, *, phase, service, target, port, tool, succeeded)
            AND success = false
            AND failure_signature IS NOT NULL
            AND created_at > now() - (%s || ' minutes')::interval
+           -- ... and newer than the last time THIS tool ran here, so a repeated
+           -- run does not re-observe the same failure (see the docstring).
+           AND created_at > COALESCE((
+                 SELECT max(created_at) FROM public.tool_attempts
+                  WHERE phase = %s AND service = %s AND target = %s
+                    AND COALESCE(port, -1) = COALESCE(%s, -1)
+                    AND tool = %s
+                    AND (%s::uuid IS NULL OR id <> %s::uuid)
+               ), '-infinity'::timestamptz)
          ORDER BY tool, failure_signature, created_at DESC
          LIMIT 10
         """,
-        (phase, service or "", target, port, tool, CORRELATION_WINDOW_MINUTES),
+        (phase, service or "", target, port, tool, CORRELATION_WINDOW_MINUTES,
+         phase, service or "", target, port, tool, attempt_id, attempt_id),
     )
     return [_upsert_rule(cur, phase, service, r[0], r[1], tool, r[2], succeeded)
             for r in cur.fetchall()]
