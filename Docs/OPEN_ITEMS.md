@@ -350,31 +350,21 @@ approval path, gated behind an explicit policy flag (Tier 3).
 
 ## Exploit classification
 
-### A vector whose MSF module is not installed is silently dropped
-**Found:** 2026-09-16 as "synthetic module ids queued as source=metasploit";
-rewritten 2026-09-21 — half of it is stale and half is now fixed.
-**Evidence:** measured against the live Metasploit via `/msf/resolve` on
-2026-09-21 — `exploit/unix/ftp/vsftpd_234_backdoor` returns exists=True,
-`exploit/linux/misc/drb_remote_codeexec` exists=False,
-`metasploitable_root_shell_1524` exists=False. The last has no generator left in
-the codebase. The DRb module IS declared in two places
-(`knowledge/service_access_methods.yaml:170`, `scan_recommender/tool_kb.py:92`)
-but is not shipped in this install.
-`process_service_vectors` now resolves before queueing and fails OPEN (`checked`
-is False when the check could not run), so that vector is SKIPPED rather than
-queued-and-failing — a log line and nothing else.
-**Where:** `knowledge/service_access_methods.yaml:168-170`,
-`scan_recommender/tool_kb.py:92`, and the still-ungated writer at
-`dashboard/bff/routers/assets.py:1856`.
-**Why it matters:** silently skipping may not be the intent. The DRb vector
-simply stops being offered; an operator looking for it will not see why. And the
-BFF writer is the same class of gap, lower risk only because it is
-operator-initiated rather than auto-fired.
-**Done when:** the operator decides one of — install the DRb module in this
-Metasploit, or remove it from both declarations so it is not offered at all; AND
-the BFF writer gets the same resolve gate.
-**Enforced by:** `tests/test_msf_resolve.py::test_the_vector_sweep_resolves_before_queueing`
-(pins the gate and that it fails open)
+### A BFF writer queues source=metasploit without resolving the module
+**Found:** 2026-09-16 (as "synthetic module ids"), narrowed 2026-09-22
+**Evidence:** `dashboard/bff/routers/assets.py:1856` inserts
+`source='metasploit'` from the recommender without calling `/msf/resolve`. The
+auto-firing twin (`exploit_watcher.process_service_vectors`) was gated on
+2026-09-21 and the DRb declarations that motivated the item were removed on
+2026-09-22, so this is the remaining ungated writer. Lower risk than the sweep —
+it is operator-initiated rather than auto-fired, so a bad row is seen — but it is
+the same class.
+**Where:** `dashboard/bff/routers/assets.py:1856`.
+**Done when:** the writer resolves through `/msf/resolve` before inserting, and
+fails OPEN (skip only when the check actually ran), matching
+`exploit_watcher.py:741-744`.
+**Enforced by:** not enforced (`tests/test_msf_resolve.py` holds the sweep's
+equivalent guard and is the natural home)
 ### A langgraph session never drains pending credential recommendations
 **Found:** 2026-09-17, rewritten 2026-09-21 after audit — the original headline
 ("hydra recommended but never auto-dispatched") is no longer true.

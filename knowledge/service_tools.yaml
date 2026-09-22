@@ -982,9 +982,11 @@ services:
       - name: nmap
         purpose: DRb detection
         command: "nmap -sV -p {port} {target}"
-    metasploit:
-      - module: exploit/linux/misc/drb_remote_codeexec
-        purpose: "DRb Remote Code Execution"
+    # No metasploit entry: exploit/linux/misc/drb_remote_codeexec was REMOVED
+    # from Metasploit on 2020-11-02 and exists in neither the current upstream
+    # module tree nor this install. Detection (nmap -sV) is kept; the exploit is
+    # not offered, because offering a module that cannot load only produces rows
+    # that fail.
     nuclei_tags: ["ruby", "drb", "network"]
     common_vulns:
       - "Remote code execution via insecure DRb service"
