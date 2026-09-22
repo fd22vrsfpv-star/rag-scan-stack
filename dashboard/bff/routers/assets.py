@@ -1820,6 +1820,31 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                     exploit_type = "rce" if module.startswith("exploit/") else "other"
                     title = (rec.get("action") or module)[:200]
 
+                    # Same gate the watcher applies: a source=metasploit row must
+                    # name a module THIS Metasploit loads, or it can only ever
+                    # fail. Resolved here, in the async caller, because
+                    # _queue_pending below is sync.
+                    # FAIL OPEN — an unreachable exploit-runner must not stop the
+                    # operator queueing work; only a check that actually RAN and
+                    # came back negative skips.
+                    try:
+                        async with httpx.AsyncClient(timeout=30, verify=False) as _c:
+                            _rr = await _c.post(f"{s.exploit_runner_url}/msf/resolve",
+                                                json={"exploit_id": module,
+                                                      "exploit_title": title},
+                                                headers=headers)
+                        _rdata = _rr.json() if _rr.status_code < 400 else None
+                    except Exception:  # noqa: BLE001 — fail open
+                        _rdata = None
+                    if _rdata is not None and not _rdata.get("error"):
+                        if not _rdata.get("module"):
+                            result["status"] = "skipped"
+                            result["detail"] = (
+                                f"{module!r} is not a loaded Metasploit module in this "
+                                "install — not queued")
+                            return result
+                        module = _rdata["module"]
+
                     def _queue_pending():
                         from db import get_db
                         with get_db() as conn, conn.cursor() as cur:
