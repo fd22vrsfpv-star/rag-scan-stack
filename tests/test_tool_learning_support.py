@@ -198,3 +198,71 @@ def test_a_run_outside_the_window_is_still_not_paired(monkeypatch):
     rows = [_fail("hydra", 0), _ok("nmap", beyond)]
     _out, rules = _backfill(monkeypatch, rows)
     assert rules == {}
+
+
+# ── the LIVE path: _learn_against_recent ────────────────────────────────────
+#
+# The backfill was fixed to count occasions by walking a materialised list. The
+# live path sees one attempt at a time and has no list, so it needs the temporal
+# equivalent: pair only against failures newer than this tool's own previous run
+# here. Without it, running B three times inside the correlation window
+# re-observed A's single old failure three times — support=3 for one occasion,
+# the same inflation the backfill produced.
+
+def _recent_query_sql():
+    """The SELECT _learn_against_recent issues, read from source (no DB)."""
+    import ast
+    src = open(os.path.join(REPO, "etl", "tool_learning.py"), encoding="utf-8").read()
+    fn = next((n for n in ast.walk(ast.parse(src))
+               if isinstance(n, ast.FunctionDef) and n.name == "_learn_against_recent"), None)
+    assert fn, "_learn_against_recent not found"
+    body = ast.get_source_segment(src, fn)
+    sqls = [n.value for n in ast.walk(ast.parse(body.lstrip()))
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+            and "tool_attempts" in n.value]
+    assert sqls, "the function no longer queries tool_attempts"
+    return max(sqls, key=len), body
+
+
+def test_the_live_path_excludes_its_own_previous_run():
+    """A repeat run must not re-observe a failure it already paired with."""
+    sql, _body = _recent_query_sql()
+    norm = " ".join(sql.split())
+    # asked as separate tokens rather than one pinned SQL spelling, so
+    # reformatting the query does not fail a test that is about its MEANING
+    assert "max" in norm and "created_at" in norm, (
+        "_learn_against_recent does not bound by this tool's previous attempt, so "
+        "re-running the same tool re-counts the same failure as a new observation")
+    sub = norm[norm.find("max"):] if "max" in norm else ""
+    assert "tool" in sub, (
+        "the bound is not scoped to the SAME tool — it must exclude this tool's "
+        "own prior run, not any tool's")
+    assert "id <> %s" in norm, (
+        "the bound does not exclude the CURRENT attempt, which was just inserted "
+        "and would otherwise suppress every pairing")
+
+
+def test_the_current_attempt_id_is_passed_in():
+    """The exclusion is inert unless the caller supplies the id it just wrote."""
+    import ast
+    src = open(os.path.join(REPO, "etl", "tool_learning.py"), encoding="utf-8").read()
+    caller = next((n for n in ast.walk(ast.parse(src))
+                   if isinstance(n, ast.FunctionDef) and n.name == "observe_execution"), None)
+    assert caller, "observe_execution not found"
+    seg = ast.get_source_segment(src, caller)
+    passes = [n for n in ast.walk(ast.parse(seg.lstrip()))
+              if isinstance(n, ast.Call)
+              and (getattr(n.func, "id", None) == "_learn_against_recent")
+              and any(k.arg == "attempt_id" for k in n.keywords)]
+    assert passes, (
+        "observe_execution calls _learn_against_recent without attempt_id, so the "
+        "current row is not excluded and the bound suppresses everything")
+
+
+def test_a_null_attempt_id_still_works():
+    """Fail-soft: an unknown id must not silently disable the whole query."""
+    sql, _ = _recent_query_sql()
+    norm = " ".join(sql.split())
+    assert "%s::uuid IS NULL OR" in norm, (
+        "a NULL attempt_id must fall back to 'exclude nothing' rather than "
+        "comparing against NULL, which matches no row and voids the bound")
