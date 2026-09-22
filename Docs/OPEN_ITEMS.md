@@ -179,22 +179,6 @@ the target — nothing was ever asked of it.
 unbalanced quotes.
 **Enforced by:** not enforced
 
-### 180 historical rows can never be parsed by the running backfill
-**Found:** 2026-09-21
-**Evidence:** The backfill in `autogen_agents/langgraph_engine.py` (~line 2279)
-filters `started_at > now() - interval '12 hours'` AND
-`COALESCE(output,'') <> ''`. The 180 rows with `parsed_results IS NULL` are all
-older than that window (newest 2026-09-19), so 0 are eligible; and the
-non-empty-output filter excludes the 11 stderr-only curl rows the new parser was
-specifically written to read. Parsers now exist for every one of those tools —
-the output stays unread for want of a one-off pass, not a parser.
-**Where:** `autogen_agents/langgraph_engine.py` backfill query.
-**Done when:** a one-off backfill reads the historical rows (an operator decision:
-it is a bulk UPDATE over recorded evidence), and the `COALESCE(output,'') <> ''`
-filter either admits stderr-only rows or is documented as deliberately excluding
-them.
-**Enforced by:** not enforced
-
 ### `_learn_against_recent` over-counts support the same way the backfill did
 **Found:** 2026-09-21
 **Evidence:** `learn_from_tool_executions` was fixed to count distinct
@@ -210,6 +194,9 @@ max(support)=79.
 only — extend it to the live path when fixing)
 
 ### A pytest run wrote into the production learning table
+**Update 2026-09-21:** the 16 polluted rows were DELETED along with the inflated
+counters. The SOURCE is untouched — a test can still write here — so the item
+stands on that alone.
 **Found:** 2026-09-21
 **Evidence:** 16 of the 65 rows in `tool_selection_learned` carry
 `phase = '__pytest_phase'`. A test run persisted learned tool-selection state into
@@ -326,29 +313,6 @@ the relay and is recorded as a held `msf_session` on the central msfrpcd.
 **Enforced by:** not enforced
 
 ## LLM routing
-
-### script_executor's exploit-code generation talks to raw ollama, not the router
-**Found:** 2026-09-14
-**Evidence:** `exploit_runner/script_executor.py:33` sets
-`OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")` and the
-LLM call at ~:371 POSTs there with a forced `model=LLM_MODEL` (`gemma4:26b`).
-docker-compose sets `OLLAMA_URL` to raw ollama for the exploit_runner service,
-and per Docs/Memories no raw ollama exists in this deployment — so this
-exploit-code generation path 404s / never produces output here, and it bypasses
-the per-task LLM router entirely (unlike the analysis callers converted in the
-`route-analysis-callers-by-task` change).
-**Where:** `exploit_runner/script_executor.py` (the `OLLAMA_URL` generate call
-and the two `LLM_URL` `/ollama/chat` calls at ~:857 and ~:1086).
-**Update 2026-09-21:** mostly done. Two generation paths now POST to `LLM_URL`
-(llm_query) with `"task": "exploit_gen"` — script_executor.py:1015 and :1256. ONE
-call site remains on raw ollama: `txt_to_exploit()` (lines 336-426) posts to
-`{OLLAMA_URL}/api/generate` at line 403, and it is exploit-code generation too
-("Generate an executable exploit from a .txt description using LLM"), so on this
-deployment it still 404s.
-**Done when:** `txt_to_exploit` routes through llm_query with `task="exploit_gen"`
-and no forced env model, the way the other two paths already do, OR is confirmed
-dead and removed.
-**Enforced by:** not enforced
 
 ## Access reconnection
 
