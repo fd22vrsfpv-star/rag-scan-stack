@@ -2918,10 +2918,14 @@ def access_run(request: AccessRunRequest):
     # through, so anything added there inherits whatever is decided here.
     scope_target = (request.target or "").strip()
     if not scope_target:
-        # A bind_shell/listener handle is "host:port"; recover the host rather
-        # than refusing a caller that simply did not repeat it.
+        # Recover the host ONLY for the kinds whose handle really is "host:port".
+        # An ssh_credential handle is "user:secret" and an msf_session handle is a
+        # session id — splitting those would treat a USERNAME as a hostname, which
+        # is wrong and would wrongly pass if a username ever matched an in-scope
+        # host. (Observed: handle "u:p" was checked as target "u".)
         handle = (request.handle or "").strip()
-        if handle.count(":") == 1 and not handle.startswith("["):
+        if request.kind in ("bind_shell", "listener_callback") \
+                and handle.count(":") == 1 and not handle.startswith("["):
             scope_target = handle.rsplit(":", 1)[0].strip()
     if not scope_target:
         # check_dispatch("") returns None — i.e. ALLOWED — so an unknown target
