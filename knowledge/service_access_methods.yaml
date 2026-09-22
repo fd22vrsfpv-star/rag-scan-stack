@@ -159,18 +159,12 @@ methods:
     success: {expect_shell: true}
     mutates: false
 
-  # ── Distributed Ruby (drb) → RCE ──────────────────────────────────────────
-  - id: drb_remote
-    service: drb
-    port: 8787
-    method: drb-rce
-    summary: "Ruby DRb exposes eval → remote code execution."
-    steps: ["drb_remote_codeexec"]
-    tool: "metasploit exploit/linux/misc/drb_remote_codeexec"
-    msf: "exploit/linux/misc/drb_remote_codeexec"
-    dispatch: metasploit
-    success: {expect_shell: true}
-    mutates: false
+  # Distributed Ruby (drb, 8787) was here. Its only dispatch was
+  # `exploit/linux/misc/drb_remote_codeexec`, which Rapid7 REMOVED from
+  # Metasploit on 2020-11-02 ("Remove the DRuby remote code execution module").
+  # It is absent from the current upstream module tree (5,778 files) and from
+  # this install, so the vector could only ever queue a row that fails. Removed
+  # rather than gated, so it is not offered at all.
 
   # ── VNC weak/none auth ────────────────────────────────────────────────────
   - id: vnc_login

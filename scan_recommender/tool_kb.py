@@ -86,12 +86,9 @@ _CURATED_HIGH_VALUE_PORTS = {
         "msf": "exploit/multi/http/tomcat_mgr_deploy",
         "note": "Tomcat manager - test tomcat:tomcat"
     },
-    8787: {
-        "service": "drb",
-        "vulns": ["CVE-2013-0156"],
-        "msf": "exploit/linux/misc/drb_remote_codeexec",
-        "note": "Ruby DRb RCE"
-    },
+    # 8787/drb removed: its only msf module,
+    # exploit/linux/misc/drb_remote_codeexec, was deleted from Metasploit on
+    # 2020-11-02 and is in neither the current upstream tree nor this install.
 }
 
 # Where the service-vector catalogue lives (bind-mounted into every container at
