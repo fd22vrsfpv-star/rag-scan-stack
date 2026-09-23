@@ -19025,11 +19025,22 @@ def _purge_engagement_data(cur, eid: str, keep_engagement: bool = False) -> Dict
         _del(tbl, f"DELETE FROM public.{tbl} WHERE engagement_id = %s::uuid", (eid,))
 
     # 6) the assets themselves.
+    #
+    # ADDITIVE, not assignment. `assets` carries an engagement_id, so step 5's
+    # dynamic sweep has ALREADY deleted these rows and recorded the real count.
+    # This pass then deletes 0 rows, and assigning `counts["assets"] = cur.rowcount`
+    # overwrote the true figure with 0 — a purge that had just removed an asset
+    # reported "assets: 0" to the operator. Measured: 1 asset in, 0 assets left
+    # afterwards, `deleted.assets` reported as 0.
+    #
+    # The delete stays: step 5 skips CONFIG_KEEP tables on a data purge, and this
+    # is the backstop if `assets` ever joins that set or the sweep misses it.
+    # `.get(...) + rowcount` is the same shape _del uses for every other table.
     if asset_ids:
         cur.execute("DELETE FROM public.assets WHERE engagement_id = %s::uuid", (eid,))
-        counts["assets"] = cur.rowcount
+        counts["assets"] = counts.get("assets", 0) + cur.rowcount
     else:
-        counts["assets"] = 0
+        counts["assets"] = counts.get("assets", 0)
 
     if keep_engagement:
         return counts
