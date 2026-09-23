@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { apiFetch } from './client'
+import { apiFetch, ApiError } from './client'
 import { useUIStore } from '@/stores/ui'
 import type { ScanJob } from '@/lib/types'
 import { POLL } from '@/lib/polling'
@@ -49,14 +49,53 @@ export function useScanDetail(jobId: string) {
   })
 }
 
+/**
+ * Launch a scan, asking the operator first when the BFF says it must.
+ *
+ * With "block local scans" on, a tool that never touches the target but DOES
+ * disclose it to a third party (crt.sh, Shodan, the Wayback CDX API) is neither
+ * run silently nor refused: the BFF answers 409 with `needs_confirmation`, and
+ * a proxy is what would have hidden who is asking. This surfaces that question
+ * and re-sends the SAME body with `allow_local: true` on a yes.
+ *
+ * Handled in the hook rather than per page so all three launch call sites
+ * (ScanLauncher, ReconExplorer, ContentIntel) behave the same. Without this the
+ * 409 reaches the UI as a bare error and ten tools that used to run — subfinder,
+ * dnsx, crtsh, uncover, chaos, vulnx, recon-pipeline, greyhatwarfare, whois,
+ * cloud-tenant — look broken.
+ *
+ * window.confirm matches the existing pattern in ScanMonitor/FollowUps rather
+ * than introducing a modal this codebase has no primitive for.
+ */
+function needsLocalConfirmation(e: unknown): string | null {
+  if (!(e instanceof ApiError) || e.status !== 409) return null
+  const d = e.detail
+  if (!d || d.needs_confirmation !== true) return null
+  return typeof d.message === 'string'
+    ? d.message
+    : 'This scan does not touch the target, but it will disclose it to a third-party service, and no proxy is set. Run it locally anyway?'
+}
+
 export function useLaunchScan() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: ({ type, params }: { type: string; params: Record<string, unknown> }) =>
-      apiFetch<{ job_id: string; type: string }>(`/scans/${type}`, {
-        method: 'POST',
-        body: JSON.stringify(params),
-      }),
+    mutationFn: async ({ type, params }: { type: string; params: Record<string, unknown> }) => {
+      const post = (body: Record<string, unknown>) =>
+        apiFetch<{ job_id: string; type: string }>(`/scans/${type}`, {
+          method: 'POST',
+          body: JSON.stringify(body),
+        })
+      try {
+        return await post(params)
+      } catch (e) {
+        const question = needsLocalConfirmation(e)
+        // Not our 409 -> rethrow untouched; the caller's error handling is
+        // unchanged for every other failure.
+        if (!question) throw e
+        if (!window.confirm(question)) throw e
+        return await post({ ...params, allow_local: true })
+      }
+    },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['scans'] }),
   })
 }
