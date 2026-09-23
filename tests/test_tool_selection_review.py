@@ -33,7 +33,7 @@ import sys
 import uuid
 
 import pytest
-from conftest import RAG_API  # shared service endpoints (see tests/conftest.py)
+from conftest import RAG_API, api_key  # shared endpoints + API key (tests/conftest.py)
 
 REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
@@ -42,7 +42,9 @@ requests = pytest.importorskip("requests", reason="requests not installed")
 tl = pytest.importorskip("etl.tool_learning", reason="etl/tool_learning.py not importable")
 
 RAG_API = os.environ.get("RAG_API_URL") or RAG_API
-API_KEY = os.environ.get("API_KEY", "changeme")
+# Via conftest.api_key(), which reads the repo .env. Reading only the env var
+# sent "changeme" and every request 401'd.
+API_KEY = api_key()
 HEADERS = {"x-api-key": API_KEY, "X-Operator": "pytest"}
 
 
@@ -64,6 +66,11 @@ def live():
         pytest.skip(f"rag-api unhealthy: {r.status_code}")
     if not tl.available():
         pytest.skip("learning store unreachable")
+    # "cannot authenticate" is cannot-run-here, not broken. Without this the
+    # whole module reported 14 failures against a perfectly healthy stack.
+    probe = _get("/tool-selection/learned", params={"service": "__pytest_probe__"})
+    if probe.status_code in (401, 403):
+        pytest.skip(f"auth required at {RAG_API} (HTTP {probe.status_code})")
 
 
 @pytest.fixture
