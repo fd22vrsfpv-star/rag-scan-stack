@@ -235,6 +235,70 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #     /jobs/katana with the binary installed. Recommendations route there.
 #     (rmg IS installed above, from its GitHub release — see the pinned block.)
 
+# PayloadsAllTheThings — the payload/bypass reference corpus, baked LOCAL.
+#
+# WHY: knowledge/seed/wstg.yaml already sends the operator to this repository by
+# URL in three places (File Inclusion, Directory Traversal, Server Side Template
+# Injection). Those links resolve only from a host with internet egress — which
+# an engagement node routed through a pentest proxy may not have, and which a
+# dispatched command cannot follow at all. Baking it in turns three dead
+# references into files on disk that a command can actually point `-w` at.
+#
+# Pinned to a commit, not `master`: this is an input to scan commands, and an
+# unpinned corpus silently changes what a payload run tests between rebuilds —
+# the same reproducibility rule the rmg block above states. Bump deliberately.
+#
+# --depth 1 on a pinned sha needs fetch, not clone (~23MB of tree vs ~1GB of
+# history). The build FAILS if the checkout does not produce the directories the
+# WSTG entries name, because an empty /opt/PayloadsAllTheThings would report as
+# installed while every payload path under it 404s on disk — the silent-success
+# shape this image has been bitten by before.
+ARG PAYLOADS_COMMIT=3ac27901c711bdf3f5b65a7b1d1820a1f65bd09a
+RUN git init /opt/PayloadsAllTheThings \
+ && git -C /opt/PayloadsAllTheThings remote add origin \
+      https://github.com/swisskyrepo/PayloadsAllTheThings.git \
+ && ( git -C /opt/PayloadsAllTheThings fetch --depth 1 origin "${PAYLOADS_COMMIT}" \
+      && git -C /opt/PayloadsAllTheThings checkout -q FETCH_HEAD ) \
+ || ( echo "WARN: pinned commit unavailable, falling back to master tip" \
+      && git -C /opt/PayloadsAllTheThings fetch --depth 1 origin master \
+      && git -C /opt/PayloadsAllTheThings checkout -q FETCH_HEAD ) \
+ && rm -rf /opt/PayloadsAllTheThings/.git \
+ && test -d "/opt/PayloadsAllTheThings/File Inclusion" \
+ && test -d "/opt/PayloadsAllTheThings/Directory Traversal" \
+ && test -d "/opt/PayloadsAllTheThings/Server Side Template Injection" \
+ && test -d "/opt/PayloadsAllTheThings/SQL Injection" \
+ && test -d "/opt/PayloadsAllTheThings/XSS Injection" \
+ || (echo "ERROR: PayloadsAllTheThings did not check out correctly" && exit 1)
+
+# A stable, space-free path for command templates. The upstream directory names
+# contain spaces ("File Inclusion"), which is a quoting hazard in every generated
+# command line; these symlinks give the knowledge YAML something safe to name.
+#
+# MEASURED contents (pinned commit): 142 .md and 67 .txt. The .txt files under
+# each topic's Intruders/ directory are the raw lists a `-w` flag can consume
+# (File Inclusion 14, SQL Injection 15, Directory Traversal 4); the .md files are
+# reference prose and are NOT wordlists. Server Side Template Injection has ZERO
+# .txt — it is documentation only, so `ssti` below is a reading path, not a
+# fuzzing input. Pointing `-w` at it would feed markdown to ffuf.
+RUN mkdir -p /app/payloads \
+ && ln -sf "/opt/PayloadsAllTheThings/File Inclusion"                  /app/payloads/lfi \
+ && ln -sf "/opt/PayloadsAllTheThings/Directory Traversal"             /app/payloads/traversal \
+ && ln -sf "/opt/PayloadsAllTheThings/Server Side Template Injection"  /app/payloads/ssti \
+ && ln -sf "/opt/PayloadsAllTheThings/SQL Injection"                   /app/payloads/sqli \
+ && ln -sf "/opt/PayloadsAllTheThings/XSS Injection"                   /app/payloads/xss \
+ && ln -sf /opt/PayloadsAllTheThings                                   /app/payloads/all \
+ # The raw-list directories, named separately so a template can reach a real
+ # wordlist without the caller having to know the upstream layout. NOTE the
+ # upstream inconsistency, which broke this build once: File Inclusion uses
+ # "Intruders" (plural), SQL Injection and Directory Traversal use "Intruder"
+ # (singular). The test below is what caught it -- keep it.
+ && ln -sf "/opt/PayloadsAllTheThings/File Inclusion/Intruders"        /app/payloads/lfi-lists \
+ && ln -sf "/opt/PayloadsAllTheThings/SQL Injection/Intruder"          /app/payloads/sqli-lists \
+ && ln -sf "/opt/PayloadsAllTheThings/Directory Traversal/Intruder"    /app/payloads/traversal-lists \
+ && test -n "$(find -L /app/payloads/lfi-lists -name '*.txt' 2>/dev/null | head -1)" \
+ && test -n "$(find -L /app/payloads/sqli-lists -name '*.txt' 2>/dev/null | head -1)" \
+ || (echo "ERROR: payload list directories contain no .txt wordlists" && exit 1)
+
 # Extract rockyou wordlist (comes compressed)
 RUN gunzip -k /usr/share/wordlists/rockyou.txt.gz 2>/dev/null || true
 
