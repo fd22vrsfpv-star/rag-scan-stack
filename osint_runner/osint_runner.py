@@ -8,9 +8,9 @@ import os, uuid, pathlib, subprocess, threading, logging, json, tempfile, shutil
 from urllib.parse import urlparse
 from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, UploadFile, File
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
@@ -214,6 +214,114 @@ _job_tracker = JobTracker(max_jobs=200)
 
 def conn():
     return psycopg2.connect(DB_DSN)
+
+
+def _record_run(tool: str, target: str, command: str, status: str,
+                started_at=None, findings: int = None, error: str = None):
+    """Record that `tool` RAN against `target`, whatever it found.
+
+    WHY THIS EXISTS. The historical-URL tools can now be started from two places
+    — the passive-recon pipeline and the standalone /jobs/{gau,waybackurls}
+    endpoints — so "has this already been done for this site?" became a real
+    question. Findings alone cannot answer it: a domain with no
+    `recon_findings` rows for source='waybackurls' may never have been queried,
+    or may have been queried and legitimately have no archived URLs. Those are
+    different facts and this repo has repeatedly shipped bugs by collapsing
+    them (a probe that could not run recorded as a negative result).
+
+    A row here is the third state. No row = never ran. status='completed' with
+    findings=0 = ran, archive had nothing. status='failed' = ran and broke.
+
+    Never raises: a bookkeeping failure must not fail the scan that succeeded.
+    """
+    try:
+        c = conn()
+        try:
+            with c.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO tool_executions
+                        (id, tool, command, target, status, started_at, completed_at,
+                         parsed_results, error)
+                    VALUES (%s, %s, %s, %s, %s, %s, now(), %s, %s)
+                """, (str(uuid.uuid4()), tool, command[:4000], target, status,
+                      started_at or datetime.now(timezone.utc),
+                      Json({"findings": findings}) if findings is not None else None,
+                      (error or None) and str(error)[:2000]))
+            c.commit()
+        finally:
+            c.close()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("could not record run of %s against %s: %s", tool, target, e)
+
+
+def _attribute_urls_per_domain(output_file: str, domains: list) -> dict:
+    """How many returned URLs belong to each requested domain.
+
+    Both tools take every domain in ONE invocation and return a flat URL list,
+    so per-site attribution has to come from the URLs themselves. A domain that
+    yielded nothing still gets an entry (0) — that is the whole point: it is
+    the difference between "queried, archive empty" and "never queried".
+    """
+    counts = {d: 0 for d in domains}
+    try:
+        with open(output_file, errors="replace") as fh:
+            for line in fh:
+                host = urlparse(line.strip()).hostname or ""
+                if not host:
+                    continue
+                for d in domains:
+                    if host == d or host.endswith("." + d):
+                        counts[d] += 1
+                        break
+    except OSError:
+        pass
+    return counts
+
+
+def _run_tool_job_recorded(job_id: str, tool: str, cmd: list, targets_file: str,
+                           output_file: str, domains: list, **kw):
+    """_run_tool_job, plus a per-domain run record.
+
+    The standalone /jobs/{gau,waybackurls} endpoints and the passive-recon
+    pipeline are TWO ways to run the same query, so "has this site already been
+    done?" must be answerable regardless of which one was used. Without this the
+    coverage endpoint would report never_run after a standalone job and send the
+    operator to repeat work.
+    """
+    started = datetime.now(timezone.utc)
+    status = "completed"
+    err = None
+    try:
+        _run_tool_job(job_id, tool, cmd, targets_file, output_file, **kw)
+    except Exception as e:  # noqa: BLE001
+        status, err = "failed", str(e)
+        raise
+    finally:
+        # The job's OWN status decides, not "did this call raise". _run_tool_job
+        # swallows a refusal: a scope-gate rejection marks the job failed and
+        # returns normally. Trusting the absence of an exception recorded a
+        # scope-REFUSED run as "completed, 0 findings", i.e. "the archive has
+        # nothing for this site" -- a negative result for a query that was never
+        # sent. That is the precise confusion this recording exists to prevent,
+        # so it is read back rather than assumed.
+        try:
+            _j = _job_tracker.get_job(job_id) or {}
+            _jstatus = (_j.get("status") or "").lower()
+            if _jstatus in ("failed", "error", "cancelled", "stopped"):
+                status = "failed"
+                err = err or _j.get("error") or _jstatus
+            elif _jstatus and _jstatus not in ("completed", "complete", "success"):
+                # still running / unknown -- do not claim a result either way
+                status = "failed"
+                err = err or f"job ended in state {_jstatus!r}"
+        except Exception:  # noqa: BLE001
+            pass
+
+        counts = (_attribute_urls_per_domain(output_file, domains)
+                  if status == "completed" else {d: None for d in domains})
+        for d in domains:
+            _record_run(tool, d, " ".join(cmd), status,
+                        started_at=started, findings=counts.get(d), error=err)
 
 
 def _write_targets_file(targets: list) -> str:
@@ -2395,12 +2503,21 @@ def _run_passive_recon(job_id: str, domains: list, include_spider: bool = False,
             one = str(REPORT_DIR / f"passive_gau_{short}_{safe}.txt")
             try:
                 cmd = ["gau", "--threads", "2", "--o", one, domain]
+                _t0 = datetime.now(timezone.utc)
                 subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+                found = 0
                 if os.path.exists(one):
                     with open(one, errors="replace") as f:
-                        gau_urls.update(l.strip() for l in f if l.strip())
+                        urls = {l.strip() for l in f if l.strip()}
+                    found = len(urls)
+                    gau_urls.update(urls)
+                # Recorded per DOMAIN, so "has gau been run for this site?" has an
+                # answer even when the archive returned nothing.
+                _record_run("gau", domain, " ".join(cmd), "completed",
+                            started_at=_t0, findings=found)
             except Exception as e:
                 logging.warning(f"[{job_id}] gau {domain} failed: {e}")
+                _record_run("gau", domain, " ".join(cmd), "failed", error=str(e))
             finally:
                 try:
                     os.path.exists(one) and os.remove(one)
@@ -2410,15 +2527,35 @@ def _run_passive_recon(job_id: str, domains: list, include_spider: bool = False,
         # waybackurls reads domains on stdin and writes URLs to stdout.
         wb_out = str(REPORT_DIR / f"passive_waybackurls_{short}.txt")
         wb_urls = set()
+        _wb_cmd = ""
+        _wb_t0 = datetime.now(timezone.utc)
         try:
             wb_targets = _write_targets_file(domains)
-            subprocess.run(["sh", "-c", f"cat {wb_targets} | waybackurls > {wb_out}"],
+            _wb_cmd = f"cat {wb_targets} | waybackurls > {wb_out}"
+            subprocess.run(["sh", "-c", _wb_cmd],
                            capture_output=True, text=True, timeout=600, env=env)
             if os.path.exists(wb_out):
                 with open(wb_out, errors="replace") as f:
                     wb_urls.update(l.strip() for l in f if l.strip())
+            # waybackurls takes every domain on stdin in ONE invocation, so the
+            # per-domain attribution has to be reconstructed from the URLs it
+            # returned -- otherwise a domain that yielded nothing would have no
+            # row and read as "never queried", which is the exact confusion this
+            # recording exists to remove.
+            _per_domain = {d: 0 for d in domains}
+            for u in wb_urls:
+                host = urlparse(u).hostname or ""
+                for d in domains:
+                    if host == d or host.endswith("." + d):
+                        _per_domain[d] += 1
+                        break
+            for d, n in _per_domain.items():
+                _record_run("waybackurls", d, _wb_cmd, "completed",
+                            started_at=_wb_t0, findings=n)
         except Exception as e:
             logging.warning(f"[{job_id}] waybackurls failed: {e}")
+            for d in domains:
+                _record_run("waybackurls", d, _wb_cmd, "failed", error=str(e))
 
         # One de-duplicated file per source, so `recon_findings.source` still says
         # WHICH archive produced a URL (the UI groups and badges on it) while the
@@ -3295,8 +3432,80 @@ def run_gau(req: GauReq, background_tasks: BackgroundTasks):
 
     env = _build_proxy_env(req.proxy)
     _job_tracker.update_progress(job_id, targets_count=len(req.domains))
-    background_tasks.add_task(_run_tool_job, job_id, "gau", cmd, targets_file, output_file, env=env, no_ingest=req.no_ingest)
+    background_tasks.add_task(_run_tool_job_recorded, job_id, "gau", cmd, targets_file,
+                              output_file, list(req.domains), env=env, no_ingest=req.no_ingest)
     return {"ok": True, "job_id": job_id, "status": "queued", "status_url": f"/jobs/{job_id}", "no_ingest": req.no_ingest}
+
+
+@app.get("/coverage/historical-urls")
+def historical_url_coverage(domain: str = Query(..., description="site / domain to check"),
+                            tools: str = Query("gau,waybackurls",
+                                               description="comma-separated tool names")):
+    """Has each historical-URL tool already run for this site, and what did it find?
+
+    gau and waybackurls can each be started from TWO places — the passive-recon
+    pipeline and their own /jobs/* endpoints — so before launching one it is
+    worth asking whether it has already been done for this site.
+
+    Three outcomes, deliberately distinct (collapsing them is this repo's
+    recurring bug):
+
+        never_run   no tool_executions row       -> running it will tell you something
+        ran_empty   ran, findings == 0           -> the archive genuinely has nothing
+        ran         ran, findings > 0            -> rows are already in recon_findings
+
+    `findings_now` is counted from recon_findings independently of the run
+    record, so a run that stored rows which were later purged is visible as a
+    disagreement rather than being silently reported as current.
+    """
+    wanted = [t.strip() for t in (tools or "").split(",") if t.strip()]
+    if not wanted:
+        raise HTTPException(status_code=400, detail="no tools requested")
+    out = {}
+    try:
+        c = conn()
+        try:
+            with c.cursor(cursor_factory=RealDictCursor) as cur:
+                for tool in wanted:
+                    cur.execute("""
+                        SELECT status, started_at, completed_at,
+                               COALESCE((parsed_results->>'findings')::int, -1) AS findings
+                          FROM tool_executions
+                         WHERE tool = %s AND target = %s
+                         ORDER BY started_at DESC
+                         LIMIT 1
+                    """, (tool, domain))
+                    row = cur.fetchone()
+                    cur.execute("""
+                        SELECT count(*) AS n FROM recon_findings
+                         WHERE source = %s
+                           AND (target = %s OR target LIKE %s)
+                    """, (tool, domain, "%." + domain))
+                    now_rows = (cur.fetchone() or {}).get("n", 0)
+
+                    if not row:
+                        state = "never_run"
+                    elif row["status"] != "completed":
+                        state = "failed"
+                    elif (row["findings"] or 0) > 0:
+                        state = "ran"
+                    else:
+                        state = "ran_empty"
+                    out[tool] = {
+                        "state": state,
+                        "last_run": row["started_at"].isoformat() if row and row["started_at"] else None,
+                        "findings_at_run": (row["findings"] if row and row["findings"] >= 0 else None),
+                        "findings_now": now_rows,
+                    }
+        finally:
+            c.close()
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        # A DB that cannot be read is NOT "never run" -- say so instead of
+        # returning a negative result the caller would act on.
+        raise HTTPException(status_code=503, detail=f"coverage unavailable: {type(e).__name__}: {e}")
+    return {"ok": True, "domain": domain, "coverage": out}
 
 
 @app.post("/jobs/waybackurls")
@@ -3311,7 +3520,8 @@ def run_waybackurls(req: WaybackurlsReq, background_tasks: BackgroundTasks):
 
     env = _build_proxy_env(req.proxy)
     _job_tracker.update_progress(job_id, targets_count=len(req.domains))
-    background_tasks.add_task(_run_tool_job, job_id, "waybackurls", cmd, targets_file, output_file,
+    background_tasks.add_task(_run_tool_job_recorded, job_id, "waybackurls", cmd,
+                              targets_file, output_file, list(req.domains),
                               ingest_as="waybackurls", env=env, no_ingest=req.no_ingest)
     return {"ok": True, "job_id": job_id, "status": "queued", "status_url": f"/jobs/{job_id}", "no_ingest": req.no_ingest}
 
