@@ -36,6 +36,49 @@ content_discovery:
 # takes the authenticated session cookie the same way (cookie_flag above).
 # Placeholders in {curly} are filled at run time. `impactful: true` recipes are
 # state-changing and MUST go through the approval lane (never auto-fire).
+# Concrete sources for the {*_wordlist} placeholders in custom_attacks below.
+#
+# The recipes are retrieved and their placeholders filled at run time (see
+# etl/load_knowledge_documents.py::_render_content_discovery, which embeds each
+# recipe with "Fill the {placeholders} at run time"). Nothing resolved them to a
+# real path, so whoever filled one had to guess — and a guessed path that does
+# not exist makes ffuf exit immediately, which reads as "the attack found
+# nothing" rather than "the attack never ran".
+#
+# EVERY path below was checked to exist inside the kali-listener image on
+# 2026-09-22. Add nothing here without doing the same: a wordlist that is not
+# on disk is worse than no recommendation, because it fails silently.
+#
+# /app/payloads/* are the PayloadsAllTheThings Intruder lists baked into the
+# image; /usr/share/seclists/* come from the seclists package.
+wordlist_sources:
+  param_wordlist:
+    - /usr/share/seclists/Discovery/Web-Content/burp-parameter-names.txt
+  payload_wordlist:
+    # Pick by the injection class being tested — a SQLi list proves nothing
+    # about XSS, and feeding all of them at one parameter is slow and noisy.
+    sqli:
+      - /app/payloads/sqli-lists/Auth_Bypass.txt
+      - /usr/share/seclists/Fuzzing/Databases/SQLi
+    xss:
+      - /usr/share/seclists/Fuzzing/XSS/robot-friendly/XSS-RSNAKE.txt
+    lfi:
+      - /app/payloads/lfi-lists/JHADDIX_LFI.txt
+    traversal:
+      - /app/payloads/traversal-lists/deep_traversal.txt
+  vhost_wordlist:
+    - /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt
+  dns_wordlist:
+    - /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt
+    - /usr/share/seclists/Discovery/DNS/namelist.txt
+  wordlist:                      # the generic dir/file brute list
+    - /usr/share/seclists/Discovery/Web-Content/common.txt
+  login_password_wordlist:
+    - /usr/share/seclists/Passwords/Common-Credentials/10k-most-common.txt
+  # NOTE: bypass_wordlist has no list in this image. seclists ships only
+  # Fuzzing/403/403.md (prose, not a list), so the 403-bypass recipe has no
+  # source here and is left undeclared rather than pointed at a markdown file.
+
 custom_attacks:
   - name: parameter-name discovery
     tool: ffuf

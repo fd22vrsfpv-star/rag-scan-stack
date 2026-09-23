@@ -535,20 +535,44 @@ def health():
     # Check critical dependencies
     dependencies = {}
 
-    # Check Ollama
+    # Check the LLM backend, THROUGH THE ROUTER.
+    #
+    # This probed a hard-coded http://ollama:11434 — a host that does not exist
+    # in this stack and never has (the same nonexistent daemon that meant news
+    # enrichment had never once run). Two consequences, both measured:
+    #
+    #   * 4.00s of this endpoint's 4.2s was this one probe. `timeout=3` does not
+    #     bound it, because requests retries the connection; the caller sees ~4s.
+    #     That is why the dashboard's aggregate /api/health took 8.6s and
+    #     reported `rag_api: ConnectTimeout (timeout=8s)` under load.
+    #   * it set response["ok"] = False, so rag-api reported UNHEALTHY
+    #     permanently — `docker ps` showed "Up 15 hours (unhealthy)" — because an
+    #     optional dependency that is not part of this deployment was missing.
+    #     A health check that is always red says nothing when something is
+    #     actually wrong.
+    #
+    # OLLAMA_BASE is the same variable the rag-api agents already dial, and it
+    # points at llm_query, which serves an ollama-compatible /api/tags. Measured
+    # from inside this container: 0.00s vs 4.00s.
+    #
+    # An unreachable LLM backend is reported, but does NOT flip `ok`: this
+    # endpoint's `ok` is about whether rag-api itself can serve, and the backend
+    # has its own entry for anyone who needs it.
     try:
-        ollama_resp = requests.get("http://ollama:11434/api/tags", verify=False, timeout=3)
-        if ollama_resp.status_code == 200:
-            models = ollama_resp.json().get("models", [])
+        llm_resp = requests.get(f"{OLLAMA_BASE}/api/tags", verify=False, timeout=3)
+        if llm_resp.status_code == 200:
+            models = llm_resp.json().get("models", [])
             dependencies["ollama"] = {
                 "healthy": True,
-                "models": len(models)
+                "models": len(models),
+                "endpoint": OLLAMA_BASE,
             }
         else:
-            dependencies["ollama"] = {"healthy": False}
-    except Exception:
-        dependencies["ollama"] = {"healthy": False}
-        response["ok"] = False
+            dependencies["ollama"] = {"healthy": False, "endpoint": OLLAMA_BASE,
+                                      "code": llm_resp.status_code}
+    except Exception as e:  # noqa: BLE001
+        dependencies["ollama"] = {"healthy": False, "endpoint": OLLAMA_BASE,
+                                  "error": type(e).__name__}
 
     # Check scan-recommender
     try:
