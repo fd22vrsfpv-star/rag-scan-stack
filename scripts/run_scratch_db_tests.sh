@@ -102,11 +102,17 @@ TARGETS=("$@"); [[ ${#TARGETS[@]} -eq 0 ]] && TARGETS=(tests/)
 read -r -a EXTRA_ARGS <<< "${PYTEST_ARGS:--q}"
 
 echo "→ running ${TARGETS[*]}"
+# DB_DSN/DATABASE_URL as well as TEST_DB_DSN: several modules predate the
+# TEST_ prefix and read the plain names (tests/test_scope_conflicts.py,
+# tests/test_credential_followups.py). Pointing all three at the SCRATCH database
+# is safe precisely because it is disposable.
+#
 # postgresql-client is installed in the test container because psql_argv shells
 # out to the psql CLI on BOTH paths, so stdout stays byte-identical to the
 # container path each module's output parsing was written against.
 docker run --rm --network "$NETWORK" \
     -e TEST_DB_DSN="$DSN" \
+    -e DB_DSN="$DSN" -e DATABASE_URL="$DSN" \
     -v "$REPO":/repo -w /repo python:3.12-slim \
     sh -c "apt-get update -qq >/dev/null 2>&1 \
         && apt-get install -y -qq postgresql-client >/dev/null 2>&1 \
