@@ -129,23 +129,74 @@ def _is_local_blocked() -> bool:
     return bool(_block_local_cache["val"])
 
 
-def _check_proxy_required(proxy: str | None, scan_type: str):
-    """If 'block local scans' is enabled, reject any scan without a proxy."""
+#: Scan types that send NOTHING anywhere about the target — local compute only.
+#: No proxy is meaningful for these because there is no observer to hide from,
+#: so they run without one even when local scans are blocked, and without asking.
+NO_EGRESS_TYPES = {"hashcat"}
+
+#: Passive in the sense that matters for the TARGET — they never touch it — but
+#: they DO disclose it to a third party: crt.sh learns the domain, Shodan and
+#: Censys learn what is being looked up, the Wayback CDX API logs the query.
+#:
+#: A proxy is exactly what protects that: it hides WHO is asking, which is the
+#: part the target's operator could otherwise correlate. So these are allowed
+#: locally, but not SILENTLY -- without a proxy the caller is asked to confirm
+#: (HTTP 409 + needs_confirmation), and re-sends with allow_local=true.
+#:
+#: The previous PASSIVE_TYPES set granted these a silent pass, which is the
+#: behaviour this replaces. It also disagreed with the frontend, which marks
+#: eight further tools `passive: true` (amass, censys, gau, hashcat,
+#: passive-recon, trufflehog, vulnx-scope, waybackurls) -- so a launcher that
+#: offered them as passive got a flat 403 from the BFF. tests/test_passive_scan_consent.py
+#: pins the two lists together.
+THIRD_PARTY_PASSIVE_TYPES = {
+    "subfinder", "dnsx", "crtsh", "uncover", "chaos", "vulnx", "vulnx-scope",
+    "recon-pipeline", "passive-recon", "greyhatwarfare", "whois", "cloud-tenant",
+    "amass", "censys", "gau", "waybackurls", "trufflehog",
+}
+
+
+def _check_proxy_required(proxy: str | None, scan_type: str, allow_local: bool = False):
+    """Decide whether this scan may run without a proxy.
+
+    Three outcomes, because "passive" is not one thing:
+
+      NO_EGRESS_TYPES            run; nothing about the target leaves this host.
+      THIRD_PARTY_PASSIVE_TYPES  run WITH a proxy, or locally once the caller has
+                                 explicitly accepted that (allow_local). Asking is
+                                 the point: these disclose the target to someone.
+      anything else (active)     refuse without a proxy.
+    """
     if not _is_local_blocked():
         return
-    # Allow passive/OSINT tools that don't touch the target directly
-    PASSIVE_TYPES = {"subfinder", "dnsx", "crtsh", "uncover", "chaos", "vulnx",
-                     "recon-pipeline", "greyhatwarfare", "whois", "cloud-tenant"}
-    if scan_type in PASSIVE_TYPES:
+    if scan_type in NO_EGRESS_TYPES:
         return
-    if not proxy:
+    if proxy:
+        return
+    if scan_type in THIRD_PARTY_PASSIVE_TYPES:
+        if allow_local:
+            return
         raise HTTPException(
-            403,
-            f"Local scans are blocked. All active scans must route through a proxy/tunnel. "
-            f"Set a proxy in the scan form or enable a tunnel in the Recon Agent. "
-            f"To disable this restriction: Settings → General → 'Block local scans' toggle, "
-            f"or unset BLOCK_LOCAL_SCANS env var."
+            409,
+            {
+                "needs_confirmation": True,
+                "scan_type": scan_type,
+                "reason": "passive_no_proxy",
+                "message": (
+                    f"'{scan_type}' does not touch the target, but it does disclose it to a "
+                    f"third-party service. A proxy hides who is asking. Run it locally without "
+                    f"one?"
+                ),
+                "retry_with": {"allow_local": True},
+            },
         )
+    raise HTTPException(
+        403,
+        f"Local scans are blocked. All active scans must route through a proxy/tunnel. "
+        f"Set a proxy in the scan form or enable a tunnel in the Recon Agent. "
+        f"To disable this restriction: Settings → General → 'Block local scans' toggle, "
+        f"or unset BLOCK_LOCAL_SCANS env var."
+    )
 
 
 def _check_scan_limit():
@@ -1376,7 +1427,18 @@ async def launch_scan(scan_type: str, req: ScanRequest):
     req.web_profile = None                        # consumed; never forwarded downstream
 
     # Block local scans if the safety switch is on
-    _check_proxy_required(req.proxy, scan_type)
+    # allow_local rides on ScanRequest's extra="allow", so the client can re-send
+    # the SAME body with one field added after answering the 409.
+    _check_proxy_required(req.proxy, scan_type,
+                          allow_local=bool(getattr(req, "allow_local", False)))
+    # Consumed here, like web_profile above: it is an answer to a BFF prompt, not
+    # a scan parameter, and forwarding it would put an unknown field in the
+    # runner's request body.
+    if hasattr(req, "allow_local"):
+        try:
+            delattr(req, "allow_local")
+        except Exception:  # pydantic extras are not always deletable
+            req.allow_local = None
 
     # Multi-URL batching for content-recon: launch one job per URL (up to limit)
     if scan_type == "content-recon":

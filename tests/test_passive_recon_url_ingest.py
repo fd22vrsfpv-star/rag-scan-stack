@@ -123,6 +123,99 @@ def test_the_union_is_deduplicated_before_ingest():
         "the waybackurls result is not reduced by what gau already returned")
 
 
+# ── "has this already been run for this site?" ───────────────────────────────
+#
+# gau and waybackurls can each be started from TWO places (the passive-recon
+# pipeline and their own /jobs/* endpoints), so the coverage answer must hold
+# whichever was used. Findings alone cannot answer it: no rows may mean "never
+# queried" OR "queried, archive empty", and this repo has shipped that confusion
+# repeatedly. A tool_executions row is the third state.
+
+
+def _module_src():
+    if not os.path.exists(RUNNER):
+        pytest.skip("osint_runner.py not present")
+    return open(RUNNER, encoding="utf-8").read()
+
+
+def _fn(name):
+    src = _module_src()
+    for n in ast.walk(ast.parse(src)):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name:
+            return ast.get_source_segment(src, n)
+    return None
+
+
+def test_the_pipeline_records_each_run():
+    fn = _func_src()
+    calls = [n for n in ast.walk(ast.parse(fn.lstrip()))
+             if isinstance(n, ast.Call)
+             and (getattr(n.func, "id", None) == "_record_run")]
+    tools = {c.args[0].value for c in calls
+             if c.args and isinstance(c.args[0], ast.Constant)}
+    assert {"gau", "waybackurls"} <= tools, (
+        f"the pipeline does not record a run for both tools (got {tools}) — a site "
+        "queried here would read as never queried")
+
+
+def test_the_standalone_endpoints_record_too():
+    """Otherwise coverage reports never_run after a standalone job and the
+    operator is sent to repeat work."""
+    src = _module_src()
+    tree = ast.parse(src)
+    wrapped = set()
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call):
+            continue
+        name = getattr(n.func, "id", None) or getattr(n.func, "attr", None)
+        if name != "add_task":
+            continue
+        if not n.args:
+            continue
+        task = getattr(n.args[0], "id", None)
+        if task == "_run_tool_job_recorded" and len(n.args) > 2 \
+                and isinstance(n.args[2], ast.Constant):
+            wrapped.add(n.args[2].value)
+    assert {"gau", "waybackurls"} <= wrapped, (
+        f"these standalone endpoints still use the unrecorded runner: "
+        f"{ {'gau','waybackurls'} - wrapped }")
+
+
+def test_a_refused_run_is_not_recorded_as_an_empty_result():
+    """THE bug this caught in practice.
+
+    _run_tool_job does not RAISE on a scope refusal — it marks the job failed and
+    returns. Trusting "no exception" recorded a scope-REFUSED waybackurls run as
+    completed with 0 findings, i.e. "the archive has nothing for this site": a
+    negative result for a query that was never sent. Observed live against
+    example.com, then fixed by reading the job's own status back.
+    """
+    fn = _fn("_run_tool_job_recorded")
+    assert fn, "_run_tool_job_recorded not found"
+    calls = {(getattr(c.func, "id", None) or getattr(c.func, "attr", None))
+             for c in ast.walk(ast.parse(fn.lstrip())) if isinstance(c, ast.Call)}
+    assert "get_job" in calls, (
+        "the wrapper does not read the job's own status back, so a refusal that "
+        "does not raise is recorded as a successful empty run")
+
+
+def test_coverage_endpoint_distinguishes_three_states():
+    fn = _fn("historical_url_coverage")
+    assert fn, "the coverage endpoint is gone"
+    consts = {n.value for n in ast.walk(ast.parse(fn.lstrip()))
+              if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    for state in ("never_run", "ran_empty", "ran", "failed"):
+        assert state in consts, f"the coverage endpoint cannot report {state!r}"
+
+
+def test_coverage_says_unavailable_rather_than_never_run_on_a_db_error():
+    """An unreadable database is not evidence that nothing ran."""
+    fn = _fn("historical_url_coverage")
+    assert "503" in fn, (
+        "a DB failure does not surface as unavailable — the caller would read "
+        "the empty result as 'never run' and repeat work, or worse, trust it")
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
