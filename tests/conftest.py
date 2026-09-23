@@ -87,6 +87,30 @@ BFF_API = f"{BFF}/api"
 DB_TEST_DSN = os.environ.get("TEST_DB_DSN") or os.environ.get("DB_DSN") or ""
 
 
+def api_key() -> str:
+    """The API key the live services actually accept.
+
+    `os.environ.get("API_KEY", "changeme")` is NOT enough: the key lives in the
+    repo's .env, which is bind-mounted into the test container but is not an
+    environment variable there. A module that read only the env var sent
+    "changeme" and got 401 from every endpoint — and because its tests asserted
+    on the status rather than skipping, fourteen of them FAILED rather than
+    saying "auth required". Twelve sibling modules already open .env for this;
+    this is the shared copy, so the thirteenth does not have to.
+    """
+    env = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    try:
+        with open(env, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("API_KEY="):
+                    val = line.split("=", 1)[1].strip()
+                    if val:
+                        return val
+    except OSError:
+        pass
+    return os.environ.get("API_KEY", "changeme")
+
+
 def psql_argv(sql=None, flags=("-v", "ON_ERROR_STOP=1", "-tAc")):
     """argv running `sql` against TEST_DB_DSN when usable, else rag-postgres.
 
