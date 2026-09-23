@@ -499,6 +499,27 @@ def _render_content_discovery(data: Dict[str, Any]) -> List[Doc]:
             f"{d.get('setting_key','content_discovery.tool')}. gobuster~ffuf for a flat "
             "brute; feroxbuster recurses + extracts links (deeper, slower, needs "
             "--filter-size 0). All reuse the persisted authenticated session cookie."))
+    # The concrete sources for the {*_wordlist} placeholders. Embedded as its own
+    # doc because the recipes tell the planner to "fill the placeholders at run
+    # time" and, without this, the only way to fill one was to guess a path — and
+    # a path that does not exist makes ffuf exit immediately, which reads as "the
+    # attack found nothing" rather than "the attack never ran".
+    ws = data.get("wordlist_sources")
+    if isinstance(ws, dict) and ws:
+        lines = []
+        for placeholder, val in ws.items():
+            if isinstance(val, dict):
+                for kind, paths in val.items():
+                    lines.append(f"{{{placeholder}}} for {kind}: " + ", ".join(paths or []))
+            elif isinstance(val, list):
+                lines.append(f"{{{placeholder}}}: " + ", ".join(val))
+        out.append((
+            "Content discovery: which wordlist to use for each placeholder",
+            "Concrete on-disk sources for the {placeholder} wordlists in the custom "
+            "attack recipes, verified present in the kali-listener image. Choose the "
+            "payload list by INJECTION CLASS — a SQLi list proves nothing about XSS. "
+            + " | ".join(lines)))
+
     # one doc per custom-attack recipe (data.get at TOP level, sibling of content_discovery)
     for r in (data.get("custom_attacks") or []):
         if not isinstance(r, dict) or not r.get("name"):
