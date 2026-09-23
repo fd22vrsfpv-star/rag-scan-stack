@@ -389,8 +389,20 @@ def test_resume_approved_executes_then_reports(graph_mod, monkeypatch):
                                         "note": "ok"}), cfg)
     assert graph_mod._interrupt_payload(final, graph, cfg) is None, "still parked"
     assert executed and executed[0]["approved"] is True
-    assert executed[0]["pending_exploit_id"] == "dead-beef", (
-        "the id the operator approved did not reach the executor")
+    # The operator may answer with the SINGULAR `pending_exploit_id`; the
+    # approval node normalises it to the plural `pending_exploit_ids`, which is
+    # what exploit_exec reads (langgraph_engine.py:1922). Asserting the singular
+    # key here tested a contract the engine deliberately stopped emitting when
+    # approval became multi-exploit -- this test skipped for want of langgraph,
+    # so nothing noticed.
+    assert executed[0]["pending_exploit_ids"] == ["dead-beef"], (
+        "the id the operator approved did not reach the executor unchanged: "
+        f"{executed[0]!r}")
+    # ...and naming ONE must not silently widen to every queued exploit, which
+    # is the property the engine's own comment calls out.
+    assert len(executed[0]["pending_exploit_ids"]) == 1, (
+        "approving one exploit widened the set — the operator's subset choice "
+        "was not honoured")
     assert final.get("report"), "no report after a completed run"
 
 

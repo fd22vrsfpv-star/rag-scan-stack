@@ -52,3 +52,23 @@ pytest-asyncio>=0.23  # async tests ERROR->skip without the plugin
 # fixture setup and reports as an ERROR, not a skip. Three tests errored this
 # way once a database made them get far enough to construct the app.
 python-multipart>=0.0.9
+
+# The agent orchestrator imports langgraph at module scope, so the
+# tests/test_langgraph_*.py modules skipped with "langgraph not importable here".
+#
+# MEASURED COST, both halves — the install is the cheap half and quoting only it
+# understates this by ~28x:
+#   pip install   6s -> 11s      (+5s, +22 packages, site-packages 114MB)
+#   FULL SUITE  477s -> 617s     (+140s, +29% wall clock)
+#   recovered   2743 -> 2771 passed, 438 -> 422 skipped
+# The langgraph tests are ~139s of that: they compile a real StateGraph and drive
+# it through checkpointed resumes, which is what makes them worth having.
+#
+# This file's own rule says anything heavier belongs behind an importorskip, and
+# +29% is not obviously on the right side of it. It is here because those tests
+# cover the exploit APPROVAL path — and the first run after adding it failed,
+# exposing a test that had asserted a contract the engine stopped emitting when
+# approval became multi-exploit. That defect was invisible for as long as the
+# module skipped. Re-measure before adding the next heavy dep; do not treat this
+# as precedent for "one more won't hurt".
+langgraph>=0.2

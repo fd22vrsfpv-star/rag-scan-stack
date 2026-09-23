@@ -25,6 +25,41 @@ named tests exist).
 
 ---
 
+## LLM routing
+
+### The configured model is not the model that runs
+**Found:** 2026-09-22
+**Evidence:** Settings and `llm_query /healthz` both report
+`DeepSeek-V4-Flash` on `https://rt3ai.services.ai.azure.com/`. The router
+disagrees: `get_route()` resolves `default`, `extract`, `exploit_gen` and every
+unknown task to `azure:gpt-5-mini` via `route.default`, and only `news` to
+`ollama:qwen2.5:14b`. `AZURE_MODEL` is the last resort in
+`llm_query.py::_route_for` — it applies only with no caller model, no task AND
+no routing — so `DeepSeek-V4-Flash` is effectively unreachable through the
+router while being the value every status surface displays.
+**Where:** `llm_query/llm_query.py::_route_for`, `common/llm_settings.py::get_route`,
+and the `/healthz` + Settings → LLM readouts that report the global instead of
+the resolved route.
+**Done when:** the status surfaces report the RESOLVED route per task (or at
+least say the global is a fallback), so "which model is running" has one answer.
+**Enforced by:** not enforced
+
+### OLLAMA_BASE falls back to a host that does not exist
+**Found:** 2026-09-22
+**Evidence:** `app/rag-api/{vault_import_agent,artifact_consumer,cloud_triage_agent}.py`
+resolve `OLLAMA_BASE_URL` -> `OLLAMA_URL` -> `http://host.docker.internal:11434`.
+In the running rag-api container `OLLAMA_BASE_URL=http://llm_query:8002` (correct,
+the router) but `OLLAMA_URL=http://ollama:11434` is also set, and there is no
+`ollama` container in the stack (`docker ps` lists 30 containers, none named
+ollama). If the first variable were ever unset these four agents would leave the
+router silently — no task routing, no fallback, no Azure — and dial a host that
+does not resolve.
+**Where:** the `OLLAMA_BASE` resolution chain in those three modules (and
+`app/rag-api/api.py:243`, which defaults straight to host.docker.internal).
+**Done when:** the fallback chain cannot silently bypass the router — either the
+legacy names are dropped, or a non-router value is logged loudly at startup.
+**Enforced by:** not enforced
+
 ## Test coverage tiers
 
 ### The service-tier tests cannot complete against the live stack
