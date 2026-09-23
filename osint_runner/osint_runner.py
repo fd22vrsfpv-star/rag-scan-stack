@@ -1653,7 +1653,7 @@ def run_recon_pipeline(req: ReconPipelineReq, background_tasks: BackgroundTasks)
 @app.post("/jobs/passive-recon")
 def run_passive_recon(req: PassiveReconReq, background_tasks: BackgroundTasks):
     """Passive-only recon pipeline: no port scanning, no brute force, no vuln scanning.
-    Chains: subfinder → findomain → dnsdumpster → whois → reverse-whois → dnsx → crtsh → httpx → tlsx → cert-chain → gau → katana → gowitness → whatweb"""
+    Chains: subfinder → findomain → dnsdumpster → whois → reverse-whois → dnsx → crtsh → httpx → tlsx → cert-chain → gau+waybackurls → katana → gowitness → whatweb"""
     domains = [t.strip() for t in req.targets if t.strip()]
     if not domains:
         raise HTTPException(status_code=400, detail="No targets provided")
@@ -1662,7 +1662,7 @@ def run_passive_recon(req: PassiveReconReq, background_tasks: BackgroundTasks):
     phases_plan = ["subfinder", "findomain", "dnsdumpster", "whois", "reverse-whois", "dnsx", "crtsh", "httpx", "tlsx"]
     if req.include_cert_chain:
         phases_plan.append(f"cert-chain (max {req.cert_chain_max_iterations or 2} iterations)")
-    phases_plan.append("gau")
+    phases_plan.append("gau+waybackurls")
     if req.include_spider:
         phases_plan.append(f"katana (depth {req.spider_depth or 2})")
     phases_plan.extend(["gowitness", "whatweb"])
@@ -1777,7 +1777,7 @@ def _run_passive_recon(job_id: str, domains: list, include_spider: bool = False,
     short = job_id[:8]
     env = _build_proxy_env(proxy)
 
-    total_phases = 14  # subfinder, findomain, dnsdumpster, whois, reverse-whois, dnsx, crtsh, httpx, tlsx, cert-chain, gau, katana, gowitness, whatweb
+    total_phases = 14  # subfinder, findomain, dnsdumpster, whois, reverse-whois, dnsx, crtsh, httpx, tlsx, cert-chain, gau+waybackurls, katana, gowitness, whatweb
     phase_num = 0
     pipeline_start = _time.time()
 
@@ -2368,25 +2368,92 @@ def _run_passive_recon(job_id: str, domains: list, include_spider: bool = False,
             phases["cert_chain"] = "skipped"
             _checkpoint("cert-chain:skipped", "Cert chaining not applicable")
 
-        # ---- Phase 7: gau (historical URLs from Wayback Machine) ----
+        # ---- Phase 7: gau + waybackurls (historical URLs, passive) ----
+        #
+        # TWO sources, deliberately, because they do not cover the same ground:
+        # gau queries Wayback + Common Crawl + URLScan + AlienVault OTX, while
+        # waybackurls queries the Wayback CDX API directly. gau is the superset
+        # on paper, but it silently drops a provider that errors or rate-limits,
+        # and Wayback is the one provider that matters most here — so the direct
+        # query is the backstop for gau's most important source, not a duplicate.
+        # The union is de-duplicated before ingest.
+        #
+        # Neither writes traffic to the target: these are third-party archives.
         phase_num = 7
-        _checkpoint("gau", f"Fetching historical URLs from Wayback Machine for {len(domains)} domain(s)")
+        _checkpoint("gau", f"Fetching historical URLs for {len(domains)} domain(s)")
         logging.info(f"[{job_id}] passive-recon phase: gau ({len(domains)} domains)")
         gau_out = str(REPORT_DIR / f"passive_gau_{short}.txt")
-        all_gau = []
+        # Per-domain into a SEPARATE file, then appended. `gau --o` TRUNCATES, so
+        # the previous loop pointed every domain at one path and kept only the
+        # last domain's URLs -- a multi-domain passive recon silently lost all
+        # but one target's history.
+        gau_urls = set()
         for domain in domains:
+            # No regex: `_re` is imported inside a different branch of this
+            # function, so it is not reliably bound here.
+            safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in domain)
+            one = str(REPORT_DIR / f"passive_gau_{short}_{safe}.txt")
             try:
-                cmd = ["gau", "--threads", "2", "--o", gau_out, domain]
+                cmd = ["gau", "--threads", "2", "--o", one, domain]
                 subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+                if os.path.exists(one):
+                    with open(one, errors="replace") as f:
+                        gau_urls.update(l.strip() for l in f if l.strip())
             except Exception as e:
                 logging.warning(f"[{job_id}] gau {domain} failed: {e}")
-        if os.path.exists(gau_out):
-            with open(gau_out) as f:
-                all_gau = [line.strip() for line in f if line.strip()]
+            finally:
+                try:
+                    os.path.exists(one) and os.remove(one)
+                except OSError:
+                    pass
+
+        # waybackurls reads domains on stdin and writes URLs to stdout.
+        wb_out = str(REPORT_DIR / f"passive_waybackurls_{short}.txt")
+        wb_urls = set()
+        try:
+            wb_targets = _write_targets_file(domains)
+            subprocess.run(["sh", "-c", f"cat {wb_targets} | waybackurls > {wb_out}"],
+                           capture_output=True, text=True, timeout=600, env=env)
+            if os.path.exists(wb_out):
+                with open(wb_out, errors="replace") as f:
+                    wb_urls.update(l.strip() for l in f if l.strip())
+        except Exception as e:
+            logging.warning(f"[{job_id}] waybackurls failed: {e}")
+
+        # One de-duplicated file per source, so `recon_findings.source` still says
+        # WHICH archive produced a URL (the UI groups and badges on it) while the
+        # overlap between them is not stored twice.
+        only_wb = wb_urls - gau_urls
+        all_gau = sorted(gau_urls)
+        with open(gau_out, "w") as f:
+            f.write("\n".join(all_gau) + ("\n" if all_gau else ""))
+        with open(wb_out, "w") as f:
+            f.write("\n".join(sorted(only_wb)) + ("\n" if only_wb else ""))
+
         phases["gau"] = {"urls": len(all_gau)}
-        all_output_files.append(gau_out)
-        logging.info(f"[{job_id}] gau done: {len(all_gau)} URLs")
-        _checkpoint("gau:done", f"Found {len(all_gau)} historical URLs")
+        phases["waybackurls"] = {"urls": len(wb_urls), "unique_to_waybackurls": len(only_wb)}
+        all_output_files.extend([gau_out, wb_out])
+
+        # INGEST -- this phase used to count its URLs and throw them away, so a
+        # passive recon found historical URLs that never reached recon_findings
+        # and so never appeared anywhere in the UI. Both parse through
+        # etl/parse_gau.py, which keys on `source`.
+        if all_gau:
+            try:
+                _ingest_results("gau", gau_out, job_id=job_id)
+            except Exception as e:
+                logging.warning(f"[{job_id}] gau ingest failed: {e}")
+        if only_wb:
+            try:
+                _ingest_results("waybackurls", wb_out, job_id=job_id)
+            except Exception as e:
+                logging.warning(f"[{job_id}] waybackurls ingest failed: {e}")
+
+        logging.info(f"[{job_id}] gau done: {len(all_gau)} URLs; "
+                     f"waybackurls: {len(wb_urls)} ({len(only_wb)} unique)")
+        _checkpoint("gau:done",
+                    f"Found {len(all_gau)} historical URLs "
+                    f"(+{len(only_wb)} only in waybackurls)")
 
         # ---- Phase 8: katana (spider, if enabled) ----
         phase_num = 8
