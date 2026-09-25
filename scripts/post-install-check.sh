@@ -888,6 +888,19 @@ if [[ -n "$DASH" ]]; then
     fail "certs/ca-bundle.crt missing — run scripts/generate-ca-bundle.sh (services set REQUESTS_CA_BUNDLE to it)"
   fi
 
+  # Vuln-class methodology "skills" feed the exploit-building prompts (web payload
+  # gen/refine + test synthesis) via common/vuln_skills.py reading this file off the
+  # /knowledge mount. If it is unreadable, methodology injection is a silent no-op.
+  for _svc in exploit-runner autogen-agents; do
+    if ct_cid "$_svc" >/dev/null 2>&1; then
+      if ct_exec "$_svc" test -r /knowledge/vuln_class_methodology.yaml 2>/dev/null; then
+        pass "$_svc can read knowledge/vuln_class_methodology.yaml"
+      else
+        fail "$_svc cannot read /knowledge/vuln_class_methodology.yaml — check the ./knowledge:/knowledge:ro mount; vuln-class methodology injection will be a silent no-op"
+      fi
+    fi
+  done
+
   # nmap_scanner resolves the SAME profile for its own empty-ports fallback, so
   # it needs the knowledge/ mount too. Without it the fallback degrades to the
   # sequential 1-1000 range — which still returns HTTP 200 and still produces

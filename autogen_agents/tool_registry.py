@@ -89,6 +89,19 @@ TOOL_SPECS: List[ToolSpec] = [
         func=scan_tools.get_wstg_guidance,
     ),
     ToolSpec(
+        name="get_vuln_methodology",
+        description=(
+            "Load the exploitation methodology skill pack for a vulnerability "
+            "CLASS by name (deterministic, not similarity search). Pass the "
+            "finding's issue_type / cwe / name / nuclei_tags and get back curated "
+            "guidance: a terse web_hint (techniques, payload shapes, success "
+            "signals, filter bypasses) and a fuller synth_methodology (how to "
+            "PROVE impact). READ-ONLY — it dispatches nothing; it tells you HOW to "
+            "build or refine an exploit/test for a class of web finding."
+        ),
+        func=scan_tools.get_vuln_methodology,
+    ),
+    ToolSpec(
         name="get_exploitdb_guidance",
         description=(
             "Read ExploitDB writeups/PoCs relevant to a finding, to build a test "
