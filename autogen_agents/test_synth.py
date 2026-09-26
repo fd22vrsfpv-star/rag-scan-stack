@@ -169,4 +169,18 @@ def synthesize(finding: Dict[str, Any], guidance: str = "",
         "assertion": assertion or {"min_output_bytes": 1},
         "rationale": str(obj.get("rationale") or "")[:200],
     }
+    # Observability: record which vuln-class skill shaped this synthesis.
+    try:
+        from common import vuln_skills as _vs
+        if _vs.enabled("SYNTH_METHODOLOGY"):
+            _cid = _vs.resolve(
+                issue_type=finding.get("issue_type") or finding.get("finding_type"),
+                cwe=finding.get("cwe"), name=finding.get("name"))
+            if _cid:
+                spec.setdefault("metadata", {})["methodology_skill"] = _cid
+                _vs.emit_selected(_cid, source="autogen", phase="synth",
+                                  knowledge_source="skill",
+                                  target=finding.get("target") or finding.get("url"))
+    except Exception:  # noqa: BLE001
+        pass
     return {"ok": True, "spec": spec, "raw": raw[:400], "error": None}

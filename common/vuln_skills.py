@@ -15,6 +15,7 @@ a synthesis because the file was missing or malformed.
 """
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from typing import Any, Dict, List, Optional
@@ -25,6 +26,8 @@ _MAP_PATH = os.environ.get(
 _lock = threading.Lock()
 _cache: Optional[Dict[str, Any]] = None
 _cache_mtime: float = 0.0
+
+_log = logging.getLogger("vuln_skills")
 
 
 def _norm(s: Any) -> str:
@@ -198,3 +201,57 @@ def list_classes() -> List[Dict[str, str]]:
         summary = hint.split(". ", 1)[0][:160] if hint else ""
         out.append({"canonical": cid, "summary": summary})
     return out
+
+
+# ── selection observability ──────────────────────────────────────────────────
+# Every place that PICKS a knowledge source/skill for a finding routes through
+# here so "which source built this?" is logged and (best-effort) emitted as a
+# webhook, consistently across services (exploit_runner, autogen, scan-recommender,
+# post-enumeration). Never raises into a build.
+def selection_payload(canonical, *, source, phase, finding_id=None, target=None,
+                      engagement_id=None, knowledge_source=None,
+                      comparison_group=None):
+    """Standard webhook body for a skill/source selection, or None when nothing
+    was selected. `source` is the emitting subsystem (stored type becomes
+    {source}_methodology_source_selected); `knowledge_source` is skill|rag|yaml."""
+    if not canonical and not knowledge_source:
+        return None
+    return {"event_type": "methodology_source_selected", "source": source,
+            "data": {"skill": canonical, "knowledge_source": knowledge_source,
+                     "phase": phase, "finding_id": finding_id, "target": target,
+                     "engagement_id": engagement_id,
+                     "comparison_group": comparison_group}}
+
+
+def emit_selected(canonical, *, source, phase, finding_id=None, target=None,
+                  engagement_id=None, knowledge_source=None,
+                  comparison_group=None):
+    """Log the selection and emit a best-effort methodology_source_selected
+    webhook. Never raises. Works in any service: API_BASE (or RAG_API_URL) +
+    API_KEY from env, httpx or requests, whichever imports."""
+    payload = selection_payload(
+        canonical, source=source, phase=phase, finding_id=finding_id,
+        target=target, engagement_id=engagement_id,
+        knowledge_source=knowledge_source, comparison_group=comparison_group)
+    if not payload:
+        return
+    _log.info("methodology selection: skill=%s knowledge_source=%s phase=%s "
+              "source=%s finding=%s target=%s", canonical, knowledge_source,
+              phase, source, finding_id, target)
+    base = os.environ.get("API_BASE") or os.environ.get("RAG_API_URL")
+    if not base:
+        return
+    url = f"{base.rstrip('/')}/webhooks/emit"
+    headers = {"x-api-key": os.environ.get("API_KEY", ""),
+               "Content-Type": "application/json"}
+    try:
+        try:
+            import httpx
+            httpx.post(url, headers=headers, json=payload, timeout=5, verify=False)
+            return
+        except ImportError:
+            pass
+        import requests
+        requests.post(url, headers=headers, json=payload, timeout=5, verify=False)
+    except Exception as e:  # noqa: BLE001
+        _log.debug("selection webhook emit skipped: %s", e)
