@@ -565,6 +565,12 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const isAwaitingApproval = session?.status === 'awaiting_approval'
   const { data: pendingApproval } = usePendingApproval(sessionId, isAwaitingApproval)
   const approveSession = useApproveSession()
+  // The operator picks from THIS session's queued exploits, not a free-text UUID
+  // — pasting the session id from the URL was how an approval became "Exploit
+  // not found". Empty selection = approve everything queued.
+  const queuedExploits = pendingApproval?.pending?.queued_exploits ?? []
+  const queuedIds = pendingApproval?.pending?.queued_exploit_ids ?? []
+  const hasQueuedList = queuedExploits.length > 0 || queuedIds.length > 0
   const [approveExploitId, setApproveExploitId] = useState('')
   const [approveNote, setApproveNote] = useState('')
 
@@ -725,12 +731,33 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <input
-              value={approveExploitId}
-              onChange={e => setApproveExploitId(e.target.value)}
-              placeholder="pending_exploit_id (required to approve)"
-              className="flex-1 min-w-[18rem] px-2 py-1.5 bg-background border border-border rounded-md text-xs font-mono"
-            />
+            {hasQueuedList ? (
+              <select
+                value={approveExploitId}
+                onChange={e => setApproveExploitId(e.target.value)}
+                className="flex-1 min-w-[18rem] px-2 py-1.5 bg-background border border-border rounded-md text-xs font-mono"
+              >
+                <option value="">
+                  All queued exploit(s) ({queuedExploits.length || queuedIds.length})
+                </option>
+                {queuedExploits.length
+                  ? queuedExploits.map(q => (
+                      <option key={q.id} value={q.id}>
+                        {(q.title || q.source || 'exploit')}{q.target ? ` → ${q.target}` : ''} ({q.id.slice(0, 8)})
+                      </option>
+                    ))
+                  : queuedIds.map(id => (
+                      <option key={id} value={id}>{id}</option>
+                    ))}
+              </select>
+            ) : (
+              <input
+                value={approveExploitId}
+                onChange={e => setApproveExploitId(e.target.value)}
+                placeholder="pending_exploit_id (required to approve)"
+                className="flex-1 min-w-[18rem] px-2 py-1.5 bg-background border border-border rounded-md text-xs font-mono"
+              />
+            )}
             <input
               value={approveNote}
               onChange={e => setApproveNote(e.target.value)}
@@ -741,13 +768,19 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
               onClick={() => approveSession.mutate({
                 id: sessionId,
                 approved: true,
-                pending_exploit_id: approveExploitId.trim(),
+                // A list is available: empty selection = approve all queued
+                // (omit ids). Fallback text box: send the one typed id.
+                ...(hasQueuedList
+                  ? (approveExploitId ? { pending_exploit_ids: [approveExploitId] } : {})
+                  : { pending_exploit_id: approveExploitId.trim() }),
                 note: approveNote || undefined,
               })}
-              disabled={!approveExploitId.trim() || approveSession.isPending}
-              title={approveExploitId.trim()
-                ? 'Execute the queued exploit and continue'
-                : 'Enter the pending_exploit_id to approve'}
+              disabled={approveSession.isPending || (!hasQueuedList && !approveExploitId.trim())}
+              title={hasQueuedList
+                ? (approveExploitId ? 'Execute the selected exploit and continue'
+                                    : 'Execute every queued exploit and continue')
+                : (approveExploitId.trim() ? 'Execute the queued exploit and continue'
+                                           : 'Enter the pending_exploit_id to approve')}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-purple-600 text-white rounded-md text-sm hover:bg-purple-700 disabled:opacity-50"
             >
               <Check className="h-3.5 w-3.5" /> Approve &amp; run

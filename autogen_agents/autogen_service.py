@@ -3529,8 +3529,10 @@ async def approve_session_step(session_id: str, request: ApprovalRequest):
     if request.pending_exploit_id and request.pending_exploit_id not in ids:
         ids.append(request.pending_exploit_id)
 
+    queued = _queued_exploit_ids(session_uuid)
+
     if request.approved and not ids:
-        ids = _queued_exploit_ids(session_uuid)
+        ids = queued
         if not ids:
             # Fail loudly rather than resuming into a no-op the operator would
             # read as "approved and executed".
@@ -3538,6 +3540,25 @@ async def approve_session_step(session_id: str, request: ApprovalRequest):
                 status_code=400,
                 detail="approved=true but this session has no pending exploits to "
                        "execute. List candidates with GET /api/exploits/pending.")
+    elif request.approved and ids:
+        # Fail CLOSED on an id that is not a queued pending exploit for THIS
+        # session. Without this, an operator who pasted the session id from the
+        # approve URL (the only UUID the old message showed) sailed straight
+        # through to execute_approved_exploit and a confusing "Exploit not found".
+        # Reject it here, naming the ids that ARE valid, so the mistake is caught
+        # at the gate instead of deep in execution.
+        unknown = [i for i in ids if i not in set(queued)]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "One or more ids are not queued pending exploits for "
+                             "this session.",
+                    "unknown_ids": unknown,
+                    "hint": "Use an id from queued_exploit_ids below (NOT the "
+                            "session id from the URL), or omit ids to approve all.",
+                    "queued_exploit_ids": queued,
+                })
 
     session_logger.info(
         "[%s] Operator approval: approved=%s exploits=%s",
