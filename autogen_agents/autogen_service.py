@@ -2811,7 +2811,8 @@ async def synthesize_test(req: SynthesizeTestRequest):
                 name=spec["name"], tier="safe", category=spec["category"],
                 target_ip=((req.target or "").split(":")[0] or None),
                 command=spec["command"], tool=spec["tool"],
-                assertion=spec["assertion"], created_by_session=req.session_id)
+                assertion=spec["assertion"], created_by_session=req.session_id,
+                metadata=spec.get("metadata"))
         except Exception as e:  # noqa: BLE001
             raise HTTPException(500, f"persist failed: {e}")
     return {"ok": True, "spec": spec, "matched_wstg": matched,
