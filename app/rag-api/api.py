@@ -19790,6 +19790,7 @@ def get_finding_exploit_matches(source: str, fid: str, _: bool = Depends(auth)):
 class GeneratePocsRequest(BaseModel):
     max_payloads: int = Field(5, description="Maximum payloads to return")
     use_llm: bool = Field(True, description="Augment templates with LLM-generated payloads")
+    knowledge_source: str = Field("all", description="skill | rag | yaml | all")
 
 
 @app.post("/findings/{source}/{fid}/generate-pocs", tags=["Findings"])
@@ -19839,6 +19840,7 @@ def generate_pocs_for_finding(
                 "name": finding.get("name", ""),
                 "max_payloads": body.max_payloads,
                 "use_llm": body.use_llm,
+                "knowledge_source": body.knowledge_source,
             },
             timeout=120,
         )
