@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import List, Optional
 import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -78,6 +78,10 @@ class ApprovalRequest(BaseModel):
     """Operator answer to a paused LangGraph approval interrupt."""
     approved: bool
     pending_exploit_id: Optional[str] = None
+    # The select list sends this. Omit (or empty) to approve everything queued;
+    # naming a subset runs only those. Forwarded to autogen, which fails closed
+    # on an id that is not a queued pending exploit for the session.
+    pending_exploit_ids: Optional[List[str]] = None
     note: Optional[str] = None
 
 
