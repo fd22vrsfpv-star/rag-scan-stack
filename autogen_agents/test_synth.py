@@ -126,12 +126,16 @@ def _prepend_methodology(guidance: str, finding: Dict[str, Any]) -> str:
 
 
 def synthesize(finding: Dict[str, Any], guidance: str = "",
-               *, max_tokens: int = 700) -> Dict[str, Any]:
+               *, max_tokens: int = 700,
+               apply_skill: Optional[bool] = None) -> Dict[str, Any]:
     """Author a candidate custom test for `finding`. Returns
     {ok, spec:{name,tool,command,category,tier,assertion,rationale}, raw, error}.
     The returned tier is the FAIL-SAFE tier, not necessarily the LLM's."""
     issue = finding.get("issue_type") or finding.get("finding_type") or finding.get("name") or ""
-    guidance = _prepend_methodology(guidance, finding)
+    # apply_skill=False suppresses the skill source (used by the rag/yaml selectors);
+    # None keeps the default (env-gated) behaviour.
+    if apply_skill is not False:
+        guidance = _prepend_methodology(guidance, finding)
     prompt = _PROMPT.format(
         issue_type=issue, name=finding.get("name") or "",
         cwe=finding.get("cwe") or "", target=finding.get("target") or "",
@@ -172,7 +176,7 @@ def synthesize(finding: Dict[str, Any], guidance: str = "",
     # Observability: record which vuln-class skill shaped this synthesis.
     try:
         from common import vuln_skills as _vs
-        if _vs.enabled("SYNTH_METHODOLOGY"):
+        if apply_skill is not False and _vs.enabled("SYNTH_METHODOLOGY"):
             _cid = _vs.resolve(
                 issue_type=finding.get("issue_type") or finding.get("finding_type"),
                 cwe=finding.get("cwe"), name=finding.get("name"))

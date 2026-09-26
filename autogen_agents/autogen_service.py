@@ -2756,6 +2756,27 @@ class SynthesizeTestRequest(BaseModel):
     edb_id: Optional[str] = None       # or a specific ExploitDB entry
     session_id: Optional[str] = None
     persist: bool = True
+    knowledge_source: Optional[str] = "all"   # skill | rag | yaml | all
+
+
+def _yaml_spec(entry: dict, finding: dict):
+    """Deterministic test spec straight from a WSTG-map entry (no LLM). Returns
+    None when the entry has no usable command."""
+    cmd = entry.get("command_rendered") or entry.get("command") or ""
+    if not cmd:
+        return None
+    assertion = entry.get("assertion") if isinstance(entry.get("assertion"), dict) else {}
+    wid = entry.get("wstg_id") or (finding.get("issue_type") or "test")
+    return {
+        "name": f"WSTG:{wid}"[:60],
+        "tool": entry.get("tool") or "curl",
+        "command": cmd,
+        "category": entry.get("category") or "http_probe",
+        "tier": entry.get("tier") or "safe",
+        "assertion": assertion or {"min_output_bytes": 1},
+        "rationale": f"Deterministic WSTG map entry ({wid})"[:200],
+        "metadata": {"knowledge_source": "yaml", "wstg_id": entry.get("wstg_id")},
+    }
 
 
 @app.post("/synthesize-test")
@@ -2775,19 +2796,27 @@ async def synthesize_test(req: SynthesizeTestRequest):
     import scan_tools
     import test_synth
     import db_utils as _db
-    guidance, matched, edb_used = "", None, None
-    try:
-        g = _json.loads(scan_tools.get_wstg_guidance(
-            issue_type=req.issue_type, cwe=req.cwe, name=req.name,
-            target=req.target, url=req.url))
-        guidance = g.get("guidance") or ""
-        matched = (g.get("entry") or {}).get("wstg_id") if g.get("matched") else None
-    except Exception:  # noqa: BLE001
-        pass
-    # ExploitDB writeup as additional guidance when a CVE/EDB id is supplied (or a
-    # CVE was passed in `cwe`). Most ExploitDB-derived tests are real exploits, so
-    # they will fail-safe classify impactful and stay approval-gated.
-    if req.cve or req.edb_id or (req.cwe and req.cwe.upper().startswith("CVE-")):
+    src = (req.knowledge_source or "all").strip().lower()
+    if src not in ("skill", "rag", "yaml", "all"):
+        src = "all"
+    finding = {"issue_type": req.issue_type, "cwe": req.cve or req.cwe,
+               "name": req.name, "url": req.url, "target": req.target}
+    guidance, matched, edb_used, entry = "", None, None, None
+    # WSTG map: prose guidance for rag/all, and the deterministic entry for yaml.
+    if src in ("rag", "yaml", "all"):
+        try:
+            g = _json.loads(scan_tools.get_wstg_guidance(
+                issue_type=req.issue_type, cwe=req.cwe, name=req.name,
+                target=req.target, url=req.url))
+            guidance = g.get("guidance") or ""
+            if g.get("matched"):
+                entry = g.get("entry") or {}
+                matched = entry.get("wstg_id")
+        except Exception:  # noqa: BLE001
+            pass
+    # ExploitDB writeup = extra RAG guidance (rag/all only).
+    if src in ("rag", "all") and (req.cve or req.edb_id
+                                  or (req.cwe and req.cwe.upper().startswith("CVE-"))):
         try:
             ed = _json.loads(scan_tools.get_exploitdb_guidance(
                 cve=req.cve or (req.cwe if (req.cwe or "").upper().startswith("CVE-") else None),
@@ -2798,12 +2827,27 @@ async def synthesize_test(req: SynthesizeTestRequest):
                             + (ed.get("guidance") or ""))[:8000]
         except Exception:  # noqa: BLE001
             pass
-    finding = {"issue_type": req.issue_type, "cwe": req.cve or req.cwe,
-               "name": req.name, "url": req.url, "target": req.target}
-    out = test_synth.synthesize(finding, guidance)
+    if src == "yaml":
+        spec = _yaml_spec(entry or {}, finding)
+        if not spec:
+            raise HTTPException(422, "no deterministic WSTG-map entry for this finding")
+        out = {"ok": True, "spec": spec, "raw": "", "error": None}
+    else:
+        if src == "skill":
+            guidance = ""   # skill-only: suppress WSTG/ExploitDB prose
+        out = test_synth.synthesize(finding, guidance,
+                                    apply_skill=(src in ("skill", "all")))
     if not out.get("ok"):
         raise HTTPException(502, out.get("error") or "synthesis failed")
     spec = out["spec"]
+    spec.setdefault("metadata", {})["knowledge_source"] = src
+    try:
+        from common import vuln_skills as _vs
+        _vs.emit_selected(spec.get("metadata", {}).get("methodology_skill"),
+                          source="autogen", phase="synth", knowledge_source=src,
+                          target=req.target or req.url)
+    except Exception:  # noqa: BLE001
+        pass
     persisted_id = None
     if req.persist and spec["tier"] == "safe":
         try:
@@ -2815,7 +2859,7 @@ async def synthesize_test(req: SynthesizeTestRequest):
                 metadata=spec.get("metadata"))
         except Exception as e:  # noqa: BLE001
             raise HTTPException(500, f"persist failed: {e}")
-    return {"ok": True, "spec": spec, "matched_wstg": matched,
+    return {"ok": True, "spec": spec, "source_used": src, "matched_wstg": matched,
             "matched_exploitdb": edb_used, "persisted_id": persisted_id,
             "requires_approval": spec["tier"] == "impactful"}
 
