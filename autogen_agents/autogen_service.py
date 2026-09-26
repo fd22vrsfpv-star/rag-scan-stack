@@ -2757,6 +2757,7 @@ class SynthesizeTestRequest(BaseModel):
     session_id: Optional[str] = None
     persist: bool = True
     knowledge_source: Optional[str] = "all"   # skill | rag | yaml | all
+    sources: Optional[List[str]] = None       # for /synthesize-test/compare
 
 
 def _yaml_spec(entry: dict, finding: dict):
@@ -2779,30 +2780,18 @@ def _yaml_spec(entry: dict, finding: dict):
     }
 
 
-@app.post("/synthesize-test")
-async def synthesize_test(req: SynthesizeTestRequest):
-    """LLM-author a CUSTOM security test for one web finding (prototype of the
-    'move past straight tools' direction).
-
-    Matches the finding to its WSTG guidance, asks the RESOLVED LLM backend to
-    write a concrete command + machine-checkable assertion, then FAIL-SAFE
-    classifies the synthesized command (the model's own opinion cannot upgrade a
-    test into the safe lane). A safe candidate is persisted (enabled) and re-runs
-    through the scope-gated executor; an impactful candidate is returned for
-    approval and NOT persisted (the security_tests lane check needs a
-    pending_exploit_id). This never executes anything.
-    """
+async def _build_synth_spec(req, src):
+    """Build one candidate test spec for `src` (skill|rag|yaml|all). No persist.
+    Returns {ok, spec, source_used, matched_wstg, matched_exploitdb, error}."""
     import json as _json
     import scan_tools
     import test_synth
-    import db_utils as _db
-    src = (req.knowledge_source or "all").strip().lower()
+    src = (src or "all").strip().lower()
     if src not in ("skill", "rag", "yaml", "all"):
         src = "all"
     finding = {"issue_type": req.issue_type, "cwe": req.cve or req.cwe,
                "name": req.name, "url": req.url, "target": req.target}
     guidance, matched, edb_used, entry = "", None, None, None
-    # WSTG map: prose guidance for rag/all, and the deterministic entry for yaml.
     if src in ("rag", "yaml", "all"):
         try:
             g = _json.loads(scan_tools.get_wstg_guidance(
@@ -2814,7 +2803,6 @@ async def synthesize_test(req: SynthesizeTestRequest):
                 matched = entry.get("wstg_id")
         except Exception:  # noqa: BLE001
             pass
-    # ExploitDB writeup = extra RAG guidance (rag/all only).
     if src in ("rag", "all") and (req.cve or req.edb_id
                                   or (req.cwe and req.cwe.upper().startswith("CVE-"))):
         try:
@@ -2830,15 +2818,16 @@ async def synthesize_test(req: SynthesizeTestRequest):
     if src == "yaml":
         spec = _yaml_spec(entry or {}, finding)
         if not spec:
-            raise HTTPException(422, "no deterministic WSTG-map entry for this finding")
-        out = {"ok": True, "spec": spec, "raw": "", "error": None}
+            return {"ok": False, "source_used": src,
+                    "error": "no deterministic WSTG-map entry for this finding"}
+        out = {"ok": True, "spec": spec}
     else:
-        if src == "skill":
-            guidance = ""   # skill-only: suppress WSTG/ExploitDB prose
-        out = test_synth.synthesize(finding, guidance,
-                                    apply_skill=(src in ("skill", "all")))
+        out = test_synth.synthesize(
+            finding, ("" if src == "skill" else guidance),
+            apply_skill=(src in ("skill", "all")))
     if not out.get("ok"):
-        raise HTTPException(502, out.get("error") or "synthesis failed")
+        return {"ok": False, "source_used": src,
+                "error": out.get("error") or "synthesis failed"}
     spec = out["spec"]
     spec.setdefault("metadata", {})["knowledge_source"] = src
     try:
@@ -2848,6 +2837,20 @@ async def synthesize_test(req: SynthesizeTestRequest):
                           target=req.target or req.url)
     except Exception:  # noqa: BLE001
         pass
+    return {"ok": True, "spec": spec, "source_used": src,
+            "matched_wstg": matched, "matched_exploitdb": edb_used}
+
+
+@app.post("/synthesize-test")
+async def synthesize_test(req: SynthesizeTestRequest):
+    """Build a custom security test for one web finding from the selected knowledge
+    source (skill|rag|yaml|all). Safe -> persisted (scope-gated executor); impactful
+    -> returned for approval. Never executes anything."""
+    import db_utils as _db
+    out = await _build_synth_spec(req, req.knowledge_source)
+    if not out.get("ok"):
+        raise HTTPException(502, out.get("error") or "synthesis failed")
+    spec = out["spec"]
     persisted_id = None
     if req.persist and spec["tier"] == "safe":
         try:
@@ -2859,9 +2862,57 @@ async def synthesize_test(req: SynthesizeTestRequest):
                 metadata=spec.get("metadata"))
         except Exception as e:  # noqa: BLE001
             raise HTTPException(500, f"persist failed: {e}")
-    return {"ok": True, "spec": spec, "source_used": src, "matched_wstg": matched,
-            "matched_exploitdb": edb_used, "persisted_id": persisted_id,
+    return {"ok": True, "spec": spec, "source_used": out["source_used"],
+            "matched_wstg": out.get("matched_wstg"),
+            "matched_exploitdb": out.get("matched_exploitdb"),
+            "persisted_id": persisted_id,
             "requires_approval": spec["tier"] == "impactful"}
+
+
+@app.post("/synthesize-test/compare")
+async def synthesize_test_compare(req: SynthesizeTestRequest):
+    """Build the SAME finding several ways (skill / rag / yaml by default) and return
+    them side by side under a shared comparison_group. Safe specs are persisted
+    (tagged) when persist=true; impactful are returned for approval."""
+    import uuid
+    import db_utils as _db
+    srcs = [x.strip().lower() for x in (req.sources or ["skill", "rag", "yaml"])
+            if isinstance(x, str) and x.strip().lower() in ("skill", "rag", "yaml", "all")]
+    if not srcs:
+        srcs = ["skill", "rag", "yaml"]
+    cg = str(uuid.uuid4())
+    by_source = {}
+    for s in srcs:
+        r = await _build_synth_spec(req, s)
+        if not r.get("ok"):
+            by_source[s] = {"ok": False, "error": r.get("error")}
+            continue
+        spec = r["spec"]
+        spec.setdefault("metadata", {})["comparison_group"] = cg
+        persisted_id = None
+        if req.persist and spec["tier"] == "safe":
+            try:
+                persisted_id = _db.create_security_test(
+                    name=spec["name"], tier="safe", category=spec["category"],
+                    target_ip=((req.target or "").split(":")[0] or None),
+                    command=spec["command"], tool=spec["tool"],
+                    assertion=spec["assertion"], created_by_session=req.session_id,
+                    metadata=spec.get("metadata"))
+            except Exception:  # noqa: BLE001
+                persisted_id = None
+        by_source[s] = {"ok": True, "spec": spec, "source_used": s,
+                        "matched_wstg": r.get("matched_wstg"),
+                        "matched_exploitdb": r.get("matched_exploitdb"),
+                        "persisted_id": persisted_id,
+                        "requires_approval": spec["tier"] == "impactful"}
+    try:
+        from common import vuln_skills as _vs
+        _vs.emit_selected(None, source="autogen", phase="compare",
+                          knowledge_source="+".join(srcs), comparison_group=cg,
+                          target=req.target or req.url)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "comparison_group": cg, "by_source": by_source}
 
 
 @app.post("/pentest/cleanup")

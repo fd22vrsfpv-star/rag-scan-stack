@@ -213,7 +213,7 @@ export interface SynthesizedTest {
 export function useSynthesizeTest(sessionId?: string) {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (vars: { issue_type?: string; cwe?: string; name?: string; url?: string; target?: string; cve?: string; edb_id?: string; persist?: boolean }) =>
+    mutationFn: (vars: { issue_type?: string; cwe?: string; name?: string; url?: string; target?: string; cve?: string; edb_id?: string; persist?: boolean; knowledge_source?: string }) =>
       apiFetch<SynthesizedTest>('/synthesize-test', {
         method: 'POST',
         body: JSON.stringify({ ...vars, session_id: sessionId }),
@@ -222,5 +222,37 @@ export function useSynthesizeTest(sessionId?: string) {
       if (d.persisted_id && sessionId)
         qc.invalidateQueries({ queryKey: ['security-tests', 'session', sessionId] })
     },
+  })
+}
+
+
+/** One finding built several ways (skill/rag/yaml) for side-by-side comparison. */
+export interface SourceCompareResult {
+  ok: boolean
+  comparison_group: string
+  by_source: Record<string, {
+    ok: boolean
+    spec?: SynthesizedTest['spec']
+    source_used?: string
+    matched_wstg?: string[] | null
+    matched_exploitdb?: string | null
+    persisted_id?: string | null
+    requires_approval?: boolean
+    error?: string
+  }>
+}
+
+/** Build the same finding from each knowledge source and compare the outputs. */
+export function useCompareSources(sessionId?: string) {
+  return useMutation({
+    mutationFn: (vars: {
+      issue_type?: string; cwe?: string; name?: string; url?: string
+      target?: string; cve?: string; edb_id?: string; persist?: boolean
+      sources?: string[]
+    }) =>
+      apiFetch<SourceCompareResult>('/synthesize-test/compare', {
+        method: 'POST',
+        body: JSON.stringify({ ...vars, session_id: sessionId }),
+      }),
   })
 }
