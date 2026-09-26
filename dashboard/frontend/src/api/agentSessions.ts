@@ -191,6 +191,10 @@ export interface PendingApproval {
     target?: string
     candidate?: string
     prompt?: string
+    /** Ids this session queued (authoritative set the operator chooses from). */
+    queued_exploit_ids?: string[]
+    /** Same rows with title/target, for a select list. */
+    queued_exploits?: { id: string; title?: string; target?: string; source?: string }[]
   } | null
   answer_with?: string
 }
@@ -280,8 +284,10 @@ interface StartSessionParams {
 export interface ApproveSessionParams {
   id: string
   approved: boolean
-  /** Required when approved — the pending_exploits row to execute. */
+  /** A single pending_exploits row to execute. Prefer pending_exploit_ids. */
   pending_exploit_id?: string
+  /** The rows to execute. Omit to approve everything this session queued. */
+  pending_exploit_ids?: string[]
   note?: string
 }
 
